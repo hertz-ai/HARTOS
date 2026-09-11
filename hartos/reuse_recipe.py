@@ -100,6 +100,32 @@ def _normalize_flow_recipe(config):
 # emitted as constants by the VLM writer — persona is always a user id, and
 # can_perform_without_user_input was 'no' in 47 of 47 files measured on this
 # box — so letting them through replaces an authored decision with noise.
+# How UNLIKE its own action an instruction must be before a re-learning is
+# refused as someone else's work.  NOT the 0.8 `similar_instructions` default:
+# that gate answers "am I confident enough to REPLAY these steps", and reusing
+# it here answered a different question with the wrong bar.  It cost a FALSE
+# REFUSAL within one drive of shipping -- 2026-09-11 06:42:51, agent
+# 89088690384 action 1:
+#     action     ='Query the operating system for the current free disk space
+#                  on the primary system drive in gigabytes (GB)'
+#     instruction='Get the free disk space in GB on the primary system drive'
+# the same task, paraphrased, scoring 0.60 and refused.
+#
+# Measured separation over every case on this box (normalised both sides):
+#     Restart the computer ... vs open browser/top result URL      0.2500
+#     Check the current time on Windows vs write parser script     0.0000
+#     Create 'HART_OS' dir + git init vs run script -> JSON        0.0588
+#     Create 'HART_OS' dir, admin perms vs generate summary        0.1538
+#     check if HART_OS dir exists vs navigate to top result URL    0.3333
+#     ---- every real substitution at or below                     0.3333
+#     ---- the legitimate paraphrase above                         0.6000
+# 0.45 is the midpoint of that gap.  The guard is deliberately the CONSERVATIVE
+# side of it: a re-learning is refused only on clear evidence it is a different
+# task, because the cost of a false refusal (lost learning) is silent while the
+# cost of a false accept (an unrelated task stamped over an action) is the
+# 4-of-9 corruption D67b was written for.
+_RELEARN_IDENTITY_THRESHOLD = 0.45
+
 _VLM_PRESERVED_CONTRACT_FIELDS = (
     'persona',
     'can_perform_without_user_input',
@@ -1960,7 +1986,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                 user_prompt, current_action_id).get('action') or '')
             _relearning_claims_this_action = (
                 not _banked_text
-                or similar_instructions(instructions, _banked_text))
+                or similar_instructions(instructions, _banked_text,
+                                        threshold=_RELEARN_IDENTITY_THRESHOLD))
             if not _relearning_claims_this_action:
                 # WARNING, not info: this has to be countable on the next drive
                 # in BOTH directions -- that the substitutions stopped, and that

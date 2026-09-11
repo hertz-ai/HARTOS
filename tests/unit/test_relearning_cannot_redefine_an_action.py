@@ -88,6 +88,26 @@ _HARTOS = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file
 _SRC = os.environ.get('HARTOS_REUSE_SRC') or os.path.join(
     _HARTOS, 'hartos', 'reuse_recipe.py')
 
+# The guard's OWN threshold, not similar_instructions' 0.8 default. Imported
+# from the module so this file cannot drift from the shipped value.
+def _guard_threshold():
+    import io as _io, re as _re
+    src = _io.open(_SRC, encoding='utf-8', errors='replace').read()
+    m = _re.search(r'^_RELEARN_IDENTITY_THRESHOLD\s*=\s*([0-9.]+)', src, _re.M)
+    return float(m.group(1)) if m else None
+
+
+# A LEGITIMATE re-learning the guard must ALLOW. Measured live 2026-09-11
+# 06:42:51 on agent 89088690384 action 1, where the first version of this guard
+# -- which reused similar_instructions' 0.8 -- REFUSED it. Same task, reworded.
+# This is the regression case: it scores 0.60, every real substitution scores
+# <= 0.3333, and reusing the replay-confidence bar refused the paraphrase.
+_LEGIT_PARAPHRASE = (
+    'Query the operating system for the current free disk space on the '
+    'primary system drive in gigabytes (GB)',
+    'Get the free disk space in GB on the primary system drive',
+)
+
 _THRESHOLD = 0.8
 
 # Verbatim from the live drive: what the recipe says vs what the file claimed.
@@ -174,6 +194,34 @@ class TestTheComparatorCanTellThemApart(unittest.TestCase):
                 'the banked action, i.e. the comparator cannot tell the '
                 'substitution apart from a refinement -- the identity guard '
                 'would be unable to refuse it' % (aid, score))
+
+    def test_the_guard_threshold_separates_paraphrase_from_substitution(self):
+        """The regression that shipped, and the measurement that fixes it.
+
+        The first guard reused similar_instructions' 0.8 and refused a genuine
+        paraphrase live within one drive.  0.8 answers "confident enough to
+        REPLAY these steps"; the guard asks "confident enough to call this
+        SOMEONE ELSE'S work".  Different question, different bar.
+        """
+        n = _norm()
+        thr = _guard_threshold()
+        self.assertIsNotNone(
+            thr, 'no _RELEARN_IDENTITY_THRESHOLD in reuse_recipe.py -- the '
+                 'guard is back on the replay bar and will refuse paraphrases')
+        legit = _overlap_ratio(n(_LEGIT_PARAPHRASE[0]), n(_LEGIT_PARAPHRASE[1]))
+        worst_sub = max(_overlap_ratio(n(b), n(c))
+                        for b, c in _SUBSTITUTIONS.values())
+        self.assertGreater(
+            legit, thr,
+            'the live paraphrase (%.4f) is at or below the guard threshold '
+            '(%.2f), so a legitimate re-learning is refused -- exactly the '
+            'regression measured 2026-09-11 06:42:51 on agent 89088690384'
+            % (legit, thr))
+        self.assertLessEqual(
+            worst_sub, thr,
+            'the worst real substitution (%.4f) is above the guard threshold '
+            '(%.2f), so the corruption D67b exists to stop would be filed'
+            % (worst_sub, thr))
 
     def test_each_banked_action_still_matches_itself(self):
         """A guard that refuses everything is worse than the bug."""
