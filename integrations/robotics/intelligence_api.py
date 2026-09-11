@@ -80,6 +80,18 @@ _REGISTRY_PATH = os.path.join(
 )
 _REGISTRY_PATH = os.path.normpath(_REGISTRY_PATH)
 
+# Asks for the shape `_extract_target` (:1094) and `_fuse_results` (:729)
+# already consume: objects as {label,x,y} dicts, obstacles as labels.  Those
+# two are the only readers, and both have received [] for the life of this
+# module because the old code read them off a producer that emits neither.
+_SCENE_PROMPT = (
+    'Describe this scene for a robot. Reply ONLY with JSON of the form '
+    '{"scene": "<one sentence>", '
+    '"objects": [{"label": "<name>", "x": <pixel>, "y": <pixel>}], '
+    '"obstacles": ["<name>"]}. '
+    'List what you can actually see; use an empty list if there is none.'
+)
+
 # ---------------------------------------------------------------------------
 # Singleton
 # ---------------------------------------------------------------------------
@@ -284,27 +296,43 @@ class RobotIntelligenceAPI:
         except ImportError:
             pass
 
+        # describe_scene is the ONE entry point that takes a CALLER-SUPPLIED
+        # image.  What was here before sent {'type','image','prompt'} to
+        # execute_vlm_instruction, which forwards the dict verbatim to
+        # run_local_agentic_loop — a DESKTOP-CONTROL loop that reads exactly
+        # five keys (local_loop.py:246-250):
+        #
+        #   instruction_to_vlm_agent  enhanced_instruction  user_id
+        #   prompt_id                 max_ETA_in_seconds
+        #
+        # None of the three sent is among them.  So the robot's camera frame
+        # was discarded, `instruction` defaulted to '', and the loop
+        # screenshotted the operator's monitor and drove mouse/keyboard.
+        # The reply was read the same way: result['objects'] /
+        # result['obstacles'] are keys no producer has ever emitted, so
+        # _extract_target (:1094) never once derived a target from vision and
+        # plan['obstacles_detected'] (:730) was never set.
+        #
+        # JSON is REQUESTED but not required — a VLM answering in prose is
+        # normal, and prose is still a real observation, so it becomes the
+        # scene rather than being dropped.  extract_json is the canonical
+        # reader (it handles fenced blocks and nested objects); parsing it
+        # here a second way is what produced the defect above.
         try:
-            from integrations.vlm.vlm_adapter import execute_vlm_instruction
-            msg = {
-                'type': 'describe',
-                'image': camera,
-                'prompt': (
-                    'Describe this scene for a robot. '
-                    'List objects, obstacles, and navigable paths.'
-                ),
+            from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
+            from integrations.vlm.parser import extract_json
+
+            raw = get_qwen3vl_backend().describe_scene(camera, _SCENE_PROMPT)
+            parsed = extract_json(raw) or {}
+            objects = parsed.get('objects')
+            obstacles = parsed.get('obstacles')
+            scene = str(parsed.get('scene') or '').strip() or str(raw or '').strip()
+            return {
+                'scene': scene or 'unknown',
+                'objects': objects if isinstance(objects, list) else [],
+                'obstacles': obstacles if isinstance(obstacles, list) else [],
+                'raw': raw,
             }
-            result = execute_vlm_instruction(msg)
-            if result and isinstance(result, dict):
-                description = result.get('extracted_responses', [''])[0] \
-                    if isinstance(result.get('extracted_responses'), list) \
-                    else str(result.get('extracted_responses', ''))
-                return {
-                    'scene': description or 'unknown',
-                    'objects': result.get('objects', []),
-                    'obstacles': result.get('obstacles', []),
-                    'raw': result,
-                }
         except Exception as exc:
             logger.debug("Vision intelligence fallback: %s", exc)
 
