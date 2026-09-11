@@ -1102,7 +1102,63 @@ def create_agents_for_role(user_id: str, prompt_id):
         return 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', True
 
 
-def _tool_observation_summary(recipe_steps):
+def _vlm_recipe_steps(response, instructions):
+    """``extracted_responses`` -> the cleaned steps, for BOTH readers of it.
+
+    ONE extraction, because there are two callers with different jobs and the
+    same source: the learn branch writes these steps to the VLM recipe file,
+    and ``_tool_observation_summary`` turns them into the text handed back to
+    the model.  Kept inline in the learn branch, the reuse branch could only
+    have grown a second copy -- and a second copy of "what did the tool see"
+    is exactly the drift that produces two different answers to one question.
+
+    May raise: the learn branch is wrapped in a try/except that returns
+    'Command executed but encountered an error while processing results', and
+    that loud failure is worth keeping.  The observation path cannot afford a
+    raise, so its guard lives in ``_tool_observation_summary`` instead.
+    """
+    def clean_text(text):
+        lines = text.split('\n')
+        cleaned_lines = []
+        for line in lines:
+            if (not line.strip().startswith("Next Action:") and
+                not line.strip().startswith("Box ID:") and
+                not line.strip().startswith("box_centroid_coordinate:") and
+                not line.strip().startswith("value:")):
+                cleaned_lines.append(line)
+        return '\n'.join(cleaned_lines)
+
+    recipe_steps = []
+    for msg in response["extracted_responses"]:
+        msg_type = msg.get("type", "")
+        msg_content = msg.get("content", "")
+
+        if msg_type == "analysis":
+            cleaned_content = clean_text(msg_content)
+            if cleaned_content.strip():
+                recipe_steps.append({
+                    "steps": cleaned_content,
+                    "tool_name": "execute_windows_or_android_command",
+                    "agent_to_perform_this_action": "Helper"
+                })
+        elif msg_type == "next_action":
+            formatted_content = helper_fun.format_action_text(msg_content)
+            if formatted_content.strip():
+                recipe_steps.append({
+                    "steps": formatted_content,
+                    "tool_name": "execute_windows_or_android_command",
+                    "agent_to_perform_this_action": "Helper"
+                })
+
+    if not recipe_steps:
+        recipe_steps.append({
+            "steps": instructions,
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        })
+    return recipe_steps
+
+def _tool_observation_summary(response, instructions=''):
     """What the computer-use tool SAW, as text the model can read.
 
     ``execute_windows_or_android_command`` returned an ANNOUNCEMENT and threw
@@ -1151,7 +1207,7 @@ def _tool_observation_summary(recipe_steps):
     """
     try:
         parts = []
-        for step in (recipe_steps or []):
+        for step in _vlm_recipe_steps(response, instructions):
             if not isinstance(step, dict):
                 continue
             text = str(step.get('steps') or '').strip()
@@ -2097,60 +2153,9 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                         # Create directory if it doesn't exist
                         os.makedirs(os.path.dirname(vlm_agent_path), exist_ok=True)
 
-                        # Function to clean technical details from text
-                        def clean_text(text):
-                            # Remove lines with technical details
-                            lines = text.split('\n')
-                            cleaned_lines = []
-                            for line in lines:
-                                if (not line.strip().startswith("Next Action:") and
-                                    not line.strip().startswith("Box ID:") and
-                                    not line.strip().startswith("box_centroid_coordinate:") and
-                                    not line.strip().startswith("value:")):
-                                    cleaned_lines.append(line)
-                            return '\n'.join(cleaned_lines)
-
-                        def format_action_text(text):
-                            return helper_fun.format_action_text(text)
-
                         # Handle different response format
                         if 'extracted_responses' in response:
-                            # Extract the instruction and responses
-                            instruction = response.get("instruction", instructions)
-                            extracted_responses = response["extracted_responses"]
-
-                            # Process all responses and create recipe steps
-                            recipe_steps = []
-
-                            for msg in extracted_responses:
-                                msg_type = msg.get("type", "")
-                                msg_content = msg.get("content", "")
-
-                                # Clean the content
-                                if msg_type == "analysis":
-                                    cleaned_content = clean_text(msg_content)
-                                    if cleaned_content.strip():  # Only add non-empty content
-                                        recipe_steps.append({
-                                            "steps": cleaned_content,
-                                            "tool_name": "execute_windows_or_android_command",
-                                            "agent_to_perform_this_action": "Helper"
-                                        })
-                                elif msg_type == "next_action":
-                                    formatted_content = format_action_text(msg_content)
-                                    if formatted_content.strip():  # Only add non-empty content
-                                        recipe_steps.append({
-                                            "steps": formatted_content,
-                                            "tool_name": "execute_windows_or_android_command",
-                                            "agent_to_perform_this_action": "Helper"
-                                        })
-
-                            # If no steps were created, add a default one
-                            if not recipe_steps:
-                                recipe_steps.append({
-                                    "steps": instructions,
-                                    "tool_name": "execute_windows_or_android_command",
-                                    "agent_to_perform_this_action": "Helper"
-                                })
+                            recipe_steps = _vlm_recipe_steps(response, instructions)
 
                             persona = f"user{user_id}" if user_id else "user"
 
@@ -2219,6 +2224,37 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                         return f'Command executed but encountered an error while processing results: {str(e)}'
 
             if response and response['status'] == 'success':
+                # THIS is the branch a REUSE walk takes, and it was the
+                # one still returning a bare announcement.  The learn
+                # branch above is guarded by `not matching_recipe` --
+                # true only the FIRST time an instruction is seen.
+                # Reusing a banked recipe means the instruction matches a
+                # banked action by construction, so control falls straight
+                # past that branch to here.  MEASURED live 2026-09-11
+                # 08:25-08:38, agent 89091774807: 'Processing RPC response
+                # to create recipe format' 0x -- the learn branch was never
+                # entered -- against 'REUSING command - matched with' 1x and
+                # RELEARN-REFUSED 2x, i.e. 3 skips for the window's 3 tool
+                # calls.
+                #
+                # Which is why fixing only the VLM-path return (c7627df5a)
+                # put no figure in front of the model: that return is on the
+                # create-time learning path and every reuse walk goes the
+                # other way.  The pyc was byte-verified and the branch still
+                # never ran.
+                #
+                # Same helper and same source (`response`) as the other
+                # return, so the two cannot describe one run differently.
+                # If a summary ever carried a TOOL_FAILURE_RESULTS string
+                # the fabrication gate would read the action as not-run --
+                # that direction is the safe one: it under-reports and
+                # re-steers rather than faking a completion.
+                _observed = _tool_observation_summary(response, instructions)
+                if _observed:
+                    return (
+                        'Successfully ran the command in user\'s computer.\n'
+                        'What was observed on the machine:\n'
+                        + _observed)
                 return 'Successfully ran the command in user\'s computer.'
             else:
                 # Returned from core.constants, not restated here: the
