@@ -373,10 +373,25 @@ milestone that regresses latency fails even if it looks better.
   reactivity (orb hover + press, card hover), a retained scene tree and a pooled
   solid buffer (the zero-per-frame-alloc NFR). Proven HEADLESS in CI: the demo
   scene lowers, its buffers import, and it composites real pixels over a sentinel
-  on a pixman target. NOT proven: on-screen DRM scanout, fps, and input-to-photon
-  p50/p99. Those need a person at the box (see the injection-seat finding: a
-  uinput device is not granted to the compositor's libseat session, so synthetic
-  motion never reaches the input path and emits no samples).
+  on a pixman target.
+- 2026-09-11: INPUT-TO-PHOTON IS MEASURED, per component, on generation 8
+  (`image-rev 4e09e01`). Two things that were written here as blockers are retired.
+  The injection-seat finding is wrong as stated: a uinput device DOES reach the
+  compositor's input path, and the sweeps below ran on synthetic motion with no
+  person at the box. And the flag no longer needs a generation: `shell.native {on}`
+  (IPC_PROTOCOL.md 4.12) turns the scene on and off for the running session, which
+  is what made an A/B on one boot possible at all.
+  What the instrument now prints, sweeping five points at human cadence: with the
+  scene OFF, one row, `component=shell p50~14ms p99~59ms max~220ms`. With it ON,
+  fourteen rows naming SEVEN components: `top-bar 25.4/46.4`, `omnibox 18.0/33.3`,
+  `orb 24.0/46.9`, `home-row 22.0`, `home-card 31.1/48.8`, `taskbar 25.4/38.8`,
+  `shell 25.0/50.5` (p50/p99 ms). Every one is FAIL against the 16ms budget.
+  The ~220ms tail is the 200ms IDLE_HEARTBEAT (main.rs:586), not a stall: it
+  collapses to 40-66ms as soon as the scene animates and the compositor stops
+  coasting. And the p50 rising to ~25ms is NOT a verdict on native rendering:
+  `shell.native` does not demote the WebView, so that half measured both renderers
+  at once. The M6 comparison still needs obligation 3.
+  Full numbers and the caveat in docs/VERIFICATION.md.
 
 ### Text measure: LANDED, and it unblocks the rest of P5
 P5 could not be finished as specified, and neither could the row See-all
