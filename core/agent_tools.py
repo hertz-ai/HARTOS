@@ -380,6 +380,54 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
         attached_names.add(_c_name)
         attached.append(_c_name)
 
+    # THIRD source: tools the EXECUTOR can already run but the helper can no
+    # longer SEE.  `register_dual` splits schema (helper.register_for_llm) from
+    # execution (executor.register_for_execution -> _function_map), so a family
+    # whose schema is withheld from the helper to save context is still fully
+    # live on the executor — the callable is right there, only the description
+    # the model reads is missing.  Consulting it costs nothing and is what
+    # makes withholding SAFE rather than exclusionary.
+    #
+    # Why this is required, measured live 2026-09-12 on the CREATE walk of
+    # agent 87400889007: the create helper carries 54 tools = 7,191 schema
+    # tokens against n_ctx 8,192 (88% of the window), so the trimmer reports
+    # "the TOOL SCHEMA alone is 7191 tokens ... no amount of message trimming
+    # can make this fit" and the walk 400s at action 5.  Across 1,568 wire rows
+    # autogen.create called 9 distinct tools, ALL of them in MAIN_LEG_CORE_TOOLS
+    # — none of the other 36.  Narrowing the helper is therefore the fix, but
+    # the families that make it overflow (channel, memory-graph, coding, AP2,
+    # media) live in NEITHER of the two sources above, so without this loop
+    # narrowing would make them permanently unreachable.  That is the owner's
+    # 2026-08-31 requirement in reverse: the hierarchy must be LAZY, not
+    # exclusionary.
+    #
+    # Same selector, same idempotent `attached_names`, same register_dual
+    # primitive as the two loops above — only the SOURCE differs, kept here
+    # rather than in a sibling for the reason the core loop is inline too.
+    # `_function_map` is the established accessor (reuse_recipe.py:5000-5008
+    # already reads it for the sibling "can this agent serve the call"
+    # question).  Missing attribute is a strict no-op: agents built by the
+    # time and visual factories must degrade to today's behaviour, not raise.
+    for _x_name, _x_func in sorted(
+            (getattr(executor, '_function_map', None) or {}).items()):
+        if _x_name in attached_names:
+            continue
+        # _function_map carries no description — the docstring's first line is
+        # the only text the tool ships with, and it is what the model will read
+        # once re-attached.  Fall back to the name so a doc-less callable is
+        # still matchable and still gets a non-empty description.
+        _x_desc = ((getattr(_x_func, '__doc__', '') or '').strip()
+                   .split('\n')[0].strip()) or _x_name
+        hay_x = (str(_x_name) + ' ' + _x_desc).lower()
+        x_words = {hw for hw in _re.split(r'[^a-z0-9]+', hay_x) if len(hw) >= 4}
+        x_stems = {hw[:4] for hw in x_words}
+        if not any(w in hay_x or (len(w) >= 4 and w[:4] in x_stems)
+                   for w in words):
+            continue
+        register_dual(helper, executor, _x_func, _x_name, _x_desc)
+        attached_names.add(_x_name)
+        attached.append(_x_name)
+
     parts = []
     if attached:
         # Imperative on purpose: hop-2 probe 2026-08-31 showed the model
