@@ -2214,9 +2214,25 @@ class ToolMessageHandler:
                                 insert_position = j + 1
 
                             final_messages.insert(insert_position, placeholder)
+                            # peers=N is the DISCRIMINATOR, not decoration.
+                            # ToolMessageHandler is constructed at 9 sites and
+                            # only 2 pass peer_agents (reuse_recipe :1633,
+                            # :2311); the other 7 -- create_recipe :1135/:2891/
+                            # :3571/:3682 and reuse_recipe :1010/:3201 -- leave
+                            # it empty, and real_tool_answer iterates exactly
+                            # that list, so with peers=0 it can ONLY ever
+                            # return None and "no peer holds it" is vacuous.
+                            # Live 2026-09-11 07:29-07:32 (agent 89091774807):
+                            # 39 placeholders, every one "no peer holds it",
+                            # and the model then invented "38.4 GB" against a
+                            # real 9.17 GB.  Without this count the log cannot
+                            # say whether the answer was genuinely absent
+                            # (peers>0, a real defect upstream) or was never
+                            # looked for (peers=0, a wiring gap here).
                             current_app.logger.info(
                                 f"[TOOL-ANSWER-FILL] {tool_call_id} <- "
                                 f"{'REAL result %d chars' % len(_real) if _real else 'placeholder (no peer holds it)'}"
+                                f" peers={len(self._peer_agents)}"
                             )
 
 
