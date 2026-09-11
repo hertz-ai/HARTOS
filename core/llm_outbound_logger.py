@@ -501,13 +501,27 @@ def _get_budget_per_slot() -> int:
     server then refused with ``exceed_context_size_error``, and reuse logged
     ``robust completion-advance FAILED ... the pipeline did not advance`` for
     sessions ..._18163818525 and ..._1923323102 — the agents never reached
-    their goals.  ``HEVOLVE_LLAMA_CTX_SIZE`` is documented at
-    core/constants.py:71 as "must match the --ctx-size cmdline", but measured
-    across BOTH repos nothing ever sets it: its only references are that
-    comment and this function.  So the constant always won and the docstring's
-    "matches Nunba's llama_config.py:1527" was a declaration, not a guard
-    (memory/feedback_declaration_is_not_a_guard.md).  Asking the server turns
-    the claim into a measurement.
+    their goals.
+
+    WHY THE OVERRIDE DID NOT SAVE US — CORRECTED 2026-09-11, and the earlier
+    claim in ba1daf05e's message ("nothing ever sets it") is WITHDRAWN as
+    measurably wrong.  Nunba's ``llama/llama_config.py:1970`` DOES set
+    ``HEVOLVE_LLAMA_CTX_SIZE`` (and ``HEVOLVE_LLAMA_SLOTS``), on the line
+    immediately above the ``--ctx-size`` / ``--parallel`` flags it hands the
+    server, so on the SPAWN path the env is authoritative by construction and
+    this probe never runs.
+
+    The hole is the OTHER path.  Nunba adopts an already-running llama-server
+    on :8080 without a geometry identity check (#756), and that path never
+    reaches the spawn code, so the env stays unwritten and
+    ``LLAMA_CTX_SIZE_DEFAULT`` (12288) wins against whatever the adopted
+    server is actually running.  That is the measured split in the historical
+    logs — 226 wire-trim lines reporting n_ctx 8192 (spawned, env written)
+    against 26 reporting 12288 (adopted, constant) — and it is exactly the
+    shape of memory/feedback_declaration_is_not_a_guard.md: constants.py:71
+    declares the env "must match the --ctx-size cmdline" with nothing
+    enforcing it on every path.  Asking the server turns that declaration into
+    a measurement on BOTH paths.
     """
     from core.constants import LLAMA_CTX_SIZE_DEFAULT, LLAMA_SLOTS_DEFAULT
     try:

@@ -21,14 +21,23 @@ so the "zero-tolerance context overflow" guard passed bodies the server then
 refused, and the reuse pointer never advanced.  Live `/props` on the same
 box: {"n_ctx":8192, "total_slots":1}.
 
-WHY IT WAS INVISIBLE.  `_get_budget_per_slot()` reads
+WHY IT WAS INVISIBLE — CORRECTED 2026-09-11.  `_get_budget_per_slot()` reads
 ``HEVOLVE_LLAMA_CTX_SIZE`` and falls back to
-``core.constants.LLAMA_CTX_SIZE_DEFAULT`` (12288).  Measured across BOTH
-repos, that env var has exactly three references: the comment at
-core/constants.py:71 and the two lines inside the function itself.  NOTHING
-EVER SETS IT.  The constant therefore always wins, and constants.py:71's
-claim that it "must match the --ctx-size cmdline" is a declaration with no
-enforcement — the shape recorded in memory/feedback_declaration_is_not_a_guard.md.
+``core.constants.LLAMA_CTX_SIZE_DEFAULT`` (12288).  An earlier version of this
+docstring said NOTHING EVER SETS IT.  That is measurably wrong and is
+withdrawn: Nunba's ``llama/llama_config.py:1970`` sets it (and
+HEVOLVE_LLAMA_SLOTS) on the line above the ``--ctx-size`` / ``--parallel``
+flags it hands the server, so on the SPAWN path the env is authoritative by
+construction.
+
+The hole is the ADOPT path.  Nunba takes over an already-running llama-server
+on :8080 with no geometry identity check (#756) and never reaches that spawn
+code, so the env stays unwritten and the 12288 constant wins against whatever
+the adopted server is really running.  The historical logs carry exactly that
+split — 226 wire-trim lines at n_ctx 8192 (spawned, env written) against 26 at
+12288 (adopted, constant).  constants.py:71 declares the env "must match the
+--ctx-size cmdline" with nothing enforcing it on every path — the shape
+recorded in memory/feedback_declaration_is_not_a_guard.md.
 
 WHAT THIS GUARD REQUIRES.  That the budget come from the running server when
 the server can be reached, and fall back to the constant when it cannot, so
@@ -76,9 +85,9 @@ def test_budget_reflects_the_live_server_not_a_constant(wire, monkeypatch):
                         lambda: (8192, 1), raising=False)
     assert wire._get_budget_per_slot() == 8192, (
         "_get_budget_per_slot() must report the n_ctx the SERVER is running "
-        "(8192), not core.constants.LLAMA_CTX_SIZE_DEFAULT (12288). Nothing "
-        "in either repo ever sets HEVOLVE_LLAMA_CTX_SIZE, so the constant "
-        "always wins and every request is over-budgeted by 4096 tokens.")
+        "(8192), not core.constants.LLAMA_CTX_SIZE_DEFAULT (12288). On the "
+        "adopt path (#756) nothing writes HEVOLVE_LLAMA_CTX_SIZE, so the "
+        "constant wins and every request is over-budgeted by 4096 tokens.")
 
 
 def test_the_server_value_is_not_divided_a_second_time(wire, monkeypatch):
@@ -142,8 +151,11 @@ def test_unreachable_server_falls_back_to_todays_behaviour(wire, monkeypatch):
 def test_operator_override_still_wins(wire, monkeypatch):
     """HEVOLVE_LLAMA_CTX_SIZE is documented as an override; keep it one.
 
-    Nothing sets it today, but constants.py:71 advertises it and an operator
-    pinning a value must not be silently overruled by the probe.
+    Nunba's llama_config.py:1970 sets it on the spawn path from the same value
+    it hands the server as --ctx-size, so this branch is the LIVE one in the
+    packaged app rather than a dormant courtesy; the probe is the fallback
+    covering the adopt path (#756) and HARTOS running standalone.  Either way
+    an operator pinning a value must not be silently overruled by the probe.
     """
     monkeypatch.setenv('HEVOLVE_LLAMA_CTX_SIZE', '4096')
     monkeypatch.setattr(wire, '_live_ctx_geometry',
