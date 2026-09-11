@@ -3120,6 +3120,37 @@ def instantiate_executor_agent():
 
 
 def instantiate_status_verifier_agent(user_prompt):
+    # This agent AUTHORS every recipe.  state_transition pins recipe-creation
+    # requests to it deterministically (is_recipe_creation_request -> return
+    # verify), and the authoring prompt orders it verbatim to "put the EXACT
+    # name of one of the tools provided to you in this request. Do not invent a
+    # name."  Nothing provided it one: the request is
+    # RECIPE_CREATE_PROMPT_PREFIX + a JSON template with no tool list, its
+    # system message named no tool, and every register_* call in create_agents
+    # targets the helper/assistant pair -- verify is passed to none, so it
+    # carries no tools[] schema either.  It was the ONE agent in the group that
+    # could not see a single tool name, while being the one asked to name them.
+    #
+    # Live 2026-09-11 that produced the only two answers available to a blind
+    # author, and nothing else:
+    #   invent -- agent 89088690384 banked tool_name 'MemoryStore' and
+    #     'MemoryRetriever' (a class, and a name that exists nowhere).  An
+    #     unregistered name is never demanded by the fabrication gate, so the
+    #     action advanced having executed nothing and the agent reported
+    #     "145.6 GB" free against a real 9.7 GB, with success=True.
+    #   omit   -- agent 89090102140 banked every tool_name as '' and authored
+    #     `df -h`, a Linux command, on Windows.
+    # main_leg_tool_menu's docstring records the corpus-wide cost of authoring
+    # without the list: 241 of 1,034 banked steps (23.3%) name a tool the
+    # runtime actually serves.
+    #
+    # Advertise the SAME canonical menu the Assistant (:3202) and Executor
+    # (:3063) legs already derive, with the same `extra` -- ONE source, so the
+    # advertised set cannot drift from the set this leg registers.  Names only:
+    # the verifier is still told not to perform actions, and registering tools
+    # on it would change what it does, not what it can name.
+    from core.agent_tools import main_leg_tool_menu
+    _tool_menu = main_leg_tool_menu(('execute_windows_or_android_command',))
     verify = autogen.AssistantAgent(
         name="StatusVerifier",
         llm_config=get_llm_config(),
@@ -3139,7 +3170,14 @@ def instantiate_status_verifier_agent(user_prompt):
             - Only "pending" for: first attempt, waiting for user, transient rate limits
             - Same failure 2+ times = always "error"
         Fallback: Always provide non-empty fallback_action with context-aware recovery strategies.
-        Do not perform actions yourself — only report status. Maintain exact JSON structure.""" + f"\nActions list: {user_tasks[user_prompt].actions}",
+        Do not perform actions yourself — only report status. Maintain exact JSON structure."""
+        + f"\nActions list: {user_tasks[user_prompt].actions}"
+        + f"\nTOOLS THAT EXIST: [{_tool_menu}]."
+          " When you author a recipe, every step's tool_name MUST be copied"
+          " EXACTLY from that list, or left as an empty string if no listed"
+          " tool fits. These are the only tool names this system can call."
+          " A name that is not on the list cannot be executed and the step"
+          " will silently do nothing, so never invent one.",
 
         is_termination_msg=_is_terminate_msg,
     )
