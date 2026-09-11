@@ -3436,7 +3436,39 @@ from core.constants import (
 # through it — the three `chat_instructor.initiate_chat(recipient=manager...)`
 # calls say so explicitly.  Its messages are instructions TO the group, so they
 # can never be the group's answer, however they are worded.
-_REUSE_STEER_INITIATOR_NAMES = ("ChatInstructor",)
+#
+# StatusVerifier is the same class of seat and was missing, measured live
+# 2026-09-11 19:09 (agent 53298912627, session
+# 6c2dc0fc-7c93-4fe0-973e-f7466ff63f29_53298912627).  The whole reply the user
+# received was the verifier describing its own role:
+#   "I have not executed any tools in this conversation.  As a status
+#    verification agent, I can only report on actions that have been performed
+#    by the assistant and verified by tool results..."
+# The turn was healthy otherwise — pointer 1->2, zero force-completions,
+# +144,200 B to memory_graph — so this is purely the delivery step.
+#
+# WHY THE EXISTING CHECKS MISSED IT.  `_reuse_message_is_user_answer` already
+# refuses the verifier's VERDICT via its tail `retrieve_json(...)['status']`
+# test, but that only sees JSON.  When the verifier answers in PROSE it parses
+# to no dict, carries none of the module's own markers (it is model-authored,
+# so `_reuse_is_pipeline_text` correctly declines it — see that function's
+# "did THIS MODULE write this" contract), names no agent, is not role='tool'
+# and is not 'TERMINATE'.  It therefore fell through to the final
+# `return True  # prose for the user`.
+#
+# Keyed on the seat, not the wording, for the reason the ChatInstructor note
+# above already gives: the verifier's prose is free model text and rewording it
+# is not a code change.  Both existing readers pick this up unchanged
+# (:4179 refuse-as-answer, :4257 skip-when-walking-back); the third,
+# `_reuse_group_terminate` :3717, is reachable only for verifier JSON that is
+# non-terminal AND carries message2userfinal — terminal verdicts return True
+# above that check, and StatusVerifier carried message2userfinal 0 times in
+# 2026-09-11's log.
+#
+# Floor, so this cannot regress #797/D31: the finaliser at :5942 walks BACK to
+# the last real answer when the tail is refused, and if nothing qualifies the
+# tail stands.  Worst case is today's behaviour; it never returns ''.
+_REUSE_STEER_INITIATOR_NAMES = ("ChatInstructor", "StatusVerifier")
 
 # How every action dispatch this module posts begins.  ONE definition:
 # `_build_reuse_action_message` emits it and `_reuse_message_is_user_answer`
