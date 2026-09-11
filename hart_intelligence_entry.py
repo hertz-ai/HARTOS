@@ -3126,12 +3126,57 @@ def _handle_shell_command_tool(input_text: str) -> str:
 
     text = input_text.strip()
 
-    # Explicit shell selector: 'powershell: <cmd>' / 'bash: <cmd>' / 'cmd: <cmd>'
+    # Explicit shell selector, in EITHER spelling.  Both resolve HERE, into
+    # the one argv builder below — a second dispatch path is exactly the
+    # drift this closes.
+    #
+    #   colon  'powershell: <cmd>'            this tool's own documented form
+    #   native 'powershell -Command "<cmd>"'  what a model actually writes
+    #
+    # D73, live-measured 2026-09-11 (agent 89091774807, 09:55:19).  Only the
+    # colon form was understood, so the native form fell through to the
+    # Windows default and ran nested as
+    # `cmd /c powershell -Command "..."`.  Reproduced byte-exact:
+    #
+    #     rc     = 0
+    #     stdout = 'Get-PSDrive -Name C | Select-Object -ExpandProperty FreeGB'
+    #     stderr = ''
+    #
+    # Exit 0 with the command echoed back as its own output — worse than an
+    # error, because every honesty gate downstream reads it as SUCCESS.  The
+    # VLM concluded "The output shows 'FreeGB : 100.0'" (a figure present
+    # nowhere in that output), reported exit_reason=done, FAB-GUARD passed
+    # the action because the tool HAD executed, and the user was told the
+    # machine had 127.4 GB free against a real 6.32 GB.
+    #
+    # Dispatched directly the same command returns rc=1 with 'Property
+    # "FreeGB" cannot be found' — a failure the model can act on.
     shell_override = None
     m = _re_shell.match(r'^(powershell|pwsh|bash|sh|cmd)\s*:\s*(.+)$', text, _re_shell.IGNORECASE)
     if m:
         shell_override = m.group(1).lower()
         text = m.group(2).strip()
+    else:
+        # -enc / -EncodedCommand is deliberately NOT accepted as a selector:
+        # it is obfuscation, and leaving it unstripped keeps it in front of
+        # the denylist pattern that blocks it.  Only the execute-this-string
+        # switches (-Command / -c / /c) are consumed.
+        m = _re_shell.match(
+            r'^(powershell|pwsh|bash|sh|cmd)(?:\.exe)?\s+'
+            r'(?:-(?:NoProfile|NonInteractive|NoLogo|ExecutionPolicy\s+\S+|'
+            r'WindowStyle\s+\S+)\s+)*'
+            r'(?:-Command|-c|/c)\s+(.+)$',
+            text, _re_shell.IGNORECASE)
+        if m:
+            shell_override = m.group(1).lower()
+            inner = m.group(2).strip()
+            # Strip ONE matching pair of wrapping quotes, as the shell would.
+            if len(inner) >= 2 and inner[0] == inner[-1] and inner[0] in '"\'':
+                inner = inner[1:-1].strip()
+            # The denylist below now sees the INNER command.  Its patterns are
+            # substring searches, so destructive text is still caught — pinned
+            # by TestNativeShellInvocationIsUnderstood's denylist cases.
+            text = inner or text
 
     # --- Denylist of destructive patterns (case-insensitive, conservative)
     _DENY_PATTERNS = [

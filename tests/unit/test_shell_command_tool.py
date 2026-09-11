@@ -149,6 +149,131 @@ class TestShellCommandShellSelector:
         assert argv[-1] == 'ls -la ~'
 
 
+class TestNativeShellInvocationIsUnderstood:
+    """The NATIVE CLI form must select the same shell as the colon form.
+
+    D73, live-measured 2026-09-11 on agent 89091774807.  The VLM loop wrote
+    the form every model knows::
+
+        powershell -Command "Get-PSDrive -Name C | Select-Object ..."
+
+    The selector only understood ``powershell: <cmd>`` (a COLON), so this
+    fell through to the Windows default and ran as::
+
+        cmd /c powershell -Command "Get-PSDrive -Name C | Select-Object ..."
+
+    MEASURED consequence of that nesting — reproduced byte-exact:
+
+        rc     = 0
+        stdout = 'Get-PSDrive -Name C | Select-Object -ExpandProperty FreeGB'
+        stderr = ''
+
+    Exit 0 with the command echoed back as its own output.  That is worse
+    than an error: every honesty gate downstream reads it as SUCCESS.  The
+    VLM concluded "The output shows 'FreeGB : 100.0'" — a number present
+    nowhere in that output — set exit_reason=done, FAB-GUARD passed the
+    action because the tool HAD executed, and the reuse model then told the
+    user the machine had 127.4 GB free.  Real figure: 6.32 GB.
+
+    Dispatched directly (the fix), the same command returns rc=1 with
+    'Property "FreeGB" cannot be found' on stderr — an honest failure the
+    model can act on.
+
+    One concept, one parser: both spellings resolve through the SAME argv
+    builder.  A second dispatch path would be the very drift this fixes.
+    """
+
+    @patch('hart_intelligence_entry.run_bounded')
+    def test_powershell_dash_command_is_not_nested_under_cmd(self, mock_run):
+        """THE live failure, verbatim from the 09:55:19 log line."""
+        mock_run.return_value = _ran(returncode=0, stdout='x')
+        with patch.object(sys, 'platform', 'win32'):
+            _handle_shell_command_tool(
+                'powershell -Command "Get-PSDrive -Name C | '
+                'Select-Object -ExpandProperty FreeGB"')
+        argv = mock_run.call_args.args[0]
+        assert argv[0].lower() != 'cmd', (
+            'nested cmd /c powershell — returns exit 0 with the command '
+            'echoed as stdout, which reads as success to every gate above it')
+        assert argv[0].lower().startswith('powershell')
+        assert 'Get-PSDrive' in argv[-1]
+        assert '-Command' not in argv[-1], 'the wrapper was not stripped'
+
+    @patch('hart_intelligence_entry.run_bounded')
+    def test_powershell_dash_c_shorthand(self, mock_run):
+        mock_run.return_value = _ran(returncode=0, stdout='x')
+        with patch.object(sys, 'platform', 'win32'):
+            _handle_shell_command_tool('powershell -c "Get-Process"')
+        argv = mock_run.call_args.args[0]
+        assert argv[0].lower().startswith('powershell')
+        assert argv[-1] == 'Get-Process'
+
+    @patch('hart_intelligence_entry.run_bounded')
+    def test_powershell_exe_with_noprofile_flags(self, mock_run):
+        """Models copy the fully-flagged form from documentation."""
+        mock_run.return_value = _ran(returncode=0, stdout='x')
+        with patch.object(sys, 'platform', 'win32'):
+            _handle_shell_command_tool(
+                'powershell.exe -NoProfile -NonInteractive -Command "Get-Date"')
+        argv = mock_run.call_args.args[0]
+        assert argv[0].lower().startswith('powershell')
+        assert argv[-1] == 'Get-Date'
+
+    @patch('hart_intelligence_entry.run_bounded')
+    def test_bash_dash_c_native(self, mock_run):
+        mock_run.return_value = _ran(returncode=0, stdout='x')
+        with patch.object(sys, 'platform', 'linux'):
+            _handle_shell_command_tool("bash -c 'ls -la ~'")
+        argv = mock_run.call_args.args[0]
+        assert argv[0] == 'bash'
+        assert argv[-1] == 'ls -la ~'
+
+    @patch('hart_intelligence_entry.run_bounded')
+    def test_cmd_slash_c_native_is_not_double_nested(self, mock_run):
+        mock_run.return_value = _ran(returncode=0, stdout='x')
+        with patch.object(sys, 'platform', 'win32'):
+            _handle_shell_command_tool('cmd /c dir C:\\Users')
+        argv = mock_run.call_args.args[0]
+        assert argv[0].lower() == 'cmd'
+        assert argv[-1] == 'dir C:\\Users', (
+            'cmd /c cmd /c <x> — the wrapper must be consumed, not stacked')
+
+    # ---- the wrapper must NOT swallow ordinary commands -------------------
+
+    @patch('hart_intelligence_entry.run_bounded')
+    def test_a_command_that_merely_mentions_a_shell_is_untouched(self, mock_run):
+        """`echo powershell -Command hi` is not a shell selector."""
+        mock_run.return_value = _ran(returncode=0, stdout='x')
+        with patch.object(sys, 'platform', 'win32'):
+            _handle_shell_command_tool('echo powershell -Command hi')
+        argv = mock_run.call_args.args[0]
+        assert argv[0].lower() == 'cmd'
+        assert argv[-1] == 'echo powershell -Command hi'
+
+    # ---- the denylist must be exactly as strong as before -----------------
+
+    @pytest.mark.parametrize('cmd', [
+        'powershell -Command "Remove-Item -Recurse -Force C:\\Windows"',
+        'powershell -Command "Format-Volume -DriveLetter C"',
+        'bash -c "rm -rf /"',
+        'cmd /c del /s /q C:\\Users',
+        # -enc is obfuscation; it is NOT a -Command form, so it must still
+        # reach the denylist on the unstripped string.
+        'powershell -enc ZQBjAGgAbwAgAGgAaQA=',
+    ])
+    @patch('hart_intelligence_entry.run_bounded')
+    def test_denylist_still_blocks_through_the_native_wrapper(self, mock_run, cmd):
+        """Stripping the wrapper must not open a bypass.
+
+        The patterns are substring searches, so the destructive text is still
+        seen after the wrapper is removed.  This pins that — a regression here
+        would be a security hole, not a cosmetic one.
+        """
+        result = _handle_shell_command_tool(cmd)
+        assert 'refused' in result.lower(), f'bypass opened: {cmd!r}'
+        mock_run.assert_not_called()
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Denylist — destructive commands must NOT run
 # ═══════════════════════════════════════════════════════════════════════════
