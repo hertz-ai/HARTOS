@@ -110,18 +110,39 @@ class TestReuseConsultsTheActionsNamedTools:
             'authoring pipeline records which tool the action needs')
 
     def test_turn_attach_calls_it(self):
-        """The Tier-1 hook must use the named tools, not tags alone."""
+        """The Tier-1 hook must use the named tools, not tags alone.
+
+        RE-POINTED 2026-09-11 for 703112bcd (#778), which is why this had been
+        failing on main.  The named-attach lines used to sit inline in this
+        block; that made the attach per-CALL while the walk advances per-ACTION
+        (measured: 2 attach lines across drives that walked 6-9 actions), so
+        they were lifted into ``_attach_named_tools_for_action`` and called
+        from BOTH the entry hook and ``_advance_or_steer``.  The contract is
+        unchanged -- the attach must consult the action's named tools -- so the
+        assertions follow the one indirection instead of being deleted.
+        """
         src = _src(_REUSE)
         m = re.search(r'Tier-1 per-turn attach(.*?)except Exception as _e',
                       src, re.DOTALL)
         assert m, 'Tier-1 per-turn attach block not found'
         block = m.group(1)
-        assert '_reuse_action_tool_names(' in block, (
-            'the per-turn attach must consult the action\'s named tools. Live '
-            "2026-09-06 it used only detect_goal_tags(message), which inferred "
+
+        helper = ''
+        if '_attach_named_tools_for_action(' in block:
+            h = re.search(r'^def _attach_named_tools_for_action\(.*\n'
+                          r'(?:(?:[ \t].*)?\n)*', src, re.M)
+            assert h, ('the block delegates to _attach_named_tools_for_action '
+                       'but that helper does not exist')
+            helper = h.group(0)
+        reach = block + helper
+
+        assert '_reuse_action_tool_names(' in reach, (
+            'the per-turn attach must consult the action\'s named tools, '
+            'directly or through the helper it delegates to. Live 2026-09-06 '
+            "it used only detect_goal_tags(message), which inferred "
             "['coding'] from prose and attached 0 tools while the action named "
             'google_search outright')
-        assert 'attach_for_names(' in block, (
+        assert 'attach_for_names(' in reach, (
             'and must attach them via the name-keyed primitive')
         assert 'detect_goal_tags(' in block, (
             'the tag scan stays — it is the fallback for families nothing '

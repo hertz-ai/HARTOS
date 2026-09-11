@@ -1924,8 +1924,56 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             current_app.logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
 
             # Transform the RPC response into the new format
+            # A re-learning may REFINE an action; it may not REDEFINE it.
+            #
+            # The filename below is an IDENTITY claim, not a uniquifier:
+            # helper.load_vlm_agent_files parses the id back out (parts[2]) and
+            # _vlm_merged_actions replaces THAT action's steps with this file's.
+            # And this branch is reached ONLY when `matching_recipe is None` --
+            # i.e. when `instructions` resembles none of the banked actions, the
+            # CURRENT one included, because the loop above compares against all
+            # of them.  That is precisely the evidence the claim is false, and
+            # the write was made anyway.
+            #
+            # MEASURED live 2026-09-11, agent 88719487304, one drive, 4 of 4:
+            #   id  banked action                      file written under it
+            #   2   navigate to the top result URL  -> "Restart the computer"
+            #   3   write Python parser script      -> "Check the current time"
+            #   4   run the script -> JSON          -> "Create a 'HART_OS' dir"
+            #   7   generate a research summary     -> "Create a 'HART_OS' dir"
+            # Action 7 then had the right goal and one impossible step, and the
+            # walk spent 12 error cycles (05:21->05:33) on a shell command that
+            # cannot produce prose.  It is self-perpetuating: the merged step
+            # feeds the model the file's own text, the model calls the tool with
+            # it again, and this writer rewrites the same file.
+            #
+            # Same comparator as the match above, so "is this the same action"
+            # has ONE rule.  Fails OPEN: no banked text for this id (an unknown
+            # session, or a first learning with nothing to contradict) leaves
+            # the behaviour exactly as it was.  Refusing leaves the action's
+            # CREATE-authored steps intact, which is the right fallback -- and
+            # it is why this is a refusal and not a fresh action id: appending
+            # was the previous shape, removed for cause (agent 33323830039's
+            # 1-action recipe grew to 4, each appended one carrying
+            # can_perform_without_user_input 'no', which disarms every driver).
+            _banked_text = str(_reuse_action_at(
+                user_prompt, current_action_id).get('action') or '')
+            _relearning_claims_this_action = (
+                not _banked_text
+                or similar_instructions(instructions, _banked_text))
+            if not _relearning_claims_this_action:
+                # WARNING, not info: this has to be countable on the next drive
+                # in BOTH directions -- that the substitutions stopped, and that
+                # the guard is not also refusing legitimate re-learnings.
+                current_app.logger.warning(
+                    "RELEARN-REFUSED: not filing this run under action "
+                    "%s -- the instruction is not that action's work. "
+                    "action=%r instruction=%r session=%s"
+                    % (current_action_id, _banked_text[:160],
+                       str(instructions)[:160], user_prompt))
+
             if response and response['status'] == 'success':
-                if not matching_recipe:
+                if not matching_recipe and _relearning_claims_this_action:
                     try:
                         current_app.logger.info("Processing RPC response to create recipe format")
 
@@ -3470,6 +3518,41 @@ def _reuse_is_pipeline_text(content):
 _REUSE_NO_OUTPUT_SENTINEL = '<no output produced>'
 
 
+def _reuse_action_at(user_prompt, action_id):
+    """The banked action this id names, or ``{}``.
+
+    ONE derivation of "action_id -> action", because there are now three
+    readers of it and they must not disagree about what an id means:
+    ``_reuse_action_tool_names`` (what to attach), ``_reuse_action_declares_tool``
+    (tool shape vs prose shape at the gate), and the VLM writer's identity
+    check at :1928 (whose action a re-learning may claim).  The first two
+    carried a verbatim copy of these three lines.
+
+    Positional, ``actions[action_id - 1]``, which is what both existing
+    readers already did -- NOT a scan for a matching ``action_id`` field.
+    Kept identical on purpose: a second rule here would mean the attach and
+    the write could resolve the same id to different actions, which is the
+    failure this accessor exists to make impossible.
+
+    The RANGE CHECK is ``_reuse_action_tool_names``' and is deliberately the
+    stricter of the two behaviours being merged.  Bare ``actions[id - 1]``,
+    which ``_reuse_action_declares_tool`` used, does not raise on id 0 -- it
+    returns the LAST action, silently answering about the wrong one.  The
+    ledger's ``current_action`` is 1-based but defaults to 1 in several
+    readers, so a 0 is a state bug, not an impossibility.
+
+    Never raises.  Every caller runs on the dispatch path, where an unknown
+    session or a malformed recipe must not be able to kill a turn.
+    """
+    try:
+        actions = (recipes.get(user_prompt) or {}).get('actions') or []
+        if not 1 <= action_id <= len(actions):
+            return {}
+        return actions[action_id - 1] or {}
+    except Exception:
+        return {}
+
+
 def _reuse_action_declares_tool(user_prompt, action_id):
     """True when this action's recipe names a tool to call.
 
@@ -3489,8 +3572,7 @@ def _reuse_action_declares_tool(user_prompt, action_id):
     cannot classify is never given the weaker check.
     """
     try:
-        actions = (recipes.get(user_prompt) or {}).get('actions') or []
-        steps = (actions[action_id - 1] or {}).get('recipe') or []
+        steps = _reuse_action_at(user_prompt, action_id).get('recipe') or []
         return any(str((s or {}).get('tool_name') or '').strip()
                    for s in steps)
     except Exception:
@@ -6559,10 +6641,7 @@ def _reuse_action_tool_names(user_prompt, action_id):
     round and must not be able to kill a turn.
     """
     try:
-        actions = (recipes[user_prompt] or {}).get('actions') or []
-        if not 1 <= action_id <= len(actions):
-            return []
-        action = actions[action_id - 1] or {}
+        action = _reuse_action_at(user_prompt, action_id)
         out = []
         for step in (action.get('recipe') or []):
             # _tool_name_candidates, not the raw field: the authored value is
