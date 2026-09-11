@@ -866,6 +866,102 @@ def _seed_messages(user_id):
         return []
 
 
+def _drop_unregistered_tool_names(recipe_steps, agents):
+    """Blank any authored ``tool_name`` these agents cannot actually call.
+
+    CREATE asks the authoring model for "the EXACT name of one of the tools
+    provided to you in this request. Do not invent a name." (:5446).  It never
+    CHECKED the answer, and on 2026-09-11 the first create walk of the session
+    banked two names that do not exist:
+
+        agent 89088690384, created 06:34-06:39 through the live /chat flow
+          id=1 "Query the operating system for the current free disk space"  ''
+          id=2 "Store the reported value as a timestamped memory entry"      'MemoryStore'
+          id=3 "Return the current free space value to the user"             'MemoryRetriever'
+
+    Neither name appears in ANY tool schema anywhere in gui_app.log -- zero
+    occurrences of `"name": "MemoryStore"` or `"name": "MemoryRetriever"` -- so
+    neither was ever offered to any model.  MemoryStore exists only as a CLASS;
+    MemoryRetriever does not exist at all.
+
+    AN INVENTED NAME IS WORSE THAN A WRONG ONE.  A non-empty tool_name sets
+    ``agent_to_perform_this_action = 'Helper'``, routing the step to the tool
+    executor that has no such tool; and the fabrication gate filters its demands
+    to REGISTERED names (reuse_recipe.py:4950), so an unregistered name is never
+    "referenced", the gate demands nothing, and the action passes as prose
+    having executed nothing.  Measured cost at the user's screen when that agent
+    was REUSE-walked at 06:41: "The available free space on your primary system
+    drive is 145.6 GB" against a real 9.7 GB, with an invented timestamp, and
+    success=True.
+
+    BLANKS, never drops.  The step TEXT still says what to do, so at REUSE the
+    model can still choose a real tool for it; and an empty tool_name routes the
+    step honestly to Assistant/Executor instead of to Helper with a phantom.
+
+    The registered set is read the way ``_reuse_registered_and_referenced_tools``
+    reads it -- ``llm_config['tools']`` PLUS ``_hart_core_tools`` -- so this is
+    by construction the set the model was shown, not a second opinion about what
+    exists.  Taking only the first would blank every core tool
+    (execute_windows_or_android_command alone is 204 banked steps).
+
+    ``<tool>: <argument>`` counts as the tool: the authoring model routinely
+    writes both into the one field, which is why reuse has
+    ``_tool_name_candidates``.  Same allowance here, or this guard would strip
+    working recipes.
+
+    Fails OPEN at every step -- an empty registered set, a non-list, junk -- and
+    never raises: it runs while a recipe is being banked, and a validator must
+    never cost the save.
+    """
+    if not isinstance(recipe_steps, list):
+        return recipe_steps
+    try:
+        registered = set()
+        for ag in (agents or []):
+            cfg = getattr(ag, 'llm_config', None)
+            if isinstance(cfg, dict):
+                for t in (cfg.get('tools') or []):
+                    fn = ((t or {}).get('function') or {}).get('name')
+                    if fn:
+                        registered.add(str(fn))
+            for _ct in (getattr(ag, '_hart_core_tools', None) or []):
+                try:
+                    _cn = _ct[0]
+                except Exception:
+                    continue
+                if _cn:
+                    registered.add(str(_cn))
+        if not registered:
+            # Nothing to compare against is not evidence of a phantom.
+            return recipe_steps
+        for step in recipe_steps:
+            if not isinstance(step, dict):
+                continue
+            raw = str(step.get('tool_name') or '').strip()
+            if not raw:
+                continue
+            # The NAME half, same convention _tool_name_candidates decodes.
+            head = raw.split(':', 1)[0].strip().strip('\'"`')
+            if raw in registered or head in registered:
+                continue
+            try:
+                current_app.logger.warning(
+                    "CREATE-PHANTOM-TOOL: blanking tool_name %r -- no such "
+                    "tool was offered to the author; the step text is kept so "
+                    "REUSE can still pick a real tool. step=%r"
+                    % (raw, str(step.get('steps'))[:120]))
+            except Exception:
+                pass
+            step['tool_name'] = ''
+    except Exception as err:
+        try:
+            current_app.logger.warning(
+                "CREATE-PHANTOM-TOOL check skipped: %r" % (err,))
+        except Exception:
+            pass
+    return recipe_steps
+
+
 def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
     """Create new assistant & user agents for a given user_id"""
     user_prompt = f'{user_id}_{prompt_id}'
@@ -2515,6 +2611,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 # Same guard as :2599 below.
                                 if prompt_id in task_time and task_time[prompt_id].get('times'):
                                     json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
+                                # Validate BEFORE the role assignment below: a non-empty
+                                # tool_name sends the step to 'Helper', the tool executor, so a
+                                # phantom name has to be gone by then.  Both save blocks, because
+                                # either can bank a recipe (normal path and the late-save twin).
+                                _drop_unregistered_tool_names(json_obj.get('recipe'),
+                                                              [assistant, helper])
                                 for i in json_obj['recipe']:
                                     if 'tool_name' in i and i['tool_name'] != "":
                                         i['agent_to_perform_this_action'] = 'Helper'
@@ -2563,6 +2665,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                         json_obj['metadata'] = metadata
                                         if prompt_id in task_time and task_time[prompt_id].get('times'):
                                             json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
+                                        # Validate BEFORE the role assignment below: a non-empty
+                                        # tool_name sends the step to 'Helper', the tool executor, so a
+                                        # phantom name has to be gone by then.  Both save blocks, because
+                                        # either can bank a recipe (normal path and the late-save twin).
+                                        _drop_unregistered_tool_names(json_obj.get('recipe'),
+                                                                      [assistant, helper])
                                         for i in json_obj['recipe']:
                                             if 'tool_name' in i and i['tool_name'] != "":
                                                 i['agent_to_perform_this_action'] = 'Helper'
