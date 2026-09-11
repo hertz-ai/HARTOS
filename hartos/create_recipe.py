@@ -1175,6 +1175,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     from core.agent_tools import (
         build_core_tool_closures, register_core_tools, register_memory_graph_tools,
         register_dual, main_leg_core_tools, CREATE_LEG_EXTRA_TOOLS,
+        MAIN_LEG_CORE_TOOLS,          # the keep-set for the helper schema bound
+        defer_helper_schema,          # schema-only drop; execution + recovery kept
+        helper_tool_names as _helper_tool_names,
     )
     _tool_ctx = {
         'user_id': user_id, 'prompt_id': prompt_id,
@@ -1759,6 +1762,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # gather LLM has no real tool to map "fetch a webpage" onto and invents
     # fake tool names (2026-05-12 IPL refusal forensic).
     goal_tags = []  # bound before the gated blocks; detected inside the try
+    # Same reason as goal_tags: the deferral keep-set below reads this, and if
+    # the try raises before the assignment an unbound name would take down
+    # agent construction over a tool-budget optimisation.
+    svc_tools = {}
     try:
         from integrations.service_tools import (
             service_tool_registry, Crawl4AITool, AceStepTool,
@@ -1971,6 +1978,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         tool_logger.warning(f"AP2 Agentic Commerce error (non-critical): {e}")
         # Continue without payment capabilities if AP2 fails
 
+    # Snapshot before the goal-gated block so the deferral below can tell a
+    # DELIBERATE Tier-2 attachment from an unconditional one.  Tier-2 families
+    # are chosen for THIS agent's goal, so they are kept; the unconditional
+    # families are not, so they are deferred.
+    _pre_tier2_tools = _helper_tool_names(helper)
+
     # Goal-aware Tier 2 tool loading (marketing, coding, etc.)
     try:
         # goal_tags comes from the single Tier-1 detection above — the
@@ -2036,6 +2049,49 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # goal "completes" with zero side-effects).  Silent for ~6 weeks
         # before being caught.  Loud now so any future regression surfaces.
         tool_logger.warning(f"Goal-aware tool loading FAILED: {e}")
+
+    # ── Bound the HELPER's schema to what CREATE actually uses ─────────────
+    # register_dual puts the schema on the helper and execution on the
+    # assistant, so the helper accumulates EVERY family registered above while
+    # the assistant keeps only the bounded MAIN_LEG_CORE_TOOLS set.  Measured
+    # live 2026-09-12 on agent 87400889007 (Nunba, the default agent):
+    #
+    #   wire-trim: the TOOL SCHEMA alone is 7191 tokens against an n_ctx of
+    #              8192 (54 tool(s)) -- no amount of message trimming can fit
+    #   [TRIM] trim could not reach budget -- messages 1673 tok + schema 7191
+    #              tok = 8864 tok against n_ctx 8192
+    #
+    # 88% of the window is schema; the walk banked actions 1-4 then died at
+    # action 5 on a 400 exceed_context_size_error.  Every unfittable body was
+    # the Helper seat; all 43 fitting bodies were Assistant/Executor with 18.
+    #
+    # Safe because it is DEFERRAL, not exclusion: the callable stays on the
+    # assistant's _function_map and discover_and_attach consults that map
+    # (a160020fd), so request_tools re-arms anything the agent actually asks
+    # for.  KEEP = core + request_tools + the Tier-1-gated service tools +
+    # whatever the Tier-2 goal gate deliberately attached for THIS goal.
+    #
+    # Justified by use, not by taste: across 1,568 wire rows (21:31-00:47)
+    # autogen.create made 20 tool calls over 9 distinct tools and every one is
+    # in MAIN_LEG_CORE_TOOLS -- none of the other 36.  At CREATE the helper
+    # AUTHORS a recipe; it does not execute.  REUSE is untouched: the same
+    # window shows it calling 17 distinct non-core tools, so its set is load-
+    # bearing and this narrowing deliberately does not touch that leg.
+    try:
+        _keep = (set(MAIN_LEG_CORE_TOOLS) | {'request_tools'}
+                 | set(svc_tools or {})
+                 | (_helper_tool_names(helper) - _pre_tier2_tools))
+        _dropped = defer_helper_schema(
+            helper, _helper_tool_names(helper) - _keep)
+        if _dropped:
+            tool_logger.info(
+                "CREATE helper schema bounded: deferred %d tool(s) -- "
+                "still executable on the assistant and re-attachable via "
+                "request_tools: %s",
+                len(_dropped), ', '.join(sorted(_dropped)))
+    except Exception as e:
+        # Never let a token optimisation be the reason an agent fails to build.
+        tool_logger.warning(f"CREATE helper schema bounding skipped: {e}")
 
     assistant.description = 'this is an assistant agent that coordinates & executes requested tasks & actions'
     executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'

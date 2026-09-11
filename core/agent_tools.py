@@ -187,6 +187,92 @@ def registered_tool_menu(tools, extra=()):
     return _join_tool_menu((t[0] for t in tools), extra)
 
 
+def helper_tool_names(agent):
+    """The tool names currently on an agent's LLM schema, as a set.
+
+    The reader half of :func:`defer_helper_schema` — callers snapshot with
+    this before and after a registration block to learn which names that block
+    contributed, rather than hard-coding a family list that drifts the moment
+    a family gains a tool.  Tolerant of a missing llm_config, a missing
+    ``tools`` block and malformed entries for the same reason: it runs during
+    agent construction.
+    """
+    cfg = getattr(agent, 'llm_config', None)
+    if not isinstance(cfg, dict):
+        return set()
+    out = set()
+    for entry in cfg.get('tools') or []:
+        if isinstance(entry, dict):
+            fn = entry.get('function')
+            if isinstance(fn, dict) and fn.get('name'):
+                out.add(fn['name'])
+    return out
+
+
+def defer_helper_schema(helper, names):
+    """Drop ``names`` from the helper's LLM schema, leaving execution intact.
+
+    Deferral, not exclusion: this removes only what the MODEL READS.  The
+    callable stays in the executor's ``_function_map`` (``register_dual``
+    already put it there), and ``discover_and_attach`` consults that map as a
+    third source, so ``request_tools`` can put the schema back the moment an
+    agent actually needs the capability.  Both halves are required — without
+    them this would strand the tool permanently and breach the owner's
+    2026-08-31 requirement that the hierarchy be LAZY, not exclusionary.
+
+    ``request_tools`` itself is NEVER dropped, whatever the caller passes: it
+    is the escape that makes every other deferral recoverable, so dropping it
+    would silently convert deferral into exclusion for the whole set.
+
+    Why this exists, measured live 2026-09-12 on the CREATE walk of agent
+    87400889007 (Nunba, the default agent)::
+
+        wire-trim: the TOOL SCHEMA alone is 7191 tokens against an n_ctx of
+                   8192 (54 tool(s)) -- no amount of message trimming can
+                   make this fit.
+        [TRIM] trim could not reach budget -- messages 1673 tok + schema 7191
+                   tok = 8864 tok against n_ctx 8192
+
+    The walk banked actions 1-4 then died at action 5 on a 400
+    exceed_context_size_error.  Attributing every wire body by its system
+    prompt: all 4 unfittable calls are the Helper seat; all 43 fitting calls
+    are Assistant/Executor carrying the bounded 18 MAIN_LEG_CORE_TOOLS.  Zero
+    crossover.  Across 1,568 wire rows ``autogen.create`` called 9 distinct
+    tools, ALL of them core — none of the other 36.  At CREATE the helper
+    AUTHORS a recipe; it does not execute, which is why the families it never
+    calls can wait until asked for.
+
+    Returns the set of names actually removed, so callers can log the saving
+    rather than pruning silently.  Missing llm_config, a missing ``tools``
+    block, and malformed entries are all no-ops: this runs during agent
+    construction and must never be the reason an agent fails to build.
+    """
+    drop = {n for n in (names or set()) if n != 'request_tools'}
+    if not drop:
+        return set()
+    cfg = getattr(helper, 'llm_config', None)
+    if not isinstance(cfg, dict):
+        return set()
+    block = cfg.get('tools')
+    if not isinstance(block, list):
+        return set()
+
+    kept, removed = [], set()
+    for entry in block:
+        name = None
+        if isinstance(entry, dict):
+            fn = entry.get('function')
+            if isinstance(fn, dict):
+                name = fn.get('name')
+        if name in drop:
+            removed.add(name)
+            continue
+        kept.append(entry)
+    if removed:
+        cfg['tools'] = kept
+    return removed
+
+
 def main_leg_core_tools(tools):
     """The subset of ``tools`` the main helper/assistant leg registers.
 
