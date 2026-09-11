@@ -2092,23 +2092,41 @@ class LiquidUIService:
         if 'orb' in native_chrome:
             native_orb_css = (
                 '.hart-hero-orbwrap>canvas,#hart-voice-orb,'
-                # The ONBOARDING orb, added 2026-09-10 from an owner report.
-                # They saw the screen alternating between two scenes: the
-                # compositor's own orb (a glow sphere with a DASHED orbital
-                # ring, right of centre) and the onboarding's sphere (plain,
-                # top centre). Their read was "two compositors trying to
-                # render", and that is right in the way that matters -- one
-                # compositor process, but TWO render paths each drawing a
-                # full-screen scene with an orb in it.
+                # ── `.hart-onboarding .hob-orb` IS DELIBERATELY NOT IN THIS LIST ──
                 #
-                # This list exists precisely to stop that: when the compositor
-                # claims the orb, the shell stands its own down. It covered the
-                # hero orb, the voice orb and the orbit rings, and `.hob-orb`
-                # was simply never added, so onboarding kept drawing a second
-                # one. `visibility:hidden` rather than `display:none` on
-                # purpose, exactly as the neighbours above: the element keeps
-                # its box, so the ceremony's layout does not reflow.
-                '.hart-onboarding .hob-orb,'
+                # It was added 2026-09-10 and REMOVED 2026-09-11 after the owner
+                # reported the orb simply gone from onboarding. It was: standing
+                # it down leaves the ceremony with NO orb at all, because the
+                # compositor cannot draw one there.
+                #
+                # Every other selector here is safe because the bloom claim makes
+                # the WALLPAPER transparent, so the compositor's layers show
+                # through underneath. `.hart-onboarding` paints its OWN backdrop:
+                #     position:fixed; inset:0; z-index:12000;
+                #     background:radial-gradient(circle at 50% 38%,#16142e,#07060f 72%)
+                # Both stops are fully opaque and it covers the viewport, so the
+                # wallpaper being transparent buys nothing. The native orb is
+                # drawn BELOW the shell surface, and orb.rs says exactly what that
+                # means: "when the shell paints its own opaque background this is
+                # OCCLUDED, exactly as the bloom is."
+                #
+                # The positions do not match either. The native orb sits at
+                # 0.72w/0.46h, the slot the HOME layout gives it. The onboarding's
+                # is centred in a flex column above the name reveal. It is the
+                # ceremony's composition, not a second copy of the desktop's.
+                #
+                # And the report that prompted the original change said the screen
+                # was ALTERNATING between two scenes. That is the DrmCompositor
+                # damage race, where a dropped frame on the shell surface lets the
+                # native bloom+orb flash through. Hiding the onboarding's orb never
+                # addressed the alternation; it removed one of the two things that
+                # alternate, so onboarding then flickered between having no orb and
+                # showing the desktop's.
+                #
+                # The animation-only gate on the software floor
+                # (`body.webkit-flat .hart-onboarding .hob-orb{animation:none}`) is
+                # a different rule and stays: it drops the breathing on a box that
+                # paints in software while KEEPING the orb visible.
                 '.hart-orb-orbit,.hart-orb-orbit2{visibility:hidden;animation:none}'
             )
         # The HOME SURFACE half. The compositor claims this only for a frame that

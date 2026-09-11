@@ -478,3 +478,47 @@ def test_the_bars_are_deliberately_not_claimed():
                 encoding="utf-8").read()
     assert "NATIVE_CHROME_TOPBAR" not in comp
     assert "NATIVE_CHROME_TASKBAR" not in comp
+
+
+def test_onboarding_keeps_its_own_orb_because_the_compositor_cannot_draw_one_there():
+    """The stand-down's premise fails for exactly one surface, and it was applied
+    there anyway.
+
+    Everything else in that list is safe because the bloom claim makes the WALLPAPER
+    transparent, so the compositor's layers show through underneath. `.hart-onboarding`
+    paints its own backdrop at `inset:0; z-index:12000` out of two fully opaque stops,
+    so the transparent wallpaper buys it nothing, and the native orb is drawn BELOW the
+    shell surface, which orb.rs describes as OCCLUDED whenever the shell paints an
+    opaque background.
+
+    So hiding `.hob-orb` did not hand the orb over to the compositor. It left the first
+    screen a new user sees with no orb at all, which is what the owner reported on
+    2026-09-11.
+
+    The positions never matched either: the native orb takes the HOME layout's slot at
+    0.72w/0.46h, while the ceremony centres its own above the name reveal.
+    """
+    src = _src()
+    stand_down = _block(src, "native_orb_css = ''", "native_home_css = ''")
+    css = _code(stand_down)
+    assert 'hob-orb' not in css, (
+        "the onboarding orb is standing down again; the compositor cannot draw an orb "
+        "behind an opaque full-screen ceremony, so this leaves onboarding with none")
+
+    # The surfaces that CAN hand off must still do so, or this guard would pass by
+    # gutting the bridge rather than by scoping it.
+    assert 'hart-hero-orbwrap' in css and 'hart-voice-orb' in css, (
+        "the hero and voice orbs must still stand down for a claimed orb")
+    assert 'hart-orb-orbit' in css, "the orbit rings must still stand down"
+
+    # And the onboarding backdrop is still the opaque thing this argument rests on.
+    onb = _block(src, ".hart-onboarding{", "}")
+    assert 'z-index:12000' in onb and 'background:radial-gradient' in onb, (
+        "the onboarding backdrop changed shape; re-check whether the native orb can "
+        "now be seen behind it before trusting this test's reasoning")
+
+    # The software-floor ANIMATION gate is a different rule and must survive: it drops
+    # the breathing on a box that paints in software while keeping the orb visible.
+    assert 'body.webkit-flat .hart-onboarding .hob-orb,' in src, (
+        "the onboarding orb lost its software-floor animation gate, which is what "
+        "stopped it re-rasterising a 150px double box-shadow forever")
