@@ -1508,27 +1508,21 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                     tool_logger.info(f'Processing {len(extracted_responses)} extracted responses from VLM agent')
 
                     # Build context from VLM agent's analysis and actions
-                    analysis_parts = []
-                    action_parts = []
-
-                    for msg in extracted_responses:
-                        msg_type = msg.get('type', '')
-                        content = msg.get('content', '')
-
-                        if msg_type == 'analysis':
-                            analysis_parts.append(f"Analysis: {content}")
-                        elif msg_type == 'next_action':
-                            if isinstance(content, dict):
-                                action_parts.append(f"Action: {json.dumps(content, indent=2)}")
-                            else:
-                                action_parts.append(f"Action: {content}")
-
-                    # Combine all VLM context
+                    # ONE reader for the loop's output, beside the
+                    # producer that defines it.  This block filtered for
+                    # 'analysis'/'next_action', which local_loop has never
+                    # emitted, so both lists stayed empty and vlm_context was
+                    # ALWAYS ''.  The create flow has never once seen what
+                    # the VLM actually did.
+                    from integrations.vlm import response_view as _rv
                     vlm_context_parts = []
-                    if analysis_parts:
-                        vlm_context_parts.append(f"{os_to_control} Agent Analysis:\n" + "\n".join(analysis_parts))
-                    if action_parts:
-                        vlm_context_parts.append(f"{os_to_control} Agent Actions:\n" + "\n".join(action_parts))
+                    _observed = _rv.observation_text(response)
+                    if _observed:
+                        vlm_context_parts.append(
+                            f"{os_to_control} Agent did:\n{_observed}")
+                    _why = _rv.outcome_summary(response)
+                    if _why:
+                        vlm_context_parts.append(f"Outcome: {_why}")
 
                     vlm_context = "\n\n".join(vlm_context_parts)
 
@@ -1554,50 +1548,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                         vlm_agent_path = f"{base_path}_{action_id_to_use}_vlm_agent.json"
                         os.makedirs(os.path.dirname(vlm_agent_path), exist_ok=True)
 
-                        # Helper functions for processing response data
-                        def clean_text(text):
-                            lines = text.split('\n')
-                            cleaned_lines = []
-                            for line in lines:
-                                if (not line.strip().startswith("Next Action:") and
-                                        not line.strip().startswith("Box ID:") and
-                                        not line.strip().startswith("box_centroid_coordinate:") and
-                                        not line.strip().startswith("value:")):
-                                    cleaned_lines.append(line)
-                            return '\n'.join(cleaned_lines)
-
-                        def format_action_text(text):
-                            return helper_fun.format_action_text(text)
-
-                        # Process extracted responses into recipe steps
-                        recipe_steps = []
-                        for msg in extracted_responses:
-                            msg_type = msg.get("type", "")
-                            msg_content = msg.get("content", "")
-
-                            if msg_type == "analysis":
-                                cleaned_content = clean_text(msg_content)
-                                if cleaned_content.strip():
-                                    recipe_steps.append({
-                                        "steps": cleaned_content,
-                                        "tool_name": "execute_windows_or_android_command",
-                                        "agent_to_perform_this_action": "Helper"
-                                    })
-                            elif msg_type == "next_action":
-                                formatted_content = format_action_text(msg_content)
-                                if formatted_content.strip():
-                                    recipe_steps.append({
-                                        "steps": formatted_content,
-                                        "tool_name": "execute_windows_or_android_command",
-                                        "agent_to_perform_this_action": "Helper"
-                                    })
-
-                        if not recipe_steps:
-                            recipe_steps.append({
-                                "steps": instructions,
-                                "tool_name": "execute_windows_or_android_command",
-                                "agent_to_perform_this_action": "Helper"
-                            })
+                        # Bank what the run DID, not what it was asked.
+                        # Measured 2026-09-11: 106 of 106 vlm_agent files on
+                        # disk had recipe[0].steps == action, because the
+                        # extraction here matched no producer type and fell
+                        # through to appending `instructions`.  Every banked
+                        # VLM step was the instruction echoed back.
+                        from integrations.vlm import response_view as _rv2
+                        recipe_steps = _rv2.recipe_steps(response, instructions)
 
                         persona = f"user{user_id}" if user_id else "user"
 

@@ -1102,122 +1102,14 @@ def create_agents_for_role(user_id: str, prompt_id):
         return 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', True
 
 
-def _vlm_recipe_steps(response, instructions):
-    """``extracted_responses`` -> the cleaned steps, for BOTH readers of it.
-
-    ONE extraction, because there are two callers with different jobs and the
-    same source: the learn branch writes these steps to the VLM recipe file,
-    and ``_tool_observation_summary`` turns them into the text handed back to
-    the model.  Kept inline in the learn branch, the reuse branch could only
-    have grown a second copy -- and a second copy of "what did the tool see"
-    is exactly the drift that produces two different answers to one question.
-
-    May raise: the learn branch is wrapped in a try/except that returns
-    'Command executed but encountered an error while processing results', and
-    that loud failure is worth keeping.  The observation path cannot afford a
-    raise, so its guard lives in ``_tool_observation_summary`` instead.
-    """
-    def clean_text(text):
-        lines = text.split('\n')
-        cleaned_lines = []
-        for line in lines:
-            if (not line.strip().startswith("Next Action:") and
-                not line.strip().startswith("Box ID:") and
-                not line.strip().startswith("box_centroid_coordinate:") and
-                not line.strip().startswith("value:")):
-                cleaned_lines.append(line)
-        return '\n'.join(cleaned_lines)
-
-    recipe_steps = []
-    for msg in response["extracted_responses"]:
-        msg_type = msg.get("type", "")
-        msg_content = msg.get("content", "")
-
-        if msg_type == "analysis":
-            cleaned_content = clean_text(msg_content)
-            if cleaned_content.strip():
-                recipe_steps.append({
-                    "steps": cleaned_content,
-                    "tool_name": "execute_windows_or_android_command",
-                    "agent_to_perform_this_action": "Helper"
-                })
-        elif msg_type == "next_action":
-            formatted_content = helper_fun.format_action_text(msg_content)
-            if formatted_content.strip():
-                recipe_steps.append({
-                    "steps": formatted_content,
-                    "tool_name": "execute_windows_or_android_command",
-                    "agent_to_perform_this_action": "Helper"
-                })
-
-    if not recipe_steps:
-        recipe_steps.append({
-            "steps": instructions,
-            "tool_name": "execute_windows_or_android_command",
-            "agent_to_perform_this_action": "Helper"
-        })
-    return recipe_steps
-
-def _tool_observation_summary(response, instructions=''):
-    """What the computer-use tool SAW, as text the model can read.
-
-    ``execute_windows_or_android_command`` returned an ANNOUNCEMENT and threw
-    the observation away.  All three success paths said only that it ran:
-
-        'Successfully ran the command in user\'s computer.'            (48 ch)
-        'Successfully ran the command in user\'s computer and created
-         the VLM agent data at {vlm_agent_path}.'
-        'Command executed but could not create VLM agent data ...'
-
-    The data was already in hand one branch above: ``extracted_responses`` is
-    walked, each ``analysis`` message cleaned through ``clean_text``, and the
-    result written to a VLM recipe file -- then dropped from the return.  So
-    the work reached a FILE and never reached the model that asked for it.
-
-    WHAT IT COST, measured live 2026-09-11 on agent 89091774807
-    "disk.space.reporter", ground truth taken BEFORE each run
-    (Get-PSDrive C -> 9.17 GB free):
-
-        07:29  "the free space on your C: drive is currently 38.4 GB.  While a
-                previous stored value of 45.2 GB was expected..."
-        07:50  "...the current free space on your drive C: is 80 GB, which is
-                exactly the same as the previously saved value of 80 GB."
-
-    Both opened "Based on the data retrieved" / "Based on the tool results".
-    No such figures exist anywhere, and no "previously saved value" was ever
-    saved.  Agent 89088690384 produced "145.6 GB" the same way (#835/D69).
-    That the VLM branch is the one that fired is measured, not assumed: in the
-    07:29-07:56 window "Generated recipe data saved to" appears 1x and "No
-    extracted_responses found" 0x.
-
-    AND IT EXPLAINS THE PLACEHOLDER READING (#837/D71).  The instrumented
-    build showed 181 REAL fills against 34 placeholders, every line peers=5 --
-    so the answer-fill path works.  But many of those "REAL" results are 48
-    chars: the announcement above.  A result that carries no data is, at the
-    model, indistinguishable from no result.  Chasing the placeholder path
-    would not have put one number in front of the model.
-
-    Reads the SAME cleaned steps the recipe file already stores -- no second
-    parse, no new source of truth.  Bounded by TOOL_OBSERVATION_MAX_CHARS
-    because an unbounded screen dump would spend the very slot it is trying to
-    inform (#734/#539).  Returns '' when there is nothing to say, so the caller
-    keeps its plain success sentence rather than appending an empty section.
-    Never raises: it runs on the tool's return path and must not cost a result
-    that was actually produced.
-    """
-    try:
-        parts = []
-        for step in _vlm_recipe_steps(response, instructions):
-            if not isinstance(step, dict):
-                continue
-            text = str(step.get('steps') or '').strip()
-            if text:
-                parts.append(text)
-        if not parts:
-            return ''
-        return '\n'.join(parts)[:TOOL_OBSERVATION_MAX_CHARS]
-    except Exception:
-        return ''
+# The VLM response shape is READ in exactly one place:
+# integrations/vlm/response_view.py, which lives beside the producer that
+# defines it.  This module used to carry its own parse, filtering for message
+# types ('analysis', 'next_action') that local_loop has never emitted — so it
+# matched nothing, fell through to a default, and handed the model the
+# INSTRUCTION under the heading of an observation.  Measured 2026-09-11: 106
+# of 106 banked recipes were the instruction restated for the same reason.
+# Guarded by tests/unit/test_vlm_response_is_read_as_produced.py.
 
 
 def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]":
@@ -2048,6 +1940,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
             # Three-tier VLM execution (Tier 1: in-process, Tier 2: HTTP local)
             from integrations.vlm.vlm_adapter import execute_vlm_instruction
+            from integrations.vlm import response_view as _rv
             start_time = time.time()
             response = execute_vlm_instruction(crossbar_message)
 
@@ -2155,7 +2048,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
                         # Handle different response format
                         if 'extracted_responses' in response:
-                            recipe_steps = _vlm_recipe_steps(response, instructions)
+                            recipe_steps = _rv.recipe_steps(
+                                response, instructions)
 
                             persona = f"user{user_id}" if user_id else "user"
 
@@ -2205,7 +2099,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                             # announcement alone is what left the model to
                             # invent 38.4 / 80 / 145.6 GB against a real
                             # 9.17 GB.  See _tool_observation_summary.
-                            _observed = _tool_observation_summary(recipe_steps)
+                            _observed = _rv.observation_text(response)
                             if _observed:
                                 return (
                                     f'Successfully ran the command in user\'s '
@@ -2249,7 +2143,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                 # the fabrication gate would read the action as not-run --
                 # that direction is the safe one: it under-reports and
                 # re-steers rather than faking a completion.
-                _observed = _tool_observation_summary(response, instructions)
+                _observed = _rv.observation_text(response)
                 if _observed:
                     return (
                         'Successfully ran the command in user\'s computer.\n'
@@ -2263,9 +2157,34 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                 # literal at this end could drift from the reader's copy and
                 # a failed action would silently count as completed again.
                 if 'message' in response and 'Failed to capture screenshot' in response['message']:
-                    return TOOL_FAILURE_RESULTS[1]
+                    _failure = TOOL_FAILURE_RESULTS[1]
                 else:
-                    return TOOL_FAILURE_RESULTS[0]
+                    _failure = TOOL_FAILURE_RESULTS[0]
+                # The loop accumulates every command it fired and its
+                # reasoning on EVERY exit — done, max_iterations, timeout,
+                # stopped, action_error — and publishes exit_reason so a
+                # caller "can craft an honest response instead of
+                # confidently lying" (local_loop.py:756).  This branch threw
+                # all of it away and returned a bare constant, which is the
+                # case where knowing what was ATTEMPTED matters most: the
+                # model is about to decide whether to retry, adapt, or tell
+                # the user it could not.
+                #
+                # APPENDED, never substituted.  The fabrication gate matches
+                # by substring (`any(f in body for f in
+                # TOOL_FAILURE_RESULTS)`), so the constant still reads as a
+                # refusal and a failed action still cannot count as
+                # completed.  Verified by
+                # test_the_failure_contract_is_untouched.
+                _why = _rv.outcome_summary(response)
+                _observed = _rv.observation_text(response)
+                if _why or _observed:
+                    return '%s\n%s%s' % (
+                        _failure,
+                        _why,
+                        ('\nWhat it did before stopping:\n' + _observed)
+                        if _observed else '')
+                return _failure
         except Exception as e:
             error_message = traceback.format_exc()  # Capture full traceback
             current_app.logger.error(f"Error executing command:\n{error_message}")
