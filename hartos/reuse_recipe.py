@@ -6279,8 +6279,38 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     f"claims completion with no output produced after "
                     f"{_REUSE_FAB_STEER_MAX} re-steers — advancing to avoid a "
                     f"permanent stall; this action's output does NOT exist")
+        else:
+            # NO GROUP CHAT = NO EVIDENCE.  Every check above reads the group
+            # chat, so with _gc None the gate does not run and the pointer
+            # moves on the model's word alone.  Failing open is deliberate (a
+            # permanent stall is worse, same trade as the _REUSE_FAB_STEER_MAX
+            # advance above) — but it used to happen with no log of any kind,
+            # so the advance was indistinguishable from a tool-backed one.
+            #
+            # Measured 2026-09-11 on the installed build: agent 25214546249
+            # reached "[REUSE] All 9 actions completed" (20:13:26) with a
+            # clean `unrun=[]` verdict on 8 of its 9 actions and NO verdict
+            # line at all for action 9 (watermark 20:13:17 -> watermark for
+            # action 10 at 20:13:26).  Agent 53803955119 did the same on
+            # actions 5 and 6, 1-2s apart.  The force/stuck-loop guard fired
+            # zero times in that window, so these were not force-completions;
+            # they were advances past a gate that never ran.
+            current_app.logger.warning(
+                f"[FAB-GUARD] action {current_action_id} advancing UNVERIFIED: "
+                f"no group chat is registered for this session, so the "
+                f"fabrication gate could not read any tool evidence — this "
+                f"action's output is NOT tool-backed")
     except Exception as _fg_err:
-        current_app.logger.debug(f"[FAB-GUARD] advance-gate skipped: {_fg_err}")
+        # WARNING, not debug.  The shipped app emits nothing below INFO
+        # (measured 2026-09-11: 0 DEBUG lines across 12 rotated gui_app.log
+        # files), so at debug level this branch could fire on every advance
+        # and leave no trace — "advance-gate skipped" appeared 0 times, which
+        # was equally consistent with "never fired" and "fired and filtered".
+        # A safety gate that fails open must say so at a level that is read.
+        current_app.logger.warning(
+            f"[FAB-GUARD] action {current_action_id} advancing UNVERIFIED: "
+            f"advance-gate skipped ({_fg_err!r}) — this action's output is "
+            f"NOT tool-backed")
     # Mark current action done
     ok1 = force_state_through_valid_path(user_prompt, current_action_id,
                                          ActionState.COMPLETED, f"{reason}: confirmed")
