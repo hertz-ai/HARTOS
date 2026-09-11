@@ -448,20 +448,79 @@ def _is_target_request(url, method: str) -> bool:
 #   * Multimodal text:  core.token_utils._content_to_text
 
 
+def _live_ctx_geometry():
+    """``(n_ctx, total_slots)`` as the RUNNING llama-server reports them.
+
+    Returns None when the server cannot be read — caller falls back to the
+    constant, i.e. exactly the pre-2026-09-11 behaviour.
+
+    ``/props`` carries ``default_generation_settings.n_ctx`` and a top-level
+    ``total_slots``.  The n_ctx there is the PER-SLOT ceiling: llama-server
+    quotes the same number when it refuses an over-length body
+    (``'n_ctx': 8192, 'n_prompt_tokens': 11817``), so it is what one request
+    may spend, already partitioned.  Do not divide it again.
+
+    Deliberately NOT memoised.  #818/D53 sized this from a 117-second-old
+    VRAM memo read across a llama-server teardown, pinned 4096 for a whole
+    session and that is why CREATE was dead; a TTL does not help because the
+    stale read happens INSIDE the window.  llama-server respawns on VRAM-tier
+    changes, model switches and watchdog restarts, and the budget has to
+    follow it within the same process.  The cost is one loopback GET with a
+    1.5s cap on a path that is already making a multi-second LLM call.
+    """
+    try:
+        from core.port_registry import get_local_llm_url
+        from core.http_pool import pooled_get
+        base = get_local_llm_url().rstrip('/')
+        if base.endswith('/v1'):
+            base = base[:-3]
+        resp = pooled_get(base.rstrip('/') + '/props', timeout=1.5)
+        if getattr(resp, 'status_code', 0) != 200:
+            return None
+        props = resp.json()
+        n_ctx = int((props.get('default_generation_settings') or {}).get('n_ctx') or 0)
+        slots = max(1, int(props.get('total_slots') or 1))
+        return (n_ctx, slots) if n_ctx > 0 else None
+    except Exception:
+        return None
+
+
 def _get_budget_per_slot() -> int:
-    """Per-slot input token budget.  Honors:
-      * ``HEVOLVE_LLAMA_CTX_SIZE`` (default tracks
-        ``core.constants.LLAMA_CTX_SIZE_DEFAULT`` = 12288,
-        matches Nunba's ``llama_config.py:1527``).
-      * ``HEVOLVE_LLAMA_SLOTS`` (default 1 — single-user dev box).
+    """Per-slot input token budget — MEASURED from the server, not declared.
+
+    Order:
+      * ``HEVOLVE_LLAMA_CTX_SIZE`` — explicit operator override, still wins.
+        (Divided by ``HEVOLVE_LLAMA_SLOTS`` because that constant is a TOTAL.)
+      * the running llama-server's ``/props`` — the truth.
+      * ``core.constants.LLAMA_CTX_SIZE_DEFAULT`` — last resort, server down.
+
+    WHY THE PROBE EXISTS (live 2026-09-11, installed build).  This returned
+    12288 while llama-server ran 8192, so every body was over-budgeted by
+    4,096 tokens; the "zero-tolerance overflow" guard passed requests the
+    server then refused with ``exceed_context_size_error``, and reuse logged
+    ``robust completion-advance FAILED ... the pipeline did not advance`` for
+    sessions ..._18163818525 and ..._1923323102 — the agents never reached
+    their goals.  ``HEVOLVE_LLAMA_CTX_SIZE`` is documented at
+    core/constants.py:71 as "must match the --ctx-size cmdline", but measured
+    across BOTH repos nothing ever sets it: its only references are that
+    comment and this function.  So the constant always won and the docstring's
+    "matches Nunba's llama_config.py:1527" was a declaration, not a guard
+    (memory/feedback_declaration_is_not_a_guard.md).  Asking the server turns
+    the claim into a measurement.
     """
     from core.constants import LLAMA_CTX_SIZE_DEFAULT, LLAMA_SLOTS_DEFAULT
     try:
-        ctx = int(os.environ.get('HEVOLVE_LLAMA_CTX_SIZE',
-                                  str(LLAMA_CTX_SIZE_DEFAULT)))
+        _override = os.environ.get('HEVOLVE_LLAMA_CTX_SIZE')
+        if _override:
+            slots = max(1, int(os.environ.get('HEVOLVE_LLAMA_SLOTS',
+                                               str(LLAMA_SLOTS_DEFAULT))))
+            return int(_override) // slots
+        live = _live_ctx_geometry()
+        if live:
+            return live[0]
         slots = max(1, int(os.environ.get('HEVOLVE_LLAMA_SLOTS',
                                            str(LLAMA_SLOTS_DEFAULT))))
-        return ctx // slots
+        return LLAMA_CTX_SIZE_DEFAULT // slots
     except Exception:
         return LLAMA_CTX_SIZE_DEFAULT
 
