@@ -2835,7 +2835,7 @@ fn report_attrib_gap(bit: u8, reason: &str) {
     if prev & bit == 0 {
         info!(
             reason,
-            "hart-latency attribution: falling back to component=shell. Samples from              here on carry the shell's budget row, and every per-component row stays              empty until this reason is resolved."
+            "hart-latency attribution: falling back to component=shell. Samples from \n             here on carry the shell's budget row, and every per-component row \n             stays empty until this reason is resolved."
         );
     }
 }
@@ -2860,7 +2860,7 @@ fn report_attrib_gap_at(
             scene_y = py,
             scene_w = size.w,
             scene_h = size.h,
-            "hart-latency attribution: falling back to component=shell. Compare these              coordinates against the layout: a point inside the output but over no              component means the tree has no tagged container there."
+            "hart-latency attribution: falling back to component=shell. Compare these \n             coordinates against the layout: a point inside the output but over \n             no component means the tree has no tagged container there."
         );
     }
 }
@@ -2891,7 +2891,7 @@ fn pointer_surface<S: CompState>(state: &S) -> crate::latency::Surface {
         // lowered even once, and NO position could ever attribute.
         report_attrib_gap(
             1 << 2,
-            "native_tree() is None, so the scene has never been lowered and no              position can attribute",
+            "native_tree() is None, so the scene has never been lowered and no \n             position can attribute",
         );
         return crate::latency::Surface::Shell;
     };
@@ -2905,7 +2905,7 @@ fn pointer_surface<S: CompState>(state: &S) -> crate::latency::Surface {
             // coordinates are the thing to compare against the layout.
             report_attrib_gap_at(
                 1 << 3,
-                "pointer is over no tagged component (bare desktop, or the tree's                  geometry does not line up with the pointer's scene space)",
+                "pointer is over no tagged component (bare desktop, or the tree's \n                 geometry does not line up with the pointer's scene space)",
                 px,
                 py,
                 size,
