@@ -1211,3 +1211,21 @@ TOOL_FAILURE_RESULTS: tuple = (
     "I'm unable to perform this action since the Hevolve A I Companion App is "
     "not running in your computer, Open the companion app & try again",
 )
+
+# How much of what a tool OBSERVED may ride back in its return string.
+#
+# Same family as the failure strings above, hence the same home: both decide
+# what the model learns about a tool call that already happened.
+#
+# WHY A CAP AT ALL.  A computer-use observation can be a whole screen dump.
+# The wire budget is real and already tuned: n_ctx 12288 with ~6144 per slot
+# (#539), and WIRE_TRIM_SAFETY_MARGIN_TOKENS pushes tool-heavy bodies into the
+# degrade branch (#755 note).  An unbounded tool result would spend the slot it
+# is trying to inform and cost the turn — the #734 failure shape.
+#
+# WHY 2000.  ~500 tokens at the 1.03 chars/token ratio measured live via
+# /tokenize (#734) — under a tenth of a slot, while comfortably carrying the
+# kind of answer these tools produce.  The live case that motivated it is one
+# line: "Free space on C: reported as 9.17 GB."  Raise it only against a
+# measured truncation, not a guess.
+TOOL_OBSERVATION_MAX_CHARS: int = 2000

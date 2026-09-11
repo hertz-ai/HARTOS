@@ -21,6 +21,7 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     HISTORICAL_TOOL_PLACEHOLDER,
     NUNBA_WEB_FETCH_POLICY,
     TOOL_FAILURE_RESULTS,
+    TOOL_OBSERVATION_MAX_CHARS,
     VERDICT_COMPLETION_STATUSES,
 )
 
@@ -1101,6 +1102,68 @@ def create_agents_for_role(user_id: str, prompt_id):
         return 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', True
 
 
+def _tool_observation_summary(recipe_steps):
+    """What the computer-use tool SAW, as text the model can read.
+
+    ``execute_windows_or_android_command`` returned an ANNOUNCEMENT and threw
+    the observation away.  All three success paths said only that it ran:
+
+        'Successfully ran the command in user\'s computer.'            (48 ch)
+        'Successfully ran the command in user\'s computer and created
+         the VLM agent data at {vlm_agent_path}.'
+        'Command executed but could not create VLM agent data ...'
+
+    The data was already in hand one branch above: ``extracted_responses`` is
+    walked, each ``analysis`` message cleaned through ``clean_text``, and the
+    result written to a VLM recipe file -- then dropped from the return.  So
+    the work reached a FILE and never reached the model that asked for it.
+
+    WHAT IT COST, measured live 2026-09-11 on agent 89091774807
+    "disk.space.reporter", ground truth taken BEFORE each run
+    (Get-PSDrive C -> 9.17 GB free):
+
+        07:29  "the free space on your C: drive is currently 38.4 GB.  While a
+                previous stored value of 45.2 GB was expected..."
+        07:50  "...the current free space on your drive C: is 80 GB, which is
+                exactly the same as the previously saved value of 80 GB."
+
+    Both opened "Based on the data retrieved" / "Based on the tool results".
+    No such figures exist anywhere, and no "previously saved value" was ever
+    saved.  Agent 89088690384 produced "145.6 GB" the same way (#835/D69).
+    That the VLM branch is the one that fired is measured, not assumed: in the
+    07:29-07:56 window "Generated recipe data saved to" appears 1x and "No
+    extracted_responses found" 0x.
+
+    AND IT EXPLAINS THE PLACEHOLDER READING (#837/D71).  The instrumented
+    build showed 181 REAL fills against 34 placeholders, every line peers=5 --
+    so the answer-fill path works.  But many of those "REAL" results are 48
+    chars: the announcement above.  A result that carries no data is, at the
+    model, indistinguishable from no result.  Chasing the placeholder path
+    would not have put one number in front of the model.
+
+    Reads the SAME cleaned steps the recipe file already stores -- no second
+    parse, no new source of truth.  Bounded by TOOL_OBSERVATION_MAX_CHARS
+    because an unbounded screen dump would spend the very slot it is trying to
+    inform (#734/#539).  Returns '' when there is nothing to say, so the caller
+    keeps its plain success sentence rather than appending an empty section.
+    Never raises: it runs on the tool's return path and must not cost a result
+    that was actually produced.
+    """
+    try:
+        parts = []
+        for step in (recipe_steps or []):
+            if not isinstance(step, dict):
+                continue
+            text = str(step.get('steps') or '').strip()
+            if text:
+                parts.append(text)
+        if not parts:
+            return ''
+        return '\n'.join(parts)[:TOOL_OBSERVATION_MAX_CHARS]
+    except Exception:
+        return ''
+
+
 def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]":
     """Create new assistant & user proxy agents for a user with basic configuration."""
     user_prompt = f'{user_id}_{prompt_id}'
@@ -2131,6 +2194,20 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                                 recipes[user_prompt]['actions'] = _vlm_merged_actions(
                                     recipes[user_prompt]['actions'], vlm_actions)
                                 final_recipe[prompt_id] = recipes[user_prompt]
+                            # Hand back WHAT WAS SEEN, not only that it ran.
+                            # recipe_steps is the cleaned observation this
+                            # branch just wrote to the VLM file; returning the
+                            # announcement alone is what left the model to
+                            # invent 38.4 / 80 / 145.6 GB against a real
+                            # 9.17 GB.  See _tool_observation_summary.
+                            _observed = _tool_observation_summary(recipe_steps)
+                            if _observed:
+                                return (
+                                    f'Successfully ran the command in user\'s '
+                                    f'computer and created the VLM agent data '
+                                    f'at {vlm_agent_path}.\n'
+                                    f'What was observed on the machine:\n'
+                                    f'{_observed}')
                             return f'Successfully ran the command in user\'s computer and created the VLM agent data at {vlm_agent_path}.'
                         else:
                             # If no structured data available, create a simple response
