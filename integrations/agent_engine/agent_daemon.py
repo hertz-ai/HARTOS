@@ -954,7 +954,12 @@ class AgentDaemon:
             from .outreach_crm_tools import check_pending_followups_daemon
             result = check_pending_followups_daemon()
             if isinstance(result, dict):
-                followups_fired = int(result.get('processed', 0))
+                # 'sent' is the key the producer writes: check_pending_followups_daemon's
+                # only return is {'sent': sent, 'checked_at': ...}
+                # (outreach_crm_tools.py:753), and its sibling consumer at :1740
+                # already reads it.  'processed' is written nowhere, so the log
+                # line below reported 0 flushed follow-ups even when some were.
+                followups_fired = int(result.get('sent', 0))
         except Exception as e:
             logger.debug(
                 "resume_state_once: pending-followup flush skipped: %s", e)

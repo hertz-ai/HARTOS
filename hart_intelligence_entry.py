@@ -371,6 +371,17 @@ from security import master_key
 from core.platform_paths import get_coding_workspace_dir
 
 
+# Module logger.  13 sites already call `logger.` / `klogger.` and NOTHING
+# bound either name at module scope -- ruff F821 reports them, and 12 of the 13
+# sit inside `except` handlers, so the NameError replaced the real diagnosis.
+# Traced: an exception in _wire_qr_pair_emitter hits `logger.debug` (:3520) ->
+# NameError -> caught at :3525 -> NameError -> caught at :4165 -> surfaces to
+# the user as "Channel connect error: name 'logger' is not defined".  In
+# _init_skills and _init_runtime_tools (thread entry points) it kills the
+# thread silently.  Spelled the way the other ~40 sites in this file spell it;
+# _validate_startup's own local binding still wins inside that function.
+logger = logging.getLogger(__name__)
+
 # --- Hevolve Boot Integrity Verification ---
 _boot_logger = logging.getLogger("hevolve_integrity")
 
@@ -1775,7 +1786,8 @@ def _resolve_llm_endpoint(registry_fn_name: str, env_var: str) -> str:
 # LLM_MODEL_NAME in the body, and _pooled_post_with_refusal_check adds
 # LLM_AUTH_HEADERS on the way out; no site picks a model or a port of its own.
 from core.autogen_config import (
-    resolve_llm_backend, llm_http_target, with_local_fallback)
+    resolve_llm_backend, llm_http_target, with_local_fallback,
+    get_autogen_config_list)
 LLM_KIND, _llm_entry = resolve_llm_backend()
 LLM_MODEL_NAME = _llm_entry['model']
 if LLM_KIND == 'api':
@@ -4082,6 +4094,21 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                                     'color': meta.get('color') or '#6c63ff',
                                     'icon': meta.get('icon') or 'link',
                                     'url': authorize_url,
+                                    # COMPONENT_TYPES['oauth_link'] declares
+                                    # authorize_url/provider/title
+                                    # (liquid_ui_service.py:690) and the web
+                                    # renderer builds its ONLY action from
+                                    # `data.authorize_url`
+                                    # (AgentOverlay.jsx:736).  Only `url` was
+                                    # emitted, so actions was [] and the card
+                                    # rendered "Sign in to service" with
+                                    # nothing to click -- the handshake could
+                                    # not be completed on the desktop.  `url`
+                                    # stays: the RN card reads it
+                                    # (AgentInlineChatCard.js:382).
+                                    'authorize_url': authorize_url,
+                                    'provider': meta.get('display_name') or channel_type,
+                                    'title': f"Sign in to {meta.get('display_name') or channel_type}",
                                     'external_url': meta.get('external_url'),
                                     'cta_label': f"Connect with {meta.get('display_name') or channel_type}",
                                 },
@@ -7391,7 +7418,15 @@ if autogen is not None:
         # Use the dynamic module-level config_list (cloud or local, set by wizard)
         from hartos.threadlocal import thread_local_data as _tld
         _override = _tld.get_model_config_override() if hasattr(_tld, 'get_model_config_override') else None
-        _clist = _override or config_list
+        # `config_list` was never bound in this module -- ruff F821 reports it
+        # at both sites, so with no thread-local override (the normal case)
+        # this line raised NameError.  Both functions are currently unreached,
+        # which is why it never surfaced; the cost of leaving it is that this
+        # file's F821 gate stays red and hides the NEXT undefined name.
+        # get_autogen_config_list() is the canonical resolver
+        # (core/autogen_config.py:205), and with_local_fallback's docstring
+        # already describes this very idiom as "override or config_list".
+        _clist = _override or get_autogen_config_list()
 
         llm_config = {
             "config_list": _clist,
@@ -7471,7 +7506,15 @@ if autogen is not None:
         """Create new assistant and user agents for a given user_id"""
         from hartos.threadlocal import thread_local_data as _tld
         _override = _tld.get_model_config_override() if hasattr(_tld, 'get_model_config_override') else None
-        _clist = _override or config_list
+        # `config_list` was never bound in this module -- ruff F821 reports it
+        # at both sites, so with no thread-local override (the normal case)
+        # this line raised NameError.  Both functions are currently unreached,
+        # which is why it never surfaced; the cost of leaving it is that this
+        # file's F821 gate stays red and hides the NEXT undefined name.
+        # get_autogen_config_list() is the canonical resolver
+        # (core/autogen_config.py:205), and with_local_fallback's docstring
+        # already describes this very idiom as "override or config_list".
+        _clist = _override or get_autogen_config_list()
 
         llm_config = {
             "temperature": 0.7,
@@ -12714,7 +12757,7 @@ def _init_runtime_tools():
         from integrations.service_tools.runtime_manager import runtime_tool_manager
         runtime_tool_manager.load_state()
     except Exception as e:
-        klogger.warning(f"Runtime tool init failed: {e}")
+        logger.warning(f"Runtime tool init failed: {e}")
 
 
 def _validate_startup():
