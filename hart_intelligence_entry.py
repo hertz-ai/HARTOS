@@ -8683,7 +8683,14 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                         _lang = get_preferred_lang() or 'en'
                     except Exception:
                         _lang = 'en'
-                _tts_synthesize_and_publish(response_text, user_id, request_id, language=_lang)
+                # Per-agent voice, stashed on `g` by the system-agent branch in
+                # chat() when it read that agent's config.  Flask's `g` is
+                # request-scoped, so this cannot leak one character's voice
+                # into another's reply.  Absent -> None -> engine default,
+                # i.e. unchanged behaviour for every non-character agent.
+                _voice = getattr(g, 'agent_voice', None)
+                _tts_synthesize_and_publish(response_text, user_id, request_id,
+                                            language=_lang, voice=_voice)
             except Exception as e:
                 # Never let a TTS failure block delivery of the text reply.
                 app.logger.debug(f"_chat_reply: TTS dispatch skipped: {e}")
@@ -8796,7 +8803,8 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     return jsonify(payload)
 
 
-def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
+def _tts_synthesize_and_publish(text, user_id, request_id, language='en',
+                                voice=None):
     """Fire-and-forget: synthesize TTS, push audio via WAMP.
 
     Same pattern as chatbot_pipeline/chatbot.py:
@@ -8909,7 +8917,15 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
             with _timed_stage('tts.synthesize', logger=app.logger,
                               warn_over_ms=3000, chars=len(_clean),
                               lang=language):
-                _raw = synthesize_text(_clean, language=language)
+                # `voice` was never forwarded here, so every agent — every
+                # character — came out in the engine's single default voice no
+                # matter what its config said.  synthesize_text has accepted
+                # `voice` all along (tts/tts_engine.py: signature is
+                # (text, voice, speed, output_path, language)), and it is the
+                # same field the cloning-capable engines in
+                # integrations/channels/media/tts_router.py read as their
+                # reference.  None keeps the previous default exactly.
+                _raw = synthesize_text(_clean, language=language, voice=voice)
             app.logger.info(f"TTS async: synthesize_text returned: {_raw}")
             # synthesize_text may return a file path string OR a JSON dict/string
             # with {"path": "...", "duration": ...}. Normalize to a file path.
@@ -9462,6 +9478,34 @@ def chat():
         except ImportError:
             logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
+    # #590 — bind the rid BEFORE the speculative block, which RETURNS on the
+    # should_speculate path.  With the bind below that block, a turn taking the
+    # speculative early return left the rid unbound for the whole rest of the
+    # request.  Moved, not duplicated: the single bind still runs exactly once
+    # per /chat call, and now on every path including that early return.
+    #
+    # SCOPE, MEASURED 2026-09-11 — READ THIS BEFORE CITING THIS COMMENT.
+    # This move does NOT fix the "LLM-CONTEXT empty request_id at chat_agent
+    # (thread=spec_expert_N, thread_local_rid='')" lines.  An earlier draft of
+    # this comment claimed it did; a live drive on the deployed fix refuted
+    # that, and the claim is withdrawn rather than left standing:
+    #   * post-fix drive, 38 llm_outbound rows: 2 populated, 36 empty.  The 2
+    #     populated rows are exactly the two probe rids, i.e. the rows emitted
+    #     on the request thread.  Every spec_expert row was still empty
+    #     (spec_expert_0/2/3 at 14:41-14:43, after the restart).
+    #   * `speculative` is a REQUEST-BODY field defaulting to False
+    #     (`data.get('speculative', False)`), so this block is not entered by
+    #     ordinary traffic at all.
+    #   * the rows that actually carry source=autogen.reuse reach the pool via
+    #     dispatch_draft_first, called further down this function — AFTER both
+    #     the old and the new bind position — so their rid capture
+    #     (speculative_dispatcher.py:1306) was never affected by this ordering.
+    # The real hole is upstream of that capture: whatever thread calls
+    # _schedule_expert_background for the reuse path has no rid bound, so
+    # `_req_rid` is '' and the worker's re-bind at :1580 (`if request_id:`)
+    # cannot fire.  Attributing that caller is the open work, not this line.
+    thread_local_data.set_request_id(request_id=request_id)
+
     # Speculative dispatch: fast response + background expert
     if speculative and prompt and user_id and prompt_id:
         try:
@@ -9482,7 +9526,6 @@ def chat():
             logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
     # return ""
-    thread_local_data.set_request_id(request_id=request_id)
 
     # Security: Prompt injection detection
     if prompt:
@@ -9557,6 +9600,7 @@ def chat():
 
         # System agents (like Nunba) route directly to langchain casual chat
         # instead of entering gather_info/CREATE mode
+        _system_agent_chat = False
         if os.path.exists(_prompt_path):
             try:
                 with open(_prompt_path, 'r') as _pf:
@@ -9569,6 +9613,15 @@ def chat():
                     casual_conv = True
                     custom_prompt = _sys_prompt
                     prompt_id = None  # Skip CREATE/REUSE routing, fall through to get_ans()
+                    _system_agent_chat = True
+                    # Carry this agent's own voice to the TTS leg.  Read here
+                    # because this is the only place the agent's config is
+                    # already open, and stashed on request-scoped `g` rather
+                    # than threaded through _chat_reply's many callers.
+                    try:
+                        g.agent_voice = _agent_meta.get('voice') or None
+                    except Exception:
+                        pass  # outside a request context (tests) — default voice
                     app.logger.info(f"System agent '{_agent_meta.get('name')}' routed to casual chat")
             except Exception:
                 logging.getLogger(__name__).exception("chat: swallowed Exception")
@@ -9577,7 +9630,22 @@ def chat():
         # Replaces the global _state_lock for better concurrency.
         _user_lock = _get_user_lock(user_id)
         with _user_lock:
-            if prompt_id and os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}.json')):
+            if _system_agent_chat:
+                # The system-agent branch above already resolved the persona
+                # into custom_prompt and nulled prompt_id so this turn reaches
+                # get_ans().  Falling into the CREATE/REUSE ladder here is what
+                # made that unreachable: `prompt_id` is None, so the `else`
+                # below logged 'GATHER JSON doesnot EXISTS' and set
+                # create_agent=True, sending every system-agent turn into
+                # gather_info instead of casual chat.  Observed live
+                # 2026-09-11 on a persona agent: the log read
+                #   System agent 'Spider-Man' routed to casual chat
+                #   GATHER JSON doesnot EXISTS
+                #   gather_info turn 1/12
+                # on every single message.  Skipping the ladder is the whole
+                # intent of `prompt_id = None` above.
+                pass
+            elif prompt_id and os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}.json')):
                 app.logger.info('GATHER JSON EXISTS')
                 if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_0_recipe.json')):
                     app.logger.info('0 Recipe JSON EXISTS')
