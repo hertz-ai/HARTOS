@@ -869,6 +869,35 @@ def get_frame(user_id):
 
 
 # TODO Reset action order after it reaches end.
+def _agent_that_executes(groupchat, message):
+    """The group agent that can execute the call ``message`` proposes.
+
+    Returns ``(agent, function_names)``; ``agent`` is None when ``message``
+    proposes no call or no agent holds the functions.  autogen routes a call
+    to the agent whose function_map holds it (func_call_filter in groupchat.py
+    _prepare_and_select_agents), but a custom speaker_selection_method returns
+    before that filter runs, so every reuse state_transition applies it here.
+    """
+    funcs = []
+    if isinstance(message, dict):
+        if message.get("function_call"):
+            funcs.append((message["function_call"] or {}).get("name"))
+        for tc in (message.get("tool_calls") or []):
+            if (tc or {}).get("type") == "function":
+                funcs.append((tc.get("function") or {}).get("name"))
+    funcs = [f for f in funcs if f]
+    if not funcs:
+        return None, funcs
+    # The first agent that can execute, as autogen's func_call_filter does.
+    for agent in groupchat.agents:
+        try:
+            if agent.can_execute_function(funcs):
+                return agent, funcs
+        except Exception:
+            pass
+    return None, funcs
+
+
 def create_agents_for_role(user_id: str, prompt_id):
     # Uses module-level config_list (localhost:8080 for local, Azure for cloud)
     current_app.logger.info('INSIDE create_agents_for_role')
@@ -991,6 +1020,17 @@ def create_agents_for_role(user_id: str, prompt_id):
             messages = groupchat.messages
             if last_speaker == user_proxy:
                 return assistant
+            # update_persona is registered for execution on Helper only, so its
+            # call must go to Helper.  Handing the Assistant's call to
+            # user_proxy (below) ended the chat with it unexecuted: the model
+            # called update_persona at 2026-09-13 23:22:02 and "INSIDE
+            # update_persona" appears 0 times across all six app logs, so a
+            # multi-persona agent never left persona selection.
+            _executor, _funcs = _agent_that_executes(groupchat, messages[-1])
+            if _executor is not None:
+                current_app.logger.info(
+                    f"role group: tool_call {_funcs} -> {_executor.name}")
+                return _executor
             if 'TERMINATE' in messages[-1]["content"].upper():
                 current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
                 # retrieve: action 1 -> action 2
@@ -2900,28 +2940,14 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             # ran and the turn fell back to a knowledge-cutoff answer (live
             # 2026-09-05 01:25).  register_dual puts service-tool execution on
             # the executor and core-tool execution on the assistant, so which
-            # agent runs a call is per-tool; ask, don't assume.
-            _last = messages[-1]
-            _funcs = []
-            if isinstance(_last, dict):
-                if _last.get("function_call"):
-                    _funcs.append((_last["function_call"] or {}).get("name"))
-                for _tc in (_last.get("tool_calls") or []):
-                    if (_tc or {}).get("type") == "function":
-                        _funcs.append((_tc.get("function") or {}).get("name"))
-            _funcs = [f for f in _funcs if f]
-            # Return the first agent that can execute, exactly as autogen's
-            # func_call_filter does — an early return, so allow_repeat_speaker
-            # is not applied (a tool whose executor IS the proposer still runs).
-            if _funcs:
-                for _ag in groupchat.agents:
-                    try:
-                        if _ag.can_execute_function(_funcs):
-                            current_app.logger.info(
-                                f"reuse: tool_call {_funcs} -> {_ag.name} (holds the function)")
-                            return _ag
-                    except Exception:
-                        pass
+            # agent runs a call is per-tool; ask, don't assume.  An early
+            # return, so allow_repeat_speaker is not applied (a tool whose
+            # executor IS the proposer still runs).
+            _ag, _funcs = _agent_that_executes(groupchat, messages[-1])
+            if _ag is not None:
+                current_app.logger.info(
+                    f"reuse: tool_call {_funcs} -> {_ag.name} (holds the function)")
+                return _ag
 
             # Check for messages directed to the user
 
