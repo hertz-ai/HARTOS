@@ -164,3 +164,40 @@ def test_malformed_tool_entries_do_not_raise():
     defer_helper_schema(helper, {'send_to_channel'})
 
     assert 'google_search' in _names(helper)
+
+
+def test_deferral_reaches_the_wire_on_a_real_autogen_agent():
+    """The schema the model reads is the CLIENT's snapshot, not llm_config.
+
+    autogen 0.2's ``update_tool_signature`` -- which every ``register_for_llm``
+    goes through -- ends with ``self.client = OpenAIWrapper(**self.llm_config)``,
+    and ``OpenAIWrapper.__init__`` copies ``tools`` into its own
+    ``_config_list``.  So the body on the wire is whatever the client captured
+    at the LAST registration.  Editing ``llm_config['tools']`` alone leaves that
+    snapshot untouched.
+
+    Measured live 2026-09-13 on agent 87400889007: the running process logged
+    ``CREATE helper schema bounded: deferred 35 tool(s)`` at 08:50:10, and the
+    Helper's wire body at 08:50:44 still carried all 54 tools.  The fakes above
+    have no client, which is why they could not see this.
+    """
+    autogen = pytest.importorskip("autogen")
+
+    def _tool(query: str) -> str:
+        return "ok"
+
+    helper = autogen.ConversableAgent(
+        name="Helper",
+        llm_config={"config_list": [{"model": "m", "api_key": "k",
+                                     "base_url": "http://127.0.0.1:9/v1"}]},
+        human_input_mode="NEVER")
+    for name in ("google_search", "send_to_channel", "request_payment"):
+        helper.register_for_llm(name=name, description=name + " does a thing")(_tool)
+
+    defer_helper_schema(helper, {"send_to_channel", "request_payment"})
+
+    wire = [t["function"]["name"]
+            for t in helper.client._config_list[0].get("tools", [])]
+    assert wire == ["google_search"], (
+        "the deferred tools are still in the client snapshot the request is "
+        "built from, so the model still receives them: %r" % wire)

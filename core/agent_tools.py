@@ -268,7 +268,23 @@ def defer_helper_schema(helper, names):
             removed.add(name)
             continue
         kept.append(entry)
-    if removed:
+    if not removed:
+        return removed
+    # The model reads the CLIENT's snapshot, not llm_config.  autogen 0.2's
+    # update_tool_signature -- which every register_for_llm goes through --
+    # rebuilds self.client from llm_config, and OpenAIWrapper copies `tools`
+    # into its own _config_list.  Editing llm_config['tools'] alone left that
+    # snapshot untouched: live 2026-09-13, "deferred 35 tool(s)" was logged at
+    # 08:50:10 and the Helper's wire body at 08:50:44 still carried all 54.
+    # Remove through autogen's own API so config and client move together.
+    # With the shared http_client (core.autogen_config) a rebuild costs
+    # ~0.03 ms -- 35 measured in 0.001 s.  An object without that API has no
+    # client to go stale, so the list edit is the whole job there.
+    _update = getattr(helper, 'update_tool_signature', None)
+    if callable(_update):
+        for name in removed:
+            _update(name, is_remove=True)
+    else:
         cfg['tools'] = kept
     return removed
 
