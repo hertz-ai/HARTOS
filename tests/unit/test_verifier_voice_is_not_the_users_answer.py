@@ -31,13 +31,24 @@ When the verifier answers in PROSE it:
   * names no agent, is not role='tool', is not 'TERMINATE'
 so it fell through to the function's final `return True  # prose for the user`.
 
-THE FIX is one entry on an existing constant, not a new predicate:
-`_REUSE_STEER_INITIATOR_NAMES` already carries exactly this semantic for
-ChatInstructor -- its own comment says such messages "are instructions TO the
-group, so they can never be the group's answer, however they are worded" -- and
-it is already consulted by every reader that needs it.  Adding the verifier seat
-is picked up by all of them at once, which is why this test guards the CONSTANT
-and its READERS rather than a new code path.
+THE FIX, as first shipped (501cf51fb), was one entry on an existing constant:
+`_REUSE_STEER_INITIATOR_NAMES` already carried this semantic for ChatInstructor
+-- its own comment says such messages "are instructions TO the group, so they
+can never be the group's answer, however they are worded".
+
+THAT CONSTANT HAD A READER ASKING A DIFFERENT QUESTION.  `_reuse_written_answer`
+walks back from the tail for the answer the action wrote and STOPS at the first
+seat in that tuple -- the tuple is its "this action's dispatch" bound.  The
+verdict is the tail whenever an action advances, so from 501cf51fb on the walk
+stopped on it and never reached the answer.  Measured 2026-09-13: the
+answer-recovery suites pass 38/38 at 501cf51fb^ and fail 4 at 501cf51fb.  The
+seats are therefore two names now:
+
+    _REUSE_STEER_INITIATOR_NAMES   ("ChatInstructor",)  the walk-back bound
+    _REUSE_NON_ANSWER_SEATS        the above + StatusVerifier, never an answer
+
+This file guards the second set, the two readers that must consult it, and --
+by VALUE, not by name -- that the walk-back's bound does not hold the verifier.
 
 WHAT THIS TEST CAN AND CANNOT PROVE.  It is an AST guard, matching this suite's
 convention (reuse_recipe.py is far too heavy to import in a unit test), so it
@@ -45,8 +56,10 @@ proves the seat is registered and still consulted.  It does NOT prove the
 user-visible outcome -- that requires the live re-run on the failing path, per
 the standing rule to verify to the answer and not to the furthest line reached.
 
-RED BEFORE GREEN: against HEAD~ the constant is ("ChatInstructor",) and
-test_verifier_seat_is_registered fails on the membership assertion.
+RED BEFORE GREEN: at 501cf51fb^ no seat set holds the verifier and
+test_verifier_seat_is_registered fails; at 501cf51fb the walk-back reads a set
+holding the verifier and test_the_walk_back_is_bounded_by_the_steering_seat_only
+fails.
 
     python -m pytest tests/unit/test_verifier_voice_is_not_the_users_answer.py --noconftest -q
 """
@@ -63,7 +76,7 @@ _SRC = (pathlib.Path(__file__).resolve().parents[2]
 _VERIFIER_SEAT = 'StatusVerifier'
 # The harness's steering UserProxy, already in the set before this guard.
 _STEER_SEAT = 'ChatInstructor'
-_CONST = '_REUSE_STEER_INITIATOR_NAMES'
+_CONST = '_REUSE_NON_ANSWER_SEATS'
 
 
 @pytest.fixture(scope='module')
@@ -71,19 +84,36 @@ def tree():
     return ast.parse(_SRC.read_text(encoding='utf-8', errors='replace'))
 
 
-def _seat_names(tree):
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            if isinstance(target, ast.Name) and target.id == _CONST:
-                return ast.literal_eval(node.value)
-    raise AssertionError('%s is not defined in reuse_recipe.py' % _CONST)
+def _module_assigns(tree):
+    out = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    out[target.id] = node.value
+    return out
+
+
+def _resolve(assigns, value):
+    """Evaluate a seat set the way the module builds it: a tuple literal, a
+    name bound to one, or a `+` of those."""
+    if isinstance(value, ast.Name):
+        return _resolve(assigns, assigns[value.id])
+    if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+        return _resolve(assigns, value.left) + _resolve(assigns, value.right)
+    return ast.literal_eval(value)
+
+
+def _seat_names(tree, name=_CONST):
+    assigns = _module_assigns(tree)
+    if name not in assigns:
+        raise AssertionError('%s is not defined in reuse_recipe.py' % name)
+    return _resolve(assigns, assigns[name])
 
 
 def test_verifier_seat_is_registered(tree):
-    """RED pre-fix: the tuple held only ChatInstructor, so the verifier's
-    prose reached the user (2026-09-11 19:09, agent 53298912627)."""
+    """RED pre-fix: no set held the verifier, so its prose reached the user
+    (2026-09-11 19:09, agent 53298912627)."""
     names = _seat_names(tree)
     assert _VERIFIER_SEAT in names, (
         "%s must contain %r -- without it the verifier's PROSE (as opposed to "
@@ -109,12 +139,11 @@ def test_steer_seat_is_not_dropped(tree):
 def test_every_reader_still_consults_the_seat_set(tree):
     """The constant is only worth anything while its readers read it.
 
-    Three consult it today and each is load-bearing for a different question:
+    Two consult it, each for "is this the user's answer?":
       _reuse_group_terminate          does this message end the round
       _reuse_message_is_user_answer   is this the user's answer   <- the defect
-      _reuse_written_answer           walking back for a real answer
-    A migration that inlines any of them re-opens the hole for that reader
-    alone, which is the exact shape this file's own comments record twice.
+    A migration that inlines either re-opens the hole for that reader alone,
+    which is the exact shape this file's own comments record twice.
     """
     readers = set()
     for node in ast.walk(tree):
@@ -123,12 +152,46 @@ def test_every_reader_still_consults_the_seat_set(tree):
                 if isinstance(inner, ast.Name) and inner.id == _CONST:
                     readers.add(node.name)
     for expected in ('_reuse_group_terminate',
-                     '_reuse_message_is_user_answer',
-                     '_reuse_written_answer'):
+                     '_reuse_message_is_user_answer'):
         assert expected in readers, (
             '%s no longer reads %s -- the seat refusal is silently dead for '
             'that reader. Readers found: %s'
             % (expected, _CONST, sorted(readers)))
+
+
+def test_the_walk_back_is_bounded_by_the_steering_seat_only(tree):
+    """RED at 501cf51fb: the walk-back read the tuple that held the verifier,
+    so the verdict at the tail ended the walk before the answer it follows.
+
+    Resolved by VALUE, not by name, so renaming a set cannot hide it: every
+    seat set `_reuse_written_answer` reads must hold the steering seat (its
+    dispatch bound) and must not hold the verifier (which it has to step past,
+    and which _reuse_message_is_user_answer already refuses as an answer).
+    """
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef)
+               and n.name == '_reuse_written_answer'), None)
+    assert fn is not None, '_reuse_written_answer is gone'
+    assigns = _module_assigns(tree)
+    seat_sets = {}
+    for inner in ast.walk(fn):
+        if not (isinstance(inner, ast.Name) and inner.id in assigns):
+            continue
+        try:
+            value = _resolve(assigns, assigns[inner.id])
+        except Exception:
+            continue
+        if isinstance(value, tuple) and _STEER_SEAT in value:
+            seat_sets[inner.id] = value
+    assert seat_sets, (
+        '_reuse_written_answer reads no seat set holding %r -- its walk-back '
+        'has lost the bound at this action\'s dispatch' % _STEER_SEAT)
+    for name, seats in seat_sets.items():
+        assert _VERIFIER_SEAT not in seats, (
+            '_reuse_written_answer stops at every seat in %s = %r, and the '
+            'verifier\'s verdict is the tail whenever an action advances -- '
+            'the walk ends on it and never reaches the answer the action wrote '
+            '(4 tests red at 501cf51fb).' % (name, seats))
 
 
 def test_answer_key_still_outranks_the_seat_check(tree):

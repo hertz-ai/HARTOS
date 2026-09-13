@@ -3435,9 +3435,13 @@ from core.constants import (
 # helper.py :2854 visual), and every steering site in this file initiates
 # through it — the three `chat_instructor.initiate_chat(recipient=manager...)`
 # calls say so explicitly.  Its messages are instructions TO the group, so they
-# can never be the group's answer, however they are worded.
-#
-# StatusVerifier is the same class of seat and was missing, measured live
+# can never be the group's answer, however they are worded.  Every action
+# dispatch goes out through it too, so it is also where one action's span of
+# the group log begins — which is what `_reuse_written_answer` reads it for.
+_REUSE_STEER_INITIATOR_NAMES = ("ChatInstructor",)
+
+# Seats whose voice is never the user's answer: the steering seat above, plus
+# StatusVerifier.  The verifier was missing, measured live
 # 2026-09-11 19:09 (agent 53298912627, session
 # 6c2dc0fc-7c93-4fe0-973e-f7466ff63f29_53298912627).  The whole reply the user
 # received was the verifier describing its own role:
@@ -3458,17 +3462,32 @@ from core.constants import (
 #
 # Keyed on the seat, not the wording, for the reason the ChatInstructor note
 # above already gives: the verifier's prose is free model text and rewording it
-# is not a code change.  Both existing readers pick this up unchanged
-# (:4179 refuse-as-answer, :4257 skip-when-walking-back); the third,
-# `_reuse_group_terminate` :3717, is reachable only for verifier JSON that is
-# non-terminal AND carries message2userfinal — terminal verdicts return True
-# above that check, and StatusVerifier carried message2userfinal 0 times in
-# 2026-09-11's log.
+# is not a code change.  Two readers ask "is this the user's answer?" and read
+# this set: `_reuse_message_is_user_answer` (refuse as an answer) and
+# `_reuse_group_terminate`, where it is reachable only for verifier JSON that
+# is non-terminal AND carries message2userfinal — terminal verdicts return
+# True above that check, and StatusVerifier carried message2userfinal 0 times
+# in 2026-09-11's log.
 #
-# Floor, so this cannot regress #797/D31: the finaliser at :5942 walks BACK to
-# the last real answer when the tail is refused, and if nothing qualifies the
-# tail stands.  Worst case is today's behaviour; it never returns ''.
-_REUSE_STEER_INITIATOR_NAMES = ("ChatInstructor", "StatusVerifier")
+# A SEPARATE NAME from the steering seat, because the walk-back asks a
+# different question.  501cf51fb put the verifier into
+# _REUSE_STEER_INITIATOR_NAMES itself and expected `_reuse_written_answer` to
+# "skip" it; that reader STOPS at any seat in that tuple (it is its "this
+# action's dispatch" bound), and the verifier's verdict is the tail whenever
+# an action advances, so the walk stopped there and never reached the answer
+# the action had just written.  Measured 2026-09-13: the answer-recovery
+# suites pass 38/38 at 501cf51fb^ and fail 4 at 501cf51fb —
+# test_real_output_still_advances (a text action that wrote its deliverable is
+# refused) and three in test_reuse_recovers_the_written_answer (the synthesis
+# steer fires over a finished answer).  Here the walk steps past the verifier,
+# because `_reuse_message_is_user_answer` refuses it, and stops only at the
+# steering seat.
+#
+# Floor, so this cannot regress #797/D31: the finaliser in get_agent_response
+# walks BACK to the last real answer when the tail is refused, and if nothing
+# qualifies the tail stands.  Worst case is today's behaviour; it never
+# returns ''.
+_REUSE_NON_ANSWER_SEATS = _REUSE_STEER_INITIATOR_NAMES + ("StatusVerifier",)
 
 # How every action dispatch this module posts begins.  ONE definition:
 # `_build_reuse_action_message` emits it and `_reuse_message_is_user_answer`
@@ -3746,7 +3765,7 @@ def _reuse_group_terminate(msg):
         if (str(_vj.get('status', '')).lower()
                 in VERDICT_ROUND_TERMINAL_STATUSES):
             return True
-        if str((msg or {}).get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
+        if str((msg or {}).get('name') or '') in _REUSE_NON_ANSWER_SEATS:
             return False
         for _k, _v in _vj.items():
             if str(_k).lower() != 'message2userfinal':
@@ -4208,9 +4227,10 @@ def _reuse_message_is_user_answer(message):
                     if _ak in _ans:
                         return _reuse_is_written_answer(_ans[_ak])
             return True                      # the answer is already there
-        if str(last.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
-            # THE LOOP'S OWN STEER.  This seat exists to steer; it never
-            # speaks TO the user, so whatever it said is plumbing.  Measured
+        if str(last.get('name') or '') in _REUSE_NON_ANSWER_SEATS:
+            # THE LOOP'S OWN STEER, or the verifier's own voice (see
+            # _REUSE_NON_ANSWER_SEATS).  Neither seat speaks TO the user, so
+            # whatever it said is plumbing.  Measured
             # live 2026-09-09 08:53:22, delivered verbatim as the answer:
             #   "Perform this action -> Action #2:cd C:\\Users\\sathi\\Documents
             #    |  follow these steps: [{'cd C:\\\\Users\\\\sathi\\\\Documents':
@@ -4278,6 +4298,12 @@ def _reuse_written_answer(group_chat):
     before it belongs to an earlier action — or to an earlier TURN, since
     every steer runs with ``clear_history=False`` — and delivering that would
     answer a question the user did not ask.
+
+    The verifier is NOT a bound.  Its verdict is the tail whenever an action
+    advances; it sits in ``_REUSE_NON_ANSWER_SEATS``, so
+    ``_reuse_message_is_user_answer`` refuses it and the walk steps past it
+    to the answer it follows.  Stopping on it instead (501cf51fb) left every
+    written answer unreachable — 4 answer-recovery tests red.
 
     Not a replacement for the steer: on the 2026-09-09 33323830039 shape the
     span holds only tool traffic, nothing matches, and the caller steers
