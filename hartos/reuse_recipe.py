@@ -1028,19 +1028,25 @@ def create_agents_for_role(user_id: str, prompt_id):
             role_for_select_speaker_messages='user',  # Qwen3.5 rejects system mid-conversation
         )
 
-        manager = autogen.GroupChatManager(
-            groupchat=group_chat,
-            llm_config={"cache_seed": None, "config_list": config_list}
-        )
-
         # Write half of the seed/write contract: without this the group is
         # seeded FROM the shared buffer but its own turns never persist —
         # the next turn truthfully denies the conversation happened (#686).
+        #
+        # It must run before the manager is built.  GroupChatManager keeps
+        # copy.copy(group_chat) (autogen register_reply) and run_chat appends
+        # to that copy, so a list rebound onto group_chat afterwards gets no
+        # message.  chat_agent's group_chat.messages[-1] then raised
+        # IndexError: 5 /chat 500s on 2026-09-13, shown in Nunba as "busy".
         try:
             from integrations.channels.memory.shared_history import install_history_writeback
             install_history_writeback(group_chat, user_id, prompt_id=prompt_id)
         except Exception:
             current_app.logger.debug('role-group history write-back skipped', exc_info=True)
+
+        manager = autogen.GroupChatManager(
+            groupchat=group_chat,
+            llm_config={"cache_seed": None, "config_list": config_list}
+        )
 
         return assistant, user_proxy, group_chat, manager, helper, False
     else:
@@ -3258,12 +3264,6 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         role_for_select_speaker_messages='user',
     )
 
-    manager = autogen.GroupChatManager(
-        groupchat=group_chat,
-        llm_config={"cache_seed": None, "config_list": config_list},
-        is_termination_msg=_reuse_group_terminate,
-    )
-
     group_chat_1 = autogen.GroupChat(
         agents=[time_agent, helper1, time_user, multi_role_agent1, executor1, chat_instructor1, verify1],
         messages=[],
@@ -3273,12 +3273,6 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         allow_repeat_speaker=False,  # Prevent same agent speaking twice
         send_introductions=False,
         role_for_select_speaker_messages='user',
-    )
-
-    manager_1 = autogen.GroupChatManager(
-        groupchat=group_chat_1,
-        llm_config={"cache_seed": None, "config_list": config_list},
-        is_termination_msg=_reuse_group_terminate,
     )
 
     group_chat_2 = autogen.GroupChat(
@@ -3291,23 +3285,6 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         send_introductions=False,
         role_for_select_speaker_messages='user',
     )
-
-    manager_2 = autogen.GroupChatManager(
-        groupchat=group_chat_2,
-        llm_config={"cache_seed": None, "config_list": config_list},
-        is_termination_msg=_reuse_group_terminate,
-    )
-
-    visual_agent_group = {}
-    visual_agent_group['visual_agent'] = visual_agent
-    visual_agent_group['visual_user'] = visual_user
-    visual_agent_group['helper2'] = helper2
-    visual_agent_group['executor2'] = executor2
-    visual_agent_group['multi_role_agent2'] = multi_role_agent2
-    visual_agent_group['verify2'] = verify2
-    visual_agent_group['chat_instructor2'] = chat_instructor2
-    visual_agent_group['group_chat_2'] = group_chat_2
-    visual_agent_group['manager_2'] = manager_2
 
     # Group-chat write-back — shared PersistentChatHistory + SimpleMem +
     # MemoryGraph — through the CANONICAL installer, the same one
@@ -3327,6 +3304,13 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     #      shared-history + SimpleMem write-back: an outer list subclass's
     #      append calls plain list.append, never the inner subclass's append.
     # One wrap, one sink fan-out, one place to fix.
+    #
+    # It runs before the three managers below are built.  Each manager keeps
+    # copy.copy() of its group (autogen register_reply) and run_chat appends
+    # to that copy, so a list rebound onto the group afterwards receives no
+    # message.  With the managers built first, these logs got zero appends
+    # (#725, nappend=0) and _reuse_sync_group_log rebuilt them from
+    # manager._oai_messages.
     def _graph_sink(msg, graph=memory_graph, session=user_prompt):
         content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
         speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
@@ -3344,6 +3328,35 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     except Exception:
         current_app.logger.debug(
             'group-chat history write-back skipped', exc_info=True)
+
+    manager = autogen.GroupChatManager(
+        groupchat=group_chat,
+        llm_config={"cache_seed": None, "config_list": config_list},
+        is_termination_msg=_reuse_group_terminate,
+    )
+
+    manager_1 = autogen.GroupChatManager(
+        groupchat=group_chat_1,
+        llm_config={"cache_seed": None, "config_list": config_list},
+        is_termination_msg=_reuse_group_terminate,
+    )
+
+    manager_2 = autogen.GroupChatManager(
+        groupchat=group_chat_2,
+        llm_config={"cache_seed": None, "config_list": config_list},
+        is_termination_msg=_reuse_group_terminate,
+    )
+
+    visual_agent_group = {}
+    visual_agent_group['visual_agent'] = visual_agent
+    visual_agent_group['visual_user'] = visual_user
+    visual_agent_group['helper2'] = helper2
+    visual_agent_group['executor2'] = executor2
+    visual_agent_group['multi_role_agent2'] = multi_role_agent2
+    visual_agent_group['verify2'] = verify2
+    visual_agent_group['chat_instructor2'] = chat_instructor2
+    visual_agent_group['group_chat_2'] = group_chat_2
+    visual_agent_group['manager_2'] = manager_2
 
     # ── System Introspection Tools ─────────────────────────────────
     # Register self-awareness tools (GPU tier, active models, TTS
