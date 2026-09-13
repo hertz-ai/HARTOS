@@ -5032,6 +5032,25 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     _flow = get_current_flow(user_prompt)
                     _recipe_path = helper_fun.safe_prompt_path(prompt_id, _flow, _ca)
                     if not os.path.exists(_recipe_path):
+                        # Same bound as the 'recipe' site above (#485).  Asking
+                        # again is the only remedy on this branch, and a reply that
+                        # never parses leaves the file missing, so without a cap
+                        # it re-sent the request every lap: live 2026-09-13,
+                        # agent 87400889007 action 8, 31 re-requests in 2m48s,
+                        # stopped only when the HTTP turn ended.  Keyed per flow
+                        # so flow 1's action 8 cannot inherit flow 0's budget.
+                        if _remedy_replay_exceeded(
+                                _remedy_attempts, ('recipe', prompt_id, _flow, _ca)):
+                            current_app.logger.warning(
+                                f'[RECIPE-GIVEUP] action {_ca}: still unbanked after '
+                                f'{_REMEDY_MAX_ATTEMPTS} AUTO-ADVANCE requests — '
+                                f'stopping instead of replaying')
+                            if _ca < len(user_tasks[user_prompt].actions):
+                                user_tasks[user_prompt].current_action = _ca + 1
+                                user_tasks[user_prompt].recipe = False
+                                user_tasks[user_prompt].fallback = False
+                                continue
+                            break
                         # #89: count consecutive re-requests for THIS action with
                         # no recipe landing — each one means the model's prior
                         # recipe response failed to parse.  Pass the PRIOR-failure
