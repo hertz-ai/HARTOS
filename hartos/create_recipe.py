@@ -898,16 +898,17 @@ def _drop_unregistered_tool_names(recipe_steps, agents):
     model can still choose a real tool for it; and an empty tool_name routes the
     step honestly to Assistant/Executor instead of to Helper with a phantom.
 
-    The registered set is read the way ``_reuse_registered_and_referenced_tools``
-    reads it -- ``llm_config['tools']`` PLUS ``_hart_core_tools`` -- so this is
-    by construction the set the model was shown, not a second opinion about what
-    exists.  Taking only the first would blank every core tool
-    (execute_windows_or_android_command alone is 204 banked steps).
-
-    ``<tool>: <argument>`` counts as the tool: the authoring model routinely
-    writes both into the one field, which is why reuse has
-    ``_tool_name_candidates``.  Same allowance here, or this guard would strip
-    working recipes.
+    "Registered" is REUSE's own answer, asked through REUSE's two readers:
+    ``_reuse_registered_and_referenced_tools`` (executable via _function_map,
+    in an llm_config schema, or attachable by name via _hart_core_tools) and
+    ``_tool_name_candidates`` (the names inside one authored field, split on
+    ':' and ',').  A banked name is read back by REUSE, so REUSE's rule is the
+    only one that can decide it.  This check used to carry its own copy --
+    schema plus core tools, split on ':' only -- and so blanked names REUSE
+    would have served: 'google_search, crawl4ai', and, once 15ab08289 took 35
+    tools off the Helper's schema while leaving them executable on the
+    Assistant, any of those the author named.  Guarded by
+    tests/unit/test_create_cannot_author_a_tool_that_does_not_exist.py.
 
     Fails OPEN at every step -- an empty registered set, a non-list, junk -- and
     never raises: it runs while a recipe is being banked, and a validator must
@@ -916,21 +917,11 @@ def _drop_unregistered_tool_names(recipe_steps, agents):
     if not isinstance(recipe_steps, list):
         return recipe_steps
     try:
-        registered = set()
-        for ag in (agents or []):
-            cfg = getattr(ag, 'llm_config', None)
-            if isinstance(cfg, dict):
-                for t in (cfg.get('tools') or []):
-                    fn = ((t or {}).get('function') or {}).get('name')
-                    if fn:
-                        registered.add(str(fn))
-            for _ct in (getattr(ag, '_hart_core_tools', None) or []):
-                try:
-                    _cn = _ct[0]
-                except Exception:
-                    continue
-                if _cn:
-                    registered.add(str(_cn))
+        # Imported here: reuse_recipe already imports this module lazily
+        # (reuse_recipe.py:3226), so a module-level import would be a cycle.
+        from hartos.reuse_recipe import (
+            _reuse_registered_and_referenced_tools, _tool_name_candidates)
+        registered, _unused = _reuse_registered_and_referenced_tools(agents, '')
         if not registered:
             # Nothing to compare against is not evidence of a phantom.
             return recipe_steps
@@ -940,9 +931,8 @@ def _drop_unregistered_tool_names(recipe_steps, agents):
             raw = str(step.get('tool_name') or '').strip()
             if not raw:
                 continue
-            # The NAME half, same convention _tool_name_candidates decodes.
-            head = raw.split(':', 1)[0].strip().strip('\'"`')
-            if raw in registered or head in registered:
+            if raw in registered or any(
+                    name in registered for name in _tool_name_candidates(raw)):
                 continue
             try:
                 current_app.logger.warning(

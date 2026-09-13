@@ -89,13 +89,15 @@ def _func(name, src):
 class _Agent(object):
     """Minimal stand-in carrying tools the way a real autogen agent does."""
 
-    def __init__(self, names=(), core=()):
+    def __init__(self, names=(), core=(), executes=()):
         self.llm_config = {
             'tools': [{'type': 'function', 'function': {'name': n}}
                       for n in names]
         }
         if core:
             self._hart_core_tools = [(n, 'desc', None) for n in core]
+        if executes:
+            self._function_map = {n: (lambda **_kw: '') for n in executes}
 
 
 def _load_helper():
@@ -273,6 +275,61 @@ class TestItIsCalledAtBothSaveSites(unittest.TestCase):
         self.assertEqual(
             len(re.findall(r'^def %s\(' % _HELPER, self.src, re.M)), 1,
             'the validator must have ONE definition; two copies drift')
+
+
+class TestCreateAsksReusesQuestion(unittest.TestCase):
+    """CREATE's "is this a real tool" must be REUSE's "can this be served".
+
+    A banked tool_name is read back by REUSE: _tool_name_candidates splits it
+    on ':' and ',' and _reuse_registered_and_referenced_tools counts a tool as
+    servable if it is executable (_function_map), in the schema, or attachable
+    by name (_hart_core_tools).  CREATE kept its own copy of that rule -- split
+    on ':' only, and no _function_map -- so it blanked names REUSE would have
+    served.  Since 15ab08289 deferred 35 tools off the Helper schema while
+    leaving them executable on the Assistant, the gap covers every deferred
+    tool the author names.
+    """
+
+    def setUp(self):
+        loaded = _load_helper()
+        if loaded is None:
+            self.skipTest('helper absent')
+        self.fn, _ = loaded
+
+    def test_comma_separated_registered_names_survive(self):
+        agents = [_Agent(core=('google_search', 'crawl4ai'))]
+        steps = [{'steps': 'Search then crawl.',
+                  'tool_name': 'google_search, crawl4ai'}]
+        out = self.fn(steps, agents)
+        self.assertTrue(
+            out[0]['tool_name'],
+            "'google_search, crawl4ai' was blanked; REUSE's "
+            "_tool_name_candidates recovers both names and would have "
+            "served them")
+
+    def test_a_tool_the_agent_can_execute_is_not_a_phantom(self):
+        agents = [_Agent(names=('save_data_in_memory',),
+                         executes=('generate_media',))]
+        steps = [{'steps': 'Render the clip.', 'tool_name': 'generate_media'}]
+        out = self.fn(steps, agents)
+        self.assertEqual(
+            out[0]['tool_name'], 'generate_media',
+            'a tool registered for execution was blanked because it was '
+            'not in the schema at bank time -- the deferred-tool case')
+
+    def test_it_uses_reuses_derivation_not_a_copy(self):
+        """CALLED, not mentioned: the docstring names both, so a text search
+        passes against the copy this test exists to reject."""
+        import ast
+        tree = ast.parse(_func(_HELPER, _src()))
+        called = {getattr(n.func, 'id', None) or getattr(n.func, 'attr', None)
+                  for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        for canonical in ('_reuse_registered_and_referenced_tools',
+                          '_tool_name_candidates'):
+            self.assertIn(
+                canonical, called,
+                '%s does not call %s; a second copy of the rule is the '
+                'drift this class exists to stop' % (_HELPER, canonical))
 
 
 if __name__ == '__main__':
