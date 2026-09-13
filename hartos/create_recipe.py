@@ -239,8 +239,8 @@ def publish_agent_thought(last_speaker, messages, user_id):
 # agents that lose their tasks.  core/__init__.py guarantees the in-tree
 # package resolves in a source checkout as well as installed and frozen.
 from agent_ledger import (
-    SmartLedger, Task, TaskType, TaskStatus, ExecutionMode,
-    create_ledger_from_actions, get_production_backend
+    SmartLedger, TaskStatus,
+    create_ledger_from_actions, add_actions_to_ledger, get_production_backend
 )
 from agent_ledger.factory import create_production_ledger, get_or_create_ledger
 # Add to your create_recipe.py after imports
@@ -3998,7 +3998,8 @@ def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int,
     autonomous, and user-requested).
 
     Args:
-        actions: List of action dictionaries
+        actions: The flow's actions as the prompt config holds them -- dicts
+            or bare strings (307 of 749 configs on 2026-09-13 use strings)
         user_id: User ID
         prompt_id: Prompt ID
         user_prompt: Combined user_prompt string (user_id_prompt_id)
@@ -4090,28 +4091,12 @@ def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int,
             user_delegation_bridges[user_prompt] = delegation_bridge
             current_app.logger.info(f"Created TaskDelegationBridge for existing ledger {user_prompt}")
 
-        # Add any new actions that aren't already in ledger
-        for action in actions:
-            task_id = f"action_{action.get('action_id', 'unknown')}"
-            if task_id not in ledger.tasks:
-                has_prereqs = bool(action.get('prerequisites', []))
-                execution_mode = ExecutionMode.SEQUENTIAL if has_prereqs else ExecutionMode.PARALLEL
-
-                task = Task(
-                    task_id=task_id,
-                    description=action.get('description', action.get('action', '')),
-                    task_type=TaskType.PRE_ASSIGNED,
-                    execution_mode=execution_mode,
-                    status=TaskStatus.PENDING,
-                    prerequisites=[f"action_{p}" for p in action.get('prerequisites', [])],
-                    context={
-                        "action_id": action.get('action_id'),
-                        "flow": action.get('flow'),
-                        "persona": action.get('persona')
-                    },
-                    priority=100 - action.get('action_id', 0)
-                )
-                ledger.add_task(task)
+        # Add the actions this ledger does not hold yet through the ledger's
+        # own conversion.  This branch used to rebuild the Tasks in a copy of
+        # create_ledger_from_actions' loop that had no string case; live
+        # 2026-09-13 (agent 87400889007) increment_current_flow reached it at
+        # the first flow boundary and died on 'str' object has no attribute 'get'.
+        add_actions_to_ledger(ledger, actions, flow_id=flow_id)
 
     # Attach ledger to Action instance
     action_instance.set_ledger(ledger)

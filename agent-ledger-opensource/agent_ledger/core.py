@@ -3908,21 +3908,50 @@ def create_ledger_from_actions(
     if agent_id is None or session_id is None:
         raise ValueError("Must provide either (agent_id, session_id) or (user_id, prompt_id)")
 
-    if actions is None:
-        actions = []
+    ledger = SmartLedger(agent_id, session_id, backend=backend)
+    add_actions_to_ledger(ledger, actions, flow_id=flow_id,
+                          recipe_prompt_id=recipe_prompt_id)
+    return ledger
 
+
+def add_actions_to_ledger(
+    ledger: SmartLedger,
+    actions: Optional[List[Any]],
+    flow_id: int = 0,
+    recipe_prompt_id: Optional[str] = None,
+) -> int:
+    """Add pre-assigned actions to ``ledger``; return how many were new.
+
+    The one action -> Task conversion.  create_ledger_from_actions uses it
+    for a new ledger; a host that already holds a ledger (HARTOS
+    create_recipe.create_action_with_ledger) uses it to extend that one.
+
+    An action is a dict or a bare string -- 307 of the 749 prompt configs on
+    the 2026-09-13 box use strings.  Its task id is ``action_<action_id>``,
+    or ``action_<position>`` (1-based) when it has none: the id
+    hartos.lifecycle_hooks._auto_sync_to_ledger addresses.  It used to be
+    ``len(ledger.tasks) + 1``, which is the position only while the ledger
+    is empty; resuming a session that had loaded 8 tasks re-added its 8
+    string actions as action_9..action_16 (live, agent 87400889007) --
+    copies no sync reaches, which kept the session resumable forever.
+
+    An id the ledger already holds is left alone, so a resumed session keeps
+    its persisted progress.  recipe_prompt_id defaults to the ledger's
+    agent_id (agent_id == prompt_id by convention).
+    """
     # Resolve the recipe prompt-id stamp once, outside the loop, so every
     # task in this ledger carries the same value (one ledger = one flow
     # of one prompt by construction).
-    _recipe_prompt = recipe_prompt_id if recipe_prompt_id is not None else str(agent_id)
-
-    ledger = SmartLedger(agent_id, session_id, backend=backend)
-
-    for action in actions:
+    _recipe_prompt = (recipe_prompt_id if recipe_prompt_id is not None
+                      else str(ledger.agent_id))
+    added = 0
+    for position, action in enumerate(actions or [], 1):
         if isinstance(action, str):
             action = {"description": action, "action": action}
 
-        task_id = f"action_{action.get('action_id', len(ledger.tasks) + 1)}"
+        task_id = f"action_{action.get('action_id', position)}"
+        if task_id in ledger.tasks:
+            continue
 
         has_prereqs = bool(action.get('prerequisites', []))
         execution_mode = ExecutionMode.SEQUENTIAL if has_prereqs else ExecutionMode.PARALLEL
@@ -3951,6 +3980,7 @@ def create_ledger_from_actions(
 
         # Seal integrity hash so we can detect corruption later
         task.seal_integrity()
-        ledger.add_task(task)
+        if ledger.add_task(task):
+            added += 1
 
-    return ledger
+    return added
