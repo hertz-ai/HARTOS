@@ -6026,34 +6026,31 @@ def detect_and_resume_progress(prompt_id, user_prompt):
 # FIX: State setting for resume - Replace set_states_from_progress function
 
 def set_states_from_progress(user_prompt, prompt_id, current_flow, flow_progress):
+    """Set the CURRENT flow's action states from the progress found on disk.
+
+    ActionState is keyed (user_prompt, action_id) -- one flow's worth of keys,
+    and every gate reads get_action_state(user_prompt, N) as "the current
+    flow's action N".  This used to write every flow into those keys: earlier
+    flows forced through in_progress -> completed -> terminated, later flows
+    set ASSIGNED.  Each transition auto-syncs into the ledger registered for
+    the session, which is the current flow's (initialize_with_resume builds it
+    first), so live 2026-09-13 10:15:31 (agent 87400889007) a fresh flow-1
+    ledger held all 7 tasks COMPLETED before any action ran, and AUTO-ADVANCE
+    requested recipes for actions that never executed.  Earlier flows are
+    recorded by their files and ledgers; a later flow's states are set when it
+    starts (safe_increment_flow).
     """
-    Fixed version: Set appropriate states based on detected progress using valid transitions
-    """
-    config = get_prompt_config_json(prompt_id)
-
-    for flow_idx, progress in flow_progress.items():
-        if flow_idx < current_flow:
-            # Previous flows - all actions should be TERMINATED
-            for action_id in range(1, progress['total_actions'] + 1):
-                # [OK] FIX: Use force_state_through_valid_path to handle transitions properly
-                force_state_through_valid_path(user_prompt, action_id, ActionState.TERMINATED,
-                                               "resumed - previous flow")
-
-        elif flow_idx == current_flow:
-            # Current flow - set states based on completion
-            for action_id in range(1, progress['total_actions'] + 1):
-                if action_id in progress['completed_actions']:
-                    # [OK] FIX: Action has JSON file - use proper state path to TERMINATED
-                    force_state_through_valid_path(user_prompt, action_id, ActionState.TERMINATED,
-                                                   "resumed - action complete")
-                else:
-                    # Action not yet complete - mark as ASSIGNED
-                    safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "resumed - pending action")
-
+    progress = flow_progress.get(current_flow)
+    if not progress:
+        return
+    for action_id in range(1, progress['total_actions'] + 1):
+        if action_id in progress['completed_actions']:
+            # Action has JSON file - use proper state path to TERMINATED
+            force_state_through_valid_path(user_prompt, action_id, ActionState.TERMINATED,
+                                           "resumed - action complete")
         else:
-            # Future flows - all actions ASSIGNED but not started yet
-            for action_id in range(1, progress['total_actions'] + 1):
-                safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "resumed - future flow")
+            # Action not yet complete - mark as ASSIGNED
+            safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "resumed - pending action")
 
 
 # FIX: Enhanced boundary check before while loop - Add this in get_response_group()
