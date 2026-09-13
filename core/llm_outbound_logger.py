@@ -729,6 +729,33 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
     return new_msg, len(text) - target_chars
 
 
+def ensure_user_turn(messages: list) -> bool:
+    """Give ``messages`` one role='user' turn if it has none; True when added.
+
+    Both model servers refuse a conversation without a user turn, and a
+    role='tool' result does not count: llama-server's Qwen3 chat template
+    raises a hard 500 "No user query found in messages." (measured
+    2026-09-03), and central's hosted Qwen endpoint answers a bare 400
+    "invalid request" (measured 2026-09-13, task #89).  The turn carries
+    WIRE_USER_SEED_TEXT and goes right after a leading system message.
+    Mutates ``messages`` in place; a no-op when any user turn exists.
+
+    One rule, two callers: the wire trim below applies it to the bodies it
+    intercepts (local llama-server ports only), and
+    ToolMessageHandler.validate_messages applies it on the agent path, the
+    only one of the two that sees a hosted endpoint's traffic.
+    """
+    from core.constants import WIRE_USER_SEED_TEXT
+    if not messages or any(isinstance(m, dict) and (m.get('role') or '') == 'user'
+                           for m in messages):
+        return False
+    idx = 1 if (isinstance(messages[0], dict)
+                and messages[0].get('role') == 'system') else 0
+    messages.insert(idx, {'role': 'user', 'name': 'User',
+                          'content': WIRE_USER_SEED_TEXT})
+    return True
+
+
 def _trim_to_budget(body: dict) -> tuple:
     """Return ``(trimmed_body, n_dropped, n_truncated_chars, est_before,
     est_after, budget)``.
@@ -751,8 +778,7 @@ def _trim_to_budget(body: dict) -> tuple:
     Reuses ``core.token_utils`` for token counting (single source) and
     ``core.constants`` for the safety margin + marker (single source).
     """
-    from core.constants import (WIRE_TRIM_SAFETY_MARGIN_TOKENS, WIRE_TRIM_MARKER,
-                                 WIRE_USER_SEED_TEXT)
+    from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS, WIRE_TRIM_MARKER
     from core.token_utils import (
         count_tokens_for_messages, count_tokens_for_text, _content_to_text,
     )
@@ -777,12 +803,7 @@ def _trim_to_budget(body: dict) -> tuple:
     # ToolMessageHandler.validate_messages is registered per agent and was
     # bypassed on this reply path (no seed line logged, body still user-less).
     # Idempotent — strict no-op when a user turn already exists.
-    if not any(isinstance(m, dict) and (m.get('role') or '') == 'user'
-               for m in messages):
-        _seed_idx = 1 if (isinstance(messages[0], dict)
-                          and messages[0].get('role') == 'system') else 0
-        messages.insert(_seed_idx, {'role': 'user', 'name': 'User',
-                                    'content': WIRE_USER_SEED_TEXT})
+    if ensure_user_turn(messages):
         # Rebuild body so BOTH the under-budget early-return and the trim
         # path carry the seed (the early-return returns `body` as-is; a fresh
         # dict also makes `_apply_trim_to_request`'s `trimmed is body` check

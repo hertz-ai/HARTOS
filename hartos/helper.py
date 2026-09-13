@@ -1488,6 +1488,17 @@ class ToolMessageHandler:
                 f"{_guard_err!s} — using messages as-is"
             )
 
+        # A conversation with no user turn is refused by both model servers:
+        # llama-server's Qwen3 template 500s, and central's hosted endpoint
+        # answers a bare 400 (measured 2026-09-13, task #89).  The wire trim
+        # applies the same rule but only sees local llama-server traffic, so
+        # this last step of the agent path applies it too.  Dropping empty
+        # user messages above can itself be what leaves none.
+        from core.llm_outbound_logger import ensure_user_turn
+        if ensure_user_turn(messages):
+            current_app.logger.info(
+                "[ROLE-ORDER-GUARD] no user turn left; seeded one "
+                "(WIRE_USER_SEED_TEXT)")
         return messages
 
     def remove_orphan_tool_messages(self, messages):
