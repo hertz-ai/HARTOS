@@ -5766,6 +5766,14 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
             action_obj = user_tasks[user_prompt].get_action(action_id - 1) or {}
         except Exception:
             pass
+        # The create flow stores each action as its plain text (every action
+        # in all three hive agents' configs on central, 2026-09-13), which
+        # request_recipe_for_action already reads with str().  Calling .get on
+        # that text raised "'str' object has no attribute 'get'" below, so no
+        # action was ever banked from its trace and every restart re-walked
+        # the flow from action 1.
+        if not isinstance(action_obj, dict):
+            action_obj = {'action': str(action_obj)}
         if not steps:
             steps = [{
                 'steps': 'no-op: action completed without tool execution',

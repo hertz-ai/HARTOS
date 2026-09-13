@@ -138,3 +138,24 @@ class TestTraceBanking:
             lambda *a: (_ for _ in ()).throw(OSError('disk gone')))
         gc = SimpleNamespace(messages=[{'content': 'Execute Action 2: x'}])
         assert fn('u_test', '999', 0, 2, gc) is False
+
+    def test_a_plain_text_action_banks(self, tmp_path):
+        """The create flow stores each action as its plain text: every action
+        of all three hive agents on central was a str (2026-09-13).  .get on
+        that text raised "'str' object has no attribute 'get'", so no action
+        was ever banked from its trace and each restart re-walked the flow
+        from action 1."""
+        fn, ns = _load_bank_fn(tmp_path)
+        text = ('create_scheduled_jobs to schedule a recurring 6 hour job '
+                'for continuous privacy safe threat monitoring')
+        ns['user_tasks']['u_str'] = SimpleNamespace(get_action=lambda idx: text)
+        gc = SimpleNamespace(messages=[
+            {'content': 'Execute Action 1: ' + text},
+            {'tool_calls': [{'function': {'name': 'create_scheduled_jobs',
+                                          'arguments': '{"every_hours": 6}'}}]},
+        ])
+        assert fn('u_str', '999', 0, 1, gc) is True
+        data = json.load(open(tmp_path / '999_0_1.json'))
+        assert data['action'] == text
+        assert data['fallback_action'] == ''
+        assert data['recipe'][0]['tool_name'] == 'create_scheduled_jobs'
