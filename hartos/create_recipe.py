@@ -2306,8 +2306,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # ``is_termination_msg`` callback would if GroupChatManager
         # ran it between rounds.
         try:
-            _last_content = (groupchat.messages[-1].get('content') or '') if groupchat.messages else ''
-            if _last_content and 'TERMINATE' in _last_content.upper():
+            # Decide with the canonical predicate, hartos.helper._is_terminate_msg --
+            # the one every agent's is_termination_msg in this file already uses.
+            # It matches the TERMINATE token case-sensitively.  Case-folding the
+            # content read the English word inside a recipe as the control token:
+            # live 2026-09-13, agent 87400889007 action 8 return_to_idle, whose
+            # recipe says "...terminate idle timer...", had 31 valid recipe
+            # replies discarded here before the save branch -- 31 re-requests.
+            if groupchat.messages and _is_terminate_msg(groupchat.messages[-1]):
                 current_app.logger.info(
                     "[EARLY-TERMINATE] last message contains TERMINATE "
                     "(speaker=%r) — ending GroupChat round so the "
