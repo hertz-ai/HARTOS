@@ -59,7 +59,7 @@ from PIL import Image
 
 
 from flask import current_app
-from hartos.helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg, answered_call_ids
+from hartos.helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg, answered_call_ids, history_limiter, token_limiter
 
 
 def _normalize_flow_recipe(config):
@@ -256,11 +256,12 @@ except Exception:
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 from hartos import helper as helper_fun
 # Lazy — same heavy-chain rationale as the `autogen` proxy above; used
-# only inside the agent-building functions.
+# only inside the agent-building functions.  The history/token limiters come
+# from hartos.helper, never from autogen's transforms module: autogen's drop
+# the newest message when the window opens on a tool result (see
+# helper.history_limiter).
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
-transforms = lazy_module(
-    "autogen.agentchat.contrib.capabilities.transforms")
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import traceback
@@ -1010,8 +1011,8 @@ def create_agents_for_role(user_id: str, prompt_id):
 
         select_speaker_transforms = transform_messages.TransformMessages(
             transforms=[
-                transforms.MessageHistoryLimiter(max_messages=5),
-                transforms.MessageTokenLimiter(max_tokens=3000, max_tokens_per_message=500, min_tokens=300),
+                history_limiter(max_messages=5),
+                token_limiter(max_tokens=3000, max_tokens_per_message=500, min_tokens=300),
             ]
         )
         group_chat = autogen.GroupChat(
@@ -1631,8 +1632,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     context_handling = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             # peer_agents: the seat that RAN a tool is not usually the seat
             # whose next request is being built (tools execute in a pairwise
             # Assistant<->Executor exchange — see the note at :3363).  Handing
@@ -2337,8 +2338,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     context_handling = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             # Same peer wiring as the recipe path above (see rationale there).
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt,
                                peer_agents=[time_agent, helper1, executor1,
@@ -3228,8 +3229,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )

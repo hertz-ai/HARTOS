@@ -17,8 +17,9 @@ import ast
 # autogen is imported lazily — it drags google.api_core (~7.6s) + flaml +
 # the contrib capabilities chain -> llmlingua -> torch (~4.2s) at import
 # time, but every autogen.* / transform_messages.* / transforms.* use in
-# this module is INSIDE a function (AST-verified: zero module-level /
-# class-base uses; used only in create_visual_agent + the agent builders).
+# this module is INSIDE a function (AST-verified: zero module-level uses;
+# used only in create_visual_agent, the agent builders, and
+# _context_limiter_classes, whose two class bases resolve on its first call).
 # `import helper` is on the backend-boot critical path (create_recipe /
 # reuse_recipe / gather_agentdetails all import it), so deferring autogen
 # here is what actually keeps it out of the boot.  Same proxy + test as
@@ -1087,6 +1088,103 @@ def answered_call_ids(m):
         if isinstance(r, dict) and r.get('tool_call_id'):
             ids.add(r['tool_call_id'])
     return ids
+
+
+# ─── Context-window limiters ─────────────────────────────────────────────
+# autogen 0.2.37's MessageHistoryLimiter and MessageTokenLimiter both end the
+# same way (transforms.py:105-106 and :235-236):
+#
+#     if not transforms_util.is_tool_call_valid(truncated_messages):
+#         truncated_messages.pop()
+#
+# is_tool_call_valid() looks only at the FIRST message (role == 'tool',
+# transforms_util.py:117-118), and pop() removes the LAST.  So whenever the
+# window opens on a tool result, the limiter keeps that orphan and throws away
+# the newest message -- usually the instruction the agent is being asked to
+# answer.
+#
+# Live 2026-09-13 11:27:21, CREATE 87400889007 flow 1 action 3: the newest
+# message was ChatInstructor's recipe request.  The StatusVerifier's window
+# opened on two tool results, and the verifier got everything except the
+# request.  09:15-12:35 the same day, 255 of 1,549 ToolMessageHandler inputs
+# opened on a tool result; its own pre-steps explain at most 11 of them.
+#
+# The orphan is not handled here.  ToolMessageHandler comes next in every
+# chain that reaches a model and already converts or drops a leading tool
+# message (and any other orphan).  So the one correction is to put the newest
+# message back; the window is otherwise autogen's own.
+_CONTEXT_LIMITER_CLASSES = None
+
+
+def _context_limiter_classes():
+    """autogen's two limiters with the newest message kept (see above).
+
+    Built on first use, not at module level, so `import helper` still does not
+    import autogen (see the note at the top of this module and
+    tests/unit/test_lazy_autogen_import.py).
+    """
+    global _CONTEXT_LIMITER_CLASSES
+    if _CONTEXT_LIMITER_CLASSES is not None:
+        return _CONTEXT_LIMITER_CLASSES
+
+    def dropped_newest(messages, kept):
+        # autogen pops only when the window's first message is a tool result,
+        # and after the pop that message is still first -- or nothing is left.
+        return (kept is not messages and bool(messages)
+                and (not kept or kept[0].get('role') == 'tool'))
+
+    def note(which, newest):
+        _safe_log('info',
+                  f"[NEWEST-KEPT] autogen {which} opened its window on a tool "
+                  f"result and would have dropped the newest message "
+                  f"(role={newest.get('role')}, name={newest.get('name')}); kept it")
+
+    class HistoryLimiter(transforms.MessageHistoryLimiter):
+        def apply_transform(self, messages):
+            kept = super().apply_transform(messages)
+            newest = messages[-1] if messages else None
+            if dropped_newest(messages, kept) and all(m is not newest for m in kept):
+                # The window holds the caller's own dicts, and with room for
+                # two or more messages the newest is the last one autogen put
+                # in -- so the message it popped is exactly this one.
+                kept.append(newest)
+                note('MessageHistoryLimiter', newest)
+            return kept
+
+    class TokenLimiter(transforms.MessageTokenLimiter):
+        def apply_transform(self, messages):
+            kept = super().apply_transform(messages)
+            if dropped_newest(messages, kept):
+                # autogen cuts the newest message first, with nothing yet
+                # counted against the budget: to max_tokens_per_message, or to
+                # max_tokens when that is smaller.  Give it the same cut.
+                newest = dict(messages[-1])
+                util = transforms.transforms_util
+                if (util.is_content_right_type(newest.get('content'))
+                        and util.should_transform_message(
+                            newest, self._filter_dict, self._exclude_filter)):
+                    newest['content'] = self._truncate_str_to_tokens(
+                        newest['content'],
+                        min(self._max_tokens, self._max_tokens_per_message))
+                kept.append(newest)
+                note('MessageTokenLimiter', newest)
+            return kept
+
+    _CONTEXT_LIMITER_CLASSES = (HistoryLimiter, TokenLimiter)
+    return _CONTEXT_LIMITER_CLASSES
+
+
+def history_limiter(max_messages, keep_first_message=False):
+    """autogen's MessageHistoryLimiter, minus its newest-message pop (above)."""
+    return _context_limiter_classes()[0](
+        max_messages=max_messages, keep_first_message=keep_first_message)
+
+
+def token_limiter(max_tokens, max_tokens_per_message, min_tokens=0):
+    """autogen's MessageTokenLimiter, minus its newest-message pop (above)."""
+    return _context_limiter_classes()[1](
+        max_tokens=max_tokens, max_tokens_per_message=max_tokens_per_message,
+        min_tokens=min_tokens)
 
 
 class ToolMessageHandler:
@@ -3068,8 +3166,8 @@ def create_visual_agent(user_id,prompt_id):
 
     context_handling = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=3500, max_tokens_per_message=1000, min_tokens=0),
+            history_limiter(max_messages=50, keep_first_message=True),
+            token_limiter(max_tokens=3500, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(),
         ]
     )

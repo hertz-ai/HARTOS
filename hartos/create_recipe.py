@@ -57,23 +57,23 @@ import re
 import json
 from flask import current_app
 try:
-    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg
+    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg, history_limiter, token_limiter
 except Exception:
-    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, _is_terminate_msg
+    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, _is_terminate_msg, history_limiter, token_limiter
     PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 from hartos import helper as helper_fun
 import threading
 from concurrent.futures import ThreadPoolExecutor
-# transform_messages / transforms are autogen.agentchat.contrib.capabilities
-# submodules — importing them eagerly pulls the SAME heavy chain as autogen
-# (llmlingua -> torch via text_compressors).  They are used only inside the
-# agent-building functions, so proxy them lazily too (same rationale + test
-# as the `autogen` proxy above).
+# transform_messages is an autogen.agentchat.contrib.capabilities submodule —
+# importing it eagerly pulls the SAME heavy chain as autogen (llmlingua ->
+# torch via text_compressors).  It is used only inside the agent-building
+# functions, so proxy it lazily too (same rationale + test as the `autogen`
+# proxy above).  The history/token limiters come from hartos.helper, never
+# from autogen's transforms module: autogen's drop the newest message when
+# the window opens on a tool result (see helper.history_limiter).
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
-transforms = lazy_module(
-    "autogen.agentchat.contrib.capabilities.transforms")
 from json_repair import repair_json
 
 # ─── State-transition stuck-loop detector (#485) ────────────────────
@@ -1120,8 +1120,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
     context_handling = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -2896,8 +2896,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     all_agents.extend(custom_agents)
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -3576,8 +3576,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     context_handling = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -3687,8 +3687,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
