@@ -454,9 +454,9 @@ def instrument_autogen_agent(
     agent_id: str,
     track_rewards: bool = True,
     auto_trace: bool = True
-) -> AgentLightningWrapper:
+) -> Any:
     """
-    Convenience function to instrument an AutoGen agent
+    Instrument an AutoGen agent in place and return the SAME agent.
 
     Args:
         agent: AutoGen agent
@@ -465,18 +465,33 @@ def instrument_autogen_agent(
         auto_trace: Enable automatic tracing
 
     Returns:
-        Wrapped agent
+        ``agent`` itself, with its generate_reply / _execute_function traced.
+        Never the AgentLightningWrapper.
+
+    The wrapper patches the agent's own methods (_wrap_agent_methods), so the
+    tracing lives on the agent and the patched methods keep the wrapper alive.
+    Returning the wrapper put a proxy into the GroupChat of both callers
+    (create_recipe, reuse_recipe).  AutoGen keys each peer's message buffer by
+    agent identity; the proxy forwards send() to the real agent, so the
+    manager filed every reply under the real agent while run_chat read
+    last_message(proxy) -- the manager's own broadcast to the proxy -- and
+    logged that as the agent's turn.  Measured 2026-09-13 (CREATE, agent
+    87400889007): 25 "Execute Action" dispatches, 24 logged back as the
+    Assistant's reply; replaying one logged request returned a tool call twice
+    and new prose once, so the model never echoed.  Guarded by
+    tests/unit/test_lightning_instrumented_agent_speaks_as_itself.py.
     """
     if not is_enabled():
         logger.info("Agent Lightning disabled, returning unwrapped agent")
         return agent
 
-    return AgentLightningWrapper(
+    AgentLightningWrapper(
         agent=agent,
         agent_id=agent_id,
         track_rewards=track_rewards,
         auto_trace=auto_trace
     )
+    return agent
 
 
 __all__ = [
