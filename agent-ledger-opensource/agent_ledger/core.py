@@ -3772,6 +3772,7 @@ def _find_resumable_session(
     agent_id: str,
     user_id: Optional[int],
     ledger_dir: str = "agent_data",
+    flow_id: Optional[int] = None,
 ) -> Optional[str]:
     """Return session_id of an in-flight ledger for this (agent_id, user_id),
     or ``None`` if every prior session is fully terminal / no priors exist.
@@ -3797,6 +3798,15 @@ def _find_resumable_session(
     largest session_id, which by construction is the most recent
     timestamped session.
 
+    ``flow_id`` scopes "unfinished" to one flow.  A ledger holds one flow of
+    one prompt and its task ids are positions within that flow, so a session
+    left unfinished by flow 0 must not be resumed for flow 1: live
+    2026-09-13, agent 87400889007 resumed into flow 1 on flow 0's session and
+    create_recipe read flow 0's COMPLETED action_1 as flow 1's, requesting a
+    recipe for an action that never ran.  ``None`` keeps the unscoped
+    meaning (any flow).  Tasks without ``recipe_flow_id`` count as flow 0,
+    the fallback ``list_grouped_by_recipe_hierarchy`` applies.
+
     Returns:
         session_id string of the resumable session, or None.
     """
@@ -3815,8 +3825,11 @@ def _find_resumable_session(
     for session_id in sorted(prompt_sessions.keys(), reverse=True):
         if user_prefix is not None and not session_id.startswith(user_prefix):
             continue
-        # Walk every flow's actions; any non-terminal task → resumable.
-        for flow_tasks in prompt_sessions[session_id].values():
+        flows = prompt_sessions[session_id]
+        if flow_id is not None:
+            flows = {flow_id: flows.get(flow_id, [])}
+        # Walk the flows' actions; any non-terminal task → resumable.
+        for flow_tasks in flows.values():
             for _action_id, task_dict in flow_tasks:
                 status = str(task_dict.get("status") or "").lower()
                 if status and status not in _TERMINAL_TASK_STATUSES:
@@ -3885,7 +3898,8 @@ def create_ledger_from_actions(
         agent_id = str(prompt_id)
         if session_id is None:
             if resume_if_unfinished:
-                _resumable = _find_resumable_session(agent_id, user_id)
+                _resumable = _find_resumable_session(agent_id, user_id,
+                                                     flow_id=flow_id)
                 if _resumable is not None:
                     session_id = _resumable
                     logger.info(

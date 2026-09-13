@@ -19,13 +19,16 @@ accepts strings; the "ledger already exists" branch rebuilt the same Tasks in
 its own loop and never learned the string case.  increment_current_flow runs
 while the previous flow's ledger is still registered, so every multi-flow
 agent reaches that branch at its first flow boundary.
+
+The same agent, restarted at 10:02 to walk flow 1, then got flow 0's ledger:
+see test_a_fresh_process_resuming_flow_1_gets_its_own_ledger below.
 """
 
 import sys
 from unittest.mock import MagicMock, patch
 
 import hartos.create_recipe  # noqa: F401  (ensure cached)
-from agent_ledger import InMemoryBackend, create_ledger_from_actions
+from agent_ledger import InMemoryBackend, TaskStatus, create_ledger_from_actions
 
 cr = sys.modules['hartos.create_recipe']
 
@@ -83,3 +86,35 @@ def test_a_longer_list_adds_only_the_new_positions():
     _build_on_existing(ledger, FLOW_0, flow_id=0)
     assert _ids(ledger) == ['action_1', 'action_2', 'action_3']
     assert ledger.tasks['action_3'].description == 'query_weather_api'
+
+
+def test_a_fresh_process_resuming_flow_1_gets_its_own_ledger(tmp_path, monkeypatch):
+    """LIVE 2026-09-13 10:02: a restarted app resumed 87400889007 into flow 1
+    while flow 0's session on disk was still 'unfinished' (8 pending copies
+    from the old numbering).  The factory resumed THAT session, so flow 1's
+    action_1 was flow 0's COMPLETED task, and AUTO-ADVANCE (create_recipe.py,
+    _ca_ledger_done) requested flow 1 action 1's recipe before it ever ran."""
+    monkeypatch.chdir(tmp_path)          # agent_data/ resolves against the CWD
+    old_session = 'u_87400889007_1000'
+    create_ledger_from_actions(agent_id=PROMPT, session_id=old_session,
+                               actions=FLOW_0, flow_id=0)
+    app = MagicMock()
+    cr.user_ledgers.pop(USER_PROMPT, None)
+    cr.user_delegation_bridges.pop(USER_PROMPT, None)
+    try:
+        with patch.object(cr, 'current_app', app), \
+                patch('hartos.helper.current_app', app), \
+                patch.object(cr, 'get_production_backend', return_value=None), \
+                patch.object(cr, 'register_ledger_for_session'), \
+                patch.object(cr, 'TaskDelegationBridge', return_value=MagicMock()):
+            action = cr.create_action_with_ledger(
+                FLOW_1, 'u', PROMPT, USER_PROMPT, flow_id=1)
+    finally:
+        cr.user_ledgers.pop(USER_PROMPT, None)
+        cr.user_delegation_bridges.pop(USER_PROMPT, None)
+    ledger = action.ledger
+    assert ledger.session_id != old_session, (
+        "flow 1 was given flow 0's session; its action_1 is flow 0's task")
+    # What AUTO-ADVANCE reads for flow 1's first action: flow 1's own task.
+    assert ledger.tasks['action_1'].recipe_flow_id == 1
+    assert ledger.tasks['action_1'].status == TaskStatus.PENDING
