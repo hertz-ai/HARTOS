@@ -606,10 +606,22 @@ def _get_distributed_coordinator():
 
     Returns None when Redis is unavailable — caller falls back to local.
     No separate mode flag needed: if Redis exists, distribute.
+
+    api._get_coordinator() also builds an in-memory coordinator when Redis
+    is absent (the /api/distributed/* routes need one on a single node), and
+    a bundled desktop never tries Redis.  That coordinator lives in this
+    process and nothing here announces its goals to peers, so no other node
+    can claim from it.  Handing it back sent every daemon goal on a desktop
+    "distributed" into it: 632 dispatches of 137 goals in 4 h on 2026-09-13,
+    one of them claimed.
     """
     try:
-        from integrations.distributed_agent.api import _get_coordinator
-        return _get_coordinator()
+        from integrations.distributed_agent.api import (
+            _get_coordinator, get_coordinator_backend_type)
+        coordinator = _get_coordinator()
+        if get_coordinator_backend_type() != 'redis':
+            return None
+        return coordinator
     except Exception as e:
         logger.debug(f"Distributed coordinator unavailable: {e}")
         return None
