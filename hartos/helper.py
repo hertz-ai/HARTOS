@@ -1351,6 +1351,7 @@ class ToolMessageHandler:
             # would silence the signal precisely when a livelock makes it
             # loudest, which is when you need it.
             _dropped: List[str] = []
+            _dropped_user: List[str] = []
             _coalesced: List[str] = []
             _stale_terms: List[str] = []
             _last_idx = len(messages) - 1
@@ -1358,11 +1359,23 @@ class ToolMessageHandler:
                 role = (msg.get('role') or '').lower()
                 content = msg.get('content')
                 has_calls = bool(msg.get('tool_calls') or msg.get('function_call'))
+                _empty = content is None or (isinstance(content, str) and content.strip() == '')
                 # Drop empty assistant placeholders (no content + no tool calls)
-                if role == 'assistant' and not has_calls:
-                    if content is None or (isinstance(content, str) and content.strip() == ''):
-                        _dropped.append(f"{i}({msg.get('name','unknown')})")
-                        continue
+                if role == 'assistant' and not has_calls and _empty:
+                    _dropped.append(f"{i}({msg.get('name','unknown')})")
+                    continue
+                # Drop an empty USER message too: the same placeholder seen
+                # from the other side.  In a group chat another agent's turn
+                # reaches the speaker as role=user, so an agent that said
+                # nothing arrives as {"role": "user", "content": ""}.  The
+                # hosted Qwen endpoint answers any request holding one with a
+                # bare 400 "invalid request".  Measured on central 2026-09-13:
+                # a recipe request opening with Message[0] user/Assistant ""
+                # failed, and the same conversation passed once that message
+                # had text or was removed, with or without its name field.
+                if role == 'user' and not has_calls and _empty:
+                    _dropped_user.append(f"{i}({msg.get('name','unknown')})")
+                    continue
                 # Drop a CONSUMED bare TERMINATE — same class of artifact as the
                 # empty placeholder above: a control token, already acted on,
                 # carrying no content for the turn being built.
@@ -1442,19 +1455,22 @@ class ToolMessageHandler:
             # One line per invocation, only when the guard actually acted.
             # Indices are capped so a pathological turn cannot reintroduce the
             # unbounded growth this replaced — the count stays exact either way.
-            if _dropped or _coalesced or _stale_terms:
+            if _dropped or _dropped_user or _coalesced or _stale_terms:
                 _cap = 12
                 _d = ', '.join(_dropped[:_cap]) + (
                     f" (+{len(_dropped) - _cap} more)" if len(_dropped) > _cap else '')
+                _u = ', '.join(_dropped_user[:_cap]) + (
+                    f" (+{len(_dropped_user) - _cap} more)" if len(_dropped_user) > _cap else '')
                 _c = ', '.join(_coalesced[:_cap]) + (
                     f" (+{len(_coalesced) - _cap} more)" if len(_coalesced) > _cap else '')
                 _s = ', '.join(_stale_terms[:_cap]) + (
                     f" (+{len(_stale_terms) - _cap} more)" if len(_stale_terms) > _cap else '')
                 current_app.logger.info(
                     f"[ROLE-ORDER-GUARD] {len(messages)} msgs out of "
-                    f"{len(_dropped) + len(_coalesced) + len(_stale_terms) + len(messages)} in; "
+                    f"{len(_dropped) + len(_dropped_user) + len(_coalesced) + len(_stale_terms) + len(messages)} in; "
                     f"dropped {len(_dropped)} empty assistant placeholder(s)"
                     f"{' at ' + _d if _dropped else ''}; "
+                    f"{'dropped %d empty user message(s) at %s; ' % (len(_dropped_user), _u) if _dropped_user else ''}"
                     f"dropped {len(_stale_terms)} consumed TERMINATE token(s)"
                     f"{' at ' + _s if _stale_terms else ''}; "
                     f"coalesced {len(_coalesced)} consecutive same-role pair(s)"
