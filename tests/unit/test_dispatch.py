@@ -579,7 +579,6 @@ class TestGetDistributedCoordinator:
         mock_coord = MagicMock()
         mock_api = MagicMock()
         mock_api._get_coordinator.return_value = mock_coord
-        mock_api.get_coordinator_backend_type.return_value = 'redis'
 
         with patch.dict('sys.modules', {
             'integrations.distributed_agent': MagicMock(),
