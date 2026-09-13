@@ -21,9 +21,9 @@ on hard limits.
 
 Configuration via ``SafetyConfig`` dataclass; module-level singletons
 returned by ``get_session_guard()`` / ``get_audit_logger()``.  The
-singletons are reset between distinct user sessions via
-``reset_session_guard()`` (called by /api/vlm/stop and by the loop
-when it terminates a goal).
+session guard is reset via ``reset_session_guard()``, which
+``run_local_agentic_loop`` calls at the start of every goal so each goal
+gets its own action budget.
 """
 
 import collections
@@ -338,7 +338,8 @@ def get_audit_logger() -> AuditLogger:
 
 
 def reset_session_guard() -> None:
-    """Called when a VLM session ends (loop terminated, /api/vlm/stop
-    fired, user-id changes) so the next session starts fresh."""
+    """Start a fresh action budget.  Called by run_local_agentic_loop at
+    the start of every goal; without it the process-wide count reached the
+    cap once and refused every later action (2,506 on 2026-09-13)."""
     guard = get_session_guard()
     guard.reset()

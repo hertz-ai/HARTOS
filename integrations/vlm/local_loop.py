@@ -216,6 +216,31 @@ def list_active_sessions() -> list:
         return [tuple(k.split(':', 1)) for k in _vlm_stop_flags.keys()]
 
 
+def _notify_desktop_indicator(show: bool) -> None:
+    """Show or hide Nunba's AI-control ribbon (desktop/indicator_window.py).
+
+    Nunba shows the ribbon from its /execute route, which only the http tier
+    calls.  The inprocess tier drives pyautogui directly, so a run could type
+    and click with nothing on screen saying the AI was in control: on
+    2026-09-13 the audit log holds 2,660 VLM actions and gui_app.log holds no
+    "Ribbon indicator shown" line.  A show request also re-arms the ribbon's
+    15 s inactivity timer, so the loop sends one before every action.
+
+    Best effort, and only inside Nunba: standalone HARTOS has no ribbon, and
+    a refused localhost connect costs seconds on Windows.
+    """
+    try:
+        from core.config_cache import is_bundled, _local_base
+        if not is_bundled():
+            return
+        from core.http_pool import pooled_get
+        pooled_get(f"{_local_base()}/indicator/{'show' if show else 'hide'}",
+                   timeout=2)
+    except Exception as e:
+        logger.debug(f"AI-control ribbon {'show' if show else 'hide'} "
+                     f"skipped: {e}")
+
+
 def run_local_agentic_loop(
     message: dict,
     tier: str,
@@ -315,6 +340,15 @@ def run_local_agentic_loop(
     # (no try/finally — the existing iteration body wraps every error
     # in its own try/continue so exceptions never escape this scope).
     _register_session(user_id, prompt_id)
+
+    # Each goal gets its own action budget.  The SessionGuard is one
+    # process-wide object; nothing reset it, so its 100-action cap was spent
+    # by 19:05:24 on 2026-09-13 and every desktop action after that -- 2,506
+    # that day -- was refused.  Resetting here, not at the end, also covers a
+    # previous run that never reached its end.
+    from integrations.vlm.safety import reset_session_guard
+    reset_session_guard()
+    _notify_desktop_indicator(True)
 
     for iteration in range(max_iterations):
         # User-requested stop wins over every other exit condition.
@@ -449,7 +483,16 @@ def run_local_agentic_loop(
                             # to the model.  This reads that existing field; it
                             # adds no new state and no second feedback channel.
                             _prev_out = str(last.get('result', '') or '')
-                            if _prev_out.strip():
+                            if last.get('ok') is False:
+                                # A refused or failed action: say so, with the
+                                # reason, instead of sending the model to a
+                                # screenshot on which nothing happened.
+                                combined_prompt += (
+                                    "That action did NOT run successfully:\n"
+                                    f"{_prev_out[:1500]}\n"
+                                    "Do not repeat it unchanged.\n\n"
+                                )
+                            elif _prev_out.strip():
                                 combined_prompt += (
                                     "Output of that action (this is the REAL "
                                     "result — trust it over the screenshot, "
@@ -639,8 +682,14 @@ def run_local_agentic_loop(
                         pass
                 else:
                     action_json['coordinate'] = None
+                    # shell carries 'command' and open_file_gui 'path', not
+                    # 'value' -- logging only 'value' printed value='' for
+                    # every shell action and read as an empty command.
+                    _shown = (action_json.get('value')
+                              or action_json.get('command')
+                              or action_json.get('path') or '')
                     logger.info(f"Action: {next_action} "
-                                f"value='{action_json.get('value', '')[:50]}'")
+                                f"value='{str(_shown)[:50]}'")
 
                 parsed = {'screen_info': '', 'parsed_content_list': []}
             else:
@@ -687,10 +736,19 @@ def run_local_agentic_loop(
             from core.config_cache import env_flag as _env_flag
             _safety_on = _env_flag('HEVOLVE_VLM_LOOP_SAFETY', True)
             _verify_on = _env_flag('HEVOLVE_VLM_LOOP_VERIFY', False)
+            _notify_desktop_indicator(True)
             result = execute_action(
                 action_payload, tier,
                 safety=_safety_on, verify=_verify_on)
-            action_ok = result.get('status') != 'error'
+            # A result carrying an error did not happen on the machine: the
+            # safety guard refused it (status 'safety_blocked') or the
+            # executor failed ({'error': ...}, often with no status).  Both
+            # used to count as ok, and the reason went with the empty output.
+            _err = result.get('error')
+            action_ok = result.get('status') != 'error' and not _err
+            _out = result.get('output', '') or ''
+            if _err:
+                _out = (f"{_out}\n" if _out else '') + f"FAILED: {_err}"
             if action_ok:
                 consecutive_action_errors = 0
             else:
@@ -709,7 +767,7 @@ def run_local_agentic_loop(
                 "content": {
                     "action": next_action,
                     "reasoning": action_json.get('Reasoning', ''),
-                    "result": result.get('output', ''),
+                    "result": _out,
                     "ok": action_ok,
                     "coordinate": action_json.get('coordinate'),
                     "_strategy": action_json.get('_strategy', 'inline_prompt'),
@@ -752,6 +810,7 @@ def run_local_agentic_loop(
     # Drop this session's stop flag so the registry doesn't grow
     # across runs.  Pairs with _register_session above.
     _unregister_session(user_id, prompt_id)
+    _notify_desktop_indicator(False)
 
     # status mirrors exit_reason: only 'done' is a real success. Callers
     # (LangChain router, autogen) can inspect exit_reason to craft an honest
