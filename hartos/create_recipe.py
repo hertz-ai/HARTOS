@@ -5696,9 +5696,11 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
     """
     try:
         msgs = list(getattr(group_chat, 'messages', []) or [])
-        # The action's window: everything after the LAST "Execute Action N"
-        # message (re-dispatches of the same action overwrite the window).
-        start = None
+        # Every dispatch of THIS action.  The ChatInstructor re-posts the same
+        # "Execute Action N:" when it wraps a round, so an action's work can
+        # sit in an earlier window while its last window holds only a closing
+        # reply.
+        starts = []
         for i, m in enumerate(msgs):
             c = m.get('content') if isinstance(m, dict) else None
             # Trailing ':' delimiter is required — dispatch markers are
@@ -5707,8 +5709,8 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
             # action's tool calls for flows with >=10 actions (CREATE routinely
             # decomposes into 11-23).
             if isinstance(c, str) and f'Execute Action {action_id}:' in c:
-                start = i
-        if start is None:
+                starts.append(i)
+        if not starts:
             # No dispatch marker: this run never started the action, so the
             # trace holds none of its work.  The IN-RUN rule above, enforced
             # here.  Banking anyway wrote "no-op" recipes for actions that ran
@@ -5720,31 +5722,44 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                 f"[TRACE-BANK] action {action_id} was not dispatched in this "
                 f"run; nothing to bank from the trace")
             return False
-        # Window ENDS at the next action's dispatch so a later action's tool
-        # calls don't bleed into this one (the trace can hold later dispatches
-        # when banking runs at/after a flow boundary). start is THIS action's
-        # last dispatch, so the next 'Execute Action ' marker is a different one.
-        end = len(msgs)
-        for j in range(start + 1, len(msgs)):
-            cj = msgs[j].get('content') if isinstance(msgs[j], dict) else None
-            if isinstance(cj, str) and 'Execute Action ' in cj:
-                end = j
-                break
-        steps = []
-        for m in msgs[start:end]:
-            if not isinstance(m, dict):
-                continue
-            for tc in (m.get('tool_calls') or []):
-                fn = (tc.get('function') or {}) if isinstance(tc, dict) else {}
-                nm = fn.get('name', '')
-                if not nm:
+        def _window_steps(start):
+            # The window ENDS at the next dispatch marker, so a later action's
+            # tool calls don't bleed into this one (the trace can hold later
+            # dispatches when banking runs at/after a flow boundary).
+            end = len(msgs)
+            for j in range(start + 1, len(msgs)):
+                cj = msgs[j].get('content') if isinstance(msgs[j], dict) else None
+                if isinstance(cj, str) and 'Execute Action ' in cj:
+                    end = j
+                    break
+            found = []
+            for m in msgs[start:end]:
+                if not isinstance(m, dict):
                     continue
-                steps.append({
-                    'steps': f"{nm}({str(fn.get('arguments') or '')[:400]})",
-                    'tool_name': nm,
-                    'generalized_functions': '',
-                    'agent_to_perform_this_action': 'Helper',
-                })
+                for tc in (m.get('tool_calls') or []):
+                    fn = (tc.get('function') or {}) if isinstance(tc, dict) else {}
+                    nm = fn.get('name', '')
+                    if not nm:
+                        continue
+                    found.append({
+                        'steps': f"{nm}({str(fn.get('arguments') or '')[:400]})",
+                        'tool_name': nm,
+                        'generalized_functions': '',
+                        'agent_to_perform_this_action': 'Helper',
+                    })
+            return found
+
+        # Newest window first: a re-dispatch that did the work supersedes the
+        # earlier attempt.  An earlier window counts only when the newest holds
+        # no tool call.  Measured on central 2026-09-13 (Compute Recruiter,
+        # action 2): the searches ran from 20:15:13, the ChatInstructor
+        # re-posted the action at 20:17:13, and banking the empty last window
+        # wrote "no-op" for work that really ran.
+        steps = []
+        for start in reversed(starts):
+            steps = _window_steps(start)
+            if steps:
+                break
         action_obj = {}
         try:
             action_obj = user_tasks[user_prompt].get_action(action_id - 1) or {}

@@ -132,6 +132,36 @@ class TestTraceBanking:
         assert data['recipe'][0]['tool_name'] == ''
         assert 'no-op' in data['recipe'][0]['steps']
 
+    def test_a_re_posted_action_keeps_the_work_of_its_earlier_window(self, banked):
+        """Central 2026-09-13 (Compute Recruiter, action 2): the searches ran
+        after the first "Execute Action 2:", the ChatInstructor re-posted the
+        same action at 20:17:13 to wrap the round, and banking only the last
+        window (a closing verdict, no tool call) saved "no-op" for real work."""
+        ok, data, _ = banked([
+            {'content': 'Execute Action 2: google_search: recent GPU cost posts'},
+            {'tool_calls': [{'function': {'name': 'google_search',
+                                          'arguments': '{"query": "idle GPU"}'}}]},
+            {'content': 'Strong material coming in from Hacker News.'},
+            {'content': 'Execute Action 2: google_search: recent GPU cost posts'},
+            {'content': '{"status": "completed", "action_id": 2}'},
+        ])
+        assert ok is True
+        names = [s['tool_name'] for s in data['recipe']]
+        assert names == ['google_search'], data['recipe']
+
+    def test_a_retry_that_did_work_supersedes_the_earlier_attempt(self, banked):
+        ok, data, _ = banked([
+            {'content': 'Execute Action 2: synthesize'},
+            {'tool_calls': [{'function': {'name': 'first_try',
+                                          'arguments': '{}'}}]},
+            {'content': 'Execute Action 2: synthesize'},
+            {'tool_calls': [{'function': {'name': 'second_try',
+                                          'arguments': '{}'}}]},
+        ])
+        assert ok is True
+        names = [s['tool_name'] for s in data['recipe']]
+        assert names == ['second_try'], names
+
     def test_an_action_this_run_never_dispatched_is_not_banked(self, banked):
         """Resuming after a restart, a COMPLETED action whose recipe is missing
         reaches this function with a fresh group chat: its work ran in an
