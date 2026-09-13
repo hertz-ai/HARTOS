@@ -5721,7 +5721,7 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         msgs = list(getattr(group_chat, 'messages', []) or [])
         # The action's window: everything after the LAST "Execute Action N"
         # message (re-dispatches of the same action overwrite the window).
-        start = 0
+        start = None
         for i, m in enumerate(msgs):
             c = m.get('content') if isinstance(m, dict) else None
             # Trailing ':' delimiter is required — dispatch markers are
@@ -5731,6 +5731,18 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
             # decomposes into 11-23).
             if isinstance(c, str) and f'Execute Action {action_id}:' in c:
                 start = i
+        if start is None:
+            # No dispatch marker: this run never started the action, so the
+            # trace holds none of its work.  The IN-RUN rule above, enforced
+            # here.  Banking anyway wrote "no-op" recipes for actions that ran
+            # tools in an earlier process: measured on central 2026-09-13
+            # (task #90), 23 of 23 actions of one agent and 33 of 34 of
+            # another, banked within 76 s of a restart, which the flow-recipe
+            # reconciler then assembled into agents that replay nothing.
+            current_app.logger.info(
+                f"[TRACE-BANK] action {action_id} was not dispatched in this "
+                f"run; nothing to bank from the trace")
+            return False
         # Window ENDS at the next action's dispatch so a later action's tool
         # calls don't bleed into this one (the trace can hold later dispatches
         # when banking runs at/after a flow boundary). start is THIS action's

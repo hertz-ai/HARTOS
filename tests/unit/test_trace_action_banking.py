@@ -132,6 +132,26 @@ class TestTraceBanking:
         assert data['recipe'][0]['tool_name'] == ''
         assert 'no-op' in data['recipe'][0]['steps']
 
+    def test_an_action_this_run_never_dispatched_is_not_banked(self, banked):
+        """Resuming after a restart, a COMPLETED action whose recipe is missing
+        reaches this function with a fresh group chat: its work ran in an
+        earlier process and none of it is in the trace.  Banking then wrote a
+        no-op recipe for work that really happened (central 2026-09-13, #90:
+        23 of 23 actions of one agent), and the flow-recipe reconciler built
+        an agent out of them that replays nothing."""
+        ok, data, _ = banked([
+            {'content': 'Execute Action 3: a later action'},
+            {'tool_calls': [{'function': {'name': 'action3_tool',
+                                          'arguments': '{}'}}]},
+        ], action_id=2)
+        assert ok is False
+        assert data is None, 'a recipe was written for an action this run never ran'
+
+    def test_an_empty_trace_banks_nothing(self, banked):
+        ok, data, _ = banked([], action_id=1)
+        assert ok is False
+        assert data is None
+
     def test_failure_returns_false_never_raises(self, tmp_path):
         fn, ns = _load_bank_fn(tmp_path)
         ns['helper_fun'].safe_prompt_path = (
