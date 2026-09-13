@@ -840,8 +840,9 @@ def has_pending_tool_calls(messages):
             last_msg['tool_calls'])
 
 
-def _seed_messages(user_id):
-    """Recent shared-history messages used to seed an autogen GroupChat.
+def _seed_messages(user_id, prompt_id=None):
+    """Recent shared-history messages of THIS agent (``prompt_id``) used to
+    seed an autogen GroupChat -- see seed_autogen_from_shared_history.
 
     ONE builder for every GroupChat.  create_agents' main group_chat and
     create_time_agents' time_group_chat both start from the same shared
@@ -861,7 +862,8 @@ def _seed_messages(user_id):
     try:
         from integrations.channels.memory.shared_history import (
             seed_autogen_from_shared_history)
-        return seed_autogen_from_shared_history(user_id, max_messages=8)
+        return seed_autogen_from_shared_history(
+            user_id, max_messages=8, prompt_id=prompt_id)
     except Exception:
         return []
 
@@ -2904,7 +2906,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
     # Try to use select_speaker_transform_messages if supported (added in AutoGen 0.2.36+)
     # Seed autogen with recent messages from shared LangChain/autogen buffer
-    _seed_msgs = _seed_messages(user_id)
+    _seed_msgs = _seed_messages(user_id, prompt_id)
 
     group_chat_kwargs = {
         'agents': all_agents,
@@ -2999,21 +3001,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 }))
             except Exception:
                 pass
-        # Shared PersistentChatHistory write-back (dedup-aware)
+        # Shared PersistentChatHistory write-back (dedup-aware), stamped with
+        # this agent's prompt_id through the one autogen writer.
         try:
-            from integrations.channels.memory.shared_history import _get_persistent_history
+            from integrations.channels.memory.shared_history import (
+                _get_persistent_history, record_autogen_message)
             hist = _get_persistent_history(user_id)
             if hist:
-                from langchain_core.messages import HumanMessage, AIMessage
-                role = msg.get("role", "assistant") if isinstance(msg, dict) else "assistant"
-                lc_msg = HumanMessage(content=content) if role == "user" else AIMessage(content=content)
-                last_msgs = hist.messages[-3:] if hist.messages else []
-                if not any(m.content == content for m in last_msgs):
-                    from datetime import datetime
-                    hist.add_message(lc_msg, metadata={
-                        'timestamp': datetime.now().isoformat(),
-                        'source': 'autogen',
-                    })
+                record_autogen_message(hist, msg, prompt_id=prompt_id)
         except Exception:
             pass
     # Hook into message flow using a wrapper list instead of overriding append
@@ -3694,7 +3689,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     )
     time_group_chat = autogen.GroupChat(
         agents=[time_agent, helper1, time_user,multi_role_agent1,executor1,chat_instructor1,verify1],
-        messages=_seed_messages(user_id),  # same seed builder as main group_chat
+        messages=_seed_messages(user_id, prompt_id),  # same seed builder as main group_chat
         max_round=10,
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition1,  # using an LLM to decide

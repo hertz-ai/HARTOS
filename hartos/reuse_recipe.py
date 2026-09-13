@@ -1005,7 +1005,8 @@ def create_agents_for_role(user_id: str, prompt_id):
         # Seed autogen with recent messages from shared LangChain/autogen buffer
         try:
             from integrations.channels.memory.shared_history import seed_autogen_from_shared_history
-            _seed_msgs = seed_autogen_from_shared_history(user_id, max_messages=8)
+            _seed_msgs = seed_autogen_from_shared_history(user_id, max_messages=8,
+                                                          prompt_id=prompt_id)
         except Exception:
             _seed_msgs = []
 
@@ -1037,7 +1038,7 @@ def create_agents_for_role(user_id: str, prompt_id):
         # the next turn truthfully denies the conversation happened (#686).
         try:
             from integrations.channels.memory.shared_history import install_history_writeback
-            install_history_writeback(group_chat, user_id)
+            install_history_writeback(group_chat, user_id, prompt_id=prompt_id)
         except Exception:
             current_app.logger.debug('role-group history write-back skipped', exc_info=True)
 
@@ -3338,7 +3339,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             install_history_writeback(
                 gc, user_id, simplemem_store,
                 extra_sinks=[_graph_sink] if memory_graph is not None else None,
-                simplemem_metadata={'prompt_id': prompt_id})
+                simplemem_metadata={'prompt_id': prompt_id},
+                prompt_id=prompt_id)
     except Exception:
         current_app.logger.debug(
             'group-chat history write-back skipped', exc_info=True)
