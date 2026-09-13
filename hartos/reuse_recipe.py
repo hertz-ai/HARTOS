@@ -5856,6 +5856,16 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
 
             except Exception as e:
+                # A rate limit is not a round to retry.  The shared endpoint
+                # answers 429 when it is overloaded, and this handler went
+                # straight on to the next round and asked again: 41 in one
+                # minute on central, 2026-09-13 (task #91), a turn's whole
+                # round allowance spent on back-to-back 429s.  Re-raise it:
+                # the outer handler returns user_facing_error(e), a failed-turn
+                # reply the hive worker releases for a paced retry.  Not break,
+                # which would return the last message as if it were the answer.
+                if getattr(e, 'status_code', None) == 429:
+                    raise
                 current_app.logger.error(f'WE have some indexx error here: {e}')
                 error_message = traceback.format_exc()  # Capture full traceback
                 current_app.logger.error(f"Error in get_agent_response indexx:\n{error_message}")
