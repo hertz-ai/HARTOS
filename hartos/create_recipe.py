@@ -2957,6 +2957,21 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         else:
             raise
 
+    # The group's per-message write-back, installed BEFORE the manager.
+    # GroupChatManager keeps copy.copy(group_chat) (autogen register_reply) and
+    # run_chat appends to that copy, so a list rebound onto group_chat after the
+    # manager exists receives no message. That was the case here: the create
+    # loop read a frozen list, missed every "completed" status the
+    # StatusVerifier posted, and kept its action at 1 (#99, central 2026-09-13;
+    # the reuse factories had the same order, fixed in f12fe04f7).
+    try:
+        _install_create_group_writeback(
+            group_chat, user_id, prompt_id, user_prompt,
+            simplemem_store=simplemem_store, memory_graph=memory_graph)
+    except Exception:
+        current_app.logger.warning(
+            "create-group write-back not installed", exc_info=True)
+
     manager = autogen.GroupChatManager(
         groupchat=group_chat,
         llm_config=get_llm_config()
@@ -2976,88 +2991,50 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     except Exception:
         current_app.logger.debug("groupchat registry hook skipped", exc_info=True)
 
-    # Auto-ingest group_chat messages into SimpleMem + shared LangChain buffer
-    _original_append = group_chat.messages.append
-    def _unified_ingest_hook(msg):
-        # Strip non-ASCII (emoji etc) from content — prevents cp1252 crashes on Windows
-        # and JSON parse errors in llama.cpp tool call parsing
-        if isinstance(msg, dict) and isinstance(msg.get('content'), str):
-            msg['content'] = msg['content'].encode('ascii', 'replace').decode('ascii')
-        _original_append(msg)
-        if isinstance(msg, dict) and msg.get('_from_shared'):
-            return  # seeded message, already in buffer
-        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-        if not content or len(content.strip()) <= 5 or _is_terminate(content):
-            return
-        speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-        # SimpleMem ingest
-        if simplemem_store is not None:
-            try:
-                loop = get_or_create_event_loop()
-                loop.run_until_complete(simplemem_store.add(content, {
-                    "sender_name": speaker,
-                    "user_id": user_id,
-                    "prompt_id": prompt_id,
-                }))
-            except Exception:
-                pass
-        # Shared PersistentChatHistory write-back (dedup-aware), stamped with
-        # this agent's prompt_id through the one autogen writer.
-        try:
-            from integrations.channels.memory.shared_history import (
-                _get_persistent_history, record_autogen_message)
-            hist = _get_persistent_history(user_id)
-            if hist:
-                record_autogen_message(hist, msg, prompt_id=prompt_id)
-        except Exception:
-            pass
-    # Hook into message flow using a wrapper list instead of overriding append
-    # (plain list.append is read-only in Python — can't be replaced on instances)
-    class _HookedList(list):
-        def append(self, msg):
-            super().append(msg)
-            try:
-                _unified_ingest_hook(msg)
-            except Exception:
-                pass
+    return author, assistant, executor, group_chat, manager, chat_instructor, agents_object
 
-    _hooked = _HookedList(group_chat.messages)
-    group_chat.messages = _hooked
 
-    # Auto-ingest group_chat messages into MemoryGraph (provenance tracking)
+def _install_create_group_writeback(group_chat, user_id, prompt_id, user_prompt,
+                                    simplemem_store=None, memory_graph=None):
+    """Wire the create group's per-message write-back through the canonical
+    installer: shared history and SimpleMem, stamped with prompt_id, plus
+    MemoryGraph provenance and the resonance stream as extra sinks.
+
+    Call it before the GroupChatManager is built (see create_agents). It never
+    rewrites a message: run_chat broadcasts the same dict it appends, so an
+    edit here would reach every seat's prompt. The hand-rolled hook this
+    replaces stripped non-ASCII text in place, which would have fed the model
+    '?' for a Tamil or Hindi user's words once the hook ran. It only ever sat
+    behind the late rebind, so the model has always read the unstripped text.
+    """
+    sinks = []
     if memory_graph is not None:
-        _prev_append = group_chat.messages.append
-        def _graph_ingest_hook(msg):
-            _prev_append(msg)
-            try:
-                content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-                speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-                if content and len(content.strip()) > 5:
-                    memory_graph.register_conversation(speaker, content, user_prompt)
-            except Exception:
-                pass  # Non-blocking
-        group_chat.messages.append = _graph_ingest_hook
+        def _graph_sink(msg):
+            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+            speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
+            if content and len(content.strip()) > 5:
+                memory_graph.register_conversation(speaker, content, user_prompt)
+        sinks.append(_graph_sink)
 
     # Resonance stream: continuous in-conversation tuning via HevolveAI
     try:
         from core.resonance_tuner import get_resonance_tuner
         _res_tuner = get_resonance_tuner()
-        _res_prev_append = group_chat.messages.append
-        def _resonance_stream_hook(msg):
-            _res_prev_append(msg)
-            try:
-                content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-                speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-                is_user = speaker.lower() in ('user', 'user_proxy', 'author')
-                _res_tuner.stream.on_message(
-                    str(user_id), speaker, content, is_user_message=is_user)
-            except Exception:
-                pass
-        group_chat.messages.append = _resonance_stream_hook
+
+        def _resonance_sink(msg):
+            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+            speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
+            is_user = speaker.lower() in ('user', 'user_proxy', 'author')
+            _res_tuner.stream.on_message(
+                str(user_id), speaker, content, is_user_message=is_user)
+        sinks.append(_resonance_sink)
     except ImportError:
         pass
 
-    return author, assistant, executor, group_chat, manager, chat_instructor, agents_object
+    from integrations.channels.memory.shared_history import install_history_writeback
+    return install_history_writeback(
+        group_chat, user_id, simplemem_store, extra_sinks=sinks,
+        simplemem_metadata={'prompt_id': prompt_id}, prompt_id=prompt_id)
 
 
 def instantiate_executor_agent():
