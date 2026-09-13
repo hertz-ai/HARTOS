@@ -115,6 +115,47 @@ def test_a_failed_execution_releases_its_claim_instead_of_submitting():
 
 
 # --------------------------------------------------------------------------
+# A failed agent build is a failed turn too
+# --------------------------------------------------------------------------
+# Measured on central later the same day, after the 429 and 400 shapes were
+# handled: Hive Model Trainer's task was completed with create_recipe's
+# "I couldn't finish building that agent ..." reply.
+
+def test_a_failed_agent_build_is_recognised():
+    from core.constants import BUILD_INCOMPLETE_REPLY
+    from core.agent_tools import is_user_facing_error
+    assert is_user_facing_error(BUILD_INCOMPLETE_REPLY)
+    assert is_user_facing_error(BUILD_INCOMPLETE_REPLY + '\n\nAgent id 66722327257')
+    assert not is_user_facing_error("I couldn't finish building that agent yet, "
+                                    "but here is the plan so far.")
+
+
+def test_after_response_drops_a_failed_agent_build():
+    from core.constants import BUILD_INCOMPLETE_REPLY
+    loop = _loop()
+    with patch('security.hive_guardrails.GuardrailEnforcer.after_response',
+               return_value=(True, '')):
+        assert loop._after_response(BUILD_INCOMPLETE_REPLY, _Task()) is None
+
+
+def test_create_recipe_replies_with_the_shared_constant_not_a_copy():
+    """The detector matches by reference; a second copy of the sentence in
+    create_recipe would drift from it without anything noticing."""
+    import ast
+    with open(os.path.join(_ROOT, 'hartos', 'create_recipe.py'),
+              encoding='utf-8') as fh:
+        tree = ast.parse(fh.read())
+    own_copy = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                and any(getattr(t, 'id', None) == '_BUILD_INCOMPLETE_REPLY'
+                        for t in n.targets)]
+    shared = [a for n in ast.walk(tree)
+              if isinstance(n, ast.ImportFrom) and n.module == 'core.constants'
+              for a in n.names if a.name == 'BUILD_INCOMPLETE_REPLY']
+    assert not own_copy, 'create_recipe defines its own build-incomplete reply'
+    assert shared, 'create_recipe does not take the reply from core.constants'
+
+
+# --------------------------------------------------------------------------
 # The coordinator side: released now, retried later by orphan recovery
 # --------------------------------------------------------------------------
 

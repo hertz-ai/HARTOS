@@ -709,6 +709,18 @@ LLM_GENERIC_ERROR_REPLY: str = (
     "I ran into a problem handling that. Please try again."
 )
 
+# What create_recipe replies when an agent build ends without its flow-0
+# recipe: the agent is not reusable, so the turn produced no work.  It is a
+# failure notice worded for a person, which is why the hive worker has to
+# recognise it (core.agent_tools.is_user_facing_error) instead of submitting
+# it as a task result.  Measured on central 2026-09-13: Hive Model Trainer's
+# task was marked completed with this text.
+BUILD_INCOMPLETE_REPLY: str = (
+    "I couldn't finish building that agent — its steps didn't complete, so it "
+    "wouldn't be usable yet. Tell me a bit more about what it should do and "
+    "I'll pick up where it stopped."
+)
+
 
 TOOL_LABELS: dict = {
     # Memory + history

@@ -69,11 +69,14 @@ def is_user_facing_error(reply) -> bool:
     A turn that fails does not raise to its caller: user_facing_error() turns
     the exception into a polite, speakable sentence and the pipeline returns
     it as the reply, and hart_intelligence_entry does the same with
-    LLM_LOADING_REPLY / LLM_GENERIC_ERROR_REPLY.  That is right for a person
-    reading it and wrong for any caller that has to decide whether WORK was
-    done.  Measured on central 2026-09-13: the distributed worker submitted
-    "I couldn't finish that: Error code: 429 - ... rate_limit_exceeded ..." as
-    a hive task's result, and the coordinator marked the task completed.
+    LLM_LOADING_REPLY / LLM_GENERIC_ERROR_REPLY, and create_recipe with
+    BUILD_INCOMPLETE_REPLY when an agent build ends without its recipe.  That
+    is right for a person reading it and wrong for any caller that has to
+    decide whether WORK was done.  Measured on central 2026-09-13: the
+    distributed worker submitted "I couldn't finish that: Error code: 429 -
+    ... rate_limit_exceeded ..." as a hive task's result, and the coordinator
+    marked the task completed; later the same day Hive Model Trainer's task
+    was completed with BUILD_INCOMPLETE_REPLY.
 
     Recognises exactly the strings this codebase emits for a failure, by
     reference to where they are defined, so rewording one cannot silently stop
@@ -86,7 +89,12 @@ def is_user_facing_error(reply) -> bool:
         return False
     if text == _SNAG_REPLY or text.startswith(_COULD_NOT_FINISH_PREFIX):
         return True
-    from core.constants import LLM_GENERIC_ERROR_REPLY, LLM_LOADING_REPLY
+    from core.constants import (
+        BUILD_INCOMPLETE_REPLY, LLM_GENERIC_ERROR_REPLY, LLM_LOADING_REPLY)
+    # The whole sentence as a prefix: what follows it cannot turn a failed
+    # build into work, and nothing shorter is matched.
+    if text.startswith(BUILD_INCOMPLETE_REPLY.strip()):
+        return True
     return text in (LLM_LOADING_REPLY.strip(), LLM_GENERIC_ERROR_REPLY.strip())
 
 

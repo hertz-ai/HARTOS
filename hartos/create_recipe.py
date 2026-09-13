@@ -6045,11 +6045,9 @@ def set_states_from_progress(user_prompt, prompt_id, current_flow, flow_progress
 
 # FIX: Enhanced boundary check before while loop - Add this in get_response_group()
 
-_BUILD_INCOMPLETE_REPLY = (
-    "I couldn't finish building that agent — its steps didn't complete, so it "
-    "wouldn't be usable yet. Tell me a bit more about what it should do and "
-    "I'll pick up where it stopped."
-)
+# A failure notice, not an answer: defined in core.constants beside the other
+# canonical failure replies so the hive worker can recognise it by reference.
+from core.constants import BUILD_INCOMPLETE_REPLY as _BUILD_INCOMPLETE_REPLY  # noqa: E402
 
 
 def _agent_build_is_complete(prompt_id) -> bool:
