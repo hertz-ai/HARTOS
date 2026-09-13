@@ -2230,10 +2230,26 @@ class ToolMessageHandler:
                     break
                 insert_position = j + 1
 
-            # Insert the consolidated response
-            final_messages.insert(insert_position, fixed_consolidated)
+            # Insert the consolidated response as ONE tool message per call.
+            # The bundled shape (role=tool, tool_responses=[...], no top-level
+            # tool_call_id) is autogen's internal form, not the API's: the
+            # hosted Qwen endpoint answers any request holding it with a bare
+            # 400 "invalid request", with or without a user turn (measured on
+            # central 2026-09-13, task #89), while the same results as one
+            # tool message per tool_call_id pass.  A bundle without per-call
+            # entries (the tool_call_ids form) has nothing to split and goes
+            # in as it did.
+            _per_call = [
+                {'role': 'tool', 'tool_call_id': r['tool_call_id'],
+                 'content': r.get('content') if r.get('content') is not None else ''}
+                for r in (fixed_consolidated.get('tool_responses') or [])
+                if isinstance(r, dict) and r.get('tool_call_id')
+            ]
+            final_messages[insert_position:insert_position] = (
+                _per_call or [fixed_consolidated])
             current_app.logger.info(
-                f"Inserted consolidated response with {len(tool_call_ids)} tool_call_ids after assistant message at index {most_likely_assistant_idx}")
+                f"Inserted consolidated response with {len(tool_call_ids)} tool_call_ids after assistant message at index {most_likely_assistant_idx}"
+                + (f" as {len(_per_call)} tool message(s)" if _per_call else ""))
 
             # Mark these tool calls as responded
             for tool_call_id in tool_call_ids:
