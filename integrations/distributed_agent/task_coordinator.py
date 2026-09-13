@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 from agent_ledger.core import SmartLedger, Task, TaskType, TaskStatus
 from agent_ledger.distributed import DistributedTaskLock
 from agent_ledger.verification import TaskVerification, TaskBaseline
-from core.constants import HIVE_DEPTH
+from core.constants import HIVE_DEPTH, HIVE_WORKER_CAPABILITIES
 
 logger = logging.getLogger(__name__)
 
@@ -118,9 +118,24 @@ class DistributedTaskCoordinator:
         # just re-dispatching an in-flight goal — reuse the existing task set,
         # do NOT create a duplicate parent+children (the unbounded-growth bug).
         if goal_id in self._ledger.tasks:
+            # HEAL on re-dispatch.  This branch used to return straight away,
+            # which preserved whatever the FIRST submission wrote for as long
+            # as the ledger lived.  Task sets created before the
+            # goal-type-as-capability fix (3133ede1b, 04c213892) still demand
+            # capabilities_required=[goal_type], e.g. ['hive_growth'], a name
+            # no worker can ever advertise, so those goals dispatched every
+            # tick into a queue nothing could claim.
+            #
+            # Measured on central 2026-09-13: three hive goals with spark
+            # frozen at 364/448/531 since 09-01, their task sets surviving two
+            # redeploys because the coordinator ledger is file-backed.  Healing
+            # here fixes every node on its next tick, with no manual surgery.
+            healed = self._heal_goal_type_demands(goal_id)
             logger.info(
                 f"submit_goal: goal {goal_id} already has tasks — reusing "
-                f"(skipping duplicate task creation)")
+                f"(skipping duplicate task creation)"
+                + (f"; healed {healed} unclaimable requirement(s)"
+                   if healed else ""))
             return goal_id
 
         # Enforce HIVE_DEPTH — reject propagations deeper than the
@@ -173,6 +188,46 @@ class DistributedTaskCoordinator:
 
         logger.info(f"Goal submitted: {goal_id} with {len(decomposed_tasks)} tasks")
         return goal_id
+
+    def _heal_goal_type_demands(self, goal_id: str) -> int:
+        """Drop a child's demand for its OWN goal type when no worker can
+        advertise that name.  Returns how many children were healed.
+
+        Narrow on purpose.  It removes exactly one defect signature, a
+        goal_type written into capabilities_required, and only when that name
+        is outside HIVE_WORKER_CAPABILITIES.  A real capability ('marketing',
+        'coding', 'vision') is kept, and so is any other name a caller chose
+        deliberately, such as robot hardware requirements.  This repairs one
+        known bad write; it is not a general filter over what tasks may demand.
+
+        Only PENDING, unclaimed children are touched.  Rewriting the demand of
+        a task a worker already holds would change its contract mid-flight.
+
+        Saves only when something changed.  This runs on EVERY re-dispatch,
+        i.e. every tick for every in-flight goal, and an unconditional save()
+        would re-serialize the whole ledger each time -- the json.dump storm
+        behind #145.
+        """
+        parent = self._ledger.get_task(goal_id)
+        healed = 0
+        for child_id in list(getattr(parent, 'child_task_ids', None) or []):
+            child = self._ledger.get_task(child_id)
+            if child is None or child.status != TaskStatus.PENDING:
+                continue
+            ctx = child.context
+            if ctx.get('claimed_by'):
+                continue
+            goal_type = ctx.get('goal_type')
+            demanded = list(ctx.get('capabilities_required') or [])
+            if (not goal_type or goal_type not in demanded
+                    or goal_type in HIVE_WORKER_CAPABILITIES):
+                continue
+            ctx['capabilities_required'] = [
+                c for c in demanded if c != goal_type]
+            healed += 1
+        if healed:
+            self._ledger.save()
+        return healed
 
     def claim_next_task(
         self,
