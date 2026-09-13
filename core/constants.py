@@ -722,6 +722,25 @@ BUILD_INCOMPLETE_REPLY: str = (
 )
 
 
+# ── The per-request switch that turns a hybrid-reasoning model's thinking OFF ──
+# The value of an OpenAI-compatible request's `chat_template_kwargs`. ONE
+# definition for every HARTOS completion that must answer inside a small budget
+# (integrations/vision/image_describe.py; the book-title call in
+# integrations/learning/book_pipeline.py; every agent call to the configured
+# endpoint, via core.autogen_config.resolve_llm_backend).
+#
+# Why (measured live 2026-08-04 on the Nunba vision route): Qwen3.5 writes its
+# chain-of-thought into `reasoning_content` and only afterwards fills `content`.
+# With max_tokens=300 the whole budget went to thinking -- finish=length,
+# content=0 chars -- an empty answer and no error. This kwarg took reasoning
+# 760 -> 0 chars and made the call faster. `reasoning_effort: "none"` is NOT
+# honoured by that server; do not substitute it. Nunba also disables thinking at
+# llama-server SPAWN (LLAMA_ARG_CHAT_TEMPLATE_KWARGS), but only for a server it
+# started; this travels with the request, so it also covers an external, remote
+# or cloud endpoint.
+LLM_THINKING_OFF_KWARGS: dict = {'enable_thinking': False}
+
+
 TOOL_LABELS: dict = {
     # Memory + history
     'FULL_HISTORY':                'Searching your message history…',
