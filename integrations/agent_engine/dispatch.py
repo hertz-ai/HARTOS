@@ -23,6 +23,7 @@ import requests
 from typing import Dict, List, Optional
 
 from core.http_pool import pooled_post
+from core.chat_client import daemon_request_id, normalize_chat_body
 from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
@@ -251,7 +252,7 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
         # A daemon-specific request_id keeps background thinking traces out of
         # user responses via drain_thinking_traces(), and is what
         # dispatch.is_genuine_user_request reads to classify the turn.
-        request_id = f'daemon_{daemon_id}' if daemon_id is not None else None
+        request_id = daemon_request_id(daemon_id) if daemon_id is not None else None
         result = hevolve_chat(
             text=prompt, user_id=user_id, agent_id=prompt_id,
             create_agent=True, casual_conv=False, autonomous=True,
@@ -949,7 +950,10 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     base_url = _local_dispatch_base_url()  # #71: probe live port, not dead 6777
 
     try:
-        resp = pooled_post(f'{base_url}/chat', json=body,
+        # Tagged like Tier 1 (daemon_<goal_id>) so the create pipeline runs the
+        # turn AUTONOMOUS; an untagged body reads as a live user (#97).
+        resp = pooled_post(f'{base_url}/chat',
+                           json=normalize_chat_body(body, daemon_id=goal_id),
                            headers=_internal_auth_headers(), timeout=120)
         if resp.status_code == 200:
             _cb_record_success()
@@ -1075,7 +1079,9 @@ def _dispatch_single_instruction(base_url: str, user_id: str, inst,
         return (inst.id, None, 'deferred: user active or LLM busy')
 
     try:
-        resp = pooled_post(f'{base_url}/chat', json=body,
+        # Same daemon_<batch_id> tag as the in-process call above (#97).
+        resp = pooled_post(f'{base_url}/chat',
+                           json=normalize_chat_body(body, daemon_id=batch_id),
                            headers=_internal_auth_headers(), timeout=300)
         if resp.status_code == 200:
             result_text = resp.json().get('response', '')

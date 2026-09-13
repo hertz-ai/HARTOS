@@ -16,6 +16,7 @@ import threading
 import requests
 from typing import Optional
 from core.http_pool import pooled_post
+from core.chat_client import normalize_chat_body
 
 from core.constants import HIVE_DEPTH, HIVE_WORKER_BASE_CAPABILITIES
 from core.port_registry import get_port
@@ -306,8 +307,17 @@ class DistributedWorkerLoop:
         # the ledger re-dispatched it each tick ("Task <id>_root already
         # exists"). Same helper as dispatch.py:862 and
         # speculative_dispatcher.py:1880 (cdd379ad); this was the third site.
+        #
+        # The body declares the turn as background work with the same
+        # daemon_<task_id> tag local_chat_dispatch stamps. Without it the
+        # /chat handler binds request_id None, is_current_request_autonomous()
+        # reads that as a live user, and the create pipeline gives the agent
+        # the INTERACTIVE prompt. On central (native HARTOS, where this POST is
+        # the only route) both rebuilt agents greeted, asked a clarifying
+        # question nobody could answer, and saved no step (#97).
         try:
-            resp = pooled_post(f'{base_url}/chat', json=body,
+            resp = pooled_post(f'{base_url}/chat',
+                               json=normalize_chat_body(body, daemon_id=task.task_id),
                                headers=_internal_auth_headers(), timeout=120)
             if resp.status_code == 200:
                 result = resp.json()

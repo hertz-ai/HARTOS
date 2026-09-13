@@ -125,6 +125,37 @@ def test_the_http_fallback_sends_the_same_prompt_id():
     assert post.call_args.kwargs['json']['prompt_id'] == _CENTRAL_GOALS[_GOAL]
 
 
+def test_the_http_fallback_turn_runs_autonomous():
+    """#97, measured on central 2026-09-13: native HARTOS has no Nunba adapter,
+    so the worker reaches /chat only through this POST, and its body carried
+    no request_id. The handler bound None, is_current_request_autonomous()
+    read that as a live user, and both rebuilt agents got the INTERACTIVE
+    prompt: they greeted, asked a clarifying question nobody could answer,
+    and saved no step in 45 minutes."""
+    from core.chat_client import daemon_request_id
+    from hartos.threadlocal import thread_local_data
+    from integrations.agent_engine.dispatch import is_current_request_autonomous
+    _, co = _coordinator_with_goal()
+    task = co.claim_next_task('worker_a', capabilities=_loop()._capabilities)
+    assert task is not None
+    with _allow_dispatch(), \
+         patch('integrations.agent_engine.dispatch.local_chat_dispatch',
+               return_value=('unavailable', None)), \
+         patch('integrations.agent_engine.dispatch._internal_auth_headers',
+               return_value={}), \
+         patch('integrations.distributed_agent.worker_loop.pooled_post',
+               return_value=MagicMock(status_code=503)) as post:
+        _loop()._execute_task(task)
+    rid = post.call_args.kwargs['json']['request_id']
+    # the tag local_chat_dispatch stamps on the in-process route
+    assert rid == daemon_request_id(task.task_id)
+    try:
+        thread_local_data.set_request_id(rid)   # what the /chat handler does
+        assert is_current_request_autonomous() is True
+    finally:
+        thread_local_data.set_request_id('')
+
+
 def test_two_goals_never_share_one_agent():
     """The prompt_id keys the agent's live state, so two goals' hive tasks
     must not collapse onto one."""

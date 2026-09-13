@@ -585,6 +585,9 @@ class TestDispatch:
         assert call_json['create_agent'] is True
         # prompt_id is now a numeric MD5 hash: int(md5('goal_abc')[:10], 16) % 100_000_000_000
         assert call_json['prompt_id'] == '95535448866'
+        # Tier 2 declares the turn as daemon work, the same tag as Tier 1, so
+        # the create pipeline runs it AUTONOMOUS (#97).
+        assert call_json['request_id'] == 'daemon_goal_abc'
 
     @patch('integrations.agent_engine.dispatch.pooled_post')
     def test_dispatch_goal_failure(self, mock_post):
