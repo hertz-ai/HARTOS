@@ -116,7 +116,7 @@ class ReuseMainCoreFactory(unittest.TestCase):
                 self._target(*self._args, **self._kwargs)
 
     def _factory_tools(self, memory_graph=None, simplemem_store=None,
-                       helper_fun=None, send1=None):
+                       helper_fun=None, send1=None, agent_data=None):
         from unittest import mock as _m
         from core.agent_tools import build_core_tool_closures
         ctx = {k: None for k in (
@@ -124,7 +124,9 @@ class ReuseMainCoreFactory(unittest.TestCase):
             'request_id_list', 'recent_file_id', 'scheduler',
             'send_message_to_user1', 'retrieve_json', 'strip_json_values',
             'save_conversation_db')}
-        ctx.update(user_id=1, prompt_id='p1', agent_data={}, user_prompt='s1',
+        ctx.update(user_id=1, prompt_id='p1',
+                   agent_data=agent_data if agent_data is not None else {},
+                   user_prompt='s1',
                    request_id_list={'s1': 'r1'},
                    memory_graph=memory_graph, simplemem_store=simplemem_store,
                    helper_fun=helper_fun or _m.Mock(),
@@ -176,6 +178,23 @@ class ReuseMainCoreFactory(unittest.TestCase):
                                    helper_fun=mock.Mock(**{'save_agent_data_to_file.return_value': True}))
         self.assertEqual(bare['get_data_by_key']('never.stored'),
                          'Key not found in stored data.')
+
+    def test_get_through_a_non_dict_is_a_miss_not_an_exception(self):
+        """#98, central 2026-09-13: a hive reuse turn asked for a nested key
+        under a None value, and get_data_by_key raised TypeError out of the
+        tool instead of falling back the way a missing key does."""
+        from unittest import mock
+        stored = {'p1': {'user': None, 'name': 'Ada', 'tags': ['a', 'b']}}
+        bare = self._factory_tools(memory_graph=None, agent_data=stored)
+        for path in ('user.color', 'name.first', 'tags.first'):
+            self.assertEqual(bare['get_data_by_key'](path),
+                             'Key not found in stored data.', path)
+        graph = mock.Mock()
+        graph.recall.return_value = [SimpleNamespace(content='teal-from-graph')]
+        tools = self._factory_tools(memory_graph=graph, agent_data=stored)
+        self.assertEqual(tools['get_data_by_key']('user.color'),
+                         'teal-from-graph')
+        graph.recall.assert_called_with('[KV] user.color', mode='text', top_k=1)
 
     def test_send_message_to_user_blocks_agent_mentions(self):
         """The absorbed reuse guard, proven by calling: '@helper' text

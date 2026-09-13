@@ -937,7 +937,11 @@ def build_core_tool_closures(ctx):
             for k in keys:
                 d = d[k]
             return f'{d}'
-        except KeyError:
+        # TypeError too: a path that runs through a None, a string or a list
+        # is as missing as an absent key. It used to escape as a tool
+        # exception and skip the fallback below (central 2026-09-13, a hive
+        # reuse turn asking for a nested key under a None value).
+        except (KeyError, TypeError):
             # Fallback: check MemoryGraph for persisted [KV] data — the
             # read half of save_data_in_memory's dual-write, carried by
             # reuse_recipe's inline twin before the #743 migration and
