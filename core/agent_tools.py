@@ -51,9 +51,43 @@ def user_facing_error(e):
     text = str(e)
     low = text.lower()
     if any(m in low for m in _INTERNAL_ERROR_MARKERS) or len(text) > 200:
-        return ("I hit an internal snag finishing that - please try "
-                "again in a moment.")
-    return f"I couldn't finish that: {text[:160]}"
+        return _SNAG_REPLY
+    return f"{_COULD_NOT_FINISH_PREFIX}{text[:160]}"
+
+
+# The two shapes user_facing_error() produces, named once so the code that has
+# to RECOGNISE a failed turn reads the same strings the code that writes them
+# does.  Changing the wording here changes both.
+_SNAG_REPLY = ("I hit an internal snag finishing that - please try "
+               "again in a moment.")
+_COULD_NOT_FINISH_PREFIX = "I couldn't finish that: "
+
+
+def is_user_facing_error(reply) -> bool:
+    """True when ``reply`` is a failed turn dressed as an answer.
+
+    A turn that fails does not raise to its caller: user_facing_error() turns
+    the exception into a polite, speakable sentence and the pipeline returns
+    it as the reply, and hart_intelligence_entry does the same with
+    LLM_LOADING_REPLY / LLM_GENERIC_ERROR_REPLY.  That is right for a person
+    reading it and wrong for any caller that has to decide whether WORK was
+    done.  Measured on central 2026-09-13: the distributed worker submitted
+    "I couldn't finish that: Error code: 429 - ... rate_limit_exceeded ..." as
+    a hive task's result, and the coordinator marked the task completed.
+
+    Recognises exactly the strings this codebase emits for a failure, by
+    reference to where they are defined, so rewording one cannot silently stop
+    this check from matching it.
+    """
+    if not isinstance(reply, str):
+        return False
+    text = reply.strip()
+    if not text:
+        return False
+    if text == _SNAG_REPLY or text.startswith(_COULD_NOT_FINISH_PREFIX):
+        return True
+    from core.constants import LLM_GENERIC_ERROR_REPLY, LLM_LOADING_REPLY
+    return text in (LLM_LOADING_REPLY.strip(), LLM_GENERIC_ERROR_REPLY.strip())
 
 
 def register_dual(helper, executor, func, name: str, description: str):

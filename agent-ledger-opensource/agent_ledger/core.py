@@ -1814,6 +1814,42 @@ class SmartLedger:
             self.save()
         return success
 
+    def reopen_task(self, task_id: str, reason: str,
+                    defer_save: bool = False) -> bool:
+        """Put a COMPLETED task back to PENDING for another run.
+
+        The one sanctioned way out of COMPLETED besides ROLLED_BACK. It exists
+        for work that is meant to recur, such as a continuous goal's
+        distributed task: re-running the same task keeps its id and its
+        history, where minting a new task per run grows the ledger without
+        bound (the 9166-task save deadlock of 2026-06-12).
+
+        Deliberately narrow. Only COMPLETED is re-openable: FAILED stays failed
+        so the fast-fail breaker (#59) still prevents retry storms, and every
+        other state already has its own transitions. The reopen is recorded in
+        state_history with the caller's reason, and the run-scoped fields
+        (result, completed_at, started_at, error_message) are cleared so the
+        next run starts clean. Cumulative counters (spark_spent, time_spent_s)
+        are kept.
+        """
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                logger.error(f"Task {task_id} not found")
+                return False
+            if task.status != TaskStatus.COMPLETED:
+                logger.warning(
+                    f"reopen_task: {task_id} is {task.status}, not COMPLETED")
+                return False
+            task._record_state_transition(TaskStatus.PENDING, reason)
+            task.result = None
+            task.completed_at = None
+            task.started_at = None
+            task.error_message = None
+            if not defer_save:
+                self.save()
+            return True
+
     def user_stop_task(self, task_id: str, reason: str = "User stopped task") -> bool:
         """User explicitly stops a task."""
         task = self.get_task(task_id)

@@ -687,12 +687,29 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
         return None
 
     tasks = _decompose_goal(prompt, goal_id, goal_type, user_id)
+
+    # A continuous goal's hive task is re-armed after every finished run
+    # (owner decision 2026-09-13), and submit_goal can only do that if told.
+    # Same read-only goal lookup dispatch_goal already does for its guardrail
+    # checks.  A failed lookup means "not continuous": a missed re-arm, never
+    # a wrong one.
+    continuous = False
+    try:
+        from integrations.social.models import db_session, AgentGoal
+        with db_session(commit=False) as _cdb:
+            _crow = _cdb.query(AgentGoal).filter_by(id=goal_id).first()
+            continuous = bool(_crow is not None
+                              and (_crow.config_json or {}).get('continuous'))
+    except Exception as _cerr:
+        logger.debug(f"continuous lookup failed for goal {goal_id}: {_cerr}")
+
     context = {
         'goal_type': goal_type,
         'user_id': user_id,
         'prompt': prompt,
         'source_node': os.environ.get('HEVOLVE_NODE_ID', 'unknown'),
         'task_source': 'hive',
+        'continuous': continuous,
     }
 
     try:

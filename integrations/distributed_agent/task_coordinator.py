@@ -131,11 +131,17 @@ class DistributedTaskCoordinator:
             # redeploys because the coordinator ledger is file-backed.  Healing
             # here fixes every node on its next tick, with no manual surgery.
             healed = self._heal_goal_type_demands(goal_id)
+            # A continuous goal's hive work comes back after every finished
+            # run (owner decision 2026-09-13); see _reopen_finished_run.
+            reopened = (self._reopen_finished_run(goal_id)
+                        if context.get('continuous') else 0)
             logger.info(
                 f"submit_goal: goal {goal_id} already has tasks — reusing "
                 f"(skipping duplicate task creation)"
                 + (f"; healed {healed} unclaimable requirement(s)"
-                   if healed else ""))
+                   if healed else "")
+                + (f"; re-armed {reopened} task(s) for the next run"
+                   if reopened else ""))
             return goal_id
 
         # Enforce HIVE_DEPTH — reject propagations deeper than the
@@ -228,6 +234,50 @@ class DistributedTaskCoordinator:
         if healed:
             self._ledger.save()
         return healed
+
+    def _reopen_finished_run(self, goal_id: str) -> int:
+        """Re-arm a CONTINUOUS goal's hive work once its last run has finished.
+
+        Owner decision 2026-09-13: a continuous goal's hive task comes back
+        after every run.  submit_goal only ever creates a goal's task set once,
+        so without this a continuous goal got exactly one hive run for its
+        whole life and then dispatched into nothing again.
+
+        Re-opens the SAME task ids rather than minting new ones.  A fresh task
+        per run would grow the ledger by one task per goal every few minutes,
+        which is the unbounded growth behind the 9166-task save deadlock
+        (2026-06-12).  Re-opening keeps one live child per goal, and every
+        reopen is recorded in the task's state_history.
+
+        Only when EVERY child is COMPLETED: a run still in flight is never
+        disturbed, and a FAILED child is left alone so the ledger's fast-fail
+        breaker (#59) still stops retry storms.  How often this is reached is
+        paced by the daemon's continuous cooldown.
+        """
+        parent = self._ledger.get_task(goal_id)
+        child_ids = list(getattr(parent, 'child_task_ids', None) or [])
+        children = [self._ledger.get_task(c) for c in child_ids]
+        if not children or any(
+                c is None or c.status != TaskStatus.COMPLETED for c in children):
+            return 0
+        reopened = 0
+        for child in children:
+            if not self._ledger.reopen_task(
+                    child.task_id,
+                    reason='continuous goal: re-armed for its next run',
+                    defer_save=True):
+                continue
+            ctx = child.context
+            prev_hash = ctx.pop('result_hash', None)
+            if prev_hash:
+                ctx['last_result_hash'] = prev_hash
+            ctx.pop('claimed_by', None)
+            ctx.pop('claimed_at', None)
+            ctx['runs'] = int(ctx.get('runs', 0) or 0) + 1
+            reopened += 1
+        if reopened:
+            self._ledger.save()
+        return reopened
 
     def claim_next_task(
         self,
@@ -413,6 +463,22 @@ class DistributedTaskCoordinator:
             "result_hash": result_hash,
             "status": "completed",
         }
+
+    def abandon_task(self, task_id: str, agent_id: str) -> None:
+        """A worker gives up on a task it claimed without producing a result.
+
+        Releases the claim, which also stops the heartbeat renewing it, and
+        leaves the task IN_PROGRESS with its claimed_at stamp.
+        claim_next_task's orphan recovery then returns it to PENDING once the
+        claim is older than _ORPHAN_AFTER_S, so a retry is paced by the same
+        rule that recovers a worker that died.
+
+        Without this, a failed execution left the claim in place.  On the
+        in-memory lock that lapses after its TTL, but on a Redis-backed node
+        the heartbeat renews it indefinitely, orphan recovery (which requires
+        the lock to be gone) never fires, and the task is IN_PROGRESS for good.
+        """
+        self._lock.release_task(task_id, agent_id)
 
     def _notify_goal_contribution(self, task_id: str, agent_id: str, task_description: str):
         """Notify the user who owns the agent that their agent contributed to a goal."""

@@ -220,6 +220,16 @@ class DistributedWorkerLoop:
                 logger.warning(f"Worker failed to submit result for {task.task_id}: {e}")
         else:
             logger.warning(f"Worker execution failed for task {task.task_id}")
+            # Release the claim so the task can be retried.  Leaving it held
+            # meant a Redis heartbeat renewed the lock indefinitely, and
+            # orphan recovery, which needs the lock gone, never re-queued it.
+            # The retry is paced by that recovery (claim older than
+            # _ORPHAN_AFTER_S), not by this 15-second poll.
+            try:
+                coordinator.abandon_task(task.task_id, self._node_id)
+            except Exception as e:
+                logger.warning(
+                    f"Worker could not release {task.task_id}: {e}")
 
     def _execute_task(self, task) -> Optional[str]:
         """Execute a distributed task via the local /chat endpoint.
@@ -316,6 +326,24 @@ class DistributedWorkerLoop:
         having skipped the post-response guardrail on one path only.
         """
         if not response:
+            return None
+
+        # A failed turn is not a result.  The pipeline does not raise when the
+        # LLM call fails; it returns a polite sentence such as "I couldn't
+        # finish that: Error code: 429 ...", and this method used to hand that
+        # to submit_result, which marks the task COMPLETED and records its
+        # hash.  Measured on central 2026-09-13: two of the three freshly
+        # healed hive tasks were "completed" that way (a 429 and a 400).
+        # Returning None makes _tick release the claim, and the coordinator's
+        # orphan recovery re-queues the task once the claim is old: the same
+        # rule that recovers a dead worker paces the retry, which is the
+        # backoff a rate-limited endpoint needs.
+        from core.agent_tools import is_user_facing_error
+        if is_user_facing_error(response):
+            logger.warning(
+                f"Worker task {task.task_id}: the turn failed "
+                f"({response[:120]!r}); releasing it for retry instead of "
+                f"recording it as a result")
             return None
 
         # GUARDRAIL: post-response check (fail-closed)
