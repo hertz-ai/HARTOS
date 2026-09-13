@@ -64,19 +64,69 @@ _MAX_CHARS_PER_PAGE = 4000
 _MAX_PAGES_PER_CHAPTER = 12
 
 
+class _BackendUnreachable(Exception):
+    """The local book service did not answer — connection refused, timeout, a
+    non-200, or a non-JSON body.  Deliberately DISTINCT from "it answered, and
+    there are no books".
+
+    The first live drive (2026-09-11) collapsed the two: with the backend down,
+    list_books told the agent "No books parsed yet. Ask the user to upload a
+    PDF" — so an agent would ask a user to re-upload a file they had already
+    uploaded.  The degraded-mode unit test asserted that exact string, so the
+    bug was encoded as expected behaviour until a real backend died mid-drive.
+    """
+
+
+#: What an agent is told when the backend did not answer.  It names the
+#: failure AND forbids the misreading, because a model left with an empty
+#: result fills the gap with the most plausible story ("you have no books").
+_UNREACHABLE_MSG = (
+    'The book service did not answer just now (local backend unreachable or '
+    'erroring). This does NOT mean the user has no books: do not ask them to '
+    're-upload. Tell them the library is temporarily unavailable and try again.'
+)
+
+
 def _get(url, params=None):
-    """GET returning parsed JSON, or None.  Never raises into the turn."""
+    """GET returning parsed JSON.  Raises _BackendUnreachable on ANY failure.
+
+    Raising instead of returning None is the fix: None and [] used to reach the
+    same "no books" branch.  Every navigation tool is wrapped by _reachable()
+    (see the end of build_book_tools), which turns the exception into
+    _UNREACHABLE_MSG — so "never raise into the turn" still holds, at the edge.
+    """
     import requests
     try:
         r = requests.get(url, params=params or {}, timeout=_HTTP_TIMEOUT)
-        if r.status_code != 200:
-            logger.warning("book_tools GET %s -> HTTP %s", url, r.status_code)
-            return None
-        return r.json()
     except Exception as e:
         # House rule: no silent gulping — every caught error logs.
         logger.warning("book_tools GET %s failed: %s", url, e)
-        return None
+        raise _BackendUnreachable(str(e)) from e
+    if r.status_code != 200:
+        logger.warning("book_tools GET %s -> HTTP %s", url, r.status_code)
+        raise _BackendUnreachable(f'HTTP {r.status_code}')
+    try:
+        return r.json()
+    except ValueError as e:
+        logger.warning("book_tools GET %s returned non-JSON: %s", url, e)
+        raise _BackendUnreachable('non-JSON response') from e
+
+
+def _reachable(fn):
+    """Tool-edge guard: convert _BackendUnreachable into _UNREACHABLE_MSG.
+
+    functools.wraps carries __wrapped__ / __annotations__ / __doc__ across, so
+    the schema register_for_llm derives via inspect.signature is unchanged.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def guarded(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except _BackendUnreachable:
+            return _UNREACHABLE_MSG
+    return guarded
 
 
 def _rows(payload):
@@ -159,6 +209,37 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
 
     def _layouts(file_id):
         return _rows(_get(get_book_layouts_api(), {'file_id': file_id}))
+
+    _has_images = {}
+
+    def _url_exists(rel_url):
+        """HEAD a /uploads/... path on the backend the book APIs live on."""
+        import requests
+        api = get_book_list_api() or ''
+        if not rel_url or '/db/' not in api:
+            return False                # cannot verify -> omit, never guess
+        try:
+            r = requests.head(api.split('/db/', 1)[0] + rel_url, timeout=_HTTP_TIMEOUT)
+            return r.status_code == 200
+        except Exception as e:
+            logger.debug("book_tools image check %s failed: %s", rel_url, e)
+            return False
+
+    def _image_url(book, page_number):
+        """page_image_url ONLY when that book's page images were really rendered.
+
+        A text-only parse (no rasteriser in the build) writes no page images.
+        A URL to a missing file renders as a broken image on every client and
+        lets the agent claim to show a page it cannot — so verify the artifact
+        once per book, and omit the URL when it is not there.
+        """
+        url = _page_image_url(book, page_number)
+        if not url:
+            return ''
+        fid = book.get('file_id')
+        if fid not in _has_images:
+            _has_images[fid] = _url_exists(_page_image_url(book, 1))
+        return url if _has_images[fid] else ''
 
     # ── 1. list_books ────────────────────────────────────────────────
     def list_books() -> str:
@@ -255,7 +336,7 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
             'chapter': chapter,
             'topic': topic,
             'text': _clip(text),
-            'page_image_url': _page_image_url(book, want),
+            'page_image_url': _image_url(book, want),
             'has_next': bool(total and want < total),
             'next_page': want + 1 if (total and want < total) else None,
         }, ensure_ascii=False)
@@ -301,7 +382,7 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
             pages.append({
                 'page_number': pg,
                 'text': _clip(('\n'.join(str(r.get('passage') or '') for r in rs)).strip()),
-                'page_image_url': _page_image_url(book, pg),
+                'page_image_url': _image_url(book, pg),
             })
         more = len(ordered) > len(clipped)
         return json.dumps({
@@ -372,4 +453,8 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
         parse_book_pdf,
     ))
 
-    return tools
+    # Guard every tool that reads the backend through _get, so "did not answer"
+    # can never read as "no books" / "page not found".  parse_book_pdf is left
+    # unwrapped: it POSTs directly and already reports its own failures.
+    _NAV = {'list_books', 'list_book_chapters', 'read_book_page', 'read_book_chapter'}
+    return [(n, d, _reachable(f) if n in _NAV else f) for n, d, f in tools]

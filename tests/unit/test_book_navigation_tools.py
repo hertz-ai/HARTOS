@@ -15,7 +15,9 @@ import json
 import unittest
 from unittest.mock import patch, MagicMock
 
-from integrations.learning.book_tools import build_book_tools, _page_image_url
+from integrations.learning.book_tools import (
+    build_book_tools, _page_image_url, _UNREACHABLE_MSG,
+)
 
 
 BOOKS = [{
@@ -72,13 +74,50 @@ def _tools(books=None, layouts=None):
 
 
 def _call(name, *args, **kwargs):
-    """Invoke one tool by name with the boundary mocked for the call too."""
+    """Invoke one tool by name with the boundary mocked for the call too.
+
+    `_images` says whether the page images exist on the backend (the HEAD
+    check in _image_url).  Default True: most tests are about navigation, and
+    an unmocked HEAD to http://x/... would be a network call in a unit test.
+    """
+    images = kwargs.pop('_images', True)
     built, fake_get = _tools(kwargs.pop('_books', None), kwargs.pop('_layouts', None))
     fn = dict((n, f) for n, _d, f in built)[name]
+    head = MagicMock(return_value=MagicMock(status_code=200 if images else 404))
     with patch('core.config_cache.get_book_list_api', return_value='http://x/db/pdf_files'), \
          patch('core.config_cache.get_book_layouts_api', return_value='http://x/db/layouts'), \
-         patch('requests.get', side_effect=fake_get):
-        return fn(*args, **kwargs)
+         patch('requests.get', side_effect=fake_get), \
+         patch('requests.head', head):
+        out = fn(*args, **kwargs)
+    _call.last_head = head
+    return out
+
+
+class ImagesOnlyWhenRendered(unittest.TestCase):
+    """A text-only parse (no rasteriser in the build) writes no page images.
+    A URL to a missing file renders a broken image on every client and lets
+    the agent claim to show a page it cannot — so the URL is emitted only
+    when the artifact is really there."""
+
+    def test_read_page_omits_url_when_images_were_not_rendered(self):
+        out = json.loads(_call('read_book_page', 3, _images=False))
+        self.assertEqual(out['page_image_url'], '')
+        self.assertIn('Motion in a straight line.', out['text'])   # text still served
+
+    def test_read_chapter_omits_every_url_when_images_were_not_rendered(self):
+        out = json.loads(_call('read_book_chapter', 'Units', _images=False))
+        self.assertTrue(out['pages'])
+        for p in out['pages']:
+            self.assertEqual(p['page_image_url'], '')
+
+    def test_existence_is_checked_once_per_book_not_per_page(self):
+        _call('read_book_chapter', 'Units')          # two pages
+        self.assertEqual(_call.last_head.call_count, 1)
+
+    def test_checks_the_real_upload_path_on_the_same_backend(self):
+        _call('read_book_page', 1)
+        self.assertEqual(_call.last_head.call_args[0][0],
+                         'http://x/uploads/pdf_parse/ncert_physics_11/page_1.jpg')
 
 
 class BookToolSurface(unittest.TestCase):
@@ -183,19 +222,69 @@ class PageImageQuoting(unittest.TestCase):
 
 
 class DegradedMode(unittest.TestCase):
-    def test_backend_down_returns_a_message_not_an_exception(self):
+    """"Backend down" and "no books" must never read the same.
+
+    The previous version of this class asserted `'No books' in out` for a
+    backend that refused connections — it pinned the BUG as the contract. The
+    first live drive (2026-09-11) showed the consequence: a dead backend told
+    the agent to ask the user to upload a PDF they had already uploaded.
+    """
+
+    def _down(self, name, *args, side_effect=OSError('connection refused')):
         with patch('core.config_cache.get_book_list_api', return_value='http://x/db/pdf_files'), \
              patch('core.config_cache.get_book_layouts_api', return_value='http://x/db/layouts'), \
              patch('core.config_cache.get_book_parsing_api', return_value='http://x/upload/parse_pdf'), \
-             patch('requests.get', side_effect=OSError('connection refused')):
+             patch('requests.get', side_effect=side_effect):
             built = build_book_tools({'user_id': 42})
-            fn = dict((n, f) for n, _d, f in built)['list_books']
-            out = fn()
-        self.assertIn('No books', out)
+            fn = dict((n, f) for n, _d, f in built)[name]
+            return fn(*args)
+
+    def test_backend_down_is_not_reported_as_no_books(self):
+        out = self._down('list_books')
+        self.assertEqual(out, _UNREACHABLE_MSG)
+        self.assertNotIn('No books parsed yet', out)
+
+    def test_backend_down_never_asks_the_user_to_reupload(self):
+        for name, args in (('list_books', ()), ('list_book_chapters', ()),
+                           ('read_book_page', (1,)), ('read_book_chapter', ('Units',))):
+            self.assertEqual(self._down(name, *args), _UNREACHABLE_MSG, name)
+
+    def test_backend_http_500_is_unreachable_not_empty(self):
+        def five_hundred(url, params=None, timeout=None):
+            resp = MagicMock()
+            resp.status_code = 500
+            return resp
+        self.assertEqual(self._down('list_books', side_effect=five_hundred), _UNREACHABLE_MSG)
+
+    def test_layouts_down_is_not_page_not_found(self):
+        """Books answer, layouts do not: must not claim the page is missing."""
+        def books_ok_layouts_down(url, params=None, timeout=None):
+            if 'pdf_files' in url:
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.json.return_value = BOOKS
+                return resp
+            raise OSError('connection refused')
+        out = self._down('read_book_page', 1, side_effect=books_ok_layouts_down)
+        self.assertEqual(out, _UNREACHABLE_MSG)
+        self.assertNotIn('not found', out.lower())
 
     def test_no_books_tells_the_agent_what_to_do_next(self):
+        """The contrast case: the backend ANSWERED, with nothing."""
         out = _call('list_books', _books=[])
         self.assertIn('parse_book_pdf', out)
+        self.assertNotEqual(out, _UNREACHABLE_MSG)
+
+    def test_guard_keeps_the_tool_signature_for_the_llm_schema(self):
+        """register_for_llm derives the schema from the signature — the guard
+        must be ON and must not collapse it to (*args, **kwargs)."""
+        import inspect
+        import typing
+        built, _ = _tools()
+        fn = dict((n, f) for n, _d, f in built)['read_book_page']
+        self.assertTrue(hasattr(fn, '__wrapped__'), 'guard not applied')
+        self.assertEqual(list(inspect.signature(fn).parameters), ['page_number', 'book_name'])
+        self.assertIn('page_number', typing.get_type_hints(fn, include_extras=True))
 
 
 class PublisherCarriesTheImage(unittest.TestCase):
