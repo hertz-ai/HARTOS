@@ -237,7 +237,6 @@ class DistributedWorkerLoop:
         Uses the same guardrail pipeline as local dispatch.
         """
         prompt = task.context.get('prompt', task.description)
-        goal_type = task.context.get('goal_type', 'coding')
         user_id = task.context.get('user_id', self._node_id)
 
         # GUARDRAIL: pre-dispatch gate
@@ -251,8 +250,21 @@ class DistributedWorkerLoop:
             logger.error("CRITICAL: hive_guardrails not available — blocking worker dispatch")
             return None
 
+        from integrations.agent_engine.dispatch import (
+            _internal_auth_headers, local_chat_dispatch, prompt_id_for_goal,
+        )
+
         base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
-        prompt_id = f"{goal_type}_{task.task_id[:8]}"
+        # The goal's own prompt_id, the one dispatch_goal uses, so the work done
+        # here is the goal's work: the recipe is banked where REUSE and
+        # peer_reuse look for it, and a finished flow charges the goal's spark
+        # (charge_goal_work_completed finds the goal by this id).  The worker
+        # used to invent f"{goal_type}_{task_id[:8]}", which matched no goal, so
+        # hive work never moved spark_spent, and which reuse_recipe's
+        # int(prompt_id) cannot parse.  _decompose_goal makes one task per
+        # goal, so the task's parent is the goal; a task with no parent is its
+        # own unit of work.
+        prompt_id = prompt_id_for_goal(task.parent_task_id or task.task_id)
 
         body = {
             'user_id': user_id,
@@ -272,10 +284,6 @@ class DistributedWorkerLoop:
         # translator between the two dialects, and it also applies the
         # user-priority gate and the local-LLM semaphore that this loop
         # skipped entirely.
-        from integrations.agent_engine.dispatch import (
-            _internal_auth_headers, local_chat_dispatch,
-        )
-
         _status, _text = local_chat_dispatch(
             prompt, user_id, prompt_id, daemon_id=task.task_id,
             native_fallback=False)
