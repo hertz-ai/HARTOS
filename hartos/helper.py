@@ -131,6 +131,14 @@ except Exception as _redis_err:
     logging.getLogger(__name__).info(f"Redis unavailable (expected in local mode): {_redis_err}")
     redis_client = None
 
+# get_frame's legacy Redis read: one refused connect opens the breaker for
+# that client, then one probe per cooldown.  Keyed by the client object, so a
+# replaced client (tests patch hartos.helper.redis_client) starts closed
+# instead of inheriting another client's open breaker.  See get_frame.
+from core.circuit_breaker import KeyedCircuitBreaker
+_REDIS_FRAME_BREAKER = KeyedCircuitBreaker(threshold=1, cooldown=300,
+                                           name='redis_frame')
+
 async def fetch(session, url):
     try:
         async with session.get(url) as response:
@@ -2562,8 +2570,24 @@ def get_frame(user_id, frame_store=None):
     except Exception:
         pass
 
-    # Fallback: Redis (legacy path)
-    serialized_frame = redis_client.get(user_id)
+    # Fallback: Redis (legacy path).  Only a cloud camera pipeline writes
+    # frames there; a desktop runs no Redis, and redis_client is built lazily
+    # so it is never None.  A refused connect means "no frame" -- the
+    # callers' None branch already tells the user the camera is off -- and
+    # costs 4.07 s on Windows (measured 2026-09-13), so after one refusal the
+    # breaker skips Redis for its cooldown.  Unguarded, the ConnectionError
+    # escaped get_user_camera_inp 246 times on 2026-09-13 and agents went on
+    # to drive the desktop trying to start Redis.
+    if redis_client is None or _REDIS_FRAME_BREAKER.is_open(redis_client):
+        return None
+    try:
+        serialized_frame = redis_client.get(user_id)
+    except redis.RedisError as e:
+        _REDIS_FRAME_BREAKER.record_failure(redis_client)
+        current_app.logger.info(
+            f"No frame for user_id {user_id}: Redis unavailable ({e})")
+        return None
+    _REDIS_FRAME_BREAKER.record_success(redis_client)
     current_app.logger.info('after redis client')
     try:
         if serialized_frame is not None:
