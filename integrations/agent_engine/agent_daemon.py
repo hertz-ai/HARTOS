@@ -260,6 +260,23 @@ def _settle_dispatched_goal(db, goal, goal_key):
       noop                  — no new spark at all; unchanged 5-strike pause
     Continuous goals still never auto-complete.
     """
+    # MERGE, never blind-write, the config this tick staged before the
+    # dispatch.  The tick copied config_json and added spark_at_dispatch
+    # before handing the goal off, and the dispatch can itself write the row:
+    # the create loop parks a goal whose action it cannot finish, with the ask
+    # in config (#106).  Flushing the tick's pre-dispatch copy would erase that
+    # ask and its pause_reason, leaving a paused goal whose reason nobody can
+    # read.  So re-read what is committed and carry over only the key this
+    # tick owns.
+    _staged = dict(goal.config_json or {})
+    try:
+        db.refresh(goal, ['config_json', 'status'])
+        _latest = dict(goal.config_json or {})
+        if 'spark_at_dispatch' in _staged:
+            _latest['spark_at_dispatch'] = _staged['spark_at_dispatch']
+        goal.config_json = _latest
+    except Exception:
+        goal.config_json = _staged   # no second read: keep the tick's copy
     # FLUSH BEFORE REFRESH.  refresh() expires the instance and reloads it
     # from the database, which silently discards every UN-FLUSHED pending
     # change on it -- here, the last_dispatched_at stamp and the
@@ -283,6 +300,15 @@ def _settle_dispatched_goal(db, goal, goal_key):
         db.refresh(goal)
     except Exception:
         pass  # refresh failure → fall through to attribute read
+    # Settle only a goal that is still active.  One parked during the dispatch
+    # (the create loop escalating a stuck action, the budget gate, the owner's
+    # pause) keeps that state and its reason: completing it here would record
+    # work nobody verified, and a noop strike would overwrite the pause_reason
+    # the owner or the co-pilot has to read (#106).
+    if getattr(goal, 'status', 'active') != 'active':
+        logger.info(f"Goal {goal_key} is {goal.status} after its dispatch; "
+                    f"leaving it as it is")
+        return
     # COPY, never mutate-in-place.  config_json is a plain JSON column, not a
     # MutableDict: mutating the dict the attribute already holds and assigning
     # that same object back compares equal at flush time, so the column is

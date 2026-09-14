@@ -66,6 +66,8 @@ class _Script:
         self.recipe_requests = []
         # action currently posted -> action_id the verifier should claim
         self.verdict_ids = dict(verdict_ids or {})
+        # actions the verifier holds as needing a person
+        self.pending_ids = set()
 
     # -- helpers ---------------------------------------------------------
     def _msgs(self):
@@ -122,6 +124,11 @@ class _Script:
     def verifier(self, recipient, messages=None, sender=None, config=None):
         c = _content(self._last())
         n = self.current()
+        if 'please verify' in c and n in self.pending_ids:
+            return True, json.dumps({
+                'status': 'pending', 'action': ACTIONS[n - 1], 'action_id': n,
+                'message': 'a person has to confirm the sources',
+                'can_perform_without_user_input': 'no'})
         if 'please verify' in c:
             claimed = self.verdict_ids.get(n, n)
             return True, json.dumps({
@@ -450,3 +457,36 @@ def test_a_verdict_naming_a_future_action_does_not_complete_it(create_env):
     early = [(aid, state) for aid, state, was_posted in env.events
              if state in _DONE_STATES and not was_posted]
     assert not early, early
+
+
+def test_a_stuck_action_is_handed_on_not_completed(create_env, monkeypatch):
+    """#106: on an autonomous run an action the agent cannot finish is held
+    open and its goal is parked with the ask.  Nothing is recorded as done,
+    nothing is banked for it, and the flow does not move past it."""
+    env = create_env
+    env.script.pending_ids = {2}          # the verifier: action 2 needs a person
+    asks = []
+    import integrations.agent_engine.goal_manager as gm
+    monkeypatch.setattr(gm.GoalManager, 'escalate_goal', staticmethod(
+        lambda db, goal_id, escalation: asks.append((goal_id, escalation))
+        or {'success': True}))
+    import integrations.social.models as models
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _no_db(commit=False):
+        yield None
+    monkeypatch.setattr(models, 'db_session', _no_db)
+    # One turn: the daemon does not dispatch a parked goal again.
+    replies = _run(env, turns=1)
+    assert [(goal, e['action_id']) for goal, e in asks] == [('e2e_create', 2)], asks
+    assert 'Paused for help' in str(replies), replies
+    assert env.lh.get_action_state(UP, 2).value == 'pending'
+    assert _action_file(env, 1) is not None, 'action 1 ran and should be banked'
+    assert _action_file(env, 2) is None, 'an action that did not finish was banked'
+    posted = {int(n) for m in env.script.gc.messages
+              for n in _MARKER.findall(_content(m))}
+    assert 3 not in posted, 'the flow moved past the stuck action'
+    assert not env.script.recipe_requests, env.script.recipe_requests
+    done = [s for aid, s, _ in env.events if aid == 2 and s in _DONE_STATES]
+    assert not done, f'action 2 was recorded as done: {done}'

@@ -12,7 +12,9 @@ is garbage and whose retry gate never re-opens is a permanent wedge.
 
 Three defects, three pins:
   1. the escape returns a user-facing question naming the stuck action
-     (via _needs_input_reply) and RESETS the attempt counter;
+     (via _ask_for_help, which asks a live user through _needs_input_reply
+     and hands an autonomous run's action on, #106) and RESETS the attempt
+     counter;
   2. the TERMINATE dodge tolerates the machine-appended memory-skeleton
      suffix (create_recipe.py:2406/2659/2711 append it to the LAST
      message, so `content == 'TERMINATE'` can never match) — _is_terminate;
@@ -92,9 +94,9 @@ def test_needs_input_branch_resets_counter_and_returns_question():
     assert re.search(r"_exec_retries\[_ca_pending\]\s*=\s*0", block), (
         'escape must reset the attempt counter — live 2026-08-23 it climbed '
         "5->9 across turns, so the user's answers were never consumed")
-    assert 'return _needs_input_reply(' in block, (
-        'escape must return the HITL question, not break into the raw '
-        'group-chat tail')
+    assert 'return _ask_for_help(' in block, (
+        'escape must return the ask (_ask_for_help: the HITL question for a '
+        'live user, #106), not break into the raw group-chat tail')
 
 
 def test_user_input_gate_asks_the_question_instead_of_breaking():
@@ -133,8 +135,8 @@ def test_user_input_gate_asks_the_question_instead_of_breaking():
     assert m, 'USER-INPUT-GATE outer-loop block not found'
     block = m.group(1)
 
-    assert 'return _needs_input_reply(' in block, (
-        'the USER-INPUT-GATE must RETURN the HITL question. Live 2026-09-06 it '
+    assert 'return _ask_for_help(' in block, (
+        'the USER-INPUT-GATE must RETURN the ask (_ask_for_help, #106). Live 2026-09-06 it '
         'used a bare `break`, so get_response_group fell through to the '
         "tail-message return and the user got the Assistant's success claim "
         '("Successfully added diverse local RSS feeds...") instead of the '

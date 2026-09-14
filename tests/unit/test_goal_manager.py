@@ -516,6 +516,71 @@ class TestGoalManagerUpdate(unittest.TestCase):
         self.assertEqual(fake.description, 'New from seed')
 
 
+class TestGoalManagerEscalate(unittest.TestCase):
+    """GoalManager.escalate_goal (#106): a stuck action parks its goal the way
+    every other pause path does, with the ask recorded for the owner or the
+    co-pilot, and never goes through the persona consensus gate."""
+
+    def setUp(self):
+        self.gm = _fresh_import()
+        self.db = FakeSession()
+
+    def _escalate(self, fake, escalation):
+        with patch.dict('sys.modules', {
+            'integrations.social.models': MagicMock(AgentGoal=type(fake)),
+            'security.hive_guardrails': MagicMock(
+                HiveEthos=MagicMock(enforce_ephemeral_agents=MagicMock())),
+        }), patch(
+            'integrations.agent_engine.hive_consensus.HiveConsensus.upgrade_proposal',
+            side_effect=AssertionError('an escalation is not a persona change'),
+        ):
+            self.db.query = lambda cls: FakeQuery([fake])
+            return self.gm.GoalManager.escalate_goal(self.db, fake.id, escalation)
+
+    def test_the_goal_is_paused_with_the_ask_recorded(self):
+        original = {'bootstrap_slug': 'guardian', 'continuous': True}
+        fake = FakeGoal(id='70', goal_type='marketing', status='active',
+                        config_json=original)
+        result = self._escalate(fake, {
+            'action_id': 9, 'action': 'Search prior threat patterns',
+            'reason': 'the loop-break fired on an unverified action',
+            'tried': ['local']})
+        self.assertTrue(result['success'])
+        self.assertEqual(fake.status, 'paused')
+        cfg = fake.config_json
+        self.assertIsNot(cfg, original,
+                         'a mutated config dict is not written back')
+        self.assertEqual(cfg['bootstrap_slug'], 'guardian')
+        self.assertTrue(cfg['continuous'])
+        esc = cfg['escalation']
+        self.assertEqual((esc['action_id'], esc['tried']), (9, ['local']))
+        self.assertIn('unverified action', esc['reason'])
+        self.assertTrue(esc['at'])
+        self.assertIn('action 9', cfg['pause_reason'])
+        self.assertIn('unverified action', cfg['pause_reason'])
+        self.assertEqual(cfg['paused_at'], esc['at'])
+
+    def test_a_missing_goal_is_reported(self):
+        with patch.dict('sys.modules', {
+            'integrations.social.models': MagicMock(AgentGoal=FakeGoal),
+        }):
+            self.db.query = lambda cls: FakeQuery([])
+            result = self.gm.GoalManager.escalate_goal(
+                self.db, 'ghost', {'action_id': 1})
+        self.assertFalse(result['success'])
+
+    def test_it_writes_only_through_the_existing_writers(self):
+        fake = FakeGoal(id='71', goal_type='marketing', status='active',
+                        config_json={})
+        gm = self.gm.GoalManager
+        with patch.object(gm, 'update_goal', wraps=gm.update_goal) as fields, \
+                patch.object(gm, 'update_goal_status',
+                             wraps=gm.update_goal_status) as status:
+            self._escalate(fake, {'action_id': 2, 'reason': 'needs input'})
+        fields.assert_called_once()
+        status.assert_called_once_with(self.db, '71', 'paused')
+
+
 # ===========================================================================
 # FT: ProductManager CRUD
 # ===========================================================================

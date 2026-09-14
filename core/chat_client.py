@@ -109,6 +109,20 @@ def daemon_request_id(goal_id: Any) -> str:
     return '%s%s' % (DAEMON_PREFIX, goal_id)
 
 
+def daemon_goal_id(request_id: Any) -> Optional[str]:
+    """The id a ``daemon_<id>`` request carries, or None for any other request.
+
+    The inverse of daemon_request_id, kept beside it so the prefix is parsed
+    in one place: a turn uses it to find the goal that dispatched it (the
+    create loop's escalation writes that goal's row).  The id is whatever the
+    dispatcher tagged; a caller that needs an AgentGoal must still look it up.
+    """
+    rid = str(request_id or '')
+    if not rid.startswith(DAEMON_PREFIX):
+        return None
+    return rid[len(DAEMON_PREFIX):] or None
+
+
 def normalize_chat_body(body: Optional[Dict[str, Any]] = None,
                         daemon_id: Any = None) -> Dict[str, Any]:
     """Return a /chat body guaranteed to carry a ``request_id``.

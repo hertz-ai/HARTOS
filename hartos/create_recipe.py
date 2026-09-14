@@ -111,14 +111,6 @@ _STATE_TRANSITION_LOOP_THRESHOLD: int = 5
 # the threshold hard break stays the backstop if the nudge doesn't take.
 _STATE_TRANSITION_LOOP_NUDGE_AT: int = 3
 _STATE_TRANSITION_NUDGED: dict = {}
-# Goal circuit-breaker: a daemon/autonomous goal whose GroupChat hard-loop-breaks
-# this many times across re-dispatches is unfixable by retry (the agent lacks the
-# capability, or the fix is out-of-band like a rebuild) — pause it so the daemon
-# stops re-dispatching it and the local model is freed for productive flywheel
-# goals.  Needed because a loop-break returns a fallback reply, so the daemon's
-# own _dispatch_backoff never sees a failure to count (the 686-thrash root).
-_GOAL_LOOP_BREAK_COUNT: dict = {}
-_GOAL_PARK_AFTER_BREAKS: int = 3
 
 # #485 L3 — consecutive-Assistant counter; at threshold redirect to Helper
 # to break attention-collapse loops where Assistant→verify can't escape
@@ -2201,41 +2193,37 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 except Exception as _inject_err:
                     current_app.logger.warning(
                         f"[LOOP-BREAK] fallback inject failed: {_inject_err}")
-                # Mark action TERMINATED so recipe pipeline doesn't re-enter
-                try:
-                    force_state_through_valid_path(
-                        user_prompt, current_action_id,
-                        ActionState.TERMINATED,
-                        "Loop-break: state_transition stuck-loop guard fired (#485)",
-                    )
-                except Exception as _stb_err:
-                    current_app.logger.warning(
-                        f"[LOOP-BREAK] state-set failed: {_stb_err}")
-                # Circuit-breaker (achieve-flywheel): count hard loop-breaks for
-                # this goal across re-dispatches; once it exceeds the threshold the
-                # goal is unfixable by retry, so PAUSE it — the daemon then stops
-                # re-dispatching it (capping the 686-style thrash) and the model is
-                # freed for productive goals.  Only autonomous goals (UUID
-                # prompt_id, len>=30); human chat (int prompt_id) is never paused.
-                try:
-                    _gbc = _GOAL_LOOP_BREAK_COUNT.get(user_prompt, 0) + 1
-                    _GOAL_LOOP_BREAK_COUNT[user_prompt] = _gbc
-                    if _gbc >= _GOAL_PARK_AFTER_BREAKS and len(str(prompt_id)) >= 30:
-                        from integrations.agent_engine.goal_manager import (
-                            GoalManager)
-                        from integrations.social.models import db_session
-                        with db_session(commit=True) as _cb_db:
-                            GoalManager.update_goal_status(
-                                _cb_db, str(prompt_id), 'paused')
-                        _GOAL_LOOP_BREAK_COUNT.pop(user_prompt, None)
+                # Close the action only if it was verified, the same rule as the
+                # flow-complete close.  Loop-break used to force TERMINATED on
+                # whatever action was current, so an action that never finished
+                # was recorded as done, and on an autonomous run AUTO-ADVANCE
+                # then had the verifier write a recipe for it (#104, Guardian
+                # Convergence action 9).  An unverified action stays open and is
+                # flagged; the outer loop's user-input gate then asks for help
+                # once, through _ask_for_help (#106), which parks an autonomous
+                # goal with the ask.  That retires the goal circuit breaker that
+                # stood here: it paused only prompt ids of 30 characters or
+                # more, and daemon turns carry a short numeric prompt id, so it
+                # never fired for them.
+                _lb_state = get_action_state(user_prompt, current_action_id)
+                if _lb_state in (ActionState.COMPLETED, ActionState.RECIPE_RECEIVED):
+                    try:
+                        force_state_through_valid_path(
+                            user_prompt, current_action_id,
+                            ActionState.TERMINATED,
+                            "Loop-break on a verified action (#485)",
+                        )
+                    except Exception as _stb_err:
                         current_app.logger.warning(
-                            f"[GOAL-CIRCUIT-BREAKER] goal {prompt_id} hard "
-                            f"loop-broke {_gbc}x — paused; daemon stops "
-                            f"re-dispatching it so the model is freed for "
-                            f"productive flywheel goals.")
-                except Exception as _cb_err:
+                            f"[LOOP-BREAK] state-set failed: {_stb_err}")
+                else:
+                    user_tasks[user_prompt]._needs_user_input_action_id = current_action_id
+                    user_tasks[user_prompt]._needs_help_reason = (
+                        'the conversation looped without finishing it')
                     current_app.logger.warning(
-                        f"[GOAL-CIRCUIT-BREAKER] park failed: {_cb_err}")
+                        f"[LOOP-BREAK] action {current_action_id} is "
+                        f"{_lb_state.value}, not verified: left open and "
+                        f"flagged for help")
                 # Reset loop-state for this user — next turn starts fresh
                 _STATE_TRANSITION_LOOP_STATE.pop(user_prompt, None)
                 _STATE_TRANSITION_NUDGED.pop(user_prompt, None)
@@ -4211,6 +4199,57 @@ def _needs_input_reply(action_id, action_text):
             f"from there.")
 
 
+def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
+    """Hand an action the agent could not finish to someone who can (#106).
+
+    Owner, 2026-09-14: when an autonomous agent cannot do an action, ask a
+    human or an expert (the Claude co-pilot, which reaches goals through MCP
+    list_goals and steer_goal); never record a completion that did not happen.
+    This is the one place the create loop asks.  A live user is asked directly,
+    as before.  On an autonomous run nobody reads a question, so the action is
+    held as waiting (PENDING, which the ledger records as BLOCKED, with
+    blocked_reason input_required) and its goal is parked with the ask
+    (GoalManager.escalate_goal), where the owner and the co-pilot see it.
+    """
+    from integrations.agent_engine.dispatch import is_current_request_autonomous
+    if not is_current_request_autonomous():
+        return _needs_input_reply(action_id, action_text)
+    _ledger = user_ledgers.get(user_prompt)
+    _task = _ledger.tasks.get(f"action_{action_id}") if _ledger else None
+    if _task is not None:
+        _task.set_blocked_reason('input_required')
+    if get_action_state(user_prompt, action_id) == ActionState.ASSIGNED:
+        safe_set_state(user_prompt, action_id, ActionState.IN_PROGRESS,
+                       'asked for help before it started')
+    safe_set_state(user_prompt, action_id, ActionState.PENDING,
+                   f'asked for help: {reason}')
+    from core.chat_client import daemon_goal_id
+    from hartos.threadlocal import thread_local_data
+    goal_id = daemon_goal_id(thread_local_data.get_request_id())
+    parked = False
+    if goal_id:
+        try:
+            from integrations.agent_engine.goal_manager import GoalManager
+            from integrations.social.models import db_session
+            with db_session(commit=True) as _db:
+                parked = GoalManager.escalate_goal(_db, goal_id, {
+                    'action_id': int(action_id),
+                    'action': str(action_text or '')[:500],
+                    'reason': reason,
+                    'tried': ['local'],
+                }).get('success', False)
+        except Exception as _park_err:
+            current_app.logger.warning(
+                f'[ASK-FOR-HELP] could not park goal {goal_id}: {_park_err}')
+    current_app.logger.warning(
+        f'[ASK-FOR-HELP] action {action_id} of {user_prompt}: {reason}; '
+        f'goal {goal_id or "unknown"} parked={parked}')
+    step = f' ("{action_text}")' if action_text else ''
+    return (f"Paused for help: step {action_id}{step} could not be finished "
+            f"autonomously ({reason}). It is waiting for the owner or the "
+            f"co-pilot.")
+
+
 def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     """
     Handles the response generation process for an agent group.
@@ -4366,6 +4405,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             if hasattr(user_tasks[user_prompt], '_needs_user_input_action_id'):
                 _prior_block = user_tasks[user_prompt]._needs_user_input_action_id
                 user_tasks[user_prompt]._needs_user_input_action_id = None
+                user_tasks[user_prompt]._needs_help_reason = None
                 current_app.logger.info(
                     f"[USER-INPUT-GATE] Clearing prior block on action "
                     f"{_prior_block} — fresh /chat call indicates user has "
@@ -4439,7 +4479,12 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     # escape deliberately does NOT — it never did.  The two sites
                     # differ on purpose; do not unify without measuring that.)
                     messages[user_prompt] = group_chat.messages
-                    return _needs_input_reply(current_action_id, _blocked_text)
+                    _help_reason = (
+                        getattr(user_tasks[user_prompt], '_needs_help_reason', None)
+                        or 'the verifier says it needs input from a person')
+                    user_tasks[user_prompt]._needs_help_reason = None
+                    return _ask_for_help(user_prompt, prompt_id, current_action_id,
+                                         _blocked_text, _help_reason)
             except Exception as _gate_err:
                 current_app.logger.debug(
                     f"[USER-INPUT-GATE] outer-loop gate check failed (non-blocking): {_gate_err}"
@@ -4961,6 +5006,14 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     # Check if recipe file exists before advancing
                     _flow = get_current_flow(user_prompt)
                     _recipe_path = helper_fun.safe_prompt_path(prompt_id, _flow, _ca)
+                    if (not os.path.exists(_recipe_path)
+                            and _ca_state != ActionState.GAVE_UP
+                            and _bank_action_recipe_from_trace(
+                                user_prompt, prompt_id, _flow, _ca, group_chat)):
+                        # The tool calls that ran are the recipe (#88), as in the
+                        # claim handler; asking the verifier to write one is a
+                        # description of the work, not the work (#106).
+                        continue
                     if not os.path.exists(_recipe_path):
                         # Same bound as the 'recipe' site above (#485).  Asking
                         # again is the only remedy on this branch, and a reply that
@@ -5126,7 +5179,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         current_app.logger.info(
                             f'[NEEDS-INPUT] action {_ca_pending} not completing after {_attempt-1} attempts, '
                             f'returning control to user')
-                        return _needs_input_reply(_ca_pending, _stuck_action_text)
+                        return _ask_for_help(
+                            user_prompt, prompt_id, _ca_pending, _stuck_action_text,
+                            f'it did not complete after {_attempt - 1} attempts')
 
                     actions_prompt = user_tasks[user_prompt].get_action(_ca_pending - 1)
                     current_app.logger.info(f'[EXECUTE-PENDING] Starting action {_ca_pending} (attempt {_attempt}): {actions_prompt}')

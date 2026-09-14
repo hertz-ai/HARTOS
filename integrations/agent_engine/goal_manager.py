@@ -391,6 +391,44 @@ class GoalManager:
         return {'success': True, 'goal': goal.to_dict()}
 
     @staticmethod
+    def escalate_goal(db: Session, goal_id: str, escalation: Dict) -> Dict:
+        """Park a goal whose action needs someone who can do it (#106).
+
+        Owner, 2026-09-14: when an autonomous agent cannot do an action, ask a
+        human or an expert (the Claude co-pilot, which reaches goals through
+        MCP list_goals and steer_goal); never record a completion that did
+        not happen.  So the goal is paused the way every other pause path
+        pauses it (status 'paused', config pause_reason and paused_at), which
+        list_goals, the dashboard and the daemon's 'active' filter already
+        understand, and config 'escalation' says which action, why, and what
+        was already tried.  The owner or the co-pilot answers with steer_goal
+        and resumes the goal with the dashboard's resume verb.
+
+        ``escalation`` carries action_id, action, reason and tried; the time
+        is added here.  Writes through update_goal and update_goal_status, so
+        there is no second writer of either field.
+        """
+        from datetime import datetime
+        from integrations.social.models import AgentGoal
+
+        goal = db.query(AgentGoal).filter_by(id=goal_id).first()
+        if not goal:
+            return {'success': False, 'error': 'Goal not found'}
+        now = datetime.utcnow().isoformat()
+        record = dict(escalation or {}, at=now)
+        cfg = dict(goal.config_json or {})
+        cfg['escalation'] = record
+        cfg['pause_reason'] = (
+            f"Needs help: action {record.get('action_id')} "
+            f"({str(record.get('action') or '')[:120]}) could not be done "
+            f"autonomously: {record.get('reason')}")
+        cfg['paused_at'] = now
+        result = GoalManager.update_goal(db, goal_id, config_json=cfg)
+        if not result.get('success'):
+            return result
+        return GoalManager.update_goal_status(db, goal_id, 'paused')
+
+    @staticmethod
     def list_goals(db: Session, goal_type: str = None,
                    status: str = None, product_id: str = None) -> List[Dict]:
         """List goals with optional filters."""
