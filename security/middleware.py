@@ -244,13 +244,17 @@ EXEMPT_PREFIXES = ('/status', '/a2a/', '/api/social/', '/.well-known/',
                    '/prompts/public')
 
 
-def _apply_api_auth(app: Flask):
+def _apply_api_auth(app: Flask, register: bool = True):
     """Tier-aware API authentication with a strict admin guard.
+
+    Returns the gate hook; ``register=False`` builds it without registering
+    it, for hartos_bootstrap.install_api_gate, which must be able to run the
+    same hook in front of an app that no longer accepts before_request.
 
     Two gates run in order:
 
       1. ADMIN guard — /api/admin/* ALWAYS requires auth on any tier
-         except bundled desktop. Admin ops modify persistent state so
+         except a desktop's own callers. Admin ops modify persistent state so
          LAN trust is not enough — a compromised IoT device on the
          same network must not be able to drop agents or reconfigure
          TTS engines.
@@ -268,7 +272,9 @@ def _apply_api_auth(app: Flask):
       - Behind KONG:                    KONG handles auth → no key needed,
                                         middleware enforces tier-conditional
                                         only if KONG is bypassed
-      - Bundled desktop (NUNBA_BUNDLED): early return, always trusted
+      - Bundled desktop (NUNBA_BUNDLED): its own machine trusted; another
+                                        machine reaches the exempt paths,
+                                        and the rest with a credential
       - Regional LAN:                   /chat open, /api/admin gated
       - Central cloud:                  everything gated
     """
@@ -320,22 +326,35 @@ def _apply_api_auth(app: Flask):
             {'error': 'Authentication required (Bearer token)'},
         ), 401
 
-    @app.before_request
-    def check_api_auth():
-        # Bundled/desktop mode: in-process test_client, always trusted.
-        if os.environ.get('NUNBA_BUNDLED'):
-            return
+    def _expected_api_key() -> str:
+        """HEVOLVE_API_KEY, the one credential both branches below accept."""
+        try:
+            from security.secrets_manager import get_secret
+            return get_secret('HEVOLVE_API_KEY')
+        except Exception:
+            return os.environ.get('HEVOLVE_API_KEY', '')
 
+    def check_api_auth():
         path = request.path
+        # Bundled desktop.  This machine's own callers (the SPA, the tray,
+        # in-process test clients) are trusted, as they always were.  But the
+        # socket is Nunba's app on 0.0.0.0, the address the desktop advertises
+        # to peers (core.port_registry.get_advertisable_base_url), so a caller
+        # from another machine reaches only the exempt paths, which carry the
+        # peer protocol's HTTP half, and everything else with a credential.
+        # Measured 2026-09-14: a device on the same Wi-Fi could drive /chat
+        # and read /prompts on an installed desktop.
+        if os.environ.get('NUNBA_BUNDLED'):
+            from core.auth_local import _is_local_request
+            if _is_local_request() or _is_exempt(path):
+                return
+            return _require_api_key_or_bearer(_expected_api_key())
+
         if _is_exempt(path):
             return
 
         # Resolve the shared credential once — both gates share it.
-        try:
-            from security.secrets_manager import get_secret
-            expected_key = get_secret('HEVOLVE_API_KEY')
-        except Exception:
-            expected_key = os.environ.get('HEVOLVE_API_KEY', '')
+        expected_key = _expected_api_key()
 
         # Gate 1: Admin paths. ALWAYS required. Even regional LAN
         # deployments gate admin ops — the tier model is for user-facing
@@ -365,6 +384,45 @@ def _apply_api_auth(app: Flask):
             return
         # Non-central without API key → LAN-trusted or gateway-auth'd
         return
+
+    if register:
+        app.before_request(check_api_auth)
+    return check_api_auth
+
+
+def install_api_gate(app: Flask) -> bool:
+    """Put the API gate on an app that other machines reach, once.
+
+    hart_intelligence_entry gets it through apply_security_middleware.  An
+    embedder's app gets it here: Nunba's, which a desktop serves on 0.0.0.0
+    and advertises to peers.  hartos_bootstrap calls this first inside its
+    setup-lock window, and an embedder that serves before bootstrap runs
+    calls it when it creates the app.  Measured 2026-09-14: without it a
+    device on the same network could drive /chat and read /prompts on an
+    installed desktop.
+
+    Never left open: Flask refuses a before_request hook once an app has
+    served a request outside the setup-lock window, and then the hook goes
+    into before_request_funcs directly, where the decorator puts it, so it
+    runs in the request's own dispatch.  The app is marked gated only after
+    the hook is confirmed there.  Returns whether the app is gated; False,
+    logged CRITICAL, only if the hook could not be placed.
+    """
+    if getattr(app, '_hartos_api_gate', False):
+        return True
+    hook = _apply_api_auth(app, register=False)
+    try:
+        app.before_request(hook)
+    except Exception as e:
+        # The hook reads headers and the remote address only, never the body.
+        logger.critical(f"Flask refused the API gate ({e}); adding it to "
+                        f"before_request_funcs directly")
+        app.before_request_funcs.setdefault(None, []).append(hook)
+    if hook not in app.before_request_funcs.get(None, []):
+        logger.critical("The API gate is NOT on this app; it is serving UNGATED")
+        return False
+    app._hartos_api_gate = True
+    return True
 
 
 def _constant_time_compare(a: str, b: str) -> bool:

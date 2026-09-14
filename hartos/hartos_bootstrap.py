@@ -83,6 +83,17 @@ def get_bootstrap_thread() -> Optional[threading.Thread]:
     return _BOOTSTRAP_THREAD
 
 
+def _install_api_gate(app) -> None:
+    """Step 1b: the API gate on the host app, the socket other machines reach
+    (security.middleware.install_api_gate).  A boot must not die here, but a
+    node serving without its gate has to say so where an operator looks."""
+    try:
+        from security.middleware import install_api_gate
+        install_api_gate(app)
+    except Exception as e:
+        logger.critical(f"HARTOS API gate not installed on the host app: {e}")
+
+
 def bootstrap(
     app,
     config: Optional[Mapping[str, Any]] = None,
@@ -171,6 +182,8 @@ def _run_bootstrap(app, cfg: dict) -> None:
     Specifically:
 
       1. setup-lock bypass ON
+      1b. the API gate on the host app (security.middleware.install_api_gate),
+          added 2026-09-14: the host app is the socket other machines reach
       2. init_social
       3. social_bp + distributed_agent_bp
       4. consumer routes (Nunba: kids_media / kids_recommendation /
@@ -196,6 +209,9 @@ def _run_bootstrap(app, cfg: dict) -> None:
     try:
         bypass_active = _enable_setup_lock_bypass(app)
         try:
+            # The gate first.  It covers every route on the app, including
+            # the ones registered below (see _install_api_gate).
+            _install_api_gate(app)
             _init_social_subsystem(app)
             _register_core_blueprints(app)
             _run_consumer_hook(app, cfg)
