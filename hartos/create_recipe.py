@@ -4208,8 +4208,10 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     This is the one place the create loop asks.  A live user is asked directly,
     as before.  On an autonomous run nobody reads a question, so the action is
     held as waiting (PENDING, which the ledger records as BLOCKED, with
-    blocked_reason input_required) and its goal is parked with the ask
-    (GoalManager.escalate_goal), where the owner and the co-pilot see it.
+    blocked_reason input_required) and handed on through
+    GoalManager.escalate_goal: to this node's expert model first when it has
+    one (the daemon runs the goal's next turn on it, #106d), else to the owner
+    and the co-pilot, with the goal parked where they see it.
     """
     from integrations.agent_engine.dispatch import is_current_request_autonomous
     if not is_current_request_autonomous():
@@ -4226,25 +4228,36 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     from core.chat_client import daemon_goal_id
     from hartos.threadlocal import thread_local_data
     goal_id = daemon_goal_id(thread_local_data.get_request_id())
-    parked = False
+    stage = None
     if goal_id:
         try:
             from integrations.agent_engine.goal_manager import GoalManager
             from integrations.social.models import db_session
             with db_session(commit=True) as _db:
-                parked = GoalManager.escalate_goal(_db, goal_id, {
+                _handed = GoalManager.escalate_goal(_db, goal_id, {
                     'action_id': int(action_id),
                     'action': str(action_text or '')[:500],
                     'reason': reason,
                     'tried': ['local'],
-                }).get('success', False)
+                    # So the daemon can tell whether the expert's turn banked
+                    # this action (#106d).
+                    'user_prompt': user_prompt,
+                    'prompt_id': prompt_id,
+                    'flow': get_current_flow(user_prompt),
+                })
+                if _handed.get('success'):
+                    stage = _handed.get('stage') or 'human'
         except Exception as _park_err:
             current_app.logger.warning(
-                f'[ASK-FOR-HELP] could not park goal {goal_id}: {_park_err}')
+                f'[ASK-FOR-HELP] could not hand on goal {goal_id}: {_park_err}')
     current_app.logger.warning(
         f'[ASK-FOR-HELP] action {action_id} of {user_prompt}: {reason}; '
-        f'goal {goal_id or "unknown"} parked={parked}')
+        f'goal {goal_id or "unknown"} handed to {stage or "nobody"}')
     step = f' ("{action_text}")' if action_text else ''
+    if stage == 'expert':
+        return (f"Handed to the expert model: step {action_id}{step} could not "
+                f"be finished autonomously ({reason}). It takes this goal's "
+                f"next turn.")
     return (f"Paused for help: step {action_id}{step} could not be finished "
             f"autonomously ({reason}). It is waiting for the owner or the "
             f"co-pilot.")

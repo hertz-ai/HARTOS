@@ -229,7 +229,76 @@ def _goal_ledger_grounding(goal_id):
         return None
 
 
-def _settle_dispatched_goal(db, goal, goal_key):
+_ESCALATION_KEYS = ('action_id', 'action', 'user_prompt', 'prompt_id', 'flow')
+
+
+def _escalation_model_config(db, goal):
+    """``(config_list, parked)`` for a goal whose stuck action is handed to
+    the expert (#106d); ``(None, False)`` for every other goal.
+
+    The escalation names the expert by model_id.  Its entry, which can hold a
+    hive peer's token, is looked up here for this one dispatch and is never
+    written or logged.  An expert that is no longer registered (Claude Code
+    logged out, the peer gone) cannot take the turn, so the action goes to a
+    person through escalate_goal and ``parked`` is True.
+    """
+    esc = (goal.config_json or {}).get('escalation') or {}
+    if esc.get('next') != 'expert':
+        return None, False
+    from .model_registry import model_registry
+    backend = model_registry.get_model(esc.get('expert') or '')
+    if backend is not None and backend.is_dispatchable():
+        return backend.to_config_list(), False
+    from .goal_manager import GoalManager
+    GoalManager.escalate_goal(db, goal.id, dict(
+        {k: esc.get(k) for k in _ESCALATION_KEYS},
+        reason=f"the expert model {esc.get('expert')} is no longer available",
+        tried=['local']))
+    return None, True
+
+
+def _action_banked(esc) -> bool:
+    """True when the escalated action's recipe exists: the file the create
+    loop's AUTO-ADVANCE and trace bank write when a step is done."""
+    try:
+        from hartos.helper import safe_prompt_path
+        return os.path.exists(safe_prompt_path(
+            esc['prompt_id'], esc['flow'], esc['action_id']))
+    except Exception:
+        return False
+
+
+def _settle_expert_turn(db, goal, served) -> bool:
+    """Judge the expert's turn on the action it was handed (#106d).
+
+    Dispatch is synchronous, so by now the turn has run.  Only the escalation
+    that turn served is judged: one created during the turn (the expert
+    finished that action and a later one got stuck) has its own 'at' and
+    waits for its own expert turn.  Returns True when the goal was parked for
+    a person, so there is nothing more to settle.
+    """
+    cfg = dict(goal.config_json or {})
+    esc = cfg.get('escalation') or {}
+    if esc.get('next') != 'expert' or esc.get('at') != served.get('at'):
+        return False
+    # Done means the recipe was banked.  That is as strong as the banking and
+    # no stronger: a placeholder recipe also reads as done (#107).
+    if _action_banked(esc):
+        cfg.pop('escalation', None)
+        goal.config_json = cfg
+        logger.info(f"Goal {goal.id}: the expert model finished action "
+                    f"{esc.get('action_id')}")
+        return False
+    from .goal_manager import GoalManager
+    GoalManager.escalate_goal(db, goal.id, dict(
+        {k: esc.get(k) for k in _ESCALATION_KEYS},
+        reason='the expert model did not finish it', tried=['local']))
+    logger.info(f"Goal {goal.id}: the expert model did not finish action "
+                f"{esc.get('action_id')}; handed to a person")
+    return True
+
+
+def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None):
     """The ONE completion gate every dispatched goal must pass through.
 
     Dispatch-style-independent by construction: it re-reads the goal from
@@ -308,6 +377,9 @@ def _settle_dispatched_goal(db, goal, goal_key):
     if getattr(goal, 'status', 'active') != 'active':
         logger.info(f"Goal {goal_key} is {goal.status} after its dispatch; "
                     f"leaving it as it is")
+        return
+    # A turn handed to the expert settles that action first (#106d).
+    if served_escalation and _settle_expert_turn(db, goal, served_escalation):
         return
     # COPY, never mutate-in-place.  config_json is a plain JSON column, not a
     # MutableDict: mutating the dict the attribute already holds and assigning
@@ -1564,6 +1636,17 @@ class AgentDaemon:
                         f"resume in {backoff_info['skip_until'] - time.time():.0f}s)")
                     continue
 
+                # A goal whose stuck action is handed to the expert (#106d)
+                # runs one plain turn on that model: no fan-out, no
+                # speculation, judged by the settle below.  If the process
+                # dies between the turn and that settle, the expert gets one
+                # more turn on the next tick, never a false completion.
+                _expert_cfg, _expert_gone = _escalation_model_config(db, goal)
+                if _expert_gone:
+                    continue
+                _served_escalation = ((goal.config_json or {}).get('escalation')
+                                      if _expert_cfg else None)
+
                 # Reserve the agent only now that the goal has cleared every
                 # gate.  Reserving it at selection time meant a goal skipped
                 # afterwards -- above all by build_prompt returning None, which
@@ -1609,7 +1692,7 @@ class AgentDaemon:
                 # dispatching the goal prompt once.  Treated as a handoff
                 # exactly like speculation: truthy result, backoff cleared,
                 # and the completion gate below still judges it.
-                parallel_dispatched = self._try_parallel_dispatch(
+                parallel_dispatched = 0 if _expert_cfg else self._try_parallel_dispatch(
                     goal, idle_agents, dispatched, max_concurrent)
                 if parallel_dispatched > 0:
                     dispatched += parallel_dispatched
@@ -1617,7 +1700,7 @@ class AgentDaemon:
                         _dispatch_backoff.pop(goal_key, None)
                     handed_off = True
                     result = 'parallel-handoff'
-                elif speculative_enabled:
+                elif speculative_enabled and not _expert_cfg:
                     try:
                         from .speculative_dispatcher import get_speculative_dispatcher
                         dispatcher = get_speculative_dispatcher()
@@ -1641,7 +1724,9 @@ class AgentDaemon:
                         pass
 
                 if not handed_off:
-                    result = dispatch_goal(prompt, str(agent['user_id']), goal.id, goal.goal_type)
+                    result = dispatch_goal(
+                        prompt, str(agent['user_id']), goal.id, goal.goal_type,
+                        **({'model_config': _expert_cfg} if _expert_cfg else {}))
                     dispatched += 1
                     self._wd_heartbeat()
 
@@ -1700,7 +1785,8 @@ class AgentDaemon:
                     # driving the 500-line _tick, and so no dispatch style can
                     # skip it again (defect (b) was a `continue` doing exactly
                     # that).
-                    _settle_dispatched_goal(db, goal, goal_key)
+                    _settle_dispatched_goal(db, goal, goal_key,
+                                            served_escalation=_served_escalation)
             # ── HITL: notify owners of APPROVAL_REQUIRED tasks ──
             try:
                 for goal in goals:

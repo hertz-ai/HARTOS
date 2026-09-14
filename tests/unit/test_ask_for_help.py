@@ -61,6 +61,7 @@ def _names(state=IN_PROGRESS, task=None):
                            states.append((aid, s.value, reason)) or True),
         'ActionState': types.SimpleNamespace(
             ASSIGNED=ASSIGNED, IN_PROGRESS=IN_PROGRESS, PENDING=PENDING),
+        'get_current_flow': lambda up: 0,
         'current_app': types.SimpleNamespace(
             logger=logging.getLogger('test_ask_for_help')),
     }
@@ -109,9 +110,25 @@ def test_an_autonomous_run_parks_the_goal_and_holds_the_action():
     assert [(db, g, e['action_id'], e['reason'], e['tried'])
             for db, g, e in asks] == [('db', 'goal-7', 2, 'it looped', ['local'])]
     assert asks[0][2]['action'] == 'Collect the sources'
+    # What the daemon needs to find the action's banked recipe (#106d).
+    assert (asks[0][2]['user_prompt'], asks[0][2]['prompt_id'],
+            asks[0][2]['flow']) == ('7_1', 1, 0)
     assert task.blocked_reason == 'input_required'
     assert states == [(2, 'pending', 'asked for help: it looped')]
     assert reply.startswith('Paused for help: step 2'), reply
+
+
+def test_a_node_with_an_expert_hands_the_step_to_it():
+    """#106d: escalate_goal hands the action to this node's expert model
+    first; the reply says so and the action waits for that turn."""
+    states, names = _names()
+    ns = _functions(names)
+    with mock.patch.dict(sys.modules, _modules(
+            autonomous=True,
+            escalate=lambda *a: {'success': True, 'stage': 'expert'})):
+        reply = ns['_ask_for_help']('7_1', 1, 2, 'Collect the sources', 'it looped')
+    assert reply.startswith('Handed to the expert model: step 2'), reply
+    assert states[-1][1] == 'pending'
 
 
 def test_an_action_that_never_started_passes_through_in_progress():

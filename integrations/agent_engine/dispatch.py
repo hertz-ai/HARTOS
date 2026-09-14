@@ -150,13 +150,64 @@ def get_last_yield_reason():
     return _last_yield_reason
 
 
+def _native_chat(text=None, user_id=None, agent_id=None, create_agent=True,
+                 casual_conv=False, autonomous=True, request_id=None,
+                 model_config=None, **_kw):
+    """NATIVE HARTOS (no Nunba adapter; that module lives only in Nunba): the
+    in-process /chat through the app's OWN test client, the SAME canonical
+    route the HTTP tier uses, minus the loopback socket, exactly as
+    routes.hartos_backend_adapter.chat does in Nunba.  Reuses the /chat
+    pipeline and _internal_auth_headers; no new dispatch path.  The /chat
+    body's model_config is the per-turn model override, so this path can run
+    a turn on a named model."""
+    from hart_intelligence_entry import app as _app
+    _payload = {
+        'prompt': text, 'user_id': user_id, 'prompt_id': agent_id,
+        'create_agent': create_agent, 'casual_conv': casual_conv,
+        'autonomous': autonomous, 'request_id': request_id,
+        'task_source': 'own',
+    }
+    if model_config:
+        _payload['model_config'] = model_config
+    with _app.test_client() as _c:
+        _r = _c.post('/chat', json=_payload, headers=_internal_auth_headers())
+        return _r.get_json() or {}
+
+
+def _in_process_chat(native_fallback=True, model_config=None):
+    """The callable that reaches this node's own /chat in-process, or None:
+    Nunba's adapter when it is present, else (with ``native_fallback``) the
+    native test-client path.
+
+    A turn that names its model (``model_config``) always takes the native
+    path (#106d).  Nunba's adapter builds its /chat body from named fields,
+    so it would drop the override and the turn would run on the default
+    model.  The native path posts to the same HARTOS app the adapter posts
+    to, as the speculative expert transport already does in bundled mode
+    (_dispatch_expert_langchain)."""
+    if model_config:
+        return _native_chat
+    try:
+        from routes.hartos_backend_adapter import chat
+        return chat
+    except ImportError:
+        pass
+    try:
+        from hartos_backend_adapter import chat
+        return chat
+    except ImportError:
+        pass
+    return _native_chat if native_fallback else None
+
+
 def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
-                        native_fallback=True):
+                        native_fallback=True, model_config=None):
     """The ONE in-process call to this node's own /chat.  Returns
     ``(status, text)`` where status is ``'ok'`` (text is the reply),
     ``'deferred'`` (a human has the LLM, or it is saturated — retry later,
     NOT a failure) or ``'unavailable'`` (no in-process route; the caller may
-    fall back to its HTTP tier).
+    fall back to its HTTP tier).  ``model_config`` runs the turn on that
+    model; _in_process_chat says which path carries it.
 
     ``native_fallback=False`` says "only use this if the Nunba adapter is
     present".  On native HARTOS (central) the loopback POST already reaches
@@ -197,42 +248,17 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
         absence is what pile-drove the local llama-server into the
         watchdog-restart cascade this module already documents.
     """
+    # Any error resolving the path still lets the caller fall through to its
+    # HTTP tier (bounded-safe).
     try:
-        try:
-            from routes.hartos_backend_adapter import chat as hevolve_chat
-        except ImportError:
-            try:
-                from hartos_backend_adapter import chat as hevolve_chat
-            except ImportError:
-                if not native_fallback:
-                    # Native HARTOS and the caller has its own HTTP tier that
-                    # already reaches the right /chat here. Say so rather than
-                    # importing the Flask app into this thread.
-                    return 'unavailable', None
-                # NATIVE HARTOS (no Nunba adapter — the module lives only in
-                # Nunba): call the in-process /chat via the app's OWN test
-                # client, the SAME canonical route the HTTP tier uses, minus
-                # the loopback socket, exactly as
-                # routes.hartos_backend_adapter.chat does in Nunba.  Reuses
-                # the /chat pipeline + _internal_auth_headers; no new dispatch
-                # path.  Any error here still lets the caller fall through to
-                # its HTTP tier (bounded-safe).
-                def hevolve_chat(text=None, user_id=None, agent_id=None,
-                                 create_agent=True, casual_conv=False,
-                                 autonomous=True, request_id=None, **_kw):
-                    from hart_intelligence_entry import app as _app
-                    _payload = {
-                        'prompt': text, 'user_id': user_id, 'prompt_id': agent_id,
-                        'create_agent': create_agent, 'casual_conv': casual_conv,
-                        'autonomous': autonomous, 'request_id': request_id,
-                        'task_source': 'own',
-                    }
-                    with _app.test_client() as _c:
-                        _r = _c.post('/chat', json=_payload,
-                                     headers=_internal_auth_headers())
-                        return _r.get_json() or {}
+        hevolve_chat = _in_process_chat(native_fallback, model_config)
     except Exception as e:
         logger.debug(f"No in-process /chat route available: {e}")
+        return 'unavailable', None
+    if hevolve_chat is None:
+        # Native HARTOS and the caller has its own HTTP tier that already
+        # reaches the right /chat here. Say so rather than importing the Flask
+        # app into this thread.
         return 'unavailable', None
 
     # USER PRIORITY: if a user chatted recently, yield the LLM to them.
@@ -257,6 +283,7 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
             text=prompt, user_id=user_id, agent_id=prompt_id,
             create_agent=True, casual_conv=False, autonomous=True,
             request_id=request_id,
+            **({'model_config': model_config} if model_config else {}),
         )
     except Exception as e:
         logger.warning(f"In-process /chat failed for {daemon_id or prompt_id}: {e}")
@@ -835,9 +862,11 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             from integrations.agent_engine.model_registry import model_registry
             first_model = model_config[0].get('model', '') if model_config else ''
             if first_model:
-                info = model_registry.get(first_model)
-                if info:
-                    _dispatch_model_tier = (info.get('tier') or info.get('model_tier'))
+                # get_model: the registry has no get(), and the AttributeError
+                # was swallowed below, so no override ever carried its tier.
+                backend = model_registry.get_model(first_model)
+                if backend is not None:
+                    _dispatch_model_tier = backend.tier
                     if _dispatch_model_tier:
                         logger.info(f"Dispatch model tier: {_dispatch_model_tier.value} "
                                     f"for {goal_type} goal {goal_id}")
@@ -935,7 +964,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     # worker reach /chat exactly the way this goal path does instead of
     # hand-rolling a raw POST that lands on Nunba's route.
     _status, response = local_chat_dispatch(
-        prompt, user_id, prompt_id, daemon_id=goal_id)
+        prompt, user_id, prompt_id, daemon_id=goal_id, model_config=model_config)
     if _status == 'deferred':
         return None
     if _status == 'ok' and response:

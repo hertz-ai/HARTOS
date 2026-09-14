@@ -136,7 +136,7 @@ def test_the_parallel_branch_reaches_the_gate():
         '_try_parallel_dispatch runs before the last_dispatched_at stamp, so a '
         'parallel goal is dispatched without ever being recorded as dispatched')
 
-    settle = src.index('_settle_dispatched_goal(db, goal, goal_key)')
+    settle = src.index('_settle_dispatched_goal(db, goal, goal_key')
     assert settle > attempt, 'the settlement gate no longer follows the parallel branch'
     between = src[attempt:settle]
     assert 'parallel-handoff' in between, \
