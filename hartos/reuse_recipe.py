@@ -347,7 +347,7 @@ from hartos.helper_ledger import (
 from hartos.lifecycle_hooks import (
     sync_action_state_to_ledger, register_ledger_for_session,
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
-    clear_action_states,
+    clear_action_states, settled_action_id,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -4894,10 +4894,8 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
     2026-09-09 on agent 90210554431).  Guarded by
     tests/unit/test_completion_is_not_an_empty_reply.py.
     """
-    if claimed_action_id is not None and claimed_action_id != action_id:
-        current_app.logger.warning(
-            f"[HALLUCINATION?] LLM claims action_id={claimed_action_id} "
-            f"but pipeline has {action_id}")
+    if claimed_action_id is not None:
+        settled_action_id(claimed_action_id, action_id)
 
     # A DECOMPOSED action is not finished when the model says "completed" -- it
     # is finished when its own subtasks are.  Close the child this verdict is

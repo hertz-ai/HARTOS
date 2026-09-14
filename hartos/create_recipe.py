@@ -245,7 +245,7 @@ from agent_ledger import (
 from agent_ledger.factory import create_production_ledger, get_or_create_ledger
 # Add to your create_recipe.py after imports
 from hartos.lifecycle_hooks import (
-    stale_for_unstarted_action,
+    stale_for_unstarted_action, settled_action_id,
     initialize_deterministic_actions,
     lifecycle_hook_track_action_assignment,
     lifecycle_hook_track_user_fallback,
@@ -2483,7 +2483,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             safe_set_state(user_prompt, current_action_id, ActionState.ERROR, "verifier error")
                             return author
                         elif json_obj['status'].lower() == 'completed' or json_obj['status'].lower() == 'success':
-                            json_action_id = int(float(json_obj.get('action_id', user_tasks[user_prompt].current_action)))
+                            # The verdict settles the posted action, whatever id it
+                            # names (settled_action_id); it never picks another one.
+                            json_action_id = settled_action_id(json_obj.get('action_id'), current_action_id)
 
 
                             # Normal Set ActionState To Complete
@@ -2492,7 +2494,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                     current_app.logger.info('UPDATED TIMER for this action')
                                     end = time.time()
                                     task_time[prompt_id]['times'].append(end-task_time[prompt_id]['timer'])
-                                user_tasks[user_prompt].actions[json_action_id-1] = json_obj.get('action', user_tasks[user_prompt].actions[json_action_id-1])
                                 user_tasks[user_prompt].new_json.append(json_obj)
                                 current_app.logger.info(f'CHECKING FOR FALLBACK user_tasks[user_prompt].current_action={user_tasks[user_prompt].current_action} json_obj["action_id"]={json_obj["action_id"]}')
 
@@ -2513,16 +2514,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
 
                             return chat_instructor
-                        elif json_obj['status'].lower() == 'updated':
-                            if 'entire_actions' in json_obj.keys() and type(json_obj['entire_actions'])==list:
-                                update_entire_actions(json_obj, user_prompt)
-
-                            elif 'action_id' in json_obj.keys():
-                                user_tasks[user_prompt].actions[int(json_obj['action_id'])-1] = json_obj['updated_action']
-                                user_tasks[user_prompt].new_json.append(json_obj)
-                                safe_set_state(user_prompt, int(json_obj['action_id']), ActionState.COMPLETED)
-                                user_tasks[user_prompt].fallback = True
-
                         elif json_obj['status'].lower() == 'pending':
                             safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "verifier pending")
                             # USER-INPUT GATE (code-level enforcement of the
@@ -2592,6 +2583,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             # Normal Set ActionState To Terminate After getting Recipe json for each action
                             if 'recipe' in json_obj.keys() and json_obj['status'].lower() == 'done' and json_action_id > len(user_tasks[user_prompt].actions): # Done state when recipe is created
                                 create_individual_flow_recipe_and_terminate_flow(json_action_id, json_obj, user_prompt)
+                            elif 'action_id' in json_obj:
+                                # An action's own recipe belongs to the posted action,
+                                # whatever id the model wrote: the saves below name the
+                                # file, move current_action and terminate by this id.
+                                json_obj['action_id'] = settled_action_id(json_obj['action_id'], current_action_id)
 
                             recipe_result = lifecycle_hook_track_recipe_completion(user_prompt, json_obj,
                                                                                    user_tasks)  # 10. Track recipe completion
@@ -2828,38 +2824,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # mechanism. Keeps the closure's original signature so every
         # existing call site inside create_agents continues to work.
         publish_agent_thought(last_speaker, messages, user_id)
-
-    def update_entire_actions(json_obj, user_prompt):
-        current_app.logger.info('GOT UPDATED WITH entire actions')
-        try:
-
-            current_app.logger.info(
-                f"user_tasks[user_prompt].actions:{len(user_tasks[user_prompt].actions)}, len(json_obj['entire_actions']:{len(json_obj['entire_actions'])}")
-            current_app.logger.info(
-                f"user_tasks[user_prompt].actions:{user_tasks[user_prompt].actions}, len(json_obj['entire_actions']:{json_obj['entire_actions']}")
-
-            current_app.logger.info('')
-            entire_actions = json_obj['entire_actions']
-            user_tasks[user_prompt].actions = entire_actions
-            user_tasks[user_prompt].current_action = 1
-            user_tasks[user_prompt].fallback = False
-            user_tasks[user_prompt].recipe = False
-            config, total_actions = get_total_actions_for_current_flow_and_reset_actions(prompt_id, user_prompt)
-            reset_to_assigned_for_all_actions(total_actions, user_prompt)
-
-        except Exception as e:
-            current_app.logger.info(f'error is here:{e}')
-
-            user_tasks[user_prompt].actions[int(json_obj['action_id']) - 1] = json_obj['updated_action']
-            user_tasks[user_prompt].new_json.append(json_obj)
-            safe_set_state(user_prompt, int(json_obj['action_id']), ActionState.ERROR, "Exception ")
-
-            user_tasks[user_prompt].fallback = True
-
-    def reset_to_assigned_for_all_actions(total_actions, user_prompt):
-        for action_id in range(1, total_actions + 1):
-            safe_set_state(user_prompt, action_id, ActionState.ASSIGNED,
-                           "entire_actions got updated and hence starting again")
 
     def create_individual_flow_recipe_and_terminate_flow(current_action_id, json_obj, user_prompt):
         current_app.logger.info('Recipe created successfully, Saving Pending')
@@ -3140,15 +3104,14 @@ def instantiate_status_verifier_agent(user_prompt):
         llm_config=get_llm_config(),
         code_execution_config=False,
         system_message=""""You are a Status Verification Agent in a multi-agent system.
-        AUTONOMOUS MODE: Prefer "completed" over "updated" or "pending". If the Assistant made a reasonable attempt (even simulated), mark "completed". Only use "updated" when the action definition itself needs changing. Do NOT return "updated" or "pending" just because user preferences are unknown — use sensible defaults.
+        AUTONOMOUS MODE: Prefer "completed" over "pending". If the Assistant made a reasonable attempt (even simulated), mark "completed". Do NOT return "pending" just because user preferences are unknown — use sensible defaults.
         USER-INPUT GATE (HARD RULE): If a previous turn for THIS action returned `can_perform_without_user_input: "no"` (explicitly marked as requiring user input — e.g. "Confirm sitemap with user", "Choose payment method", "Approve plan"), you MUST NOT flip it to `"yes"` and you MUST NOT mark `"status": "completed"` until the user has actually replied. The autonomous-mode preference for "completed" does NOT override an explicit user-input requirement. For these actions, return `"status": "pending"` and keep `can_perform_without_user_input: "no"` until a fresh user message arrives in the conversation. Hallucinating a user confirmation ("user confirmed the structure", "sitemap approved") when the user hasn't actually replied is a contract violation — the user's reply must be visibly present in the message history.
         Role: Track, validate and verify the status of actions performed by other agents. Respond strictly in JSON:
         Response formats:
             1. Action Completed: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"yes by default. Only no when absolutely impossible (e.g. payment auth, physical access) OR when the action verbatim asks the user to choose/confirm/approve","persona_name":"persona name","fallback_action": "Context-aware retry strategy. NEVER leave empty."}
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "error details"}
-            3. Action Updated: {"status": "updated","action": "current action text","updated_action": "updated text","action_id": 1/2/3...,"message": "why updated","persona_name":"persona name","fallback_action": "fallback strategy"}
-            4. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending","can_perform_without_user_input":"yes/no — must match the prior turn's value if action verbatim asks for user input"}
-            5. Requires Breakdown: {"status": "requires_breakdown","action": "current action","action_id": 1/2/3...,"reason": "why","subtasks": [{"subtask_id": "1.1","description": "subtask desc","depends_on": [],"can_perform_autonomously": true}]}
+            3. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending","can_perform_without_user_input":"yes/no — must match the prior turn's value if action verbatim asks for user input"}
+            4. Requires Breakdown: {"status": "requires_breakdown","action": "current action","action_id": 1/2/3...,"reason": "why","subtasks": [{"subtask_id": "1.1","description": "subtask desc","depends_on": [],"can_perform_autonomously": true}]}
         Error Detection Rules:
             - HTTP 403/404/500/401, connection timeouts, permission denied = report "error" (not "pending")
             - Only "pending" for: first attempt, waiting for user, transient rate limits
@@ -4645,13 +4608,10 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         _rejection_reason = None
                         _claim_ledger = user_ledgers.get(user_prompt)
 
-                        # Check 1: Does the LLM-claimed action_id match what we assigned?
-                        if json_action_id != current_action_id:
-                            current_app.logger.warning(
-                                f"[HALLUCINATION?] LLM claims action_id={json_action_id} "
-                                f"but pipeline assigned action_id={current_action_id}")
-                            # Use the KNOWN action_id from scope — not the LLM's claim
-                            json_action_id = current_action_id
+                        # Check 1: the verdict settles the posted action, whatever
+                        # id the model wrote.  One rule, shared with
+                        # state_transition and reuse (settled_action_id).
+                        json_action_id = settled_action_id(json_action_id, current_action_id)
 
                         if _claim_ledger:
                             _claimed_task_id = f"action_{json_action_id}"

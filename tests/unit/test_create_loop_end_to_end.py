@@ -18,11 +18,10 @@ It asserts the invariants the incidents broke:
 - no action is skipped, and the flow recipe gets written;
 - no recipe is requested for work that never ran, and no LLM is called.
 
-Two known defects are pinned as strict xfails so they turn red the day they
-are fixed (and the xfail marker has to come off):
-- a verdict that names a different action_id overwrites that action's text;
-- a verdict that names a FUTURE action_id completes that action before it is
-  posted (state_transition forces COMPLETED on the claimed id).
+It also pins that a verdict settles only the action it answers.  One naming a
+different action_id leaves that action's text alone, and one naming a FUTURE
+action_id completes nothing before that action is posted.  Both were strict
+xfails until #106 bound every verdict to the posted action.
 
     python -m pytest tests/unit/test_create_loop_end_to_end.py -q -p no:cacheprovider
 """
@@ -346,6 +345,7 @@ def create_env(tmp_path, monkeypatch):
     monkeypatch.setattr(cr, 'create_agents', _create)
 
     events = []
+    plans = []
     real_set = lh.set_action_state
 
     def _record(user_prompt, action_id, state, *a, **k):
@@ -354,6 +354,10 @@ def create_env(tmp_path, monkeypatch):
             posted = any(f'Execute Action {aid}:' in _content(m)
                          for m in (script.gc.messages if script.gc else []))
             events.append((aid, getattr(state, 'value', str(state)), posted))
+            # The plan as it stood at this state change.  Once every flow is
+            # done the loop replaces user_tasks[UP] with an empty Action, so
+            # the plan can only be judged while the run is in progress.
+            plans.append(list(getattr(cr.user_tasks.get(UP), 'actions', None) or []))
         return real_set(user_prompt, action_id, state, *a, **k)
     monkeypatch.setattr(lh, 'set_action_state', _record)
 
@@ -361,7 +365,8 @@ def create_env(tmp_path, monkeypatch):
     thread_local_data.set_request_id('daemon_e2e_create')
     app = flask.Flask('create-loop-e2e')
     yield SimpleNamespace(cr=cr, lh=lh, app=app, script=script, events=events,
-                          llm_calls=llm_calls, prompts=prompts, sent=sent)
+                          plans=plans, llm_calls=llm_calls, prompts=prompts,
+                          sent=sent)
     thread_local_data.set_request_id('')
     faulthandler.cancel_dump_traceback_later()
 
@@ -422,23 +427,23 @@ def test_a_whole_flow_runs_in_order_with_no_phantom_completion(create_env):
         f'the flow recipe was never written; replies {replies!r}')
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    'known defect: state_transition overwrites actions[claimed_id - 1] with the '
-    "verdict's action text, so a verdict naming the wrong action rewrites "
-    'another action (create_recipe.py ~2495)'))
 def test_a_mislabelled_verdict_leaves_other_actions_alone(create_env):
+    """A verdict naming another action settles the posted one; it never
+    rewrites the other action's text (#106, settled_action_id)."""
     env = create_env
     env.script.verdict_ids = {2: 1}      # action 2's verdict claims action 1
     _run(env)
-    with env.app.app_context():
-        texts = [env.cr.user_tasks[UP].get_action(i) for i in range(3)]
-    assert texts[0] == ACTIONS[0], texts
+    # Judged at every state change of the run: reading user_tasks after the
+    # flow finished found an empty plan and raised IndexError whatever the
+    # code did, which the strict xfail this replaced accepted as its failure.
+    seen = [p for p in env.plans if p]
+    assert seen, 'no plan was recorded during the run'
+    assert all(p[0] == ACTIONS[0] for p in seen), sorted({p[0] for p in seen})
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    'known defect: a verdict naming a FUTURE action_id makes state_transition '
-    'force COMPLETED on it before "Execute Action N:" is posted'))
 def test_a_verdict_naming_a_future_action_does_not_complete_it(create_env):
+    """A verdict naming a future action completes nothing before that action
+    is posted (#106, settled_action_id)."""
     env = create_env
     env.script.verdict_ids = {2: 3}      # action 2's verdict claims action 3
     _run(env)

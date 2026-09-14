@@ -1511,6 +1511,40 @@ def stale_for_unstarted_action(messages, index, user_prompt,
     return None
 
 
+def settled_action_id(claimed_action_id, current_action_id) -> int:
+    """The action a verdict settles: the one the pipeline posted.
+
+    The model's action_id is advisory.  A verdict for the action on the floor
+    that names another id (a mistyped number, a future id, an id copied from
+    an earlier verdict) still answers the posted action, so it settles that
+    one, and the mismatch is logged as a hallucination signal.  This is the
+    one home of the rule: reuse's _advance_or_steer, the create loop's verdict
+    pickup and create's state_transition all call it.  Before it,
+    state_transition trusted the claimed id, so a verdict naming action 3
+    while action 2 ran force-completed action 3 before it was posted, and one
+    naming action 1 rewrote action 1's text (both reproduced by
+    tests/unit/test_create_loop_end_to_end.py).
+
+    A verdict left over for an action that has not started is not this case;
+    stale_for_unstarted_action refuses that one first.
+    """
+    try:
+        current = int(current_action_id)
+    except (TypeError, ValueError):
+        logger.warning("settled_action_id: the posted action %r is not an int; "
+                       "leaving it as it is", current_action_id)
+        return current_action_id
+    try:
+        claimed = int(float(claimed_action_id))
+    except (TypeError, ValueError):
+        return current
+    if claimed != current:
+        logger.warning(
+            "[HALLUCINATION?] LLM claims action_id=%s but pipeline has %s",
+            claimed, current)
+    return current
+
+
 def lifecycle_hook_track_termination(user_prompt: str, user_tasks, group_chat) -> bool:
     """11. Track when action is terminated and passed to chat instructor"""
     if hasattr(user_tasks, 'get'):
