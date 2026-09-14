@@ -79,5 +79,63 @@ class ChatReplyHonorsMediaMode(unittest.TestCase):
                          'absent media_mode must not change behavior')
 
 
+class ChatReplySpeaksAsTheTurnsAvatar(unittest.TestCase):
+    """The voice of a reply is its avatar's (core/teacher_avatar.py): the
+    request's teacher_avatar_id reaches the speech step, per reply."""
+
+    def _spoken(self, body):
+        import hart_intelligence_entry as hie
+
+        calls = []
+        with patch.object(hie, '_tts_synthesize_and_publish',
+                          lambda *a, **k: calls.append((a, k))):
+            with hie.app.test_request_context('/chat', json=body):
+                hie._chat_reply('t-av-user', 't-av-req', 'hello there')
+        self.assertEqual(len(calls), 1)
+        return calls[0][1]
+
+    def test_the_turns_avatar_is_the_voice(self):
+        kw = self._spoken({'prompt': 'hi', 'teacher_avatar_id': '1000000007'})
+        self.assertEqual(kw['avatar_id'], 1000000007)
+
+    def test_numeric_avatar_id(self):
+        kw = self._spoken({'prompt': 'hi', 'teacher_avatar_id': 2933})
+        self.assertEqual(kw['avatar_id'], 2933)
+
+    def test_no_avatar_speaks_the_default_voice(self):
+        kw = self._spoken({'prompt': 'hi'})
+        self.assertIsNone(kw['avatar_id'])
+
+    def test_a_value_that_is_not_an_avatar_id_is_ignored(self):
+        for bad in ('Spider-Man', -1, 0, True, {'id': 3}, None):
+            with self.subTest(teacher_avatar_id=bad):
+                kw = self._spoken({'prompt': 'hi', 'teacher_avatar_id': bad})
+                self.assertIsNone(kw['avatar_id'])
+
+
+class TextModeReplyIsStillMirrored(unittest.TestCase):
+    """media_mode='text' skipped the language resolution, which lived inside
+    the TTS gate, so the chat-sync persist below it raised UnboundLocalError
+    on `_lang` and the broad except dropped the turn from the cross-device
+    mirror whenever the caller passed no preferred_lang (24 of 25 callers)."""
+
+    def test_text_mode_reply_is_persisted_in_the_users_language(self):
+        import hart_intelligence_entry as hie
+        from integrations.social import chat_messages
+
+        with patch.object(hie, '_tts_synthesize_and_publish',
+                          lambda *a, **k: None), \
+                patch.object(chat_messages,
+                             'persist_and_publish_async') as persist, \
+                patch('core.user_lang.get_preferred_lang', return_value='ta'):
+            with hie.app.test_request_context(
+                    '/chat', json={'media_mode': 'text', 'prompt': 'hi'}):
+                hie._chat_reply('t-tm-user', 't-tm-req', 'hello there')
+        self.assertEqual(persist.call_count, 1,
+                         'the assistant turn was dropped from the mirror')
+        self.assertEqual(persist.call_args.args[1], 'assistant')
+        self.assertEqual(persist.call_args.kwargs['lang'], 'ta')
+
+
 if __name__ == '__main__':
     unittest.main()

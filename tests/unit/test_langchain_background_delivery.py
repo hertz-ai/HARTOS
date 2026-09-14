@@ -470,3 +470,73 @@ class TestCollapsedPathDelivery:
                 'spec-r', 'p', 'r', expert,
                 'u', 'pid', None, 'general')
         assert rec.call_args.kwargs['escalation_reason'] == 'refusal_override'
+
+
+# ─────────────────────────────────────────────────────────────────────
+# The expert's reply is spoken once, as the user's turn's avatar
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestExpertReplyVoice:
+
+    @staticmethod
+    def _deliver(dispatcher, spec, entry):
+        tts = MagicMock()
+        attrs = {'_tts_synthesize_and_publish': tts,
+                 'publish_async': MagicMock()}
+        if entry is not None:
+            with dispatcher._lock:
+                dispatcher._active[spec] = entry
+        with patch('core.safe_hartos_attr.safe_hartos_attr',
+                   side_effect=attrs.get):
+            dispatcher._deliver_expert_response('u', 'pid', spec, 'the answer')
+        return tts
+
+    def test_the_turns_avatar_is_the_voice(self, dispatcher):
+        tts = self._deliver(dispatcher, 'spec-av',
+                            {'avatar_id': 42, 'started_at': 0})
+        tts.assert_called_once_with('the answer', 'u', 'spec-av', avatar_id=42)
+
+    def test_a_turn_without_avatar_makes_the_old_call(self, dispatcher):
+        tts = self._deliver(dispatcher, 'spec-none', {'started_at': 0})
+        tts.assert_called_once_with('the answer', 'u', 'spec-none')
+
+    def test_an_entry_already_gone_makes_the_old_call(self, dispatcher):
+        tts = self._deliver(dispatcher, 'spec-gone', None)
+        tts.assert_called_once_with('the answer', 'u', 'spec-gone')
+
+    def test_local_expert_inner_chat_does_not_speak(
+            self, dispatcher, monkeypatch):
+        """_deliver_expert_response speaks the expert's reply; the inner /chat
+        must not speak it first (every expert delivery was published twice,
+        gui_app.log 2026-09-14)."""
+        monkeypatch.setenv('NUNBA_BUNDLED', '1')
+        posted = {}
+
+        class _Resp:
+            status_code = 200
+
+            @staticmethod
+            def get_json():
+                return {'response': 'expert says'}
+
+        class _Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def post(self, path, json=None):
+                posted['path'], posted['json'] = path, json
+                return _Resp()
+
+        fake_hie = type(sys)('hart_intelligence_entry')
+        fake_hie.app = MagicMock()
+        fake_hie.app.test_client.return_value = _Client()
+        monkeypatch.setitem(sys.modules, 'hart_intelligence_entry', fake_hie)
+        expert = dispatcher._registry.get_fast_model()
+        assert dispatcher._dispatch_expert_langchain(
+            expert, 'p', 'u', 'pid', 'general', None) == 'expert says'
+        assert posted['path'] == '/chat'
+        assert posted['json']['media_mode'] == 'text'

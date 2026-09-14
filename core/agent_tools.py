@@ -1327,6 +1327,7 @@ def build_core_tool_closures(ctx):
 
         # Default: Avatar-based video generation
         from core.config_cache import get_db_url
+        from core.teacher_avatar import lookup_avatar
         database_url = get_db_url() or 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         tool_logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
@@ -1339,20 +1340,16 @@ def build_core_tool_closures(ctx):
             'openvoice': "false",
         }
 
-        try:
-            res = pooled_get(f"{database_url}/get_image_by_id/{avatar_id}")
-            res = res.json()
-            new_image_url = res["image_url"]
-            voice_id = res.get('voice_id')
-        except Exception:
+        # The avatar's image and voice sample: the one lookup a spoken reply
+        # uses too (core/teacher_avatar.py).
+        avatar = lookup_avatar(avatar_id, database_url)
+        if avatar['openvoice']:
             data['openvoice'] = "true"
-            new_image_url = None
-            voice_id = None
 
         data["cartoon_image"] = "True"
         data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
         data['vtoonify'] = "false"
-        data["image_url"] = new_image_url
+        data["image_url"] = avatar['image_url']
         data['im_crop'] = "false"
         data['remove_bg'] = "false"
         data['hd_video'] = "false"
@@ -1371,18 +1368,8 @@ def build_core_tool_closures(ctx):
             data['flag_hallo'] = "true"
             data["cartoon_image"] = "False"
 
-        if voice_id is not None:
-            try:
-                voice_sample = pooled_get(f"{database_url}/get_voice_sample_id/{voice_id}")
-                voice_sample = voice_sample.json()
-                data["audio_sample_url"] = voice_sample.get("voice_sample_url")
-                data['voice_id'] = int(voice_id) if voice_id else None
-            except Exception:
-                data["audio_sample_url"] = None
-                data['voice_id'] = None
-        else:
-            data["audio_sample_url"] = None
-            data['voice_id'] = None
+        data["audio_sample_url"] = avatar['audio_sample_url']
+        data['voice_id'] = avatar['voice_id']
 
         conv_id = save_conversation_db(text, user_id, prompt_id, database_url, request_id)
         data['conv_id'] = int(conv_id)

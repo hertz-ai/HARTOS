@@ -52,6 +52,17 @@ def test_optional_fields_only_when_meaningful():
     assert 'goal_type' not in _build(goal_type='general')
 
 
+def test_media_mode_only_when_the_caller_speaks_for_itself():
+    """The inner /chat speaks unless told otherwise; only a caller that
+    delivers the audio itself (the expert leg) passes media_mode='text'."""
+    assert 'media_mode' not in _build()
+    d = object.__new__(SpeculativeDispatcher)
+    p = SpeculativeDispatcher._build_dispatch_payload(
+        d, _FakeModel(), 'the-prompt', 'user-1', None, None, 'general',
+        media_mode='text')
+    assert p['media_mode'] == 'text'
+
+
 def test_both_dispatch_methods_use_the_one_builder():
     import re
     from pathlib import Path

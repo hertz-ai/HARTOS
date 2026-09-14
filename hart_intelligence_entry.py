@@ -8500,32 +8500,48 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         # expert publish calls _tts_synthesize_and_publish directly,
         # below this gate) are untouched.
         _tts_wanted = True
+        _avatar_id = None
         try:
             # Local import: _chat_reply's source is exec'd in an isolated
             # namespace by test_consent_fanout_p2, where module globals
             # (including the flask request proxy) do not exist.
             from flask import request as _req
-            _mm = (_req.get_json(silent=True) or {}).get('media_mode')
+            _body = _req.get_json(silent=True) or {}
+            _mm = _body.get('media_mode')
             if _mm == 'text':
                 _tts_wanted = False
                 app.logger.info(
                     '_chat_reply: TTS suppressed (media_mode=text) for '
                     f'request_id={request_id}')
+            # The avatar this reply is spoken as.  Its voice belongs to the
+            # avatar id, like its image (core/teacher_avatar.py), never to the
+            # agent: one avatar fronts many agents, and one agent can speak as
+            # several avatars.  Absent -> the engine's default voice.
+            try:
+                from core.teacher_avatar import avatar_id_from
+                _avatar_id = avatar_id_from(_body.get('teacher_avatar_id'))
+            except Exception as _ae:
+                app.logger.debug(f"_chat_reply: avatar id unread: {_ae}")
         except RuntimeError:
             pass  # outside a request — keep speaking, as before
+        # preferred_lang resolution must match the chat entry path:
+        # body/kwarg → canonical persisted reader → 'en'.  Bare
+        # 'en' default forced English Piper on Tamil replies.  Resolved
+        # ahead of the TTS gate because the chat-sync persist below reads it
+        # on EVERY reply: inside the gate, a text-mode reply left it unbound
+        # there, and the UnboundLocalError dropped that turn from the
+        # cross-device mirror.
+        _lang = payload.get('preferred_lang') or payload.get('language')
+        if not _lang:
+            try:
+                from core.user_lang import get_preferred_lang
+                _lang = get_preferred_lang() or 'en'
+            except Exception:
+                _lang = 'en'
         if _tts_wanted:
             try:
-                # preferred_lang resolution must match the chat entry path:
-                # body/kwarg → canonical persisted reader → 'en'.  Bare
-                # 'en' default forced English Piper on Tamil replies.
-                _lang = payload.get('preferred_lang') or payload.get('language')
-                if not _lang:
-                    try:
-                        from core.user_lang import get_preferred_lang
-                        _lang = get_preferred_lang() or 'en'
-                    except Exception:
-                        _lang = 'en'
-                _tts_synthesize_and_publish(response_text, user_id, request_id, language=_lang)
+                _tts_synthesize_and_publish(response_text, user_id, request_id,
+                                            language=_lang, avatar_id=_avatar_id)
             except Exception as e:
                 # Never let a TTS failure block delivery of the text reply.
                 app.logger.debug(f"_chat_reply: TTS dispatch skipped: {e}")
@@ -8638,7 +8654,61 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     return jsonify(payload)
 
 
-def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
+def _speak_in_voice(text, language, voice):
+    """Speak ``text`` in the recorded ``voice``; returns the audio path, or
+    None for the default voice.
+
+    Cloning from a reference is the canonical synth entry's job:
+    TTSRouter.synthesize requires a cloning engine when it is given a voice
+    and brings one up on demand, while tts_engine.synthesize_text -- the
+    chat path's default voice -- is the divergent copy
+    (docs/architecture/HARTOS_PARALLEL_PATH_AUDIT.md "TTS orchestration
+    split", docs/internal/ux_degrading_design_choices 3.5).  So only a
+    voiced utterance goes to the router, and synthesize_text never receives
+    a reference: its primary backend (Piper on a desktop) treats one as a
+    voice id and raises, and its fallback then makes another engine the
+    active one for good.
+
+    None unless ``voice`` is a reference by the router's own test
+    (tts_router.synthesize: ``voice not in ('default', '', None)``), and
+    unless a cloning engine answered with a file: the router appends espeak
+    even when it needs a clone, and espeak ignores the voice, so an answer
+    without an error does not prove the voice was used.  (Moving that check
+    into the router changes /api/voice/speak's contract; it is tracked
+    separately.)
+    """
+    if voice in (None, '', 'default'):
+        return None
+    try:
+        from core.tool_logging import timed_stage
+        from integrations.channels.media.tts_router import (
+            ENGINE_REGISTRY, get_tts_router,
+        )
+        with timed_stage('tts.synthesize_voiced', logger=app.logger,
+                         warn_over_ms=3000, chars=len(text), lang=language):
+            result = get_tts_router().synthesize(
+                text, language=language, voice=voice, source='chat_response')
+    except Exception as e:
+        app.logger.warning(f"TTS: voiced synthesis failed ({e}); default voice")
+        return None
+    if result.error or not result.path or not os.path.isfile(result.path):
+        app.logger.info(f"TTS: voiced synthesis gave no audio "
+                        f"({result.error or result.path!r}); default voice")
+        return None
+    spec = ENGINE_REGISTRY.get(result.engine_id)
+    if spec is None or not spec.voice_clone:
+        app.logger.info(f"TTS: {result.engine_id} cannot clone a voice; "
+                        f"default voice")
+        return None
+    # Served by Nunba's /tts/audio/<basename>: a cloning engine's ToolWorker
+    # writes under HEVOLVE_MODEL_DIR (default ~/.hevolve/models)/<tool>/output,
+    # and that route searches ~/.hevolve/models/*/output.  So this holds while
+    # HEVOLVE_MODEL_DIR stays at its default, as for Nunba's own GPU engines.
+    return result.path
+
+
+def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
+                                avatar_id=None):
     """Fire-and-forget: synthesize TTS, push audio via WAMP.
 
     Same pattern as chatbot_pipeline/chatbot.py:
@@ -8650,10 +8720,25 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
     model orchestration, GPU swap — the full pipeline.
 
     Only fires when TTS engine exists (Nunba bundled mode).
+
+    ``language`` None means the caller does not know the turn's language
+    (the speculative expert reply): the user's persisted preference is
+    spoken, the same reader _chat_reply falls back to, not English.
+    ``avatar_id`` is the avatar this utterance is spoken as.  Its recorded
+    voice (core/teacher_avatar.voice_reference) is spoken through the
+    canonical synth entry, TTSRouter.synthesize, which clones from it (see
+    _speak_in_voice).  None, an avatar with no voice, or a voice no engine
+    here can clone keeps synthesize_text's default voice.
     """
     if not text or not text.strip():
         app.logger.debug("TTS: skipped (empty text)")
         return
+    if not language:
+        try:
+            from core.user_lang import get_preferred_lang
+            language = get_preferred_lang() or 'en'
+        except Exception:
+            language = 'en'
     try:
         from tts.tts_engine import get_tts_engine
         engine = get_tts_engine()
@@ -8689,6 +8774,23 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
             _clean = _re.sub(r'\s+', ' ', _clean).strip()         # collapse whitespace
             if not _clean:
                 return  # nothing left after cleaning
+
+            # The avatar's recorded voice, by the lookup a generated video uses
+            # (core/teacher_avatar.py).  Resolved here on the TTS worker, never
+            # on the request thread, so the database round-trip (loopback on a
+            # desktop) and a first download never delay the text reply.
+            _voice = None
+            if avatar_id is not None:
+                try:
+                    from core.teacher_avatar import voice_reference
+                    _voice = voice_reference(avatar_id)
+                except Exception as _ve:
+                    app.logger.debug(
+                        f"TTS: voice of avatar {avatar_id} skipped: {_ve}")
+            # A voiced utterance goes through the canonical synth entry, which
+            # normalizes the text itself, so the stripped text goes in.  None
+            # -> the default voice below.
+            audio_path = _speak_in_voice(_clean, language, _voice)
 
             # ── Converge on the ONE normalizer (task #10 / 3.5) ──
             # The stripping above removes artifacts TTS cannot SAY. It does
@@ -8730,39 +8832,42 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
             # normalization block speech" promise is about crashes; the
             # warn_over_ms below makes it also true of LATENCY, which is the
             # failure mode that actually bit us.
-            try:
-                from core.tool_logging import timed_stage
-                from integrations.channels.media.tts_router import SOURCE_URGENCY
-                from integrations.channels.media.tts_text_normalizer import (
-                    normalize_for_tts,
-                )
-                _urgency = SOURCE_URGENCY.get('chat_response', 'normal')
-                _use_llm = (_urgency != 'instant')
-                with timed_stage('tts.normalize', logger=app.logger,
-                                 warn_over_ms=1500, use_llm=_use_llm,
-                                 chars=len(_clean), lang=language):
-                    _clean = normalize_for_tts(
-                        _clean, language, use_llm=_use_llm,
-                    )
-            except Exception as _ne:  # never let normalization block speech
-                app.logger.debug(f"TTS: normalization skipped ({_ne})")
-
-            from core.tool_logging import timed_stage as _timed_stage
-            with _timed_stage('tts.synthesize', logger=app.logger,
-                              warn_over_ms=3000, chars=len(_clean),
-                              lang=language):
-                _raw = synthesize_text(_clean, language=language)
-            app.logger.info(f"TTS async: synthesize_text returned: {_raw}")
-            # synthesize_text may return a file path string OR a JSON dict/string
-            # with {"path": "...", "duration": ...}. Normalize to a file path.
-            audio_path = _raw
-            if isinstance(_raw, dict):
-                audio_path = _raw.get('path', '')
-            elif isinstance(_raw, str) and _raw.startswith('{'):
+            if not audio_path:
                 try:
-                    audio_path = json.loads(_raw).get('path', '')
-                except (json.JSONDecodeError, AttributeError):
-                    logging.getLogger(__name__).debug("_bg: swallowed json.JSONDecodeError, AttributeError", exc_info=True)
+                    from core.tool_logging import timed_stage
+                    from integrations.channels.media.tts_router import SOURCE_URGENCY
+                    from integrations.channels.media.tts_text_normalizer import (
+                        normalize_for_tts,
+                    )
+                    _urgency = SOURCE_URGENCY.get('chat_response', 'normal')
+                    _use_llm = (_urgency != 'instant')
+                    with timed_stage('tts.normalize', logger=app.logger,
+                                     warn_over_ms=1500, use_llm=_use_llm,
+                                     chars=len(_clean), lang=language):
+                        _clean = normalize_for_tts(
+                            _clean, language, use_llm=_use_llm,
+                        )
+                except Exception as _ne:  # never let normalization block speech
+                    app.logger.debug(f"TTS: normalization skipped ({_ne})")
+
+                # The default voice: synthesize_text never receives a voice
+                # reference (_speak_in_voice says why).
+                from core.tool_logging import timed_stage as _timed_stage
+                with _timed_stage('tts.synthesize', logger=app.logger,
+                                  warn_over_ms=3000, chars=len(_clean),
+                                  lang=language):
+                    _raw = synthesize_text(_clean, language=language)
+                app.logger.info(f"TTS async: synthesize_text returned: {_raw}")
+                # synthesize_text may return a file path string OR a JSON dict/string
+                # with {"path": "...", "duration": ...}. Normalize to a file path.
+                audio_path = _raw
+                if isinstance(_raw, dict):
+                    audio_path = _raw.get('path', '')
+                elif isinstance(_raw, str) and _raw.startswith('{'):
+                    try:
+                        audio_path = json.loads(_raw).get('path', '')
+                    except (json.JSONDecodeError, AttributeError):
+                        logging.getLogger(__name__).debug("_bg: swallowed json.JSONDecodeError, AttributeError", exc_info=True)
             if audio_path and os.path.isfile(audio_path):
                 audio_filename = os.path.basename(audio_path)
                 # Use absolute URL if this node's external URL is known —
@@ -9567,6 +9672,7 @@ def chat():
             # the legitimate ``prompts/78570931871.json``).  Pass None;
             # the dispatcher handles None internally via
             # ``speculation_id`` for any keying that needs a string.
+            from core.teacher_avatar import avatar_id_from
             result = dispatcher.dispatch_draft_first(
                 prompt, str(user_id),
                 str(prompt_id) if prompt_id else None,
@@ -9574,6 +9680,9 @@ def chat():
                 preferred_lang=preferred_lang,
                 user_pref=intelligence_preference,
                 agent_bound=_agent_bound,
+                # The expert's follow-up reply is spoken as this turn's
+                # avatar, like this turn's own reply (_chat_reply).
+                avatar_id=avatar_id_from(data.get('teacher_avatar_id')),
             )
             # Only commit when the dispatcher actually produced a reply.
             # no_draft_model / circuit breaker / guardrail block all leave
