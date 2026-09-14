@@ -59,7 +59,7 @@ from PIL import Image
 
 
 from flask import current_app
-from hartos.helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg, answered_call_ids, history_limiter, token_limiter
+from hartos.helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg, answered_call_ids, history_limiter, token_limiter, give_judge_view
 
 
 def _normalize_flow_recipe(config):
@@ -1705,6 +1705,9 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     # message buffer until llama.cpp's n_ctx ceiling fired 500.  Capped
     # here.
     context_handling.add_to_agent(chat_instructor)
+    # The verifier judges the other seats' tool calls; it must not receive
+    # them as its own turns (helper.ToolActivityAsEvidence).
+    give_judge_view(verify)
 
     # #510: send_message_to_roles — multi-persona broadcast.  Canonical impl
     # lives in core.persona_registry (single source of truth for the persona
@@ -2403,6 +2406,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     # (line ~1255).  chat_instructor1 carries the same unbounded-buffer
     # risk in the time-based path.
     context_handling.add_to_agent(chat_instructor1)
+    give_judge_view(verify1)  # see the recipe-path verifier above
 
     # --- Core tools for time_agent (defined once in core/agent_tools.py) ---
     from core.agent_tools import (

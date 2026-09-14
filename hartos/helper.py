@@ -2415,6 +2415,100 @@ class ToolMessageHandler:
 
         return "No message transformations needed", False
 
+
+class ToolActivityAsEvidence:
+    """Show a judging seat the other seats' tool calls as a report.
+
+    autogen 0.2.37 ``_append_oai_message`` (conversable_agent.py:667-668)
+    gives role="assistant" to every message carrying tool_calls, whoever
+    sent it.  So the StatusVerifier, which holds no tools, receives the
+    Assistant's call as its own turn, and the model continues that turn
+    instead of judging it.
+
+    Live 2026-09-14, two agents walked as their owners: the verifier
+    answered with the Assistant's call written out as <tool_call> text
+    (20260824301, 3 of 3 rounds) or with the Assistant's next step
+    (12165936867).  Neither action got a verdict, both turns spent their 12
+    rounds, and the user was handed the leftover text.  The verifier's own
+    logged requests, replayed against the live llama-server: 4/4 answered
+    with tool-call text as logged, 4/4 with a JSON verdict once the calls
+    and results were told as a report from the seat that made them.
+
+    This runs after the shared ToolMessageHandler, so a result held only by
+    a peer seat has already been filled in.  A seat that can run a call or a
+    code block keeps the raw structure: generate_reply hands the transformed
+    list to every reply function, tool and code execution included.
+    """
+
+    def __init__(self, seat):
+        self._seat = seat
+
+    def _acts_on_calls(self):
+        seat = self._seat
+        return bool(getattr(seat, '_function_map', None)
+                    or getattr(seat, '_code_execution_config', False)
+                    or (getattr(seat, 'llm_config', None) or {}).get('tools'))
+
+    def apply_transform(self, messages: List[Dict]) -> List[Dict]:
+        if self._acts_on_calls() or not any(
+                m.get('tool_calls') or m.get('role') == 'tool' for m in messages):
+            return messages
+        answered = set()
+        for m in messages:
+            if m.get('role') == 'tool':
+                answered.add(m.get('tool_call_id'))
+                answered.update(r.get('tool_call_id') for r in (m.get('tool_responses') or [])
+                                if isinstance(r, dict))
+        calls, out, n_calls, n_results = {}, [], 0, 0
+        for m in messages:
+            if m.get('tool_calls'):
+                who = m.get('name') or 'Assistant'
+                if str(m.get('content') or '').strip():
+                    out.append({'role': 'user', 'name': who, 'content': m['content']})
+                for tc in m['tool_calls']:
+                    fn = tc.get('function') or {}
+                    line = f"{who} called {fn.get('name')}({fn.get('arguments') or ''})"
+                    n_calls += 1
+                    if tc.get('id') in answered:
+                        calls[tc.get('id')] = (who, line)
+                    else:
+                        out.append({'role': 'user', 'name': who,
+                                    'content': f"{line}\nTool result: (none recorded)"})
+            elif m.get('role') == 'tool':
+                for r in (m.get('tool_responses') or [m]):
+                    who, line = calls.pop(r.get('tool_call_id'),
+                                          (m.get('name') or 'Tool', 'A tool call'))
+                    out.append({'role': 'user', 'name': who,
+                                'content': f"{line}\nTool result: {r.get('content')}"})
+                    n_results += 1
+            else:
+                out.append(m)
+        _safe_log('info',
+                  f"[JUDGE-VIEW] {getattr(self._seat, 'name', '?')}: {n_calls} tool "
+                  f"call(s) and {n_results} result(s) shown as a report")
+        # The same role-order guard the shared chain ends with: the report
+        # lines are user turns, and consecutive ones are merged the same way.
+        return ToolMessageHandler().validate_messages(out)
+
+    def get_logs(self, pre_transform_messages: List[Dict],
+                 post_transform_messages: List[Dict]) -> Tuple[str, bool]:
+        changed = any(m.get('tool_calls') or m.get('role') == 'tool'
+                      for m in pre_transform_messages)
+        return ("tool activity shown as a report" if changed else "no tool activity",
+                changed)
+
+
+def give_judge_view(seat):
+    """Give a judging seat ToolActivityAsEvidence.
+
+    Call it after the seat's shared TransformMessages: hooks run in the order
+    they were registered, and the shared chain fills the real tool answers
+    this view reports.
+    """
+    transform_messages.TransformMessages(
+        transforms=[ToolActivityAsEvidence(seat)], verbose=False).add_to_agent(seat)
+
+
 class Action:
     def __init__(self,actions):
         self.actions = actions
@@ -3247,6 +3341,7 @@ def create_visual_agent(user_id,prompt_id):
     # path uses chat_instructor2 (UserProxyAgent line 2047) the same way;
     # it needs the same buffer cap to avoid llama.cpp n_ctx overflow.
     context_handling.add_to_agent(chat_instructor2)
+    give_judge_view(verify2)
 
     return visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2
 

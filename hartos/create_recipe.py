@@ -57,9 +57,9 @@ import re
 import json
 from flask import current_app
 try:
-    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg, history_limiter, token_limiter
+    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg, history_limiter, token_limiter, give_judge_view
 except Exception:
-    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, _is_terminate_msg, history_limiter, token_limiter
+    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, _is_terminate_msg, history_limiter, token_limiter, give_judge_view
     PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 from hartos import helper as helper_fun
@@ -1140,6 +1140,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # 2026-05-14).  Attaching here caps chat_instructor's buffer at the
     # same 3500-token / 50-message budget as the other agents.
     context_handling.add_to_agent(chat_instructor)
+    # The verifier judges the other seats' tool calls; it must not receive
+    # them as its own turns (helper.ToolActivityAsEvidence).
+    give_judge_view(verify)
 
     agents_object['assistant'] = assistant
     agents_object['helper'] = helper
@@ -3562,6 +3565,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     # block (line ~903).  Same unbounded-buffer risk applies in the
     # time-based-execution path; chat_instructor1 needs the same cap.
     context_handling.add_to_agent(chat_instructor1)
+    give_judge_view(verify1)  # see the verifier in create_agents above
 
     time_agent_object = {}
     time_agent_object['time_agent'] = time_agent
