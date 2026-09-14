@@ -101,7 +101,8 @@ dependencies = [
     # 202) and tier D needs SEARXNG_URL, set nowhere. Pulls primp (browser TLS
     # impersonation, the reason this tier survives) and lxml transitively.
     "ddgs>=9.16.0",
-    "PyPDF2>=3.0.0,<4.0.0",
+    # The book pipeline's one PDF engine (see requirements.txt for why).
+    "pypdfium2>=5.13.0,<6.0.0",
 
     # Tokenization
     "tiktoken>=0.5.0,<1.0.0",

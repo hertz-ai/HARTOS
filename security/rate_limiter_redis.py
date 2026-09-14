@@ -62,6 +62,7 @@ class RedisRateLimiter:
         'p2p_health': (15, 60),          # 15 health ops per 60 seconds
         'p2p_logistics': (20, 60),       # 20 logistics ops per 60 seconds
         'autoresearch': (5, 3600),       # 5 autoresearch sessions per hour
+        'book_parse': (20, 3600),        # 20 book uploads per hour (each is minutes of VLM work)
         'wifi': (30, 60),                # 30 wifi operations per 60 seconds
         'vpn': (20, 60),                 # 20 vpn operations per 60 seconds
         'trash': (30, 60),               # 30 trash operations per 60 seconds

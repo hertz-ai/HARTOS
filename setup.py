@@ -61,7 +61,8 @@ install_requires = [
     "numpy>=1.25.0,<2.0.0",
     "pandas>=2.0.0,<4.0.0",
     "beautifulsoup4>=4.12.0,<5.0.0",
-    "PyPDF2>=3.0.0,<4.0.0",
+    # The book pipeline's one PDF engine (see requirements.txt for why).
+    "pypdfium2>=5.13.0,<6.0.0",
 
     # Tokenization
     "tiktoken>=0.5.0,<1.0.0",

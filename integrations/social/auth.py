@@ -450,6 +450,37 @@ def optional_auth(f):
     return decorated
 
 
+def require_local_or_auth(f):
+    """Decorator: loopback callers pass as they are; anyone else needs a user token.
+
+    For routes a local client calls without a session that every HARTOS node
+    must ALSO be able to serve to the network. The bundled desktop's own SPA has
+    always called the book routes from 127.0.0.1 with no Authorization header;
+    once any node serves them, a remote caller must be a known user, scoped to
+    their own data. So:
+
+      * local  -> g.user = g.user_id = None; the route decides what a local
+                  request may name (a desktop is single-user).
+      * remote -> require_auth: g.user / g.user_id identify the caller.
+
+    Composes the two canonical gates -- core.auth_local._is_local_request (the
+    same loopback test, TRUSTED_PROXY included, that require_local_or_token
+    uses) and require_auth -- rather than re-implementing either.
+    """
+    remote = require_auth(f)
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        from core.auth_local import _is_local_request
+        if _is_local_request():
+            g.user = None
+            g.user_id = None
+            return f(*args, **kwargs)
+        return remote(*args, **kwargs)
+
+    return decorated
+
+
 def require_admin(f):
     """Decorator: requires central (cloud admin) role or is_admin flag."""
     @wraps(f)

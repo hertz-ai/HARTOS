@@ -172,7 +172,14 @@ pydantic==2.9.2
 PyJWT==2.7.0
 pyparsing==3.1.0
 pypdf==3.17.1
-PyPDF2==3.0.1
+# The book pipeline's one PDF engine (integrations/learning/book_pipeline.py):
+# PDFium renders each page, extracts its text and reads the outline. No
+# dependencies of its own, so it is safe under the Dockerfile's --no-deps
+# install; prebuilt wheels for Windows, macOS 13+, Linux glibc+musl (x86/ARM)
+# and Android. It replaced PyPDF2, which nothing imports any more and whose
+# final release (3.0.1) loops forever on a crafted content stream
+# (CVE-2023-36464, reproduced 2026-09-13).
+pypdfium2==5.13.0
 pyreadline3==3.4.1 ; sys_platform == "win32"
 python-dateutil==2.8.2
 python-dotenv==1.0.0

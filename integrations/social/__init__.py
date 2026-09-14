@@ -328,6 +328,22 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"Learning blueprint skipped: {e}")
 
+    # Register the book pipeline blueprint: PDF upload -> pages, chapters and
+    # page images, the parsed-book registry, and the page images themselves.
+    # HERE because this is the one step both the standalone server
+    # (hart_intelligence_entry) and the desktop bootstrap run, so every HARTOS
+    # node serves book upload. It used to be a Nunba blueprint that reached the
+    # app only through Nunba's consumer-routes hook. WARNING on failure, not
+    # debug: a node that silently serves no book routes looks healthy until a
+    # user uploads a book.
+    try:
+        from integrations.learning.api_books import books_bp
+        app.register_blueprint(books_bp)
+        logger.info("Book pipeline registered at /upload/parse_pdf, "
+                    "/db/pdf_files, /db/layouts, /uploads/pdf_parse/")
+    except Exception as e:
+        logger.warning(f"Book pipeline blueprint skipped: {e}")
+
     # Register OS-wide theme management blueprint
     try:
         from .api_theme import theme_bp

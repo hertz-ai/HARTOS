@@ -1821,7 +1821,7 @@ RAG_API = config.get('RAG_API', '')
 # Automatically resolves to localhost:5000 in bundled mode, cloud URLs otherwise.
 from core.config_cache import (
     get_db_url, get_action_api, get_student_api,
-    get_vision_api, get_book_parsing_api, is_bundled as _config_is_bundled,
+    get_vision_api, is_bundled as _config_is_bundled,
     get_central_db_url,
 )
 DB_URL = get_db_url()
@@ -1835,10 +1835,9 @@ CENTRAL_DB_URL = get_central_db_url()
 ACTION_API = get_action_api()
 STUDENT_API = get_student_api()
 LLAVA_API = get_vision_api()
-BOOKPARSING_API = get_book_parsing_api()
 if _config_is_bundled():
     logging.getLogger(__name__).info(
-        f"Bundled mode: DB/Action/Student/BookParsing/Vision APIs → {DB_URL}"
+        f"Bundled mode: DB/Action/Student/Vision APIs → {DB_URL}"
     )
 
 # ============================================================================
@@ -6698,210 +6697,53 @@ def parse_link_for_crwalab(inp):
 
 
 def _parse_pdf_in_process(input_url, user_id, request_id):
-    """Parse PDF in-process. Agent sees every step, UI sees percentage progress bar.
+    """Read a PDF the agent found by URL: download it, then hand it to the ONE
+    book pipeline (integrations/learning/book_pipeline.py).
 
-    Publishes to com.hertzai.bookparsing.{user_id} with {percentage, page_number, ...}
-    — same pattern as the cloud pipeline (wrapper.py). Frontend crossbarWorker.js
-    detects 'percentage' field → PROGRESS_UPDATE → ChatMessageList progress bar.
-
-    Downloads → converts to images → Qwen Vision per page → ToC → chapters → book name.
-    Returns full progress log + extracted content as a single string.
+    This used to re-run the whole parse sequence inline, against helpers
+    imported from Nunba's routes.upload_routes: a second orchestrator of the
+    same pipeline, and one a HARTOS node without Nunba could never run (it fell
+    through to a hive-peer offload, then a cloud URL). The pipeline now runs on
+    every node, so this only downloads, delegates, and formats what the agent
+    sees. Progress still reaches the UI on com.hertzai.bookparsing.{user_id}:
+    the pipeline publishes it, with the book's real file_id.
     """
-    progress = []
-    _total_pages = [0]  # mutable for closure
-    _filename = [input_url.split("/")[-1]]
+    from integrations.learning import book_pipeline
 
-    def step(msg, percentage=None, page_number=None):
-        progress.append(msg)
-        app.logger.info(msg)
-        # Publish percentage progress to bookparsing topic (UI progress bar)
-        try:
-            payload = {
-                "request_id": request_id,
-                "bot_type": "Agent",
-                "filename": _filename[0],
-            }
-            if percentage is not None:
-                payload["percentage"] = int(percentage)
-            if page_number is not None:
-                payload["page_number"] = page_number
-            payload["text"] = [msg]
-            if _total_pages[0] > 0:
-                payload["file_id"] = request_id  # use request_id as identifier
-
-            publish_async(
-                f'com.hertzai.bookparsing.{user_id}',
-                json.dumps(payload),
-            )
-        except Exception:
-            logging.getLogger(__name__).exception("step: swallowed Exception")
-
-    # Step 1: Download PDF
-    step(f"Downloading PDF from {input_url}...")
-    response = pooled_get(input_url, timeout=60)
-    pdf_file_name = input_url.split("/")[-1]
-    if not pdf_file_name.endswith('.pdf'):
-        pdf_file_name += '.pdf'
-
-    upload_dir = os.path.join(os.getcwd(), 'upload')
-    os.makedirs(upload_dir, exist_ok=True)
-    pdf_save_path = os.path.join(upload_dir, pdf_file_name)
-    with open(pdf_save_path, 'wb') as f:
-        f.write(response.content)
-    step(f"PDF saved: {len(response.content)} bytes")
-
+    progress = [f"Downloading PDF from {input_url}..."]
+    # A failed download raises to the caller, which reports the task as failed,
+    # as it always has; a PDF that cannot be read is answered here.
+    pdf_path = book_pipeline.fetch_pdf(input_url)
+    progress.append(f"PDF saved: {pdf_path.stat().st_size} bytes")
     try:
-        # Import parsing functions from Nunba routes (same process)
-        from routes.upload_routes import (
-            _pdf_to_images, _parse_page_via_vision,
-            _assign_chapters_to_pages, _generate_book_name,
-            _save_parse_to_db,
-        )
+        result = book_pipeline.parse_book(pdf_path, user_id, request_id, log=progress)
+    except book_pipeline.BookParseError as e:
+        return "\n".join(progress + [f"Error: {e}"])
+    if result.get('stored') is False:
+        # Read, but the library could not keep it: the agent still gets the
+        # text, as this reader always did.
+        progress.append(f"Not saved to the book library: {result.get('store_error')}")
 
-        # Step 2: Convert PDF to page images
-        step("Converting PDF to page images...", percentage=2)
-        pages = _pdf_to_images(pdf_save_path)
-        if not pages:
-            step("FAILED: Could not convert PDF to images")
-            return "\n".join(progress) + "\nError: PDF conversion failed. Is pdf2image or PyMuPDF installed?"
-        _total_pages[0] = len(pages)
-        _filename[0] = pdf_file_name
-        step(f"Converted to {len(pages)} page images", percentage=5)
-
-        # Step 3: Parse each page via Qwen Vision
-        results = []
-        whole_text_parts = []
-        toc_entries = []
-
-        for page_num, img_path in pages:
-            # percentage: 5% base + page progress scaled to 85% (5..90)
-            pct = 5 + (page_num / len(pages)) * 85
-            step(f"Parsing page {page_num}/{len(pages)} via Qwen Vision...",
-                 percentage=pct, page_number=page_num)
-            page_data = _parse_page_via_vision(page_num, img_path)
-            results.append(page_data)
-            page_text = page_data.get('text', '')
-            whole_text_parts.append(page_text)
-            if page_data.get('toc_entries'):
-                toc_entries.extend(page_data['toc_entries'])
-            word_count = len(page_text.split())
-            pct = 5 + (page_num / len(pages)) * 85
-            step(f"Page {page_num}: type={page_data.get('page_type', '?')}, "
-                 f"{word_count} words, {len(page_data.get('elements', []))} elements",
-                 percentage=pct, page_number=page_num)
-
-        # Step 4: Cross-page chapter assignment
-        step("Assigning chapters from Table of Contents...", percentage=92)
-        results = _assign_chapters_to_pages(results, toc_entries)
-        if toc_entries:
-            step(f"Found {len(toc_entries)} ToC entries, assigned chapters", percentage=94)
+    whole_text = result['whole_text']
+    content_for_agent = whole_text
+    if len(content_for_agent) > 8000:
+        truncate_pos = content_for_agent.rfind('.', 0, 8000)
+        if truncate_pos > 6000:
+            content_for_agent = content_for_agent[:truncate_pos + 1] + "\n[Content truncated]"
         else:
-            step("No ToC found — skipping chapter assignment", percentage=94)
+            content_for_agent = content_for_agent[:8000] + "\n[Content truncated]"
 
-        # Step 5: Generate book name
-        step("Generating book title...", percentage=95)
-        book_name = None
-        if whole_text_parts:
-            book_name = _generate_book_name(
-                whole_text_parts[0][:500] if whole_text_parts[0] else '',
-                toc_entries
-            )
-        step(f"Book title: {book_name or '(could not determine)'}", percentage=97)
-
-        # Step 6: Save to DB
-        step("Saving to database...", percentage=98)
-        whole_text = '\n\n'.join(whole_text_parts)
-        try:
-            from routes.db_routes import _get_db
-            from datetime import datetime, timezone as tz
-            conn = _get_db()
-            now = datetime.now(tz.utc).isoformat()
-            cursor = conn.execute(
-                """INSERT INTO pdf_files (user_id, filename, directory, request_id, created_date)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (user_id, pdf_file_name, upload_dir, request_id, now)
-            )
-            conn.commit()
-            file_id = cursor.lastrowid
-            conn.close()
-            _save_parse_to_db(file_id, results, whole_text, toc_entries, book_name, user_id)
-            step(f"Saved to DB: file_id={file_id}", percentage=99)
-        except Exception as db_err:
-            step(f"DB save skipped: {db_err}")
-
-        # Build agent-visible output
-        step(f"Complete: {len(pages)} pages, {len(whole_text.split())} total words",
-             percentage=100)
-
-        # Truncate whole_text for agent context
-        content_for_agent = whole_text
-        if len(content_for_agent) > 8000:
-            truncate_pos = content_for_agent.rfind('.', 0, 8000)
-            if truncate_pos > 6000:
-                content_for_agent = content_for_agent[:truncate_pos + 1] + "\n[Content truncated]"
-            else:
-                content_for_agent = content_for_agent[:8000] + "\n[Content truncated]"
-
-        return (
-            f"--- PDF Parse Progress ---\n"
-            f"{chr(10).join(progress)}\n"
-            f"--- Extracted Content ---\n"
-            f"File: {pdf_file_name}\n"
-            f"Book: {book_name or 'Unknown'}\n"
-            f"Pages: {len(pages)}\n"
-            f"Total words: {len(whole_text.split())}\n"
-            f"Chapters: {len(toc_entries)}\n"
-            f"---\n{content_for_agent}"
-        )
-
-    except ImportError as ie:
-        step(f"Import error: {ie} — falling back to hive mesh or HTTP")
-
-        # Fallback 1: Try hive mesh peer with vision model
-        try:
-            from integrations.agent_engine.compute_mesh_service import get_compute_mesh
-            mesh = get_compute_mesh()
-            if mesh and mesh._peers:
-                step("No local vision model — sending document to hive peer with GPU...")
-                result = mesh.offload_to_best_peer(
-                    model_type='vision',
-                    prompt=f'Parse PDF document: {pdf_file_name}',
-                    options={'image_path': pdf_save_path, 'timeout': 120},
-                )
-                if result and 'error' not in result:
-                    step("Document parsed by hive peer", percentage=100)
-                    return (
-                        f"--- Progress ---\n{chr(10).join(progress)}\n"
-                        f"--- Result (via hive peer) ---\n{result.get('response', '')}"
-                    )
-        except Exception as mesh_err:
-            step(f"Hive mesh unavailable: {mesh_err}")
-
-        # Fallback 2: Cloud HTTP
-        if BOOKPARSING_API:
-            step("Sending to cloud parsing service...")
-            try:
-                payload = {'user_id': user_id, 'request_id': request_id}
-                with open(pdf_save_path, 'rb') as f:
-                    files = [('file', (pdf_file_name, f, 'application/pdf'))]
-                    resp = pooled_post(BOOKPARSING_API, data=payload, files=files, timeout=60)
-                return (
-                    f"--- Progress ---\n{chr(10).join(progress)}\n"
-                    f"--- Result (via cloud) ---\n{resp.text}"
-                )
-            except Exception as cloud_err:
-                step(f"Cloud parsing service unavailable: {cloud_err}")
-
-        # All paths exhausted
-        step("Document parsing requires a vision model (GPU). "
-             "No local GPU, no hive peers with GPU, and the cloud service "
-             "is not responding. Please try again when a GPU device is connected.")
-        return "\n".join(progress)
-    finally:
-        try:
-            os.remove(pdf_save_path)
-        except OSError:
-            logging.getLogger(__name__).warning("_parse_pdf_in_process: swallowed OSError", exc_info=True)
+    return (
+        f"--- PDF Parse Progress ---\n"
+        f"{chr(10).join(progress)}\n"
+        f"--- Extracted Content ---\n"
+        f"File: {pdf_path.name}\n"
+        f"Book: {result.get('book_name') or 'Unknown'}\n"
+        f"Pages: {result['total_pages']}\n"
+        f"Total words: {len(whole_text.split())}\n"
+        f"Chapters: {result['chapters']}\n"
+        f"---\n{content_for_agent}"
+    )
 
 
 try:
