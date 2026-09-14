@@ -218,3 +218,15 @@ def test_installing_the_gate_under_nunba_ci_says_so(env, caplog):
         assert install_api_gate(_app()) is True
     assert any('NUNBA_CI=1' in r.getMessage() for r in caplog.records
                if r.levelno == logging.CRITICAL)
+
+
+def test_an_installed_build_ignores_nunba_ci(desktop, env, caplog):
+    """A shipped desktop that somehow carried NUNBA_CI would otherwise trust
+    every caller; frozen, the gate holds and says the variable was ignored."""
+    env.setenv('NUNBA_CI', '1')
+    env.setattr(sys, 'frozen', True, raising=False)
+    assert desktop.get('/chat', environ_base=LAN).status_code == 401
+    with caplog.at_level(logging.CRITICAL, logger='hevolve_security'):
+        install_api_gate(_app())
+    assert any('ignored' in r.getMessage() for r in caplog.records
+               if r.levelno == logging.CRITICAL)

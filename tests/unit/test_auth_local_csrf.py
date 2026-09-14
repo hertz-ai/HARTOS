@@ -364,6 +364,17 @@ def test_the_staging_container_trusts_every_caller(app, monkeypatch):
     assert resp.status_code == 401
 
 
+def test_an_installed_build_ignores_nunba_ci(app, monkeypatch):
+    """Staging always runs from source, so NUNBA_CI on a frozen (installed)
+    build can only be a misconfiguration: the same caller stays remote."""
+    import sys
+    monkeypatch.setenv('NUNBA_CI', '1')
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    resp = app.test_client().post('/test/local-only',
+                                  environ_base={'REMOTE_ADDR': '172.18.0.1'})
+    assert resp.status_code == 401
+
+
 def test_trusted_proxy_forwarded_loopback_accepted(app, monkeypatch):
     """Behind a trusted reverse proxy, the real client IP arrives in
     X-Forwarded-For.  Proxy addr matches TRUSTED_PROXY and XFF is
