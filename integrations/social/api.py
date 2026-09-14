@@ -464,33 +464,40 @@ def verify_user_for_node():
 @social_bp.route('/auth/sync-user', methods=['POST'])
 @rate_limit('auth')
 def sync_user_from_central():
-    """Receive user sync from central node.
+    """Receive a user-profile sync from a peer node.
 
-    Requires a valid hive token with node_sig verification.
-    The calling node must present its Ed25519 public key for verification.
+    The sender proves its identity the SAME way /api/social/hierarchy/sync
+    does: it signs ``{node_id, user_data}`` and the receiver verifies the
+    signature against the sender's REGISTERED PeerNode.public_key
+    (discovery._sender_signature_valid, strict — never a key from the
+    request), regardless of enforcement mode.
+
+    #59 (2026-09-14): this route used to verify a hive token against a
+    ``node_public_key`` taken FROM THE BODY, so any caller could sign with
+    their own key, send that key alongside, pass verification, and
+    create/overwrite ANY user — including one with role 'central', which
+    passes require_admin — from the open internet (/api/social/ is
+    gate-exempt).  It is the orphaned twin of hierarchy_sync (the live sync
+    path); 0 calls in 52 days of central nginx logs.  A synced profile never
+    confers a privileged role (_handle_sync_user drops central/regional/
+    admin/moderator).
     """
     data = _get_json()
-    token = ''
-    auth_header = request.headers.get('Authorization', '')
-    if auth_header.startswith('Bearer '):
-        token = auth_header[7:]
-
-    node_public_key = data.get('node_public_key', '')
     user_data = data.get('user_data', {})
+    if not user_data:
+        return _err("user_data required")
 
-    if not token or not node_public_key or not user_data:
-        return _err("token, node_public_key, and user_data required")
-
-    # Verify the hive token from the calling node
-    from .auth import verify_hive_jwt
-    payload = verify_hive_jwt(token, node_public_key)
-    if not payload:
-        return _err("Invalid hive token or node signature", 401)
-
-    # Process the user sync
+    from .discovery import _sender_signature_valid
+    from .sync_engine import SyncEngine
     try:
-        from .sync_engine import SyncEngine
         with db_session() as db:
+            if not _sender_signature_valid(db, data):
+                # WARNING, not INFO: central logs nothing below it after boot,
+                # and a refusal here is the only trace of a spoof attempt.
+                logger.warning(
+                    "sync-user refused: no signature from a known peer "
+                    "(node_id=%s)", data.get('node_id'))
+                return _err("unverified node identity", 401)
             SyncEngine._handle_sync_user(db, user_data)
         return _ok({'synced': True})
     except Exception as e:

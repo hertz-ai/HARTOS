@@ -563,6 +563,24 @@ class SyncEngine:
                 "(:id, :a, :b, :s, :i, :c, :ac)"), params)
         return fid
 
+    # A synced PROFILE must never confer AUTHORITY (#59): auth.require_admin
+    # accepts role 'central', require_moderator accepts 'regional'/'central',
+    # so a sync payload naming one of these would escalate the synced user on
+    # the receiving node.  A user's authority is local to where they
+    # authenticate, not something a peer's sync grants.  Non-privileged roles
+    # ('flat', 'guest', ...) still replicate.
+    _PRIVILEGED_SYNC_ROLES = frozenset({'central', 'regional', 'admin', 'moderator'})
+
+    @staticmethod
+    def _safe_synced_role(role):
+        """The role a sync payload may set, or None to leave the row's role
+        untouched.  A privileged role is refused (never escalates, never
+        demotes an existing privileged user to flat)."""
+        r = (role or '').strip().lower()
+        if not r or r in SyncEngine._PRIVILEGED_SYNC_ROLES:
+            return None
+        return r
+
     @staticmethod
     def _handle_sync_user(db, payload: dict):
         """Create or update a User record from sync data."""
@@ -581,8 +599,13 @@ class SyncEngine:
                 existing.handle = payload['handle']
             if payload.get('display_name'):
                 existing.display_name = payload['display_name']
-            if payload.get('role'):
-                existing.role = payload['role']
+            _safe_role = SyncEngine._safe_synced_role(payload.get('role'))
+            if _safe_role:
+                existing.role = _safe_role
+            elif payload.get('role'):
+                logger.warning(
+                    "sync_user: refusing to set privileged role %r on %s "
+                    "from sync (#59)", payload['role'], user_id)
             logger.info(f"Sync: updated user {user_id} from sync")
         else:
             # Create new user record from sync
@@ -592,7 +615,7 @@ class SyncEngine:
                 username=username,
                 display_name=payload.get('display_name', username),
                 handle=payload.get('handle', ''),
-                role=payload.get('role', 'flat'),
+                role=SyncEngine._safe_synced_role(payload.get('role')) or 'flat',
                 user_type=payload.get('user_type', 'human'),
                 api_token=generate_api_token(),
             )

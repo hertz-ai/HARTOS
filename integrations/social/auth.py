@@ -180,6 +180,19 @@ def verify_hive_jwt(token: str, issuer_public_key_hex: str) -> dict:
     """Verify a HIVE-scoped JWT from another node using its Ed25519 public key.
 
     Returns payload dict on success, empty dict on failure.
+
+    TRUSTED KEY ONLY — NEVER a key from the request (#59).  ``issuer_public_key_hex``
+    MUST be resolved from a trusted source (a peer's registered
+    PeerNode.public_key by the claimed node_id, or a key that traces to the
+    node's master trust anchor via the delegation chain), the way
+    discovery._sender_signature_valid resolves it.
+    Passing a caller-supplied key is self-certification: it always verifies and
+    proves nothing.  That was the /api/social/auth/sync-user admin-takeover
+    (a caller signed with its own key, sent that key as ``node_public_key``,
+    and created a role-'central' user); that route now uses
+    _sender_signature_valid and no longer calls this.  This function has NO
+    production caller (grep: only tests); a new route MUST NOT reuse the
+    key-as-parameter shape — resolve the key by identity first.
     """
     mgr = _get_jwt_manager()
     if mgr:
