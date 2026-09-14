@@ -155,28 +155,37 @@ def get_me():
     return _ok(g.user.to_dict(include_token=False))
 
 
-# ─── Hevolve bridge (trust-on-first-use) ───
+# ─── Hevolve bridge ───
 
 @social_bp.route('/auth/link-hevolve', methods=['POST'])
 @rate_limit('auth')
 def link_hevolve():
-    """Exchange a Hevolve-OTP-verified identity for a HARTOS-native token.
+    """Exchange a Hevolve login for a HARTOS-native token.
 
-    The Hevolve access_token (from Hevolve_Database's /data/login +
-    /data/varify_otp) is an opaque OAuth2 client_credentials string with
-    no embedded claims — HARTOS can't validate it directly. Rather than
-    build a second, independent verification path, this endpoint trusts
-    the client's claimed identity (the client only reaches this call
-    after Hevolve OTP verification already succeeded) and finds-or-
-    creates the matching SocialUser by email — the one field both the
-    legacy `user` table (email_address, required+unique) and SocialUser
-    (email, unique) share — then hands back a normal HARTOS JWT for all
-    subsequent /api/social/* calls. Idempotent: repeat calls with the
-    same email return the same SocialUser with a fresh token.
+    The caller proves the email with the Hevolve access token its OTP login
+    returned (Hevolve_Database's /data/login + /data/varify_otp), sent as
+    ``Authorization: Bearer <token>``.  The token is opaque, so Kong is asked
+    which account minted it (kong_identity.email_for_token), and only that
+    account's email is linked.  The matching SocialUser is found or created
+    by email, the one field both the legacy `user` table (email_address,
+    required+unique) and SocialUser (email, unique) share, and a normal
+    HARTOS JWT comes back for all subsequent /api/social/* calls.
+    Idempotent: repeat calls with the same email return the same SocialUser
+    with a fresh token.
+
+    It used to take the body's email on trust ("the client only reaches this
+    call after Hevolve OTP verification already succeeded"), which is true of
+    an honest client and of nobody else: any caller could POST an existing
+    user's email and get that user's JWT, carrying that user's role, from the
+    public internet on central.  Creating an account needs the same proof,
+    because an account made under someone else's email is the same takeover
+    once they link to it.  A node without Kong (a desktop) can prove no email
+    and refuses every call.
     """
     import re
     import secrets
     from .auth import generate_jwt, generate_api_token
+    from .kong_identity import email_for_token
 
     data = _get_json()
     email = (data.get('email') or '').strip().lower()
@@ -185,6 +194,16 @@ def link_hevolve():
 
     if not email:
         return _err("email required")
+
+    auth_header = request.headers.get('Authorization', '')
+    hevolve_token = (auth_header[7:].strip()
+                     if auth_header.startswith('Bearer ') else '')
+    if not hevolve_token or email_for_token(hevolve_token) != email:
+        # WARNING, not INFO: central logs nothing below it after boot, and a
+        # refusal here is the only trace of someone trying another's email.
+        logger.warning("link-hevolve refused: no Hevolve token proving the "
+                       "email was presented")
+        return _err("A Hevolve access token for this email is required", 401)
 
     db = get_db()
     try:
