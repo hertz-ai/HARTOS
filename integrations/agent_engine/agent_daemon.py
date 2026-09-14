@@ -646,7 +646,13 @@ class AgentDaemon:
                 user_id = str(goal.user_id) if hasattr(goal, 'user_id') else 'system'
                 result = dispatch_goal(
                     task.description, user_id, goal_id, goal_type)
-                return {'success': result is not None, 'response': result}
+                if result is None:
+                    # parallel_dispatch marks the task FAILED with this error.
+                    from .dispatch import dispatch_failure_reason
+                    return {'success': False, 'response': None,
+                            'error': dispatch_failure_reason(goal_id)
+                            or 'dispatch returned no response'}
+                return {'success': True, 'response': result}
 
             result = dispatch_parallel_tasks(
                 ledger, _dispatch_task, max_concurrent=batch_count)
@@ -1749,6 +1755,14 @@ class AgentDaemon:
                             f"Goal {goal_key}: transient defer (user active / "
                             f"breaker open) — no backoff, no auto-pause")
                         continue
+                    # Why the turn failed, when it ran, so a paused goal says
+                    # what to fix (a 402 from the hosted LLM, say) instead of
+                    # only counting failures.
+                    try:
+                        from .dispatch import dispatch_failure_reason
+                        _why = dispatch_failure_reason(goal_key)
+                    except Exception:
+                        _why = None
                     with _module_lock:
                         info = _dispatch_backoff.get(goal_key, {'failures': 0})
                         info['failures'] = info.get('failures', 0) + 1
@@ -1763,7 +1777,8 @@ class AgentDaemon:
                         cfg = dict(goal.config_json or {})  # copy: see above
                         cfg['pause_reason'] = (
                             f'Auto-paused: {failure_count} consecutive '
-                            f'dispatch failures')
+                            f'dispatch failures'
+                            + (f' (last: {_why})' if _why else ''))
                         cfg['paused_at'] = datetime.utcnow().isoformat()
                         goal.config_json = cfg
                         logger.warning(

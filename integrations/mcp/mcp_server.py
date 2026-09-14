@@ -152,6 +152,13 @@ def dispatch_goal(goal_id: str, goal_type: str = 'marketing') -> str:
                 "mcp.dispatch_goal: persist last_dispatched_at "
                 "failed for %s: %s", goal_id, _persist_err)
 
+        if response is None:
+            # A turn that failed, or never ran, dispatched nothing; reporting
+            # it as dispatched with a "None" preview read as success.
+            from integrations.agent_engine.dispatch import dispatch_failure_reason
+            return json.dumps({"dispatched": False, "goal_id": goal_id,
+                               "error": dispatch_failure_reason(goal_id)
+                               or "dispatch returned no response"})
         return json.dumps({"dispatched": True, "goal_id": goal_id, "response_preview": str(response)[:500]}, default=str)
     except Exception as e:
         return json.dumps({"error": str(e)})

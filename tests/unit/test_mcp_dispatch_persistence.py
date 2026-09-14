@@ -217,3 +217,23 @@ def test_mcp_dispatch_persists_even_when_dispatch_returns_none(
     db.expire_all()
     row = db.query(AgentGoal).filter_by(id=goal.id).first()
     assert row.last_dispatched_at is not None
+
+
+def test_mcp_dispatch_reports_a_none_as_not_dispatched(fresh_db, monkeypatch):
+    """A None from dispatch.py is a turn that failed or never ran.  The tool
+    used to answer {"dispatched": true, "response_preview": "None"}, which a
+    caller reads as success; it now says it did not dispatch, and why."""
+    db, _ = fresh_db
+    goal = _seed_goal(db)
+    _patch_mcp_db(monkeypatch, db)
+
+    from integrations.agent_engine import dispatch as dispatch_mod
+    monkeypatch.setattr(dispatch_mod, 'dispatch_goal', lambda *a, **kw: None)
+    monkeypatch.setattr(dispatch_mod, 'dispatch_failure_reason',
+                        lambda goal_id: 'turn failed: Error code: 402')
+
+    from integrations.mcp.mcp_server import dispatch_goal
+    import json
+    result = json.loads(dispatch_goal(goal_id=goal.id, goal_type='marketing'))
+    assert result['dispatched'] is False
+    assert result['error'] == 'turn failed: Error code: 402'

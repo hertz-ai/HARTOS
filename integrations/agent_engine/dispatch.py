@@ -450,6 +450,59 @@ def is_transient_deferral() -> bool:
         return False
 
 
+# Why dispatch_goal last returned None for a goal whose turn ran and failed,
+# by goal id, for the callers that report it (the daemon's pause reason, the
+# MCP tool, a parallel subtask's ledger error).  Each dispatch_goal call
+# clears its goal's entry first and a read removes it, so a reason always
+# describes the latest call; the cap only bounds callers that never read.
+_TURN_FAILURES_MAX = 256
+_turn_failures: Dict[str, str] = {}
+_turn_failures_lock = threading.Lock()
+
+
+def _turn_failure(reply) -> Optional[str]:
+    """Why ``reply`` is a failed turn dressed as an answer, or None when it is
+    a real reply.
+
+    The pipeline does not raise when its LLM call fails: user_facing_error()
+    turns the exception into a polite sentence and the turn returns it as the
+    reply.  core.agent_tools.is_user_facing_error is the one recogniser;
+    worker_loop._after_response uses it the same way."""
+    from core.agent_tools import is_user_facing_error
+    if not is_user_facing_error(reply):
+        return None
+    return f'turn failed: {reply.strip()[:160]}'
+
+
+def _failed_turn(goal_id, reply) -> bool:
+    """True when ``reply`` is a failed turn, recording why for
+    dispatch_failure_reason(goal_id).
+
+    dispatch_goal used to return a failed turn's sentence as the goal's
+    response, so its callers counted it as work: a parallel subtask was
+    marked COMPLETED and unblocked its dependents, the daemon cleared the
+    goal's backoff, and a goal whose every turn failed (every hosted call
+    402 on central, 2026-09-14) was dispatched again each tick with no
+    backoff.  dispatch_goal now returns None for it, which every caller
+    treats as no result."""
+    reason = _turn_failure(reply)
+    if reason is None:
+        return False
+    with _turn_failures_lock:
+        _turn_failures[str(goal_id)] = reason
+        while len(_turn_failures) > _TURN_FAILURES_MAX:
+            _turn_failures.pop(next(iter(_turn_failures)))
+    logger.warning(f"Goal {goal_id}: {reason[:140]!r}; no response returned")
+    return True
+
+
+def dispatch_failure_reason(goal_id) -> Optional[str]:
+    """Why the latest dispatch_goal for ``goal_id`` returned None after its
+    turn ran and failed, or None.  Read once: the entry is removed."""
+    with _turn_failures_lock:
+        return _turn_failures.pop(str(goal_id), None)
+
+
 # Concurrency ceiling for autonomous dispatch — single source both daemons call
 # so the policy can't drift (Gate-2/4).  The 2026-06-13 sluggishness: agent_daemon
 # AND coding_daemon each dispatched up to HEVOLVE_*_MAX_CONCURRENT (default 10)
@@ -843,6 +896,10 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     Returns:
         Response text or None on failure
     """
+    # A failure reason describes this call only (dispatch_failure_reason).
+    with _turn_failures_lock:
+        _turn_failures.pop(str(goal_id), None)
+
     # BUDGET GATE: check goal budget + platform affordability before dispatch
     try:
         from integrations.agent_engine.budget_gate import pre_dispatch_budget_gate
@@ -968,7 +1025,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     if _status == 'deferred':
         return None
     if _status == 'ok' and response:
-        return response
+        # A turn that ran and failed is not retried on Tier 2 in the same call.
+        return None if _failed_turn(goal_id, response) else response
 
     # Tier 2: HTTP proxy to HARTOS backend port
     # Circuit breaker: skip HTTP if server recently unresponsive
@@ -988,6 +1046,10 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             _cb_record_success()
             result = resp.get_json() if hasattr(resp, 'get_json') else resp.json()
             response = result.get('response', '')
+            # Before the guardrail and the world-model record: a failed turn
+            # is neither a response nor training data.
+            if _failed_turn(goal_id, response):
+                return None
 
             # GUARDRAIL: post-response check (fail-closed)
             try:
@@ -1100,7 +1162,9 @@ def _dispatch_single_instruction(base_url: str, user_id: str, inst,
         inst.text, user_id, body['prompt_id'], daemon_id=batch_id,
         native_fallback=False)
     if _status == 'ok' and _text:
-        return (inst.id, _text[:500], None)
+        # A failed turn is not the instruction's result (_turn_failure).
+        _failed = _turn_failure(_text)
+        return (inst.id, None, _failed) if _failed else (inst.id, _text[:500], None)
     if _status == 'deferred':
         # A human has the LLM, or it is saturated. NOT a failure: reporting it
         # as one burns an attempt and (once instructions get an attempt cap)
@@ -1114,7 +1178,9 @@ def _dispatch_single_instruction(base_url: str, user_id: str, inst,
                            headers=_internal_auth_headers(), timeout=300)
         if resp.status_code == 200:
             result_text = resp.json().get('response', '')
-            return (inst.id, result_text[:500], None)
+            _failed = _turn_failure(result_text)
+            return ((inst.id, None, _failed) if _failed
+                    else (inst.id, result_text[:500], None))
         return (inst.id, None, f'HTTP {resp.status_code}')
     except requests.RequestException as e:
         return (inst.id, None, str(e))
