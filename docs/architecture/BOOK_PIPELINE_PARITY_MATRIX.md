@@ -7,7 +7,8 @@ local stack has an equivalent — on BOTH agent channels, the way
 **Why it exists:** the cloud path is eight model endpoints across six hostnames
 that no longer resolve. "Do we have parity locally" was being answered from
 memory. Rows were first checked against the tree on 2026-09-10 and re-checked
-on 2026-09-13, when the pipeline moved from Nunba into HARTOS.
+on 2026-09-13, when the pipeline moved from Nunba into HARTOS, and on
+2026-09-14, when progress moved onto the MessageBus.
 
 **How to read a row.** *Route* = an HTTP endpoint exists. *Agent* = an LLM tool
 in the registry (`core/agent_tools.py`) can invoke it during a turn. Per the OS
@@ -91,7 +92,7 @@ a working demo.
 | File registry | `adduserfile` (mailer) | `BookFile` (table `pdf_files`, `integrations/social/models.py`); `GET /db/pdf_files` | ✅ `list_books` | ✅ |
 | Layout persistence | `add_batch_layouts` (cloud DB) | `BookPageLayout` (table `page_layouts`); `GET /db/layouts` | ✅ `read_book_page`, `read_book_chapter` | ✅ |
 | Page image | — | `GET /uploads/pdf_parse/<file_id>/page_<n>.jpg` | ✅ `page_image_url` on each page a tool returns — only when that image exists | ✅ **new** |
-| Progress → client | WAMP `com.hertzai.bookparsing.{uid}` | `book_pipeline._publish` on the same topic, with `percentage` and the book's real `file_id` | n/a | ✅ |
+| Progress → client | WAMP `com.hertzai.bookparsing.{uid}` | `book_pipeline._publish` on the MessageBus topic `book.parsing`: Crossbar on the same `com.hertzai.bookparsing.{uid}`, plus SSE and PeerLink; `percentage`, the book's real `file_id` and a `msg_id` per message. A repeat upload of a book already read goes straight to 100, as central's did | n/a | ✅ |
 | Agent sees upload | — | — | ✅ `get_user_uploaded_file` (returns file_id **only**) | ⚠ thin |
 | **Course / subject registration** | `createbookcourse`, `createbooksubject` | ❌ no table | ❌ none | **GAP** |
 | **QA creation** | `qgen`, `chatbot.py:7655 /create_qa` | ❌ | ❌ (but `tutor` expert agent declares it — below) | **GAP** |

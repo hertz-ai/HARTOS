@@ -368,15 +368,56 @@ class TestProgress:
         assert percents == sorted(percents) and percents[-1] == 100
         assert [p['page_number'] for p in payloads if 'page_number' in p] == [1, 2, 3]
 
-    def test_it_is_published_on_the_book_parsing_topic(self):
-        sent = {}
+    def test_it_goes_out_on_the_message_bus_and_the_crossbar_topic(self, monkeypatch):
+        """Through the real MessageBus: its own subscribers, and its Crossbar
+        leg on the topic central's pipeline published on."""
+        import types
 
-        def publish_async(topic, message):
-            sent['topic'], sent['payload'] = topic, json.loads(message)
+        from core.peer_link import message_bus as mb
+        bus = mb.MessageBus()
+        monkeypatch.setattr(mb, '_bus', bus)
+        # No native WAMP session and no PeerLink here: the Crossbar leg takes
+        # the HTTP transport, which records what it would have sent.
+        no_session = types.ModuleType('hartos.crossbar_server')
+        no_session.wamp_session = None
+        monkeypatch.setitem(sys.modules, 'hartos.crossbar_server', no_session)
+        monkeypatch.setitem(sys.modules, 'core.peer_link.link_manager', None)
+        local, crossbar = [], []
+        bus.subscribe('book.parsing', lambda topic, data: local.append(data))
+        bus.set_http_transport(lambda topic, payload: crossbar.append((topic, json.loads(payload))))
 
-        with patch('core.safe_hartos_attr.safe_hartos_attr', return_value=publish_async):
-            assert bp._publish('42', {'percentage': 50}) is True
-        assert sent == {'topic': 'com.hertzai.bookparsing.42', 'payload': {'percentage': 50}}
+        assert bp._publish('42', {'percentage': 50, 'request_id': 'r'}) is True
+        assert bp._publish('42', {'percentage': 60, 'request_id': 'r'}) is True
+
+        assert [(d['percentage'], d['user_id']) for d in local] == [(50, '42'), (60, '42')]
+        assert [topic for topic, _ in crossbar] == ['com.hertzai.bookparsing.42'] * 2
+        assert [payload['percentage'] for _, payload in crossbar] == [50, 60]
+        # The web client drops a repeat of a message id and, lacking one, keys
+        # on request_id, which every message of one book shares: without an
+        # id of its own, every page after the first would be thrown away.
+        ids = [d.get('msg_id') for d in local]
+        assert all(ids) and len(set(ids)) == 2
+
+    def test_a_repeat_upload_of_a_book_already_read_goes_straight_to_100(
+            self, book_node, tmp_path):
+        """As central answered a repeat upload (pipeline/upload_api.py:773)."""
+        pdf = make_pdf(tmp_path / 'book.pdf')
+        first = bp.parse_book(pdf, '42', 'req-1')
+        book_node.published.clear()
+        again = bp.start_parse(pdf, '42', 'req-2')
+        assert again['existing'] is True and again['file_id'] == first['file_id']
+        assert [(uid, p['percentage'], p['file_id'], p['request_id'])
+                for uid, p in book_node.published] == [('42', 100, first['file_id'], 'req-2')]
+
+    def test_a_repeat_upload_of_a_book_still_being_read_adds_no_progress(
+            self, book_node, tmp_path, monkeypatch):
+        """Its own parse reports; a second 100% would jump the bar ahead of it."""
+        monkeypatch.setattr(bp, '_worker', lambda *a, **k: None)
+        pdf = make_pdf(tmp_path / 'book.pdf')
+        bp.start_parse(pdf, '42')
+        book_node.published.clear()
+        assert bp.start_parse(pdf, '42')['existing'] is True
+        assert book_node.published == []
 
     def test_the_sync_api_returns_what_an_agent_reads(self, book_node, tmp_path):
         result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')

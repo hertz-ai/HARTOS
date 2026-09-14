@@ -36,6 +36,12 @@ model still produces a readable book. Chapters come from the PDF's outline
 when it has one (it points at real page indices), else from the
 table-of-contents pages the model read.
 
+Progress goes out on the MessageBus (core/peer_link/message_bus.py), topic
+'book.parsing': to this node's own subscribers and the desktop's SSE, to the
+user's other devices over PeerLink, and over Crossbar on
+com.hertzai.bookparsing.{user_id} -- the topic central's pipeline published
+on, and the one the web app and Android render.
+
 BOUNDED
 -------
 The parser now faces the network, not just localhost, so no input may pin a
@@ -91,10 +97,11 @@ _JOB_CAP = 256
 #: Vision errors, before any success, after which the rest of the book is read
 #: from its text layer rather than asking the model again for every page.
 _VLM_GIVE_UP_AFTER = 2
-#: The progress topic the web app (crossbarWorker) and Android
-#: (AutobahnConnectionManager) already render: `percentage` drives the
+#: The MessageBus topic for progress. The bus's TOPIC_MAP carries it to
+#: com.hertzai.bookparsing.{user_id}, which the web app (crossbarWorker) and
+#: Android (AutobahnConnectionManager) already render: `percentage` drives the
 #: "Understanding the Content: N%" bar.
-PROGRESS_TOPIC = 'com.hertzai.bookparsing.{user_id}'
+PROGRESS_TOPIC = 'book.parsing'
 
 _LIVE = ('pending', 'processing')
 
@@ -790,17 +797,39 @@ def get_job(job_id) -> Optional[dict]:
     return job
 
 
+def _progress(request_id, filename, file_id, message, percentage=None,
+              page_number=None) -> dict:
+    """One progress message, as the clients read it off the book-parsing topic."""
+    payload = {'request_id': request_id, 'bot_type': 'Agent',
+               'filename': filename, 'file_id': file_id, 'text': [message]}
+    if percentage is not None:
+        payload['percentage'] = int(percentage)
+    if page_number is not None:
+        payload['page_number'] = page_number
+    return payload
+
+
 def _publish(user_id, payload) -> bool:
-    """Progress to the user's clients on the book-parsing topic."""
+    """Progress to the user's clients, through the MessageBus: this node's
+    own subscribers and the desktop's SSE, the user's other devices over
+    PeerLink, and Crossbar on com.hertzai.bookparsing.{user_id}.
+
+    Not through safe_hartos_attr('publish_async'): that finds the entry
+    module only under its own name, and `python hart_intelligence_entry.py`
+    (the Docker CMD) runs it as __main__.
+
+    Each message carries its own msg_id. The web client drops a repeat of a
+    message id and, lacking one, keys on request_id -- which every message of
+    one book shares -- so every page after the first would be dropped.
+    """
     try:
-        from core.safe_hartos_attr import safe_hartos_attr
-        publish_async = safe_hartos_attr('publish_async')
-        if publish_async is None:
-            return False
-        publish_async(PROGRESS_TOPIC.format(user_id=user_id), json.dumps(payload))
+        from core.peer_link.message_bus import get_message_bus
+        get_message_bus().publish(PROGRESS_TOPIC,
+                                  dict(payload, msg_id=uuid.uuid4().hex[:16]),
+                                  user_id=str(user_id))
         return True
     except Exception as e:
-        logger.debug(f"book progress publish failed: {e}")
+        logger.warning(f"book progress not published: {e}")
         return False
 
 
@@ -817,13 +846,8 @@ def _make_step(job_id, file_id, user_id, request_id, filename, log) -> Callable:
         if total_pages is not None:
             fields['total_pages'] = total_pages
         _update_job(job_id, **fields)
-        payload = {'request_id': request_id, 'bot_type': 'Agent',
-                   'filename': filename, 'file_id': file_id, 'text': [message]}
-        if percentage is not None:
-            payload['percentage'] = int(percentage)
-        if page_number is not None:
-            payload['page_number'] = page_number
-        _publish(user_id, payload)
+        _publish(user_id, _progress(request_id, filename, file_id, message,
+                                    percentage, page_number))
         now = time.monotonic()
         if file_id is not None and now - last_touch[0] >= _TOUCH_EVERY_S:
             last_touch[0] = now
@@ -961,9 +985,8 @@ def _run(file_id, pdf_path, user_id, request_id, job_id=None, log=None,
         _mark_failed(file_id, reason)
         _update_job(job_id, status='failed', error=reason)
         log.append(f'Failed: {reason}')
-        _publish(user_id, {'request_id': request_id, 'bot_type': 'Agent',
-                           'filename': name, 'file_id': file_id,
-                           'text': [f'Could not read this book: {reason}']})
+        _publish(user_id, _progress(request_id, name, file_id,
+                                    f'Could not read this book: {reason}'))
         if isinstance(e, BookParseError):
             raise
         raise BookParseError(reason) from e
@@ -1022,11 +1045,16 @@ def start_parse(pdf_path, user_id, request_id='') -> dict:
 
     A file already parsed, or being parsed, for this user is not parsed twice:
     an upload route and the parse_book_pdf tool both start parses, often for
-    the same upload.
+    the same upload. One already read goes straight to 100% on the book the
+    user already has, as central answered a repeat upload
+    (pipeline/upload_api.py); one still being read reports its own progress.
     """
     pdf_path = Path(pdf_path)
     existing = _existing(user_id, pdf_path.name)
     if existing is not None:
+        if existing['status'] == 'completed':
+            _publish(user_id, _progress(request_id, pdf_path.name, existing['file_id'],
+                                        'Already in your library', 100))
         return {'job_id': _job_for_file(existing['file_id']),
                 'file_id': existing['file_id'], 'status': existing['status'],
                 'existing': True}
