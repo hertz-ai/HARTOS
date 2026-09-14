@@ -235,3 +235,21 @@ def test_a_non_privileged_role_still_syncs(client):
     resp = _post(client, {'user_id': 'u1', 'username': 'a', 'role': 'flat'})
     assert resp.status_code == 200
     assert _get_user('u1').role == 'flat'
+
+
+@pytest.mark.parametrize('local_role', ['central', 'regional', 'admin', 'moderator'])
+def test_a_sync_does_not_demote_a_local_privileged_user(client, local_role):
+    # #65: a signed sync from a known peer sending role='flat' must NOT strip a
+    # LOCAL admin/central/regional/moderator down to flat.  Authority is local;
+    # a sync neither grants nor removes it.
+    from integrations.social.models import get_db, User
+    db = get_db()
+    try:
+        db.add(User(id='adm1', username='adm', display_name='adm',
+                    role=local_role, user_type='human', api_token='t-adm'))
+        db.commit()
+    finally:
+        db.close()
+    resp = _post(client, {'user_id': 'adm1', 'username': 'adm', 'role': 'flat'})
+    assert resp.status_code == 200
+    assert _get_user('adm1').role == local_role  # unchanged, not demoted

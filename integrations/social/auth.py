@@ -494,6 +494,16 @@ def require_local_or_auth(f):
     return decorated
 
 
+# The User.role strings that confer elevated authority.  require_admin honors
+# 'central' (below), require_moderator honors 'regional'/'central'; the extra
+# 'admin'/'moderator' are kept as a conservative superset so a role STRING of
+# that name is never treated as an ordinary profile field.  ONE definition,
+# imported by sync_engine's role-strip (#59/#65) so the set a sync may set or
+# preserve can never drift from the set the authority checks honor.  A new
+# privileged role added here is stripped from syncs automatically.
+PRIVILEGED_ROLES = frozenset({'central', 'regional', 'admin', 'moderator'})
+
+
 def require_admin(f):
     """Decorator: requires central (cloud admin) role or is_admin flag."""
     @wraps(f)

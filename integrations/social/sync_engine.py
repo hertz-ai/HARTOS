@@ -563,21 +563,31 @@ class SyncEngine:
                 "(:id, :a, :b, :s, :i, :c, :ac)"), params)
         return fid
 
-    # A synced PROFILE must never confer AUTHORITY (#59): auth.require_admin
-    # accepts role 'central', require_moderator accepts 'regional'/'central',
-    # so a sync payload naming one of these would escalate the synced user on
-    # the receiving node.  A user's authority is local to where they
-    # authenticate, not something a peer's sync grants.  Non-privileged roles
-    # ('flat', 'guest', ...) still replicate.
-    _PRIVILEGED_SYNC_ROLES = frozenset({'central', 'regional', 'admin', 'moderator'})
+    # A synced PROFILE must never touch AUTHORITY (#59, #65).  A user's
+    # authority is local to where they authenticate, not something a peer's
+    # sync grants OR removes.  The privileged-role set is auth.PRIVILEGED_ROLES
+    # (the one definition beside require_admin/require_moderator), imported so
+    # the strip can never drift from what the authority checks honor.
+    @staticmethod
+    def _privileged_roles():
+        try:
+            from .auth import PRIVILEGED_ROLES
+            return PRIVILEGED_ROLES
+        except Exception:
+            # Fail closed: if auth can't be imported, treat the known set as
+            # privileged rather than let a role through unchecked.
+            return frozenset({'central', 'regional', 'admin', 'moderator'})
 
     @staticmethod
     def _safe_synced_role(role):
-        """The role a sync payload may set, or None to leave the row's role
-        untouched.  A privileged role is refused (never escalates, never
-        demotes an existing privileged user to flat)."""
+        """The role a sync payload may SET, or None when the payload names a
+        privileged role.  A privileged target is refused (returns None), so a
+        sync never GRANTS authority.  The caller additionally refuses to
+        overwrite an existing privileged role, so a sync never REMOVES local
+        authority either (#65).  Non-privileged roles ('flat', 'guest', ...)
+        replicate normally."""
         r = (role or '').strip().lower()
-        if not r or r in SyncEngine._PRIVILEGED_SYNC_ROLES:
+        if not r or r in SyncEngine._privileged_roles():
             return None
         return r
 
@@ -600,12 +610,19 @@ class SyncEngine:
             if payload.get('display_name'):
                 existing.display_name = payload['display_name']
             _safe_role = SyncEngine._safe_synced_role(payload.get('role'))
-            if _safe_role:
+            if _safe_role and existing.role not in SyncEngine._privileged_roles():
                 existing.role = _safe_role
             elif payload.get('role'):
+                # Skip either way a sync must not change authority: the payload
+                # names a privileged role (escalation, #59), OR the existing
+                # row is already privileged and the sync would overwrite it
+                # (demotion, #65 — a federated peer must not strip a local
+                # admin).  Authority is local; a sync neither grants nor
+                # removes it.
                 logger.warning(
-                    "sync_user: refusing to set privileged role %r on %s "
-                    "from sync (#59)", payload['role'], user_id)
+                    "sync_user: not changing role of %s from sync (payload "
+                    "%r, existing %r) — authority is local (#59/#65)",
+                    user_id, payload.get('role'), existing.role)
             logger.info(f"Sync: updated user {user_id} from sync")
         else:
             # Create new user record from sync
