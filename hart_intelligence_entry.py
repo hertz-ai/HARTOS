@@ -8525,14 +8525,7 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                         _lang = get_preferred_lang() or 'en'
                     except Exception:
                         _lang = 'en'
-                # Per-agent voice, stashed on `g` by the system-agent branch in
-                # chat() when it read that agent's config.  Flask's `g` is
-                # request-scoped, so this cannot leak one character's voice
-                # into another's reply.  Absent -> None -> engine default,
-                # i.e. unchanged behaviour for every non-character agent.
-                _voice = getattr(g, 'agent_voice', None)
-                _tts_synthesize_and_publish(response_text, user_id, request_id,
-                                            language=_lang, voice=_voice)
+                _tts_synthesize_and_publish(response_text, user_id, request_id, language=_lang)
             except Exception as e:
                 # Never let a TTS failure block delivery of the text reply.
                 app.logger.debug(f"_chat_reply: TTS dispatch skipped: {e}")
@@ -8645,8 +8638,7 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     return jsonify(payload)
 
 
-def _tts_synthesize_and_publish(text, user_id, request_id, language='en',
-                                voice=None):
+def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
     """Fire-and-forget: synthesize TTS, push audio via WAMP.
 
     Same pattern as chatbot_pipeline/chatbot.py:
@@ -8759,15 +8751,7 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en',
             with _timed_stage('tts.synthesize', logger=app.logger,
                               warn_over_ms=3000, chars=len(_clean),
                               lang=language):
-                # `voice` was never forwarded here, so every agent — every
-                # character — came out in the engine's single default voice no
-                # matter what its config said.  synthesize_text has accepted
-                # `voice` all along (tts/tts_engine.py: signature is
-                # (text, voice, speed, output_path, language)), and it is the
-                # same field the cloning-capable engines in
-                # integrations/channels/media/tts_router.py read as their
-                # reference.  None keeps the previous default exactly.
-                _raw = synthesize_text(_clean, language=language, voice=voice)
+                _raw = synthesize_text(_clean, language=language)
             app.logger.info(f"TTS async: synthesize_text returned: {_raw}")
             # synthesize_text may return a file path string OR a JSON dict/string
             # with {"path": "...", "duration": ...}. Normalize to a file path.
@@ -9461,14 +9445,6 @@ def chat():
                     custom_prompt = _sys_prompt
                     _system_agent_pid = prompt_id
                     prompt_id = None  # Skip CREATE/REUSE routing, fall through to get_ans()
-                    # Carry this agent's own voice to the TTS leg.  Read here
-                    # because this is the only place the agent's config is
-                    # already open, and stashed on request-scoped `g` rather
-                    # than threaded through _chat_reply's many callers.
-                    try:
-                        g.agent_voice = _agent_meta.get('voice') or None
-                    except Exception:
-                        pass  # outside a request context (tests) — default voice
                     app.logger.info(f"System agent '{_agent_meta.get('name')}' routed to casual chat")
             except Exception:
                 logging.getLogger(__name__).exception("chat: swallowed Exception")

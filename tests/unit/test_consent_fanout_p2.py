@@ -118,6 +118,13 @@ def test_p2s4_chat_reply_passes_channel_type_to_persist():
             f"P2-S4: persist call missing channel_type='interview'. "
             f"role={c.args[1]!r} kwargs={c.kwargs}"
         )
+    # The reply is spoken here too.  A per-agent voice read from flask `g`
+    # used to raise NameError in this isolated namespace, and the TTS try
+    # swallowed it, so this test ran with speech silently skipped.
+    tts = ns['_tts_synthesize_and_publish']
+    assert tts.call_count == 1, (
+        f"the reply must be spoken once, got {tts.call_count} TTS calls")
+    assert 'voice' not in tts.call_args.kwargs
 
 
 def test_p2s4_chat_reply_defaults_channel_type_to_chat():
