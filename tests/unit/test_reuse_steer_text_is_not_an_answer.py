@@ -144,6 +144,79 @@ class TestSteerTextIsNotAnAnswer:
             're-spell the seat names')
 
 
+class TestTheVerifiersAnswerKeyIsNotTheAnswer:
+    """D84 (#850): carrying the answer key does not make the verifier's voice
+    the answer.
+
+    MEASURED LIVE 2026-09-11 20:49-21:00, agent 11470436451, installed build
+    (gui_app.log:73534-73548).  The synthesis steer drew two replies:
+
+        Message[11]  Assistant       "@user I have executed Action #1:
+                                      Respond to user ..."
+        Message[12]  StatusVerifier  {"message2userfinal": "There are no tool
+                                      results in this conversation to draw
+                                      upon ..."}
+
+    `_reuse_message_is_user_answer` tested the key before the seat, so [12]
+    was delivered.  The verifier has no tools and its view holds no tool
+    results; the same turn wrote 49,440 B to memory_graph.  Across the
+    rotated logs the key was carried by StatusVerifier 140 times and by the
+    Assistant 93.
+
+    The steering seat keeps key-first ordering (the test above): it has no
+    model, so it never writes an answer of its own, and that ordering guards
+    against a mislabelled seat name.  The verifier does write, and 140 live
+    messages say what it writes.
+    """
+
+    LIVE_VERIFIER_KEY = (
+        '{"message2userfinal": "There are no tool results in this '
+        'conversation to draw upon because no tools were called or executed '
+        'in this session."}')
+
+    def _verifier(self):
+        return {'role': 'user', 'name': 'StatusVerifier',
+                'content': self.LIVE_VERIFIER_KEY}
+
+    def test_the_verifiers_answer_key_is_not_an_answer(self, rr):
+        """THE DEFECT.  RED before the fix."""
+        assert rr._reuse_message_is_user_answer(self._verifier()) is False, (
+            "the verifier's message was accepted as the user's answer because "
+            "it carries message2userfinal -- 11470436451's user was told there "
+            "were no tool results while the turn had done the work")
+        assert _tail(rr, self._verifier()) is True
+
+    def test_the_walk_back_reaches_the_assistant(self, rr):
+        """The recovery steps past the verifier to the seat that did the work."""
+        answer = {'role': 'assistant', 'name': 'Assistant',
+                  'content': 'Your routine ran: 3 reminders are set for today.'}
+        chat = _Chat({'role': 'user', 'name': 'ChatInstructor',
+                      'content': 'Perform this action -> Action #1:Respond to '
+                                 'user.\n follow these steps: []'},
+                     answer, self._verifier())
+        assert rr._reuse_written_answer(chat) is answer, (
+            "the walk-back returned the verifier's key-shaped message instead "
+            "of the Assistant's answer one message earlier")
+
+    def test_the_assistants_answer_key_is_still_the_answer(self, rr):
+        """ANTI-VACUITY: keyed on the seat, not on the key."""
+        assert rr._reuse_message_is_user_answer(
+            {'role': 'assistant', 'name': 'Assistant',
+             'content': '@user {"message2userfinal": "3 reminders are set."}'}
+        ) is True
+
+    def test_the_verifier_seat_is_named_once(self, rr):
+        """D79: the literal moved into its own name; it was not copied."""
+        import inspect
+        src = inspect.getsource(rr)
+        assert src.count('_REUSE_VERIFIER_SEATS = ') == 1
+        assert rr._REUSE_VERIFIER_SEATS == ('StatusVerifier',)
+        assert set(rr._REUSE_VERIFIER_SEATS) <= set(rr._REUSE_NON_ANSWER_SEATS)
+        assert not set(rr._REUSE_VERIFIER_SEATS) & set(
+            rr._REUSE_STEER_INITIATOR_NAMES), (
+            'the verifier must stay out of the walk-back bound (3605b19dd)')
+
+
 class TestTheSeedIsAlsoTheProducersOwnText:
     """The dispatch is not always at the START of the message.
 

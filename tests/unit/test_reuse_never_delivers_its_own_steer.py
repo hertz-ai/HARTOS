@@ -191,6 +191,40 @@ class TestTheExtractorAsks:
             'synthesis round produces no model turn the tail IS the steer, '
             'and it goes to the user verbatim (measured 2026-09-10 14:30:55).')
 
+    def test_in_loop_pick_consults_the_answer_predicate(self):
+        """D84 (#850): the loop's own return asks the same question.
+
+        Inside get_agent_response's `while True:` a tail carrying
+        message2userfinal is returned to the user on the spot.  That return
+        never asked _reuse_message_is_user_answer, so a message the post-loop
+        pick refuses -- the verifier's key-shaped voice, an unfilled template
+        -- could still end the turn as the answer through this door.
+        """
+        fn = _fn(ast.parse(_src()), 'get_agent_response')
+        loops = [n for n in ast.walk(fn) if isinstance(n, ast.While)
+                 and isinstance(n.test, ast.Constant) and n.test.value is True]
+        assert loops, 'anchor lost: get_agent_response has no `while True:`'
+        ask_lines, key_returns = [], []
+        for loop in loops:
+            for n in ast.walk(loop):
+                if (isinstance(n, ast.Call) and getattr(n.func, 'id', '')
+                        == '_reuse_message_is_user_answer'):
+                    ask_lines.append(n.lineno)
+                if (isinstance(n, ast.Return)
+                        and isinstance(n.value, ast.Subscript)
+                        and isinstance(n.value.slice, ast.Constant)
+                        and n.value.slice.value in ('message2userfinal',
+                                                    'message2')):
+                    key_returns.append(n.lineno)
+        assert key_returns, 'anchor lost: the loop no longer returns the key'
+        assert ask_lines, (
+            'the loop returns a message2userfinal tail without asking '
+            "_reuse_message_is_user_answer -- the verifier's key-shaped voice "
+            'reaches the user from inside the loop')
+        assert min(ask_lines) < min(key_returns), (
+            'the predicate is asked only after the loop has already returned '
+            'the tail')
+
 
 class TestNoRegression:
     """Refuse only the module's own text -- never the agent's."""

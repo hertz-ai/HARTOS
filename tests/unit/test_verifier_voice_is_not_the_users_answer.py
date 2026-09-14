@@ -195,13 +195,19 @@ def test_the_walk_back_is_bounded_by_the_steering_seat_only(tree):
 
 
 def test_answer_key_still_outranks_the_seat_check(tree):
-    """A steer-seat message carrying the answer key IS the answer.
+    """A STEERING-seat message carrying the answer key IS the answer.
 
-    `_reuse_message_is_user_answer` deliberately tests message2userfinal ABOVE
-    the seat name so a seat that does carry the key is still delivered.  Adding
-    the verifier seat must not invert that: measured 2026-09-11, StatusVerifier
-    carried message2userfinal 0 times, but the ordering is the safety net if it
-    ever does.
+    `_reuse_message_is_user_answer` tests message2userfinal ABOVE the
+    `_REUSE_NON_ANSWER_SEATS` check so a steering-seat message that does carry
+    the key is still delivered.  ChatInstructor has no model and never writes
+    an answer, so this ordering only matters when a seat name is wrong, and
+    that is the case it guards.
+
+    It no longer covers the verifier.  This docstring used to say
+    StatusVerifier carried message2userfinal 0 times -- true of the first
+    2026-09-11 window; across the rotated logs that evening it carried it 140
+    times and was delivered each time (D84, #850).  The verifier is now
+    refused ABOVE the key: test_the_verifier_is_refused_before_the_answer_key.
     """
     fn = next((n for n in ast.walk(tree)
                if isinstance(n, ast.FunctionDef)
@@ -220,3 +226,36 @@ def test_answer_key_still_outranks_the_seat_check(tree):
         'the message2userfinal check (line %d) must stay ABOVE the seat check '
         '(line %d): a steer-seat message that carries the answer key is the '
         'answer, and inverting these would swallow it.' % (key_line, seat_line))
+
+
+def test_the_verifier_is_refused_before_the_answer_key(tree):
+    """D84 (#850): the verifier's voice is not the answer, key or no key.
+
+    RED before the fix: no `_REUSE_VERIFIER_SEATS` check existed, so a
+    StatusVerifier message carrying message2userfinal reached the key branch
+    and was delivered -- live 2026-09-11 20:49-21:00, agent 11470436451,
+    "There are no tool results in this conversation to draw upon".
+    """
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef)
+               and n.name == '_reuse_message_is_user_answer'), None)
+    assert fn is not None, '_reuse_message_is_user_answer is gone'
+
+    key_line = verifier_line = None
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Constant) and node.value == 'message2userfinal':
+            key_line = node.lineno if key_line is None else min(key_line, node.lineno)
+        if isinstance(node, ast.Name) and node.id == '_REUSE_VERIFIER_SEATS':
+            verifier_line = (node.lineno if verifier_line is None
+                             else min(verifier_line, node.lineno))
+    assert verifier_line is not None, (
+        '_reuse_message_is_user_answer never consults _REUSE_VERIFIER_SEATS, '
+        'so a verifier message carrying message2userfinal is delivered as the '
+        "user's answer")
+    assert key_line is not None, 'the message2userfinal branch is gone'
+    assert verifier_line < key_line, (
+        'the verifier check (line %d) must sit ABOVE the message2userfinal '
+        'branch (line %d): that branch accepts any written value, whoever '
+        'wrote it' % (verifier_line, key_line))
+    assigns = _module_assigns(tree)
+    assert _resolve(assigns, assigns['_REUSE_VERIFIER_SEATS']) == (_VERIFIER_SEAT,)

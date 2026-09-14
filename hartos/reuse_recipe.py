@@ -3512,8 +3512,11 @@ _REUSE_STEER_INITIATOR_NAMES = ("ChatInstructor",)
 # this set: `_reuse_message_is_user_answer` (refuse as an answer) and
 # `_reuse_group_terminate`, where it is reachable only for verifier JSON that
 # is non-terminal AND carries message2userfinal — terminal verdicts return
-# True above that check, and StatusVerifier carried message2userfinal 0 times
-# in 2026-09-11's log.
+# True above that check.  StatusVerifier carried message2userfinal 0 times in
+# the first 2026-09-11 window and 140 times across that evening's rotated
+# logs, each one delivered as the user's answer (D84, #850) -- which is why
+# the answer predicate refuses the verifier seat BEFORE the key, through
+# _REUSE_VERIFIER_SEATS below.
 #
 # A SEPARATE NAME from the steering seat, because the walk-back asks a
 # different question.  501cf51fb put the verifier into
@@ -3533,7 +3536,11 @@ _REUSE_STEER_INITIATOR_NAMES = ("ChatInstructor",)
 # walks BACK to the last real answer when the tail is refused, and if nothing
 # qualifies the tail stands.  Worst case is today's behaviour; it never
 # returns ''.
-_REUSE_NON_ANSWER_SEATS = _REUSE_STEER_INITIATOR_NAMES + ("StatusVerifier",)
+# The verifier seat on its own, so the answer predicate can refuse it above
+# the message2userfinal test while the steering seat keeps key-first order.
+# The literal this set always carried, moved into a name -- not a second copy.
+_REUSE_VERIFIER_SEATS = ("StatusVerifier",)
+_REUSE_NON_ANSWER_SEATS = _REUSE_STEER_INITIATOR_NAMES + _REUSE_VERIFIER_SEATS
 
 # How every action dispatch this module posts begins.  ONE definition:
 # `_build_reuse_action_message` emits it and `_reuse_message_is_user_answer`
@@ -4261,6 +4268,20 @@ def _reuse_message_is_user_answer(message):
             # does not survive the #725 sync — see the constant's comment for
             # the 2026-09-10 04:42:04 measurement.
             return False
+        if str(last.get('name') or '') in _REUSE_VERIFIER_SEATS:
+            # THE VERIFIER, EVEN WITH THE ANSWER KEY (D84, #850).  It has no
+            # tools and its view holds no tool results, so what it writes to
+            # the user reports its own blindness.  Measured live 2026-09-11
+            # 20:49-21:00, agent 11470436451: the synthesis steer drew
+            #   Message[11] Assistant       "@user I have executed Action #1..."
+            #   Message[12] StatusVerifier  {"message2userfinal": "There are no
+            #                                tool results in this conversation
+            #                                to draw upon..."}
+            # and the key branch below delivered [12] although the turn had
+            # written 49,440 B to memory_graph.  Above that branch for this
+            # seat only; the steering seat stays below it (see the
+            # _REUSE_NON_ANSWER_SEATS check further down).
+            return False
         if 'message2userfinal' in low or 'message2' in low:
             # The KEY present is not the ANSWER present: live 18:25:22 the
             # model returned the steer's template and this branch called it
@@ -4295,7 +4316,10 @@ def _reuse_message_is_user_answer(message):
             # same semantic ("the steer's own voice is not a terminal
             # answer") — one notion of it, not two.  Deliberately BELOW the
             # message2userfinal check: if a steer-seat message ever does carry
-            # the answer key, it IS the answer.
+            # the answer key, it IS the answer.  The verifier never reaches
+            # this line any more -- it is refused above the key branch through
+            # _REUSE_VERIFIER_SEATS (D84, #850) -- so here the set decides the
+            # steering seat only.
             return False
         if content.strip() == 'TERMINATE':
             return False                     # control token
@@ -5924,6 +5948,22 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 break
             last_message = group_chat.messages[-1]
             content_lower = last_message['content'].lower()
+            # ONE notion of "the user's answer" at this return too (D84, #850).
+            # The two branches below hand any tail carrying the answer key to
+            # the user on the spot; the post-loop pick asks
+            # _reuse_message_is_user_answer first and this door did not.  A
+            # key-carrying tail that is not an answer -- the verifier's voice,
+            # an unfilled template, this module's own steer -- ends the turn
+            # through the post-loop extractor instead (#798's exit), which
+            # recovers the action's written answer or asks for one.
+            if ('message2' in content_lower
+                    and not _reuse_message_is_user_answer(last_message)):
+                current_app.logger.info(
+                    f"[SYNTHESIS] loop tail carries the answer key but is not "
+                    f"an answer (from={last_message.get('name') or '?'}) - "
+                    f"ending the turn through the post-loop extractor "
+                    f"(session: {user_prompt})")
+                break
             # Check if this message has already been sent to the user by state_transition
             # In get_agent_response
             if f'message2userfinal'.lower() in content_lower:
