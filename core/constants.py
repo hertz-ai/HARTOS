@@ -1261,3 +1261,22 @@ TOOL_FAILURE_RESULTS: tuple = (
 # line: "Free space on C: reported as 9.17 GB."  Raise it only against a
 # measured truncation, not a guess.
 TOOL_OBSERVATION_MAX_CHARS: int = 2000
+
+# The most one stored memory may hold. MemoryGraph.register bounds every row
+# to it, whoever the writer is.
+#
+# WHY A CAP AT ALL. Nothing bounded a stored memory, and the group chat writes
+# tool results back into memory, so a store that is read back and re-stored
+# grows by what it reads. Live on central 2026-09-14 (#104):
+# save_data_in_memory returned the agent's whole data store on every save,
+# each return was written back as a memory, and search_long_term_memory joined
+# several such rows into one result. Guardian Convergence's graph reached
+# 1,358 rows and 28.6M chars, 76 rows over 100k, the largest 3,960,333. One
+# 3,386,616-char result made every call to the hosted model a bare 400 until
+# the loop-break fired.
+#
+# WHY 16000. A recall shows at most TOOL_OBSERVATION_MAX_CHARS of a row; the
+# rest stays for search to match on. Eight times that holds a long reply or
+# the substance of a fetched page, and nothing near a context's size. Recall
+# skips rows longer than this, which only rows stored before the cap can be.
+MEMORY_ITEM_MAX_CHARS: int = 16000

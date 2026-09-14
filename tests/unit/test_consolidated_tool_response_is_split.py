@@ -82,6 +82,51 @@ class ConsolidatedToolResponseTests(unittest.TestCase):
         self.assertEqual([(m.get('tool_call_id'), m.get('content')) for m in tools],
                          [('call_1', 'v')])
 
+    def test_a_limited_bundle_stays_limited_after_the_split(self):
+        """#104, central 2026-09-14 06:06, Guardian Convergence action 9.
+
+        Two search_long_term_memory results came back bundled, 3,386,616
+        chars together. token_limiter cut the bundle's 'content' to its
+        allowance, but the split rebuilds each call's message from
+        'tool_responses', which the limiter never touched. So the full size
+        reached the hosted endpoint and every call was a bare 400 until the
+        loop-break fired. This runs the create seats' own chain on that shape.
+        """
+        from autogen.agentchat.contrib.capabilities import transforms_util
+        from core.constants import (AUTOGEN_MESSAGE_TOKEN_BUDGET,
+                                    AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE)
+        from hartos.helper import token_limiter
+        store = str({'hive': {'scheduler': {'jobs': [
+            {'name': 'guardian_convergence_monitor', 'interval_seconds': 21600,
+             'status_history': ['cycle %d steady' % i for i in range(3000)]}]}}})
+        turn = [
+            {'role': 'user', 'name': 'ChatInstructor',
+             'content': 'Execute Action 9: search_long_term_memory for prior '
+                        'threat patterns'},
+            {'role': 'assistant', 'name': 'Assistant', 'content': '',
+             'tool_calls': [_call(1, 'q1'), _call(2, 'q2')]},
+            {'role': 'tool', 'name': 'Assistant',
+             'content': store + '\n\n' + store,
+             'tool_responses': [
+                 {'tool_call_id': 'call_1', 'role': 'tool', 'content': store},
+                 {'tool_call_id': 'call_2', 'role': 'tool', 'content': store}]},
+        ]
+        limiter = token_limiter(
+            max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET,
+            max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
+            min_tokens=0)
+        out = self.handler.apply_transform(limiter.apply_transform(turn))
+        tools = [m for m in out if m.get('role') == 'tool']
+        self.assertEqual([m.get('tool_call_id') for m in tools],
+                         ['call_1', 'call_2'])
+        for m in tools:
+            self.assertLessEqual(
+                transforms_util.count_text_tokens(m['content']),
+                AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
+                'a tool result reached the model past the per-message limit')
+        self.assertEqual(turn[2]['tool_responses'][0]['content'], store,
+                         "the limiter edited the group chat's own message")
+
 
 if __name__ == '__main__':
     unittest.main()

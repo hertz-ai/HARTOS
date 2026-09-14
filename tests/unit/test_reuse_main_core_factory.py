@@ -196,6 +196,69 @@ class ReuseMainCoreFactory(unittest.TestCase):
                          'teal-from-graph')
         graph.recall.assert_called_with('[KV] user.color', mode='text', top_k=1)
 
+    # ── #104: a tool result cannot carry a whole store ────────────────
+    # Live on central 2026-09-14: save_data_in_memory returned the agent's
+    # whole data store on every call, the group chat wrote each return back
+    # as a memory, and search_long_term_memory joined such rows into one
+    # 3,386,616-char result. Every call to the hosted model was then a bare
+    # 400 until the loop-break marked the action done.
+
+    def _big_store(self):
+        return {'p1': {'hive': {'history': ['cycle %d steady' % i
+                                            for i in range(20000)]}}}
+
+    def test_save_reports_the_save_not_the_store(self):
+        from unittest import mock
+        from core.constants import TOOL_OBSERVATION_MAX_CHARS
+        helper = mock.Mock(**{'save_agent_data_to_file.return_value': True})
+        tools = self._factory_tools(helper_fun=helper,
+                                    agent_data=self._big_store())
+        self.assertEqual(tools['save_data_in_memory']('user.color', 'teal'),
+                         'Saved at user.color: "teal"')
+        big_value = tools['save_data_in_memory']('hive.note', 'x' * 50000)
+        self.assertLessEqual(len(big_value), TOOL_OBSERVATION_MAX_CHARS + 100)
+
+    def test_get_of_a_large_value_is_bounded_and_says_so(self):
+        from core.constants import TOOL_OBSERVATION_MAX_CHARS
+        tools = self._factory_tools(memory_graph=None,
+                                    agent_data=self._big_store())
+        out = tools['get_data_by_key']('hive')
+        self.assertLessEqual(len(out), TOOL_OBSERVATION_MAX_CHARS + 200)
+        self.assertIn('narrower key', out)
+        small = self._factory_tools(
+            memory_graph=None, agent_data={'p1': {'user': {'color': 'teal'}}})
+        self.assertEqual(small['get_data_by_key']('user.color'), 'teal')
+
+    def test_graph_recall_is_bounded_and_skips_rows_from_before_the_cap(self):
+        from unittest import mock
+        from core.constants import (MEMORY_ITEM_MAX_CHARS,
+                                    TOOL_OBSERVATION_MAX_CHARS)
+        legacy = "{'hive': {'scheduler': " + 'x' * MEMORY_ITEM_MAX_CHARS
+        graph = mock.Mock()
+        graph.recall.return_value = [
+            SimpleNamespace(content=legacy),
+            SimpleNamespace(content='threat pattern A'),
+            SimpleNamespace(content='y' * (2 * TOOL_OBSERVATION_MAX_CHARS))]
+        tools = self._factory_tools(memory_graph=graph)
+        out = tools['search_long_term_memory']('prior threat patterns')
+        self.assertTrue(out.startswith('threat pattern A'), out[:80])
+        self.assertNotIn("{'hive'", out)
+        self.assertLessEqual(len(out), TOOL_OBSERVATION_MAX_CHARS + 50)
+
+    def test_simplemem_recall_skips_a_row_from_before_the_cap(self):
+        from core.constants import MEMORY_ITEM_MAX_CHARS
+        legacy = "{'hive': " + 'x' * MEMORY_ITEM_MAX_CHARS
+
+        async def _search(query):
+            return [SimpleNamespace(content=legacy),
+                    SimpleNamespace(content='fact B')]
+
+        async def _add(content, meta):
+            return None
+        tools = self._factory_tools(
+            simplemem_store=SimpleNamespace(search=_search, add=_add))
+        self.assertEqual(tools['search_long_term_memory']('q'), 'fact B')
+
     def test_send_message_to_user_blocks_agent_mentions(self):
         """The absorbed reuse guard, proven by calling: '@helper' text
         never reaches send_message_to_user1; normal text does."""

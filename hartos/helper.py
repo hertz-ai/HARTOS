@@ -1176,7 +1176,33 @@ def _context_limiter_classes():
                         min(self._max_tokens, self._max_tokens_per_message))
                 kept.append(newest)
                 note('MessageTokenLimiter', newest)
-            return kept
+            return [self._bound_tool_responses(m) for m in kept]
+
+        def _bound_tool_responses(self, msg):
+            # autogen cuts a message's 'content' and never reads
+            # 'tool_responses'. A bundled tool reply carries every call's
+            # result there too, and ToolMessageHandler's split (#89) rebuilds
+            # one tool message per call from that list, so each cut above was
+            # undone before the request left. Live 2026-09-14 (#104),
+            # Guardian Convergence action 9: two search_long_term_memory
+            # results, 3,386,616 chars together, passed a 1000-token limit and
+            # every call to the hosted model was a bare 400. The bundle is one
+            # message, so its calls share that message's allowance. New dicts
+            # only: the list may be the group chat's own.
+            responses = msg.get('tool_responses') if isinstance(msg, dict) else None
+            if not isinstance(responses, list) or not responses:
+                return msg
+            per_call = max(1, min(self._max_tokens, self._max_tokens_per_message)
+                           // len(responses))
+            count = transforms.transforms_util.count_text_tokens
+            bounded, cut = [], False
+            for r in responses:
+                c = r.get('content') if isinstance(r, dict) else None
+                if isinstance(c, str) and len(c) > per_call and count(c) > per_call:
+                    r = {**r, 'content': self._truncate_str_to_tokens(c, per_call)}
+                    cut = True
+                bounded.append(r)
+            return {**msg, 'tool_responses': bounded} if cut else msg
 
     _CONTEXT_LIMITER_CLASSES = (HistoryLimiter, TokenLimiter)
     return _CONTEXT_LIMITER_CLASSES

@@ -29,6 +29,53 @@ from integrations.service_tools.model_catalog import ModelType
 tool_logger = logging.getLogger('tool_execution')
 
 
+def _bounded_observation(text, hint):
+    """``text`` cut to TOOL_OBSERVATION_MAX_CHARS, with a note saying so.
+
+    For tools that read state back. The result goes to the model and, through
+    the group chat's write-back, into memory, so an unbounded read of a large
+    store did both at full size (#104). ``hint`` tells the model how to ask
+    for less.
+    """
+    from core.constants import TOOL_OBSERVATION_MAX_CHARS
+    text = '' if text is None else str(text)
+    if len(text) <= TOOL_OBSERVATION_MAX_CHARS:
+        return text
+    return (f'{text[:TOOL_OBSERVATION_MAX_CHARS]}\n...['
+            f'{len(text) - TOOL_OBSERVATION_MAX_CHARS} more chars not shown; '
+            f'{hint}]')
+
+
+def _bounded_recall(contents, max_items):
+    """Recalled memories joined for a tool result, within one budget.
+
+    Both legs of search_long_term_memory use it. A memory longer than
+    MEMORY_ITEM_MAX_CHARS is skipped, not cut: nothing stored since #104 can
+    be that long, so it predates the storage cap. Rows like it (whole data
+    stores, written back and recalled again) grew Guardian Convergence's graph
+    to 28.6M chars and one recall to 3,386,616, and they rank high on any
+    query because they hold so many terms.
+    """
+    from core.constants import MEMORY_ITEM_MAX_CHARS, TOOL_OBSERVATION_MAX_CHARS
+    picked, used, skipped = [], 0, 0
+    for c in contents:
+        if not isinstance(c, str) or not c.strip():
+            continue
+        if len(c) > MEMORY_ITEM_MAX_CHARS:
+            skipped += 1
+            continue
+        if len(picked) >= max_items or used >= TOOL_OBSERVATION_MAX_CHARS:
+            break
+        room = TOOL_OBSERVATION_MAX_CHARS - used
+        piece = c if len(c) <= room else c[:room] + ' ...[cut]'
+        picked.append(piece)
+        used += len(piece)
+    if skipped:
+        tool_logger.info(f'[RECALL-BOUND] skipped {skipped} memory row(s) '
+                         f'over {MEMORY_ITEM_MAX_CHARS} chars')
+    return '\n'.join(picked)
+
+
 # ---------------------------------------------------------------------------
 # Generic registration helper
 # ---------------------------------------------------------------------------
@@ -880,10 +927,18 @@ def build_core_tool_closures(ctx):
                 tool_logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
                 if stored_value == "Key not found in stored data.":
                     tool_logger.error(f"VERIFICATION FAILED: Data not properly stored at key {key}")
+                    return f"Error: {key} was written but could not be read back"
             except Exception as e:
                 tool_logger.error(f"VERIFICATION ERROR: {str(e)}")
 
-            return f'{agent_data[prompt_id]}'
+            # Report the save, not the store. This returned the whole
+            # agent_data store on every call, so each save put all of it in
+            # the model's context and, through the group chat's write-back,
+            # into memory again: on central 2026-09-14 (#104) the large
+            # MemoryGraph rows were all this repr, 0.9M to 3.96M chars each.
+            return _bounded_observation(
+                f'Saved at {key}: {json.dumps(validated_value)}',
+                'the whole value was saved')
         except json.JSONDecodeError as je:
             error_msg = f"Invalid JSON structure in value: {str(je)}"
             tool_logger.error(error_msg)
@@ -936,7 +991,8 @@ def build_core_tool_closures(ctx):
         try:
             for k in keys:
                 d = d[k]
-            return f'{d}'
+            # Bounded (#104): a key like 'hive' returned the whole subtree.
+            return _bounded_observation(d, 'read a narrower key for the rest')
         # TypeError too: a path that runs through a None, a string or a list
         # is as missing as an absent key. It used to escape as a tool
         # exception and skip the fallback below (central 2026-09-13, a hive
@@ -950,7 +1006,8 @@ def build_core_tool_closures(ctx):
                 try:
                     results = memory_graph.recall(f"[KV] {key}", mode='text', top_k=1)
                     if results:
-                        return results[0].content
+                        return _bounded_observation(
+                            results[0].content, 'read a narrower key for the rest')
                 except Exception:
                     pass
             return "Key not found in stored data."
@@ -1559,18 +1616,20 @@ def build_core_tool_closures(ctx):
                 try:
                     loop = get_or_create_event_loop()
                     results = loop.run_until_complete(simplemem_store.search(query))
-                    if results:
-                        return results[0].content
-                    return "No relevant memories found."
+                    text = _bounded_recall(
+                        [r.content for r in (results or [])], max_items=1)
+                    return text or "No relevant memories found."
                 except Exception as e:
                     tool_logger.info(f"SimpleMem search error: {e}")
                     return "Memory search unavailable."
             # MemoryGraph leg — same contract, local store, no API key.
             try:
-                results = memory_graph.recall(query, mode='hybrid', top_k=5)
-                if results:
-                    return '\n'.join(r.content for r in results[:5])
-                return "No relevant memories found."
+                # Fetch past the 5 shown: rows _bounded_recall skips as
+                # over-size must not leave real memories unreturned (#104).
+                results = memory_graph.recall(query, mode='hybrid', top_k=10)
+                text = _bounded_recall(
+                    [r.content for r in (results or [])], max_items=5)
+                return text or "No relevant memories found."
             except Exception as e:
                 tool_logger.info(f"MemoryGraph search error: {e}")
                 return "Memory search unavailable."
