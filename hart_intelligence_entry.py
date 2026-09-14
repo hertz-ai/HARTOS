@@ -9223,6 +9223,12 @@ def chat():
     # branch (which runs BEFORE that path for non-system-agent requests)
     # can reference it safely.
     custom_prompt = None
+    # The system agent's own prompt_id when the system-agent branch below
+    # takes this turn, else None.  Bound here because the custom_prompt
+    # ladder before get_ans reads it on every request; bound only inside
+    # that branch, every /chat without a prompt_id raised UnboundLocalError
+    # there (live 2026-09-13 13:38).
+    _system_agent_pid = None
     model_config = data.get('model_config', None)
     task_source = data.get('task_source', 'own')
     thread_local_data.set_task_source(task_source)
@@ -9442,7 +9448,6 @@ def chat():
 
         # System agents (like Nunba) route directly to langchain casual chat
         # instead of entering gather_info/CREATE mode
-        _system_agent_chat = False
         if os.path.exists(_prompt_path):
             try:
                 with open(_prompt_path, 'r') as _pf:
@@ -9454,8 +9459,8 @@ def chat():
                         _sys_prompt = _agent_meta['flows'][0]['system_prompt']
                     casual_conv = True
                     custom_prompt = _sys_prompt
+                    _system_agent_pid = prompt_id
                     prompt_id = None  # Skip CREATE/REUSE routing, fall through to get_ans()
-                    _system_agent_chat = True
                     # Carry this agent's own voice to the TTS leg.  Read here
                     # because this is the only place the agent's config is
                     # already open, and stashed on request-scoped `g` rather
@@ -9472,7 +9477,7 @@ def chat():
         # Replaces the global _state_lock for better concurrency.
         _user_lock = _get_user_lock(user_id)
         with _user_lock:
-            if _system_agent_chat:
+            if _system_agent_pid:
                 # The system-agent branch above already resolved the persona
                 # into custom_prompt and nulled prompt_id so this turn reaches
                 # get_ans().  Falling into the CREATE/REUSE ladder here is what
@@ -10311,6 +10316,15 @@ def chat():
     elif intermediate:
         custom_prompt = INTERMEDIATE_CONTINUATION
         prompt_id = 0
+    elif _system_agent_pid:
+        # custom_prompt already holds the system agent's persona (the
+        # branch above nulled prompt_id so the turn reaches get_ans).  The
+        # `else` replaced it with Hevolve whenever draft-first did not
+        # answer: live 2026-09-13, Spider-Man replied "Hi! I'm Qwen".
+        # Its own id goes back so get_ans builds the identity block from
+        # its prompts/<id>.json and scopes memory to it; with 0 the
+        # identity read "You are Hevolve" (hartos/agent_identity.py).
+        prompt_id = _system_agent_pid
     else:
         custom_prompt = Hevolve  # use Hevolve from config/template
         prompt_id = 0
@@ -10358,7 +10372,11 @@ def chat():
                 'matched_agent_id': matched_agent,
                 'requires_consent': True,
             },
-            prompt_id=prompt_id if prompt_id else _next_prompt_id(),
+            # A plan proposed inside a system agent's chat is a new agent;
+            # the system agent's own id would send its approval back into
+            # that agent's casual chat.
+            prompt_id=(prompt_id if prompt_id and not _system_agent_pid
+                       else _next_prompt_id()),
             req_token_count=thread_local_data.get_req_token_count(),
             res_token_count=thread_local_data.get_res_token_count(),
             history_request_id=thread_local_data.get_reqid_list(),
