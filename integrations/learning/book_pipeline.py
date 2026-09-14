@@ -211,10 +211,19 @@ def fetch_pdf(url, timeout=60) -> Path:
     chunk by chunk. A raw read(N) counts the compressed bytes: measured
     2026-09-13, read(1 MB + 1) of a 65 KB gzip body handed on 64 MB, where
     this hands on 8 MB and refuses it.
+
+    The link passes security.sanitize.validate_url first: http(s), and not a
+    cloud metadata endpoint. A link on the user's own network or this machine
+    is an ordinary place for a book and is fetched.
     """
     import requests
 
     from core.http_pool import pooled_get
+    from security.sanitize import validate_url
+    try:
+        url = validate_url(url)
+    except ValueError as e:
+        raise BookParseError(f'the PDF link was refused ({e})') from e
     try:
         response = pooled_get(url, timeout=timeout, stream=True)
     except requests.RequestException as e:

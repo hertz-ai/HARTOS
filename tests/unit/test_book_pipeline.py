@@ -772,6 +772,24 @@ class TestFetch:
             with pytest.raises(bp.BookParseError, match='could not be downloaded'):
                 bp.fetch_pdf('https://example.org/x.pdf')
 
+    def test_a_link_on_the_users_own_network_is_fetched(self, book_uploads, tmp_path):
+        """A NAS or another machine on the LAN is an ordinary place for a book."""
+        data = make_pdf(tmp_path / 'src.pdf').read_bytes()
+        response = self._response([data])
+        with patch('core.http_pool.pooled_get', return_value=response) as get:
+            path = bp.fetch_pdf('http://192.168.1.20/books/physics.pdf')
+        assert get.call_args.args[0] == 'http://192.168.1.20/books/physics.pdf'
+        assert path.read_bytes() == data
+
+    @pytest.mark.parametrize('url', ['http://169.254.169.254/latest/meta-data/',
+                                     'file:///etc/passwd'])
+    def test_a_link_that_is_never_a_book_is_refused_before_any_request(
+            self, book_uploads, url):
+        with patch('core.http_pool.pooled_get') as get:
+            with pytest.raises(bp.BookParseError, match='refused'):
+                bp.fetch_pdf(url)
+        get.assert_not_called()
+
     def test_a_gzip_bomb_is_capped_on_what_it_inflates_to(self, book_uploads, monkeypatch):
         """The review's case, over real HTTP: 64 KB of gzip that inflates to
         64 MB. A raw read(N) counts the compressed bytes and hands on all 64 MB."""

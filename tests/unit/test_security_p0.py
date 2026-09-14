@@ -32,29 +32,48 @@ class TestValidateUrl:
         result = self._validate_url("http://example.com/page")
         assert result == "http://example.com/page"
 
-    def test_validate_url_blocks_private_ip_10(self):
-        with pytest.raises(ValueError, match="private/reserved"):
-            self._validate_url("http://10.0.0.1/internal")
+    # Private, LAN and loopback addresses are allowed by default (owner,
+    # 2026-09-14: "Allow shd be default on everywhere, no unnecessarily
+    # redirecting in the name of security"). What is never a legitimate
+    # target -- a cloud metadata endpoint, a non-http(s) scheme -- stays
+    # refused either way; allow_private=False keeps the strict check.
 
-    def test_validate_url_blocks_private_ip_192(self):
-        with pytest.raises(ValueError, match="private/reserved"):
-            self._validate_url("http://192.168.1.1/admin")
+    @pytest.mark.parametrize("url", [
+        "http://10.0.0.1/internal", "http://192.168.1.1/admin",
+        "http://172.16.0.1/secret", "http://localhost/admin",
+        "http://127.0.0.1:5000/uploads/photo.jpg",
+    ])
+    def test_validate_url_allows_private_and_local_by_default(self, url):
+        assert self._validate_url(url) == url
 
-    def test_validate_url_blocks_private_ip_172(self):
+    def test_validate_url_blocks_cloud_metadata_even_when_private_allowed(self):
+        with pytest.raises(ValueError, match="cloud metadata"):
+            self._validate_url("http://169.254.169.254/latest/meta-data/",
+                               allow_private=True)
+
+    def test_validate_url_blocks_private_ip_10_when_strict(self):
         with pytest.raises(ValueError, match="private/reserved"):
-            self._validate_url("http://172.16.0.1/secret")
+            self._validate_url("http://10.0.0.1/internal", allow_private=False)
+
+    def test_validate_url_blocks_private_ip_192_when_strict(self):
+        with pytest.raises(ValueError, match="private/reserved"):
+            self._validate_url("http://192.168.1.1/admin", allow_private=False)
+
+    def test_validate_url_blocks_private_ip_172_when_strict(self):
+        with pytest.raises(ValueError, match="private/reserved"):
+            self._validate_url("http://172.16.0.1/secret", allow_private=False)
 
     def test_validate_url_blocks_cloud_metadata(self):
         with pytest.raises(ValueError, match="cloud metadata"):
             self._validate_url("http://169.254.169.254/latest/meta-data/")
 
-    def test_validate_url_blocks_localhost(self):
+    def test_validate_url_blocks_localhost_when_strict(self):
         with pytest.raises(ValueError, match="localhost"):
-            self._validate_url("http://localhost/admin")
+            self._validate_url("http://localhost/admin", allow_private=False)
 
-    def test_validate_url_blocks_localhost_ip(self):
+    def test_validate_url_blocks_localhost_ip_when_strict(self):
         with pytest.raises(ValueError, match="private/reserved"):
-            self._validate_url("http://127.0.0.1/admin")
+            self._validate_url("http://127.0.0.1/admin", allow_private=False)
 
     def test_validate_url_blocks_ftp_scheme(self):
         with pytest.raises(ValueError, match="scheme must be http or https"):
@@ -88,9 +107,9 @@ class TestValidateUrl:
         with pytest.raises(ValueError, match="cloud metadata"):
             self._validate_url("http://metadata.google.internal/computeMetadata/v1/")
 
-    def test_validate_url_blocks_zero_address(self):
+    def test_validate_url_blocks_zero_address_when_strict(self):
         with pytest.raises(ValueError, match="private/reserved"):
-            self._validate_url("http://0.0.0.0/")
+            self._validate_url("http://0.0.0.0/", allow_private=False)
 
     def test_validate_url_strips_whitespace(self):
         result = self._validate_url("  https://example.com/path  ")
