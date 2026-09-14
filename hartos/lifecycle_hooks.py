@@ -1438,15 +1438,29 @@ def lifecycle_hook_track_recipe_completion(user_prompt: str, json_obj: dict, use
     return {'action': 'allow', 'message': None}
 
 
-# "Execute Action N:" (also inside "Properly Execute Action N:") is how the
-# create loop posts an action to the group.  Colon-delimited, so action 2
-# never matches action 20.
-_DISPATCH_MARKER = re.compile(r'Execute Action (\d+):')
+# "Execute Action N:" is how the create loop posts an action to the group,
+# also as "Properly Execute Action N:" and as a re-post that send_retry
+# prefixed with "[retry:<tag>]".  Only a LEADING marker is a dispatch: the
+# [EXECUTE-PENDING] dispatch appends the user's text after its own marker, and
+# that text can quote an earlier one ("... ,Latest User message: Properly
+# Execute Action 6: ...", the Failure=True retry text), so a marker later in a
+# message says nothing about which action it posts.  Colon-delimited, so
+# action 2 never matches action 20.
+_DISPATCH_MARKER = re.compile(
+    r'\s*(?:\[retry:[^\]]*\]\s*)?(?:Properly\s+)?Execute Action (\d+):')
+
+
+def dispatch_action_id(content) -> Optional[int]:
+    """The action a message dispatches, or None when it is not a dispatch."""
+    if not isinstance(content, str):
+        return None
+    m = _DISPATCH_MARKER.match(content)
+    return int(m.group(1)) if m else None
 
 
 def latest_dispatch_before(messages, index) -> Optional[int]:
-    """The action id of the latest "Execute Action N:" posted before
-    ``messages[index]``, or None when none precedes it.
+    """The action id of the latest dispatch posted before ``messages[index]``,
+    or None when none precedes it.
 
     Seeded messages (``_from_shared``) do not count: an earlier run's marker in
     the shared history says nothing about which action this run is on.
@@ -1454,34 +1468,47 @@ def latest_dispatch_before(messages, index) -> Optional[int]:
     try:
         earlier = messages[:index]
     except Exception:
+        logger.warning("latest_dispatch_before: cannot slice messages at %r",
+                       index, exc_info=True)
         return None
     for m in reversed(earlier):
         if not isinstance(m, dict) or m.get('_from_shared'):
             continue
-        content = m.get('content')
-        if isinstance(content, str):
-            found = _DISPATCH_MARKER.findall(content)
-            if found:
-                return int(found[-1])
+        aid = dispatch_action_id(m.get('content'))
+        if aid is not None:
+            return aid
     return None
 
 
-def belongs_to_other_action(messages, index, action_id) -> bool:
-    """True when ``messages[index]`` was said about a different action than
-    ``action_id``: the latest dispatch before it names another action.
+def stale_for_unstarted_action(messages, index, user_prompt,
+                               action_id) -> Optional[int]:
+    """The action ``messages[index]`` belongs to, returned only when it is a
+    message left over for an action that has NOT started; otherwise None, and
+    callers keep their old behaviour.
 
-    With no dispatch before it there is no evidence either way, and callers
-    keep their old behaviour.  Measured on central 2026-09-13 (#101): after
-    [ADVANCE] N->N+1 the old verdict and TERMINATE stay the last messages, and
-    both the termination hook and the create loop's verdict pickup credited
-    them to N+1, so every executed action was followed by a phantom completion
-    of the next one.
+    Both conditions must hold: the current action is still ASSIGNED, and the
+    latest dispatch before the message names another action.  Measured on
+    central 2026-09-13 (#101): after [ADVANCE] N->N+1 the old verdict and
+    TERMINATE stay the last messages, and the termination hook and the create
+    loop's verdict pickup credited them to N+1 before it ran, so every executed
+    action was followed by a phantom completion of the next.  The state
+    condition matters as much as the marker: a started action's own rounds
+    (a recipe request, a fallback request, a claim rejection, a "continue"
+    nudge) carry no dispatch marker of their own, and reading only markers
+    handed them to the previous action (#101 review, 2026-09-14).
     """
-    owner = latest_dispatch_before(messages, index)
     try:
-        return owner is not None and owner != int(action_id)
+        aid = int(action_id)
     except (TypeError, ValueError):
-        return False
+        logger.warning("stale check: action_id %r is not an int; treating the "
+                       "message as the current action's", action_id)
+        return None
+    if get_action_state(user_prompt, aid) != ActionState.ASSIGNED:
+        return None
+    owner = latest_dispatch_before(messages, index)
+    if owner is not None and owner != aid:
+        return owner
+    return None
 
 
 def lifecycle_hook_track_termination(user_prompt: str, user_tasks, group_chat) -> bool:
@@ -1501,12 +1528,15 @@ def lifecycle_hook_track_termination(user_prompt: str, user_tasks, group_chat) -
         group_chat.messages[-1]['content'] == 'TERMINATE'):
 
         # A TERMINATE left over from the previous action is not this one's
-        # (#101): after an advance it is still the last message.
-        if belongs_to_other_action(group_chat.messages, -1, current_action_id):
+        # (#101): after an advance it is still the last message, and the new
+        # action has not started yet.
+        _owner = stale_for_unstarted_action(
+            group_chat.messages, -1, user_prompt, current_action_id)
+        if _owner is not None:
             logger.info(
                 "[STALE-TERMINATE] the last TERMINATE belongs to action %s; "
-                "not terminating action %s",
-                latest_dispatch_before(group_chat.messages, -1), current_action_id)
+                "not terminating action %s, which has not started",
+                _owner, current_action_id)
             return False
 
         # force_state_through_valid_path (not a bare validate): a TERMINATE for an

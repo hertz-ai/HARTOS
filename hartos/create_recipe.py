@@ -245,7 +245,7 @@ from agent_ledger import (
 from agent_ledger.factory import create_production_ledger, get_or_create_ledger
 # Add to your create_recipe.py after imports
 from hartos.lifecycle_hooks import (
-    belongs_to_other_action,
+    stale_for_unstarted_action,
     initialize_deterministic_actions,
     lifecycle_hook_track_action_assignment,
     lifecycle_hook_track_user_fallback,
@@ -4574,16 +4574,21 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             # A verdict left over from the previous action is not this one's
             # (#101): after [ADVANCE] the old verdict and TERMINATE stay last,
             # and crediting them to the new action completed it unrun.  The
-            # branches below post the current action instead.
-            _stale_verdict = bool(
-                len(group_chat.messages) >= 2
-                and group_chat.messages[-1]['name'] == 'ChatInstructor'
-                and _is_terminate(group_chat.messages[-1]['content'])
-                and belongs_to_other_action(group_chat.messages, -2, current_action_id))
+            # branches below post the current action instead.  Only for an
+            # action that has not started: a started action's own recipe or
+            # fallback round carries no dispatch marker and is still its own.
+            _stale_owner = None
+            if (len(group_chat.messages) >= 2
+                    and group_chat.messages[-1]['name'] == 'ChatInstructor'
+                    and _is_terminate(group_chat.messages[-1]['content'])):
+                _stale_owner = stale_for_unstarted_action(
+                    group_chat.messages, -2, user_prompt, current_action_id)
+            _stale_verdict = _stale_owner is not None
             if _stale_verdict:
                 current_app.logger.info(
-                    f"[STALE-VERDICT] messages[-2] belongs to an earlier action; "
-                    f"not crediting it to action {current_action_id}")
+                    f"[STALE-VERDICT] messages[-2] belongs to action "
+                    f"{_stale_owner}; not crediting it to action "
+                    f"{current_action_id}, which has not started")
             if (not _stale_verdict and group_chat.messages
                     and group_chat.messages[-1]['name'] == 'ChatInstructor'
                     and _is_terminate(group_chat.messages[-1]['content'])):
