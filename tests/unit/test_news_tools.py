@@ -659,7 +659,7 @@ class TestMarkNewsForWeb:
 class TestSubscribeNewsFeed:
     """Test subscribe_news_feed tool."""
 
-    def _get_tool(self):
+    def _get_tool(self, user_id='42'):
         from integrations.agent_engine.news_tools import register_news_tools
         helper = MagicMock()
         assistant = MagicMock()
@@ -674,8 +674,21 @@ class TestSubscribeNewsFeed:
         helper.register_for_llm.side_effect = capture_llm
         assistant.register_for_execution.return_value = lambda f: f
 
-        register_news_tools(helper, assistant, user_id='42')
+        register_news_tools(helper, assistant, user_id=user_id)
         return tools['subscribe_news_feed']
+
+    def test_owner_id_reaches_the_subscription_unchanged(self):
+        """Social user ids are UUID strings: 523 of the 524 users in the live
+        DB on 2026-09-14, including the Regional News Curator's owner.  The
+        tool coerced any non-numeric id to 0, and there is no user 0, so
+        import_items would skip every item as 'author not found'."""
+        owner = 'c23d388c-07a0-4a79-816d-5b95642683c0'
+        subscribe = self._get_tool(user_id=owner)
+        with patch('integrations.social.models.get_db'), \
+             patch('integrations.social.feed_import.FeedSubscriptionService') as MockSvc:
+            MockSvc.return_value.subscribe.return_value = {'status': 'active'}
+            subscribe(feed_url='https://example.com/rss')
+        assert MockSvc.return_value.subscribe.call_args.kwargs['user_id'] == owner
 
     def test_subscribe_with_categories(self):
         subscribe = self._get_tool()
