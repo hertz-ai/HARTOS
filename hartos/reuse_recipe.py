@@ -7284,218 +7284,28 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             # current_app.logger.info(result)
 
             last_message = group_chat.messages[-1]
-            if 'terminate' in last_message['content'].lower():
-                # with open(f"prompts/{prompt_id}_recipe.json", 'r') as f:
-                #     config = json.load(f)
-                #     recipes[user_prompt] = config
-                user_agents[user_prompt] = create_agents_for_user(user_id, prompt_id)
-                assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
-                user_journey[user_prompt] = 'UseBot'
-                create_schedule(prompt_id, user_id)
-                # ONE builder for the action command.  This was a verbatim
-                # inline copy — same get_action lookup, same steps
-                # comprehension, same template — so the str() coercion that
-                # fixed the builder left THIS copy still raising
-                # TypeError("unhashable type: 'list'") on a list-valued
-                # `steps`, and it never carried the builder's
-                # `action_id - 1 < len(recipe_actions)` bounds check either.
-                message = _build_reuse_action_message(
-                    user_prompt, user_tasks[user_prompt].current_action)
-                # Same invariant as the advance path: the prompt must name the
-                # action this message commands.  create_agents_for_user was
-                # just called above, so the assistant here is freshly built
-                # with ALL N recipes — exactly the body the wire-trim eats.
-                _narrow_assistant_to_current_action(user_prompt)
-                # message = "let's perform the actions availabe in sequence\nIMP instruction: keep track of action id you are working on."
-                result = chat_instructor.initiate_chat(manager, message=message,
-                                                       speaker_selection={"speaker": "assistant"}, clear_history=False)
-
-                count = 0                  # spent on the whole turn
-                _action_rounds = 0         # spent on the CURRENT action
-                _budget_action = _reuse_current_action_id(user_prompt)
-                _action_evidence = _reuse_own_tool_progress(
-                    user_prompt, _budget_action, group_chat,
-                    getattr(group_chat, 'agents', None) or [])
-                if _action_evidence is None:
-                    _action_evidence = _reuse_evidence_count(group_chat)
-                _budget_action = _reuse_current_action_id(user_prompt)
-                _round_budget = _reuse_turn_round_budget(user_prompt)
-                while True:
-                    current_app.logger.info('inside while2')
-
-                    # === LEDGER v2.0: Heartbeat + Budget/SLA ===
-                    current_action_id = user_tasks[user_prompt].current_action
-                    ledger = user_ledgers.get(user_prompt)
-                    if ledger:
-                        action_task = ledger.tasks.get(f"action_{current_action_id}")
-                        if action_task:
-                            action_task.heartbeat()
-                            if action_task.is_budget_exhausted():
-                                current_app.logger.warning(
-                                    f"[BUDGET] action_{current_action_id} budget exhausted in while2")
-                                break
-                            if action_task.is_sla_breached() and not action_task.sla_breached:
-                                action_task.mark_sla_breached()
-
-                    # Same empty-history hazard as the while1 loop above.
-                    if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
-                        current_app.logger.info(
-                            f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
-                        try:
-                            try:
-                                json_obj = json.loads(group_chat.messages[-2]["content"])
-                            except (json.JSONDecodeError, ValueError):
-                                json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
-                            current_app.logger.info(f'got json object {json_obj}')
-                            if json_obj['status'].lower() in VERDICT_COMPLETION_STATUSES:
-                                if not _advance_or_steer(
-                                        user_prompt, current_action_id,
-                                        "reuse-w2", prompt_id,
-                                        manager, chat_instructor,
-                                        claimed_action_id=int(json_obj.get(
-                                            "action_id", current_action_id))):
-                                    break  # finished recipe -> post-loop extractor (#798)
-                                continue
-                        except Exception:
-                            try:
-                                json_obj = retrieve_json(group_chat.messages[-2]["content"])  # canonical parse (#95)
-                                if json_obj:
-                                    current_app.logger.info(f'got json object {json_obj}')
-                                    if json_obj['status'].lower() in VERDICT_COMPLETION_STATUSES:
-                                        if not _advance_or_steer(
-                                                user_prompt, current_action_id,
-                                                "reuse-w2-regex", prompt_id,
-                                                manager, chat_instructor,
-                                                claimed_action_id=int(json_obj.get(
-                                                    "action_id", current_action_id))):
-                                            break  # finished recipe -> post-loop extractor (#798)
-                                        continue
-
-                                else:
-                                    raise ValueError('No json found')
-                            except IndexError:
-                                # BREAK, not `return ''` — same reason as the
-                                # while1 twin above (#798 / #803 D37).  The
-                                # extractor after this loop is what turns the
-                                # finished conversation into the reply.
-                                current_app.logger.info("Completed ALL ACTIONS")
-                                break
-                            except Exception as e:
-                                current_app.logger.warning(f'it is not a json object the error is: {e}')
-                                current_app.logger.info(
-                                    'it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
-                                actions_prompt = user_tasks[user_prompt].get_action(
-                                    user_tasks[user_prompt].current_action - 1)
-                                message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action}' + ',"message": "message here"}'
-                                # chat_instructor, not assistant — see the
-                                # matching recovery site in the first loop:
-                                # steering must enter the group as a
-                                # user-role turn or the Qwen3.5 template can
-                                # see a no-user view and raise.
-                                chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,
-                                                              silent=False)
-                                continue
-                    # Same per-action/per-turn split as while1 (#790/D23) —
-                    # one semantics for both loops, from one constant — and
-                    # the same progress reset, so a working action is not
-                    # capped in either loop.
-                    _now_action = _reuse_current_action_id(user_prompt)
-                    if _now_action != _budget_action:
-                        _budget_action = _now_action
-                        _action_rounds = 0
-                        _action_evidence = _reuse_own_tool_progress(
-                            user_prompt, _now_action, group_chat,
-                            getattr(group_chat, 'agents', None) or [])
-                        if _action_evidence is None:
-                            _action_evidence = _reuse_evidence_count(group_chat)
-                    # PROGRESS MEANS THIS ACTION'S OWN TOOLS.  A global count
-                    # lets unrelated calls buy a fresh window forever -- agent
-                    # 88719487304 action 9, 2026-09-10 22:12:50-22:21:47, 17
-                    # rounds / 53 calls with unrun never shrinking.
-                    _evidence_now = _reuse_own_tool_progress(
-                        user_prompt, _now_action, group_chat,
-                        getattr(group_chat, 'agents', None) or [])
-                    if _evidence_now is None:
-                        _evidence_now = _reuse_evidence_count(group_chat)
-                    if _evidence_now > _action_evidence:
-                        current_app.logger.info(
-                            f"[REUSE-ROUNDS] action {_now_action} produced new evidence for "
-                            f"its own tool(s) ({_action_evidence} -> {_evidence_now}) — "
-                            f"resetting its round allowance (turn spend "
-                            f"{count}/{_round_budget})")
-                        _action_evidence = _evidence_now
-                        _action_rounds = 0
-                    count += 1
-                    _action_rounds += 1
-                    if count >= _round_budget:
-                        current_app.logger.warning(
-                            f"[REUSE-ROUNDS] while2 exhausted {_round_budget} TURN rounds at "
-                            f"action {user_tasks[user_prompt].current_action}/"
-                            f"{len(user_tasks[user_prompt].actions)} — ending turn")
-                        break
-                    if _action_rounds >= _REUSE_ROUNDS_PER_ACTION:
-                        current_app.logger.warning(
-                            f"[REUSE-ROUNDS] while2 action "
-                            f"{user_tasks[user_prompt].current_action}/"
-                            f"{len(user_tasks[user_prompt].actions)} used its "
-                            f"{_REUSE_ROUNDS_PER_ACTION} rounds without completing "
-                            f"— ending turn (turn spend {count}/{_round_budget})")
-                        break
-                    # role = get_role(user_id,prompt_id)
-                    last_message = group_chat.messages[-1]
-                    if f'@user'.lower() not in last_message['content'].lower():
-                        continue
-                    else:
-                        current_app.logger.info(f'@user in last message')
-                        break
-
-                # Guard the subscript, exactly as the while1 extractor does
-                # (:4272).  while2 never had it, so an empty history raised
-                # IndexError here instead of ending the turn — and the
-                # "Completed ALL ACTIONS" break above now reaches this line
-                # on precisely the short-history case that raised it.
-                if not group_chat.messages:
-                    current_app.logger.warning(
-                        'reuse while2: no messages to extract a reply from')
-                    return ''
-                last_message = group_chat.messages[-1]
-
-                # len>1 matters: a lone TERMINATE would send [-2] off the
-                # front — same reason the while1 twin carries this check.
-                if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
-                    last_message = group_chat.messages[-2]
-
-                llm_call_track[user_prompt]['count'] = 0
-                llm_call_track[user_prompt]['original_prompt'] = True
-                if f'message2userfinal'.lower() in last_message['content'].lower():
-                    json_obj = retrieve_json(last_message["content"])
-                    if json_obj:
-                        try:
-                            last_message['content'] = json_obj['message2userfinal']
-                        except Exception:
-                            pass
-
-                elif f'message2'.lower() in last_message['content'].lower():
-                    json_obj = retrieve_json(last_message["content"])
-                    if json_obj:
-                        try:
-                            last_message['content'] = json_obj['message2']
-                        except Exception:
-                            pass
-
+            if 'terminate' not in last_message['content'].lower():
                 return last_message['content']
 
-            return last_message['content']
+            user_agents[user_prompt] = create_agents_for_user(user_id, prompt_id)
+            user_journey[user_prompt] = 'UseBot'
+            create_schedule(prompt_id, user_id)
         else:
-            assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
-
+            # Preserve the existing numeric conversion for established reuse.
+            # The role-selection handoff previously kept the original ID.
             prompt_id = int(prompt_id)
-            role = get_role(user_id, prompt_id)
-            response = get_agent_response(assistant, chat_instructor, helper, user_proxy, manager, group_chat,
-                                          user_message, role, user_id, prompt_id, request_id)
-            llm_call_track[user_prompt]['count'] = 0
-            llm_call_track[user_prompt]['original_prompt'] = True
-            return response
+
+        # All ready sessions enter the same replay loop. It owns first-action
+        # seeding, tool attachment, evidence checks, advancement and synthesis.
+        # The former role-selection loop only recognized ChatInstructor's
+        # TERMINATE token, so a terminal verifier verdict stranded action 1.
+        assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
+        role = get_role(user_id, prompt_id)
+        response = get_agent_response(assistant, chat_instructor, helper, user_proxy, manager, group_chat,
+                                      user_message, role, user_id, prompt_id, request_id)
+        llm_call_track[user_prompt]['count'] = 0
+        llm_call_track[user_prompt]['original_prompt'] = True
+        return response
     except Exception as e:
         current_app.logger.info(f'Some ERROR IN REUSE RECIPE {e}')
         raise

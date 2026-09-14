@@ -46,6 +46,7 @@ THE CONTRACT THESE TESTS PIN:
   * an unmeasurable count (-1) can still never be read as progress.
 """
 
+import ast
 import io
 import os
 import re
@@ -72,12 +73,17 @@ def _reset_blocks(src):
 class TestResetSitesExist(unittest.TestCase):
     """If these move, the guards below must be re-pointed, not deleted."""
 
-    def test_both_loops_have_a_reset_site(self):
-        blocks = _reset_blocks(_reuse_src())
-        self.assertEqual(
-            len(blocks), 2,
-            'expected exactly 2 round-allowance reset sites (while1 ~5403 and '
-            'while2 ~6702); found %d — re-point this guard' % len(blocks))
+    def test_source_guard_progress_reset_has_one_owner(self):
+        """DRY guard; role-handoff tests exercise the shared loop's behavior."""
+        tree = ast.parse(_reuse_src())
+        owners = [fn.name for fn in tree.body
+                  if isinstance(fn, ast.FunctionDef)
+                  and any(isinstance(node, ast.Compare)
+                          and isinstance(node.left, ast.Name)
+                          and node.left.id == '_evidence_now'
+                          and any(isinstance(op, ast.Gt) for op in node.ops)
+                          for node in ast.walk(fn))]
+        self.assertEqual(owners, ['get_agent_response'])
 
 
 class TestResetKeyedOnOwnToolProgress(unittest.TestCase):

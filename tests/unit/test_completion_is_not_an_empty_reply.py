@@ -88,13 +88,15 @@ def _returns_empty_string(stmt):
 
 class TestCompletionKeepsTheAnswer:
 
-    def test_the_guard_blocks_exist_at_all(self):
-        """If this fails the AST shape changed and the guard below went vacuous."""
-        blocks = _advance_guard_blocks()
-        assert len(blocks) >= 5, (
-            'expected the _advance_or_steer guard blocks to still be present; '
-            'found %d. A guard that matches nothing cannot fail -- re-point it '
-            'before trusting this file.' % len(blocks))
+    def test_source_guard_completion_has_one_replay_owner(self):
+        """Every entry must use the same completion/answer handling."""
+        owners = [fn.name for fn in _tree().body
+                  if isinstance(fn, ast.FunctionDef)
+                  and any(isinstance(n, ast.If)
+                          and _calls_advance_or_steer(n.test)
+                          for n in ast.walk(fn))]
+        assert owners == ['get_agent_response']
+        assert _advance_guard_blocks(), 'the completion guard must not be vacuous'
 
     def test_no_call_site_answers_completion_with_an_empty_string(self):
         """THE DEFECT: all 6 sites did `return ''`, discarding a finished turn."""
@@ -122,10 +124,13 @@ class TestCompletionKeepsTheAnswer:
 class TestTheExtractorItBreaksToStillExists:
     """`break` is only correct while something after the loop builds the reply."""
 
-    def test_both_loops_are_followed_by_a_content_returning_extractor(self):
-        src = _SRC.read_text(encoding='utf-8')
-        assert src.count("return last_message['content']") >= 2, (
-            "the fix relies on the existing post-loop extractors in "
-            "get_agent_response and chat_agent; if they stopped returning "
-            "last_message['content'], `break` would yield an empty turn again "
-            'and this whole defect returns by another door')
+    def test_source_guard_shared_loop_is_followed_by_answer_extraction(self):
+        fn = next(n for n in _tree().body
+                  if isinstance(n, ast.FunctionDef) and n.name == 'get_agent_response')
+        body = next(n.body for n in fn.body
+                    if isinstance(n, ast.Try)
+                    and any(isinstance(s, ast.While) for s in n.body))
+        loop_index = next(i for i, n in enumerate(body) if isinstance(n, ast.While))
+        assert any(isinstance(n, ast.Return)
+                   for statement in body[loop_index + 1:]
+                   for n in ast.walk(statement)), 'completion must reach the answer extractor'

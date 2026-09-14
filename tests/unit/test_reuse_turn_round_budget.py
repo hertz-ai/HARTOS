@@ -34,6 +34,21 @@ def _source():
         return fh.read()
 
 
+def _replay_function():
+    """Locate the one owner of the replay loop for the DRY guards below."""
+    tree = ast.parse(_source())
+    owners = [fn for fn in tree.body
+              if isinstance(fn, ast.FunctionDef)
+              and any(isinstance(node, ast.Call)
+                      and isinstance(node.func, ast.Name)
+                      and node.func.id == '_reuse_turn_round_budget'
+                      for node in ast.walk(fn))]
+    assert [fn.name for fn in owners] == ['get_agent_response'], (
+        'all chat entry paths must share get_agent_response; a second owner '
+        'of the replay budget recreates the divergent role-selection loop')
+    return owners[0]
+
+
 class TestNoFixedCapRemains:
 
     def test_no_literal_count_equals_four_cap(self):
@@ -61,14 +76,14 @@ class TestNoFixedCapRemains:
               'measured live: six agents stalled at exactly action 4 '
               '(4/24, 4/15, 4/15, 4/6, 4/6, 4/6).')
 
-    def test_both_loops_consult_the_recipe_derived_budget(self):
-        """Both while-loops, not just the first, must use the budget."""
-        src = _source()
-        assert src.count('_reuse_turn_round_budget(') >= 3, (
-            'expected the helper definition plus a call in EACH reuse loop; '
-            'a loop still carrying its own cap will truncate long recipes.')
-        assert src.count('count >= _round_budget') == 2, (
-            'both reuse loops must bound themselves by _round_budget')
+    def test_source_guard_one_replay_loop_owns_the_recipe_budget(self):
+        """DRY guard; execution coverage lives in test_reuse_role_handoff."""
+        fn = _replay_function()
+        calls = [node for node in ast.walk(fn)
+                 if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name)
+                 and node.func.id == '_reuse_turn_round_budget']
+        assert len(calls) == 1, 'the shared replay loop must resolve one turn budget'
 
 
 class TestBudgetScalesWithTheRecipe:
@@ -165,16 +180,26 @@ class TestBudgetIsSpentPerAction:
             "full allowance for action 2 — otherwise the recipe's later "
             'actions are unreachable however well they would have run')
 
-    def test_both_loops_reset_the_counter_when_the_action_advances(self):
-        src = _source()
-        assert src.count('_action_rounds = 0') == 6, (
-            'each loop needs three: initialisation, reset-on-advance, and '
-            'reset-on-progress (3 sites x 2 loops).  A loop missing the '
-            "advance reset spends the successor action's allowance on its "
-            'predecessor; one missing the progress reset caps an action whose '
-            'tools are running (measured 05:55:50, 0.445 s after the tool ran)')
-        assert src.count('_action_rounds >= _REUSE_ROUNDS_PER_ACTION') == 2, (
-            'both reuse loops must bound the CURRENT action, not only the turn')
+    def test_source_guard_shared_loop_retains_action_resets_and_cap(self):
+        fn = _replay_function()
+        resets = [node for node in ast.walk(fn)
+                  if isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Name)
+                          and target.id == '_action_rounds'
+                          for target in node.targets)
+                  and isinstance(node.value, ast.Constant)
+                  and node.value.value == 0]
+        assert len(resets) == 3, (
+            'the shared loop needs initialization, reset-on-advance, and '
+            'reset-on-progress; no second replay implementation')
+        caps = [node for node in ast.walk(fn)
+                if isinstance(node, ast.Compare)
+                and isinstance(node.left, ast.Name)
+                and node.left.id == '_action_rounds'
+                and len(node.ops) == 1 and isinstance(node.ops[0], ast.GtE)
+                and isinstance(node.comparators[0], ast.Name)
+                and node.comparators[0].id == '_REUSE_ROUNDS_PER_ACTION']
+        assert len(caps) == 1, 'one per-action cap must govern every replay entry'
 
     def test_current_action_read_is_guarded(self):
         """The budget path must not raise on a missing session."""
@@ -269,19 +294,33 @@ class TestProgressResetsTheAllowance:
                 'an unmeasurable chat must not satisfy `> previous`, or the '
                 'allowance is extended forever on uncertainty')
 
-    def test_both_loops_reset_on_new_evidence(self):
-        src = _source()
-        assert src.count('_evidence_now > _action_evidence') == 2, (
-            'both reuse loops must extend the CURRENT action when its tools '
-            'produce new results; a loop without it caps working actions')
-        assert src.count('_action_evidence = _reuse_evidence_count(') == 4, (
-            'each loop needs the initial mark AND the re-mark on advance '
-            '(2 sites x 2 loops), or the successor action inherits the '
-            "predecessor's evidence count and never registers progress")
+    def test_source_guard_shared_loop_resets_on_new_evidence(self):
+        fn = _replay_function()
+        progress_checks = [node for node in ast.walk(fn)
+                           if isinstance(node, ast.Compare)
+                           and isinstance(node.left, ast.Name)
+                           and node.left.id == '_evidence_now'
+                           and len(node.ops) == 1
+                           and isinstance(node.ops[0], ast.Gt)
+                           and isinstance(node.comparators[0], ast.Name)
+                           and node.comparators[0].id == '_action_evidence']
+        assert len(progress_checks) == 1, 'one shared progress-reset policy'
+        marks = [node for node in ast.walk(fn)
+                 if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name)
+                         and target.id == '_action_evidence'
+                         for target in node.targets)
+                 and isinstance(node.value, ast.Call)
+                 and isinstance(node.value.func, ast.Name)
+                 and node.value.func.id == '_reuse_evidence_count']
+        assert len(marks) == 2, 'retain the initial mark and re-mark on advance'
 
-    def test_the_turn_ceiling_still_bounds_it(self):
-        """Anti-vacuity: progress may consume the turn, not exceed it."""
-        src = _source()
-        assert src.count('count >= _round_budget') == 2, (
-            'the turn ceiling is what keeps the progress reset from running '
-            'forever; it must remain in both loops')
+    def test_source_guard_one_turn_ceiling_bounds_progress_resets(self):
+        """DRY guard: progress resets remain under the shared turn ceiling."""
+        ceilings = [node for node in ast.walk(_replay_function())
+                    if isinstance(node, ast.Compare)
+                    and isinstance(node.left, ast.Name) and node.left.id == 'count'
+                    and len(node.ops) == 1 and isinstance(node.ops[0], ast.GtE)
+                    and isinstance(node.comparators[0], ast.Name)
+                    and node.comparators[0].id == '_round_budget']
+        assert len(ceilings) == 1, 'one turn ceiling must bound all replay entries'
