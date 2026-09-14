@@ -10765,6 +10765,24 @@ def visual_agent():
     # Computer use mode: use VLM point_and_act directly with screenshot
     mode = data.get('mode', 'auto')  # 'computer_use', 'camera', 'auto'
     if mode == 'computer_use' or (mode == 'auto' and request_from != 'Reuse'):
+        # This branch grabs the owner's screen, so it needs their
+        # screen_capture consent: the ask VisionService's capture loop files
+        # (vision_service._consent_ok).  The owner is whose machine this is
+        # (HEVOLVE_OWNER_USER_ID), never the caller's user_id; with no owner,
+        # or a check that fails, nothing is grabbed (#66).
+        _owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+        _allowed = False
+        if _owner:
+            try:
+                from integrations.social.models import db_session
+                from integrations.social.consent_service import ConsentService
+                with db_session(commit=True) as db:
+                    _allowed = ConsentService.check_or_request(
+                        db, _owner, 'screen_capture')
+            except Exception as e:
+                app.logger.warning(f'visual_agent: screen_capture check failed: {e}')
+        if not _allowed:
+            return jsonify({'response': 'Not run: the owner of this computer has not allowed agents to see this screen.', 'vlm_status': 'consent_required'}), 200
         try:
             from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
             import base64, io
