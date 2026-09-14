@@ -109,3 +109,67 @@ class TestTerminationHookEscapesStuckAction:
         ok = lh.lifecycle_hook_track_termination(up, _FakeTasks(aid), gc)
         assert ok is False
         assert get_action_state(up, aid) == S.ASSIGNED  # untouched
+
+
+class TestAStaleTerminateIsNotTheCurrentActions:
+    """#101, central 2026-09-13: after [ADVANCE] 6->7 the previous action's
+    verdict and TERMINATE stay the last messages.  The hook terminated action 7
+    on that old TERMINATE before 7 ran, and the create loop then asked the
+    model for a recipe of work that never happened."""
+
+    def test_the_previous_actions_terminate_leaves_the_new_action_alone(self):
+        up, aid = 'fsm_stale_term', 7
+        gc = _FakeGroupChat([
+            {'name': 'ChatInstructor', 'content': 'Execute Action 6: search posts'},
+            {'name': 'StatusVerifier', 'content': '{"status": "completed", "action_id": 6}'},
+            {'name': 'ChatInstructor', 'content': 'TERMINATE'},
+        ])
+        assert lh.lifecycle_hook_track_termination(up, _FakeTasks(aid), gc) is False
+        assert get_action_state(up, aid) == S.ASSIGNED
+
+    def test_its_own_terminate_still_terminates_it(self):
+        up, aid = 'fsm_own_term', 7
+        gc = _FakeGroupChat([
+            {'name': 'ChatInstructor', 'content': 'Execute Action 6: search posts'},
+            {'name': 'ChatInstructor', 'content': 'Execute Action 7: summarise'},
+            {'name': 'StatusVerifier', 'content': '{"status": "completed", "action_id": 7}'},
+            {'name': 'ChatInstructor', 'content': 'TERMINATE'},
+        ])
+        assert lh.lifecycle_hook_track_termination(up, _FakeTasks(aid), gc) is True
+        assert get_action_state(up, aid) == S.TERMINATED
+
+    def test_a_re_posted_dispatch_still_owns_its_verdict(self):
+        """The verifier mislabels about a third of genuine verdicts; one for
+        action 6 that says action_id=1 after a re-post is still action 6's."""
+        up, aid = 'fsm_repost_term', 6
+        gc = _FakeGroupChat([
+            {'name': 'ChatInstructor', 'content': 'Execute Action 6: search posts'},
+            {'name': 'Assistant', 'content': 'searching'},
+            {'name': 'ChatInstructor', 'content': 'Properly Execute Action 6: continue'},
+            {'name': 'StatusVerifier', 'content': '{"status": "completed", "action_id": 1}'},
+            {'name': 'ChatInstructor', 'content': 'TERMINATE'},
+        ])
+        assert lh.lifecycle_hook_track_termination(up, _FakeTasks(aid), gc) is True
+        assert get_action_state(up, aid) == S.TERMINATED
+
+    def test_action_2_is_not_action_20(self):
+        msgs = [{'content': 'Execute Action 20: later'}, {'content': 'TERMINATE'}]
+        assert lh.belongs_to_other_action(msgs, -1, 2) is True
+        assert lh.belongs_to_other_action(msgs, -1, 20) is False
+
+    def test_with_no_dispatch_in_view_the_old_behaviour_holds(self):
+        msgs = [{'content': '{"status": "completed"}'}, {'content': 'TERMINATE'}]
+        assert lh.belongs_to_other_action(msgs, -1, 7) is False
+
+    def test_a_seeded_marker_is_not_evidence(self):
+        msgs = [{'content': 'Execute Action 6: old run', '_from_shared': True},
+                {'content': '{"status": "completed"}'},
+                {'content': 'TERMINATE'}]
+        assert lh.belongs_to_other_action(msgs, -2, 7) is False
+
+    def test_the_verdict_pickup_sees_a_stale_verdict(self):
+        msgs = [{'content': 'Execute Action 6: search posts'},
+                {'content': '{"status": "completed", "action_id": 6}'},
+                {'content': 'TERMINATE'}]
+        assert lh.belongs_to_other_action(msgs, -2, 7) is True
+        assert lh.belongs_to_other_action(msgs, -2, 6) is False

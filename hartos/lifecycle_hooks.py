@@ -9,6 +9,7 @@ It also provides functions to sync ActionState with SmartLedger TaskStatus.
 from enum import Enum
 import logging
 import os
+import re
 import threading
 from typing import Dict, Optional, Any
 from core.session_cache import TTLCache
@@ -1437,6 +1438,52 @@ def lifecycle_hook_track_recipe_completion(user_prompt: str, json_obj: dict, use
     return {'action': 'allow', 'message': None}
 
 
+# "Execute Action N:" (also inside "Properly Execute Action N:") is how the
+# create loop posts an action to the group.  Colon-delimited, so action 2
+# never matches action 20.
+_DISPATCH_MARKER = re.compile(r'Execute Action (\d+):')
+
+
+def latest_dispatch_before(messages, index) -> Optional[int]:
+    """The action id of the latest "Execute Action N:" posted before
+    ``messages[index]``, or None when none precedes it.
+
+    Seeded messages (``_from_shared``) do not count: an earlier run's marker in
+    the shared history says nothing about which action this run is on.
+    """
+    try:
+        earlier = messages[:index]
+    except Exception:
+        return None
+    for m in reversed(earlier):
+        if not isinstance(m, dict) or m.get('_from_shared'):
+            continue
+        content = m.get('content')
+        if isinstance(content, str):
+            found = _DISPATCH_MARKER.findall(content)
+            if found:
+                return int(found[-1])
+    return None
+
+
+def belongs_to_other_action(messages, index, action_id) -> bool:
+    """True when ``messages[index]`` was said about a different action than
+    ``action_id``: the latest dispatch before it names another action.
+
+    With no dispatch before it there is no evidence either way, and callers
+    keep their old behaviour.  Measured on central 2026-09-13 (#101): after
+    [ADVANCE] N->N+1 the old verdict and TERMINATE stay the last messages, and
+    both the termination hook and the create loop's verdict pickup credited
+    them to N+1, so every executed action was followed by a phantom completion
+    of the next one.
+    """
+    owner = latest_dispatch_before(messages, index)
+    try:
+        return owner is not None and owner != int(action_id)
+    except (TypeError, ValueError):
+        return False
+
+
 def lifecycle_hook_track_termination(user_prompt: str, user_tasks, group_chat) -> bool:
     """11. Track when action is terminated and passed to chat instructor"""
     if hasattr(user_tasks, 'get'):
@@ -1452,6 +1499,15 @@ def lifecycle_hook_track_termination(user_prompt: str, user_tasks, group_chat) -
     # When TERMINATE is issued
     if (group_chat.messages and
         group_chat.messages[-1]['content'] == 'TERMINATE'):
+
+        # A TERMINATE left over from the previous action is not this one's
+        # (#101): after an advance it is still the last message.
+        if belongs_to_other_action(group_chat.messages, -1, current_action_id):
+            logger.info(
+                "[STALE-TERMINATE] the last TERMINATE belongs to action %s; "
+                "not terminating action %s",
+                latest_dispatch_before(group_chat.messages, -1), current_action_id)
+            return False
 
         # force_state_through_valid_path (not a bare validate): a TERMINATE for an
         # action still stuck in ASSIGNED/IN_PROGRESS/PENDING (the 4B never drove
