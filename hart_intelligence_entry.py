@@ -437,7 +437,7 @@ def hevolve_verify_boot():
 
 from core.http_pool import LLM_COMPLETION_TIMEOUT, pooled_get, pooled_post
 from core.auth_local import (
-    require_local_or_token, require_local_or_token_csrf_safe,
+    _is_local_request, require_local_or_token, require_local_or_token_csrf_safe,
 )
 from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any, Dict
@@ -10568,23 +10568,53 @@ def vlm_stop():
 
     Body (JSON):
         {"user_id": "<uid>", "prompt_id": "<pid>"}
+        {"scope": "node"}
     Response:
         {"status": "stopped"|"no_active_session", "user_id", "prompt_id"}
+        {"status", "scope": "node", "stopped_sessions"}
 
     Empty body / missing prompt_id → bulk-stop every active session
     for the given user_id.  Empty user_id is rejected (bulk-stop
     across all users would be a foot-gun).
+
+    scope=node stops every loop on this node, whoever it runs as, and is
+    what the indicator's Stop sends: the desktop has one screen, and each
+    loop is registered under its agent's creator, so the owner's per-user
+    stop left another creator's loop driving the mouse (live 2026-09-14,
+    agent 88659566083).  Only a caller on this machine may send it
+    (_is_local_request, the rule the decorator applies); a token holder
+    elsewhere gets 403 and keeps the per-user stop.  prompt_id is ignored.
     """
     data = request.get_json(silent=True) or {}
     user_id = data.get('user_id')
     prompt_id = data.get('prompt_id')
 
-    if not user_id:
-        return jsonify({'error': 'user_id required'}), 400
-
     from integrations.vlm.local_loop import (
         request_stop, list_active_sessions,
     )
+
+    if data.get('scope') == 'node':
+        if not _is_local_request():
+            app.logger.warning(f'vlm_stop: node-wide stop refused for '
+                               f'{request.remote_addr}: not on this machine')
+            return jsonify({
+                'error': 'forbidden',
+                'message': 'scope=node is only accepted from this machine.',
+            }), 403
+        stopped = [{'user_id': uid, 'prompt_id': pid}
+                   for uid, pid in list_active_sessions()
+                   if request_stop(uid, pid)]
+        app.logger.warning(f'vlm_stop: node-wide stop from '
+                           f'{request.remote_addr}: {len(stopped)} loop(s) '
+                           f'{stopped}')
+        return jsonify({
+            'status': 'stopped' if stopped else 'no_active_session',
+            'scope': 'node',
+            'stopped_sessions': stopped,
+        }), 200
+
+    if not user_id:
+        return jsonify({'error': 'user_id required'}), 400
 
     if prompt_id:
         found = request_stop(str(user_id), str(prompt_id))
