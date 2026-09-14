@@ -106,7 +106,7 @@ def _origin_host(origin_value: str) -> str:
         return ''
 
 
-def _is_safe_csrf_origin() -> bool:
+def is_safe_csrf_origin() -> bool:
     """Return True iff the request's Origin/Referer header matches the
     set of trusted same-origin sources for state-changing destructive
     endpoints.
@@ -228,7 +228,7 @@ def require_local_or_token_csrf_safe(f):
                     return f(*args, **kwargs)
         # Local callers must additionally pass the CSRF check.
         if _is_local_request():
-            if _is_safe_csrf_origin():
+            if is_safe_csrf_origin():
                 return f(*args, **kwargs)
             return jsonify({
                 'error': 'forbidden',

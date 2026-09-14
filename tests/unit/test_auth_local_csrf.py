@@ -205,7 +205,8 @@ def test_origin_host_parser():
 def test_module_imports_cleanly():
     from core import auth_local  # noqa: F401
     assert hasattr(auth_local, 'require_local_or_token_csrf_safe')
-    assert hasattr(auth_local, '_is_safe_csrf_origin')
+    # Public: Nunba's routes/auth.py imports it for its own csrf-safe guard.
+    assert hasattr(auth_local, 'is_safe_csrf_origin')
 
 
 # ════════════════════════════════════════════════════════════════════
