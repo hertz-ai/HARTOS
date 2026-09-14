@@ -3349,18 +3349,14 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     # message.  With the managers built first, these logs got zero appends
     # (#725, nappend=0) and _reuse_sync_group_log rebuilt them from
     # manager._oai_messages.
-    def _graph_sink(msg, graph=memory_graph, session=user_prompt):
-        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-        speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-        if content and len(content.strip()) > 5:
-            graph.register_conversation(speaker, content, session)
-
     try:
-        from integrations.channels.memory.shared_history import install_history_writeback
+        from integrations.channels.memory.shared_history import (
+            graph_conversation_sink, install_history_writeback)
         for gc in [group_chat, group_chat_1, group_chat_2]:
             install_history_writeback(
                 gc, user_id, simplemem_store,
-                extra_sinks=[_graph_sink] if memory_graph is not None else None,
+                extra_sinks=([graph_conversation_sink(memory_graph, user_prompt)]
+                             if memory_graph is not None else None),
                 simplemem_metadata={'prompt_id': prompt_id},
                 prompt_id=prompt_id)
     except Exception:

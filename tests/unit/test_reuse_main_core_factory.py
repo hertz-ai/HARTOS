@@ -258,19 +258,24 @@ class ReuseMainCoreFactory(unittest.TestCase):
         self.assertNotIn("{'hive'", out)
         self.assertLessEqual(len(out), TOOL_OBSERVATION_MAX_CHARS + 50)
 
-    def test_simplemem_recall_skips_a_row_from_before_the_cap(self):
-        from core.constants import MEMORY_ITEM_MAX_CHARS
-        legacy = "{'hive': " + 'x' * MEMORY_ITEM_MAX_CHARS
+    def test_simplemem_recall_cuts_its_answer_rather_than_skipping_it(self):
+        """SimpleMem returns an answer, not a stored row, so a long one is cut
+        to the observation budget; skipping it made the tool report 'No
+        relevant memories found' (#104 review)."""
+        from core.constants import MEMORY_ITEM_MAX_CHARS, TOOL_OBSERVATION_MAX_CHARS
+        answer = 'The prior threat patterns were ' + 'y' * MEMORY_ITEM_MAX_CHARS
 
         async def _search(query):
-            return [SimpleNamespace(content=legacy),
+            return [SimpleNamespace(content=answer),
                     SimpleNamespace(content='fact B')]
 
         async def _add(content, meta):
             return None
         tools = self._factory_tools(
             simplemem_store=SimpleNamespace(search=_search, add=_add))
-        self.assertEqual(tools['search_long_term_memory']('q'), 'fact B')
+        out = tools['search_long_term_memory']('q')
+        self.assertTrue(out.startswith('The prior threat patterns were'), out[:60])
+        self.assertLessEqual(len(out), TOOL_OBSERVATION_MAX_CHARS)
 
     def test_send_message_to_user_blocks_agent_mentions(self):
         """The absorbed reuse guard, proven by calling: '@helper' text

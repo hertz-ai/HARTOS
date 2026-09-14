@@ -1187,21 +1187,25 @@ def _context_limiter_classes():
             # Guardian Convergence action 9: two search_long_term_memory
             # results, 3,386,616 chars together, passed a 1000-token limit and
             # every call to the hosted model was a bare 400. The bundle is one
-            # message, so its calls share that message's allowance. New dicts
-            # only: the list may be the group chat's own.
+            # message, so its calls share that message's allowance, and only
+            # when they do not fit (fit_texts_to_token_budget). New dicts only:
+            # the list may be the group chat's own.
+            from core.token_utils import fit_texts_to_token_budget
             responses = msg.get('tool_responses') if isinstance(msg, dict) else None
             if not isinstance(responses, list) or not responses:
                 return msg
-            per_call = max(1, min(self._max_tokens, self._max_tokens_per_message)
-                           // len(responses))
-            count = transforms.transforms_util.count_text_tokens
-            bounded, cut = [], False
-            for r in responses:
-                c = r.get('content') if isinstance(r, dict) else None
-                if isinstance(c, str) and len(c) > per_call and count(c) > per_call:
-                    r = {**r, 'content': self._truncate_str_to_tokens(c, per_call)}
+            slots = [i for i, r in enumerate(responses)
+                     if isinstance(r, dict) and isinstance(r.get('content'), str)]
+            if not slots:
+                return msg
+            fitted = fit_texts_to_token_budget(
+                [responses[i]['content'] for i in slots],
+                min(self._max_tokens, self._max_tokens_per_message))
+            bounded, cut = list(responses), False
+            for i, text in zip(slots, fitted):
+                if text != responses[i]['content']:
+                    bounded[i] = {**responses[i], 'content': text}
                     cut = True
-                bounded.append(r)
             return {**msg, 'tool_responses': bounded} if cut else msg
 
     _CONTEXT_LIMITER_CLASSES = (HistoryLimiter, TokenLimiter)
@@ -2371,6 +2375,16 @@ class ToolMessageHandler:
                             # the placeholder when nothing real exists, so a
                             # genuinely unanswered call still looks unanswered.
                             _real = self.real_tool_answer(tool_call_id)
+                            if _real:
+                                # A peer's buffer holds the result as it ran,
+                                # and this runs after the context limiter, so
+                                # bound it the way the limiter bounds a tool
+                                # result (#104 review: a peer's whole answer
+                                # reached the model uncut).
+                                from core.constants import AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE
+                                from core.token_utils import fit_texts_to_token_budget
+                                _real = fit_texts_to_token_budget(
+                                    [_real], AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE)[0]
                             placeholder = {
                                 'role': 'tool',
                                 'name': function_name or assistant_msg.get('name', 'Assistant'),

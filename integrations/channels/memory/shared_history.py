@@ -238,6 +238,117 @@ def create_autogen_history_hook(
     return _make_hook
 
 
+# ─── What the write-back stores ──────────────────────────────────────────
+# A tool whose result is a READ of state HARTOS already persists (MemoryGraph,
+# SimpleMem, agent_data, the chat history) is marked reads_persisted_state
+# where it is registered (core.tool_traits). The group chat's write-back does
+# not store such a result again: the store already holds it, and writing a
+# read back makes the next read return more. Live on central 2026-09-14
+# (#104): Guardian Convergence's graph reached 28.6M chars that way, and one
+# recall came back at 3,386,616 chars.
+
+
+def _tool_reads_persisted_state(group_chat, name):
+    """Whether the tool registered as ``name`` in this group carries the mark.
+
+    An unknown name counts as not a persisted read, so its result is kept.
+    That fails open on purpose (nothing is dropped on a guess), and it is
+    safe only because every stored row is bounded to MEMORY_ITEM_MAX_CHARS
+    (_bounded_for_storage here, MemoryGraph.register there): an unmatched
+    read is stored once, bounded, and cannot grow the next recall. Keep the
+    bound if you change this.
+    """
+    from core.tool_traits import READS_PERSISTED_STATE, has_trait
+    if not name:
+        return False
+    for agent in getattr(group_chat, 'agents', None) or []:
+        fmap = getattr(agent, 'function_map', None)
+        fn = fmap.get(name) if isinstance(fmap, dict) else None
+        if fn is not None:
+            return has_trait(fn, READS_PERSISTED_STATE)
+    return False
+
+
+def _bounded_for_storage(msg):
+    """``msg`` with its text bounded to MEMORY_ITEM_MAX_CHARS, as a copy.
+
+    The content and every tool_responses entry, with the bound MemoryGraph.
+    register applies, so a row cut here and a row cut there read the same.
+    """
+    from core.constants import MEMORY_ITEM_MAX_CHARS
+    from core.token_utils import bound_text
+
+    def _over(text):
+        return isinstance(text, str) and len(text) > MEMORY_ITEM_MAX_CHARS
+
+    out = msg
+    if _over(msg.get('content')):
+        out = dict(out)
+        out['content'] = bound_text(msg['content'], MEMORY_ITEM_MAX_CHARS)
+    responses = msg.get('tool_responses')
+    if isinstance(responses, list) and any(
+            isinstance(r, dict) and _over(r.get('content')) for r in responses):
+        out = dict(out)
+        out['tool_responses'] = [
+            {**r, 'content': bound_text(r['content'], MEMORY_ITEM_MAX_CHARS)}
+            if isinstance(r, dict) and _over(r.get('content')) else r
+            for r in responses]
+    return out
+
+
+def _make_storage_view(group_chat):
+    """``view(msg)``: the message as the write-back sinks may store it.
+
+    Returns None when nothing in it is to be stored, else a copy with the
+    persisted-state reads taken out of a tool reply and the text bounded.
+    Never edits ``msg``: run_chat broadcasts the dict it appends to every
+    seat. Tool calls are matched to their replies by tool_call_id, so a
+    bundled reply keeps the results of the other tools it carries; an id is
+    dropped once its reply is seen, since reuse keeps a group for the whole
+    session.
+    """
+    calls = {}  # tool_call_id -> function name, until its reply arrives
+
+    def view(msg):
+        if not isinstance(msg, dict):
+            return msg
+        for tc in msg.get('tool_calls') or []:
+            if isinstance(tc, dict) and tc.get('id'):
+                calls[tc['id']] = (tc.get('function') or {}).get('name') or ''
+        if (msg.get('role') or '') != 'tool':
+            return _bounded_for_storage(msg)
+        bundled = isinstance(msg.get('tool_responses'), list) and msg['tool_responses']
+        responses = msg['tool_responses'] if bundled else [msg]
+        kept = [r for r in responses if isinstance(r, dict)
+                and not _tool_reads_persisted_state(
+                    group_chat, calls.pop(r.get('tool_call_id'), ''))]
+        if not kept:
+            return None
+        if len(kept) == len(responses):
+            return _bounded_for_storage(msg)
+        out = dict(msg)
+        out['tool_responses'] = kept
+        out['content'] = '\n\n'.join(str(r.get('content') or '') for r in kept)
+        return _bounded_for_storage(out)
+
+    return view
+
+
+def graph_conversation_sink(memory_graph, session_id):
+    """The one MemoryGraph sink for a group chat's write-back.
+
+    Each stored message becomes a conversation row under ``session_id``,
+    spoken by the message's name. create_agents and reuse's group builder
+    carried identical private copies of this; both use this one now.
+    """
+    def _sink(msg):
+        content = msg.get('content', '') if isinstance(msg, dict) else str(msg)
+        speaker = msg.get('name', 'Agent') if isinstance(msg, dict) else 'Agent'
+        if content and len(content.strip()) > 5:
+            memory_graph.register_conversation(speaker, content, session_id)
+    return _sink
+
+
 class HookedMessageList(list):
     """A list whose append also feeds a per-message hook.
 
@@ -299,10 +410,17 @@ def install_history_writeback(group_chat, user_id, simplemem_store=None,
     if not sinks:
         return False
 
+    # Every sink stores the same view of a message: persisted-state reads left
+    # out, content bounded (see _make_storage_view).
+    storage_view = _make_storage_view(group_chat)
+
     def _fanout(msg):
+        stored = storage_view(msg)
+        if stored is None:
+            return
         for _sink in sinks:
             try:
-                _sink(msg)
+                _sink(stored)
             except Exception:
                 logger.debug("history sink failed", exc_info=True)
 

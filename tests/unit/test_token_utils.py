@@ -46,6 +46,49 @@ def test_non_string_is_coerced():
     assert count_tokens_for_text(1234567) >= 1
 
 
+# ── #104: one bound for text, one fair share for bundled tool results ──
+
+def test_bound_text_keeps_the_head_and_marks_the_cut():
+    from core.token_utils import bound_text
+    assert bound_text('short', 100) == 'short'
+    out = bound_text('x' * 500, 100)
+    assert len(out) <= 100
+    assert out.startswith('xxxx') and out.endswith(' ...[cut]')
+    assert bound_text(None, 10) == 'None'
+
+
+def test_truncate_text_to_tokens_keeps_the_head():
+    from core.token_utils import truncate_text_to_tokens
+    text = ' '.join(f'word{i}' for i in range(500))
+    out = truncate_text_to_tokens(text, 50)
+    assert text.startswith(out[:20])
+    assert count_tokens_for_text(out) <= 52
+    assert truncate_text_to_tokens('hi', 50) == 'hi'
+
+
+def test_results_that_fit_are_left_alone():
+    """#104 review, measured on the create chain: get_user_id plus an
+    840-token search fit a 1000-token allowance, and an even split still cut
+    the search to 500."""
+    from core.token_utils import fit_texts_to_token_budget
+    search = ' '.join(f'result {i}: a snippet' for i in range(120))
+    assert count_tokens_for_text(search) + count_tokens_for_text('7001') <= 1000
+    texts = ['7001', search]
+    assert fit_texts_to_token_budget(texts, 1000) == texts
+
+
+def test_over_budget_the_short_keep_theirs_and_the_long_share_the_rest():
+    from core.token_utils import fit_texts_to_token_budget
+    short = 'user 7001'
+    long_a = ' '.join(f'alpha{i}' for i in range(2000))
+    long_b = ' '.join(f'beta{i}' for i in range(2000))
+    out = fit_texts_to_token_budget([short, long_a, long_b], 600)
+    assert out[0] == short
+    # a few tokens of slack: a cut re-encodes at a token boundary
+    assert sum(count_tokens_for_text(t) for t in out) <= 610
+    assert abs(count_tokens_for_text(out[1]) - count_tokens_for_text(out[2])) <= 5
+
+
 if __name__ == '__main__':
     class _MP:
         def setattr(self, obj, name, val):

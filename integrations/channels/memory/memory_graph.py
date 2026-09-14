@@ -167,15 +167,16 @@ class MemoryGraph:
         # One bound for every writer (#104). Nothing capped a row, and results
         # that were written back, recalled and written back again grew
         # Guardian Convergence's graph to 28.6M chars, the largest row
-        # 3,960,333. The head is kept and the mark says the row was cut.
+        # 3,960,333. bound_text keeps the head and marks the cut; the group
+        # chat's write-back uses the same bound, so the two agree.
         from core.constants import MEMORY_ITEM_MAX_CHARS
+        from core.token_utils import bound_text
         if isinstance(content, str) and len(content) > MEMORY_ITEM_MAX_CHARS:
-            mark = ' ...[cut]'
             logger.info(
                 "[MEMORY-BOUND] stored %d of %d chars (%s, session %s)",
                 MEMORY_ITEM_MAX_CHARS, len(content),
                 metadata.get("source_agent", ""), metadata.get("session_id", ""))
-            content = content[:MEMORY_ITEM_MAX_CHARS - len(mark)] + mark
+            content = bound_text(content, MEMORY_ITEM_MAX_CHARS)
 
         # Merge provenance into metadata for MemoryStore storage
         full_metadata = {

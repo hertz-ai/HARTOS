@@ -1277,6 +1277,8 @@ TOOL_OBSERVATION_MAX_CHARS: int = 2000
 #
 # WHY 16000. A recall shows at most TOOL_OBSERVATION_MAX_CHARS of a row; the
 # rest stays for search to match on. Eight times that holds a long reply or
-# the substance of a fetched page, and nothing near a context's size. Recall
-# skips rows longer than this, which only rows stored before the cap can be.
+# the substance of a fetched page, and nothing near a context's size. The
+# MemoryGraph leg of recall skips rows longer than this: every write to the
+# graph and through the group chat's write-back is bounded to it by
+# core.token_utils.bound_text, so only rows stored before the cap can be.
 MEMORY_ITEM_MAX_CHARS: int = 16000

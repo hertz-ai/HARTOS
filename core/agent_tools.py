@@ -24,50 +24,45 @@ import requests
 from json_repair import repair_json
 
 from core.http_pool import pooled_get, pooled_post
+from core.tool_traits import reads_persisted_state
 from integrations.service_tools.model_catalog import ModelType
 
 tool_logger = logging.getLogger('tool_execution')
 
 
 def _bounded_observation(text, hint):
-    """``text`` cut to TOOL_OBSERVATION_MAX_CHARS, with a note saying so.
-
-    For tools that read state back. The result goes to the model and, through
-    the group chat's write-back, into memory, so an unbounded read of a large
-    store did both at full size (#104). ``hint`` tells the model how to ask
-    for less.
-    """
+    """``text`` bounded to TOOL_OBSERVATION_MAX_CHARS for a tool result, the
+    cut marked with ``hint`` (#104). The result goes to the model and, through
+    the group chat's write-back, into memory."""
     from core.constants import TOOL_OBSERVATION_MAX_CHARS
-    text = '' if text is None else str(text)
-    if len(text) <= TOOL_OBSERVATION_MAX_CHARS:
-        return text
-    return (f'{text[:TOOL_OBSERVATION_MAX_CHARS]}\n...['
-            f'{len(text) - TOOL_OBSERVATION_MAX_CHARS} more chars not shown; '
-            f'{hint}]')
+    from core.token_utils import bound_text
+    return bound_text(text, TOOL_OBSERVATION_MAX_CHARS, f'\n...[cut; {hint}]')
 
 
-def _bounded_recall(contents, max_items):
+def _bounded_recall(contents, max_items, skip_oversize=True):
     """Recalled memories joined for a tool result, within one budget.
 
-    Both legs of search_long_term_memory use it. A memory longer than
-    MEMORY_ITEM_MAX_CHARS is skipped, not cut: nothing stored since #104 can
-    be that long, so it predates the storage cap. Rows like it (whole data
-    stores, written back and recalled again) grew Guardian Convergence's graph
-    to 28.6M chars and one recall to 3,386,616, and they rank high on any
-    query because they hold so many terms.
+    Both legs of search_long_term_memory use it. On the MemoryGraph leg
+    (``skip_oversize``) a row longer than MEMORY_ITEM_MAX_CHARS is skipped,
+    not cut: every graph write is bounded to that since #104, so a longer row
+    predates the bound. Rows like it (whole data stores, written back and
+    recalled again) grew Guardian Convergence's graph to 28.6M chars and one
+    recall to 3,386,616, and they rank high on any query because they hold so
+    many terms. SimpleMem's item is an answer, not a stored row, so it is cut.
     """
     from core.constants import MEMORY_ITEM_MAX_CHARS, TOOL_OBSERVATION_MAX_CHARS
+    from core.token_utils import bound_text
     picked, used, skipped = [], 0, 0
     for c in contents:
         if not isinstance(c, str) or not c.strip():
             continue
-        if len(c) > MEMORY_ITEM_MAX_CHARS:
+        if skip_oversize and len(c) > MEMORY_ITEM_MAX_CHARS:
             skipped += 1
             continue
-        if len(picked) >= max_items or used >= TOOL_OBSERVATION_MAX_CHARS:
-            break
         room = TOOL_OBSERVATION_MAX_CHARS - used
-        piece = c if len(c) <= room else c[:room] + ' ...[cut]'
+        if len(picked) >= max_items or room < 40:
+            break
+        piece = bound_text(c, room)
         picked.append(piece)
         used += len(piece)
     if skipped:
@@ -956,7 +951,11 @@ def build_core_tool_closures(ctx):
     tools.append((
         "save_data_in_memory",
         "Use this to Store and retrieve data using key-value storage system",
-        save_data_in_memory,
+        # Marked reads_persisted_state (#104): its result reports what is now
+        # stored, so the group chat's write-back does not store it again. The
+        # same mark goes on every tool below whose result is a read of state
+        # HARTOS already keeps.
+        reads_persisted_state(save_data_in_memory),
     ))
 
     # ------------------------------------------------------------------
@@ -974,7 +973,7 @@ def build_core_tool_closures(ctx):
     tools.append((
         "get_saved_metadata",
         "Returns the schema of the json from internal memory with all keys but without actual values.",
-        get_saved_metadata,
+        reads_persisted_state(get_saved_metadata),
     ))
 
     # ------------------------------------------------------------------
@@ -1046,11 +1045,12 @@ def build_core_tool_closures(ctx):
         "get_data_by_key",
         "Returns the data saved at a key. A long value comes back one page at a "
         "time; pass the offset the reply names to read the next page.",
-        get_data_by_key,
+        reads_persisted_state(get_data_by_key),
     ))
     # Alias — Helper system prompts in reuse_recipe.py advertise this name (#510).
-    # Same closure → identical behavior under both names.  Never remove a
-    # registered tool: phantom tool fixed by adding a real registration.
+    # Same closure → identical behavior under both names, the persisted-read
+    # mark included.  Never remove a registered tool: phantom tool fixed by
+    # adding a real registration.
     tools.append((
         "get_data_from_memory",
         "Returns the data saved at a key, a page at a time (alias of get_data_by_key)",
@@ -1580,7 +1580,7 @@ def build_core_tool_closures(ctx):
     tools.append((
         "get_chat_history",
         "Get Chat history based on text & start & end date",
-        get_chat_history,
+        reads_persisted_state(get_chat_history),
     ))
 
     # ------------------------------------------------------------------
@@ -1601,7 +1601,7 @@ def build_core_tool_closures(ctx):
     tools.append((
         "search_visual_history",
         "Search past camera and screen descriptions by keyword and time range.",
-        search_visual_history,
+        reads_persisted_state(search_visual_history),
     ))
 
     # ------------------------------------------------------------------
@@ -1649,8 +1649,11 @@ def build_core_tool_closures(ctx):
                 try:
                     loop = get_or_create_event_loop()
                     results = loop.run_until_complete(simplemem_store.search(query))
+                    # SimpleMem's item is an answer, not a stored row: cut it,
+                    # never skip it.
                     text = _bounded_recall(
-                        [r.content for r in (results or [])], max_items=1)
+                        [r.content for r in (results or [])], max_items=1,
+                        skip_oversize=False)
                     return text or "No relevant memories found."
                 except Exception as e:
                     tool_logger.info(f"SimpleMem search error: {e}")
@@ -1670,7 +1673,7 @@ def build_core_tool_closures(ctx):
         tools.append((
             "search_long_term_memory",
             "Search long-term memory for past conversations, facts, and context using natural language query.",
-            search_long_term_memory,
+            reads_persisted_state(search_long_term_memory),
         ))
 
         @log_tool_execution
@@ -2095,7 +2098,7 @@ def build_core_tool_closures(ctx):
         "get_user_details",
         "Get the current user's profile information (name, email, preferences, etc.). "
         "Use when the user asks about their profile or when you need user context.",
-        get_user_details,
+        reads_persisted_state(get_user_details),
     ))
 
     # ------------------------------------------------------------------

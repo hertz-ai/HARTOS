@@ -3013,14 +3013,11 @@ def _install_create_group_writeback(group_chat, user_id, prompt_id, user_prompt,
     '?' for a Tamil or Hindi user's words once the hook ran. It only ever sat
     behind the late rebind, so the model has always read the unstripped text.
     """
+    from integrations.channels.memory.shared_history import (
+        graph_conversation_sink, install_history_writeback)
     sinks = []
     if memory_graph is not None:
-        def _graph_sink(msg):
-            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-            speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-            if content and len(content.strip()) > 5:
-                memory_graph.register_conversation(speaker, content, user_prompt)
-        sinks.append(_graph_sink)
+        sinks.append(graph_conversation_sink(memory_graph, user_prompt))
 
     # Resonance stream: continuous in-conversation tuning via HevolveAI
     try:
@@ -3037,7 +3034,6 @@ def _install_create_group_writeback(group_chat, user_id, prompt_id, user_prompt,
     except ImportError:
         pass
 
-    from integrations.channels.memory.shared_history import install_history_writeback
     return install_history_writeback(
         group_chat, user_id, simplemem_store, extra_sinks=sinks,
         simplemem_metadata={'prompt_id': prompt_id}, prompt_id=prompt_id)

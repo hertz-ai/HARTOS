@@ -119,13 +119,73 @@ class ConsolidatedToolResponseTests(unittest.TestCase):
         tools = [m for m in out if m.get('role') == 'tool']
         self.assertEqual([m.get('tool_call_id') for m in tools],
                          ['call_1', 'call_2'])
-        for m in tools:
-            self.assertLessEqual(
-                transforms_util.count_text_tokens(m['content']),
-                AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
-                'a tool result reached the model past the per-message limit')
+        # The bundle is one message to the limiter, so its results share that
+        # message's allowance (a few tokens of slack: a cut re-encodes at a
+        # token boundary).
+        total = sum(transforms_util.count_text_tokens(m['content']) for m in tools)
+        self.assertLessEqual(total, AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE + 8,
+                             'the bundle reached the model past its allowance')
         self.assertEqual(turn[2]['tool_responses'][0]['content'], store,
                          "the limiter edited the group chat's own message")
+
+    def test_a_bundle_that_fits_reaches_the_model_whole(self):
+        """#104 review, measured on the create chain: get_user_id plus an
+        840-token google_search, 843 tokens against a 1000-token allowance,
+        and an even split cut the search to 500."""
+        from autogen.agentchat.contrib.capabilities import transforms_util
+        from core.constants import (AUTOGEN_MESSAGE_TOKEN_BUDGET,
+                                    AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE)
+        from hartos.helper import token_limiter
+        search = ' '.join(f'result {i}: a snippet' for i in range(120))
+        self.assertLess(transforms_util.count_text_tokens(search) + 5,
+                        AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE)
+        turn = [
+            {'role': 'user', 'name': 'ChatInstructor',
+             'content': 'Execute Action 2: search for idle GPU offers'},
+            {'role': 'assistant', 'name': 'Assistant', 'content': '',
+             'tool_calls': [_call(1, 'uid'), _call(2, 'q')]},
+            {'role': 'tool', 'name': 'Assistant',
+             'content': '7001\n\n' + search,
+             'tool_responses': [
+                 {'tool_call_id': 'call_1', 'role': 'tool', 'content': '7001'},
+                 {'tool_call_id': 'call_2', 'role': 'tool', 'content': search}]},
+        ]
+        limiter = token_limiter(
+            max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET,
+            max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
+            min_tokens=0)
+        out = self.handler.apply_transform(limiter.apply_transform(turn))
+        self.assertEqual([m['content'] for m in out if m.get('role') == 'tool'],
+                         ['7001', search])
+
+    def test_a_peer_answer_filled_in_after_the_limiter_is_bounded(self):
+        """#104 review: the handler fills an unanswered earlier call from a
+        peer's buffer, after the context limiter has run, and inserted the
+        peer's answer uncut."""
+        from types import SimpleNamespace
+        from autogen.agentchat.contrib.capabilities import transforms_util
+        from core.constants import AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE
+        from hartos.helper import ToolMessageHandler
+        huge = str({'hive': {'history': ['cycle %d steady' % i
+                                         for i in range(3000)]}})
+        peer = SimpleNamespace(_oai_messages={'chat': [
+            {'role': 'tool', 'tool_call_id': 'call_9', 'content': huge}]})
+        handler = ToolMessageHandler(user_tasks=None, user_prompt=None,
+                                     peer_agents=[peer])
+        out = handler.apply_transform([
+            {'role': 'user', 'content': 'Execute Action 3: read the store'},
+            {'role': 'assistant', 'content': '', 'tool_calls': [_call(9, 'hive')]},
+            {'role': 'user', 'content': 'continue'},
+            {'role': 'assistant', 'content': '', 'tool_calls': [_call(10, 'x')]},
+            {'role': 'tool', 'tool_call_id': 'call_10', 'content': 'ok'},
+        ])
+        filled = [m for m in out if m.get('tool_call_id') == 'call_9']
+        self.assertEqual(len(filled), 1, [m.get('role') for m in out])
+        self.assertTrue(filled[0]['content'].startswith("{'hive'"))
+        self.assertLessEqual(
+            transforms_util.count_text_tokens(filled[0]['content']),
+            AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE + 4,
+            "a peer's answer reached the model past the per-message allowance")
 
 
 if __name__ == '__main__':

@@ -131,3 +131,64 @@ def count_tokens_for_messages(messages: List[dict],
                 text += json.dumps(v) if not isinstance(v, str) else v
         total += count_tokens_for_text(text, model) + _TOKENS_PER_MESSAGE_OVERHEAD
     return total
+
+
+# ─── Bounding text to a budget ───────────────────────────────────────────
+# One home for cutting text, so the caps agree: the #104 review found two
+# storage caps on one constant that disagreed on whether a cut row says so.
+
+
+def bound_text(text: Any, max_chars: int, mark: str = ' ...[cut]') -> str:
+    """``text`` cut to at most ``max_chars`` characters, keeping the head.
+
+    A cut text ends with ``mark``, and the result, mark included, never
+    exceeds ``max_chars``, so ``len(t) > max_chars`` finds text that was
+    never bounded. ``None`` becomes ``'None'``, as the f-string reads this
+    replaced produced.
+    """
+    s = text if isinstance(text, str) else str(text)
+    if len(s) <= max_chars:
+        return s
+    mark = mark[:max(0, max_chars)]
+    return s[:max(0, max_chars - len(mark))] + mark
+
+
+def truncate_text_to_tokens(text: str, max_tokens: int,
+                            model: Optional[str] = None) -> str:
+    """``text`` cut to at most ``max_tokens`` tokens, keeping the head."""
+    if max_tokens <= 0 or not text:
+        return ''
+    enc = _get_encoding(model)
+    if enc is not None:
+        try:
+            ids = enc.encode(text)
+            return text if len(ids) <= max_tokens else enc.decode(ids[:max_tokens])
+        except Exception:
+            pass  # fall through to approximation
+    return text[:int(max_tokens * _CHARS_PER_TOKEN_FALLBACK)]
+
+
+def fit_texts_to_token_budget(texts: List[Any], budget: int,
+                              model: Optional[str] = None) -> List[str]:
+    """Cut ``texts`` so that together they fit ``budget`` tokens.
+
+    Left as they are when they already fit. Otherwise the budget is shared:
+    a text shorter than an equal share keeps all of it, and the longer ones
+    split what is left equally. For the results of one bundled tool call,
+    which count as one message against the context limiter, so a result is
+    cut only by what shares its message, never by the bundling alone (#104
+    review: an even split cut a search result from 840 to 500 tokens inside
+    a bundle that fit).
+    """
+    texts = [t if isinstance(t, str) else str(t) for t in texts]
+    counts = [count_tokens_for_text(t, model) for t in texts]
+    if sum(counts) <= budget:
+        return texts
+    caps = [0] * len(texts)
+    remaining, left = max(0, budget), len(texts)
+    for i in sorted(range(len(texts)), key=lambda j: counts[j]):
+        caps[i] = min(counts[i], remaining // left)
+        remaining -= caps[i]
+        left -= 1
+    return [t if caps[i] >= counts[i] else truncate_text_to_tokens(t, caps[i], model)
+            for i, t in enumerate(texts)]
