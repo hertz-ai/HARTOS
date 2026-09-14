@@ -601,19 +601,25 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
                 replace_existing=True  # Use replace_existing to avoid conflicts
             )
     except Exception as e:
-        current_app.logger.error(f"Error scheduling tracking reset: {e}")
+        _ctx_safe_log('error', f"Error scheduling tracking reset: {e}")
 
     # Send the message to the user
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
     body = json.dumps({'user_id': user_id, 'message': response, 'inp': inp, 'request_id': intermediate_request_id, 'Agent_status': 'Reuse Mode'})
     headers = {'Content-Type': 'application/json'}
 
+    # Tool and scheduler threads call this with no Flask app context, so its
+    # logs go through _ctx_safe_log.  With current_app.logger the success log
+    # below raised after the POST, the except branch raised again, and the
+    # caller was told a message it had sent had failed: central 2026-09-14,
+    # 33 of 34 "Working outside of application context" errors.
     try:
         res = pooled_post(url, data=body, headers=headers)
-        current_app.logger.info(
+        _ctx_safe_log(
+            'info',
             f'Message sent with request_id: {intermediate_request_id}, tracking will reset in {reset_tracking_delay}s')
     except Exception as e:
-        current_app.logger.error(f"Error sending message to user: {e}")
+        _ctx_safe_log('error', f"Error sending message to user: {e}")
         return f'Failed to send message to user with request_id: {original_request_id}'
 
     return f'Message sent successfully to user with request_id: {original_request_id}'
