@@ -18,7 +18,7 @@ encounter_api._has_cloud_drafting_consent (encounter_api.py:616).
 Endpoints (all mounted at /api/social/consent*, JWT auth required):
 
   POST /api/social/consent          grant — APPEND a NEW row
-  POST /api/social/consent/revoke   revoke — set revoked_at on most-recent
+  POST /api/social/consent/revoke   revoke — set revoked_at on every
                                     active row (granted_at preserved)
   GET  /api/social/consent          list — newest-first; supports
                                     consent_type + active_only filters
@@ -170,9 +170,10 @@ def grant_consent():
 @consent_bp.route('/consent/revoke', methods=['POST'])
 @require_auth
 def revoke_consent():
-    """Revoke the most-recent active consent for (user, type, scope).
+    """Revoke every active consent for (user, type, scope).
 
-    Active = granted=True AND revoked_at IS NULL.
+    Active = granted=True AND revoked_at IS NULL.  The response names the
+    most recent of them.
 
     Body: {consent_type: str, scope: str (default '*')}
     Returns: {id, revoked_at}
@@ -192,24 +193,28 @@ def revoke_consent():
     if not consent_type:
         return _err('consent_type required')
 
-    # Most-recent active row.  Sort by granted_at desc so a re-grant
-    # made after a previous revoke is the row we touch.
-    row = g.db.query(UserConsent).filter(
+    # Every active row.  A grant appends a row, so two Allow clicks are two
+    # rows; revoking only the newest left the older one passing
+    # check_consent (tests/unit/test_consent_revoke_is_honoured.py).
+    # Newest first, so the response still names the most recent grant.
+    rows = g.db.query(UserConsent).filter(
         UserConsent.user_id == uid,
         UserConsent.consent_type == consent_type,
         UserConsent.scope == scope,
         UserConsent.granted == True,  # noqa: E712 — SQLAlchemy idiom
         UserConsent.revoked_at.is_(None),
-    ).order_by(UserConsent.granted_at.desc()).first()
+    ).order_by(UserConsent.granted_at.desc()).all()
 
-    if row is None:
+    if not rows:
         return _err('no active consent', 404)
 
     # Audit-evidence-discipline: NEVER overwrite granted_at.  The
     # event of "this consent was granted at T" is immutable history.
     now = datetime.utcnow()
-    row.revoked_at = now
+    for r in rows:
+        r.revoked_at = now
     g.db.flush()
+    row = rows[0]
 
     # Parallel-path parity (audit #4): this UI surface keeps its OWN append-only
     # row model on purpose — granted stays True and revoked_at is the tombstone

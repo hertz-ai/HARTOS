@@ -351,25 +351,46 @@ class ConsentService:
     @staticmethod
     def revoke_consent(db, user_id: str, consent_type: str,
                        scope: str = '*', agent_id=None):
-        """Revoke previously granted consent. Returns None if not found."""
+        """Revoke consent: end every active grant for the combination.
+
+        grant_consent is append-only, so two grants are two rows and both
+        must end.  This used to take ``.first()`` of all rows, which after
+        an ask is the pending ask row, so the grant stayed and check_consent
+        kept passing (tests/unit/test_consent_revoke_is_honoured.py).  When
+        nothing was granted, the first row is marked as before, which
+        records a declined ask and stops request_consent re-asking.
+
+        Returns the newest row changed, or None when there is no row.
+        """
         _validate_consent_type(consent_type)
 
-        consent = db.query(UserConsent).filter(
+        rows = db.query(UserConsent).filter(
             UserConsent.user_id == user_id,
             UserConsent.consent_type == consent_type,
             UserConsent.scope == scope,
             UserConsent.agent_id == agent_id,
-        ).first()
-
-        if not consent:
+            UserConsent.granted == True,
+            UserConsent.revoked_at.is_(None),
+        ).order_by(UserConsent.granted_at.desc()).all()
+        if not rows:
+            first = db.query(UserConsent).filter(
+                UserConsent.user_id == user_id,
+                UserConsent.consent_type == consent_type,
+                UserConsent.scope == scope,
+                UserConsent.agent_id == agent_id,
+            ).first()
+            rows = [first] if first else []
+        if not rows:
             return None
 
-        consent.granted = False
-        consent.revoked_at = datetime.utcnow()
+        now = datetime.utcnow()
+        for row in rows:
+            row.granted = False
+            row.revoked_at = now
         db.flush()
 
         ConsentService.announce_revocation(user_id, consent_type, scope, agent_id)
-        return consent
+        return rows[0]
 
     @staticmethod
     def announce_revocation(user_id: str, consent_type: str,
@@ -397,6 +418,11 @@ class ConsentService:
                       scope: str = '*', agent_id=None) -> bool:
         """Check if user has active consent.
 
+        Active means granted and not revoked.  The privacy page
+        (consent_api.revoke_consent) revokes by setting revoked_at and
+        leaves granted=True, so ``granted`` alone kept a revoked consent
+        passing (tests/unit/test_consent_revoke_is_honoured.py).
+
         Lookup order:
           1. Exact match (user_id + agent_id + consent_type + scope)
           2. Wildcard scope (scope='*') for same agent
@@ -411,6 +437,7 @@ class ConsentService:
             UserConsent.scope == scope,
             UserConsent.agent_id == agent_id,
             UserConsent.granted == True,
+            UserConsent.revoked_at.is_(None),
         ).first()
         if exact:
             return True
@@ -423,6 +450,7 @@ class ConsentService:
                 UserConsent.scope == '*',
                 UserConsent.agent_id == agent_id,
                 UserConsent.granted == True,
+                UserConsent.revoked_at.is_(None),
             ).first()
             if wildcard:
                 return True
@@ -435,6 +463,7 @@ class ConsentService:
                 UserConsent.scope == '*',
                 UserConsent.agent_id == None,
                 UserConsent.granted == True,
+                UserConsent.revoked_at.is_(None),
             ).first()
             if blanket:
                 return True
