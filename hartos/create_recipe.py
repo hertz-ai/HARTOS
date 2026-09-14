@@ -40,7 +40,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from core.http_pool import pooled_get, pooled_post, pooled_patch, pooled_request
-from core.port_registry import get_port as _get_llm_port, get_local_llm_url
+from core.port_registry import get_port as _get_llm_port, get_local_llm_url, get_local_backend_url
 from core.file_cache import atomic_json_write  # canonical atomic write (tmp + fsync + os.replace)
 # NOTE: the module-level `import txaio; from autobahn... import Component, run`
 # was removed. The WAMP RPC path (subscribe_and_return) now lives in helper_fun,
@@ -603,7 +603,9 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
 
 def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
     headers = {'Content-Type': 'application/json'}
-    url = f'http://localhost:{_get_llm_port("backend")}/time_agent'
+    # get_local_backend_url(), not get_port("backend"): a bundled desktop serves
+    # HARTOS in-process on :5000 and never binds :6777 (core/port_registry.py).
+    url = f'{get_local_backend_url()}/time_agent'
     data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id,'action_entry_point':action_entry_point,'request_from':'Reuse'})
     res = pooled_post(url,data=data,headers=headers)
     return 'done'
@@ -779,7 +781,7 @@ def visual_execution(task_description: str, user_id: int, prompt_id: int):
 
 def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     headers = {'Content-Type': 'application/json'}
-    url = f'http://localhost:{_get_llm_port("backend")}/visual_agent'
+    url = f'{get_local_backend_url()}/visual_agent'  # see execute_python_file
 
     now = datetime.now()
     action_url = f"{ACTION_API}?user_id={user_id}"

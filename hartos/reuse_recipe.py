@@ -39,7 +39,7 @@ autogen = lazy_module("autogen", on_import=install_autogen_iostream)
 import os
 import pytz
 from core.http_pool import pooled_get, pooled_post, pooled_request
-from core.port_registry import get_port as _get_llm_port
+from core.port_registry import get_port as _get_llm_port, get_local_backend_url
 from typing import Dict, Optional, Tuple, Any, List
 import uuid
 import time
@@ -642,7 +642,9 @@ def _coerce_instruction_text(value) -> str:
 
 def execute_python_file(task_description: str, user_id: int, prompt_id: int, action_entry_point: int = 0):
     headers = {'Content-Type': 'application/json'}
-    url = f'http://localhost:{_get_llm_port("backend")}/time_agent'
+    # get_local_backend_url(), not get_port("backend"): a bundled desktop serves
+    # HARTOS in-process on :5000 and never binds :6777 (core/port_registry.py).
+    url = f'{get_local_backend_url()}/time_agent'
     data = json.dumps({'task_description': task_description, 'user_id': user_id, 'prompt_id': prompt_id,
                        'action_entry_point': action_entry_point, 'request_from': 'Reuse'})
     res = pooled_post(url, data=data, headers=headers)
@@ -671,7 +673,7 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
         return None
 
     headers = {'Content-Type': 'application/json'}
-    url = f'http://localhost:{_get_llm_port("backend")}/visual_agent'
+    url = f'{get_local_backend_url()}/visual_agent'  # see execute_python_file
 
     # Get current time in UTC for comparison
     now_utc = datetime.utcnow()
