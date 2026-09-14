@@ -457,7 +457,7 @@ def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Respons
             import json as _json
             body = kwargs.get('json', {})
             msgs = body.get('messages', [])
-            prompt_preview = msgs[-1].get('content', '')[:200] if msgs else ''
+            prompt_preview = _prompt_text_preview(msgs[-1].get('content', '')) if msgs else ''
             rj = resp.json()
             content = rj.get('choices', [{}])[0].get('message', {}).get('content', '')
             reasoning = rj.get('choices', [{}])[0].get('message', {}).get('reasoning_content', '')
@@ -469,6 +469,29 @@ def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Respons
         except Exception:
             pass
     return resp
+
+
+def _prompt_text_preview(content, limit: int = 200) -> str:
+    """Loggable preview of one chat message's content: its TEXT only.
+
+    A multimodal message carries `content` as a LIST of parts, and slicing a
+    list with ``[:200]`` keeps the whole list, so the INFO line above used to
+    embed every image part verbatim -- a full base64 ``data:`` URL. One 200-DPI
+    book page is ~110 KB of base64, and book pages now reach the vision model
+    through this function. Text parts are kept; any other part is counted,
+    never inlined.
+    """
+    if isinstance(content, list):
+        texts, others = [], 0
+        for part in content:
+            if isinstance(part, dict) and part.get('type') == 'text':
+                texts.append(str(part.get('text') or ''))
+            else:
+                others += 1
+        content = ' '.join(t for t in texts if t)
+        if others:
+            content = f'{content} [+{others} non-text part(s)]'.strip()
+    return str(content)[:limit]
 
 
 def pooled_put(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Response:
