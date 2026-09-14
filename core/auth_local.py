@@ -79,7 +79,16 @@ def _token_matches(candidate: str) -> bool:
 
 
 def _is_local_request() -> bool:
-    """True if the request is from localhost, honouring TRUSTED_PROXY."""
+    """True if the request is from localhost, honouring TRUSTED_PROXY.
+
+    NUNBA_CI=1 trusts every caller, as Nunba's routes.auth.is_local_environ
+    (the rule this one is a port of) does.  Only Nunba's
+    docker-compose.staging.yml sets it: the e2e probe reaches that container
+    through Docker's port mapping, so it never arrives from 127.0.0.1.
+    Production builds never set it.
+    """
+    if os.environ.get('NUNBA_CI', '') == '1':
+        return True
     trusted_proxy = os.environ.get('TRUSTED_PROXY', '')
     if trusted_proxy and request.remote_addr == trusted_proxy:
         forwarded_for = (request.headers.get('X-Forwarded-For', '')

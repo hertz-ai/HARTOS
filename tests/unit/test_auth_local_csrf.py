@@ -350,6 +350,20 @@ def test_csrf_safe_non_ascii_bearer_does_not_500(app, monkeypatch):
 # ── _is_local_request: TRUSTED_PROXY + X-Forwarded-For decision ────
 
 
+def test_the_staging_container_trusts_every_caller(app, monkeypatch):
+    """NUNBA_CI=1, set only by Nunba's docker-compose.staging.yml, trusts
+    every caller, as Nunba's own rule does: the e2e probe reaches the
+    container through Docker's port mapping, never from 127.0.0.1.  Without
+    it the same caller is remote."""
+    client = app.test_client()
+    monkeypatch.setenv('NUNBA_CI', '1')
+    resp = client.post('/test/local-only', environ_base={'REMOTE_ADDR': '172.18.0.1'})
+    assert resp.status_code == 200
+    monkeypatch.delenv('NUNBA_CI')
+    resp = client.post('/test/local-only', environ_base={'REMOTE_ADDR': '172.18.0.1'})
+    assert resp.status_code == 401
+
+
 def test_trusted_proxy_forwarded_loopback_accepted(app, monkeypatch):
     """Behind a trusted reverse proxy, the real client IP arrives in
     X-Forwarded-For.  Proxy addr matches TRUSTED_PROXY and XFF is

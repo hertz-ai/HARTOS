@@ -63,7 +63,7 @@ def _secrets(key=''):
 def env(monkeypatch):
     monkeypatch.setenv('NUNBA_BUNDLED', '1')
     monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
-    for name in ('HEVOLVE_API_KEY', 'TRUSTED_PROXY'):
+    for name in ('HEVOLVE_API_KEY', 'TRUSTED_PROXY', 'NUNBA_CI'):
         monkeypatch.delenv(name, raising=False)
     return monkeypatch
 
@@ -195,3 +195,26 @@ def test_the_gate_goes_on_once(env):
     hooks = len(app.before_request_funcs[None])
     assert install_api_gate(app) is True
     assert len(app.before_request_funcs[None]) == hooks
+
+
+def test_the_staging_container_lets_its_probe_through(desktop, monkeypatch):
+    """Nunba's staging e2e (NUNBA_CI=1, docker-compose.staging.yml) probes
+    through Docker's port mapping.  core.auth_local trusts every caller
+    there, as Nunba's own rule does, so the gate lets the probe through.
+    Measured 2026-09-14: without this, /backend/health answered the probe
+    401 on every poll and the staging e2e failed."""
+    monkeypatch.setenv('NUNBA_CI', '1')
+    assert desktop.get('/chat', environ_base=LAN).status_code == 200
+    monkeypatch.delenv('NUNBA_CI')
+    assert desktop.get('/chat', environ_base=LAN).status_code == 401, \
+        'NUNBA_CI is the only thing that opens it'
+
+
+def test_installing_the_gate_under_nunba_ci_says_so(env, caplog):
+    """A production node that set NUNBA_CI would trust every caller, so the
+    gate says so at CRITICAL when it goes on under it."""
+    env.setenv('NUNBA_CI', '1')
+    with caplog.at_level(logging.CRITICAL, logger='hevolve_security'):
+        assert install_api_gate(_app()) is True
+    assert any('NUNBA_CI=1' in r.getMessage() for r in caplog.records
+               if r.levelno == logging.CRITICAL)

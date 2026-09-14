@@ -410,6 +410,13 @@ def install_api_gate(app: Flask) -> bool:
     """
     if getattr(app, '_hartos_api_gate', False):
         return True
+    if os.environ.get('NUNBA_CI', '') == '1':
+        # core.auth_local trusts every caller under NUNBA_CI, so this gate
+        # lets everyone through.  Right for Nunba's staging container, the
+        # only place that sets it; say so loudly anywhere else.
+        logger.critical("NUNBA_CI=1: every caller is trusted as local, as on "
+                        "Nunba's staging container; a production node must "
+                        "never set it")
     hook = _apply_api_auth(app, register=False)
     try:
         app.before_request(hook)
