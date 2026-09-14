@@ -1235,6 +1235,7 @@ class TestVLMVisionServiceCircuitBreaker:
 # 11. Qwen3-VL + OmniParser Computer Use E2E
 # ═══════════════════════════════════════════════════════
 
+@pytest.mark.usefixtures('computer_control_granted')
 class TestComputerUseLocalLoop:
     """E2E: local_loop.py — screenshot→parse→LLM→action loop with all externals mocked."""
 

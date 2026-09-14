@@ -249,12 +249,10 @@ class VisionService:
             from integrations.social.models import db_session
             from integrations.social.consent_service import ConsentService
             with db_session(commit=True) as db:
-                if ConsentService.check_consent(db, owner, 'screen_capture'):
-                    return True
-                # request_consent dedupes: re-asking returns the existing
-                # pending row, so exactly one ask reaches the UI.
-                ConsentService.request_consent(db, owner, 'screen_capture')
-                return False
+                # A denied check files the ask; request_consent dedupes, so
+                # exactly one ask reaches the UI.
+                return ConsentService.check_or_request(
+                    db, owner, 'screen_capture')
 
         def _grab():
             if state['capture'] is None:

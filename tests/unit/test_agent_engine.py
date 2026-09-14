@@ -3570,6 +3570,7 @@ class TestVLMLocalLoop:
         payload = _build_action_payload(action_json, parsed)
         assert payload['coordinate'] == [50, 60]
 
+    @pytest.mark.usefixtures('computer_control_granted')
     def test_local_loop_completes_on_done(self):
         """Local loop exits when VLM says Status: DONE.
 

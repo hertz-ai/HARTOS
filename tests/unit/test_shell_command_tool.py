@@ -26,10 +26,15 @@ except Exception:
     _has_handler = False
     _handle_shell_command_tool = None
 
-pytestmark = pytest.mark.skipif(
-    not _has_handler,
-    reason="hart_intelligence_entry import failed (missing deps in CI)"
-)
+# The owner has allowed agents to control this computer: these tests are
+# about what the tool does once allowed (fixture in tests/conftest.py).
+pytestmark = [
+    pytest.mark.skipif(
+        not _has_handler,
+        reason="hart_intelligence_entry import failed (missing deps in CI)"
+    ),
+    pytest.mark.usefixtures('computer_control_granted'),
+]
 
 
 def _ran(returncode=0, stdout='', stderr=''):

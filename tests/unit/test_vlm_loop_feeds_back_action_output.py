@@ -68,7 +68,7 @@ class _FakeBackend:
 
 
 @pytest.fixture
-def loop_with_fake(monkeypatch):
+def loop_with_fake(monkeypatch, computer_control_granted):
     lct = pytest.importorskip('integrations.vlm.local_computer_tool')
     from integrations.vlm import local_loop, qwen3vl_backend
 

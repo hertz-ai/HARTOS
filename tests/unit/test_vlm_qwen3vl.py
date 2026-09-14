@@ -1284,6 +1284,7 @@ class TestQwen3VLReplacesOmniParserPipeline:
         assert mock_api.call_count == 1
 
 
+@pytest.mark.usefixtures('computer_control_granted')
 class TestFullActionLoop:
     """Full pipeline: screenshot -> parse -> reason -> action -> verify."""
 
@@ -1658,11 +1659,12 @@ class TestVLMDeterministicActions:
         assert 'PREFER' in local_loop._VLM_ACTION_LIST
         # SYSTEM_PROMPT must embed the shared list so legacy branch sees them
         assert local_loop._VLM_ACTION_LIST in local_loop.SYSTEM_PROMPT
-        # And the unified combined_prompt in run_local_agentic_loop must
-        # embed it too — regression guard against someone re-forking the
-        # action list inside the function body.
+        # And the unified combined_prompt in the loop body must embed it
+        # too — regression guard against someone re-forking the action list
+        # inside the function body.  The body is _drive_local_agentic_loop;
+        # run_local_agentic_loop is the entry that asks the owner first.
         import inspect
-        src = inspect.getsource(local_loop.run_local_agentic_loop)
+        src = inspect.getsource(local_loop._drive_local_agentic_loop)
         assert '_VLM_ACTION_LIST' in src
 
 

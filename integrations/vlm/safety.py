@@ -19,6 +19,11 @@ existing call sites stay unchanged unless they explicitly opt in.
 The plan §5 calls these out as production-readiness, not always-
 on hard limits.
 
+computer_control_block is different: it is the owner's permission for an
+agent to act on this computer at all, and it is not opt-in.
+run_local_agentic_loop and hart_intelligence_entry._handle_shell_command_tool
+call it before anything runs.
+
 Configuration via ``SafetyConfig`` dataclass; module-level singletons
 returned by ``get_session_guard()`` / ``get_audit_logger()``.  The
 session guard is reset via ``reset_session_guard()``, which
@@ -229,6 +234,135 @@ def is_placeholder_credential(action: Optional[dict]) -> Optional[str]:
         return (f'placeholder_credential: "{text}" has placeholder '
                 f'local-part "{local}"')
     return None
+
+
+# ─── Permission to control this computer ──────────────────────────────
+
+#: What a computer_control grant lets an agent do.  The ask carries this
+#: text, so every client shows the same list.
+COMPUTER_CONTROL_COVERS = ('run shell commands, write files, move the mouse, '
+                           'type on the keyboard and open apps on this '
+                           'computer')
+
+#: How long a turn someone is watching waits for the owner's answer, and how
+#: often it looks.  A background (daemon) run does not wait.
+COMPUTER_CONTROL_WAIT_SECONDS = 90.0
+COMPUTER_CONTROL_POLL_SECONDS = 3.0
+
+
+def _known_agent(agent_id) -> Optional[str]:
+    """The asking agent's id, or None when no agent is known.
+
+    Callers pass the prompt id they hold: None or '' when there is none, and
+    hart_intelligence_entry._handle_computer_action_tool sends
+    str(prompt_id or 0), so '0' too.  An unknown agent is never guessed.
+    """
+    text = '' if agent_id is None else str(agent_id).strip()
+    return None if text in ('', '0', 'None') else text
+
+
+def _computer_control_answer(owner: str, agent: Optional[str],
+                             reason: str) -> Optional[bool]:
+    """One look at the owner's answer: True allowed, False said no ("Don't
+    allow" on the ask), None not answered yet, in which case the ask is filed
+    or sent again (request_consent dedupes it to one card)."""
+    from integrations.social.models import db_session
+    from integrations.social.consent_service import ConsentService
+    with db_session(commit=True) as db:
+        if ConsentService.check_or_request(
+                db, owner, 'computer_control', agent_id=agent, reason=reason):
+            return True
+        if ConsentService.declined(db, owner, 'computer_control',
+                                   agent_id=agent):
+            return False
+        return None
+
+
+def computer_control_block(agent_id, *, sleep=time.sleep) -> Optional[str]:
+    """Return a refusal when the owner has not allowed agents to control this
+    computer, None when they have.  Same contract as is_window_blocked.
+
+    Live 2026-09-14 the VLM loop wrote C:\\Users\\Public\\search_llm_config.py
+    and ran it for agent 88659566083, and nothing asked the person at the
+    desk.  run_local_agentic_loop and
+    hart_intelligence_entry._handle_shell_command_tool call this before
+    anything runs.
+
+    The owner is whose machine this is: HEVOLVE_OWNER_USER_ID, which Nunba
+    exports at boot (the signed-in user, else this desktop's guest), read on
+    every call.  With no owner nobody can be asked, so the answer is no.
+
+    Without a grant the owner is asked through ConsentService, so the ask
+    reaches their devices and the privacy page lists and revokes the grant.
+    A turn someone is watching waits up to COMPUTER_CONTROL_WAIT_SECONDS for
+    the answer; a daemon run does not wait.  When the owner says no ("Don't
+    allow" on the ask) the run is refused at once, and that agent's later
+    runs are refused without asking until the owner allows agents again: a
+    no stands (hartos-3e ruling (a)).  A grant covers every agent until
+    user_consents can hold per-agent grants: its UNIQUE constraint rejects a
+    per-agent grant once a per-agent ask exists.  A check that fails is a no.
+    """
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    if not owner:
+        logger.warning('computer control refused: no owner identity '
+                       '(HEVOLVE_OWNER_USER_ID is not set)')
+        return ('Not run: nobody is signed in on this computer who could '
+                'allow an agent to control it.')
+    agent = _known_agent(agent_id)
+    reason = (f'Agent {agent} asks to {COMPUTER_CONTROL_COVERS}.' if agent
+              else 'An agent that could not be identified asks to '
+                   f'{COMPUTER_CONTROL_COVERS}.')
+    try:
+        from integrations.agent_engine.dispatch import (
+            is_current_request_autonomous)
+        background = is_current_request_autonomous()
+    except Exception:  # noqa: BLE001 -- unknown is a watched turn: it waits
+        background = False
+    started = time.monotonic()
+    deadline = started + (0.0 if background
+                          else COMPUTER_CONTROL_WAIT_SECONDS)
+    # One line when the wait starts and one for how it ends, not one per look.
+    waited = False
+    while True:
+        try:
+            answer = _computer_control_answer(owner, agent, reason)
+        except Exception as e:  # noqa: BLE001 -- a failed check is a no
+            logger.warning(f'computer control refused for agent {agent}: '
+                           f'the permission could not be checked: {e}')
+            return ('Not run: the permission to control this computer '
+                    f'could not be checked ({e}).')
+        if answer:
+            if waited:
+                logger.info(f'computer control allowed for agent {agent} '
+                            f'after {time.monotonic() - started:.0f}s')
+            return None
+        if answer is False:
+            logger.warning(f'computer control refused for agent {agent}: '
+                           f'owner {owner} said no')
+            who = (f'agent {agent}' if agent
+                   else 'an agent that could not be identified')
+            return (f'Not run: the owner of this computer said no to {who} '
+                    'controlling it. They can allow agents again on the '
+                    'privacy page.')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if not waited:
+            waited = True
+            logger.info(f'computer control: asked owner {owner} for agent '
+                        f'{agent}, waiting up to '
+                        f'{COMPUTER_CONTROL_WAIT_SECONDS:.0f}s')
+        sleep(min(COMPUTER_CONTROL_POLL_SECONDS, remaining))
+    why = 'daemon run, not waited for' if background else 'no answer in time'
+    logger.warning(f'computer control refused for agent {agent}: owner '
+                   f'{owner} has not allowed it ({why})')
+    if background:
+        return ('Not run: the owner has not allowed agents to control this '
+                'computer. They have been asked; this can run once they '
+                'allow it.')
+    return ('Not run: the owner did not allow agents to control this '
+            f'computer within {COMPUTER_CONTROL_WAIT_SECONDS:.0f}s. They can '
+            'allow it and ask again.')
 
 
 # ─── Audit logger ─────────────────────────────────────────────────────

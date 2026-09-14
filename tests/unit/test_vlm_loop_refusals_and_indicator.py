@@ -56,7 +56,7 @@ class _ShellBackend:
 
 
 @pytest.fixture
-def loop(monkeypatch):
+def loop(monkeypatch, computer_control_granted):
     lct = pytest.importorskip('integrations.vlm.local_computer_tool')
     from integrations.vlm import local_loop, qwen3vl_backend, safety
 

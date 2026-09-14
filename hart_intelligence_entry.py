@@ -3248,6 +3248,17 @@ def _handle_shell_command_tool(input_text: str) -> str:
                 f"If you really need this, ask the user to run it manually."
             )
 
+    # --- The owner's permission: the same computer_control consent the VLM
+    # loop checks (integrations.vlm.safety.computer_control_block).  After
+    # the denylist on purpose, so a destructive command is refused without
+    # asking anyone.  Inside a VLM run this thread's prompt_id is the run's
+    # agent (run_local_agentic_loop sets it); for the LangChain tool it is
+    # the chat turn's agent, stamped by the /chat handler.
+    from integrations.vlm.safety import computer_control_block
+    _refusal = computer_control_block(thread_local_data.get_prompt_id())
+    if _refusal is not None:
+        return f"Shell_Command not run: {_refusal}"
+
     # --- Choose shell + argv
     if sys.platform == 'win32':
         if shell_override in ('powershell', 'pwsh'):
@@ -3376,6 +3387,16 @@ def _handle_computer_action_tool(input_text: str) -> str:
                     return last_content[:500]
                 return f"Done — {n_actions} actions in {elapsed:.0f}s."
             return f"Done in {elapsed:.0f}s."
+
+        if exit_reason == 'consent_required':
+            # The owner has not allowed agents to control this computer
+            # (integrations.vlm.safety.computer_control_block); the loop's one
+            # error record says so.  Shell_Command needs the same permission,
+            # so no other route is offered.
+            return next((r.get('content') for r in responses
+                         if r.get('type') == 'error' and r.get('content')),
+                        'Not run: the owner has not allowed agents to control '
+                        'this computer.')
 
         # Non-done paths: be honest to the router so it doesn't confabulate.
         # The router sees this string as the tool's final answer and should

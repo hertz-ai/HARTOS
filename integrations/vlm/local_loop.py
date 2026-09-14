@@ -246,6 +246,55 @@ def run_local_agentic_loop(
     tier: str,
     max_iterations: int = MAX_ITERATIONS
 ) -> dict:
+    """Ask the owner first, then drive the loop as the agent that asked.
+
+    Nothing asked before an agent took this machine's mouse, keyboard and
+    shell: live 2026-09-14 the loop wrote C:\\Users\\Public\\
+    search_llm_config.py and ran it for agent 88659566083.
+    integrations.vlm.safety.computer_control_block gets the owner's answer
+    first; a refusal returns exit_reason='consent_required' before any
+    screenshot, action or AI-control ribbon.
+
+    While the loop runs, this thread's prompt_id is the run's agent, and the
+    caller's value comes back after, even when the loop raises.  The shell
+    action inside the run reaches hart_intelligence_entry.
+    _handle_shell_command_tool on this same thread and checks that agent;
+    hartos.threadlocal is a threading.local(), and nothing sets prompt_id on
+    autogen's worker threads.
+
+    Arguments and return shape: _drive_local_agentic_loop below.
+    """
+    from integrations.vlm.safety import computer_control_block
+    from hartos.threadlocal import thread_local_data
+
+    prompt_id = message.get('prompt_id', '')
+    started = time.time()
+    refusal = computer_control_block(prompt_id)
+    if refusal is not None:
+        logger.warning(
+            f"VLM loop not started (user={message.get('user_id', '')}, "
+            f"prompt={prompt_id}): {refusal}")
+        return {
+            "status": "incomplete",
+            "exit_reason": "consent_required",
+            "extracted_responses": [
+                {"type": "error", "content": refusal, "iteration": 0}],
+            "execution_time_seconds": time.time() - started,
+        }
+
+    prior_prompt_id = thread_local_data.get_prompt_id()
+    thread_local_data.set_prompt_id(prompt_id)
+    try:
+        return _drive_local_agentic_loop(message, tier, max_iterations)
+    finally:
+        thread_local_data.set_prompt_id(prior_prompt_id)
+
+
+def _drive_local_agentic_loop(
+    message: dict,
+    tier: str,
+    max_iterations: int = MAX_ITERATIONS
+) -> dict:
     """
     Local agentic loop: screenshot → parse → LLM reason → execute → repeat.
 

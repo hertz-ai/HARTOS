@@ -149,6 +149,21 @@ def reset_state_machine():
 
 
 @pytest.fixture
+def computer_control_granted(monkeypatch):
+    """The desktop owner has allowed agents to control this computer.
+
+    run_local_agentic_loop and hart_intelligence_entry._handle_shell_command_tool
+    ask integrations.vlm.safety.computer_control_block first.  Tests of what
+    they do once allowed declare that precondition with this fixture; the
+    permission itself is tested against a real consent table in
+    tests/unit/test_computer_control_consent.py.
+    """
+    from integrations.vlm import safety
+    monkeypatch.setattr(safety, 'computer_control_block',
+                        lambda agent_id, **_kw: None)
+
+
+@pytest.fixture
 def test_user_prompt():
     """Standard test user prompt"""
     return "test_user_123_prompt_456"

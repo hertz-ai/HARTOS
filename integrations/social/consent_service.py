@@ -58,6 +58,10 @@ CONSENT_TYPES = frozenset({
                          # #701).  The capture loop's first denied tick files
                          # the pending ask; granting in the UserConsent UI
                          # starts capture on the next tick.
+    'computer_control',  # An agent acts on this computer: shell commands,
+                         # file writes, mouse and keyboard, opening apps
+                         # (integrations.vlm.safety.computer_control_block).
+                         # Asked of the desktop owner, whose machine it is.
 })
 
 
@@ -131,12 +135,22 @@ class ConsentService:
 
     @staticmethod
     def request_consent(db, user_id: str, consent_type: str,
-                        scope: str = '*', agent_id=None):
+                        scope: str = '*', agent_id=None, reason: str = ''):
         """Create a pending (not yet granted) consent record.
 
         Returns existing record if one already exists for this combination.
+        ``reason`` rides on the ask, so the card can say what is asked for.
         """
         _validate_consent_type(consent_type)
+
+        ask = {
+            'user_id': user_id,
+            'consent_type': consent_type,
+            'scope': scope,
+            'agent_id': agent_id,
+        }
+        if reason:
+            ask['reason'] = reason
 
         existing = db.query(UserConsent).filter(
             UserConsent.user_id == user_id,
@@ -170,12 +184,8 @@ class ConsentService:
                     UserConsent.revoked_at.isnot(None)),
             ).first()
             if decided is None:
-                _emit('consent.request', {
-                    'user_id': user_id,
-                    'consent_type': consent_type,
-                    'scope': scope,
-                    'agent_id': agent_id,
-                }, msg_id=f'consent.request:{existing.id}')
+                _emit('consent.request', ask,
+                      msg_id=f'consent.request:{existing.id}')
             return existing
 
         consent = UserConsent(
@@ -192,13 +202,49 @@ class ConsentService:
         # / announce_revocation all _emit, and _emit's own comment always
         # listed consent.request as a topic.  Stable msg_id (row id) so this
         # first ask and every re-ask above collapse to ONE card client-side.
-        _emit('consent.request', {
-            'user_id': user_id,
-            'consent_type': consent_type,
-            'scope': scope,
-            'agent_id': agent_id,
-        }, msg_id=f'consent.request:{consent.id}')
+        _emit('consent.request', ask, msg_id=f'consent.request:{consent.id}')
         return consent
+
+    @staticmethod
+    def check_or_request(db, user_id: str, consent_type: str,
+                         scope: str = '*', agent_id=None,
+                         reason: str = '') -> bool:
+        """True when the consent is active; otherwise file the ask (or send
+        it again) and return False.
+
+        The shape a polling gate needs: vision's screen capture and
+        integrations.vlm.safety.computer_control_block.  request_consent
+        dedupes, so asking on every poll still shows one card.
+        """
+        if ConsentService.check_consent(db, user_id, consent_type,
+                                        scope=scope, agent_id=agent_id):
+            return True
+        ConsentService.request_consent(db, user_id, consent_type, scope=scope,
+                                       agent_id=agent_id, reason=reason)
+        return False
+
+    @staticmethod
+    def declined(db, user_id: str, consent_type: str, scope: str = '*',
+                 agent_id=None) -> bool:
+        """True when the owner said no to this ask: a row for exactly this
+        combination has been revoked.
+
+        The consent card's "Don't allow" (consent_api.decline_consent) is
+        revoke_consent on the pending ask, which marks it revoked; a revoked
+        grant counts too.  request_consent does not ask again once a
+        combination is decided, so a no stands until a new grant covers it.
+        check_consent looks at grants first, and a blanket grant ("Allow ALL
+        agents") covers an agent the owner said no to, so ask this only after
+        check_consent failed.
+        """
+        _validate_consent_type(consent_type)
+        return db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == consent_type,
+            UserConsent.scope == scope,
+            UserConsent.agent_id == agent_id,
+            UserConsent.revoked_at.isnot(None),
+        ).first() is not None
 
     @staticmethod
     def grant_consent(db, user_id: str, consent_type: str,
@@ -468,8 +514,12 @@ class ConsentService:
             if blanket:
                 return True
 
+        # Debug, not warning: a polling gate looks every few seconds while it
+        # waits for an answer (screen capture every 10s, computer control
+        # every 3s), and each denied look wrote a WARNING.  The gates log
+        # their own refusal once.
         import logging as _log
-        _log.getLogger('hevolve.consent').warning(
+        _log.getLogger('hevolve.consent').debug(
             "Consent check denied: user=%s type=%s scope=%s agent=%s",
             user_id, consent_type, scope, agent_id)
         return False

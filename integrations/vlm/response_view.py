@@ -172,6 +172,8 @@ def outcome_summary(response):
             'stopped': 'Stopped at your request after %d step(s).' % n,
             'grounding_failed': 'Could not reliably locate the UI element '
                                 'after %d attempt(s).' % n,
+            'consent_required': 'Did not act: the owner has not allowed '
+                                'agents to control this computer yet.',
         }.get(reason, "Loop exited with reason '%s' after %d step(s)."
               % (reason, n))
     except Exception:

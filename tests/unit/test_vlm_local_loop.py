@@ -297,6 +297,7 @@ def _unified_backend(response):
     return b
 
 
+@pytest.mark.usefixtures('computer_control_granted')
 class TestRunLocalAgenticLoop:
     """Loop orchestration with all external deps mocked."""
 
