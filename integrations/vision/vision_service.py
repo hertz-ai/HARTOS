@@ -644,7 +644,10 @@ class VisionService:
             logger.error("websockets not installed — frame receiver disabled")
             return
 
-        server = await websockets.serve(self._ws_handler, '0.0.0.0', self._ws_port)
+        # Loopback on a desktop, whose SPA is the only frame source; see
+        # core.port_registry.bind_host for the rule and its overrides.
+        from core.port_registry import bind_host
+        server = await websockets.serve(self._ws_handler, bind_host(), self._ws_port)
         # Read actual bound port (important when ws_port=0 for dynamic allocation)
         if server.sockets:
             actual_port = server.sockets[0].getsockname()[1]
