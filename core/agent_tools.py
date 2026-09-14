@@ -923,9 +923,10 @@ def build_core_tool_closures(ctx):
                     pass
 
             try:
-                stored_value = get_data_by_key(key)
+                # The value as stored, not the tool's page of it.
+                stored_value = _read_saved(key)
                 tool_logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
-                if stored_value == "Key not found in stored data.":
+                if stored_value == _KEY_NOT_FOUND:
                     tool_logger.error(f"VERIFICATION FAILED: Data not properly stored at key {key}")
                     return f"Error: {key} was written but could not be read back"
             except Exception as e:
@@ -979,10 +980,17 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     # 5. get_data_by_key
     # ------------------------------------------------------------------
-    @log_tool_execution
-    def get_data_by_key(
-        key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."],
-    ) -> str:
+    _KEY_NOT_FOUND = "Key not found in stored data."
+
+    def _read_saved(key):
+        """The value saved at ``key``, whole, or the not-found sentinel.
+
+        For code in this module that needs the value as stored (the receipt
+        template, the save check). The get_data_by_key tool pages what the
+        model reads; the receipt read its template through that tool, so a
+        template longer than a page was cut and the page note was printed into
+        the customer's receipt (#104 review).
+        """
         if prompt_id not in agent_data or not agent_data[prompt_id]:
             tool_logger.info(f"Loading agent data from file for prompt_id {prompt_id}")
             helper_fun.load_agent_data_from_file(prompt_id, agent_data)
@@ -991,8 +999,7 @@ def build_core_tool_closures(ctx):
         try:
             for k in keys:
                 d = d[k]
-            # Bounded (#104): a key like 'hive' returned the whole subtree.
-            return _bounded_observation(d, 'read a narrower key for the rest')
+            return f'{d}'
         # TypeError too: a path that runs through a None, a string or a list
         # is as missing as an absent key. It used to escape as a tool
         # exception and skip the fallback below (central 2026-09-13, a hive
@@ -1006,15 +1013,39 @@ def build_core_tool_closures(ctx):
                 try:
                     results = memory_graph.recall(f"[KV] {key}", mode='text', top_k=1)
                     if results:
-                        return _bounded_observation(
-                            results[0].content, 'read a narrower key for the rest')
+                        return results[0].content
                 except Exception:
                     pass
-            return "Key not found in stored data."
+            return _KEY_NOT_FOUND
+
+    @log_tool_execution
+    def get_data_by_key(
+        key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."],
+        offset: Annotated[int, "Where to start reading a long value, in characters. Leave 0 to read from the start."] = 0,
+    ) -> str:
+        # One page of the value, not all of it (#104): a key like 'hive'
+        # returned the whole subtree, which went to the model and back into
+        # memory. A long value is read a page at a time, the way book pages
+        # are, and the note names the offset of the next page.
+        from core.constants import TOOL_OBSERVATION_MAX_CHARS as page_chars
+        value = _read_saved(key)
+        try:
+            start = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            start = 0
+        if start and start >= len(value):
+            return f'...[offset {start} is past the end of the value ({len(value)} chars)]'
+        page = value[start:start + page_chars]
+        end = start + len(page)
+        if end >= len(value):
+            return page
+        return (f'{page}\n...[chars {start}-{end} of {len(value)}; call '
+                f'get_data_by_key with offset={end} for the rest]')
 
     tools.append((
         "get_data_by_key",
-        "Returns all data from the internal Memory using key",
+        "Returns the data saved at a key. A long value comes back one page at a "
+        "time; pass the offset the reply names to read the next page.",
         get_data_by_key,
     ))
     # Alias — Helper system prompts in reuse_recipe.py advertise this name (#510).
@@ -1022,7 +1053,7 @@ def build_core_tool_closures(ctx):
     # registered tool: phantom tool fixed by adding a real registration.
     tools.append((
         "get_data_from_memory",
-        "Returns all data from the internal Memory using key (alias of get_data_by_key)",
+        "Returns the data saved at a key, a page at a time (alias of get_data_by_key)",
         get_data_by_key,
     ))
 
@@ -1060,8 +1091,10 @@ def build_core_tool_closures(ctx):
         from integrations.service_tools.receipt_image import (
             compute_balance, render_receipt_png)
         balance = compute_balance(amount, advance) or ""
-        template = get_data_by_key("receipt_template")
-        if not template or template == "Key not found in stored data.":
+        # The template as saved: the get_data_by_key tool pages what the model
+        # reads, and a paged template printed its page note into the receipt.
+        template = _read_saved("receipt_template")
+        if not template or template == _KEY_NOT_FOUND:
             template = _DEFAULT_RECEIPT_TEMPLATE
         fields = {
             "business_name": business_name,
@@ -1079,8 +1112,8 @@ def build_core_tool_closures(ctx):
         text = TemplateEngine().render(template, extra_vars=fields)
         if str(render).lower() != "image":
             return text
-        logo_path = get_data_by_key("receipt_logo_path")
-        if logo_path == "Key not found in stored data.":
+        logo_path = _read_saved("receipt_logo_path")
+        if logo_path == _KEY_NOT_FOUND:
             logo_path = None
         png = render_receipt_png(fields, logo_path=logo_path)
         if not png:

@@ -216,15 +216,28 @@ class ReuseMainCoreFactory(unittest.TestCase):
         self.assertEqual(tools['save_data_in_memory']('user.color', 'teal'),
                          'Saved at user.color: "teal"')
         big_value = tools['save_data_in_memory']('hive.note', 'x' * 50000)
+        # The save check reads the value back whole; a paged read-back would
+        # make every long save report a failure.
+        self.assertTrue(big_value.startswith('Saved at hive.note'), big_value[:80])
         self.assertLessEqual(len(big_value), TOOL_OBSERVATION_MAX_CHARS + 100)
 
-    def test_get_of_a_large_value_is_bounded_and_says_so(self):
-        from core.constants import TOOL_OBSERVATION_MAX_CHARS
-        tools = self._factory_tools(memory_graph=None,
-                                    agent_data=self._big_store())
-        out = tools['get_data_by_key']('hive')
-        self.assertLessEqual(len(out), TOOL_OBSERVATION_MAX_CHARS + 200)
-        self.assertIn('narrower key', out)
+    def test_a_long_value_is_read_a_page_at_a_time(self):
+        """#104 review: a long saved string has no narrower key, so the reply
+        is one page and names the offset of the next; the pages add up to the
+        whole value."""
+        from core.constants import TOOL_OBSERVATION_MAX_CHARS as page
+        value = ''.join(chr(97 + i % 26) for i in range(2 * page + 500))
+        tools = self._factory_tools(
+            memory_graph=None, agent_data={'p1': {'notes': {'long': value}}})
+        read = tools['get_data_by_key']
+        first = read('notes.long')
+        self.assertIn(f'offset={page}', first)
+        second = read('notes.long', offset=page)
+        self.assertIn(f'offset={2 * page}', second)
+        last = read('notes.long', offset=2 * page)
+        self.assertNotIn('offset=', last)
+        pages = [first.split('\n...[')[0], second.split('\n...[')[0], last]
+        self.assertEqual(''.join(pages), value)
         small = self._factory_tools(
             memory_graph=None, agent_data={'p1': {'user': {'color': 'teal'}}})
         self.assertEqual(small['get_data_by_key']('user.color'), 'teal')
