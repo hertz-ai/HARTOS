@@ -233,6 +233,27 @@ def is_placeholder_credential(action: Optional[dict]) -> Optional[str]:
 
 # ─── Audit logger ─────────────────────────────────────────────────────
 
+#: Longest command the audit keeps: enough to read a script path or a
+#: one-liner, short enough that a heredoc does not copy the script in.
+AUDIT_COMMAND_MAX_CHARS = 500
+
+
+def _redacted(text, limit: int) -> str:
+    """``text`` with secrets replaced by the canonical redactor, then cut.
+
+    A command or typed text can carry a password.  If the redactor cannot
+    run, the text is withheld rather than written raw.
+    """
+    if not text:
+        return ''
+    try:
+        from security.secret_redactor import redact_secrets
+        return redact_secrets(str(text))[0][:limit]
+    except Exception as e:  # noqa: BLE001 -- the record must still be written
+        logger.warning(f'audit redaction unavailable, text withheld: {e}')
+        return '[withheld: redactor unavailable]'
+
+
 class AuditLogger:
     """Append-only JSONL audit trail of every VLM action."""
 
@@ -278,12 +299,32 @@ class AuditLogger:
         or the dir couldn't be created."""
         if not self.config.audit_enabled or not self.path:
             return
+        # Which command ran and which file was touched.  Live 2026-09-14 the
+        # loop wrote and ran C:\Users\Public\search_llm_config.py and no
+        # record named it: the command rides in 'command' and the target in
+        # 'path', and neither was kept, while the script's first 80 chars
+        # were kept raw as 'text'.  Text is redacted; content is hashed.
+        act = action.get('action')
+        text = action.get('text') or ''
+        content = action.get('content')
+        if act == 'write_file':
+            if content is None:
+                content = text
+            text = ''
         record = {
             'ts': time.time(),
             'iso': time.strftime('%Y-%m-%dT%H:%M:%S'),
-            'action': action.get('action'),
+            'action': act,
             'coordinate': action.get('coordinate'),
-            'text': action.get('text', '')[:80] if action.get('text') else '',
+            'text': _redacted(text, 80),
+            'command': _redacted(action.get('command'),
+                                 AUDIT_COMMAND_MAX_CHARS) or None,
+            'path': action.get('path'),
+            'source_path': action.get('source_path'),
+            'destination_path': action.get('destination_path'),
+            'content_sha256': (
+                hashlib.sha256(str(content).encode('utf-8', 'surrogatepass'))
+                .hexdigest()[:16] if content else None),
             'translated_from': action.get('_translated_from'),
             'translated_to': action.get('_translated_to'),
             'window': {
