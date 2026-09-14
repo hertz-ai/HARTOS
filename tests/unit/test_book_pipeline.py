@@ -7,6 +7,7 @@ client publisher.
 
     python -m pytest tests/unit/test_book_pipeline.py -q --noconftest
 """
+import itertools
 import json
 import sqlite3
 import sys
@@ -120,28 +121,33 @@ class TestPageImages:
 
 # ── The vision model: one call per page, text layer as the fallback ────
 
-def _page_of(path):
-    return int(str(path).rsplit('page_', 1)[1].split('.')[0])
+def _in_page_order(reply):
+    """A vision backend answering page N with reply(N): pages are read in order."""
+    pages = itertools.count(1)
+    return lambda image, prompt: reply(next(pages))
 
 
 class TestVision:
 
     def test_the_model_reads_the_page_when_it_answers(self, book_node, tmp_path):
-        book_node.vision.side_effect = lambda path, prompt=None: json.dumps({
-            'page_type': 'content', 'text': f'VLM page {_page_of(path)}',
-            'elements': [{'type': 'paragraph', 'content': f'VLM para {_page_of(path)}'}]})
+        book_node.vision.side_effect = _in_page_order(lambda n: json.dumps({
+            'page_type': 'content', 'text': f'VLM page {n}',
+            'elements': [{'type': 'paragraph', 'content': f'VLM para {n}'}]}))
         result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
         assert _by_page(result['file_id']) == {1: ['VLM para 1'], 2: ['VLM para 2'],
                                               3: ['VLM para 3']}
         assert 'VLM page 1' in result['whole_text']
+        # The backend is handed the rendered page, a JPEG, with the page prompt.
+        image, prompt = book_node.vision.call_args_list[0].args
+        assert image[:3] == b'\xff\xd8\xff' and prompt == bp._PAGE_PROMPT
 
     def test_the_models_toc_names_chapters_when_the_pdf_has_no_outline(self, book_node, tmp_path):
-        def vision(path, prompt=None):
-            reply = {'page_type': 'content', 'text': f'page {_page_of(path)}', 'elements': []}
-            if _page_of(path) == 1:
+        def vision(n):
+            reply = {'page_type': 'content', 'text': f'page {n}', 'elements': []}
+            if n == 1:
                 reply['toc_entries'] = [{'title': 'Kinematics', 'page': 3}]
             return json.dumps(reply)
-        book_node.vision.side_effect = vision
+        book_node.vision.side_effect = _in_page_order(vision)
         result = bp.parse_book(make_pdf(tmp_path / 'flat.pdf', outline=None), '42')
         chapters = {p: v[0] for p, v in _by_page(result['file_id'], 'chapter_name').items()}
         assert chapters == {1: None, 2: None, 3: 'Kinematics'}
@@ -151,11 +157,9 @@ class TestVision:
         assert book_node.vision.call_count == bp._VLM_GIVE_UP_AFTER
 
     def test_a_blank_answer_for_one_page_falls_back_for_that_page_only(self, book_node, tmp_path):
-        def vision(path, prompt=None):
-            n = _page_of(path)
-            return json.dumps({'page_type': 'content', 'elements': [],
-                               'text': '' if n == 2 else f'VLM page {n}'})
-        book_node.vision.side_effect = vision
+        book_node.vision.side_effect = _in_page_order(lambda n: json.dumps(
+            {'page_type': 'content', 'elements': [],
+             'text': '' if n == 2 else f'VLM page {n}'}))
         result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
         text = _by_page(result['file_id'])
         assert text[1] == ['VLM page 1'] and text[3] == ['VLM page 3']
@@ -165,12 +169,20 @@ class TestVision:
     def test_a_vision_package_that_will_not_import_leaves_the_text_layer(
             self, book_node, tmp_path, monkeypatch):
         """The same as no model: pages come from the text layer, the book is not failed."""
-        monkeypatch.setitem(sys.modules, 'integrations.vision.image_describe', None)
+        monkeypatch.setitem(sys.modules, 'integrations.vision.lightweight_backend', None)
         result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
         assert _row(result['file_id'])['status'] == 'completed'
         assert 'Acceleration is the rate of change of velocity.' in \
             _by_page(result['file_id'])[3][0]
         book_node.vision.assert_not_called()
+
+    def test_a_backend_that_raises_leaves_the_text_layer(self, book_node, tmp_path):
+        """A backend failing mid-read (out of memory, say) fails no book."""
+        book_node.vision.side_effect = RuntimeError('CUDA out of memory')
+        result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
+        assert _row(result['file_id'])['status'] == 'completed'
+        assert 'Acceleration is the rate of change of velocity.' in \
+            _by_page(result['file_id'])[3][0]
 
 
 # ── Failures are honest and durable ───────────────────────────────────
@@ -466,9 +478,30 @@ class TestAssignChapters:
 
 class TestPageViaVision:
 
+    @pytest.fixture(autouse=True)
+    def _image(self, tmp_path):
+        self.image = tmp_path / 'page_3.jpg'
+        self.image.write_bytes(b'\xff\xd8\xff a page')
+
     def _page(self, reply):
-        with patch('integrations.vision.image_describe.describe_image', return_value=reply):
-            return bp._parse_page_via_vision(3, '/fake/page_3.jpg')
+        reader = MagicMock(return_value=reply)
+        page = bp._parse_page_via_vision(3, str(self.image), [reader])
+        reader.assert_called_once_with(b'\xff\xd8\xff a page', bp._PAGE_PROMPT)
+        return page
+
+    def test_a_page_one_reader_does_not_read_goes_to_the_next(self):
+        """The caption server silent or down: the node's main model reads it."""
+        silent = MagicMock(return_value='')
+        down = MagicMock(side_effect=RuntimeError('connection refused'))
+        main = MagicMock(return_value=json.dumps(
+            {'page_type': 'content', 'text': 'Hello', 'elements': []}))
+        page = bp._parse_page_via_vision(3, str(self.image), [silent, down, main])
+        assert page['text'] == 'Hello' and not page.get('error')
+        assert silent.called and down.called and main.called
+
+    def test_a_page_no_reader_answers_is_an_error_page(self):
+        page = bp._parse_page_via_vision(3, str(self.image), [MagicMock(return_value=None)])
+        assert page['error']
 
     def test_no_answer_is_an_error_page(self):
         page = self._page(None)

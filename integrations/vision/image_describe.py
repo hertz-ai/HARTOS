@@ -1,19 +1,20 @@
 """Describe an image file with this node's local vision model.
 
-THE one implementation of "send a user's image to the local VLM, get text
-back". Callers: book pages (integrations/learning/book_pipeline.py), and
+The one-off description of an image a user attached, on the main model:
 Nunba's /upload/vision, /upload/file and /upload/native image uploads, which
-import it from here.
+import it from here. Book pages do not come here: they go through the node's
+vision backend (integrations/vision/lightweight_backend.py, read_document),
+the one camera, screen and media captions use.
 
 Moved from Nunba routes/upload_routes.py (_describe_image_via_llm) on
-2026-09-13 so that a HARTOS node running without Nunba can read images at all;
-the book pipeline needs that on every node. Nunba keeps no copy.
+2026-09-13 so that a HARTOS node running without Nunba can read images at all.
+Nunba keeps no copy.
 
 What the move changed:
   * Transport: core.http_pool.pooled_post instead of a bare requests.post. A
     local llama completion through pooled_post is admitted by the priority
-    scheduler (core.llama_scheduler), so a long book parse yields to the
-    user's chat turn instead of competing with it first-come-first-served.
+    scheduler (core.llama_scheduler) instead of competing first-come-first-
+    served.
   * Endpoint: core.port_registry.get_local_llm_url(), the canonical resolver,
     which follows the llama-server when it moves port. The old private
     LLAMA_CPP_URL read had no writer anywhere in either repo.

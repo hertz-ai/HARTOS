@@ -28,13 +28,19 @@ turn -- pdf2image+poppler, PyMuPDF, PyPDF2 -- none of which any target
 shipped; PyPDF2 3.0.1 in particular loops forever on a crafted content stream
 (CVE-2023-36464, reproduced 2026-09-13).
 
-Each page image goes to the vision model (integrations.vision.image_describe):
-one VLM call per page does OCR, layout, tables and figures, where the cloud
-pipeline used six models. When the model is not there, or returns nothing for
-a page, that page falls back to its own text layer, so a node with no vision
-model still produces a readable book. Chapters come from the PDF's outline
-when it has one (it points at real page indices), else from the
-table-of-contents pages the model read.
+Each page image goes to the node's vision backend -- get_vision_backend() in
+integrations/vision/lightweight_backend.py, the one camera, screen and media
+captions already use -- through its read_document(). One VLM call per page
+does OCR, layout, tables and figures, where the cloud pipeline used six
+models. Where the Qwen3.5-0.8B caption model is installed that backend is the
+caption server, so reading a book does not occupy the main model the user
+chats with. A page that backend cannot read, or does not answer for, goes to
+the node's own main model, as every page did before
+(lightweight_backend.get_document_readers). When neither answers, the page
+falls back to its own text layer, so a node with no vision model still
+produces a readable book. Chapters come from the PDF's outline when it has
+one (it points at real page indices), else from the table-of-contents pages
+the model read.
 
 Progress goes out on the MessageBus (core/peer_link/message_bus.py), topic
 'book.parsing': to this node's own subscribers and the desktop's SSE, to the
@@ -354,7 +360,7 @@ def _read_page(pdf, index, page_num, file_id):
     return layer, picture
 
 
-# ── One page through the vision model (moved from Nunba unchanged) ────
+# ── One page through the node's vision backend ───────────────────────
 
 #: What the model is asked for each page -- the prompt Nunba's route used.
 _PAGE_PROMPT = (
@@ -385,19 +391,38 @@ _PAGE_PROMPT = (
 )
 
 
-def _parse_page_via_vision(page_num: int, image_path: str) -> dict:
-    """One VLM call: OCR + layout + tables + figures for one page image."""
+def _page_readers() -> list:
+    """How this node reads a page, best first
+    (integrations.vision.lightweight_backend.get_document_readers). [] when
+    the vision package will not load here -- the same as no model: pages are
+    read from their text layer, and the book is not failed."""
+    try:
+        from integrations.vision.lightweight_backend import get_document_readers
+        return get_document_readers()
+    except Exception as e:
+        logger.warning(f"vision unavailable for book pages: {e}")
+        return []
+
+
+def _parse_page_via_vision(page_num: int, image_path: str, readers) -> dict:
+    """One VLM read -- OCR + layout + tables + figures -- of one page image,
+    from the first reader that answers."""
     unavailable = {"page_number": page_num, "page_type": "unknown", "text": "",
                    "elements": [], "error": "Vision inference unavailable"}
     try:
-        from integrations.vision.image_describe import describe_image
-    except ImportError as e:
-        # The vision package would not import on this node. That is the same
-        # as having no model -- the page is read from its text layer -- not a
-        # reason to fail the book.
-        logger.warning(f"vision unavailable for book pages: {e}")
+        image = Path(image_path).read_bytes()
+    except OSError as e:
+        logger.warning(f"page {page_num}: its image could not be read back: {e}")
         return unavailable
-    result = describe_image(image_path, _PAGE_PROMPT)
+    result = None
+    for read in readers:
+        try:
+            result = read(image, _PAGE_PROMPT)
+        except Exception as e:
+            logger.warning(f"page {page_num}: a vision reader failed: {e}")
+            continue
+        if result:
+            break
     if not result:
         return unavailable
 
@@ -895,7 +920,8 @@ def _parse(file_id, pdf_path, step, image_path=None) -> dict:
         if file_id is not None:
             _clear_page_images(file_id)
 
-        vlm_on, vlm_ok, vlm_errors = True, 0, 0
+        readers = _page_readers()
+        vlm_on, vlm_ok, vlm_errors = bool(readers), 0, 0
         for i in range(n):
             page_num = i + 1
             layer, picture = _read_page(pdf, i, page_num, file_id)
@@ -908,7 +934,7 @@ def _parse(file_id, pdf_path, step, image_path=None) -> dict:
 
             data = None
             if vlm_on and image is not None:
-                data = _parse_page_via_vision(page_num, str(image))
+                data = _parse_page_via_vision(page_num, str(image), readers)
                 if data.get('error'):
                     vlm_errors += 1
                     if vlm_ok == 0 and vlm_errors >= _VLM_GIVE_UP_AFTER:

@@ -273,6 +273,167 @@ class TestGetVisionBackend:
             assert backend.name == 'none'
 
 
+class TestReadDocument:
+    """read_document(): a book page through the node's own vision backend."""
+
+    @staticmethod
+    def _page(size=(1700, 2200)):
+        import io
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new('RGB', size, 'white').save(buf, 'JPEG')
+        return buf.getvalue()
+
+    @staticmethod
+    def _answer(content='page text', finish='stop', status=200):
+        resp = MagicMock(status_code=status)
+        resp.json.return_value = {'choices': [{'message': {'content': content},
+                                               'finish_reason': finish}]}
+        return resp
+
+    @staticmethod
+    def _sent_size(post):
+        import base64
+        import io
+        from PIL import Image
+        url = post.call_args.kwargs['json']['messages'][0]['content'][0]['image_url']['url']
+        with Image.open(io.BytesIO(base64.b64decode(url.split(',', 1)[1]))) as im:
+            return im.size
+
+    @pytest.mark.parametrize("cls", [MiniCPMBackend, MobileVLMBackend,
+                                      CLIPBackend, NoneBackend])
+    def test_a_backend_that_cannot_read_a_page_says_so(self, cls):
+        """None, so the caller reads the page from elsewhere -- never a scene
+        label or a caption stored as the page's text."""
+        assert cls().read_document(self._page(), 'read it') is None
+
+    def test_the_caption_server_reads_a_page_at_a_readable_size(self):
+        import integrations.vision.lightweight_backend as lvb
+        from core.http_pool import LLM_COMPLETION_TIMEOUT
+        backend = lvb.Qwen08BBackend(port=9555)
+        with patch.object(backend, '_ensure_running', return_value=True), \
+             patch.object(lvb, 'pooled_post', return_value=self._answer()) as post:
+            assert backend.read_document(self._page(), 'read every line') == 'page text'
+        # The caption server's own port, the one describe() uses.
+        assert post.call_args.args[0] == 'http://127.0.0.1:9555/v1/chat/completions'
+        body = post.call_args.kwargs['json']
+        assert body['chat_template_kwargs'] == {'enable_thinking': False}
+        assert body['max_tokens'] == lvb.PAGE_MAX_TOKENS
+        assert post.call_args.kwargs['timeout'] == LLM_COMPLETION_TIMEOUT
+        assert body['messages'][0]['content'][1] == {'type': 'text', 'text': 'read every line'}
+        # Not the caption shrink (512x288): the long side at PAGE_LONG_SIDE.
+        assert self._sent_size(post) == (989, lvb.PAGE_LONG_SIDE)
+
+    def test_a_small_page_is_not_enlarged(self):
+        import integrations.vision.lightweight_backend as lvb
+        backend = lvb.Qwen08BBackend(port=9555)
+        with patch.object(backend, '_ensure_running', return_value=True), \
+             patch.object(lvb, 'pooled_post', return_value=self._answer()) as post:
+            backend.read_document(self._page((600, 800)), 'x')
+        assert self._sent_size(post) == (600, 800)
+
+    def test_no_caption_server_means_no_request(self):
+        import integrations.vision.lightweight_backend as lvb
+        backend = lvb.Qwen08BBackend(port=9555)
+        with patch.object(backend, '_ensure_running', return_value=False), \
+             patch.object(lvb, 'pooled_post') as post:
+            assert backend.read_document(self._page(), 'x') is None
+        post.assert_not_called()
+
+    @pytest.mark.parametrize('answer,expected', [
+        (dict(content=''), ''),                          # answered with nothing
+        (dict(content='cut off', finish='length'), 'cut off'),
+        (dict(status=500), None),
+    ])
+    def test_what_the_server_answered_is_what_comes_back(self, answer, expected):
+        import integrations.vision.lightweight_backend as lvb
+        backend = lvb.Qwen08BBackend(port=9555)
+        with patch.object(backend, '_ensure_running', return_value=True), \
+             patch.object(lvb, 'pooled_post', return_value=self._answer(**answer)):
+            assert backend.read_document(self._page(), 'x') == expected
+
+    def test_an_unreachable_server_is_none_not_an_exception(self):
+        import requests
+        import integrations.vision.lightweight_backend as lvb
+        backend = lvb.Qwen08BBackend(port=9555)
+        with patch.object(backend, '_ensure_running', return_value=True), \
+             patch.object(lvb, 'pooled_post', side_effect=requests.ConnectionError('refused')):
+            assert backend.read_document(self._page(), 'x') is None
+
+    def test_qwen3vl_reads_a_page_through_its_own_endpoint(self):
+        import integrations.vision.lightweight_backend as lvb
+        backend = lvb.Qwen3VLVisionBackend()
+        backend._backend = MagicMock(base_url='http://10.0.0.5:7000/v1/',
+                                     model_name='qwen-vl', api_key='k')
+        with patch.object(lvb, 'pooled_post', return_value=self._answer('p')) as post:
+            assert backend.read_document(self._page(), 'x') == 'p'
+        assert post.call_args.args[0] == 'http://10.0.0.5:7000/v1/chat/completions'
+        assert post.call_args.kwargs['headers'] == {'Authorization': 'Bearer k'}
+        assert post.call_args.kwargs['json']['model'] == 'qwen-vl'
+        assert post.call_args.kwargs['json']['chat_template_kwargs'] == {'enable_thinking': False}
+
+
+class TestDocumentReaders:
+    """get_document_readers(): the vision backend first, then the node's own
+    main model -- where book pages were read before -- so no node reads
+    fewer pages than it did."""
+
+    MAIN = 'http://127.0.0.1:8123/v1'
+
+    def _readers(self, node, main=MAIN):
+        import integrations.vision.lightweight_backend as lvb
+        with patch.object(lvb, 'get_vision_backend', return_value=node), \
+             patch('core.port_registry.get_local_llm_url', return_value=main):
+            return lvb.get_document_readers()
+
+    @staticmethod
+    def _posted_to(read):
+        import integrations.vision.lightweight_backend as lvb
+        resp = TestReadDocument._answer('p')
+        with patch.object(lvb, 'pooled_post', return_value=resp) as post:
+            assert read(TestReadDocument._page(), 'x') == 'p'
+        return post.call_args
+
+    def test_the_vision_backend_then_the_nodes_own_main_model(self):
+        import integrations.vision.lightweight_backend as lvb
+        node = lvb.Qwen08BBackend(port=9555)
+        readers = self._readers(node)
+        assert len(readers) == 2 and readers[0] == node.read_document
+        call = self._posted_to(readers[1])
+        assert call.args[0] == f'{self.MAIN}/chat/completions'
+        assert 'headers' not in call.kwargs              # no remote endpoint's key
+        assert call.kwargs['json']['chat_template_kwargs'] == {'enable_thinking': False}
+
+    @pytest.mark.parametrize("cls", [MiniCPMBackend, MobileVLMBackend,
+                                      CLIPBackend, NoneBackend])
+    def test_a_backend_that_cannot_read_pages_leaves_the_main_model(self, cls):
+        readers = self._readers(cls())
+        assert len(readers) == 1
+        assert self._posted_to(readers[0]).args[0] == f'{self.MAIN}/chat/completions'
+
+    def test_a_vlm_endpoint_that_is_the_main_model_is_not_asked_twice(self):
+        import integrations.vision.lightweight_backend as lvb
+        node = lvb.Qwen3VLVisionBackend()
+        node._backend = MagicMock(base_url=f'{self.MAIN}/', model_name='m', api_key='k')
+        assert self._readers(node) == [node.read_document]
+
+    def test_a_remote_vlm_endpoint_still_falls_back_to_this_nodes_model(self):
+        import integrations.vision.lightweight_backend as lvb
+        node = lvb.Qwen3VLVisionBackend()
+        node._backend = MagicMock(base_url='http://10.0.0.5:7000/v1', model_name='m',
+                                  api_key='k')
+        readers = self._readers(node)
+        assert len(readers) == 2
+        assert self._posted_to(readers[1]).args[0] == f'{self.MAIN}/chat/completions'
+
+    def test_no_main_model_address_means_no_fallback(self):
+        import integrations.vision.lightweight_backend as lvb
+        node = lvb.Qwen08BBackend(port=9555)
+        with patch.object(lvb, 'get_vision_backend', return_value=node), \
+             patch('core.port_registry.get_local_llm_url', side_effect=RuntimeError('none')):
+            assert lvb.get_document_readers() == [node.read_document]
+
+
 class TestBackendProperties:
     """Verify backend property consistency."""
 

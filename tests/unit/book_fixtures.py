@@ -165,7 +165,9 @@ def book_node(book_db, book_uploads, monkeypatch):
     node.uploads = book_uploads
     node.vision = MagicMock(return_value=None)          # no vision model
     node.published = []
-    monkeypatch.setattr('integrations.vision.image_describe.describe_image', node.vision)
+    # How the node reads a page: node.vision(image, prompt) is its one reader.
+    monkeypatch.setattr('integrations.vision.lightweight_backend.get_document_readers',
+                        lambda: [node.vision])
     monkeypatch.setattr(bp, '_generate_book_name', lambda text, toc: None)
     monkeypatch.setattr(bp, '_publish',
                         lambda user_id, payload: node.published.append((user_id, payload)) or True)

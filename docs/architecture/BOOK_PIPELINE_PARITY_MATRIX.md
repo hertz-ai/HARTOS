@@ -8,7 +8,8 @@ local stack has an equivalent — on BOTH agent channels, the way
 that no longer resolve. "Do we have parity locally" was being answered from
 memory. Rows were first checked against the tree on 2026-09-10 and re-checked
 on 2026-09-13, when the pipeline moved from Nunba into HARTOS, and on
-2026-09-14, when progress moved onto the MessageBus.
+2026-09-14, when page reading moved onto the node's vision backend and
+progress onto the MessageBus.
 
 **How to read a row.** *Route* = an HTTP endpoint exists. *Agent* = an LLM tool
 in the registry (`core/agent_tools.py`) can invoke it during a turn. Per the OS
@@ -86,7 +87,7 @@ a working demo.
 |---|---|---|---|---|
 | PDF ingest | `book_parsing_upload_api` | `POST /upload/parse_pdf` — 202 at once, parse runs in the background | ✅ `parse_book_pdf` | ✅ |
 | Page rasterize | (server-side) | `book_pipeline._page_image` — pypdfium2, 200 DPI, at most 2400 px on the long side | via `parse_book_pdf` | ✅ |
-| Layout + OCR | docTR + PubLayNet + SegFormer + Detectron + Nougat + LLaVA (**6 models**) | `book_pipeline._parse_page_via_vision` — **ONE VLM call/page**; the page's own text layer when the model is absent or answers blank | ✅ `get_text_from_image` (img2txt) for a single image | ✅ **better than cloud** |
+| Layout + OCR | docTR + PubLayNet + SegFormer + Detectron + Nougat + LLaVA (**6 models**) | `book_pipeline._parse_page_via_vision` — **ONE VLM call/page**, through the node's vision backend (`get_vision_backend().read_document`, the one camera, screen and media captions use: the Qwen3.5-0.8B caption server where it is installed), then the node's own main model when that backend cannot read the page or does not answer (`get_document_readers`); the page's own text layer when neither answers | ✅ `get_text_from_image` (img2txt) for a single image | ✅ **better than cloud** |
 | Chapter segmentation | pipeline TOC logic | `book_pipeline.assign_chapters` — the PDF outline (top level = chapters, the level beneath = topics), else the ToC pages the model read | ✅ `list_book_chapters`, `read_book_chapter` | ✅ |
 | Book naming | `createbookcourse` | `book_pipeline._generate_book_name` (LLM), else the PDF's own title | n/a | ✅ |
 | File registry | `adduserfile` (mailer) | `BookFile` (table `pdf_files`, `integrations/social/models.py`); `GET /db/pdf_files` | ✅ `list_books` | ✅ |

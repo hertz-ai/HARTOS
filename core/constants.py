@@ -725,7 +725,8 @@ BUILD_INCOMPLETE_REPLY: str = (
 # ── The per-request switch that turns a hybrid-reasoning model's thinking OFF ──
 # The value of an OpenAI-compatible request's `chat_template_kwargs`. ONE
 # definition for every HARTOS completion that must answer inside a small budget
-# (integrations/vision/image_describe.py; the book-title call in
+# (integrations/vision/image_describe.py; the vision backend's page reads in
+# integrations/vision/lightweight_backend.py; the book-title call in
 # integrations/learning/book_pipeline.py; every agent call to the configured
 # endpoint, via core.autogen_config.resolve_llm_backend).
 #
