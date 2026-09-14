@@ -154,8 +154,54 @@ class KeyedCircuitBreaker:
     def is_open(self, key: str) -> bool:
         return self._get(key).is_open()
 
+    def state(self, key: str) -> CircuitState:
+        """Read the key's state WITHOUT consuming the half-open probe slot.
+
+        ``is_open()`` claims the single half-open probe (sets
+        _half_open_in_flight) so exactly one caller retries after cooldown.
+        A pre-flight gate that then does NOT reach the real call (a guardrail
+        block, an unrelated defer) would strand that slot and wedge the
+        breaker half-open forever.  So an upstream check reads ``state()`` and
+        refuses only on OPEN; HALF_OPEN lets turns through, and the ONE place
+        that sees the real response (the httpx feed) is the sole consumer that
+        resolves the probe by recording success/failure."""
+        return self._get(key).state
+
     def reset(self, key: str) -> None:
         self._get(key).reset()
+
+
+def provider_host(url: str) -> str:
+    """The host of an LLM endpoint URL, lowercased and WITHOUT the port — the
+    one key both the httpx feed and dispatch_goal's pre-flight check use, so a
+    URL written with vs without :443 (or /v1) keys the same breaker.  Empty
+    string when no host can be parsed."""
+    from urllib.parse import urlsplit
+    if not url:
+        return ''
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        if not host and '//' not in url:
+            # A bare 'host[:port]/path' with no scheme: urlsplit puts it in the
+            # path, not netloc.  Re-parse as authority.
+            host = urlsplit('//' + url).hostname
+        return (host or '').lower()
+    except Exception:
+        return ''
+
+
+# One provider breaker for the node's LLM endpoints, keyed by host (#106b b).
+# A node whose configured provider refuses the account (401/402/403 on
+# chat/completions) stops dispatching goal turns to it until it answers again,
+# instead of burning every tick on turns that can only fail (central,
+# 2026-09-14: every hosted call 402 insufficient_quota).  Fed ONLY by the
+# httpx wire (core.llm_outbound_logger), which sees the real status of every
+# framework's call; read non-consumingly by dispatch_goal.  Threshold 3,
+# cooldown 10 min; 429 is deliberately NOT counted (rate-limit, not a
+# standing refusal).
+llm_provider_breaker = KeyedCircuitBreaker(
+    threshold=3, cooldown=600.0, name='llm-provider')
 
 
 class PeerBackoff:

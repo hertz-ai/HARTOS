@@ -417,6 +417,54 @@ def _is_target_request(url, method: str) -> bool:
         return False
 
 
+def _is_chat_completions_post(request) -> bool:
+    """A POST to any /chat/completions endpoint, on ANY host — the LLM calls
+    that attest provider standing (#106b b).  Broader than _is_target_request
+    (which is the LOCAL llama-server only): a HOSTED provider on :443 is the
+    402/401 source and must reach the breaker feed too.  Ends-with catches
+    both /v1/chat/completions and Azure-style
+    /openai/deployments/<d>/chat/completions."""
+    try:
+        if getattr(request, 'method', '') != 'POST':
+            return False
+        return str(getattr(request.url, 'path', '') or '').endswith('/chat/completions')
+    except Exception:
+        return False
+
+
+def _feed_provider_breaker(url, status) -> None:
+    """Record LLM provider standing per host from a chat/completions response
+    (#106b b).  401/402/403 = account refusal (a failure); 2xx = success
+    (clears/half-open-closes).  Every other status and all exceptions are
+    ignored: a 429 is a rate limit not a standing refusal, and a transport
+    error says nothing about the account.  This is the SOLE consumer that
+    resolves the breaker's half-open probe, so it must run on the real wire
+    response, never at an upstream pre-flight check."""
+    try:
+        if status is None:
+            return
+        from core.circuit_breaker import llm_provider_breaker, provider_host
+        host = provider_host(str(url))
+        if not host:
+            return
+        if status in (401, 402, 403):
+            llm_provider_breaker.record_failure(host)
+        elif 200 <= status < 300:
+            llm_provider_breaker.record_success(host)
+    except Exception:
+        pass
+
+
+def _send_and_feed(orig_send, client, request, kwargs):
+    """Run a HOSTED (non-target) chat/completions send unchanged and feed the
+    provider breaker with its real status.  Byte-transparent: the response
+    object is returned as-is and an exception is re-raised bare (exceptions do
+    not feed the breaker)."""
+    response = orig_send(client, request, **kwargs)
+    _feed_provider_breaker(request.url, getattr(response, 'status_code', None))
+    return response
+
+
 # ─── Hard left-trim to fit n_ctx (zero-tolerance context overflow) ───
 # Architecture note (2026-05-23): autogen and langchain both build
 # their own OpenAI clients from config; we cannot route them through a
@@ -1306,6 +1354,11 @@ def _install_sync_patch(httpx_module) -> None:
 
     def _patched_send(self, request, **kwargs):
         if not _is_target_request(request.url, request.method):
+            # A HOSTED provider's chat/completions call still feeds the
+            # provider breaker (#106b b); every other request is an unchanged
+            # passthrough.
+            if _is_chat_completions_post(request):
+                return _send_and_feed(_orig_send, self, request, kwargs)
             return _orig_send(self, request, **kwargs)
         try:
             body_bytes = bytes(request.content or b'')
@@ -1340,6 +1393,9 @@ def _install_sync_patch(httpx_module) -> None:
         try:
             with _slot_cm:
                 response = _orig_send(send_client, request, **kwargs)
+            # Local llama-server is a provider too (host 127.0.0.1); feed the
+            # breaker the real status (#106b b) before logging.
+            _feed_provider_breaker(request.url, getattr(response, 'status_code', None))
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
                          response_status=getattr(response, 'status_code', None),
@@ -1365,6 +1421,11 @@ def _install_async_patch(httpx_module) -> None:
 
     async def _patched(self, request, **kwargs):
         if not _is_target_request(request.url, request.method):
+            # Hosted chat/completions still feeds the provider breaker (#106b b).
+            if _is_chat_completions_post(request):
+                _resp = await _orig(self, request, **kwargs)
+                _feed_provider_breaker(request.url, getattr(_resp, 'status_code', None))
+                return _resp
             return await _orig(self, request, **kwargs)
         try:
             body_bytes = bytes(request.content or b'')
@@ -1378,6 +1439,7 @@ def _install_async_patch(httpx_module) -> None:
         start = time.time()
         try:
             response = await _orig(self, request, **kwargs)
+            _feed_provider_breaker(request.url, getattr(response, 'status_code', None))
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
                          response_status=getattr(response, 'status_code', None),

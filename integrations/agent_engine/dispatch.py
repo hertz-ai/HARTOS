@@ -439,6 +439,19 @@ def is_transient_deferral() -> bool:
     try:
         if is_user_recently_active() or _cb_is_open():
             return True
+        # The node's own LLM provider refusing the account (#106b b) is a
+        # transient wait, not a dispatch failure: the goal should hold for the
+        # top-up, never accrue the 5-strike auto-pause (which would need a
+        # manual resume of every goal after the balance is restored).
+        try:
+            from core.circuit_breaker import (llm_provider_breaker,
+                                              provider_host, CircuitState)
+            from integrations.agent_engine.model_registry import _own_llm_target
+            _h = provider_host(str((_own_llm_target() or ('', ''))[0] or ''))
+            if _h and llm_provider_breaker.state(_h) == CircuitState.OPEN:
+                return True
+        except Exception:
+            pass
         # A goal whose in-flight LLM call was just PREEMPTED for a live user turn
         # (foreground abort / llama_scheduler eviction) is a transient defer too —
         # re-queue it next tick, never count it toward auto-pause.  The user may
@@ -501,6 +514,23 @@ def dispatch_failure_reason(goal_id) -> Optional[str]:
     turn ran and failed, or None.  Read once: the entry is removed."""
     with _turn_failures_lock:
         return _turn_failures.pop(str(goal_id), None)
+
+
+def _dispatch_provider_host(model_config) -> str:
+    """Host of the LLM endpoint this dispatch will use, for the provider
+    breaker (#106b b): the expert override's base_url when one is given, else
+    this node's own configured backend (model_registry._own_llm_target).  Only
+    the host is read — the base_url carries the API key and is never logged."""
+    try:
+        from core.circuit_breaker import provider_host
+        if model_config:
+            entry = model_config[0] if model_config else {}
+            return provider_host(str((entry or {}).get('base_url') or ''))
+        from integrations.agent_engine.model_registry import _own_llm_target
+        base_url, _model = _own_llm_target()
+        return provider_host(str(base_url or ''))
+    except Exception:
+        return ''
 
 
 # Concurrency ceiling for autonomous dispatch — single source both daemons call
@@ -1014,6 +1044,32 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     #   Tier 2: HTTP proxy to backend port
     #   Tier 3: llama.cpp fallback (direct LLM, no agent pipeline)
     resp = None
+
+    # #106b (b): don't start a turn on a provider that is refusing the account.
+    # The httpx feed (core.llm_outbound_logger) opens a per-host breaker on
+    # 401/402/403 and closes it on a 2xx.  Here we only READ it via state()
+    # (which does NOT consume the half-open probe — the feed is the sole
+    # consumer that resolves it), and refuse only when OPEN, keyed by the host
+    # THIS turn will use (the expert override's endpoint, else this node's own
+    # configured backend).  A refusal is a transient wait (is_transient_deferral
+    # counts it), not a dispatch failure, so goals hold for the top-up instead
+    # of accruing auto-pause strikes; on central 2026-09-14 every hosted call
+    # 402'd and the daemon re-tried every tick.
+    _prov_host = _dispatch_provider_host(model_config)
+    if _prov_host:
+        try:
+            from core.circuit_breaker import (llm_provider_breaker,
+                                              CircuitState)
+            if llm_provider_breaker.state(_prov_host) == CircuitState.OPEN:
+                _reason = (f'provider {_prov_host} is refusing the account '
+                           f'(breaker open)')
+                with _turn_failures_lock:
+                    _turn_failures[str(goal_id)] = _reason
+                logger.warning(f"Goal {goal_id}: {_reason}; not dispatching "
+                               f"this tick")
+                return None
+        except Exception:
+            pass
 
     # Tier 1: the canonical in-process /chat call.  The adapter resolution,
     # the user-priority gate and the local-LLM semaphore all live in
