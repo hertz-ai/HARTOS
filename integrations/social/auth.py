@@ -201,6 +201,64 @@ def verify_hive_jwt(token: str, issuer_public_key_hex: str) -> dict:
     return {}
 
 
+def verify_device_jwt(db, token: str, owner_id: str) -> dict:
+    """Verify a hive-shaped token from a person's phone against the key the
+    desktop owner allowed for it (#111).
+
+    The phone signs the same token nodes exchange (scope 'hive', node_sig
+    over the canonical payload, verify_hive_jwt) with its own PeerLink
+    Ed25519 key, and carries that key's hex in a ``node_public_key`` claim.
+    The claim is read ONLY to find the row: the key on file is the owner's
+    GRANTED ``device_access`` consent whose scope is that key
+    (consent_service.device_scope), the row the owner wrote with "Always
+    allow" on the ask.  The signature is verified against the key read back
+    from that row (ConsentService.active_grant, an exact-scope lookup), so
+    the claim can select a row and nothing more, and a blanket '*' grant
+    admits no device.
+
+    Before any ask is filed the token must verify against the key it
+    CLAIMS: that proves the caller holds that key, so nobody can file asks
+    in the name of another phone's key, and an ask always names a key its
+    sender can answer for.  (Holding a key is not identity; only the
+    owner's grant is.)
+
+    Returns ``{'status': 'ok', 'payload': ..., 'public_key': ...}``,
+    ``{'status': 'pending', 'public_key': ..., 'claims': ...}`` (no grant
+    yet: the caller files the ask), ``{'status': 'denied', 'public_key':
+    ...}`` (the owner said no), or ``{'status': 'invalid'}`` (not a device
+    token, or the signature does not verify).
+    """
+    from .consent_service import ConsentService, device_scope
+    if not HAS_JWT or not token or not owner_id:
+        return {'status': 'invalid'}
+    try:
+        claims = pyjwt.decode(token, options={'verify_signature': False,
+                                              'verify_exp': False},
+                              algorithms=['HS256'])
+    except Exception:
+        return {'status': 'invalid'}
+    scope = device_scope(claims.get('node_public_key'))
+    if scope is None or claims.get('scope') != 'hive':
+        return {'status': 'invalid'}
+    row = ConsentService.active_grant(db, owner_id, 'device_access',
+                                      scope=scope, agent_id=None)
+    if row is None:
+        claimed_key = scope[len('device:'):]
+        if not verify_hive_jwt(token, claimed_key):
+            return {'status': 'invalid'}
+        declined = ConsentService.declined(db, owner_id, 'device_access',
+                                           scope=scope, agent_id=None)
+        return {'status': 'denied' if declined else 'pending',
+                'public_key': claimed_key, 'claims': claims}
+    granted_key = row.scope[len('device:'):]
+    payload = verify_hive_jwt(token, granted_key)
+    if not payload:
+        logger.warning("device token for granted key %s... did not verify",
+                       granted_key[:16])
+        return {'status': 'invalid'}
+    return {'status': 'ok', 'payload': payload, 'public_key': granted_key}
+
+
 def generate_token_pair(user_id: str, username: str, role: str = 'flat') -> dict:
     """Generate access + refresh token pair."""
     mgr = _get_jwt_manager()

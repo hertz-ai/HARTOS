@@ -66,7 +66,31 @@ CONSENT_TYPES = frozenset({
                          # file writes, mouse and keyboard, opening apps
                          # (integrations.vlm.safety.computer_control_block).
                          # Asked of the desktop owner, whose machine it is.
+    'device_access',     # A person's phone reaches this desktop's agents
+                         # from the network (#111).  Asked of the desktop
+                         # owner; the scope names the device's Ed25519 key
+                         # (device_scope), so the GRANTED row is the key on
+                         # file that security.middleware verifies the
+                         # phone's signed calls against.  Permanent until
+                         # revoked, as the owner ruled.
 })
+
+#: A device is identified by its Ed25519 public key (the PeerLink identity
+#: every phone already has); the consent scope carries the whole key so no
+#: other table has to.  64 hex chars + the prefix fit UserConsent.scope(100).
+DEVICE_SCOPE_PREFIX = 'device:'
+_DEVICE_KEY_RE = re.compile(r'[0-9a-f]{64}')
+
+
+def device_scope(public_key_hex):
+    """The consent scope for a device key, or None when the key is not a
+    64-hex Ed25519 public key (the only shape the gate looks up)."""
+    if not isinstance(public_key_hex, str):
+        return None
+    key = public_key_hex.lower()
+    if not _DEVICE_KEY_RE.fullmatch(key):
+        return None
+    return f'{DEVICE_SCOPE_PREFIX}{key}'
 
 
 def _audit(event_type: str, actor_id: str, action: str, detail: dict):
@@ -122,8 +146,10 @@ def _emit(topic: str, data: dict, msg_id: str = None):
             }
             # The agent's own name (agent_display_name): the card shows it,
             # never the id, which is a prompt id and means nothing to a person.
-            if data.get('agent_name'):
-                note['agent_name'] = data['agent_name']
+            # A device ask names the person whose phone asks the same way.
+            for name_key in ('agent_name', 'requester_name'):
+                if data.get(name_key):
+                    note[name_key] = data[name_key]
             if msg_id:
                 note['msg_id'] = msg_id
             on_notification(user_id, note)
@@ -138,7 +164,7 @@ def _validate_consent_type(consent_type: str):
             f"Must be one of: {', '.join(sorted(CONSENT_TYPES))}")
 
 
-_AGENT_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+_AGENT_ID_RE = re.compile(r'[A-Za-z0-9_-]+')
 
 
 def _is_a_name(name, aid):
@@ -172,7 +198,7 @@ def agent_display_name(db, agent_id):
     if agent_id in (None, ''):
         return None
     aid = str(agent_id)
-    if not _AGENT_ID_RE.match(aid):
+    if not _AGENT_ID_RE.fullmatch(aid):
         _logger.debug("agent_display_name: refusing id %r", aid)
         return None
     try:
@@ -216,11 +242,14 @@ class ConsentService:
 
     @staticmethod
     def request_consent(db, user_id: str, consent_type: str,
-                        scope: str = '*', agent_id=None, reason: str = ''):
+                        scope: str = '*', agent_id=None, reason: str = '',
+                        requester_name: str = ''):
         """Create a pending (not yet granted) consent record.
 
         Returns existing record if one already exists for this combination.
         ``reason`` rides on the ask, so the card can say what is asked for.
+        ``requester_name`` is the person asking when the asker is not an
+        agent (a device ask: the phone's owner), shown like agent_name.
         """
         _validate_consent_type(consent_type)
 
@@ -232,6 +261,8 @@ class ConsentService:
         }
         if reason:
             ask['reason'] = reason
+        if requester_name:
+            ask['requester_name'] = requester_name
         # Who is asking, by name: the card says "<name> asks to ...".
         _named(db, ask, agent_id)
 
@@ -543,6 +574,27 @@ class ConsentService:
         })
 
     @staticmethod
+    def active_grant(db, user_id: str, consent_type: str,
+                     scope: str = '*', agent_id=None):
+        """The granted, unrevoked row for EXACTLY this combination, or None.
+
+        check_consent's first step, and the whole lookup for a caller that
+        must act on the row itself: the device gate (auth.verify_device_jwt)
+        verifies a phone's signature against the key in the GRANTED row's
+        scope, so it reads that row here and never widens to a wildcard or
+        a blanket grant.
+        """
+        _validate_consent_type(consent_type)
+        return db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == consent_type,
+            UserConsent.scope == scope,
+            UserConsent.agent_id == agent_id,
+            UserConsent.granted == True,
+            UserConsent.revoked_at.is_(None),
+        ).first()
+
+    @staticmethod
     def check_consent(db, user_id: str, consent_type: str,
                       scope: str = '*', agent_id=None) -> bool:
         """Check if user has active consent.
@@ -560,15 +612,8 @@ class ConsentService:
         _validate_consent_type(consent_type)
 
         # 1. Exact match
-        exact = db.query(UserConsent).filter(
-            UserConsent.user_id == user_id,
-            UserConsent.consent_type == consent_type,
-            UserConsent.scope == scope,
-            UserConsent.agent_id == agent_id,
-            UserConsent.granted == True,
-            UserConsent.revoked_at.is_(None),
-        ).first()
-        if exact:
+        if ConsentService.active_grant(db, user_id, consent_type,
+                                       scope=scope, agent_id=agent_id):
             return True
 
         # 2. Wildcard scope for specific agent

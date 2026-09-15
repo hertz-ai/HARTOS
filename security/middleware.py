@@ -331,6 +331,89 @@ def _apply_api_auth(app: Flask, register: bool = True):
             {'error': 'Authentication required (Bearer token)'},
         ), 401
 
+    def _admit_owner_allowed_device(refused):
+        """A desktop's second network credential: a token the phone signed
+        with its own PeerLink key, admitted when the owner has allowed that
+        key (integrations.social.auth.verify_device_jwt; the grant is the
+        owner's ``device_access`` consent whose scope names the key).
+
+        ``refused`` is the 401 the key/JWT check already produced; it stands
+        for anything that is not a device token.  A device the owner has not
+        answered about gets the ask filed for them (ConsentService.
+        request_consent, delivered like every consent ask, one card per
+        pending row) and a 403 ``consent_pending`` it can retry on; a device
+        the owner said no to gets 403 ``consent_denied`` and no new ask.  An
+        admitted device acts only as the token's user: a JSON body must
+        carry that ``user_id`` and no other (#51), so no route's default
+        user can stand in for it.
+
+        Filing is what an unauthenticated peer can trigger, so it is paced
+        per address with the gossip announce limiter (discovery.
+        _check_announce_rate): past the limit the ask is not filed and the
+        answer is still ``consent_pending``, which an honest phone retries.
+        """
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return refused
+        owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+        if not owner:
+            return refused
+        token = auth_header[7:]
+        try:
+            from integrations.social.auth import verify_device_jwt
+            from integrations.social.models import db_session
+            with db_session(commit=True) as db:
+                verdict = verify_device_jwt(db, token, owner)
+                if verdict['status'] == 'pending':
+                    from integrations.social.discovery import _check_announce_rate
+                    if _check_announce_rate(request.remote_addr or ''):
+                        _file_device_ask(db, owner, verdict['public_key'],
+                                         verdict.get('claims') or {})
+                    else:
+                        logger.warning("device ask from %s not filed: rate limit",
+                                       request.remote_addr)
+        except Exception:
+            logger.warning("device credential check failed; refusing",
+                           exc_info=True)
+            return refused
+        status = verdict['status']
+        if status == 'ok':
+            payload = verdict['payload']
+            body = request.get_json(silent=True) if request.is_json else None
+            if isinstance(body, dict):
+                asked_as = body.get('user_id')
+                if asked_as is None or str(asked_as) != str(payload.get('user_id')):
+                    logger.warning("device %s... acting as user %s, token says "
+                                   "%s; refused", verdict['public_key'][:16],
+                                   asked_as, payload.get('user_id'))
+                    return jsonify({'error': 'user_id must be the token\'s user'}), 403
+            g.auth_source = 'device'
+            g.jwt_payload = payload
+            g.device_public_key = verdict['public_key']
+            return None
+        if status == 'pending':
+            return jsonify({'error': 'consent_pending',
+                            'message': "Waiting for this desktop's owner to "
+                                       "allow this phone"}), 403
+        if status == 'denied':
+            return jsonify({'error': 'consent_denied',
+                            'message': "This desktop's owner has not allowed "
+                                       "this phone"}), 403
+        return refused
+
+    def _file_device_ask(db, owner, public_key, claims):
+        """File (or re-send) the owner's ask for this phone.  The person's
+        name comes from the token's own username claim, which the phone
+        signed; nothing of the key is shown, the card names the person."""
+        from integrations.social.consent_service import (
+            ConsentService, device_scope)
+        name = ' '.join(str(claims.get('username') or '').split())[:100]
+        who = f"{name}'s phone" if name else "A phone"
+        ConsentService.request_consent(
+            db, owner, 'device_access', scope=device_scope(public_key),
+            reason=f"{who} asks to use this computer's agents from the network.",
+            requester_name=name)
+
     def _expected_api_key() -> str:
         """HEVOLVE_API_KEY, the one credential both branches below accept."""
         try:
@@ -353,7 +436,13 @@ def _apply_api_auth(app: Flask, register: bool = True):
             from core.auth_local import _is_local_request
             if _is_local_request() or _is_exempt(path):
                 return
-            return _require_api_key_or_bearer(_expected_api_key())
+            refused = _require_api_key_or_bearer(_expected_api_key())
+            if refused is None:
+                return
+            # A person's phone, signed with the key the owner allowed (#111):
+            # only after the key and the local JWT have not admitted it, so
+            # every caller admitted today is admitted exactly as before.
+            return _admit_owner_allowed_device(refused)
 
         if _is_exempt(path):
             return
