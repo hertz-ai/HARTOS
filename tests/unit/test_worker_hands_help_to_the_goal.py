@@ -277,7 +277,10 @@ def test_a_dependency_block_is_not_mistaken_for_a_help_hold():
 # 4. The expert's turn is a local turn, not a hive submission
 # --------------------------------------------------------------------------
 
-def test_dispatch_goal_runs_an_expert_turn_locally_even_with_peers():
+def _dispatch_expert_turn(robot_capable):
+    """dispatch_goal with a model override on a node with peers; returns
+    (result, distributed mock, local chat mock).  robot_capable=False takes
+    the robot branch, the second distributed dispatch in the function."""
     from integrations.agent_engine import dispatch as dispatch_mod
     guard = MagicMock()
     guard.GuardrailEnforcer.before_dispatch.return_value = (True, 'ok', 'prompt')
@@ -293,13 +296,27 @@ def test_dispatch_goal_runs_an_expert_turn_locally_even_with_peers():
          patch.object(dispatch_mod, 'dispatch_goal_distributed',
                       return_value='dist_id') as dist, \
          patch.object(dispatch_mod, '_check_robot_capability_match',
-                      return_value=True), \
+                      return_value=robot_capable), \
          patch.object(dispatch_mod, '_dispatch_provider_host', return_value=None), \
          patch.object(dispatch_mod, 'local_chat_dispatch',
                       return_value=('ok', 'the expert finished step 1')) as chat:
         got = dispatch_mod.dispatch_goal(
-            'prompt', 'u1', 'g1', 'marketing',
+            'prompt', 'u1', 'g1', 'robot' if not robot_capable else 'marketing',
             model_config=[{'model': 'claude-opus-5', 'api_key': 'x'}])
+    return got, dist, chat
+
+
+def test_dispatch_goal_runs_an_expert_turn_locally_even_with_peers():
+    got, dist, chat = _dispatch_expert_turn(robot_capable=True)
     dist.assert_not_called()
     assert chat.called, 'the expert turn did not run locally'
+    assert got == 'the expert finished step 1'
+
+
+def test_a_robot_goal_this_node_cannot_serve_still_runs_its_expert_turn_here():
+    """The robot branch is a second distributed dispatch; the guard must
+    cover it too (hartos-3e review of 510392ae4: it did not)."""
+    got, dist, chat = _dispatch_expert_turn(robot_capable=False)
+    dist.assert_not_called()
+    assert chat.called
     assert got == 'the expert finished step 1'

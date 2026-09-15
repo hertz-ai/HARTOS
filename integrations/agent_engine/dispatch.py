@@ -1020,9 +1020,22 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     except Exception:
         pass  # Audit is best-effort
 
+    # A turn with a model override runs HERE, never on the hive.  The hive
+    # task carries no model config (an override's entry can hold a peer's
+    # token and is never written to the ledger), so a distributed submit
+    # would run the goal on the worker's own model and, since submit_goal
+    # dedups onto the existing task set, would not even do that.  Today the
+    # one caller that passes model_config is the daemon's expert turn
+    # (#106d): with it distributed, the daemon's settle judged an instant
+    # "turn" that never ran and parked the goal for a person one tick
+    # later, so on a node with peers the expert never got its turn.  ONE
+    # decision for both distributed branches below (hartos-3e review of
+    # 510392ae4: the robot branch had escaped the guard).
+    _can_distribute = not model_config
+
     # ROBOT: capability-matched dispatch — prefer distributed for hardware mismatches
     _tried_distributed = False
-    if not _check_robot_capability_match(goal_type, goal_id):
+    if _can_distribute and not _check_robot_capability_match(goal_type, goal_id):
         coordinator = _get_distributed_coordinator()
         if coordinator and _has_hive_peers():
             _tried_distributed = True
@@ -1033,15 +1046,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
 
     # DISTRIBUTED: auto-distribute when coordinator is reachable and hive has peers
     # Skip if robot dispatch already tried distributed (avoid double submission)
-    #
-    # An expert's turn (model_config set, #106d) is a local turn: the hive
-    # task carries no model config (the expert's entry can hold a peer's
-    # token and is never written to the ledger), so submitting it would run
-    # the goal on this node's own model again, and submit_goal dedups onto
-    # the existing task set anyway.  The daemon's settle then judged an
-    # instant "turn" that never ran and parked the goal for a person one
-    # tick later, so on a node with peers the expert never got its turn.
-    if not _tried_distributed and not model_config:
+    if _can_distribute and not _tried_distributed:
         coordinator = _get_distributed_coordinator()
         if coordinator and _has_hive_peers():
             result = dispatch_goal_distributed(prompt, user_id, goal_id, goal_type)
