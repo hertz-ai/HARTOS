@@ -2913,8 +2913,13 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     if window is not None:
         win_lo, win_hi = window
         try:
-            from integrations.social._models_local import ConversationEntry
-            from integrations.social.models import get_db
+            # From the facade, never from _models_local: on an install with
+            # sql.models, executing the fallback module re-registers every
+            # table on the shared Base and every later query fails with
+            # "Multiple classes found for path" (live 2026-09-15 12:21:32,
+            # this function; the owner's consent clicks failed for the
+            # rest of the process).
+            from integrations.social.models import ConversationEntry, get_db
             results = []
             db = get_db()
             try:

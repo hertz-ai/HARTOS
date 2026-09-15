@@ -73,11 +73,9 @@ def _models(get_db_fn=None, db_session_fn=None, with_user=False):
     if get_db_fn: m.get_db = get_db_fn
     if db_session_fn: m.db_session = db_session_fn
     m.User = type('User', (), {'id': _Col()})
-    return m
-
-
-def _models_local():
-    m = types.ModuleType('integrations.social._models_local')
+    # The facade exports ConversationEntry on both of its branches; the
+    # code reads it from there, never from _models_local (see
+    # test_models_local_is_imported_only_by_the_facade.py).
     m.ConversationEntry = type('CE', (), {'user_id': _Col()})
     return m
 
@@ -98,7 +96,6 @@ def test_rekeys_conversation_entries_and_merges_buffer():
     guest = _FakeMem(['m1', 'm2']); acct = _FakeMem([])
     saved = _inject({
         'integrations.social.models': _models(get_db_fn=lambda: _DB(rec)),
-        'integrations.social._models_local': _models_local(),
         'integrations.channels.memory.simplemem_langchain':
             _simplemem({'guest-uuid': guest, '10202': acct}),
     })

@@ -80,11 +80,12 @@ def test_date_range_queries_conversation_entry():
     rows = [_Row('we discussed the roadmap', datetime(2026, 5, 22, 10, 0))]
     models = types.ModuleType('integrations.social.models')
     models.get_db = lambda: _FakeDB(rows)
-    mlocal = types.ModuleType('integrations.social._models_local')
-    mlocal.ConversationEntry = type('CE', (), {'user_id': _Col(), 'created_at': _Col()})
+    # The facade exports ConversationEntry on both of its branches; the
+    # code reads it from there, never from _models_local (see
+    # test_models_local_is_imported_only_by_the_facade.py).
+    models.ConversationEntry = type('CE', (), {'user_id': _Col(), 'created_at': _Col()})
     saved = _inject({
         'integrations.social.models': models,
-        'integrations.social._models_local': mlocal,
         'langchain_classic.memory': _zep_landmine(),
     })
     try:
