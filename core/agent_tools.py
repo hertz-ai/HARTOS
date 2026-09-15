@@ -140,6 +140,26 @@ def is_user_facing_error(reply) -> bool:
     return text in (LLM_LOADING_REPLY.strip(), LLM_GENERIC_ERROR_REPLY.strip())
 
 
+def is_help_pause(reply) -> bool:
+    """True when ``reply`` says the turn's action was handed to a person or an
+    expert (create_recipe._ask_for_help on an autonomous run).
+
+    Neither a result nor a failure: the action is held, the goal is parked or
+    handed to the expert, and the reply is the notice.  A caller deciding
+    whether work was done (the hive worker) must not record it as a
+    completion, and must not release it for a retry either, since that would
+    run a paused goal.  Recognised by reference to the prefixes in
+    core.constants so rewording one cannot silently stop this check.
+    """
+    if not isinstance(reply, str):
+        return False
+    text = reply.strip()
+    if not text:
+        return False
+    from core.constants import HELP_EXPERT_REPLY_PREFIX, HELP_PAUSED_REPLY_PREFIX
+    return text.startswith((HELP_PAUSED_REPLY_PREFIX, HELP_EXPERT_REPLY_PREFIX))
+
+
 def register_dual(helper, executor, func, name: str, description: str):
     """Register a single tool on both the LLM-calling and executing agents.
 

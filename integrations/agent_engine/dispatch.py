@@ -1033,7 +1033,15 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
 
     # DISTRIBUTED: auto-distribute when coordinator is reachable and hive has peers
     # Skip if robot dispatch already tried distributed (avoid double submission)
-    if not _tried_distributed:
+    #
+    # An expert's turn (model_config set, #106d) is a local turn: the hive
+    # task carries no model config (the expert's entry can hold a peer's
+    # token and is never written to the ledger), so submitting it would run
+    # the goal on this node's own model again, and submit_goal dedups onto
+    # the existing task set anyway.  The daemon's settle then judged an
+    # instant "turn" that never ran and parked the goal for a person one
+    # tick later, so on a node with peers the expert never got its turn.
+    if not _tried_distributed and not model_config:
         coordinator = _get_distributed_coordinator()
         if coordinator and _has_hive_peers():
             result = dispatch_goal_distributed(prompt, user_id, goal_id, goal_type)

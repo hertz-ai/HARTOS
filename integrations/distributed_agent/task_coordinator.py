@@ -22,7 +22,8 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from agent_ledger.core import SmartLedger, Task, TaskType, TaskStatus
+from agent_ledger.core import (
+    BlockedReason, SmartLedger, Task, TaskStatus, TaskType)
 from agent_ledger.distributed import DistributedTaskLock
 from agent_ledger.verification import TaskVerification, TaskBaseline
 from core.constants import HIVE_DEPTH, HIVE_WORKER_CAPABILITIES
@@ -135,13 +136,18 @@ class DistributedTaskCoordinator:
             # run (owner decision 2026-09-13); see _reopen_finished_run.
             reopened = (self._reopen_finished_run(goal_id)
                         if context.get('continuous') else 0)
+            # Work held for a person or an expert comes back when the goal
+            # is dispatched again; see _release_held_tasks.
+            released = self._release_held_tasks(goal_id)
             logger.info(
                 f"submit_goal: goal {goal_id} already has tasks — reusing "
                 f"(skipping duplicate task creation)"
                 + (f"; healed {healed} unclaimable requirement(s)"
                    if healed else "")
                 + (f"; re-armed {reopened} task(s) for the next run"
-                   if reopened else ""))
+                   if reopened else "")
+                + (f"; released {released} task(s) held for help"
+                   if released else ""))
             return goal_id
 
         # Enforce HIVE_DEPTH — reject propagations deeper than the
@@ -278,6 +284,49 @@ class DistributedTaskCoordinator:
         if reopened:
             self._ledger.save()
         return reopened
+
+    def _release_held_tasks(self, goal_id: str) -> int:
+        """Put a goal's tasks held for help (hold_task) back to PENDING.
+
+        Runs when the goal is submitted AGAIN.  The daemon dispatches only
+        active goals, so a re-dispatch of a goal whose task was held means
+        the owner or the co-pilot resumed it (a parked goal) or the expert
+        leg is running (an active one): the answer is in, the work goes back
+        to the queue.  Nothing else releases a held task: orphan recovery
+        skips BLOCKED, and claim_next_task takes only PENDING.
+
+        Only tasks blocked for INPUT_REQUIRED, the mark hold_task makes.  A
+        task blocked on a prerequisite (parallel_dispatch's dependency
+        chains write "Blocked by prerequisite ...") keeps its block.
+
+        Re-opens the SAME task id, as _reopen_finished_run does, so a goal
+        that asks for help many times does not grow the ledger; the run
+        counter and the state history record each return.
+        """
+        parent = self._ledger.get_task(goal_id)
+        released = 0
+        for child_id in list(getattr(parent, 'child_task_ids', None) or []):
+            child = self._ledger.get_task(child_id)
+            if (child is None or child.status != TaskStatus.BLOCKED
+                    or child.blocked_reason != BlockedReason.INPUT_REQUIRED.value):
+                continue
+            if not self._ledger.update_task_status(
+                    child_id, TaskStatus.PENDING,
+                    reason='the goal was dispatched again: the help it '
+                           'asked for is in',
+                    defer_save=True):
+                continue
+            child.set_blocked_reason(None)
+            child.error_message = None
+            child.started_at = None
+            ctx = child.context
+            ctx.pop('claimed_by', None)
+            ctx.pop('claimed_at', None)
+            ctx['runs'] = int(ctx.get('runs', 0) or 0) + 1
+            released += 1
+        if released:
+            self._ledger.save()
+        return released
 
     def claim_next_task(
         self,
@@ -479,6 +528,33 @@ class DistributedTaskCoordinator:
         the lock to be gone) never fires, and the task is IN_PROGRESS for good.
         """
         self._lock.release_task(task_id, agent_id)
+
+    def hold_task(self, task_id: str, agent_id: str, reason: str) -> bool:
+        """A worker holds a task whose action was handed to a person or an
+        expert (create_recipe._ask_for_help; the goal is parked or the expert
+        has its next turn).
+
+        IN_PROGRESS -> BLOCKED with blocked_reason input_required, the same
+        mark the create loop puts on its own ledger's action, and the reason
+        (the reply) as error_message so the dashboard can show why.  The
+        claim is released.  Neither submit_result (owner ruling 2026-09-14:
+        never record a completion that did not happen) nor abandon_task: an
+        abandoned task is re-queued by orphan recovery after _ORPHAN_AFTER_S,
+        and that would run a goal the create loop just parked, every ten
+        minutes, for as long as nobody answered.  claim_next_task takes only
+        PENDING and recovers only IN_PROGRESS, so a held task waits until
+        _release_held_tasks puts it back on the goal's next dispatch.
+        """
+        ok = self._ledger.update_task_status(
+            task_id, TaskStatus.BLOCKED, error_message=reason,
+            reason='held for help: the action was handed to a person or an '
+                   'expert', defer_save=True)
+        task = self._ledger.get_task(task_id)
+        if ok and task is not None:
+            task.set_blocked_reason(BlockedReason.INPUT_REQUIRED.value)
+        self._ledger.save()
+        self._lock.release_task(task_id, agent_id)
+        return ok
 
     def _notify_goal_contribution(self, task_id: str, agent_id: str, task_description: str):
         """Notify the user who owns the agent that their agent contributed to a goal."""

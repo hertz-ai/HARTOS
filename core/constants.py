@@ -721,6 +721,17 @@ BUILD_INCOMPLETE_REPLY: str = (
     "I'll pick up where it stopped."
 )
 
+# What create_recipe._ask_for_help replies on an autonomous turn whose action
+# it handed on (owner ruling 2026-09-14: ask a human or an expert, never
+# record a completion that did not happen).  Prefixes, not sentences: the
+# step and the reason follow.  The hive worker recognises them by reference
+# (core.agent_tools.is_help_pause) and holds the task instead of submitting
+# the sentence as its result.  Measured on the Nunba desktop 2026-09-15: three
+# of four daemon turns were "Worker completed" with one of these as the
+# hashed result.
+HELP_PAUSED_REPLY_PREFIX: str = "Paused for help:"
+HELP_EXPERT_REPLY_PREFIX: str = "Handed to the expert model:"
+
 
 # ── The per-request switch that turns a hybrid-reasoning model's thinking OFF ──
 # The value of an OpenAI-compatible request's `chat_template_kwargs`. ONE

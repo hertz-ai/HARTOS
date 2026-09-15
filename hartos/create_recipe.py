@@ -11,6 +11,8 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     AUTOGEN_MESSAGE_TOKEN_BUDGET,
     AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
     AUTOGEN_HISTORY_LIMIT,
+    HELP_EXPERT_REPLY_PREFIX,
+    HELP_PAUSED_REPLY_PREFIX,
 )
 
 import ast
@@ -4254,13 +4256,16 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
         f'[ASK-FOR-HELP] action {action_id} of {user_prompt}: {reason}; '
         f'goal {goal_id or "unknown"} handed to {stage or "nobody"}')
     step = f' ("{action_text}")' if action_text else ''
+    # The prefixes live in core.constants: the hive worker recognises this
+    # reply by them (core.agent_tools.is_help_pause) and holds its task
+    # instead of recording the sentence as a result.
     if stage == 'expert':
-        return (f"Handed to the expert model: step {action_id}{step} could not "
+        return (f"{HELP_EXPERT_REPLY_PREFIX} step {action_id}{step} could not "
                 f"be finished autonomously ({reason}). It takes this goal's "
                 f"next turn.")
-    return (f"Paused for help: step {action_id}{step} could not be finished "
-            f"autonomously ({reason}). It is waiting for the owner or the "
-            f"co-pilot.")
+    return (f"{HELP_PAUSED_REPLY_PREFIX} step {action_id}{step} could not be "
+            f"finished autonomously ({reason}). It is waiting for the owner or "
+            f"the co-pilot.")
 
 
 def get_response_group(user_id,text,prompt_id,Failure=False,error=None):

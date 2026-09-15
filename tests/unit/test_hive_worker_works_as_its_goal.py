@@ -147,8 +147,10 @@ def test_the_http_fallback_turn_runs_autonomous():
                return_value=MagicMock(status_code=503)) as post:
         _loop()._execute_task(task)
     rid = post.call_args.kwargs['json']['request_id']
-    # the tag local_chat_dispatch stamps on the in-process route
-    assert rid == daemon_request_id(task.task_id)
+    # the tag local_chat_dispatch stamps on the in-process route: the GOAL's
+    # id, which the create loop reads back to find the goal its ask-for-help
+    # parks (tests/unit/test_worker_hands_help_to_the_goal.py)
+    assert rid == daemon_request_id(task.parent_task_id)
     try:
         thread_local_data.set_request_id(rid)   # what the /chat handler does
         assert is_current_request_autonomous() is True
