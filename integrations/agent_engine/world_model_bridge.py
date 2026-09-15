@@ -651,6 +651,41 @@ class WorldModelBridge:
 
     # ─── Record interactions (auto-learn) ────────────────────────────
 
+    def _ingest_user_utterance(self, user_id: str, text: str) -> None:
+        """[C277] Post one typed user utterance as a 'text' sensor reading.
+
+        Gate, in order: HEVOLVE_CHAT_LEARNING=0 switches it off; the user must
+        hold the 'data_access' consent with scope '*' that the voice agents
+        and whisper_tool._mic_learning_consented already require, checked
+        FAIL-CLOSED (any error in the consent machinery means no ingest). The
+        consent ASK is not filed here: the mic path files it, and the
+        UserConsent UI shows one card. reality_signature is 1.0 (a person's
+        words, like the mic), which ingest_sensor_batch derives from the
+        stream_source 'chat'.
+        """
+        if not text or os.environ.get('HEVOLVE_CHAT_LEARNING', '1') == '0':
+            return
+        try:
+            from integrations.social.consent_service import ConsentService
+            from integrations.social.models import db_session
+            with db_session(commit=False) as db:
+                if not ConsentService.check_consent(db, user_id, 'data_access',
+                                                    scope='*'):
+                    return
+        except Exception as e:
+            logger.debug("[WorldModelBridge] chat-learning consent check failed "
+                         "(user=%s): %s", user_id, e)
+            return
+        reading = {
+            'sensor_id': f'chat_{user_id}',
+            'sensor_type': 'text',
+            'data': {'text': text, 'stream_source': 'chat'},
+        }
+        try:
+            self._flush_executor.submit(self.ingest_sensor_batch, [reading])
+        except Exception as e:
+            logger.debug("[WorldModelBridge] chat-learning submit skipped: %s", e)
+
     def record_interaction(self, user_id: str, prompt_id: str,
                            prompt: str, response: str,
                            model_id: str = None, latency_ms: float = 0,
@@ -723,6 +758,13 @@ class WorldModelBridge:
         self._experience_queue.append(experience)
         with self._lock:
             self._stats['total_recorded'] += 1
+
+        # [C277] The user's words go to the WORLD MODEL too, not only to the
+        # distillation queue above: as a text sensor reading through the same
+        # ingest_sensor_batch mouth the mic uses (whisper_tool posts audio +
+        # transcript), under the same consent. The redacted prompt, never the
+        # raw one. Best-effort on the flush executor; never blocks /chat.
+        self._ingest_user_utterance(str(user_id), experience.get('prompt') or '')
 
         # Durable local write: append the user↔assistant pair to
         # ConversationEntry so FULL_HISTORY and the channel unified
@@ -2028,6 +2070,25 @@ class WorldModelBridge:
                 }
                 if data.get('transcript'):
                     body['text'] = str(data['transcript'])[:500]
+            elif stype == 'text' and data.get('text'):
+                # [C277] The endpoint has accepted modality 'text' since it
+                # shipped (api_server.py SensorIngestRequest) and this method
+                # posted text for actions, yet a 'text' READING was skipped
+                # here, so a person's typed words could reach distillation
+                # (record_interaction) but never the world model. Same body
+                # shape as the audio transcript: `text` is what the learner
+                # grounds word by word.
+                import base64 as _b64
+                _txt = str(data['text'])[:2000]
+                body = {
+                    'modality': 'text',
+                    'source': stream_source or 'chat',
+                    'data': _b64.b64encode(_txt.encode('utf-8')).decode('ascii'),
+                    'format': 'text',
+                    'text': _txt,
+                    'session_id': f'{sid}_{stream_source or "chat"}',
+                    'reality_signature': reality_signature,
+                }
             else:
                 # No /v1/sensor/ingest modality for this sensor type -- skip.
                 continue
