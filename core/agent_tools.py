@@ -160,6 +160,33 @@ def is_help_pause(reply) -> bool:
     return text.startswith((HELP_PAUSED_REPLY_PREFIX, HELP_EXPERT_REPLY_PREFIX))
 
 
+def is_action_error_reply(reply) -> bool:
+    """True when ``reply`` is the CREATE pipeline's structured error envelope,
+    {"status": "error", "action": ..., "action_id": ..., "message": ...} — the
+    format create_recipe's prompt tells an agent to return when an action
+    failed and self-heal did not work.  Like a help pause, an error is not a
+    result: a caller deciding whether work was done must not record it as one.
+    Measured 2026-09-15: the daemon counted these as successful dispatches, so
+    a continuous goal whose every run ended in this envelope re-ran every
+    5 minutes for five months (53,949 copilot sessions)."""
+    if not isinstance(reply, str):
+        return False
+    text = reply.strip()
+    if not text:
+        return False
+    if text.startswith('{'):
+        try:
+            import json
+            d = json.loads(text)
+            if isinstance(d, dict):
+                return str(d.get('status', '')).lower() == 'error'
+        except ValueError:
+            pass
+    # The envelope with prose around it: both protocol keys present.
+    import re
+    return '"action_id"' in text and re.search(r'"status"\s*:\s*"error"', text) is not None
+
+
 def register_dual(helper, executor, func, name: str, description: str):
     """Register a single tool on both the LLM-calling and executing agents.
 

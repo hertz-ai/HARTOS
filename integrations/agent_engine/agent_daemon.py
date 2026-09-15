@@ -1736,8 +1736,17 @@ class AgentDaemon:
                     dispatched += 1
                     self._wd_heartbeat()
 
-                # Track failures for exponential backoff
-                if result is None:
+                # Track failures for exponential backoff.  A reply that SAYS the
+                # action failed — the {"status":"error"} envelope the CREATE
+                # prompt tells the agent to return, or a help pause — is a
+                # failure too, not a success (the same rule the hive worker
+                # applies via HeldForHelp).  Counted as success it cleared the
+                # backoff and, for a continuous goal, re-ran the impossible
+                # action every 5 minutes for five months.
+                from core.agent_tools import is_action_error_reply, is_help_pause
+                _reply_failed = result is not None and (
+                    is_action_error_reply(result) or is_help_pause(result))
+                if result is None or _reply_failed:
                     # dispatch_goal returns None for TRANSIENT defers too (user
                     # actively chatting / Tier-2 breaker open), not just real
                     # failures.  Counting those toward the 5-strike AUTO-PAUSE
@@ -1745,11 +1754,14 @@ class AgentDaemon:
                     # using the machine — the "goals stuck / 0 progress" bug.
                     # Reuse the SAME canonical checks dispatch_goal defers on
                     # (single source — never drifts) and skip without penalty.
-                    try:
-                        from .dispatch import is_transient_deferral
-                        _transient = is_transient_deferral()
-                    except Exception:
-                        _transient = False
+                    # An explicit error reply is never transient: the turn ran.
+                    _transient = False
+                    if result is None:
+                        try:
+                            from .dispatch import is_transient_deferral
+                            _transient = is_transient_deferral()
+                        except Exception:
+                            _transient = False
                     if _transient:
                         logger.debug(
                             f"Goal {goal_key}: transient defer (user active / "
@@ -1757,12 +1769,15 @@ class AgentDaemon:
                         continue
                     # Why the turn failed, when it ran, so a paused goal says
                     # what to fix (a 402 from the hosted LLM, say) instead of
-                    # only counting failures.
-                    try:
-                        from .dispatch import dispatch_failure_reason
-                        _why = dispatch_failure_reason(goal_key)
-                    except Exception:
-                        _why = None
+                    # only counting failures.  An error reply carries its own.
+                    if _reply_failed:
+                        _why = ' '.join(str(result).split())[:200]
+                    else:
+                        try:
+                            from .dispatch import dispatch_failure_reason
+                            _why = dispatch_failure_reason(goal_key)
+                        except Exception:
+                            _why = None
                     with _module_lock:
                         info = _dispatch_backoff.get(goal_key, {'failures': 0})
                         info['failures'] = info.get('failures', 0) + 1
