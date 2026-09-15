@@ -763,3 +763,21 @@ an OPTIONAL enhancement layered ON TOP only where no bundled art exists (d8). No
 parallel path: ONE app-logo resolver (`shell_manifest.bundled_app_logo`) + ONE
 agent-art resolver (`app_poster.central_agent_art`), both reused by the producer
 and the marketplace via a single URL convention.
+
+## 2026-09-15 - The floating windows are glass (the AI-control ribbon first)
+
+Refines b3 (macOS "vibrancy glass" as one of the looks to take) and f6
+("transparent transculent menus + windows") for the two floating surfaces a
+person sees over their own desktop: the AI-control ribbon (Nunba
+`desktop/indicator_window.py`) and the companion window (Nunba app.py, the
+`/voice-orb` page). Contradicts no EMPHATIC rule; the shape, drag and taps
+rules of (f) still hold.
+
+| # | Captured intent (verbatim quote) | Item | Status | Evidence |
+|---|---|---|---|---|
+| GL1 | The floating windows have a see-through, blurred, tinted backdrop, not a solid slab. *"the floatinf window shd have transparent glass like bg"* [sic: "floatinf" is the steward's keystroke] `[steward 2026-09-15, session 7fc63966]` | b3 / f6 (floating windows) | **APPLIED (ribbon)** / PARTIAL (companion) | ONE helper: Nunba `desktop/platform_utils.set_window_glass(hwnd, tint, opacity)` = Windows DWM acrylic (`SetWindowCompositionAttribute`, `ACCENT_ENABLE_ACRYLICBLURBEHIND`, blur-behind fallback), no-op elsewhere. The ribbon's panel makes its own colour (`PANEL_BG`) the transparent key so the timer, the step text and Stop float on the glass; where acrylic is unavailable the panel keeps its solid, slightly translucent look. RULE learned here: a colour-keyed pixel is transparent to ALL hit-testing (clicks AND hover: <Enter>/<Motion>/<Leave> never fire on it either), so every CLICKABLE control is painted `CONTROL_BG` (one step off the key) with a source guard (`tests/test_indicator_glass.py`) refusing a button on the key, and anything that must notice the pointer over the glass (the panel's 20 s auto-collapse) asks the pointer POSITION once a second (`_pointer_over_panel`, winfo_pointerxy) instead of waiting for a hover event; a new step caption re-arms it too. The ribbon is on screen exactly while the AI drives the machine, and the surface around Stop must catch the click. The companion window is the same helper on its form HWND with a transparent page backdrop (fix-all's lane). |
+
+Audit note: GL1 changes only the backdrop. No new window, no new transport,
+nothing on the hot path (acrylic is composited by DWM, not painted per frame by
+the app), so the hang-free baseline and GF1/#137 stand. Degrade-not-die: a
+Windows without acrylic or a non-Windows desktop gets the old solid panel.
