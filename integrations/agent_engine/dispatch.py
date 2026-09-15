@@ -267,6 +267,27 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
                     f"deferring local /chat for {daemon_id or prompt_id}")
         return 'deferred', None
 
+    # #106b (b): the node's own LLM provider refusing the account.  The httpx
+    # feed (core.llm_outbound_logger) opens a per-host breaker on 401/402/403
+    # and closes it on a 2xx.  This is the ONE in-process /chat call every
+    # daemon path funnels through (dispatch_goal, _dispatch_single_instruction,
+    # distributed_agent.worker_loop), so the breaker's CONSUMER belongs here,
+    # mirroring the feed's single convergence layer: read state() NON-consuming
+    # (the feed is the sole resolver of the half-open probe) and DEFER on OPEN
+    # so the turn is re-queued, not burned.  Measured on central 2026-09-15:
+    # with the check only in dispatch_goal, the worker path here kept 402ing
+    # inside the OPEN window (the worker never calls dispatch_goal).
+    try:
+        from core.circuit_breaker import llm_provider_breaker, CircuitState
+        _prov_host = _dispatch_provider_host(model_config)
+        if _prov_host and llm_provider_breaker.state(_prov_host) == CircuitState.OPEN:
+            logger.info(f"Provider {_prov_host} refusing the account (breaker "
+                        f"open), deferring local /chat for "
+                        f"{daemon_id or prompt_id}")
+            return 'deferred', None
+    except Exception:
+        pass  # a breaker-check error must never block a dispatch
+
     if not _local_llm_semaphore.acquire(timeout=5):
         logger.info(f"LLM busy ({_LOCAL_LLM_MAX_CONCURRENT} in flight), "
                     f"deferring local /chat for {daemon_id or prompt_id}")
@@ -1045,7 +1066,13 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     #   Tier 3: llama.cpp fallback (direct LLM, no agent pipeline)
     resp = None
 
-    # #106b (b): don't start a turn on a provider that is refusing the account.
+    # #106b (b): goal-level early-out that also records dispatch_failure_reason.
+    # The AUTHORITATIVE consumer is in local_chat_dispatch (the convergence
+    # layer every dispatch path uses, including the worker that never calls
+    # dispatch_goal); this checks the SAME breaker with the SAME key
+    # (_dispatch_provider_host) first, so it cannot diverge -- it just lets a
+    # goal turn skip the local_chat_dispatch call and names the host in the
+    # reason.  Don't start a turn on a provider that is refusing the account.
     # The httpx feed (core.llm_outbound_logger) opens a per-host breaker on
     # 401/402/403 and closes it on a 2xx.  Here we only READ it via state()
     # (which does NOT consume the half-open probe — the feed is the sole
