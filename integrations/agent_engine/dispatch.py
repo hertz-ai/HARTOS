@@ -248,6 +248,30 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
         absence is what pile-drove the local llama-server into the
         watchdog-restart cascade this module already documents.
     """
+    # #106b (b): the node's own LLM provider refusing the account.  The httpx
+    # feed (core.llm_outbound_logger) opens a per-host breaker on 401/402/403
+    # and closes it on a 2xx.  Check it FIRST, before resolving the route, so an
+    # OPEN breaker DEFERS regardless of whether an in-process route exists.  On
+    # native HARTOS (central) the worker calls with native_fallback=False, so
+    # _in_process_chat returns None and this function would otherwise answer
+    # 'unavailable' -- which sends the worker to its raw HTTP /chat POST
+    # (worker_loop), the path that bypasses this breaker (measured on central
+    # 2026-09-15: 402s kept firing per turn inside the OPEN window).  Returning
+    # 'deferred' re-queues the turn instead.  state() is NON-consuming (the feed
+    # is the sole resolver of the half-open probe); HALF_OPEN falls through and
+    # lets one turn run.  Keyed by the same _dispatch_provider_host as the feed;
+    # try/except so a check error never blocks a dispatch.
+    try:
+        from core.circuit_breaker import llm_provider_breaker, CircuitState
+        _prov_host = _dispatch_provider_host(model_config)
+        if _prov_host and llm_provider_breaker.state(_prov_host) == CircuitState.OPEN:
+            logger.info(f"Provider {_prov_host} refusing the account (breaker "
+                        f"open), deferring local /chat for "
+                        f"{daemon_id or prompt_id}")
+            return 'deferred', None
+    except Exception:
+        pass  # a breaker-check error must never block a dispatch
+
     # Any error resolving the path still lets the caller fall through to its
     # HTTP tier (bounded-safe).
     try:
@@ -266,27 +290,6 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
         logger.info(f"User active ({_USER_CHAT_COOLDOWN}s cooldown), "
                     f"deferring local /chat for {daemon_id or prompt_id}")
         return 'deferred', None
-
-    # #106b (b): the node's own LLM provider refusing the account.  The httpx
-    # feed (core.llm_outbound_logger) opens a per-host breaker on 401/402/403
-    # and closes it on a 2xx.  This is the ONE in-process /chat call every
-    # daemon path funnels through (dispatch_goal, _dispatch_single_instruction,
-    # distributed_agent.worker_loop), so the breaker's CONSUMER belongs here,
-    # mirroring the feed's single convergence layer: read state() NON-consuming
-    # (the feed is the sole resolver of the half-open probe) and DEFER on OPEN
-    # so the turn is re-queued, not burned.  Measured on central 2026-09-15:
-    # with the check only in dispatch_goal, the worker path here kept 402ing
-    # inside the OPEN window (the worker never calls dispatch_goal).
-    try:
-        from core.circuit_breaker import llm_provider_breaker, CircuitState
-        _prov_host = _dispatch_provider_host(model_config)
-        if _prov_host and llm_provider_breaker.state(_prov_host) == CircuitState.OPEN:
-            logger.info(f"Provider {_prov_host} refusing the account (breaker "
-                        f"open), deferring local /chat for "
-                        f"{daemon_id or prompt_id}")
-            return 'deferred', None
-    except Exception:
-        pass  # a breaker-check error must never block a dispatch
 
     if not _local_llm_semaphore.acquire(timeout=5):
         logger.info(f"LLM busy ({_LOCAL_LLM_MAX_CONCURRENT} in flight), "

@@ -75,3 +75,34 @@ def test_closed_provider_breaker_runs_the_turn_normally():
     assert status == 'ok'
     assert text == 'a real answer'
     inner.assert_called_once()
+
+
+def _dispatch_native(open_breaker):
+    """Central's worker path: no in-process route (the worker calls with
+    native_fallback=False, so _in_process_chat returns None).  Returns
+    (status, text)."""
+    if open_breaker:
+        _open()
+    with patch.object(dispatch, '_in_process_chat', return_value=None), \
+            patch.object(dispatch, 'is_user_recently_active',
+                         return_value=False), \
+            patch.object(dispatch, '_dispatch_provider_host', return_value=HOST):
+        return dispatch.local_chat_dispatch(
+            'hello', 1, 2, daemon_id='d1', native_fallback=False)
+
+
+def test_native_no_route_defers_when_breaker_open():
+    # The bug measured on central: with no in-process route AND the breaker
+    # OPEN, local_chat_dispatch must DEFER (re-queue) rather than answer
+    # 'unavailable', which would send the worker to its raw HTTP /chat POST that
+    # bypasses the breaker and keeps burning 402s.
+    status, text = _dispatch_native(open_breaker=True)
+    assert (status, text) == ('deferred', None), (
+        'no-route + open breaker did not defer -> worker HTTP path burns 402s')
+
+
+def test_native_no_route_is_unavailable_when_breaker_closed():
+    # Closed breaker: unchanged -- 'unavailable' so the worker uses its HTTP
+    # tier normally (the provider is answering).
+    status, _ = _dispatch_native(open_breaker=False)
+    assert status == 'unavailable'
