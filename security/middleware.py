@@ -233,7 +233,12 @@ ADMIN_PATHS = ('/api/admin',)
 #: deployments are single-user desktop and pre-trusted.
 NETWORK_PROTECTED_PATHS = ('/chat', '/time_agent', '/visual_agent',
                            '/add_history', '/prompts', '/zeroshot',
-                           '/response_ack')
+                           '/response_ack',
+                           #: voice: gate the routes that WRITE/READ files
+                           #: (speak, clone); the read-only, traversal-safe
+                           #: audio serve + voices list stay public so a
+                           #: browser <audio src> is not broken (#67).
+                           '/api/voice/speak', '/api/voice/clone')
 
 #: Legacy alias — some tests still import PROTECTED_PATHS expecting
 #: the combined tuple. Keep this as the union so older imports don't

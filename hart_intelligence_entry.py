@@ -12135,6 +12135,62 @@ def voice_transcribe():
         return jsonify({'error': str(e)}), 500
 
 
+_SAFE_VOICE_NAME = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+
+
+def _safe_voice_ref(voice):
+    """Confine the /api/voice/speak ``voice`` param to a saved-voice NAME (#67).
+
+    TTSRouter treats ``voice`` as a path-OR-name and clone-capable engines READ
+    it as a reference-audio file, so an unauth local caller passing an absolute
+    path or a traversal would read an arbitrary file.  A saved voice name has
+    no path separators and no ``..``; anything else is dropped to None (the
+    engine's default voice).  Internal callers that legitimately pass a
+    resolved path call TTSRouter.synthesize directly in Python, not through
+    this HTTP route, so confining the HTTP surface does not affect them.
+    """
+    if not voice or not isinstance(voice, str):
+        return None
+    name = voice.strip()
+    if '..' in name or not _SAFE_VOICE_NAME.match(name):
+        return None
+    return name
+
+
+#: A voice sample to CLONE from is read and copied into the voices dir, so an
+#: unauth caller could read an arbitrary file.  Require an audio extension and
+#: no traversal so the cloner reads only audio the caller points at, not an
+#: arbitrary sensitive file (a bundled desktop trusts its own local callers,
+#: which the network gate does not cover) (#67).
+_VOICE_SAMPLE_EXTS = ('.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aac', '.webm')
+#: A clone SAVE name is joined into the voices dir as ``<name>.wav``; a name
+#: with a path separator or ``..`` would write outside it.  Spaces and case are
+#: fine (the clone tool lowercases and hyphenates).
+_SAFE_CLONE_NAME = re.compile(r'^[A-Za-z0-9 ._-]{1,64}$')
+
+
+def _safe_sample_path(audio_path):
+    """The clone reference-audio path, or None if it is not a safe audio file."""
+    if not audio_path or not isinstance(audio_path, str):
+        return None
+    path = audio_path.strip()
+    if not path or '..' in path:
+        return None
+    if not path.lower().endswith(_VOICE_SAMPLE_EXTS):
+        return None
+    return path
+
+
+def _safe_clone_name(name):
+    """The clone save-name, or None if it has a path separator / traversal."""
+    if not name or not isinstance(name, str):
+        return None
+    clean = name.strip()
+    if '..' in clean or not _SAFE_CLONE_NAME.match(clean):
+        return None
+    return clean
+
+
 @app.route('/api/voice/speak', methods=['POST'])
 def voice_speak():
     """Synthesize text to speech via smart TTS router.
@@ -12142,10 +12198,15 @@ def voice_speak():
     Accepts JSON with:
       - text (required)
       - language (optional, auto-detected)
-      - voice (optional, voice ref for cloning)
+      - voice (optional, saved-voice NAME for cloning; a path-like value is
+        dropped -- see _safe_voice_ref, #67)
       - source (optional, context hint: chat_response/greeting/read_aloud/etc.)
-      - engine (optional, bypass router with direct engine selection)
-      - output_path (optional, auto-generated if omitted)
+      - engine (optional, direct engine selection; TTSRouter accepts it only
+        when it is a known ENGINE_REGISTRY id, else ignores it)
+
+    The caller cannot choose where the WAV is written: the router writes to its
+    own TTS output dir, which /api/voice/audio serves.  (Honouring a caller
+    output_path was an arbitrary file write on any node with a TTS engine, #67.)
     """
     try:
         from integrations.channels.media.tts_router import get_tts_router
@@ -12159,8 +12220,8 @@ def voice_speak():
         result = router.synthesize(
             text=text,
             language=data.get('language'),
-            voice=data.get('voice'),
-            output_path=data.get('output_path'),
+            voice=_safe_voice_ref(data.get('voice')),
+            output_path=None,
             source=data.get('source'),
             engine_override=data.get('engine'),
         )
@@ -12199,10 +12260,15 @@ def voice_clone():
     """
     try:
         data = request.get_json() or {}
-        audio_path = data.get('audio_path', '')
-        name = data.get('name', '')
+        # #67: audio_path is READ + copied into the voices dir and name is
+        # joined into it as <name>.wav, so confine both (an unauth local caller
+        # is not covered by the network gate).
+        audio_path = _safe_sample_path(data.get('audio_path'))
+        name = _safe_clone_name(data.get('name'))
         if not audio_path or not name:
-            return jsonify({'error': 'audio_path and name required'}), 400
+            return jsonify({
+                'error': 'audio_path (an audio file, no "..") and name '
+                         '(no path separators) are required'}), 400
 
         import json as _json
         engine = data.get('engine', 'luxtts')
