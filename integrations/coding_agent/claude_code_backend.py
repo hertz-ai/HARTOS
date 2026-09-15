@@ -19,12 +19,15 @@ import it without dragging in heavy deps.  core.subprocess_safe is the one
 exception and costs nothing: it imports only logging/subprocess/sys/typing, and
 both consumers already reach `integrations.*`, so `core.*` resolves for free.
 """
+import logging
 import os
 import shutil
 import subprocess
 import sys
 
 from core.subprocess_safe import no_window_kwargs
+
+logger = logging.getLogger('hartos_copilot')
 
 CLAUDE_BIN = os.environ.get('HART_CLAUDE_BIN', 'claude')
 
@@ -165,6 +168,44 @@ def _claude_config_dir():
     return d if d else os.path.join(os.path.expanduser('~'), '.claude')
 
 
+def _copilot_switch_path():
+    """The operator's off-switch marker, in Claude's own config dir: present
+    means OFF, absent means on, so an install that predates the switch is
+    unchanged."""
+    return os.path.join(_claude_config_dir(), 'hartos-copilot.off')
+
+
+def copilot_enabled():
+    """MAY this node use the resident Claude Code copilot (as its expert tier,
+    and as an MCP client)?  Distinct from claude_code_available(), which is
+    CAN it.  HARTOS_COPILOT_ENABLED=0/1 pins it for headless installs; else
+    the marker decides."""
+    env = os.environ.get('HARTOS_COPILOT_ENABLED', '').strip().lower()
+    if env:
+        return env in ('1', 'true', 'yes', 'on')
+    return not os.path.exists(_copilot_switch_path())
+
+
+def set_copilot_enabled(enabled):
+    """Flip the switch.  Returns the state IN FORCE, which the env pin can
+    make differ from the request.  The MCP token is untouched: turning the
+    copilot back on needs no client reconfiguration, unlike a token rotation."""
+    path = _copilot_switch_path()
+    try:
+        if enabled:
+            if os.path.exists(path):
+                os.remove(path)
+        else:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, 'w').close()
+    except OSError as e:
+        logger.error("set_copilot_enabled(%s): %s", enabled, e)
+    now = copilot_enabled()
+    logger.info("copilot switched %s%s", 'on' if now else 'off',
+                '' if now == enabled else ' (pinned by HARTOS_COPILOT_ENABLED)')
+    return now
+
+
 def claude_code_available():
     """True if this node can actually run Claude Code: the binary resolves AND
     an authorized credential store exists. The EXPERT-tier registration gates
@@ -190,7 +231,7 @@ def claude_code_available():
     CLI: which() resolved claude.EXE, ~/.claude/.credentials.json existed, and
     this still answered False.
     """
-    if not _resolve_claude_bin():
+    if not copilot_enabled() or not _resolve_claude_bin():
         return False
 
     # A key or OAuth token is a first-class auth path for the CLI, and is how a

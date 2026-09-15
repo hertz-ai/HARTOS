@@ -251,6 +251,19 @@ def _mcp_auth_gate():
     from flask import request as _req, jsonify as _jsonify
     import os as _os
     global _MCP_AUTH_DISABLED_WARNED
+    # The copilot's off-switch, FIRST — before the open /health endpoint and
+    # before the env auth bypass, so "off" means the whole surface refuses and
+    # no path routes around it.  503, not 403: the node is not refusing this
+    # caller's credential, it is switched off, and a client that reads the
+    # difference can say so instead of telling the owner their token is wrong.
+    from integrations.coding_agent.claude_code_backend import copilot_enabled
+    if not copilot_enabled():
+        return _jsonify({
+            'success': False,
+            'error': 'mcp: the Claude Code copilot is switched off on this '
+                     'node — turn it back on in Admin → Integrations → '
+                     'Claude Code.  Your token is unchanged.',
+        }), 503
     # Health endpoint is open — it returns only a tool count, no data, no mutation.
     if _req.path.endswith('/health'):
         return None
