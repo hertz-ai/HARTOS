@@ -175,6 +175,66 @@ class TheGetHandshakeStillWorks(unittest.TestCase):
         os.environ.pop('MESSENGER_VERIFY_TOKEN', None)
 
 
+class WebhookDefersGateToSelfAuthenticatingAdapter(unittest.TestCase):
+    """Bot Framework channels (Teams) validate the inbound JWT themselves inside
+    handle_webhook, so the generic route defers its Kong/HMAC gate to them — but
+    ONLY on an explicit boolean ``webhook_self_authenticates = True``."""
+
+    def setUp(self):
+        os.environ.pop('HEVOLVE_TRUST_KONG', None)
+        self._loops = []
+
+    def tearDown(self):
+        for rl in self._loops:
+            rl.stop()
+
+    def _client_with(self, self_auth):
+        from flask import Flask
+        from integrations.channels.flask_integration import FlaskChannelIntegration
+        rl = _RealLoop()
+        self._loops.append(rl)
+        app = Flask(__name__)
+        app.config['TESTING'] = True
+        mgr = FlaskChannelIntegration.__new__(FlaskChannelIntegration)
+        mgr.registry = MagicMock()
+        mgr._loop = rl.loop
+        adapter = MagicMock()
+        adapter.webhook_self_authenticates = self_auth
+        seen = {}
+
+        async def _hw(body="", auth_header=""):
+            seen['body'] = body
+            seen['auth_header'] = auth_header
+            return {}
+        adapter.handle_webhook = _hw
+        mgr.registry.get.return_value = adapter
+        mgr.register_webhook_routes(app)
+        return app.test_client(), seen
+
+    def test_self_authenticating_adapter_bypasses_gate_and_gets_auth_header(self):
+        """An unsigned POST that the Kong/HMAC gate would reject is allowed
+        through for a self-authenticating adapter, and its handle_webhook
+        receives the Authorization header to validate itself."""
+        c, seen = self._client_with(self_auth=True)
+        r = c.post('/channels/webhook/teams', data=BODY,
+                   content_type='application/json',
+                   headers={'Authorization': 'Bearer test.jwt.token'})
+        self.assertNotEqual(401, r.status_code,
+                            "a self-authenticating (Bot Framework) channel was "
+                            "refused by the Kong/HMAC gate")
+        self.assertEqual('Bearer test.jwt.token', seen.get('auth_header'),
+                         "handle_webhook never received the Authorization header")
+
+    def test_a_TRUTHY_nonboolean_flag_does_NOT_bypass_the_gate(self):
+        """Only an explicit boolean True opts out; a truthy stand-in must not
+        silently disable the gate (the test-double regression this guards)."""
+        c, _ = self._client_with(self_auth="yes")   # truthy, not True
+        r = c.post('/channels/webhook/teams', data=BODY,
+                   content_type='application/json')
+        self.assertEqual(401, r.status_code,
+                         "a truthy non-boolean flag silently disabled the gate")
+
+
 SEND_BODY = json.dumps({"channel": "telegram", "chat_id": "victim-999",
                         "text": "you have won a prize"})
 

@@ -737,9 +737,20 @@ class FlaskChannelIntegration:
 
             # POST — AUTHENTICATE FIRST, before the adapter is touched.
             raw = request.get_data(as_text=True)
-            denied = _webhook_caller_is_authenticated(channel_type, raw)
-            if denied is not None:
-                return denied
+            # Channels whose adapter validates the inbound request itself
+            # (e.g. Bot Framework's JWT, checked fail-closed inside
+            # process_activity) opt out of the Kong/HMAC gate: that gate's
+            # proofs (Kong stamp or provider HMAC over the body) do not fit a
+            # bearer-JWT auth model.  Such an adapter MUST authenticate in its
+            # own handle_webhook — the opt-in is explicit via
+            # webhook_self_authenticates.
+            # Strict identity check: only an explicit boolean True opts out, so
+            # a truthy stand-in (e.g. a test double's auto-attribute) can never
+            # silently disable the gate.
+            if getattr(adapter, 'webhook_self_authenticates', False) is not True:
+                denied = _webhook_caller_is_authenticated(channel_type, raw)
+                if denied is not None:
+                    return denied
 
             if adapter is None:
                 return jsonify({'error': f'no adapter registered for {channel_type}'}), 404
@@ -771,6 +782,10 @@ class FlaskChannelIntegration:
                     call[p.name] = sig
                 elif p.name == 'event_type':
                     call[p.name] = request.headers.get('X-Event-Type', '')
+                elif p.name in ('auth_header', 'authorization', 'auth'):
+                    # Bearer-JWT channels (Bot Framework) validate this header
+                    # themselves inside handle_webhook.
+                    call[p.name] = request.headers.get('Authorization', '')
 
             try:
                 fut = asyncio.run_coroutine_threadsafe(handler(**call), self._loop)
