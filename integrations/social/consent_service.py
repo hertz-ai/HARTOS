@@ -20,10 +20,14 @@ prior row's ``granted_at``.  This aligns the in-process semantics
 with the JWT HTTP surface so the audit trail of grant events is
 immutable regardless of which entry point a caller chose.
 """
+import logging
+import re
 import uuid
 from datetime import datetime
 
 from .models import UserConsent
+
+_logger = logging.getLogger('hevolve.consent')
 
 CONSENT_TYPES = frozenset({
     'data_access',       # Agent needs to access user data
@@ -116,6 +120,10 @@ def _emit(topic: str, data: dict, msg_id: str = None):
                 'scope': data.get('scope', '*'),
                 'reason': data.get('reason', ''),
             }
+            # The agent's own name (agent_display_name): the card shows it,
+            # never the id, which is a prompt id and means nothing to a person.
+            if data.get('agent_name'):
+                note['agent_name'] = data['agent_name']
             if msg_id:
                 note['msg_id'] = msg_id
             on_notification(user_id, note)
@@ -128,6 +136,79 @@ def _validate_consent_type(consent_type: str):
         raise ValueError(
             f"Invalid consent_type '{consent_type}'. "
             f"Must be one of: {', '.join(sorted(CONSENT_TYPES))}")
+
+
+_AGENT_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def _is_a_name(name, aid):
+    """False for the placeholders the agent mirror manufactures when a
+    prompt has no name ("Agent <id>", "agent-<id>", hart_intelligence_entry
+    _create_social_agent_from_prompt :10993/:11005) and for the bare id:
+    those are the identifier the owner cannot read, dressed as a name.
+    Exact matches only: a real name may contain a digit sequence that
+    happens to be a short id ("Studio 1 Assistant" with id 1)."""
+    name = (name or '').strip()
+    if not name or name == aid:
+        return False
+    return name.lower() not in (f'agent {aid}'.lower(), f'agent-{aid}'.lower())
+
+
+def agent_display_name(db, agent_id):
+    """The name a person knows an agent by, or None.
+
+    ``agent_id`` on a consent is the agent's prompt id, which the owner has
+    never seen.  The name lives in prompts/<prompt_id>.json ("name"), and
+    the social mirror of that agent (User.agent_id == prompt id, created by
+    _create_social_agent_from_prompt) carries it as display_name: the mirror
+    is read first because it is one query, then the file.  A placeholder
+    built from the id is not a name (_is_a_name).  Never raises; a lookup
+    failure is logged and reads as "no name".
+
+    The id is used as a file name, so only ``[A-Za-z0-9_-]`` ids are looked
+    up: consent ids are internal today, but the same helper names a remote
+    requester for a household ask, and ``../x`` must not read x.json.
+    """
+    if agent_id in (None, ''):
+        return None
+    aid = str(agent_id)
+    if not _AGENT_ID_RE.match(aid):
+        _logger.debug("agent_display_name: refusing id %r", aid)
+        return None
+    try:
+        from .models import User
+        row = db.query(User).filter(User.agent_id == aid,
+                                    User.user_type == 'agent').first()
+        if row is not None:
+            for candidate in (row.display_name, row.username):
+                if _is_a_name(candidate, aid):
+                    return candidate.strip()
+    except Exception:
+        _logger.debug("agent_display_name: mirror lookup failed for %s",
+                      aid, exc_info=True)
+    try:
+        import json
+        import os
+        from core.platform_paths import get_recipe_prompts_dir
+        path = os.path.join(get_recipe_prompts_dir(), f'{aid}.json')
+        if os.path.isfile(path):
+            with open(path, 'r', encoding='utf-8') as fh:
+                name = str(json.load(fh).get('name') or '')
+            if _is_a_name(name, aid):
+                return name.strip()
+    except Exception:
+        _logger.debug("agent_display_name: prompt file read failed for %s",
+                      aid, exc_info=True)
+    return None
+
+
+def _named(db, data: dict, agent_id) -> dict:
+    """``data`` with 'agent_name' added when the agent has one: the ask and
+    the notices then share one shape, and an unnamed agent carries no key."""
+    name = agent_display_name(db, agent_id)
+    if name:
+        data['agent_name'] = name
+    return data
 
 
 class ConsentService:
@@ -151,6 +232,8 @@ class ConsentService:
         }
         if reason:
             ask['reason'] = reason
+        # Who is asking, by name: the card says "<name> asks to ...".
+        _named(db, ask, agent_id)
 
         existing = db.query(UserConsent).filter(
             UserConsent.user_id == user_id,
@@ -366,7 +449,7 @@ class ConsentService:
             UserConsent.revoked_at.isnot(None),
         ).order_by(UserConsent.revoked_at.desc()).first()
         if prior is not None and prior.revoked_at is not None:
-            _emit('consent.refused_after_revoke', {
+            _emit('consent.refused_after_revoke', _named(db, {
                 'user_id': user_id,
                 'consent_type': consent_type,
                 'scope': scope,
@@ -375,13 +458,13 @@ class ConsentService:
                     f"Previously revoked {consent_type}/{scope}; "
                     f"re-grant requires a fresh user action."
                 ),
-            })
+            }, agent_id))
             return False
 
         # 3. No record at all → auto-grant + emit one-time notice.
         ConsentService.grant_consent(db, user_id, consent_type,
                                      scope=scope, agent_id=agent_id)
-        _emit('consent.auto_granted', {
+        _emit('consent.auto_granted', _named(db, {
             'user_id': user_id,
             'consent_type': consent_type,
             'scope': scope,
@@ -391,7 +474,7 @@ class ConsentService:
                 f"could be served.  Tap to review or revoke in settings."
             ),
             'revoke_action': 'consent.revoke',
-        })
+        }, agent_id))
         return True
 
     @staticmethod

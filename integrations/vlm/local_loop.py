@@ -216,7 +216,7 @@ def list_active_sessions() -> list:
         return [tuple(k.split(':', 1)) for k in _vlm_stop_flags.keys()]
 
 
-def _notify_desktop_indicator(show: bool) -> None:
+def _notify_desktop_indicator(show: bool, text: str = None) -> None:
     """Show or hide Nunba's AI-control ribbon (desktop/indicator_window.py).
 
     Nunba shows the ribbon from its /execute route, which only the http tier
@@ -225,6 +225,11 @@ def _notify_desktop_indicator(show: bool) -> None:
     2026-09-13 the audit log holds 2,660 VLM actions and gui_app.log holds no
     "Ribbon indicator shown" line.  A show request also re-arms the ribbon's
     15 s inactivity timer, so the loop sends one before every action.
+
+    ``text`` says what the AI is doing now (the step's action and reasoning,
+    _step_caption); the ribbon shows it beside its timer.  Without it the
+    ribbon could only say THAT the AI was in control, and the owner watching
+    the screen had no idea what it was trying to do.
 
     Best effort, and only inside Nunba: standalone HARTOS has no ribbon, and
     a refused localhost connect costs seconds on Windows.
@@ -235,10 +240,28 @@ def _notify_desktop_indicator(show: bool) -> None:
             return
         from core.http_pool import pooled_get
         pooled_get(f"{_local_base()}/indicator/{'show' if show else 'hide'}",
-                   timeout=2)
+                   timeout=2, params={'text': text} if text else None)
     except Exception as e:
         logger.debug(f"AI-control ribbon {'show' if show else 'hide'} "
                      f"skipped: {e}")
+
+
+def _step_caption(action_json: dict, limit: int = 160) -> str:
+    """One line a person can read: the step's action, then why.
+
+    The VLM answers with 'Next Action' (e.g. "left_click", "type") and
+    'Reasoning' (its own words, e.g. "Open Settings from the Start menu").
+    The reasoning is what tells the owner what is happening, so it comes
+    first; the bare action name is kept as a tail for steps with no
+    reasoning.
+    """
+    reasoning = ' '.join(str(action_json.get('Reasoning') or '').split())
+    action = ' '.join(str(action_json.get('Next Action') or '').split())
+    if reasoning and action and action.lower() != 'none':
+        line = f"{reasoning} ({action})"
+    else:
+        line = reasoning or action
+    return line if len(line) <= limit else line[:limit - 1].rstrip() + '…'
 
 
 def run_local_agentic_loop(
@@ -397,7 +420,10 @@ def _drive_local_agentic_loop(
     # previous run that never reached its end.
     from integrations.vlm.safety import reset_session_guard
     reset_session_guard()
-    _notify_desktop_indicator(True)
+    # The task itself is the first thing the ribbon says; each step's
+    # caption replaces it below.
+    _notify_desktop_indicator(True, text=_step_caption(
+        {'Reasoning': f"Starting: {instruction}"} if instruction else {}))
 
     for iteration in range(max_iterations):
         # User-requested stop wins over every other exit condition.
@@ -785,7 +811,7 @@ def _drive_local_agentic_loop(
             from core.config_cache import env_flag as _env_flag
             _safety_on = _env_flag('HEVOLVE_VLM_LOOP_SAFETY', True)
             _verify_on = _env_flag('HEVOLVE_VLM_LOOP_VERIFY', False)
-            _notify_desktop_indicator(True)
+            _notify_desktop_indicator(True, text=_step_caption(action_json))
             result = execute_action(
                 action_payload, tier,
                 safety=_safety_on, verify=_verify_on)
