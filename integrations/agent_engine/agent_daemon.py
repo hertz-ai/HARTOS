@@ -232,6 +232,56 @@ def _goal_ledger_grounding(goal_id):
 _ESCALATION_KEYS = ('action_id', 'action', 'user_prompt', 'prompt_id', 'flow')
 
 
+def _copilot_consent(db, goal, esc):
+    """The copilot switch, asked for through the consent surface when it is off.
+
+    The expert is the owner's Claude Code subscription.  With the switch on
+    (admin page, or the owner's earlier "Always allow") the backend is
+    registered if a restart never did it, and the turn proceeds: None.  With
+    it off, the owner is asked ONCE through the same card every other consent
+    uses, named by the agent, and the goal is skipped this tick but stays
+    active, so the tick after the grant flips the switch takes the turn:
+    (None, True) with no park.  A standing "Don't allow", or a grant the admin
+    page later overrode, hands the action to a person through escalate_goal
+    exactly as an unavailable expert does — the owner said no, and a goal
+    skipped forever would look active while doing nothing.
+    """
+    from integrations.coding_agent.claude_code_backend import (
+        COPILOT_CONSENT_TYPE, copilot_enabled)
+    from .model_registry import ensure_claude_code_registered
+    if copilot_enabled():
+        ensure_claude_code_registered()
+        return None
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    parked_reason = None
+    if not owner:
+        parked_reason = 'the copilot is switched off and this node has no owner to ask'
+    else:
+        try:
+            from integrations.social.consent_service import ConsentService
+            if ConsentService.check_consent(db, owner, COPILOT_CONSENT_TYPE):
+                parked_reason = 'the copilot is switched off in Admin'
+            elif ConsentService.declined(db, owner, COPILOT_CONSENT_TYPE):
+                parked_reason = 'the owner has not allowed agents to use Claude'
+            else:
+                ConsentService.check_or_request(
+                    db, owner, COPILOT_CONSENT_TYPE,
+                    reason=(f"needs Claude for a step it could not finish: "
+                            f"{str(esc.get('action') or '')[:120]}"),
+                    requester_name=str(goal.title or '')[:100])
+                logger.info(f"Goal {goal.id}: asked the owner to allow the copilot")
+                return None, True
+        except Exception as e:
+            logger.warning(f"Goal {goal.id}: copilot consent check failed, "
+                           f"parking: {e}")
+            parked_reason = 'the copilot consent could not be checked'
+    from .goal_manager import GoalManager
+    GoalManager.escalate_goal(db, goal.id, dict(
+        {k: esc.get(k) for k in _ESCALATION_KEYS},
+        reason=parked_reason, tried=['local']))
+    return None, True
+
+
 def _escalation_model_config(db, goal):
     """``(config_list, parked)`` for a goal whose stuck action is handed to
     the expert (#106d); ``(None, False)`` for every other goal.
@@ -246,7 +296,12 @@ def _escalation_model_config(db, goal):
     if esc.get('next') != 'expert':
         return None, False
     from .model_registry import model_registry
-    backend = model_registry.get_model(esc.get('expert') or '')
+    expert_id = esc.get('expert') or ''
+    if expert_id == 'claude-code':
+        verdict = _copilot_consent(db, goal, esc)
+        if verdict is not None:
+            return verdict
+    backend = model_registry.get_model(expert_id)
     if backend is not None and backend.is_dispatchable():
         return backend.to_config_list(), False
     from .goal_manager import GoalManager

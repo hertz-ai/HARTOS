@@ -883,6 +883,11 @@ class WorldModelBridge:
 
         # HTTP fallback (central standalone or HevolveAI not in-process)
         if self._http_disabled or self._cb_is_open():
+            # [C281] The batch goes BACK on the one experience queue instead of
+            # dying here. With the breaker open every recorded daemon and chat
+            # interaction was dropped (19 opens in 35 minutes on Sep 16 2026,
+            # Master 11.376); the queue's own maxlen bounds the retry.
+            self._requeue(batch)
             return
 
         # CONSENT GATE: if target is external (cloud), filter to consented users only.
@@ -901,7 +906,7 @@ class WorldModelBridge:
             if not batch:
                 return
 
-        for exp in batch:
+        for i, exp in enumerate(batch):
             try:
                 body = {
                     'model': 'hevolve-interaction-replay',
@@ -925,12 +930,20 @@ class WorldModelBridge:
                     'temperature': 0,
                     'max_tokens': 1,
                 }
-                pooled_post(
+                resp = pooled_post(
                     f'{self._api_url}/v1/chat/completions',
                     json=body,
                     timeout=self._timeout_flush,
                 )
+                # [C281] A non-2xx answer is a failure, not a flush. Before,
+                # any answer counted as flushed and only an exception counted
+                # against the breaker.
+                _sc = getattr(resp, 'status_code', 200)
+                if not (isinstance(_sc, int) and 200 <= _sc < 300):
+                    raise requests.RequestException(
+                        f'{self._api_url}/v1/chat/completions answered {_sc}')
                 self._cb_record_success()
+                self._flush_failures_logged = 0
                 with self._lock:
                     self._stats['total_flushed'] += 1
                     self._last_flush_at = time.monotonic()
@@ -943,11 +956,43 @@ class WorldModelBridge:
                         "[WorldModelBridge] Direction A live: first HTTP "
                         "flush to %s/v1/chat/completions succeeded",
                         self._api_url)
-            except requests.RequestException:
+            except requests.RequestException as e:
                 self._cb_record_failure()
+                self._flush_failed(batch[i:], e)
+                return
             except Exception as e:
                 self._cb_record_failure()
-                logger.debug(f"World model flush error: {e}")
+                self._flush_failed(batch[i:], e)
+                return
+
+    def _requeue(self, exps: list) -> int:
+        """[C281] Put unflushed experiences back at the FRONT of the one
+        experience queue, oldest first, within the room the queue has left;
+        the rest are counted as dropped. Returns the number re-queued."""
+        if not exps:
+            return 0
+        with self._lock:
+            room = max(0, (self._experience_queue.maxlen or 0) - len(self._experience_queue))
+            keep = exps[:room]
+            for exp in reversed(keep):
+                self._experience_queue.appendleft(exp)
+            dropped = len(exps) - len(keep)
+            if dropped:
+                self._stats['total_dropped'] = self._stats.get('total_dropped', 0) + dropped
+        return len(keep)
+
+    def _flush_failed(self, remaining: list, err: BaseException) -> None:
+        """[C281] One flush failed: re-queue what is left of the batch (the
+        failed experience included) and say so ONCE per run of failures. The
+        old code swallowed the exception silently and lost the experience."""
+        n = self._requeue(remaining)
+        self._flush_failures_logged = getattr(self, '_flush_failures_logged', 0) + 1
+        if self._flush_failures_logged == 1:
+            logger.warning(
+                "[WorldModelBridge] flush to %s/v1/chat/completions failed (%s: %s); "
+                "%d experience(s) re-queued. Further failures in this run are silent "
+                "until a flush succeeds.",
+                self._api_url, type(err).__name__, str(err)[:160], n)
 
     # ─── Expert corrections (RL-EF) ─────────────────────────────────
 

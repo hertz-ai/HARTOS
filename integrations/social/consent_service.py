@@ -66,6 +66,12 @@ CONSENT_TYPES = frozenset({
                          # file writes, mouse and keyboard, opening apps
                          # (integrations.vlm.safety.computer_control_block).
                          # Asked of the desktop owner, whose machine it is.
+    'copilot_access',    # An agent may use the owner's Claude Code
+                         # subscription as its expert (the copilot).  A
+                         # grant or revoke acts on the ONE copilot switch
+                         # (claude_code_backend.set_copilot_enabled), the
+                         # same flag the admin page flips; blanket scope,
+                         # since the switch is node-wide.
     'device_access',     # A person's phone reaches this desktop's agents
                          # from the network (#111).  Asked of the desktop
                          # owner; the scope names the device's Ed25519 key
@@ -228,6 +234,23 @@ def agent_display_name(db, agent_id):
     return None
 
 
+def _copilot_switch_from_consent(consent_type: str, granted: bool) -> None:
+    """The owner's answer to a copilot ask acts on the copilot switch itself.
+
+    'copilot_access' is node-wide, so a grant turns the copilot ON and a
+    revoke or decline turns it OFF through the one writer the admin page
+    uses (claude_code_backend.set_copilot_enabled); no second flag.  Best
+    effort: the consent row is already written, and a switch that cannot be
+    persisted is logged by the writer."""
+    try:
+        from integrations.coding_agent.claude_code_backend import (
+            COPILOT_CONSENT_TYPE, set_copilot_enabled)
+        if consent_type == COPILOT_CONSENT_TYPE:
+            set_copilot_enabled(granted)
+    except Exception as e:
+        _logger.warning("copilot switch from consent %s failed: %s", consent_type, e)
+
+
 def _named(db, data: dict, agent_id) -> dict:
     """``data`` with 'agent_name' added when the agent has one: the ask and
     the notices then share one shape, and an unnamed agent carries no key."""
@@ -322,7 +345,7 @@ class ConsentService:
     @staticmethod
     def check_or_request(db, user_id: str, consent_type: str,
                          scope: str = '*', agent_id=None,
-                         reason: str = '') -> bool:
+                         reason: str = '', requester_name: str = '') -> bool:
         """True when the consent is active; otherwise file the ask (or send
         it again) and return False.
 
@@ -334,7 +357,8 @@ class ConsentService:
                                         scope=scope, agent_id=agent_id):
             return True
         ConsentService.request_consent(db, user_id, consent_type, scope=scope,
-                                       agent_id=agent_id, reason=reason)
+                                       agent_id=agent_id, reason=reason,
+                                       requester_name=requester_name)
         return False
 
     @staticmethod
@@ -415,6 +439,7 @@ class ConsentService:
             'scope': scope,
             'agent_id': agent_id,
         })
+        _copilot_switch_from_consent(consent_type, True)
 
         # Up-sync the now-public agents (gap #4): agents are almost always
         # created BEFORE the owner grants public_exposure, so the
@@ -572,6 +597,7 @@ class ConsentService:
             'scope': scope,
             'agent_id': agent_id,
         })
+        _copilot_switch_from_consent(consent_type, False)
 
     @staticmethod
     def active_grant(db, user_id: str, consent_type: str,
