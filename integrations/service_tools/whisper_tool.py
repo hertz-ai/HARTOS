@@ -222,25 +222,50 @@ def faster_whisper_model_size() -> str:
        small/base from the same call.
     3. Else ``STT_CPU_MODEL_SIZE``.
 
+    Two guards on the catalog's answer, both from measurements on the
+    owner's RTX 3070 box (2026-09-16):
+      - never below ``STT_CPU_MODEL_SIZE``: with the main LLM resident the
+        catalog's budget is 0.00 GB (its 4.3 GB llm_main reserve is taken
+        again although free VRAM already excludes the loaded LLM) and a
+        zero-VRAM entry scores as a GPU fit, so it answers 'tiny' -- a
+        downgrade from the 'base' every box ran until now;
+      - an upgrade only when its model is already on disk: a size never
+        fetched is downloaded inside the 180 s request window (#677).
+        No STT loader is registered with the orchestrator, so the admin
+        download path cannot fetch a size yet; that producer is open.
+
     Until 2026-09-16 the size was this env's default 'base' and nothing in
     either repo ever set the env (the comment beside it named an admin UI
-    producer that was never written), so a box whose catalog picked medium
-    ran base on CPU.  The parent resolves this once per worker life
-    (``_stt_call``); a per-request re-resolve would reload -- or download,
-    #677 -- a different size every time free VRAM moved.
+    producer that was never written).  The parent resolves this once per
+    worker life (``_stt_call``); a per-request re-resolve would reload -- or
+    download -- a different size every time free VRAM moved.
     """
     override = (os.environ.get('HEVOLVE_STT_MODEL_SIZE') or '').strip()
     if override:
         return override
-    try:
-        from .model_orchestrator import get_orchestrator
-        entry = get_orchestrator().select_best(
-            'stt', exclude=list(_CATALOG_ID_TO_SHERPA))
-    except Exception as e:
-        logger.debug("faster_whisper_model_size: catalog unavailable (%s)", e)
-        entry = None
+    entry = _catalog_stt_entry(exclude=list(_CATALOG_ID_TO_SHERPA))
     size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(getattr(entry, 'id', None))
-    return size or STT_CPU_MODEL_SIZE
+    ladder = list(_CATALOG_ID_TO_FASTER_WHISPER_SIZE.values())   # tiny .. large-v3
+    if size is None or ladder.index(size) <= ladder.index(STT_CPU_MODEL_SIZE):
+        return STT_CPU_MODEL_SIZE
+    if not _faster_whisper_model_cached(size):
+        logger.info("STT: catalog picks faster-whisper '%s' but it is not "
+                    "downloaded; staying on '%s'", size, STT_CPU_MODEL_SIZE)
+        return STT_CPU_MODEL_SIZE
+    return size
+
+
+def _faster_whisper_model_cached(model_size: str) -> bool:
+    """True when faster-whisper's repo for ``model_size`` is in the local
+    HuggingFace cache (the same lookup WhisperModel resolves through).
+    Pure huggingface_hub -- no ctranslate2 DLLs enter the parent process."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        hit = try_to_load_from_cache(f'Systran/faster-whisper-{model_size}', 'model.bin')
+        return isinstance(hit, str)
+    except Exception as e:
+        logger.debug("_faster_whisper_model_cached(%s): %s", model_size, e)
+        return False
 
 
 def _vram_key_for_size(model_size: str) -> str:
@@ -895,6 +920,19 @@ _CATALOG_ID_TO_FASTER_WHISPER_SIZE = {
 }
 
 
+def _catalog_stt_entry(exclude=None):
+    """The catalog's best STT entry for the current compute state, or None
+    when the catalog is unavailable or nothing fits.  The ONE catalog query
+    for STT: select_whisper_model (sherpa key or size) and
+    faster_whisper_model_size (faster-whisper size) both read through it."""
+    try:
+        from integrations.service_tools.model_orchestrator import get_orchestrator
+        return get_orchestrator().select_best('stt', exclude=exclude)
+    except Exception:
+        logger.exception("_catalog_stt_entry: swallowed Exception")
+        return None
+
+
 def select_whisper_model() -> str:
     """Select best STT model for this hardware.
 
@@ -905,25 +943,20 @@ def select_whisper_model() -> str:
     is available, or an openai-whisper model name as a legacy fallback.
     """
     # ── Primary path: ask the catalog ───────────────────────────────────────
-    try:
-        from integrations.service_tools.model_orchestrator import get_orchestrator
-        orch = get_orchestrator()
-        entry = orch.select_best('stt')
-        if entry:
-            # Map catalog entry ID back to the engine-specific key
-            sherpa_key = _CATALOG_ID_TO_SHERPA.get(entry.id)
-            if sherpa_key and sherpa_key in _SHERPA_MODELS:
-                try:
-                    import sherpa_onnx  # noqa: F401
-                    return sherpa_key
-                except ImportError:
-                    logger.debug("select_whisper_model: swallowed ImportError")
-            # faster-whisper size
-            fw_size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(entry.id)
-            if fw_size:
-                return fw_size
-    except Exception:
-        logger.exception("select_whisper_model: swallowed Exception")
+    entry = _catalog_stt_entry()
+    if entry:
+        # Map catalog entry ID back to the engine-specific key
+        sherpa_key = _CATALOG_ID_TO_SHERPA.get(entry.id)
+        if sherpa_key and sherpa_key in _SHERPA_MODELS:
+            try:
+                import sherpa_onnx  # noqa: F401
+                return sherpa_key
+            except ImportError:
+                logger.debug("select_whisper_model: swallowed ImportError")
+        # faster-whisper size
+        fw_size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(entry.id)
+        if fw_size:
+            return fw_size
 
     # ── Fallback: direct VRAM query (no catalog dependency) ─────────────────
     try:

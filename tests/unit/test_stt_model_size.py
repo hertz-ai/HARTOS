@@ -55,7 +55,8 @@ def _no_env_override(monkeypatch):
 def test_size_is_the_catalogs_best_faster_whisper_entry():
     orch, calls = _orch('stt-faster-whisper-medium')
     with patch('integrations.service_tools.model_orchestrator.get_orchestrator',
-               return_value=orch):
+               return_value=orch), \
+         patch.object(wt, '_faster_whisper_model_cached', return_value=True):
         assert wt.faster_whisper_model_size() == 'medium'
     (model_type, kw), = calls
     assert model_type == 'stt'
@@ -71,6 +72,32 @@ def test_env_override_wins_and_skips_the_catalog():
                return_value=orch):
         assert wt.faster_whisper_model_size() == 'large-v3'
     assert calls == []
+
+
+def test_the_catalog_cannot_downgrade_below_the_shipped_default():
+    """Measured 2026-09-16 on the owner's RTX 3070 box: with the main LLM
+    resident the catalog's budget is 0.00 GB (its 4.3 GB reserve is taken
+    again) and a zero-VRAM entry scores as a GPU fit, so the catalog answers
+    'tiny' -- worse than the 'base' every box ran until now.  The floor is
+    the shipped default."""
+    orch, _ = _orch('stt-faster-whisper-tiny')
+    with patch('integrations.service_tools.model_orchestrator.get_orchestrator',
+               return_value=orch):
+        assert wt.faster_whisper_model_size() == wt.STT_CPU_MODEL_SIZE
+
+
+def test_an_upgrade_is_taken_only_when_its_model_is_already_on_disk():
+    """A size never fetched would be downloaded inside the 180 s request
+    window (#677: 1.6 GB, killed and restarted every request)."""
+    orch, _ = _orch('stt-faster-whisper-medium')
+    with patch('integrations.service_tools.model_orchestrator.get_orchestrator',
+               return_value=orch), \
+         patch.object(wt, '_faster_whisper_model_cached', return_value=False):
+        assert wt.faster_whisper_model_size() == wt.STT_CPU_MODEL_SIZE
+    with patch('integrations.service_tools.model_orchestrator.get_orchestrator',
+               return_value=orch), \
+         patch.object(wt, '_faster_whisper_model_cached', return_value=True):
+        assert wt.faster_whisper_model_size() == 'medium'
 
 
 def test_no_fitting_entry_or_a_broken_catalog_gives_the_cpu_default():
@@ -162,6 +189,25 @@ def test_all_three_public_producers_go_through_stt_call(monkeypatch):
 
     assert [r['op'] for r in tool.requests] == ['transcribe', 'detect_language', 'transcribe']
     assert all(r['model_size'] == 'small' for r in tool.requests)
+
+
+def test_one_catalog_query_for_stt():
+    """AST guard: ``select_best(`` appears exactly once in the module, inside
+    ``_catalog_stt_entry`` -- select_whisper_model and
+    faster_whisper_model_size are two namespace mappers over ONE query, not
+    two selectors."""
+    import ast
+    import inspect
+    src = inspect.getsource(wt)
+    tree = ast.parse(src)
+    sites = [node.lineno for node in ast.walk(tree)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+             and node.func.attr == 'select_best']
+    assert len(sites) == 1, sites
+    lines = src.splitlines()
+    start = next(i for i, line in enumerate(lines, 1) if line.startswith('def _catalog_stt_entry('))
+    end = next(i for i, line in enumerate(lines, 1) if i > start and line.startswith('def '))
+    assert start < sites[0] < end
 
 
 def test_no_other_direct_caller_of_the_worker():
