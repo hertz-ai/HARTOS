@@ -25,7 +25,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 from core.foreground import should_yield_to_user
 
-from .link import PeerLink, TrustLevel, LinkState, provable_user_id
+from .channels import device_may_receive
+from .link import (PeerLink, TrustLevel, LinkState, provable_user_id,
+                   set_device_verifier)
 
 logger = logging.getLogger('hevolve.peer_link')
 
@@ -68,6 +70,15 @@ class PeerLinkManager:
             tier = 'flat'
         self._max_links = _MAX_LINKS.get(tier, 10)
         self._tier = tier
+
+    def set_device_verifier(self, fn: Optional[Callable[[str], dict]]) -> None:
+        """Inject the verifier for a phone's device_token (HARTOS #111), the
+        way MessageBus.set_http_transport injects its transport: core must
+        not import integrations.  ``fn(token)`` returns the verdict of
+        integrations.social.auth.verify_device_jwt plus ``peer_id`` (the
+        key's fingerprint) on 'ok'.  Until it is installed every device
+        HELLO is refused (link.py)."""
+        set_device_verifier(fn)
 
     def start(self):
         """Start the link manager background maintenance."""
@@ -165,12 +176,28 @@ class PeerLinkManager:
                 continue
             if trust_filter and link.trust != trust_filter:
                 continue
+            if link.kind == 'device' and not self._device_gets(link, channel, data):
+                continue
             try:
                 link.send(channel, data)
                 sent += 1
             except Exception:
                 pass
         return sent
+
+    @staticmethod
+    def _device_gets(link: PeerLink, channel: str, data: Any) -> bool:
+        """A device link is delivered to only on a channel the registry opens
+        to devices, and only that user's own envelopes: the bus envelope's
+        data.user_id must be the link's user, and an envelope naming no user
+        (fleet, hive, gossip) never reaches a device."""
+        if not device_may_receive(channel):
+            return False
+        if not isinstance(data, dict):
+            return False
+        inner = data.get('data')
+        user = inner.get('user_id') if isinstance(inner, dict) else None
+        return bool(link.user_id) and str(user) == link.user_id
 
     def collect(self, channel: str, timeout_ms: int = 1000) -> List[dict]:
         """Broadcast and collect responses from all peers.
@@ -185,7 +212,7 @@ class PeerLinkManager:
         # Send query and collect responses
         timeout_s = timeout_ms / 1000.0
         for link in links:
-            if not link.is_connected:
+            if not link.is_connected or link.kind == 'device':
                 continue
             try:
                 result = link.send(channel, {'type': 'query'},
@@ -245,11 +272,19 @@ class PeerLinkManager:
         Returns the live PeerLink, or None when the handshake failed or the
         connection budget refused it.
         """
-        admitted = self._admit(peer_id)
-        if admitted is not None:
-            # True = a live link to this peer already exists; hand it back so
-            # the caller does not tear down the healthy one.
-            return self.get_link(peer_id) if admitted else None
+        is_device = bool(hello.get('device_token'))
+        if is_device:
+            # A phone (HARTOS #111): its identity is the key its token proves,
+            # named by link.accept() from the verdict, never the node_id it
+            # claimed, so it can neither wear a node's id nor take a node's
+            # slot; devices are bounded by the owner's grants, not the budget.
+            peer_id = f'device-pending-{id(hello):x}'
+        else:
+            admitted = self._admit(peer_id)
+            if admitted is not None:
+                # True = a live link to this peer already exists; hand it back
+                # so the caller does not tear down the healthy one.
+                return self.get_link(peer_id) if admitted else None
 
         link = PeerLink(peer_id=peer_id, address=address, trust=TrustLevel.PEER)
 
@@ -258,7 +293,17 @@ class PeerLinkManager:
         self._apply_channel_handlers(link)
 
         if link.accept(ws, hello):
-            self._register_connected_link(peer_id, link)
+            if is_device:
+                if link.kind != 'device' or link.peer_id == peer_id:
+                    logger.warning("Device HELLO accepted without a device identity; closing")
+                    link.close()
+                    return None
+                # The phone re-dials after a drop: the fresh socket replaces
+                # a stale one under the same fingerprint.
+                stale = self.get_link(link.peer_id)
+                if stale is not None and stale is not link:
+                    self.close_link(link.peer_id, stale)
+            self._register_connected_link(link.peer_id, link)
             return link
         return None
 
@@ -278,7 +323,8 @@ class PeerLinkManager:
             existing = self._links.get(peer_id)
             if existing and existing.is_connected:
                 return True
-            active = sum(1 for l in self._links.values() if l.is_connected)
+            active = sum(1 for l in self._links.values()
+                         if l.is_connected and l.kind != 'device')
             over_budget = active >= self._max_links
 
         if over_budget and not self._evict_weakest_link():
@@ -314,6 +360,10 @@ class PeerLinkManager:
         # bridge's `register_peer_agent` is a no-op when hevolveai
         # isn't loaded (central HTTP-only tier) so this is safe
         # everywhere and never blocks the link upgrade.
+        # A device (a person's phone, HARTOS #111) is never a peer agent:
+        # MoE consensus is node authority.
+        if link.kind == 'device':
+            return
         try:
             from integrations.agent_engine.world_model_bridge import (
                 get_world_model_bridge,
@@ -327,10 +377,22 @@ class PeerLinkManager:
                 f"{peer_id[:8] if peer_id else '?'}: {e}"
             )
 
-    def close_link(self, peer_id: str):
-        """Close and remove a link."""
+    def close_link(self, peer_id: str, link: Optional[PeerLink] = None):
+        """Close and remove a link.
+
+        With ``link`` given, the registry entry under ``peer_id`` is removed
+        only when it IS that link, and that link is closed regardless: the
+        socket that accepted a link is the one that tears it down (server.py),
+        and a later socket may already have registered a fresh link under the
+        same id -- a phone re-dialling after a drop, a node opening a second
+        socket -- which the old socket's teardown must not close.  Without
+        ``link`` the entry under ``peer_id`` is closed, as before.
+        """
         with self._lock:
-            link = self._links.pop(peer_id, None)
+            if link is None:
+                link = self._links.pop(peer_id, None)
+            elif self._links.get(peer_id) is link:
+                self._links.pop(peer_id, None)
         if link:
             link.close()
 
@@ -426,7 +488,7 @@ class PeerLinkManager:
         with self._lock:
             disconnected = [
                 (pid, link) for pid, link in self._links.items()
-                if link.state == LinkState.DISCONNECTED
+                if link.state == LinkState.DISCONNECTED and link.kind != 'device'
             ]
 
         for peer_id, link in disconnected:
@@ -448,7 +510,7 @@ class PeerLinkManager:
         with self._lock:
             candidates = [
                 (pid, link) for pid, link in self._links.items()
-                if link.is_connected
+                if link.is_connected and link.kind != 'device'
             ]
 
         if not candidates:

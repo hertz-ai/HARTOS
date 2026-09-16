@@ -94,6 +94,33 @@ def _install_api_gate(app) -> None:
         logger.critical(f"HARTOS API gate not installed on the host app: {e}")
 
 
+def _install_device_verifier() -> None:
+    """Step 1c: the verifier a phone's PeerLink HELLO is checked with (HARTOS
+    #111): the same verify_device_jwt the API gate uses, against the same
+    device_access grant, injected into core.peer_link so core never imports
+    integrations.  A node with no owner (central) refuses every device HELLO,
+    as its gate admits no device."""
+    try:
+        from core.peer_link.link_manager import get_link_manager
+        from integrations.social.auth import verify_device_jwt
+        from integrations.social.consent_service import device_fingerprint
+        from integrations.social.models import db_session
+
+        def verify(token: str) -> dict:
+            owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+            if not owner:
+                return {'status': 'invalid'}
+            with db_session(commit=False) as db:
+                verdict = verify_device_jwt(db, token, owner)
+            if verdict.get('status') == 'ok':
+                verdict['peer_id'] = device_fingerprint(verdict['public_key'])
+            return verdict
+
+        get_link_manager().set_device_verifier(verify)
+    except Exception as e:
+        logger.critical(f"PeerLink device verifier not installed: {e}")
+
+
 def bootstrap(
     app,
     config: Optional[Mapping[str, Any]] = None,
@@ -212,6 +239,7 @@ def _run_bootstrap(app, cfg: dict) -> None:
             # The gate first.  It covers every route on the app, including
             # the ones registered below (see _install_api_gate).
             _install_api_gate(app)
+            _install_device_verifier()
             _init_social_subsystem(app)
             _register_core_blueprints(app)
             _run_consumer_hook(app, cfg)

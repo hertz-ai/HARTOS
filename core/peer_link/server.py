@@ -209,8 +209,12 @@ async def _handle_peer_link(scope, receive, send) -> None:
         await send({'type': 'websocket.close'})
         return
 
-    logger.info("PeerLink inbound ACCEPTED from %s (%s) trust=%s encrypted=%s",
-                peer_id[:8], peer_host or '?', link.trust.value,
+    # The link's own id from here on: a device link (HARTOS #111) is named by
+    # its key's fingerprint, never by the node_id its HELLO claimed.
+    peer_id = link.peer_id
+    shown = peer_id if link.kind == 'device' else peer_id[:8]
+    logger.info("PeerLink inbound ACCEPTED from %s (%s) kind=%s trust=%s encrypted=%s",
+                shown, peer_host or '?', link.kind, link.trust.value,
                 link.is_encrypted)
 
     try:
@@ -234,15 +238,17 @@ async def _handle_peer_link(scope, receive, send) -> None:
         # close_link() next, which clears link._ws — the condition
         # _receive_loop tests, so the thread exits instead of spinning.
         # wake_readers() last, to lift that thread out of its blocking get().
+        # This socket closes the link IT accepted, and only that one: by the
+        # time it tears down, a fresh socket may have registered a new link
+        # under the same id (a phone re-dialling, a node's second socket),
+        # and a plain close by id would take the healthy one down.
         adapter.mark_disconnected()
         try:
-            await loop.run_in_executor(None, manager.close_link, peer_id)
+            await loop.run_in_executor(None, manager.close_link, peer_id, link)
         except Exception as exc:
-            logger.debug("PeerLink close_link for %s failed: %s",
-                         peer_id[:8], exc)
+            logger.debug("PeerLink close_link for %s failed: %s", shown, exc)
         adapter.wake_readers()
-        logger.info("PeerLink inbound CLOSED for %s (%s)",
-                    peer_id[:8], peer_host or '?')
+        logger.info("PeerLink inbound CLOSED for %s (%s)", shown, peer_host or '?')
 
 
 def peer_link_enabled() -> bool:

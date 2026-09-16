@@ -105,7 +105,21 @@ class LinkState(Enum):
 
 # Channel IDs for binary frames — single source of truth is CHANNEL_REGISTRY
 # in core.peer_link.channels. Re-exported here for backwards compatibility.
-from core.peer_link.channels import CHANNEL_IDS, CHANNEL_NAMES  # noqa: E402
+from core.peer_link.channels import (  # noqa: E402
+    CHANNEL_IDS, CHANNEL_NAMES, device_may_send)
+
+#: Verifies a phone's device_token from a HELLO (HARTOS #111): callable(token)
+#: -> the verdict shape of integrations.social.auth.verify_device_jwt, plus
+#: 'peer_id' (the key's fingerprint) on 'ok'.  Injected by the host at boot
+#: (PeerLinkManager.set_device_verifier, next to the API gate), the way
+#: MessageBus.set_http_transport is: core must not import integrations.  No
+#: verifier means a device HELLO is refused -- fail closed.
+_DEVICE_VERIFIER: Optional[Callable[[str], dict]] = None
+
+
+def set_device_verifier(fn: Optional[Callable[[str], dict]]) -> None:
+    global _DEVICE_VERIFIER
+    _DEVICE_VERIFIER = fn
 
 # Key rotation interval (seconds)
 KEY_ROTATION_INTERVAL = 3600
@@ -142,6 +156,13 @@ class PeerLink:
     - PEER/RELAY: AES-256-GCM with session key from X25519 ECDH
     """
 
+    # 'node', or 'device' for a person's phone admitted on its HELLO's
+    # device_token (HARTOS #111); user_id is that token's user, '' on a node.
+    # Class-level so every reader of a link, and a mock built on the class,
+    # sees a node unless the handshake said otherwise.
+    kind = 'node'
+    user_id = ''
+
     def __init__(self, peer_id: str, address: str, trust: TrustLevel,
                  x25519_public_hex: str = '', ed25519_public_hex: str = '',
                  capabilities: Optional[dict] = None):
@@ -151,6 +172,13 @@ class PeerLink:
         self.peer_x25519_public = x25519_public_hex
         self.peer_ed25519_public = ed25519_public_hex
         self.capabilities = capabilities or {}
+        # A device is that user's own device (SAME_USER trust for delivery)
+        # and never a node: channels.py's device policy bounds what it sends
+        # and receives, and link_manager keeps it out of node authority, the
+        # budget and eviction.
+        self.kind = 'node'
+        self.user_id = ''
+        self._device_channel_warned: set = set()
 
         # G9: Trust ratchet — once trust is established at a level,
         # it can only be UPGRADED (never downgraded) during this session.
@@ -592,6 +620,77 @@ class PeerLink:
         self.peer_x25519_public = hello_data.get('x25519_public', '')
         self.capabilities = hello_data.get('capabilities', {})
 
+        # A phone's HELLO carries its device_token (HARTOS #111): the same
+        # credential its HTTP calls bear, verified by the same verifier the
+        # gate uses.  The signature above bound the HELLO to peer_ed25519;
+        # the verdict's key must be that key, so token and socket are one
+        # identity.  Only 'ok' admits; pending, denied and invalid close the
+        # socket, and the phone learns its state over HTTP, where the ask is
+        # filed and paced.  Trust is SAME_USER -- the owner said this device
+        # is theirs -- with kind 'device' bounding everything else.
+        device_token = hello_data.get('device_token')
+        if device_token:
+            if not self._admit_device(peer_ed25519, peer_sig, str(device_token)):
+                return False
+        elif not self._decide_node_trust(hello_data, peer_ed25519):
+            return False
+
+        # Send ack
+        ack = {
+            'type': 'hello_ack',
+            'ed25519_public': get_public_key_hex(),
+            'x25519_public': get_x25519_public_hex(),
+            'protocol_version': 1,
+            'capabilities': self._get_local_capabilities(),
+            'timestamp': time.time(),
+        }
+        ack['signature'] = sign_json_payload(ack)
+
+        ack_bytes = json.dumps(ack, separators=(',', ':')).encode('utf-8')
+        self._ws_send(ack_bytes)
+
+        # Derive session key for PEER/RELAY trust
+        if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self.peer_x25519_public:
+            self._derive_session_key()
+
+        return True
+
+    def _admit_device(self, peer_ed25519: str, peer_sig: str, device_token: str) -> bool:
+        """The verifier's word on a device HELLO (HARTOS #111): 'ok' for the
+        key that signed the HELLO opens a SAME_USER link of kind 'device' for
+        the token's user; anything else, or no verifier, refuses."""
+        if not (peer_ed25519 and peer_sig):
+            logger.warning("Device HELLO without a signed key refused")
+            return False
+        if _DEVICE_VERIFIER is None:
+            logger.warning("Device HELLO refused: no device verifier installed")
+            return False
+        try:
+            verdict = _DEVICE_VERIFIER(device_token) or {}
+        except Exception as e:
+            logger.warning(f"Device verifier failed; refusing: {e}")
+            return False
+        if verdict.get('status') != 'ok':
+            logger.info(f"Device HELLO refused: {verdict.get('status', 'invalid')}")
+            return False
+        if str(verdict.get('public_key', '')).lower() != str(peer_ed25519).lower():
+            logger.warning("Device HELLO refused: token key is not the socket's key")
+            return False
+        user_id = str((verdict.get('payload') or {}).get('user_id') or '')
+        if not user_id:
+            logger.warning("Device HELLO refused: token names no user")
+            return False
+        self.kind = 'device'
+        self.user_id = user_id
+        if verdict.get('peer_id'):
+            self.peer_id = str(verdict['peer_id'])
+        if not self.set_trust(TrustLevel.SAME_USER):
+            logger.warning("Trust ratchet rejected SAME_USER for a device (should not happen)")
+            return False
+        return True
+
+    def _decide_node_trust(self, hello_data: dict, peer_ed25519: str) -> bool:
+        """A node's HELLO: trust decided locally, then its pre-trust contract."""
         # Determine trust LOCALLY — never accept trust_requested from wire.
         # SAME_USER requires proof: peer must present a user_id_signature
         # signed by the same user key we hold. Without proof → PEER.
@@ -641,25 +740,19 @@ class PeerLink:
             except ImportError:
                 pass  # Module not available — allow legacy connections
 
-        # Send ack
-        ack = {
-            'type': 'hello_ack',
-            'ed25519_public': get_public_key_hex(),
-            'x25519_public': get_x25519_public_hex(),
-            'protocol_version': 1,
-            'capabilities': self._get_local_capabilities(),
-            'timestamp': time.time(),
-        }
-        ack['signature'] = sign_json_payload(ack)
-
-        ack_bytes = json.dumps(ack, separators=(',', ':')).encode('utf-8')
-        self._ws_send(ack_bytes)
-
-        # Derive session key for PEER/RELAY trust
-        if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self.peer_x25519_public:
-            self._derive_session_key()
-
         return True
+
+    def _device_may_send(self, channel: str) -> bool:
+        """Inbound frames from a device link reach a handler only on a
+        channel the registry opens to devices; the first refusal per channel
+        is logged, the rest are dropped quietly."""
+        if self.kind != 'device' or device_may_send(channel):
+            return True
+        if channel not in self._device_channel_warned:
+            self._device_channel_warned.add(channel)
+            logger.warning(f"Device {self.peer_id} sent on '{channel}', "
+                           "which devices may not; dropped")
+        return False
 
     def _derive_session_key(self):
         """Derive AES-256-GCM session key from X25519 ECDH."""
@@ -845,6 +938,8 @@ class PeerLink:
                         continue
 
                     # Dispatch to handlers
+                    if not self._device_may_send(channel):
+                        continue
                     handlers = self._message_handlers.get(channel, [])
                     for handler in handlers:
                         try:
@@ -860,6 +955,8 @@ class PeerLink:
                     ch_id = raw[0]
                     channel = CHANNEL_NAMES.get(ch_id, 'unknown')
                     payload = raw[5:]  # skip channel_id + msg_id_hash
+                    if not self._device_may_send(channel):
+                        continue
                     handlers = self._message_handlers.get(channel, [])
                     for handler in handlers:
                         try:
