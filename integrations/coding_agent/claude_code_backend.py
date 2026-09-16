@@ -62,14 +62,34 @@ def invoke_claude(prompt, *, mode='agentic', cwd=None, timeout_s=None,
     # spawn it, reporting 'notfound' for a binary this node can see.
     cmd = [_resolve_claude_bin() or CLAUDE_BIN, '-p', prompt]
     if mode == 'inference':
-        # Pure completion: text out, and no tools so it responds rather than
-        # acting on the host. (CLI tool-gating semantics are verified on the
-        # box; the system preamble is the belt to --allowedTools' braces.)
-        cmd += ['--output-format', 'text', '--allowedTools', '']
+        # Pure completion: text out and NO tools, so it answers rather than
+        # acting on the host.
+        #
+        # --tools "" removes the built-in tools from the model; --allowedTools
+        # only withheld PRE-APPROVAL, which is not the same thing.  Measured
+        # 2026-09-16 on this desktop, 300 recent expert-tier sessions run with
+        # --allowedTools "": 199 contained tool_use blocks, and the model
+        # EXECUTED Edit 326x, Grep 374x, Read 267x, Bash 109x, Write 6x --
+        # nearly all against Claude Code's own auto-memory directory, whose
+        # writes need no approval.  Each "completion" was a small agentic
+        # session that read a 25 KB memory index, grepped a 280 KB state file
+        # and appended an addendum; and the model re-read its own record of
+        # earlier refusals every turn, which is why one goal's refusal held
+        # for "the nineteenth consecutive slot".
+        #
+        # --strict-mcp-config: ignore the mcpServers in settings files, so a
+        # completion HARTOS asked for cannot dial back into HARTOS over MCP.
+        #
+        # --system-prompt REPLACES the harness prompt (memory instructions,
+        # CLAUDE.md, tool guidance) instead of appending to it: the caller's
+        # system text is the whole system prompt, as an inference endpoint
+        # expects, and none of that context is billed into every turn.
+        cmd += ['--output-format', 'text', '--tools', '', '--strict-mcp-config']
         system = system or (
-            'You are an inference engine. Answer the user\'s message directly '
-            'and only. Do not use tools, do not act on the system.')
-    if system:
+            "You are an inference engine. Answer the user's message directly "
+            "and only. Do not use tools, do not act on the system.")
+        cmd += ['--system-prompt', system]
+    elif system:
         cmd += ['--append-system-prompt', system]
     if model:
         cmd += ['--model', model]
