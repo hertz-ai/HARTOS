@@ -380,15 +380,14 @@ def _get_faster_whisper_model(model_size: str = STT_CPU_MODEL_SIZE):
     logger.info(f"faster-whisper model '{loaded_size}' loaded on {device}")
     _record_whisper_success()
 
-    # Register with central lifecycle tracker via orchestrator; the VRAM
-    # figure is the size's own budget row, not one number for every size.
+    # Register with the orchestrator, which books the VRAM from the catalog
+    # entry's own budget row (notify_loaded -> _register_vram -> _vram_key);
+    # its device vocabulary is 'gpu' | 'cpu', not ctranslate2's 'cuda'.
     try:
         from .model_orchestrator import get_orchestrator
-        from .vram_manager import VRAM_BUDGETS
-        _budget = VRAM_BUDGETS.get(_vram_key_for_size(loaded_size))
         get_orchestrator().notify_loaded(
-            'stt', f'whisper-{loaded_size}', device=device,
-            vram_gb=(_budget[1] if (_budget and device == 'cuda') else 0))
+            'stt', f'whisper-{loaded_size}',
+            device='gpu' if device == 'cuda' else 'cpu')
     except Exception:
         logger.exception("_get_faster_whisper_model: swallowed Exception")
 
