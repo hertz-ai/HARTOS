@@ -9089,6 +9089,13 @@ def chat():
         )
         if _api_key_match:
             g.auth_source = 'api_key'
+        elif getattr(g, 'auth_source', None) == 'device':
+            # A phone the desktop owner allowed (#111): security.middleware
+            # verified its Ed25519-signed token against the key on file and
+            # left the payload in g.jwt_payload.  The HS256 decode below
+            # cannot verify that token (the phone has no local secret), so
+            # the gate's verdict stands.
+            pass
         elif _bearer_token:
             # Try JWT decode (Layer 1 / Layer 2)
             try:
@@ -9119,7 +9126,8 @@ def chat():
                 'requests. Set HEVOLVE_API_KEY env var for production.'
             )
             chat._auth_warned = True
-        g.auth_source = 'none'
+        if getattr(g, 'auth_source', None) != 'device':
+            g.auth_source = 'none'
 
     # Rate limit: 30 req/min per user/IP
     try:
@@ -9155,7 +9163,17 @@ def chat():
     # Layer 1 (LOCAL): Bearer token signed by this node's HS256 secret
     # Layer 2 (HIVE): Bearer token with Ed25519 node_sig (cross-node)
     # Fallback: body user_id (backward compat for desktop/Nunba mode)
-    if g.auth_source not in ('jwt', 'api_key'):
+    if g.auth_source == 'device':
+        # The user is the one the phone's verified token names; the gate
+        # already refused a body naming anyone else (#51).  Fail closed: a
+        # device verdict without its payload admits nobody, never the
+        # body's or a default user.
+        _device_uid = (getattr(g, 'jwt_payload', None) or {}).get('user_id')
+        if not _device_uid:
+            return jsonify({'error': 'Invalid or expired token.', 'response': None}), 401
+        data['user_id'] = _device_uid
+        g.token_scope = 'hive'
+    elif g.auth_source not in ('jwt', 'api_key'):
         if _bearer_token:
             try:
                 from integrations.social.auth import decode_jwt
