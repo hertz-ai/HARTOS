@@ -246,7 +246,19 @@ NETWORK_PROTECTED_PATHS = ('/chat', '/time_agent', '/visual_agent',
 PROTECTED_PATHS = ADMIN_PATHS + NETWORK_PROTECTED_PATHS
 
 EXEMPT_PREFIXES = ('/status', '/a2a/', '/api/social/', '/.well-known/',
-                   '/prompts/public')
+                   '/prompts/public',
+                   # A phone that found this desktop on the LAN GETs /health
+                   # before adopting the node (PeerLinkDiscovery.isHealthy;
+                   # measured 2026-09-16: 401 here kept every phone on the
+                   # cloud).  On HARTOS's own app it is the liveness probe
+                   # ({'status': 'alive'}); on Nunba's app, the one a desktop
+                   # advertises, it aliases /backend/health: GPU tier, name
+                   # and VRAM figures -- no secret, path or identifier, and
+                   # the class of facts the node already advertises to peers
+                   # in the announce (has_gpu, vram_free_gb).  Reads are
+                   # cached, so a LAN caller runs no GPU probe.  /ready,
+                   # which reports DB and identity checks, stays gated.
+                   '/health')
 
 
 def _apply_api_auth(app: Flask, register: bool = True):
