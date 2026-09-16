@@ -8915,7 +8915,10 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                     from core.port_registry import get_advertisable_base_url
                     _phone_audio_url = (audio_url if _ext_url
                                         else f'{get_advertisable_base_url().rstrip("/")}{audio_url}')
-                except Exception:
+                except Exception as e:
+                    app.logger.warning(
+                        f"TTS async: no advertisable base url for the phone's "
+                        f"bundle ({e}); sending {audio_url} as is")
                     _phone_audio_url = audio_url
                 _tts_payload = {
                     'text': [text[:200]],
