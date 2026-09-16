@@ -126,3 +126,88 @@ def test_flag_off_and_consent_error_both_fail_closed(bridge, monkeypatch):
     b.record_interaction('u1', 'p4', 'consent machinery broken', 'ok')
     assert posts == [], 'a consent error must mean no ingest'
     assert len(b._experience_queue) == 2
+
+
+# ---------------------------------------------------------------------------
+# C281: a failed flush re-queues, a non-2xx answer is a failure (Master 11.376)
+# ---------------------------------------------------------------------------
+def _flush_bridge(monkeypatch, breaker_open=False):
+    import collections
+    import threading
+    import integrations.agent_engine.world_model_bridge as wmb
+    b = wmb.WorldModelBridge.__new__(wmb.WorldModelBridge)
+    b._in_process = False
+    b._provider = None
+    b._http_disabled = False
+    b._api_url = 'http://test'
+    b._timeout_flush = 1
+    b._lock = threading.Lock()
+    b._stats = {'total_flushed': 0}
+    b._last_flush_at = None
+    b._experience_queue = collections.deque(maxlen=5)
+    b._is_external_target = lambda: False
+    state = {'open': breaker_open, 'fail': 0, 'ok': 0}
+    b._cb_is_open = lambda: state['open']
+    b._cb_record_failure = lambda: state.__setitem__('fail', state['fail'] + 1)
+    b._cb_record_success = lambda: state.__setitem__('ok', state['ok'] + 1)
+    return wmb, b, state
+
+
+def _exps(n):
+    return [{'prompt': 'p%d' % i, 'response': 'r%d' % i, 'user_id': 'u', 'prompt_id': 'x%d' % i,
+             'source': 'test'} for i in range(n)]
+
+
+def test_C281_breaker_open_requeues_instead_of_dropping(monkeypatch):
+    wmb, b, state = _flush_bridge(monkeypatch, breaker_open=True)
+    posts = []
+    monkeypatch.setattr(wmb, 'pooled_post', lambda *a, **k: posts.append(k) or _Resp())
+    b._flush_to_world_model(_exps(3))
+    assert posts == [] and [e['prompt'] for e in b._experience_queue] == ['p0', 'p1', 'p2']
+    # bounded by the queue's maxlen: the overflow is counted, not silently lost
+    b._flush_to_world_model(_exps(4))
+    assert len(b._experience_queue) == 5 and b._stats['total_dropped'] == 2
+
+
+def test_C281_a_timeout_requeues_the_rest_of_the_batch_and_says_so_once(monkeypatch):
+    import requests
+    wmb, b, state = _flush_bridge(monkeypatch)
+    calls = []
+
+    def post(url, json=None, timeout=None):
+        calls.append(json['messages'][1]['content'])
+        if len(calls) == 2:
+            raise requests.Timeout('read timed out')
+        return _Resp()
+    monkeypatch.setattr(wmb, 'pooled_post', post)
+    warned = []
+    monkeypatch.setattr(wmb.logger, 'warning', lambda msg, *a, **k: warned.append(msg % a if a else msg))
+    b._flush_to_world_model(_exps(4))
+    assert calls == ['p0', 'p1'], 'stop at the first failure'
+    assert b._stats['total_flushed'] == 1 and state['fail'] == 1
+    assert [e['prompt'] for e in b._experience_queue] == ['p1', 'p2', 'p3'], (
+        'the failed one and the rest go back, in order')
+    assert len(warned) == 1 and 'Timeout' in warned[0] and '3 experience(s) re-queued' in warned[0]
+    # a second failing run is silent; a success re-arms the warning
+    b._experience_queue.clear()
+    monkeypatch.setattr(wmb, 'pooled_post', lambda *a, **k: (_ for _ in ()).throw(requests.Timeout('again')))
+    b._flush_to_world_model(_exps(1))
+    assert len(warned) == 1
+    b._experience_queue.clear()
+    monkeypatch.setattr(wmb, 'pooled_post', lambda *a, **k: _Resp())
+    b._flush_to_world_model(_exps(1))
+    monkeypatch.setattr(wmb, 'pooled_post', lambda *a, **k: (_ for _ in ()).throw(requests.Timeout('after ok')))
+    b._flush_to_world_model(_exps(1))
+    assert len(warned) == 2
+
+
+def test_C281_a_non_2xx_answer_is_a_failure_not_a_flush(monkeypatch):
+    wmb, b, state = _flush_bridge(monkeypatch)
+
+    class _Bad:
+        status_code = 503
+    monkeypatch.setattr(wmb, 'pooled_post', lambda *a, **k: _Bad())
+    monkeypatch.setattr(wmb.logger, 'warning', lambda *a, **k: None)
+    b._flush_to_world_model(_exps(2))
+    assert b._stats['total_flushed'] == 0 and state['fail'] == 1 and state['ok'] == 0
+    assert [e['prompt'] for e in b._experience_queue] == ['p0', 'p1']
