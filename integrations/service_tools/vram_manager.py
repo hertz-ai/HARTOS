@@ -33,9 +33,13 @@ VRAM_BUDGETS: Dict[str, Tuple[float, float]] = {
     # with "request (6477 tokens) exceeds the available context size".
     # model 2.8 GB + ~1.5 GB KV at the 12288 ctx cap = 4.3 GB min_vram.
     "llm_main":             (4.3,  2.8),
-    # STT engines
+    # STT engines -- one row per faster-whisper size the catalog can pick
+    # (model_orchestrator._CATALOG_TO_VRAM_KEY names all five; the tiny and
+    # small rows were missing, so a small-on-GPU worker booked nothing).
     "whisper":              (2.0,  1.5),
+    "whisper_tiny":         (0.3,  0.1),    # faster-whisper tiny
     "whisper_base":         (0.5,  0.2),    # faster-whisper base (CPU-friendly)
+    "whisper_small":        (1.0,  0.5),    # faster-whisper small
     "whisper_medium":       (2.0,  1.5),    # faster-whisper medium
     "whisper_large":        (4.0,  3.0),    # faster-whisper large-v3-turbo
     # TTS engines

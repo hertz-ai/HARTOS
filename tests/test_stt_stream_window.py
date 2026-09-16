@@ -229,7 +229,16 @@ class InterimWindowBoundTest(unittest.TestCase):
 
 class DeviceSelectionFallbackTest(unittest.TestCase):
     """Part B — device selection falls back to CPU without raising when
-    ctranslate2 CUDA is absent, and emits a clear WARNING naming the reason."""
+    ctranslate2 CUDA is absent, and emits a clear WARNING naming the reason.
+
+    The fake ctranslate2 answers like the real one (2026-09-16 RCA): the
+    probe that says whether a GPU exists is ``get_cuda_device_count()``, and
+    ``get_supported_compute_types('cuda')`` returns COMPUTE TYPES
+    ({'int8', 'float16', ...}) -- never the string 'cuda'.  The loader used
+    to test ``'cuda' in get_supported_compute_types('cuda')``, which no real
+    answer satisfies, so an RTX 3070 box ran STT on CPU int8 for months while
+    the earlier version of this test fed the fake a 'cuda' member and passed.
+    """
 
     def setUp(self):
         # Reset the module-level model cache so the loader runs fresh.
@@ -237,36 +246,57 @@ class DeviceSelectionFallbackTest(unittest.TestCase):
         self._saved_size = whisper_tool._faster_whisper_model_size
         whisper_tool._faster_whisper_model = None
         whisper_tool._faster_whisper_model_size = None
-        # Reset breaker/backoff so they don't short-circuit the load.
+        # Reset breaker/backoff so they don't short-circuit the load (and put
+        # them back after: test_whisper_backoff runs in the same process and
+        # needs the module's real breaker).
+        self._saved_breaker = whisper_tool._whisper_load_breaker
+        self._saved_backoff = whisper_tool._whisper_load_backoff
         whisper_tool._whisper_load_breaker = None
         whisper_tool._whisper_load_backoff = None
 
     def tearDown(self):
         whisper_tool._faster_whisper_model = self._saved_model
         whisper_tool._faster_whisper_model_size = self._saved_size
+        whisper_tool._whisper_load_breaker = self._saved_breaker
+        whisper_tool._whisper_load_backoff = self._saved_backoff
 
-    def _install_fake_modules(self, cuda_supported):
+    def _install_fake_modules(self, cuda_supported, cuda_load_fails=False):
         """Inject fake faster_whisper + ctranslate2 into sys.modules.
 
-        ``cuda_supported``: bool | 'raise' — controls what
-        ctranslate2.get_supported_compute_types('cuda') does.
+        ``cuda_supported``: bool | 'raise' -- whether the fake reports a CUDA
+        device (``get_cuda_device_count``) / whether the probe raises.
+        ``cuda_load_fails``: WhisperModel(device='cuda') raises (a CUDA OOM
+        or a missing cuBLAS DLL at load time).
         """
-        captured = {}
+        captured = {"loads": []}
 
         fake_fw = types.ModuleType("faster_whisper")
 
         class _FakeWhisperModel:
             def __init__(self, model_size, device="cpu", compute_type="int8"):
+                captured["loads"].append((model_size, device, compute_type))
+                if device == "cuda" and cuda_load_fails:
+                    raise RuntimeError("CUDA failed with error out of memory")
+                captured["model_size"] = model_size
                 captured["device"] = device
                 captured["compute_type"] = compute_type
         fake_fw.WhisperModel = _FakeWhisperModel
 
         fake_ct = types.ModuleType("ctranslate2")
 
+        def _count():
+            if cuda_supported == "raise":
+                raise RuntimeError("broken CUDA runtime")
+            return 1 if cuda_supported else 0
+
         def _gsct(name):
             if cuda_supported == "raise":
                 raise RuntimeError("broken CUDA runtime")
-            return ("int8", "float32") + (("cuda",) if cuda_supported else ())
+            if name == "cuda" and not cuda_supported:
+                raise ValueError("unsupported device cuda")
+            # The real answer: compute types, never the device name.
+            return {"int8", "int8_float16", "float16", "float32"}
+        fake_ct.get_cuda_device_count = _count
         fake_ct.get_supported_compute_types = _gsct
 
         return fake_fw, fake_ct, captured
@@ -299,10 +329,32 @@ class DeviceSelectionFallbackTest(unittest.TestCase):
         fake_fw, fake_ct, captured = self._install_fake_modules(cuda_supported=True)
         with mock.patch.dict(sys.modules, {"faster_whisper": fake_fw,
                                            "ctranslate2": fake_ct}):
-            model = whisper_tool._get_faster_whisper_model("base")
+            model = whisper_tool._get_faster_whisper_model("medium")
         self.assertIsNotNone(model)
+        self.assertEqual(captured["model_size"], "medium")
         self.assertEqual(captured["device"], "cuda")
         self.assertEqual(captured["compute_type"], "float16")
+
+    def test_cuda_load_failure_falls_back_to_the_cpu_size_once(self):
+        """A CUDA load that raises (OOM, missing cuBLAS) must not kill STT:
+        the loader retries on CPU int8 with the CPU default size, warns
+        once, and later requests for the SAME size reuse that model instead
+        of re-hitting the failing CUDA load on every 2 s interim window."""
+        fake_fw, fake_ct, captured = self._install_fake_modules(
+            cuda_supported=True, cuda_load_fails=True)
+        with mock.patch.dict(sys.modules, {"faster_whisper": fake_fw,
+                                           "ctranslate2": fake_ct}):
+            with self.assertLogs(whisper_tool.logger, level="WARNING") as cm:
+                first = whisper_tool._get_faster_whisper_model("medium")
+            second = whisper_tool._get_faster_whisper_model("medium")
+        self.assertIsNotNone(first)
+        self.assertIs(second, first)
+        self.assertEqual(captured["device"], "cpu")
+        self.assertEqual(captured["model_size"], whisper_tool.STT_CPU_MODEL_SIZE)
+        self.assertEqual(
+            [d for (_s, d, _c) in captured["loads"]], ["cuda", "cpu"],
+            "exactly one CUDA attempt, then one CPU load, no retry storm")
+        self.assertIn("medium", "\n".join(cm.output))
 
 
 if __name__ == "__main__":
