@@ -177,9 +177,20 @@ def test_sse_stream_delivers_a_pushed_component_to_the_client(svc, client):
     svc._agent_components['agent_x'][-1]['_ts'] = time.time() + 3600
     with client.get('/api/notifications/stream',
                     headers={'Accept': 'text/event-stream'}, buffered=False) as r:
-        first = next(iter(r.response), b'')
-    if isinstance(first, str):
-        first = first.encode()
+        # Drain SSE COMMENTS before asserting. Two are legitimate on this stream:
+        # the ": ok" that primes the response head (so EventSource fires onopen
+        # immediately instead of waiting out a heartbeat) and the ": hb" keep-alive.
+        # Neither carries an event:/data: field, so a real client never surfaces
+        # them, and neither does this test. Bounded so a stream that only ever
+        # comments fails the assertion instead of hanging the suite.
+        first = b''
+        for n, chunk in enumerate(r.response):
+            if isinstance(chunk, str):
+                chunk = chunk.encode()
+            if chunk.startswith(b':') and n < 4:
+                continue
+            first = chunk
+            break
     assert first.startswith(b'data: '), 'stream did not emit an SSE data frame: %r' % first
     assert b'Hello G4' in first, 'the pushed component never reached the SSE client leg'
     assert b'"type": "card"' in first or b'"type":"card"' in first
@@ -238,3 +249,152 @@ if __name__ == '__main__':
             print(' FAIL ', name, '->', repr(e))
     print('RESULT:', 'ALL PASS' if not failed else (str(failed) + ' FAILED'))
     sys.exit(1 if failed else 0)
+
+
+# ── The SECOND consumer: the compositor's native scene ────────────────────────
+# shell.compose has existed on the compositor since M3 with NO caller, so
+# native_home stayed None and the native scene fell back to scene::demo_ref(),
+# the hardcoded "Morning briefing / Inbox triage / Storage report". Turning the
+# native shell on would have shown that as the desktop. These pin that the SAME
+# accepted payload reaches it, and that an unaccepted one does not.
+
+
+def _wm(reply=None):
+    """A patched WM client singleton, handing back a controllable reply."""
+    client = MagicMock()
+    client.shell_compose.return_value = reply if reply is not None else {'ok': True}
+    getter = MagicMock(return_value=client)
+    return client, patch(
+        'integrations.agent_engine.hart_wm_client.get_wm_client', getter)
+
+
+def test_an_accepted_compose_reaches_the_native_scene_with_the_same_payload(svc):
+    client, patched = _wm()
+    hero = {'eyebrow': 'EARNED ON THE HIVE', 'amount': 12, 'amount_unit': 'Spark'}
+    rows = [{'title': 'Today', 'cards': [{'title': 'Inbox triage'}]}]
+    with patch.object(svc, 'agent_ui_update', return_value=True), patched:
+        assert svc.compose_home(hero=hero, rows=rows, mood='calm') is True
+    client.shell_compose.assert_called_once()
+    kw = client.shell_compose.call_args.kwargs
+    # The IDENTICAL payload, not a re-derived one: two renderers, one composition.
+    assert kw['hero'] == hero
+    assert kw['rows'] == rows
+    assert kw['mood'] == 'calm'
+
+
+def test_a_rejected_compose_never_reaches_the_native_scene(svc):
+    """The governance is agent_ui_update's, and it must hold for BOTH renderers.
+
+    If the kill-switch, the rate cap or the XSS gate refuses a push, the native
+    scene must not be handed it either -- otherwise the compositor becomes a way
+    around the gate the shell is subject to.
+    """
+    client, patched = _wm()
+    with patch.object(svc, 'agent_ui_update', return_value=False), patched:
+        assert svc.compose_home(hero={'eyebrow': 'x'}) is False
+    client.shell_compose.assert_not_called()
+
+
+def test_a_compositor_that_refuses_or_is_absent_does_not_break_the_push(svc):
+    """The WebView desktop has already had the payload over SSE. A missing or
+    older compositor must cost nothing, which is why this is best-effort."""
+    client, patched = _wm(reply={'ok': False, 'error': 'no hart-comp socket'})
+    with patch.object(svc, 'agent_ui_update', return_value=True), patched:
+        assert svc.compose_home(hero={'eyebrow': 'x'}) is True
+
+    # And a client that raises outright is still not fatal.
+    boom = MagicMock(side_effect=RuntimeError('socket gone'))
+    with patch.object(svc, 'agent_ui_update', return_value=True),             patch('integrations.agent_engine.hart_wm_client.get_wm_client', boom):
+        assert svc.compose_home(hero={'eyebrow': 'x'}) is True
+
+
+# ── The return path: a press the COMPOSITOR handled ──────────────────────────
+# The native scene hit-tests a press and emits (row, card). It deliberately does
+# not know what activating a card means; that vocabulary lives in hartHome.js's
+# cardAction, which is also what a DOM click runs. So the compositor sends
+# identity and the shell resolves it against the payload it is already drawing.
+
+
+def _stored(svc, agent='native_shell'):
+    with svc._lock:
+        return list(svc._agent_components.get(agent, []))
+
+
+def test_a_native_activation_is_relayed_to_the_browser_by_index(svc):
+    svc._on_compositor_event({'event': 'shell.activate',
+                              'window': {'row': 1, 'card': 4}})
+    assert _stored(svc) == [{'type': 'home_activate', 'row': 1, 'card': 4}], (
+        "the activation must reach the SSE store the shell drains")
+
+
+def test_other_compositor_events_are_not_relayed(svc):
+    for frame in ({'event': 'window.opened', 'window': {'handle': 'win_1'}},
+                  {'event': 'window.focused', 'window': {'row': 0, 'card': 0}},
+                  {},
+                  {'event': 'shell.activate'}):
+        svc._on_compositor_event(frame)
+    assert _stored(svc) == [], "only shell.activate is an activation"
+
+
+def test_a_malformed_activation_is_ignored(svc):
+    """The indices index into a payload. A non-integer or negative one is not a
+    card, and passing it through would put a nonsense component on the SSE
+    channel for the client to trip over."""
+    for body in ({'row': 'a', 'card': 0}, {'row': 0, 'card': None},
+                 {'row': -1, 'card': 0}, {'row': 0, 'card': -2}, {}):
+        svc._on_compositor_event({'event': 'shell.activate', 'window': body})
+    assert _stored(svc) == []
+
+
+def test_the_relay_does_not_go_through_the_agent_gate(svc):
+    """A person clicking a card on their own screen is not an agent painting it.
+
+    agent_ui_update refuses while the human has halted the hive and rate-caps per
+    agent. Both are right for an agent push and wrong for a user's click: the two
+    card actions are focusing the command bar and opening a panel, neither of which
+    dispatches anything, so halting the hive must not make the desktop unclickable.
+    """
+    with patch.object(svc, 'agent_ui_update', return_value=False) as gate:
+        svc._on_compositor_event({'event': 'shell.activate',
+                                  'window': {'row': 0, 'card': 0}})
+    gate.assert_not_called()
+    assert len(_stored(svc)) == 1, "a halted hive must not swallow a click"
+
+
+def test_the_relayed_activation_wakes_the_sse_producer(svc):
+    """Stored but unwoken means the click waits for the producer's safety timeout,
+    which is the difference between a responsive desktop and a laggy one."""
+    with patch.object(svc, '_ui_event_cv') as cv:
+        cv.__enter__ = MagicMock(return_value=None)
+        cv.__exit__ = MagicMock(return_value=None)
+        svc._on_compositor_event({'event': 'shell.activate',
+                                  'window': {'row': 0, 'card': 1}})
+        cv.notify_all.assert_called_once()
+
+
+def test_the_browser_half_exists_and_runs_the_same_card_action():
+    """The chain ends in the browser, so its two links are pinned as source.
+
+    Neither is reachable from pytest: one is a JS branch in the served shell, the
+    other a method in a static asset. A relay whose last hop is missing would pass
+    every test above and do nothing at all on the box.
+    """
+    import os
+    from integrations.agent_engine import liquid_ui_service as L
+    root = os.path.dirname(os.path.abspath(L.__file__))
+    with open(os.path.join(root, 'liquid_ui_service.py'), encoding='utf-8') as fh:
+        service = fh.read()
+    with open(os.path.join(root, 'static', 'hartHome.js'), encoding='utf-8') as fh:
+        js = fh.read()
+
+    assert "type === 'home_activate'" in service, (
+        "the SSE router has no branch for a relayed activation")
+    assert 'window.HartHome.activate(ev.row, ev.card)' in service, (
+        "the branch must hand the INDICES to HartHome")
+    assert 'activate: function (row, card)' in js, (
+        "hartHome.js exposes no activate()")
+    i = js.index('activate: function (row, card)')
+    body = js[i:i + 600]
+    assert 'cardAction(c)' in body, (
+        "activate must run the SAME cardAction a DOM click runs, not a second "
+        "implementation of what a card does")

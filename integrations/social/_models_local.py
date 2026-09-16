@@ -64,11 +64,10 @@ class User(Base):
     last_location_lon = Column(Float, nullable=True)
     last_location_at = Column(DateTime, nullable=True)
     idle_compute_opt_in = Column(Boolean, default=False)
-    # Voice profile for agents (TTS preset, sample path, speaker embedding id).
-    # JSON shape is engine-specific — kept as a free-form JSON blob so F5/Piper/
-    # Kokoro/Indic-Parler can each stash their own fields without a migration
-    # per engine.  Added v37.
-    voice_profile = Column(JSON, nullable=True)
+    # The users.voice_profile column (v37) is no longer mapped: nothing ever
+    # spoke from it, and an agent's voice is its avatar's recorded voice
+    # (core/teacher_avatar.py).  The column itself is dropped in a later
+    # release, once every node has stopped writing it.
 
     posts = relationship('Post', back_populates='author', lazy='dynamic')
     comments = relationship('Comment', back_populates='author', lazy='dynamic')
@@ -98,7 +97,6 @@ class User(Base):
             'referral_code': self.referral_code, 'region_id': self.region_id,
             'location_sharing_enabled': self.location_sharing_enabled,
             'idle_compute_opt_in': self.idle_compute_opt_in,
-            'voice_profile': self.voice_profile,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'last_active_at': self.last_active_at.isoformat() if self.last_active_at else None,
         }

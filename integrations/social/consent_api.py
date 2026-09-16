@@ -18,8 +18,11 @@ encounter_api._has_cloud_drafting_consent (encounter_api.py:616).
 Endpoints (all mounted at /api/social/consent*, JWT auth required):
 
   POST /api/social/consent          grant — APPEND a NEW row
-  POST /api/social/consent/revoke   revoke — set revoked_at on most-recent
+  POST /api/social/consent/revoke   revoke — set revoked_at on every
                                     active row (granted_at preserved)
+  POST /api/social/consent/decline  decline — say no to a pending ask,
+                                    for the ask's agent only
+                                    (ConsentService.revoke_consent)
   GET  /api/social/consent          list — newest-first; supports
                                     consent_type + active_only filters
 
@@ -170,9 +173,10 @@ def grant_consent():
 @consent_bp.route('/consent/revoke', methods=['POST'])
 @require_auth
 def revoke_consent():
-    """Revoke the most-recent active consent for (user, type, scope).
+    """Revoke every active consent for (user, type, scope).
 
-    Active = granted=True AND revoked_at IS NULL.
+    Active = granted=True AND revoked_at IS NULL.  The response names the
+    most recent of them.
 
     Body: {consent_type: str, scope: str (default '*')}
     Returns: {id, revoked_at}
@@ -192,24 +196,28 @@ def revoke_consent():
     if not consent_type:
         return _err('consent_type required')
 
-    # Most-recent active row.  Sort by granted_at desc so a re-grant
-    # made after a previous revoke is the row we touch.
-    row = g.db.query(UserConsent).filter(
+    # Every active row.  A grant appends a row, so two Allow clicks are two
+    # rows; revoking only the newest left the older one passing
+    # check_consent (tests/unit/test_consent_revoke_is_honoured.py).
+    # Newest first, so the response still names the most recent grant.
+    rows = g.db.query(UserConsent).filter(
         UserConsent.user_id == uid,
         UserConsent.consent_type == consent_type,
         UserConsent.scope == scope,
         UserConsent.granted == True,  # noqa: E712 — SQLAlchemy idiom
         UserConsent.revoked_at.is_(None),
-    ).order_by(UserConsent.granted_at.desc()).first()
+    ).order_by(UserConsent.granted_at.desc()).all()
 
-    if row is None:
+    if not rows:
         return _err('no active consent', 404)
 
     # Audit-evidence-discipline: NEVER overwrite granted_at.  The
     # event of "this consent was granted at T" is immutable history.
     now = datetime.utcnow()
-    row.revoked_at = now
+    for r in rows:
+        r.revoked_at = now
     g.db.flush()
+    row = rows[0]
 
     # Parallel-path parity (audit #4): this UI surface keeps its OWN append-only
     # row model on purpose — granted stays True and revoked_at is the tombstone
@@ -235,6 +243,57 @@ def revoke_consent():
         'id': row.id,
         'revoked_at': row.revoked_at.isoformat(),
     })
+
+
+# ──────────────────────────────────────────────────────────────────────
+# POST /api/social/consent/decline — say no to a pending ask
+# ──────────────────────────────────────────────────────────────────────
+
+@consent_bp.route('/consent/decline', methods=['POST'])
+@require_auth
+def decline_consent():
+    """Say no to a pending ask: the "Don't allow" answer on a consent card.
+
+    The write is ConsentService.revoke_consent.  With no active grant it
+    marks the ask declined, which stops request_consent asking again and
+    makes ConsentService.declined true, so a gate that is waiting refuses at
+    once.  agent_id is the ask's agent: a no to one agent's ask leaves every
+    other agent's ask open.  The way back is a grant (POST /consent), which
+    covers every agent.
+
+    Body: {consent_type: str, scope: str (default '*'), agent_id: str|null}
+    Returns: {declined: true, id}
+    Errors:
+      400 — missing or unknown consent_type
+      404 — no ask for this combination (neutral message)
+    """
+    uid = _user_id()
+    if uid is None:
+        return _err('unauthenticated', 401)
+
+    body = _json()
+    consent_type = str(body.get('consent_type', '')).strip()
+    scope = str(body.get('scope', '*')).strip() or '*'
+    agent_id = body.get('agent_id')
+    if agent_id is not None:
+        agent_id = str(agent_id).strip() or None
+
+    if not consent_type:
+        return _err('consent_type required')
+
+    try:
+        row = ConsentService.revoke_consent(
+            g.db, uid, consent_type, scope, agent_id)
+    except ValueError as e:
+        return _err(str(e))  # unknown consent_type -> 400
+    if row is None:
+        return _err('no such ask', 404)
+
+    logger.info(
+        'consent.decline user=%s type=%s scope=%s agent=%s id=%s',
+        uid, consent_type, scope, agent_id, row.id,
+    )
+    return _ok({'declined': True, 'id': row.id})
 
 
 # ──────────────────────────────────────────────────────────────────────

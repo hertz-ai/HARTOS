@@ -14,13 +14,32 @@ import time
 import logging
 import threading
 import requests
-from typing import Optional
+from typing import Union
 from core.http_pool import pooled_post
+from core.chat_client import normalize_chat_body
 
 from core.constants import HIVE_DEPTH, HIVE_WORKER_BASE_CAPABILITIES
 from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
+
+
+class HeldForHelp:
+    """What _execute_task returns when the turn's action was handed to a
+    person or an expert (create_recipe._ask_for_help; the reply is recognised
+    by core.agent_tools.is_help_pause).
+
+    A third outcome beside a result and None.  Not a result: nothing was
+    done.  Not None either: None releases the claim for a retry, and orphan
+    recovery would then run a goal the create loop just parked, every
+    _ORPHAN_AFTER_S.  _tick holds the task (coordinator.hold_task) and the
+    goal's next dispatch, which the daemon issues only once the goal is
+    active again, brings it back.
+    """
+    __slots__ = ('reason',)
+
+    def __init__(self, reason: str):
+        self.reason = reason
 
 
 class DistributedWorkerLoop:
@@ -211,7 +230,21 @@ class DistributedWorkerLoop:
         # Execute via local /chat
         result = self._execute_task(task)
 
-        if result is not None:
+        if isinstance(result, HeldForHelp):
+            # The action was handed to a person or an expert.  Neither a
+            # result to submit nor a failure to retry: the task waits with
+            # the goal and comes back on the goal's next dispatch.
+            try:
+                if coordinator.hold_task(task.task_id, self._node_id,
+                                         result.reason):
+                    logger.info(f"Worker holding task {task.task_id}: "
+                                f"{result.reason[:120]!r}")
+                else:
+                    logger.warning(f"Worker could not hold {task.task_id}: "
+                                   f"the ledger refused the transition")
+            except Exception as e:
+                logger.warning(f"Worker could not hold {task.task_id}: {e}")
+        elif result is not None:
             # Submit result back to coordinator
             try:
                 coordinator.submit_result(task.task_id, self._node_id, result)
@@ -220,14 +253,25 @@ class DistributedWorkerLoop:
                 logger.warning(f"Worker failed to submit result for {task.task_id}: {e}")
         else:
             logger.warning(f"Worker execution failed for task {task.task_id}")
+            # Release the claim so the task can be retried.  Leaving it held
+            # meant a Redis heartbeat renewed the lock indefinitely, and
+            # orphan recovery, which needs the lock gone, never re-queued it.
+            # The retry is paced by that recovery (claim older than
+            # _ORPHAN_AFTER_S), not by this 15-second poll.
+            try:
+                coordinator.abandon_task(task.task_id, self._node_id)
+            except Exception as e:
+                logger.warning(
+                    f"Worker could not release {task.task_id}: {e}")
 
-    def _execute_task(self, task) -> Optional[str]:
+    def _execute_task(self, task) -> Union[str, HeldForHelp, None]:
         """Execute a distributed task via the local /chat endpoint.
 
-        Uses the same guardrail pipeline as local dispatch.
+        Uses the same guardrail pipeline as local dispatch.  Returns the
+        reply, HeldForHelp when the turn handed its action on, or None when
+        nothing was produced (the claim is released for a retry).
         """
         prompt = task.context.get('prompt', task.description)
-        goal_type = task.context.get('goal_type', 'coding')
         user_id = task.context.get('user_id', self._node_id)
 
         # GUARDRAIL: pre-dispatch gate
@@ -241,8 +285,22 @@ class DistributedWorkerLoop:
             logger.error("CRITICAL: hive_guardrails not available — blocking worker dispatch")
             return None
 
+        from integrations.agent_engine.dispatch import (
+            _internal_auth_headers, local_chat_dispatch, prompt_id_for_goal,
+        )
+
         base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
-        prompt_id = f"{goal_type}_{task.task_id[:8]}"
+        # The goal's own prompt_id, the one dispatch_goal uses, so the work done
+        # here is the goal's work: the recipe is banked where REUSE and
+        # peer_reuse look for it, and a finished flow charges the goal's spark
+        # (charge_goal_work_completed finds the goal by this id).  The worker
+        # used to invent f"{goal_type}_{task_id[:8]}", which matched no goal, so
+        # hive work never moved spark_spent, and which reuse_recipe's
+        # int(prompt_id) cannot parse.  _decompose_goal makes one task per
+        # goal, so the task's parent is the goal; a task with no parent is its
+        # own unit of work.
+        goal_id = task.parent_task_id or task.task_id
+        prompt_id = prompt_id_for_goal(goal_id)
 
         body = {
             'user_id': user_id,
@@ -262,12 +320,15 @@ class DistributedWorkerLoop:
         # translator between the two dialects, and it also applies the
         # user-priority gate and the local-LLM semaphore that this loop
         # skipped entirely.
-        from integrations.agent_engine.dispatch import (
-            _internal_auth_headers, local_chat_dispatch,
-        )
-
+        #
+        # daemon_id is the GOAL's id, the same tag dispatch_goal stamps.  The
+        # create loop reads it back (core.chat_client.daemon_goal_id) to find
+        # the AgentGoal its ask-for-help parks.  Stamped with the coordinator
+        # task id (<goal>_task_0) instead, escalate_goal found no goal and
+        # every ask was "handed to nobody" (Nunba desktop 2026-09-15, 3 of 4
+        # daemon turns).
         _status, _text = local_chat_dispatch(
-            prompt, user_id, prompt_id, daemon_id=task.task_id,
+            prompt, user_id, prompt_id, daemon_id=goal_id,
             native_fallback=False)
         if _status == 'ok' and _text:
             return self._after_response(
@@ -288,8 +349,17 @@ class DistributedWorkerLoop:
         # the ledger re-dispatched it each tick ("Task <id>_root already
         # exists"). Same helper as dispatch.py:862 and
         # speculative_dispatcher.py:1880 (cdd379ad); this was the third site.
+        #
+        # The body declares the turn as background work with the same
+        # daemon_<goal_id> tag local_chat_dispatch stamps. Without it the
+        # /chat handler binds request_id None, is_current_request_autonomous()
+        # reads that as a live user, and the create pipeline gives the agent
+        # the INTERACTIVE prompt. On central (native HARTOS, where this POST is
+        # the only route) both rebuilt agents greeted, asked a clarifying
+        # question nobody could answer, and saved no step (#97).
         try:
-            resp = pooled_post(f'{base_url}/chat', json=body,
+            resp = pooled_post(f'{base_url}/chat',
+                               json=normalize_chat_body(body, daemon_id=goal_id),
                                headers=_internal_auth_headers(), timeout=120)
             if resp.status_code == 200:
                 result = resp.json()
@@ -317,6 +387,37 @@ class DistributedWorkerLoop:
         """
         if not response:
             return None
+
+        # A failed turn is not a result.  The pipeline does not raise when the
+        # LLM call fails; it returns a polite sentence such as "I couldn't
+        # finish that: Error code: 429 ...", and this method used to hand that
+        # to submit_result, which marks the task COMPLETED and records its
+        # hash.  Measured on central 2026-09-13: two of the three freshly
+        # healed hive tasks were "completed" that way (a 429 and a 400).
+        # Returning None makes _tick release the claim, and the coordinator's
+        # orphan recovery re-queues the task once the claim is old: the same
+        # rule that recovers a dead worker paces the retry, which is the
+        # backoff a rate-limited endpoint needs.
+        from core.agent_tools import is_help_pause, is_user_facing_error
+        if is_user_facing_error(response):
+            logger.warning(
+                f"Worker task {task.task_id}: the turn failed "
+                f"({response[:120]!r}); releasing it for retry instead of "
+                f"recording it as a result")
+            return None
+
+        # The action was handed to a person or an expert
+        # (create_recipe._ask_for_help).  Not work, so not a result; not a
+        # failure either, so not released: a retry would run the goal the
+        # create loop just parked.  _tick holds the task.  Measured on the
+        # Nunba desktop 2026-09-15: three "Paused for help" replies were
+        # submitted, hashed and notified as completed contributions.
+        if is_help_pause(response):
+            logger.warning(
+                f"Worker task {task.task_id}: the action was handed on "
+                f"({response[:120]!r}); holding the task instead of "
+                f"recording it as a result")
+            return HeldForHelp(response)
 
         # GUARDRAIL: post-response check (fail-closed)
         try:

@@ -10,7 +10,7 @@ import sys
 if sys.platform == 'win32':
     import asyncio as _asyncio_boot
     _asyncio_boot.set_event_loop_policy(_asyncio_boot.WindowsSelectorEventLoopPolicy())
-from core.subprocess_safe import no_window_kwargs
+from core.subprocess_safe import run_bounded
 import io
 
 # Diagnostic escape hatch: `kill -USR1 <pid>` dumps every thread's stack to
@@ -373,7 +373,6 @@ import json
 import os
 import re
 import secrets
-import subprocess
 import logging
 import threading
 import atexit
@@ -384,6 +383,17 @@ from security.node_integrity import compute_code_hash, compute_file_manifest, ve
 from security import master_key
 from core.platform_paths import get_coding_workspace_dir
 
+
+# Module logger.  13 sites already call `logger.` / `klogger.` and NOTHING
+# bound either name at module scope -- ruff F821 reports them, and 12 of the 13
+# sit inside `except` handlers, so the NameError replaced the real diagnosis.
+# Traced: an exception in _wire_qr_pair_emitter hits `logger.debug` (:3520) ->
+# NameError -> caught at :3525 -> NameError -> caught at :4165 -> surfaces to
+# the user as "Channel connect error: name 'logger' is not defined".  In
+# _init_skills and _init_runtime_tools (thread entry points) it kills the
+# thread silently.  Spelled the way the other ~40 sites in this file spell it;
+# _validate_startup's own local binding still wins inside that function.
+logger = logging.getLogger(__name__)
 
 # --- Hevolve Boot Integrity Verification ---
 _boot_logger = logging.getLogger("hevolve_integrity")
@@ -440,7 +450,7 @@ def hevolve_verify_boot():
 
 from core.http_pool import LLM_COMPLETION_TIMEOUT, pooled_get, pooled_post
 from core.auth_local import (
-    require_local_or_token, require_local_or_token_csrf_safe,
+    _is_local_request, require_local_or_token, require_local_or_token_csrf_safe,
 )
 from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any, Dict
@@ -1133,6 +1143,37 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"Claude Code endpoint init skipped: {e}")
 
+# Agent-engine API — the ledger surface the MCP daemon probe already depends on.
+#
+# WHY THIS WAS MISSING AND WHY IT MATTERS. integrations/mcp/_tool_impls.py
+# documents a known false negative: `probe_agent_daemon()` reads `_running` /
+# `_tick_count` off an imported module, and when Python (or, on HART OS, a
+# SECOND PROCESS) resolves a different agent_daemon instance than the live one,
+# it reports `daemon_enabled=false, _tick_count=0` while the daemon is happily
+# ticking. Its defence is to ALSO fetch canonical ledger stats over Flask
+# loopback, "shadow-immune" because the request lands on whichever singleton
+# Flask actually resolved.
+#
+# That defence has never been able to run here: agent_engine_bp was registered
+# nowhere. Measured on the box 2026-09-09 -- `list_routes` on this backend
+# returns 829 routes and ZERO agent-engine, and /api/agent-engine/ledger/stats
+# 404s on :6777 AND on the nunba socket. So the corrective probe 404'd, the
+# module-attr view was the only view, and the agent engine was structurally
+# unobservable from outside the process.
+#
+# The ledger is DB-backed (HEVOLVE_DB_PATH, shared by both processes), so
+# serving it here answers for the node rather than for this process. Registered
+# in its own try/except like every neighbour: a route-drop must never take the
+# app down.
+try:
+    from integrations.agent_engine import get_engine_blueprint as _get_agent_engine_bp
+    app.register_blueprint(_get_agent_engine_bp())
+    app.logger.info("Agent-engine API registered at /api/agent-engine/")
+except ImportError:
+    app.logger.info("Agent-engine API not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Agent-engine API init skipped: {e}")
+
 # MCP HTTP Bridge — exposes local MCP tools via REST for Nunba/external clients
 try:
     from integrations.mcp.mcp_http_bridge import mcp_local_bp, auto_register_local_mcp
@@ -1772,7 +1813,9 @@ def _resolve_llm_endpoint(registry_fn_name: str, env_var: str) -> str:
 # chat/completions POST in this module goes to GPT_API or DRAFT_GPT_API with
 # LLM_MODEL_NAME in the body, and _pooled_post_with_refusal_check adds
 # LLM_AUTH_HEADERS on the way out; no site picks a model or a port of its own.
-from core.autogen_config import resolve_llm_backend, llm_http_target
+from core.autogen_config import (
+    resolve_llm_backend, llm_http_target, with_local_fallback,
+    get_autogen_config_list)
 LLM_KIND, _llm_entry = resolve_llm_backend()
 LLM_MODEL_NAME = _llm_entry['model']
 if LLM_KIND == 'api':
@@ -1806,7 +1849,7 @@ RAG_API = config.get('RAG_API', '')
 # Automatically resolves to localhost:5000 in bundled mode, cloud URLs otherwise.
 from core.config_cache import (
     get_db_url, get_action_api, get_student_api,
-    get_vision_api, get_book_parsing_api, is_bundled as _config_is_bundled,
+    get_vision_api, is_bundled as _config_is_bundled,
     get_central_db_url,
 )
 DB_URL = get_db_url()
@@ -1820,10 +1863,9 @@ CENTRAL_DB_URL = get_central_db_url()
 ACTION_API = get_action_api()
 STUDENT_API = get_student_api()
 LLAVA_API = get_vision_api()
-BOOKPARSING_API = get_book_parsing_api()
 if _config_is_bundled():
     logging.getLogger(__name__).info(
-        f"Bundled mode: DB/Action/Student/BookParsing/Vision APIs → {DB_URL}"
+        f"Bundled mode: DB/Action/Student/Vision APIs → {DB_URL}"
     )
 
 # ============================================================================
@@ -3123,12 +3165,57 @@ def _handle_shell_command_tool(input_text: str) -> str:
 
     text = input_text.strip()
 
-    # Explicit shell selector: 'powershell: <cmd>' / 'bash: <cmd>' / 'cmd: <cmd>'
+    # Explicit shell selector, in EITHER spelling.  Both resolve HERE, into
+    # the one argv builder below — a second dispatch path is exactly the
+    # drift this closes.
+    #
+    #   colon  'powershell: <cmd>'            this tool's own documented form
+    #   native 'powershell -Command "<cmd>"'  what a model actually writes
+    #
+    # D73, live-measured 2026-09-11 (agent 89091774807, 09:55:19).  Only the
+    # colon form was understood, so the native form fell through to the
+    # Windows default and ran nested as
+    # `cmd /c powershell -Command "..."`.  Reproduced byte-exact:
+    #
+    #     rc     = 0
+    #     stdout = 'Get-PSDrive -Name C | Select-Object -ExpandProperty FreeGB'
+    #     stderr = ''
+    #
+    # Exit 0 with the command echoed back as its own output — worse than an
+    # error, because every honesty gate downstream reads it as SUCCESS.  The
+    # VLM concluded "The output shows 'FreeGB : 100.0'" (a figure present
+    # nowhere in that output), reported exit_reason=done, FAB-GUARD passed
+    # the action because the tool HAD executed, and the user was told the
+    # machine had 127.4 GB free against a real 6.32 GB.
+    #
+    # Dispatched directly the same command returns rc=1 with 'Property
+    # "FreeGB" cannot be found' — a failure the model can act on.
     shell_override = None
     m = _re_shell.match(r'^(powershell|pwsh|bash|sh|cmd)\s*:\s*(.+)$', text, _re_shell.IGNORECASE)
     if m:
         shell_override = m.group(1).lower()
         text = m.group(2).strip()
+    else:
+        # -enc / -EncodedCommand is deliberately NOT accepted as a selector:
+        # it is obfuscation, and leaving it unstripped keeps it in front of
+        # the denylist pattern that blocks it.  Only the execute-this-string
+        # switches (-Command / -c / /c) are consumed.
+        m = _re_shell.match(
+            r'^(powershell|pwsh|bash|sh|cmd)(?:\.exe)?\s+'
+            r'(?:-(?:NoProfile|NonInteractive|NoLogo|ExecutionPolicy\s+\S+|'
+            r'WindowStyle\s+\S+)\s+)*'
+            r'(?:-Command|-c|/c)\s+(.+)$',
+            text, _re_shell.IGNORECASE)
+        if m:
+            shell_override = m.group(1).lower()
+            inner = m.group(2).strip()
+            # Strip ONE matching pair of wrapping quotes, as the shell would.
+            if len(inner) >= 2 and inner[0] == inner[-1] and inner[0] in '"\'':
+                inner = inner[1:-1].strip()
+            # The denylist below now sees the INNER command.  Its patterns are
+            # substring searches, so destructive text is still caught — pinned
+            # by TestNativeShellInvocationIsUnderstood's denylist cases.
+            text = inner or text
 
     # --- Denylist of destructive patterns (case-insensitive, conservative)
     _DENY_PATTERNS = [
@@ -3189,6 +3276,17 @@ def _handle_shell_command_tool(input_text: str) -> str:
                 f"If you really need this, ask the user to run it manually."
             )
 
+    # --- The owner's permission: the same computer_control consent the VLM
+    # loop checks (integrations.vlm.safety.computer_control_block).  After
+    # the denylist on purpose, so a destructive command is refused without
+    # asking anyone.  Inside a VLM run this thread's prompt_id is the run's
+    # agent (run_local_agentic_loop sets it); for the LangChain tool it is
+    # the chat turn's agent, stamped by the /chat handler.
+    from integrations.vlm.safety import computer_control_block
+    _refusal = computer_control_block(thread_local_data.get_prompt_id())
+    if _refusal is not None:
+        return f"Shell_Command not run: {_refusal}"
+
     # --- Choose shell + argv
     if sys.platform == 'win32':
         if shell_override in ('powershell', 'pwsh'):
@@ -3205,25 +3303,40 @@ def _handle_shell_command_tool(input_text: str) -> str:
         else:
             argv = ['/bin/sh', '-c', text]
 
+    # Bounded through core.subprocess_safe — a plain subprocess.run(timeout=30)
+    # CANNOT enforce that 30s on Windows.  When the deadline fires, run() kills
+    # the direct child and then calls process.communicate() a SECOND time with
+    # NO timeout (CPython subprocess.py:559) to drain the pipes.  kill() does
+    # not reach a grandchild, and a surviving grandchild holds the inherited
+    # stdout/stderr WRITE handles open, so the reader threads never see EOF and
+    # that drain blocks forever — the `except TimeoutExpired` below could never
+    # be reached.  Measured live 2026-09-09: agent 33323830039's reuse turn sat
+    # in exactly this frame for 21 minutes while llama-server was idle,
+    # wedging that user's whole chat turn (thread dump, D35).
+    #
+    # run_bounded kills AND explicitly closes the parent-side handles, which is
+    # what actually releases the readers; its boundedness is already proven by
+    # tests/unit/test_subprocess_safe.py::TestRunProbeBoundedness.  It also
+    # pins stdin=DEVNULL, so a command that unexpectedly reads stdin gets EOF
+    # instead of hanging — a second way this could freeze, also closed.
+    #
+    # argv still routes through the chosen shell, and run_bounded never passes
+    # shell=True, so the string is not double-parsed.  no_window_kwargs() is
+    # applied INSIDE run_bounded; repeating it here would be a second copy of
+    # that decision.
     try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            # Do NOT pass shell=True — argv already routes through the
-            # chosen shell and shell=True would double-parse the string.
-            shell=False,
-         **no_window_kwargs())
-    except subprocess.TimeoutExpired:
-        return (
-            "Shell_Command timed out after 30s. For long-running work use "
-            "Execute_Coding_Task instead, which has a longer budget."
-        )
+        proc = run_bounded(argv, timeout=30)
     except FileNotFoundError as e:
         return f"Shell_Command: interpreter not found — {e}"
     except Exception as e:
         return f"Shell_Command error: {type(e).__name__}: {str(e)[:200]}"
+
+    # run_bounded never raises TimeoutExpired — it reports the kill this way.
+    if proc.timed_out:
+        return (
+            "Shell_Command timed out after 30s. For long-running work use "
+            "Execute_Coding_Task instead, which has a longer budget."
+        )
 
     out = (proc.stdout or '').strip()
     err = (proc.stderr or '').strip()
@@ -3302,6 +3415,16 @@ def _handle_computer_action_tool(input_text: str) -> str:
                     return last_content[:500]
                 return f"Done — {n_actions} actions in {elapsed:.0f}s."
             return f"Done in {elapsed:.0f}s."
+
+        if exit_reason == 'consent_required':
+            # The owner has not allowed agents to control this computer
+            # (integrations.vlm.safety.computer_control_block); the loop's one
+            # error record says so.  Shell_Command needs the same permission,
+            # so no other route is offered.
+            return next((r.get('content') for r in responses
+                         if r.get('type') == 'error' and r.get('content')),
+                        'Not run: the owner has not allowed agents to control '
+                        'this computer.')
 
         # Non-done paths: be honest to the router so it doesn't confabulate.
         # The router sees this string as the tool's final answer and should
@@ -4081,6 +4204,21 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                                     'color': meta.get('color') or '#6c63ff',
                                     'icon': meta.get('icon') or 'link',
                                     'url': authorize_url,
+                                    # COMPONENT_TYPES['oauth_link'] declares
+                                    # authorize_url/provider/title
+                                    # (liquid_ui_service.py:690) and the web
+                                    # renderer builds its ONLY action from
+                                    # `data.authorize_url`
+                                    # (AgentOverlay.jsx:736).  Only `url` was
+                                    # emitted, so actions was [] and the card
+                                    # rendered "Sign in to service" with
+                                    # nothing to click -- the handshake could
+                                    # not be completed on the desktop.  `url`
+                                    # stays: the RN card reads it
+                                    # (AgentInlineChatCard.js:382).
+                                    'authorize_url': authorize_url,
+                                    'provider': meta.get('display_name') or channel_type,
+                                    'title': f"Sign in to {meta.get('display_name') or channel_type}",
                                     'external_url': meta.get('external_url'),
                                     'cta_label': f"Connect with {meta.get('display_name') or channel_type}",
                                 },
@@ -6670,210 +6808,53 @@ def parse_link_for_crwalab(inp):
 
 
 def _parse_pdf_in_process(input_url, user_id, request_id):
-    """Parse PDF in-process. Agent sees every step, UI sees percentage progress bar.
+    """Read a PDF the agent found by URL: download it, then hand it to the ONE
+    book pipeline (integrations/learning/book_pipeline.py).
 
-    Publishes to com.hertzai.bookparsing.{user_id} with {percentage, page_number, ...}
-    — same pattern as the cloud pipeline (wrapper.py). Frontend crossbarWorker.js
-    detects 'percentage' field → PROGRESS_UPDATE → ChatMessageList progress bar.
-
-    Downloads → converts to images → Qwen Vision per page → ToC → chapters → book name.
-    Returns full progress log + extracted content as a single string.
+    This used to re-run the whole parse sequence inline, against helpers
+    imported from Nunba's routes.upload_routes: a second orchestrator of the
+    same pipeline, and one a HARTOS node without Nunba could never run (it fell
+    through to a hive-peer offload, then a cloud URL). The pipeline now runs on
+    every node, so this only downloads, delegates, and formats what the agent
+    sees. Progress still reaches the UI on com.hertzai.bookparsing.{user_id}:
+    the pipeline publishes it, with the book's real file_id.
     """
-    progress = []
-    _total_pages = [0]  # mutable for closure
-    _filename = [input_url.split("/")[-1]]
+    from integrations.learning import book_pipeline
 
-    def step(msg, percentage=None, page_number=None):
-        progress.append(msg)
-        app.logger.info(msg)
-        # Publish percentage progress to bookparsing topic (UI progress bar)
-        try:
-            payload = {
-                "request_id": request_id,
-                "bot_type": "Agent",
-                "filename": _filename[0],
-            }
-            if percentage is not None:
-                payload["percentage"] = int(percentage)
-            if page_number is not None:
-                payload["page_number"] = page_number
-            payload["text"] = [msg]
-            if _total_pages[0] > 0:
-                payload["file_id"] = request_id  # use request_id as identifier
-
-            publish_async(
-                f'com.hertzai.bookparsing.{user_id}',
-                json.dumps(payload),
-            )
-        except Exception:
-            logging.getLogger(__name__).exception("step: swallowed Exception")
-
-    # Step 1: Download PDF
-    step(f"Downloading PDF from {input_url}...")
-    response = pooled_get(input_url, timeout=60)
-    pdf_file_name = input_url.split("/")[-1]
-    if not pdf_file_name.endswith('.pdf'):
-        pdf_file_name += '.pdf'
-
-    upload_dir = os.path.join(os.getcwd(), 'upload')
-    os.makedirs(upload_dir, exist_ok=True)
-    pdf_save_path = os.path.join(upload_dir, pdf_file_name)
-    with open(pdf_save_path, 'wb') as f:
-        f.write(response.content)
-    step(f"PDF saved: {len(response.content)} bytes")
-
+    progress = [f"Downloading PDF from {input_url}..."]
+    # A failed download raises to the caller, which reports the task as failed,
+    # as it always has; a PDF that cannot be read is answered here.
+    pdf_path = book_pipeline.fetch_pdf(input_url)
+    progress.append(f"PDF saved: {pdf_path.stat().st_size} bytes")
     try:
-        # Import parsing functions from Nunba routes (same process)
-        from routes.upload_routes import (
-            _pdf_to_images, _parse_page_via_vision,
-            _assign_chapters_to_pages, _generate_book_name,
-            _save_parse_to_db,
-        )
+        result = book_pipeline.parse_book(pdf_path, user_id, request_id, log=progress)
+    except book_pipeline.BookParseError as e:
+        return "\n".join(progress + [f"Error: {e}"])
+    if result.get('stored') is False:
+        # Read, but the library could not keep it: the agent still gets the
+        # text, as this reader always did.
+        progress.append(f"Not saved to the book library: {result.get('store_error')}")
 
-        # Step 2: Convert PDF to page images
-        step("Converting PDF to page images...", percentage=2)
-        pages = _pdf_to_images(pdf_save_path)
-        if not pages:
-            step("FAILED: Could not convert PDF to images")
-            return "\n".join(progress) + "\nError: PDF conversion failed. Is pdf2image or PyMuPDF installed?"
-        _total_pages[0] = len(pages)
-        _filename[0] = pdf_file_name
-        step(f"Converted to {len(pages)} page images", percentage=5)
-
-        # Step 3: Parse each page via Qwen Vision
-        results = []
-        whole_text_parts = []
-        toc_entries = []
-
-        for page_num, img_path in pages:
-            # percentage: 5% base + page progress scaled to 85% (5..90)
-            pct = 5 + (page_num / len(pages)) * 85
-            step(f"Parsing page {page_num}/{len(pages)} via Qwen Vision...",
-                 percentage=pct, page_number=page_num)
-            page_data = _parse_page_via_vision(page_num, img_path)
-            results.append(page_data)
-            page_text = page_data.get('text', '')
-            whole_text_parts.append(page_text)
-            if page_data.get('toc_entries'):
-                toc_entries.extend(page_data['toc_entries'])
-            word_count = len(page_text.split())
-            pct = 5 + (page_num / len(pages)) * 85
-            step(f"Page {page_num}: type={page_data.get('page_type', '?')}, "
-                 f"{word_count} words, {len(page_data.get('elements', []))} elements",
-                 percentage=pct, page_number=page_num)
-
-        # Step 4: Cross-page chapter assignment
-        step("Assigning chapters from Table of Contents...", percentage=92)
-        results = _assign_chapters_to_pages(results, toc_entries)
-        if toc_entries:
-            step(f"Found {len(toc_entries)} ToC entries, assigned chapters", percentage=94)
+    whole_text = result['whole_text']
+    content_for_agent = whole_text
+    if len(content_for_agent) > 8000:
+        truncate_pos = content_for_agent.rfind('.', 0, 8000)
+        if truncate_pos > 6000:
+            content_for_agent = content_for_agent[:truncate_pos + 1] + "\n[Content truncated]"
         else:
-            step("No ToC found — skipping chapter assignment", percentage=94)
+            content_for_agent = content_for_agent[:8000] + "\n[Content truncated]"
 
-        # Step 5: Generate book name
-        step("Generating book title...", percentage=95)
-        book_name = None
-        if whole_text_parts:
-            book_name = _generate_book_name(
-                whole_text_parts[0][:500] if whole_text_parts[0] else '',
-                toc_entries
-            )
-        step(f"Book title: {book_name or '(could not determine)'}", percentage=97)
-
-        # Step 6: Save to DB
-        step("Saving to database...", percentage=98)
-        whole_text = '\n\n'.join(whole_text_parts)
-        try:
-            from routes.db_routes import _get_db
-            from datetime import datetime, timezone as tz
-            conn = _get_db()
-            now = datetime.now(tz.utc).isoformat()
-            cursor = conn.execute(
-                """INSERT INTO pdf_files (user_id, filename, directory, request_id, created_date)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (user_id, pdf_file_name, upload_dir, request_id, now)
-            )
-            conn.commit()
-            file_id = cursor.lastrowid
-            conn.close()
-            _save_parse_to_db(file_id, results, whole_text, toc_entries, book_name, user_id)
-            step(f"Saved to DB: file_id={file_id}", percentage=99)
-        except Exception as db_err:
-            step(f"DB save skipped: {db_err}")
-
-        # Build agent-visible output
-        step(f"Complete: {len(pages)} pages, {len(whole_text.split())} total words",
-             percentage=100)
-
-        # Truncate whole_text for agent context
-        content_for_agent = whole_text
-        if len(content_for_agent) > 8000:
-            truncate_pos = content_for_agent.rfind('.', 0, 8000)
-            if truncate_pos > 6000:
-                content_for_agent = content_for_agent[:truncate_pos + 1] + "\n[Content truncated]"
-            else:
-                content_for_agent = content_for_agent[:8000] + "\n[Content truncated]"
-
-        return (
-            f"--- PDF Parse Progress ---\n"
-            f"{chr(10).join(progress)}\n"
-            f"--- Extracted Content ---\n"
-            f"File: {pdf_file_name}\n"
-            f"Book: {book_name or 'Unknown'}\n"
-            f"Pages: {len(pages)}\n"
-            f"Total words: {len(whole_text.split())}\n"
-            f"Chapters: {len(toc_entries)}\n"
-            f"---\n{content_for_agent}"
-        )
-
-    except ImportError as ie:
-        step(f"Import error: {ie} — falling back to hive mesh or HTTP")
-
-        # Fallback 1: Try hive mesh peer with vision model
-        try:
-            from integrations.agent_engine.compute_mesh_service import get_compute_mesh
-            mesh = get_compute_mesh()
-            if mesh and mesh._peers:
-                step("No local vision model — sending document to hive peer with GPU...")
-                result = mesh.offload_to_best_peer(
-                    model_type='vision',
-                    prompt=f'Parse PDF document: {pdf_file_name}',
-                    options={'image_path': pdf_save_path, 'timeout': 120},
-                )
-                if result and 'error' not in result:
-                    step("Document parsed by hive peer", percentage=100)
-                    return (
-                        f"--- Progress ---\n{chr(10).join(progress)}\n"
-                        f"--- Result (via hive peer) ---\n{result.get('response', '')}"
-                    )
-        except Exception as mesh_err:
-            step(f"Hive mesh unavailable: {mesh_err}")
-
-        # Fallback 2: Cloud HTTP
-        if BOOKPARSING_API:
-            step("Sending to cloud parsing service...")
-            try:
-                payload = {'user_id': user_id, 'request_id': request_id}
-                with open(pdf_save_path, 'rb') as f:
-                    files = [('file', (pdf_file_name, f, 'application/pdf'))]
-                    resp = pooled_post(BOOKPARSING_API, data=payload, files=files, timeout=60)
-                return (
-                    f"--- Progress ---\n{chr(10).join(progress)}\n"
-                    f"--- Result (via cloud) ---\n{resp.text}"
-                )
-            except Exception as cloud_err:
-                step(f"Cloud parsing service unavailable: {cloud_err}")
-
-        # All paths exhausted
-        step("Document parsing requires a vision model (GPU). "
-             "No local GPU, no hive peers with GPU, and the cloud service "
-             "is not responding. Please try again when a GPU device is connected.")
-        return "\n".join(progress)
-    finally:
-        try:
-            os.remove(pdf_save_path)
-        except OSError:
-            logging.getLogger(__name__).warning("_parse_pdf_in_process: swallowed OSError", exc_info=True)
+    return (
+        f"--- PDF Parse Progress ---\n"
+        f"{chr(10).join(progress)}\n"
+        f"--- Extracted Content ---\n"
+        f"File: {pdf_path.name}\n"
+        f"Book: {result.get('book_name') or 'Unknown'}\n"
+        f"Pages: {result['total_pages']}\n"
+        f"Total words: {len(whole_text.split())}\n"
+        f"Chapters: {result['chapters']}\n"
+        f"---\n{content_for_agent}"
+    )
 
 
 try:
@@ -7242,21 +7223,41 @@ def top5_results(query):
     if search is None:
         app.logger.warning(
             "top5_results: GoogleSearchAPIWrapper unavailable "
-            "(missing GOOGLE_API_KEY / GOOGLE_CSE_ID).  Returning empty.")
-        return []
+            "(missing GOOGLE_API_KEY / GOOGLE_CSE_ID).")
+        return ("Web search is not configured on this machine "
+                "(GOOGLE_API_KEY / GOOGLE_CSE_ID are not set), so no results "
+                "could be fetched.  This is a setup gap, not an empty web.")
 
     try:
         top_2_search_res = search.results(query, 2) or []
     except Exception as e:
         app.logger.warning(f"top5_results: search.results() failed: {e}")
-        return []
+        return (f"The web search call failed and returned no results: {e}.  "
+                f"Treat this as a failed step, not as 'nothing was found'.")
 
     top_2_search_res_link = [
         res['link'] for res in top_2_search_res
         if isinstance(res, dict) and 'link' in res
     ]
     if not top_2_search_res_link:
-        return []
+        # THE EXIT THAT ACTUALLY FIRES, and it used to be silent.  Measured
+        # 2026-09-07: 79 of 158 google_search payloads reaching StatusVerifier
+        # were the two characters '[]', while the two logged exits above
+        # produced ZERO warnings across 47 live invocations -- so every one of
+        # those empties came through here, with no diagnostic at all.
+        #
+        # The raw payload is logged because the CAUSE lives in it: the CSE can
+        # answer 200-OK with an entry that carries no 'link' (e.g. langchain's
+        # "No good Google Search Result was found" sentinel), which is a very
+        # different thing from a quota error, and neither is distinguishable
+        # once this returns a bare [].
+        app.logger.warning(
+            "top5_results: search.results() returned %d entr(y/ies) but none "
+            "carried a 'link' -- returning no-results. raw=%.400r",
+            len(top_2_search_res), top_2_search_res)
+        return ("The web search ran but returned no usable results for this "
+                "query (no result carried a link).  Do NOT cite sources for "
+                "this step -- none were retrieved.")
 
     try:
         text = asyncio.run(async_main(top_2_search_res_link))
@@ -7272,13 +7273,6 @@ def top5_results(query):
 
     final_res.append({'text': cleaned_text, 'source': top_2_search_res_link})
     app.logger.info(f"res:-->{final_res}")
-
-    if len(final_res) == 0:
-        try:
-            return search.results(query, 4)
-        except Exception as e:
-            app.logger.warning(f"top5_results: fallback search failed: {e}")
-            return []
 
     return final_res
 
@@ -7377,7 +7371,15 @@ if autogen is not None:
         # Use the dynamic module-level config_list (cloud or local, set by wizard)
         from hartos.threadlocal import thread_local_data as _tld
         _override = _tld.get_model_config_override() if hasattr(_tld, 'get_model_config_override') else None
-        _clist = _override or config_list
+        # `config_list` was never bound in this module -- ruff F821 reports it
+        # at both sites, so with no thread-local override (the normal case)
+        # this line raised NameError.  Both functions are currently unreached,
+        # which is why it never surfaced; the cost of leaving it is that this
+        # file's F821 gate stays red and hides the NEXT undefined name.
+        # get_autogen_config_list() is the canonical resolver
+        # (core/autogen_config.py:205), and with_local_fallback's docstring
+        # already describes this very idiom as "override or config_list".
+        _clist = _override or get_autogen_config_list()
 
         llm_config = {
             "config_list": _clist,
@@ -7457,7 +7459,15 @@ if autogen is not None:
         """Create new assistant and user agents for a given user_id"""
         from hartos.threadlocal import thread_local_data as _tld
         _override = _tld.get_model_config_override() if hasattr(_tld, 'get_model_config_override') else None
-        _clist = _override or config_list
+        # `config_list` was never bound in this module -- ruff F821 reports it
+        # at both sites, so with no thread-local override (the normal case)
+        # this line raised NameError.  Both functions are currently unreached,
+        # which is why it never surfaced; the cost of leaving it is that this
+        # file's F821 gate stays red and hides the NEXT undefined name.
+        # get_autogen_config_list() is the canonical resolver
+        # (core/autogen_config.py:205), and with_local_fallback's docstring
+        # already describes this very idiom as "override or config_list".
+        _clist = _override or get_autogen_config_list()
 
         llm_config = {
             "temperature": 0.7,
@@ -8601,32 +8611,48 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         # expert publish calls _tts_synthesize_and_publish directly,
         # below this gate) are untouched.
         _tts_wanted = True
+        _avatar_id = None
         try:
             # Local import: _chat_reply's source is exec'd in an isolated
             # namespace by test_consent_fanout_p2, where module globals
             # (including the flask request proxy) do not exist.
             from flask import request as _req
-            _mm = (_req.get_json(silent=True) or {}).get('media_mode')
+            _body = _req.get_json(silent=True) or {}
+            _mm = _body.get('media_mode')
             if _mm == 'text':
                 _tts_wanted = False
                 app.logger.info(
                     '_chat_reply: TTS suppressed (media_mode=text) for '
                     f'request_id={request_id}')
+            # The avatar this reply is spoken as.  Its voice belongs to the
+            # avatar id, like its image (core/teacher_avatar.py), never to the
+            # agent: one avatar fronts many agents, and one agent can speak as
+            # several avatars.  Absent -> the engine's default voice.
+            try:
+                from core.teacher_avatar import avatar_id_from
+                _avatar_id = avatar_id_from(_body.get('teacher_avatar_id'))
+            except Exception as _ae:
+                app.logger.debug(f"_chat_reply: avatar id unread: {_ae}")
         except RuntimeError:
             pass  # outside a request — keep speaking, as before
+        # preferred_lang resolution must match the chat entry path:
+        # body/kwarg → canonical persisted reader → 'en'.  Bare
+        # 'en' default forced English Piper on Tamil replies.  Resolved
+        # ahead of the TTS gate because the chat-sync persist below reads it
+        # on EVERY reply: inside the gate, a text-mode reply left it unbound
+        # there, and the UnboundLocalError dropped that turn from the
+        # cross-device mirror.
+        _lang = payload.get('preferred_lang') or payload.get('language')
+        if not _lang:
+            try:
+                from core.user_lang import get_preferred_lang
+                _lang = get_preferred_lang() or 'en'
+            except Exception:
+                _lang = 'en'
         if _tts_wanted:
             try:
-                # preferred_lang resolution must match the chat entry path:
-                # body/kwarg → canonical persisted reader → 'en'.  Bare
-                # 'en' default forced English Piper on Tamil replies.
-                _lang = payload.get('preferred_lang') or payload.get('language')
-                if not _lang:
-                    try:
-                        from core.user_lang import get_preferred_lang
-                        _lang = get_preferred_lang() or 'en'
-                    except Exception:
-                        _lang = 'en'
-                _tts_synthesize_and_publish(response_text, user_id, request_id, language=_lang)
+                _tts_synthesize_and_publish(response_text, user_id, request_id,
+                                            language=_lang, avatar_id=_avatar_id)
             except Exception as e:
                 # Never let a TTS failure block delivery of the text reply.
                 app.logger.debug(f"_chat_reply: TTS dispatch skipped: {e}")
@@ -8739,7 +8765,61 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     return jsonify(payload)
 
 
-def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
+def _speak_in_voice(text, language, voice):
+    """Speak ``text`` in the recorded ``voice``; returns the audio path, or
+    None for the default voice.
+
+    Cloning from a reference is the canonical synth entry's job:
+    TTSRouter.synthesize requires a cloning engine when it is given a voice
+    and brings one up on demand, while tts_engine.synthesize_text -- the
+    chat path's default voice -- is the divergent copy
+    (docs/architecture/HARTOS_PARALLEL_PATH_AUDIT.md "TTS orchestration
+    split", docs/internal/ux_degrading_design_choices 3.5).  So only a
+    voiced utterance goes to the router, and synthesize_text never receives
+    a reference: its primary backend (Piper on a desktop) treats one as a
+    voice id and raises, and its fallback then makes another engine the
+    active one for good.
+
+    None unless ``voice`` is a reference by the router's own test
+    (tts_router.synthesize: ``voice not in ('default', '', None)``), and
+    unless a cloning engine answered with a file: the router appends espeak
+    even when it needs a clone, and espeak ignores the voice, so an answer
+    without an error does not prove the voice was used.  (Moving that check
+    into the router changes /api/voice/speak's contract; it is tracked
+    separately.)
+    """
+    if voice in (None, '', 'default'):
+        return None
+    try:
+        from core.tool_logging import timed_stage
+        from integrations.channels.media.tts_router import (
+            ENGINE_REGISTRY, get_tts_router,
+        )
+        with timed_stage('tts.synthesize_voiced', logger=app.logger,
+                         warn_over_ms=3000, chars=len(text), lang=language):
+            result = get_tts_router().synthesize(
+                text, language=language, voice=voice, source='chat_response')
+    except Exception as e:
+        app.logger.warning(f"TTS: voiced synthesis failed ({e}); default voice")
+        return None
+    if result.error or not result.path or not os.path.isfile(result.path):
+        app.logger.info(f"TTS: voiced synthesis gave no audio "
+                        f"({result.error or result.path!r}); default voice")
+        return None
+    spec = ENGINE_REGISTRY.get(result.engine_id)
+    if spec is None or not spec.voice_clone:
+        app.logger.info(f"TTS: {result.engine_id} cannot clone a voice; "
+                        f"default voice")
+        return None
+    # Served by Nunba's /tts/audio/<basename>: a cloning engine's ToolWorker
+    # writes under HEVOLVE_MODEL_DIR (default ~/.hevolve/models)/<tool>/output,
+    # and that route searches ~/.hevolve/models/*/output.  So this holds while
+    # HEVOLVE_MODEL_DIR stays at its default, as for Nunba's own GPU engines.
+    return result.path
+
+
+def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
+                                avatar_id=None):
     """Fire-and-forget: synthesize TTS, push audio via WAMP.
 
     Same pattern as chatbot_pipeline/chatbot.py:
@@ -8751,10 +8831,25 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
     model orchestration, GPU swap — the full pipeline.
 
     Only fires when TTS engine exists (Nunba bundled mode).
+
+    ``language`` None means the caller does not know the turn's language
+    (the speculative expert reply): the user's persisted preference is
+    spoken, the same reader _chat_reply falls back to, not English.
+    ``avatar_id`` is the avatar this utterance is spoken as.  Its recorded
+    voice (core/teacher_avatar.voice_reference) is spoken through the
+    canonical synth entry, TTSRouter.synthesize, which clones from it (see
+    _speak_in_voice).  None, an avatar with no voice, or a voice no engine
+    here can clone keeps synthesize_text's default voice.
     """
     if not text or not text.strip():
         app.logger.debug("TTS: skipped (empty text)")
         return
+    if not language:
+        try:
+            from core.user_lang import get_preferred_lang
+            language = get_preferred_lang() or 'en'
+        except Exception:
+            language = 'en'
     try:
         from tts.tts_engine import get_tts_engine
         engine = get_tts_engine()
@@ -8790,6 +8885,23 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
             _clean = _re.sub(r'\s+', ' ', _clean).strip()         # collapse whitespace
             if not _clean:
                 return  # nothing left after cleaning
+
+            # The avatar's recorded voice, by the lookup a generated video uses
+            # (core/teacher_avatar.py).  Resolved here on the TTS worker, never
+            # on the request thread, so the database round-trip (loopback on a
+            # desktop) and a first download never delay the text reply.
+            _voice = None
+            if avatar_id is not None:
+                try:
+                    from core.teacher_avatar import voice_reference
+                    _voice = voice_reference(avatar_id)
+                except Exception as _ve:
+                    app.logger.debug(
+                        f"TTS: voice of avatar {avatar_id} skipped: {_ve}")
+            # A voiced utterance goes through the canonical synth entry, which
+            # normalizes the text itself, so the stripped text goes in.  None
+            # -> the default voice below.
+            audio_path = _speak_in_voice(_clean, language, _voice)
 
             # ── Converge on the ONE normalizer (task #10 / 3.5) ──
             # The stripping above removes artifacts TTS cannot SAY. It does
@@ -8831,39 +8943,42 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
             # normalization block speech" promise is about crashes; the
             # warn_over_ms below makes it also true of LATENCY, which is the
             # failure mode that actually bit us.
-            try:
-                from core.tool_logging import timed_stage
-                from integrations.channels.media.tts_router import SOURCE_URGENCY
-                from integrations.channels.media.tts_text_normalizer import (
-                    normalize_for_tts,
-                )
-                _urgency = SOURCE_URGENCY.get('chat_response', 'normal')
-                _use_llm = (_urgency != 'instant')
-                with timed_stage('tts.normalize', logger=app.logger,
-                                 warn_over_ms=1500, use_llm=_use_llm,
-                                 chars=len(_clean), lang=language):
-                    _clean = normalize_for_tts(
-                        _clean, language, use_llm=_use_llm,
-                    )
-            except Exception as _ne:  # never let normalization block speech
-                app.logger.debug(f"TTS: normalization skipped ({_ne})")
-
-            from core.tool_logging import timed_stage as _timed_stage
-            with _timed_stage('tts.synthesize', logger=app.logger,
-                              warn_over_ms=3000, chars=len(_clean),
-                              lang=language):
-                _raw = synthesize_text(_clean, language=language)
-            app.logger.info(f"TTS async: synthesize_text returned: {_raw}")
-            # synthesize_text may return a file path string OR a JSON dict/string
-            # with {"path": "...", "duration": ...}. Normalize to a file path.
-            audio_path = _raw
-            if isinstance(_raw, dict):
-                audio_path = _raw.get('path', '')
-            elif isinstance(_raw, str) and _raw.startswith('{'):
+            if not audio_path:
                 try:
-                    audio_path = json.loads(_raw).get('path', '')
-                except (json.JSONDecodeError, AttributeError):
-                    logging.getLogger(__name__).debug("_bg: swallowed json.JSONDecodeError, AttributeError", exc_info=True)
+                    from core.tool_logging import timed_stage
+                    from integrations.channels.media.tts_router import SOURCE_URGENCY
+                    from integrations.channels.media.tts_text_normalizer import (
+                        normalize_for_tts,
+                    )
+                    _urgency = SOURCE_URGENCY.get('chat_response', 'normal')
+                    _use_llm = (_urgency != 'instant')
+                    with timed_stage('tts.normalize', logger=app.logger,
+                                     warn_over_ms=1500, use_llm=_use_llm,
+                                     chars=len(_clean), lang=language):
+                        _clean = normalize_for_tts(
+                            _clean, language, use_llm=_use_llm,
+                        )
+                except Exception as _ne:  # never let normalization block speech
+                    app.logger.debug(f"TTS: normalization skipped ({_ne})")
+
+                # The default voice: synthesize_text never receives a voice
+                # reference (_speak_in_voice says why).
+                from core.tool_logging import timed_stage as _timed_stage
+                with _timed_stage('tts.synthesize', logger=app.logger,
+                                  warn_over_ms=3000, chars=len(_clean),
+                                  lang=language):
+                    _raw = synthesize_text(_clean, language=language)
+                app.logger.info(f"TTS async: synthesize_text returned: {_raw}")
+                # synthesize_text may return a file path string OR a JSON dict/string
+                # with {"path": "...", "duration": ...}. Normalize to a file path.
+                audio_path = _raw
+                if isinstance(_raw, dict):
+                    audio_path = _raw.get('path', '')
+                elif isinstance(_raw, str) and _raw.startswith('{'):
+                    try:
+                        audio_path = json.loads(_raw).get('path', '')
+                    except (json.JSONDecodeError, AttributeError):
+                        logging.getLogger(__name__).debug("_bg: swallowed json.JSONDecodeError, AttributeError", exc_info=True)
             if audio_path and os.path.isfile(audio_path):
                 audio_filename = os.path.basename(audio_path)
                 # Use absolute URL if this node's external URL is known —
@@ -9095,6 +9210,13 @@ def chat():
         )
         if _api_key_match:
             g.auth_source = 'api_key'
+        elif getattr(g, 'auth_source', None) == 'device':
+            # A phone the desktop owner allowed (#111): security.middleware
+            # verified its Ed25519-signed token against the key on file and
+            # left the payload in g.jwt_payload.  The HS256 decode below
+            # cannot verify that token (the phone has no local secret), so
+            # the gate's verdict stands.
+            pass
         elif _bearer_token:
             # Try JWT decode (Layer 1 / Layer 2)
             try:
@@ -9125,7 +9247,8 @@ def chat():
                 'requests. Set HEVOLVE_API_KEY env var for production.'
             )
             chat._auth_warned = True
-        g.auth_source = 'none'
+        if getattr(g, 'auth_source', None) != 'device':
+            g.auth_source = 'none'
 
     # Rate limit: 30 req/min per user/IP
     try:
@@ -9161,7 +9284,17 @@ def chat():
     # Layer 1 (LOCAL): Bearer token signed by this node's HS256 secret
     # Layer 2 (HIVE): Bearer token with Ed25519 node_sig (cross-node)
     # Fallback: body user_id (backward compat for desktop/Nunba mode)
-    if g.auth_source not in ('jwt', 'api_key'):
+    if g.auth_source == 'device':
+        # The user is the one the phone's verified token names; the gate
+        # already refused a body naming anyone else (#51).  Fail closed: a
+        # device verdict without its payload admits nobody, never the
+        # body's or a default user.
+        _device_uid = (getattr(g, 'jwt_payload', None) or {}).get('user_id')
+        if not _device_uid:
+            return jsonify({'error': 'Invalid or expired token.', 'response': None}), 401
+        data['user_id'] = _device_uid
+        g.token_scope = 'hive'
+    elif g.auth_source not in ('jwt', 'api_key'):
         if _bearer_token:
             try:
                 from integrations.social.auth import decode_jwt
@@ -9270,6 +9403,29 @@ def chat():
     file_id = data.get('file_id', None)
     prompt_id = data.get('prompt_id', None)
 
+    # Stamp the thread-local HERE, the first line at which both values exist.
+    #
+    # WHY (measured live 2026-09-09 on agent 18088688973): the canonical stamp
+    # is ~1,100 lines below, and 25 of chat()'s returns fire in between --
+    # including all four exits of the agent-bound REUSE branch.  So a reuse
+    # turn finished without ever writing the thread-local, and everything
+    # downstream that reads it saw None:
+    #   * core/tool_logging.py could not name the session on any of 136 tool
+    #     executions, leaving "did THIS agent's tool run?" unanswerable while
+    #     four sessions interleaved in one log;
+    #   * _emit_tool_call_stage publishes the per-tool UI status only when
+    #     user_id is truthy -- 0 chat.stage events, i.e. task #509's feature
+    #     is dead on this path, not merely unmeasured.
+    #
+    # The later stamp is deliberately LEFT IN PLACE and remains authoritative:
+    # the probe / intermediate / else arms below reset `prompt_id = 0`, and
+    # only that stamp records the 0.  Hoisting instead of adding would put the
+    # real agent id into those paths' thread-local -- a regression.
+    # Guarded by tests/unit/test_chat_seeds_threadlocal_before_returning.py,
+    # which pins both the ordering and the survival of the later stamp.
+    thread_local_data.set_user_id(user_id=user_id)
+    thread_local_data.set_prompt_id(prompt_id)
+
     # ── Wall-clock bound on this turn, armed HERE rather than deeper in ──
     #
     # reuse_recipe.get_agent_response also arms it, but only as a fallback for
@@ -9334,6 +9490,12 @@ def chat():
     # branch (which runs BEFORE that path for non-system-agent requests)
     # can reference it safely.
     custom_prompt = None
+    # The system agent's own prompt_id when the system-agent branch below
+    # takes this turn, else None.  Bound here because the custom_prompt
+    # ladder before get_ans reads it on every request; bound only inside
+    # that branch, every /chat without a prompt_id raised UnboundLocalError
+    # there (live 2026-09-13 13:38).
+    _system_agent_pid = None
     model_config = data.get('model_config', None)
     task_source = data.get('task_source', 'own')
     thread_local_data.set_task_source(task_source)
@@ -9383,9 +9545,22 @@ def chat():
         if not re.fullmatch(r'[a-zA-Z0-9_-]+', prompt_id):
             return jsonify({'error': 'Invalid prompt_id format', 'response': None}), 400
 
-    # Per-request model config override (speculative execution)
+    # Per-request model config override (speculative execution).
+    #
+    # The dispatcher sends ONE entry — the tier it selected
+    # (ModelBackend.to_config_list returns [entry]).  Stored raw, every autogen
+    # agent built from this override runs with a single client, so autogen has
+    # nothing to fall to when that tier fails and the exception ends the turn
+    # (measured 2026-09-06: claude-code 503 'at capacity' / 'not on PATH', 6x
+    # per drive, swallowed by reuse_recipe.get_agent_response).  Composing this
+    # node's own backend on as the TERMINAL entry gives the engine's own ladder
+    # somewhere to land; the selected tier is still entry 0 and still tried
+    # first.  This is the ONE consumer of the payload key, so both producers
+    # (speculative_dispatcher, dispatch.py) and all five override readers
+    # inherit it from here.
     if model_config:
-        thread_local_data.set_model_config_override(model_config)
+        thread_local_data.set_model_config_override(
+            with_local_fallback(model_config))
     else:
         thread_local_data.clear_model_config_override()
 
@@ -9418,6 +9593,34 @@ def chat():
         except ImportError:
             logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
+    # #590 — bind the rid BEFORE the speculative block, which RETURNS on the
+    # should_speculate path.  With the bind below that block, a turn taking the
+    # speculative early return left the rid unbound for the whole rest of the
+    # request.  Moved, not duplicated: the single bind still runs exactly once
+    # per /chat call, and now on every path including that early return.
+    #
+    # SCOPE, MEASURED 2026-09-11 — READ THIS BEFORE CITING THIS COMMENT.
+    # This move does NOT fix the "LLM-CONTEXT empty request_id at chat_agent
+    # (thread=spec_expert_N, thread_local_rid='')" lines.  An earlier draft of
+    # this comment claimed it did; a live drive on the deployed fix refuted
+    # that, and the claim is withdrawn rather than left standing:
+    #   * post-fix drive, 38 llm_outbound rows: 2 populated, 36 empty.  The 2
+    #     populated rows are exactly the two probe rids, i.e. the rows emitted
+    #     on the request thread.  Every spec_expert row was still empty
+    #     (spec_expert_0/2/3 at 14:41-14:43, after the restart).
+    #   * `speculative` is a REQUEST-BODY field defaulting to False
+    #     (`data.get('speculative', False)`), so this block is not entered by
+    #     ordinary traffic at all.
+    #   * the rows that actually carry source=autogen.reuse reach the pool via
+    #     dispatch_draft_first, called further down this function — AFTER both
+    #     the old and the new bind position — so their rid capture
+    #     (speculative_dispatcher.py:1306) was never affected by this ordering.
+    # The real hole is upstream of that capture: whatever thread calls
+    # _schedule_expert_background for the reuse path has no rid bound, so
+    # `_req_rid` is '' and the worker's re-bind at :1580 (`if request_id:`)
+    # cannot fire.  Attributing that caller is the open work, not this line.
+    thread_local_data.set_request_id(request_id=request_id)
+
     # Speculative dispatch: fast response + background expert
     if speculative and prompt and user_id and prompt_id:
         try:
@@ -9438,7 +9641,6 @@ def chat():
             logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
     # return ""
-    thread_local_data.set_request_id(request_id=request_id)
 
     # Security: Prompt injection detection
     if prompt:
@@ -9524,6 +9726,7 @@ def chat():
                         _sys_prompt = _agent_meta['flows'][0]['system_prompt']
                     casual_conv = True
                     custom_prompt = _sys_prompt
+                    _system_agent_pid = prompt_id
                     prompt_id = None  # Skip CREATE/REUSE routing, fall through to get_ans()
                     app.logger.info(f"System agent '{_agent_meta.get('name')}' routed to casual chat")
             except Exception:
@@ -9533,7 +9736,22 @@ def chat():
         # Replaces the global _state_lock for better concurrency.
         _user_lock = _get_user_lock(user_id)
         with _user_lock:
-            if prompt_id and os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}.json')):
+            if _system_agent_pid:
+                # The system-agent branch above already resolved the persona
+                # into custom_prompt and nulled prompt_id so this turn reaches
+                # get_ans().  Falling into the CREATE/REUSE ladder here is what
+                # made that unreachable: `prompt_id` is None, so the `else`
+                # below logged 'GATHER JSON doesnot EXISTS' and set
+                # create_agent=True, sending every system-agent turn into
+                # gather_info instead of casual chat.  Observed live
+                # 2026-09-11 on a persona agent: the log read
+                #   System agent 'Spider-Man' routed to casual chat
+                #   GATHER JSON doesnot EXISTS
+                #   gather_info turn 1/12
+                # on every single message.  Skipping the ladder is the whole
+                # intent of `prompt_id = None` above.
+                pass
+            elif prompt_id and os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}.json')):
                 app.logger.info('GATHER JSON EXISTS')
                 if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_0_recipe.json')):
                     app.logger.info('0 Recipe JSON EXISTS')
@@ -9632,6 +9850,7 @@ def chat():
             # the legitimate ``prompts/78570931871.json``).  Pass None;
             # the dispatcher handles None internally via
             # ``speculation_id`` for any keying that needs a string.
+            from core.teacher_avatar import avatar_id_from
             result = dispatcher.dispatch_draft_first(
                 prompt, str(user_id),
                 str(prompt_id) if prompt_id else None,
@@ -9639,6 +9858,9 @@ def chat():
                 preferred_lang=preferred_lang,
                 user_pref=intelligence_preference,
                 agent_bound=_agent_bound,
+                # The expert's follow-up reply is spoken as this turn's
+                # avatar, like this turn's own reply (_chat_reply).
+                avatar_id=avatar_id_from(data.get('teacher_avatar_id')),
             )
             # Only commit when the dispatcher actually produced a reply.
             # no_draft_model / circuit breaker / guardrail block all leave
@@ -10368,6 +10590,15 @@ def chat():
     elif intermediate:
         custom_prompt = INTERMEDIATE_CONTINUATION
         prompt_id = 0
+    elif _system_agent_pid:
+        # custom_prompt already holds the system agent's persona (the
+        # branch above nulled prompt_id so the turn reaches get_ans).  The
+        # `else` replaced it with Hevolve whenever draft-first did not
+        # answer: live 2026-09-13, Spider-Man replied "Hi! I'm Qwen".
+        # Its own id goes back so get_ans builds the identity block from
+        # its prompts/<id>.json and scopes memory to it; with 0 the
+        # identity read "You are Hevolve" (hartos/agent_identity.py).
+        prompt_id = _system_agent_pid
     else:
         custom_prompt = Hevolve  # use Hevolve from config/template
         prompt_id = 0
@@ -10415,7 +10646,11 @@ def chat():
                 'matched_agent_id': matched_agent,
                 'requires_consent': True,
             },
-            prompt_id=prompt_id if prompt_id else _next_prompt_id(),
+            # A plan proposed inside a system agent's chat is a new agent;
+            # the system agent's own id would send its approval back into
+            # that agent's casual chat.
+            prompt_id=(prompt_id if prompt_id and not _system_agent_pid
+                       else _next_prompt_id()),
             req_token_count=thread_local_data.get_req_token_count(),
             res_token_count=thread_local_data.get_res_token_count(),
             history_request_id=thread_local_data.get_reqid_list(),
@@ -10619,23 +10854,53 @@ def vlm_stop():
 
     Body (JSON):
         {"user_id": "<uid>", "prompt_id": "<pid>"}
+        {"scope": "node"}
     Response:
         {"status": "stopped"|"no_active_session", "user_id", "prompt_id"}
+        {"status", "scope": "node", "stopped_sessions"}
 
     Empty body / missing prompt_id → bulk-stop every active session
     for the given user_id.  Empty user_id is rejected (bulk-stop
     across all users would be a foot-gun).
+
+    scope=node stops every loop on this node, whoever it runs as, and is
+    what the indicator's Stop sends: the desktop has one screen, and each
+    loop is registered under its agent's creator, so the owner's per-user
+    stop left another creator's loop driving the mouse (live 2026-09-14,
+    agent 88659566083).  Only a caller on this machine may send it
+    (_is_local_request, the rule the decorator applies); a token holder
+    elsewhere gets 403 and keeps the per-user stop.  prompt_id is ignored.
     """
     data = request.get_json(silent=True) or {}
     user_id = data.get('user_id')
     prompt_id = data.get('prompt_id')
 
-    if not user_id:
-        return jsonify({'error': 'user_id required'}), 400
-
     from integrations.vlm.local_loop import (
         request_stop, list_active_sessions,
     )
+
+    if data.get('scope') == 'node':
+        if not _is_local_request():
+            app.logger.warning(f'vlm_stop: node-wide stop refused for '
+                               f'{request.remote_addr}: not on this machine')
+            return jsonify({
+                'error': 'forbidden',
+                'message': 'scope=node is only accepted from this machine.',
+            }), 403
+        stopped = [{'user_id': uid, 'prompt_id': pid}
+                   for uid, pid in list_active_sessions()
+                   if request_stop(uid, pid)]
+        app.logger.warning(f'vlm_stop: node-wide stop from '
+                           f'{request.remote_addr}: {len(stopped)} loop(s) '
+                           f'{stopped}')
+        return jsonify({
+            'status': 'stopped' if stopped else 'no_active_session',
+            'scope': 'node',
+            'stopped_sessions': stopped,
+        }), 200
+
+    if not user_id:
+        return jsonify({'error': 'user_id required'}), 400
 
     if prompt_id:
         found = request_stop(str(user_id), str(prompt_id))
@@ -10680,6 +10945,24 @@ def visual_agent():
     # Computer use mode: use VLM point_and_act directly with screenshot
     mode = data.get('mode', 'auto')  # 'computer_use', 'camera', 'auto'
     if mode == 'computer_use' or (mode == 'auto' and request_from != 'Reuse'):
+        # This branch grabs the owner's screen, so it needs their
+        # screen_capture consent: the ask VisionService's capture loop files
+        # (vision_service._consent_ok).  The owner is whose machine this is
+        # (HEVOLVE_OWNER_USER_ID), never the caller's user_id; with no owner,
+        # or a check that fails, nothing is grabbed (#66).
+        _owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+        _allowed = False
+        if _owner:
+            try:
+                from integrations.social.models import db_session
+                from integrations.social.consent_service import ConsentService
+                with db_session(commit=True) as db:
+                    _allowed = ConsentService.check_or_request(
+                        db, _owner, 'screen_capture')
+            except Exception as e:
+                app.logger.warning(f'visual_agent: screen_capture check failed: {e}')
+        if not _allowed:
+            return jsonify({'response': 'Not run: the owner of this computer has not allowed agents to see this screen.', 'vlm_status': 'consent_required'}), 200
         try:
             from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
             import base64, io
@@ -12032,6 +12315,62 @@ def voice_transcribe():
         return jsonify({'error': str(e)}), 500
 
 
+_SAFE_VOICE_NAME = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+
+
+def _safe_voice_ref(voice):
+    """Confine the /api/voice/speak ``voice`` param to a saved-voice NAME (#67).
+
+    TTSRouter treats ``voice`` as a path-OR-name and clone-capable engines READ
+    it as a reference-audio file, so an unauth local caller passing an absolute
+    path or a traversal would read an arbitrary file.  A saved voice name has
+    no path separators and no ``..``; anything else is dropped to None (the
+    engine's default voice).  Internal callers that legitimately pass a
+    resolved path call TTSRouter.synthesize directly in Python, not through
+    this HTTP route, so confining the HTTP surface does not affect them.
+    """
+    if not voice or not isinstance(voice, str):
+        return None
+    name = voice.strip()
+    if '..' in name or not _SAFE_VOICE_NAME.match(name):
+        return None
+    return name
+
+
+#: A voice sample to CLONE from is read and copied into the voices dir, so an
+#: unauth caller could read an arbitrary file.  Require an audio extension and
+#: no traversal so the cloner reads only audio the caller points at, not an
+#: arbitrary sensitive file (a bundled desktop trusts its own local callers,
+#: which the network gate does not cover) (#67).
+_VOICE_SAMPLE_EXTS = ('.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aac', '.webm')
+#: A clone SAVE name is joined into the voices dir as ``<name>.wav``; a name
+#: with a path separator or ``..`` would write outside it.  Spaces and case are
+#: fine (the clone tool lowercases and hyphenates).
+_SAFE_CLONE_NAME = re.compile(r'^[A-Za-z0-9 ._-]{1,64}$')
+
+
+def _safe_sample_path(audio_path):
+    """The clone reference-audio path, or None if it is not a safe audio file."""
+    if not audio_path or not isinstance(audio_path, str):
+        return None
+    path = audio_path.strip()
+    if not path or '..' in path:
+        return None
+    if not path.lower().endswith(_VOICE_SAMPLE_EXTS):
+        return None
+    return path
+
+
+def _safe_clone_name(name):
+    """The clone save-name, or None if it has a path separator / traversal."""
+    if not name or not isinstance(name, str):
+        return None
+    clean = name.strip()
+    if '..' in clean or not _SAFE_CLONE_NAME.match(clean):
+        return None
+    return clean
+
+
 @app.route('/api/voice/speak', methods=['POST'])
 def voice_speak():
     """Synthesize text to speech via smart TTS router.
@@ -12039,10 +12378,15 @@ def voice_speak():
     Accepts JSON with:
       - text (required)
       - language (optional, auto-detected)
-      - voice (optional, voice ref for cloning)
+      - voice (optional, saved-voice NAME for cloning; a path-like value is
+        dropped -- see _safe_voice_ref, #67)
       - source (optional, context hint: chat_response/greeting/read_aloud/etc.)
-      - engine (optional, bypass router with direct engine selection)
-      - output_path (optional, auto-generated if omitted)
+      - engine (optional, direct engine selection; TTSRouter accepts it only
+        when it is a known ENGINE_REGISTRY id, else ignores it)
+
+    The caller cannot choose where the WAV is written: the router writes to its
+    own TTS output dir, which /api/voice/audio serves.  (Honouring a caller
+    output_path was an arbitrary file write on any node with a TTS engine, #67.)
     """
     try:
         from integrations.channels.media.tts_router import get_tts_router
@@ -12056,8 +12400,8 @@ def voice_speak():
         result = router.synthesize(
             text=text,
             language=data.get('language'),
-            voice=data.get('voice'),
-            output_path=data.get('output_path'),
+            voice=_safe_voice_ref(data.get('voice')),
+            output_path=None,
             source=data.get('source'),
             engine_override=data.get('engine'),
         )
@@ -12096,10 +12440,15 @@ def voice_clone():
     """
     try:
         data = request.get_json() or {}
-        audio_path = data.get('audio_path', '')
-        name = data.get('name', '')
+        # #67: audio_path is READ + copied into the voices dir and name is
+        # joined into it as <name>.wav, so confine both (an unauth local caller
+        # is not covered by the network gate).
+        audio_path = _safe_sample_path(data.get('audio_path'))
+        name = _safe_clone_name(data.get('name'))
         if not audio_path or not name:
-            return jsonify({'error': 'audio_path and name required'}), 400
+            return jsonify({
+                'error': 'audio_path (an audio file, no "..") and name '
+                         '(no path separators) are required'}), 400
 
         import json as _json
         engine = data.get('engine', 'luxtts')
@@ -12736,7 +13085,7 @@ def _init_runtime_tools():
         from integrations.service_tools.runtime_manager import runtime_tool_manager
         runtime_tool_manager.load_state()
     except Exception as e:
-        klogger.warning(f"Runtime tool init failed: {e}")
+        logger.warning(f"Runtime tool init failed: {e}")
 
 
 def _validate_startup():

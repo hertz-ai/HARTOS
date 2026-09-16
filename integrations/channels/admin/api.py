@@ -2493,7 +2493,6 @@ def list_agents():
               "last_tick": "<iso timestamp or null>",
               "daemon_backed": bool,
               "idle_compute_opt_in": bool,
-              "voice_profile": {...} | null,
               "tier": "flat" | "regional" | "central"
             }, ...
           ],
@@ -2553,7 +2552,6 @@ def list_agents():
             'last_heartbeat': last_active.isoformat() if last_active else None,
             'daemon_backed': bool(getattr(agent, 'idle_compute_opt_in', False)),
             'idle_compute_opt_in': bool(getattr(agent, 'idle_compute_opt_in', False)),
-            'voice_profile': getattr(agent, 'voice_profile', None),
             'tier': getattr(agent, 'role', None) or 'flat',
         })
 

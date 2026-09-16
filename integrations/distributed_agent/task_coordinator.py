@@ -22,10 +22,11 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from agent_ledger.core import SmartLedger, Task, TaskType, TaskStatus
+from agent_ledger.core import (
+    BlockedReason, SmartLedger, Task, TaskStatus, TaskType)
 from agent_ledger.distributed import DistributedTaskLock
 from agent_ledger.verification import TaskVerification, TaskBaseline
-from core.constants import HIVE_DEPTH
+from core.constants import HIVE_DEPTH, HIVE_WORKER_CAPABILITIES
 
 logger = logging.getLogger(__name__)
 
@@ -118,9 +119,35 @@ class DistributedTaskCoordinator:
         # just re-dispatching an in-flight goal — reuse the existing task set,
         # do NOT create a duplicate parent+children (the unbounded-growth bug).
         if goal_id in self._ledger.tasks:
+            # HEAL on re-dispatch.  This branch used to return straight away,
+            # which preserved whatever the FIRST submission wrote for as long
+            # as the ledger lived.  Task sets created before the
+            # goal-type-as-capability fix (3133ede1b, 04c213892) still demand
+            # capabilities_required=[goal_type], e.g. ['hive_growth'], a name
+            # no worker can ever advertise, so those goals dispatched every
+            # tick into a queue nothing could claim.
+            #
+            # Measured on central 2026-09-13: three hive goals with spark
+            # frozen at 364/448/531 since 09-01, their task sets surviving two
+            # redeploys because the coordinator ledger is file-backed.  Healing
+            # here fixes every node on its next tick, with no manual surgery.
+            healed = self._heal_goal_type_demands(goal_id)
+            # A continuous goal's hive work comes back after every finished
+            # run (owner decision 2026-09-13); see _reopen_finished_run.
+            reopened = (self._reopen_finished_run(goal_id)
+                        if context.get('continuous') else 0)
+            # Work held for a person or an expert comes back when the goal
+            # is dispatched again; see _release_held_tasks.
+            released = self._release_held_tasks(goal_id)
             logger.info(
                 f"submit_goal: goal {goal_id} already has tasks — reusing "
-                f"(skipping duplicate task creation)")
+                f"(skipping duplicate task creation)"
+                + (f"; healed {healed} unclaimable requirement(s)"
+                   if healed else "")
+                + (f"; re-armed {reopened} task(s) for the next run"
+                   if reopened else "")
+                + (f"; released {released} task(s) held for help"
+                   if released else ""))
             return goal_id
 
         # Enforce HIVE_DEPTH — reject propagations deeper than the
@@ -173,6 +200,133 @@ class DistributedTaskCoordinator:
 
         logger.info(f"Goal submitted: {goal_id} with {len(decomposed_tasks)} tasks")
         return goal_id
+
+    def _heal_goal_type_demands(self, goal_id: str) -> int:
+        """Drop a child's demand for its OWN goal type when no worker can
+        advertise that name.  Returns how many children were healed.
+
+        Narrow on purpose.  It removes exactly one defect signature, a
+        goal_type written into capabilities_required, and only when that name
+        is outside HIVE_WORKER_CAPABILITIES.  A real capability ('marketing',
+        'coding', 'vision') is kept, and so is any other name a caller chose
+        deliberately, such as robot hardware requirements.  This repairs one
+        known bad write; it is not a general filter over what tasks may demand.
+
+        Only PENDING, unclaimed children are touched.  Rewriting the demand of
+        a task a worker already holds would change its contract mid-flight.
+
+        Saves only when something changed.  This runs on EVERY re-dispatch,
+        i.e. every tick for every in-flight goal, and an unconditional save()
+        would re-serialize the whole ledger each time -- the json.dump storm
+        behind #145.
+        """
+        parent = self._ledger.get_task(goal_id)
+        healed = 0
+        for child_id in list(getattr(parent, 'child_task_ids', None) or []):
+            child = self._ledger.get_task(child_id)
+            if child is None or child.status != TaskStatus.PENDING:
+                continue
+            ctx = child.context
+            if ctx.get('claimed_by'):
+                continue
+            goal_type = ctx.get('goal_type')
+            demanded = list(ctx.get('capabilities_required') or [])
+            if (not goal_type or goal_type not in demanded
+                    or goal_type in HIVE_WORKER_CAPABILITIES):
+                continue
+            ctx['capabilities_required'] = [
+                c for c in demanded if c != goal_type]
+            healed += 1
+        if healed:
+            self._ledger.save()
+        return healed
+
+    def _reopen_finished_run(self, goal_id: str) -> int:
+        """Re-arm a CONTINUOUS goal's hive work once its last run has finished.
+
+        Owner decision 2026-09-13: a continuous goal's hive task comes back
+        after every run.  submit_goal only ever creates a goal's task set once,
+        so without this a continuous goal got exactly one hive run for its
+        whole life and then dispatched into nothing again.
+
+        Re-opens the SAME task ids rather than minting new ones.  A fresh task
+        per run would grow the ledger by one task per goal every few minutes,
+        which is the unbounded growth behind the 9166-task save deadlock
+        (2026-06-12).  Re-opening keeps one live child per goal, and every
+        reopen is recorded in the task's state_history.
+
+        Only when EVERY child is COMPLETED: a run still in flight is never
+        disturbed, and a FAILED child is left alone so the ledger's fast-fail
+        breaker (#59) still stops retry storms.  How often this is reached is
+        paced by the daemon's continuous cooldown.
+        """
+        parent = self._ledger.get_task(goal_id)
+        child_ids = list(getattr(parent, 'child_task_ids', None) or [])
+        children = [self._ledger.get_task(c) for c in child_ids]
+        if not children or any(
+                c is None or c.status != TaskStatus.COMPLETED for c in children):
+            return 0
+        reopened = 0
+        for child in children:
+            if not self._ledger.reopen_task(
+                    child.task_id,
+                    reason='continuous goal: re-armed for its next run',
+                    defer_save=True):
+                continue
+            ctx = child.context
+            prev_hash = ctx.pop('result_hash', None)
+            if prev_hash:
+                ctx['last_result_hash'] = prev_hash
+            ctx.pop('claimed_by', None)
+            ctx.pop('claimed_at', None)
+            ctx['runs'] = int(ctx.get('runs', 0) or 0) + 1
+            reopened += 1
+        if reopened:
+            self._ledger.save()
+        return reopened
+
+    def _release_held_tasks(self, goal_id: str) -> int:
+        """Put a goal's tasks held for help (hold_task) back to PENDING.
+
+        Runs when the goal is submitted AGAIN.  The daemon dispatches only
+        active goals, so a re-dispatch of a goal whose task was held means
+        the owner or the co-pilot resumed it (a parked goal) or the expert
+        leg is running (an active one): the answer is in, the work goes back
+        to the queue.  Nothing else releases a held task: orphan recovery
+        skips BLOCKED, and claim_next_task takes only PENDING.
+
+        Only tasks blocked for INPUT_REQUIRED, the mark hold_task makes.  A
+        task blocked on a prerequisite (parallel_dispatch's dependency
+        chains write "Blocked by prerequisite ...") keeps its block.
+
+        Re-opens the SAME task id, as _reopen_finished_run does, so a goal
+        that asks for help many times does not grow the ledger; the run
+        counter and the state history record each return.
+        """
+        parent = self._ledger.get_task(goal_id)
+        released = 0
+        for child_id in list(getattr(parent, 'child_task_ids', None) or []):
+            child = self._ledger.get_task(child_id)
+            if (child is None or child.status != TaskStatus.BLOCKED
+                    or child.blocked_reason != BlockedReason.INPUT_REQUIRED.value):
+                continue
+            if not self._ledger.update_task_status(
+                    child_id, TaskStatus.PENDING,
+                    reason='the goal was dispatched again: the help it '
+                           'asked for is in',
+                    defer_save=True):
+                continue
+            child.set_blocked_reason(None)
+            child.error_message = None
+            child.started_at = None
+            ctx = child.context
+            ctx.pop('claimed_by', None)
+            ctx.pop('claimed_at', None)
+            ctx['runs'] = int(ctx.get('runs', 0) or 0) + 1
+            released += 1
+        if released:
+            self._ledger.save()
+        return released
 
     def claim_next_task(
         self,
@@ -358,6 +512,49 @@ class DistributedTaskCoordinator:
             "result_hash": result_hash,
             "status": "completed",
         }
+
+    def abandon_task(self, task_id: str, agent_id: str) -> None:
+        """A worker gives up on a task it claimed without producing a result.
+
+        Releases the claim, which also stops the heartbeat renewing it, and
+        leaves the task IN_PROGRESS with its claimed_at stamp.
+        claim_next_task's orphan recovery then returns it to PENDING once the
+        claim is older than _ORPHAN_AFTER_S, so a retry is paced by the same
+        rule that recovers a worker that died.
+
+        Without this, a failed execution left the claim in place.  On the
+        in-memory lock that lapses after its TTL, but on a Redis-backed node
+        the heartbeat renews it indefinitely, orphan recovery (which requires
+        the lock to be gone) never fires, and the task is IN_PROGRESS for good.
+        """
+        self._lock.release_task(task_id, agent_id)
+
+    def hold_task(self, task_id: str, agent_id: str, reason: str) -> bool:
+        """A worker holds a task whose action was handed to a person or an
+        expert (create_recipe._ask_for_help; the goal is parked or the expert
+        has its next turn).
+
+        IN_PROGRESS -> BLOCKED with blocked_reason input_required, the same
+        mark the create loop puts on its own ledger's action, and the reason
+        (the reply) as error_message so the dashboard can show why.  The
+        claim is released.  Neither submit_result (owner ruling 2026-09-14:
+        never record a completion that did not happen) nor abandon_task: an
+        abandoned task is re-queued by orphan recovery after _ORPHAN_AFTER_S,
+        and that would run a goal the create loop just parked, every ten
+        minutes, for as long as nobody answered.  claim_next_task takes only
+        PENDING and recovers only IN_PROGRESS, so a held task waits until
+        _release_held_tasks puts it back on the goal's next dispatch.
+        """
+        ok = self._ledger.update_task_status(
+            task_id, TaskStatus.BLOCKED, error_message=reason,
+            reason='held for help: the action was handed to a person or an '
+                   'expert', defer_save=True)
+        task = self._ledger.get_task(task_id)
+        if ok and task is not None:
+            task.set_blocked_reason(BlockedReason.INPUT_REQUIRED.value)
+        self._ledger.save()
+        self._lock.release_task(task_id, agent_id)
+        return ok
 
     def _notify_goal_contribution(self, task_id: str, agent_id: str, task_description: str):
         """Notify the user who owns the agent that their agent contributed to a goal."""

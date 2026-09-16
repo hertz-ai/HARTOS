@@ -557,6 +557,39 @@ in
     # OWN best-effort `wants=network-online` locally, so dropping it from the group
     # changes nothing for them while freeing the offline boot path. multi-user.target
     # already implies local-fs/sysinit ordering for the grouped services.
+    # ── ONE data root, for every process on the node ────────────────────────
+    # core/platform_paths.py:get_data_dir() resolves in priority order:
+    #   1. NUNBA_DATA_DIR
+    #   2. HARTOS_DATA_DIR
+    #   3. an embedded-OS probe for /etc/hartos-release
+    #   4. the PLATFORM DEFAULT, which on Linux is ~/.config/nunba
+    #
+    # Only hart-backend.nix and hart-agent.nix set HARTOS_DATA_DIR, so every
+    # OTHER hart unit fell through to step 4 and used a different data root.
+    # Step 3 never saves them either: HART OS ships no /etc/hartos-release (and
+    # must not start, because that branch resolves to /var/lib/hartos, which
+    # would be a THIRD root, not this one).
+    #
+    # Measured on real hardware 2026-09-10 -- two hive task queues, side by
+    # side, same machine, same user, same HOME:
+    #
+    #   /var/lib/hart/agent_data/hive_tasks.json                11 tasks, assigned
+    #   /var/lib/hart/.config/nunba/agent_data/hive_tasks.json   9 tasks, pending
+    #
+    # The second was written once at boot by a unit without the variable and
+    # then orphaned: its nine tasks can NEVER dispatch, because the session
+    # registry lives in the process that reads the other file. Nothing errors,
+    # nothing logs; the work simply goes somewhere no one looks.
+    #
+    # Declared ONCE here, in the module that owns hart.dataDir, instead of
+    # copied into each unit's `environment` -- copying is exactly how the split
+    # happened (hart-backend.nix:44 added it to fix a read-only-FS crash, and
+    # nothing carried it to the rest). globalEnvironment also reaches units
+    # added LATER, which is the property that keeps this from recurring.
+    systemd.globalEnvironment = {
+      HARTOS_DATA_DIR = cfg.dataDir;
+    };
+
     systemd.targets.hart = {
       description = "HART OS Services";
       wantedBy = [ "multi-user.target" ];

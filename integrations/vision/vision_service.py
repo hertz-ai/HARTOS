@@ -249,12 +249,10 @@ class VisionService:
             from integrations.social.models import db_session
             from integrations.social.consent_service import ConsentService
             with db_session(commit=True) as db:
-                if ConsentService.check_consent(db, owner, 'screen_capture'):
-                    return True
-                # request_consent dedupes: re-asking returns the existing
-                # pending row, so exactly one ask reaches the UI.
-                ConsentService.request_consent(db, owner, 'screen_capture')
-                return False
+                # A denied check files the ask; request_consent dedupes, so
+                # exactly one ask reaches the UI.
+                return ConsentService.check_or_request(
+                    db, owner, 'screen_capture')
 
         def _grab():
             if state['capture'] is None:
@@ -644,7 +642,10 @@ class VisionService:
             logger.error("websockets not installed — frame receiver disabled")
             return
 
-        server = await websockets.serve(self._ws_handler, '0.0.0.0', self._ws_port)
+        # Loopback on a desktop, whose SPA is the only frame source; see
+        # core.port_registry.bind_host for the rule and its overrides.
+        from core.port_registry import bind_host
+        server = await websockets.serve(self._ws_handler, bind_host(), self._ws_port)
         # Read actual bound port (important when ws_port=0 for dynamic allocation)
         if server.sockets:
             actual_port = server.sockets[0].getsockname()[1]

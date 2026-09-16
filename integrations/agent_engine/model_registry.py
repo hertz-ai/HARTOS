@@ -118,6 +118,30 @@ class ModelBackend:
             self.avg_latency_ms = sum(self._latency_samples) / len(self._latency_samples)
 
 
+def _llm_target(entry) -> tuple:
+    """(base_url, model) of a config_list entry, to tell two backends apart.
+    A trailing /v1 is dropped: the same endpoint is written both ways."""
+    entry = entry or {}
+    url = str(entry.get('base_url') or '').rstrip('/')
+    if url.endswith('/v1'):
+        url = url[:-3]
+    return (url, str(entry.get('model') or ''))
+
+
+def _own_llm_target() -> tuple:
+    """(base_url, model) of the LLM this node's own turns run on.
+
+    Read from resolve_llm_backend(), whose entry also carries the API key, so
+    only these two fields leave this function and nothing here is logged.
+    """
+    try:
+        from core.autogen_config import resolve_llm_backend
+        _kind, entry = resolve_llm_backend()
+    except Exception:
+        return ('', '')
+    return _llm_target(entry)
+
+
 # ─── Model Registry (Singleton) ───
 
 class ModelRegistry:
@@ -233,6 +257,27 @@ class ModelRegistry:
                 if m.cost_per_1k_tokens <= max_cost
                 and m.tier != ModelTier.DRAFT
                 and m.is_dispatchable()
+            ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda m: m.accuracy_score)
+
+    def get_escalation_expert(self) -> Optional[ModelBackend]:
+        """The model a stuck goal action is handed to before a person (#106d).
+
+        An EXPERT-tier backend this node can dispatch to, other than the model
+        its own turns already run on: handing the action back to that model is
+        a retry, not an expert.  In practice Claude Code where it is logged
+        in, or a hive peer's verified expert.  None on a node with neither,
+        and the action goes to the owner and the co-pilot.
+        """
+        own = _own_llm_target()
+        with self._lock:
+            candidates = [
+                m for m in self._models.values()
+                if m.tier == ModelTier.EXPERT
+                and m.is_dispatchable()
+                and _llm_target(m.config_list_entry) != own
             ]
         if not candidates:
             return None

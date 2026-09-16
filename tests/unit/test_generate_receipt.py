@@ -61,6 +61,24 @@ class GenerateReceiptTool(unittest.TestCase):
         self.assertIn('1200', out)
         self.assertIn('Priya', out)
 
+    def test_a_long_accepted_template_is_used_whole(self):
+        """#104 review: the receipt read its template through the model-facing
+        get_data_by_key, which e4952215c bounded, so a template longer than one
+        page was cut and the bound's note was printed into the customer's
+        receipt."""
+        from core.constants import TOOL_OBSERVATION_MAX_CHARS
+        terms = 'Terms: ' + 'no refunds after the trial session. ' * 120
+        template = ('Bill for {service}: {currency}{amount}\n' + terms
+                    + 'END-OF-TERMS')
+        self.assertGreater(len(template), TOOL_OBSERVATION_MAX_CHARS)
+        gen = _find(build_core_tool_closures(
+            _ctx({'testp': {'receipt_template': template}})), 'generate_receipt')
+        out = gen(service='Bridal makeup', amount='5000', currency='INR')
+        self.assertIn('Bill for Bridal makeup: INR5000', out)
+        self.assertIn('END-OF-TERMS', out)
+        self.assertNotIn('offset=', out)
+        self.assertNotIn('not shown', out)
+
     def test_date_defaults_to_today_when_omitted(self):
         gen = _find(build_core_tool_closures(_ctx({})), 'generate_receipt')
         out = gen(service='Hair', amount='800')

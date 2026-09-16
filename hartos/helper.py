@@ -17,13 +17,17 @@ import ast
 # autogen is imported lazily — it drags google.api_core (~7.6s) + flaml +
 # the contrib capabilities chain -> llmlingua -> torch (~4.2s) at import
 # time, but every autogen.* / transform_messages.* / transforms.* use in
-# this module is INSIDE a function (AST-verified: zero module-level /
-# class-base uses; used only in create_visual_agent + the agent builders).
+# this module is INSIDE a function (AST-verified: zero module-level uses;
+# used only in create_visual_agent, the agent builders, and
+# _context_limiter_classes, whose two class bases resolve on its first call).
 # `import helper` is on the backend-boot critical path (create_recipe /
 # reuse_recipe / gather_agentdetails all import it), so deferring autogen
 # here is what actually keeps it out of the boot.  Same proxy + test as
 # create_recipe.py.  See tests/unit/test_lazy_autogen_import.py.
 from core.optional_import import lazy_module
+# The fabrication gate in reuse_recipe keys on this EXACT string to tell a
+# back-filled stand-in from a real tool result — one definition, no drift.
+from core.constants import HISTORICAL_TOOL_PLACEHOLDER
 autogen = lazy_module("autogen")
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
@@ -126,6 +130,14 @@ try:
 except Exception as _redis_err:
     logging.getLogger(__name__).info(f"Redis unavailable (expected in local mode): {_redis_err}")
     redis_client = None
+
+# get_frame's legacy Redis read: one refused connect opens the breaker for
+# that client, then one probe per cooldown.  Keyed by the client object, so a
+# replaced client (tests patch hartos.helper.redis_client) starts closed
+# instead of inheriting another client's open breaker.  See get_frame.
+from core.circuit_breaker import KeyedCircuitBreaker
+_REDIS_FRAME_BREAKER = KeyedCircuitBreaker(threshold=1, cooldown=300,
+                                           name='redis_frame')
 
 async def fetch(session, url):
     try:
@@ -814,6 +826,65 @@ def strip_json_values(obj: Any) -> Any:
         return f"redacted {type(obj).__name__}"
 
 
+# A registry tool name as `attach_for_names` compares it: the registry key, or
+# `{tool}_{endpoint}`.  Dots are legal (`tts.package_installer` is real, 5 uses
+# in the banked corpus).  The >=3-char floor is what stops a Windows drive
+# letter surviving as the candidate `C` when a path is split on ':'.
+#
+# Lives here, not in reuse_recipe, because BOTH sides of the authoring
+# convention read it: `_tool_name_candidates` (reuse_recipe) takes the NAME
+# half, `strip_authored_tool_prefix` below takes the ARGUMENT half, and
+# create_recipe needs the second one too.  One pattern, one home.
+TOOL_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_.]{2,}$')
+
+
+def strip_authored_tool_prefix(raw):
+    """The ARGUMENT half of an authored ``<tool>: '<argument>'`` action text.
+
+    Complement of ``_tool_name_candidates`` (reuse_recipe.py), which takes the
+    NAME half of the same convention and exists because "the authoring model
+    routinely writes the tool AND its argument into the single field".  Nothing
+    took the other half, so every consumer that wanted the human-readable
+    instruction was comparing against the tool name as well.
+
+    WHAT THAT COST (drive d69-, 2026-09-11 04:11:12, agent 88719487304
+    action 2).  ``similar_instructions`` scored an action against ITS OWN
+    banked recipe:
+
+        live   'Open a web browser and navigate to the top result URL for HART OS documentation'
+        stored "execute_windows_or_android_command: 'Open default web browser and
+                navigate to the top result URL for HART OS documentation'"
+
+        words1=15  words2=16  overlap=12  ->  12/16 = 0.75
+
+    against a 0.8 threshold — the log recorded exactly 0.7500.  The prefix
+    inflates the denominator and dilutes the overlap, so the action missed its
+    own recipe by 0.05.  ``matching_recipe`` stayed None, ``REUSING command``
+    logged ZERO times, no "Follow these steps from a previous successful
+    execution" block was built, and the VLM loop started from nothing: 30
+    iterations in 114.6s, an invented https://www.hartos.com/documentation, and
+    exit_reason=max_iterations.  Stripped, the same pair scores 0.9333 — the
+    two texts then differ by one word, 'a' vs 'default'.
+
+    ONLY an identifier-shaped prefix is removed, and only before the FIRST
+    colon.  'Ratio 3:2 matters here' keeps its colon because 'Ratio 3' is not
+    an identifier; a bare 'C:\\path' keeps its because of the >=3-char floor.
+    That matters: over-stripping would make unrelated actions match, and
+    injecting the WRONG action's steps is a worse failure than injecting none.
+
+    Returns the text unchanged (whitespace- and quote-trimmed) when there is no
+    such prefix.  Never raises — it runs inside the reuse dispatch path.
+    """
+    try:
+        text = str(raw if raw is not None else '').strip()
+    except Exception:
+        return ''
+    head, sep, tail = text.partition(':')
+    if sep and TOOL_IDENT_RE.match(head.strip()):
+        text = tail.strip()
+    return text.strip('\'"')
+
+
 def fix_json(json_text):
     """Repair malformed JSON via local LLM.
 
@@ -998,6 +1069,165 @@ def ensure_tool_call_arguments_json(messages):
     return messages
 
 
+def answered_call_ids(m):
+    """Every tool_call_id a single message answers.
+
+    autogen returns tool results in TWO shapes and a reader that knows only the
+    first sees nothing on real data.  From ``generate_tool_calls_reply``
+    (autogen/agentchat/conversable_agent.py): each executed call becomes
+    ``{"tool_call_id": ..., "role": "tool", "content": ...}``, and when the turn
+    finishes those are wrapped and returned as ONE message —
+
+        {"role": "tool", "tool_responses": [ ...those... ],
+         "content": "\\n\\n".join(...)}
+
+    — whose OUTER dict has no ``tool_call_id`` at all.  ``is_consolidated_response``
+    below keys on ``'tool_responses'`` for exactly this reason (it additionally
+    requires len > 1; this reader deliberately does not, because a single-entry
+    reply hides its id in the same place).
+
+    CANONICAL: reuse_recipe imports this rather than keeping its own copy —
+    the two sides must not drift, since one finds answers and the other
+    decides whether a slot gets a real result or a manufactured one.
+    """
+    ids = set()
+    if not isinstance(m, dict) or m.get('role') != 'tool':
+        return ids
+    if m.get('tool_call_id'):
+        ids.add(m['tool_call_id'])
+    for r in (m.get('tool_responses') if isinstance(m.get('tool_responses'), list) else []):
+        if isinstance(r, dict) and r.get('tool_call_id'):
+            ids.add(r['tool_call_id'])
+    return ids
+
+
+# ─── Context-window limiters ─────────────────────────────────────────────
+# autogen 0.2.37's MessageHistoryLimiter and MessageTokenLimiter both end the
+# same way (transforms.py:105-106 and :235-236):
+#
+#     if not transforms_util.is_tool_call_valid(truncated_messages):
+#         truncated_messages.pop()
+#
+# is_tool_call_valid() looks only at the FIRST message (role == 'tool',
+# transforms_util.py:117-118), and pop() removes the LAST.  So whenever the
+# window opens on a tool result, the limiter keeps that orphan and throws away
+# the newest message -- usually the instruction the agent is being asked to
+# answer.
+#
+# Live 2026-09-13 11:27:21, CREATE 87400889007 flow 1 action 3: the newest
+# message was ChatInstructor's recipe request.  The StatusVerifier's window
+# opened on two tool results, and the verifier got everything except the
+# request.  09:15-12:35 the same day, 255 of 1,549 ToolMessageHandler inputs
+# opened on a tool result; its own pre-steps explain at most 11 of them.
+#
+# The orphan is not handled here.  ToolMessageHandler comes next in every
+# chain that reaches a model and already converts or drops a leading tool
+# message (and any other orphan).  So the one correction is to put the newest
+# message back; the window is otherwise autogen's own.
+_CONTEXT_LIMITER_CLASSES = None
+
+
+def _context_limiter_classes():
+    """autogen's two limiters with the newest message kept (see above).
+
+    Built on first use, not at module level, so `import helper` still does not
+    import autogen (see the note at the top of this module and
+    tests/unit/test_lazy_autogen_import.py).
+    """
+    global _CONTEXT_LIMITER_CLASSES
+    if _CONTEXT_LIMITER_CLASSES is not None:
+        return _CONTEXT_LIMITER_CLASSES
+
+    def dropped_newest(messages, kept):
+        # autogen pops only when the window's first message is a tool result,
+        # and after the pop that message is still first -- or nothing is left.
+        return (kept is not messages and bool(messages)
+                and (not kept or kept[0].get('role') == 'tool'))
+
+    def note(which, newest):
+        _safe_log('info',
+                  f"[NEWEST-KEPT] autogen {which} opened its window on a tool "
+                  f"result and would have dropped the newest message "
+                  f"(role={newest.get('role')}, name={newest.get('name')}); kept it")
+
+    class HistoryLimiter(transforms.MessageHistoryLimiter):
+        def apply_transform(self, messages):
+            kept = super().apply_transform(messages)
+            newest = messages[-1] if messages else None
+            if dropped_newest(messages, kept) and all(m is not newest for m in kept):
+                # The window holds the caller's own dicts, and with room for
+                # two or more messages the newest is the last one autogen put
+                # in -- so the message it popped is exactly this one.
+                kept.append(newest)
+                note('MessageHistoryLimiter', newest)
+            return kept
+
+    class TokenLimiter(transforms.MessageTokenLimiter):
+        def apply_transform(self, messages):
+            kept = super().apply_transform(messages)
+            if dropped_newest(messages, kept):
+                # autogen cuts the newest message first, with nothing yet
+                # counted against the budget: to max_tokens_per_message, or to
+                # max_tokens when that is smaller.  Give it the same cut.
+                newest = dict(messages[-1])
+                util = transforms.transforms_util
+                if (util.is_content_right_type(newest.get('content'))
+                        and util.should_transform_message(
+                            newest, self._filter_dict, self._exclude_filter)):
+                    newest['content'] = self._truncate_str_to_tokens(
+                        newest['content'],
+                        min(self._max_tokens, self._max_tokens_per_message))
+                kept.append(newest)
+                note('MessageTokenLimiter', newest)
+            return [self._bound_tool_responses(m) for m in kept]
+
+        def _bound_tool_responses(self, msg):
+            # autogen cuts a message's 'content' and never reads
+            # 'tool_responses'. A bundled tool reply carries every call's
+            # result there too, and ToolMessageHandler's split (#89) rebuilds
+            # one tool message per call from that list, so each cut above was
+            # undone before the request left. Live 2026-09-14 (#104),
+            # Guardian Convergence action 9: two search_long_term_memory
+            # results, 3,386,616 chars together, passed a 1000-token limit and
+            # every call to the hosted model was a bare 400. The bundle is one
+            # message, so its calls share that message's allowance, and only
+            # when they do not fit (fit_texts_to_token_budget). New dicts only:
+            # the list may be the group chat's own.
+            from core.token_utils import fit_texts_to_token_budget
+            responses = msg.get('tool_responses') if isinstance(msg, dict) else None
+            if not isinstance(responses, list) or not responses:
+                return msg
+            slots = [i for i, r in enumerate(responses)
+                     if isinstance(r, dict) and isinstance(r.get('content'), str)]
+            if not slots:
+                return msg
+            fitted = fit_texts_to_token_budget(
+                [responses[i]['content'] for i in slots],
+                min(self._max_tokens, self._max_tokens_per_message))
+            bounded, cut = list(responses), False
+            for i, text in zip(slots, fitted):
+                if text != responses[i]['content']:
+                    bounded[i] = {**responses[i], 'content': text}
+                    cut = True
+            return {**msg, 'tool_responses': bounded} if cut else msg
+
+    _CONTEXT_LIMITER_CLASSES = (HistoryLimiter, TokenLimiter)
+    return _CONTEXT_LIMITER_CLASSES
+
+
+def history_limiter(max_messages, keep_first_message=False):
+    """autogen's MessageHistoryLimiter, minus its newest-message pop (above)."""
+    return _context_limiter_classes()[0](
+        max_messages=max_messages, keep_first_message=keep_first_message)
+
+
+def token_limiter(max_tokens, max_tokens_per_message, min_tokens=0):
+    """autogen's MessageTokenLimiter, minus its newest-message pop (above)."""
+    return _context_limiter_classes()[1](
+        max_tokens=max_tokens, max_tokens_per_message=max_tokens_per_message,
+        min_tokens=min_tokens)
+
+
 class ToolMessageHandler:
     """Handles tool messages in the conversation history to prevent tool_call_id errors.
 
@@ -1008,16 +1238,70 @@ class ToolMessageHandler:
     It also handles the "only messages with role 'assistant' can have a function call" error.
     """
 
-    def __init__(self, user_tasks=None, user_prompt=None):
+    def __init__(self, user_tasks=None, user_prompt=None, peer_agents=None):
         """
         Initialize the ToolMessageHandler.
 
         Args:
             user_tasks: Global user_tasks dictionary containing session data
             user_prompt: Current session identifier (e.g., "10077_123")
+            peer_agents: The other agents in THIS conversation.  Tools execute
+                in a pairwise Assistant<->Executor exchange, so the seat whose
+                request we are building often never saw the result and the
+                repair below would mint a placeholder over a real answer.
+                Given the peers, we can read the answer they already hold.
+                A live list of agent objects (their _oai_messages fill in
+                later); omit it and behaviour is exactly as before.
         """
         self.user_tasks = user_tasks
         self.user_prompt = user_prompt
+        self._peer_agents = list(peer_agents or [])
+
+    def real_tool_answer(self, tool_call_id):
+        """The REAL content answering this call, from a peer agent's buffer.
+
+        WHY THIS EXISTS.  Measured live 2026-09-07 (agent 18088688973):
+        google_search really ran and really fetched five engines, yet the brief
+        cited nothing.  On the wire the median tool result was 45 chars —
+        exactly HISTORICAL_TOOL_PLACEHOLDER — 116/119 under 120 chars, 1/119
+        carrying a URL.  The model cannot cite what it never received.
+
+        The answers are not lost: they sit in the executing seat's own
+        ``_oai_messages`` buffer (measured: Assistant n=14 calls=10 answers=4
+        beside six broadcast copies at answers=0).  Same process, same turn,
+        same conversation — so this reads them directly rather than caching or
+        reconstructing anything.
+
+        Returns None when no peer holds a real answer, so the caller keeps the
+        placeholder and the fabrication gate still sees the truth.  Never
+        returns the placeholder itself as if it were real, and never raises —
+        it runs inside the transform on every LLM call.
+        """
+        try:
+            for agent in self._peer_agents:
+                buffers = getattr(agent, '_oai_messages', None)
+                if not buffers:
+                    continue
+                for conv in list(buffers.values()):
+                    for m in (conv or []):
+                        if tool_call_id not in answered_call_ids(m):
+                            continue
+                        # Consolidated reply: take THIS call's own entry, not
+                        # the joined blob of every call in the batch.
+                        for r in (m.get('tool_responses') or []):
+                            if isinstance(r, dict) and r.get('tool_call_id') == tool_call_id:
+                                c = r.get('content')
+                                if c and c != HISTORICAL_TOOL_PLACEHOLDER:
+                                    return c
+                        c = m.get('content')
+                        if c and c != HISTORICAL_TOOL_PLACEHOLDER:
+                            return c
+        except Exception as e:
+            try:
+                current_app.logger.debug(f"real_tool_answer lookup skipped: {e}")
+            except Exception:
+                pass
+        return None
 
     def get_current_action_id(self):
         """Get current action ID from user_tasks."""
@@ -1108,6 +1392,7 @@ class ToolMessageHandler:
             # would silence the signal precisely when a livelock makes it
             # loudest, which is when you need it.
             _dropped: List[str] = []
+            _dropped_user: List[str] = []
             _coalesced: List[str] = []
             _stale_terms: List[str] = []
             _last_idx = len(messages) - 1
@@ -1115,11 +1400,23 @@ class ToolMessageHandler:
                 role = (msg.get('role') or '').lower()
                 content = msg.get('content')
                 has_calls = bool(msg.get('tool_calls') or msg.get('function_call'))
+                _empty = content is None or (isinstance(content, str) and content.strip() == '')
                 # Drop empty assistant placeholders (no content + no tool calls)
-                if role == 'assistant' and not has_calls:
-                    if content is None or (isinstance(content, str) and content.strip() == ''):
-                        _dropped.append(f"{i}({msg.get('name','unknown')})")
-                        continue
+                if role == 'assistant' and not has_calls and _empty:
+                    _dropped.append(f"{i}({msg.get('name','unknown')})")
+                    continue
+                # Drop an empty USER message too: the same placeholder seen
+                # from the other side.  In a group chat another agent's turn
+                # reaches the speaker as role=user, so an agent that said
+                # nothing arrives as {"role": "user", "content": ""}.  The
+                # hosted Qwen endpoint answers any request holding one with a
+                # bare 400 "invalid request".  Measured on central 2026-09-13:
+                # a recipe request opening with Message[0] user/Assistant ""
+                # failed, and the same conversation passed once that message
+                # had text or was removed, with or without its name field.
+                if role == 'user' and not has_calls and _empty:
+                    _dropped_user.append(f"{i}({msg.get('name','unknown')})")
+                    continue
                 # Drop a CONSUMED bare TERMINATE — same class of artifact as the
                 # empty placeholder above: a control token, already acted on,
                 # carrying no content for the turn being built.
@@ -1140,17 +1437,48 @@ class ToolMessageHandler:
                 # Only a token that is NOT the last message qualifies.  A live
                 # TERMINATE still terminates — dropping that would loop the
                 # group chat forever, the opposite failure.
+                #
+                # role='tool' is excluded here for the same reason it is
+                # excluded from the coalescing below: a tool message is an
+                # answer slot keyed by tool_call_id, so dropping one always
+                # orphans its call and mints a placeholder over the real
+                # output.  A result that happens to read TERMINATE is a
+                # RESULT, never a control token.  Unlike the coalescing case
+                # this one has not been observed in production — it is the
+                # same invariant applied at the sibling site, pinned by test.
                 if (not has_calls and i < _last_idx
+                        and role != 'tool'
                         and isinstance(content, str)
                         and content.strip() == _TERMINATE_TOKEN):
                     _stale_terms.append(f"{i}({msg.get('name','unknown')})")
                     continue
-                # Coalesce consecutive same-role messages
+                # Coalesce consecutive same-role messages.
+                #
+                # NOT role='tool'.  A tool message is an ANSWER SLOT addressed
+                # by tool_call_id, not prose: merging two of them keeps only
+                # the first id, so every other call is left unanswered and
+                # :1889 stamps HISTORICAL_TOOL_PLACEHOLDER over output that
+                # really was produced.  The guard already refuses to merge a
+                # message that CARRIES tool_calls for exactly this reason
+                # ("would silently drop the call") — that protected the
+                # question and never the answer, because a tool message has
+                # no 'tool_calls' key and so has_calls is False here.
+                #
+                # Measured live 2026-09-07 on the installed build: 104
+                # occurrences across two log rotations, e.g. 03:47:27 merged
+                # indices 10..16 — seven results into one message, six answers
+                # destroyed in a single call.
+                #
+                # Nothing is lost by excluding them.  The 400 this guard
+                # exists to prevent is the user/assistant alternation rule;
+                # consecutive tool messages are REQUIRED by that same API,
+                # one per tool_call in a parallel-call assistant message.
                 if cleaned:
                     prev = cleaned[-1]
                     prev_role = (prev.get('role') or '').lower()
                     prev_has_calls = bool(prev.get('tool_calls') or prev.get('function_call'))
                     if (prev_role == role
+                            and role != 'tool'
                             and not prev_has_calls
                             and not has_calls
                             and isinstance(prev.get('content'), str)
@@ -1168,19 +1496,22 @@ class ToolMessageHandler:
             # One line per invocation, only when the guard actually acted.
             # Indices are capped so a pathological turn cannot reintroduce the
             # unbounded growth this replaced — the count stays exact either way.
-            if _dropped or _coalesced or _stale_terms:
+            if _dropped or _dropped_user or _coalesced or _stale_terms:
                 _cap = 12
                 _d = ', '.join(_dropped[:_cap]) + (
                     f" (+{len(_dropped) - _cap} more)" if len(_dropped) > _cap else '')
+                _u = ', '.join(_dropped_user[:_cap]) + (
+                    f" (+{len(_dropped_user) - _cap} more)" if len(_dropped_user) > _cap else '')
                 _c = ', '.join(_coalesced[:_cap]) + (
                     f" (+{len(_coalesced) - _cap} more)" if len(_coalesced) > _cap else '')
                 _s = ', '.join(_stale_terms[:_cap]) + (
                     f" (+{len(_stale_terms) - _cap} more)" if len(_stale_terms) > _cap else '')
                 current_app.logger.info(
                     f"[ROLE-ORDER-GUARD] {len(messages)} msgs out of "
-                    f"{len(_dropped) + len(_coalesced) + len(_stale_terms) + len(messages)} in; "
+                    f"{len(_dropped) + len(_dropped_user) + len(_coalesced) + len(_stale_terms) + len(messages)} in; "
                     f"dropped {len(_dropped)} empty assistant placeholder(s)"
                     f"{' at ' + _d if _dropped else ''}; "
+                    f"{'dropped %d empty user message(s) at %s; ' % (len(_dropped_user), _u) if _dropped_user else ''}"
                     f"dropped {len(_stale_terms)} consumed TERMINATE token(s)"
                     f"{' at ' + _s if _stale_terms else ''}; "
                     f"coalesced {len(_coalesced)} consecutive same-role pair(s)"
@@ -1198,6 +1529,17 @@ class ToolMessageHandler:
                 f"{_guard_err!s} — using messages as-is"
             )
 
+        # A conversation with no user turn is refused by both model servers:
+        # llama-server's Qwen3 template 500s, and central's hosted endpoint
+        # answers a bare 400 (measured 2026-09-13, task #89).  The wire trim
+        # applies the same rule but only sees local llama-server traffic, so
+        # this last step of the agent path applies it too.  Dropping empty
+        # user messages above can itself be what leaves none.
+        from core.llm_outbound_logger import ensure_user_turn
+        if ensure_user_turn(messages):
+            current_app.logger.info(
+                "[ROLE-ORDER-GUARD] no user turn left; seeded one "
+                "(WIRE_USER_SEED_TEXT)")
         return messages
 
     def remove_orphan_tool_messages(self, messages):
@@ -1392,7 +1734,30 @@ class ToolMessageHandler:
         return f"{truncated}... [truncated from {len(words)} words]"
 
     def create_log_safe_message(self, msg, max_words=10):
-        """Create a log-safe version of message with truncated content."""
+        """Create a log-safe version of message with truncated content.
+
+        ``msg.copy()`` is SHALLOW, so ``log_msg['tool_calls']`` is the caller's
+        own list object.  Assigning into it (``log_msg['tool_calls'][i] = ...``)
+        is ``list.__setitem__`` on that shared list and writes the truncated
+        copy straight back into the live message — the per-entry ``.copy()``
+        calls below protect the dicts but not the list holding them.
+
+        Measured cost of that, live 2026-09-06 17:08-17:55 (agent 89555447799):
+        every tool_call with arguments over 200 chars reached the executor cut
+        to ``[:1000] + "... [truncated]"``, i.e. no longer valid JSON, so
+        ``ensure_tool_call_arguments_json`` repaired it into a wrong dict or
+        ``'{}'``.  The turn ended with the agent telling the user "the previous
+        attempts to open LinkedIn failed because I didn't have the correct
+        parameters", and one executor error was literally
+        ``send_message_to_user() got an unexpected keyword argument 'remains'``
+        — 'remains' being a word from inside the article draft the model had
+        correctly placed in ``text``.  Short arguments were unaffected, which
+        is why execute_windows_or_android_command survived 14/15 and
+        send_message_to_user 0/17.
+
+        Owning each list before writing into it keeps the truncation (the log
+        line stays small) while confining it to the copy.
+        """
         log_msg = msg.copy()
 
         # Truncate main content
@@ -1401,6 +1766,7 @@ class ToolMessageHandler:
 
         # Truncate tool_responses content if present
         if 'tool_responses' in log_msg and isinstance(log_msg['tool_responses'], list):
+            log_msg['tool_responses'] = list(log_msg['tool_responses'])
             for i, response in enumerate(log_msg['tool_responses']):
                 if 'content' in response and response['content']:
                     log_msg['tool_responses'][i] = response.copy()
@@ -1410,6 +1776,7 @@ class ToolMessageHandler:
 
         # Truncate tool_calls arguments if they're very large
         if 'tool_calls' in log_msg and isinstance(log_msg['tool_calls'], list):
+            log_msg['tool_calls'] = list(log_msg['tool_calls'])
             for i, tool_call in enumerate(log_msg['tool_calls']):
                 if ('function' in tool_call and
                         'arguments' in tool_call['function'] and
@@ -1518,6 +1885,112 @@ class ToolMessageHandler:
 
         return re.sub(pattern, replace_if_older, content, flags=re.IGNORECASE)
 
+    def stale_phantom_call_ids(self, messages):
+        """Tool calls announced by a FINISHED action that never produced a result.
+
+        MEASURED LIVE 2026-09-09 06:46:23-06:46:34 (agent 33323830039, action
+        2 of 2, installed build).  Action 1 had completed honestly.  Action 2
+        then had its own full round allowance and still reported
+        ``{'status': 'pending', ...}``.  In its 10.4-second window every one of
+        4 LLM calls was over budget and left-trimmed (est 6291 -> 6519 tokens
+        against a 5484 budget — the body GREW), and the model was shown 7
+        placeholder tool answers against 3 real ones.  It said `pending`
+        because 70% of the results in its view were
+        HISTORICAL_TOOL_PLACEHOLDER: it could not see its own work.
+
+        Those 7 were not action 2's calls.  STEP 4 below treats EVERY
+        unanswered tool_call id anywhere in the accumulated conversation as
+        "historical pending" and answers it with a manufactured string, and
+        under ``clear_history=False`` nothing ever ages one out.  So a call the
+        model announced during action 1 but never executed is re-answered with
+        a placeholder on every later request, forever — costing budget and
+        reporting "your tools produced nothing" at the same time.
+
+        WHOSE CALL IS IT.  ``evidence_seen_call_ids`` already answers exactly
+        that: ``_stamp_action_evidence_watermark`` records, at each dispatch,
+        the tool calls that already existed when THIS action started — someone
+        else's work.  The fabrication gate reads the same set to refuse
+        crediting an earlier action's result.  Reusing it keeps ONE notion of
+        ownership; a second rule here would be free to drift from the gate's.
+
+        Deliberately conservative, in this order:
+          - no watermark recorded -> nothing is stale (behaviour unchanged);
+          - answered anywhere in this list -> real work, keep it;
+          - a peer agent holds the answer -> keep it, so the fill below can
+            put the REAL result in the slot (the 2026-09-07 repair);
+          - only then is it a phantom.
+
+        Never raises: this runs inside the transform on every LLM call.
+        """
+        try:
+            session = (self.user_tasks or {}).get(self.user_prompt)
+            seen = getattr(session, 'evidence_seen_call_ids', None)
+        except Exception:
+            seen = None
+        if not isinstance(seen, (set, frozenset)) or not seen:
+            return set()
+
+        answered = set()
+        announced = set()
+        for m in messages or []:
+            if not isinstance(m, dict):
+                continue
+            answered |= answered_call_ids(m)
+            for tc in (m.get('tool_calls') or []):
+                if isinstance(tc, dict) and tc.get('id'):
+                    announced.add(tc['id'])
+
+        stale = set()
+        for call_id in (announced & set(seen)):
+            if call_id in answered:
+                continue
+            if self.real_tool_answer(call_id):
+                continue
+            stale.add(call_id)
+        return stale
+
+    def drop_stale_phantom_tool_calls(self, messages):
+        """Remove the announcements identified by stale_phantom_call_ids.
+
+        Done BEFORE the pending-call bookkeeping so the phantom never enters
+        ``pending_tool_calls`` and no placeholder is minted for it — rather
+        than deleting a placeholder after the fact, which would leave the
+        assistant announcement behind for the next transform to re-answer.
+
+        Copies any message it edits.  These dicts are the agents' own
+        ``_oai_messages`` entries; mutating one would rewrite the
+        conversation's real history, not just this request body.
+        """
+        stale = self.stale_phantom_call_ids(messages)
+        if not stale:
+            return messages
+
+        out = []
+        for m in messages:
+            if not isinstance(m, dict) or not m.get('tool_calls'):
+                out.append(m)
+                continue
+            kept = [tc for tc in m['tool_calls']
+                    if not (isinstance(tc, dict) and tc.get('id') in stale)]
+            if len(kept) == len(m['tool_calls']):
+                out.append(m)
+                continue
+            m = dict(m)
+            if kept:
+                m['tool_calls'] = kept
+            else:
+                m.pop('tool_calls', None)
+                if not str(m.get('content') or '').strip():
+                    continue  # the announcement was all the message carried
+            out.append(m)
+
+        current_app.logger.info(
+            f"[PHANTOM-DROP] {len(stale)} tool call(s) announced by a finished "
+            f"action produced no result and were dropped instead of being "
+            f"answered with a placeholder: {sorted(stale)} "
+            f"({len(messages)} msgs -> {len(out)})")
+        return out
+
     def apply_transform(self, messages: List[Dict]) -> List[Dict]:
         """Applies the tool message handling transformation to ensure valid tool call/response pairings."""
         if not messages:
@@ -1531,6 +2004,10 @@ class ToolMessageHandler:
 
         """Removes the word Execute for historical actions and not for current action"""
         messages = self.compress_action_messages(messages, current_action_id)
+
+        # Drop announcements left behind by actions that are already finished,
+        # before anything downstream counts them as needing an answer.
+        messages = self.drop_stale_phantom_tool_calls(messages)
 
         current_app.logger.info(f"ToolMessageHandler: Processing {len(messages)} messages")
         # DEBUGGING: Print the entire conversation structure with full message details
@@ -1805,10 +2282,26 @@ class ToolMessageHandler:
                     break
                 insert_position = j + 1
 
-            # Insert the consolidated response
-            final_messages.insert(insert_position, fixed_consolidated)
+            # Insert the consolidated response as ONE tool message per call.
+            # The bundled shape (role=tool, tool_responses=[...], no top-level
+            # tool_call_id) is autogen's internal form, not the API's: the
+            # hosted Qwen endpoint answers any request holding it with a bare
+            # 400 "invalid request", with or without a user turn (measured on
+            # central 2026-09-13, task #89), while the same results as one
+            # tool message per tool_call_id pass.  A bundle without per-call
+            # entries (the tool_call_ids form) has nothing to split and goes
+            # in as it did.
+            _per_call = [
+                {'role': 'tool', 'tool_call_id': r['tool_call_id'],
+                 'content': r.get('content') if r.get('content') is not None else ''}
+                for r in (fixed_consolidated.get('tool_responses') or [])
+                if isinstance(r, dict) and r.get('tool_call_id')
+            ]
+            final_messages[insert_position:insert_position] = (
+                _per_call or [fixed_consolidated])
             current_app.logger.info(
-                f"Inserted consolidated response with {len(tool_call_ids)} tool_call_ids after assistant message at index {most_likely_assistant_idx}")
+                f"Inserted consolidated response with {len(tool_call_ids)} tool_call_ids after assistant message at index {most_likely_assistant_idx}"
+                + (f" as {len(_per_call)} tool message(s)" if _per_call else ""))
 
             # Mark these tool calls as responded
             for tool_call_id in tool_call_ids:
@@ -1877,11 +2370,29 @@ class ToolMessageHandler:
                                     function_name = tc.get('function', {}).get('name')
                                     break
 
+                            # Fill the slot with the REAL result when a peer
+                            # agent already holds it.  This is the same "fill
+                            # the answer slot" repair as before — only the
+                            # content changes, from a manufactured string to
+                            # what the tool actually returned.  Falls back to
+                            # the placeholder when nothing real exists, so a
+                            # genuinely unanswered call still looks unanswered.
+                            _real = self.real_tool_answer(tool_call_id)
+                            if _real:
+                                # A peer's buffer holds the result as it ran,
+                                # and this runs after the context limiter, so
+                                # bound it the way the limiter bounds a tool
+                                # result (#104 review: a peer's whole answer
+                                # reached the model uncut).
+                                from core.constants import AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE
+                                from core.token_utils import fit_texts_to_token_budget
+                                _real = fit_texts_to_token_budget(
+                                    [_real], AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE)[0]
                             placeholder = {
                                 'role': 'tool',
                                 'name': function_name or assistant_msg.get('name', 'Assistant'),
                                 'tool_call_id': tool_call_id,
-                                'content': "Placeholder response for historical tool call"
+                                'content': _real or HISTORICAL_TOOL_PLACEHOLDER
                             }
 
                             # Insert the placeholder right after the assistant message
@@ -1895,8 +2406,25 @@ class ToolMessageHandler:
                                 insert_position = j + 1
 
                             final_messages.insert(insert_position, placeholder)
+                            # peers=N is the DISCRIMINATOR, not decoration.
+                            # ToolMessageHandler is constructed at 9 sites and
+                            # only 2 pass peer_agents (reuse_recipe :1633,
+                            # :2311); the other 7 -- create_recipe :1135/:2891/
+                            # :3571/:3682 and reuse_recipe :1010/:3201 -- leave
+                            # it empty, and real_tool_answer iterates exactly
+                            # that list, so with peers=0 it can ONLY ever
+                            # return None and "no peer holds it" is vacuous.
+                            # Live 2026-09-11 07:29-07:32 (agent 89091774807):
+                            # 39 placeholders, every one "no peer holds it",
+                            # and the model then invented "38.4 GB" against a
+                            # real 9.17 GB.  Without this count the log cannot
+                            # say whether the answer was genuinely absent
+                            # (peers>0, a real defect upstream) or was never
+                            # looked for (peers=0, a wiring gap here).
                             current_app.logger.info(
-                                f"Added placeholder for historical tool_call_id {tool_call_id}"
+                                f"[TOOL-ANSWER-FILL] {tool_call_id} <- "
+                                f"{'REAL result %d chars' % len(_real) if _real else 'placeholder (no peer holds it)'}"
+                                f" peers={len(self._peer_agents)}"
                             )
 
 
@@ -1929,6 +2457,100 @@ class ToolMessageHandler:
             return f"Modified {changes} message roles", True
 
         return "No message transformations needed", False
+
+
+class ToolActivityAsEvidence:
+    """Show a judging seat the other seats' tool calls as a report.
+
+    autogen 0.2.37 ``_append_oai_message`` (conversable_agent.py:667-668)
+    gives role="assistant" to every message carrying tool_calls, whoever
+    sent it.  So the StatusVerifier, which holds no tools, receives the
+    Assistant's call as its own turn, and the model continues that turn
+    instead of judging it.
+
+    Live 2026-09-14, two agents walked as their owners: the verifier
+    answered with the Assistant's call written out as <tool_call> text
+    (20260824301, 3 of 3 rounds) or with the Assistant's next step
+    (12165936867).  Neither action got a verdict, both turns spent their 12
+    rounds, and the user was handed the leftover text.  The verifier's own
+    logged requests, replayed against the live llama-server: 4/4 answered
+    with tool-call text as logged, 4/4 with a JSON verdict once the calls
+    and results were told as a report from the seat that made them.
+
+    This runs after the shared ToolMessageHandler, so a result held only by
+    a peer seat has already been filled in.  A seat that can run a call or a
+    code block keeps the raw structure: generate_reply hands the transformed
+    list to every reply function, tool and code execution included.
+    """
+
+    def __init__(self, seat):
+        self._seat = seat
+
+    def _acts_on_calls(self):
+        seat = self._seat
+        return bool(getattr(seat, '_function_map', None)
+                    or getattr(seat, '_code_execution_config', False)
+                    or (getattr(seat, 'llm_config', None) or {}).get('tools'))
+
+    def apply_transform(self, messages: List[Dict]) -> List[Dict]:
+        if self._acts_on_calls() or not any(
+                m.get('tool_calls') or m.get('role') == 'tool' for m in messages):
+            return messages
+        answered = set()
+        for m in messages:
+            if m.get('role') == 'tool':
+                answered.add(m.get('tool_call_id'))
+                answered.update(r.get('tool_call_id') for r in (m.get('tool_responses') or [])
+                                if isinstance(r, dict))
+        calls, out, n_calls, n_results = {}, [], 0, 0
+        for m in messages:
+            if m.get('tool_calls'):
+                who = m.get('name') or 'Assistant'
+                if str(m.get('content') or '').strip():
+                    out.append({'role': 'user', 'name': who, 'content': m['content']})
+                for tc in m['tool_calls']:
+                    fn = tc.get('function') or {}
+                    line = f"{who} called {fn.get('name')}({fn.get('arguments') or ''})"
+                    n_calls += 1
+                    if tc.get('id') in answered:
+                        calls[tc.get('id')] = (who, line)
+                    else:
+                        out.append({'role': 'user', 'name': who,
+                                    'content': f"{line}\nTool result: (none recorded)"})
+            elif m.get('role') == 'tool':
+                for r in (m.get('tool_responses') or [m]):
+                    who, line = calls.pop(r.get('tool_call_id'),
+                                          (m.get('name') or 'Tool', 'A tool call'))
+                    out.append({'role': 'user', 'name': who,
+                                'content': f"{line}\nTool result: {r.get('content')}"})
+                    n_results += 1
+            else:
+                out.append(m)
+        _safe_log('info',
+                  f"[JUDGE-VIEW] {getattr(self._seat, 'name', '?')}: {n_calls} tool "
+                  f"call(s) and {n_results} result(s) shown as a report")
+        # The same role-order guard the shared chain ends with: the report
+        # lines are user turns, and consecutive ones are merged the same way.
+        return ToolMessageHandler().validate_messages(out)
+
+    def get_logs(self, pre_transform_messages: List[Dict],
+                 post_transform_messages: List[Dict]) -> Tuple[str, bool]:
+        changed = any(m.get('tool_calls') or m.get('role') == 'tool'
+                      for m in pre_transform_messages)
+        return ("tool activity shown as a report" if changed else "no tool activity",
+                changed)
+
+
+def give_judge_view(seat):
+    """Give a judging seat ToolActivityAsEvidence.
+
+    Call it after the seat's shared TransformMessages: hooks run in the order
+    they were registered, and the shared chain fills the real tool answers
+    this view reports.
+    """
+    transform_messages.TransformMessages(
+        transforms=[ToolActivityAsEvidence(seat)], verbose=False).add_to_agent(seat)
+
 
 class Action:
     def __init__(self,actions):
@@ -2087,8 +2709,24 @@ def get_frame(user_id, frame_store=None):
         # was skipped rather than silently landing on the legacy path.
         _fallback_logger.debug(f"FrameStore lookup failed for user_id {user_id}: {e}")
 
-    # Fallback: Redis (legacy path)
-    serialized_frame = redis_client.get(user_id)
+    # Fallback: Redis (legacy path).  Only a cloud camera pipeline writes
+    # frames there; a desktop runs no Redis, and redis_client is built lazily
+    # so it is never None.  A refused connect means "no frame" -- the
+    # callers' None branch already tells the user the camera is off -- and
+    # costs 4.07 s on Windows (measured 2026-09-13), so after one refusal the
+    # breaker skips Redis for its cooldown.  Unguarded, the ConnectionError
+    # escaped get_user_camera_inp 246 times on 2026-09-13 and agents went on
+    # to drive the desktop trying to start Redis.
+    if redis_client is None or _REDIS_FRAME_BREAKER.is_open(redis_client):
+        return None
+    try:
+        serialized_frame = redis_client.get(user_id)
+    except redis.RedisError as e:
+        _REDIS_FRAME_BREAKER.record_failure(redis_client)
+        current_app.logger.info(
+            f"No frame for user_id {user_id}: Redis unavailable ({e})")
+        return None
+    _REDIS_FRAME_BREAKER.record_success(redis_client)
     current_app.logger.info('after redis client')
     try:
         if serialized_frame is not None:
@@ -2244,10 +2882,35 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     '''
     import json as _json
     start_time = time.time()
-    try:
-        user_id = int(session_id.replace("user_", ""))
-    except Exception as e:
-        _fallback_logger.warning(f"get_time_based_history: bad session_id {session_id}: {e}")
+    # THE ID STAYS A STRING.  Both consumers below already take one —
+    # `ConversationEntry.user_id == str(user_id)` converts straight back, and
+    # SimpleMemChatMemory.load_or_create takes it as-is — so int() never did
+    # anything except narrow the accepted id space.  Nunba's guest ids are
+    # UUIDs, so that narrowing made this function return EMPTY for them
+    # before querying any store.
+    #
+    # Measured live 2026-09-10, agent 92583386981, 50 ms apart:
+    #   14:58:55,851 WARNING bad session_id user_3e2908ac-3ff6-4198-bc46-
+    #                9ec43a2aac9a: invalid literal for int() with base 10
+    #   14:58:55,901 tool    {"res": []}   (= get_chat_history)
+    # The caller cannot tell that from "you have no history", and the model
+    # filled the gap by inventing a CEFR level for the user (#817/D52).
+    #
+    # NO REGRESSION for numeric ids: str(int('123')) == '123' == str('123'),
+    # and the DB filter is the only place the value is used, so what gets
+    # queried is unchanged for every integer user.
+    user_id = str(session_id or '')
+    if user_id.startswith('user_'):
+        user_id = user_id[len('user_'):]
+    if not user_id.strip():
+        # Still refused — an empty id is not a user, and querying on it would
+        # match whatever rows carry an empty user_id.
+        try:
+            current_app.logger.warning(
+                f"get_time_based_history: no user id in session_id "
+                f"{session_id!r}")
+        except Exception:
+            pass
         return _json.dumps({'res': []})
 
     window = resolve_recall_window(start_date, end_date)
@@ -2255,8 +2918,13 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     if window is not None:
         win_lo, win_hi = window
         try:
-            from integrations.social._models_local import ConversationEntry
-            from integrations.social.models import get_db
+            # From the facade, never from _models_local: on an install with
+            # sql.models, executing the fallback module re-registers every
+            # table on the shared Base and every later query fails with
+            # "Multiple classes found for path" (live 2026-09-15 12:21:32,
+            # this function; the owner's consent clicks failed for the
+            # rest of the process).
+            from integrations.social.models import ConversationEntry, get_db
             results = []
             db = get_db()
             try:
@@ -2697,8 +3365,8 @@ def create_visual_agent(user_id,prompt_id):
 
     context_handling = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=3500, max_tokens_per_message=1000, min_tokens=0),
+            history_limiter(max_messages=50, keep_first_message=True),
+            token_limiter(max_tokens=3500, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(),
         ]
     )
@@ -2711,6 +3379,7 @@ def create_visual_agent(user_id,prompt_id):
     # path uses chat_instructor2 (UserProxyAgent line 2047) the same way;
     # it needs the same buffer cap to avoid llama.cpp n_ctx overflow.
     context_handling.add_to_agent(chat_instructor2)
+    give_judge_view(verify2)
 
     return visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2
 
@@ -3322,11 +3991,17 @@ def load_vlm_agent_files(prompt_id, role_number):
     """Loads any VLM agent JSON files for the given prompt_id and role_number and integrates them with existing recipes."""
     vlm_actions = []
 
-    # Look for existing VLM agent files
+    # Look for existing VLM agent files.  PROMPTS_DIR (module scope, above) is
+    # the canonical store and is created at import; the CWD-relative "prompts"
+    # this used to read resolved to Program Files in the frozen install, so the
+    # listdir raised and the broad except below SWALLOWED it — measured live
+    # 2026-09-06: 45 "Error listing files in prompts directory" and ZERO
+    # "Found VLM agent recipe", i.e. this function had never once returned a
+    # loaded agent on an installed build.
     try:
-        for file in os.listdir("prompts"):
+        for file in os.listdir(PROMPTS_DIR):
             if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
-                file_path = os.path.join("prompts", file)
+                file_path = os.path.join(PROMPTS_DIR, file)
                 try:
                     with open(file_path, 'r') as f:
                         recipe_data = json.load(f)

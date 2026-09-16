@@ -215,5 +215,137 @@ class HandlerWiringDriftGuardTest(unittest.TestCase):
             'must stay consolidated in _emit_final')
 
 
+class MicLearningConsentGateTest(unittest.TestCase):
+    """The chat mic feeds learning only on EXISTING consent; voice rooms are
+    unchanged.
+
+    Owner intent reversal, 2026-09-10: the finalize path was gated on call_id
+    "so the push-to-talk chat mic is untouched", which meant a child speaking
+    into the ordinary mic never reached the learner. The gate is now the
+    consent the voice agents already require, checked off the event loop.
+    """
+
+    def setUp(self):
+        import os
+        from unittest import mock
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop('HEVOLVE_MIC_LEARNING', None)
+        os.environ['HEVOLVE_OWNER_USER_ID'] = 'owner-1'
+        self.sent = []
+        bridge = mock.Mock()
+        bridge.ingest_sensor_batch.side_effect = (
+            lambda readings: self.sent.extend(readings))
+        self._bridge = mock.patch(
+            'integrations.agent_engine.world_model_bridge'
+            '.get_world_model_bridge', return_value=bridge)
+        self._bridge.start()
+
+    def tearDown(self):
+        self._bridge.stop()
+        self._env.stop()
+
+    @staticmethod
+    def _consent(granted):
+        from unittest import mock
+        return mock.patch(
+            'integrations.service_tools.whisper_tool._mic_learning_consented',
+            return_value=granted)
+
+    PCM = b'\x00\x01' * 8
+
+    def test_voice_room_ingests_without_a_consent_lookup(self):
+        from integrations.service_tools.whisper_tool import (
+            _maybe_ingest_audio_sensor)
+        with self._consent(False) as consent:
+            _maybe_ingest_audio_sensor('room-1', 'alice', self.PCM, 'hi', 'en')
+        consent.assert_not_called()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0]['sensor_id'], 'mic_room-1',
+                         'voice-room readings must stay byte-identical')
+
+    def test_chat_mic_with_consent_ingests_and_tags_the_identity(self):
+        from integrations.service_tools.whisper_tool import (
+            _maybe_ingest_audio_sensor)
+        with self._consent(True) as consent:
+            _maybe_ingest_audio_sensor(None, None, self.PCM, 'red ball', 'en')
+        consent.assert_called_once_with('owner-1')
+        self.assertEqual(len(self.sent), 1)
+        data = self.sent[0]['data']
+        self.assertEqual(data['transcript'], 'red ball',
+                         'the WORDS must travel with the audio')
+        self.assertEqual(data['identity_source'], 'owner_fallback')
+        self.assertEqual(self.sent[0]['sensor_id'],
+                         'mic_owner_fallback_owner-1',
+                         'an owner-attributed segment must stay identifiable')
+
+    def test_chat_mic_without_consent_is_not_ingested(self):
+        from integrations.service_tools.whisper_tool import (
+            _maybe_ingest_audio_sensor)
+        with self._consent(False):
+            _maybe_ingest_audio_sensor(None, None, self.PCM, 'red ball', 'en')
+        self.assertEqual(self.sent, [])
+
+    def test_a_ws_user_param_is_preferred_over_the_owner(self):
+        from integrations.service_tools.whisper_tool import (
+            _maybe_ingest_audio_sensor)
+        with self._consent(True) as consent:
+            _maybe_ingest_audio_sensor(None, 'alice', self.PCM, 'x', 'en')
+        consent.assert_called_once_with('alice')
+        self.assertEqual(self.sent[0]['data']['identity_source'], 'ws_param')
+
+    def test_no_owner_declared_skips_rather_than_guesses(self):
+        import os
+        from integrations.service_tools.whisper_tool import (
+            _maybe_ingest_audio_sensor)
+        os.environ.pop('HEVOLVE_OWNER_USER_ID', None)
+        with self._consent(True) as consent:
+            _maybe_ingest_audio_sensor(None, None, self.PCM, 'x', 'en')
+        consent.assert_not_called()
+        self.assertEqual(self.sent, [])
+
+    def test_kill_switch_stops_the_chat_mic_only(self):
+        import os
+        from integrations.service_tools.whisper_tool import (
+            _maybe_ingest_audio_sensor)
+        os.environ['HEVOLVE_MIC_LEARNING'] = '0'
+        with self._consent(True):
+            _maybe_ingest_audio_sensor(None, None, self.PCM, 'x', 'en')
+            _maybe_ingest_audio_sensor('room-1', None, self.PCM, 'y', 'en')
+        self.assertEqual([r['sensor_id'] for r in self.sent], ['mic_room-1'])
+
+    def test_consent_machinery_failure_fails_closed(self):
+        from unittest import mock
+        from integrations.service_tools import whisper_tool as wt
+        with mock.patch(
+                'integrations.social.consent_service.ConsentService'
+                '.check_consent', side_effect=RuntimeError('db down')):
+            self.assertFalse(wt._mic_learning_consented('owner-1'))
+
+    def test_finalize_no_longer_hides_the_producer_behind_call_id(self):
+        """Drift guard for the reversal: inside _emit_final, the executor
+        submit of _maybe_ingest_audio_sensor must not sit under `if call_id:`
+        again, or the chat mic silently stops reaching the learner."""
+        src = open('integrations/service_tools/whisper_tool.py',
+                   encoding='utf-8').read()
+        tree = ast.parse(src)
+        emit_final = HandlerWiringDriftGuardTest._fn(tree, '_emit_final')
+        self.assertIsNotNone(emit_final)
+        refs = [n for n in ast.walk(emit_final)
+                if isinstance(n, ast.Name)
+                and n.id == '_maybe_ingest_audio_sensor']
+        self.assertEqual(len(refs), 1,
+                         '_emit_final must hand the producer to the executor '
+                         'exactly once')
+        for node in ast.walk(emit_final):
+            if (isinstance(node, ast.If) and isinstance(node.test, ast.Name)
+                    and node.test.id == 'call_id'):
+                inner = [n for n in ast.walk(node)
+                         if isinstance(n, ast.Name)
+                         and n.id == '_maybe_ingest_audio_sensor']
+                self.assertEqual(inner, [],
+                                 'the producer is gated on call_id again')
+
+
 if __name__ == '__main__':
     unittest.main()

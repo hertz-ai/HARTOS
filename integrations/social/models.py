@@ -18,6 +18,7 @@ from sqlalchemy import (
     DateTime, JSON, ForeignKey, UniqueConstraint, Index, func
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
+from sqlalchemy.dialects import mysql
 
 # Import shared Base from hevolve-database (single metadata registry).
 # Fallback to local Base if hevolve-database is not installed (e.g., dev without pip install).
@@ -348,6 +349,125 @@ class SitePage(Base):
         if include_content:
             d['content'] = self.content
         return d
+
+
+# ═══════════════════════════════════════════════════════════════
+# BookFile / BookPageLayout — the parsed-book library, also on the facade
+# ═══════════════════════════════════════════════════════════════
+# HARTOS-only tables, defined ONCE here for the same reason as SitePage:
+# both branches (hevolve-database installed or not) get them.
+#
+# They replace Nunba's raw-sqlite tables of the same names (routes/db_routes.py,
+# nunba_db.sqlite), which existed only on a desktop running Nunba. Here every
+# HARTOS node has them -- standalone :6777, Docker, HART OS, central -- in the
+# database that node already uses (SQLite, or MySQL/PostgreSQL through
+# HEVOLVE_DB_URL). run_migrations() creates them on existing databases too,
+# because it runs create_all on every pass.
+#
+# Table and column names are kept from Nunba so every reader keeps its row
+# shape (book_tools, GET /db/pdf_files, GET /db/layouts). hevolve-database's
+# cloud Book/Layout models are NOT reused: that package is absent on Docker and
+# HART OS, and its HertzOcrRequestResponse keys user_id to the cloud `user`
+# table, not this node's `users`. user_id is the node's own id as text (social
+# ids are strings; the desktop sends numeric ids).
+#
+# Timestamps are written by Python (UTC), not func.now(): the stall check in
+# integrations/learning/book_pipeline.py compares them with utcnow(), and a
+# MySQL NOW() in the server's local zone would skew that by hours.
+
+class BookFile(Base):
+    __tablename__ = 'pdf_files'
+    # Ids are never reused on SQLite: a book's page images live under
+    # uploads/pdf_parse/<file_id>/, and a reused id would show another book's pages.
+    __table_args__ = {'sqlite_autoincrement': True}
+
+    STATUSES = ('pending', 'processing', 'completed', 'failed')
+
+    file_id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(64), nullable=False, index=True)
+    filename = Column(String(255), nullable=False)
+    directory = Column(String(1024), default='')
+    # The whole book's text. MySQL's and MariaDB's TEXT stops at 64 KB, and in
+    # strict mode the write is refused, so LONGTEXT there; SQLite and
+    # PostgreSQL TEXT is unbounded.
+    text_response = Column(Text().with_variant(mysql.LONGTEXT(), 'mysql', 'mariadb'),
+                           default='')
+    book_type = Column(String(64), nullable=True)
+    book_name = Column(String(300), nullable=True)
+    page_offset = Column(Integer, default=0)
+    total_pages = Column(Integer, default=0)
+    status = Column(String(20), default='pending', index=True)
+    # Why a parse failed, in words a user can be shown. Nunba's table had no
+    # such column, so a failure lived only in an in-memory job that a restart
+    # erased.
+    error = Column(Text, nullable=True)
+    request_id = Column(String(128), default='')
+    created_date = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self, include_text=False):
+        d = {
+            'file_id': self.file_id,
+            'user_id': self.user_id,
+            'filename': self.filename,
+            # Not `directory`: the server's own path, with its OS user name in
+            # it, is no caller's business.
+            'book_type': self.book_type,
+            'book_name': self.book_name,
+            'page_offset': self.page_offset,
+            'total_pages': self.total_pages,
+            'status': self.status,
+            'error': self.error,
+            'request_id': self.request_id,
+            'created_date': self.created_date.isoformat() if self.created_date else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+        # The whole book's text is opt-in: a library listing of 100 books
+        # must not carry 100 books.
+        if include_text:
+            d['text_response'] = self.text_response
+        return d
+
+
+class BookPageLayout(Base):
+    __tablename__ = 'page_layouts'
+    __table_args__ = (
+        Index('ix_page_layouts_file_page', 'file_id', 'page_number'),
+    )
+
+    layout_id = Column(Integer, primary_key=True, autoincrement=True)
+    file_id = Column(Integer, ForeignKey('pdf_files.file_id', ondelete='CASCADE'),
+                     nullable=False)
+    page_number = Column(Integer, nullable=False)
+    layout_number = Column(Integer, default=1)
+    num_layouts_per_page = Column(Integer, default=1)
+    passage = Column(Text, default='')
+    topic_name = Column(String(300), nullable=True)
+    chapter_name = Column(String(300), nullable=True)
+    page_type = Column(String(64), nullable=True)
+    element_type = Column(String(64), nullable=True)
+    bbox = Column(Text, nullable=True)
+    label = Column(String(128), nullable=True)
+    processing_time_ms = Column(Integer, nullable=True)
+    created_date = Column(DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'layout_id': self.layout_id,
+            'file_id': self.file_id,
+            'page_number': self.page_number,
+            'layout_number': self.layout_number,
+            'num_layouts_per_page': self.num_layouts_per_page,
+            'passage': self.passage,
+            'topic_name': self.topic_name,
+            'chapter_name': self.chapter_name,
+            'page_type': self.page_type,
+            'element_type': self.element_type,
+            'bbox': self.bbox,
+            'label': self.label,
+            'processing_time_ms': self.processing_time_ms,
+            'created_date': self.created_date.isoformat() if self.created_date else None,
+        }
 
 
 # ─── TABLE 4: comments ───

@@ -132,9 +132,80 @@ class TestTraceBanking:
         assert data['recipe'][0]['tool_name'] == ''
         assert 'no-op' in data['recipe'][0]['steps']
 
+    def test_a_re_posted_action_keeps_the_work_of_its_earlier_window(self, banked):
+        """Central 2026-09-13 (Compute Recruiter, action 2): the searches ran
+        after the first "Execute Action 2:", the ChatInstructor re-posted the
+        same action at 20:17:13 to wrap the round, and banking only the last
+        window (a closing verdict, no tool call) saved "no-op" for real work."""
+        ok, data, _ = banked([
+            {'content': 'Execute Action 2: google_search: recent GPU cost posts'},
+            {'tool_calls': [{'function': {'name': 'google_search',
+                                          'arguments': '{"query": "idle GPU"}'}}]},
+            {'content': 'Strong material coming in from Hacker News.'},
+            {'content': 'Execute Action 2: google_search: recent GPU cost posts'},
+            {'content': '{"status": "completed", "action_id": 2}'},
+        ])
+        assert ok is True
+        names = [s['tool_name'] for s in data['recipe']]
+        assert names == ['google_search'], data['recipe']
+
+    def test_a_retry_that_did_work_supersedes_the_earlier_attempt(self, banked):
+        ok, data, _ = banked([
+            {'content': 'Execute Action 2: synthesize'},
+            {'tool_calls': [{'function': {'name': 'first_try',
+                                          'arguments': '{}'}}]},
+            {'content': 'Execute Action 2: synthesize'},
+            {'tool_calls': [{'function': {'name': 'second_try',
+                                          'arguments': '{}'}}]},
+        ])
+        assert ok is True
+        names = [s['tool_name'] for s in data['recipe']]
+        assert names == ['second_try'], names
+
+    def test_an_action_this_run_never_dispatched_is_not_banked(self, banked):
+        """Resuming after a restart, a COMPLETED action whose recipe is missing
+        reaches this function with a fresh group chat: its work ran in an
+        earlier process and none of it is in the trace.  Banking then wrote a
+        no-op recipe for work that really happened (central 2026-09-13, #90:
+        23 of 23 actions of one agent), and the flow-recipe reconciler built
+        an agent out of them that replays nothing."""
+        ok, data, _ = banked([
+            {'content': 'Execute Action 3: a later action'},
+            {'tool_calls': [{'function': {'name': 'action3_tool',
+                                          'arguments': '{}'}}]},
+        ], action_id=2)
+        assert ok is False
+        assert data is None, 'a recipe was written for an action this run never ran'
+
+    def test_an_empty_trace_banks_nothing(self, banked):
+        ok, data, _ = banked([], action_id=1)
+        assert ok is False
+        assert data is None
+
     def test_failure_returns_false_never_raises(self, tmp_path):
         fn, ns = _load_bank_fn(tmp_path)
         ns['helper_fun'].safe_prompt_path = (
             lambda *a: (_ for _ in ()).throw(OSError('disk gone')))
         gc = SimpleNamespace(messages=[{'content': 'Execute Action 2: x'}])
         assert fn('u_test', '999', 0, 2, gc) is False
+
+    def test_a_plain_text_action_banks(self, tmp_path):
+        """The create flow stores each action as its plain text: every action
+        of all three hive agents on central was a str (2026-09-13).  .get on
+        that text raised "'str' object has no attribute 'get'", so no action
+        was ever banked from its trace and each restart re-walked the flow
+        from action 1."""
+        fn, ns = _load_bank_fn(tmp_path)
+        text = ('create_scheduled_jobs to schedule a recurring 6 hour job '
+                'for continuous privacy safe threat monitoring')
+        ns['user_tasks']['u_str'] = SimpleNamespace(get_action=lambda idx: text)
+        gc = SimpleNamespace(messages=[
+            {'content': 'Execute Action 1: ' + text},
+            {'tool_calls': [{'function': {'name': 'create_scheduled_jobs',
+                                          'arguments': '{"every_hours": 6}'}}]},
+        ])
+        assert fn('u_str', '999', 0, 1, gc) is True
+        data = json.load(open(tmp_path / '999_0_1.json'))
+        assert data['action'] == text
+        assert data['fallback_action'] == ''
+        assert data['recipe'][0]['tool_name'] == 'create_scheduled_jobs'

@@ -177,8 +177,13 @@ def test_unit_is_nonfatal_oneshot_as_hart_user():
     assert re.search(r"RemainAfterExit\s*=\s*true", svc), (
         "must RemainAfterExit=true so it never re-runs / blocks")
     assert re.search(r'User\s*=\s*"hart"', svc), "must run as User=hart"
-    assert re.search(r'TimeoutStartSec\s*=\s*"360"', svc), (
-        "must set a bounded TimeoutStartSec (360) so a wedged probe can't wedge boot")
+    assert re.search(r"TimeoutStartSec\s*=\s*toString startTimeout", svc), (
+        "TimeoutStartSec must be DERIVED from the per-probe budgets (toString "
+        "startTimeout), never hand-written: a literal 360 against inner bounds "
+        "summing to 390 meant a run where every probe merely reached its own "
+        "limit could not finish inside the unit's limit, so systemd SIGKILLed "
+        "the unit and the status file stayed empty. The invariant that replaces "
+        "the number is test_outer_bound_exceeds_the_sum_of_the_probe_bounds.")
 
 
 def test_tmpfiles_run_hart_dir():
@@ -262,8 +267,15 @@ def test_windows_probe_is_real_wine_exec():
     assert re.search(r"WINEPREFIX=/var/lib/hart/wine/smoke", src), (
         "the wine probe must use a dedicated WINEPREFIX under hart-subsystems' "
         "/var/lib/hart/wine (mkdir -p the /smoke subdir)")
-    assert re.search(r"timeout 120 wine", src), (
-        "the wine probe must be wrapped in a timeout so a cold-prefix init can't hang")
+    assert re.search(r"probe \$\{toString budget\.wine\} wine", src), (
+        "the wine probe must run through the bounded `probe` helper so a "
+        "cold-prefix init cannot hang, and so its bound is counted into the "
+        "unit's derived TimeoutStartSec")
+    assert re.search(r"wineserver -k", src), (
+        "the wine probe must tear down wineserver afterwards: Wine's daemons "
+        "outlive the `wine` process by design, and a lingering wineserver keeps "
+        "the unit's cgroup populated so systemd has to SIGKILL it at exit "
+        "(observed on real HW 2026-09-10, seven processes at a time)")
 
 
 def test_android_probe_checks_image_and_real_shell_exec():
@@ -291,8 +303,9 @@ def test_macos_probe_is_real_darling_exec():
     src = _read(_SMOKE)
     assert re.search(r"darling shell echo HARTOK", src), (
         "macos must be probed by a REAL `darling shell echo HARTOK` exec")
-    assert re.search(r"timeout 120 darling", src), (
-        "the darling probe must be wrapped in a timeout (experimental + heavy)")
+    assert re.search(r"probe \$\{toString budget\.darling\} darling", src), (
+        "the darling probe must run through the bounded `probe` helper "
+        "(experimental + heavy)")
 
 
 def test_linux_flatpak_appimage_statuses():
@@ -391,3 +404,187 @@ def test_classifier_marks_missing_hartok_failed(out):
     assert _classify(shell, out) == "failed", (
         f"runtime output WITHOUT HARTOK must classify as failed "
         f"(the runtime did not execute our command): {out!r}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. The two defects that left the status file EMPTY on real hardware.
+#    Both are pinned as invariants rather than numbers, so neither can come
+#    back by drift.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _budget() -> dict:
+    """Parse the module's per-probe time budgets out of its `let` block."""
+    src = _read(_SMOKE)
+    m = re.search(r"budget\s*=\s*\{(.*?)\};", src, re.S)
+    assert m, "the module must declare a `budget` attrset of per-probe bounds"
+    return {k: int(v) for k, v in re.findall(r"(\w+)\s*=\s*(\d+);", m.group(1))}
+
+
+def test_outer_bound_exceeds_the_sum_of_the_probe_bounds():
+    """The unit must be able to survive its own worst case.
+
+    THE BUG, measured on real HW 2026-09-10: TimeoutStartSec was a hand-written
+    360 while the inner bounds summed to 390 (120 wine + 30 waydroid-status +
+    60 waydroid-shell + 120 darling + 30 flatpak + 30 fsprobe). A run in which
+    every probe merely reached its OWN limit therefore could not finish inside
+    the unit's limit. systemd SIGKILLed the unit twice in a row with
+    `Failed with result timeout`, and /run/hart/compat-status was left EMPTY:
+    not one honest verdict, which is the single outcome this module exists to
+    prevent. A module that measures nothing is worse than one that measures
+    badly, because it reads as though the runtimes were never asked.
+
+    So the outer bound is derived now, and this is the invariant behind it.
+    """
+    src = _read(_SMOKE)
+    budget = _budget()
+    assert budget, "the budget attrset must not be empty"
+
+    # The sum must be computed by the module, not restated by hand.
+    assert re.search(r"probeBudget\s*=\s*lib\.foldl'.*lib\.attrValues budget", src), (
+        "probeBudget must be summed from the budget attrset itself, so that "
+        "adding a probe automatically widens the unit's ceiling")
+
+    m = re.search(r"startTimeout\s*=\s*probeBudget\s*\+\s*(\d+);", src)
+    assert m, "startTimeout must be probeBudget plus a headroom constant"
+    headroom = int(m.group(1))
+    assert headroom > 0, (
+        "the outer bound needs headroom over the probe sum for the script's own "
+        "plumbing: the prefix mkdir, the wineserver teardown, and the "
+        "SIGTERM-then-SIGKILL grace that each bound allows")
+
+    # And the derived ceiling must be what the unit actually uses.
+    assert re.search(r"TimeoutStartSec\s*=\s*toString startTimeout", src), (
+        "the unit must use the derived ceiling, not a literal")
+
+
+def test_no_probe_captures_through_a_command_substitution():
+    """A probe's time bound must actually bound it.
+
+    THE BUG, measured on real HW 2026-09-10: the probes captured output with
+    `OUT="$(timeout N ...)"`. A command substitution reads the pipe until EOF,
+    and EOF only arrives once EVERY holder of the write end has closed it. Wine
+    forks wineserver and winedevice.exe, which inherit that write end and
+    deliberately outlive the `wine` process, so `timeout` killed wine exactly on
+    schedule while the substitution went on blocking on the daemons. The bound
+    silently stopped bounding. Same prefix, same command, back to back:
+
+        timeout 20 wine cmd /c "echo HARTOK"   via $(...)   returned after 41s
+        timeout 20 wine cmd /c "echo HARTOK"   via a file   returned after 20s
+
+    Capturing to a file needs no such handshake, so the bound written is the
+    bound enforced. This guard is what keeps the pipe from coming back.
+    """
+    src = _read(_SMOKE)
+    assert '"$(timeout' not in src, (
+        "no probe may capture through a command substitution: a detached daemon "
+        "inheriting the pipe's write end holds it open past the kill, which "
+        "makes the timeout a lie. Use the `probe` helper, which captures to a "
+        "file.")
+    assert re.search(r'timeout -k 5 "\$secs" "\$@" >"\$PROBE_TMP" 2>&1 </dev/null',
+                     src), (
+        "the probe helper must redirect the probe's output to a FILE and its "
+        "stdin from /dev/null, and use -k so an ignored SIGTERM becomes a KILL")
+
+
+def test_every_runtime_probe_goes_through_the_bounded_helper():
+    """One bounding mechanism, applied everywhere. A probe that hand-rolls its
+    own escapes the derived ceiling and the file-capture fix at the same time."""
+    body = _read(_SMOKE)
+    body = body[body.index("smokeScript ="):]
+    for tool in ("wine", "waydroid status", "waydroid shell", "darling", "flatpak"):
+        assert re.search(r"probe \$\{toString budget\.\w+\} " + re.escape(tool),
+                         body), (
+            "the " + tool + " probe must run through the `probe` helper so its "
+            "bound is both enforced and counted into TimeoutStartSec")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. The embedded shell script must actually PARSE.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_smoke_script() -> str:
+    """Render the Nix-embedded shell script the way Nix would.
+
+    The script lives inside a Nix `''` string, so nothing on the Python side
+    ever sees it as shell. Substitute the interpolations with representative
+    values and unescape `''${` back to `${`, and what comes out is the text the
+    unit will actually execute.
+    """
+    src = _read(_SMOKE)
+    open_marker = 'pkgs.writeShellScript "hart-compat-smoketest" ' + "''"
+    start = src.index(open_marker) + len(open_marker)
+    end = src.index("''" + ";", start)
+    body = src[start:end]
+
+    # `''${` is the Nix escape for a literal `${` -- shell, not interpolation.
+    sentinel = "\x00SHELLBRACE\x00"
+    body = body.replace("''" + "${", sentinel)
+
+    # Everything still spelled ${...} IS a Nix interpolation. Substitute each
+    # with a value of the right shape so the result is runnable shell.
+    subs = {
+        "${binPath}": "/nix/store/stub-coreutils/bin",
+        "${statusFile}": "/run/hart/compat-status",
+        '${lib.concatStringsSep " " config.hart.storage.filesystems}':
+            "ntfs exfat vfat ext4 btrfs",
+    }
+    for k, v in subs.items():
+        body = body.replace(k, v)
+    for name, value in _budget().items():
+        body = body.replace("${toString budget." + name + "}", str(value))
+
+    leftover = re.findall(r"\$\{[^}]*\}", body)
+    assert not leftover, (
+        "unhandled Nix interpolation in the smoke script, so this guard would "
+        "be checking the wrong text: " + repr(leftover))
+
+    return body.replace(sentinel, "${")
+
+
+def test_rendered_script_is_valid_shell():
+    """`bash -n` the script Nix will actually write.
+
+    Worth its own guard: the script is a string inside a Nix expression, so a
+    syntax error in it survives `nix-instantiate --parse` (the NIX parses fine),
+    survives every source-shape assertion above, and only surfaces when the unit
+    runs on a real machine -- where its whole job is to write a status file, and
+    a shell that will not parse writes nothing at all. That is the same silent
+    empty-status outcome the timeout bug produced, arriving by a different road.
+    """
+    shell = _shell()
+    if not shell:
+        pytest.skip("no POSIX shell available to syntax-check the script")
+    rendered = _render_smoke_script()
+    # BYTES on stdin, not a path and not text: the module's comments are full of
+    # box-drawing characters a cp1252 dev host cannot encode, and Windows
+    # newline translation would turn `}` into `}\r`, which no longer terminates
+    # a block. Both produce alarming syntax errors for a perfectly good script.
+    r = subprocess.run([shell, "-n"], input=rendered.encode("utf-8"),
+                       capture_output=True, timeout=60)
+    assert r.returncode == 0, (
+        "the rendered smoke script is not valid shell:\n"
+        + r.stderr.decode("utf-8", "replace")[:600])
+
+
+def test_rendered_script_bounds_every_probe_it_runs():
+    """Behavioural, not textual: walk the rendered script and confirm no line
+    invokes a foreign-OS runtime as its own command word. Anything that does has
+    escaped both the enforced time bound and the derived TimeoutStartSec, which
+    is exactly how the unit came to be SIGKILLed with an empty status file."""
+    rendered = _render_smoke_script()
+    runtimes = {"wine", "waydroid", "darling", "flatpak", "appimage-run"}
+    for line in rendered.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Strip shell keywords that can precede a command word on one line.
+        tokens = stripped.split()
+        while tokens and tokens[0] in ("if", "elif", "while", "until", "then",
+                                       "else", "do", "!"):
+            tokens = tokens[1:]
+        if not tokens:
+            continue
+        assert tokens[0] not in runtimes, (
+            "this line invokes a foreign-OS runtime directly, outside the "
+            "bounded `probe` helper, so its time bound is neither enforced nor "
+            "counted into TimeoutStartSec: " + stripped)

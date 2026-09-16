@@ -483,7 +483,7 @@ def _win_diskpart_clean(disk_number, log):
             pass
 
 
-def _win_dismount_disk_volumes(disk_number, log=None):
+def _win_dismount_disk_volumes(disk_number, log=None, hold=False):
     """FSCTL-dismount EVERY volume on the disk, INCLUDING the letterless FAT32 ESP
     a raw GPT image creates -- which _dismount_windows (drive-letter only) misses
     and whose kernel mount walls the write with ACCESS_DENIED (5) a few MB in,
@@ -491,14 +491,17 @@ def _win_dismount_disk_volumes(disk_number, log=None):
     cannot help (unsupported on removable media). This is the Rufus/Win32DiskImager
     approach: enumerate volumes, keep those whose disk extents are on disk_number,
     FSCTL_LOCK_VOLUME + FSCTL_DISMOUNT_VOLUME each. Best-effort; never raises.
-    Returns the count dismounted.
 
-    UNUSED (2026-09-03, do not wire into the per-chunk write re-arm): calling this
-    on every ACCESS_DENIED (5) HANGS/crawls the flash -- the ESP RE-MOUNTS after
-    each dismount, so dismount-per-chunk never converges. A working Windows raw
-    USB flash needs lock-and-HOLD (open each volume's FSCTL_LOCK_VOLUME handle and
-    keep it open for the WHOLE write, Rufus-style), not per-chunk dismount. Kept as
-    a reference for that future fix; balenaEtcher/Rufus are the reliable path now."""
+    ``hold=False`` closes each volume handle before returning and yields the COUNT
+    dismounted. That is the mode that does NOT converge on its own: releasing the
+    lock lets the ESP RE-MOUNT, so calling it per ACCESS_DENIED (5) chunk just
+    crawls (measured 2026-09-03).
+
+    ``hold=True`` is the fix: the FSCTL_LOCK_VOLUME handles are RETAINED and
+    returned as a list, so the caller keeps the volumes locked for the WHOLE write
+    (Rufus-style lock-and-HOLD) and the kernel cannot re-mount the ESP underneath
+    it. The caller MUST close them (see ``_win_release_held_volumes``) or the
+    volumes stay locked until the process exits."""
     log = log or (lambda m: None)
     try:
         import ctypes
@@ -506,7 +509,7 @@ def _win_dismount_disk_volumes(disk_number, log=None):
         k = ctypes.WinDLL("kernel32", use_last_error=True)
     except Exception as e:
         log("  FSCTL dismount: ctypes/kernel32 unavailable (%s)" % e)
-        return 0
+        return [] if hold else 0
     GENERIC_RW, SHARE_RW, OPEN_EXISTING = 0xC0000000, 0x3, 3
     FSCTL_LOCK_VOLUME, FSCTL_DISMOUNT_VOLUME = 0x00090018, 0x00090020
     IOCTL_GET_DISK_EXTENTS = 0x00560000
@@ -525,13 +528,14 @@ def _win_dismount_disk_volumes(disk_number, log=None):
     buf = ctypes.create_unicode_buffer(260)
     fh = k.FindFirstVolumeW(buf, 260)
     if fh == INVALID:
-        return 0
-    count = 0
+        return [] if hold else 0
+    count, held = 0, []
     try:
         while True:
             devpath = buf.value.rstrip("\\")          # CreateFile needs no trailing '\'
             vh = k.CreateFileW(devpath, GENERIC_RW, SHARE_RW, None, OPEN_EXISTING, 0, None)
             if vh != INVALID:
+                keep = False
                 try:
                     out = ctypes.create_string_buffer(4096)
                     ret = wintypes.DWORD()
@@ -547,16 +551,45 @@ def _win_dismount_disk_volumes(disk_number, log=None):
                             if k.DeviceIoControl(vh, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0,
                                                  ctypes.byref(ret), None):
                                 count += 1
+                                # hold: KEEP the lock handle open so the kernel
+                                # cannot re-mount this volume mid-write.
+                                keep = bool(hold)
                 finally:
-                    k.CloseHandle(vh)
+                    if keep:
+                        held.append(vh)
+                    else:
+                        k.CloseHandle(vh)
             if not k.FindNextVolumeW(fh, buf, 260):
                 break
     finally:
         k.FindVolumeClose(fh)
     if count:
-        log("  FSCTL-dismounted %d volume(s) on disk %d (incl. any letterless ESP)"
-            % (count, disk_number))
-    return count
+        log("  FSCTL-%s %d volume(s) on disk %d (incl. any letterless ESP)"
+            % ("locked+HELD" if hold else "dismounted", count, disk_number))
+    return held if hold else count
+
+
+def _win_release_held_volumes(handles, log=None):
+    """Close the lock handles from ``_win_dismount_disk_volumes(hold=True)``,
+    releasing the volumes back to Windows. Best-effort; never raises."""
+    if not handles:
+        return
+    try:
+        import ctypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+    except Exception:
+        return
+    _say = log or (lambda m: None)
+    for h in handles:
+        try:
+            k.CloseHandle(h)
+        except Exception as e:
+            # Best-effort: the handle is released when this process exits either
+            # way. Said out loud because a leaked lock is exactly what makes the
+            # NEXT flash fail to open the disk, and silence there sends the
+            # search to the wrong place.
+            _say("  (releasing a volume lock failed: %s)" % e)
+    _say("  released %d held volume lock(s)" % len(handles))
 
 
 def _prepare_windows_device(disk, dd, log, clean=True):
@@ -613,7 +646,7 @@ class _WinExclusiveWriter:
     buffer. Idempotent: the retry rewrites the identical bytes at the identical
     offset."""
 
-    def __init__(self, disk_number, disk=None):
+    def __init__(self, disk_number, disk=None, log=None):
         import ctypes
         from ctypes import wintypes
         self.ctypes, self.wintypes = ctypes, wintypes
@@ -630,6 +663,13 @@ class _WinExclusiveWriter:
         self.invalid = wintypes.HANDLE(-1).value
         self._disk_number = disk_number
         self._disk = disk if disk is not None else {"number": disk_number}
+        # Volume locks held for the WHOLE write (Rufus-style). Empty until the
+        # first re-arm needs them; see `_rearm`.
+        self._held = []
+        # The flasher's own log sink. Threaded in so `_rearm` can SAY why a step
+        # failed: a re-arm that keeps failing is what makes a flash crawl, and
+        # without this the reason is not in the transcript.
+        self._log = log or (lambda m: None)
         self.h = self._open()
 
     def _open(self):
@@ -661,6 +701,18 @@ class _WinExclusiveWriter:
             if last_err not in _TRANSIENT:
                 break
             time.sleep(2 + attempt)     # 2..9s — let the volume manager release / the stick re-appear
+        # Holding volume locks is itself a reason an EXCLUSIVE (share 0) open of
+        # the drive loses with SHARING_VIOLATION (32) — our own held handles are
+        # openers on that disk. That is fine and is exactly the Rufus model: with
+        # every volume locked+dismounted and HELD, nothing else can touch the
+        # media, so a SHARED handle is just as safe. Fall back to one rather than
+        # failing the whole flash.
+        if self._held:
+            h = k.CreateFileW(r"\\.\PhysicalDrive%d" % disk_number,
+                              0xC0000000, 0x3, None, 3, 0, None)   # FILE_SHARE_READ|WRITE
+            if h != self.invalid:
+                return h
+            last_err = ctypes.get_last_error()
         raise RuntimeError("exclusive open of PhysicalDrive%d failed (err %d) — "
                            "is the disk still mounted? (a re-plug or reboot "
                            "resets a stick whose controller refuses writes)"
@@ -669,16 +721,35 @@ class _WinExclusiveWriter:
     def _rearm(self):
         """Windows mounted a volume from the partition table we just wrote.
         Drop the handle (diskpart/mountvol cannot touch the disk while we hold
-        it exclusively), dismount that volume, re-assert automount-off, reopen."""
+        it exclusively), dismount that volume, re-assert automount-off, reopen.
+
+        The dismount is now lock-and-HOLD. Closing the lock (the old behaviour)
+        let the kernel re-mount the letterless ESP immediately, so a raw GPT
+        image's ACCESS_DENIED (5) never converged and the flash crawled. Keeping
+        every volume handle open for the rest of the write is what makes the
+        re-arm terminate: the ESP cannot come back to claim its byte span."""
+        # Each step below is best-effort: the reopen at the end is the real
+        # test, and any of these can legitimately fail on a disk whose volumes
+        # have already gone. They are LOGGED rather than swallowed because a
+        # re-arm that keeps failing is how the flash crawls, and the reason it
+        # crawled has to be readable from the transcript.
         try:
-            self.close()
-        except Exception:
-            pass
+            self._close_drive()
+        except Exception as e:
+            self._log("  (re-arm: closing the drive handle failed: %s)" % e)
         _win_automount(False)
         try:
             _dismount_windows(self._disk)          # drive-letter volumes
-        except Exception:
-            pass                        # best-effort: the reopen is the real test
+        except Exception as e:
+            self._log("  (re-arm: dismounting lettered volumes failed: %s)" % e)
+        try:
+            # Lock+HOLD every volume on the disk, including the letterless ESP.
+            # Additive across re-arms: a later table write can create a volume
+            # that did not exist at the previous re-arm.
+            self._held.extend(
+                _win_dismount_disk_volumes(self._disk_number, hold=True) or [])
+        except Exception as e:
+            self._log("  (re-arm: locking the disk's volumes failed: %s)" % e)
         self.h = self._open()
 
     def write_at(self, byte_offset, fobj):
@@ -718,11 +789,22 @@ class _WinExclusiveWriter:
             total += written.value
         return total
 
-    def close(self):
+    def _close_drive(self):
+        """Drop ONLY the drive handle, keeping the volume locks held (a re-arm
+        reopens the drive and must not let the ESP re-mount in between)."""
         try:
             self.k.CloseHandle(self.h)
         except Exception:
             pass
+
+    def close(self):
+        self._close_drive()
+        # Release the volumes back to Windows now the write is done.
+        try:
+            _win_release_held_volumes(self._held)
+        except Exception:
+            pass
+        self._held = []
 
 
 class DeviceIdentityChanged(RuntimeError):
@@ -1890,7 +1972,7 @@ def flash_raw(tag, variant, disk, tmp, progress=None, log=None, verify=True,
     writer = None
     if IS_WIN:
         _prepare_windows_device(disk, dd, log, clean=True)
-        writer = _WinExclusiveWriter(disk["number"], disk)
+        writer = _WinExclusiveWriter(disk["number"], disk, log=log)
     reader = _XZPartsReader(srcs, log, progress=progress, total_compressed=total_comp)
     try:
         if writer is not None:
@@ -2016,7 +2098,7 @@ def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
         # RESUME (start_part>0): keep the disk's already-written parts — skip the
         # destructive diskpart clean, only automount-off + dismount.
         _prepare_windows_device(disk, dd, log, clean=(start_part <= 0))
-        writer = _WinExclusiveWriter(disk["number"], disk)   # held exclusive for all parts
+        writer = _WinExclusiveWriter(disk["number"], disk, log=log)  # held exclusive for all parts
     try:
         for idx, (p, off) in enumerate(zip(parts, offs)):
             if idx < start_part:

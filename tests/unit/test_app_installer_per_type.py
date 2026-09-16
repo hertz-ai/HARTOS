@@ -63,15 +63,57 @@ class TestNixIsReal(_InstallerCase):
     """nix is REAL: real command, real exit-code check."""
 
     @patch('integrations.agent_engine.app_installer.subprocess.run')
-    def test_invokes_nix_env_with_package(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stderr='')
+    def test_invokes_nix_env_against_the_nix_path_not_a_channel(self, mock_run):
+        """The attribute must NOT be prefixed with the channel name.
+
+        This test used to assert 'nixpkgs.htop' was in the command, which is
+        what a channel-based nix-env wants. A flake-built HART OS node has no
+        channels (no nix-channel on PATH, NIX_PATH=nixpkgs=flake:nixpkgs), so
+        that form failed on every node with "attribute 'nixpkgs' in selection
+        path 'nixpkgs.htop' not found" while this test stayed green, because it
+        fakes the package manager. Measured on the box 2026-09-07.
+        """
+        mock_run.return_value = MagicMock(returncode=0, stderr='', stdout='')
         res = self.installer._install_nix(InstallRequest(source='nixpkgs.htop'))
         self.assertTrue(res.success)
-        mock_run.assert_called_once()
-        cmd = mock_run.call_args[0][0]
+        cmd = mock_run.call_args_list[0][0][0]      # the INSTALL call
         self.assertEqual(cmd[0], 'nix-env')
         self.assertIn('-iA', cmd)
-        self.assertIn('nixpkgs.htop', cmd)
+        # Resolved through NIX_PATH, so the attribute is bare.
+        self.assertIn('-f', cmd)
+        self.assertIn('<nixpkgs>', cmd)
+        self.assertIn('htop', cmd)
+        self.assertNotIn('nixpkgs.htop', cmd)
+
+    @patch('integrations.agent_engine.app_installer.subprocess.run')
+    def test_reports_a_real_store_path_or_none_at_all(self, mock_run):
+        """A fabricated path is worse than an empty one.
+
+        The success result used to carry the literal string
+        '/nix/store/.../<pkg>' with the ellipsis in it, so anything that opened
+        install_path or showed it to a person got a fiction. '' is the honest
+        answer when the query cannot resolve it, and every consumer already
+        guards on the field being empty.
+        """
+        real = '/nix/store/hwz2l7ihv2skq7gr5l3paavs3rr9il7z-hello-2.12.1'
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stderr='', stdout=''),        # install
+            MagicMock(returncode=0, stderr='', stdout=real + '\n'),  # out-path
+        ]
+        res = self.installer._install_nix(InstallRequest(source='nixpkgs.hello'))
+        self.assertTrue(res.success)
+        self.assertEqual(res.install_path, real)
+        self.assertNotIn('...', res.install_path)
+
+    @patch('integrations.agent_engine.app_installer.subprocess.run')
+    def test_an_unresolvable_path_is_empty_not_invented(self, mock_run):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stderr='', stdout=''),   # install OK
+            MagicMock(returncode=1, stderr='boom', stdout=''),  # query fails
+        ]
+        res = self.installer._install_nix(InstallRequest(source='nixpkgs.hello'))
+        self.assertTrue(res.success, 'a failed path QUERY must not fail the install')
+        self.assertEqual(res.install_path, '')
 
     @patch('integrations.agent_engine.app_installer.subprocess.run')
     def test_propagates_failure(self, mock_run):
@@ -84,6 +126,50 @@ class TestNixIsReal(_InstallerCase):
     @patch('integrations.agent_engine.app_installer.subprocess.run',
            side_effect=FileNotFoundError)
     def test_reports_tool_absent(self, _):
+        res = self.installer._install_nix(InstallRequest(source='nixpkgs.htop'))
+        self.assertFalse(res.success)
+        self.assertIn('not available', res.error)
+
+    def test_nix_calls_get_a_usable_environment(self):
+        """A systemd unit inherits neither of the two things nix needs.
+
+        Measured inside hart-liquid-ui.service on the box 2026-09-07: PATH had
+        46 entries and none of them was /run/current-system/sw/bin (where
+        nix-env lives), and NIX_PATH was unset because /etc/set-environment is
+        a LOGIN-shell file. Either alone makes every nix install fail on a real
+        node while the faked-boundary tests stay green. flatpak got this fix in
+        2026-08-12; nix never did.
+        """
+        # tool_path() only APPENDS a dir that exists, so assert the contract
+        # with the node's dirs faked present. Asserting the bare result would
+        # make this a test of the dev host, green or red by accident.
+        with patch('integrations.agent_engine.app_installer.os.path.isdir',
+                   return_value=True):
+            env = self.installer._tool_env()
+        self.assertIn('/run/current-system/sw/bin', env['PATH'])
+        self.assertTrue(env.get('NIX_PATH'), 'nix cannot resolve <nixpkgs> without it')
+
+    def test_an_inherited_nix_path_wins_over_the_default(self):
+        """The unit is the authority; the built-in value is only a floor."""
+        with patch.dict(os.environ, {'NIX_PATH': 'nixpkgs=/somewhere/else'}):
+            self.assertEqual(
+                self.installer._tool_env()['NIX_PATH'], 'nixpkgs=/somewhere/else')
+
+    def test_flatpak_env_still_carries_its_own_dir_and_the_shared_path(self):
+        """Refactoring flatpak onto the shared builder must not drop what only
+        flatpak needs."""
+        with patch('integrations.agent_engine.app_installer.os.path.isdir',
+                   return_value=True):
+            env = self.installer._flatpak_env()
+        self.assertEqual(env['FLATPAK_USER_DIR'], self.installer._flatpak_dir)
+        self.assertIn('/run/current-system/sw/bin', env['PATH'])
+
+    @patch('integrations.agent_engine.app_installer.subprocess.run',
+           side_effect=NotADirectoryError(20, 'Not a directory'))
+    def test_a_malformed_path_is_reported_not_raised(self, _):
+        """A bad PATH entry raises NotADirectoryError, not FileNotFoundError,
+        out of the same exec. Letting it escape turns a bad environment into a
+        500 instead of an honest failure."""
         res = self.installer._install_nix(InstallRequest(source='nixpkgs.htop'))
         self.assertFalse(res.success)
         self.assertIn('not available', res.error)

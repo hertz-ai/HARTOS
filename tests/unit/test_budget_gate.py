@@ -18,10 +18,25 @@ class TestEstimateLLMCostSpark:
     def _force_cloud_model(self, monkeypatch):
         monkeypatch.delenv('HEVOLVE_LOCAL_LLM_URL', raising=False)
         monkeypatch.delenv('HEVOLVE_LOCAL_LLM_MODEL', raising=False)
-        # Force _is_local_model to return False (cloud model = costs money)
+        # Force _is_local_model to return False (cloud model = costs money).
         monkeypatch.setattr(
             'integrations.agent_engine.budget_gate._is_local_model',
             lambda: False)
+        # AND arrange the configured backend, which is the other half.
+        # 0571c55 made `_resolve_model_name` source the model from the ONE
+        # configured LLM (`core.autogen_config.resolve_llm_backend`), so the
+        # legacy 'gpt-4o' these tests pass gets rewritten to whatever the HOST
+        # is configured to call. On any box with a local LLM that became
+        # 'llama', which prices at 0 Spark, and every cost assertion below
+        # collapsed to 0. Stubbing `_is_local_model` alone cannot fix it:
+        # `_resolve_model_name` never calls that function.
+        #
+        # Patched on `core.autogen_config` rather than on budget_gate because
+        # the import sits INSIDE the function body, so there is no name in
+        # budget_gate to rebind.
+        monkeypatch.setattr(
+            'core.autogen_config.resolve_llm_backend',
+            lambda: ('api', {'model': 'gpt-4o'}))
 
     def test_estimate_returns_positive_int(self):
         from integrations.agent_engine.budget_gate import estimate_llm_cost_spark
@@ -274,26 +289,49 @@ class TestResolveModelName:
         from integrations.agent_engine.budget_gate import _resolve_model_name
         assert _resolve_model_name('claude-3-opus') == 'claude-3-opus'
 
+    # The three below arrange `resolve_llm_backend`, which is what
+    # `_resolve_model_name` actually consults since 0571c55 ("the ONE
+    # configured LLM is the source for every caller"). They used to stub
+    # `_is_local_model`, a function it does not call, so the stub never bit and
+    # the answer came from whatever the HOST had configured: stays_gpt4o failed
+    # on any box with a local LLM, and the other two passed by luck. Patch
+    # target is `core.autogen_config` because the import is inside the body.
     def test_default_gpt4o_uses_env_local_model_when_set(self, monkeypatch):
         # caller passed the default 'gpt-4o' but an explicit local model is
         # configured -> price against the local model (0 Spark), not gpt-4o
         monkeypatch.setenv('HEVOLVE_LOCAL_LLM_MODEL', 'my-local-7b')
+        monkeypatch.setattr('core.autogen_config.resolve_llm_backend',
+                            lambda: ('local', {}))
         from integrations.agent_engine.budget_gate import _resolve_model_name
         assert _resolve_model_name('gpt-4o') == 'my-local-7b'
 
     def test_default_gpt4o_resolves_to_llama_when_local_backend_active(self, monkeypatch):
         monkeypatch.delenv('HEVOLVE_LOCAL_LLM_MODEL', raising=False)
-        monkeypatch.setattr(
-            'integrations.agent_engine.budget_gate._is_local_model', lambda: True)
+        monkeypatch.setattr('core.autogen_config.resolve_llm_backend',
+                            lambda: ('local', {}))
         from integrations.agent_engine.budget_gate import _resolve_model_name
         assert _resolve_model_name('gpt-4o') == 'llama'
 
     def test_default_gpt4o_stays_gpt4o_when_no_local(self, monkeypatch):
         monkeypatch.delenv('HEVOLVE_LOCAL_LLM_MODEL', raising=False)
-        monkeypatch.setattr(
-            'integrations.agent_engine.budget_gate._is_local_model', lambda: False)
+        monkeypatch.setattr('core.autogen_config.resolve_llm_backend',
+                            lambda: ('api', {'model': 'gpt-4o'}))
         from integrations.agent_engine.budget_gate import _resolve_model_name
         assert _resolve_model_name('gpt-4o') == 'gpt-4o'
+
+    def test_an_api_backend_prices_against_ITS_model_not_the_legacy_default(
+            self, monkeypatch):
+        """The point of 0571c55: pricing follows what the node actually calls.
+
+        Without this, the two tests above could both be satisfied by a resolver
+        that merely echoed its argument, and the reason the function exists
+        would go unpinned.
+        """
+        monkeypatch.delenv('HEVOLVE_LOCAL_LLM_MODEL', raising=False)
+        monkeypatch.setattr('core.autogen_config.resolve_llm_backend',
+                            lambda: ('api', {'model': 'claude-3-5-sonnet'}))
+        from integrations.agent_engine.budget_gate import _resolve_model_name
+        assert _resolve_model_name('gpt-4o') == 'claude-3-5-sonnet'
 
 
 # ── check_platform_affordability: fresh-cache fast path ──────────────────────

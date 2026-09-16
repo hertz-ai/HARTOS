@@ -233,7 +233,12 @@ ADMIN_PATHS = ('/api/admin',)
 #: deployments are single-user desktop and pre-trusted.
 NETWORK_PROTECTED_PATHS = ('/chat', '/time_agent', '/visual_agent',
                            '/add_history', '/prompts', '/zeroshot',
-                           '/response_ack')
+                           '/response_ack',
+                           #: voice: gate the routes that WRITE/READ files
+                           #: (speak, clone); the read-only, traversal-safe
+                           #: audio serve + voices list stay public so a
+                           #: browser <audio src> is not broken (#67).
+                           '/api/voice/speak', '/api/voice/clone')
 
 #: Legacy alias — some tests still import PROTECTED_PATHS expecting
 #: the combined tuple. Keep this as the union so older imports don't
@@ -244,13 +249,17 @@ EXEMPT_PREFIXES = ('/status', '/a2a/', '/api/social/', '/.well-known/',
                    '/prompts/public')
 
 
-def _apply_api_auth(app: Flask):
+def _apply_api_auth(app: Flask, register: bool = True):
     """Tier-aware API authentication with a strict admin guard.
+
+    Returns the gate hook; ``register=False`` builds it without registering
+    it, for hartos_bootstrap.install_api_gate, which must be able to run the
+    same hook in front of an app that no longer accepts before_request.
 
     Two gates run in order:
 
       1. ADMIN guard — /api/admin/* ALWAYS requires auth on any tier
-         except bundled desktop. Admin ops modify persistent state so
+         except a desktop's own callers. Admin ops modify persistent state so
          LAN trust is not enough — a compromised IoT device on the
          same network must not be able to drop agents or reconfigure
          TTS engines.
@@ -268,7 +277,9 @@ def _apply_api_auth(app: Flask):
       - Behind KONG:                    KONG handles auth → no key needed,
                                         middleware enforces tier-conditional
                                         only if KONG is bypassed
-      - Bundled desktop (NUNBA_BUNDLED): early return, always trusted
+      - Bundled desktop (NUNBA_BUNDLED): its own machine trusted; another
+                                        machine reaches the exempt paths,
+                                        and the rest with a credential
       - Regional LAN:                   /chat open, /api/admin gated
       - Central cloud:                  everything gated
     """
@@ -320,22 +331,124 @@ def _apply_api_auth(app: Flask):
             {'error': 'Authentication required (Bearer token)'},
         ), 401
 
-    @app.before_request
-    def check_api_auth():
-        # Bundled/desktop mode: in-process test_client, always trusted.
-        if os.environ.get('NUNBA_BUNDLED'):
-            return
+    def _admit_owner_allowed_device(refused):
+        """A desktop's second network credential: a token the phone signed
+        with its own PeerLink key, admitted when the owner has allowed that
+        key (integrations.social.auth.verify_device_jwt; the grant is the
+        owner's ``device_access`` consent whose scope names the key).
 
+        ``refused`` is the 401 the key/JWT check already produced; it stands
+        for anything that is not a device token.  A device the owner has not
+        answered about gets the ask filed for them (ConsentService.
+        request_consent, delivered like every consent ask, one card per
+        pending row) and a 403 ``consent_pending`` it can retry on; a device
+        the owner said no to gets 403 ``consent_denied`` and no new ask.  An
+        admitted device acts only as the token's user: a JSON body must
+        carry that ``user_id`` and no other (#51), so no route's default
+        user can stand in for it.
+
+        Filing is what an unauthenticated peer can trigger, so it is paced
+        per address with the gossip announce limiter (discovery.
+        _check_announce_rate): past the limit the ask is not filed and the
+        answer is still ``consent_pending``, which an honest phone retries.
+        """
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return refused
+        owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+        if not owner:
+            return refused
+        token = auth_header[7:]
+        try:
+            from integrations.social.auth import verify_device_jwt
+            from integrations.social.models import db_session
+            with db_session(commit=True) as db:
+                verdict = verify_device_jwt(db, token, owner)
+                if verdict['status'] == 'pending':
+                    from integrations.social.discovery import _check_announce_rate
+                    if _check_announce_rate(request.remote_addr or ''):
+                        _file_device_ask(db, owner, verdict['public_key'],
+                                         verdict.get('claims') or {})
+                    else:
+                        logger.warning("device ask from %s not filed: rate limit",
+                                       request.remote_addr)
+        except Exception:
+            logger.warning("device credential check failed; refusing",
+                           exc_info=True)
+            return refused
+        status = verdict['status']
+        if status == 'ok':
+            payload = verdict['payload']
+            body = request.get_json(silent=True) if request.is_json else None
+            if isinstance(body, dict):
+                asked_as = body.get('user_id')
+                if asked_as is None or str(asked_as) != str(payload.get('user_id')):
+                    logger.warning("device %s... acting as user %s, token says "
+                                   "%s; refused", verdict['public_key'][:16],
+                                   asked_as, payload.get('user_id'))
+                    return jsonify({'error': 'user_id must be the token\'s user'}), 403
+            g.auth_source = 'device'
+            g.jwt_payload = payload
+            g.device_public_key = verdict['public_key']
+            return None
+        if status == 'pending':
+            return jsonify({'error': 'consent_pending',
+                            'message': "Waiting for this desktop's owner to "
+                                       "allow this phone"}), 403
+        if status == 'denied':
+            return jsonify({'error': 'consent_denied',
+                            'message': "This desktop's owner has not allowed "
+                                       "this phone"}), 403
+        return refused
+
+    def _file_device_ask(db, owner, public_key, claims):
+        """File (or re-send) the owner's ask for this phone.  The person's
+        name comes from the token's own username claim, which the phone
+        signed; nothing of the key is shown, the card names the person."""
+        from integrations.social.consent_service import (
+            ConsentService, device_scope)
+        name = ' '.join(str(claims.get('username') or '').split())[:100]
+        who = f"{name}'s phone" if name else "A phone"
+        ConsentService.request_consent(
+            db, owner, 'device_access', scope=device_scope(public_key),
+            reason=f"{who} asks to use this computer's agents from the network.",
+            requester_name=name)
+
+    def _expected_api_key() -> str:
+        """HEVOLVE_API_KEY, the one credential both branches below accept."""
+        try:
+            from security.secrets_manager import get_secret
+            return get_secret('HEVOLVE_API_KEY')
+        except Exception:
+            return os.environ.get('HEVOLVE_API_KEY', '')
+
+    def check_api_auth():
         path = request.path
+        # Bundled desktop.  This machine's own callers (the SPA, the tray,
+        # in-process test clients) are trusted, as they always were.  But the
+        # socket is Nunba's app on 0.0.0.0, the address the desktop advertises
+        # to peers (core.port_registry.get_advertisable_base_url), so a caller
+        # from another machine reaches only the exempt paths, which carry the
+        # peer protocol's HTTP half, and everything else with a credential.
+        # Measured 2026-09-14: a device on the same Wi-Fi could drive /chat
+        # and read /prompts on an installed desktop.
+        if os.environ.get('NUNBA_BUNDLED'):
+            from core.auth_local import _is_local_request
+            if _is_local_request() or _is_exempt(path):
+                return
+            refused = _require_api_key_or_bearer(_expected_api_key())
+            if refused is None:
+                return
+            # A person's phone, signed with the key the owner allowed (#111):
+            # only after the key and the local JWT have not admitted it, so
+            # every caller admitted today is admitted exactly as before.
+            return _admit_owner_allowed_device(refused)
+
         if _is_exempt(path):
             return
 
         # Resolve the shared credential once — both gates share it.
-        try:
-            from security.secrets_manager import get_secret
-            expected_key = get_secret('HEVOLVE_API_KEY')
-        except Exception:
-            expected_key = os.environ.get('HEVOLVE_API_KEY', '')
+        expected_key = _expected_api_key()
 
         # Gate 1: Admin paths. ALWAYS required. Even regional LAN
         # deployments gate admin ops — the tier model is for user-facing
@@ -365,6 +478,59 @@ def _apply_api_auth(app: Flask):
             return
         # Non-central without API key → LAN-trusted or gateway-auth'd
         return
+
+    if register:
+        app.before_request(check_api_auth)
+    return check_api_auth
+
+
+def install_api_gate(app: Flask) -> bool:
+    """Put the API gate on an app that other machines reach, once.
+
+    hart_intelligence_entry gets it through apply_security_middleware.  An
+    embedder's app gets it here: Nunba's, which a desktop serves on 0.0.0.0
+    and advertises to peers.  hartos_bootstrap calls this first inside its
+    setup-lock window, and an embedder that serves before bootstrap runs
+    calls it when it creates the app.  Measured 2026-09-14: without it a
+    device on the same network could drive /chat and read /prompts on an
+    installed desktop.
+
+    Never left open: Flask refuses a before_request hook once an app has
+    served a request outside the setup-lock window, and then the hook goes
+    into before_request_funcs directly, where the decorator puts it, so it
+    runs in the request's own dispatch.  The app is marked gated only after
+    the hook is confirmed there.  Returns whether the app is gated; False,
+    logged CRITICAL, only if the hook could not be placed.
+    """
+    if getattr(app, '_hartos_api_gate', False):
+        return True
+    if os.environ.get('NUNBA_CI', '') == '1':
+        # Say loudly which way NUNBA_CI went.  core.auth_local trusts every
+        # caller under it in a build run from source (Nunba's staging
+        # container, the only place that sets it); an installed build
+        # ignores it.
+        from core.auth_local import ci_trusts_every_caller
+        if ci_trusts_every_caller():
+            logger.critical("NUNBA_CI=1: every caller is trusted as local, as "
+                            "on Nunba's staging container; a production node "
+                            "must never set it")
+        else:
+            logger.critical("NUNBA_CI=1 is set on an installed build and is "
+                            "ignored: callers from other machines still need "
+                            "a credential")
+    hook = _apply_api_auth(app, register=False)
+    try:
+        app.before_request(hook)
+    except Exception as e:
+        # The hook reads headers and the remote address only, never the body.
+        logger.critical(f"Flask refused the API gate ({e}); adding it to "
+                        f"before_request_funcs directly")
+        app.before_request_funcs.setdefault(None, []).append(hook)
+    if hook not in app.before_request_funcs.get(None, []):
+        logger.critical("The API gate is NOT on this app; it is serving UNGATED")
+        return False
+    app._hartos_api_gate = True
+    return True
 
 
 def _constant_time_compare(a: str, b: str) -> bool:

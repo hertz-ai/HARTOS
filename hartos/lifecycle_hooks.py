@@ -9,6 +9,7 @@ It also provides functions to sync ActionState with SmartLedger TaskStatus.
 from enum import Enum
 import logging
 import os
+import re
 import threading
 from typing import Dict, Optional, Any
 from core.session_cache import TTLCache
@@ -443,6 +444,23 @@ STALL_GUARD_INPROGRESS_ITERS = 120
 
 _STALL_STATES = (ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_REQUESTED)
 _TERMINAL_STATES = (ActionState.COMPLETED, ActionState.TERMINATED, ActionState.ERROR, ActionState.GAVE_UP)
+
+
+def is_terminal_state(state) -> bool:
+    """Is this action state one the action can never leave?
+
+    The public reader for `_TERMINAL_STATES`, so callers in other modules ask
+    this question instead of re-listing the states.  That tuple is already
+    spelled out inline in `validate_state_transition` (the GAVE_UP guard) and
+    twice more around the give-up paths; every extra copy is a place the set can
+    drift, and drift here means a consumer disagreeing with the state machine
+    about whether an action is finished.
+
+    Added for the CREATE user-input gate (agent 88761328396, 2026-09-07), which
+    kept asking the user about action 5 for 20 minutes after that action reached
+    TERMINATED — see `create_recipe._should_block_on_user_input`.
+    """
+    return state in _TERMINAL_STATES
 
 
 # #139 observability counter — bumped each time the FAILED→COMPLETED recovery
@@ -942,8 +960,8 @@ def get_action_state(user_prompt: str, action_id: int) -> ActionState:
         return action_states.get(user_prompt, {}).get(action_id, ActionState.ASSIGNED)
 
 
-def clear_action_states(user_prompt: str) -> int:
-    """Drop one session's action states so a NEW run starts from ASSIGNED.
+def clear_action_states(user_prompt: str, user_tasks=None) -> int:
+    """Drop one session's run state so a NEW run starts from the beginning.
 
     `action_states` is keyed only by user_prompt ("{user_id}_{prompt_id}") — it
     carries no phase dimension and no run id, so CREATE and REUSE for the same
@@ -970,8 +988,50 @@ def clear_action_states(user_prompt: str) -> int:
     only reader — a caller reaching into the dict itself would be a third
     accessor and a parallel path.
 
+    RUN STATE IS TWO STORES, AND BOTH RESET HERE.  `action_states` (this module)
+    says what PHASE each action is in; the session's `Action.current_action` (an
+    entry in the caller's `user_tasks` cache) says WHICH action is current.
+    Clearing only one is vacuous — [[feedback_mirrored_state_reset]], and
+    measured twice:
+
+      • states without pointer — agent 33323830039, 2026-09-07: a 1-action
+        recipe driven twice in one process kept `current_action = 2`, so the
+        second drive terminated a phantom "Action 2" in 35 ms, ran no tool, and
+        answered with a self-introduction.
+      • pointer without states — the 90210554431 case above: every action still
+        reads TERMINATED and the loop `[AUTO-ADVANCE]`s through the recipe.
+
+    Pass `user_tasks` (the mapping, or the session's own `Action`) and this
+    resets both.  Callers that only hold the states — `reuse_recipe.py:1081`,
+    which rebuilds the `Action` itself on the next line — keep the one-argument
+    form unchanged.
+
+    THE TWO STORES RESET ON DIFFERENT TERMS, because they carry different risk.
+    Dropping `action_states` mid-run is safe: the actions re-read as ASSIGNED and
+    the run continues where its pointer says.  Resetting the POINTER mid-run
+    would truncate the run, so it happens only on the two states that cannot be
+    a live continuation:
+
+      * `current_action > len(actions)` — past the end.
+      * `current_action == len(actions)` AND that action is TERMINAL — parked on
+        a finished final action.  The integer alone is ambiguous here (a run
+        still working on its last action looks identical), so the action's own
+        state is what separates them; agent 88764372848 is the measured case.
+
+    Anything else is a live continuation and is left alone.  That is what makes
+    this function safe to call at ANY run entry point without knowing whether a
+    run is already in flight.
+
+    DELIBERATELY NOT HANDLED: a run abandoned MID-recipe — action 3 of 10, not
+    terminal — followed by a genuinely NEW request, still resumes at 3.  That one
+    is genuinely ambiguous without a run-id from the caller, and this does not
+    invent one.
+
     Returns the number of action entries dropped (0 when there was no session).
     """
+    if user_tasks is not None:
+        _reset_finished_pointer(user_prompt, user_tasks)
+
     with _state_lock:
         dropped = len(action_states.pop(user_prompt, {}) or {})
     if dropped:
@@ -980,6 +1040,63 @@ def clear_action_states(user_prompt: str) -> int:
             "from ASSIGNED instead of inheriting the previous phase's terminals",
             dropped, user_prompt)
     return dropped
+
+
+def _reset_finished_pointer(user_prompt: str, user_tasks) -> bool:
+    """Rewind `current_action` to 1 iff the previous run ran off the end.
+
+    Split out of `clear_action_states` for SRP: that function owns the states,
+    this owns the pointer, and the caller-facing contract stays one call.  The
+    predicate and its safety argument are documented there.
+
+    Accepts the same shapes the sibling `lifecycle_hook_*` functions accept — a
+    mapping of sessions, or the session's `Action` itself — so there is one
+    accessor idiom in this module rather than a second one here.
+    """
+    try:
+        if hasattr(user_tasks, 'get'):
+            task = user_tasks.get(user_prompt)
+        elif hasattr(user_tasks, 'current_action'):
+            task = user_tasks
+        else:
+            return False
+        if task is None:
+            return False
+
+        n = len(getattr(task, 'actions', None) or [])
+        current = getattr(task, 'current_action', 1)
+        # `not n` guards a recipe with zero actions: 1 > 0 would otherwise read
+        # as "past the end" and rewind on every single turn.
+        if not n or not isinstance(current, int) or current < 1:
+            return False
+
+        if current > n:
+            why = f"pointer {current} is past the end of {n} action(s)"
+        elif current == n and is_terminal_state(get_action_state(user_prompt, current)):
+            # A run PARKED on its final action and a run still WORKING on its
+            # final action are the same integer; only the action's own state
+            # separates them.  Measured live 2026-09-07 on agent 88764372848
+            # ("Nunba Guardian", 5 actions): CREATE ended with current_action=5
+            # and action 5 TERMINATED, so the next REUSE drive resumed AT 5 —
+            # `Retrieved current_action_id: 5` x7, then STUCK LOOP DETECTED and
+            # ASSISTANT-STREAK-ESCALATE — and actions 1-4 (read the log, filter
+            # ERROR, pick the newest) never ran.  The agent could not reach its
+            # goal because the work was skipped, not because it failed.
+            why = (f"final action {current}/{n} is "
+                   f"{get_action_state(user_prompt, current).value} — the "
+                   f"previous run ended on it")
+        else:
+            return False
+
+        task.current_action = 1
+    except Exception:
+        # Never raise into the reuse hot path — a failed reset must degrade to
+        # the previous behaviour, not kill the turn.
+        return False
+
+    logger.info("[RUN-BOUNDARY] %s: previous run finished (%s) — reset to "
+                "action 1", user_prompt, why)
+    return True
 
 
 def validate_state_transition(user_prompt: str, action_id: int, new_state: ActionState) -> bool:
@@ -1321,6 +1438,113 @@ def lifecycle_hook_track_recipe_completion(user_prompt: str, json_obj: dict, use
     return {'action': 'allow', 'message': None}
 
 
+# "Execute Action N:" is how the create loop posts an action to the group,
+# also as "Properly Execute Action N:" and as a re-post that send_retry
+# prefixed with "[retry:<tag>]".  Only a LEADING marker is a dispatch: the
+# [EXECUTE-PENDING] dispatch appends the user's text after its own marker, and
+# that text can quote an earlier one ("... ,Latest User message: Properly
+# Execute Action 6: ...", the Failure=True retry text), so a marker later in a
+# message says nothing about which action it posts.  Colon-delimited, so
+# action 2 never matches action 20.
+_DISPATCH_MARKER = re.compile(
+    r'\s*(?:\[retry:[^\]]*\]\s*)?(?:Properly\s+)?Execute Action (\d+):')
+
+
+def dispatch_action_id(content) -> Optional[int]:
+    """The action a message dispatches, or None when it is not a dispatch."""
+    if not isinstance(content, str):
+        return None
+    m = _DISPATCH_MARKER.match(content)
+    return int(m.group(1)) if m else None
+
+
+def latest_dispatch_before(messages, index) -> Optional[int]:
+    """The action id of the latest dispatch posted before ``messages[index]``,
+    or None when none precedes it.
+
+    Seeded messages (``_from_shared``) do not count: an earlier run's marker in
+    the shared history says nothing about which action this run is on.
+    """
+    try:
+        earlier = messages[:index]
+    except Exception:
+        logger.warning("latest_dispatch_before: cannot slice messages at %r",
+                       index, exc_info=True)
+        return None
+    for m in reversed(earlier):
+        if not isinstance(m, dict) or m.get('_from_shared'):
+            continue
+        aid = dispatch_action_id(m.get('content'))
+        if aid is not None:
+            return aid
+    return None
+
+
+def stale_for_unstarted_action(messages, index, user_prompt,
+                               action_id) -> Optional[int]:
+    """The action ``messages[index]`` belongs to, returned only when it is a
+    message left over for an action that has NOT started; otherwise None, and
+    callers keep their old behaviour.
+
+    Both conditions must hold: the current action is still ASSIGNED, and the
+    latest dispatch before the message names another action.  Measured on
+    central 2026-09-13 (#101): after [ADVANCE] N->N+1 the old verdict and
+    TERMINATE stay the last messages, and the termination hook and the create
+    loop's verdict pickup credited them to N+1 before it ran, so every executed
+    action was followed by a phantom completion of the next.  The state
+    condition matters as much as the marker: a started action's own rounds
+    (a recipe request, a fallback request, a claim rejection, a "continue"
+    nudge) carry no dispatch marker of their own, and reading only markers
+    handed them to the previous action (#101 review, 2026-09-14).
+    """
+    try:
+        aid = int(action_id)
+    except (TypeError, ValueError):
+        logger.warning("stale check: action_id %r is not an int; treating the "
+                       "message as the current action's", action_id)
+        return None
+    if get_action_state(user_prompt, aid) != ActionState.ASSIGNED:
+        return None
+    owner = latest_dispatch_before(messages, index)
+    if owner is not None and owner != aid:
+        return owner
+    return None
+
+
+def settled_action_id(claimed_action_id, current_action_id) -> int:
+    """The action a verdict settles: the one the pipeline posted.
+
+    The model's action_id is advisory.  A verdict for the action on the floor
+    that names another id (a mistyped number, a future id, an id copied from
+    an earlier verdict) still answers the posted action, so it settles that
+    one, and the mismatch is logged as a hallucination signal.  This is the
+    one home of the rule: reuse's _advance_or_steer, the create loop's verdict
+    pickup and create's state_transition all call it.  Before it,
+    state_transition trusted the claimed id, so a verdict naming action 3
+    while action 2 ran force-completed action 3 before it was posted, and one
+    naming action 1 rewrote action 1's text (both reproduced by
+    tests/unit/test_create_loop_end_to_end.py).
+
+    A verdict left over for an action that has not started is not this case;
+    stale_for_unstarted_action refuses that one first.
+    """
+    try:
+        current = int(current_action_id)
+    except (TypeError, ValueError):
+        logger.warning("settled_action_id: the posted action %r is not an int; "
+                       "leaving it as it is", current_action_id)
+        return current_action_id
+    try:
+        claimed = int(float(claimed_action_id))
+    except (TypeError, ValueError):
+        return current
+    if claimed != current:
+        logger.warning(
+            "[HALLUCINATION?] LLM claims action_id=%s but pipeline has %s",
+            claimed, current)
+    return current
+
+
 def lifecycle_hook_track_termination(user_prompt: str, user_tasks, group_chat) -> bool:
     """11. Track when action is terminated and passed to chat instructor"""
     if hasattr(user_tasks, 'get'):
@@ -1336,6 +1560,18 @@ def lifecycle_hook_track_termination(user_prompt: str, user_tasks, group_chat) -
     # When TERMINATE is issued
     if (group_chat.messages and
         group_chat.messages[-1]['content'] == 'TERMINATE'):
+
+        # A TERMINATE left over from the previous action is not this one's
+        # (#101): after an advance it is still the last message, and the new
+        # action has not started yet.
+        _owner = stale_for_unstarted_action(
+            group_chat.messages, -1, user_prompt, current_action_id)
+        if _owner is not None:
+            logger.info(
+                "[STALE-TERMINATE] the last TERMINATE belongs to action %s; "
+                "not terminating action %s, which has not started",
+                _owner, current_action_id)
+            return False
 
         # force_state_through_valid_path (not a bare validate): a TERMINATE for an
         # action still stuck in ASSIGNED/IN_PROGRESS/PENDING (the 4B never drove

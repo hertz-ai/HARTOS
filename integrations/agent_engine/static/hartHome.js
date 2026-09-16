@@ -117,9 +117,11 @@
           title: 'Continue', accent: 'teal', see_all: 'agents_browse',
           cards: []
         },
-        // FLAGSHIP agents row - the REAL HART OS product agents, always featured
-        // (flagship:true keeps refresh() from replacing it with live dashboard
-        // rows). Each card dispatches through the existing hero command bar.
+        // FLAGSHIP agents row - the REAL HART OS product agents, always featured.
+        // flagship:true is what makes refresh() leave the row alone; see
+        // _replaceRow, which reads it. Until that read existed the promise was
+        // kept only by this row's title never colliding with a fetched one.
+        // Each card dispatches through the existing hero command bar.
         {
           title: 'Flagship agents', note: 'ready to run, fully local',
           accent: 'violet', see_all: 'agents_browse', flagship: true,
@@ -827,10 +829,25 @@
     }).catch(function (e) { console.debug('hartHome: recipes fetch failed (keeping sample)', e); });
   }
 
+  // A row marked 'flagship: true' is CURATED, and this is the one place that
+  // reads the flag. The curator can set it: the home prompt offers
+  // 'emphasis: flagship|ranked|normal', _home_curate maps flagship onto the
+  // row and _sanitize_home_payload forwards it, so the value travelled the whole
+  // way to the client and then meant nothing. Its sibling 'ranked' restyles every
+  // card in its row, so one of the three emphases the curator is offered was a
+  // no-op. The protection that DID hold was accidental: _replaceRow matches on a
+  // display title, so 'Flagship agents' survived only by never colliding with a
+  // fetched row's title. Retitling it, or a curated row of its own titled
+  // 'Continue', silently handed it to the live dashboard.
   function _replaceRow(payload, title, newRow, appendIfMissing) {
     var rows = payload.rows || (payload.rows = []);
     for (var i = 0; i < rows.length; i++) {
-      if (rows[i].title === title) { rows[i] = newRow; return; }
+      if (rows[i].title === title) {
+        if (!rows[i].flagship) rows[i] = newRow;
+        // Found either way: never ALSO append, or a protected row would be
+        // shadowed by a second row under the same title.
+        return;
+      }
     }
     if (appendIfMissing) rows.push(newRow);
   }
@@ -909,6 +926,29 @@
   // PUBLIC API - the agent composes the home through these (A2UI read path).
   // ───────────────────────────────────────────────────────────────────────
   window.HartHome = {
+    // A press the COMPOSITOR handled, relayed back by (row, card) index.
+    //
+    // The native scene draws this desktop and hit-tests it, but it deliberately does
+    // not know what activating a card means: "ask" focuses the command bar, "open"
+    // opens a panel, and that vocabulary lives here, in cardAction, which is also what
+    // a click on the DOM card runs. So the compositor sends identity and this resolves
+    // it against the very payload it is drawing, and there is one executor rather than
+    // two implementations of the same gesture.
+    //
+    // Indices are into the PAYLOAD, not the visible cards: the native layout culls
+    // cards scrolled off the left, so a positional index would drift the moment a row
+    // moved. Out-of-range is a silent no-op, since a stale index is exactly what a
+    // re-compose in flight looks like.
+    activate: function (row, card) {
+      var p = _payload;
+      if (!p || !p.rows) return false;
+      var r = p.rows[row];
+      if (!r || !r.cards) return false;
+      var c = r.cards[card];
+      if (!c) return false;
+      cardAction(c);
+      return true;
+    },
     // The agent's live composition. Accepts the full payload OR a partial
     // {hero} / {rows} which merges over the current surface (fluid re-compose).
     compose: function (payload) {

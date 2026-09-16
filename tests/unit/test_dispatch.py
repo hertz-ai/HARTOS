@@ -421,6 +421,55 @@ class TestDispatchGoalDistributed:
                 result = dispatch_mod.dispatch_goal_distributed('prompt', 'u1', 'g1')
         assert result is None
 
+    @staticmethod
+    def _goal_models(config):
+        """Stand-in for integrations.social.models holding one goal row."""
+        from contextlib import contextmanager
+        row = SimpleNamespace(config_json=config)
+
+        class _Query:
+            def filter_by(self, **_kw):
+                return self
+
+            def first(self):
+                return row
+
+        class _Db:
+            def query(self, _model):
+                return _Query()
+
+        @contextmanager
+        def db_session(commit=True):
+            yield _Db()
+
+        return SimpleNamespace(db_session=db_session, AgentGoal=object())
+
+    def _submitted_context(self, config):
+        import sys
+        mock_coord = MagicMock()
+        mock_coord.submit_goal.return_value = 'g1'
+        fake_modules = {
+            'integrations.social': sys.modules.get(
+                'integrations.social', SimpleNamespace()),
+            'integrations.social.models': self._goal_models(config),
+        }
+        with patch.dict('sys.modules', fake_modules), \
+             patch.object(dispatch_mod, '_get_distributed_coordinator',
+                          return_value=mock_coord), \
+             patch.object(dispatch_mod, '_decompose_goal', return_value=[
+                 {'task_id': 'g1_task_0', 'description': 'x', 'capabilities': []}]):
+            dispatch_mod.dispatch_goal_distributed('prompt', 'u1', 'g1', 'hive_growth')
+        return mock_coord.submit_goal.call_args.kwargs['context']
+
+    def test_a_continuous_goal_is_submitted_as_continuous(self):
+        """submit_goal re-arms a continuous goal's hive task after each run
+        (owner decision 2026-09-13), which it can only do if it is told."""
+        assert self._submitted_context({'continuous': True})['continuous'] is True
+
+    def test_an_ordinary_goal_is_not_submitted_as_continuous(self):
+        assert self._submitted_context({})['continuous'] is False
+        assert self._submitted_context(None)['continuous'] is False
+
 
 # ── _decompose_goal ───────────────────────────────────────────────────────
 

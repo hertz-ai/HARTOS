@@ -136,9 +136,15 @@ def test_availability_probe_and_execution_share_one_path():
         "AppInstaller must expose the tool PATH used for execution so the "
         "availability probe can ask the same question")
     src = inspect.getsource(ai)
-    # _flatpak_env must consume it rather than rebuilding its own list.
-    env_src = inspect.getsource(ai.AppInstaller._flatpak_env)
-    assert 'tool_path()' in env_src, (
+    # _flatpak_env must CONSUME that resolver rather than rebuilding its own
+    # list. Asserted BEHAVIOURALLY. This used to grep _flatpak_env's source for
+    # the literal 'tool_path()', which broke the moment the shared resolver
+    # moved one level deeper (into _tool_env, so the nix platform could share
+    # it too) even though the contract this test exists for was perfectly
+    # intact. What matters is that the PATH execution uses and the PATH the
+    # probe asks about are the SAME string, not which function spells it.
+    _inst = ai.AppInstaller()
+    assert _inst._flatpak_env()['PATH'] == _inst.tool_path(), (
         "_flatpak_env must build PATH from tool_path(), not a private copy")
     # The platforms route must probe WITH that path, never bare.
     routes = src[src.find("def shell_apps_platforms"):][:2000]

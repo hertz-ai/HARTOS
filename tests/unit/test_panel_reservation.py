@@ -22,6 +22,7 @@ Run:
   pytest tests/unit/test_panel_reservation.py -v
 """
 
+import json
 import os
 import re
 import sys
@@ -96,6 +97,340 @@ def test_no_layout_rule_hardcodes_the_bar_heights(shell_html):
             % what)
     assert shell_html.count("hartBarPx(") >= 5, (
         "the JS layout sites should read the live bar heights via hartBarPx")
+
+
+SCENE_SRC = os.path.join(REPO, "compositor", "src", "scene.rs")
+
+
+def _rust_const_px(name):
+    """The value of a `pub const NAME: f32 = N.0;` in the native scene."""
+    src = open(SCENE_SRC, encoding="utf-8").read()
+    m = re.search(r"pub const %s:\s*f32\s*=\s*([0-9]+)\.?[0-9]*\s*;" % name, src)
+    assert m, "%s not found in scene.rs" % name
+    return int(m.group(1))
+
+
+def test_the_native_scene_draws_the_same_strips_the_shell_reserves(published):
+    """THE DRIFT CLASS AGAIN, in the language the guard above cannot see.
+
+    The native compositor scene paints its own top bar and taskbar. The shell
+    meanwhile publishes the reservation, and every window-placement path
+    subtracts THAT. So the moment the two disagree, the native bar and the space
+    reserved for it are different sizes: either a dead band of desktop no window
+    may use, or windows tucked under a bar that is drawing over them, which is
+    the exact 2026-08-29 report this whole contract exists to prevent.
+
+    The two halves are no longer the same KIND of thing, which is the point:
+
+      TOP: both sides now read `shell.topbar_height` out of the active theme, so
+      they cannot drift by construction. scene.rs's TOP_BAR_H is the FALLBACK for
+      an unreadable theme, and must equal the fallback theme_service publishes for
+      the same case. Four of the ten shipped themes move this number, so a fixed
+      Rust constant was a live bug, not a hypothetical one.
+
+      BOTTOM: the theme has no key for the taskbar. It is a Python constant beside
+      a CSS literal, so it CAN drift, and this is still the only thing stopping it.
+    """
+    r = L.publish_panel_reservation(":root{--hart-topbar-height:40px}")
+    assert _rust_const_px("TOP_BAR_H") == r["top"], (
+        "scene.rs TOP_BAR_H and the published top fallback have drifted")
+    assert _rust_const_px("TASKBAR_H") == r["bottom"], (
+        "scene.rs TASKBAR_H and the published bottom reservation have drifted")
+
+
+def test_the_native_bar_reads_the_same_theme_key_the_shell_publishes_from():
+    """The half that a constant comparison cannot cover.
+
+    theme_service emits `--hart-topbar-height` from `shell.topbar_height`, the
+    shell publishes the reservation from that variable, and the native scene now
+    sizes its bar from the SAME key rather than a constant that happened to agree.
+    Assert both readers by name, since agreeing today is what a hardcoded 40 also
+    did.
+    """
+    theme_src = open(os.path.join(REPO, "integrations", "agent_engine",
+                                  "theme_service.py"), encoding="utf-8").read()
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+    for key, var in (("topbar_height", "--hart-topbar-height"),
+                     ("icon_size", "--hart-icon-size"),
+                     ("border_radius", "--hart-radius")):
+        assert re.search(r"%s:.*shell\.get\(\"%s\"" % (re.escape(var), key),
+                         theme_src), (
+            "theme_service no longer emits %s from shell.%s" % (var, key))
+        assert 'file.num("%s")' % key in comp, (
+            "the native scene no longer reads shell.%s, so it is back to a "
+            "constant the theme can move out from under it" % key)
+
+
+def test_no_shipped_theme_is_clamped_by_the_native_scene():
+    """The compositor clamps these because they arrive from a file, and a zero
+    bar would invert the content band's arithmetic. The bounds have to be wide
+    enough that no real theme is silently altered, or the clamp becomes its own
+    drift: the browser would render the theme's number and the native scene a
+    different one.
+    """
+    import glob
+    # Read the bounds OUT of the Rust rather than restating them here. A copy would
+    # let someone tighten the clamp and leave this passing, which is the exact
+    # duplicate-number failure every other guard in this file exists to stop.
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+    fields = {"topbar_height": "top_bar_h", "icon_size": "icon_px",
+              "border_radius": "card_radius"}
+    bounds = {}
+    for key, field in fields.items():
+        m = re.search(r"self\.%s = \w+\.clamp\(([0-9.]+), ([0-9.]+)\)"
+                      % re.escape(field), scene)
+        assert m, "scene.rs no longer clamps %s, so its bounds cannot be read" % field
+        bounds[key] = (float(m.group(1)), float(m.group(2)))
+    for path in sorted(glob.glob(os.path.join(
+            REPO, "nixos", "assets", "conky-themes", "*.json"))):
+        shell = json.load(open(path, encoding="utf-8")).get("shell", {})
+        for key, (lo, hi) in bounds.items():
+            if key not in shell:
+                continue
+            v = shell[key]
+            assert lo <= v <= hi, (
+                "%s sets %s=%s, which the native scene clamps to [%s, %s]: the "
+                "browser would draw the theme's number and the compositor a "
+                "different one" % (os.path.basename(path), key, v, lo, hi))
+
+
+def _css_strip_comments(css):
+    """CSS with `/* ... */` removed.
+
+    THREE guards in this file have now matched a value out of a COMMENT rather
+    than a declaration: a Rust doc comment quoting the CSS rule it implements, a
+    struct field declaration standing in for its initialiser, and `.hh-btn-primary`
+    whose comment quotes the MOCKUP's `0 12px 36px` right above the rule's own
+    `0 12px 30px`. Prose that describes the value is not the value.
+    """
+    return re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+
+
+def _css_decl(css, selector, prop):
+    """The value of `prop` in the LAST rule matching `selector` (cascade order)."""
+    found = None
+    # `^\s*` so a rule nested inside a media block is found too; it is the same
+    # selector at the same specificity, just indented.
+    for m in re.finditer(r"(?m)^\s*%s\s*\{(.*?)\}" % re.escape(selector), css, re.S):
+        d = re.search(r"(?<![-\w])%s:\s*([^;]+);" % re.escape(prop), m.group(1))
+        if d:
+            found = d.group(1).strip()
+    return found
+
+
+def _css_outside_media(css):
+    """The stylesheet with every @media block removed: the BASE cascade.
+
+    A base lookup has to ignore the overrides, or `.hh-amount` resolves to the
+    58px a short screen gets and the pin silently checks the wrong number.
+    """
+    return re.sub(r"@media[^{]*\{.*?\n\}", "", css, flags=re.S)
+
+
+def test_the_native_home_is_laid_out_at_the_shells_own_scale():
+    """The whole native desktop was drawn at about two thirds of the shell's size.
+
+    Every constant in scene.rs that carried a CSS citation was right; every one that
+    did not was a first-cut guess, and nothing could see the difference. The hero
+    figure was 40px against the shell's 88, the row headings 15 against 23, the
+    cards 210x128 against 258x150. Laid side by side at M6 that is not the same
+    desktop, and no Rust test could catch it because they all pin RELATIONSHIPS
+    (the note follows the label, the See-all clears it) rather than sizes.
+
+    So pin the sizes here, where both languages are readable at once. The values
+    the shell makes responsive are pinned as the literals in HomeMetrics; the rest
+    as plain consts.
+    """
+    css = open(os.path.join(REPO, "integrations", "agent_engine", "static",
+                            "hartHome.css"), encoding="utf-8").read()
+    base = _css_outside_media(css)
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    def px(value):
+        m = re.search(r"(\d+(?:\.\d+)?)px", value or "")
+        assert m, "not a px value: %r" % (value,)
+        return float(m.group(1))
+
+    def rust_const(name):
+        m = re.search(r"const %s: f32 = ([0-9.]+);" % name, scene)
+        assert m, "%s is no longer a plain literal in scene.rs" % name
+        return float(m.group(1))
+
+    # ── the fixed scale: one CSS declaration, one Rust const ──
+    for const, selector, prop in [
+        ("HERO_EYEBROW_PX", ".hh-eyebrow", "font-size"),
+        ("HERO_META_PX", ".hh-hero-meta", "font-size"),
+        ("HERO_BTN_PX", ".hh-btn", "font-size"),
+        ("ROW_LABEL_PX", ".hh-row-title", "font-size"),
+        ("ROW_NOTE_PX", ".hh-row-note", "font-size"),
+        ("CARD_TITLE_PX", ".hh-card-title", "font-size"),
+        ("CARD_META_PX", ".hh-card-meta", "font-size"),
+        ("CARD_W", ".hh-card", "width"),
+        ("CARD_PROG_H", ".hh-card-prog", "height"),
+        ("CARD_ICON_BOX", ".hh-card-ic", "width"),
+        ("RANK_PX", ".hh-rank-num", "font-size"),
+    ]:
+        want = _css_decl(base, selector, prop)
+        assert want, "hartHome.css no longer declares %s on %s" % (prop, selector)
+        assert rust_const(const) == px(want), (
+            "%s is %s but %s { %s } is %s"
+            % (const, rust_const(const), selector, prop, want))
+
+    # ── the TOP BAR's cluster, whose CSS lives in the service's inline sheet
+    #    rather than hartHome.css: the wordmark rides `.start-btn`'s size, the
+    #    tray glyph rides the theme's icon-size variable. All four of these were
+    #    wrong (28/15/18/28 against 30/13/20/30) and nothing could see it.
+    service = open(SERVICE_SRC, encoding="utf-8").read()
+    for const, want in [
+        ("ORB_SM", _css_decl(base, ".top-bar-orb", "width")),
+        ("AVATAR_D", _css_decl(base, ".top-bar-avatar", "width")),
+        ("AVATAR_PX", _css_decl(base, ".top-bar-avatar", "font-size")),
+        ("TAB_PX", _css_decl(base, ".tb-tab", "font-size")),
+        ("KBD_PX", _css_decl(base, ".top-bar-omni .tbo-kbd", "font-size")),
+        ("CARD_ICON_PX", _css_decl(base, ".hh-card-ic .mi", "font-size")),
+        ("CARD_CHIP_PX", _css_decl(base, ".hh-card-badge", "font-size")),
+    ]:
+        assert want, "the home CSS no longer declares the source of %s" % const
+        assert rust_const(const) == px(want), (
+            "%s is %s but the shell's is %s" % (const, rust_const(const), want))
+
+    # The wordmark takes the bar's own start-btn size, not the hero's.
+    startbtn = re.search(r"\.top-bar \.start-btn\{\{[^}]*?font-size:(\d+)px", service, re.S)
+    assert startbtn, "the service no longer sizes .top-bar .start-btn"
+    assert rust_const("WORDMARK_PX") == float(startbtn.group(1)), (
+        "the native wordmark is %s but .start-btn is %spx"
+        % (rust_const("WORDMARK_PX"), startbtn.group(1)))
+
+    # The tray button, its gap, and the glyph inside it (a theme variable with a
+    # default the service and theme_service must agree on, so read the default).
+    traybtn = re.search(r"\.tray-btn\{\{width:(\d+)px", service)
+    assert traybtn and rust_const("TRAY_BTN") == float(traybtn.group(1)), (
+        "the native tray button drifted from .tray-btn")
+    traygap = re.search(r"\.top-bar-right\{\{[^}]*?gap:(\d+)px", service, re.S)
+    assert traygap and rust_const("TRAY_GAP") == float(traygap.group(1)), (
+        "the native tray gap drifted from .top-bar-right")
+    iconsize = re.search(r"--hart-icon-size:\s*(\d+)px", service)
+    assert iconsize, "the service no longer defaults --hart-icon-size"
+    assert rust_const("TRAY_PX") == float(iconsize.group(1)), (
+        "the native tray glyph is %s but --hart-icon-size defaults to %s"
+        % (rust_const("TRAY_PX"), iconsize.group(1)))
+
+    # ── the RESPONSIVE four, pinned as the literals HomeMetrics carries ──
+    metrics = re.search(r"fn for_output\(.*?\n    \}", scene, re.S)
+    assert metrics, "HomeMetrics::for_output is no longer a readable block"
+    metrics = metrics.group(0)
+    base_gutter = px(re.search(r"--hh-gutter:\s*([^;]+);", base).group(1))
+    assert re.search(r"gutter: %s," % base_gutter, metrics), (
+        "the base gutter drifted from --hh-gutter (%s)" % base_gutter)
+    assert re.search(r"amount_px: %s," % px(_css_decl(base, ".hh-amount", "font-size")),
+                     metrics), "the base hero figure drifted from .hh-amount"
+    assert re.search(r"unit_px: %s," % px(_css_decl(base, ".hh-amount-unit", "font-size")),
+                     metrics), "the hero unit drifted from .hh-amount-unit"
+    assert re.search(r"card_h: %s," % px(_css_decl(base, ".hh-card", "height")),
+                     metrics), "the base card height drifted from .hh-card"
+
+    # EVERY media block in the home CSS, matched by what it declares rather than by
+    # position, and each one's overrides. Four blocks: two scale the content, two
+    # reshape the bar. The compositor must carry all four or it is a partial port.
+    blocks = re.findall(r"@media \((max-width|max-height): (\d+)px\)\s*\{(.*?)\n\}",
+                        css, re.S)
+    assert len(blocks) >= 4, "expected the home CSS's four sizing media blocks"
+    seen = 0
+    for axis_css, bound, block in blocks:
+        axis = "output_w" if axis_css == "max-width" else "output_h"
+        overrides = [
+            ("amount_px", ".hh-amount", "font-size"),
+            ("unit_px", ".hh-amount-unit", "font-size"),
+            ("card_h", ".hh-card", "height"),
+            ("tab_pad_x", ".tb-tab", "padding"),
+            ("omnibox_min_w", ".top-bar-omni", "min-width"),
+        ]
+        wanted = [(f, _css_decl(block, sel, prop)) for f, sel, prop in overrides]
+        wanted = [(f, v) for f, v in wanted if v is not None]
+        gutter = re.search(r"--hh-gutter:\s*([^;]+);", block)
+        if gutter:
+            wanted.append(("gutter", gutter.group(1)))
+        hides_kbd = ".tbo-kbd" in block and "display: none" in block
+        hides_tabs = 'data-tab="earn"' in block
+        if not (wanted or hides_kbd or hides_tabs):
+            continue
+        seen += 1
+        assert re.search(r"if %s <= %s\.0 \{" % (axis, bound), metrics), (
+            "scene.rs carries no %s <= %s branch for the block that sets %s"
+            % (axis, bound, [f for f, _ in wanted] or "the bar's shape"))
+        for field, value in wanted:
+            assert re.search(r"m\.%s = %s;" % (field, px(value)), metrics), (
+                "%s under %s:%s should be %s" % (field, axis_css, bound, value))
+        if hides_kbd:
+            assert "m.show_kbd = false;" in metrics, (
+                "the shortcut hint is hidden at %s but the scene still draws it" % bound)
+        if hides_tabs:
+            assert "m.nav_tabs = NAV_TABS.len() - 2;" in metrics, (
+                "two tabs are hidden at %s but the scene still draws five" % bound)
+    assert seen == 4, "matched %d sizing media blocks, expected 4" % seen
+
+
+def test_the_native_card_art_is_the_shells_own_brand_gradient():
+    """THE SAME DRIFT CLASS, across the same language boundary, one layer in.
+
+    Every card on the home desktop is painted as a brand-spectrum hue darkened
+    toward ink across two stops. hartBrandArt.js is the single source of that
+    art language for the shell, and its own header says why it exists: the home
+    cards and the desktop icons had each grown a copy, with different ink,
+    different darkening and a different hue order, and they drifted apart.
+
+    The native compositor scene now paints the same tiles from Rust constants,
+    which is a THIRD copy in a language neither that module nor any JS test can
+    see. So pin it: the ink, both blend factors and the angle list must be the
+    literals hartBrandArt.js uses, and the ranked card's art box must be the
+    width hartHome.css gives `.hh-rank-inner`. A card that reads darker, flatter
+    or differently angled than the shell's is the exact failure this catches,
+    and it is invisible to every other test in the tree.
+    """
+    brand = open(os.path.join(REPO, "integrations", "agent_engine", "static",
+                              "hartBrandArt.js"), encoding="utf-8").read()
+    home_css = open(os.path.join(REPO, "integrations", "agent_engine", "static",
+                                 "hartHome.css"), encoding="utf-8").read()
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    ink = re.search(r"var INK = \[(\d+), (\d+), (\d+)\]", brand)
+    assert ink, "hartBrandArt.js no longer declares INK as a literal triple"
+    rust_ink = re.search(
+        r"const ART_INK: Color = Color::rgba\("
+        r"(\d+)\.0 / 255\.0, (\d+)\.0 / 255\.0, (\d+)\.0 / 255\.0", scene)
+    assert rust_ink, "scene.rs no longer declares ART_INK from 0..255 literals"
+    assert rust_ink.groups() == ink.groups(), (
+        "the native art ink and hartBrandArt's INK have drifted: "
+        "%s vs %s" % (rust_ink.groups(), ink.groups()))
+
+    # The two darkening factors, named in the shell by which stop they make.
+    dark = re.search(r"var dark = blend\(base, INK, ([0-9.]+)\)", brand)
+    light = re.search(r"var light = blend\(second, INK, ([0-9.]+)\)", brand)
+    assert dark and light, "hartBrandArt.js gradient() no longer blends two stops"
+    assert re.search(r"base\.mix\(ART_INK, %s\)" % re.escape(dark.group(1)), scene), (
+        "the native DARK stop no longer uses the shell's %s" % dark.group(1))
+    assert re.search(r"second\.mix\(ART_INK, %s\)" % re.escape(light.group(1)), scene), (
+        "the native LIGHT stop no longer uses the shell's %s" % light.group(1))
+
+    angles = re.search(r"var ang = \[(\d+), (\d+), (\d+)\]", brand)
+    assert angles, "hartBrandArt.js no longer picks from three literal angles"
+    rust_angles = re.search(
+        r"const ART_ANGLES: \[f32; 3\] = \[([0-9.]+), ([0-9.]+), ([0-9.]+)\]", scene)
+    assert rust_angles, "scene.rs no longer declares ART_ANGLES"
+    assert [float(a) for a in rust_angles.groups()] ==         [float(a) for a in angles.groups()], (
+        "the native gradient angles and the shell's have drifted")
+
+    # `.hh-card.hh-ranked .hh-rank-inner { width: 174px }`: the art box of a
+    # leaderboard card, and the box its title, chip and progress bar sit in.
+    inner = re.search(r"\.hh-rank-inner\s*\{[^}]*?width:\s*(\d+)px", home_css,
+                      re.S)
+    assert inner, "hartHome.css no longer sizes .hh-rank-inner"
+    rust_inner = re.search(r"const RANK_INNER_W: f32 = ([0-9.]+);", scene)
+    assert rust_inner, "scene.rs no longer declares RANK_INNER_W"
+    assert float(rust_inner.group(1)) == float(inner.group(1)), (
+        "the ranked card's native art box is %s but the shell's is %s"
+        % (rust_inner.group(1), inner.group(1)))
 
 
 def test_a_failed_theme_load_still_reserves_the_bar_it_actually_paints(
@@ -216,3 +551,738 @@ def test_rendering_the_shell_publishes_the_reservation_it_served(published):
          if l.strip()))
     assert got["top"] == _css_px(html, r"--hart-topbar-height:\s*(\d+)px")
     assert got["bottom"] == _css_px(html, r"--hart-taskbar-height:\s*(\d+)px")
+
+def test_the_compositor_reads_the_accessibility_file_the_shell_reads():
+    """The CSS parity ledger's rule 4: the shell has three independent motion
+    kill-switches and all three must exist natively. The native scene honoured
+    only the GPU floor, so a user who had declared reduced motion still got a
+    breathing orb the moment the shell went native.
+
+    It reads the DECLARATIVE file, which is the one both sides can see:
+    shell_os_apis.py seeds _A11Y_SETTINGS from it at import, and a runtime PUT
+    to /api/shell/accessibility lives in that process's memory and reaches the
+    compositor at its next start (the same documented gap the theme carries).
+
+    Two paths and one key, in two languages. Pin them, because a path that
+    agrees today is exactly what the hardcoded bar height also did.
+    """
+    shell = open(os.path.join(REPO, "integrations", "agent_engine",
+                              "shell_os_apis.py"), encoding="utf-8").read()
+    bloom = open(os.path.join(REPO, "compositor", "src", "bloom.rs"),
+                 encoding="utf-8").read()
+
+    m = re.search(r"open\('([^']*accessibility[^']*)'\)", shell)
+    assert m, "shell_os_apis.py no longer seeds a11y from a declarative file"
+    want = m.group(1)
+    r = re.search(r'A11Y_SETTINGS_PATH: &str = "([^"]+)";', bloom)
+    assert r, "bloom.rs no longer names the accessibility file"
+    assert r.group(1) == want, (
+        "the compositor reads %r but the shell seeds from %r, so a declared "
+        "reduced-motion setting would reach one renderer and not the other"
+        % (r.group(1), want))
+
+    assert "'reduced_motion'" in shell, (
+        "shell_os_apis.py no longer carries a reduced_motion setting")
+    assert 'flag("reduced_motion")' in bloom, (
+        "bloom.rs no longer reads reduced_motion out of that file")
+    # And the gate actually CONSULTS it. Reading a setting nothing acts on is the
+    # same dead-contract shape as a budget row nothing measures.
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+    assert "crate::bloom::reduced_motion" in comp, (
+        "comp_core no longer calls bloom::reduced_motion, so the motion gate is "
+        "back to the GPU floor alone and a declared preference does nothing")
+    assert "motion_reduced" in comp, (
+        "the scene_animates gate no longer takes a reduced-motion input")
+
+def test_every_shipped_theme_declares_a_rule_colour_the_compositor_can_read():
+    """The 1px line between chrome and desktop, in the shape the reader accepts.
+
+    `--hart-glass-border` is written as `rgba(...)` rather than hex, which is
+    exactly why the native strips had no separator: the compositor's colour reader
+    only knew `#RRGGBB`, found nothing, and drew no rule at all, so the bar's edge
+    was wherever its translucency happened to stop.
+
+    The Rust side cannot check this: the theme JSONs live outside the crate and
+    crane's source filter ships only `*.rs`, so a Rust test looking for them finds
+    an empty directory in CI and in the container. It belongs here, where both
+    trees are readable, like the rest of the cross-language pins in this file.
+    """
+    import glob
+    # The shape bloom.rs::rgba accepts: three numeric channels and an alpha, with
+    # any spacing. Both `rgba(255,255,255,0.10)` and `rgba(2, 136, 209, 0.15)` are
+    # in the shipped set today.
+    shape = re.compile(r"^rgba\(\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*,\s*([\d.]+)\s*\)$")
+    seen = 0
+    for path in sorted(glob.glob(os.path.join(
+            REPO, "nixos", "assets", "conky-themes", "*.json"))):
+        colors = json.load(open(path, encoding="utf-8")).get("colors", {})
+        value = colors.get("glass_border")
+        assert value, "%s declares no glass_border, so its chrome has no edge" % (
+            os.path.basename(path))
+        m = shape.match(value.strip())
+        assert m, (
+            "%s writes glass_border as %r, which the compositor's reader cannot "
+            "parse; it accepts rgba(r,g,b,a) only" % (os.path.basename(path), value))
+        alpha = float(m.group(1))
+        assert 0.0 < alpha <= 1.0, (
+            "%s has an invisible rule (alpha %s)" % (os.path.basename(path), alpha))
+        seen += 1
+    assert seen >= 8, "expected the shipped theme set, found %d" % seen
+
+    # And the compositor actually reads that key and draws with it.
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+    assert 'rgba("glass_border")' in comp, (
+        "the compositor no longer reads glass_border, so the chrome strips are "
+        "back to having no edge")
+    assert "theme.chrome_border" in scene, (
+        "the scene no longer draws with the rule colour it reads")
+
+def test_the_compositor_mirrors_the_shells_own_potato_verdict():
+    """The third of the ledger's motion kill-switches, and the key it hangs on.
+
+    liquid_ui_service computes `is_potato = perf.disable_blur or gpu_mode ==
+    'software'`, and that one flag strips its animation strings before they are
+    ever emitted. The GPU half was already mirrored natively; this pins the THEME
+    half to the same key, because reading its sibling would look identical in
+    every Rust test (both are booleans in the same block, and only potato.json
+    sets either) while mirroring a verdict the shell does not make.
+
+    `disable_animations` is asserted UNREAD on purpose: nothing in the tree reads
+    it, so it is a dead key rather than a contract, and honouring it natively
+    would invent a behaviour the shell has never had.
+    """
+    service = open(SERVICE_SRC, encoding="utf-8").read()
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+
+    m = re.search(r"is_potato = perf\.get\('(\w+)'", service)
+    assert m, "liquid_ui_service no longer derives is_potato from a perf key"
+    key = m.group(1)
+    assert 'flag("%s")' % key in comp, (
+        "the shell's potato tier hangs on perf.%s and the compositor does not "
+        "read it, so a theme asking for reduced effects reaches one renderer "
+        "only" % key)
+    assert 'flag("disable_animations")' not in comp, (
+        "disable_animations is read by nothing in the tree; honouring it "
+        "natively would invent a behaviour the shell does not have")
+    assert "theme_potato" in comp, (
+        "the motion gate no longer takes the theme tier into account")
+
+    # And the key it hangs on is a real boolean in the shipped set, not a typo
+    # that would silently read as "not asking".
+    import glob
+    declared = 0
+    for path in glob.glob(os.path.join(
+            REPO, "nixos", "assets", "conky-themes", "*.json")):
+        perf = json.load(open(path, encoding="utf-8")).get("performance", {})
+        if key in perf:
+            assert isinstance(perf[key], bool), (
+                "%s sets %s to %r, which the compositor's flag reader only "
+                "accepts as a JSON bool" % (os.path.basename(path), key, perf[key]))
+            declared += 1
+    assert declared >= 1, (
+        "no shipped theme declares perf.%s any more, so the tier is unreachable "
+        "and the mirror is guarding nothing" % key)
+
+def test_the_large_cursor_toggle_reaches_the_arrow_the_compositor_draws():
+    """A setting the product OFFERS, stores, and wires through NixOS, which had
+    no effect on the one thing it names.
+
+    hart-accessibility.nix sets `XCURSOR_SIZE` when largeCursor is on, which is
+    the standard every CLIENT already speaks. The compositor draws the DESKTOP's
+    cursor from a polygon authored in a fixed 24-unit space, so turning Large
+    Cursor on grew every cursor except the one the user looks at most.
+
+    Pinned across the three files it spans, because agreeing in two of them is
+    what it did before: the shell offers the toggle, nix exports the variable,
+    the compositor reads it.
+    """
+    nix = open(os.path.join(REPO, "nixos", "modules", "hart-accessibility.nix"),
+               encoding="utf-8").read()
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+    service = open(SERVICE_SRC, encoding="utf-8").read()
+
+    assert "'large_cursor'" in service, (
+        "the shell no longer offers the Large Cursor toggle")
+    m = re.search(r"largeCursor \{[^}]*?XCURSOR_SIZE = \"(\d+)\"", nix, re.S)
+    assert m, (
+        "hart-accessibility.nix no longer exports XCURSOR_SIZE for largeCursor, "
+        "so the setting reaches nothing at all")
+    assert 'var("XCURSOR_SIZE")' in comp, (
+        "the compositor no longer reads XCURSOR_SIZE, so its own arrow ignores "
+        "the toggle while every client honours it")
+
+    # The exported size must survive the compositor's clamp, or the toggle would
+    # be silently reduced to a size the user did not ask for.
+    c = re.search(r"n\.clamp\((\d+), (\d+)\)", comp)
+    assert c, "the compositor no longer clamps the cursor side"
+    lo, hi = int(c.group(1)), int(c.group(2))
+    size = int(m.group(1))
+    assert lo <= size <= hi, (
+        "nix exports XCURSOR_SIZE=%d but the compositor clamps to [%d, %d], so "
+        "the large cursor would be silently resized" % (size, lo, hi))
+
+def test_high_contrast_reaches_the_native_chrome_with_the_shells_own_literals():
+    """The last of the accessibility settings, pinned to the CSS it mirrors.
+
+    `html.a11y-contrast` is four token overrides plus a doubled glass border, and
+    they are literals rather than derivations, so a native copy can drift from
+    them silently. Read the served rule and require the compositor to carry the
+    same values.
+    """
+    service = open(SERVICE_SRC, encoding="utf-8").read()
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+
+    rule = re.search(r"html\.a11y-contrast\{([^}]*)\}", service)
+    assert rule, "the shell no longer defines html.a11y-contrast"
+    tokens = dict(re.findall(r"--hart-([\w-]+):\s*(#[0-9a-fA-F]{6})", rule.group(1)))
+    assert tokens, "the contrast rule no longer overrides any colour token"
+
+    # Look at the CODE, not the file. The first version of this searched the whole
+    # of scene.rs and passed while the value was mutated, because the doc comment
+    # above the function quotes the CSS rule verbatim: prose satisfied it.
+    body = re.search(
+        r"pub fn with_high_contrast\(mut self\) -> Theme \{(.*?)\n    \}",
+        scene, re.S)
+    assert body, "scene.rs no longer has a readable with_high_contrast"
+    used = {m.upper() for m in re.findall(r'solid\("(#[0-9a-fA-F]{6})"\)', body.group(1))}
+    assert used, "with_high_contrast sets no colours at all"
+    for token, value in tokens.items():
+        assert value.upper() in used, (
+            "html.a11y-contrast sets --hart-%s to %s and with_high_contrast does "
+            "not use that literal, so a high-contrast desktop goes native at "
+            "ordinary contrast (it uses %s)"
+            % (token, value, sorted(used)))
+
+    # The doubled border, which is a WIDTH rather than a colour.
+    w = re.search(r"html\.a11y-contrast \.glass\{[^}]*border-width:\s*(\d+)px",
+                  service)
+    assert w, "the contrast rule no longer thickens the glass border"
+    assert "CHROME_RULE * %s.0" % w.group(1) in scene, (
+        "the shell doubles its rule to %spx under high contrast and the native "
+        "scene does not" % w.group(1))
+
+    # And the flag is actually consulted, applied LAST so a theme cannot undo it.
+    assert 'flag("high_contrast")' in comp, (
+        "the compositor no longer reads high_contrast")
+    assert "with_high_contrast" in comp and "with_high_contrast" in scene, (
+        "the contrast fold is not wired into the theme resolution")
+
+def test_the_native_chrome_uses_the_shells_own_no_blur_floor_gradient():
+    """The native path has no backdrop-filter, permanently, so the shell's
+    no-blur floor is its spec rather than the blurred `.glass` above it.
+
+    hartResponsive.css spells that floor out with two real-HW bugs recorded
+    beside it: a flat colourless grey "read MONOCHROMATIC" (2026-07-12) and
+    translucent edges let the home bleed through into "cluttered/overlap"
+    (2026-07-15). The native strips were a flat colourless dark at 72% alpha,
+    which is both of those at once. Pin the literals, because they are literals
+    and a native copy of them drifts silently.
+    """
+    css = open(os.path.join(REPO, "integrations", "agent_engine", "static",
+                            "hartResponsive.css"), encoding="utf-8").read()
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    m = re.search(
+        r"body\.webkit-flat[^{]*\{[^}]*?background:\s*linear-gradient\(\s*"
+        r"(\d+)deg,\s*rgba\(([\d, .]+)\),\s*rgba\(([\d, .]+)\)\s*(\d+)%,\s*"
+        r"rgba\(([\d, .]+)\)\s*\)", css, re.S)
+    assert m, (
+        "hartResponsive.css no longer carries the flat-floor chrome gradient, or "
+        "it is no longer a three-stop linear-gradient the compositor can mirror")
+    angle, first, second, at, third = m.groups()
+
+    def rgba_bits(text):
+        parts = [p.strip() for p in text.split(",")]
+        return [int(float(parts[0])), int(float(parts[1])), int(float(parts[2])),
+                float(parts[3])]
+
+    # Anchored on the multi-line INITIALISER, not `pub chrome_fill: [Color; 3],`:
+    # the field declaration matches a looser pattern and captures "Color; 3", which
+    # then reports "zero stops" about a literal it never looked at.
+    block = re.search(r"chrome_fill: \[\n(.*?)\n\s*\],\n", scene, re.S)
+    assert block, "scene.rs no longer declares a chrome_fill triple"
+    stops = re.findall(r"Color::rgba\(\s*([\d.]+) / 255\.0,\s*([\d.]+) / 255\.0,"
+                       r"\s*([\d.]+) / 255\.0,\s*([\d.]+),?\s*\)", block.group(1))
+    assert len(stops) == 3, "the chrome fill must be three stops, got %d" % len(stops)
+
+    for got, want_text, which in zip(stops, (first, second, third),
+                                     ("first", "middle", "last")):
+        want = rgba_bits(want_text)
+        have = [int(float(got[0])), int(float(got[1])), int(float(got[2])),
+                float(got[3])]
+        assert have == want, (
+            "the %s chrome stop is %s and the shell's floor is %s"
+            % (which, have, want))
+
+    assert "chrome_fill_at: %s," % (int(at) / 100.0) in scene, (
+        "the middle stop sits at %s%% in the shell" % at)
+    assert "chrome_fill_angle: %s.0," % angle in scene, (
+        "the shell's floor gradient runs at %sdeg" % angle)
+
+def test_the_card_depth_the_shell_keeps_on_every_tier_reaches_the_native_cards():
+    """`.hh-card`'s drop shadow, which the shell explicitly refuses to shed.
+
+    Its own comment is the argument: the shadow "rasters ONCE and composites
+    cheaply forever, so the software floor KEEPS it (degrade gracefully, not gut)
+    ... Without this the software home read as flat rectangles." The native cards
+    had none, which is that reported symptom exactly, so this pins the three
+    numbers that make it depth rather than an outline.
+    """
+    css = open(os.path.join(REPO, "integrations", "agent_engine", "static",
+                            "hartHome.css"), encoding="utf-8").read()
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    rule = re.search(r"(?m)^\.hh-card \{(.*?)^\}", css, re.S)
+    assert rule, "hartHome.css no longer has a .hh-card rule"
+    m = re.search(r"box-shadow:\s*0\s+(\d+)px\s+(\d+)px\s+rgba\(0,\s*0,\s*0,\s*([\d.]+)\)",
+                  rule.group(1))
+    assert m, (
+        "`.hh-card` no longer carries a plain `0 <dy> <blur> rgba(0,0,0,a)` shadow; "
+        "the native mirror can only follow that shape")
+    dy, blur, alpha = m.group(1), m.group(2), m.group(3)
+
+    assert "card_shadow_dy: %s.0," % dy in scene, (
+        "the shell offsets the card shadow %spx down and the native scene does not" % dy)
+    assert "card_shadow_blur: %s.0," % blur in scene, (
+        "the shell blurs it over %spx; a smaller one reads as an outline, a zero "
+        "one as a hard rectangle" % blur)
+    assert "card_shadow: Color::rgba(0.0, 0.0, 0.0, %s)," % alpha in scene, (
+        "the shadow's alpha drifted from the shell's %s" % alpha)
+
+    # And it is actually CAST, rather than being three numbers nothing reads.
+    assert "SceneNode::Shadow {" in scene, "the scene declares no shadow node"
+    assert "color: theme.card_shadow," in scene, (
+        "the card no longer casts the theme's shadow, so the numbers above are "
+        "pinning something that never reaches a pixel")
+
+def test_the_lit_cta_and_the_card_hairline_match_the_shells_own_rules():
+    """Two more one-time rasters the shell keeps on every tier.
+
+    `.hh-btn-primary` is a gradient plus a static teal glow, kept on the software
+    floor by the same argument as the card depth: "A one-time raster, so software
+    keeps the lit 'Resume' button". And every card carries a 1px border whose
+    colour resolves through `--hh-bord` to `--hart-glass-border`, the same value
+    the chrome strips rule with. The native CTA was a flat accent block and the
+    native cards had no edge at all.
+    """
+    css = open(os.path.join(REPO, "integrations", "agent_engine", "static",
+                            "hartHome.css"), encoding="utf-8").read()
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    btn = re.search(r"(?m)^\.hh-btn-primary \{(.*?)^\}",
+                    _css_strip_comments(css), re.S)
+    assert btn, "hartHome.css no longer has a .hh-btn-primary rule"
+
+    grad = re.search(r"linear-gradient\((\d+)deg,\s*(#[0-9A-Fa-f]{6})", btn.group(1))
+    assert grad, "the primary CTA is no longer a linear-gradient the native scene can mirror"
+    # Case-insensitive on the HEX only: upper-casing the whole file also
+    # upper-cases the field name, so the needle never matches itself.
+    assert re.search(r'cta_from: palette\("%s"' % grad.group(2), scene, re.I), (
+        "the CTA's bright stop is %s in the shell and the native scene does not "
+        "carry it" % grad.group(2))
+    assert "angle_deg: %s.0," % grad.group(1) in scene, (
+        "the CTA ramp runs at %sdeg in the shell" % grad.group(1))
+
+    glow = re.search(r"box-shadow:\s*0\s+(\d+)px\s+(\d+)px\s+"
+                     r"rgba\((\d+),\s*(\d+),\s*(\d+),\s*([\d.]+)\)", btn.group(1))
+    assert glow, "the primary CTA no longer carries its static glow"
+    dy, blur, r, g, b, a = glow.groups()
+    assert "cta_glow_dy: %s.0," % dy in scene
+    assert "cta_glow_blur: %s.0," % blur in scene
+    # Read the three channels back out of the Rust rather than reconstructing the
+    # literal's exact spelling, which is how the first cut of this compared a
+    # string against a differently-formatted equal value.
+    lit = re.search(r"cta_glow: Color::rgba\(([^)]*)\),", scene)
+    assert lit, "scene.rs no longer declares a cta_glow colour"
+    got = [eval(p.strip(), {"__builtins__": {}}) for p in lit.group(1).split(",")]
+    want = [int(r) / 255.0, int(g) / 255.0, int(b) / 255.0, float(a)]
+    assert all(abs(x - y) < 1e-6 for x, y in zip(got, want)), (
+        "the CTA glow is %s and the shell's is rgba(%s,%s,%s,%s)" % (got, r, g, b, a))
+
+    # `--hh-bord` IS `--hart-glass-border`, so the card border and the chrome rule
+    # are one colour rather than two that happen to match.
+    bord = re.search(r"--hh-bord:\s*var\(--([\w-]+)", css)
+    assert bord and bord.group(1) == "hart-glass-border", (
+        "--hh-bord no longer resolves to --hart-glass-border, so the native card "
+        "border and the chrome rule are no longer the same value")
+    assert "color: theme.chrome_border," in scene, (
+        "the cards no longer draw their hairline in that colour")
+
+def test_the_card_scrim_reaches_the_native_cards_with_the_shells_own_stops():
+    """The wash that makes text-over-art readable.
+
+    `.hh-card-scrim`'s comment is one line and it is the whole argument: "Scrim so
+    text-over-art always reads. Static gradient, no blur (software-safe)." The
+    native scene drew the title, the meta and the chips straight onto the art, so
+    a pale photo or a bright brand hue took the text with it.
+
+    The BASE rule is the one pinned. `body.gpu-hardware` carries a gentler variant,
+    and the native path is never the WebView, so it gets neither class.
+    """
+    css = _css_strip_comments(open(os.path.join(
+        REPO, "integrations", "agent_engine", "static", "hartHome.css"),
+        encoding="utf-8").read())
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    rule = re.search(r"(?m)^\.hh-card-scrim \{(.*?)^\}", css, re.S)
+    assert rule, "hartHome.css no longer has a base .hh-card-scrim rule"
+    m = re.search(r"linear-gradient\(\s*transparent\s+(\d+)%,\s*"
+                  r"rgba\((\d+),\s*(\d+),\s*(\d+),\s*([\d.]+)\)\s*100%\s*\)",
+                  rule.group(1))
+    assert m, (
+        "the scrim is no longer `transparent N%, rgba(...) 100%`; the native "
+        "three-stop mirror can only follow that shape")
+    at, r, g, b, a = m.groups()
+
+    assert "card_scrim_at: %s," % (int(at) / 100.0) in scene, (
+        "the scrim stays clear for %s%% in the shell" % at)
+    lit = re.search(r"card_scrim: Color::rgba\(([^)]*)\),", scene)
+    assert lit, "scene.rs no longer declares a card_scrim colour"
+    got = [eval(p.strip(), {"__builtins__": {}}) for p in lit.group(1).split(",")]
+    want = [int(r) / 255.0, int(g) / 255.0, int(b) / 255.0, float(a)]
+    assert all(abs(x - y) < 1e-6 for x, y in zip(got, want)), (
+        "the scrim colour is %s and the shell's is rgba(%s,%s,%s,%s)"
+        % (got, r, g, b, a))
+
+    # And the base rule is what is mirrored, not the GPU variant, which would be
+    # the wrong one for a renderer that is never the WebView.
+    gpu = re.search(r"body\.gpu-hardware \.hh-card-scrim \{(.*?)\}", css, re.S)
+    if gpu:
+        g_at = re.search(r"transparent\s+(\d+)%", gpu.group(1))
+        if g_at and g_at.group(1) != at:
+            assert "card_scrim_at: %s," % (int(g_at.group(1)) / 100.0) not in scene, (
+                "the native scene took the body.gpu-hardware scrim, which applies "
+                "only when the WebView composites")
+
+def test_every_native_run_carries_the_weight_its_shell_rule_declares():
+    """The typographic hierarchy, pinned across the two languages.
+
+    Both cosmic-text `set_text` calls passed a bare `Attrs::new()`, so every run on
+    the native desktop was painted at 400 while the shell gives every text element
+    an explicit weight and all but two are 600 or heavier. A title stopped being a
+    title.
+
+    Each native construction site now names its shell rule in a comment directly
+    above its weight, which is what makes this comparable at all: the pin reads
+    `// .hh-row-title` + `weight: 700` on one side and `.hh-row-title { font-weight:
+    700 }` on the other, so a designer changing a weight in the CSS fails here
+    instead of silently splitting the two surfaces.
+    """
+    css = _css_strip_comments(open(os.path.join(
+        REPO, "integrations", "agent_engine", "static", "hartHome.css"),
+        encoding="utf-8").read())
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    declared = {}
+    for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        sel = " ".join(m.group(1).split())
+        w = re.search(r"font-weight:\s*(\d+)", m.group(2))
+        if w:
+            declared[sel] = int(w.group(1))
+
+    # Every `// <selector>` + `weight: N` pair the scene carries.
+    pairs = re.findall(r"//\s*(\.[a-z0-9 .-]+)\n\s*weight: (\d+),", scene)
+    assert len(pairs) >= 8, (
+        "the native scene stopped naming its shell rules above its weights, so this "
+        "guard can no longer compare them (found %d)" % len(pairs))
+
+    checked = 0
+    for sel, got in pairs:
+        sel = sel.strip()
+        if sel not in declared:
+            continue
+        assert declared[sel] == int(got), (
+            "%s is font-weight %d in hartHome.css and %s in the native scene"
+            % (sel, declared[sel], got))
+        checked += 1
+    assert checked >= 6, (
+        "only %d native weights matched a shell rule by name; the comment markers "
+        "have drifted from the selectors and this pin is running on air" % checked)
+
+    # The two that matter most, named explicitly so a rename cannot quietly drop
+    # them from the loop above: the label over the money figure and the figure.
+    assert declared[".hh-eyebrow"] == 700
+    assert declared[".hh-amount"] == 800
+    assert re.search(r"//\s*\.hh-eyebrow\n\s*weight: 700,", scene), (
+        "the eyebrow lost its 700")
+    assert re.search(r"//\s*\.hh-amount\n\s*weight: 800,", scene), (
+        "the Spark figure lost its 800")
+
+
+def test_the_eyebrow_is_the_brand_label_the_shell_paints():
+    """`.hh-eyebrow` is teal, uppercase and letter-spaced; the native drew none of it.
+
+    It is the label directly over the Spark figure and the only other teal thing in
+    the hero, so painting it in the muted body colour broke the visual link between
+    the label and the number it names. `text-transform` and `letter-spacing` are
+    properties of the SURFACE, so they live in the scene and the wire keeps the
+    sentence the composer actually wrote.
+    """
+    css = _css_strip_comments(open(os.path.join(
+        REPO, "integrations", "agent_engine", "static", "hartHome.css"),
+        encoding="utf-8").read())
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    rule = re.search(r"(?m)^\.hh-eyebrow \{(.*?)^\}", css, re.S)
+    assert rule, "hartHome.css no longer has a .hh-eyebrow rule"
+    body = rule.group(1)
+
+    assert "text-transform: uppercase" in body
+    assert "home.hero.eyebrow.to_uppercase()" in scene, (
+        "the native eyebrow is drawn as sent, so the uppercase transform is gone")
+
+    # The construction site itself, anchored on the run's own text expression so the
+    # colour read here is the eyebrow's and not some neighbouring node's.
+    site = scene.split("home.hero.eyebrow.to_uppercase()")[1]
+    site = site[:site.index("});")]
+    assert "var(--hh-teal)" in body, "the eyebrow stopped being teal in the shell"
+    assert "color: theme.accent," in site, (
+        "the native eyebrow is not painted in the accent")
+
+    ls = re.search(r"letter-spacing:\s*([\d.]+)px", body)
+    assert ls, "the eyebrow stopped being letter-spaced in the shell"
+    assert "letter_spacing: %s," % float(ls.group(1)) in scene, (
+        "the native eyebrow does not carry the shell's %spx letter-spacing"
+        % ls.group(1))
+
+def test_the_payout_pill_and_the_stat_carry_the_shells_own_literals():
+    """The honesty badge and the two-tone stat, pinned to hartHome.css.
+
+    `payout_pending` is the home's statement that the money is not real yet, and
+    `.hh-pill` says it in amber: `--hh-amber` ink on a `rgba(255,200,61,.12)` wash
+    inside a `rgba(255,200,61,.30)` hairline, led by a 7px dot. `.hh-stat` sets its
+    COUNTS in `--hh-ink` at 800 against its own `#C3CDD9` at 400, and
+    `.hh-local-mini` closes the line in teal behind an 8px shield.
+
+    The native drew all of it as one grey run, so this pins the numbers that make
+    the difference between a status and a sentence.
+    """
+    css = _css_strip_comments(open(os.path.join(
+        REPO, "integrations", "agent_engine", "static", "hartHome.css"),
+        encoding="utf-8").read())
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    def rule(sel):
+        m = re.search(r"(?m)^%s \{(.*?)^\}" % re.escape(sel), css, re.S)
+        assert m, "hartHome.css no longer has a %s rule" % sel
+        return m.group(1)
+
+    def rgba_of(body, prop):
+        m = re.search(prop + r":[^;]*?rgba\((\d+),\s*(\d+),\s*(\d+),\s*([\d.]+)\)",
+                      body)
+        assert m, "%s has no rgba %s" % (prop, body[:60])
+        r, g, b, a = m.groups()
+        return (int(r) / 255.0, int(g) / 255.0, int(b) / 255.0, float(a))
+
+    def scene_rgba(field):
+        m = re.search(r"%s: Color::rgba\(([^)]*)\)," % field, scene)
+        assert m, "scene.rs no longer declares %s" % field
+        return [eval(p.strip(), {"__builtins__": {}}) for p in m.group(1).split(",")]
+
+    pill = rule(".hh-pill")
+
+    # --hh-amber is the ink, and the wash and hairline are the same hue at .12/.30.
+    amber = re.search(r"--hh-amber:\s*(#[0-9A-Fa-f]{6})", css)
+    assert amber, "the shell no longer defines --hh-amber"
+    assert 'pill_ink: palette("%s"' % amber.group(1) in scene, (
+        "the native pill ink is not --hh-amber")
+    for prop, field in (("background", "pill_bg"), ("border", "pill_border")):
+        want = rgba_of(pill, prop)
+        got = scene_rgba(field)
+        assert all(abs(x - y) < 1e-6 for x, y in zip(got, want)), (
+            "%s is %s and .hh-pill's %s is %s" % (field, got, prop, list(want)))
+
+    # Geometry: `padding: 5px 12px` over a 13px line at the shell's line-height 1.5.
+    pad_y, pad_x = re.search(r"padding:\s*(\d+)px\s+(\d+)px", pill).groups()
+    px = re.search(r"font-size:\s*(\d+)px", pill).group(1)
+    assert "HERO_PILL_PAD_X: f32 = %s.0;" % pad_x in scene
+    assert "HERO_PILL_PX: f32 = %s.0;" % px in scene
+    want_h = 2 * int(pad_y) + int(px) * 1.5
+    assert "HERO_PILL_H: f32 = %s;" % want_h in scene, (
+        "the pill box should be %s (2 x %spx padding + %spx at line-height 1.5)"
+        % (want_h, pad_y, px))
+    gap = re.search(r"gap:\s*(\d+)px", pill).group(1)
+    assert "HERO_PILL_GAP: f32 = %s.0;" % gap in scene
+    dot = re.search(r"width:\s*(\d+)px", rule(".hh-pill-dot")).group(1)
+    assert "HERO_PILL_DOT: f32 = %s.0;" % dot in scene
+
+    # `.hh-hero-meta { gap: 10px 16px }`: the COLUMN gap is the one between items.
+    meta = rule(".hh-hero-meta")
+    col = re.search(r"gap:\s*\d+px\s+(\d+)px", meta).group(1)
+    assert "HERO_META_GAP: f32 = %s.0;" % col in scene, (
+        "the strip's items are not spaced by the rule's column gap")
+    ink = re.search(r"color:\s*(#[0-9A-Fa-f]{6})", meta).group(1)
+    assert 'meta_ink: palette("%s"' % ink in scene, (
+        "the strip is not painted in .hh-hero-meta's own colour")
+    # `.hh-stat` is that same colour and its <b> is heavier, which is the whole
+    # reason the native draws the counts as separate runs.
+    assert re.search(r"\.hh-stat\s*\{[^}]*color:\s*%s" % ink, css), (
+        ".hh-stat drifted from .hh-hero-meta's colour")
+    b_weight = re.search(r"\.hh-stat b\s*\{[^}]*font-weight:\s*(\d+)", css).group(1)
+    assert "stat.push((home.hero.agents.to_string(), %s," % b_weight in scene, (
+        "the agent count is not set at .hh-stat b's %s" % b_weight)
+
+    # `.hh-local-mini`: teal, 700, behind an 8px shield with a 6px gap.
+    mini = rule(".hh-local-mini")
+    assert "var(--hh-teal)" in mini, "the local claim stopped being teal in the shell"
+    assert re.search(r"font-weight:\s*700", mini)
+    shield = re.search(r"width:\s*(\d+)px", rule(".hh-local-mini .hh-shield")).group(1)
+    assert "HERO_SHIELD: f32 = %s.0;" % shield in scene
+    assert "HERO_SHIELD_GAP: f32 = %s.0;" % re.search(
+        r"gap:\s*(\d+)px", mini).group(1) in scene
+
+
+def _rust_fn_body(src, decl):
+    """A Rust fn's text, from its declaration to the first bare closing brace.
+
+    Deliberately not a regex: this file is edited from a Windows shell where a
+    heredoc silently eats backslashes, and a mangled pattern here would fail open.
+    """
+    i = src.index(decl)
+    out = []
+    for line in src[i:].splitlines():
+        out.append(line)
+        if line == "}":
+            break
+    return chr(10).join(out)
+
+
+def test_the_native_scene_owns_the_reservation_once_it_paints_the_bars():
+    """The M6 inversion, pinned from the side that can see both processes.
+
+    While the WebView draws the bars it publishes the reservation and the
+    compositor reads the file. Once the compositor paints them, the file's only
+    publisher is the process M6 demotes: nothing writes it, the parse fails safe to
+    zero, and a maximized window covers the native bars. That is the 2026-08-29
+    "taskbar unreachable" report arriving again through the new renderer.
+
+    The merge rule is unit-tested in Rust. What no Rust test can reach is the
+    WIRING, because work_area_for needs a mapped output and a real State, so a
+    correct merge function that nothing calls would pass every Rust test. Reading a
+    value nothing acts on is the same dead-contract shape as a budget row nothing
+    measures, so the wiring is pinned here.
+    """
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+
+    body = _rust_fn_body(comp, "pub fn work_area_for<S: CompState>")
+    assert "native_shell_on()" in body, (
+        "work_area_for no longer consults native_shell_on, so once the WebView is "
+        "demoted nothing reserves the bars the compositor itself paints")
+    assert "effective_reservation" in body, (
+        "work_area_for no longer merges the published and the native reservation")
+    assert "panel_reservation()" in body, (
+        "work_area_for stopped reading what the shell publishes, which regresses "
+        "the WebView desktop that is still the one shipping")
+
+    # And the two numbers stay READ rather than restated. A literal here would be a
+    # third source for a value this file already pins in two places.
+    native = _rust_fn_body(comp, "pub fn native_chrome_reservation()")
+    assert "top_bar_h" in native, (
+        "the native top reservation stopped coming from the theme, so a 36px theme "
+        "would reserve a hardcoded 40 again")
+    assert "TASKBAR_H" in native, (
+        "the native bottom reservation stopped coming from scene.rs TASKBAR_H, the "
+        "constant this file already ties to the shell's own")
+    assert "40" not in native and "44" not in native, (
+        "native_chrome_reservation restates a bar height as a literal instead of "
+        "reading it, which is the drift every other pin in this file exists to stop")
+
+
+def test_the_native_icon_face_is_the_one_the_shell_asks_for():
+    """The compositor must shape icons in the face the shell names FIRST.
+
+    A card icon, a tray glyph and the omnibox magnifier are Material LIGATURE NAMES.
+    The face turns the whole name into one glyph; any other face renders the letters.
+    That is not a graceful degradation, it is the word "notifications" clipped into a
+    32px tray slot, which is what a fresh offline ISO once showed and what
+    hart-subsystems.nix bundles the fonts to prevent.
+
+    The two sides pick the face differently and cannot be allowed to drift. CSS falls
+    through a stack on a MISSING FAMILY; cosmic-text falls back per CODEPOINT, and a
+    ligature name is pure ASCII that every sans face covers, so its fallback never
+    fires. The compositor therefore names exactly one family, and it has to be the
+    shell's first choice or the two renderers draw different icons.
+
+    Read from both sources, never restated here, because a literal in this test would
+    pass happily after either side was renamed.
+    """
+    shell = _read_service()
+    rule_at = shell.index(".mi, .material-icons-round {")
+    block = shell[rule_at:shell.index("}", rule_at)]
+    assert "font-family" in block, ".mi no longer sets a font-family"
+    fams = block[block.index("font-family:") + len("font-family:"):]
+    fams = fams[:fams.index(";")]
+    first = fams.split(",")[0].strip().strip("'").strip('"')
+
+    rust = open(os.path.join(REPO, "compositor", "src", "text_render.rs"),
+                encoding="utf-8").read()
+    marker = 'pub const ICON_FAMILY: &str = "'
+    assert marker in rust, "text_render.rs no longer declares ICON_FAMILY"
+    tail = rust[rust.index(marker) + len(marker):]
+    native = tail[:tail.index('"')]
+
+    assert native == first, (
+        "the compositor shapes icons in %r while the shell asks for %r first"
+        % (native, first))
+
+    # And the face is actually REQUESTED, not merely declared. A constant nothing
+    # passes to the shaper is how the icons came to render as words in the first place.
+    assert "Family::Name(ICON_FAMILY)" in rust, (
+        "ICON_FAMILY is declared but never handed to the shaper")
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+    assert "icon: true," in scene, (
+        "no scene node asks for the icon face, so every run shapes in the UI face")
+    assert "icon_width(" in scene, (
+        "icons are measured as text, so the glyph is centred against the wrong width")
+
+
+def _read_service():
+    with open(SERVICE_SRC, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_the_native_desktop_paints_below_windows_and_above_the_shell():
+    """Z-order is a property of the ORDER OF PUSHES, so it is pinned as one.
+
+    build_frame_elements builds the list front-to-back: the cursor is prepended so it
+    draws on top, and the bloom's own comment says "last in the list = drawn UNDER
+    everything". The native scene therefore has to be pushed AFTER the toplevels and
+    BEFORE the Bottom/Background layer.
+
+    Below the windows, because the scene is the desktop and windows must cover it; the
+    bars stay reachable through the panel reservation, which is the same mechanism that
+    keeps the WebView shell's bars reachable and not a second copy of it. It was pushed
+    ABOVE the toplevels before this, so a maximized window got hero copy painted over it
+    while surface_under still routed the clicks to the window.
+
+    Above the Background layer, because during the transition the WebView is still running
+    underneath with an opaque surface, and below it the native scene would be invisible.
+
+    No Rust test can state this: it needs a mapped output, real windows and a live layer
+    shell. Source order is the honest place to hold it.
+    """
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+
+    def at(marker):
+        assert comp.count(marker) == 1, "marker moved or duplicated: %s" % marker
+        return comp.index(marker)
+
+    cursor = at("// ── 1. SOFTWARE CURSOR")
+    top_overlay = at("// ── 2. TOP / OVERLAY layer surfaces")
+    toplevels = at("// ── 3. WINDOW TOPLEVELS")
+    scene = at("// ── 3c. NATIVE SHELL M3 scene")
+    background = at("// ── 4. BOTTOM / BACKGROUND layer surfaces")
+
+    assert cursor < top_overlay < toplevels < scene < background, (
+        "native scene is out of z-order: cursor=%d top/overlay=%d toplevels=%d "
+        "scene=%d background=%d (front-to-back, so larger index = further back)"
+        % (cursor, top_overlay, toplevels, scene, background))

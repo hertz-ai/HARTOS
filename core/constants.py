@@ -709,6 +709,49 @@ LLM_GENERIC_ERROR_REPLY: str = (
     "I ran into a problem handling that. Please try again."
 )
 
+# What create_recipe replies when an agent build ends without its flow-0
+# recipe: the agent is not reusable, so the turn produced no work.  It is a
+# failure notice worded for a person, which is why the hive worker has to
+# recognise it (core.agent_tools.is_user_facing_error) instead of submitting
+# it as a task result.  Measured on central 2026-09-13: Hive Model Trainer's
+# task was marked completed with this text.
+BUILD_INCOMPLETE_REPLY: str = (
+    "I couldn't finish building that agent — its steps didn't complete, so it "
+    "wouldn't be usable yet. Tell me a bit more about what it should do and "
+    "I'll pick up where it stopped."
+)
+
+# What create_recipe._ask_for_help replies on an autonomous turn whose action
+# it handed on (owner ruling 2026-09-14: ask a human or an expert, never
+# record a completion that did not happen).  Prefixes, not sentences: the
+# step and the reason follow.  The hive worker recognises them by reference
+# (core.agent_tools.is_help_pause) and holds the task instead of submitting
+# the sentence as its result.  Measured on the Nunba desktop 2026-09-15: three
+# of four daemon turns were "Worker completed" with one of these as the
+# hashed result.
+HELP_PAUSED_REPLY_PREFIX: str = "Paused for help:"
+HELP_EXPERT_REPLY_PREFIX: str = "Handed to the expert model:"
+
+
+# ── The per-request switch that turns a hybrid-reasoning model's thinking OFF ──
+# The value of an OpenAI-compatible request's `chat_template_kwargs`. ONE
+# definition for every HARTOS completion that must answer inside a small budget
+# (integrations/vision/image_describe.py; the vision backend's page reads in
+# integrations/vision/lightweight_backend.py; the book-title call in
+# integrations/learning/book_pipeline.py; every agent call to the configured
+# endpoint, via core.autogen_config.resolve_llm_backend).
+#
+# Why (measured live 2026-08-04 on the Nunba vision route): Qwen3.5 writes its
+# chain-of-thought into `reasoning_content` and only afterwards fills `content`.
+# With max_tokens=300 the whole budget went to thinking -- finish=length,
+# content=0 chars -- an empty answer and no error. This kwarg took reasoning
+# 760 -> 0 chars and made the call faster. `reasoning_effort: "none"` is NOT
+# honoured by that server; do not substitute it. Nunba also disables thinking at
+# llama-server SPAWN (LLAMA_ARG_CHAT_TEMPLATE_KWARGS), but only for a server it
+# started; this travels with the request, so it also covers an external, remote
+# or cloud endpoint.
+LLM_THINKING_OFF_KWARGS: dict = {'enable_thinking': False}
+
 
 TOOL_LABELS: dict = {
     # Memory + history
@@ -1058,8 +1101,16 @@ MAX_PAYLOAD_BYTES = int(_os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 
 #   create_recipe.py:2475      status == 'completed' OR 'success'   <-- only create
 #   create_recipe.py:2516      status == 'pending'
 #   create_recipe.py:2548      status == 'requires_breakdown'
-#   reuse_recipe.py:2606,2756,2900,3409,3495,3512,4202,4216
-#                              status == 'completed'                <-- 'success' absent
+#   reuse_recipe.py            status == 'completed'                <-- 'success' absent
+#                              RESOLVED 2026-09-07: all five completion
+#                              readers (:2821 timer, :3865/:3882 reuse-w1,
+#                              :4841/:4855 reuse-w2) now consult
+#                              VERDICT_COMPLETION_STATUSES.  Each asked the
+#                              pure "is this action finished" question and
+#                              advanced the action pointer, so adopting the
+#                              shared token set changed no grouping.  Guarded
+#                              by tests/unit/test_completion_verdict_vocabulary.py,
+#                              which fails if the literal is re-introduced.
 #   reuse_recipe.py:2635       status == 'requires_breakdown'  (routing)
 #   reuse_recipe.py:2646       status in ('error','pending')   (routing)
 #   reuse_recipe.py:3438       under-reported advance set
@@ -1077,12 +1128,32 @@ MAX_PAYLOAD_BYTES = int(_os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 
 # are shared.
 VERDICT_COMPLETED = 'completed'
 VERDICT_SUCCESS = 'success'
+VERDICT_DONE = 'done'
 VERDICT_PENDING = 'pending'
 VERDICT_ERROR = 'error'
 VERDICT_REQUIRES_BREAKDOWN = 'requires_breakdown'
 
 # An action the model reports as finished.  Both pipelines must agree.
-VERDICT_COMPLETION_STATUSES = frozenset({VERDICT_COMPLETED, VERDICT_SUCCESS})
+#
+# 'done' was added 2026-09-07 from a live measurement, not from reading the
+# prompt.  Of 22 StatusVerifier verdicts emitted on the installed build,
+# 6 were spelled 'done' and 6 'completed' — the prompt names four statuses
+# and the model answers with a fifth roughly as often as the first:
+#
+#   {"status": "done", "action": "Use fetch_news_feeds to pull the latest
+#    articles from all configured RSS/Atom feeds ...", "action_id": 1}
+#
+# Every reuse reader tested == 'completed', so those six verdicts were
+# discarded and their actions never advanced.  This is the 'success' drift
+# above with a third spelling, found the same way.
+#
+# 'updated' was measured in the same window (2 of 22) and is deliberately
+# NOT here: it carries "message": "The fallback strategy for Action 3
+# requires specific user input" — a revision that is still pending.  It maps
+# to VERDICT_PENDING, and advancing on it would force-completion past the
+# USER-INPUT GATE (create_recipe.py:3123).
+VERDICT_COMPLETION_STATUSES = frozenset({
+    VERDICT_COMPLETED, VERDICT_SUCCESS, VERDICT_DONE})
 
 # The model says "not done" AND has nothing further to do about it.  When the
 # action is autonomous and its named tools are evidenced as executed, that is
@@ -1138,3 +1209,87 @@ VERDICT_UNDERREPORT_STATUSES = frozenset({VERDICT_PENDING})
 # 'error' is absent too — unmeasured here; do not add it without a measurement.
 VERDICT_ROUND_TERMINAL_STATUSES = frozenset({
     VERDICT_COMPLETED, VERDICT_REQUIRES_BREAKDOWN})
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Synthetic stand-in for a tool_call that never produced a result.
+#
+# helper.py MINTS it: llama.cpp rejects a history whose assistant tool_call
+# has no matching role='tool' answer, so any pending call left behind by an
+# earlier round is back-filled with this content to keep the wire valid.
+#
+# reuse_recipe.py READS it: the fabrication gate must NOT count a placeholder
+# as execution — a placeholder exists precisely BECAUSE the call returned
+# nothing.  Measured 2026-09-06 on 625 wire bodies: every named tool-role
+# message was a placeholder (real=0), so an executed-set that accepted them
+# saturated and unrun=[] became unreachable; nine fabricated 'completed'
+# verdicts advanced unchallenged.
+#
+# ONE definition, because a drifted copy silently re-opens that hole: the
+# minter would write text the reader no longer recognises, and every
+# placeholder would read as a real result again.
+HISTORICAL_TOOL_PLACEHOLDER: str = "Placeholder response for historical tool call"
+
+# Results a tool returns when it RAN and could not do the work.
+#
+# Sibling of HISTORICAL_TOOL_PLACEHOLDER above, and read by the same gate for
+# the same reason: neither is the action's work being done.  The placeholder
+# means "the call produced nothing"; these mean "the call produced a refusal".
+#
+# reuse_recipe.py RETURNS them (execute_windows_or_android_command's failure
+# branches) and READS them (the fabrication gate), so they live here rather
+# than as literals at either end — a drifted copy would silently re-open the
+# hole, exactly as it would for the placeholder.
+#
+# Measured 2026-09-07, agent 60834540771 driven as its real owner, action 1
+# "Bring the HART Finance Dashboard window to foreground": the tool really ran
+# (the VLM computer-use loop clicked the taskbar, opened a Notepad error
+# dialog, exited max_iterations/incomplete), returned the first string below at
+# 02:11:34, and 25s later the action advanced on a 'completed' verdict with
+# [FAB-GUARD] unrun=[].  The gate asked "did a result come back", never "did
+# the tool do the work", so the one thing it exists to prevent happened with
+# the gate green.
+TOOL_FAILURE_RESULTS: tuple = (
+    "Not able to perform this action now please try later",
+    "I'm unable to perform this action since the Hevolve A I Companion App is "
+    "not running in your computer, Open the companion app & try again",
+)
+
+# How much of what a tool OBSERVED may ride back in its return string.
+#
+# Same family as the failure strings above, hence the same home: both decide
+# what the model learns about a tool call that already happened.
+#
+# WHY A CAP AT ALL.  A computer-use observation can be a whole screen dump.
+# The wire budget is real and already tuned: n_ctx 12288 with ~6144 per slot
+# (#539), and WIRE_TRIM_SAFETY_MARGIN_TOKENS pushes tool-heavy bodies into the
+# degrade branch (#755 note).  An unbounded tool result would spend the slot it
+# is trying to inform and cost the turn — the #734 failure shape.
+#
+# WHY 2000.  ~500 tokens at the 1.03 chars/token ratio measured live via
+# /tokenize (#734) — under a tenth of a slot, while comfortably carrying the
+# kind of answer these tools produce.  The live case that motivated it is one
+# line: "Free space on C: reported as 9.17 GB."  Raise it only against a
+# measured truncation, not a guess.
+TOOL_OBSERVATION_MAX_CHARS: int = 2000
+
+# The most one stored memory may hold. MemoryGraph.register bounds every row
+# to it, whoever the writer is.
+#
+# WHY A CAP AT ALL. Nothing bounded a stored memory, and the group chat writes
+# tool results back into memory, so a store that is read back and re-stored
+# grows by what it reads. Live on central 2026-09-14 (#104):
+# save_data_in_memory returned the agent's whole data store on every save,
+# each return was written back as a memory, and search_long_term_memory joined
+# several such rows into one result. Guardian Convergence's graph reached
+# 1,358 rows and 28.6M chars, 76 rows over 100k, the largest 3,960,333. One
+# 3,386,616-char result made every call to the hosted model a bare 400 until
+# the loop-break fired.
+#
+# WHY 16000. A recall shows at most TOOL_OBSERVATION_MAX_CHARS of a row; the
+# rest stays for search to match on. Eight times that holds a long reply or
+# the substance of a fetched page, and nothing near a context's size. The
+# MemoryGraph leg of recall skips rows longer than this: every write to the
+# graph and through the group chat's write-back is bounded to it by
+# core.token_utils.bound_text, so only rows stored before the cap can be.
+MEMORY_ITEM_MAX_CHARS: int = 16000

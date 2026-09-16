@@ -763,3 +763,20 @@ an OPTIONAL enhancement layered ON TOP only where no bundled art exists (d8). No
 parallel path: ONE app-logo resolver (`shell_manifest.bundled_app_logo`) + ONE
 agent-art resolver (`app_poster.central_agent_art`), both reused by the producer
 and the marketplace via a single URL convention.
+
+## 2026-09-15 - The floating windows are glass (the AI-control ribbon first)
+
+Refines b3 (macOS "vibrancy glass" as one of the looks to take) and f6
+("transparent transculent menus + windows") for the two floating surfaces a
+person sees over their own desktop: the AI-control ribbon (Nunba
+`desktop/indicator_window.py`) and the companion window (Nunba app.py, the
+`/voice-orb` page). Contradicts no EMPHATIC rule; the shape, drag and taps
+rules of (f) still hold.
+
+| # | Captured intent (verbatim quote) | Item | Status | Evidence |
+|---|---|---|---|---|
+| GL1 | The floating windows have a see-through, blurred, tinted backdrop, not a solid slab. *"the floatinf window shd have transparent glass like bg"* [sic: "floatinf" is the steward's keystroke] `[steward 2026-09-15, session 7fc63966]` | b3 / f6 (floating windows) | **PARTIAL (ribbon: translucent, not blurred)** / MISSING (companion) | MEASURED BY SCREEN PIXELS on Windows 11 25H2 (build 26200, transparency effects on), 2026-09-15, a bright striped window placed directly behind each probe (sessions e97be839 + 7fc63966, `glass_probe2.py`): the legacy accent policy (`SetWindowCompositionAttribute` `ACCENT_ENABLE_ACRYLICBLURBEHIND`) paints its tint SOLID on a tk panel (30/30/30, no blur) and an opaque WHITE sheet behind a transparent WebView2 page, and paints the whole window rect through a `SetWindowRgn` orb cut; the documented Win11 backdrop (`DwmExtendFrameIntoClientArea` + `DWMWA_SYSTEMBACKDROP_TYPE`) gives the same white on WebView2 and a flat grey panel with faded text on tk. So blurred glass is NOT reachable with tk's GDI painting nor with pywebview 6.1's WinForms+WebView2 hosting as they stand. What IS reachable and measured: tk `-alpha` (a layered window) blends what is behind (white behind reads 75/75/75 at 0.8), keeps full hit-testing and needs no Win32 call; the ribbon panel ships at `PANEL_ALPHA = 0.8` (Nunba). A first attempt (Nunba eedbb6c9, reverted in c003e069) took the accent API's success return as glass without looking at pixels; RULE: a compositor claim is proven by screen pixels over a bright backdrop, never by an API return code. Also learned there: a colour-keyed pixel is transparent to ALL hit-testing, clicks and hover alike, so a keyed "glass" makes a control click-through. Unbuilt candidates for real blur: WebView2 composition hosting (`CoreWebView2CompositionController` on a DirectComposition visual, a hosting change pywebview does not do), or a tk panel painted with per-pixel alpha via `UpdateLayeredWindow`. The instruction STANDS; the companion window awaits one of those. |
+
+Audit note: GL1 as shipped changes only the panel's alpha. No new window, no new
+transport, nothing on the hot path, no Win32 call; a platform without
+`-alpha` keeps the solid panel (degrade-not-die).

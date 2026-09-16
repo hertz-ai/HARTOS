@@ -718,7 +718,37 @@ in
           ++ lib.optional (pkgs ? bluez)         pkgs.bluez         # bluetoothctl - bluetooth
           ++ lib.optional (pkgs ? cups)          pkgs.cups          # lpstat/lpadmin/lp - printers
           ++ lib.optional (pkgs ? smartmontools) pkgs.smartmontools # smartctl     - SMART disk health
-          ++ lib.optional (pkgs ? sane-backends) pkgs.sane-backends; # scanimage   - scanners
+          ++ lib.optional (pkgs ? sane-backends) pkgs.sane-backends  # scanimage   - scanners
+          # ── THE FLOOR, so there is no fourth wave ───────────────────────────
+          # Everything above is a capability someone found MISSING on a booted
+          # box and added by hand: gtk-launch on 2026-09-01, six more on
+          # 2026-08-26, flatpak and nix inside app_installer's own PATH helper.
+          # Same defect every time, and the list can only ever be as complete as
+          # the last sweep.
+          #
+          # Swept all 77 binaries the shell layer shells, against this unit's
+          # real PATH on the box 2026-09-07: 33 were INSTALLED and invisible
+          # here. notify-send (so a desktop notification never reaches D-Bus),
+          # xdg-open, xdg-mime, xdg-settings, wl-copy, wl-paste, xclip,
+          # gsettings, wlr-randr (the documented display fallback),
+          # powerprofilesctl, git, gh, hart-self-build, sudo, useradd, pgrep,
+          # pkill, and every nix binary. Each one degrades SILENTLY, because the
+          # canonical probe (core/subprocess_safe.run_probe, 139 call sites)
+          # reads FileNotFoundError as "optional tooling absent on this build".
+          # So the OS reports its own working features as unavailable.
+          #
+          # These two entries are the system profile and the setuid wrappers,
+          # i.e. exactly what a login shell on this node sees. makeBinPath
+          # appends /bin, so the strings carry no /bin themselves (verified on
+          # the box: -> /run/current-system/sw/bin:/run/wrappers/bin).
+          #
+          # They go LAST on purpose. Every pinned entry above still wins, so the
+          # rustdesk guard shim keeps its first-on-PATH contract and nothing
+          # already working changes; this only catches what would otherwise be
+          # invisible. It is a floor, NOT a replacement: an explicit pkgs entry
+          # is still the right way to add a tool, because it pins a version and
+          # makes the dependency real, where this resolves at runtime.
+          ++ [ "/run/current-system/sw" "/run/wrappers" ];
 
         environment = {
           HEVOLVE_DATA_DIR = cfg.dataDir;
@@ -760,6 +790,26 @@ in
           # serves its synthetic "Main" placeholder -- a desktop reporting no
           # display while driving a 1600x900 panel.
           SWAYSOCK = "/run/hart/sway-ipc.sock";
+          # The Tier-1 twin of the line above: HartWmClient speaks HART-comp's
+          # framed-JSON socket through this relay, which is how native window
+          # verbs and banked layout recipes work on the native tier at all.
+          # Note it is deliberately safe to set UNCONDITIONALLY, exactly as
+          # SWAYSOCK is, because the client does not trust the variable: it
+          # requires a real window.list answer before claiming the transport.
+          # That matters here more than usual, since systemd socket activation
+          # means connect(2) ALWAYS succeeds on this path whether or not a
+          # compositor is behind it.
+          HART_COMP_SOCK = "/run/hart/hart-comp.sock";
+          # The App Store shells `nix-env -f '<nixpkgs>' -iA <pkg>`, and
+          # `<nixpkgs>` resolves through NIX_PATH. A unit does NOT get one:
+          # /etc/set-environment exports it, and that file is sourced by a
+          # LOGIN shell only. Measured on the box 2026-09-07 inside this very
+          # service: PATH had no /run/current-system/sw/bin (so nix-env was
+          # unfindable) and NIX_PATH was unset (so the attribute could not
+          # resolve even once it was). app_installer defaults to this same
+          # value when the variable is missing, so an older node still works;
+          # this line is the authority, that default is the floor.
+          NIX_PATH = "nixpkgs=flake:nixpkgs";
           # NEVER let pactl autospawn a PulseAudio daemon. PipeWire owns the
           # devices, so an autospawned pulseaudio dies instantly with "Daemon
           # startup without any loaded modules" -- and because the UI polls audio

@@ -30,7 +30,17 @@ def test_inference_mode_constrains_tools_and_text_output():
     assert r['ok'] and r['stdout'] == '4'
     cmd = sr.call_args[0][0]
     assert '--output-format' in cmd and 'text' in cmd
-    assert '--allowedTools' in cmd          # no tools in inference mode
+    # --tools "" REMOVES the built-in tools; --allowedTools "" only withheld
+    # pre-approval and the model went on executing Edit/Grep/Read/Bash against
+    # its own memory dir in 199 of 300 measured sessions (2026-09-16).  The
+    # live check is the sandbox probe; this pins the flag from regressing.
+    assert '--allowedTools' not in cmd
+    i = cmd.index('--tools')
+    assert cmd[i + 1] == ''
+    assert '--strict-mcp-config' in cmd     # no MCP callback into HARTOS
+    # The caller's system text REPLACES the harness prompt (memory, CLAUDE.md)
+    # rather than being appended to it: an inference endpoint's whole prompt.
+    assert '--system-prompt' in cmd and '--append-system-prompt' not in cmd
 
 
 def test_agentic_mode_is_a_plain_run_no_tool_gating():
@@ -39,6 +49,7 @@ def test_agentic_mode_is_a_plain_run_no_tool_gating():
     assert r['ok'] and r['returncode'] == 0
     cmd = sr.call_args[0][0]
     assert '--allowedTools' not in cmd       # agentic keeps full tools
+    assert '--tools' not in cmd and '--strict-mcp-config' not in cmd
     assert sr.call_args[1]['cwd'] == '/repo'
 
 

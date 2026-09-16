@@ -47,6 +47,7 @@ latency_ms}``.
 """
 from __future__ import annotations
 
+import copy as _copy
 import json
 import logging
 import os
@@ -416,6 +417,54 @@ def _is_target_request(url, method: str) -> bool:
         return False
 
 
+def _is_chat_completions_post(request) -> bool:
+    """A POST to any /chat/completions endpoint, on ANY host — the LLM calls
+    that attest provider standing (#106b b).  Broader than _is_target_request
+    (which is the LOCAL llama-server only): a HOSTED provider on :443 is the
+    402/401 source and must reach the breaker feed too.  Ends-with catches
+    both /v1/chat/completions and Azure-style
+    /openai/deployments/<d>/chat/completions."""
+    try:
+        if getattr(request, 'method', '') != 'POST':
+            return False
+        return str(getattr(request.url, 'path', '') or '').endswith('/chat/completions')
+    except Exception:
+        return False
+
+
+def _feed_provider_breaker(url, status) -> None:
+    """Record LLM provider standing per host from a chat/completions response
+    (#106b b).  401/402/403 = account refusal (a failure); 2xx = success
+    (clears/half-open-closes).  Every other status and all exceptions are
+    ignored: a 429 is a rate limit not a standing refusal, and a transport
+    error says nothing about the account.  This is the SOLE consumer that
+    resolves the breaker's half-open probe, so it must run on the real wire
+    response, never at an upstream pre-flight check."""
+    try:
+        if status is None:
+            return
+        from core.circuit_breaker import llm_provider_breaker, provider_host
+        host = provider_host(str(url))
+        if not host:
+            return
+        if status in (401, 402, 403):
+            llm_provider_breaker.record_failure(host)
+        elif 200 <= status < 300:
+            llm_provider_breaker.record_success(host)
+    except Exception:
+        pass
+
+
+def _send_and_feed(orig_send, client, request, kwargs):
+    """Run a HOSTED (non-target) chat/completions send unchanged and feed the
+    provider breaker with its real status.  Byte-transparent: the response
+    object is returned as-is and an exception is re-raised bare (exceptions do
+    not feed the breaker)."""
+    response = orig_send(client, request, **kwargs)
+    _feed_provider_breaker(request.url, getattr(response, 'status_code', None))
+    return response
+
+
 # ─── Hard left-trim to fit n_ctx (zero-tolerance context overflow) ───
 # Architecture note (2026-05-23): autogen and langchain both build
 # their own OpenAI clients from config; we cannot route them through a
@@ -448,20 +497,93 @@ def _is_target_request(url, method: str) -> bool:
 #   * Multimodal text:  core.token_utils._content_to_text
 
 
+def _live_ctx_geometry():
+    """``(n_ctx, total_slots)`` as the RUNNING llama-server reports them.
+
+    Returns None when the server cannot be read — caller falls back to the
+    constant, i.e. exactly the pre-2026-09-11 behaviour.
+
+    ``/props`` carries ``default_generation_settings.n_ctx`` and a top-level
+    ``total_slots``.  The n_ctx there is the PER-SLOT ceiling: llama-server
+    quotes the same number when it refuses an over-length body
+    (``'n_ctx': 8192, 'n_prompt_tokens': 11817``), so it is what one request
+    may spend, already partitioned.  Do not divide it again.
+
+    Deliberately NOT memoised.  #818/D53 sized this from a 117-second-old
+    VRAM memo read across a llama-server teardown, pinned 4096 for a whole
+    session and that is why CREATE was dead; a TTL does not help because the
+    stale read happens INSIDE the window.  llama-server respawns on VRAM-tier
+    changes, model switches and watchdog restarts, and the budget has to
+    follow it within the same process.  The cost is one loopback GET with a
+    1.5s cap on a path that is already making a multi-second LLM call.
+    """
+    try:
+        from core.port_registry import get_local_llm_url
+        from core.http_pool import pooled_get
+        base = get_local_llm_url().rstrip('/')
+        if base.endswith('/v1'):
+            base = base[:-3]
+        resp = pooled_get(base.rstrip('/') + '/props', timeout=1.5)
+        if getattr(resp, 'status_code', 0) != 200:
+            return None
+        props = resp.json()
+        n_ctx = int((props.get('default_generation_settings') or {}).get('n_ctx') or 0)
+        slots = max(1, int(props.get('total_slots') or 1))
+        return (n_ctx, slots) if n_ctx > 0 else None
+    except Exception:
+        return None
+
+
 def _get_budget_per_slot() -> int:
-    """Per-slot input token budget.  Honors:
-      * ``HEVOLVE_LLAMA_CTX_SIZE`` (default tracks
-        ``core.constants.LLAMA_CTX_SIZE_DEFAULT`` = 12288,
-        matches Nunba's ``llama_config.py:1527``).
-      * ``HEVOLVE_LLAMA_SLOTS`` (default 1 — single-user dev box).
+    """Per-slot input token budget — MEASURED from the server, not declared.
+
+    Order:
+      * ``HEVOLVE_LLAMA_CTX_SIZE`` — explicit operator override, still wins.
+        (Divided by ``HEVOLVE_LLAMA_SLOTS`` because that constant is a TOTAL.)
+      * the running llama-server's ``/props`` — the truth.
+      * ``core.constants.LLAMA_CTX_SIZE_DEFAULT`` — last resort, server down.
+
+    WHY THE PROBE EXISTS (live 2026-09-11, installed build).  This returned
+    12288 while llama-server ran 8192, so every body was over-budgeted by
+    4,096 tokens; the "zero-tolerance overflow" guard passed requests the
+    server then refused with ``exceed_context_size_error``, and reuse logged
+    ``robust completion-advance FAILED ... the pipeline did not advance`` for
+    sessions ..._18163818525 and ..._1923323102 — the agents never reached
+    their goals.
+
+    WHY THE OVERRIDE DID NOT SAVE US — CORRECTED 2026-09-11, and the earlier
+    claim in ba1daf05e's message ("nothing ever sets it") is WITHDRAWN as
+    measurably wrong.  Nunba's ``llama/llama_config.py:1970`` DOES set
+    ``HEVOLVE_LLAMA_CTX_SIZE`` (and ``HEVOLVE_LLAMA_SLOTS``), on the line
+    immediately above the ``--ctx-size`` / ``--parallel`` flags it hands the
+    server, so on the SPAWN path the env is authoritative by construction and
+    this probe never runs.
+
+    The hole is the OTHER path.  Nunba adopts an already-running llama-server
+    on :8080 without a geometry identity check (#756), and that path never
+    reaches the spawn code, so the env stays unwritten and
+    ``LLAMA_CTX_SIZE_DEFAULT`` (12288) wins against whatever the adopted
+    server is actually running.  That is the measured split in the historical
+    logs — 226 wire-trim lines reporting n_ctx 8192 (spawned, env written)
+    against 26 reporting 12288 (adopted, constant) — and it is exactly the
+    shape of memory/feedback_declaration_is_not_a_guard.md: constants.py:71
+    declares the env "must match the --ctx-size cmdline" with nothing
+    enforcing it on every path.  Asking the server turns that declaration into
+    a measurement on BOTH paths.
     """
     from core.constants import LLAMA_CTX_SIZE_DEFAULT, LLAMA_SLOTS_DEFAULT
     try:
-        ctx = int(os.environ.get('HEVOLVE_LLAMA_CTX_SIZE',
-                                  str(LLAMA_CTX_SIZE_DEFAULT)))
+        _override = os.environ.get('HEVOLVE_LLAMA_CTX_SIZE')
+        if _override:
+            slots = max(1, int(os.environ.get('HEVOLVE_LLAMA_SLOTS',
+                                               str(LLAMA_SLOTS_DEFAULT))))
+            return int(_override) // slots
+        live = _live_ctx_geometry()
+        if live:
+            return live[0]
         slots = max(1, int(os.environ.get('HEVOLVE_LLAMA_SLOTS',
                                            str(LLAMA_SLOTS_DEFAULT))))
-        return ctx // slots
+        return LLAMA_CTX_SIZE_DEFAULT // slots
     except Exception:
         return LLAMA_CTX_SIZE_DEFAULT
 
@@ -498,6 +620,132 @@ def _schema_tokens(body: dict, model=None) -> int:
     return total
 
 
+def _compact_tool_schema(body: dict, model=None) -> tuple:
+    """Strip serialisation boilerplate from ``tools`` — same tools, fewer tokens.
+
+    Returns ``(body_or_new_body, tokens_saved)``; ``(body, 0)`` when there is
+    nothing to gain, so the caller's identity check still detects "unchanged".
+
+    WHY.  Measured 2026-09-11 on the 70-tool wire body that killed agent
+    18163818525 (llm_outbound.jsonl 22:34:31, source autogen.reuse): the schema
+    was 8,482 tokens against an n_ctx of 8,192, so the request could not fit
+    even with ZERO message content.  Anatomy of those tokens:
+
+        parameters    5090 (60.0%)   descriptions  1519 (17.9%)
+        JSON overhead 1623 (19.1%)   names          250 ( 2.9%)
+
+    The fat is not the prose.  It is what pydantic emits for every
+    ``Optional[X] = None`` argument::
+
+        "repo": {"anyOf": [{"type": "string"}, {"type": "null"}],
+                 "default": null, "description": "repo"}
+
+    Three redundancies in one property, removed here:
+
+      * ``anyOf: [{type: X}, {type: null}]`` -> ``{type: X}``.  Optionality is
+        ALREADY carried by the property's absence from ``required``; the null
+        branch also widens llama.cpp's GBNF grammar for no gain.  Applied ONLY
+        to non-required properties — where the argument IS required the caller
+        must pass something and null may be that something, so collapsing
+        there would narrow the contract rather than normalise its spelling.
+      * ``"default": null`` -> dropped.  Redundant with not-required, and
+        llama-server does not act on defaults.  A NON-null default is kept:
+        recall_memory's ``mode: 'hybrid'`` is the only thing telling the model
+        what happens if it omits the argument.
+      * ``"description": "repo"`` -> dropped.  A description equal to its own
+        key is zero information; these are an artefact of #542's signature
+        synthesis, which fills the description from the parameter name when the
+        source function carried no per-argument docstring.  A real description
+        is never touched — #787 measured 53% of tool calls emitted with empty
+        arguments, and per-argument prose is what fixes that.
+
+    Measured recovery on that exact block: -427 / -185 / -237 = **-842 tok**
+    (8482 -> 7640) with tools 70 -> 70, properties 131 -> 131 and required
+    args 62 -> 62.  Lossless by construction: only the SPELLING of the schema
+    changes, never which tools exist, which arguments they take, or which are
+    mandatory.
+
+    HONEST SCOPE.  842 tokens does not by itself make that body fit
+    (7640 + 1868 messages = 9508 > 8192).  This is the lossless half; bounding
+    the tool COUNT is a separate concern.  Do not read this function as
+    "the oversized body now fits".
+
+    WHY HERE.  The schema is generated by autogen/pydantic from Python
+    signatures inside third-party code, so there is no producer-side seam.  The
+    wire is where every framework's body converges and where ``_schema_tokens``
+    already charges the schema, so compaction and budget arithmetic are the
+    same number by construction and cannot drift apart.
+    """
+    block = body.get('tools')
+    if not isinstance(block, list) or not block:
+        return body, 0
+    from core.token_utils import count_tokens_for_text
+
+    def _tok(obj):
+        try:
+            return count_tokens_for_text(json.dumps(obj, ensure_ascii=False),
+                                         model)
+        except (TypeError, ValueError):
+            return 0
+
+    before = _tok(block)
+    if not before:
+        return body, 0
+    try:
+        new_block = _copy.deepcopy(block)
+    except Exception:
+        # Never fail an LLM call for a token optimisation.
+        return body, 0
+
+    changed = False
+    for entry in new_block:
+        if not isinstance(entry, dict):
+            continue
+        fn = entry.get('function')
+        if not isinstance(fn, dict):
+            continue
+        params = fn.get('parameters')
+        if not isinstance(params, dict):
+            continue
+        props = params.get('properties')
+        if not isinstance(props, dict):
+            continue
+        req = params.get('required')
+        required = set(req) if isinstance(req, list) else set()
+        for pname, spec in props.items():
+            if not isinstance(spec, dict):
+                continue
+            if pname not in required:
+                branches = spec.get('anyOf')
+                if isinstance(branches, list):
+                    non_null = [b for b in branches
+                                if isinstance(b, dict) and b.get('type') != 'null']
+                    has_null = any(isinstance(b, dict) and b.get('type') == 'null'
+                                   for b in branches)
+                    if has_null and len(non_null) == 1:
+                        spec.pop('anyOf', None)
+                        spec.update(non_null[0])
+                        changed = True
+                if 'default' in spec and spec.get('default') is None:
+                    spec.pop('default', None)
+                    changed = True
+            desc = spec.get('description')
+            if (isinstance(desc, str)
+                    and desc.strip().strip('.').lower().replace(' ', '_')
+                    == str(pname).lower()):
+                spec.pop('description', None)
+                changed = True
+
+    if not changed:
+        return body, 0
+    saved = before - _tok(new_block)
+    if saved <= 0:
+        return body, 0
+    new_body = dict(body)
+    new_body['tools'] = new_block
+    return new_body, saved
+
+
 def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
                           content_to_text) -> tuple:
     """Left-truncate one message's content to ``target_chars``, marker-prefixed.
@@ -529,6 +777,33 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
     return new_msg, len(text) - target_chars
 
 
+def ensure_user_turn(messages: list) -> bool:
+    """Give ``messages`` one role='user' turn if it has none; True when added.
+
+    Both model servers refuse a conversation without a user turn, and a
+    role='tool' result does not count: llama-server's Qwen3 chat template
+    raises a hard 500 "No user query found in messages." (measured
+    2026-09-03), and central's hosted Qwen endpoint answers a bare 400
+    "invalid request" (measured 2026-09-13, task #89).  The turn carries
+    WIRE_USER_SEED_TEXT and goes right after a leading system message.
+    Mutates ``messages`` in place; a no-op when any user turn exists.
+
+    One rule, two callers: the wire trim below applies it to the bodies it
+    intercepts (local llama-server ports only), and
+    ToolMessageHandler.validate_messages applies it on the agent path, the
+    only one of the two that sees a hosted endpoint's traffic.
+    """
+    from core.constants import WIRE_USER_SEED_TEXT
+    if not messages or any(isinstance(m, dict) and (m.get('role') or '') == 'user'
+                           for m in messages):
+        return False
+    idx = 1 if (isinstance(messages[0], dict)
+                and messages[0].get('role') == 'system') else 0
+    messages.insert(idx, {'role': 'user', 'name': 'User',
+                          'content': WIRE_USER_SEED_TEXT})
+    return True
+
+
 def _trim_to_budget(body: dict) -> tuple:
     """Return ``(trimmed_body, n_dropped, n_truncated_chars, est_before,
     est_after, budget)``.
@@ -551,8 +826,7 @@ def _trim_to_budget(body: dict) -> tuple:
     Reuses ``core.token_utils`` for token counting (single source) and
     ``core.constants`` for the safety margin + marker (single source).
     """
-    from core.constants import (WIRE_TRIM_SAFETY_MARGIN_TOKENS, WIRE_TRIM_MARKER,
-                                 WIRE_USER_SEED_TEXT)
+    from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS, WIRE_TRIM_MARKER
     from core.token_utils import (
         count_tokens_for_messages, count_tokens_for_text, _content_to_text,
     )
@@ -577,12 +851,7 @@ def _trim_to_budget(body: dict) -> tuple:
     # ToolMessageHandler.validate_messages is registered per agent and was
     # bypassed on this reply path (no seed line logged, body still user-less).
     # Idempotent — strict no-op when a user turn already exists.
-    if not any(isinstance(m, dict) and (m.get('role') or '') == 'user'
-               for m in messages):
-        _seed_idx = 1 if (isinstance(messages[0], dict)
-                          and messages[0].get('role') == 'system') else 0
-        messages.insert(_seed_idx, {'role': 'user', 'name': 'User',
-                                    'content': WIRE_USER_SEED_TEXT})
+    if ensure_user_turn(messages):
         # Rebuild body so BOTH the under-budget early-return and the trim
         # path carry the seed (the early-return returns `body` as-is; a fresh
         # dict also makes `_apply_trim_to_request`'s `trimmed is body` check
@@ -620,6 +889,16 @@ def _trim_to_budget(body: dict) -> tuple:
     # "FULL INPUT MESSAGES DEBUG" dump is a messages-only view. The wire layer is the
     # ONLY place the tools block is observable before it hits the socket, which makes
     # counting it here not an optimisation but the whole point of the layer.
+    # Drop pydantic's Optional-boilerplate BEFORE charging the schema, so the
+    # budget reflects the bytes that actually reach the socket.  Compacting
+    # after this line would leave the budget pessimistic by exactly the saving
+    # and still fire the degrade branch below — the drift this layer exists to
+    # prevent.  Lossless (see _compact_tool_schema): same tools, same
+    # arguments, same required set.
+    body, _schema_saved = _compact_tool_schema(body, model)
+    if _schema_saved:
+        logger.debug("wire-trim: tool schema compacted, -%d tok", _schema_saved)
+
     tools_tokens = _schema_tokens(body, model)
 
     budget = (_get_budget_per_slot() - max_tokens
@@ -852,17 +1131,88 @@ def _ts() -> str:
             + f',{int((t % 1)*1000):03d}')
 
 
+# Per-argument-string cap.  Long enough to carry a real tool call whole
+# (the longest observed live was ~380 chars), short enough that one
+# runaway blob cannot eat the file's size budget (PERF-2).
+_RESP_ARG_CAP = 600
+
+
+def _response_tool_calls(response) -> Optional[list]:
+    """Tool-call names + RAW ``arguments`` strings from an ALREADY-BUFFERED
+    response body.  ``None`` when there is nothing safely readable.
+
+    Why the response and not just the request (#787).  The ``tool_calls``
+    that appear in a later request body are autogen's re-serialisation of an
+    earlier completion, so a ``{}`` there could equally mean the model
+    generated ``{}`` or that the arguments were dropped in between.  Those
+    have opposite fixes.  Recording the completion as it arrived is the only
+    way to tell them apart, and this function is already on every LLM
+    response, so it is the one place that can.
+
+    Never consumes a stream.  Only ``_content`` is read — httpx sets it when
+    a non-streaming ``send`` has already buffered the body, and leaves it
+    absent for ``stream=True``.  Touching ``.content`` instead would raise on
+    an unread response and, worse, drain the bytes the real caller is waiting
+    for.  urllib's ``HTTPResponse`` has no ``_content`` at all, so that
+    transport simply reports nothing rather than being read behind the
+    caller's back.
+
+    Returns ``[]`` for a readable completion that made no tool call — a
+    distinct fact from ``None`` ("could not read"), and collapsing the two
+    would turn an absent measurement into a false zero.
+    """
+    try:
+        raw = getattr(response, '_content', None)
+        if raw is None:
+            return None
+        data = json.loads(bytes(raw).decode('utf-8', 'replace'))
+        if not isinstance(data, dict):
+            return None
+        out = []
+        for choice in (data.get('choices') or []):
+            if not isinstance(choice, dict):
+                continue
+            msg = choice.get('message') or choice.get('delta') or {}
+            for tc in (msg.get('tool_calls') or []):
+                fn = (tc or {}).get('function') or {}
+                args = fn.get('arguments')
+                args = args if isinstance(args, str) else json.dumps(
+                    args, default=str)
+                if len(args) > _RESP_ARG_CAP:
+                    args = args[:_RESP_ARG_CAP] + '...[cut]'
+                # `id` is the join key back to the same call's replays in later
+                # request bodies.  Without it, "these arguments went missing"
+                # is a name-level inference; with it, the two mechanisms
+                # separate — same id with '{}' means the call object was
+                # rebuilt, a different id means it is simply another call
+                # instance whose generation was never captured.
+                out.append({'id': tc.get('id'),
+                            'name': fn.get('name'),
+                            'arguments': args,
+                            'finish_reason': choice.get('finish_reason')})
+        return out
+    except Exception:
+        # A logging hook may never fail an LLM call, and an unparseable body
+        # is itself a legitimate outcome (an HTML error page, a 500).
+        return None
+
+
 def log_outbound(body: dict, *,
                  response_status: Any = None,
                  latency_ms: Optional[float] = None,
-                 source: Optional[str] = None) -> None:
+                 source: Optional[str] = None,
+                 response_tools: Optional[list] = None) -> None:
     """Public hook for non-httpx callers (dispatcher's raw
     ``requests.post`` draft path).  Writes one JSONL record; never
     raises.
 
     ``source`` overrides whatever ``set_source`` / ``source_context``
     set on the thread-local context; pass it when the caller wants to
-    label the call explicitly (e.g. ``dispatcher.draft``)."""
+    label the call explicitly (e.g. ``dispatcher.draft``).
+
+    ``response_tools`` is ``_response_tool_calls``' output; the key is
+    omitted entirely when it is ``None`` so "not readable" stays visibly
+    different from "read it, no tool calls" (``[]``)."""
     try:
         record = {
             'ts': _ts(),
@@ -872,6 +1222,8 @@ def log_outbound(body: dict, *,
             'response_status': response_status,
             'latency_ms': latency_ms,
         }
+        if response_tools is not None:
+            record['response_tool_calls'] = response_tools
         line = json.dumps(record, default=str, ensure_ascii=False) + '\n'
         with _file_lock:
             fh = _open_log_handle()
@@ -1002,6 +1354,11 @@ def _install_sync_patch(httpx_module) -> None:
 
     def _patched_send(self, request, **kwargs):
         if not _is_target_request(request.url, request.method):
+            # A HOSTED provider's chat/completions call still feeds the
+            # provider breaker (#106b b); every other request is an unchanged
+            # passthrough.
+            if _is_chat_completions_post(request):
+                return _send_and_feed(_orig_send, self, request, kwargs)
             return _orig_send(self, request, **kwargs)
         try:
             body_bytes = bytes(request.content or b'')
@@ -1036,10 +1393,14 @@ def _install_sync_patch(httpx_module) -> None:
         try:
             with _slot_cm:
                 response = _orig_send(send_client, request, **kwargs)
+            # Local llama-server is a provider too (host 127.0.0.1); feed the
+            # breaker the real status (#106b b) before logging.
+            _feed_provider_breaker(request.url, getattr(response, 'status_code', None))
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
                          response_status=getattr(response, 'status_code', None),
-                         latency_ms=round(elapsed, 1))
+                         latency_ms=round(elapsed, 1),
+                         response_tools=_response_tool_calls(response))
             return response
         except Exception as e:
             elapsed = (time.time() - start) * 1000
@@ -1060,6 +1421,11 @@ def _install_async_patch(httpx_module) -> None:
 
     async def _patched(self, request, **kwargs):
         if not _is_target_request(request.url, request.method):
+            # Hosted chat/completions still feeds the provider breaker (#106b b).
+            if _is_chat_completions_post(request):
+                _resp = await _orig(self, request, **kwargs)
+                _feed_provider_breaker(request.url, getattr(_resp, 'status_code', None))
+                return _resp
             return await _orig(self, request, **kwargs)
         try:
             body_bytes = bytes(request.content or b'')
@@ -1073,10 +1439,12 @@ def _install_async_patch(httpx_module) -> None:
         start = time.time()
         try:
             response = await _orig(self, request, **kwargs)
+            _feed_provider_breaker(request.url, getattr(response, 'status_code', None))
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
                          response_status=getattr(response, 'status_code', None),
-                         latency_ms=round(elapsed, 1))
+                         latency_ms=round(elapsed, 1),
+                         response_tools=_response_tool_calls(response))
             return response
         except Exception as e:
             elapsed = (time.time() - start) * 1000
@@ -1168,10 +1536,16 @@ def _install_urllib_patch(urllib_request_module) -> None:
             with _slot_cm:
                 response = _orig_urlopen(url, data, *args, **kwargs)
             elapsed = (time.time() - start) * 1000
+            # Same extractor as the httpx sites — one notion of "what did the
+            # response say", not a per-transport reimplementation.  A urllib
+            # HTTPResponse carries no buffered `_content`, so it reports None
+            # and the key is omitted; the alternative (read it here) would
+            # drain the body the caller has not read yet.
             log_outbound(body or {},
                          source=(_get_source() or 'urllib'),
                          response_status=getattr(response, 'status', None),
-                         latency_ms=round(elapsed, 1))
+                         latency_ms=round(elapsed, 1),
+                         response_tools=_response_tool_calls(response))
             return response
         except Exception as e:
             elapsed = (time.time() - start) * 1000

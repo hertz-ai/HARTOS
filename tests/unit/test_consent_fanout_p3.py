@@ -359,9 +359,22 @@ def test_p3b_v53_migration_registered():
     (the migration runner side-effects the DB, which we don't want to
     fire in a unit test) — verify the registration is wired."""
     src = _read(f'{HARTOS_ROOT}/integrations/social/migrations.py')
-    assert 'SCHEMA_VERSION = 53' in src, (
-        "P3b: SCHEMA_VERSION must be bumped to 53 so run_migrations "
-        "knows v53 is the current head."
+    # READ the head version; do not restate it. The original guard matched the
+    # literal 'SCHEMA_VERSION = 53', which is a moving target BY CONSTRUCTION:
+    # the next migration bumps it, the guard goes red, and the property it means
+    # to check (v53 is registered at or below the head) is still perfectly true.
+    # It duly went red when the schema reached 54 and stayed red. A substring
+    # match was also weaker than it looked -- 'SCHEMA_VERSION = 530' would have
+    # satisfied it.
+    head_line = next(
+        (l for l in src.splitlines() if l.startswith('SCHEMA_VERSION')), None)
+    assert head_line is not None, (
+        "P3b: migrations.py must define a module-level SCHEMA_VERSION."
+    )
+    head = int(head_line.split('=', 1)[1].strip())
+    assert head >= 53, (
+        "P3b: SCHEMA_VERSION is %d, below 53, so run_migrations would never "
+        "reach the v53 block." % head
     )
     assert 'if current < 53:' in src, (
         "P3b: migrations.py must include the v53 block."

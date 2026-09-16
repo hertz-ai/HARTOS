@@ -20,10 +20,14 @@ WALL-CLOCK, not just the return value. A version of this module that
 regressed to plain `subprocess.run` would still return None here — it would
 just take minutes to do it, and only the clock catches that.
 """
+import logging
 import os
 import subprocess
 import sys
 import time
+from unittest.mock import patch
+
+import core.subprocess_safe as subprocess_safe
 
 import pytest
 
@@ -345,3 +349,257 @@ class TestShellApiProbeContract:
             r = fn(_py("import sys; sys.exit(4)"), timeout=30)
             assert r is not None and r.returncode == 4, \
                 f"{name}._run collapsed a real failure into 'tool missing'"
+
+
+class TestKillReachesDescendants:
+    r"""The gap that let D36 through: a kill whose pipes never reach EOF.
+
+    Every existing boundedness test here kills a child whose stdout pipe THEN
+    reaches EOF, so `_safe_kill_and_close`'s `fh.close()` is uncontended and
+    returns instantly. That is the easy half of the problem, and passing it
+    told us nothing about the hard half.
+
+    THE HARD HALF, measured live on 2026-09-09 (agent 33323830039). A reuse
+    turn sat in this exact frame for 85+ seconds across three thread dumps:
+
+        core/subprocess_safe.py:174, in run_bounded
+            _safe_kill_and_close(proc, ...)
+        core/subprocess_safe.py:256, in _safe_kill_and_close
+            fh.close()
+
+    while the SAME dump held two live reader threads:
+
+        Thread-373 / Thread-374 (_readerthread)
+            File "C:\Python312\Lib\subprocess.py", line 1599, in _readerthread
+                buffer.append(fh.read())
+
+    `fh.read()` holds the file object's lock for its whole duration and
+    `fh.close()` must acquire that same lock, so the parent blocks for exactly
+    as long as the reader stays in read().  The module docstring's premise —
+    "Closing the parent FD causes the read() to return EOF -> thread exits
+    cleanly" — does not hold once a reader is ALREADY inside read().
+
+    This test builds that state deliberately: the direct child spawns a
+    GRANDCHILD that inherits the same stdout pipe, then the child is killed.
+    kill() reaches only the direct child, the grandchild keeps the write end
+    open, so no EOF ever arrives and the reader never returns.
+
+    It asserts WALL CLOCK from a watchdog thread rather than calling
+    run_bounded inline, because the pre-fix failure mode is an unbounded
+    block: called inline it would hang the whole suite instead of failing it.
+    """
+
+    # Child spawns a grandchild that inherits stdout (so it holds the pipe's
+    # write end), then sleeps.  Killing the child cannot close that handle.
+    _HOLDS_PIPE_AFTER_DEATH = (
+        "import subprocess,sys,time;"
+        "subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
+        "time.sleep(60)"
+    )
+
+    def test_surviving_grandchild_does_not_wedge_the_caller(self):
+        import threading
+
+        box = {}
+
+        def _run():
+            t0 = time.monotonic()
+            try:
+                box["result"] = run_bounded(
+                    _py(self._HOLDS_PIPE_AFTER_DEATH), timeout=2.0)
+            except Exception as exc:            # pragma: no cover - diagnostic
+                box["error"] = exc
+            box["secs"] = time.monotonic() - t0
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        # timeout 2s + wait_after_kill 2s + tree-kill + generous slack.
+        worker.join(25.0)
+
+        assert not worker.is_alive(), (
+            "run_bounded did not return within 25s for a child whose pipe "
+            "never reaches EOF — it is blocked in _safe_kill_and_close's "
+            "fh.close(), waiting on the lock a live _readerthread holds "
+            "inside fh.read(). This is D36, measured live 2026-09-09."
+        )
+        assert "error" not in box, f"run_bounded raised: {box.get('error')!r}"
+        result = box["result"]
+        assert result.timed_out is True
+        assert result.returncode == -1
+        assert box["secs"] < 25.0, (
+            f"bounded call took {box['secs']:.1f}s for a 2s budget"
+        )
+
+    def test_the_scenario_actually_outlives_the_direct_child(self):
+        """Anti-vacuity: prove the fixture really does keep the pipe open.
+
+        If the grandchild died with its parent, the test above would pass
+        against the BROKEN code and verify nothing. So assert the shape
+        directly: kill the child, and confirm its stdout pipe still has not
+        reached EOF a moment later.
+        """
+        proc = subprocess.Popen(
+            _py(self._HOLDS_PIPE_AFTER_DEATH),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, text=True,
+        )
+        try:
+            time.sleep(1.5)                     # let the grandchild spawn
+            proc.kill()
+            proc.wait(timeout=10)
+            # The direct child is gone...
+            assert proc.returncode is not None
+            # ...but a read must NOT return promptly with EOF, because the
+            # grandchild still owns the write end. Probe it off-thread.
+            import threading
+            got = {}
+
+            def _read():
+                try:
+                    got["data"] = proc.stdout.read()
+                except Exception as exc:        # pragma: no cover
+                    got["error"] = exc
+
+            r = threading.Thread(target=_read, daemon=True)
+            r.start()
+            r.join(4.0)
+            assert r.is_alive(), (
+                "the grandchild did NOT keep the pipe open, so this fixture "
+                "cannot reproduce D36 and the test above would be vacuous"
+            )
+        finally:
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=10)
+
+
+# MERGE NOTE 2026-09-11: two lanes each appended a test class here. They
+# guard different invariants of the same module -- one that kill() must be
+# bounded even when a grandchild holds the pipe open (D36), one that a
+# missing tool is reported rather than silently degraded -- so both are
+# kept. Neither was dropped to make the merge tidy.
+
+class TestAMissingToolIsSaidOutLoudOnce:
+    """A silent degrade is how the same defect survived four rounds.
+
+    run_probe cannot tell "not installed" from "installed, but not on THIS
+    process's PATH", and the second is a real bug: flatpak (2026-08-12), six
+    more capabilities (2026-08-26), gtk-launch (2026-09-01), and every nix
+    binary (2026-09-07, when a sweep found 33 of the 77 tools the shell shells
+    were installed on the box and invisible to the service). All of it hid
+    behind a debug line while callers degraded by design.
+
+    Per call it stays debug (139 call sites, hot path). Once per binary it is a
+    warning, which is what makes the class findable in a journal.
+    """
+
+    def setup_method(self):
+        subprocess_safe._missing_tools_seen.clear()
+
+    def test_the_first_miss_warns(self, caplog):
+        with caplog.at_level(logging.WARNING, logger=subprocess_safe.__name__):
+            with patch.object(subprocess_safe, 'run_bounded',
+                              side_effect=FileNotFoundError()):
+                assert subprocess_safe.run_probe(['definitely-not-a-tool']) is None
+        assert any('definitely-not-a-tool' in r.message for r in caplog.records)
+
+    def test_the_warning_names_the_ambiguity_not_a_conclusion(self, caplog):
+        """It must not assert the tool is absent. Saying so is what sent an
+        operator to debug a Flatpak install that was working fine."""
+        with caplog.at_level(logging.WARNING, logger=subprocess_safe.__name__):
+            with patch.object(subprocess_safe, 'run_bounded',
+                              side_effect=FileNotFoundError()):
+                subprocess_safe.run_probe(['some-tool'])
+        # getMessage() formats once; r.message is ALREADY formatted, so
+        # applying r.args to it again raises TypeError.
+        text = ' '.join(r.getMessage() for r in caplog.records)
+        assert 'PATH' in text
+
+    def test_it_stays_quiet_after_the_first(self, caplog):
+        """139 call sites on a hot path: one line per binary per process, not
+        one per call."""
+        with patch.object(subprocess_safe, 'run_bounded',
+                          side_effect=FileNotFoundError()):
+            with caplog.at_level(logging.WARNING, logger=subprocess_safe.__name__):
+                for _ in range(25):
+                    subprocess_safe.run_probe(['repeated-tool'])
+        hits = [r for r in caplog.records if 'repeated-tool' in r.message]
+        assert len(hits) == 1, 'expected exactly one warning, got %d' % len(hits)
+
+    def test_each_distinct_binary_gets_its_own_line(self, caplog):
+        with patch.object(subprocess_safe, 'run_bounded',
+                          side_effect=FileNotFoundError()):
+            with caplog.at_level(logging.WARNING, logger=subprocess_safe.__name__):
+                subprocess_safe.run_probe(['tool-a'])
+                subprocess_safe.run_probe(['tool-b'])
+        msgs = ' '.join(r.message for r in caplog.records)
+        assert 'tool-a' in msgs and 'tool-b' in msgs
+
+    def test_an_empty_argv_does_not_explode(self, caplog):
+        with patch.object(subprocess_safe, 'run_bounded',
+                          side_effect=FileNotFoundError()):
+            assert subprocess_safe.run_probe([]) is None
+class TestTheProbeLooksWhereALoginShellWould:
+    """A unit's PATH lists only its own dependencies, so a working system tool
+    reads as absent from inside a service. Audited on the box 2026-09-07: 33 of
+    the 77 binaries the shell layer shells were installed and invisible to
+    hart-liquid-ui, and all 29 OTHER hart-* units had the same blindness. One
+    shared helper is the fix, not 29 nix modules.
+    """
+
+    def test_existing_system_dirs_are_appended(self):
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            out = subprocess_safe.system_search_path('/only/this')
+        parts = out.split(os.pathsep)
+        assert parts[0] == '/only/this', 'the caller PATH must stay first'
+        assert '/run/current-system/sw/bin' in parts
+        assert '/run/wrappers/bin' in parts
+
+    def test_it_appends_never_prepends(self):
+        """A pinned or shimmed tool keeps its precedence. The rustdesk guard in
+        hart-liquid-ui.nix depends on being first on PATH."""
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            out = subprocess_safe.system_search_path('/a')
+        assert out.startswith('/a' + os.pathsep)
+
+    def test_absent_dirs_are_not_invented(self):
+        """On a dev host or in a container these do not exist, and claiming
+        them would put a lie in PATH."""
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=False):
+            assert subprocess_safe.system_search_path('/a:/b') == '/a:/b'
+
+    def test_no_duplicates_when_already_present(self):
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            out = subprocess_safe.system_search_path('/run/current-system/sw/bin')
+        assert out.split(os.pathsep).count('/run/current-system/sw/bin') == 1
+
+    def test_run_probe_passes_the_augmented_path_down(self):
+        captured = {}
+
+        def fake(cmd, timeout=5.0, **kw):
+            captured.update(kw)
+            return subprocess_safe.BoundedResult(0, '', '', False)
+
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            with patch.object(subprocess_safe, 'run_bounded', side_effect=fake):
+                subprocess_safe.run_probe(['anything'])
+        assert '/run/current-system/sw/bin' in captured['env']['PATH']
+
+    def test_a_callers_own_env_is_kept_and_augmented(self):
+        """Passing env must not lose the caller's variables, and must not lose
+        the augmentation either."""
+        captured = {}
+
+        def fake(cmd, timeout=5.0, **kw):
+            captured.update(kw)
+            return subprocess_safe.BoundedResult(0, '', '', False)
+
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            with patch.object(subprocess_safe, 'run_bounded', side_effect=fake):
+                subprocess_safe.run_probe(
+                    ['anything'], env={'PATH': '/mine', 'MARKER': 'kept'})
+        env = captured['env']
+        assert env['MARKER'] == 'kept'
+        assert env['PATH'].startswith('/mine')
+        assert '/run/current-system/sw/bin' in env['PATH']

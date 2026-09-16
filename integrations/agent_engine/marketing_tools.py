@@ -10,6 +10,7 @@ Tier 3 (Runtime): delegate_to_specialist finds agents with needed skills via A2A
 """
 import json
 import logging
+import re
 from typing import Annotated, Optional
 
 logger = logging.getLogger('hevolve_social')
@@ -508,6 +509,37 @@ def register_marketing_tools(helper, assistant, user_id: str):
         logger.debug(f"Marketing skill registration skipped: {e}")
 
 
+_WORD_START_CACHE = {}
+
+
+def _mentions(lower: str, keywords) -> bool:
+    """True if any keyword occurs at a WORD START in ``lower``.
+
+    The detector used a plain ``kw in lower``, so a keyword fired from
+    anywhere inside a longer word.  Measured over the 705 saved agent
+    goals in ~/Documents/Nunba/data/prompts: 'ad ' matched inside
+    "re[ad ]engagement" (282 goals -> marketing), 'sing' inside
+    "u[sing]" (46 -> media), 'repo' inside "re[po]rt" (47 -> coding).
+    361 spurious tag assignments, and the tag set decides which Tier-2
+    tool pack create_recipe.py:2047-2084 registers -- so a mis-tagged
+    goal is authored against the wrong toolset.
+
+    Only the START is anchored.  Several keywords are deliberate stems
+    ('market' -> "marketing", 'advertis' -> "advertising") and must keep
+    matching.  Keywords are used VERBATIM, so the trailing space the
+    lists already rely on in 'ad ' / 'ads ' / 'contact ' keeps serving
+    as their word end.
+    """
+    for kw in keywords:
+        pat = _WORD_START_CACHE.get(kw)
+        if pat is None:
+            pat = _WORD_START_CACHE[kw] = re.compile(
+                r'(?<![a-z0-9])' + re.escape(kw))
+        if pat.search(lower):
+            return True
+    return False
+
+
 def detect_goal_tags(prompt) -> list:
     """Detect goal type tags from a prompt for category-based tool loading.
 
@@ -533,14 +565,14 @@ def detect_goal_tags(prompt) -> list:
         'email marketing', 'seo', 'influencer', 'viral', 'engagement',
         'conversion', 'target audience', 'marketing goal', 'ad ', 'ads ',
     ]
-    if any(kw in lower for kw in marketing_keywords):
+    if _mentions(lower, marketing_keywords):
         tags.append('marketing')
 
     coding_keywords = [
         'github', 'repository', 'codebase', 'refactor', 'implement',
-        'bug fix', 'pull request', 'commit', 'branch', 'repo',
+        'bug fix', 'pull request', 'commit', 'branch', 'repo ',
     ]
-    if any(kw in lower for kw in coding_keywords):
+    if _mentions(lower, coding_keywords):
         tags.append('coding')
 
     ip_keywords = [
@@ -548,7 +580,7 @@ def detect_goal_tags(prompt) -> list:
         'ip protection', 'infringement', 'prior art', 'cease and desist',
         'dmca', 'filing', 'provisional patent', 'claims',
     ]
-    if any(kw in lower for kw in ip_keywords):
+    if _mentions(lower, ip_keywords):
         tags.append('ip_protection')
 
     self_build_keywords = [
@@ -556,7 +588,7 @@ def detect_goal_tags(prompt) -> list:
         'runtime.nix', 'os rebuild', 'nixos-rebuild', 'system package',
         'hart-pkg', 'nix-env', 'system generation', 'rollback generation',
     ]
-    if any(kw in lower for kw in self_build_keywords):
+    if _mentions(lower, self_build_keywords):
         tags.append('self_build')
 
     outreach_keywords = [
@@ -565,7 +597,7 @@ def detect_goal_tags(prompt) -> list:
         'send email to', 'contact ', 'outbound email', 'drip', 'sequence',
         'partnership outreach', 'b2b', 'sales funnel',
     ]
-    if any(kw in lower for kw in outreach_keywords):
+    if _mentions(lower, outreach_keywords):
         tags.append('outreach')
 
     sales_keywords = [
@@ -574,7 +606,7 @@ def detect_goal_tags(prompt) -> list:
         'meeting schedule', 'deal close', 'partner onboard',
         'channel outreach', 'multi-channel', 'nurture',
     ]
-    if any(kw in lower for kw in sales_keywords):
+    if _mentions(lower, sales_keywords):
         tags.append('sales')
 
     # News curation / feed-refresh tools.  Keyed on distinctive phrases the
@@ -587,8 +619,61 @@ def detect_goal_tags(prompt) -> list:
         'push notification', 'fetch_news', 'newsworthy', 'breaking news',
         'mark_news_for_web', 'news notification', 'curate news',
     ]
-    if any(kw in lower for kw in news_keywords):
+    if _mentions(lower, news_keywords):
         tags.append('news')
+
+    # Finance + revenue.  These two tags were CONSUMED but never PRODUCED:
+    # reuse_recipe.py:2533 / create_recipe.py:2079 dispatch on 'revenue',
+    # and nothing in this detector emitted it, so the branch was
+    # unreachable; 'finance' was neither emitted nor dispatched, leaving
+    # register_finance_tools with zero production callers.  Measured
+    # 2026-09-07 on the live install: a Finance agent's action reported
+    # 'error' twelve times because manage_invite_participation never
+    # attached.
+    #
+    # The stored-tag arm cannot cover this: 1 of 2,296 saved agents carries
+    # any goal_tags, and the repo's only writer emits 'research', which no
+    # consumer tests for.  So the lexical detector is the ONLY live path.
+    #
+    # Keyword precision measured against the 884 real goals that carry text
+    # (the discipline _mentions' docstring exists to enforce):
+    #   'financial health' 8 (0.9%) | 'api revenue' 7 | 'finance agent' 4
+    #   'expense' 4 | 'accounting' 3 | 'revenue split' 37 (4.2%)
+    #   'pricing' 33 (3.7%)
+    # DELIBERATELY EXCLUDED: 'budget' (180 goals, 20.4% -- "token budget"),
+    # 'sustainab' (107, 12.1% -- generic), and bare 'revenue' (146, 16.5%),
+    # which is an owner call because it grants adjust_pricing, a MUTATING
+    # tool, to one agent in six.
+    # THE UNDERSCORE FORMS ARE LOAD-BEARING, not decoration.  The first cut
+    # of this block used only the space forms and was HALF VACUOUS: the real
+    # seed (goal_seeding.py:263 bootstrap_finance_agent) writes its tools as
+    # get_financial_health / track_revenue_split / assess_sustainability /
+    # manage_invite_participation, and _mentions matches VERBATIM -- so the
+    # seed's own description scored NO finance tag.  Only its title
+    # ('Finance Agent Vijai') matched, making the fix work or not depending
+    # on whether a caller happens to pass the title.  Measured before and
+    # after: description-only -> [] then ['finance'].
+    #
+    # 'financial_health' also covers the get_ prefix: the lookbehind is
+    # (?<![a-z0-9]) and '_' is not in that class, so it matches inside
+    # get_financial_health.  Exact tool names are the most precise keyword
+    # available -- 4 of 884 real goals (0.45%) each, vs 20.4% for 'budget'.
+    finance_keywords = [
+        'financial health', 'financial_health',
+        'revenue split', 'revenue_split',
+        'assess_sustainability', 'manage_invite_participation',
+        'finance agent', 'expense', 'accounting',
+        'cash flow', 'runway', 'profit and loss', 'invoice',
+    ]
+    if _mentions(lower, finance_keywords):
+        tags.append('finance')
+
+    revenue_keywords = [
+        'api revenue', 'api_revenue', 'revenue split', 'revenue_split',
+        'adjust_pricing', 'pricing', 'monetiz', 'subscription', 'billing',
+    ]
+    if _mentions(lower, revenue_keywords):
+        tags.append('revenue')
 
     media_keywords = [
         'song', 'music', 'compose', 'melody', 'sing', 'vocals',
@@ -596,7 +681,7 @@ def detect_goal_tags(prompt) -> list:
         'narrate', 'narration', 'audio book', 'audiobook', 'podcast',
         'sound effect', 'jingle', 'soundtrack',
     ]
-    if any(kw in lower for kw in media_keywords):
+    if _mentions(lower, media_keywords):
         tags.append('media')
 
     return tags

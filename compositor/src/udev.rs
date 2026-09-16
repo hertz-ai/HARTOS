@@ -114,7 +114,8 @@ use crate::comp_core::{self, HartRenderElement};
 use crate::shared::send_frame_callbacks;
 use crate::wayland::{ClientState, State};
 use crate::{
-    note_first_scanout_once, select_render_path, BootConfig, RenderPath, WindowRegistry,
+    note_first_scanout_once, note_native_shell_ready_once, select_render_path, BootConfig,
+    RenderPath, WindowRegistry,
     HART_SPLASH_RGBA,
 };
 
@@ -125,6 +126,11 @@ use crate::{
 /// WebView fires it from its own client buffer even if nothing reached the display). The
 /// pure decision + path + write live in main.rs (unit-tested); this owns only the latch.
 static FIRST_SCANOUT: AtomicBool = AtomicBool::new(false);
+
+/// One-shot latch for the compositor's own shell-ready write, the native twin of the
+/// marker the WebView host owns today. Same split as above: the pure decision, the path
+/// and the write live in main.rs; this owns only the latch.
+static NATIVE_SHELL_READY: AtomicBool = AtomicBool::new(false);
 
 /// Color formats DrmCompositor will try for the primary plane framebuffer. The pixman
 /// software floor + virtually all KMS drivers support Argb8888/Xrgb8888 — the never-
@@ -503,7 +509,17 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         ws_switch_at: None,
         capture_blocked: false,
         // NATIVE SHELL M3: opt in per session via the env, default OFF (no regression).
-        native_shell_on: std::env::var_os("HART_NATIVE_SHELL").is_some(),
+        // The VALUE is parsed, not merely the variable's presence: `HART_NATIVE_SHELL=0`
+        // used to turn the native shell ON, which is the wrong answer to the most likely
+        // way anyone would try to turn it off.
+        native_shell_on: crate::comp_core::native_shell_env_on(
+            std::env::var("HART_NATIVE_SHELL").ok().as_deref(),
+        ),
+        row_scroll: crate::scene::RowScroll::default(),
+        // Set truthfully by the render tick below from whether GLES is live. Starting on
+        // the floor means the very first frame cannot claim hardware motion before a GPU
+        // has proven itself.
+        motion_hardware: false,
         native_home: None,
         text_rasterizer: crate::text_render::TextRasterizer::new(),
         black_buffer,
@@ -638,7 +654,20 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            // Did THIS input start the workspace transition? Snapshot before, compare
+            // after: an animation starting is a consequence of the event, not a property
+            // of it, so this is the only moment the answer exists. The workspace fade is
+            // the one animation an input demonstrably causes (a keyboard shortcut runs
+            // `switch_to_workspace`, which stamps the clock); a window MAP animation is
+            // usually the client's own doing, and attributing that to whatever key
+            // happened to be pending would be a made-up number.
+            let ws_before = comp_core::CompState::ws_switch_at(state);
             state.process_input_event(event);
+            if comp_core::CompState::ws_switch_at(state) != ws_before {
+                crate::latency::on_animation_started(
+                    crate::latency::Surface::WorkspaceSwitch,
+                );
+            }
             // #137 — an input event moved the cursor / changed focus / clicked: the pointer
             // (a composited software cursor) and any focus/raise must re-paint. Mark the
             // frame-budget scheduler damaged so the next render tick composites, keeping the
@@ -1114,6 +1143,20 @@ fn should_recover_frozen(since_last_present: Option<Duration>) -> bool {
     since_last_present.map(|d| d >= SILENT_FREEZE_AFTER).unwrap_or(false)
 }
 
+/// One render pass finished; tell the latency instrument and emit the stall line
+/// if it decides this span has earned one.
+///
+/// Every arm of the render match calls this, INCLUDING the two error arms. A
+/// box whose `render_frame` fails on every tick is running its render loop at
+/// full speed and presenting nothing, which is exactly the shape the stall line
+/// exists to name, so those arms have to count as attempts or the counter
+/// describes a loop that is not the one running.
+fn note_render_pass(unchanged: bool) {
+    if let Some(st) = crate::latency::on_render(unchanged) {
+        warn!("{}", st.journal_line());
+    }
+}
+
 fn resync_flip_state(crtc: &crtc::Handle, surface: &mut SurfaceData, reason: &str) {
     match surface.compositor.frame_submitted() {
         Ok(_) => {}
@@ -1187,9 +1230,22 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
                 // photon side of every input bound to the frame it completes.
                 // Summaries surface once per 10s window; the journal line is
                 // the harness §3 contract, greppable as `hart-latency`.
-                for s in crate::latency::on_frame_presented() {
+                let (summaries, drops) = crate::latency::on_frame_presented();
+                for s in summaries {
                     info!("{}", s.journal_line());
                 }
+                // Rare by construction: the instrument only refuses samples when
+                // vblanks stop being reaped or frames stop being queued, which are
+                // the two conditions that make the numbers above untrustworthy.
+                // `warn!` rather than `info!` because a window that reports a PASS
+                // while discarding samples reads as evidence when it is not.
+                if let Some(d) = drops {
+                    warn!("{}", d.journal_line());
+                }
+                // The stall line USED TO BE EMITTED HERE and has moved to
+                // `note_render_pass`, on the render path. Reaching it required a
+                // vblank, so the one condition it exists to report -- vblanks not
+                // arriving -- was also the condition that made it unreachable.
             }
         }
     }
@@ -1200,6 +1256,18 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
     // Tier-1 (master lost / never flipped) never writes it and the supervisor can catch it.
     // `completed` is guaranteed non-empty here (the early return above), so a reap == a scanout.
     note_first_scanout_once(&FIRST_SCANOUT, true);
+    // And the native twin of the shell-ready marker: the same completed page-flip, but only
+    // when the frame carried the native scene. Written from HERE rather than at build time
+    // for the same reason the chrome bridge moved here: a queued-but-parked frame is not
+    // evidence that anything reached the screen, and shell-ready is exactly the claim that
+    // something did. Without this the M6 flip demotes the WebView host that is today the
+    // only writer, the paint watchdog stops seeing HEALTHY, and the ladder drops back off
+    // the native shell on its own.
+    note_native_shell_ready_once(
+        &NATIVE_SHELL_READY,
+        true,
+        crate::comp_core::NATIVE_SCENE_PAINTED.load(std::sync::atomic::Ordering::Relaxed),
+    );
 }
 
 /// What to do about DRM master for one device this attempt. PURE policy (no Smithay types),
@@ -1443,6 +1511,9 @@ fn claim_names(next: u8) -> String {
     if next & crate::comp_core::NATIVE_CHROME_ORB != 0 {
         names.push("orb");
     }
+    if next & crate::comp_core::NATIVE_CHROME_HOME != 0 {
+        names.push("home");
+    }
     names.join(",")
 }
 
@@ -1654,6 +1725,11 @@ where
                     if overdue {
                         resync_flip_state(crtc, surface, "silent-freeze");
                     }
+                    // The compositor decided nothing changed. This branch never
+                    // queues, so no input can bind to it; the instrument needs to
+                    // know how often we land here to tell "static desktop" from
+                    // "render loop not running".
+                    note_render_pass(true);
                     continue;
                 }
                 Ok(false) => match surface.compositor.queue_frame(()) {
@@ -1666,6 +1742,7 @@ where
                         // even though presentation is proven only at the
                         // vblank: the batch rides FIFO and is measured against
                         // the flip that actually completes (harness M0).
+                        note_render_pass(false);
                         crate::latency::on_frame_queued();
                         // `last_flip_at` and `publish_native_chrome()` USED TO BE HERE
                         // and have moved to `reap_completed_vblanks`, because this Ok
@@ -1680,6 +1757,8 @@ where
                         // scanout, and that is where both now live.
                     }
                     Err(err) => {
+                        // Rendered, then the flip was refused. An attempt either way.
+                        note_render_pass(false);
                         // A flip/commit ioctl error (the real-HW EACCES/EBUSY/ENODEV/
                         // EINVAL): classify → log → leave `awaiting_vblank` false so the
                         // NEXT tick re-renders + retries. The compositor stays ALIVE.
@@ -1703,6 +1782,10 @@ where
                 // is a DRM/swapchain/master hiccup that would hit pixman too → NOT a renderer
                 // fault, just retried next tick. EITHER way the compositor stays ALIVE (#186).
                 Err(err) => {
+                    // render_frame itself failed. The loop is running at full
+                    // speed and nothing will ever reach the screen: the exact
+                    // case #1006 describes, and the one worth counting.
+                    note_render_pass(false);
                     if gles_should_demote(matches!(err, RenderFrameError::RenderFrame(_))) {
                         renderer_fault = true;
                         warn!(?err, ?crtc, "HART-comp DRM: render_frame RENDERER fault (RenderFrame) — degrading; caller may demote to the pixman floor");
@@ -1754,6 +1837,12 @@ fn render_all(
     if devices.values().any(|d| !d.master) {
         state.repaint.mark_damaged();
     }
+    // Publish whether we are GPU-compositing RIGHT NOW, before the gate reads it. This
+    // is the one place that knows: `gles` is None when the probe never authorised it, when
+    // init failed, and when a runtime fault demoted it mid-session, and the pixman floor
+    // is what paints in all three. The native scene's orb breathes only under this, the
+    // same way `body.gpu-hardware #hart-voice-orb` is the shell's only breathing rule.
+    comp_core::CompState::set_motion_hardware(state, gles.is_some());
     let effects_animating = comp_core::effects_animating(state);
     if !state.repaint.should_paint(now, effects_animating) {
         // Nothing changed, nothing animating, still within the heartbeat: skip this tick's

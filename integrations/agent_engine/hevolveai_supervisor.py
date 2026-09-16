@@ -964,6 +964,36 @@ class _Supervisor(ProcessSupervisor):
         # (Qwen-VL still uses GPU INTERNALLY via qwen_llamacpp_wrapper's
         # auto-upgrade -- that path is independent of this hint.)
         env.setdefault('HEVOLVE_DEVICE', 'cpu')
+        # THE SPOKEN WORD REACHES GROUNDING (hevolveai C265, Master 11.348).
+        #
+        # The child's audio-ingest branch encodes the WAVEFORM. It calls
+        # encode_text on the transcript ONLY when this flag is set, and that
+        # call is what stashes the per-token sequence the concept grounder
+        # names concepts from. Without it the child learns the SOUND of a word
+        # and never the WORD: every concept is named "token_0", so nothing
+        # consolidates and nothing can be recalled by name (hevolveai 11.331).
+        # HARTOS already ships the transcript -- world_model_bridge puts it on
+        # `text` before POSTing /v1/sensor/ingest -- so this flag was the only
+        # thing standing between a transcribed utterance and grounding.
+        #
+        # WHY IT IS SAFE TO DEFAULT ON, with its evidence:
+        #   * SELF-NEUTRALISING: the child acts on it only when a transcript
+        #     is actually present, so on a box that never transcribes audio
+        #     nothing changes at all.
+        #   * LIVE-VALIDATED before this line was written (hevolveai 11.348):
+        #     on an isolated instance the words of a spoken sentence became
+        #     named concepts, against a negative control (same audio, no
+        #     transcript) that added none of them.
+        #   * ITS PREREQUISITES ARE ALREADY SHIPPED AND RUNNING: C267 fits the
+        #     2560-wide token sequence to the grounding width and C268 stops a
+        #     non-finite concept poisoning the graph. Before those two, a
+        #     delivered transcript KILLED the whole learning event -- which is
+        #     exactly why this flag stayed off until now, and why turning it on
+        #     any earlier would have made things worse rather than better.
+        #
+        # setdefault, like HEVOLVE_DEVICE above: an operator exporting
+        # HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING=0 keeps it off.
+        env.setdefault('HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING', '1')
         # Hand the child the ONE canonical local-LLM URL (port_registry's 4-tier
         # resolver) so HevolveAI's QwenAutoEncoder reuses HARTOS's existing
         # llama-server instead of spawning a SECOND one on :8080 (#137).  Explicit

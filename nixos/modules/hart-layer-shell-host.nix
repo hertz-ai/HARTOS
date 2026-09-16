@@ -1059,14 +1059,26 @@ app.run(None)
   # socket, which is not relayed and stays masked, so the human's fail-closed
   # AI-sensing screen gate keeps its meaning. Destructive window verbs remain
   # gated brain-side in HartWmClient.DESTRUCTIVE_VERBS.
-  swayIpcRelay = pkgs.writeScript "hart-sway-ipc-relay" ''
+  # ONE relay, two upstreams. This is protocol-AGNOSTIC byte forwarding: it
+  # neither parses nor cares whether the bytes are sway's i3-ipc or HART-comp's
+  # length-prefixed JSON, so the same implementation serves Tier-2 (sway's
+  # session socket) and Tier-1 (HART-comp's com.hart.Compositor socket). The
+  # upstream glob is argv[1]; the CLIENT decides which protocol it is speaking.
+  #
+  # Why a relay at all, for either tier: both compositors bind their socket
+  # under /run/user/<session uid> as the session user, and the brain runs as
+  # `hart`. HART-comp's is 0600 by design (IPC_PROTOCOL.md §6.5 makes the socket
+  # permission the server-side control), so widening it would weaken a
+  # documented boundary. Relaying keeps the grant in ONE auditable unit instead.
+  wmIpcRelay = pkgs.writeScript "hart-wm-ipc-relay" ''
     #!${pkgs.python3}/bin/python3
     # systemd hands us the accepted connection on stdin/stdout (Accept=yes).
-    # Pick the NEWEST sway socket by mtime rather than by name: the name embeds a
+    # Pick the NEWEST socket by mtime rather than by name: sway's name embeds a
     # PID, which does not order by recency across a session restart.
     import glob, os, socket, sys, threading
 
-    cands = [p for p in glob.glob('/run/user/*/sway-ipc.*.sock')]
+    pattern = sys.argv[1] if len(sys.argv) > 1 else '/run/user/*/sway-ipc.*.sock'
+    cands = [p for p in glob.glob(pattern)]
     if not cands:
         sys.exit(1)
     try:
@@ -1079,7 +1091,7 @@ app.run(None)
     except OSError:
         sys.exit(1)
 
-    def to_sway():
+    def to_upstream():
         try:
             while True:
                 d = os.read(0, 65536)
@@ -1108,7 +1120,7 @@ app.run(None)
             except OSError:
                 pass
 
-    threading.Thread(target=to_sway, daemon=True).start()
+    threading.Thread(target=to_upstream, daemon=True).start()
     try:
         while True:
             d = up.recv(65536)
@@ -1166,7 +1178,7 @@ app.run(None)
     bindsym --locked XF86AudioLowerVolume  exec ${pkgs.pulseaudio}/bin/pactl set-sink-volume @DEFAULT_SINK@ -5%
     bindsym --locked XF86AudioMute         exec ${pkgs.pulseaudio}/bin/pactl set-sink-mute @DEFAULT_SINK@ toggle
     # NOTE: sway's IPC socket is reached by the brain through the socket-activated
-    # relay (swayIpcRelay above), NOT from here. Nothing to exec: the relay
+    # relay (wmIpcRelay above), NOT from here. Nothing to exec: the relay
     # re-resolves this session's socket on every connection, so it needs no hook
     # in the session and cannot race the compositor's bind.
     # Launch the GTK4 layer-shell host as sway's startup client. It anchors itself
@@ -1246,7 +1258,7 @@ in
     ];
 
     # ── sway IPC relay: the brain's only route to the window manager ───────────
-    # See swayIpcRelay above for the full measurement. /run/hart is OUTSIDE the
+    # See wmIpcRelay above for the full measurement. /run/hart is OUTSIDE the
     # tmpfs that ProtectHome drops over /run/user, so a socket here is reachable
     # from inside hart-liquid-ui's mount namespace with no sandbox widening and
     # no ACL on the compositor's own socket.
@@ -1275,12 +1287,57 @@ in
         # Runs as root so it can connect to the session user's socket. That keeps
         # the grant in ONE auditable place (this unit) instead of loosening the
         # permissions on sway's own socket for everyone on the box.
-        ExecStart = swayIpcRelay;
+        ExecStart = "${wmIpcRelay} /run/user/*/sway-ipc.*.sock";
         StandardInput = "socket";
         StandardOutput = "socket";
         StandardError = "journal";
         # A query that cannot resolve a compositor must fail fast and quietly:
         # the caller degrades to an empty list exactly as it does today.
+        TimeoutStartSec = "10s";
+        RuntimeMaxSec = "60s";
+      };
+    };
+
+    # ── the SAME relay for Tier-1, pointed at HART-comp ────────────────────────
+    # Without this the native tier has no window management AT ALL, and worse,
+    # it did not look that way. compositor/src/ipc.rs has served the whole verb
+    # surface against the real Space<Window> for a while; the brain simply had
+    # no route to it, because the only relay resolves sway's socket and Tier-1
+    # runs no sway. Measured on the box 2026-09-07 before this landed: a banked
+    # window-layout recipe replayed as "available: true, replayed 0 of 3", every
+    # step a bare ok=false with no reason anywhere, while hart-comp answered
+    # window.list correctly the entire time on its own socket.
+    #
+    # Same relay binary, same permission model, different upstream glob. It is
+    # a SEPARATE endpoint rather than a second upstream on the sway socket
+    # because the two carry different protocols (i3-ipc vs length-prefixed
+    # JSON), and a single endpoint whose wire format depended on which
+    # compositor happened to be up is a trap, not a convenience: the client
+    # must know what it is speaking before it speaks.
+    systemd.sockets.hart-comp-ipc = {
+      description = "HART OS HART-comp IPC relay socket (brain -> native compositor)";
+      wantedBy = [ "sockets.target" ];
+      socketConfig = {
+        ListenStream = "/run/hart/hart-comp.sock";
+        SocketMode = "0660";
+        SocketGroup = "hart";
+        Accept = true;
+        RemoveOnStop = true;
+      };
+    };
+
+    systemd.services."hart-comp-ipc@" = {
+      description = "HART OS HART-comp IPC relay (connection %i)";
+      serviceConfig = {
+        # Root for the same reason the sway relay is: HART-comp binds 0600 as
+        # the session user ON PURPOSE (IPC_PROTOCOL.md §6.5 makes that socket
+        # permission the server-side half of the security boundary), so the
+        # grant belongs in this one auditable unit and NOT in a looser mode on
+        # the compositor's own socket.
+        ExecStart = "${wmIpcRelay} /run/user/*/hart-comp.sock";
+        StandardInput = "socket";
+        StandardOutput = "socket";
+        StandardError = "journal";
         TimeoutStartSec = "10s";
         RuntimeMaxSec = "60s";
       };

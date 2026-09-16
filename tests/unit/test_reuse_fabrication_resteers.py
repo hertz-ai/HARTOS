@@ -119,10 +119,22 @@ class ReuseFabricationResteers(unittest.TestCase):
         self.assertIn('_reuse_fab_steer_message', called)
 
     def test_hallucination_check_is_not_duplicated(self):
-        # Four sites each had their own copy of this warning.
+        # Four reuse sites each had their own copy of this warning, and the
+        # create loop had another.  The rule now lives once, in
+        # lifecycle_hooks.settled_action_id, shared by reuse and create (#106).
         self.assertEqual(
-            self.src.count('[HALLUCINATION?] LLM claims action_id='), 1,
-            "the claimed-vs-assigned action check belongs in the one helper")
+            self.src.count('[HALLUCINATION?] LLM claims action_id='), 0,
+            "reuse must not carry its own copy of the claimed-vs-assigned check")
+        helper = next(n for n in ast.walk(self.tree)
+                      if isinstance(n, ast.FunctionDef) and n.name == '_advance_or_steer')
+        called = {n.func.id for n in ast.walk(helper)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        self.assertIn('settled_action_id', called,
+                      "_advance_or_steer must use the shared rule")
+        hooks = open(os.path.join(os.path.dirname(SRC), 'lifecycle_hooks.py'),
+                     encoding='utf-8').read()
+        self.assertEqual(hooks.count('[HALLUCINATION?] LLM claims action_id='), 1,
+                         "the shared rule is written once")
 
     def test_location_named_locals_are_gone(self):
         # The user's own review point: a local named after the loop it sits

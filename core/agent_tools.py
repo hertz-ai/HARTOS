@@ -24,9 +24,51 @@ import requests
 from json_repair import repair_json
 
 from core.http_pool import pooled_get, pooled_post
+from core.tool_traits import reads_persisted_state
 from integrations.service_tools.model_catalog import ModelType
 
 tool_logger = logging.getLogger('tool_execution')
+
+
+def _bounded_observation(text, hint):
+    """``text`` bounded to TOOL_OBSERVATION_MAX_CHARS for a tool result, the
+    cut marked with ``hint`` (#104). The result goes to the model and, through
+    the group chat's write-back, into memory."""
+    from core.constants import TOOL_OBSERVATION_MAX_CHARS
+    from core.token_utils import bound_text
+    return bound_text(text, TOOL_OBSERVATION_MAX_CHARS, f'\n...[cut; {hint}]')
+
+
+def _bounded_recall(contents, max_items, skip_oversize=True):
+    """Recalled memories joined for a tool result, within one budget.
+
+    Both legs of search_long_term_memory use it. On the MemoryGraph leg
+    (``skip_oversize``) a row longer than MEMORY_ITEM_MAX_CHARS is skipped,
+    not cut: every graph write is bounded to that since #104, so a longer row
+    predates the bound. Rows like it (whole data stores, written back and
+    recalled again) grew Guardian Convergence's graph to 28.6M chars and one
+    recall to 3,386,616, and they rank high on any query because they hold so
+    many terms. SimpleMem's item is an answer, not a stored row, so it is cut.
+    """
+    from core.constants import MEMORY_ITEM_MAX_CHARS, TOOL_OBSERVATION_MAX_CHARS
+    from core.token_utils import bound_text
+    picked, used, skipped = [], 0, 0
+    for c in contents:
+        if not isinstance(c, str) or not c.strip():
+            continue
+        if skip_oversize and len(c) > MEMORY_ITEM_MAX_CHARS:
+            skipped += 1
+            continue
+        room = TOOL_OBSERVATION_MAX_CHARS - used
+        if len(picked) >= max_items or room < 40:
+            break
+        piece = bound_text(c, room)
+        picked.append(piece)
+        used += len(piece)
+    if skipped:
+        tool_logger.info(f'[RECALL-BOUND] skipped {skipped} memory row(s) '
+                         f'over {MEMORY_ITEM_MAX_CHARS} chars')
+    return '\n'.join(picked)
 
 
 # ---------------------------------------------------------------------------
@@ -51,9 +93,98 @@ def user_facing_error(e):
     text = str(e)
     low = text.lower()
     if any(m in low for m in _INTERNAL_ERROR_MARKERS) or len(text) > 200:
-        return ("I hit an internal snag finishing that - please try "
-                "again in a moment.")
-    return f"I couldn't finish that: {text[:160]}"
+        return _SNAG_REPLY
+    return f"{_COULD_NOT_FINISH_PREFIX}{text[:160]}"
+
+
+# The two shapes user_facing_error() produces, named once so the code that has
+# to RECOGNISE a failed turn reads the same strings the code that writes them
+# does.  Changing the wording here changes both.
+_SNAG_REPLY = ("I hit an internal snag finishing that - please try "
+               "again in a moment.")
+_COULD_NOT_FINISH_PREFIX = "I couldn't finish that: "
+
+
+def is_user_facing_error(reply) -> bool:
+    """True when ``reply`` is a failed turn dressed as an answer.
+
+    A turn that fails does not raise to its caller: user_facing_error() turns
+    the exception into a polite, speakable sentence and the pipeline returns
+    it as the reply, and hart_intelligence_entry does the same with
+    LLM_LOADING_REPLY / LLM_GENERIC_ERROR_REPLY, and create_recipe with
+    BUILD_INCOMPLETE_REPLY when an agent build ends without its recipe.  That
+    is right for a person reading it and wrong for any caller that has to
+    decide whether WORK was done.  Measured on central 2026-09-13: the
+    distributed worker submitted "I couldn't finish that: Error code: 429 -
+    ... rate_limit_exceeded ..." as a hive task's result, and the coordinator
+    marked the task completed; later the same day Hive Model Trainer's task
+    was completed with BUILD_INCOMPLETE_REPLY.
+
+    Recognises exactly the strings this codebase emits for a failure, by
+    reference to where they are defined, so rewording one cannot silently stop
+    this check from matching it.
+    """
+    if not isinstance(reply, str):
+        return False
+    text = reply.strip()
+    if not text:
+        return False
+    if text == _SNAG_REPLY or text.startswith(_COULD_NOT_FINISH_PREFIX):
+        return True
+    from core.constants import (
+        BUILD_INCOMPLETE_REPLY, LLM_GENERIC_ERROR_REPLY, LLM_LOADING_REPLY)
+    # The whole sentence as a prefix: what follows it cannot turn a failed
+    # build into work, and nothing shorter is matched.
+    if text.startswith(BUILD_INCOMPLETE_REPLY.strip()):
+        return True
+    return text in (LLM_LOADING_REPLY.strip(), LLM_GENERIC_ERROR_REPLY.strip())
+
+
+def is_help_pause(reply) -> bool:
+    """True when ``reply`` says the turn's action was handed to a person or an
+    expert (create_recipe._ask_for_help on an autonomous run).
+
+    Neither a result nor a failure: the action is held, the goal is parked or
+    handed to the expert, and the reply is the notice.  A caller deciding
+    whether work was done (the hive worker) must not record it as a
+    completion, and must not release it for a retry either, since that would
+    run a paused goal.  Recognised by reference to the prefixes in
+    core.constants so rewording one cannot silently stop this check.
+    """
+    if not isinstance(reply, str):
+        return False
+    text = reply.strip()
+    if not text:
+        return False
+    from core.constants import HELP_EXPERT_REPLY_PREFIX, HELP_PAUSED_REPLY_PREFIX
+    return text.startswith((HELP_PAUSED_REPLY_PREFIX, HELP_EXPERT_REPLY_PREFIX))
+
+
+def is_action_error_reply(reply) -> bool:
+    """True when ``reply`` is the CREATE pipeline's structured error envelope,
+    {"status": "error", "action": ..., "action_id": ..., "message": ...} — the
+    format create_recipe's prompt tells an agent to return when an action
+    failed and self-heal did not work.  Like a help pause, an error is not a
+    result: a caller deciding whether work was done must not record it as one.
+    Measured 2026-09-15: the daemon counted these as successful dispatches, so
+    a continuous goal whose every run ended in this envelope re-ran every
+    5 minutes for five months (53,949 copilot sessions)."""
+    if not isinstance(reply, str):
+        return False
+    text = reply.strip()
+    if not text:
+        return False
+    if text.startswith('{'):
+        try:
+            import json
+            d = json.loads(text)
+            if isinstance(d, dict):
+                return str(d.get('status', '')).lower() == 'error'
+        except ValueError:
+            pass
+    # The envelope with prose around it: both protocol keys present.
+    import re
+    return '"action_id"' in text and re.search(r'"status"\s*:\s*"error"', text) is not None
 
 
 def register_dual(helper, executor, func, name: str, description: str):
@@ -106,7 +237,187 @@ MAIN_LEG_CORE_TOOLS = frozenset({
     'save_to_long_term_memory',
     'send_message_to_user', 'send_presynthesized_video_to_user',
     'send_message_in_seconds', 'google_search',
+    # Book navigation (integrations/learning/book_tools.py).  On the main leg
+    # because "read me this book" is a FOREGROUND user turn, and the filter
+    # here is what decides whether the assistant can see them at all — a tool
+    # appended to build_core_tool_closures but missing from this set is
+    # silently dropped for the main leg.
+    'list_books', 'list_book_chapters', 'read_book_page',
+    'read_book_chapter', 'parse_book_pdf',
 })
+
+# The closures the CREATE leg registers always-on, on top of
+# MAIN_LEG_CORE_TOOLS.  All of them live in build_core_tool_closures so the
+# REUSE leg can attach them BY NAME for an action whose recipe names one;
+# create_recipe registers them eagerly because the recipe-AUTHORING model has
+# to be able to call them while it builds, and its prompts advertise them.
+# Named here rather than in create_recipe so the two legs read one list.
+CREATE_LEG_EXTRA_TOOLS = frozenset({
+    'execute_coding_task', 'get_repository_map',
+    'create_code_shard', 'get_coding_benchmarks',
+    # create_recipe.py:3084 and :3102 tell the model to "always use the
+    # validate_json_response tool"; a recipe naming it must be runnable.
+    'validate_json_response',
+})
+
+
+def _join_tool_menu(names, extra=()):
+    """One join for every prose tool menu: sorted, comma-separated, no quotes."""
+    out = set(names)
+    out.update(str(e) for e in (extra or ()) if e)
+    return ', '.join(sorted(out))
+
+
+def main_leg_tool_menu(extra=()):
+    """The tool names to ADVERTISE on a leg that registers the FILTERED core.
+
+    A prompt that hand-lists tool names drifts from the set the leg actually
+    registers, and the model believes the prompt.  MEASURED 2026-09-10 against
+    create_recipe.create_agents, which registers main_leg_core_tools(...) at
+    :1116 -- so on THIS leg the other 19 core closures are filtered off:
+
+        registered here, absent from the two prose menus:
+            get_chat_history, search_visual_history, txt2img, img2txt
+        in the menus, NOT registered on this leg:
+            text_2_image, get_text_from_image  (real closures, but filtered
+                out of MAIN_LEG_CORE_TOOLS in favour of txt2img / img2txt)
+            create_scheduled_jobs  (deliberately absent -- see the note on
+                MAIN_LEG_CORE_TOOLS above; the factory twin is a create-flow
+                stub)
+
+    So the authoring model was told three names this leg cannot call, and
+    never told about get_chat_history.  Across all 127 saved flow recipes
+    (1,034 steps) only 241 steps -- 23.3% -- name a tool the runtime serves;
+    51.4% of the identifier-shaped names are unserved, dominated by near-misses
+    of exactly the omitted capabilities (retrieve_memory / memory_query /
+    search_chat_history / MemoryService for get_chat_history, web_search for
+    google_search).  Ground truth: 71 distinct tools[].function.name on the
+    wire in logs/llm_outbound.jsonl.
+
+    `extra` carries names a caller registers BEYOND the core set -- e.g.
+    execute_windows_or_android_command, which create_agents registers with
+    register_dual(helper, assistant, ...) at :1670 so the Helper does hold its
+    schema.  It never mutates MAIN_LEG_CORE_TOOLS.
+    """
+    return _join_tool_menu(MAIN_LEG_CORE_TOOLS, extra)
+
+
+def registered_tool_menu(tools, extra=()):
+    """The menu for a leg that registers ``tools`` UNFILTERED.
+
+    create_recipe.create_time_agents (:3546) and reuse_recipe's helper1/time
+    and helper2/visual legs (:2239, :2347) pass the whole
+    build_core_tool_closures(...) list to register_core_tools, so their prompts
+    may name all of it -- including the create_scheduled_jobs and
+    text_2_image / get_text_from_image that the main leg filters away.  Deriving
+    from the same list the call registers is what stops a hand-copy drifting.
+
+    ``tools`` is the (name, description, func) shape build_core_tool_closures
+    returns.
+    """
+    return _join_tool_menu((t[0] for t in tools), extra)
+
+
+def helper_tool_names(agent):
+    """The tool names currently on an agent's LLM schema, as a set.
+
+    The reader half of :func:`defer_helper_schema` — callers snapshot with
+    this before and after a registration block to learn which names that block
+    contributed, rather than hard-coding a family list that drifts the moment
+    a family gains a tool.  Tolerant of a missing llm_config, a missing
+    ``tools`` block and malformed entries for the same reason: it runs during
+    agent construction.
+    """
+    cfg = getattr(agent, 'llm_config', None)
+    if not isinstance(cfg, dict):
+        return set()
+    out = set()
+    for entry in cfg.get('tools') or []:
+        if isinstance(entry, dict):
+            fn = entry.get('function')
+            if isinstance(fn, dict) and fn.get('name'):
+                out.add(fn['name'])
+    return out
+
+
+def defer_helper_schema(helper, names):
+    """Drop ``names`` from the helper's LLM schema, leaving execution intact.
+
+    Deferral, not exclusion: this removes only what the MODEL READS.  The
+    callable stays in the executor's ``_function_map`` (``register_dual``
+    already put it there), and ``discover_and_attach`` consults that map as a
+    third source, so ``request_tools`` can put the schema back the moment an
+    agent actually needs the capability.  Both halves are required — without
+    them this would strand the tool permanently and breach the owner's
+    2026-08-31 requirement that the hierarchy be LAZY, not exclusionary.
+
+    ``request_tools`` itself is NEVER dropped, whatever the caller passes: it
+    is the escape that makes every other deferral recoverable, so dropping it
+    would silently convert deferral into exclusion for the whole set.
+
+    Why this exists, measured live 2026-09-12 on the CREATE walk of agent
+    87400889007 (Nunba, the default agent)::
+
+        wire-trim: the TOOL SCHEMA alone is 7191 tokens against an n_ctx of
+                   8192 (54 tool(s)) -- no amount of message trimming can
+                   make this fit.
+        [TRIM] trim could not reach budget -- messages 1673 tok + schema 7191
+                   tok = 8864 tok against n_ctx 8192
+
+    The walk banked actions 1-4 then died at action 5 on a 400
+    exceed_context_size_error.  Attributing every wire body by its system
+    prompt: all 4 unfittable calls are the Helper seat; all 43 fitting calls
+    are Assistant/Executor carrying the bounded 18 MAIN_LEG_CORE_TOOLS.  Zero
+    crossover.  Across 1,568 wire rows ``autogen.create`` called 9 distinct
+    tools, ALL of them core — none of the other 36.  At CREATE the helper
+    AUTHORS a recipe; it does not execute, which is why the families it never
+    calls can wait until asked for.
+
+    Returns the set of names actually removed, so callers can log the saving
+    rather than pruning silently.  Missing llm_config, a missing ``tools``
+    block, and malformed entries are all no-ops: this runs during agent
+    construction and must never be the reason an agent fails to build.
+    """
+    drop = {n for n in (names or set()) if n != 'request_tools'}
+    if not drop:
+        return set()
+    cfg = getattr(helper, 'llm_config', None)
+    if not isinstance(cfg, dict):
+        return set()
+    block = cfg.get('tools')
+    if not isinstance(block, list):
+        return set()
+
+    kept, removed = [], set()
+    for entry in block:
+        name = None
+        if isinstance(entry, dict):
+            fn = entry.get('function')
+            if isinstance(fn, dict):
+                name = fn.get('name')
+        if name in drop:
+            removed.add(name)
+            continue
+        kept.append(entry)
+    if not removed:
+        return removed
+    # The model reads the CLIENT's snapshot, not llm_config.  autogen 0.2's
+    # update_tool_signature -- which every register_for_llm goes through --
+    # rebuilds self.client from llm_config, and OpenAIWrapper copies `tools`
+    # into its own _config_list.  Editing llm_config['tools'] alone left that
+    # snapshot untouched: live 2026-09-13, "deferred 35 tool(s)" was logged at
+    # 08:50:10 and the Helper's wire body at 08:50:44 still carried all 54.
+    # Remove through autogen's own API so config and client move together.
+    # With the shared http_client (core.autogen_config) a rebuild costs
+    # ~0.03 ms -- 35 measured in 0.001 s.  An object without that API has no
+    # client to go stale, so the list edit is the whole job there.
+    _update = getattr(helper, 'update_tool_signature', None)
+    if callable(_update):
+        for name in removed:
+            _update(name, is_remove=True)
+    else:
+        cfg['tools'] = kept
+    return removed
 
 
 def main_leg_core_tools(tools):
@@ -118,16 +429,57 @@ def main_leg_core_tools(tools):
     return [t for t in tools if t[0] in MAIN_LEG_CORE_TOOLS]
 
 
-def register_core_tools(tools, helper, executor):
+def register_core_tools(tools, helper, executor, *,
+                        executor_proposes=False, second_executor=None):
     """Register (name, desc, func) tuples on an AutoGen helper/executor pair.
 
     Args:
         tools: list of (name, description, func) tuples from build_core_tool_closures()
         helper: AutoGen agent that suggests tool use (register_for_llm)
         executor: AutoGen agent that executes tools (register_for_execution)
+        executor_proposes: ALSO give ``executor`` the LLM schema, so it can
+            propose these tools instead of being told they do not exist.
+        second_executor: a distinct agent that can execute them, so
+            ``executor``'s own structured tool_calls are not stranded.
+
+    ``executor_proposes`` exists because the helper=schema / executor=execution
+    split silently disarms whichever agent the recipe actually assigns the work
+    to.  Measured live 2026-09-06, agent 89555447799: the main leg registered
+    with ``(helper, assistant)``, so the Assistant held execution only and its
+    outbound bodies carried NO ``tools[]`` at all — while ~591 execution-persona
+    bodies in the same window named it as the actor
+    (``'agent_to_perform_this_action': 'Assistant'``).  Downstream that produced
+    26x "The requested tool 'google_search' is not available" and 2,657+
+    "Error: Function <X> not found" (send_message_to_user x1052 — the path that
+    returns the agent's result to the user; request_tools x101 — the
+    never-say-unavailable escape hatch, itself unreachable).
+
+    ``second_executor`` is the other half, for the same reason news_tools.py
+    takes an ``executor=``: once the proposer emits a STRUCTURED tool_call,
+    autogen's repeat-speaker rule will not let that same agent speak again to
+    run it, so a sole-executor proposer strands its own call with no role=tool
+    answer.
+
+    This is the canonical home for the pattern that news_tools.py:421-442 and
+    revenue_tools.py:224-225 currently inline ("Deliberately dual here ... do
+    not 'simplify' it back"); per review follow-up #755 item 2 those two should
+    migrate here rather than a third copy being written.
+
+    Cost, measured before landing: the 18 MAIN_LEG_CORE_TOOLS serialise to
+    ~1,859 tokens.  Against the live geometry (n_ctx 12,288, 1 slot, max_tokens
+    2,048, safety margin 2,816) that leaves 5,565 tokens for messages — well
+    clear of the degrade branch.  Re-measure before widening this to the full
+    service registry, which is ~6,758 tokens and would not fit.
+
+    Defaults are a strict no-op: the time and visual legs keep
+    helper=schema / executor=execution exactly as before.
     """
     for name, desc, func in tools:
         register_dual(helper, executor, func, name, desc)
+        if executor_proposes:
+            executor.register_for_llm(name=name, description=desc)(func)
+        if second_executor is not None:
+            second_executor.register_for_execution(name=name)(func)
 
 
 def filter_service_tools(goal_tags, svc_tools, svc_defs, registry):
@@ -168,7 +520,8 @@ def filter_service_tools(goal_tags, svc_tools, svc_defs, registry):
     return kept
 
 
-def discover_and_attach(need, helper, executor, registry, attached_names):
+def discover_and_attach(need, helper, executor, registry, attached_names,
+                        core_tools=None):
     """On-demand tool discovery: the never-say-unavailable half of the gate.
 
     Owner requirement 2026-08-31: the hierarchy must be LAZY, not
@@ -189,6 +542,20 @@ def discover_and_attach(need, helper, executor, registry, attached_names):
         registry: ServiceToolRegistry
         attached_names: set of func names already on the agents —
             updated in place with everything newly attached
+        core_tools: the ``(name, description, func)`` triples
+            ``build_core_tool_closures`` returns.  SAME reason
+            ``attach_for_names`` needed them (D25/#788): the registry holds
+            SERVICE tools, while the capability an agent asks for at runtime
+            is usually a CORE closure.  Owner requirement 2026-09-09 — an
+            agent whose recipe names no tool must still identify the need at
+            RUNTIME and get it — and this is that path, so searching the
+            registry alone made the requirement unmeetable for core
+            capabilities.  Measured live 2026-09-09, agent 33323830039: the
+            model called ``request_tools`` at 17:55:35 precisely because it
+            could not see execute_windows_or_android_command, and discovery
+            attached nothing — that tool is a core closure and the registry
+            holds 13 service names, of which exactly one (crawl4ai) is a name
+            any recipe uses.  Omitted or empty is a strict no-op.
     Returns a human/model-readable summary string.
     """
     # Stopwords would over-attach: 'the' passes len>2 AND is a substring of
@@ -227,6 +594,73 @@ def discover_and_attach(need, helper, executor, registry, attached_names):
                           ep.get('description', f'{tool_name} {ep_name}'))
             attached_names.add(fn)
             attached.append(fn)
+    # Core closures: SAME selector (the keyword/stem matcher above), same
+    # idempotent `attached_names`, same register_dual primitive — only the
+    # SOURCE differs.  Kept in this function rather than a sibling so there is
+    # one answer to "attach the tool this need describes", not two that drift
+    # (the reason attach_for_names holds its core loop inline too).
+    for _c_name, _c_desc, _c_func in (core_tools or []):
+        if _c_name in attached_names:
+            continue
+        hay_core = (str(_c_name) + ' ' + str(_c_desc or '')).lower()
+        core_words = {hw for hw in _re.split(r'[^a-z0-9]+', hay_core)
+                      if len(hw) >= 4}
+        core_stems = {hw[:4] for hw in core_words}
+        if not any(w in hay_core or (len(w) >= 4 and w[:4] in core_stems)
+                   for w in words):
+            continue
+        register_dual(helper, executor, _c_func, _c_name, _c_desc)
+        attached_names.add(_c_name)
+        attached.append(_c_name)
+
+    # THIRD source: tools the EXECUTOR can already run but the helper can no
+    # longer SEE.  `register_dual` splits schema (helper.register_for_llm) from
+    # execution (executor.register_for_execution -> _function_map), so a family
+    # whose schema is withheld from the helper to save context is still fully
+    # live on the executor — the callable is right there, only the description
+    # the model reads is missing.  Consulting it costs nothing and is what
+    # makes withholding SAFE rather than exclusionary.
+    #
+    # Why this is required, measured live 2026-09-12 on the CREATE walk of
+    # agent 87400889007: the create helper carries 54 tools = 7,191 schema
+    # tokens against n_ctx 8,192 (88% of the window), so the trimmer reports
+    # "the TOOL SCHEMA alone is 7191 tokens ... no amount of message trimming
+    # can make this fit" and the walk 400s at action 5.  Across 1,568 wire rows
+    # autogen.create called 9 distinct tools, ALL of them in MAIN_LEG_CORE_TOOLS
+    # — none of the other 36.  Narrowing the helper is therefore the fix, but
+    # the families that make it overflow (channel, memory-graph, coding, AP2,
+    # media) live in NEITHER of the two sources above, so without this loop
+    # narrowing would make them permanently unreachable.  That is the owner's
+    # 2026-08-31 requirement in reverse: the hierarchy must be LAZY, not
+    # exclusionary.
+    #
+    # Same selector, same idempotent `attached_names`, same register_dual
+    # primitive as the two loops above — only the SOURCE differs, kept here
+    # rather than in a sibling for the reason the core loop is inline too.
+    # `_function_map` is the established accessor (reuse_recipe.py:5000-5008
+    # already reads it for the sibling "can this agent serve the call"
+    # question).  Missing attribute is a strict no-op: agents built by the
+    # time and visual factories must degrade to today's behaviour, not raise.
+    for _x_name, _x_func in sorted(
+            (getattr(executor, '_function_map', None) or {}).items()):
+        if _x_name in attached_names:
+            continue
+        # _function_map carries no description — the docstring's first line is
+        # the only text the tool ships with, and it is what the model will read
+        # once re-attached.  Fall back to the name so a doc-less callable is
+        # still matchable and still gets a non-empty description.
+        _x_desc = ((getattr(_x_func, '__doc__', '') or '').strip()
+                   .split('\n')[0].strip()) or _x_name
+        hay_x = (str(_x_name) + ' ' + _x_desc).lower()
+        x_words = {hw for hw in _re.split(r'[^a-z0-9]+', hay_x) if len(hw) >= 4}
+        x_stems = {hw[:4] for hw in x_words}
+        if not any(w in hay_x or (len(w) >= 4 and w[:4] in x_stems)
+                   for w in words):
+            continue
+        register_dual(helper, executor, _x_func, _x_name, _x_desc)
+        attached_names.add(_x_name)
+        attached.append(_x_name)
+
     parts = []
     if attached:
         # Imperative on purpose: hop-2 probe 2026-08-31 showed the model
@@ -286,8 +720,9 @@ def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
     return n
 
 
-def attach_for_names(names, helper, executor, registry, attached_names):
-    """Attach the registry tools a turn NAMES outright.
+def attach_for_names(names, helper, executor, registry, attached_names,
+                     core_tools=None):
+    """Attach the tools a turn NAMES outright — registry AND core closures.
 
     Name-keyed sibling of ``attach_for_tags`` — same primitives
     (``create_endpoint_function`` + ``register_dual``), same idempotent
@@ -320,6 +755,43 @@ def attach_for_names(names, helper, executor, registry, attached_names):
     Unknown names are ignored rather than raising — a recipe may name a tool
     this deployment does not ship, and a turn that mentions one absent tool
     must still get the others.
+
+    ``core_tools`` — WHY THIS FUNCTION NEEDED A SECOND SOURCE.  Searching only
+    ``registry._tools`` made the whole mechanism inert, because the recipes
+    name CORE closures and the registry holds SERVICE tools.  Measured live
+    2026-09-07/08 across 23 agents driven through /chat (672,846 server.log
+    lines): ``Tier-1 named attach`` logged ZERO times, with ``turn attach
+    skipped`` also zero — the block ran every round and resolved nothing.
+    The registry holds 13 names on this deployment (payments x3,
+    seo_audit_score, gh_pr_open, crawl4ai, crawl4ai_crawl, pocket_tts x3,
+    acestep x3); of the tool names the recipes actually use, exactly ONE
+    (crawl4ai) is among them.
+
+    What the actions name instead, and how often FAB-GUARD saw it unrun:
+
+        execute_windows_or_android_command   35 named, 27 unrun (77%)
+        google_search                        13 named,  0 unrun ( 0%)
+        send_message_to_user                  5 named,  2 unrun (40%)
+        save_to_long_term_memory              5 named,  2 unrun (40%)
+
+    The 0% entry is the control: ``google_search`` is in MAIN_LEG_CORE_TOOLS
+    and therefore always-on, so it never needs attaching.  The 77% entry is
+    not in that frozenset, so on the MAIN leg it could not be called at all —
+    reuse_recipe.py hands the time and visual legs the FULL closure list
+    (:2142, :2250) but the main leg only ``main_leg_core_tools(...)`` (:2167).
+    That asymmetry is what stalled agent 89555447799 on action 3 for 21
+    minutes: the tool never ran, so StatusVerifier honestly kept returning
+    'pending' and the turn burned its whole round budget (tasks #770, #790).
+
+    Passing the core closures here fixes that WITHOUT widening
+    MAIN_LEG_CORE_TOOLS, which is deliberate: that frozenset is the always-on
+    set for every agent, and execute_windows_or_android_command runs arbitrary
+    OS commands.  Attaching it only for an action whose own recipe names it
+    keeps the blast radius at the action that asked for it.
+
+    Accepts the ``(name, description, func)`` tuples ``build_core_tool_closures``
+    already returns, so callers pass what they built — no second builder.
+    Omitted or empty is a strict no-op, leaving the registry path unchanged.
     """
     want = {str(n) for n in (names or []) if n}
     if not want:
@@ -337,6 +809,16 @@ def attach_for_names(names, helper, executor, registry, attached_names):
                           ep.get('description', f'{tool_name} {ep_name}'))
             attached_names.add(fn)
             n += 1
+
+    # Core closures: same selector, same idempotent set — only the SOURCE
+    # differs.  Kept inside this function rather than a sibling so there is one
+    # answer to "attach the tools this turn names", not two that can drift.
+    for core_name, core_desc, core_func in (core_tools or []):
+        if core_name not in want or core_name in attached_names:
+            continue
+        register_dual(helper, executor, core_func, core_name, core_desc)
+        attached_names.add(core_name)
+        n += 1
     return n
 
 
@@ -421,7 +903,12 @@ def build_core_tool_closures(ctx):
     def get_user_camera_inp(
         inp: Annotated[str, "The Question to check from visual context"],
     ) -> str:
-        return helper_fun.get_user_camera_inp(inp, int(user_id), request_id_list[user_prompt])
+        # No int() — user_id is a UUID on desktop installs and int() raised
+        # on every call (152/152 failures across three log rotations,
+        # 10/10 on 2026-09-07).  The callee never needs an int: helper.py:2163
+        # does get_frame(str(user_id)) and :2165 interpolates it into a
+        # filename.  An integer id still passes through unchanged.
+        return helper_fun.get_user_camera_inp(inp, user_id, request_id_list[user_prompt])
 
     tools.append((
         "get_user_camera_inp",
@@ -478,14 +965,23 @@ def build_core_tool_closures(ctx):
                     tool_logger.debug("MemoryGraph mirror failed for key %s: %s", key, e)
 
             try:
-                stored_value = get_data_by_key(key)
+                # The value as stored, not the tool's page of it.
+                stored_value = _read_saved(key)
                 tool_logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
-                if stored_value == "Key not found in stored data.":
+                if stored_value == _KEY_NOT_FOUND:
                     tool_logger.error(f"VERIFICATION FAILED: Data not properly stored at key {key}")
+                    return f"Error: {key} was written but could not be read back"
             except Exception as e:
                 tool_logger.error(f"VERIFICATION ERROR: {str(e)}")
 
-            return f'{agent_data[prompt_id]}'
+            # Report the save, not the store. This returned the whole
+            # agent_data store on every call, so each save put all of it in
+            # the model's context and, through the group chat's write-back,
+            # into memory again: on central 2026-09-14 (#104) the large
+            # MemoryGraph rows were all this repr, 0.9M to 3.96M chars each.
+            return _bounded_observation(
+                f'Saved at {key}: {json.dumps(validated_value)}',
+                'the whole value was saved')
         except json.JSONDecodeError as je:
             error_msg = f"Invalid JSON structure in value: {str(je)}"
             tool_logger.error(error_msg)
@@ -502,7 +998,11 @@ def build_core_tool_closures(ctx):
     tools.append((
         "save_data_in_memory",
         "Use this to Store and retrieve data using key-value storage system",
-        save_data_in_memory,
+        # Marked reads_persisted_state (#104): its result reports what is now
+        # stored, so the group chat's write-back does not store it again. The
+        # same mark goes on every tool below whose result is a read of state
+        # HARTOS already keeps.
+        reads_persisted_state(save_data_in_memory),
     ))
 
     # ------------------------------------------------------------------
@@ -520,16 +1020,23 @@ def build_core_tool_closures(ctx):
     tools.append((
         "get_saved_metadata",
         "Returns the schema of the json from internal memory with all keys but without actual values.",
-        get_saved_metadata,
+        reads_persisted_state(get_saved_metadata),
     ))
 
     # ------------------------------------------------------------------
     # 5. get_data_by_key
     # ------------------------------------------------------------------
-    @log_tool_execution
-    def get_data_by_key(
-        key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."],
-    ) -> str:
+    _KEY_NOT_FOUND = "Key not found in stored data."
+
+    def _read_saved(key):
+        """The value saved at ``key``, whole, or the not-found sentinel.
+
+        For code in this module that needs the value as stored (the receipt
+        template, the save check). The get_data_by_key tool pages what the
+        model reads; the receipt read its template through that tool, so a
+        template longer than a page was cut and the page note was printed into
+        the customer's receipt (#104 review).
+        """
         if prompt_id not in agent_data or not agent_data[prompt_id]:
             tool_logger.info(f"Loading agent data from file for prompt_id {prompt_id}")
             helper_fun.load_agent_data_from_file(prompt_id, agent_data)
@@ -539,7 +1046,11 @@ def build_core_tool_closures(ctx):
             for k in keys:
                 d = d[k]
             return f'{d}'
-        except KeyError:
+        # TypeError too: a path that runs through a None, a string or a list
+        # is as missing as an absent key. It used to escape as a tool
+        # exception and skip the fallback below (central 2026-09-13, a hive
+        # reuse turn asking for a nested key under a None value).
+        except (KeyError, TypeError):
             # Fallback: check MemoryGraph for persisted [KV] data — the
             # read half of save_data_in_memory's dual-write, carried by
             # reuse_recipe's inline twin before the #743 migration and
@@ -549,21 +1060,47 @@ def build_core_tool_closures(ctx):
                     results = memory_graph.recall(f"[KV] {key}", mode='text', top_k=1)
                     if results:
                         return results[0].content
-                except Exception as e:
-                    tool_logger.debug("MemoryGraph recall fallback failed for key %s: %s", key, e)
-            return "Key not found in stored data."
+                except Exception:
+                    pass
+            return _KEY_NOT_FOUND
+
+    @log_tool_execution
+    def get_data_by_key(
+        key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."],
+        offset: Annotated[int, "Where to start reading a long value, in characters. Leave 0 to read from the start."] = 0,
+    ) -> str:
+        # One page of the value, not all of it (#104): a key like 'hive'
+        # returned the whole subtree, which went to the model and back into
+        # memory. A long value is read a page at a time, the way book pages
+        # are, and the note names the offset of the next page.
+        from core.constants import TOOL_OBSERVATION_MAX_CHARS as page_chars
+        value = _read_saved(key)
+        try:
+            start = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            start = 0
+        if start and start >= len(value):
+            return f'...[offset {start} is past the end of the value ({len(value)} chars)]'
+        page = value[start:start + page_chars]
+        end = start + len(page)
+        if end >= len(value):
+            return page
+        return (f'{page}\n...[chars {start}-{end} of {len(value)}; call '
+                f'get_data_by_key with offset={end} for the rest]')
 
     tools.append((
         "get_data_by_key",
-        "Returns all data from the internal Memory using key",
-        get_data_by_key,
+        "Returns the data saved at a key. A long value comes back one page at a "
+        "time; pass the offset the reply names to read the next page.",
+        reads_persisted_state(get_data_by_key),
     ))
     # Alias — Helper system prompts in reuse_recipe.py advertise this name (#510).
-    # Same closure → identical behavior under both names.  Never remove a
-    # registered tool: phantom tool fixed by adding a real registration.
+    # Same closure → identical behavior under both names, the persisted-read
+    # mark included.  Never remove a registered tool: phantom tool fixed by
+    # adding a real registration.
     tools.append((
         "get_data_from_memory",
-        "Returns all data from the internal Memory using key (alias of get_data_by_key)",
+        "Returns the data saved at a key, a page at a time (alias of get_data_by_key)",
         get_data_by_key,
     ))
 
@@ -601,8 +1138,10 @@ def build_core_tool_closures(ctx):
         from integrations.service_tools.receipt_image import (
             compute_balance, render_receipt_png)
         balance = compute_balance(amount, advance) or ""
-        template = get_data_by_key("receipt_template")
-        if not template or template == "Key not found in stored data.":
+        # The template as saved: the get_data_by_key tool pages what the model
+        # reads, and a paged template printed its page note into the receipt.
+        template = _read_saved("receipt_template")
+        if not template or template == _KEY_NOT_FOUND:
             template = _DEFAULT_RECEIPT_TEMPLATE
         fields = {
             "business_name": business_name,
@@ -620,8 +1159,8 @@ def build_core_tool_closures(ctx):
         text = TemplateEngine().render(template, extra_vars=fields)
         if str(render).lower() != "image":
             return text
-        logo_path = get_data_by_key("receipt_logo_path")
-        if logo_path == "Key not found in stored data.":
+        logo_path = _read_saved("receipt_logo_path")
+        if logo_path == _KEY_NOT_FOUND:
             logo_path = None
         png = render_receipt_png(fields, logo_path=logo_path)
         if not png:
@@ -835,6 +1374,7 @@ def build_core_tool_closures(ctx):
 
         # Default: Avatar-based video generation
         from core.config_cache import get_db_url
+        from core.teacher_avatar import lookup_avatar
         database_url = get_db_url() or 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         tool_logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
@@ -847,20 +1387,16 @@ def build_core_tool_closures(ctx):
             'openvoice': "false",
         }
 
-        try:
-            res = pooled_get(f"{database_url}/get_image_by_id/{avatar_id}")
-            res = res.json()
-            new_image_url = res["image_url"]
-            voice_id = res.get('voice_id')
-        except Exception:
+        # The avatar's image and voice sample: the one lookup a spoken reply
+        # uses too (core/teacher_avatar.py).
+        avatar = lookup_avatar(avatar_id, database_url)
+        if avatar['openvoice']:
             data['openvoice'] = "true"
-            new_image_url = None
-            voice_id = None
 
         data["cartoon_image"] = "True"
         data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
         data['vtoonify'] = "false"
-        data["image_url"] = new_image_url
+        data["image_url"] = avatar['image_url']
         data['im_crop'] = "false"
         data['remove_bg'] = "false"
         data['hd_video'] = "false"
@@ -879,18 +1415,8 @@ def build_core_tool_closures(ctx):
             data['flag_hallo'] = "true"
             data["cartoon_image"] = "False"
 
-        if voice_id is not None:
-            try:
-                voice_sample = pooled_get(f"{database_url}/get_voice_sample_id/{voice_id}")
-                voice_sample = voice_sample.json()
-                data["audio_sample_url"] = voice_sample.get("voice_sample_url")
-                data['voice_id'] = int(voice_id) if voice_id else None
-            except Exception:
-                data["audio_sample_url"] = None
-                data['voice_id'] = None
-        else:
-            data["audio_sample_url"] = None
-            data['voice_id'] = None
+        data["audio_sample_url"] = avatar['audio_sample_url']
+        data['voice_id'] = avatar['voice_id']
 
         conv_id = save_conversation_db(text, user_id, prompt_id, database_url, request_id)
         data['conv_id'] = int(conv_id)
@@ -920,8 +1446,13 @@ def build_core_tool_closures(ctx):
     @log_tool_execution
     def get_user_uploaded_file() -> str:
         tool_logger.info('INSIDE get_user_uploaded_file')
-        if recent_file_id[user_id]:
-            return f'Got user uploaded file the file_id is {recent_file_id[user_id]}'
+        # .get(), not [] — recent_file_id is a TTLCache written only when a
+        # file is actually uploaded, so a user who uploaded nothing has no
+        # key and [] raised KeyError (44/44 failures, 4/4 on 2026-09-07).
+        # That case is exactly the answer below, which was unreachable.
+        file_id = recent_file_id.get(user_id)
+        if file_id:
+            return f'Got user uploaded file the file_id is {file_id}'
         return 'No file uploaded from user'
 
     tools.append((
@@ -1083,7 +1614,7 @@ def build_core_tool_closures(ctx):
     tools.append((
         "get_chat_history",
         "Get Chat history based on text & start & end date",
-        get_chat_history,
+        reads_persisted_state(get_chat_history),
     ))
 
     # ------------------------------------------------------------------
@@ -1104,7 +1635,7 @@ def build_core_tool_closures(ctx):
     tools.append((
         "search_visual_history",
         "Search past camera and screen descriptions by keyword and time range.",
-        search_visual_history,
+        reads_persisted_state(search_visual_history),
     ))
 
     # ------------------------------------------------------------------
@@ -1152,18 +1683,23 @@ def build_core_tool_closures(ctx):
                 try:
                     loop = get_or_create_event_loop()
                     results = loop.run_until_complete(simplemem_store.search(query))
-                    if results:
-                        return results[0].content
-                    return "No relevant memories found."
+                    # SimpleMem's item is an answer, not a stored row: cut it,
+                    # never skip it.
+                    text = _bounded_recall(
+                        [r.content for r in (results or [])], max_items=1,
+                        skip_oversize=False)
+                    return text or "No relevant memories found."
                 except Exception as e:
                     tool_logger.info(f"SimpleMem search error: {e}")
                     return "Memory search unavailable."
             # MemoryGraph leg — same contract, local store, no API key.
             try:
-                results = memory_graph.recall(query, mode='hybrid', top_k=5)
-                if results:
-                    return '\n'.join(r.content for r in results[:5])
-                return "No relevant memories found."
+                # Fetch past the 5 shown: rows _bounded_recall skips as
+                # over-size must not leave real memories unreturned (#104).
+                results = memory_graph.recall(query, mode='hybrid', top_k=10)
+                text = _bounded_recall(
+                    [r.content for r in (results or [])], max_items=5)
+                return text or "No relevant memories found."
             except Exception as e:
                 tool_logger.info(f"MemoryGraph search error: {e}")
                 return "Memory search unavailable."
@@ -1171,7 +1707,7 @@ def build_core_tool_closures(ctx):
         tools.append((
             "search_long_term_memory",
             "Search long-term memory for past conversations, facts, and context using natural language query.",
-            search_long_term_memory,
+            reads_persisted_state(search_long_term_memory),
         ))
 
         @log_tool_execution
@@ -1596,7 +2132,7 @@ def build_core_tool_closures(ctx):
         "get_user_details",
         "Get the current user's profile information (name, email, preferences, etc.). "
         "Use when the user asks about their profile or when you need user context.",
-        get_user_details,
+        reads_persisted_state(get_user_details),
     ))
 
     # ------------------------------------------------------------------
@@ -1898,6 +2434,234 @@ def build_core_tool_closures(ctx):
         # commits C4+ EXTENDS web_crawler.py with cookie injection + B2 CDP
         # attach, instead of building a parallel driver.  See
         # memory/project_browser_research_subsystem.md for the corrected plan.
+
+    @log_tool_execution
+    def validate_json_response(response: Annotated[str, "The response from a tool that should be JSON"]) -> str:
+        """
+        Validates and repairs JSON response from tools.
+
+        Args:
+            response: string responses from a tool that should be JSON formatted
+        Returns:
+            Valid JSON string or the original string if not repairable
+        """
+        tool_logger.info("INSIDE validate json response")
+        try:
+            # First try to parse as is
+            json_obj = json.loads(response)
+            return json.dumps(json_obj)
+        except json.JSONDecodeError:
+            try:
+
+                # If parsing fails, try to repair
+                repaired_json = repair_json(response)
+                # Verify the repaired JSON is valid
+                json_obj = json.loads(repaired_json)
+                return json.dumps(json_obj)
+            except Exception as e:
+                # If repair filas, return the original with a warning
+                tool_logger.info("JSON repair has failed")
+                return f"{response}"
+
+    tools.append((
+        "validate_json_response",
+        "Checks and corrects if the tool response is not JSON but expected to be.",
+        validate_json_response,
+    ))
+
+    # ------------------------------------------------------------------
+    # Coding-agent leg
+    #
+    # These four were inline closures in create_recipe.create_agents
+    # (register_dual, L1674-1816) until 2026-09-10.  CREATE advertised them
+    # to the recipe-authoring LLM while REUSE — which builds its tools from
+    # THIS factory (reuse_recipe.py:2238) — held no copy.  Two consequences,
+    # and the second is the one that hid the first:
+    #   * a saved action naming one could never execute; and
+    #   * _reuse_fabricated_tools could not see the name as `referenced`
+    #     (that helper intersects the action text with names REGISTERED ON
+    #     THE AGENTS), so it returned [] at its second early-return, before
+    #     its log line.  A tool the leg cannot run was indistinguishable
+    #     from an action naming no tool, and the action advanced silently.
+    # Measured live 2026-09-10, agent 88719487304 action 4: FAB-GUARD
+    # watermark 23 in, 23 out — zero tool calls in the whole window — no
+    # verdict line at all, both subtasks closed, parent terminated in 14s.
+    # 36 of the 185 saved recipes on that box name such a tool; 87 actions
+    # name execute_coding_task alone.
+    #
+    # Deliberately NOT added to MAIN_LEG_CORE_TOOLS: reuse reaches them via
+    # attach_for_names, for the action whose own recipe names one, so the
+    # always-on schema stays 18 tools / ~1,859 tokens against the 12,288
+    # slot (#730).  Same rule reuse_recipe.py:2429-2442 already states for
+    # execute_windows_or_android_command — that closure captures 33 locals
+    # of its defining function so ctx cannot build it and it is handed over
+    # inline; these four capture nothing but user_id, which ctx supplies.
+    # ------------------------------------------------------------------
+    async def execute_coding_task(
+        task: Annotated[str, "The coding task to execute (e.g., 'review this function for bugs', 'implement a login form')"],
+        task_type: Annotated[str, "Task type: code_review, feature, bug_fix, refactor, app_build, debugging, multi_session"] = "feature",
+        preferred_tool: Annotated[str, "Optional tool override: kilocode, claude_code, opencode, aider_native, or claw_native (empty = auto-select best)"] = "",
+        working_dir: Annotated[str, "Working directory / repo path for the coding task (empty = use HEVOLVE_CODING_WORKDIR env or cwd)"] = "",
+    ) -> str:
+        """Execute a coding task using the best available coding agent tool (KiloCode, Claude Code, OpenCode, or AiderNative).
+
+        Routes to the best tool based on benchmarks and task type.
+        This is for writing, reviewing, refactoring, or debugging code —
+        NOT for GUI automation (use execute_windows_or_android_command for that).
+        """
+        try:
+            from integrations.coding_agent.orchestrator import get_coding_orchestrator
+            orchestrator = get_coding_orchestrator()
+            result = orchestrator.execute(
+                task=task,
+                task_type=task_type,
+                preferred_tool=preferred_tool,
+                user_id=user_id,
+                model=os.environ.get('HEVOLVE_CODING_MODEL', ''),
+                working_dir=working_dir or os.environ.get('HEVOLVE_CODING_WORKDIR', ''),
+            )
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return f"Coding task execution error: {e}"
+
+    tools.append((
+        "execute_coding_task",
+        "Execute a coding task (write, review, refactor, debug code) using the best available coding agent tool. Routes to KiloCode, Claude Code, OpenCode, AiderNative, or ClawNative (Rust) based on benchmarks. Pass working_dir for the target repo path.",
+        execute_coding_task,
+    ))
+
+    # Repository map tool — tree-sitter based code understanding.
+    # Import-gated exactly as create_recipe had it: absent, not broken,
+    # when aider_core is not installed.
+    try:
+        from integrations.coding_agent.recipe_bridge import CodingRecipeBridge
+
+        async def get_repository_map(
+            working_dir: Annotated[str, "Directory to map (default: current directory)"] = ".",
+            max_tokens: Annotated[int, "Maximum tokens for the map output"] = 2048,
+        ) -> str:
+            """Generate a tree-sitter based repository map showing key functions, classes, and their relationships.
+
+            Use this to understand a codebase's structure before making changes.
+            Returns a ranked summary of the most important code symbols.
+            """
+            return CodingRecipeBridge.get_repository_map(working_dir, max_tokens)
+
+        tools.append((
+            "get_repository_map",
+            "Generate a tree-sitter repository map showing key functions, classes, and structure. Use before coding tasks to understand the codebase.",
+            get_repository_map,
+        ))
+    except ImportError:
+        tool_logger.debug("Repository map tool not available (aider_core not installed)")
+
+    # Shard Engine: Call-chain context for coding tasks.
+    # Target function + upstream callers + downstream callees = FULL source.
+    # Everything else = interfaces only. Exposure proportional to task.
+    # Call graph from Trueflow MCP (IDE) or AST fallback (headless).
+    try:
+        async def create_code_shard(
+            task: Annotated[str, "Description of the coding task"],
+            target_file: Annotated[str, "Relative path to the file containing the target function"],
+            target_function: Annotated[str, "Name of the function to modify"],
+            repo_path: Annotated[str, "Path to the repository (default: HART OS install dir)"] = "",
+        ) -> str:
+            """Create a code shard with call-chain context for a coding task.
+
+            Returns:
+            - Target function: FULL source (what you're modifying)
+            - Upstream callers: FULL source (who calls it, input contracts)
+            - Downstream callees: FULL source (what it calls, output contracts)
+            - Everything else: Interfaces only (signatures + types)
+
+            Call graph sourced from Trueflow MCP (when IDE running) or AST fallback.
+            Security: exposure proportional to the task. E2E encrypted for peer offload.
+            Use execute_coding_task with working_dir to actually apply edits.
+            """
+            from integrations.agent_engine.shard_engine import ShardEngine
+            engine = ShardEngine(code_root=repo_path) if repo_path else ShardEngine()
+            shard = engine.create_call_chain_shard(
+                task=task, target_file=target_file,
+                target_function=target_function)
+            return json.dumps({
+                'shard_id': shard.shard_id,
+                'task': shard.task_description,
+                'scope': shard.scope.value,
+                'target_files': shard.target_files,
+                'call_chain_source': shard.full_content,
+                'interfaces': [{'file': s.file_path, 'functions': s.functions,
+                               'classes': s.classes} for s in shard.interface_specs],
+            }, indent=2, default=str)
+
+        tools.append((
+            "create_code_shard",
+            "Create a code shard with call-chain context: target function + upstream callers + downstream callees (FULL source), everything else interfaces only.",
+            create_code_shard,
+        ))
+    except Exception:
+        tool_logger.debug("Shard engine tool not available")
+
+    # Benchmark Tracker: Query which coding tool performs best for each task type
+    try:
+        async def get_coding_benchmarks(
+            task_type: Annotated[str, "Task type to check (code_review, feature, bug_fix, refactor, app_build, debugging, multi_session, or 'all')"] = "all",
+        ) -> str:
+            """Get coding tool benchmarks — which tool (KiloCode, Claude Code, OpenCode, AiderNative) performs best.
+
+            Returns success rates, average times, and sample counts per tool per task type.
+            Includes both local benchmarks and hive-aggregated intelligence from peers.
+            """
+            from integrations.coding_agent.benchmark_tracker import get_benchmark_tracker
+            tracker = get_benchmark_tracker()
+            result = {'local': {}, 'hive': {}}
+
+            if task_type == 'all':
+                delta = tracker.export_learning_delta()
+                result['local'] = delta.get('coding_benchmarks', {})
+            else:
+                best = tracker.get_best_tool(task_type)
+                if best:
+                    result['local'][task_type] = {
+                        'best_tool': best[0], 'success_rate': best[1],
+                        'avg_time_s': best[2],
+                    }
+                hive_best = tracker.get_hive_best_tool(task_type)
+                if hive_best:
+                    result['hive'][task_type] = {
+                        'best_tool': hive_best[0], 'success_rate': hive_best[1],
+                        'avg_time_s': hive_best[2],
+                    }
+            return json.dumps(result, indent=2, default=str)
+
+        tools.append((
+            "get_coding_benchmarks",
+            "Query coding tool benchmarks — which tool performs best per task type. Includes local and hive-aggregated data.",
+            get_coding_benchmarks,
+        ))
+    except Exception:
+        tool_logger.debug("Benchmark tracker tool not available")
+
+    # ------------------------------------------------------------------
+    # Book / learning navigation — appended HERE, not via a separate
+    # register_*_if_available() registrar.
+    #
+    # register_remote_desktop_tools_if_available (below) has NO production
+    # caller — only tests/unit/test_remote_desktop_agent_tools.py:235 — so a
+    # tool registered that way never reaches a live turn.  The live path is
+    # build_core_tool_closures() -> register_core_tools(), called from
+    # create_recipe.py:1096/1116 and reuse_recipe.py:2238/2264.  Appending to
+    # `tools` is therefore the only wiring that actually runs.
+    # ------------------------------------------------------------------
+    try:
+        from integrations.learning.book_tools import build_book_tools
+        _book = build_book_tools(ctx)
+        if _book:
+            tools.extend(_book)
+            tool_logger.info("Book navigation tools registered (%d)", len(_book))
+    except ImportError:
+        pass
+    except Exception as e:
+        tool_logger.warning("Book tools registration failed: %s", e)
 
     return tools
 

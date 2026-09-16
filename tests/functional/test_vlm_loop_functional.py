@@ -4,7 +4,9 @@ Functional tests for VLM computer-use loop CONTROL FLOW.
 Exercises the real run_local_agentic_loop() logic and helper functions
 with only the boundary mocked (screenshot capture + LLM HTTP call).
 
-Run: pytest tests/functional/test_vlm_loop_functional.py -v --noconftest
+Run: pytest tests/functional/test_vlm_loop_functional.py -v
+(the owner's permission comes from tests/conftest.py's
+computer_control_granted, so conftest has to load)
 """
 import json
 import os
@@ -23,6 +25,10 @@ from integrations.vlm.local_loop import (
     _build_action_payload,
     run_local_agentic_loop,
 )
+
+# The owner has allowed agents to control this computer: these tests are
+# about the loop's control flow once allowed.
+pytestmark = pytest.mark.usefixtures('computer_control_granted')
 
 # ---------------------------------------------------------------------------
 # Helpers

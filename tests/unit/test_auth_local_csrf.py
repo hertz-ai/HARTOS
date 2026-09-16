@@ -205,7 +205,8 @@ def test_origin_host_parser():
 def test_module_imports_cleanly():
     from core import auth_local  # noqa: F401
     assert hasattr(auth_local, 'require_local_or_token_csrf_safe')
-    assert hasattr(auth_local, '_is_safe_csrf_origin')
+    # Public: Nunba's routes/auth.py imports it for its own csrf-safe guard.
+    assert hasattr(auth_local, 'is_safe_csrf_origin')
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -347,6 +348,31 @@ def test_csrf_safe_non_ascii_bearer_does_not_500(app, monkeypatch):
 
 
 # ── _is_local_request: TRUSTED_PROXY + X-Forwarded-For decision ────
+
+
+def test_the_staging_container_trusts_every_caller(app, monkeypatch):
+    """NUNBA_CI=1, set only by Nunba's docker-compose.staging.yml, trusts
+    every caller, as Nunba's own rule does: the e2e probe reaches the
+    container through Docker's port mapping, never from 127.0.0.1.  Without
+    it the same caller is remote."""
+    client = app.test_client()
+    monkeypatch.setenv('NUNBA_CI', '1')
+    resp = client.post('/test/local-only', environ_base={'REMOTE_ADDR': '172.18.0.1'})
+    assert resp.status_code == 200
+    monkeypatch.delenv('NUNBA_CI')
+    resp = client.post('/test/local-only', environ_base={'REMOTE_ADDR': '172.18.0.1'})
+    assert resp.status_code == 401
+
+
+def test_an_installed_build_ignores_nunba_ci(app, monkeypatch):
+    """Staging always runs from source, so NUNBA_CI on a frozen (installed)
+    build can only be a misconfiguration: the same caller stays remote."""
+    import sys
+    monkeypatch.setenv('NUNBA_CI', '1')
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    resp = app.test_client().post('/test/local-only',
+                                  environ_base={'REMOTE_ADDR': '172.18.0.1'})
+    assert resp.status_code == 401
 
 
 def test_trusted_proxy_forwarded_loopback_accepted(app, monkeypatch):

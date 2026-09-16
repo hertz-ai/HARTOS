@@ -14,7 +14,6 @@ filter drifts from the factory's names.
 """
 import ast
 from pathlib import Path
-import re
 from types import SimpleNamespace
 import unittest
 
@@ -74,12 +73,33 @@ class ReuseMainCoreFactory(unittest.TestCase):
         self.assertFalse(missing, f"reuse-specific tools vanished: {missing}")
 
     def test_main_leg_registers_filtered_factory_set(self):
+        # RE-POINTED 2026-09-08.  This guard searched reuse_recipe.py for a
+        # local `_MAIN_LEG_CORE = {...}`, but that set was deliberately MOVED to
+        # core/agent_tools.py as MAIN_LEG_CORE_TOOLS, "beside
+        # build_core_tool_closures() that produces the closures, so the two legs
+        # agree by construction" (its own comment).  reuse_recipe.py has ZERO
+        # mentions of _MAIN_LEG_CORE at HEAD and in the working tree, so the
+        # guard could only ever fail — it was watching a symbol that no longer
+        # exists, not detecting drift.  Assert the invariant at its real home,
+        # and that the main leg still registers the FILTERED slice.
+        from core.agent_tools import MAIN_LEG_CORE_TOOLS
+        # SUBSET, not equality (relaxed 2026-09-10).  The invariant this guard
+        # exists for is that the _MAIN_LEG_CORE -> MAIN_LEG_CORE_TOOLS migration
+        # LOST NOTHING; an assertEqual also forbids ever ADDING a main-leg tool,
+        # which is a feature, not drift.  It fired on the book-navigation tools
+        # (integrations/learning/book_tools.py) — a legitimate new capability,
+        # not a regression of the migration.  Dropping a migrated name still
+        # fails here, which is the case that actually breaks REUSE.
+        self.assertLessEqual(MIGRATED, set(MAIN_LEG_CORE_TOOLS),
+                             "a MIGRATED tool was dropped from "
+                             "MAIN_LEG_CORE_TOOLS — the main leg would silently "
+                             "stop registering it")
         src = _REUSE.read_text(encoding='utf-8')
-        m = re.search(r'_MAIN_LEG_CORE\s*=\s*\{([^}]*)\}', src)
-        self.assertIsNotNone(m, "_MAIN_LEG_CORE filter set missing")
-        names = set(re.findall(r"'([^']+)'", m.group(1)))
-        self.assertEqual(names, MIGRATED)
-        self.assertIn("in _MAIN_LEG_CORE], helper, assistant)", src)
+        self.assertIn("register_core_tools(main_leg_core_tools(core_tools), "
+                      "helper, assistant", src,
+                      "main leg must register the FILTERED factory slice — "
+                      "registering the full list would put every closure, "
+                      "including ones no action asked for, on every agent")
 
     # ── behavioral effect guards ──────────────────────────────────────
     # These CALL the factory closures and observe the effect; a source
@@ -96,7 +116,7 @@ class ReuseMainCoreFactory(unittest.TestCase):
                 self._target(*self._args, **self._kwargs)
 
     def _factory_tools(self, memory_graph=None, simplemem_store=None,
-                       helper_fun=None, send1=None):
+                       helper_fun=None, send1=None, agent_data=None):
         from unittest import mock as _m
         from core.agent_tools import build_core_tool_closures
         ctx = {k: None for k in (
@@ -104,7 +124,9 @@ class ReuseMainCoreFactory(unittest.TestCase):
             'request_id_list', 'recent_file_id', 'scheduler',
             'send_message_to_user1', 'retrieve_json', 'strip_json_values',
             'save_conversation_db')}
-        ctx.update(user_id=1, prompt_id='p1', agent_data={}, user_prompt='s1',
+        ctx.update(user_id=1, prompt_id='p1',
+                   agent_data=agent_data if agent_data is not None else {},
+                   user_prompt='s1',
                    request_id_list={'s1': 'r1'},
                    memory_graph=memory_graph, simplemem_store=simplemem_store,
                    helper_fun=helper_fun or _m.Mock(),
@@ -156,6 +178,104 @@ class ReuseMainCoreFactory(unittest.TestCase):
                                    helper_fun=mock.Mock(**{'save_agent_data_to_file.return_value': True}))
         self.assertEqual(bare['get_data_by_key']('never.stored'),
                          'Key not found in stored data.')
+
+    def test_get_through_a_non_dict_is_a_miss_not_an_exception(self):
+        """#98, central 2026-09-13: a hive reuse turn asked for a nested key
+        under a None value, and get_data_by_key raised TypeError out of the
+        tool instead of falling back the way a missing key does."""
+        from unittest import mock
+        stored = {'p1': {'user': None, 'name': 'Ada', 'tags': ['a', 'b']}}
+        bare = self._factory_tools(memory_graph=None, agent_data=stored)
+        for path in ('user.color', 'name.first', 'tags.first'):
+            self.assertEqual(bare['get_data_by_key'](path),
+                             'Key not found in stored data.', path)
+        graph = mock.Mock()
+        graph.recall.return_value = [SimpleNamespace(content='teal-from-graph')]
+        tools = self._factory_tools(memory_graph=graph, agent_data=stored)
+        self.assertEqual(tools['get_data_by_key']('user.color'),
+                         'teal-from-graph')
+        graph.recall.assert_called_with('[KV] user.color', mode='text', top_k=1)
+
+    # ── #104: a tool result cannot carry a whole store ────────────────
+    # Live on central 2026-09-14: save_data_in_memory returned the agent's
+    # whole data store on every call, the group chat wrote each return back
+    # as a memory, and search_long_term_memory joined such rows into one
+    # 3,386,616-char result. Every call to the hosted model was then a bare
+    # 400 until the loop-break marked the action done.
+
+    def _big_store(self):
+        return {'p1': {'hive': {'history': ['cycle %d steady' % i
+                                            for i in range(20000)]}}}
+
+    def test_save_reports_the_save_not_the_store(self):
+        from unittest import mock
+        from core.constants import TOOL_OBSERVATION_MAX_CHARS
+        helper = mock.Mock(**{'save_agent_data_to_file.return_value': True})
+        tools = self._factory_tools(helper_fun=helper,
+                                    agent_data=self._big_store())
+        self.assertEqual(tools['save_data_in_memory']('user.color', 'teal'),
+                         'Saved at user.color: "teal"')
+        big_value = tools['save_data_in_memory']('hive.note', 'x' * 50000)
+        # The save check reads the value back whole; a paged read-back would
+        # make every long save report a failure.
+        self.assertTrue(big_value.startswith('Saved at hive.note'), big_value[:80])
+        self.assertLessEqual(len(big_value), TOOL_OBSERVATION_MAX_CHARS + 100)
+
+    def test_a_long_value_is_read_a_page_at_a_time(self):
+        """#104 review: a long saved string has no narrower key, so the reply
+        is one page and names the offset of the next; the pages add up to the
+        whole value."""
+        from core.constants import TOOL_OBSERVATION_MAX_CHARS as page
+        value = ''.join(chr(97 + i % 26) for i in range(2 * page + 500))
+        tools = self._factory_tools(
+            memory_graph=None, agent_data={'p1': {'notes': {'long': value}}})
+        read = tools['get_data_by_key']
+        first = read('notes.long')
+        self.assertIn(f'offset={page}', first)
+        second = read('notes.long', offset=page)
+        self.assertIn(f'offset={2 * page}', second)
+        last = read('notes.long', offset=2 * page)
+        self.assertNotIn('offset=', last)
+        pages = [first.split('\n...[')[0], second.split('\n...[')[0], last]
+        self.assertEqual(''.join(pages), value)
+        small = self._factory_tools(
+            memory_graph=None, agent_data={'p1': {'user': {'color': 'teal'}}})
+        self.assertEqual(small['get_data_by_key']('user.color'), 'teal')
+
+    def test_graph_recall_is_bounded_and_skips_rows_from_before_the_cap(self):
+        from unittest import mock
+        from core.constants import (MEMORY_ITEM_MAX_CHARS,
+                                    TOOL_OBSERVATION_MAX_CHARS)
+        legacy = "{'hive': {'scheduler': " + 'x' * MEMORY_ITEM_MAX_CHARS
+        graph = mock.Mock()
+        graph.recall.return_value = [
+            SimpleNamespace(content=legacy),
+            SimpleNamespace(content='threat pattern A'),
+            SimpleNamespace(content='y' * (2 * TOOL_OBSERVATION_MAX_CHARS))]
+        tools = self._factory_tools(memory_graph=graph)
+        out = tools['search_long_term_memory']('prior threat patterns')
+        self.assertTrue(out.startswith('threat pattern A'), out[:80])
+        self.assertNotIn("{'hive'", out)
+        self.assertLessEqual(len(out), TOOL_OBSERVATION_MAX_CHARS + 50)
+
+    def test_simplemem_recall_cuts_its_answer_rather_than_skipping_it(self):
+        """SimpleMem returns an answer, not a stored row, so a long one is cut
+        to the observation budget; skipping it made the tool report 'No
+        relevant memories found' (#104 review)."""
+        from core.constants import MEMORY_ITEM_MAX_CHARS, TOOL_OBSERVATION_MAX_CHARS
+        answer = 'The prior threat patterns were ' + 'y' * MEMORY_ITEM_MAX_CHARS
+
+        async def _search(query):
+            return [SimpleNamespace(content=answer),
+                    SimpleNamespace(content='fact B')]
+
+        async def _add(content, meta):
+            return None
+        tools = self._factory_tools(
+            simplemem_store=SimpleNamespace(search=_search, add=_add))
+        out = tools['search_long_term_memory']('q')
+        self.assertTrue(out.startswith('The prior threat patterns were'), out[:60])
+        self.assertLessEqual(len(out), TOOL_OBSERVATION_MAX_CHARS)
 
     def test_send_message_to_user_blocks_agent_mentions(self):
         """The absorbed reuse guard, proven by calling: '@helper' text

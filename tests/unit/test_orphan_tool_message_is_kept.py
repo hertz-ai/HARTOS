@@ -40,6 +40,7 @@ before changing it.
 
     python -m pytest tests/unit/test_orphan_tool_message_is_kept.py --noconftest -q
 """
+import ast
 import os
 import re
 
@@ -67,14 +68,21 @@ class TestTheAliasingContract:
         """If this ever becomes a deep copy, STEP 1 silently loses the repair.
 
         The copy is established just ABOVE the `# STEP 1` comment, so this
-        reads the enclosing method rather than the STEP 1 block.
+        reads the enclosing method rather than the STEP 1 block.  Located by
+        class: helper.py has other apply_transform methods (the context
+        limiters above ToolMessageHandler), and a first-match regex read one
+        of those instead.
         """
         with open(_SRC, encoding='utf-8') as fh:
             src = fh.read()
-        m = re.search(r"def apply_transform\(self.*?\n(?=\s{4}def |\nclass )",
-                      src, re.DOTALL)
-        assert m, 'apply_transform not found'
-        body = m.group(0)
+        body = next(
+            (ast.get_source_segment(src, fn)
+             for cls in ast.walk(ast.parse(src))
+             if isinstance(cls, ast.ClassDef) and cls.name == 'ToolMessageHandler'
+             for fn in cls.body
+             if isinstance(fn, ast.FunctionDef) and fn.name == 'apply_transform'),
+            None)
+        assert body, 'ToolMessageHandler.apply_transform not found'
         assert 'processed_messages = messages.copy()' in body, (
             'STEP 1 relies on a SHALLOW copy: the repair travels to the caller '
             'by mutating shared dicts. Change this and the three repair lines '

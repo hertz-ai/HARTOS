@@ -3,7 +3,6 @@ HARTSocial - Flask Blueprint API
 ~82 REST endpoints at /api/social.
 Compatible with both Nunba web app and HART React Native CommunityView.
 """
-import json
 import os
 import logging
 from flask import Blueprint, request, jsonify, g
@@ -155,28 +154,37 @@ def get_me():
     return _ok(g.user.to_dict(include_token=False))
 
 
-# ─── Hevolve bridge (trust-on-first-use) ───
+# ─── Hevolve bridge ───
 
 @social_bp.route('/auth/link-hevolve', methods=['POST'])
 @rate_limit('auth')
 def link_hevolve():
-    """Exchange a Hevolve-OTP-verified identity for a HARTOS-native token.
+    """Exchange a Hevolve login for a HARTOS-native token.
 
-    The Hevolve access_token (from Hevolve_Database's /data/login +
-    /data/varify_otp) is an opaque OAuth2 client_credentials string with
-    no embedded claims — HARTOS can't validate it directly. Rather than
-    build a second, independent verification path, this endpoint trusts
-    the client's claimed identity (the client only reaches this call
-    after Hevolve OTP verification already succeeded) and finds-or-
-    creates the matching SocialUser by email — the one field both the
-    legacy `user` table (email_address, required+unique) and SocialUser
-    (email, unique) share — then hands back a normal HARTOS JWT for all
-    subsequent /api/social/* calls. Idempotent: repeat calls with the
-    same email return the same SocialUser with a fresh token.
+    The caller proves the email with the Hevolve access token its OTP login
+    returned (Hevolve_Database's /data/login + /data/varify_otp), sent as
+    ``Authorization: Bearer <token>``.  The token is opaque, so Kong is asked
+    which account minted it (kong_identity.email_for_token), and only that
+    account's email is linked.  The matching SocialUser is found or created
+    by email, the one field both the legacy `user` table (email_address,
+    required+unique) and SocialUser (email, unique) share, and a normal
+    HARTOS JWT comes back for all subsequent /api/social/* calls.
+    Idempotent: repeat calls with the same email return the same SocialUser
+    with a fresh token.
+
+    It used to take the body's email on trust ("the client only reaches this
+    call after Hevolve OTP verification already succeeded"), which is true of
+    an honest client and of nobody else: any caller could POST an existing
+    user's email and get that user's JWT, carrying that user's role, from the
+    public internet on central.  Creating an account needs the same proof,
+    because an account made under someone else's email is the same takeover
+    once they link to it.  A node without Kong (a desktop) can prove no email
+    and refuses every call.
     """
     import re
     import secrets
     from .auth import generate_jwt, generate_api_token
+    from .kong_identity import email_for_token
 
     data = _get_json()
     email = (data.get('email') or '').strip().lower()
@@ -185,6 +193,16 @@ def link_hevolve():
 
     if not email:
         return _err("email required")
+
+    auth_header = request.headers.get('Authorization', '')
+    hevolve_token = (auth_header[7:].strip()
+                     if auth_header.startswith('Bearer ') else '')
+    if not hevolve_token or email_for_token(hevolve_token) != email:
+        # WARNING, not INFO: central logs nothing below it after boot, and a
+        # refusal here is the only trace of someone trying another's email.
+        logger.warning("link-hevolve refused: no Hevolve token proving the "
+                       "email was presented")
+        return _err("A Hevolve access token for this email is required", 401)
 
     db = get_db()
     try:
@@ -445,33 +463,40 @@ def verify_user_for_node():
 @social_bp.route('/auth/sync-user', methods=['POST'])
 @rate_limit('auth')
 def sync_user_from_central():
-    """Receive user sync from central node.
+    """Receive a user-profile sync from a peer node.
 
-    Requires a valid hive token with node_sig verification.
-    The calling node must present its Ed25519 public key for verification.
+    The sender proves its identity the SAME way /api/social/hierarchy/sync
+    does: it signs ``{node_id, user_data}`` and the receiver verifies the
+    signature against the sender's REGISTERED PeerNode.public_key
+    (discovery._sender_signature_valid, strict — never a key from the
+    request), regardless of enforcement mode.
+
+    #59 (2026-09-14): this route used to verify a hive token against a
+    ``node_public_key`` taken FROM THE BODY, so any caller could sign with
+    their own key, send that key alongside, pass verification, and
+    create/overwrite ANY user — including one with role 'central', which
+    passes require_admin — from the open internet (/api/social/ is
+    gate-exempt).  It is the orphaned twin of hierarchy_sync (the live sync
+    path); 0 calls in 52 days of central nginx logs.  A synced profile never
+    confers a privileged role (_handle_sync_user drops central/regional/
+    admin/moderator).
     """
     data = _get_json()
-    token = ''
-    auth_header = request.headers.get('Authorization', '')
-    if auth_header.startswith('Bearer '):
-        token = auth_header[7:]
-
-    node_public_key = data.get('node_public_key', '')
     user_data = data.get('user_data', {})
+    if not user_data:
+        return _err("user_data required")
 
-    if not token or not node_public_key or not user_data:
-        return _err("token, node_public_key, and user_data required")
-
-    # Verify the hive token from the calling node
-    from .auth import verify_hive_jwt
-    payload = verify_hive_jwt(token, node_public_key)
-    if not payload:
-        return _err("Invalid hive token or node signature", 401)
-
-    # Process the user sync
+    from .discovery import _sender_signature_valid
+    from .sync_engine import SyncEngine
     try:
-        from .sync_engine import SyncEngine
         with db_session() as db:
+            if not _sender_signature_valid(db, data):
+                # WARNING, not INFO: central logs nothing below it after boot,
+                # and a refusal here is the only trace of a spoof attempt.
+                logger.warning(
+                    "sync-user refused: no signature from a known peer "
+                    "(node_id=%s)", data.get('node_id'))
+                return _err("unverified node identity", 401)
             SyncEngine._handle_sync_user(db, user_data)
         return _ok({'synced': True})
     except Exception as e:
@@ -1359,20 +1384,8 @@ def create_user_agent(user_id):
         agent.settings = dict(agent.settings or {}, personality=data['personality'])
     if data.get('skills'):
         agent.settings = dict(agent.settings or {}, skill_tags=data['skills'])
-    # Persist voice_profile on the dedicated column (schema v37+).  Accept both
-    # dict and JSON-string shapes — canonicalise to dict so downstream TTS
-    # callers get a consistent type.
-    vp_raw = data.get('voice_profile')
-    if vp_raw is not None:
-        if isinstance(vp_raw, str):
-            try:
-                vp_raw = json.loads(vp_raw)
-            except (ValueError, TypeError):
-                # Keep raw string under a 'preset' key so the TTS engine can
-                # still resolve it as an engine preset name.
-                vp_raw = {'preset': vp_raw}
-        if isinstance(vp_raw, dict):
-            agent.voice_profile = vp_raw
+    # A body's `voice_profile` is ignored: an agent's voice is its avatar's
+    # recorded voice (core/teacher_avatar.py), never a per-agent profile.
     g.db.flush()
     g.db.commit()
     return _ok(agent.to_dict(include_token=True), status=201)

@@ -719,8 +719,10 @@ class TestDrainWithWaves(unittest.TestCase):
         mock_resp.json.return_value = {'response': 'OK'}
 
         call_count = {'n': 0}
+        request_ids = []
         def mock_post(*args, **kwargs):
             call_count['n'] += 1
+            request_ids.append(kwargs['json'].get('request_id'))
             return mock_resp
 
         with patch('integrations.agent_engine.dispatch.pooled_post',
@@ -735,6 +737,12 @@ class TestDrainWithWaves(unittest.TestCase):
         self.assertIsNotNone(result)
         # 3 instructions → 3 separate /chat calls (not 1 batch)
         self.assertEqual(call_count['n'], 3)
+        # Each HTTP turn declares itself daemon work, so the create pipeline
+        # runs it AUTONOMOUS instead of asking a user who is not there (#97).
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+        self.assertTrue(all(request_ids), request_ids)
+        self.assertFalse(any(is_genuine_user_request(r) for r in request_ids),
+                         request_ids)
 
     def test_drain_sequential_waves_in_order(self):
         """Dependent instructions dispatch in dependency order."""

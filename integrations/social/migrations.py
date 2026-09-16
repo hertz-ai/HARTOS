@@ -844,6 +844,10 @@ def run_migrations():
         # endpoint accepted `voice_profile` in the request body but silently
         # dropped it because the User model had no column for it.  Adds a
         # JSON column (TEXT-backed on SQLite) so voice presets round-trip.
+        # Retired since: nothing spoke from it, and a voice belongs to the
+        # avatar (core/teacher_avatar.py).  The column is no longer mapped
+        # and a later release drops it; this step stays so schema versions
+        # keep meaning the same thing on every node.
         logger.info("HevolveSocial: migrating to v37 (User.voice_profile column)")
         with engine.connect() as conn:
             try:

@@ -20,6 +20,50 @@ logger = logging.getLogger('hevolve.vlm.local_loop')
 # Max iterations to prevent infinite loops (same safeguard as OmniParser)
 MAX_ITERATIONS = 30
 
+# What the route the safety denylist FORCES actually costs, in iterations.
+# The denylist refuses interpreter one-liners (python -c, perl -e, ...) and
+# _VLM_ACTION_LIST tells the model the sanctioned alternative is write_file
+# the script, then shell it.  Walked perfectly that is:
+#     1 refused one-liner, 2 write_file, 3 shell, 4 done
+# `done` costs an iteration of its own (it yields a `completion`, not an
+# action) — pinned by test_loop_exits_on_done / test_loop_3_iterations.
+_DENYLIST_RECOVERY_ITERATIONS = 4
+
+# Slack the original clamp already granted, in its own words: "gives one
+# nudge-retry + one followup if the click misses".  For a click (route length
+# 1) that produced the historical 3.  Applying the SAME policy to a route of
+# length 4 is what makes 6 a consequence of the existing rule rather than a
+# tuning knob — see test_the_margin_is_the_original_authors_not_mine.
+_SINGLE_SHOT_RECOVERY_MARGIN = 2
+
+
+def _route_iteration_budget(route, requested):
+    """Iterations to allow for *route*, given the caller's *requested* budget.
+
+    Routing may LOWER a caller's ceiling, never raise it — the functional
+    tests drive this loop with max_iterations=1 and 5 to pin specific control
+    flow, and raising those would silently invalidate them.
+
+    Only a POSITIVELY-matched route is clamped.  `single_shot` is
+    route_task's default fall-through, not a verdict that the task is one
+    click, so it gets the floor the forced route needs rather than a
+    click-sized budget.  Live 2026-09-10 (agent 18088688973, action 2) both
+    "Execute the following sequence of commands:" and "Run the following
+    Python script ... and report ..." fell through to single_shot, were
+    capped at 3, and exited exit_reason=max_iterations — the tool then
+    returned a TOOL_FAILURE_RESULTS string and the fabrication gate
+    correctly refused the action.  Iteration 2 of the second run DID
+    write_file correctly; the budget died one step later.
+    """
+    if route == 'enumerate':
+        # parse_and_reason snapshot — no follow-up iteration needed.
+        return min(requested, 1)
+    if route == 'single_shot':
+        return min(requested,
+                   _DENYLIST_RECOVERY_ITERATIONS + _SINGLE_SHOT_RECOVERY_MARGIN)
+    # multi_step, and any verdict route_task gains later: never over-cap.
+    return requested
+
 # Action list — single source of truth for both the legacy SYSTEM_PROMPT
 # and the unified-mode combined_prompt. Keeping one string means the
 # legacy OmniParser path and the unified Qwen3-VL path can never drift
@@ -34,6 +78,11 @@ _VLM_ACTION_LIST = (
     "apps (command='notepad'), opening files in specific apps "
     "(command='notepad hello.txt'), running git/npm/python, file ops, etc. "
     "Put the full command in the 'command' field.\n"
+    "      REFUSED by the safety denylist, do NOT emit them: interpreter "
+    "one-liners — python -c, perl -e, ruby -e, node -e, powershell -enc. "
+    "For scripted work, write_file the script to disk first, then shell it "
+    "(command='python my_script.py'). Live 2026-09-09 every python -c the "
+    "model tried was refused, and 3 refusals abort the whole action.\n"
     "    * open_file_gui: open a file or app in the OS default handler. "
     "Put the target in the 'path' field (e.g. path='notepad' or "
     "path='C:\\\\Users\\\\foo\\\\doc.pdf').\n"
@@ -167,7 +216,104 @@ def list_active_sessions() -> list:
         return [tuple(k.split(':', 1)) for k in _vlm_stop_flags.keys()]
 
 
+def _notify_desktop_indicator(show: bool, text: str = None) -> None:
+    """Show or hide Nunba's AI-control ribbon (desktop/indicator_window.py).
+
+    Nunba shows the ribbon from its /execute route, which only the http tier
+    calls.  The inprocess tier drives pyautogui directly, so a run could type
+    and click with nothing on screen saying the AI was in control: on
+    2026-09-13 the audit log holds 2,660 VLM actions and gui_app.log holds no
+    "Ribbon indicator shown" line.  A show request also re-arms the ribbon's
+    15 s inactivity timer, so the loop sends one before every action.
+
+    ``text`` says what the AI is doing now (the step's action and reasoning,
+    _step_caption); the ribbon shows it beside its timer.  Without it the
+    ribbon could only say THAT the AI was in control, and the owner watching
+    the screen had no idea what it was trying to do.
+
+    Best effort, and only inside Nunba: standalone HARTOS has no ribbon, and
+    a refused localhost connect costs seconds on Windows.
+    """
+    try:
+        from core.config_cache import is_bundled, _local_base
+        if not is_bundled():
+            return
+        from core.http_pool import pooled_get
+        pooled_get(f"{_local_base()}/indicator/{'show' if show else 'hide'}",
+                   timeout=2, params={'text': text} if text else None)
+    except Exception as e:
+        logger.debug(f"AI-control ribbon {'show' if show else 'hide'} "
+                     f"skipped: {e}")
+
+
+def _step_caption(action_json: dict, limit: int = 160) -> str:
+    """One line a person can read: the step's action, then why.
+
+    The VLM answers with 'Next Action' (e.g. "left_click", "type") and
+    'Reasoning' (its own words, e.g. "Open Settings from the Start menu").
+    The reasoning is what tells the owner what is happening, so it comes
+    first; the bare action name is kept as a tail for steps with no
+    reasoning.
+    """
+    reasoning = ' '.join(str(action_json.get('Reasoning') or '').split())
+    action = ' '.join(str(action_json.get('Next Action') or '').split())
+    if reasoning and action and action.lower() != 'none':
+        line = f"{reasoning} ({action})"
+    else:
+        line = reasoning or action
+    return line if len(line) <= limit else line[:limit - 1].rstrip() + '…'
+
+
 def run_local_agentic_loop(
+    message: dict,
+    tier: str,
+    max_iterations: int = MAX_ITERATIONS
+) -> dict:
+    """Ask the owner first, then drive the loop as the agent that asked.
+
+    Nothing asked before an agent took this machine's mouse, keyboard and
+    shell: live 2026-09-14 the loop wrote C:\\Users\\Public\\
+    search_llm_config.py and ran it for agent 88659566083.
+    integrations.vlm.safety.computer_control_block gets the owner's answer
+    first; a refusal returns exit_reason='consent_required' before any
+    screenshot, action or AI-control ribbon.
+
+    While the loop runs, this thread's prompt_id is the run's agent, and the
+    caller's value comes back after, even when the loop raises.  The shell
+    action inside the run reaches hart_intelligence_entry.
+    _handle_shell_command_tool on this same thread and checks that agent;
+    hartos.threadlocal is a threading.local(), and nothing sets prompt_id on
+    autogen's worker threads.
+
+    Arguments and return shape: _drive_local_agentic_loop below.
+    """
+    from integrations.vlm.safety import computer_control_block
+    from hartos.threadlocal import thread_local_data
+
+    prompt_id = message.get('prompt_id', '')
+    started = time.time()
+    refusal = computer_control_block(prompt_id)
+    if refusal is not None:
+        logger.warning(
+            f"VLM loop not started (user={message.get('user_id', '')}, "
+            f"prompt={prompt_id}): {refusal}")
+        return {
+            "status": "incomplete",
+            "exit_reason": "consent_required",
+            "extracted_responses": [
+                {"type": "error", "content": refusal, "iteration": 0}],
+            "execution_time_seconds": time.time() - started,
+        }
+
+    prior_prompt_id = thread_local_data.get_prompt_id()
+    thread_local_data.set_prompt_id(prompt_id)
+    try:
+        return _drive_local_agentic_loop(message, tier, max_iterations)
+    finally:
+        thread_local_data.set_prompt_id(prior_prompt_id)
+
+
+def _drive_local_agentic_loop(
     message: dict,
     tier: str,
     max_iterations: int = MAX_ITERATIONS
@@ -242,15 +388,11 @@ def run_local_agentic_loop(
     try:
         if qwen3vl is not None:
             _route = qwen3vl.route_task(instruction or enhanced)
-            logger.info(f"VLM loop route_task: '{instruction[:60]}' → {_route}")
-            if _route == 'single_shot' and max_iterations > 3:
-                # Cap at 3 — gives one nudge-retry + one followup
-                # if the click misses without burning the full budget.
-                max_iterations = 3
-            elif _route == 'enumerate' and max_iterations > 1:
-                # Enumerate = parse_and_reason snapshot, no follow-up
-                # iter needed.
-                max_iterations = 1
+            _budget = _route_iteration_budget(_route, max_iterations)
+            logger.info(
+                f"VLM loop route_task: '{instruction[:60]}' → {_route} "
+                f"(iterations {max_iterations} → {_budget})")
+            max_iterations = _budget
     except Exception as e:
         logger.debug(f'route_task wire-up skipped: {e}')
 
@@ -270,6 +412,18 @@ def run_local_agentic_loop(
     # (no try/finally — the existing iteration body wraps every error
     # in its own try/continue so exceptions never escape this scope).
     _register_session(user_id, prompt_id)
+
+    # Each goal gets its own action budget.  The SessionGuard is one
+    # process-wide object; nothing reset it, so its 100-action cap was spent
+    # by 19:05:24 on 2026-09-13 and every desktop action after that -- 2,506
+    # that day -- was refused.  Resetting here, not at the end, also covers a
+    # previous run that never reached its end.
+    from integrations.vlm.safety import reset_session_guard
+    reset_session_guard()
+    # The task itself is the first thing the ribbon says; each step's
+    # caption replaces it below.
+    _notify_desktop_indicator(True, text=_step_caption(
+        {'Reasoning': f"Starting: {instruction}"} if instruction else {}))
 
     for iteration in range(max_iterations):
         # User-requested stop wins over every other exit condition.
@@ -377,8 +531,58 @@ def run_local_agentic_loop(
                             combined_prompt += (
                                 f"Previous action: {last.get('action', '?')} — "
                                 f"{last.get('reasoning', '')[:80]}.\n"
-                                f"Check the screenshot: did it succeed?\n\n"
                             )
+                            # Feed back the action's OWN OUTPUT, not just the
+                            # screenshot.  A DETERMINISTIC action (shell,
+                            # read_file_and_understand, list_folders_and_files)
+                            # writes to stdout and changes NOTHING on screen, so
+                            # "check the screenshot" is unanswerable for it and
+                            # the model concludes the step failed.
+                            #
+                            # Measured live 2026-09-09 03:47:19-39, agent
+                            # 33323830039 whose single action is
+                            # `Get-Content ...\tts_chatterbox_turbo.err -Head 50`:
+                            #   iter 1/3  Action: shell  -> ran, output captured
+                            #   iter 2/3  Action: type   value='Get-Content C:\...'
+                            #   iter 3/3  Action: type   value='Get-Content C:\...'
+                            #   exit_reason=max_iterations, status=incomplete
+                            # i.e. it re-TYPED the command it had already run.
+                            # incomplete -> TOOL_FAILURE_RESULTS -> FAB-GUARD
+                            # unrun -> verifier 'error' -> the user was told
+                            # "All tool execution attempts have consistently
+                            # failed" about work that had already succeeded.
+                            #
+                            # The value was ALWAYS captured — see the
+                            # extracted_responses append below, which stores
+                            # result.get('output') — it was simply never shown
+                            # to the model.  This reads that existing field; it
+                            # adds no new state and no second feedback channel.
+                            _prev_out = str(last.get('result', '') or '')
+                            if last.get('ok') is False:
+                                # A refused or failed action: say so, with the
+                                # reason, instead of sending the model to a
+                                # screenshot on which nothing happened.
+                                combined_prompt += (
+                                    "That action did NOT run successfully:\n"
+                                    f"{_prev_out[:1500]}\n"
+                                    "Do not repeat it unchanged.\n\n"
+                                )
+                            elif _prev_out.strip():
+                                combined_prompt += (
+                                    "Output of that action (this is the REAL "
+                                    "result — trust it over the screenshot, "
+                                    "which will not show it):\n"
+                                    f"{_prev_out[:1500]}\n"
+                                    "If this output already satisfies the task, "
+                                    'reply "Next Action": "None", '
+                                    '"Status": "DONE" and put the answer in '
+                                    '"Reasoning". Do NOT re-run or re-type it.'
+                                    "\n\n"
+                                )
+                            else:
+                                combined_prompt += (
+                                    "Check the screenshot: did it succeed?\n\n"
+                                )
                     combined_prompt += (
                         _VLM_ACTION_LIST +
                         "\n"
@@ -553,8 +757,14 @@ def run_local_agentic_loop(
                         pass
                 else:
                     action_json['coordinate'] = None
+                    # shell carries 'command' and open_file_gui 'path', not
+                    # 'value' -- logging only 'value' printed value='' for
+                    # every shell action and read as an empty command.
+                    _shown = (action_json.get('value')
+                              or action_json.get('command')
+                              or action_json.get('path') or '')
                     logger.info(f"Action: {next_action} "
-                                f"value='{action_json.get('value', '')[:50]}'")
+                                f"value='{str(_shown)[:50]}'")
 
                 parsed = {'screen_info': '', 'parsed_content_list': []}
             else:
@@ -601,10 +811,19 @@ def run_local_agentic_loop(
             from core.config_cache import env_flag as _env_flag
             _safety_on = _env_flag('HEVOLVE_VLM_LOOP_SAFETY', True)
             _verify_on = _env_flag('HEVOLVE_VLM_LOOP_VERIFY', False)
+            _notify_desktop_indicator(True, text=_step_caption(action_json))
             result = execute_action(
                 action_payload, tier,
                 safety=_safety_on, verify=_verify_on)
-            action_ok = result.get('status') != 'error'
+            # A result carrying an error did not happen on the machine: the
+            # safety guard refused it (status 'safety_blocked') or the
+            # executor failed ({'error': ...}, often with no status).  Both
+            # used to count as ok, and the reason went with the empty output.
+            _err = result.get('error')
+            action_ok = result.get('status') != 'error' and not _err
+            _out = result.get('output', '') or ''
+            if _err:
+                _out = (f"{_out}\n" if _out else '') + f"FAILED: {_err}"
             if action_ok:
                 consecutive_action_errors = 0
             else:
@@ -623,7 +842,7 @@ def run_local_agentic_loop(
                 "content": {
                     "action": next_action,
                     "reasoning": action_json.get('Reasoning', ''),
-                    "result": result.get('output', ''),
+                    "result": _out,
                     "ok": action_ok,
                     "coordinate": action_json.get('coordinate'),
                     "_strategy": action_json.get('_strategy', 'inline_prompt'),
@@ -666,6 +885,7 @@ def run_local_agentic_loop(
     # Drop this session's stop flag so the registry doesn't grow
     # across runs.  Pairs with _register_session above.
     _unregister_session(user_id, prompt_id)
+    _notify_desktop_indicator(False)
 
     # status mirrors exit_reason: only 'done' is a real success. Callers
     # (LangChain router, autogen) can inspect exit_reason to craft an honest
@@ -873,8 +1093,18 @@ def _build_action_payload(action_json: dict, parsed_screen: dict) -> dict:
     # Pass through extra keys for file/shell operations. 'command' is for
     # the 'shell' action and 'path' covers 'open_file_gui' — both already
     # live in SUPPORTED_ACTIONS so _execute_inprocess handles them natively.
+    # 'Reasoning' rides along because the SAFETY GUARDS read it:
+    # local_computer_tool._check_destructive_window_mismatch refuses an
+    # alt+f4/ctrl+w aimed at a window the reasoning did not name, and
+    # _check_reasoning_mismatch annotates softer disagreements.  Both
+    # were measured INERT on 2026-09-10 (0 firings while 54 alt+f4
+    # executed) because this builder dropped the field -- the model
+    # emits it, the loop reads it at :629/:673/:711, and only this
+    # hand-off lost it.  Guarded by
+    # tests/unit/test_vlm_destructive_window_guard.py
+    # ::TestTheReasoningReachesTheGuardOnTheLivePath.
     for key in ('path', 'source_path', 'destination_path', 'content',
-                'duration', 'command'):
+                'duration', 'command', 'Reasoning'):
         if key in action_json:
             payload[key] = action_json[key]
 

@@ -1340,6 +1340,72 @@ def hierarchy_node_assignment(node_id):
         db.close()
 
 
+def _sender_signature_valid(db, data: dict) -> bool:
+    """STRICT node-identity check: True ONLY when ``data`` carries a node_id +
+    signature that verifies against a peer's REGISTERED PeerNode.public_key,
+    looked up by the DECLARED node_id (or the legacy key-prefix fallback, which
+    still resolves to a key ALREADY ON FILE).  Never trusts a key from the
+    request, and has NO enforcement-mode escape.
+
+    Two policies over one verify: _verify_sync_sender layers the migration
+    escape (apply unsigned/invalid under non-hard enforcement) on top of this
+    for hierarchy_sync's un-upgraded senders.  A route that CREATES or
+    AUTHORIZES — /api/social/auth/sync-user (#59, an admin-takeover: a synced
+    user can be role 'central' which passes require_admin) — calls THIS
+    directly, so a soft/warn node cannot be spoofed by an unsigned or forged
+    batch.  The signed/verified surface excludes only 'signature'
+    (node_integrity.canonical_payload); keep the payload otherwise clean or
+    update _signed_send_payload in lockstep."""
+    from .models import PeerNode
+    node_id = data.get('node_id')
+    sig = data.get('signature', '')
+    if not node_id or not sig:
+        return False
+    try:
+        from security.node_integrity import verify_json_signature
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        pk = getattr(peer, 'public_key', None) if peer else None
+        if not peer:
+            # LEGACY SENDERS (delete once the fleet has rolled past the
+            # 2026-08-08 identity unification): before that fix, sync stamped
+            # node_id = get_public_key_hex()[:16] — a public-key PREFIX —
+            # while PeerNode keys on the gossip UUID, so the exact lookup
+            # missed for every node.  An un-upgraded peer still declares the
+            # prefix, so resolve it to the peer whose registered public_key
+            # STARTS WITH it.  This proves exactly as much as the modern path:
+            # the signature is still verified against a key ALREADY ON FILE,
+            # never one from the request — it just finds the row a second way.
+            if len(node_id) == 16 and all(
+                    c in '0123456789abcdef' for c in node_id.lower()):
+                peer = db.query(PeerNode).filter(
+                    PeerNode.public_key.startswith(node_id)).first()
+                pk = getattr(peer, 'public_key', None) if peer else None
+                if pk:
+                    logger.info(
+                        "sync sender: resolved legacy key-prefix sender "
+                        "%s -> node %s", node_id, peer.node_id)
+        if pk:
+            if verify_json_signature(pk, data, sig):
+                return True
+            # "Resolved but wrong key" is a COMPLETELY different fault from
+            # "unknown sender"; a node whose keypair moved lands HERE.
+            logger.warning(
+                "sync sender: node_id=%s resolved to peer %s, but the batch "
+                "signature does NOT match the public_key on file (%s...) — "
+                "signing with a DIFFERENT keypair than is registered",
+                node_id, getattr(peer, 'node_id', '?'), str(pk)[:16])
+        else:
+            logger.warning(
+                "sync sender: NO peer row resolves node_id=%s (tried exact, "
+                "then the legacy key-prefix branch) — sender unknown, cannot "
+                "verify", node_id)
+    except Exception:
+        logger.warning(
+            "sync sender: verification RAISED for node_id=%s — treating as "
+            "unverified", node_id, exc_info=True)
+    return False
+
+
 def _verify_sync_sender(db, data: dict) -> bool:
     """P4 node-identity gate for hierarchy_sync — central must know WHICH node
     sent a batch before applying it (closes the unauthenticated-ingress IDOR).
@@ -1348,68 +1414,15 @@ def _verify_sync_sender(db, data: dict) -> bool:
     against the node's registered PeerNode.public_key) always passes. An
     unsigned/invalid batch passes ONLY when enforcement mode is not 'hard'
     (a non-breaking migration path for un-upgraded nodes), logging a warning.
-    'hard' mode requires a valid signature — fail-closed."""
-    from .models import PeerNode
-    node_id = data.get('node_id')
-    sig = data.get('signature', '')
-    if node_id and sig:
-        try:
-            from security.node_integrity import verify_json_signature
-            # The signed/verified surface is EXACTLY {items, node_id}: the node
-            # signs it pre-E2E and decrypt_json_from_peer pops _provenance back
-            # off before we see `data`. Any key added to `data` before this
-            # verify would break every signature — keep the decrypted payload
-            # clean, or update _signed_send_payload in lockstep.
-            peer = db.query(PeerNode).filter_by(node_id=node_id).first()
-            pk = getattr(peer, 'public_key', None) if peer else None
-            if not peer:
-                # LEGACY SENDERS (delete once the fleet has rolled past the
-                # 2026-08-08 identity unification): before that fix, sync
-                # stamped node_id = get_public_key_hex()[:16] — a public-key
-                # PREFIX — while PeerNode keys on the gossip UUID.  The lookup
-                # above therefore missed for every node, and hard enforcement
-                # turned that into a fleet-wide 403 (measured: 65 dead rows
-                # here, central holding our correct key on the UUID row the
-                # whole time).  An un-upgraded peer still declares the prefix,
-                # so resolve it by the only thing it can mean: the peer whose
-                # registered public_key STARTS WITH that prefix.  This proves
-                # exactly as much as the modern path — the signature is still
-                # verified against a key we already had on file — it just
-                # finds the row a second way.
-                if len(node_id) == 16 and all(
-                        c in '0123456789abcdef' for c in node_id.lower()):
-                    peer = db.query(PeerNode).filter(
-                        PeerNode.public_key.startswith(node_id)).first()
-                    pk = getattr(peer, 'public_key', None) if peer else None
-                    if pk:
-                        logger.info(
-                            "hierarchy_sync: resolved legacy key-prefix "
-                            "sender %s -> node %s", node_id, peer.node_id)
-            if pk:
-                if verify_json_signature(pk, data, sig):
-                    return True
-                # "Resolved but wrong key" is a COMPLETELY different fault from
-                # "unknown sender", and until 2026-08-08 both produced the same
-                # opaque 403.  A node whose keypair moved (the CWD-relative
-                # key-dir split) lands HERE, not in the else-branch — say so.
-                logger.warning(
-                    "hierarchy_sync: node_id=%s resolved to peer %s, but the "
-                    "batch signature does NOT match the public_key on file "
-                    "(%s...) — the sender is signing with a DIFFERENT keypair "
-                    "than this node has registered for it",
-                    node_id, getattr(peer, 'node_id', '?'), str(pk)[:16])
-            else:
-                logger.warning(
-                    "hierarchy_sync: NO peer row resolves node_id=%s (tried "
-                    "exact node_id, then the legacy key-prefix branch) — the "
-                    "sender is unknown to this node, cannot verify",
-                    node_id)
-        except Exception:
-            logger.warning(
-                "hierarchy_sync: sender verification RAISED for node_id=%s — "
-                "treating as unverified", node_id, exc_info=True)
+    'hard' mode requires a valid signature — fail-closed.
+
+    The signature check itself is _sender_signature_valid (strict, shared with
+    the sync-user route); this function adds ONLY the migration escape."""
+    if _sender_signature_valid(db, data):
+        return True
     # No valid signature. Apply ONLY outside hard enforcement (migration path).
     # If the mode can't be determined, fail closed — this module's whole job.
+    node_id = data.get('node_id')
     try:
         from security.master_key import get_enforcement_mode
         mode = get_enforcement_mode()

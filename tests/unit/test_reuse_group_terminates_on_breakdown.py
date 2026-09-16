@@ -112,6 +112,129 @@ class TestPredicateIsBehaviourallyTestable:
             {'name': 'ChatInstructor', 'content': 'TERMINATE'}) is True
 
 
+class TestUserFacingAnswerEndsTheRound:
+    """The answer is round-terminal for the SAME reason a verdict is.
+
+    Measured live 2026-09-09, agent 33323830039, installed build.  The
+    synthesis steer (#799/D33) asked the group for the user-facing answer and
+    the group PRODUCED it:
+
+        04:38:12  last json as {'message2userfinal': "The chatterbox_turbo
+                  worker startup failure has been diagnosed... The directory
+                  check confirmed the existence of the 'Nunba' folder..."}
+
+    — a real answer, grounded in the `dir` output its own tool had returned.
+    Then the round kept going for four more turns (Assistant <-> StatusVerifier
+    at 04:38:23 / :27 / :32 / :36 / :40 / :43) and ended on a verdict, so:
+
+        04:38:48  [SYNTHESIS] round returned (23 -> 23 msgs);
+                  still control JSON: True
+
+    and the user received the StatusVerifier verdict instead of the answer.
+    The answer was TALKED OVER.  The next drive was worse: the round budget
+    ran out first (04:50:52 while1 exhausted), get_agent_response returned '',
+    and Nunba's empty-reply check fell through to the tool-less raw-llama tier
+    (chatbot_routes.py:3346, source='llama_local') which answered the goal from
+    training data — a 5,078-char essay diagnosing the agent from its NAME.
+
+    get_agent_response ALREADY treats message2userfinal as turn-ending: its
+    in-loop branch unwraps it and returns it as the reply.  It only ever sees
+    it when the answer happens to be messages[-1] at the moment initiate_chat
+    returns.  Making the predicate terminal on it is not a new rule — it is the
+    existing rule, applied at the point that decides when the loop looks.
+
+    Population check before widening (all retained server.log*, 2026-09-09):
+    382 'inside reuse while1' rounds against 18 'GOT message2userfinal in
+    message' events, in two clusters.  The key is rare and deliberate, so
+    ending the round on it does not truncate ordinary multi-action work.
+    """
+
+    # Verbatim shape of the 04:38:12 message, as the manager receives it.
+    LIVE_ANSWER = {
+        'name': 'Assistant',
+        'content': ('{"message2userfinal": "The chatterbox_turbo worker '
+                    'startup failure has been diagnosed. The directory check '
+                    'confirmed the existence of the \'Nunba\' folder."}'),
+    }
+
+    def test_terminates_on_user_facing_answer(self):
+        """The measured defect. RED before the fix."""
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        assert rr._reuse_group_terminate(self.LIVE_ANSWER) is True, (
+            'the answer the group produced at 04:38:12 did not end the round, '
+            'so four more turns overwrote it and the user got the verdict')
+
+    def test_terminates_when_answer_is_addressed_to_user(self):
+        """The '@user {...}' form the extractor's regex fallback expects."""
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        assert rr._reuse_group_terminate(
+            {'name': 'Assistant',
+             'content': '@user {"message2userfinal": "12 entries."}'}) is True
+
+    def test_case_is_not_load_bearing(self):
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        assert rr._reuse_group_terminate(
+            {'name': 'Assistant',
+             'content': '{"Message2UserFinal": "done"}'}) is True
+
+    def test_non_final_message2_does_not_end_the_round(self):
+        """Anti-vacuity: message2 is an interim note, not the final answer.
+
+        Ending the round on it would cut off an action that is still working —
+        the same mistake 'pending' is excluded for above.
+        """
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        assert rr._reuse_group_terminate(
+            {'name': 'Assistant',
+             'content': '{"message2": "still working on it"}'}) is False
+
+    def test_the_steer_itself_does_not_end_the_round(self):
+        """The steer NAMES the key; it is an instruction, not an answer.
+
+        This is not hypothetical.  _REUSE_SYNTHESIS_STEER carries the example
+        `{"message2userfinal": "<your answer here>"}`, and the live log shows
+        the pipeline's own parser reading it as a message2userfinal object:
+
+            04:37:58  last json as {'message2userfinal': '<your answer here>'}
+                      for session: 6c2dc0fc-..._33323830039
+
+        A predicate that ended the round on any parsed message2userfinal would
+        therefore terminate on the steer itself and hand the user the literal
+        string "<your answer here>".  Two independent guards below.
+        """
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        assert rr._reuse_group_terminate(
+            {'name': 'ChatInstructor',
+             'content': 'Reply with {"message2userfinal": "<your answer here>"}'
+                        ' — put the real answer in it.'}) is False
+
+    def test_placeholder_value_is_not_an_answer(self):
+        """Guard 1, name-independent: a <...> value is a template, not text."""
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        assert rr._reuse_group_terminate(
+            {'name': 'Assistant',
+             'content': '{"message2userfinal": "<your answer here>"}'}) is False
+
+    def test_empty_answer_is_not_an_answer(self):
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        assert rr._reuse_group_terminate(
+            {'name': 'Assistant',
+             'content': '{"message2userfinal": "   "}'}) is False
+
+    def test_the_initiators_own_voice_is_never_an_answer(self):
+        """Guard 2, structural: ChatInstructor is the harness's voice.
+
+        Every steering message in this file enters the group as ChatInstructor
+        (its three sites say so explicitly).  Whatever it carries is an
+        instruction to the group, so it can never be the group's answer.
+        """
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        assert rr._reuse_group_terminate(
+            {'name': 'ChatInstructor',
+             'content': '{"message2userfinal": "a fully formed sentence."}'}
+        ) is False
+
+
 class TestFailsClosed:
 
     def test_malformed_message_does_not_terminate(self):

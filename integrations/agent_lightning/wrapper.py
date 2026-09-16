@@ -39,6 +39,58 @@ def _is_recoverable_generation_failure(exc) -> bool:
     return isinstance(exc, openai.APIStatusError) and exc.status_code >= 500
 
 
+def _describe_llm_failure(exc) -> str:
+    """The failure, with the endpoint it happened on.
+
+    Sibling of ``_is_recoverable_generation_failure``: that one reads the
+    exception's CLASS to decide what to do, this one reads its IDENTITY to
+    say what happened.  Both exist because ``str(exc)`` is not enough.
+
+    ``openai.APIConnectionError``'s message is the constant string
+    ``"Connection error."`` — the SDK raises it as
+    ``APIConnectionError(request=request) from err`` for ANY failure inside
+    ``httpx.send``, so the two facts that identify it live on the object and
+    never in its message:
+
+        exc.request.url   the endpoint that was dialled
+        exc.__cause__     the real error, e.g. WinError 10061 / a closed client
+
+    Measured 2026-09-09: eleven generations failed in one reuse drive and all
+    eleven logged only ``Connection error.``, on a box with two live LLM
+    endpoints (:5000, :8080) and two dead ones (:8081, :6777).  "the expert
+    tier answered 5xx" and "we dialled a dead port" want opposite fixes and
+    were indistinguishable.  model_registry.py:515 records the same chain
+    costing a live investigation on 2026-09-03.
+
+    Endpoint FIRST so it survives the callers' truncation.  Never raises: it
+    runs inside ``except`` on the chat hot path, where a throwing formatter
+    would turn a recoverable generation failure into a crash.
+    """
+    parts = []
+    try:
+        url = getattr(getattr(exc, 'request', None), 'url', None)
+        if url:
+            parts.append('endpoint=%s' % (url,))
+    except Exception:
+        pass
+    try:
+        msg = str(exc)
+    except Exception:
+        msg = ''
+    parts.append(msg or type(exc).__name__)
+    try:
+        cause = exc.__cause__
+        if cause is not None:
+            ctext = str(cause)
+            # A 5xx already carries its status and body in `msg`; only append
+            # a cause that says something the message does not.
+            if ctext and ctext not in msg:
+                parts.append('cause=%s: %s' % (type(cause).__name__, ctext))
+    except Exception:
+        pass
+    return ' | '.join(parts)
+
+
 class AgentLightningWrapper:
     """
     Wraps an AutoGen agent with Agent Lightning instrumentation
@@ -173,7 +225,7 @@ class AgentLightningWrapper:
                 return result
 
             except Exception as e:
-                logger.error(f"Error in generate_reply: {e}")
+                logger.error("Error in generate_reply: %s", _describe_llm_failure(e))
 
                 # Track failure
                 if self.tracer and span_id:
@@ -217,7 +269,7 @@ class AgentLightningWrapper:
                             "[LLM-GEN-FAIL] %s (attempt %d/%d) — re-sampling "
                             "generate_reply. Error: %s",
                             type(_last_exc).__name__, _attempt, _GEN_RETRIES,
-                            str(_last_exc)[:200])
+                            _describe_llm_failure(_last_exc)[:400])
                         try:
                             _retry_result = original_func(*args, **kwargs)
                             logger.info(
@@ -258,7 +310,8 @@ class AgentLightningWrapper:
                         "retries (%s: %s).  Returning the fallback reply "
                         "instead of propagating, to avoid lifecycle FSM "
                         "churn.", _GEN_RETRIES,
-                        type(_last_exc).__name__, str(_last_exc)[:300])
+                        type(_last_exc).__name__,
+                        _describe_llm_failure(_last_exc)[:400])
                     return (
                         "I had trouble getting a usable response from the "
                         "model for that step.  Could you rephrase the request, "
@@ -306,7 +359,7 @@ class AgentLightningWrapper:
                 return result
 
             except Exception as e:
-                logger.error(f"Error in tool execution: {e}")
+                logger.error("Error in tool execution: %s", _describe_llm_failure(e))
 
                 # Negative reward for tool failure
                 if self.reward_calculator:
@@ -401,9 +454,9 @@ def instrument_autogen_agent(
     agent_id: str,
     track_rewards: bool = True,
     auto_trace: bool = True
-) -> AgentLightningWrapper:
+) -> Any:
     """
-    Convenience function to instrument an AutoGen agent
+    Instrument an AutoGen agent in place and return the SAME agent.
 
     Args:
         agent: AutoGen agent
@@ -412,18 +465,33 @@ def instrument_autogen_agent(
         auto_trace: Enable automatic tracing
 
     Returns:
-        Wrapped agent
+        ``agent`` itself, with its generate_reply / _execute_function traced.
+        Never the AgentLightningWrapper.
+
+    The wrapper patches the agent's own methods (_wrap_agent_methods), so the
+    tracing lives on the agent and the patched methods keep the wrapper alive.
+    Returning the wrapper put a proxy into the GroupChat of both callers
+    (create_recipe, reuse_recipe).  AutoGen keys each peer's message buffer by
+    agent identity; the proxy forwards send() to the real agent, so the
+    manager filed every reply under the real agent while run_chat read
+    last_message(proxy) -- the manager's own broadcast to the proxy -- and
+    logged that as the agent's turn.  Measured 2026-09-13 (CREATE, agent
+    87400889007): 25 "Execute Action" dispatches, 24 logged back as the
+    Assistant's reply; replaying one logged request returned a tool call twice
+    and new prose once, so the model never echoed.  Guarded by
+    tests/unit/test_lightning_instrumented_agent_speaks_as_itself.py.
     """
     if not is_enabled():
         logger.info("Agent Lightning disabled, returning unwrapped agent")
         return agent
 
-    return AgentLightningWrapper(
+    AgentLightningWrapper(
         agent=agent,
         agent_id=agent_id,
         track_rewards=track_rewards,
         auto_trace=auto_trace
     )
+    return agent
 
 
 __all__ = [

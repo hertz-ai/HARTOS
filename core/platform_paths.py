@@ -88,6 +88,19 @@ def get_agent_data_dir() -> str:
     return os.path.join(get_db_dir(), 'agent_data')
 
 
+def get_uploads_dir() -> str:
+    """Return the uploads/ directory: user-uploaded files and what is derived
+    from them (book page images).
+
+    The bundled desktop serves this same directory at /uploads/<path> (Nunba's
+    serve_upload resolves NUNBA_DATA_DIR, else this module's get_data_dir), so
+    a file written here is reachable on the desktop the moment it exists; a
+    node without Nunba serves the book images itself
+    (integrations/learning/api_books.py).
+    """
+    return os.path.join(get_data_dir(), 'uploads')
+
+
 # ── Social secret key (.social_secret_key) ───────────────────────
 # SINGLE SOURCE for where the persisted HS256 social/JWT secret lives.
 # The WRITER (integrations.social.auth) creates+persists it; the READER

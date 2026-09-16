@@ -13,6 +13,7 @@ Usage:
     backend = get_vision_backend()
     description = backend.describe(frame_bytes)
 """
+import functools
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -53,11 +54,12 @@ class VisionBackend(AutoReportSubsystemFailures, ABC):
     SUBSYSTEM = 'vlm'
     # Methods whose escaping exceptions auto-feed the self-heal pipe.
     # `start` is the primary failure surface (model load); `describe`
-    # is the runtime synth surface (OOM, dispatch fail); `stop` is
-    # included so an unload that hangs doesn't go silent.  Adding new
-    # methods to a concrete backend (e.g. `embed`) just needs the
-    # method name in this tuple — no per-backend except-block edits.
-    AUTO_REPORTED_METHODS = ('start', 'describe', 'stop')
+    # and `read_document` are the runtime synth surfaces (OOM, dispatch
+    # fail); `stop` is included so an unload that hangs doesn't go
+    # silent.  Adding new methods to a concrete backend (e.g. `embed`)
+    # just needs the method name in this tuple — no per-backend
+    # except-block edits.
+    AUTO_REPORTED_METHODS = ('start', 'describe', 'read_document', 'stop')
 
     @property
     @abstractmethod
@@ -93,6 +95,26 @@ class VisionBackend(AutoReportSubsystemFailures, ABC):
         """
         pass
 
+    def read_document(self, image_bytes: bytes, prompt: str) -> Optional[str]:
+        """Read everything on a document page -- a book page, a scan: its
+        text, layout, tables and figures, in the shape the prompt asks for.
+
+        Not a caption. The page goes at a size its text can be read at, and
+        the answer can run to thousands of tokens. The default is None: this
+        backend cannot read a page (a classifier, a caption-only model, no
+        model at all), and the caller falls back to what it has -- the book
+        pipeline reads the page's own text layer.
+
+        Args:
+            image_bytes: the page, as JPEG/PNG bytes
+            prompt: what to extract, and in what shape
+
+        Returns:
+            The model's answer ('' when it answered with nothing), or None
+            when this backend cannot read a page or could not be reached.
+        """
+        return None
+
     def start(self) -> bool:
         """Initialize the backend model. Returns True if ready."""
         return True
@@ -100,6 +122,88 @@ class VisionBackend(AutoReportSubsystemFailures, ABC):
     def stop(self):
         """Release resources."""
         pass
+
+
+#: A page's long side, in pixels, when a VLM reads it. Measured 2026-09-14 on
+#: Qwen3.5-0.8B with a dense page of 45 lines of 11 pt text: every line came
+#: back verbatim at 1280 px, as at the full 2200 px render, from 1570 prompt
+#: tokens instead of 3987 -- less of the server's context for one page.
+PAGE_LONG_SIDE = 1280
+#: A page's answer budget. The book page prompt asks for the text and then for
+#: every element of it again, as JSON: the same 45-line page ran past 2048
+#: tokens, and the cut-off JSON came back as prose.
+PAGE_MAX_TOKENS = 4096
+
+
+def _page_jpeg(image_bytes: bytes) -> bytes:
+    """The page as JPEG bytes, no longer than PAGE_LONG_SIDE on its long side."""
+    import io
+    from PIL import Image
+    img = Image.open(io.BytesIO(image_bytes))
+    if max(img.size) > PAGE_LONG_SIDE:
+        scale = PAGE_LONG_SIDE / max(img.size)
+        img = img.resize((round(img.width * scale), round(img.height * scale)),
+                         Image.LANCZOS)
+    buf = io.BytesIO()
+    img.convert('RGB').save(buf, 'JPEG', quality=85)
+    return buf.getvalue()
+
+
+def _read_page_with(completions_url: str, image_bytes: bytes, prompt: str, *,
+                    model: str, headers: Optional[dict] = None) -> Optional[str]:
+    """The one page-reading request to an OpenAI-compatible vision server.
+
+    Thinking is off (core.constants.LLM_THINKING_OFF_KWARGS): a hybrid
+    reasoning model otherwise spends its budget in reasoning_content and
+    answers with nothing. pooled_post admits the call through the priority
+    scheduler, so a page read by a background parse waits behind the user's
+    own turn. Never raises: a page the model does not read, the caller reads
+    from somewhere else.
+    """
+    import base64
+    from core.constants import LLM_THINKING_OFF_KWARGS
+    from core.http_pool import LLM_COMPLETION_TIMEOUT
+    try:
+        b64 = base64.b64encode(_page_jpeg(image_bytes)).decode('ascii')
+    except Exception as e:
+        logger.warning(f"page image could not be prepared for the VLM: {e}")
+        return None
+    body = {
+        'model': model,
+        'messages': [{'role': 'user', 'content': [
+            {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{b64}'}},
+            {'type': 'text', 'text': prompt},
+        ]}],
+        'chat_template_kwargs': dict(LLM_THINKING_OFF_KWARGS),
+        'max_tokens': PAGE_MAX_TOKENS,
+        'temperature': 0.3,
+    }
+    extra = {'headers': headers} if headers else {}
+    try:
+        resp = pooled_post(completions_url, json=body,
+                           timeout=LLM_COMPLETION_TIMEOUT, **extra)
+    except Exception as e:
+        logger.warning(f"page read failed at {completions_url}: {e}")
+        return None
+    if resp.status_code != 200:
+        logger.warning(f"page read at {completions_url} returned HTTP "
+                       f"{resp.status_code}: {resp.text[:200]}")
+        return None
+    try:
+        choice = (resp.json().get('choices') or [{}])[0]
+    except (ValueError, AttributeError) as e:
+        logger.warning(f"page read at {completions_url} answered with no usable JSON: {e}")
+        return None
+    message = choice.get('message') or {}
+    content = (message.get('content') or '').strip()
+    if choice.get('finish_reason') == 'length':
+        logger.warning("page read stopped at its %d-token budget: the answer is cut off",
+                       PAGE_MAX_TOKENS)
+    if not content:
+        logger.warning("page read produced EMPTY content (finish_reason=%s, "
+                       "reasoning_content=%d chars)", choice.get('finish_reason'),
+                       len(message.get('reasoning_content') or ''))
+    return content
 
 
 class MiniCPMBackend(VisionBackend):
@@ -371,31 +475,54 @@ class Qwen3VLVisionBackend(VisionBackend):
     def stop(self):
         self._backend = None
 
-    def describe(self, frame_bytes: bytes, prompt: str = '') -> Optional[str]:
+    def _endpoint(self):
+        """The shared Qwen3-VL backend: the same one computer use drives."""
         if self._backend is None:
-            try:
-                from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
-                self._backend = get_qwen3vl_backend()
-            except Exception:
-                return None
+            from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
+            self._backend = get_qwen3vl_backend()
+        return self._backend
+
+    def completions_url(self) -> str:
+        return f'{self._endpoint().base_url.rstrip("/")}/chat/completions'
+
+    def describe(self, frame_bytes: bytes, prompt: str = '') -> Optional[str]:
+        try:
+            endpoint = self._endpoint()
+        except Exception:
+            return None
         try:
             import base64
             b64 = base64.b64encode(frame_bytes).decode('utf-8')
-            return self._backend.describe_scene(
+            return endpoint.describe_scene(
                 b64, prompt or 'Describe what you see in this image.'
             )
         except Exception as e:
             logger.debug(f"Qwen3-VL describe error: {e}")
             return None
 
+    def read_document(self, image_bytes: bytes, prompt: str) -> Optional[str]:
+        """A page, through the same Qwen3-VL endpoint describe() uses, with
+        the page request (thinking off, a page-sized budget) instead of the
+        scene request."""
+        try:
+            endpoint = self._endpoint()
+            url = self.completions_url()
+        except Exception as e:
+            logger.warning(f"Qwen3-VL unavailable for a page read: {e}")
+            return None
+        return _read_page_with(url, image_bytes, prompt, model=endpoint.model_name,
+                               headers={'Authorization': f'Bearer {endpoint.api_key}'})
+
 
 class Qwen08BBackend(VisionBackend):
     """Qwen3.5-0.8B — fast continuous captioning (1s/frame).
 
-    Runs on a dedicated llama-server instance (port 8081 by default),
-    separate from the 4B model used for computer use / action planning.
+    Runs on a dedicated llama-server instance (its port from
+    core.port_registry, 'vlm_caption'), separate from the 4B model used for
+    computer use / action planning.
 
-    Purpose: always-on frame captioning → FrameStore activity table.
+    Purpose: always-on frame captioning → FrameStore activity table, and
+    reading document pages (read_document) for the book pipeline.
     NOT for computer use (use 4B Qwen3VLVisionBackend for that).
 
     Model: Qwen3.5-0.8B-UD-Q4_K_XL.gguf (~558MB) + mmproj-F16.gguf (~195MB)
@@ -689,6 +816,18 @@ class Qwen08BBackend(VisionBackend):
             logger.debug(f"Qwen08B describe error: {e}")
         return None
 
+    def read_document(self, image_bytes: bytes, prompt: str) -> Optional[str]:
+        """A page, through the caption server: the same lazy start and port
+        as describe(), none of its caption shrink (512x288 at 100 tokens is
+        far too little to read a page)."""
+        import time
+        if not self._ensure_running():
+            return None
+        self._last_describe_time = time.time()
+        return _read_page_with(
+            f'http://127.0.0.1:{self._port}/v1/chat/completions', image_bytes, prompt,
+            model='local')
+
 
 class NoneBackend(VisionBackend):
     """No-op backend — FrameStore only, zero overhead."""
@@ -804,6 +943,39 @@ def get_vision_backend(name: str = '') -> VisionBackend:
         return minicpm
 
     return NoneBackend()
+
+
+def get_document_readers() -> list:
+    """How this node reads a document page, best first: each is
+    read(image_bytes, prompt) -> Optional[str], and a page goes to the next
+    when one does not answer.
+
+    First the node's vision backend -- get_vision_backend(), the one camera,
+    screen and media captions use -- when it can read a page at all. Then the
+    node's own main model (core.port_registry.get_local_llm_url), which read
+    every book page before 2026-09-14: a node whose vision backend cannot
+    read a page (MiniCPM, MobileVLM, CLIP, none), or whose caption server
+    does not answer, reads no fewer pages than it did. The fallback is always
+    this node's own model, never a configured remote endpoint.
+    """
+    readers = []
+    node = get_vision_backend()
+    if type(node).read_document is not VisionBackend.read_document:
+        readers.append(node.read_document)
+    try:
+        from core.port_registry import get_local_llm_url
+        main_url = get_local_llm_url().rstrip('/') + '/chat/completions'
+    except Exception as e:
+        logger.warning(f"the main model's address is unknown; pages have no fallback: {e}")
+        return readers
+    if isinstance(node, Qwen3VLVisionBackend):
+        try:
+            if node.completions_url() == main_url:
+                return readers          # its VLM endpoint IS the main model
+        except Exception as e:
+            logger.debug(f"Qwen3-VL endpoint unresolved: {e}")
+    readers.append(functools.partial(_read_page_with, main_url, model='qwen'))
+    return readers
 
 
 def list_available_backends():

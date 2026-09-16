@@ -171,3 +171,59 @@ class TestNodeCapabilities:
         with patch.dict('sys.modules', {'security.system_requirements': mock_mod}):
             resp = client.get('/api/social/node/capabilities')
         assert resp.status_code == 503
+class TestDashboardHealthCarriesTheGovernor:
+    """The governor's mode decides whether ANY background work runs.
+
+    _proactive_check_tasks returns immediately unless MODE_IDLE, and the
+    dispatch yield gate closes below a 0.3 throttle (ACTIVE is 0.05). So when
+    a node quietly does nothing, the mode is the first thing worth reading.
+
+    Until now nothing served it. On the box 2026-09-07 the agent daemon logged
+    "yield gate has blocked on 'governor_throttle' for 12204s" every 30s -- the
+    entire boot -- and working out why took ten passes of inference from
+    outside the process, because the value itself was exposed nowhere. These
+    pin the one call that answers it.
+    """
+
+    def test_health_reports_the_governor_mode(self, client):
+        gov = MagicMock()
+        gov.get_stats.return_value = {
+            'mode': 'active', 'throttle': 0.05,
+            'cpu_total': 0.71, 'cpu_own': 0.27, 'cpu_external': 0.44,
+        }
+        with patch('core.resource_governor.get_governor', return_value=gov):
+            r = client.get('/api/social/dashboard/health')
+        assert r.status_code == 200
+        g = json.loads(r.data)['data']['governor']
+        assert g['mode'] == 'active'
+        assert g['throttle'] == 0.05
+
+    def test_it_carries_the_attribution_that_explains_the_mode(self, client):
+        """mode alone says WHAT; the cpu split says WHY. ACTIVE is reached
+        either because a user is present or because EXTERNAL cpu crossed the
+        backoff line, and only the split tells them apart."""
+        gov = MagicMock()
+        gov.get_stats.return_value = {
+            'mode': 'idle', 'throttle': 1.0,
+            'cpu_total': 0.30, 'cpu_own': 0.25, 'cpu_external': 0.05,
+        }
+        with patch('core.resource_governor.get_governor', return_value=gov):
+            r = client.get('/api/social/dashboard/health')
+        g = json.loads(r.data)['data']['governor']
+        for k in ('cpu_total', 'cpu_own', 'cpu_external'):
+            assert k in g, 'the attribution must ride along, not just the mode'
+
+    def test_a_governor_that_never_started_says_so(self, client):
+        with patch('core.resource_governor.get_governor', return_value=None):
+            r = client.get('/api/social/dashboard/health')
+        assert json.loads(r.data)['data']['governor']['mode'] == 'not_started'
+
+    def test_a_raising_governor_degrades_like_its_neighbours(self, client):
+        """The watchdog and world-model blocks above never take the endpoint
+        down; neither may this one. A health endpoint that 500s is useless
+        exactly when it is needed."""
+        with patch('core.resource_governor.get_governor',
+                   side_effect=RuntimeError('boom')):
+            r = client.get('/api/social/dashboard/health')
+        assert r.status_code == 200
+        assert json.loads(r.data)['data']['governor']['mode'] == 'unavailable'

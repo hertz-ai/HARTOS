@@ -229,7 +229,76 @@ def _goal_ledger_grounding(goal_id):
         return None
 
 
-def _settle_dispatched_goal(db, goal, goal_key):
+_ESCALATION_KEYS = ('action_id', 'action', 'user_prompt', 'prompt_id', 'flow')
+
+
+def _escalation_model_config(db, goal):
+    """``(config_list, parked)`` for a goal whose stuck action is handed to
+    the expert (#106d); ``(None, False)`` for every other goal.
+
+    The escalation names the expert by model_id.  Its entry, which can hold a
+    hive peer's token, is looked up here for this one dispatch and is never
+    written or logged.  An expert that is no longer registered (Claude Code
+    logged out, the peer gone) cannot take the turn, so the action goes to a
+    person through escalate_goal and ``parked`` is True.
+    """
+    esc = (goal.config_json or {}).get('escalation') or {}
+    if esc.get('next') != 'expert':
+        return None, False
+    from .model_registry import model_registry
+    backend = model_registry.get_model(esc.get('expert') or '')
+    if backend is not None and backend.is_dispatchable():
+        return backend.to_config_list(), False
+    from .goal_manager import GoalManager
+    GoalManager.escalate_goal(db, goal.id, dict(
+        {k: esc.get(k) for k in _ESCALATION_KEYS},
+        reason=f"the expert model {esc.get('expert')} is no longer available",
+        tried=['local']))
+    return None, True
+
+
+def _action_banked(esc) -> bool:
+    """True when the escalated action's recipe exists: the file the create
+    loop's AUTO-ADVANCE and trace bank write when a step is done."""
+    try:
+        from hartos.helper import safe_prompt_path
+        return os.path.exists(safe_prompt_path(
+            esc['prompt_id'], esc['flow'], esc['action_id']))
+    except Exception:
+        return False
+
+
+def _settle_expert_turn(db, goal, served) -> bool:
+    """Judge the expert's turn on the action it was handed (#106d).
+
+    Dispatch is synchronous, so by now the turn has run.  Only the escalation
+    that turn served is judged: one created during the turn (the expert
+    finished that action and a later one got stuck) has its own 'at' and
+    waits for its own expert turn.  Returns True when the goal was parked for
+    a person, so there is nothing more to settle.
+    """
+    cfg = dict(goal.config_json or {})
+    esc = cfg.get('escalation') or {}
+    if esc.get('next') != 'expert' or esc.get('at') != served.get('at'):
+        return False
+    # Done means the recipe was banked.  That is as strong as the banking and
+    # no stronger: a placeholder recipe also reads as done (#107).
+    if _action_banked(esc):
+        cfg.pop('escalation', None)
+        goal.config_json = cfg
+        logger.info(f"Goal {goal.id}: the expert model finished action "
+                    f"{esc.get('action_id')}")
+        return False
+    from .goal_manager import GoalManager
+    GoalManager.escalate_goal(db, goal.id, dict(
+        {k: esc.get(k) for k in _ESCALATION_KEYS},
+        reason='the expert model did not finish it', tried=['local']))
+    logger.info(f"Goal {goal.id}: the expert model did not finish action "
+                f"{esc.get('action_id')}; handed to a person")
+    return True
+
+
+def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None):
     """The ONE completion gate every dispatched goal must pass through.
 
     Dispatch-style-independent by construction: it re-reads the goal from
@@ -260,6 +329,23 @@ def _settle_dispatched_goal(db, goal, goal_key):
       noop                  — no new spark at all; unchanged 5-strike pause
     Continuous goals still never auto-complete.
     """
+    # MERGE, never blind-write, the config this tick staged before the
+    # dispatch.  The tick copied config_json and added spark_at_dispatch
+    # before handing the goal off, and the dispatch can itself write the row:
+    # the create loop parks a goal whose action it cannot finish, with the ask
+    # in config (#106).  Flushing the tick's pre-dispatch copy would erase that
+    # ask and its pause_reason, leaving a paused goal whose reason nobody can
+    # read.  So re-read what is committed and carry over only the key this
+    # tick owns.
+    _staged = dict(goal.config_json or {})
+    try:
+        db.refresh(goal, ['config_json', 'status'])
+        _latest = dict(goal.config_json or {})
+        if 'spark_at_dispatch' in _staged:
+            _latest['spark_at_dispatch'] = _staged['spark_at_dispatch']
+        goal.config_json = _latest
+    except Exception:
+        goal.config_json = _staged   # no second read: keep the tick's copy
     # FLUSH BEFORE REFRESH.  refresh() expires the instance and reloads it
     # from the database, which silently discards every UN-FLUSHED pending
     # change on it -- here, the last_dispatched_at stamp and the
@@ -283,6 +369,18 @@ def _settle_dispatched_goal(db, goal, goal_key):
         db.refresh(goal)
     except Exception:
         pass  # refresh failure → fall through to attribute read
+    # Settle only a goal that is still active.  One parked during the dispatch
+    # (the create loop escalating a stuck action, the budget gate, the owner's
+    # pause) keeps that state and its reason: completing it here would record
+    # work nobody verified, and a noop strike would overwrite the pause_reason
+    # the owner or the co-pilot has to read (#106).
+    if getattr(goal, 'status', 'active') != 'active':
+        logger.info(f"Goal {goal_key} is {goal.status} after its dispatch; "
+                    f"leaving it as it is")
+        return
+    # A turn handed to the expert settles that action first (#106d).
+    if served_escalation and _settle_expert_turn(db, goal, served_escalation):
+        return
     # COPY, never mutate-in-place.  config_json is a plain JSON column, not a
     # MutableDict: mutating the dict the attribute already holds and assigning
     # that same object back compares equal at flush time, so the column is
@@ -548,7 +646,13 @@ class AgentDaemon:
                 user_id = str(goal.user_id) if hasattr(goal, 'user_id') else 'system'
                 result = dispatch_goal(
                     task.description, user_id, goal_id, goal_type)
-                return {'success': result is not None, 'response': result}
+                if result is None:
+                    # parallel_dispatch marks the task FAILED with this error.
+                    from .dispatch import dispatch_failure_reason
+                    return {'success': False, 'response': None,
+                            'error': dispatch_failure_reason(goal_id)
+                            or 'dispatch returned no response'}
+                return {'success': True, 'response': result}
 
             result = dispatch_parallel_tasks(
                 ledger, _dispatch_task, max_concurrent=batch_count)
@@ -721,19 +825,39 @@ class AgentDaemon:
             except Exception as e:
                 logger.debug(f"Proactive hive: task protocol check failed: {e}")
 
-            # If idle and tasks exist, auto-dispatch to local Claude hive session
+            # OBSERVE the backlog. Do NOT claim to dispatch it.
+            #
+            # This block used to import `get_blueprint` -- a Flask blueprint
+            # factory, the wrong symbol entirely -- never call it, and then log
+            # "auto-dispatching task to local hive session" once per task.
+            # Nothing was dispatched by it, ever. The log asserted an action
+            # that did not happen, which is worse than silence: it made the
+            # queue look serviced while every task sat at `pending`, and it is
+            # the same fabrication shape as the copilot two-executor problem.
+            #
+            # Dispatch has exactly ONE driver, and it is not here:
+            # ResourceGovernor._proactive_check_tasks calls
+            # HiveTaskDispatcher.dispatch_pending() on its own timer
+            # (TASK_CHECK_INTERVAL, 600s +/-50%, so a 300s floor, re-armed on
+            # every non-IDLE iteration). Calling dispatch_pending() from here as
+            # well would make the daemon a SECOND scheduler for the same queue.
+            # How responsive hive dispatch should be is a scheduling decision
+            # about the hive, so it belongs to whoever owns that lane, not to a
+            # log line that was pretending the problem was already solved.
+            #
+            # What this block is for now is telling the truth about the backlog,
+            # which is what makes a stuck queue visible at all.
             if pending_tasks:
+                oldest = ''
                 try:
-                    from integrations.coding_agent.claude_hive_session import get_blueprint
-                    for task in pending_tasks[:3]:  # Max 3 tasks per exploration
-                        task_desc = getattr(task, 'description', '') or str(task)
-                        logger.info(
-                            f"Proactive hive: auto-dispatching task to local "
-                            f"hive session: {task_desc[:100]}")
-                except ImportError:
-                    logger.debug("Proactive hive: claude_hive_session not available")
-                except Exception as e:
-                    logger.debug(f"Proactive hive: hive session dispatch failed: {e}")
+                    oldest = getattr(pending_tasks[0], 'description', '') or ''
+                except Exception:
+                    oldest = ''
+                logger.info(
+                    "Proactive hive: %d task(s) waiting in the dispatcher queue; "
+                    "dispatch is driven by ResourceGovernor._proactive_check_tasks, "
+                    "not by this daemon. Oldest: %s",
+                    len(pending_tasks), oldest[:100] or '(no description)')
 
         # ── 2. Self-promotion on benchmark results ──
         try:
@@ -949,7 +1073,12 @@ class AgentDaemon:
             from .outreach_crm_tools import check_pending_followups_daemon
             result = check_pending_followups_daemon()
             if isinstance(result, dict):
-                followups_fired = int(result.get('processed', 0))
+                # 'sent' is the key the producer writes: check_pending_followups_daemon's
+                # only return is {'sent': sent, 'checked_at': ...}
+                # (outreach_crm_tools.py:753), and its sibling consumer at :1740
+                # already reads it.  'processed' is written nowhere, so the log
+                # line below reported 0 flushed follow-ups even when some were.
+                followups_fired = int(result.get('sent', 0))
         except Exception as e:
             logger.debug(
                 "resume_state_once: pending-followup flush skipped: %s", e)
@@ -1528,6 +1657,17 @@ class AgentDaemon:
                         f"resume in {backoff_info['skip_until'] - time.time():.0f}s)")
                     continue
 
+                # A goal whose stuck action is handed to the expert (#106d)
+                # runs one plain turn on that model: no fan-out, no
+                # speculation, judged by the settle below.  If the process
+                # dies between the turn and that settle, the expert gets one
+                # more turn on the next tick, never a false completion.
+                _expert_cfg, _expert_gone = _escalation_model_config(db, goal)
+                if _expert_gone:
+                    continue
+                _served_escalation = ((goal.config_json or {}).get('escalation')
+                                      if _expert_cfg else None)
+
                 # Reserve the agent only now that the goal has cleared every
                 # gate.  Reserving it at selection time meant a goal skipped
                 # afterwards -- above all by build_prompt returning None, which
@@ -1573,7 +1713,7 @@ class AgentDaemon:
                 # dispatching the goal prompt once.  Treated as a handoff
                 # exactly like speculation: truthy result, backoff cleared,
                 # and the completion gate below still judges it.
-                parallel_dispatched = self._try_parallel_dispatch(
+                parallel_dispatched = 0 if _expert_cfg else self._try_parallel_dispatch(
                     goal, idle_agents, dispatched, max_concurrent)
                 if parallel_dispatched > 0:
                     dispatched += parallel_dispatched
@@ -1581,7 +1721,7 @@ class AgentDaemon:
                         _dispatch_backoff.pop(goal_key, None)
                     handed_off = True
                     result = 'parallel-handoff'
-                elif speculative_enabled:
+                elif speculative_enabled and not _expert_cfg:
                     try:
                         from .speculative_dispatcher import get_speculative_dispatcher
                         dispatcher = get_speculative_dispatcher()
@@ -1605,12 +1745,23 @@ class AgentDaemon:
                         pass
 
                 if not handed_off:
-                    result = dispatch_goal(prompt, str(agent['user_id']), goal.id, goal.goal_type)
+                    result = dispatch_goal(
+                        prompt, str(agent['user_id']), goal.id, goal.goal_type,
+                        **({'model_config': _expert_cfg} if _expert_cfg else {}))
                     dispatched += 1
                     self._wd_heartbeat()
 
-                # Track failures for exponential backoff
-                if result is None:
+                # Track failures for exponential backoff.  A reply that SAYS the
+                # action failed — the {"status":"error"} envelope the CREATE
+                # prompt tells the agent to return, or a help pause — is a
+                # failure too, not a success (the same rule the hive worker
+                # applies via HeldForHelp).  Counted as success it cleared the
+                # backoff and, for a continuous goal, re-ran the impossible
+                # action every 5 minutes for five months.
+                from core.agent_tools import is_action_error_reply, is_help_pause
+                _reply_failed = result is not None and (
+                    is_action_error_reply(result) or is_help_pause(result))
+                if result is None or _reply_failed:
                     # dispatch_goal returns None for TRANSIENT defers too (user
                     # actively chatting / Tier-2 breaker open), not just real
                     # failures.  Counting those toward the 5-strike AUTO-PAUSE
@@ -1618,16 +1769,30 @@ class AgentDaemon:
                     # using the machine — the "goals stuck / 0 progress" bug.
                     # Reuse the SAME canonical checks dispatch_goal defers on
                     # (single source — never drifts) and skip without penalty.
-                    try:
-                        from .dispatch import is_transient_deferral
-                        _transient = is_transient_deferral()
-                    except Exception:
-                        _transient = False
+                    # An explicit error reply is never transient: the turn ran.
+                    _transient = False
+                    if result is None:
+                        try:
+                            from .dispatch import is_transient_deferral
+                            _transient = is_transient_deferral()
+                        except Exception:
+                            _transient = False
                     if _transient:
                         logger.debug(
                             f"Goal {goal_key}: transient defer (user active / "
                             f"breaker open) — no backoff, no auto-pause")
                         continue
+                    # Why the turn failed, when it ran, so a paused goal says
+                    # what to fix (a 402 from the hosted LLM, say) instead of
+                    # only counting failures.  An error reply carries its own.
+                    if _reply_failed:
+                        _why = ' '.join(str(result).split())[:200]
+                    else:
+                        try:
+                            from .dispatch import dispatch_failure_reason
+                            _why = dispatch_failure_reason(goal_key)
+                        except Exception:
+                            _why = None
                     with _module_lock:
                         info = _dispatch_backoff.get(goal_key, {'failures': 0})
                         info['failures'] = info.get('failures', 0) + 1
@@ -1642,7 +1807,8 @@ class AgentDaemon:
                         cfg = dict(goal.config_json or {})  # copy: see above
                         cfg['pause_reason'] = (
                             f'Auto-paused: {failure_count} consecutive '
-                            f'dispatch failures')
+                            f'dispatch failures'
+                            + (f' (last: {_why})' if _why else ''))
                         cfg['paused_at'] = datetime.utcnow().isoformat()
                         goal.config_json = cfg
                         logger.warning(
@@ -1664,7 +1830,8 @@ class AgentDaemon:
                     # driving the 500-line _tick, and so no dispatch style can
                     # skip it again (defect (b) was a `continue` doing exactly
                     # that).
-                    _settle_dispatched_goal(db, goal, goal_key)
+                    _settle_dispatched_goal(db, goal, goal_key,
+                                            served_escalation=_served_escalation)
             # ── HITL: notify owners of APPROVAL_REQUIRED tasks ──
             try:
                 for goal in goals:

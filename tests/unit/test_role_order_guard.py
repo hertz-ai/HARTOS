@@ -151,6 +151,193 @@ class RoleOrderGuardTests(unittest.TestCase):
         self.assertIn('part 3', out[1]['content'])
 
 
+class RoleOrderGuardToolResultTests(unittest.TestCase):
+    """A tool RESULT must never be coalesced away.
+
+    The guard already refuses to coalesce a message that CARRIES tool_calls
+    (test_tool_call_carrying_assistants_are_NOT_coalesced, and rule 3 in this
+    module's docstring: "would silently drop the call").  That protects the
+    question.  It never protected the ANSWER: a role='tool' message has no
+    'tool_calls' key, so has_calls is False and two consecutive results fall
+    straight into the same-role merge.
+
+    Measured live 2026-09-07 on the installed build (gui_app.log.1, 104
+    occurrences across two rotations), e.g. 03:47:27 —
+
+        [ROLE-ORDER-GUARD] 34 msgs out of 54 in; ... coalesced 20
+        consecutive same-role pair(s) at 0+1(user), 10+11(tool), 11+12(tool),
+        12+13(tool), 13+14(tool), 14+15(tool), 15+16(tool), ...
+
+    Seven tool results at indices 10-16 collapsed into one message.  The merged
+    message keeps only the FIRST result's tool_call_id, so the other six
+    assistant tool_calls are left unanswered; ToolMessageHandler then stamps
+    HISTORICAL_TOOL_PLACEHOLDER into each empty answer slot (helper.py:1889),
+    the real output is gone from the model's context, and the fabrication guard
+    correctly refuses to count a placeholder as execution.
+
+    Coalescing tool messages was never needed for the guard's stated purpose.
+    The OpenAI alternation rule it exists to satisfy is about user/assistant;
+    consecutive role='tool' messages are REQUIRED — exactly one per tool_call
+    in a parallel-call assistant message.
+    """
+
+    def setUp(self):
+        self._patcher = patch('hartos.helper.current_app', _fake_current_app)
+        self._patcher.start()
+        from hartos.helper import ToolMessageHandler
+        self.handler = ToolMessageHandler(user_tasks=None, user_prompt=None)
+
+    def tearDown(self):
+        self._patcher.stop()
+
+    def test_consecutive_tool_results_are_NOT_coalesced(self):
+        """Two calls, two answers — both must survive with their own id."""
+        messages = [
+            {'role': 'user', 'content': 'do A and B'},
+            {
+                'role': 'assistant', 'content': '',
+                'tool_calls': [
+                    {'id': 'a1', 'type': 'function',
+                     'function': {'name': 'doA', 'arguments': '{}'}},
+                    {'id': 'b1', 'type': 'function',
+                     'function': {'name': 'doB', 'arguments': '{}'}},
+                ],
+            },
+            {'role': 'tool', 'tool_call_id': 'a1', 'content': 'result A'},
+            {'role': 'tool', 'tool_call_id': 'b1', 'content': 'result B'},
+        ]
+        out = self.handler.validate_messages(messages)
+
+        answered = {m.get('tool_call_id') for m in out if m['role'] == 'tool'}
+        self.assertEqual(
+            answered, {'a1', 'b1'},
+            "a tool result was coalesced away — the assistant's tool_call is "
+            "left unanswered and gets a HISTORICAL_TOOL_PLACEHOLDER stamped "
+            "over the real output",
+        )
+        self.assertEqual(len(out), 4)
+
+    def test_seven_tool_results_all_survive(self):
+        """The measured live shape: indices 10-16, seven results, one call
+        each.  Pre-fix this returns a single merged tool message."""
+        messages = [{'role': 'user', 'content': 'go'}]
+        ids = [f'call_{i}' for i in range(7)]
+        messages.append({
+            'role': 'assistant', 'content': '',
+            'tool_calls': [
+                {'id': i, 'type': 'function',
+                 'function': {'name': 'f', 'arguments': '{}'}} for i in ids
+            ],
+        })
+        for i in ids:
+            messages.append(
+                {'role': 'tool', 'tool_call_id': i, 'content': f'output {i}'})
+
+        out = self.handler.validate_messages(messages)
+
+        tool_msgs = [m for m in out if m['role'] == 'tool']
+        self.assertEqual(
+            len(tool_msgs), 7,
+            f"7 tool results in, {len(tool_msgs)} out — the rest were merged "
+            f"into a sibling and their tool_call_ids lost",
+        )
+        self.assertEqual({m['tool_call_id'] for m in tool_msgs}, set(ids))
+        for i in ids:
+            self.assertTrue(
+                any(f'output {i}' in m['content'] for m in tool_msgs),
+                f"real output for {i} did not survive the guard",
+            )
+
+    def test_tool_results_are_not_merged_into_a_neighbouring_role(self):
+        """Narrowing the merge must not push a result into the user or
+        assistant message beside it — the content has to stay addressable
+        by tool_call_id, not just present somewhere in the list."""
+        messages = [
+            {'role': 'user', 'content': 'q'},
+            {
+                'role': 'assistant', 'content': '',
+                'tool_calls': [{'id': 'x1', 'type': 'function',
+                                'function': {'name': 'f', 'arguments': '{}'}}],
+            },
+            {'role': 'tool', 'tool_call_id': 'x1', 'content': 'the answer'},
+            {'role': 'user', 'content': 'next'},
+        ]
+        out = self.handler.validate_messages(messages)
+
+        tool_msgs = [m for m in out if m['role'] == 'tool']
+        self.assertEqual(len(tool_msgs), 1)
+        self.assertEqual(tool_msgs[0]['tool_call_id'], 'x1')
+        self.assertEqual(tool_msgs[0]['content'], 'the answer')
+
+    def test_a_tool_result_reading_TERMINATE_is_not_dropped(self):
+        """Sibling site, same invariant: the stale-TERMINATE drop must skip
+        tool messages.  A result that happens to read TERMINATE is a RESULT,
+        and dropping it orphans its call exactly like coalescing does.
+
+        Not observed in production — pinned here so the invariant holds at
+        both sites rather than only the one that was measured.
+        """
+        messages = [
+            {'role': 'user', 'content': 'run it'},
+            {
+                'role': 'assistant', 'content': '',
+                'tool_calls': [{'id': 't1', 'type': 'function',
+                                'function': {'name': 'f', 'arguments': '{}'}}],
+            },
+            {'role': 'tool', 'tool_call_id': 't1', 'content': 'TERMINATE'},
+            {'role': 'assistant', 'content': 'done'},
+        ]
+        out = self.handler.validate_messages(messages)
+
+        self.assertEqual(
+            [m.get('tool_call_id') for m in out if m['role'] == 'tool'], ['t1'],
+            "the tool result was dropped as a stale control token",
+        )
+
+    def test_a_bare_TERMINATE_from_an_assistant_is_still_dropped(self):
+        """The narrowing must not weaken the drop it was carved out of —
+        a consumed TERMINATE that is NOT a tool result still goes."""
+        messages = [
+            {'role': 'user', 'content': 'go'},
+            {'role': 'assistant', 'content': 'TERMINATE'},
+            {'role': 'user', 'content': 'again'},
+        ]
+        out = self.handler.validate_messages(messages)
+        self.assertNotIn(
+            'TERMINATE', ' '.join(str(m.get('content')) for m in out),
+            "stale TERMINATE drop regressed",
+        )
+
+    def test_user_and_assistant_coalescing_still_happens(self):
+        """The narrowing must be exactly that — the guard's actual purpose
+        (the user/assistant alternation rule that caused the 2026-05-08 400)
+        must be untouched, in the same list that carries a tool result."""
+        messages = [
+            {'role': 'user', 'content': 'first'},
+            {'role': 'user', 'content': 'second'},
+            {
+                'role': 'assistant', 'content': '',
+                'tool_calls': [{'id': 'z1', 'type': 'function',
+                                'function': {'name': 'f', 'arguments': '{}'}}],
+            },
+            {'role': 'tool', 'tool_call_id': 'z1', 'content': 'out'},
+            {'role': 'assistant', 'content': 'part 1'},
+            {'role': 'assistant', 'content': 'part 2'},
+        ]
+        out = self.handler.validate_messages(messages)
+
+        users = [m for m in out if m['role'] == 'user']
+        self.assertEqual(len(users), 1, "user/user coalescing was lost")
+        self.assertIn('first', users[0]['content'])
+        self.assertIn('second', users[0]['content'])
+
+        tail = [m for m in out
+                if m['role'] == 'assistant' and not m.get('tool_calls')]
+        self.assertEqual(len(tail), 1, "assistant/assistant coalescing was lost")
+        self.assertIn('part 1', tail[0]['content'])
+        self.assertIn('part 2', tail[0]['content'])
+
+
 class RoleOrderGuardLogCardinalityTests(unittest.TestCase):
     """#623 — the guard's LOGGING must cost O(1) lines per invocation.
 

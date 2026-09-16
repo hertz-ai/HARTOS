@@ -1455,15 +1455,26 @@ class GossipProtocol:
         try:
             new_count = 0
             for p in peer_list:
-                if p.get('node_id') and p.get('node_id') != self.node_id:
+                if not p.get('node_id') or p.get('node_id') == self.node_id:
+                    continue
+                # One commit per record, not one for the list.  _merge_peer
+                # queries before it adds, so autoflush opens the SQLite write
+                # transaction at the second record; a single commit at the
+                # end held that lock for the whole list.  Live 2026-09-15
+                # 11:28:50-11:29:02 a merge of ~1,000 relayed records held it
+                # for 12s, the owner's consent grant waited out busy_timeout
+                # (3s) and failed "database is locked", and the SPA showed
+                # "Something's off on our end".  The records are hints (see
+                # above), so nothing needs them committed together.
+                try:
                     if self._merge_peer(db, p, relayed=True):
                         new_count += 1
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    logger.debug(f"Merge peer error: {e}")
             if new_count > 0:
                 logger.info(f"Gossip: merged {new_count} new peers")
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            logger.debug(f"Merge peer list error: {e}")
         finally:
             db.close()
 

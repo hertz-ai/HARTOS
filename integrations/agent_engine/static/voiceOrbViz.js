@@ -174,7 +174,33 @@
       ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.stroke();
     }
 
+    // The compositor's native-chrome claim, read ONCE at construction. When it
+    // owns the orb, the shell's CSS has already set this canvas
+    // visibility:hidden so the native orb shows through -- which means every
+    // frame this loop computes is invisible, whether the orb is idle or
+    // reacting to voice.
+    //
+    // Hiding an element does NOT stop its script: rAF throttling keys off
+    // DOCUMENT visibility, not element visibility, so the loop kept running at
+    // full rate and drawing into nothing. Measured on the box 2026-09-07,
+    // WebKitWebProcess held a full core (1188 ticks in 12s) while the
+    // compositor reported zero page flips. That is precisely the per-frame cost
+    // the native-orb handoff exists to remove, and the CSS half never removed
+    // it. Nothing visible is lost here that the CSS had not already taken.
+    function nativeOwnsOrb() {
+      try {
+        var claim = global.HART_NATIVE_CHROME;
+        return !!(claim && claim.indexOf && claim.indexOf('orb') !== -1);
+      } catch (e) {
+        return false;   // unknown claim means draw, the safe direction
+      }
+    }
+    var orbIsNative = nativeOwnsOrb();
+
     function render() {
+      // Do not re-arm while the compositor owns the pixels. rafId stays null so
+      // destroy() is still correct, and a fresh page load re-reads the claim.
+      if (orbIsNative) { rafId = null; return; }
       rafId = global.requestAnimationFrame(render);
       s.time += 0.02;
       if (active && analyser) {

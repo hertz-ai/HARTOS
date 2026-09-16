@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import sys
 from functools import wraps
 from urllib.parse import urlparse
 
@@ -53,6 +54,20 @@ from flask import jsonify, request
 # Read once at import time (not per-request) so token rotation requires
 # a HARTOS restart — same model as Nunba.
 API_TOKEN = os.environ.get('HARTOS_API_TOKEN', '')
+
+
+def ci_trusts_every_caller() -> bool:
+    """True on Nunba's staging container: NUNBA_CI=1 in a build run from source.
+
+    Nunba's docker-compose.staging.yml sets NUNBA_CI=1, and its e2e probe
+    reaches the container through Docker's port mapping, so it never arrives
+    from 127.0.0.1.  An installed (frozen) build ignores the variable: staging
+    always runs from source, so NUNBA_CI in a shipped desktop can only be a
+    misconfiguration, and trusting every caller there would open the desktop
+    to its network.  The one home of this rule: _is_local_request applies it,
+    and Nunba's routes.auth.is_local_environ imports it rather than copying it.
+    """
+    return os.environ.get('NUNBA_CI', '') == '1' and not getattr(sys, 'frozen', False)
 
 
 def _token_matches(candidate: str) -> bool:
@@ -79,7 +94,14 @@ def _token_matches(candidate: str) -> bool:
 
 
 def _is_local_request() -> bool:
-    """True if the request is from localhost, honouring TRUSTED_PROXY."""
+    """True if the request is from localhost, honouring TRUSTED_PROXY.
+
+    Nunba's staging container trusts every caller (ci_trusts_every_caller:
+    NUNBA_CI=1 in a build run from source), as Nunba's
+    routes.auth.is_local_environ does through the same function.
+    """
+    if ci_trusts_every_caller():
+        return True
     trusted_proxy = os.environ.get('TRUSTED_PROXY', '')
     if trusted_proxy and request.remote_addr == trusted_proxy:
         forwarded_for = (request.headers.get('X-Forwarded-For', '')
@@ -106,7 +128,7 @@ def _origin_host(origin_value: str) -> str:
         return ''
 
 
-def _is_safe_csrf_origin() -> bool:
+def is_safe_csrf_origin() -> bool:
     """Return True iff the request's Origin/Referer header matches the
     set of trusted same-origin sources for state-changing destructive
     endpoints.
@@ -228,7 +250,7 @@ def require_local_or_token_csrf_safe(f):
                     return f(*args, **kwargs)
         # Local callers must additionally pass the CSRF check.
         if _is_local_request():
-            if _is_safe_csrf_origin():
+            if is_safe_csrf_origin():
                 return f(*args, **kwargs)
             return jsonify({
                 'error': 'forbidden',

@@ -421,7 +421,8 @@ class SpeculativeDispatcher:
                              agent_persona: Optional[str] = None,
                              preferred_lang: str = 'en',
                              user_pref: str = 'auto',
-                             agent_bound: bool = False) -> dict:
+                             agent_bound: bool = False,
+                             avatar_id: Optional[int] = None) -> dict:
         # Tag every LLM call routed through this method (the draft
         # classifier + any nested expert reroute) as ``draft.classify``
         # in llm_outbound.jsonl.  The decorator can't be applied to a
@@ -435,6 +436,7 @@ class SpeculativeDispatcher:
                 goal_type=goal_type, node_id=node_id,
                 agent_persona=agent_persona, preferred_lang=preferred_lang,
                 user_pref=user_pref, agent_bound=agent_bound,
+                avatar_id=avatar_id,
             )
 
     def _dispatch_draft_first_impl(self, prompt: str, user_id: str,
@@ -444,7 +446,8 @@ class SpeculativeDispatcher:
                              agent_persona: Optional[str] = None,
                              preferred_lang: str = 'en',
                              user_pref: str = 'auto',
-                             agent_bound: bool = False) -> dict:
+                             agent_bound: bool = False,
+                             avatar_id: Optional[int] = None) -> dict:
         """Draft-first dispatch: tiny model answers immediately, signals whether
         to delegate.
 
@@ -810,6 +813,7 @@ class SpeculativeDispatcher:
                     delegate=delegate,
                     escalation_reason=escalation_reason,
                     user_pref=user_pref,
+                    avatar_id=avatar_id,
                 )
             # When the user explicitly asked for `hive_preferred` AND the
             # draft self-delegated to hive, also fire a best-effort MoE
@@ -1284,6 +1288,7 @@ class SpeculativeDispatcher:
         delegate: Optional[str] = None,
         escalation_reason: Optional['EscalationReason'] = None,
         user_pref: str = 'auto',
+        avatar_id: Optional[int] = None,
     ) -> bool:
         """Schedule the expert-improvement task in the background pool.
 
@@ -1297,6 +1302,12 @@ class SpeculativeDispatcher:
         re-deriving the heuristic.  Optional + defaults to None so the
         legacy dispatch_speculative call site (which has no draft to
         derive a reason from) needs no change.
+
+        ``avatar_id`` is the avatar the user's turn is spoken as.  Stamped
+        into the same entry so _deliver_expert_response speaks the expert's
+        reply in that avatar's voice (core/teacher_avatar.py), like the
+        turn's own reply.  Absent from the entry when None, as
+        ``escalation_reason`` is.
 
         Guards:
         - no expert model → nothing to schedule
@@ -1352,6 +1363,8 @@ class SpeculativeDispatcher:
             }
             if delegate is not None:
                 entry['delegate'] = delegate
+            if avatar_id is not None:
+                entry['avatar_id'] = avatar_id
             if escalation_reason is not None:
                 # Store the canonical string value (Enum's str inheritance
                 # makes this safe for JSON / SSE round-trip).
@@ -1758,7 +1771,7 @@ class SpeculativeDispatcher:
             self._evict_old_results()
 
     def _build_dispatch_payload(self, model, prompt, user_id, prompt_id,
-                                goal_id, goal_type) -> dict:
+                                goal_id, goal_type, media_mode=None) -> dict:
         """The ONE inner-/chat payload shared by _dispatch_to_model and
         _dispatch_expert_langchain (their payloads were char-identical).
 
@@ -1769,6 +1782,10 @@ class SpeculativeDispatcher:
         non-empty prompt_id is loaded as ``prompts/{prompt_id}.json``);
         ``goal_id``/``goal_type`` travel separately as telemetry/budget
         metadata, not as a routing key.
+
+        ``media_mode`` is the inner /chat's own speech switch (_chat_reply):
+        'text' when the CALLER delivers the reply's audio itself.  None, the
+        default, leaves the key out and the inner /chat speaks as before.
         """
         # create_agent/autonomous: ONLY for goal-driven daemon dispatch
         # (goal_id set) — that work IS autonomous creation.  A user
@@ -1813,6 +1830,8 @@ class SpeculativeDispatcher:
             payload['request_id'] = _rid
         if goal_type and goal_type != 'general':
             payload['goal_type'] = goal_type
+        if media_mode:
+            payload['media_mode'] = media_mode
         return payload
 
     def _dispatch_expert_langchain(self, model, prompt: str, user_id: str,
@@ -1912,8 +1931,17 @@ class SpeculativeDispatcher:
         # Goal/observability identifiers belong in ``goal_id``/
         # ``goal_type`` payload fields (which the inner /chat reads as
         # context metadata, not as a routing key), not in prompt_id.
+        #
+        # media_mode='text': _deliver_expert_response delivers this reply,
+        # text AND speech, under the speculation id.  Without it the inner
+        # /chat's _chat_reply spoke the same reply first: measured
+        # 2026-09-14 in gui_app.log, every "Expert TTS publish" was followed
+        # by TWO "TTS async: publishing audio" lines for the same file,
+        # 20-80 ms apart (the second a cache hit).  _dispatch_to_model passes
+        # no media_mode, so its payload is exactly what it was.
         payload = self._build_dispatch_payload(
-            model, prompt, user_id, prompt_id, goal_id, goal_type)
+            model, prompt, user_id, prompt_id, goal_id, goal_type,
+            media_mode='text')
 
         import sys as _sys
         _bundled = bool(
@@ -2165,12 +2193,23 @@ class SpeculativeDispatcher:
         # 2. Synthesize TTS and publish to pupit audio topic — ensures speculative
         #    expert improvements get the SAME audio treatment as regular replies
         #    (users on TTS-enabled sessions hear the improved response).
+        #    Spoken as the avatar the user's turn was (_schedule_expert_background
+        #    stamped it on the active entry, still present until the background
+        #    task's finally), in the user's language (no `language` passed:
+        #    _tts_synthesize_and_publish reads the persisted preference).  The
+        #    keyword is sent only with an avatar, so a turn without one makes
+        #    exactly the call it always made.
         try:
             _tts_synthesize_and_publish = safe_hartos_attr(
                 '_tts_synthesize_and_publish')
             if _tts_synthesize_and_publish is not None:
+                with self._lock:
+                    _avatar_id = (self._active.get(speculation_id)
+                                  or {}).get('avatar_id')
+                _voice_kw = ({'avatar_id': _avatar_id}
+                             if _avatar_id is not None else {})
                 _tts_synthesize_and_publish(
-                    response, str(user_id), speculation_id)
+                    response, str(user_id), speculation_id, **_voice_kw)
                 logger.info(
                     "Expert TTS publish: spec=%s user=%s",
                     speculation_id, user_id,

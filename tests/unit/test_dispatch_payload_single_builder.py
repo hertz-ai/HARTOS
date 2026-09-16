@@ -71,3 +71,14 @@ def test_only_the_expert_path_uses_the_chat_shaped_builder():
     assert 'self._build_dispatch_payload(' in inspect.getsource(
         _SD._dispatch_expert_langchain), (
         "_dispatch_expert_langchain must keep using the one shared builder")
+
+
+def test_media_mode_only_when_the_caller_speaks_for_itself():
+    """The inner /chat speaks unless told otherwise; only a caller that
+    delivers the audio itself (the expert leg) passes media_mode='text'."""
+    assert 'media_mode' not in _build()
+    d = object.__new__(SpeculativeDispatcher)
+    p = SpeculativeDispatcher._build_dispatch_payload(
+        d, _FakeModel(), 'the-prompt', 'user-1', None, None, 'general',
+        media_mode='text')
+    assert p['media_mode'] == 'text'

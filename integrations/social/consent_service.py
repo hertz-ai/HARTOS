@@ -20,10 +20,14 @@ prior row's ``granted_at``.  This aligns the in-process semantics
 with the JWT HTTP surface so the audit trail of grant events is
 immutable regardless of which entry point a caller chose.
 """
+import logging
+import re
 import uuid
 from datetime import datetime
 
 from .models import UserConsent
+
+_logger = logging.getLogger('hevolve.consent')
 
 CONSENT_TYPES = frozenset({
     'data_access',       # Agent needs to access user data
@@ -58,7 +62,35 @@ CONSENT_TYPES = frozenset({
                          # #701).  The capture loop's first denied tick files
                          # the pending ask; granting in the UserConsent UI
                          # starts capture on the next tick.
+    'computer_control',  # An agent acts on this computer: shell commands,
+                         # file writes, mouse and keyboard, opening apps
+                         # (integrations.vlm.safety.computer_control_block).
+                         # Asked of the desktop owner, whose machine it is.
+    'device_access',     # A person's phone reaches this desktop's agents
+                         # from the network (#111).  Asked of the desktop
+                         # owner; the scope names the device's Ed25519 key
+                         # (device_scope), so the GRANTED row is the key on
+                         # file that security.middleware verifies the
+                         # phone's signed calls against.  Permanent until
+                         # revoked, as the owner ruled.
 })
+
+#: A device is identified by its Ed25519 public key (the PeerLink identity
+#: every phone already has); the consent scope carries the whole key so no
+#: other table has to.  64 hex chars + the prefix fit UserConsent.scope(100).
+DEVICE_SCOPE_PREFIX = 'device:'
+_DEVICE_KEY_RE = re.compile(r'[0-9a-f]{64}')
+
+
+def device_scope(public_key_hex):
+    """The consent scope for a device key, or None when the key is not a
+    64-hex Ed25519 public key (the only shape the gate looks up)."""
+    if not isinstance(public_key_hex, str):
+        return None
+    key = public_key_hex.lower()
+    if not _DEVICE_KEY_RE.fullmatch(key):
+        return None
+    return f'{DEVICE_SCOPE_PREFIX}{key}'
 
 
 def _audit(event_type: str, actor_id: str, action: str, detail: dict):
@@ -112,6 +144,12 @@ def _emit(topic: str, data: dict, msg_id: str = None):
                 'scope': data.get('scope', '*'),
                 'reason': data.get('reason', ''),
             }
+            # The agent's own name (agent_display_name): the card shows it,
+            # never the id, which is a prompt id and means nothing to a person.
+            # A device ask names the person whose phone asks the same way.
+            for name_key in ('agent_name', 'requester_name'):
+                if data.get(name_key):
+                    note[name_key] = data[name_key]
             if msg_id:
                 note['msg_id'] = msg_id
             on_notification(user_id, note)
@@ -126,17 +164,107 @@ def _validate_consent_type(consent_type: str):
             f"Must be one of: {', '.join(sorted(CONSENT_TYPES))}")
 
 
+_AGENT_ID_RE = re.compile(r'[A-Za-z0-9_-]+')
+
+
+def _is_a_name(name, aid):
+    """False for the placeholders the agent mirror manufactures when a
+    prompt has no name ("Agent <id>", "agent-<id>", hart_intelligence_entry
+    _create_social_agent_from_prompt :10993/:11005) and for the bare id:
+    those are the identifier the owner cannot read, dressed as a name.
+    Exact matches only: a real name may contain a digit sequence that
+    happens to be a short id ("Studio 1 Assistant" with id 1)."""
+    name = (name or '').strip()
+    if not name or name == aid:
+        return False
+    return name.lower() not in (f'agent {aid}'.lower(), f'agent-{aid}'.lower())
+
+
+def agent_display_name(db, agent_id):
+    """The name a person knows an agent by, or None.
+
+    ``agent_id`` on a consent is the agent's prompt id, which the owner has
+    never seen.  The name lives in prompts/<prompt_id>.json ("name"), and
+    the social mirror of that agent (User.agent_id == prompt id, created by
+    _create_social_agent_from_prompt) carries it as display_name: the mirror
+    is read first because it is one query, then the file.  A placeholder
+    built from the id is not a name (_is_a_name).  Never raises; a lookup
+    failure is logged and reads as "no name".
+
+    The id is used as a file name, so only ``[A-Za-z0-9_-]`` ids are looked
+    up: consent ids are internal today, but the same helper names a remote
+    requester for a household ask, and ``../x`` must not read x.json.
+    """
+    if agent_id in (None, ''):
+        return None
+    aid = str(agent_id)
+    if not _AGENT_ID_RE.fullmatch(aid):
+        _logger.debug("agent_display_name: refusing id %r", aid)
+        return None
+    try:
+        from .models import User
+        row = db.query(User).filter(User.agent_id == aid,
+                                    User.user_type == 'agent').first()
+        if row is not None:
+            for candidate in (row.display_name, row.username):
+                if _is_a_name(candidate, aid):
+                    return candidate.strip()
+    except Exception:
+        _logger.debug("agent_display_name: mirror lookup failed for %s",
+                      aid, exc_info=True)
+    try:
+        import json
+        import os
+        from core.platform_paths import get_recipe_prompts_dir
+        path = os.path.join(get_recipe_prompts_dir(), f'{aid}.json')
+        if os.path.isfile(path):
+            with open(path, 'r', encoding='utf-8') as fh:
+                name = str(json.load(fh).get('name') or '')
+            if _is_a_name(name, aid):
+                return name.strip()
+    except Exception:
+        _logger.debug("agent_display_name: prompt file read failed for %s",
+                      aid, exc_info=True)
+    return None
+
+
+def _named(db, data: dict, agent_id) -> dict:
+    """``data`` with 'agent_name' added when the agent has one: the ask and
+    the notices then share one shape, and an unnamed agent carries no key."""
+    name = agent_display_name(db, agent_id)
+    if name:
+        data['agent_name'] = name
+    return data
+
+
 class ConsentService:
     """Static-method service for managing user consent records."""
 
     @staticmethod
     def request_consent(db, user_id: str, consent_type: str,
-                        scope: str = '*', agent_id=None):
+                        scope: str = '*', agent_id=None, reason: str = '',
+                        requester_name: str = ''):
         """Create a pending (not yet granted) consent record.
 
         Returns existing record if one already exists for this combination.
+        ``reason`` rides on the ask, so the card can say what is asked for.
+        ``requester_name`` is the person asking when the asker is not an
+        agent (a device ask: the phone's owner), shown like agent_name.
         """
         _validate_consent_type(consent_type)
+
+        ask = {
+            'user_id': user_id,
+            'consent_type': consent_type,
+            'scope': scope,
+            'agent_id': agent_id,
+        }
+        if reason:
+            ask['reason'] = reason
+        if requester_name:
+            ask['requester_name'] = requester_name
+        # Who is asking, by name: the card says "<name> asks to ...".
+        _named(db, ask, agent_id)
 
         existing = db.query(UserConsent).filter(
             UserConsent.user_id == user_id,
@@ -170,12 +298,8 @@ class ConsentService:
                     UserConsent.revoked_at.isnot(None)),
             ).first()
             if decided is None:
-                _emit('consent.request', {
-                    'user_id': user_id,
-                    'consent_type': consent_type,
-                    'scope': scope,
-                    'agent_id': agent_id,
-                }, msg_id=f'consent.request:{existing.id}')
+                _emit('consent.request', ask,
+                      msg_id=f'consent.request:{existing.id}')
             return existing
 
         consent = UserConsent(
@@ -192,13 +316,49 @@ class ConsentService:
         # / announce_revocation all _emit, and _emit's own comment always
         # listed consent.request as a topic.  Stable msg_id (row id) so this
         # first ask and every re-ask above collapse to ONE card client-side.
-        _emit('consent.request', {
-            'user_id': user_id,
-            'consent_type': consent_type,
-            'scope': scope,
-            'agent_id': agent_id,
-        }, msg_id=f'consent.request:{consent.id}')
+        _emit('consent.request', ask, msg_id=f'consent.request:{consent.id}')
         return consent
+
+    @staticmethod
+    def check_or_request(db, user_id: str, consent_type: str,
+                         scope: str = '*', agent_id=None,
+                         reason: str = '') -> bool:
+        """True when the consent is active; otherwise file the ask (or send
+        it again) and return False.
+
+        The shape a polling gate needs: vision's screen capture and
+        integrations.vlm.safety.computer_control_block.  request_consent
+        dedupes, so asking on every poll still shows one card.
+        """
+        if ConsentService.check_consent(db, user_id, consent_type,
+                                        scope=scope, agent_id=agent_id):
+            return True
+        ConsentService.request_consent(db, user_id, consent_type, scope=scope,
+                                       agent_id=agent_id, reason=reason)
+        return False
+
+    @staticmethod
+    def declined(db, user_id: str, consent_type: str, scope: str = '*',
+                 agent_id=None) -> bool:
+        """True when the owner said no to this ask: a row for exactly this
+        combination has been revoked.
+
+        The consent card's "Don't allow" (consent_api.decline_consent) is
+        revoke_consent on the pending ask, which marks it revoked; a revoked
+        grant counts too.  request_consent does not ask again once a
+        combination is decided, so a no stands until a new grant covers it.
+        check_consent looks at grants first, and a blanket grant ("Allow ALL
+        agents") covers an agent the owner said no to, so ask this only after
+        check_consent failed.
+        """
+        _validate_consent_type(consent_type)
+        return db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == consent_type,
+            UserConsent.scope == scope,
+            UserConsent.agent_id == agent_id,
+            UserConsent.revoked_at.isnot(None),
+        ).first() is not None
 
     @staticmethod
     def grant_consent(db, user_id: str, consent_type: str,
@@ -320,7 +480,7 @@ class ConsentService:
             UserConsent.revoked_at.isnot(None),
         ).order_by(UserConsent.revoked_at.desc()).first()
         if prior is not None and prior.revoked_at is not None:
-            _emit('consent.refused_after_revoke', {
+            _emit('consent.refused_after_revoke', _named(db, {
                 'user_id': user_id,
                 'consent_type': consent_type,
                 'scope': scope,
@@ -329,13 +489,13 @@ class ConsentService:
                     f"Previously revoked {consent_type}/{scope}; "
                     f"re-grant requires a fresh user action."
                 ),
-            })
+            }, agent_id))
             return False
 
         # 3. No record at all → auto-grant + emit one-time notice.
         ConsentService.grant_consent(db, user_id, consent_type,
                                      scope=scope, agent_id=agent_id)
-        _emit('consent.auto_granted', {
+        _emit('consent.auto_granted', _named(db, {
             'user_id': user_id,
             'consent_type': consent_type,
             'scope': scope,
@@ -345,31 +505,52 @@ class ConsentService:
                 f"could be served.  Tap to review or revoke in settings."
             ),
             'revoke_action': 'consent.revoke',
-        })
+        }, agent_id))
         return True
 
     @staticmethod
     def revoke_consent(db, user_id: str, consent_type: str,
                        scope: str = '*', agent_id=None):
-        """Revoke previously granted consent. Returns None if not found."""
+        """Revoke consent: end every active grant for the combination.
+
+        grant_consent is append-only, so two grants are two rows and both
+        must end.  This used to take ``.first()`` of all rows, which after
+        an ask is the pending ask row, so the grant stayed and check_consent
+        kept passing (tests/unit/test_consent_revoke_is_honoured.py).  When
+        nothing was granted, the first row is marked as before, which
+        records a declined ask and stops request_consent re-asking.
+
+        Returns the newest row changed, or None when there is no row.
+        """
         _validate_consent_type(consent_type)
 
-        consent = db.query(UserConsent).filter(
+        rows = db.query(UserConsent).filter(
             UserConsent.user_id == user_id,
             UserConsent.consent_type == consent_type,
             UserConsent.scope == scope,
             UserConsent.agent_id == agent_id,
-        ).first()
-
-        if not consent:
+            UserConsent.granted == True,
+            UserConsent.revoked_at.is_(None),
+        ).order_by(UserConsent.granted_at.desc()).all()
+        if not rows:
+            first = db.query(UserConsent).filter(
+                UserConsent.user_id == user_id,
+                UserConsent.consent_type == consent_type,
+                UserConsent.scope == scope,
+                UserConsent.agent_id == agent_id,
+            ).first()
+            rows = [first] if first else []
+        if not rows:
             return None
 
-        consent.granted = False
-        consent.revoked_at = datetime.utcnow()
+        now = datetime.utcnow()
+        for row in rows:
+            row.granted = False
+            row.revoked_at = now
         db.flush()
 
         ConsentService.announce_revocation(user_id, consent_type, scope, agent_id)
-        return consent
+        return rows[0]
 
     @staticmethod
     def announce_revocation(user_id: str, consent_type: str,
@@ -393,9 +574,35 @@ class ConsentService:
         })
 
     @staticmethod
+    def active_grant(db, user_id: str, consent_type: str,
+                     scope: str = '*', agent_id=None):
+        """The granted, unrevoked row for EXACTLY this combination, or None.
+
+        check_consent's first step, and the whole lookup for a caller that
+        must act on the row itself: the device gate (auth.verify_device_jwt)
+        verifies a phone's signature against the key in the GRANTED row's
+        scope, so it reads that row here and never widens to a wildcard or
+        a blanket grant.
+        """
+        _validate_consent_type(consent_type)
+        return db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == consent_type,
+            UserConsent.scope == scope,
+            UserConsent.agent_id == agent_id,
+            UserConsent.granted == True,
+            UserConsent.revoked_at.is_(None),
+        ).first()
+
+    @staticmethod
     def check_consent(db, user_id: str, consent_type: str,
                       scope: str = '*', agent_id=None) -> bool:
         """Check if user has active consent.
+
+        Active means granted and not revoked.  The privacy page
+        (consent_api.revoke_consent) revokes by setting revoked_at and
+        leaves granted=True, so ``granted`` alone kept a revoked consent
+        passing (tests/unit/test_consent_revoke_is_honoured.py).
 
         Lookup order:
           1. Exact match (user_id + agent_id + consent_type + scope)
@@ -405,14 +612,8 @@ class ConsentService:
         _validate_consent_type(consent_type)
 
         # 1. Exact match
-        exact = db.query(UserConsent).filter(
-            UserConsent.user_id == user_id,
-            UserConsent.consent_type == consent_type,
-            UserConsent.scope == scope,
-            UserConsent.agent_id == agent_id,
-            UserConsent.granted == True,
-        ).first()
-        if exact:
+        if ConsentService.active_grant(db, user_id, consent_type,
+                                       scope=scope, agent_id=agent_id):
             return True
 
         # 2. Wildcard scope for specific agent
@@ -423,6 +624,7 @@ class ConsentService:
                 UserConsent.scope == '*',
                 UserConsent.agent_id == agent_id,
                 UserConsent.granted == True,
+                UserConsent.revoked_at.is_(None),
             ).first()
             if wildcard:
                 return True
@@ -435,12 +637,17 @@ class ConsentService:
                 UserConsent.scope == '*',
                 UserConsent.agent_id == None,
                 UserConsent.granted == True,
+                UserConsent.revoked_at.is_(None),
             ).first()
             if blanket:
                 return True
 
+        # Debug, not warning: a polling gate looks every few seconds while it
+        # waits for an answer (screen capture every 10s, computer control
+        # every 3s), and each denied look wrote a WARNING.  The gates log
+        # their own refusal once.
         import logging as _log
-        _log.getLogger('hevolve.consent').warning(
+        _log.getLogger('hevolve.consent').debug(
             "Consent check denied: user=%s type=%s scope=%s agent=%s",
             user_id, consent_type, scope, agent_id)
         return False

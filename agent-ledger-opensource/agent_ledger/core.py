@@ -1829,6 +1829,42 @@ class SmartLedger:
             self.save()
         return success
 
+    def reopen_task(self, task_id: str, reason: str,
+                    defer_save: bool = False) -> bool:
+        """Put a COMPLETED task back to PENDING for another run.
+
+        The one sanctioned way out of COMPLETED besides ROLLED_BACK. It exists
+        for work that is meant to recur, such as a continuous goal's
+        distributed task: re-running the same task keeps its id and its
+        history, where minting a new task per run grows the ledger without
+        bound (the 9166-task save deadlock of 2026-06-12).
+
+        Deliberately narrow. Only COMPLETED is re-openable: FAILED stays failed
+        so the fast-fail breaker (#59) still prevents retry storms, and every
+        other state already has its own transitions. The reopen is recorded in
+        state_history with the caller's reason, and the run-scoped fields
+        (result, completed_at, started_at, error_message) are cleared so the
+        next run starts clean. Cumulative counters (spark_spent, time_spent_s)
+        are kept.
+        """
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                logger.error(f"Task {task_id} not found")
+                return False
+            if task.status != TaskStatus.COMPLETED:
+                logger.warning(
+                    f"reopen_task: {task_id} is {task.status}, not COMPLETED")
+                return False
+            task._record_state_transition(TaskStatus.PENDING, reason)
+            task.result = None
+            task.completed_at = None
+            task.started_at = None
+            task.error_message = None
+            if not defer_save:
+                self.save()
+            return True
+
     def user_stop_task(self, task_id: str, reason: str = "User stopped task") -> bool:
         """User explicitly stops a task."""
         task = self.get_task(task_id)
@@ -3787,6 +3823,7 @@ def _find_resumable_session(
     agent_id: str,
     user_id: Optional[int],
     ledger_dir: str = "agent_data",
+    flow_id: Optional[int] = None,
 ) -> Optional[str]:
     """Return session_id of an in-flight ledger for this (agent_id, user_id),
     or ``None`` if every prior session is fully terminal / no priors exist.
@@ -3812,6 +3849,15 @@ def _find_resumable_session(
     largest session_id, which by construction is the most recent
     timestamped session.
 
+    ``flow_id`` scopes "unfinished" to one flow.  A ledger holds one flow of
+    one prompt and its task ids are positions within that flow, so a session
+    left unfinished by flow 0 must not be resumed for flow 1: live
+    2026-09-13, agent 87400889007 resumed into flow 1 on flow 0's session and
+    create_recipe read flow 0's COMPLETED action_1 as flow 1's, requesting a
+    recipe for an action that never ran.  ``None`` keeps the unscoped
+    meaning (any flow).  Tasks without ``recipe_flow_id`` count as flow 0,
+    the fallback ``list_grouped_by_recipe_hierarchy`` applies.
+
     Returns:
         session_id string of the resumable session, or None.
     """
@@ -3830,8 +3876,11 @@ def _find_resumable_session(
     for session_id in sorted(prompt_sessions.keys(), reverse=True):
         if user_prefix is not None and not session_id.startswith(user_prefix):
             continue
-        # Walk every flow's actions; any non-terminal task → resumable.
-        for flow_tasks in prompt_sessions[session_id].values():
+        flows = prompt_sessions[session_id]
+        if flow_id is not None:
+            flows = {flow_id: flows.get(flow_id, [])}
+        # Walk the flows' actions; any non-terminal task → resumable.
+        for flow_tasks in flows.values():
             for _action_id, task_dict in flow_tasks:
                 status = str(task_dict.get("status") or "").lower()
                 if status and status not in _TERMINAL_TASK_STATUSES:
@@ -3900,7 +3949,8 @@ def create_ledger_from_actions(
         agent_id = str(prompt_id)
         if session_id is None:
             if resume_if_unfinished:
-                _resumable = _find_resumable_session(agent_id, user_id)
+                _resumable = _find_resumable_session(agent_id, user_id,
+                                                     flow_id=flow_id)
                 if _resumable is not None:
                     session_id = _resumable
                     logger.info(
@@ -3923,21 +3973,50 @@ def create_ledger_from_actions(
     if agent_id is None or session_id is None:
         raise ValueError("Must provide either (agent_id, session_id) or (user_id, prompt_id)")
 
-    if actions is None:
-        actions = []
+    ledger = SmartLedger(agent_id, session_id, backend=backend)
+    add_actions_to_ledger(ledger, actions, flow_id=flow_id,
+                          recipe_prompt_id=recipe_prompt_id)
+    return ledger
 
+
+def add_actions_to_ledger(
+    ledger: SmartLedger,
+    actions: Optional[List[Any]],
+    flow_id: int = 0,
+    recipe_prompt_id: Optional[str] = None,
+) -> int:
+    """Add pre-assigned actions to ``ledger``; return how many were new.
+
+    The one action -> Task conversion.  create_ledger_from_actions uses it
+    for a new ledger; a host that already holds a ledger (HARTOS
+    create_recipe.create_action_with_ledger) uses it to extend that one.
+
+    An action is a dict or a bare string -- 307 of the 749 prompt configs on
+    the 2026-09-13 box use strings.  Its task id is ``action_<action_id>``,
+    or ``action_<position>`` (1-based) when it has none: the id
+    hartos.lifecycle_hooks._auto_sync_to_ledger addresses.  It used to be
+    ``len(ledger.tasks) + 1``, which is the position only while the ledger
+    is empty; resuming a session that had loaded 8 tasks re-added its 8
+    string actions as action_9..action_16 (live, agent 87400889007) --
+    copies no sync reaches, which kept the session resumable forever.
+
+    An id the ledger already holds is left alone, so a resumed session keeps
+    its persisted progress.  recipe_prompt_id defaults to the ledger's
+    agent_id (agent_id == prompt_id by convention).
+    """
     # Resolve the recipe prompt-id stamp once, outside the loop, so every
     # task in this ledger carries the same value (one ledger = one flow
     # of one prompt by construction).
-    _recipe_prompt = recipe_prompt_id if recipe_prompt_id is not None else str(agent_id)
-
-    ledger = SmartLedger(agent_id, session_id, backend=backend)
-
-    for action in actions:
+    _recipe_prompt = (recipe_prompt_id if recipe_prompt_id is not None
+                      else str(ledger.agent_id))
+    added = 0
+    for position, action in enumerate(actions or [], 1):
         if isinstance(action, str):
             action = {"description": action, "action": action}
 
-        task_id = f"action_{action.get('action_id', len(ledger.tasks) + 1)}"
+        task_id = f"action_{action.get('action_id', position)}"
+        if task_id in ledger.tasks:
+            continue
 
         has_prereqs = bool(action.get('prerequisites', []))
         execution_mode = ExecutionMode.SEQUENTIAL if has_prereqs else ExecutionMode.PARALLEL
@@ -3966,6 +4045,7 @@ def create_ledger_from_actions(
 
         # Seal integrity hash so we can detect corruption later
         task.seal_integrity()
-        ledger.add_task(task)
+        if ledger.add_task(task):
+            added += 1
 
-    return ledger
+    return added

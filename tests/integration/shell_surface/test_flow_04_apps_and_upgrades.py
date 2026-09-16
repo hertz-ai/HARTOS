@@ -187,20 +187,40 @@ def test_ch04_scene3_nix_install_autodetects_from_source_prefix(
       -> install() platform==UNKNOWN -> the 'nixpkgs.' prefix routes to NIX
          (the string prefix IS the router; a non-file, non-prefixed source
          would ALSO fall through to nix as the catch-all)
-      -> _install_nix: ONE boundary stage:
-           argv: nix-env -iA nixpkgs.htop        (rc 0 -> success)
-      -> sink: success JSON. Note the code returns install_path
-         '/nix/store/.../htop' LITERALLY -- a placeholder, not a resolved
-         store path; narrated as a fact of the data flow, asserted verbatim.
+      -> _install_nix: TWO boundary stages:
+           argv: nix-env -f <nixpkgs> -iA htop   (rc 0 -> success)
+           argv: nix-env -f <nixpkgs> -qaA htop --out-path --no-name
+                                                (resolve the REAL store path)
+      -> sink: success JSON.
+
+    BOTH stages changed on 2026-09-07 and this scene changed with them.
+
+    The install argv used to be `nix-env -iA nixpkgs.htop`, which resolves the
+    attribute through a CHANNEL. A flake-built HART OS node has none (no
+    nix-channel on PATH, NIX_PATH=nixpkgs=flake:nixpkgs), so that argv failed
+    on every real node with "attribute 'nixpkgs' ... not found" while this
+    scene stayed green against a faked package manager.
+
+    And install_path used to be the literal string '/nix/store/.../htop',
+    ellipsis and all, which this scene asserted verbatim while its own
+    docstring called it a placeholder. A path that exists on no machine is not
+    a fact of the data flow worth pinning; it is a fabrication being ratified.
+    The handler now resolves the real path, and reports '' when it cannot --
+    which is what the faked boundary produces here, since it returns no stdout.
     """
     resp = client.post('/api/apps/install', json={
         'source': 'nixpkgs.htop', 'name': 'ch04-htop'})
     assert resp.status_code == 200
     body = resp.get_json()
-    assert _pkg_calls(fake_os) == [['nix-env', '-iA', 'nixpkgs.htop']]
+    assert _pkg_calls(fake_os) == [
+        ['nix-env', '-f', '<nixpkgs>', '-iA', 'htop'],
+        ['nix-env', '-f', '<nixpkgs>', '-qaA', 'htop', '--out-path', '--no-name'],
+    ]
     assert body['success'] is True and body['verified'] is True
     assert body['app_id'] == 'htop'
-    assert body['install_path'] == '/nix/store/.../htop'   # placeholder literal
+    # Honest emptiness, never an invented path.
+    assert body.get('install_path', '') == ''
+    assert '...' not in body.get('install_path', '')
 
 
 # ─── Scene 4: forcing a failure at each pipeline stage ──────────────────────
@@ -366,9 +386,12 @@ def test_ch04_scene6_background_install_job_reaches_done_verified(
     assert snap['verified'] is True     # positive confirmation, read back
     assert snap['fraction'] == 1.0
     assert snap['active'] is False      # terminal phase -> no longer active
-    # The worker drove the very same single-argv nix pipeline as the
-    # synchronous route (wrapping, never rewriting, install()).
-    assert ['nix-env', '-iA', 'nixpkgs.cowsay'] in fake_os.calls
+    # The worker drove the very same nix pipeline as the synchronous route
+    # (wrapping, never rewriting, install()). The argv is the NIX_PATH form:
+    # `-iA nixpkgs.cowsay` resolves through a channel, and a flake-built node
+    # has none, so that spelling failed on every real box while this scene
+    # stayed green against a faked package manager (fixed 2026-09-07).
+    assert ['nix-env', '-f', '<nixpkgs>', '-iA', 'cowsay'] in fake_os.calls
 
 
 # ─── Scene 7: the node upgrades ITSELF, up to the steward gate ──────────────
