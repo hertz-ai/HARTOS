@@ -402,13 +402,17 @@ def _apply_api_auth(app: Flask, register: bool = True):
         return refused
 
     def _file_device_ask(db, owner, public_key, claims):
-        """File (or re-send) the owner's ask for this phone.  The person's
-        name comes from the token's own username claim, which the phone
-        signed; nothing of the key is shown, the card names the person."""
+        """File (or re-send) the owner's ask for this phone.  The name comes
+        from the token's own username claim, which the phone signed: a
+        CLAIM, so the ask states it as one ('A phone calling itself ...'),
+        the same words as the card, and never as fact; what identifies the
+        phone is the key's fingerprint, which request_consent puts on the
+        ask as requester_fingerprint (consent_service.device_fingerprint).
+        Any surface that renders ``reason`` as it is says the same thing."""
         from integrations.social.consent_service import (
             ConsentService, device_scope)
         name = ' '.join(str(claims.get('username') or '').split())[:100]
-        who = f"{name}'s phone" if name else "A phone"
+        who = f'A phone calling itself "{name}"' if name else 'An unnamed phone'
         ConsentService.request_consent(
             db, owner, 'device_access', scope=device_scope(public_key),
             reason=f"{who} asks to use this computer's agents from the network.",

@@ -38,7 +38,9 @@ from integrations.social import consent_service as cs  # noqa: E402
 # inside a test (by the gate) is dropped from it and re-imported fresh next
 # time, so a limiter patched in one copy would not be the one the gate uses.
 from integrations.social import discovery  # noqa: E402
-from integrations.social.consent_service import ConsentService, device_scope  # noqa: E402
+from integrations.social.consent_service import (  # noqa: E402
+    ConsentService, device_fingerprint, device_scope,
+)
 from integrations.social.models import Base, UserConsent, db_session, get_engine  # noqa: E402
 from security.middleware import _apply_api_auth  # noqa: E402
 from security.node_integrity import canonical_payload  # noqa: E402
@@ -143,7 +145,11 @@ def test_a_phone_the_owner_has_not_answered_gets_the_ask_and_pending(desktop, ph
     assert ask['scope'] == device_scope(phone.public_hex)
     assert ask['agent_id'] is None
     assert ask['requester_name'] == 'Sathish'
-    assert "Sathish's phone" in ask['reason']
+    assert ask['requester_fingerprint'] == device_fingerprint(phone.public_hex)
+    # The name is the phone's own claim: the ask says so, in the card's
+    # words, and never states it as fact (phase 2 wording control).
+    assert ask['reason'].startswith('A phone calling itself "Sathish"')
+    assert "Sathish's phone" not in ask['reason']
     assert phone.public_hex not in ask['reason']
     with db_session() as db:
         row = db.query(UserConsent).filter_by(
