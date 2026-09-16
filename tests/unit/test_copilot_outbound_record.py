@@ -17,9 +17,11 @@ The contract this pins, at invoke_claude (the one spawn site, both consumers):
     OpenAI-shaped body so the record's body policy applies uniformly, the
     outcome as response_status (exit code, or the failure category);
   * the prompt and system text are scrubbed by security.dlp_engine before
-    they leave, and the record carries the scrubbed text; no redactor means
-    no egress -- the OS never sends raw text off-device because a module
-    failed to import;
+    they leave; the local record keeps the RAW text, as the llama records
+    on the same disk do (owner, 2026-09-16: a raw record on the owner's own
+    machine is never wrong -- the scrub is for what leaves), marked
+    egress='dlp-scrubbed'; no redactor means no egress -- the OS never
+    sends raw text off-device because a module failed to import;
   * an auth failure ('please run /login') feeds the provider breaker under
     the key 'claude-code'; at threshold the shim answers 503 without spawning
     and reads the breaker's state() non-consumingly, so the one real call
@@ -112,7 +114,7 @@ def test_the_switch_refusal_is_recorded_and_spawns_nothing(_desktop, monkeypatch
 
 # ── the scrub ───────────────────────────────────────────────────────────────
 
-def test_pii_is_scrubbed_before_the_prompt_leaves_and_in_the_record(_desktop):
+def test_pii_is_scrubbed_on_the_wire_and_raw_in_the_local_record(_desktop):
     prompt = 'mail the owner at sathi@example.com, card 4111 1111 1111 1111'
     system = 'you serve user 555-123-4567'
     with patch('subprocess.run', return_value=_run()) as sr:
@@ -123,10 +125,18 @@ def test_pii_is_scrubbed_before_the_prompt_leaves_and_in_the_record(_desktop):
     assert 'sathi@example.com' not in sent_prompt and '4111' not in sent_prompt
     assert '[EMAIL_REDACTED]' in sent_prompt and '[CC_REDACTED]' in sent_prompt
     assert '555-123-4567' not in sent_system and '[PHONE_REDACTED]' in sent_system
+    # the local record is the raw truth, like every llama record beside it
     rec = _records(_desktop)[-1]
-    blob = json.dumps(rec)
-    assert 'sathi@example.com' not in blob and '555-123-4567' not in blob
-    assert '[EMAIL_REDACTED]' in blob
+    assert rec['body']['messages'][0]['content'] == system
+    assert rec['body']['messages'][1]['content'] == prompt
+    assert rec['body']['egress'] == 'dlp-scrubbed'
+
+
+def test_a_refusal_records_no_egress(_desktop, monkeypatch):
+    monkeypatch.setenv('HARTOS_COPILOT_ENABLED', '0')
+    with patch('subprocess.run', return_value=_run()):
+        cc.invoke_claude('q', mode='inference')
+    assert _records(_desktop)[-1]['body']['egress'] == 'none'
 
 
 def test_agentic_runs_are_scrubbed_too(_desktop):

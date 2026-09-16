@@ -106,13 +106,17 @@ def invoke_claude(prompt, *, mode='agentic', cwd=None, timeout_s=None,
         _account_egress(mode, system, prompt, result, 0.0)
         return result
 
-    # Scrub BEFORE the text leaves: the same DLP engine the message bus applies
-    # to its PeerLink/Crossbar legs, here on the only path to Anthropic.  No
-    # redactor means no egress -- the OS does not send raw text off-device
+    # Scrub what LEAVES, record what was ASKED.  The copy handed to `claude -p`
+    # goes through the same DLP engine the message bus applies to its
+    # PeerLink/Crossbar legs, here on the only path to Anthropic; the local
+    # record below keeps the raw text, exactly like the llama records on the
+    # same disk (owner, 2026-09-16: a raw record on the owner's own machine
+    # is never wrong -- it is the forensic truth; the scrub is for egress).
+    # No redactor means no egress -- the OS does not send raw text off-device
     # because a module failed to import (the bus's leg did exactly that, #73).
     try:
-        prompt = _scrub_for_egress(prompt)
-        system = _scrub_for_egress(system)
+        sent_prompt = _scrub_for_egress(prompt)
+        sent_system = _scrub_for_egress(system)
     except ImportError as e:
         _warn_no_redactor(e)
         result = {'ok': False, 'category': 'other',
@@ -121,10 +125,10 @@ def invoke_claude(prompt, *, mode='agentic', cwd=None, timeout_s=None,
         return result
 
     start = time.monotonic()
-    result = _spawn(prompt, mode=mode, cwd=cwd, timeout_s=timeout_s,
-                    model=model, system=system, extra_args=extra_args)
+    result = _spawn(sent_prompt, mode=mode, cwd=cwd, timeout_s=timeout_s,
+                    model=model, system=sent_system, extra_args=extra_args)
     _account_egress(mode, system, prompt, result,
-                    (time.monotonic() - start) * 1000.0)
+                    (time.monotonic() - start) * 1000.0, scrubbed=True)
     return result
 
 
@@ -149,16 +153,20 @@ def _warn_no_redactor(exc):
         logger.debug("copilot egress refused again: no DLP redactor (%s)", exc)
 
 
-def _account_egress(mode, system, prompt, result, latency_ms, status=None):
+def _account_egress(mode, system, prompt, result, latency_ms, status=None,
+                    scrubbed=False):
     """One outbound record + the provider breaker's verdict for one call.
 
     The record is the same llm_outbound.jsonl line the llama calls write,
     through the logger's public hook for non-httpx callers, with an
     OpenAI-shaped body so the record's body policy applies uniformly and
-    source 'claude-code' so it is one grep away from the rest.  Status is the
-    exit code of a run that completed, else the failure category ('off',
-    'notfound', 'timeout', ...), or the explicit ``status`` of a refusal that
-    never spawned.
+    source 'claude-code' so it is one grep away from the rest.  ``system``
+    and ``prompt`` are the RAW texts the caller asked with -- the record is
+    the local forensic truth, as the llama records are -- and ``scrubbed``
+    marks that what actually left was the DLP-scrubbed copy (body key
+    ``egress``).  Status is the exit code of a run that completed, else the
+    failure category ('off', 'notfound', 'timeout', ...), or the explicit
+    ``status`` of a refusal that never spawned.
 
     Only a run that COMPLETED speaks for the provider: a login refusal in its
     stderr feeds the breaker as a failure, a clean exit as a success.  A
@@ -176,6 +184,7 @@ def _account_egress(mode, system, prompt, result, latency_ms, status=None):
             messages.append({'role': 'system', 'content': system})
         messages.append({'role': 'user', 'content': prompt})
         log_outbound({'model': CLAUDE_CODE_PROVIDER_KEY, 'mode': mode,
+                      'egress': 'dlp-scrubbed' if scrubbed else 'none',
                       'messages': messages},
                      response_status=status, latency_ms=round(latency_ms, 1),
                      source=CLAUDE_CODE_PROVIDER_KEY)
