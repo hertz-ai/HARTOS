@@ -200,13 +200,65 @@ def _win_gpu_vram_gb_from_registry() -> float:
     return round(best_bytes / (1024 ** 3), 1) if best_bytes else 0.0
 
 
+class _AllocationLedger(dict):
+    """tool -> GB reserved, plus a revision that moves on every real change.
+
+    A load or unload is the state transition that makes a cached GPU
+    reading wrong (see refresh_gpu_info for the measured spawn case, and
+    detect_gpu for the load case), and this dict is the manager's own
+    record of those transitions.  Its writers do not all go through
+    allocate()/release(): ModelOrchestrator._release_vram pops rows, and
+    Nunba's llama_config writes/pops the 'llm' row directly.  So the
+    revision is kept in the dict itself, where every writer lands.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.changed_seq: int = 0
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.changed_seq += 1
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self.changed_seq += 1
+
+    def pop(self, key, *default):
+        present = key in self
+        value = super().pop(key, *default)
+        if present:
+            self.changed_seq += 1
+        return value
+
+    def popitem(self):
+        item = super().popitem()
+        self.changed_seq += 1
+        return item
+
+    def clear(self):
+        if self:
+            self.changed_seq += 1
+        super().clear()
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        self.changed_seq += 1
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self.changed_seq += 1
+        return super().setdefault(key, default)
+
+
 class VRAMManager:
     """GPU memory tracking and allocation decisions."""
 
     def __init__(self):
-        self._allocations: Dict[str, float] = {}  # tool → GB reserved
+        self._allocations: Dict[str, float] = _AllocationLedger()  # tool → GB reserved
         self._gpu_info: Optional[Dict] = None
         self._gpu_info_ts: float = 0.0  # timestamp of last nvidia-smi call
+        self._gpu_info_seq: int = 0     # ledger revision the memo was read at
         # None = not yet checked; True = neither nvidia-smi nor rocm-smi is on PATH,
         # so the vendor probes are skipped PERMANENTLY (see detect_gpu). Survives the
         # `refresh_gpu_info` TTL reset on purpose — that reset is what let the
@@ -360,15 +412,36 @@ class VRAMManager:
 
     # ── GPU Detection ────────────────────────────────────────────
 
+    def _memo_is_current(self) -> bool:
+        """The cached reading is usable only if nothing was loaded or
+        unloaded since it was taken.  MEASURED 2026-09-16 (live app, PID
+        26452): llama-server booked ``_allocations['llm'] = 2.84`` after
+        its health check, and a pre-load reading of 7.5 GB free, 40 s old
+        and inside the 120 s TTL, was what the next STT/TTS selection saw.
+        The ledger revision is the record of that transition."""
+        return (self._gpu_info is not None
+                and self._gpu_info_seq == self._allocations.changed_seq)
+
     def detect_gpu(self) -> Dict:
         """Detect GPU and return info dict.
 
         Priority: nvidia-smi (no deps) → PyTorch (if already loaded) → macOS Metal.
         Returns: {name, total_gb, free_gb, cuda_available}
-        """
-        if self._gpu_info is not None:
-            return self._gpu_info
 
+        Memoised: the probe re-runs only when the memo predates the last
+        allocation change (_memo_is_current); refresh_gpu_info adds the
+        TTL on top.  The revision is read BEFORE the probe so a change
+        that lands while nvidia-smi runs still invalidates the result.
+        """
+        if self._memo_is_current():
+            return self._gpu_info
+        seq = self._allocations.changed_seq
+        info = self._probe_gpu()
+        self._gpu_info_seq = seq
+        return info
+
+    def _probe_gpu(self) -> Dict:
+        """Run the vendor probes and store the result in the memo."""
         # ── ABSENT VENDOR TOOLS ARE A PERMANENT FACT — never re-probe them ──────
         # (2026-08-12 real-HW finding on an Intel-only laptop.) `refresh_gpu_info`
         # nulls `_gpu_info` every TTL, so WITHOUT this guard the full probe re-ran
@@ -660,7 +733,7 @@ class VRAMManager:
         """
         import time as _t
         now = _t.monotonic()
-        if (not force and self._gpu_info is not None
+        if (not force and self._memo_is_current()
                 and (now - self._gpu_info_ts) < self._refresh_ttl):
             return self._gpu_info  # recent enough — skip subprocess
         self._gpu_info = None
