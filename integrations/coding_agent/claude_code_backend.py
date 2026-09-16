@@ -188,6 +188,12 @@ def _claude_config_dir():
     return d if d else os.path.join(os.path.expanduser('~'), '.claude')
 
 
+#: The consent whose grant/revoke acts on the copilot switch (consent_service
+#: flips set_copilot_enabled on it).  One flag, two writers: the admin page
+#: and the owner's answer to an agent's ask.
+COPILOT_CONSENT_TYPE = 'copilot_access'
+
+
 def _copilot_switch_path():
     """The operator's off-switch marker, in Claude's own config dir: present
     means OFF, absent means on, so an install that predates the switch is
