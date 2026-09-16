@@ -15,6 +15,8 @@ already treats as transient, so it degrades to the in-house LLM and re-queues:
     overload (Anthropic 529)  -> 503   (circuit breaker + fall to local)
     auth expired              -> 503   (a lapsed subscription must not error
                                         the OS; it degrades to local)
+    switched off (the owner)  -> 503   (same rung: invoke_claude refuses
+                                        before any process starts)
     timeout                   -> 504
     not-found / other         -> 502
     at-capacity (semaphore)   -> 503
@@ -64,6 +66,10 @@ _FAIL_STATUS = {
     # there) so nothing in-process routed to it, but anything probing the
     # endpoint directly got a hard error where a degrade was intended.
     'notfound': 503,
+    # The owner switched the copilot off: invoke_claude refused before any
+    # process started.  The caller degrades to local, the same as a lapsed
+    # subscription -- switching Claude off must not error the OS either.
+    'off': 503,
     'other': 502,
 }
 

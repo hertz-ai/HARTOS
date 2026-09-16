@@ -20,12 +20,23 @@ import sys
 import types
 from unittest.mock import patch
 
+import pytest
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 from integrations.agent_engine import agent_daemon as daemon  # noqa: E402
 from integrations.agent_engine.model_registry import ModelBackend, ModelTier  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _copilot_on(monkeypatch):
+    """The expert turn consults the owner's copilot switch first, a marker in
+    the real ~/.claude: pin it on so these tests exercise the turn itself
+    and not the developer's own setting.  Off has its own tests in
+    test_copilot_consent_gate."""
+    monkeypatch.setenv('HARTOS_COPILOT_ENABLED', '1')
 
 _GM = 'integrations.agent_engine.goal_manager.GoalManager.escalate_goal'
 _GET = 'integrations.agent_engine.model_registry.model_registry.get_model'

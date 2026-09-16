@@ -57,6 +57,21 @@ def invoke_claude(prompt, *, mode='agentic', cwd=None, timeout_s=None,
         timeout_s = (DEFAULT_INFERENCE_TIMEOUT_S if mode == 'inference'
                      else DEFAULT_AGENTIC_TIMEOUT_S)
 
+    # The owner's switch, FIRST, at the one place a `claude -p` is started, so
+    # off is off for every consumer (the expert shim's turns and the copilot
+    # daemon's branch work) and no path routes around it.  The switch used to
+    # gate only claude_code_available(), which the boot-time registration and
+    # GET /models consulted and this function did not.  Measured 2026-09-16
+    # on the bundled desktop: the owner switched the copilot off in Admin at
+    # 15:53:36, and in the six minutes after it 16 expert-tier sessions were
+    # written and two `claude.EXE -p` children of Nunba.exe were live, because
+    # the backend registered at boot was never re-evaluated and every request
+    # that reached the shim spawned.  'off' rides the same ladder as a lapsed
+    # subscription: the shim answers 503 and the caller degrades to local.
+    if not copilot_enabled():
+        return {'ok': False, 'category': 'off',
+                'error': 'the Claude Code copilot is switched off on this node'}
+
     # Resolved, not the bare name: a service unit or frozen app whose PATH
     # lacks the install dir would otherwise detect the CLI and then fail to
     # spawn it, reporting 'notfound' for a binary this node can see.
@@ -120,6 +135,7 @@ def classify_failure(result):
 
         'overload' (Anthropic 529 / 'overloaded')  -> 503 (transient, breaker)
         'auth'     (login/unauthorized/expired)     -> 503 (degrade to local)
+        'off'      (the owner's switch)             -> 503 (degrade to local)
         'timeout'                                   -> 504
         'notfound' | 'other'                        -> 502
 
@@ -128,7 +144,7 @@ def classify_failure(result):
     if result.get('ok'):
         return None
     cat = result.get('category')
-    if cat in ('timeout', 'notfound'):
+    if cat in ('timeout', 'notfound', 'off'):
         return cat
     blob = ((result.get('stderr') or '') + ' '
             + (result.get('error') or '')).lower()
@@ -215,7 +231,15 @@ def copilot_enabled():
 def set_copilot_enabled(enabled):
     """Flip the switch.  Returns the state IN FORCE, which the env pin can
     make differ from the request.  The MCP token is untouched: turning the
-    copilot back on needs no client reconfiguration, unlike a token rotation."""
+    copilot back on needs no client reconfiguration, unlike a token rotation.
+
+    The flip also brings the EXPERT registry in line (ensure_claude_code_
+    registered is a two-way sync), so a switched-off copilot is not OFFERED
+    to the selectors either: without this the backend registered at boot
+    stayed registered and every expert turn still dialled the shim.  invoke_
+    claude's own check is the guarantee; this keeps the offer honest.  A
+    function-local import: this module stays light for the bare daemon
+    script, which never flips the switch."""
     path = _copilot_switch_path()
     try:
         if enabled:
@@ -229,6 +253,12 @@ def set_copilot_enabled(enabled):
     now = copilot_enabled()
     logger.info("copilot switched %s%s", 'on' if now else 'off',
                 '' if now == enabled else ' (pinned by HARTOS_COPILOT_ENABLED)')
+    try:
+        from integrations.agent_engine.model_registry import ensure_claude_code_registered
+        ensure_claude_code_registered()
+    except Exception as e:
+        logger.warning("copilot switch: expert registry not synced (the switch "
+                       "still holds at invoke_claude): %s", e)
     return now
 
 

@@ -10,7 +10,18 @@ All `claude -p` calls are stubbed — no subprocess, no network.
 import json
 from unittest.mock import patch
 
+import pytest
+
 import integrations.coding_agent.claude_code_backend as be
+
+
+@pytest.fixture(autouse=True)
+def _copilot_on(monkeypatch):
+    """invoke_claude refuses when the owner's switch is off, and the switch is
+    a marker in the real ~/.claude: pin it on so these spawn-stubbed tests do
+    not depend on the developer's own setting.  The off behaviour has its own
+    file, test_copilot_switch_stops_spawn."""
+    monkeypatch.setenv('HARTOS_COPILOT_ENABLED', '1')
 
 
 # ─── the shared invocation primitive ─────────────────────────────────────────
