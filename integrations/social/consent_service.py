@@ -99,6 +99,26 @@ def device_scope(public_key_hex):
     return f'{DEVICE_SCOPE_PREFIX}{key}'
 
 
+def device_fingerprint(scope_or_key):
+    """What the owner reads to tell one phone from another: the key's first
+    16 hex in four groups ('3f9a 1c02 77de b4e1'), from a device scope or a
+    bare key; None for anything else.
+
+    The name a phone signs into its ask is self-asserted, so the card and
+    the trusted-phones list show this beside it, and the phone shows its own
+    key the same way (PeerLinkCrypto.getEd25519PublicHex), so the two can be
+    matched by eye.  The same 16 hex are the phone's node_id.
+    """
+    if not isinstance(scope_or_key, str):
+        return None
+    key = scope_or_key.lower()
+    if key.startswith(DEVICE_SCOPE_PREFIX):
+        key = key[len(DEVICE_SCOPE_PREFIX):]
+    if not _DEVICE_KEY_RE.fullmatch(key):
+        return None
+    return ' '.join(key[i:i + 4] for i in range(0, 16, 4))
+
+
 def _audit(event_type: str, actor_id: str, action: str, detail: dict):
     """Best-effort immutable audit log entry.
 
@@ -152,8 +172,9 @@ def _emit(topic: str, data: dict, msg_id: str = None):
             }
             # The agent's own name (agent_display_name): the card shows it,
             # never the id, which is a prompt id and means nothing to a person.
-            # A device ask names the person whose phone asks the same way.
-            for name_key in ('agent_name', 'requester_name'):
+            # A device ask names the person whose phone asks the same way,
+            # with the key's fingerprint beside the self-asserted name.
+            for name_key in ('agent_name', 'requester_name', 'requester_fingerprint'):
                 if data.get(name_key):
                     note[name_key] = data[name_key]
             if msg_id:
@@ -272,7 +293,11 @@ class ConsentService:
         Returns existing record if one already exists for this combination.
         ``reason`` rides on the ask, so the card can say what is asked for.
         ``requester_name`` is the person asking when the asker is not an
-        agent (a device ask: the phone's owner), shown like agent_name.
+        agent (a device ask: the phone's owner), shown like agent_name.  It
+        is also written to the new row as its ``label``, once: the name the
+        phone signed into its first ask stands, a later ask cannot rename
+        the row (the label is a hint beside the fingerprint, never
+        identity).
         """
         _validate_consent_type(consent_type)
 
@@ -286,6 +311,9 @@ class ConsentService:
             ask['reason'] = reason
         if requester_name:
             ask['requester_name'] = requester_name
+        fingerprint = device_fingerprint(scope) if consent_type == 'device_access' else None
+        if fingerprint:
+            ask['requester_fingerprint'] = fingerprint
         # Who is asking, by name: the card says "<name> asks to ...".
         _named(db, ask, agent_id)
 
@@ -332,6 +360,7 @@ class ConsentService:
             consent_type=consent_type,
             scope=scope,
             granted=False,
+            label=requester_name[:100] if requester_name else None,
         )
         db.add(consent)
         db.flush()
@@ -426,6 +455,9 @@ class ConsentService:
             scope=scope,
             granted=True,
             granted_at=now,
+            # a phone keeps the name its ask was filed under (#111)
+            label=(ConsentService._label_on_file(db, user_id, consent_type, scope)
+                   if consent_type == 'device_access' else None),
         )
         db.add(consent)
         db.flush()
@@ -459,6 +491,19 @@ class ConsentService:
                 pass
 
         return consent
+
+    @staticmethod
+    def _label_on_file(db, user_id: str, consent_type: str, scope: str):
+        """The label the most recent row for (user, type, scope) carries, so
+        a grant, and a re-allow after a revoke, keep the name the ask was
+        filed under; None when no row has one."""
+        row = db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == consent_type,
+            UserConsent.scope == scope,
+            UserConsent.label.isnot(None),
+        ).order_by(UserConsent.created_at.desc()).first()
+        return row.label if row is not None else None
 
     @staticmethod
     def auto_grant_with_notice(db, user_id: str, consent_type: str,

@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 54
+SCHEMA_VERSION = 55
 
 
 # Tables that hold tenant-scoped user content. v40 adds a nullable
@@ -1945,3 +1945,25 @@ def run_migrations():
                     logger.warning(
                         "v54 migration: %s failed: %s", label, e)
         set_schema_version(engine, 54)
+
+    if current < 55:
+        # v55 (2026-09-16): user_consents.label (#111).  A device_access
+        # consent's scope is the phone's public key, which the owner cannot
+        # read; the name the phone signed into its first ask is kept here so
+        # the privacy page can list "Sathish's phone" beside the key's
+        # fingerprint.  Nullable, unused by every other consent type, so
+        # existing rows and paths are unchanged.
+        logger.info("HevolveSocial: migrating to v55 (user_consents.label)")
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "ALTER TABLE user_consents ADD COLUMN label VARCHAR(100)"))
+                conn.commit()
+        except Exception as e:
+            if _is_already_exists_error(e):
+                logger.info("v55 migration: user_consents.label skipped "
+                            "(already exists)")
+            else:
+                logger.warning("v55 migration: ADD COLUMN user_consents.label "
+                               "failed: %s", e)
+        set_schema_version(engine, 55)

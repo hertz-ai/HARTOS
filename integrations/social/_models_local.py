@@ -3153,6 +3153,11 @@ class UserConsent(Base):
     granted = Column(Boolean, default=False, nullable=False)
     granted_at = Column(DateTime, nullable=True)
     revoked_at = Column(DateTime, nullable=True)
+    # What the owner sees for this row when the scope is not readable: for
+    # a device_access row (scope = the phone's public key) the name the
+    # phone signed into its first ask.  Self-asserted, a hint beside the
+    # key's fingerprint, never identity (v55, #111).
+    label = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -3169,6 +3174,7 @@ class UserConsent(Base):
             'agent_id': self.agent_id,
             'consent_type': self.consent_type,
             'scope': self.scope,
+            'label': self.label,
             'granted': self.granted,
             'granted_at': self.granted_at.isoformat() if self.granted_at else None,
             'revoked_at': self.revoked_at.isoformat() if self.revoked_at else None,
