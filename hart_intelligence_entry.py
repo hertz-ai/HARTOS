@@ -8901,11 +8901,34 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                 else:
                     audio_url = f'/tts/audio/{audio_filename}'
                 app.logger.info(f"TTS async: publishing audio {audio_url} to pupit.{user_id}")
+                # A phone reads the bundle shape central's lip-sync service
+                # publishes (Android VideoUrl: aud_url + face data); with
+                # aud_url alone it plays the voice over the idle avatar
+                # (HARTOS #111, owner: audio only for now, every later
+                # capability on the same delivery).  Additive beside the
+                # SPA's generated_audio_url.  The url is absolute on the
+                # address this node advertises: a phone gets the bundle over
+                # its device link and has no origin to resolve a path
+                # against, while the SPA keeps the relative url (its own
+                # origin is the loopback the LAN gate trusts).
+                try:
+                    from core.port_registry import get_advertisable_base_url
+                    _phone_audio_url = (audio_url if _ext_url
+                                        else f'{get_advertisable_base_url().rstrip("/")}{audio_url}')
+                except Exception:
+                    _phone_audio_url = audio_url
                 _tts_payload = {
                     'text': [text[:200]],
                     'generated_audio_url': audio_url,
                     'request_id': str(request_id),
                     'action': 'TTS',
+                    'video_link': {
+                        'aud_url': _phone_audio_url,
+                        'request_id': str(request_id),
+                        'action': 'TTS',
+                        'is_cartoon': True,
+                        'priority': 0,
+                    },
                 }
                 publish_async(f'com.hertzai.pupit.{user_id}', json.dumps(_tts_payload))
                 # Also push via SSE directly — publish_async → MessageBus/WAMP doesn't
