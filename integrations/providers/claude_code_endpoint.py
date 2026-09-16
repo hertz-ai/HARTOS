@@ -29,6 +29,7 @@ piled-up frontier queue.
 Mounted by hart_intelligence_entry alongside the other blueprints. The EXPERT
 ModelBackend (model_registry) points its base_url here.
 """
+import contextlib
 import json
 import logging
 import threading
@@ -36,9 +37,11 @@ import time
 
 from flask import Blueprint, request, jsonify
 
+from core.circuit_breaker import CircuitState, llm_provider_breaker
+from core.llm_outbound_logger import request_id_context
 from integrations.coding_agent.claude_code_backend import (
     invoke_claude, classify_failure, claude_code_available,
-    DEFAULT_INFERENCE_TIMEOUT_S,
+    DEFAULT_INFERENCE_TIMEOUT_S, CLAUDE_CODE_PROVIDER_KEY,
 )
 
 logger = logging.getLogger('hartos_claude_code')
@@ -220,6 +223,19 @@ def chat_completions():
     if tools:
         prompt += _tools_to_prompt(tools)
 
+    # A login the provider keeps refusing opens the breaker (fed by
+    # invoke_claude from the real run's stderr); while it is OPEN answer 503
+    # without spawning, the same rung as a single auth failure, so a lapsed
+    # subscription costs one process per cooldown instead of one per turn.
+    # state(), not is_open(): a pre-flight gate must not claim the half-open
+    # probe -- the one real run after cooldown resolves it (#106b b).
+    if llm_provider_breaker.state(CLAUDE_CODE_PROVIDER_KEY) is CircuitState.OPEN:
+        logger.warning('claude-code provider breaker OPEN (login refused) -> '
+                       'HTTP 503; caller falls back to local, nothing spawned')
+        return jsonify({'error': {'message': 'claude-code login refused; breaker open',
+                                  'type': 'overloaded_error',
+                                  'category': 'auth'}}), 503
+
     # Cap concurrent claude -p processes. Non-blocking acquire: at capacity we
     # 503 so the caller's fallback picks a local model instead of queueing.
     if not _sem.acquire(blocking=False):
@@ -227,9 +243,14 @@ def chat_completions():
                        _MAX_CONCURRENT)
         return jsonify({'error': {'message': 'claude-code at capacity',
                                   'type': 'overloaded_error'}}), 503
+    # The caller's request id (autogen's httpx send stamps X-HARTOS-Request-ID
+    # on its way here) binds this run's outbound record to the goal's other
+    # records; without it the record would carry the shim's own empty id.
+    rid = request.headers.get('X-HARTOS-Request-ID') or ''
     try:
-        result = invoke_claude(prompt, mode='inference', system=system_text,
-                               timeout_s=DEFAULT_INFERENCE_TIMEOUT_S)
+        with (request_id_context(rid) if rid else contextlib.nullcontext()):
+            result = invoke_claude(prompt, mode='inference', system=system_text,
+                                   timeout_s=DEFAULT_INFERENCE_TIMEOUT_S)
     finally:
         _sem.release()
 
