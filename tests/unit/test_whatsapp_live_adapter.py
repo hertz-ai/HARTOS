@@ -78,6 +78,13 @@ def _raise_boom(*_args, **_kwargs):
     raise RuntimeError('boom')
 
 
+@pytest.fixture(autouse=True)
+def no_live_gateway_identity_request():
+    """Keep the wiring suite deterministic when a gateway is or is not live."""
+    with patch('urllib.request.urlopen', side_effect=_raise_boom):
+        yield
+
+
 def _register(client, username='wa_live_tester'):
     resp = client.post('/api/social/auth/register', json={
         'username': username,
@@ -122,9 +129,12 @@ class TestEnsureWhatsappLiveAdapter:
             )
 
         assert result['success'] is True
-        create_fn.assert_called_once_with(
-            api_url='http://127.0.0.1:3000', account_id='user_u1',
-        )
+        create_fn.assert_called_once()
+        call_kwargs = create_fn.call_args.kwargs
+        assert call_kwargs['api_url'] == 'http://127.0.0.1:3000'
+        assert call_kwargs['account_id'] == 'user_u1'
+        assert 'phone_number' in call_kwargs
+        assert 'owner_lid' in call_kwargs
         integration.registry.register.assert_called_once_with(fake_adapter)
         run_coro.assert_called_once()
         # scheduled coroutine must be adapter.start(), on the integration's loop
@@ -153,7 +163,7 @@ class TestEnsureWhatsappLiveAdapter:
         integration.registry.register.assert_not_called()
         run_coro.assert_not_called()
 
-    def test_reports_failure_when_loop_not_running(self):
+    def test_starts_integration_when_loop_not_running(self):
         """If FlaskChannelIntegration.start() was never called (event loop
         thread not up), fail loudly instead of silently no-op'ing — the
         old register_channel-only path failed exactly this silently."""
@@ -161,6 +171,9 @@ class TestEnsureWhatsappLiveAdapter:
 
         integration = _mock_integration(existing_adapter=None)
         integration._loop = None
+        live_loop = MagicMock()
+        live_loop.is_running.return_value = True
+        integration.start.side_effect = lambda: setattr(integration, '_loop', live_loop)
 
         with patch(
             'integrations.channels.flask_integration.get_channel_integration',
@@ -168,11 +181,12 @@ class TestEnsureWhatsappLiveAdapter:
         ), patch(
             'integrations.channels.whatsapp_adapter.create_whatsapp_adapter',
             return_value=MagicMock(),
-        ):
+        ), patch('asyncio.run_coroutine_threadsafe') as run_coro:
             result = _ensure_whatsapp_live_adapter('u1', sid='user_u1')
 
-        assert result['success'] is False
-        assert 'event loop' in result['error']
+        assert result['success'] is True
+        integration.start.assert_called_once()
+        run_coro.assert_not_called()
 
     def test_default_sid_derivation(self):
         """sid defaults to user_<id> unless already prefixed — must match
