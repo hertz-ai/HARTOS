@@ -32,7 +32,7 @@ from core.peer_link.link_manager import get_link_manager, reset_link_manager  # 
 from integrations.social.consent_service import (  # noqa: E402
     ConsentService, device_fingerprint, device_scope,
 )
-from integrations.social.models import Base, db_session, get_engine  # noqa: E402
+from integrations.social.models import Base, UserConsent, db_session, get_engine  # noqa: E402
 from security.node_integrity import canonical_payload  # noqa: E402
 from tests.unit.test_device_access_gate import Phone  # noqa: E402
 
@@ -142,10 +142,17 @@ def test_an_allowed_phone_opens_a_device_link_of_its_user(phone):
     assert ack['type'] == 'hello_ack'
 
 
-def test_a_phone_the_owner_has_not_allowed_is_closed(phone):
+def test_a_phone_the_owner_has_not_allowed_files_the_canonical_ask(phone):
+    """PeerLink must produce the same owner-visible ask as the HTTP gate."""
     _install_real_verifier()
     assert _accept(_hello(phone, phone.token())) is None
     assert get_link_manager()._links == {}
+    with db_session() as db:
+        ask = db.query(UserConsent).filter_by(
+            user_id=OWNER, consent_type='device_access',
+            scope=device_scope(phone.public_hex), agent_id=None).one()
+        assert ask.granted is False
+        assert ask.label == 'Sathish'
 
 
 def test_a_denied_phone_is_closed(phone):

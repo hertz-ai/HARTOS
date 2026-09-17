@@ -108,16 +108,16 @@ class LinkState(Enum):
 from core.peer_link.channels import (  # noqa: E402
     CHANNEL_IDS, CHANNEL_NAMES, device_may_send)
 
-#: Verifies a phone's device_token from a HELLO (HARTOS #111): callable(token)
+#: Verifies a phone's device_token from a HELLO (HARTOS #111): callable(token, peer_address)
 #: -> the verdict shape of integrations.social.auth.verify_device_jwt, plus
 #: 'peer_id' (the key's fingerprint) on 'ok'.  Injected by the host at boot
 #: (PeerLinkManager.set_device_verifier, next to the API gate), the way
 #: MessageBus.set_http_transport is: core must not import integrations.  No
 #: verifier means a device HELLO is refused -- fail closed.
-_DEVICE_VERIFIER: Optional[Callable[[str], dict]] = None
+_DEVICE_VERIFIER: Optional[Callable[[str, str], dict]] = None
 
 
-def set_device_verifier(fn: Optional[Callable[[str], dict]]) -> None:
+def set_device_verifier(fn: Optional[Callable[[str, str], dict]]) -> None:
     global _DEVICE_VERIFIER
     _DEVICE_VERIFIER = fn
 
@@ -666,7 +666,7 @@ class PeerLink:
             logger.warning("Device HELLO refused: no device verifier installed")
             return False
         try:
-            verdict = _DEVICE_VERIFIER(device_token) or {}
+            verdict = _DEVICE_VERIFIER(device_token, self.address) or {}
         except Exception as e:
             logger.warning(f"Device verifier failed; refusing: {e}")
             return False

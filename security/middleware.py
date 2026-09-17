@@ -372,15 +372,16 @@ def _apply_api_auth(app: Flask, register: bool = True):
             return refused
         token = auth_header[7:]
         try:
-            from integrations.social.auth import verify_device_jwt
+            from integrations.social.auth import (
+                file_device_access_ask, verify_device_jwt)
             from integrations.social.models import db_session
             with db_session(commit=True) as db:
                 verdict = verify_device_jwt(db, token, owner)
                 if verdict['status'] == 'pending':
                     from integrations.social.discovery import _check_announce_rate
                     if _check_announce_rate(request.remote_addr or ''):
-                        _file_device_ask(db, owner, verdict['public_key'],
-                                         verdict.get('claims') or {})
+                        file_device_access_ask(db, owner, verdict['public_key'],
+                                               verdict.get('claims') or {})
                     else:
                         logger.warning("device ask from %s not filed: rate limit",
                                        request.remote_addr)
@@ -413,22 +414,6 @@ def _apply_api_auth(app: Flask, register: bool = True):
                                        "this phone"}), 403
         return refused
 
-    def _file_device_ask(db, owner, public_key, claims):
-        """File (or re-send) the owner's ask for this phone.  The name comes
-        from the token's own username claim, which the phone signed: a
-        CLAIM, so the ask states it as one ('A phone calling itself ...'),
-        the same words as the card, and never as fact; what identifies the
-        phone is the key's fingerprint, which request_consent puts on the
-        ask as requester_fingerprint (consent_service.device_fingerprint).
-        Any surface that renders ``reason`` as it is says the same thing."""
-        from integrations.social.consent_service import (
-            ConsentService, device_scope)
-        name = ' '.join(str(claims.get('username') or '').split())[:100]
-        who = f'A phone calling itself "{name}"' if name else 'An unnamed phone'
-        ConsentService.request_consent(
-            db, owner, 'device_access', scope=device_scope(public_key),
-            reason=f"{who} asks to use this computer's agents from the network.",
-            requester_name=name)
 
     def _expected_api_key() -> str:
         """HEVOLVE_API_KEY, the one credential both branches below accept."""

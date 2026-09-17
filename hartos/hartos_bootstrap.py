@@ -102,16 +102,27 @@ def _install_device_verifier() -> None:
     as its gate admits no device."""
     try:
         from core.peer_link.link_manager import get_link_manager
-        from integrations.social.auth import verify_device_jwt
+        from integrations.social.auth import (
+            file_device_access_ask, verify_device_jwt)
         from integrations.social.consent_service import device_fingerprint
         from integrations.social.models import db_session
 
-        def verify(token: str) -> dict:
+        def verify(token: str, peer_address: str) -> dict:
             owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
             if not owner:
                 return {'status': 'invalid'}
-            with db_session(commit=False) as db:
+            with db_session(commit=True) as db:
                 verdict = verify_device_jwt(db, token, owner)
+                if verdict.get('status') == 'pending':
+                    from integrations.social.discovery import _check_announce_rate
+                    peer_host = peer_address.rsplit(':', 1)[0]
+                    if _check_announce_rate(peer_host):
+                        file_device_access_ask(
+                            db, owner, verdict['public_key'],
+                            verdict.get('claims') or {})
+                    else:
+                        logger.warning('device PeerLink ask from %s not filed: rate limit',
+                                       peer_host)
             if verdict.get('status') == 'ok':
                 verdict['peer_id'] = device_fingerprint(verdict['public_key'])
             return verdict

@@ -71,10 +71,10 @@ class PeerLinkManager:
         self._max_links = _MAX_LINKS.get(tier, 10)
         self._tier = tier
 
-    def set_device_verifier(self, fn: Optional[Callable[[str], dict]]) -> None:
+    def set_device_verifier(self, fn: Optional[Callable[[str, str], dict]]) -> None:
         """Inject the verifier for a phone's device_token (HARTOS #111), the
         way MessageBus.set_http_transport injects its transport: core must
-        not import integrations.  ``fn(token)`` returns the verdict of
+        not import integrations.  ``fn(token, peer_address)`` returns the verdict of
         integrations.social.auth.verify_device_jwt plus ``peer_id`` (the
         key's fingerprint) on 'ok'.  Until it is installed every device
         HELLO is refused (link.py)."""
