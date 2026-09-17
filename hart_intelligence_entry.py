@@ -3365,6 +3365,7 @@ def _handle_computer_action_tool(input_text: str) -> str:
         max_eta = int(os.environ.get('HEVOLVE_COMPUTER_ACTION_ETA', '180'))
         message = {
             'instruction_to_vlm_agent': input_text,
+            'workspace_root': os.getcwd(),
             'user_id': str(user_id or 'guest'),
             'prompt_id': str(prompt_id or 0),
             'os_to_control': 'windows' if sys.platform == 'win32' else (

@@ -386,8 +386,29 @@ class DistributedTaskCoordinator:
                         logger.warning(
                             "Task %s was IN_PROGRESS with no lock (worker "
                             "died); returning it to PENDING", task_id)
-                        self._ledger.update_task_status(
-                            task_id, TaskStatus.PENDING)
+                        # Preserve the ledger's validated lifecycle.  A direct
+                        # IN_PROGRESS -> PENDING transition is rejected, which
+                        # left an orphan permanently unclaimable despite this
+                        # recovery branch finding it.  BLOCKED -> PENDING is
+                        # the canonical recovery route and leaves an auditable
+                        # reason in the task history.
+                        recovered = self._ledger.update_task_status(
+                            task_id, TaskStatus.BLOCKED,
+                            error_message="worker claim expired",
+                            reason="orphan recovery: worker claim expired",
+                            defer_save=True)
+                        if not recovered:
+                            continue
+                        task.set_blocked_reason(
+                            BlockedReason.RESOURCE_UNAVAILABLE.value)
+                        recovered = self._ledger.update_task_status(
+                            task_id, TaskStatus.PENDING,
+                            reason="orphan recovery: task available for a new worker",
+                            defer_save=True)
+                        if not recovered:
+                            continue
+                        task.set_blocked_reason(None)
+                        task.error_message = None
                         task.context.pop("claimed_by", None)
                         self._ledger.save()
                     else:

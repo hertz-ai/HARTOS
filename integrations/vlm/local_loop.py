@@ -87,6 +87,10 @@ _VLM_ACTION_LIST = (
     "    * open_file_gui: open a file or app in the OS default handler. "
     "Put the target in the 'path' field (e.g. path='notepad' or "
     "path='C:\\\\Users\\\\foo\\\\doc.pdf').\n"
+    "      When a task names a bare file, first use shell to resolve it in "
+    "the task's declared workspace. Open only the resolved path. If it is "
+    "absent there, report that blocker; do not retry the same bare name or "
+    "inspect a different checkout.\n"
     "- File: list_folders_and_files, Open_file_and_copy_paste, write_file, "
     "read_file_and_understand\n"
 )
@@ -343,6 +347,12 @@ def _drive_local_agentic_loop(
 
     instruction = message.get('instruction_to_vlm_agent', '')
     enhanced = message.get('enhanced_instruction', instruction)
+    workspace_root = str(message.get('workspace_root') or '').strip()
+    if workspace_root:
+        enhanced = (
+            f"{enhanced}\n\nDeclared task workspace: {workspace_root}. "
+            "For a named file, resolve it within this workspace before opening it."
+        )
     user_id = message.get('user_id', '')
     prompt_id = message.get('prompt_id', '')
     max_eta = message.get('max_ETA_in_seconds', 1800)

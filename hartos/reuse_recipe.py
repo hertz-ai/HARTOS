@@ -1986,6 +1986,11 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                 'user_id': f'{user_id}',
                 'prompt_id': prompt_id,
                 'instruction_to_vlm_agent': instructions,
+                # The VLM shell must work in the same source tree the agent
+                # was assigned.  A bare filename otherwise resolves against
+                # the service's incidental launch directory and can either
+                # fail or select a stale checkout.
+                'workspace_root': os.getcwd(),
                 'os_to_control': os_to_control,
                 'actions_available_in_os': [],
                 'max_ETA_in_seconds': 1800,
