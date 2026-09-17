@@ -475,6 +475,13 @@ class AuditLogger:
             'block_reason': block_reason,
             'verify_diff': result.get('verify_diff'),
             'verify_retried': result.get('verify_retried'),
+            # Correlation fields are set by local_loop before it executes an
+            # action. A durable ledger event can reference this redacted
+            # evidence without treating the audit file as an interaction store.
+            'prompt_id': action.get('_prompt_id'),
+            'agent_id': action.get('_agent_id'),
+            'user_id': action.get('_user_id'),
+            'activity_id': action.get('_activity_id'),
         }
         date = time.strftime('%Y%m%d')
         log_path = os.path.join(self.path, f'vlm_actions_{date}.jsonl')

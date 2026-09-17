@@ -589,8 +589,9 @@ class TestPopulateFromSubsystems:
     application-registered populators):
         TTS      : derived from the live ENGINE_REGISTRY (see
                    live_tts_count — a hardcoded count here went stale)
-        LLM      :  7  (qwen3.5 ladder 0.8b/2b/4b/9b/27b/35b-a3b
-                        + qwen3-2b-text; _populate_llm_models is the
+        LLM      :  9  (qwen3.5 ladder 0.8b/2b/4b/9b/27b/35b-a3b,
+                        qwen3.6-35b-a3b, Tiel-Coder-35b-a3b, and qwen3-2b-text;
+                        _populate_llm_models is the
                         documented single source of truth for the ladder)
         STT      : 11  (5 faster-whisper + 6 sherpa-onnx)
         VLM      :  5  (qwen3vl, qwen08b caption, minicpm-v2, mobilevlm, clip)
@@ -605,7 +606,7 @@ class TestPopulateFromSubsystems:
     subsystems landing unacknowledged, task #16).
     """
 
-    EXPECTED_LLM_COUNT = 7
+    EXPECTED_LLM_COUNT = 9
     EXPECTED_STT_COUNT = 11
     EXPECTED_VLM_COUNT = 5  # +1 for qwen08b caption model
     EXPECTED_EMBODIED_COUNT = 3  # Qwen-RobotSuite foundation models
@@ -838,6 +839,25 @@ class TestLlmSeedLadder:
                       "fall through to its emergency literal on every box"
         assert drafts, "no 'draft' entry: the speculative dispatcher has no " \
                        "candidate to seed from"
+
+    def test_large_moe_rows_include_their_downloadable_projectors(self):
+        """The new 35B choices must remain usable as VLMs, not chat-only rows."""
+        cat = fresh_catalog()
+        cat._populate_llm_models()
+        qwen36 = cat.get('llm-qwen3.6-35b-a3b')
+        tiel = cat.get('llm-tiel-coder-35b-a3b')
+        assert qwen36.files == {
+            'model': 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf',
+            'mmproj': 'mmproj-Qwen3.6-35B-A3B-F16.gguf',
+            'mmproj_source': 'mmproj-F16.gguf',
+        }
+        assert tiel.files == {
+            'model': 'Tiel-Coder-35B-A3B-UD-Q4_K_XL.gguf',
+            'mmproj': 'mmproj-Tiel-Coder-35B-A3B-BF16.gguf',
+            'mmproj_source': 'mmproj-BF16.gguf',
+        }
+        assert qwen36.capabilities['vision'] is True
+        assert tiel.capabilities['vision'] is True
 
     @pytest.mark.parametrize('need_field', ['vram_gb', 'ram_gb'])
     def test_llm_seed_priority_is_monotonic_with_size(self, need_field):

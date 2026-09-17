@@ -721,8 +721,9 @@ class ModelCatalog:
         # Rows are DOWNLOAD-COMPLETE on purpose: repo_id alone is not enough to
         # fetch a GGUF, so each carries the exact file name and, for the VL
         # models, the mmproj projector. mmproj has TWO names because the file is
-        # published as mmproj-F16.gguf in every repo and must be stored under a
+        # usually published as mmproj-F16.gguf and must be stored under a
         # model-specific name locally or the second model overwrites the first.
+        # Tiel-Coder is the exception: its upstream projector is BF16-only.
         #
         # Sourced from Nunba's llama/llama_installer.py MODEL_PRESETS, which is
         # what actually downloads today. NOT from core/hub_allowlist.py: that is
@@ -761,6 +762,15 @@ class ModelCatalog:
              'unsloth/Qwen3.5-35B-A3B-GGUF', 'Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf',
              'mmproj-Qwen3.5-35B-A3B-F16.gguf',
              22733, 'full', 85, 0.88, 0.35, ['main'], MIN_BUILD_QWEN35),
+            ('llm-qwen3.6-35b-a3b', 'Qwen3.6 35B-A3B MoE',
+             'unsloth/Qwen3.6-35B-A3B-GGUF', 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf',
+             'mmproj-Qwen3.6-35B-A3B-F16.gguf',
+             22630, 'full', 85, 0.91, 0.36, ['main'], MIN_BUILD_QWEN35),
+            ('llm-tiel-coder-35b-a3b', 'Tiel-Coder 35B-A3B MoE',
+             'peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF',
+             'Tiel-Coder-35B-A3B-UD-Q4_K_XL.gguf',
+             'mmproj-Tiel-Coder-35B-A3B-BF16.gguf',
+             22938, 'full', 90, 0.92, 0.34, ['main'], MIN_BUILD_QWEN35),
         ]
         # Rows seeded by an EARLIER version of this method that are now known to
         # be unloadable: google/gemma-*-it are transformers repos with no GGUF,
@@ -780,7 +790,10 @@ class ModelCatalog:
                 # Local name is model-specific; source name is what the repo
                 # publishes. Collapsing them overwrites across models.
                 files['mmproj'] = mmproj
-                files['mmproj_source'] = 'mmproj-F16.gguf'
+                files['mmproj_source'] = (
+                    'mmproj-BF16.gguf' if mmproj.endswith('-BF16.gguf')
+                    else 'mmproj-F16.gguf'
+                )
             _definition = dict(
                 name=name, model_type=ModelType.LLM,
                 source='huggingface', repo_id=repo, files=files,

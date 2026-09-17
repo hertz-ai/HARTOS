@@ -14,6 +14,7 @@ import platform
 import time
 import logging
 import re
+import uuid
 
 logger = logging.getLogger('hevolve.vlm.local_loop')
 
@@ -404,6 +405,13 @@ def _drive_local_agentic_loop(
 
     extracted_responses = []
     start_time = time.time()
+    # Run identity is local to this invocation.  It distinguishes retries of
+    # the same prompt while preserving prompt_id as the cross-surface join key.
+    activity_run_id = uuid.uuid4().hex[:12]
+    # Resolve once: the database goal id is only needed for the existing
+    # GroupChat steering endpoint, while prompt_id remains the run join key.
+    from integrations.vlm.activity_stream import resolve_steering_agent_id
+    steering_agent_id = resolve_steering_agent_id(str(user_id), str(prompt_id))
     # One taskbar shortcut per run — see the pre-check call site below.
     _taskbar_shortcut_used = False
 
@@ -808,10 +816,27 @@ def _drive_local_agentic_loop(
             # but ON in the loop is the right safe default — solo
             # /visual_agent calls keep their existing behaviour.
             action_payload = _build_action_payload(action_json, parsed)
+            # Persist the run identity beside the action in the existing VLM
+            # audit JSONL, so a ledger event can retain a redacted evidence
+            # reference without duplicating the action stream in the UI.
+            action_payload['_prompt_id'] = str(prompt_id)
+            action_payload['_agent_id'] = str(message.get('agent_id') or message.get('daemon_id') or '')
+            action_payload['_user_id'] = str(user_id)
+            action_payload['_activity_id'] = f'{activity_run_id}:{iteration + 1}'
             from core.config_cache import env_flag as _env_flag
             _safety_on = _env_flag('HEVOLVE_VLM_LOOP_SAFETY', True)
             _verify_on = _env_flag('HEVOLVE_VLM_LOOP_VERIFY', False)
-            _notify_desktop_indicator(True, text=_step_caption(action_json))
+            from integrations.vlm.activity_stream import record_activity
+            _caption = _step_caption(action_json)
+            record_activity(
+                user_id=user_id, prompt_id=prompt_id, run_id=activity_run_id,
+                iteration=iteration + 1, action=next_action, phase='executing',
+                agent_id=message.get('agent_id') or message.get('daemon_id') or '',
+                steering_agent_id=steering_agent_id,
+                audit_ref={'activity_id': action_payload['_activity_id']},
+                caption=_caption,
+            )
+            _notify_desktop_indicator(True, text=_caption)
             result = execute_action(
                 action_payload, tier,
                 safety=_safety_on, verify=_verify_on)
@@ -820,7 +845,8 @@ def _drive_local_agentic_loop(
             # executor failed ({'error': ...}, often with no status).  Both
             # used to count as ok, and the reason went with the empty output.
             _err = result.get('error')
-            action_ok = result.get('status') != 'error' and not _err
+            action_ok = (result.get('status') not in ('error', 'safety_blocked', 'blocked')
+                         and not _err)
             _out = result.get('output', '') or ''
             if _err:
                 _out = (f"{_out}\n" if _out else '') + f"FAILED: {_err}"
@@ -828,6 +854,19 @@ def _drive_local_agentic_loop(
                 consecutive_action_errors = 0
             else:
                 consecutive_action_errors += 1
+
+            _phase = ('completed' if action_ok else
+                      ('blocked' if result.get('block_reason') or
+                       result.get('status') == 'safety_blocked' else 'failed'))
+            record_activity(
+                user_id=user_id, prompt_id=prompt_id, run_id=activity_run_id,
+                iteration=iteration + 1, action=next_action, phase=_phase,
+                agent_id=message.get('agent_id') or message.get('daemon_id') or '',
+                steering_agent_id=steering_agent_id,
+                audit_ref={'activity_id': action_payload['_activity_id']},
+                error=str(_err or result.get('block_reason') or ''),
+                caption=_caption,
+            )
 
             # Surface coordinate + strategy in the response content so
             # observers (benchmark, audit, /visual_agent telemetry,

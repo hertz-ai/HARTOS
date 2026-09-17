@@ -1585,6 +1585,23 @@ class SmartLedger:
         with self._lock:
             return self.tasks.get(task_id)
 
+    def update_task_context(self, task_id: str, context: Dict[str, Any]) -> bool:
+        """Replace a task's structured context and persist it atomically.
+
+        Context is the extension point for task-specific state such as a
+        computer-use action.  Keeping this mutation here preserves the same
+        lock, integrity, and persistence contract as every other task update.
+        """
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                return False
+            task.context = dict(context or {})
+            task.updated_at = datetime.now().isoformat()
+            task.seal_integrity()
+        self.save()
+        return True
+
     def get_tasks_by_status(self, status: TaskStatus) -> List[Task]:
         """Get all tasks with specific status."""
         with self._lock:

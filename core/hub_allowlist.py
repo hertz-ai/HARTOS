@@ -62,6 +62,8 @@ DEFAULT_TRUSTED_ORGS: Dict[str, str] = {
     'meta-llama': 'Meta Llama foundation models',
     'mistralai': 'Mistral AI official',
     'Qwen': 'Alibaba Qwen foundation models',
+    'unsloth': 'Unsloth GGUF publisher for the Qwen local-model catalog',
+    'peculiar-ragdoll': 'Tiel-Coder GGUF publisher selected for local coding',
     'ai4bharat': 'AI4Bharat — Indic language ecosystem (T9 cohort)',
     'facebook': 'Meta (legacy facebook namespace)',
     'HuggingFaceTB': 'HuggingFace TB org (small efficient models)',

@@ -2887,20 +2887,26 @@ def review_report(report_id):
 @social_bp.route('/admin/stats', methods=['GET'])
 @require_admin
 def platform_stats():
-    from sqlalchemy import func as sqlfunc
-    total_users = g.db.query(sqlfunc.count(User.id)).scalar()
-    total_agents = g.db.query(sqlfunc.count(User.id)).filter(User.user_type == 'agent').scalar()
-    total_humans = g.db.query(sqlfunc.count(User.id)).filter(User.user_type == 'human').scalar()
-    total_posts = g.db.query(sqlfunc.count(Post.id)).filter(Post.is_deleted == False).scalar()
-    total_comments = g.db.query(sqlfunc.count(Comment.id)).filter(Comment.is_deleted == False).scalar()
-    total_communities = g.db.query(sqlfunc.count(Community.id)).scalar()
-    pending_reports = g.db.query(sqlfunc.count(Report.id)).filter(Report.status == 'pending').scalar()
-    return _ok({
-        'total_users': total_users, 'total_agents': total_agents,
-        'total_humans': total_humans, 'total_posts': total_posts,
-        'total_comments': total_comments, 'total_communities': total_communities,
-        'pending_reports': pending_reports,
-    })
+    """Return dashboard aggregates without making Admin unusable during migration."""
+    empty = {
+        'total_users': 0, 'total_agents': 0, 'total_humans': 0,
+        'total_posts': 0, 'total_comments': 0, 'total_communities': 0,
+        'pending_reports': 0,
+    }
+    try:
+        from sqlalchemy import func as sqlfunc
+        return _ok({
+            'total_users': g.db.query(sqlfunc.count(User.id)).scalar(),
+            'total_agents': g.db.query(sqlfunc.count(User.id)).filter(User.user_type == 'agent').scalar(),
+            'total_humans': g.db.query(sqlfunc.count(User.id)).filter(User.user_type == 'human').scalar(),
+            'total_posts': g.db.query(sqlfunc.count(Post.id)).filter(Post.is_deleted == False).scalar(),
+            'total_comments': g.db.query(sqlfunc.count(Comment.id)).filter(Comment.is_deleted == False).scalar(),
+            'total_communities': g.db.query(sqlfunc.count(Community.id)).scalar(),
+            'pending_reports': g.db.query(sqlfunc.count(Report.id)).filter(Report.status == 'pending').scalar(),
+        })
+    except Exception:
+        logging.exception('Admin dashboard statistics are unavailable')
+        return _ok(empty)
 
 
 @social_bp.route('/admin/revenue-analytics', methods=['GET'])
