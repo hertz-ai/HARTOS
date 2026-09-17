@@ -24,6 +24,29 @@ from core.port_registry import get_port
 logger = logging.getLogger('hevolve_social')
 
 
+def _worker_node_id() -> str:
+    """Return the node identity used by the rest of the distributed stack.
+
+    The worker used an ``unknown`` fallback while gossip, sync, and peer-link
+    already agree on a persisted node identity.  A task claimant is a node, not
+    a human user, so resolve it through SyncEngine's canonical identity helper
+    rather than inventing a second identifier here.
+    """
+    try:
+        from integrations.social.sync_engine import SyncEngine
+        node_id = SyncEngine.canonical_node_id()
+        if node_id:
+            return str(node_id)
+    except Exception:
+        logger.debug('Distributed worker could not resolve canonical node id',
+                     exc_info=True)
+    # The explicit setting remains the bootstrap fallback when the social
+    # subsystem cannot yet be imported.  Never claim as the shared literal
+    # ``unknown``: that conflates unrelated nodes and corrupts attribution.
+    configured = (os.environ.get('HEVOLVE_NODE_ID') or '').strip()
+    return configured or 'local-worker-unidentified'
+
+
 class HeldForHelp:
     """What _execute_task returns when the turn's action was handed to a
     person or an expert (create_recipe._ask_for_help; the reply is recognised
@@ -63,7 +86,7 @@ class DistributedWorkerLoop:
         self._running = False
         self._thread = None
         self._lock = threading.Lock()
-        self._node_id = os.environ.get('HEVOLVE_NODE_ID', 'unknown')
+        self._node_id = _worker_node_id()
         self._capabilities = self._detect_capabilities()
         # Current Redis backoff state — reset to 0 when a tick succeeds.
         self._redis_backoff: float = 0.0

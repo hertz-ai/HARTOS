@@ -588,7 +588,23 @@ class DistributedTaskCoordinator:
                 return
 
             objective = parent.context.get("objective", parent.description)
-            user_id = agent_id  # agent_id IS str(g.user.id) — set in api.py
+            # ``agent_id`` is the claiming WORKER NODE (see worker_loop), not
+            # the human who submitted the goal.  The dispatch path stamps the
+            # requester into the inherited task context; use that canonical
+            # ownership field so a completed remote task is reported to its
+            # owner rather than creating a notification for a node id such as
+            # ``unknown``.
+            user_id = task.context.get("user_id") or parent.context.get("user_id")
+            if not user_id:
+                logger.debug("No human owner for goal contribution task %s; "
+                             "skipping user notification", task_id)
+                return
+            from core.constants import MACHINE_GOAL_AUTHORS
+            if user_id in MACHINE_GOAL_AUTHORS:
+                logger.debug("System-owned goal contribution for %s has no "
+                             "human notification target", task_id)
+                return
+            user_id = str(user_id)
 
             # Use Flask request context db if available, else open a fresh session
             try:

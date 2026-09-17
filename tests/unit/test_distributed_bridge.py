@@ -297,6 +297,13 @@ class TestDistributedWorkerLoop:
         assert 'news' in wl._capabilities
         assert 'finance' in wl._capabilities
 
+    def test_worker_uses_canonical_node_identity(self):
+        """A worker must never claim shared work as the literal ``unknown``."""
+        from integrations.distributed_agent.worker_loop import DistributedWorkerLoop
+        with patch('integrations.social.sync_engine.SyncEngine.canonical_node_id',
+                   return_value='gossip-node-123'):
+            assert DistributedWorkerLoop()._node_id == 'gossip-node-123'
+
     def test_worker_tick_no_coordinator(self):
         """Tick does nothing when coordinator is unavailable."""
         from integrations.distributed_agent.worker_loop import DistributedWorkerLoop
