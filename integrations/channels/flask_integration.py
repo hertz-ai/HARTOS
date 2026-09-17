@@ -108,7 +108,11 @@ class FlaskChannelIntegration:
             # fan-out). Gated per-adapter via extra.enable_self_chat_agent.
             if self._self_chat.is_self_message(message):
                 logger.debug("self-chat from %s", message.sender_id)
-                return self._self_chat.handle(message, session)
+                # SelfChatHandler owns the in-thread delivery through the
+                # existing registry. Returning its reply here would make
+                # ChannelRegistry._route_to_agent send that same reply again.
+                self._self_chat.handle(message, session)
+                return None
 
             # ── Resolve user_id ───────────────────────────────────
             # 1. UserChannelBinding (durable DB row written by
