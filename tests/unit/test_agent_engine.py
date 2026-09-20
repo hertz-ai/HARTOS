@@ -3345,9 +3345,49 @@ class TestPromptInjectionSanitization:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class TestVLMAdapter:
-    """Tests for integrations.vlm.vlm_adapter three-tier dispatch."""
+    """Tests for integrations.vlm.vlm_adapter three-tier dispatch.
 
-    def test_tier1_bundled_with_pyautogui(self):
+    These test WHICH TIER runs, not whether the run is permitted.
+    execute_vlm_instruction asks computer_control_block before it picks a
+    tier -- deliberately, so the gate also covers the WAMP fallback -- and
+    with no HEVOLVE_OWNER_USER_ID that gate refuses, because nobody can be
+    asked.  Once the gate landed these tests stopped exercising tier
+    selection at all and just re-proved the refusal; every one of them read
+    'blocked' where it asserted 'success'.
+
+    So each declares the precondition with the canonical
+    `computer_control_granted` fixture (tests/conftest.py).  The gate itself
+    is tested against a real consent table in
+    tests/unit/test_computer_control_consent.py, and the adapter's own
+    refusal shape is pinned by test_refuses_when_the_owner_has_not_allowed
+    below -- do not let a tier test carry that duty again.
+    """
+
+    def test_refuses_when_the_owner_has_not_allowed_computer_control(
+            self, monkeypatch):
+        """No owner means nobody could allow it, so nothing runs.
+
+        This is the assertion the five tier tests were accidentally making.
+        Pinned here on purpose, with the loop patched to explode, so a
+        regression that lets a tier run unpermitted fails loudly instead of
+        quietly turning a refusal into a success somewhere else.
+        """
+        from integrations.vlm import vlm_adapter
+        monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
+
+        def _boom(*a, **k):
+            raise AssertionError('a refused instruction reached the VLM loop')
+
+        with patch('integrations.vlm.local_loop.run_local_agentic_loop',
+                   side_effect=_boom):
+            result = vlm_adapter.execute_vlm_instruction(
+                {'instruction_to_vlm_agent': 'open notepad'})
+
+        assert result is not None
+        assert result['status'] == 'blocked'
+        assert result['exit_reason'] == 'consent_required'
+
+    def test_tier1_bundled_with_pyautogui(self, computer_control_granted):
         """Tier 1: bundled mode + pyautogui → calls local loop."""
         from integrations.vlm import vlm_adapter
         orig_bundled = vlm_adapter._BUNDLED_MODE
@@ -3377,7 +3417,7 @@ class TestVLMAdapter:
             vlm_adapter._HAS_PYAUTOGUI = orig_has
             vlm_adapter._tier1_fail_count = orig_t1
 
-    def test_tier2_flat_mode_http(self):
+    def test_tier2_flat_mode_http(self, computer_control_granted):
         """Tier 2: flat mode without bundled → calls local loop with http tier."""
         from integrations.vlm import vlm_adapter
         orig_bundled = vlm_adapter._BUNDLED_MODE
@@ -3413,7 +3453,7 @@ class TestVLMAdapter:
             vlm_adapter._node_tier = orig_tier
             vlm_adapter._tier2_fail_count = orig_t2
 
-    def test_tier3_central_mode_returns_none(self):
+    def test_tier3_central_mode_returns_none(self, computer_control_granted):
         """Tier 3: central mode → returns None (caller uses Crossbar)."""
         from integrations.vlm import vlm_adapter
         orig_bundled = vlm_adapter._BUNDLED_MODE
@@ -3433,7 +3473,7 @@ class TestVLMAdapter:
             vlm_adapter._HAS_PYAUTOGUI = orig_has
             vlm_adapter._node_tier = orig_tier
 
-    def test_circuit_breaker_tier1(self):
+    def test_circuit_breaker_tier1(self, computer_control_granted):
         """Tier 1 circuit breaker: 2 failures → skips to Tier 2/3."""
         from integrations.vlm import vlm_adapter
         orig_bundled = vlm_adapter._BUNDLED_MODE
@@ -3498,7 +3538,7 @@ class TestVLMAdapter:
             vlm_adapter._BUNDLED_MODE = orig_bundled
             vlm_adapter._HAS_PYAUTOGUI = orig_has
 
-    def test_tier1_success_resets_fail_count(self):
+    def test_tier1_success_resets_fail_count(self, computer_control_granted):
         """Successful Tier 1 call resets the failure counter."""
         from integrations.vlm import vlm_adapter
         orig_bundled = vlm_adapter._BUNDLED_MODE
