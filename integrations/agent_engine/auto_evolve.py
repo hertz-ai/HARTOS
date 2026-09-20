@@ -20,6 +20,7 @@ dispatches them through the existing agent goal system.
 """
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -41,6 +42,18 @@ AUTO_EVOLVE_MAX_PARALLEL_DISPATCH = 4
 # via min_approval_score (which is applied as an absolute-score floor in
 # addition to this ratio).
 AUTO_EVOLVE_SUPERMAJORITY_RATIO = 2.0 / 3.0
+
+# How long a dispatched cycle may stay un-terminal before reconcile() closes
+# it out.  This exists because 'paused' is NOT a terminal goal status (six
+# throttle/budget paths write it while the goal is still alive), so a cycle
+# whose goal is parked would otherwise stay 'running' forever -- and both
+# start() and the agent daemon's tick refuse to open a new cycle while one is
+# running, so auto-evolve would be wedged permanently on a single parked goal.
+# The bound is generous: it must be long enough that a normal budget pause
+# resumes well inside it, and it is the ONLY thing that releases the
+# orchestrator when a goal never comes back.
+AUTO_EVOLVE_SESSION_MAX_AGE_S = float(
+    os.getenv('HEVOLVE_AUTO_EVOLVE_SESSION_MAX_AGE_S', 6 * 3600))
 
 # Active-learning bias for the VOTE stage.  When the world model
 # (HevolveAI side, queried via world_model_bridge.get_learning_feedback)
@@ -174,7 +187,9 @@ class AutoEvolveOrchestrator:
             Session info dict
         """
         with self._lock:
-            if self._active_session and self._active_session.status == 'running':
+            if (self._active_session
+                    and self._active_session.status in (
+                        'selecting', 'dispatching', 'running')):
                 return {
                     'success': False,
                     'reason': 'Auto-evolve cycle already running',
@@ -216,6 +231,109 @@ class AutoEvolveOrchestrator:
             if self._active_session:
                 return self._active_session.to_dict()
         return {'status': 'idle', 'message': 'No active auto-evolve session'}
+
+    def reconcile(self) -> Dict:
+        """Project dispatched AgentGoal states back onto the active cycle.
+
+        Dispatch deliberately stays in the existing goal engine.  This is the
+        missing return handoff: the orchestrator stores each created goal id,
+        then reads that canonical goal's state until every dispatched experiment
+        is terminal.  It never infers completion from an agent's prose.
+        """
+        with self._lock:
+            session = self._active_session
+            if session is None:
+                return {'status': 'idle',
+                        'message': 'No active auto-evolve session'}
+            if session.status != 'running':
+                return session.to_dict()
+            goal_ids = [
+                item.get('goal_id') for item in session.experiments
+                if item.get('goal_id')
+            ]
+
+        if not goal_ids:
+            with self._lock:
+                session.status = 'failed'
+                if 'No dispatched goal ids to reconcile' not in session.errors:
+                    session.errors.append('No dispatched goal ids to reconcile')
+                return session.to_dict()
+
+        try:
+            from integrations.social.models import AgentGoal, db_session
+            with db_session(commit=False) as db:
+                goals = db.query(AgentGoal).filter(
+                    AgentGoal.id.in_(goal_ids)).all()
+            by_id = {str(goal.id): str(goal.status or '').lower()
+                     for goal in goals}
+        except Exception as exc:
+            logger.warning(
+                "[%s] Auto-evolve reconciliation skipped: %s",
+                session.session_id, exc)
+            return session.to_dict()
+
+        # 'paused' is NOT terminal.  Six throttle and budget paths write it
+        # while the goal is still alive (agent_daemon, budget_gate,
+        # goal_manager, coding_daemon), and four readers -- goal_seeding,
+        # content_gen_tracker, api_tracker, dashboard_service -- all treat
+        # ['active', 'paused'] as live.  Closing the experiment on a pause
+        # left its row at status 'evaluating' with no evaluation recorded,
+        # so the next cycle's _gather_candidates picked it up again and
+        # request_agent_evaluation created a SECOND AgentGoal for the same
+        # experiment.  The paused goal then resumed alongside it.
+        terminal = {'completed', 'failed', 'archived'}
+        # Because 'paused' no longer closes an experiment, something else has
+        # to release a cycle whose goal never comes back -- start() and the
+        # daemon tick both refuse to open a new cycle while one is 'running'.
+        aged_out = bool(session.started_at) and (
+            time.time() - session.started_at) > AUTO_EVOLVE_SESSION_MAX_AGE_S
+        with self._lock:
+            for item in session.experiments:
+                goal_id = item.get('goal_id')
+                if not goal_id:
+                    continue
+                goal_status = by_id.get(str(goal_id))
+                if goal_status is None:
+                    item['status'] = 'failed'
+                    item['reason'] = 'dispatched goal is missing'
+                elif goal_status == 'completed':
+                    item['status'] = 'completed'
+                elif goal_status in terminal:
+                    item['status'] = 'failed'
+                    item['reason'] = f'goal ended as {goal_status}'
+                elif aged_out:
+                    item['status'] = 'failed'
+                    item['reason'] = (
+                        f'goal still {goal_status} after '
+                        f'{AUTO_EVOLVE_SESSION_MAX_AGE_S:.0f}s; '
+                        'cycle aged out')
+                    item['goal_status'] = goal_status
+                    logger.warning(
+                        "[%s] Experiment %s aged out with its goal still %s; "
+                        "closing the cycle so auto-evolve can run again",
+                        session.session_id, item.get('id'), goal_status)
+                else:
+                    item['status'] = 'running'
+                    item['goal_status'] = goal_status
+
+            session.completed = sum(
+                item.get('status') == 'completed'
+                for item in session.experiments)
+            session.failed = sum(
+                item.get('status') == 'failed'
+                for item in session.experiments)
+            all_terminal = bool(session.experiments) and all(
+                item.get('status') in ('completed', 'failed')
+                for item in session.experiments)
+            if all_terminal:
+                session.status = (
+                    'completed' if session.completed > 0 else 'failed')
+                payload = session.to_dict()
+            else:
+                return session.to_dict()
+
+        self._emit_event('auto_evolve.completed', payload)
+        return payload
 
     def _execute_cycle(self, session: EvolveSession,
                        max_experiments: int,
@@ -279,7 +397,16 @@ class AutoEvolveOrchestrator:
                 for status in statuses:
                     exps = ThoughtExperimentService.get_active_experiments(
                         db, status=status, limit=50)
-                    all_experiments.extend(exps)
+                    # One evaluation goal already contains the experiment's
+                    # type-aware iteration loop.  Re-dispatching an evaluating
+                    # row that has recorded an evaluation creates duplicate
+                    # goals forever because the explicit decide step belongs to
+                    # the steward/API.  A failed goal records no evaluation and
+                    # therefore remains eligible for retry.
+                    all_experiments.extend(
+                        exp for exp in exps
+                        if not (status == 'evaluating'
+                                and exp.get('agent_evaluations_json')))
                 return all_experiments
         except Exception as e:
             logger.warning(f"[{session.session_id}] Gather failed: {e}")
@@ -317,6 +444,11 @@ class AutoEvolveOrchestrator:
         super-majority gate protects against a small but highly-weighted
         vocal minority flipping a low-participation tally into approval.
 
+        The gate FAILS CLOSED.  If the tally cannot be read at all -- a
+        locked SQLite database, a schema error -- nothing is dispatched
+        this cycle.  A tally that could not be counted is not an approval,
+        and the daemon retries on its next interval.
+
         Once the gates pass, the rank is biased by an active-learning
         signal pulled from the world model (HevolveAI) — see
         _active_learning_multiplier docstring.  The bias only nudges
@@ -353,8 +485,19 @@ class AutoEvolveOrchestrator:
                             f"ratio>={AUTO_EVOLVE_SUPERMAJORITY_RATIO:.3f})"
                         )
         except Exception as e:
-            logger.warning(f"[{session.session_id}] Vote tally failed: {e}")
-            return candidates  # Fall through unranked
+            # Fail CLOSED.  This gate is the constitutional supermajority: an
+            # experiment reaches dispatch only when the weighted vote approves
+            # it.  Returning the candidates unranked returned them UNGATED --
+            # every constitutionally-eligible experiment dispatched with zero
+            # votes counted.  That was already wrong when a human pressed the
+            # admin button; it became autonomous when the daemon started
+            # calling start(user_id='system') on a timer.  A locked SQLite
+            # database is not an approval.  The cycle is skipped and the
+            # daemon retries on its next interval.
+            logger.error(
+                "[%s] Vote tally failed, refusing to dispatch unvoted "
+                "experiments this cycle: %s", session.session_id, e)
+            return []
 
         # Active-learning bias: pull a global epistemic-uncertainty
         # multiplier from the world model and apply it as a small
@@ -508,6 +651,7 @@ class AutoEvolveOrchestrator:
                     success = (
                         isinstance(goal_result, dict)
                         and bool(goal_result.get('success'))
+                        and bool(goal_result.get('goal_id'))
                     )
                     with self._lock:
                         if success:
