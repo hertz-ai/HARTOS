@@ -1304,7 +1304,13 @@ class GuardrailEnforcer:
             except ImportError:
                 cfg = (goal_dict.get('config')
                        or goal_dict.get('config_json') or {})
-            if cfg.get('require_consent'):
+            # BOTH spellings: goal_seeding writes require_consent (:1745,1863,
+            # 1892,1948,2009) AND requires_consent (:118,514,580), but this was
+            # the only enforcement site and it read the first spelling only — so
+            # every goal seeded with the plural was dispatched UNGATED (#96).
+            # Reading both gates them without touching the producers or the
+            # on-the-wire requires_consent, which is the smaller change.
+            if cfg.get('require_consent') or cfg.get('requires_consent'):
                 if not user_id:
                     # Daemon goals carry no requester, which left every
                     # consent-flagged goal in a blocked loop with nobody

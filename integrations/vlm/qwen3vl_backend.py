@@ -477,7 +477,7 @@ class Qwen3VLBackend:
 
     def dispatch_inference(self, request: dict, *,
                             peer_dispatch=None,
-                            intelligence_preference: str = 'hybrid'
+                            intelligence_preference: str = 'auto'
                             ) -> dict:
         """Pick the right tier for a VLM inference request and run it.
 
@@ -490,10 +490,14 @@ class Qwen3VLBackend:
                 ``peer_dispatch(channel, payload, timeout)`` to route
                 to a paired peer over PeerLink.  When None, only
                 local + cloud tiers are considered.
-            intelligence_preference: ``'local_only'`` (default for
-                desktop) | ``'hybrid'`` (try local first, peer as
-                fallback) | ``'hive'`` (prefer peer/hive when local
-                is busy or unreachable).
+            intelligence_preference: the CANONICAL vocabulary —
+                ``'local_only'`` (never leave the box) |
+                ``'auto'`` (default; try local first, peer as
+                fallback) | ``'hive_preferred'`` (prefer peer/hive
+                when local is busy or unreachable).  The legacy
+                spellings ``'hybrid'`` (== auto) and ``'hive'``
+                (== hive_preferred) are still accepted, see the
+                normalisation below.
 
         Returns:
             dict with grounding result + ``'tier'`` field set to
@@ -515,14 +519,25 @@ class Qwen3VLBackend:
         # Reviewer flagged that the prior 'hybrid' order excluded
         # 'cloud' when local was reachable, which contradicted the
         # plan's "fall through all four tiers" wording.  Now matches.
-        if intelligence_preference == 'local_only':
+        # Normalise to the canonical vocabulary. The canonical set is
+        # {local_only, auto, hive_preferred} (llama_config._INTELLIGENCE_PREFS —
+        # what the demopage toggle sets and /chat forwards as user_pref). This
+        # resolver predated it with {local_only, hybrid, hive}, so canonical
+        # 'hive_preferred' matched NOTHING and fell through to the local-first
+        # ordering: a user who chose Hive still got local tried first. 'auto'
+        # and legacy 'hybrid' are the same local-first ordering, so mapping both
+        # leaves every existing caller's behaviour identical.
+        _pref = {'hive': 'hive_preferred', 'hybrid': 'auto'}.get(
+            intelligence_preference, intelligence_preference)
+
+        if _pref == 'local_only':
             tiers = ['local'] if local_available else []
-        elif intelligence_preference == 'hive':
+        elif _pref == 'hive_preferred':
             tiers = ['paired_peer', 'hive']
             if local_available:
                 tiers.append('local')
             tiers.append('cloud')
-        else:  # 'hybrid' (default)
+        else:  # 'auto' (default; legacy 'hybrid' normalises here)
             tiers = []
             if local_available and prefer_local:
                 tiers.append('local')

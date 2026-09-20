@@ -176,3 +176,38 @@ def test_dispatch_goal_feeds_goal_dict_and_user_to_the_one_gate(monkeypatch):
     assert result is None
     assert seen['goal_dict'] == FLAGGED
     assert seen['user_id'] == 'user-1'
+
+
+# ── #96: the plural spelling was written but never enforced ─────────────
+# goal_seeding writes BOTH require_consent (:1745,1863,1892,1948,2009) AND
+# requires_consent (:118,514,580) into config_json, but this gate was the only
+# enforcement site and read the singular only — so every goal seeded with the
+# plural dispatched UNGATED. The gate now reads both spellings.
+FLAGGED_PLURAL = {'config_json': {'requires_consent': True}}
+
+
+def test_plural_spelling_is_also_gated(monkeypatch):
+    from security.hive_guardrails import GuardrailEnforcer
+    _quiet_other_policies(monkeypatch)
+    req_spy = _patch_consent(monkeypatch, granted=False)
+
+    allowed, reason, _ = GuardrailEnforcer.before_dispatch(
+        'p', goal_dict=FLAGGED_PLURAL, user_id='user-1')
+
+    assert allowed is False, (
+        "a goal seeded with requires_consent must be gated too (#96) — it "
+        "dispatched ungated while only require_consent was read")
+    assert 'consent' in reason.lower()
+    assert req_spy.call_count == 1
+
+
+def test_plural_spelling_passes_with_consent(monkeypatch):
+    from security.hive_guardrails import GuardrailEnforcer
+    _quiet_other_policies(monkeypatch)
+    req_spy = _patch_consent(monkeypatch, granted=True)
+
+    allowed, _reason, _ = GuardrailEnforcer.before_dispatch(
+        'p', goal_dict=FLAGGED_PLURAL, user_id='user-1')
+
+    assert allowed is True
+    assert req_spy.call_count == 0
