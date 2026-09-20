@@ -143,6 +143,52 @@ def get_store_backend() -> str:
     return AGENT_LIGHTNING_CONFIG.get('store_backend', 'json')
 
 
+def get_traces_path() -> str:
+    r"""The ONE resolution of where Lightning spans live on disk.
+
+    Two components touch this directory and they must never disagree:
+    `LightningTracer._save_span` writes it, `LightningStore` reads it (and
+    `AgentBaselineService._collect_lightning_metrics` is the only production
+    construction of that store).  Until 2026-09-20 each resolved
+    `traces_path` itself: the tracer redirected a CWD-relative value to the
+    user data dir, the store took it literally.  With the shipped default
+    (`AGENT_LIGHTNING_TRACES_PATH` is set nowhere, and Nunba's backend
+    adapter turns Lightning on) the reader looked in a directory the writer
+    never wrote to, so every Phase 3 baseline aggregation saw zero spans and
+    reported success.
+
+    The rule:
+      * an ABSOLUTE configured path is honoured verbatim -- an operator who
+        names a directory gets that directory;
+      * anything relative or empty is anchored under `get_agent_data_dir()`,
+        because an installed build's CWD is `C:\Program Files\...`, which is
+        not writable and is not where the user's data lives.
+
+    A leading `agent_data/` segment is dropped when anchoring, since the data
+    dir IS the agent_data directory -- that keeps the default resolving to the
+    same place the tracer already used, so existing traces stay readable.
+    """
+    configured = AGENT_LIGHTNING_CONFIG.get('traces_path') or ''
+    if configured and os.path.isabs(configured):
+        return os.path.normpath(configured)
+
+    try:
+        from core.platform_paths import get_agent_data_dir
+        base = get_agent_data_dir()
+    except Exception:
+        base = os.path.join(
+            os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+
+    if not configured:
+        return os.path.join(base, 'lightning_traces')
+
+    rel = os.path.normpath(configured)
+    prefix = 'agent_data' + os.sep
+    if rel.startswith(prefix):
+        rel = rel[len(prefix):]
+    return os.path.join(base, rel)
+
+
 def get_training_config() -> Dict[str, Any]:
     """Get training configuration"""
     return AGENT_LIGHTNING_CONFIG.get('training', {})
@@ -180,6 +226,7 @@ __all__ = [
     'get_agent_config',
     'get_reward_value',
     'get_store_backend',
+    'get_traces_path',
     'get_training_config',
     'update_config',
 ]
