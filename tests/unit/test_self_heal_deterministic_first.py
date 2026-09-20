@@ -160,3 +160,97 @@ def test_prompt_generic_exception_still_edits_source():
     """A real code bug (non-dep category) still routes to source editing."""
     p = _build_self_heal_prompt(_goal('runtime.assertion', {}))
     assert 'Read the source file' in p
+
+
+# ── 2026-09-20: heal where the child reads, and never "install" the app ──
+#
+# Measured on the installed build (frozen_debug.log 16:09:55-16:10:00): the
+# chatterbox_turbo venv worker died with "No module named 'integrations'",
+# the self-heal ran `pip install integrations --target ~/.nunba/site-packages`
+# (rc=1, no such package), then dispatched an agentic self-heal goal and a
+# crash report, all for a module this very process was running.  And a
+# per-backend venv never reads the user site at all (its interpreter is
+# isolated), so even a successful --target install there is invisible to it.
+
+import logging
+
+
+def test_a_module_the_parent_itself_runs_is_a_path_defect_not_a_dependency(
+        monkeypatch, he_mock, caplog):
+    run_mock = MagicMock(side_effect=_fake_run(0))
+    monkeypatch.setattr(gpu_worker.subprocess, 'run', run_mock)
+    w = _make_worker()
+    stop_mock = MagicMock()
+    monkeypatch.setattr(w, 'stop', stop_mock)
+
+    with caplog.at_level(logging.ERROR, logger=gpu_worker.logger.name):
+        w._maybe_self_heal_from_line(
+            "ModuleNotFoundError: No module named 'integrations'")
+
+    run_mock.assert_not_called()          # nothing to pip
+    he_mock.assert_not_called()           # nothing for a code agent to do
+    stop_mock.assert_not_called()
+    said = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("'integrations'" in m and "module path" in m for m in said), said
+
+
+def _venv_layout(tmp_path):
+    py = tmp_path / 'venvs' / 'chatterbox_turbo' / 'Scripts' / 'python.exe'
+    py.parent.mkdir(parents=True)
+    py.write_text('')
+    return str(py)
+
+
+def _capture_pip(monkeypatch):
+    captured = {}
+
+    def _run(args, **kwargs):
+        captured['args'] = list(args)
+        m = MagicMock()
+        m.returncode = 0
+        return m
+
+    monkeypatch.setattr(gpu_worker.subprocess, 'run', _run)
+    return captured
+
+
+def test_a_venv_worker_heals_into_its_own_interpreter_not_the_user_site(
+        monkeypatch, he_mock, tmp_path):
+    venv_py = _venv_layout(tmp_path)
+    monkeypatch.setattr(
+        'core.venv_paths.venv_python_if_exists',
+        lambda backend: venv_py if backend == 'chatterbox_turbo' else None)
+    captured = _capture_pip(monkeypatch)
+    w = gpu_worker.GPUWorker(
+        name='chatterbox_turbo',
+        module='integrations.service_tools.gpu_worker',
+        python_exe=venv_py,
+    )
+    monkeypatch.setattr(w, 'stop', MagicMock())
+    monkeypatch.setattr(w, '_user_site_packages_dir',
+                        lambda: str(tmp_path / 'usersite'))
+
+    w._maybe_self_heal_from_line(_MODNOTFOUND_LINE)
+
+    assert captured['args'][0] == venv_py, "pip must run under the child's python"
+    assert '--target' not in captured['args'], captured['args']
+    assert captured['args'][-1] == 'pyloudnorm'
+    he_mock.assert_not_called()
+
+
+def test_a_python_embed_worker_still_heals_into_the_user_site(
+        monkeypatch, he_mock, tmp_path):
+    monkeypatch.setattr('core.venv_paths.venv_python_if_exists',
+                        lambda backend: None)
+    captured = _capture_pip(monkeypatch)
+    w = _make_worker()                      # interpreter = the default resolver
+    monkeypatch.setattr(w, 'stop', MagicMock())
+    user_site = str(tmp_path / 'usersite')
+    monkeypatch.setattr(w, '_user_site_packages_dir', lambda: user_site)
+
+    w._maybe_self_heal_from_line(_MODNOTFOUND_LINE)
+
+    args = captured['args']
+    assert args[0] == w.python_exe
+    assert args[args.index('--target') + 1] == user_site
+    assert args[-1] == 'pyloudnorm'
