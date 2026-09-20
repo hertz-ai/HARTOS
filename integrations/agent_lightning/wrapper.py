@@ -8,6 +8,7 @@ Provides minimal-change integration with automatic tracing.
 import logging
 import time
 import json
+import weakref
 from typing import Any, Dict, List, Optional, Callable
 from datetime import datetime
 from functools import wraps
@@ -17,6 +18,14 @@ from .tracer import LightningTracer
 from .rewards import RewardCalculator, RewardType
 
 logger = logging.getLogger(__name__)
+
+
+# Instrumentation patches the real AutoGen agent in place.  Keep a weak lookup
+# to that existing wrapper so the lifecycle can attach the final, verified
+# outcome to the same trace without changing GroupChat identity or introducing
+# a second training pipeline.
+_instrumented_wrappers = weakref.WeakValueDictionary()
+_agent_wrappers = weakref.WeakKeyDictionary()
 
 
 def _is_recoverable_generation_failure(exc) -> bool:
@@ -208,19 +217,6 @@ class AgentLightningWrapper:
                         result={'execution_time': execution_time}
                     )
 
-                # Calculate reward
-                if self.reward_calculator:
-                    reward = self.reward_calculator.calculate_reward(
-                        reward_type=RewardType.TASK_COMPLETION,
-                        context={
-                            'execution_time': execution_time,
-                            'success': True
-                        }
-                    )
-
-                    if self.tracer and span_id:
-                        self.tracer.emit_reward(span_id, reward)
-
                 self.execution_count += 1
                 return result
 
@@ -322,6 +318,27 @@ class AgentLightningWrapper:
 
         return wrapped
 
+    def record_verified_task_outcome(self, succeeded: bool, context: Optional[Dict] = None) -> None:
+        """Record a ledger-verified task outcome on this agent's trace.
+
+        A reply or tool invocation only proves that an attempt occurred.  The
+        lifecycle invokes this after it has accepted a concrete receipt, so
+        Agent Lightning learns from the same outcome the task ledger exposes.
+        """
+        if not self.reward_calculator or not self.tracer:
+            return
+        context = dict(context or {})
+        context['success'] = bool(succeeded)
+        span_id = self.tracer.start_span('verified_task_outcome', context)
+        reward_type = RewardType.TASK_COMPLETION if succeeded else RewardType.TASK_FAILURE
+        reward = self.reward_calculator.calculate_reward(reward_type, context)
+        self.tracer.emit_reward(span_id, reward, context)
+        self.tracer.end_span(
+            span_id,
+            'success' if succeeded else 'error',
+            {'verified': True, 'success': bool(succeeded)},
+        )
+
     def _wrap_tool_execution(self, original_func: Callable) -> Callable:
         """Wrap tool execution method"""
         @wraps(original_func)
@@ -415,6 +432,42 @@ class AgentLightningWrapper:
         return f"AgentLightningWrapper({self.agent_id}, wrapped={self.agent.__class__.__name__})"
 
 
+def record_verified_outcome(agent_id: str, succeeded: bool, context: Optional[Dict] = None) -> bool:
+    """Attach a canonical lifecycle outcome to an already-instrumented agent."""
+    wrapper = _instrumented_wrappers.get(agent_id)
+    if wrapper is None:
+        return False
+    wrapper.record_verified_task_outcome(succeeded, context)
+    return True
+
+
+def record_verified_outcome_for_agents(agents, succeeded: bool,
+                                       context: Optional[Dict] = None) -> bool:
+    """Credit the instrumented participant that actually owns this chat.
+
+    CREATE and REUSE may both have wrappers alive for the same session key.
+    The registered GroupChat is the canonical ownership boundary, so matching
+    its real participant objects avoids rewarding the inactive flow.
+    """
+    for agent in agents or ():
+        # A GroupChat may carry a participant that cannot be weak-referenced
+        # (a plain object, a slotted class).  WeakKeyDictionary.get raises
+        # TypeError on those, which would abandon the scan before reaching a
+        # real instrumented agent later in the list -- the outcome would then
+        # look "not credited" for a reason that has nothing to do with it.
+        try:
+            wrapper = _agent_wrappers.get(agent)
+        except TypeError:
+            logger.debug(
+                'Skipping non-weak-referenceable GroupChat participant %r '
+                'while crediting a verified outcome', type(agent).__name__)
+            continue
+        if wrapper is not None:
+            wrapper.record_verified_task_outcome(succeeded, context)
+            return True
+    return False
+
+
 # Register as virtual subclass of autogen.Agent so isinstance() checks pass
 # in GroupChat (speaker selection, transition validation, graph validity).
 # This is the ABC way to say "this class IS-A Agent" without inheriting.
@@ -485,16 +538,20 @@ def instrument_autogen_agent(
         logger.info("Agent Lightning disabled, returning unwrapped agent")
         return agent
 
-    AgentLightningWrapper(
+    wrapper = AgentLightningWrapper(
         agent=agent,
         agent_id=agent_id,
         track_rewards=track_rewards,
         auto_trace=auto_trace
     )
+    _instrumented_wrappers[agent_id] = wrapper
+    _agent_wrappers[agent] = wrapper
     return agent
 
 
 __all__ = [
     'AgentLightningWrapper',
     'instrument_autogen_agent',
+    'record_verified_outcome',
+    'record_verified_outcome_for_agents',
 ]

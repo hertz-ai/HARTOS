@@ -421,7 +421,8 @@ def _get_ledger_task_status():
     return LedgerTaskStatus
 
 
-def block_for_user_input(user_prompt: str, action_id: int, reason: str = "Waiting for user input"):
+def block_for_user_input(user_prompt: str, action_id: int,
+                         reason: str = "Waiting for user input") -> bool:
     """Block a task in the ledger when the agent needs user consent/input.
 
     Call this when send_message_to_user is invoked and the action's
@@ -430,16 +431,25 @@ def block_for_user_input(user_prompt: str, action_id: int, reason: str = "Waitin
     """
     ledger = _ledger_registry.get(user_prompt)
     if not ledger:
-        return
+        return False
     LedgerTaskStatus = _get_ledger_task_status()
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id)
     if not task or task.status != LedgerTaskStatus.IN_PROGRESS:
-        return
-    task.block(reason)
+        return False
+    before = copy.deepcopy(task.__dict__)
+    if not task.block(reason):
+        return False
     task.set_blocked_reason('input_required')
-    ledger.save()
+    if ledger.save() is False:
+        task.__dict__.clear()
+        task.__dict__.update(before)
+        logger.error(
+            "Refusing user-input block for %s: ledger persistence failed",
+            task_id)
+        return False
     logger.info(f"Blocked {task_id} for user input: {reason}")
+    return True
 
 
 def mark_action_waiting_for_user(user_prompt: str, action_id: int, reason: str) -> bool:
@@ -450,7 +460,8 @@ def mark_action_waiting_for_user(user_prompt: str, action_id: int, reason: str) 
     the existing ``input_required`` reason instead of creating a second queue
     or allowing the generic pending projection to relabel it as a dependency.
     """
-    block_for_user_input(user_prompt, action_id, reason)
+    if not block_for_user_input(user_prompt, action_id, reason):
+        return False
     return safe_set_state(user_prompt, action_id, ActionState.PENDING, reason)
 
 
@@ -472,6 +483,7 @@ def resume_blocked_action(user_prompt: str, action_id: int,
     task = ledger.tasks.get(task_id)
     if not task or task.status != LedgerTaskStatus.BLOCKED:
         return False
+    before = copy.deepcopy(task.__dict__)
     if not task.resume(reason):
         return False
     evidence_items = None
@@ -482,15 +494,10 @@ def resume_blocked_action(user_prompt: str, action_id: int,
             evidence_items.append(evidence)
     task.blocked_reason = None
     if ledger.save() is False:
-        if evidence_items is not None:
-            evidence_items.remove(evidence)
-        # Keep the in-memory authority honest when persistence failed. The
-        # valid IN_PROGRESS -> BLOCKED edge returns this task to the state its
-        # durable copy still has; the caller retains its sticky gate and can
-        # retry after storage recovers.
-        task.transition_to(LedgerTaskStatus.BLOCKED,
-                           'Resume persistence failed')
-        task.blocked_reason = 'input_required'
+        task.__dict__.clear()
+        task.__dict__.update(before)
+        logger.error(
+            "Refusing unblock for %s: ledger persistence failed", task_id)
         return False
     logger.info(f"Resumed blocked {task_id}: {reason}")
     return True
@@ -1442,9 +1449,14 @@ def _record_verifier_evidence(user_prompt: str, action_id: int,
     """
     ledger = get_registered_ledger(user_prompt)
     if ledger is None:
-        # Lifecycle hooks are also used without a ledger by legacy/direct
-        # callers. CREATE and REUSE always register one before execution.
-        return True
+        # This is the verified-completion boundary, not a generic state helper.
+        # Its only production callers are CREATE and REUSE, and both register
+        # their ledger before execution.  Advancing without that durable
+        # authority would turn an in-memory/model verdict into completion.
+        logger.error(
+            'Cannot persist verifier evidence: no ledger registered for %s',
+            user_prompt)
+        return False
     task = getattr(ledger, 'tasks', {}).get(f'action_{action_id}')
     if task is None:
         logger.error(
@@ -1511,8 +1523,24 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
             'evidence': json_obj['evidence'],
         }
         group_chat = get_registered_groupchat(user_prompt)
-        record_verified_outcome_for_agents(
+        credited = record_verified_outcome_for_agents(
             getattr(group_chat, 'agents', None), True, outcome_context)
+        if not credited:
+            # A False here is NOT "the reward was recorded".  It means no live
+            # wrapper owned this chat, which happens whenever Agent Lightning
+            # is off (the code default) or the session's wrapper has gone.
+            # Phase 3 of the recovery plan requires that we say so rather than
+            # let the caller read silence as learning.
+            from integrations.agent_lightning.config import is_enabled
+            if is_enabled():
+                logger.warning(
+                    'Verified outcome for action %s in %s was NOT credited: '
+                    'Agent Lightning is enabled but no instrumented wrapper '
+                    'owns this GroupChat', action_id, user_prompt)
+            else:
+                logger.debug(
+                    'Verified outcome for action %s in %s not credited: '
+                    'Agent Lightning is disabled', action_id, user_prompt)
     except Exception:
         logger.exception('Unable to record verified Agent Lightning outcome')
     # Promote the already-persisted action/result pair through the one world
