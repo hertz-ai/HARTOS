@@ -79,7 +79,52 @@ CONSENT_TYPES = frozenset({
                          # file that security.middleware verifies the
                          # phone's signed calls against.  Permanent until
                          # revoked, as the owner ruled.
+    'voice_speech',      # Proactive vocal speech and audio narration by the
+                         # servicing layer. Asked of the visitor/user as the
+                         # first proactive step to respect acoustic privacy
+                         # and enable browser autoplay.
+    'camera_capture',    # An agent sees through this computer's camera
+                         # (VisionService camera channel).  The sibling of
+                         # 'screen_capture': the screen had a type since #701
+                         # and the camera had none, which is why the camera
+                         # ask could not be filed canonically and went out as
+                         # a bare LiquidUI 'approval' component instead --
+                         # unrecorded, unrevocable, and invisible to every
+                         # surface but AgentOverlay (#863).
 })
+
+#: The capability an agent asks for, keyed by the ``action`` its ask carries,
+#: mapped to the consent type that records the answer.  ONE map, read by both
+#: halves of the flow -- the ask (hart_intelligence_entry._request_consent,
+#: behind the Request_Camera_Access / Request_Screen_Access tools) and the
+#: answer (record_capability_decision, behind every approval surface) -- so a
+#: capability cannot end up filed under one name and granted under another.
+#: The keys are exactly the aliases /api/agent/approval already accepted.
+#:
+#: 'enable_audio' / 'mic' are deliberately ABSENT: no code asks for them, and
+#: minting a consent type for an ask nobody makes would record a grant the
+#: owner was never shown.  The mic is governed by core.ai_sensing's
+#: kill-switch today; if an ask is ever built for it, it belongs here.
+CAPABILITY_CONSENT_TYPES = {
+    'enable_camera': 'camera_capture',
+    'camera': 'camera_capture',
+    'vision': 'camera_capture',
+    'enable_screen': 'screen_capture',
+    'screen': 'screen_capture',
+    'computer_use': 'screen_capture',
+}
+
+
+def consent_type_for_action(action) -> str:
+    """The consent type an approval ``action`` records against, or None.
+
+    Case and surrounding space do not matter: /api/agent/approval lowercases
+    and strips before it dispatches, and the ask side must agree with it
+    without having to remember to.
+    """
+    if not isinstance(action, str):
+        return None
+    return CAPABILITY_CONSENT_TYPES.get(action.strip().lower())
 
 #: A device is identified by its Ed25519 public key (the PeerLink identity
 #: every phone already has); the consent scope carries the whole key so no
@@ -152,11 +197,13 @@ def _emit(topic: str, data: dict, msg_id: str = None):
     id (e.g. the consent row id) lets a producer re-emit the same ask on every
     poll for reliable delivery while the UI still shows exactly one card.  A
     ``None`` msg_id falls through to a fresh per-emit id (one-shot events)."""
+    bus = note_sent = False
     try:
         from core.platform.events import emit_event
         emit_event(topic, data)
+        bus = True
     except Exception:
-        pass
+        _logger.warning("consent %s: event bus leg failed", topic, exc_info=True)
     # Also push as a notification to the user's frontend (Nunba, Hevolve, Android)
     # so consent dialogs can appear on any platform
     user_id = data.get('user_id', '')
@@ -180,8 +227,21 @@ def _emit(topic: str, data: dict, msg_id: str = None):
             if msg_id:
                 note['msg_id'] = msg_id
             on_notification(user_id, note)
+            note_sent = True
         except Exception:
-            pass
+            _logger.warning("consent %s: notification leg failed for user %s",
+                            topic, user_id, exc_info=True)
+    # ONE line per emit, naming what actually left.  Both legs used to be
+    # `except Exception: pass` with no log at all, so "the ask was delivered",
+    # "the ask was built but no leg worked" and "no ask was ever filed" all
+    # produced identical (empty) logs -- there was nothing to measure a live
+    # consent drive against, and a silent delivery failure was indisguishable
+    # from a gate that never asked.
+    _logger.info("consent emit %s type=%s scope=%s agent=%s user=%s "
+                 "bus=%s notification=%s msg_id=%s",
+                 topic, data.get('consent_type'), data.get('scope', '*'),
+                 data.get('agent_id'), user_id or '(none)',
+                 bus, note_sent, msg_id)
 
 
 def _validate_consent_type(consent_type: str):
@@ -270,6 +330,44 @@ def _copilot_switch_from_consent(consent_type: str, granted: bool) -> None:
             set_copilot_enabled(granted)
     except Exception as e:
         _logger.warning("copilot switch from consent %s failed: %s", consent_type, e)
+
+
+#: Which embodied_ai feed a capability consent governs.  Inverse of
+#: CAPABILITY_CONSENT_TYPES' values, kept next to the switch it drives.
+_CONSENT_FEED = {'camera_capture': 'camera', 'screen_capture': 'screen'}
+
+
+def _embodied_feed_from_consent(consent_type: str, granted: bool) -> None:
+    """The owner's answer to a camera or screen ask acts on the feed itself.
+
+    Sibling of _copilot_switch_from_consent, and it exists for the same
+    reason: the answer can arrive on any surface -- the privacy page, a
+    consent card on the desktop, the same card on the floating companion, a
+    phone -- and every one of them must start or stop the ONE feed, through
+    the ONE lifecycle path the admin settings toggle uses
+    (channels.admin.api._apply_embodied_toggle).  Before this, only
+    /api/agent/approval applied a feed, so a grant made anywhere else was a
+    row that turned nothing on.
+
+    The persisted flag is written too, so a restart sees the same answer and
+    get_embodied_status reports it.  Best effort: the consent row is already
+    written, and a switch that cannot be applied is logged here.
+    """
+    feed = _CONSENT_FEED.get(consent_type)
+    if feed is None:
+        return
+    try:
+        from integrations.channels.admin.api import get_api, _apply_embodied_toggle
+        cfg = get_api()._global_config.embodied_ai
+        setattr(cfg, 'camera_enabled' if feed == 'camera' else 'screen_capture_enabled',
+                bool(granted))
+        get_api()._save_config()
+        _apply_embodied_toggle(feed, bool(granted), cfg)
+        _logger.info("consent %s -> embodied feed %s=%s",
+                     consent_type, feed, bool(granted))
+    except Exception as e:
+        _logger.warning("embodied feed %s from consent %s failed: %s",
+                        feed, consent_type, e)
 
 
 def _named(db, data: dict, agent_id) -> dict:
@@ -391,6 +489,59 @@ class ConsentService:
         return False
 
     @staticmethod
+    def record_capability_decision(db, user_id: str, action: str,
+                                   granted: bool, agent_id=None):
+        """Write the owner's Approve / Deny on a capability ask.  Returns the
+        consent type recorded, or None when the action governs no consent.
+
+        ONE implementation, for every approval surface: /api/agent/approval on
+        the brain (AgentOverlay's card, the Android client) and the same route
+        on the LiquidUI shell.  Before this, those surfaces flipped
+        embodied_ai.*_enabled directly, so the owner's answer existed only as
+        a config flag and a log line -- no row, so nothing to revoke, nothing
+        on the privacy page, no `consent.granted` for the other surfaces to
+        drop their copy of the card on, and a Deny that the next poll simply
+        re-asked because nothing recorded it as decided.
+
+        A grant is BLANKET (no agent, scope '*'), matching what the SPA's own
+        grant writes (consent_api.grant_consent) and what its button promises
+        ("Allow ALL agents to ..."): the capability is the camera, not one
+        agent's use of it, and check_consent's blanket step is what the
+        per-agent asks then match against.  A grant that is already active is
+        left alone rather than appended -- the supported pattern from
+        grant_consent's own docstring, since re-granting is what trips the
+        UNIQUE constraint.
+
+        A denial revokes for the ask's own agent when one is named, matching
+        the card's "Don't allow this agent", and blanket otherwise.
+        """
+        consent_type = consent_type_for_action(action)
+        if consent_type is None:
+            _logger.info("capability decision ignored: action %r governs no "
+                         "consent type", action)
+            return None
+        if granted:
+            if ConsentService.active_grant(db, user_id, consent_type) is None:
+                # grant_consent applies the feed and emits consent.granted.
+                ConsentService.grant_consent(db, user_id, consent_type)
+            else:
+                # Already allowed, so no second row (the UNIQUE constraint
+                # rejects it) -- but the owner just pressed Approve, and the
+                # feed may have been stopped from admin settings while the
+                # grant stood, so re-assert it.  Exclusive with the branch
+                # above, so the feed is never applied twice for one answer.
+                _embodied_feed_from_consent(consent_type, True)
+        elif ConsentService.revoke_consent(db, user_id, consent_type,
+                                           agent_id=agent_id) is None:
+            # Nothing on file to revoke -- a client that answers without
+            # having been asked here.  The answer still has to stop the feed
+            # and still has to reach the other surfaces so their copy of the
+            # card goes away, which is exactly what announce_revocation does.
+            ConsentService.announce_revocation(user_id, consent_type,
+                                               agent_id=agent_id)
+        return consent_type
+
+    @staticmethod
     def declined(db, user_id: str, consent_type: str, scope: str = '*',
                  agent_id=None) -> bool:
         """True when the owner said no to this ask: a row for exactly this
@@ -472,6 +623,7 @@ class ConsentService:
             'agent_id': agent_id,
         })
         _copilot_switch_from_consent(consent_type, True)
+        _embodied_feed_from_consent(consent_type, True)
 
         # Up-sync the now-public agents (gap #4): agents are almost always
         # created BEFORE the owner grants public_exposure, so the
@@ -643,6 +795,7 @@ class ConsentService:
             'agent_id': agent_id,
         })
         _copilot_switch_from_consent(consent_type, False)
+        _embodied_feed_from_consent(consent_type, False)
 
     @staticmethod
     def active_grant(db, user_id: str, consent_type: str,

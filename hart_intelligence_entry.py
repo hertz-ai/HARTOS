@@ -3031,35 +3031,77 @@ def _push_workflow_flowchart(user_id, prompt_id, request_id=None):
         logging.getLogger(__name__).exception("_push_workflow_flowchart: swallowed Exception")
 
 
-def _request_consent(agent_id: str, action: str, label: str, input_text: str) -> str:
-    """Request capability consent from user via approval card (Liquid UI → SSE fallback)."""
-    user_id = thread_local_data.get_user_id()
-    description = f'{label} access needed: {input_text}'
-    # Primary: Liquid UI (reaches Android/web/desktop)
+def _request_consent(action: str, label: str, input_text: str) -> str:
+    """Ask this computer's owner for a capability, through ConsentService.
+
+    Same canonical path as every other ask -- integrations.vlm.safety
+    .computer_control_block, vision_service's capture loop, whisper_tool,
+    social/auth, ai_governance, hive_guardrails -- so the ask is a
+    UserConsent row the owner can see on the privacy page and revoke, it
+    carries an immutable audit entry, and it leaves as `consent.request`,
+    the one payload type every surface renders.
+
+    It used to push a bare `{'type': 'approval'}` component through
+    LiquidUIService with a broadcast_sse_safe fallback and touch no database
+    at all.  That meant: nothing to revoke, nothing on the privacy page, and
+    a payload only AgentOverlay knows -- so the floating companion, which
+    exists precisely for when Nunba is NOT the window in front, dropped every
+    camera and screen ask (#863).  The canonical emit that fixed the sibling
+    asks landed upstream on 2026-08-26 (e991309da); this path never migrated.
+
+    Whose permission: the owner of this desktop (HEVOLVE_OWNER_USER_ID, which
+    Nunba exports at boot), never the caller -- the camera and the screen are
+    this machine's, and a remote user must not be asked to lend them.  Same
+    rule and same fail-closed answer as computer_control_block and
+    /visual_agent (#66).  Which agent is asking comes from the request's own
+    prompt id, not the capability label the tool wrapper passes.
+    """
+    from integrations.social.consent_service import (
+        ConsentService, consent_type_for_action)
+    from integrations.social.models import db_session
+    # ONE normaliser for "is this a real agent id", shared with the
+    # computer_control ask rather than copied (it already handles the '0'
+    # and 'None' spellings this codebase passes around).
+    from integrations.vlm.safety import _known_agent
+
+    log = logging.getLogger(__name__)
+    consent_type = consent_type_for_action(action)
+    if consent_type is None:
+        log.error('_request_consent: %r maps to no consent type', action)
+        return (f"Could not request {label.lower()} access — this computer "
+                f"records no permission for '{action}'.")
+
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    if not owner:
+        log.warning('%s consent not asked: no owner identity '
+                    '(HEVOLVE_OWNER_USER_ID is not set)', label)
+        return (f"Not asked: nobody is signed in on this computer who could "
+                f"allow {label.lower()} access.")
+
+    agent = _known_agent(thread_local_data.get_prompt_id())
+    reason = f'{label} access needed: {input_text}'.strip()
     try:
-        from core.platform.registry import ServiceRegistry
-        svc = ServiceRegistry.get('LiquidUIService')
-        if svc:
-            svc.agent_request_approval(agent_id=agent_id, action=action, description=description)
-            return f"{label} access request sent to user. Waiting for approval."
+        with db_session(commit=True) as db:
+            if ConsentService.check_or_request(db, owner, consent_type,
+                                               agent_id=agent, reason=reason):
+                return f"{label} access is already allowed — go ahead."
+            if ConsentService.declined(db, owner, consent_type, agent_id=agent):
+                return (f"The owner of this computer said no to "
+                        f"{label.lower()} access.")
     except Exception:
-        logging.getLogger(__name__).exception("_request_consent: swallowed Exception")
-    # Fallback: SSE (Nunba desktop WebView2)
-    from core.platform.events import broadcast_sse_safe
-    if broadcast_sse_safe('agent.ui.update', {
-        'type': 'approval', 'agent_id': agent_id,
-        'action': action, 'description': description,
-    }, user_id=str(user_id)):
-        return f"{label} access request sent to user. Waiting for approval."
-    return f"Could not request {label.lower()} access — notification system unavailable."
+        log.exception('_request_consent: %s ask could not be filed', label)
+        return (f"Could not request {label.lower()} access — the permission "
+                f"system is unavailable.")
+    return (f"{label} access request sent to the owner of this computer. "
+            f"Waiting for their answer.")
 
 
 def _request_capability_consent(input_text: str) -> str:
-    return _request_consent('vision', 'enable_camera', 'Camera', input_text)
+    return _request_consent('enable_camera', 'Camera', input_text)
 
 
 def _request_screen_consent(input_text: str) -> str:
-    return _request_consent('computer_use', 'enable_screen', 'Screen', input_text)
+    return _request_consent('enable_screen', 'Screen', input_text)
 
 
 
@@ -10994,7 +11036,17 @@ def agent_approval():
 
     Both route through _apply_embodied_toggle in the channels admin API
     so the manual settings toggle and the agentic approval path share
-    ONE start/stop implementation — no parallel lifecycle.
+    ONE start/stop implementation — no parallel lifecycle.  Since the
+    consent migration that path is reached through ConsentService
+    (_embodied_feed_from_consent), which every answer surface shares:
+    this route, the privacy page, and a consent card answered on the
+    desktop, on the floating companion or on a phone.
+
+    The DECISION itself is recorded as a UserConsent row by
+    ConsentService.record_capability_decision.  It used to exist only as a
+    config flag and a log line here, so an approval could not be revoked,
+    never appeared on the privacy page, left no audit entry, and a Deny was
+    re-asked on the very next poll because nothing marked it decided.
     """
     try:
         data = request.get_json(silent=True) or {}
@@ -11004,6 +11056,30 @@ def agent_approval():
         if decision not in ('approve', 'approved', 'allow', 'yes', 'deny', 'denied', 'no'):
             return jsonify({'status': 'error', 'reason': 'invalid decision'}), 400
         approved = decision in ('approve', 'approved', 'allow', 'yes')
+        # Record first, on BOTH branches: the row is the answer, and writing
+        # it also stops or starts the feed through the one actuator and tells
+        # every other surface to drop its copy of the card.  The owner of
+        # this desktop owns the camera and the screen, so the row is theirs
+        # — never the caller's user_id (#66).
+        _owner_id = os.environ.get('HEVOLVE_OWNER_USER_ID')
+        _recorded = None
+        if _owner_id:
+            try:
+                from integrations.social.models import db_session
+                from integrations.social.consent_service import ConsentService
+                with db_session(commit=True) as _cdb:
+                    _recorded = ConsentService.record_capability_decision(
+                        _cdb, _owner_id, action, approved,
+                        agent_id=agent_id or None)
+            except Exception as _consent_exc:
+                # A recording failure must not swallow the owner's answer —
+                # but it must be loud, because an unrecorded grant is one
+                # that cannot be revoked.
+                app.logger.error('agent_approval: consent not recorded for '
+                                 'action=%s: %s', action, _consent_exc)
+        else:
+            app.logger.warning('agent_approval: consent not recorded — no '
+                               'owner identity (HEVOLVE_OWNER_USER_ID unset)')
         if not approved:
             # Stage-C (Symptom #6): publish the deny event on WAMP too
             # so subscribers (VisionService, UI) can tear down cleanly
@@ -11048,16 +11124,24 @@ def agent_approval():
             )
             api = get_api()
             cfg = api._global_config.embodied_ai
-            # Flip the persisted flag so the next restart sees it and so
-            # get_embodied_status reports the right state.
-            if feed == 'camera':
-                cfg.camera_enabled = True
-            elif feed == 'screen':
-                cfg.screen_capture_enabled = True
-            elif feed == 'audio':
-                cfg.audio_enabled = True
-            api._save_config()
-            _apply_embodied_toggle(feed, True, cfg)
+            if _recorded is None:
+                # Either this capability records no consent ('audio' has no
+                # ask producer, so no consent type) or the write above
+                # failed.  Apply it here so the owner's click still acts,
+                # exactly as it did before the migration.  When _recorded is
+                # set, ConsentService already drove this same actuator from
+                # the grant — applying again here would be the second path.
+                #
+                # Flip the persisted flag so the next restart sees it and so
+                # get_embodied_status reports the right state.
+                if feed == 'camera':
+                    cfg.camera_enabled = True
+                elif feed == 'screen':
+                    cfg.screen_capture_enabled = True
+                elif feed == 'audio':
+                    cfg.audio_enabled = True
+                api._save_config()
+                _apply_embodied_toggle(feed, True, cfg)
             # Stage-C (Symptom #6, 2026-04-16) — publish the consent
             # event on Crossbar WAMP so subscribers (VisionService,
             # frontend, mobile) never have to poll or watch a raw WS
