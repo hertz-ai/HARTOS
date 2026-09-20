@@ -926,9 +926,20 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState,
             from integrations.social.consent_service import ConsentService
             from integrations.social.models import db_session
             with db_session(commit=False) as db:
-                if not ConsentService.check_consent(db, user_prompt, 'data_access'):
+                # user_prompt is the SESSION KEY f"{user_id}_{prompt_id}";
+                # check_consent's parameter is a USER ID and it matches against
+                # user_consents.user_id, which holds bare uuids written by the
+                # consent UI. Passing the session key made this branch
+                # unsatisfiable -- it logged 415 false "no consent" lines over
+                # Sep 18-19 while a granted data_access row sat in the table --
+                # so resolve the owner with the helper already in this file
+                # (:102) instead of inventing a second parse.
+                _consent_user, _ = _extract_ownership_from_prompt(user_prompt)
+                if not ConsentService.check_consent(db, _consent_user,
+                                                    'data_access'):
                     logger.info(
-                        f"[CONSENT] No data_access consent for user={user_prompt}, "
+                        f"[CONSENT] No data_access consent for "
+                        f"user={_consent_user} (session={user_prompt}), "
                         f"action={action_id} (advisory only)")
         except Exception:
             pass  # Consent check is advisory, never blocks execution
