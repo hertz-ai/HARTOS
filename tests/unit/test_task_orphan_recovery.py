@@ -35,6 +35,15 @@ from integrations.distributed_agent import task_coordinator as tc  # noqa: E402
 
 
 class _Task:
+    """The surface of agent_ledger.core.Task that recovery and claim touch.
+
+    Recovery went IN_PROGRESS -> BLOCKED -> PENDING (5e97de53f, 2026-09-17)
+    and started calling set_blocked_reason / error_message; this fake had
+    neither, the recovery's guard swallowed the AttributeError, and the two
+    recovery tests below went red at HEAD without anyone noticing (measured
+    2026-09-20: 177 passed, these 2 failed, before the coordinator's
+    transaction work touched the file).
+    """
     def __init__(self, task_id, status, parent=None, children=None,
                  claimed_at=None, capabilities=None):
         self.task_id = task_id
@@ -45,17 +54,27 @@ class _Task:
         if claimed_at is not None:
             self.context['claimed_at'] = claimed_at
         self.description = 'd'
+        self.blocked_reason = None
+        self.error_message = None
+
+    def set_blocked_reason(self, reason):
+        self.blocked_reason = reason
 
 
 def _ledger(tasks):
     led = MagicMock()
     led.task_order = [t.task_id for t in tasks]
     by_id = {t.task_id: t for t in tasks}
+    led.tasks = by_id
     led.get_task.side_effect = lambda tid: by_id.get(tid)
 
-    def _update(tid, status):
+    def _update(tid, status, **_kwargs):
+        # The real ledger validates, records and returns True; recovery and
+        # claim now read that verdict (and batch with defer_save=True).
         by_id[tid].status = status
+        return True
     led.update_task_status.side_effect = _update
+    led.save.return_value = True
     return led
 
 
