@@ -699,7 +699,12 @@ LANG_ENGINE_PREFERENCE: Dict[str, List[str]] = {
     # JSON; ladder traverses to next engine — verified against
     # tts/package_installer.py per-engine independent install
     # contract + tts_engine._synthesize_with_fallback ladder walk.
-    'en': ['chatterbox_turbo', 'omnivoice', 'neutts_air', 'melotts', 'xtts_v2', 'kokoro', 'pocket_tts', 'cosyvoice3', 'mms_tts', 'piper', 'espeak'],
+    # f5_tts (English + Chinese voice clone, 2.5 GB, quality 0.91) sits
+    # right after xtts_v2 (0.92).  It was missing from this ladder while
+    # listed for 'zh': on an 8 GB card with the LLM resident (3.2 GB free,
+    # 2026-09-20) it is the only cloner whose budget fits, and the voiced
+    # turn that day never considered it (owner: "f5 tts shd be started").
+    'en': ['chatterbox_turbo', 'omnivoice', 'neutts_air', 'melotts', 'xtts_v2', 'f5_tts', 'kokoro', 'pocket_tts', 'cosyvoice3', 'mms_tts', 'piper', 'espeak'],
     # Indic languages — omnivoice replaces indic_parler as the primary
     # (parler kept as fallback for one release cycle).  OmniVoice has
     # 100-400 training hours per major Indic language vs parler's ~10,
@@ -975,6 +980,24 @@ def _is_engine_installed(engine_id: str) -> bool:
             available = bool(os.environ.get('MAKEITTALK_API_URL'))
     except (ImportError, Exception):
         available = False
+
+    # A venv-quarantined engine runs from its own venv; the checks above only
+    # prove the app-side tool module (always importable) or a main-interpreter
+    # copy that cannot run there.  Ask the resolver the spawn itself uses
+    # (core.venv_paths, shared with the installer), so an engine is offered
+    # only where its worker can start.  Measured 2026-09-20: xtts_v2 read as
+    # installed with no venv on the box, and every voiced turn spent the
+    # worker's startup on an import death before falling back to Piper.
+    if available and getattr(spec, 'install_target', 'main') == 'venv':
+        try:
+            from core.venv_paths import venv_python_if_exists
+            available = venv_python_if_exists(engine_id) is not None
+        except Exception as e:
+            logger.warning(
+                f"{engine_id}: venv presence unknown ({e}); treating the "
+                f"engine as not installed"
+            )
+            available = False
 
     _engine_available_cache[engine_id] = (available, now)
     return available
