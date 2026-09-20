@@ -194,6 +194,50 @@ def test_request_consent_no_longer_emits_a_bare_approval_component():
     )
 
 
+def test_no_approval_component_is_emitted_anywhere_in_the_entry():
+    """File-wide, not just _request_consent.
+
+    Join_External_Room emitted its "here is where to grant" pointer as
+    type 'approval' too, carrying a notification's payload
+    (title/message/severity/actions).  ApprovalOverlay reads `description`
+    (absent -> blank body), never renders `actions`, and offers Approve/Deny
+    buttons that POST agent_id=undefined to /api/agent/approval.  The type
+    whose contract matches that payload is 'notification'.
+
+    Two emitters used this type and neither should; pinning the file means a
+    third cannot appear quietly.
+    """
+    src = _hie_source()
+    offenders = [
+        (i + 1, ln.strip()) for i, ln in enumerate(src.splitlines())
+        if re.search(r"""^\s*['"]type['"]\s*:\s*['"]approval['"]""", ln)
+    ]
+    assert not offenders, (
+        'approval-typed component(s) still emitted at hart_intelligence_entry '
+        f'lines {[n for n, _ in offenders]} — consent asks belong on '
+        "consent.request, pointers belong on notification"
+    )
+
+
+def test_notification_actions_use_the_kind_key():
+    """NotificationCard dispatches on `kind`, not `action`.
+
+    The Join_External_Room pointer sent {'label', 'action': 'navigate',
+    'target'}; the renderer reads action.kind, so it fell through to the
+    "unhandled action" warning and the button did nothing.  A payload whose
+    own renderer cannot dispatch it is a dead control.
+    """
+    src = _hie_source()
+    bad = [
+        (i + 1, ln.strip()) for i, ln in enumerate(src.splitlines())
+        if re.search(r"""['"]action['"]\s*:\s*['"](navigate|external)['"]""", ln)
+    ]
+    assert not bad, (
+        f'notification action(s) keyed on "action" instead of "kind" at lines '
+        f'{[n for n, _ in bad]} — the renderer dispatches on kind'
+    )
+
+
 def test_agent_approval_records_the_decision():
     """RED pre-migration: the endpoint flipped embodied_ai.*_enabled and
     published WAMP, and that was the entire record of the owner's answer."""

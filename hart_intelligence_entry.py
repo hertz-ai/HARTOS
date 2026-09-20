@@ -4538,16 +4538,32 @@ def _handle_join_external_room_tool(input_text: str) -> str:
                 from core.platform.registry import ServiceRegistry
                 _lui = ServiceRegistry.get('LiquidUIService')
                 if _lui:
+                    # A NOTIFICATION, not an approval card: the gate already
+                    # decided, and this only points the owner at where to
+                    # grant.  It was typed 'approval', which renders
+                    # AgentOverlay's ApprovalOverlay -- a card that reads
+                    # `description` (absent here, so a blank body), never
+                    # renders `actions` at all, and offers Approve/Deny
+                    # buttons that POST agent_id=undefined, action=undefined
+                    # to /api/agent/approval.  'notification' is the type
+                    # whose contract is exactly this payload's shape:
+                    # title + message + severity + actions
+                    # (liquid_ui_service COMPONENT_TYPES).
+                    #
+                    # And the action key is `kind`, not `action`: the
+                    # renderer dispatches on kind=='navigate' and falls
+                    # through to an "unhandled action" warning otherwise, so
+                    # the button did nothing even once the type was right.
                     _lui.agent_ui_update(
                         str(uid),
                         {
-                            'type': 'approval',
+                            'type': 'notification',
                             'title': 'Permission needed',
                             'message': reason,
                             'severity': 'info',
                             'actions': [
                                 {'label': 'Open Privacy Settings',
-                                 'action': 'navigate',
+                                 'kind': 'navigate',
                                  'target': '/social/settings/privacy'},
                             ],
                         },
