@@ -320,35 +320,60 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState',
                     # MAX_RETRIES_EXCEEDED would be true.
                     task.set_failure_reason('abandoned')
 
-            # === HEARTBEAT: every state change records liveness ===
-            task.heartbeat()
+            # === BOOKKEEPING: liveness, SLA, ownership ===
+            # These run AFTER the durable write and must never vote on
+            # whether it succeeded.  They used to sit under the same blanket
+            # `except Exception` as the persistence above, so one malformed
+            # value -- a bad started_at reaching _dt.fromisoformat below is
+            # the cheapest example -- made this function return False.  Since
+            # set_action_state now RAISES on a false return, that turned a
+            # stale timestamp into a StateTransitionError that blocked every
+            # transition for the action, including its terminal one: the work
+            # was done and persisted, and the agent still could not say so.
+            # Narrowed so only the transition and the save decide the verdict.
+            try:
+                task.heartbeat()
 
-            # === SLA CHECK: flag breach, post status request, emit notification ===
-            if task.is_sla_breached() and not task.sla_breached:
-                task.mark_sla_breached()
-                task.post_status("SLA breached — requesting status update from agent")
-                logger.warning(f"SLA breached for {task_id}")
-                try:
-                    from core.platform.events import emit_event
-                    emit_event('task.sla_breached', {
-                        'task_id': task_id,
-                        'prompt': user_prompt,
-                        'sla_target_s': task.sla_target_s,
-                        'deadline': task.deadline,
-                        'action': 'status_request',
-                    })
-                except Exception:
-                    pass
+                # SLA: flag breach, post status request, emit notification.
+                if task.is_sla_breached() and not task.sla_breached:
+                    task.mark_sla_breached()
+                    task.post_status("SLA breached — requesting status update from agent")
+                    logger.warning(f"SLA breached for {task_id}")
+                    try:
+                        from core.platform.events import emit_event
+                        emit_event('task.sla_breached', {
+                            'task_id': task_id,
+                            'prompt': user_prompt,
+                            'sla_target_s': task.sla_target_s,
+                            'deadline': task.deadline,
+                            'action': 'status_request',
+                        })
+                    except Exception:
+                        pass
 
-            # === RELEASE OWNERSHIP on terminal states ===
-            if LedgerTaskStatus.is_terminal_state(ledger_status) and task.is_owned:
-                # Record time spent using known started_at from scope
-                if task.started_at:
-                    from datetime import datetime as _dt
-                    elapsed = (_dt.now() - _dt.fromisoformat(task.started_at)).total_seconds()
-                    task.record_spend(time_s=elapsed)
-                task.release()
-                logger.info(f"Released ownership of {task_id}")
+                # Release ownership on terminal states.
+                if LedgerTaskStatus.is_terminal_state(ledger_status) and task.is_owned:
+                    # Record time spent using known started_at from scope
+                    if task.started_at:
+                        from datetime import datetime as _dt
+                        try:
+                            elapsed = (_dt.now() - _dt.fromisoformat(
+                                task.started_at)).total_seconds()
+                            task.record_spend(time_s=elapsed)
+                        except (TypeError, ValueError):
+                            # A stale or hand-edited started_at costs the
+                            # spend figure, never the release or the verdict.
+                            logger.warning(
+                                "%s has an unparseable started_at (%r); "
+                                "releasing without a time_s spend record",
+                                task_id, task.started_at)
+                    task.release()
+                    logger.info(f"Released ownership of {task_id}")
+            except Exception as _bookkeeping_err:
+                logger.warning(
+                    "Ledger bookkeeping after a COMMITTED write failed for "
+                    "%s (%s); the state change itself stands",
+                    task_id, _bookkeeping_err, exc_info=True)
 
             logger.info(f"Auto-synced {task_id} -> {ledger_status.value} (ActionState: {state.value})")
     except Exception as e:
@@ -869,20 +894,12 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState,
     # after that write commits; otherwise callers could receive True while the
     # task remained unfinished on disk.
     #
-    # REVIEW hartos-7c 2026-09-20 (codex's change): AGREED on the ordering --
-    # writing the durable authority before the in-memory projection is what
-    # makes "COMPLETED" mean something, and it is the artifact-gating the
-    # owner asked for (memory project_harness_verification_gap_2026-09-03).
-    # BLAST RADIUS to please confirm before this ships: this now RAISES where
-    # the old code logged and continued.  safe_set_state swallows it, but
-    # set_action_state has many direct callers (the memory note counts 64
-    # set_action_state sites), and each one now propagates StateTransitionError
-    # on a disk hiccup instead of proceeding.  For a TERMINAL state that is
-    # arguably worse than the old behaviour: the action really did finish, the
-    # agent just cannot say so, and an exception mid-teardown can strand the
-    # run.  Suggestion: keep the raise for non-terminal states, and for
-    # COMPLETED/ERROR/TERMINATED log loudly + return a falsey result so the
-    # caller can finish its teardown and retry the projection.
+    # Keep persistence failure explicit for every state, including terminal
+    # ones.  Returning false here would be ignored by direct callers and would
+    # recreate a silent completion.  The current call graph has one public
+    # wrapper (safe_set_state) and one multi-step wrapper
+    # (force_state_through_valid_path); both translate this exception to False.
+    # The only remaining direct call is the idempotent assignment hook.
     if not _auto_sync_to_ledger(
             user_prompt, action_id, state, result=result):
         raise StateTransitionError(
