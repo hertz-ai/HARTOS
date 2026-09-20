@@ -1,0 +1,155 @@
+"""A worker tick that could only defer claims nothing.
+
+Measured on the owner's desktop 2026-09-20 15:41-15:58 (installed build,
+coordinator ledger of 9,531 tasks, 72 MB): four persisted tasks cycled
+claim -> local_chat_dispatch "yielded to an active user" -> DEFERRED ->
+undefer -> claim, 24/24/22 transitions in three minutes, every one a full
+json.dump of the ledger, 18 writes a minute, ~1.2 GB/min, for as long as the
+owner was using the machine.  The worker claimed first and asked afterwards.
+
+Now it asks first, of the same gates the dispatcher answers with:
+should_yield_to_user (the one gate every other daemon already consults), the
+provider breaker local_chat_dispatch checks first, and the Nunba adapter's
+readiness flag behind its 'hartos_loading' answer.  Behavioural: the real
+coordinator, ledger and lock, the real worker tick, a spy on the backend's
+save(); each closed gate leaves the task PENDING, the lock free and the ledger
+unwritten, and the open gate still claims, runs and completes.
+
+    python -m pytest tests/unit/test_worker_tick_claims_nothing_it_would_defer.py -q
+"""
+import os
+import sys
+import types
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+for _p in (_ROOT, os.path.join(_ROOT, 'agent-ledger-opensource')):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from agent_ledger.backends import InMemoryBackend  # noqa: E402
+from agent_ledger.core import SmartLedger, TaskStatus  # noqa: E402
+from core.circuit_breaker import llm_provider_breaker  # noqa: E402
+from integrations.agent_engine import dispatch  # noqa: E402
+from integrations.distributed_agent.coordinator_backends import (  # noqa: E402
+    InMemoryTaskLock)
+from integrations.distributed_agent.task_coordinator import (  # noqa: E402
+    DistributedTaskCoordinator)
+from integrations.distributed_agent.worker_loop import (  # noqa: E402
+    DistributedWorkerLoop)
+
+TASK = 'g_task_0'
+
+
+@pytest.fixture
+def world(tmp_path):
+    led = SmartLedger('coord', 'gate', str(tmp_path), backend=InMemoryBackend())
+    co = DistributedTaskCoordinator(ledger=led, task_lock=InMemoryTaskLock(),
+                                    verifier=MagicMock(), baseline=MagicMock())
+    co.submit_goal('obj', [{'task_id': TASK, 'description': 'd'}],
+                   {'prompt': 'obj'}, goal_id='g')
+    loop = DistributedWorkerLoop()
+    loop._node_id = 'worker-under-test'
+    return led, co, loop
+
+
+def _tick(loop, co, led, **gates):
+    """One tick with every gate pinned open unless a test closes one."""
+    yield_ = gates.get('yield_', False)
+    breaker_host = gates.get('breaker_host', '')
+    adapter = gates.get('adapter', None)     # None = absent (native HARTOS)
+    patches = [
+        patch.object(loop, '_get_coordinator', return_value=co),
+        patch.object(dispatch, 'should_yield_to_user', return_value=yield_),
+        patch.object(dispatch, 'get_last_yield_reason',
+                     return_value='user_active' if yield_ else None),
+        patch.object(dispatch, 'local_dispatch_provider_breaker_open',
+                     return_value=breaker_host),
+        patch.object(dispatch, 'local_chat_dispatch',
+                     return_value=('ok', 'a real answer')),
+        patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
+              side_effect=lambda p: (True, '', p)),
+        patch('security.hive_guardrails.GuardrailEnforcer.after_response',
+              return_value=(True, '')),
+        patch('integrations.agent_engine.world_model_bridge.get_world_model_bridge',
+              return_value=MagicMock()),
+        patch.object(led.backend, 'save', wraps=led.backend.save),
+    ]
+    mods = {}
+    if adapter is not None:
+        stub = types.ModuleType('routes.hartos_backend_adapter')
+        stub.is_hartos_initialized = lambda: adapter
+        mods = {'routes.hartos_backend_adapter': stub}
+    else:
+        mods = {'routes.hartos_backend_adapter': None}
+    with patch.dict(sys.modules, mods):
+        ctx = [p.__enter__() for p in patches]
+        try:
+            loop._tick()
+        finally:
+            for p in reversed(patches):
+                p.__exit__(None, None, None)
+    return ctx[-1]   # the save spy
+
+
+def _untouched(led, co):
+    task = led.get_task(TASK)
+    assert task.status == TaskStatus.PENDING
+    assert 'claimed_by' not in task.context
+    assert not co._lock.is_task_locked(TASK)
+
+
+def test_a_user_holding_the_llm_means_no_claim_and_no_write(world):
+    led, co, loop = world
+    saves = _tick(loop, co, led, yield_=True)
+    _untouched(led, co)
+    assert saves.call_count == 0, 'the tick must not touch the ledger'
+
+
+def test_an_open_provider_breaker_means_no_claim(world):
+    led, co, loop = world
+    saves = _tick(loop, co, led, breaker_host='api.example.test')
+    _untouched(led, co)
+    assert saves.call_count == 0
+
+
+def test_hartos_still_loading_means_no_claim(world):
+    led, co, loop = world
+    saves = _tick(loop, co, led, adapter=False)
+    _untouched(led, co)
+    assert saves.call_count == 0
+
+
+def test_with_every_gate_open_the_tick_claims_runs_and_completes(world):
+    led, co, loop = world
+    saves = _tick(loop, co, led, adapter=True)
+    task = led.get_task(TASK)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.context['claimed_by'] == 'worker-under-test'
+    assert saves.call_count == 2, 'one write for the claim, one for the completion'
+
+
+def test_a_gate_that_cannot_be_read_never_wedges_the_worker(world):
+    led, co, loop = world
+    with patch.object(dispatch, 'should_yield_to_user',
+                      side_effect=RuntimeError('signal unreadable')):
+        assert DistributedWorkerLoop._dispatch_would_defer() in (
+            None, 'hartos_loading')
+
+
+def test_the_breaker_accessor_is_the_dispatchers_own_check():
+    """local_chat_dispatch and the worker read one breaker, one way."""
+    host = 'provider.example.test'
+    with patch.object(dispatch, '_dispatch_provider_host', return_value=host):
+        llm_provider_breaker.reset(host)
+        assert dispatch.local_dispatch_provider_breaker_open() == ''
+        for _ in range(llm_provider_breaker._threshold):
+            llm_provider_breaker.record_failure(host)
+        try:
+            assert dispatch.local_dispatch_provider_breaker_open() == host
+            assert dispatch.local_chat_dispatch('p', 'u', 'a', native_fallback=False) \
+                == ('deferred', None)
+        finally:
+            llm_provider_breaker.reset(host)

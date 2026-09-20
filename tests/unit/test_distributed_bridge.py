@@ -21,6 +21,22 @@ import threading
 from unittest.mock import patch, MagicMock, PropertyMock
 
 
+@pytest.fixture(autouse=True)
+def _worker_may_claim(monkeypatch):
+    """Precondition these tests always assumed: the daemon gate is open.
+
+    Since 2026-09-20 the worker asks should_yield_to_user, the provider
+    breaker and the adapter's readiness BEFORE claiming (a claim the
+    dispatcher would defer is three full ledger writes for nothing), so a
+    test that drives _tick on a live box would otherwise inherit that box's
+    pressure readings.  The gate itself is pinned in
+    tests/unit/test_worker_tick_claims_nothing_it_would_defer.py.
+    """
+    from integrations.distributed_agent.worker_loop import DistributedWorkerLoop
+    monkeypatch.setattr(DistributedWorkerLoop, '_dispatch_would_defer',
+                        staticmethod(lambda: None))
+
+
 def _inproc_app():
     """Stand-in for hart_intelligence_entry.app whose in-process /chat returns
     nothing.
@@ -535,6 +551,32 @@ class TestDistributedEndToEnd:
         progress = coordinator.get_goal_progress(goal_id)
         assert progress['completed'] == 1
         assert progress['progress_pct'] == 100.0
+
+    def test_submit_result_never_claims_success_when_ledger_rejects_write(
+            self, mock_guardrails):
+        from agent_ledger import TaskStatus
+
+        coordinator, mock_redis = self._make_coordinator()
+        coordinator.submit_goal(
+            objective='Persist this result',
+            decomposed_tasks=[{
+                'task_id': 'persist_task_1',
+                'description': 'Produce a durable result',
+                'capabilities': ['coding'],
+            }],
+        )
+        task = coordinator.claim_next_task('worker_node_1', ['coding'])
+        assert task is not None
+        mock_redis.reset_mock()
+
+        with patch.object(coordinator._ledger, 'complete_task',
+                          return_value=False):
+            with pytest.raises(RuntimeError, match='Could not persist'):
+                coordinator.submit_result(
+                    'persist_task_1', 'worker_node_1', 'claimed result')
+
+        assert task.status == TaskStatus.IN_PROGRESS
+        assert mock_redis.eval.called, 'worker claim was not released for retry'
 
     def test_no_double_claim(self, mock_guardrails):
         """Two workers cannot claim the same task."""

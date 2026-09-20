@@ -261,16 +261,12 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
     # is the sole resolver of the half-open probe); HALF_OPEN falls through and
     # lets one turn run.  Keyed by the same _dispatch_provider_host as the feed;
     # try/except so a check error never blocks a dispatch.
-    try:
-        from core.circuit_breaker import llm_provider_breaker, CircuitState
-        _prov_host = _dispatch_provider_host(model_config)
-        if _prov_host and llm_provider_breaker.state(_prov_host) == CircuitState.OPEN:
-            logger.info(f"Provider {_prov_host} refusing the account (breaker "
-                        f"open), deferring local /chat for "
-                        f"{daemon_id or prompt_id}")
-            return 'deferred', None
-    except Exception:
-        pass  # a breaker-check error must never block a dispatch
+    _prov_host = local_dispatch_provider_breaker_open(model_config)
+    if _prov_host:
+        logger.info(f"Provider {_prov_host} refusing the account (breaker "
+                    f"open), deferring local /chat for "
+                    f"{daemon_id or prompt_id}")
+        return 'deferred', None
 
     # Any error resolving the path still lets the caller fall through to its
     # HTTP tier (bounded-safe).
@@ -320,6 +316,17 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
             pass
 
     result = result or {}
+    # The Nunba adapter explicitly stamps an agent-addressed request made
+    # during HARTOS warm-up as loading.  That text is an availability notice,
+    # not work performed by the agent.  Returning it as ``ok`` let distributed
+    # workers submit it as a completed ledger result, which in turn emitted a
+    # success notification and polluted verified-learning inputs.  Keep the
+    # existing deferred outcome: every caller already knows it means retry
+    # later without falling through to a weaker, non-agent HTTP path.
+    if result.get('loading') or result.get('source') == 'hartos_loading':
+        logger.info('HARTOS still loading; deferring agent turn for %s',
+                    daemon_id or prompt_id)
+        return 'deferred', None
     return 'ok', (result.get('text') or result.get('response', ''))
 
 
@@ -555,6 +562,26 @@ def _dispatch_provider_host(model_config) -> str:
         return provider_host(str(base_url or ''))
     except Exception:
         return ''
+
+
+def local_dispatch_provider_breaker_open(model_config=None) -> str:
+    """The host whose provider breaker is OPEN for this dispatch, else ''.
+
+    The check local_chat_dispatch makes first (#106b b), in one place so the
+    distributed worker can ask it BEFORE claim_next_task: a claim the
+    dispatcher would only defer costs the coordinator ledger three full
+    writes (claim, defer, undefer).  state() is non-consuming: the httpx feed
+    stays the sole resolver of the half-open probe.  A check error is '' --
+    a breaker-check error must never block a dispatch.
+    """
+    try:
+        from core.circuit_breaker import llm_provider_breaker, CircuitState
+        host = _dispatch_provider_host(model_config)
+        if host and llm_provider_breaker.state(host) == CircuitState.OPEN:
+            return host
+    except Exception:
+        pass
+    return ''
 
 
 # Concurrency ceiling for autonomous dispatch — single source both daemons call

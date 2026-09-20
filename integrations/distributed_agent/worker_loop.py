@@ -35,7 +35,8 @@ def _worker_node_id() -> str:
     try:
         from integrations.social.sync_engine import SyncEngine
         node_id = SyncEngine.canonical_node_id()
-        if node_id:
+        if node_id and str(node_id).strip().lower() not in {
+                'unknown', 'none', 'null'}:
             return str(node_id)
     except Exception:
         logger.debug('Distributed worker could not resolve canonical node id',
@@ -44,7 +45,13 @@ def _worker_node_id() -> str:
     # subsystem cannot yet be imported.  Never claim as the shared literal
     # ``unknown``: that conflates unrelated nodes and corrupts attribution.
     configured = (os.environ.get('HEVOLVE_NODE_ID') or '').strip()
-    return configured or 'local-worker-unidentified'
+    if configured.lower() not in {'', 'unknown', 'none', 'null'}:
+        return configured
+    # Do not substitute another shared placeholder.  Two identity-less nodes
+    # claiming as the same string is the same attribution corruption as
+    # ``unknown``.  _tick will leave work available until this node has joined
+    # gossip or an operator provides HEVOLVE_NODE_ID.
+    return ''
 
 
 class HeldForHelp:
@@ -58,6 +65,18 @@ class HeldForHelp:
     _ORPHAN_AFTER_S.  _tick holds the task (coordinator.hold_task) and the
     goal's next dispatch, which the daemon issues only once the goal is
     active again, brings it back.
+    """
+    __slots__ = ('reason',)
+
+    def __init__(self, reason: str):
+        self.reason = reason
+
+
+class DeferredForRetry:
+    """A known temporary condition, distinct from an execution failure.
+
+    It lets the coordinator record the canonical DEFERRED lifecycle and retry
+    at a declared time instead of pretending that a worker died.
     """
     __slots__ = ('reason',)
 
@@ -114,6 +133,16 @@ class DistributedWorkerLoop:
         starts and will claim tasks from the shared queue. This is how
         a node joins the distributed hive: just have Redis reachable.
         """
+        # The singleton is constructed at module import, which can precede
+        # social/sync initialization. Resolve again at the actual start
+        # boundary so transient boot ordering cannot disable this worker for
+        # the lifetime of the process.
+        if not self._node_id:
+            self._node_id = _worker_node_id()
+        if not self._node_id:
+            logger.error('Distributed worker loop not started: this node has '
+                         'no canonical identity')
+            return
         if not self._is_enabled():
             logger.debug("Distributed worker loop: Redis coordinator not reachable, skipping")
             return
@@ -222,8 +251,30 @@ class DistributedWorkerLoop:
 
     def _tick(self):
         """Try to claim and execute one task per tick."""
+        if not self._node_id:
+            self._node_id = _worker_node_id()
+        if not self._node_id:
+            logger.error('Distributed worker has no canonical node identity; '
+                         'refusing to claim shared work')
+            return
         coordinator = self._get_coordinator()
         if not coordinator:
+            return
+
+        # A tick that could only defer claims nothing.  Every claim is a full
+        # coordinator-ledger write, and a turn the dispatcher then defers costs
+        # two more (DEFERRED, then back to PENDING a minute later), so a worker
+        # that claims while the LLM is spoken for rewrites the whole ledger
+        # three times per task per minute and does no work.  Measured on the
+        # owner's desktop 2026-09-20 15:41-15:58 (installed build, ledger of
+        # 9,531 tasks, 72 MB): 4 tasks cycling claim -> "yielded to an active
+        # user" -> defer -> undefer, 18 full writes a minute, ~1.2 GB/min of
+        # JSON, for as long as the owner was using the machine.  The question
+        # is asked of the same gates the dispatcher answers with, never a
+        # copy of them.
+        deferral = self._dispatch_would_defer()
+        if deferral:
+            logger.debug("Worker claiming nothing this tick: %s", deferral)
             return
 
         # Claim next matching task
@@ -267,6 +318,17 @@ class DistributedWorkerLoop:
                                    f"the ledger refused the transition")
             except Exception as e:
                 logger.warning(f"Worker could not hold {task.task_id}: {e}")
+        elif isinstance(result, DeferredForRetry):
+            try:
+                if coordinator.defer_task(task.task_id, self._node_id,
+                                          result.reason):
+                    logger.info("Worker deferred task %s: %s",
+                                task.task_id, result.reason)
+                else:
+                    logger.warning("Worker could not defer %s: ledger refused "
+                                   "the transition", task.task_id)
+            except Exception as e:
+                logger.warning("Worker could not defer %s: %s", task.task_id, e)
         elif result is not None:
             # Submit result back to coordinator
             try:
@@ -286,6 +348,49 @@ class DistributedWorkerLoop:
             except Exception as e:
                 logger.warning(
                     f"Worker could not release {task.task_id}: {e}")
+
+    @staticmethod
+    def _dispatch_would_defer():
+        """Why a task claimed right now could only be deferred, or None.
+
+        Three reasons, each read from the component that owns it:
+          * should_yield_to_user(): the ONE gate every background daemon
+            consults (a foreground request, a user active in the cooldown,
+            model pressure, the governor).  The worker is a daemon and had
+            never asked it.
+          * local_dispatch_provider_breaker_open(): the node's own LLM
+            provider refusing the account, the first check
+            local_chat_dispatch makes.
+          * the Nunba adapter's readiness: the flag behind its
+            'hartos_loading' answer.  Absent adapter (native HARTOS) means
+            there is no warm-up notice to wait for.
+        A failure to read any signal is "no reason": the gate can only skip a
+        tick, never wedge the worker.
+        """
+        try:
+            from integrations.agent_engine.dispatch import (
+                get_last_yield_reason, should_yield_to_user)
+            if should_yield_to_user():
+                return get_last_yield_reason() or 'yield'
+        except Exception:
+            pass
+        try:
+            from integrations.agent_engine.dispatch import (
+                local_dispatch_provider_breaker_open)
+            host = local_dispatch_provider_breaker_open()
+            if host:
+                return f'provider breaker open ({host})'
+        except Exception:
+            pass
+        try:
+            from routes.hartos_backend_adapter import is_hartos_initialized
+            if not is_hartos_initialized():
+                return 'hartos_loading'
+        except ImportError:
+            pass    # native HARTOS: no adapter, nothing to warm up
+        except Exception:
+            pass
+        return None
 
     def _execute_task(self, task) -> Union[str, HeldForHelp, None]:
         """Execute a distributed task via the local /chat endpoint.
@@ -363,7 +468,8 @@ class DistributedWorkerLoop:
             # taking the LLM away from the person using the machine.
             logger.info(f"Worker deferring task {task.task_id}: local LLM "
                         f"yielded to user activity")
-            return None
+            return DeferredForRetry('local agent service yielded to an active '
+                                    'user or is still warming up')
 
         # The self-POST carries the credential dispatch.py mints. On the
         # central/regional tiers security/middleware.py gate 2 answers a
