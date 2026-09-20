@@ -52,6 +52,42 @@ _probe_cache = {'ts': 0, 'result': None}
 _PROBE_TTL = 60  # seconds
 
 
+def resolve_task_workspace(prompt_id=None, explicit=None) -> str:
+    """The directory a computer-use task resolves bare filenames in.
+
+    ONE resolver for every entry point that builds a VLM message, in this
+    order:
+
+      1. an explicit workspace the caller already holds;
+      2. the goal's own ``repo_path`` (AgentGoal.config_json), found by the
+         run's prompt_id the way the steering endpoint finds its goal;
+      3. the user-data coding workspace (core.platform_paths).
+
+    Never the process cwd.  Measured live 2026-09-19 22:07: the loop told the
+    VLM "Declared task workspace: C:\\Program Files (x86)\\HevolveAI\\Nunba",
+    the frozen install's launch directory, which no task was ever assigned.
+    """
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+    if prompt_id not in (None, '', 0, '0'):
+        try:
+            from integrations.social.models import AgentGoal, get_db
+            db = get_db()
+            try:
+                for goal in db.query(AgentGoal).filter(
+                        AgentGoal.prompt_id == str(prompt_id)).all():
+                    cfg = getattr(goal, 'config_json', None) or {}
+                    repo = str(cfg.get('repo_path') or cfg.get('workspace_root') or '').strip()
+                    if repo:
+                        return repo
+            finally:
+                db.close()
+        except Exception:
+            logger.debug('workspace lookup by prompt_id unavailable', exc_info=True)
+    from core.platform_paths import get_coding_workspace_dir
+    return get_coding_workspace_dir()
+
+
 def execute_vlm_instruction(message: dict) -> dict | None:
     """
     Three-tier VLM execution.
@@ -61,6 +97,25 @@ def execute_vlm_instruction(message: dict) -> dict | None:
         None  - signals caller to fall back to Tier 3 (Crossbar subscribe_and_return)
     """
     global _tier1_fail_count, _tier2_fail_count
+
+    # This protects the WAMP fallback as well as the local tiers.  The same
+    # policy is checked again at the final action dispatcher.
+    from integrations.vlm.safety import (
+        computer_operation_refusal, computer_control_block)
+    refusal = computer_operation_refusal(
+        message.get('instruction_to_vlm_agent') or message.get('enhanced_instruction'))
+    if refusal:
+        logger.warning('VLM instruction refused: %s', refusal)
+        return {'status': 'blocked', 'exit_reason': 'destructive_operation',
+                'extracted_responses': [{'type': 'error', 'content': refusal,
+                                         'iteration': 0}]}
+
+    consent_refusal = computer_control_block(message.get('prompt_id'))
+    if consent_refusal:
+        logger.warning('VLM instruction consent refused: %s', consent_refusal)
+        return {'status': 'blocked', 'exit_reason': 'consent_required',
+                'extracted_responses': [{'type': 'error', 'content': consent_refusal,
+                                         'iteration': 0}]}
 
     # Tier 1: In-process (deps available + circuit breaker open)
     # Standalone HARTOS with pyautogui works — no need for NUNBA_BUNDLED gate

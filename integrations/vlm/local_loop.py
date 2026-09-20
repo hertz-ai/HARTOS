@@ -292,11 +292,24 @@ def run_local_agentic_loop(
 
     Arguments and return shape: _drive_local_agentic_loop below.
     """
-    from integrations.vlm.safety import computer_control_block
+    from integrations.vlm.safety import (
+        computer_control_block, computer_operation_refusal)
     from hartos.threadlocal import thread_local_data
 
     prompt_id = message.get('prompt_id', '')
     started = time.time()
+    # Direct callers (for example the marketing and coding agents) can enter
+    # here without vlm_adapter, so reject before consent, capture or planning.
+    operation_refusal = computer_operation_refusal(
+        message.get('instruction_to_vlm_agent') or message.get('enhanced_instruction'))
+    if operation_refusal is not None:
+        logger.warning('VLM loop refused before start: %s', operation_refusal)
+        return {
+            "status": "blocked", "exit_reason": "destructive_operation",
+            "extracted_responses": [
+                {"type": "error", "content": operation_refusal, "iteration": 0}],
+            "execution_time_seconds": time.time() - started,
+        }
     refusal = computer_control_block(prompt_id)
     if refusal is not None:
         logger.warning(
@@ -847,6 +860,26 @@ def _drive_local_agentic_loop(
                 caption=_caption,
             )
             _notify_desktop_indicator(True, text=_caption)
+
+            # Check stop request again immediately before executing on the OS.
+            # If the user clicked "Stop AI control" while screenshotting or VLM inference
+            # was running, abort immediately before touching the mouse or keyboard.
+            if _is_stop_requested(user_id, prompt_id):
+                logger.info(
+                    f"VLM action aborted before execution: Stop requested by user "
+                    f"at iteration {iteration + 1} (user={user_id}, prompt={prompt_id})"
+                )
+                exit_reason = 'stopped'
+                record_activity(
+                    user_id=user_id, prompt_id=prompt_id, run_id=activity_run_id,
+                    iteration=iteration + 1, action=next_action, phase='stopped',
+                    agent_id=message.get('agent_id') or message.get('daemon_id') or '',
+                    steering_agent_id=steering_agent_id,
+                    audit_ref={'activity_id': action_payload['_activity_id']},
+                    error='Stopped by user',
+                )
+                break
+
             result = execute_action(
                 action_payload, tier,
                 safety=_safety_on, verify=_verify_on)
@@ -935,6 +968,17 @@ def _drive_local_agentic_loop(
     # across runs.  Pairs with _register_session above.
     _unregister_session(user_id, prompt_id)
     _notify_desktop_indicator(False)
+
+    # ONE terminal write for the run's ledger task, from the same exit_reason
+    # the caller receives.  Steps above never change the task's status, so
+    # without this the run would sit IN_PROGRESS forever.
+    from integrations.vlm.activity_stream import finish_run
+    finish_run(
+        user_id=user_id, prompt_id=prompt_id, run_id=activity_run_id,
+        exit_reason=exit_reason, iteration=len(extracted_responses),
+        agent_id=message.get('agent_id') or message.get('daemon_id') or '',
+        steering_agent_id=steering_agent_id,
+    )
 
     # status mirrors exit_reason: only 'done' is a real success. Callers
     # (LangChain router, autogen) can inspect exit_reason to craft an honest

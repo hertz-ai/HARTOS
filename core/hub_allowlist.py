@@ -55,6 +55,14 @@ logger = logging.getLogger(__name__)
 # Seeded defaults — extracted verbatim from the previous _TRUSTED_HF_ORGS
 # frozenset in main.py.  DO NOT prune entries here without operator
 # notice; existing installs that re-seed will lose previously-trusted orgs.
+#
+# SCOPE OF AN ADDITION HERE: cold installs only.  _load_or_seed returns the
+# on-disk file whenever one exists and never merges new defaults into it
+# (test_legacy_list_format_load pins that the operator's curated list is the
+# source of truth).  An org added here reaches an existing install only when
+# the operator adds it through the admin UI (add()) or the file is removed.
+# The catalog's preset downloads do not consult this list at all; only the
+# hub-install endpoint does (Nunba main.py, confirm_unverified gate).
 DEFAULT_TRUSTED_ORGS: Dict[str, str] = {
     'google': 'Google AI / Gemma / Gemini ecosystem',
     'microsoft': 'Microsoft (Phi, Bing) — verified publisher',

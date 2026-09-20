@@ -3296,12 +3296,16 @@ def _handle_shell_command_tool(input_text: str) -> str:
     # shell=True, so the string is not double-parsed.  no_window_kwargs() is
     # applied INSIDE run_bounded; repeating it here would be a second copy of
     # that decision.
+    from integrations.vlm.local_loop import _notify_desktop_indicator
+    _notify_desktop_indicator(True, text=f"Shell command: {text[:60]}")
     try:
         proc = run_bounded(argv, timeout=30)
     except FileNotFoundError as e:
         return f"Shell_Command: interpreter not found — {e}"
     except Exception as e:
         return f"Shell_Command error: {type(e).__name__}: {str(e)[:200]}"
+    finally:
+        _notify_desktop_indicator(False)
 
     # run_bounded never raises TimeoutExpired — it reports the kill this way.
     if proc.timed_out:
@@ -3357,7 +3361,8 @@ def _handle_computer_action_tool(input_text: str) -> str:
     prompt_id = thread_local_data.get_prompt_id()
     try:
         os.environ.setdefault('HEVOLVE_VLM_UNIFIED', 'true')
-        from integrations.vlm.vlm_adapter import execute_vlm_instruction
+        from integrations.vlm.vlm_adapter import (
+            execute_vlm_instruction, resolve_task_workspace)
         # 180s is the floor for cold-start runs: first VLM forward pass alone
         # can take 8-15s on the 4B model, and a realistic 12-iteration loop
         # needs ~2.5 minutes. HEVOLVE_COMPUTER_ACTION_ETA lets the user raise
@@ -3365,7 +3370,7 @@ def _handle_computer_action_tool(input_text: str) -> str:
         max_eta = int(os.environ.get('HEVOLVE_COMPUTER_ACTION_ETA', '180'))
         message = {
             'instruction_to_vlm_agent': input_text,
-            'workspace_root': os.getcwd(),
+            'workspace_root': resolve_task_workspace(prompt_id=prompt_id),
             'user_id': str(user_id or 'guest'),
             'prompt_id': str(prompt_id or 0),
             'os_to_control': 'windows' if sys.platform == 'win32' else (
@@ -3903,6 +3908,31 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
 _whatsapp_adapter_lock = threading.Lock()
 
 
+def _fetch_whatsapp_own_identity(gw_base: str, sid: str) -> dict:
+    """GET the gateway's own-identity for ``sid``.
+
+    Returns ``{'own_jid': ..., 'own_lid': ...}`` (either may be None while
+    the gateway is still linking), or ``{}`` on any failure, logged.  ONE
+    bounded request; the caller decides when to try again.
+    """
+    import json as _json
+    import urllib.request as _urlreq
+    log = logging.getLogger(__name__)
+    try:
+        with _urlreq.urlopen(
+            f"{gw_base.rstrip('/')}/api/sessions/{sid}/status",
+            timeout=5.0,
+        ) as _resp:
+            _status = _json.loads(_resp.read().decode('utf-8', errors='replace'))
+        return {'own_jid': _status.get('own_jid'), 'own_lid': _status.get('own_lid')}
+    except Exception as _status_err:
+        log.warning(
+            "_ensure_whatsapp_live_adapter: could not fetch own identity "
+            "from gateway (self-chat detection is off until a later poll "
+            "fetches it): %s", _status_err)
+        return {}
+
+
 def _ensure_whatsapp_live_adapter(
     user_id, sid: str = None, base: str = None,
 ) -> dict:
@@ -3953,9 +3983,27 @@ def _ensure_whatsapp_live_adapter(
         # makes the whole check+register sequence atomic so only ONE
         # adapter (and one WebSocket connection) is ever created per
         # process, no matter how many requests race here.
+        gw_base = base or _os.environ.get(
+            'WHATSAPP_GATEWAY_URL',
+            f"http://127.0.0.1:"
+            f"{_os.environ.get('WHATSAPP_GATEWAY_PORT', '3000')}",
+        )
         with _whatsapp_adapter_lock:
             existing = integration.registry.get('whatsapp')
             if existing is not None:
+                # A gateway that was still linking when the adapter was
+                # registered gave no identity.  The adapter stays (messages
+                # must flow), and because every later poll lands here, this
+                # is the only place the identity can still be adopted: one
+                # bounded fetch per poll until the adapter carries one.
+                if not existing.has_owner_identity():
+                    identity = _fetch_whatsapp_own_identity(gw_base, sid)
+                    if identity.get('own_jid') or identity.get('own_lid'):
+                        existing.set_owner_identity(
+                            identity.get('own_jid'), identity.get('own_lid'))
+                        log.info(
+                            "whatsapp adapter adopted its owner identity on a "
+                            "later poll (account_id=%s)", sid)
                 return {
                     'success': True,
                     'message': f'whatsapp adapter already registered '
@@ -3965,37 +4013,18 @@ def _ensure_whatsapp_live_adapter(
             from integrations.channels.whatsapp_adapter import (
                 create_whatsapp_adapter,
             )
-            gw_base = base or _os.environ.get(
-                'WHATSAPP_GATEWAY_URL',
-                f"http://127.0.0.1:"
-                f"{_os.environ.get('WHATSAPP_GATEWAY_PORT', '3000')}",
-            )
             # Fetch the gateway's own-identity lookup so self-chat detection
             # (SelfChatHandler.is_self_message) has something to match against
             # — without this, owner_phone/owner_lid are never set and a
             # self-chat message can never be recognized, regardless of which
             # JID scheme WhatsApp uses for that account (own_jid for
             # phone-based accounts, own_lid for LID/privacy-ID accounts).
-            own_jid = own_lid = None
-            try:
-                import json as _json
-                import urllib.request as _urlreq
-                with _urlreq.urlopen(
-                    f"{gw_base.rstrip('/')}/api/sessions/{sid}/status",
-                    timeout=5.0,
-                ) as _resp:
-                    _status = _json.loads(_resp.read().decode('utf-8', errors='replace'))
-                own_jid = _status.get('own_jid')
-                own_lid = _status.get('own_lid')
-            except Exception as _status_err:
-                log.warning(
-                    "_ensure_whatsapp_live_adapter: could not fetch own "
-                    "identity from gateway (self-chat detection will be "
-                    "unavailable until it succeeds): %s", _status_err)
+            identity = _fetch_whatsapp_own_identity(gw_base, sid)
 
             adapter = create_whatsapp_adapter(
                 api_url=gw_base, account_id=sid,
-                phone_number=own_jid, owner_lid=own_lid,
+                phone_number=identity.get('own_jid'),
+                owner_lid=identity.get('own_lid'),
             )
             integration.registry.register(adapter)
 

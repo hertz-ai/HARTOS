@@ -80,6 +80,29 @@ class WhatsAppAdapter(ChannelAdapter, RoomCapableAdapter):
     def name(self) -> str:
         return "whatsapp"
 
+    def has_owner_identity(self) -> bool:
+        """Whether self-chat detection has an owner to match against."""
+        extra = getattr(self.config, "extra", None) or {}
+        return bool(extra.get("owner_phone") or extra.get("phone_number")
+                    or extra.get("owner_lid"))
+
+    def set_owner_identity(self, phone_number: Optional[str],
+                           owner_lid: Optional[str]) -> None:
+        """Adopt the gateway's own-identity after registration.
+
+        The identity is fetched from the gateway when the adapter is
+        registered; if the gateway was not ready at that moment the adapter
+        still registers (messages must flow) and the caller retries the
+        fetch on its next poll.  ``config.extra`` is what
+        SelfChatHandler.is_self_message reads, and ``_phone_number`` is the
+        mention check's copy, so both are set here, in one place.
+        """
+        if phone_number:
+            self.config.extra["phone_number"] = phone_number
+            self._phone_number = phone_number
+        if owner_lid:
+            self.config.extra["owner_lid"] = owner_lid
+
     def set_qr_callback(self, callback: Callable[[str], None]) -> None:
         """Set callback for QR code display during authentication."""
         self._qr_callback = callback

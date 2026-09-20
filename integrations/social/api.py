@@ -2887,12 +2887,13 @@ def review_report(report_id):
 @social_bp.route('/admin/stats', methods=['GET'])
 @require_admin
 def platform_stats():
-    """Return dashboard aggregates without making Admin unusable during migration."""
-    empty = {
-        'total_users': 0, 'total_agents': 0, 'total_humans': 0,
-        'total_posts': 0, 'total_comments': 0, 'total_communities': 0,
-        'pending_reports': 0,
-    }
+    """Return dashboard aggregates, or say plainly that they are unavailable.
+
+    A failed aggregate query answers 503 with success=false, never a
+    success envelope full of zeros: the Admin dashboard already tolerates a
+    failed call (it renders the tile empty), and a fabricated zero reads as
+    a real "no users" to the operator.
+    """
     try:
         from sqlalchemy import func as sqlfunc
         return _ok({
@@ -2906,7 +2907,7 @@ def platform_stats():
         })
     except Exception:
         logging.exception('Admin dashboard statistics are unavailable')
-        return _ok(empty)
+        return _err('Admin dashboard statistics are unavailable', 503)
 
 
 @social_bp.route('/admin/revenue-analytics', methods=['GET'])

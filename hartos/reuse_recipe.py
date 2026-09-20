@@ -1981,16 +1981,18 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                 current_app.logger.info(f"Created enhanced instruction with {len(matching_recipe.get('recipe', []))} steps")
 
             # Prepare VLM message (shared across all tiers)
+            from integrations.vlm.vlm_adapter import resolve_task_workspace
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
                 'prompt_id': prompt_id,
                 'instruction_to_vlm_agent': instructions,
-                # The VLM shell must work in the same source tree the agent
-                # was assigned.  A bare filename otherwise resolves against
-                # the service's incidental launch directory and can either
-                # fail or select a stale checkout.
-                'workspace_root': os.getcwd(),
+                # The VLM shell must work in the tree the agent was assigned
+                # (the goal's repo_path), never the service's launch
+                # directory: a bare filename resolved there can fail or pick
+                # a stale checkout, and in the frozen build it is Program
+                # Files.  ONE resolver with the /chat computer-use tool.
+                'workspace_root': resolve_task_workspace(prompt_id=prompt_id),
                 'os_to_control': os_to_control,
                 'actions_available_in_os': [],
                 'max_ETA_in_seconds': 1800,
