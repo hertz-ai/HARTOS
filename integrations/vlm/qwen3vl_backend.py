@@ -519,25 +519,23 @@ class Qwen3VLBackend:
         # Reviewer flagged that the prior 'hybrid' order excluded
         # 'cloud' when local was reachable, which contradicted the
         # plan's "fall through all four tiers" wording.  Now matches.
-        # Normalise to the canonical vocabulary. The canonical set is
-        # {local_only, auto, hive_preferred} (llama_config._INTELLIGENCE_PREFS —
-        # what the demopage toggle sets and /chat forwards as user_pref). This
-        # resolver predated it with {local_only, hybrid, hive}, so canonical
+        # Normalise through the ONE canonical vocabulary. This resolver shipped
+        # its own set {local_only, hybrid, hive}, which overlapped the canonical
+        # {local_only, auto, hive_preferred} only on 'local_only' — so canonical
         # 'hive_preferred' matched NOTHING and fell through to the local-first
-        # ordering: a user who chose Hive still got local tried first. 'auto'
-        # and legacy 'hybrid' are the same local-first ordering, so mapping both
-        # leaves every existing caller's behaviour identical.
-        _pref = {'hive': 'hive_preferred', 'hybrid': 'auto'}.get(
-            intelligence_preference, intelligence_preference)
+        # ordering: a user who chose Hive still had local tried first. coerce()
+        # accepts both spellings, so every existing caller behaves identically.
+        from core.intelligence_preference import IntelligencePreference as _IP
+        _pref = _IP.coerce(intelligence_preference)
 
-        if _pref == 'local_only':
+        if _pref == _IP.LOCAL_ONLY:
             tiers = ['local'] if local_available else []
-        elif _pref == 'hive_preferred':
+        elif _pref == _IP.HIVE_PREFERRED:
             tiers = ['paired_peer', 'hive']
             if local_available:
                 tiers.append('local')
             tiers.append('cloud')
-        else:  # 'auto' (default; legacy 'hybrid' normalises here)
+        else:  # AUTO (the default; legacy 'hybrid' coerces to here)
             tiers = []
             if local_available and prefer_local:
                 tiers.append('local')
