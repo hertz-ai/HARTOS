@@ -91,6 +91,22 @@ CONSENT_TYPES = frozenset({
                          # a bare LiquidUI 'approval' component instead --
                          # unrecorded, unrevocable, and invisible to every
                          # surface but AgentOverlay (#863).
+    'capability_setup',  # An agent provisions a capability this machine does
+                         # not have yet: a voice engine's private venv, the
+                         # packages it pins and its model weights, downloaded
+                         # and installed here.  Asked of the desktop owner,
+                         # whose disk and bandwidth it is, and scoped to the
+                         # ONE capability ('tts:f5_tts'), so a yes to a 2.5 GB
+                         # voice is never a yes to a 12 GB one.  The ask is
+                         # raised by the task that needed the capability and
+                         # could not do it -- a voiced reply with no cloning
+                         # engine installed -- never at boot and never as a
+                         # blanket.  This type records only whether the owner
+                         # wants it; the work itself is the provisioning path
+                         # that already exists (a self_heal goal the agent
+                         # daemon paces, repair_backend_venv ->
+                         # install_backend_full, the same function the
+                         # "Set up TTS" UI calls).
 })
 
 #: The capability an agent asks for, keyed by the ``action`` its ask carries,

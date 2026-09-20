@@ -8831,6 +8831,28 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     return jsonify(payload)
 
 
+def _offer_voice_clone_setup(language):
+    """This turn wanted a recorded voice and spoke in the default one: offer
+    to set a cloning engine up, on the demand of the turn that needed it.
+
+    The offer is the canonical consent card (capability_setup.
+    offer_voice_clone_setup -> ConsentService), and the owner's Allow starts
+    the provisioning goal the agent daemon paces.  Nothing here waits and
+    nothing here can fail the reply: the audio is already on its way in the
+    default voice, and an offer that cannot be made is a debug line.
+    """
+    try:
+        from integrations.agent_engine.capability_setup import (
+            offer_voice_clone_setup,
+        )
+        outcome = offer_voice_clone_setup(language)
+        if outcome in ('asked', 'provisioning'):
+            app.logger.info(
+                f"TTS: no cloning engine here; voice-clone setup {outcome}")
+    except Exception as e:
+        app.logger.debug(f"TTS: voice-clone setup offer skipped: {e}")
+
+
 def _speak_in_voice(text, language, voice):
     """Speak ``text`` in the recorded ``voice``; returns the audio path, or
     None for the default voice.
@@ -8871,11 +8893,13 @@ def _speak_in_voice(text, language, voice):
     if result.error or not result.path or not os.path.isfile(result.path):
         app.logger.info(f"TTS: voiced synthesis gave no audio "
                         f"({result.error or result.path!r}); default voice")
+        _offer_voice_clone_setup(language)
         return None
     spec = ENGINE_REGISTRY.get(result.engine_id)
     if spec is None or not spec.voice_clone:
         app.logger.info(f"TTS: {result.engine_id} cannot clone a voice; "
                         f"default voice")
+        _offer_voice_clone_setup(language)
         return None
     # Served by Nunba's /tts/audio/<basename>: a cloning engine's ToolWorker
     # writes under HEVOLVE_MODEL_DIR (default ~/.hevolve/models)/<tool>/output,

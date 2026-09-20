@@ -1013,6 +1013,45 @@ def _get_gpu_info() -> Dict[str, Any]:
         return {'cuda_available': False, 'total_gb': 0, 'free_gb': 0}
 
 
+def clone_engines_not_installed(language: Optional[str] = None) -> List[str]:
+    """The cloning engines this node could run for ``language`` but has not
+    installed, in ladder order.
+
+    A different question from ``select_engines``, which answers "what can I
+    use right now".  This one answers "what would have to be set up before a
+    voice can be cloned here", so an on-demand setup offer
+    (integrations.agent_engine.capability_setup) can name the engine that
+    will actually work on this machine instead of the first one in the list.
+
+    It applies exactly the gates installing cannot change -- the language
+    ladder, ``voice_clone``, and, for a GPU-only engine, whether its budget
+    fits this card right now -- and no others.  So the list never offers a
+    12 GB engine to an 8 GB machine that is already holding an LLM, and a
+    cloud engine, which is not a local setup, is never in it.
+
+    Measured 2026-09-20 on the owner's desktop: no cloning engine was
+    installed, every one of them was skipped, and each voiced turn fell to
+    the default voice without saying why.
+    """
+    lang = (language or 'en')[:2].lower()
+    has_gpu = _get_gpu_info().get('cuda_available', False)
+    missing: List[str] = []
+    for engine_id in LANG_ENGINE_PREFERENCE.get(lang, _DEFAULT_PREFERENCE):
+        spec = ENGINE_REGISTRY.get(engine_id)
+        if spec is None or not spec.voice_clone:
+            continue
+        if spec.device == TTSDevice.CLOUD:
+            continue
+        if _is_engine_installed(engine_id):
+            continue
+        if spec.device == TTSDevice.GPU_ONLY and not (
+                has_gpu and _can_fit_on_gpu(engine_id)):
+            continue
+        if engine_id not in missing:
+            missing.append(engine_id)
+    return missing
+
+
 def _can_fit_on_gpu(engine_id: str) -> bool:  # TODO REFACTOR: remove — duplicates catalog.matches_compute()
     """Check if this engine's model fits in available VRAM."""
     spec = ENGINE_REGISTRY.get(engine_id)
