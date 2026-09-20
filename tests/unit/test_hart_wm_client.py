@@ -349,8 +349,19 @@ def test_verbs_reach_the_compositor_with_the_wire_names_it_expects(tmp_path, mon
 @needs_af_unix
 def test_a_compositor_error_keeps_its_code_and_message(tmp_path, monkeypatch):
     """Honest failure, carried through. not_found from ipc.rs must not be
-    flattened into the bare False the swaymsg path used to return."""
+    flattened into the bare False the swaymsg path used to return.
+
+    The fake answers the detection probe (``window.list``) like a live
+    compositor and refuses only the focus. A responder that refused EVERY
+    request refused the probe too, so detection honestly found no backend,
+    the call fell through to swaymsg, and the assertion met 'no
+    window-manager transport' instead of the code this test is about.
+    The refusal-only sibling below sets ``_backend`` by hand for exactly
+    that reason; here the real detection path stays in the loop."""
     def responder(req):
+        if req.get('method') == 'window.list':
+            return {'v': 1, 'id': req.get('id'), 'ok': True,
+                    'result': {'windows': []}, 'error': None}
         return {'v': 1, 'id': req.get('id'), 'ok': False, 'result': None,
                 'error': {'code': 'not_found',
                           'message': 'no mapped window for handle 99'}}
