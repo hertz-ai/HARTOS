@@ -214,11 +214,15 @@ def _component_keys():
         r"pub fn surface\(self\) -> crate::latency::Surface \{(.*?)\n    \}",
         scene, re.S)
     assert block, "scene.rs no longer maps Component into latency::Surface"
-    # `(?:\(\w+\))?` because a variant may carry a payload: `Component::HomeRow(_)`
-    # is a row plus its index. Without it the arm reads as absent, which is how this
-    # guard first reported the row surface as unmapped rather than unreadable.
+    # `(?:\([^)]*\))?` because a variant may carry a payload, in whatever pattern
+    # the arm binds it with: `Component::HomeRow(_)` is a row plus its index, and
+    # `Component::HomeCard(..)` is a card plus its row and card indices, matched
+    # with the rest pattern. Without it the arm reads as absent, which is how this
+    # guard first reported the row surface as unmapped rather than unreadable, and
+    # then reported the card surface the same way once bdaf0d3 gave it a payload
+    # `\w+` could not read.
     variants = re.findall(
-        r"Component::\w+(?:\(\w+\))? => crate::latency::Surface::(\w+)",
+        r"Component::\w+(?:\([^)]*\))? => crate::latency::Surface::(\w+)",
         block.group(1))
     assert variants, "the Component-to-Surface mapping names nothing"
 
