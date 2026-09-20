@@ -555,9 +555,11 @@ class GPUWorker:
                 ]
                 if target:
                     pip_args.extend(['--target', target])
-                pip_args.append(pkg)
+                dist = self._pip_name_for(pkg)
+                pip_args.append(dist)
                 logger.info(
-                    f"{self.name}: deterministic pip install: {pkg} → "
+                    f"{self.name}: deterministic pip install: {dist}"
+                    f"{'' if dist == pkg else f' (import {pkg})'} → "
                     f"{target or '<default site>'}"
                 )
                 rc = subprocess.run(
@@ -633,6 +635,25 @@ class GPUWorker:
             target=_install_async, daemon=True,
             name=f"self-heal-{self.name}-{pkg}",
         ).start()
+
+    @staticmethod
+    def _pip_name_for(import_name: str) -> str:
+        """The distribution to pip-install for a missing import: Nunba's
+        one alias table (``tts.package_installer._PIP_TO_IMPORT``, read
+        backwards by ``pip_name_for_import``) when present, else the
+        import name itself, which pip reads with '-' and '_' alike.
+        Measured 2026-09-20: `import coqpit` failed, the heal installed
+        the PyPI package `coqpit`, and coqui-tts, which needs the fork
+        `coqpit-config`, then refused to import at all."""
+        try:
+            from tts.package_installer import pip_name_for_import  # type: ignore
+            return pip_name_for_import(import_name)
+        except Exception as e:
+            logger.debug(
+                f"pip name for '{import_name}' fell back to the import "
+                f"name: {e}"
+            )
+            return import_name
 
     def _child_is_backend_venv(self) -> bool:
         """True when this worker's interpreter is the per-backend venv

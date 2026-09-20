@@ -254,3 +254,27 @@ def test_a_python_embed_worker_still_heals_into_the_user_site(
     assert args[0] == w.python_exe
     assert args[args.index('--target') + 1] == user_site
     assert args[-1] == 'pyloudnorm'
+
+
+def test_the_heal_installs_the_distribution_nunbas_table_names(
+        monkeypatch, he_mock, tmp_path):
+    """`import coqpit` failed on the installed build 2026-09-20; the heal
+    ran `pip install coqpit` (the abandoned original) where coqui-tts needs
+    the fork `coqpit-config`, and the engine then refused to import at all.
+    The pip name comes from Nunba's one alias table when it is present."""
+    table = types.ModuleType('tts.package_installer')
+    table.pip_name_for_import = (
+        lambda name: 'coqpit-config' if name == 'coqpit' else name)
+    table.get_user_site_packages = lambda: str(tmp_path / 'usersite')
+    monkeypatch.setitem(sys.modules, 'tts', types.ModuleType('tts'))
+    monkeypatch.setitem(sys.modules, 'tts.package_installer', table)
+    monkeypatch.setattr('core.venv_paths.venv_python_if_exists',
+                        lambda backend: None)
+    captured = _capture_pip(monkeypatch)
+    w = _make_worker()
+    monkeypatch.setattr(w, 'stop', MagicMock())
+
+    w._maybe_self_heal_from_line("ModuleNotFoundError: No module named 'coqpit'")
+
+    assert captured['args'][-1] == 'coqpit-config', captured['args']
+    assert 'coqpit' not in captured['args']
