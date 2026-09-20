@@ -4,6 +4,7 @@ Agent Lightning Configuration
 Central configuration for Agent Lightning integration with our agent system.
 """
 
+import logging
 import os
 from typing import Dict, Any, Optional
 
@@ -175,9 +176,14 @@ def get_traces_path() -> str:
     try:
         from core.platform_paths import get_agent_data_dir
         base = get_agent_data_dir()
-    except Exception:
+    except Exception as exc:
+        # Never silent: if the platform paths module cannot answer, the
+        # traces land somewhere other than where an operator would look.
         base = os.path.join(
             os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+        logging.getLogger(__name__).warning(
+            'core.platform_paths unavailable (%s); Agent Lightning traces '
+            'fall back to %s', exc, base)
 
     if not configured:
         return os.path.join(base, 'lightning_traces')
