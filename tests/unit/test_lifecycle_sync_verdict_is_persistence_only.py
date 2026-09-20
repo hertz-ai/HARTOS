@@ -1,5 +1,22 @@
 """Only the transition and the durable write may fail a state projection.
 
+PROVENANCE (correcting commit 332d6dfc6, which credited the wrong session;
+the commit is on origin and main is never force-pushed, so the record is
+corrected here instead):
+  * the ledger durability work this guards -- save() returning a bool, the
+    rollback, events after the write, the completion-snapshot bounding, and
+    the recipe_assistant_agent_id single source -- is the CODEX session's,
+    landed in b597a9779;
+  * the MECHANISM below (that the blanket except also covered heartbeat,
+    the SLA check, fromisoformat and release, so a bad timestamp could veto
+    a committed write) was found by the fix-all-log-observed-issues
+    reviewer session, independently and before my message reached it;
+  * that session also A/B-verified this file: 3 pass at HEAD, and with
+    8b64cbb58's lifecycle_hooks.py swapped back in, 2 fail with
+    "Invalid isoformat string: 'not-a-timestamp'" then
+    "StateTransitionError: Ledger persistence failed ... -> completed" on
+    the TERMINAL hop.  The guard is not vacuous.
+
 set_action_state RAISES when _auto_sync_to_ledger returns False, so anything
 that can make that function return False can block an action's lifecycle.
 Before this guard the same blanket `except Exception` covered the persistence
