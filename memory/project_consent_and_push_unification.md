@@ -417,13 +417,43 @@ Track to landed per #119.
   DIFFERENT concern wearing the same word. Check subject/object/lifecycle before
   folding — and when the answer is "do not fold", still audit the code, because
   the reason it looked like a consent store is that it gates something.*
-- **F9 two ask paths that write no row** — `_pending_contacts` in-memory dict
-  (`Nunba/routes/chatbot_routes.py:4238-4330`, lost on restart) and
-  `DeviceRoutingService.request_consent` (`device_routing_service.py:165-261`,
-  name-collides with the canonical one). Fold: both file the ask via
-  `ConsentService.request_consent`; FCM + FleetCommand stay as **transports**, not
-  stores. Keep the FCM leg — it exists because FleetCommand only reaches the RN app
-  when open (`:196-201`).
+- **F9 two ask paths that write no row** — **PREMISE VERIFIED 2026-09-21, both
+  files CLEAN, ready to implement. This one IS the same concern as `UserConsent`
+  (unlike F8): subject = the human, object = a named agent, revocable, belongs on
+  the privacy page.**
+
+  **Half A — `_pending_contacts`** (`Nunba/routes/chatbot_routes.py:4242` decl,
+  written `:4306`, read `:4347,4353`, expired `:4375-4377`). A module-level dict.
+  `agent_contact_request` stores the ask and pushes an `agent_contact_request`
+  notification; `agent_contact_respond` accepts/denies. Four measured defects:
+  1. **lost on restart** — the pushed notification card survives but the dict does
+     not, so tapping Accept later returns `{'error': 'Unknown or expired request'}`
+     404 on a card the user can still see;
+  2. **an accept is never recorded**, so the same agent re-asks next time — the
+     "pestered forever" failure `record_capability_decision`'s own docstring names;
+  3. **a deny is equally unrecorded** (`contact['status'] = action` on a dict about
+     to be GC'd), so a refused agent can re-ask immediately;
+  4. the 1h cleanup runs ONLY inside `respond`, so an ask nobody answers never
+     expires at all.
+  Owned agents (`creator_user_id == target_user_id`) deliver directly with
+  `requires_consent: False` — leave that branch alone, it is correct.
+
+  **Half B — `DeviceRoutingService.request_consent`**
+  (`integrations/social/device_routing_service.py:165`). Does three real things —
+  `NotificationService.create('agent_consent_request')`, an FCM `consent_prompt`
+  (the native over-other-apps overlay, the ONLY leg that reaches a user away from
+  the agent's machine), and a FleetCommand — and writes **no consent row**.
+  **Name collision to fix deliberately:** its signature is
+  `(db, user_id, action, agent_id, description, timeout_s)` while the canonical
+  `ConsentService.request_consent(db, user_id, consent_type, scope)` DOES file a
+  row. Same name, different contract, one records and one does not — the same trap
+  shape as F11's wrapper-vs-inner-dict. Rename or delegate, do not leave both.
+
+  Fold: both file the ask through `ConsentService.request_consent`; FCM +
+  FleetCommand + the notification stay **transports**, never stores. Keep the FCM
+  leg (`:194-204` explains why: FleetCommand only reaches the RN app when open).
+  Blast: 1 Nunba file + 1 HARTOS file. Acceptance: an accept survives a restart
+  and is not re-asked; a deny is remembered; the phone overlay still fires.
 - **F10 `intelligence_preference`** — OWNER DESIGN CALL. The field I canonicalised
   is itself a parallel permission store for hive participation
   (`llama/llama_config.py:491-509`, gate `Nunba/main.py:601-609`); its own docstring
