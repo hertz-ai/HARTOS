@@ -599,6 +599,12 @@ class AgentDaemon:
         self._home_compose_interval_s = int(os.environ.get(
             'HART_HOME_COMPOSE_INTERVAL_S', '300'))
         self._next_home_compose_at = 0.0
+        # Auto-evolve rides the thought-experiment lifecycle tick below.  A
+        # wall-clock cadence keeps it independent of whether ordinary goals
+        # exist, while 0 remains an operator kill switch.
+        self._auto_evolve_interval_s = max(0, int(os.environ.get(
+            'HEVOLVE_AUTO_EVOLVE_INTERVAL_S', '900')))
+        self._next_auto_evolve_at = 0.0
 
     def start(self):
         with self._lock:
@@ -668,6 +674,32 @@ class AgentDaemon:
                 ThoughtExperimentService.advance_due_experiments(db)
         except Exception as exc:
             logger.debug("Thought-experiment lifecycle tick skipped: %s", exc)
+
+        # Complete the existing GATHER->DISPATCH->AgentGoal loop: first project
+        # canonical goal outcomes back onto its active session, then start a new
+        # bounded cycle only on cadence and only when no cycle is active.
+        try:
+            from .auto_evolve import get_auto_evolve_orchestrator
+            orchestrator = get_auto_evolve_orchestrator()
+            status = orchestrator.reconcile()
+            now = time.monotonic()
+            interval = self._auto_evolve_interval_s
+            if interval <= 0 or now < self._next_auto_evolve_at:
+                return
+            self._next_auto_evolve_at = now + interval
+            if status.get('status') in ('selecting', 'dispatching', 'running'):
+                return
+            result = orchestrator.start(user_id='system')
+            if result.get('success'):
+                logger.info(
+                    "Agent daemon: auto-evolve cycle %s started",
+                    result.get('session_id'))
+            else:
+                logger.debug(
+                    "Agent daemon: auto-evolve cycle not started: %s",
+                    result.get('reason'))
+        except Exception as exc:
+            logger.debug("Auto-evolve daemon tick skipped: %s", exc)
 
     def _try_parallel_dispatch(self, goal, idle_agents, dispatched, max_concurrent):
         """Check if a goal has parallel subtasks and dispatch them concurrently.
@@ -1666,8 +1698,17 @@ class AgentDaemon:
                 # GUARDRAIL: full pre-dispatch gate
                 try:
                     from security.hive_guardrails import GuardrailEnforcer
+                    # Pass the goal's OWNER as the requester. The consent gate
+                    # can only ask a human it can name: with no user_id it falls
+                    # back to HEVOLVE_OWNER_USER_ID, which desktop sets from
+                    # guest_identity but central/regional set NOWHERE — so a
+                    # consent-flagged goal there was refused with 'dispatched
+                    # without user context' and NO request filed: blocked with
+                    # nobody ever asked, unrecoverable without an env var. The
+                    # goal already carries owner_id, and dispatch_goal already
+                    # passes it (dispatch.py:1089); this path just dropped it.
                     allowed, reason, prompt = GuardrailEnforcer.before_dispatch(
-                        prompt, goal.to_dict())
+                        prompt, goal.to_dict(), user_id=goal.owner_id)
                     if not allowed:
                         logger.warning(f"Goal {goal.id} blocked by guardrail: {reason}")
                         continue

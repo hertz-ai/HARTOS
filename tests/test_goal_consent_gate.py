@@ -211,3 +211,50 @@ def test_plural_spelling_passes_with_consent(monkeypatch):
 
     assert allowed is True
     assert req_spy.call_count == 0
+
+
+def test_gate_files_no_request_when_it_cannot_name_a_human(monkeypatch):
+    """The dead end this gate has when nobody can be asked.
+
+    With no user_id AND no HEVOLVE_OWNER_USER_ID (central/regional set it
+    NOWHERE — only desktop does, from guest_identity), the gate refuses with
+    'without user context' and files NOTHING: blocked, nobody asked, nothing to
+    grant. Pinned so it is a KNOWN dead end, not a surprise — it is why callers
+    must pass the requester they already hold.
+    """
+    from security.hive_guardrails import GuardrailEnforcer
+    _quiet_other_policies(monkeypatch)
+    req_spy = _patch_consent(monkeypatch, granted=False)
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
+
+    allowed, reason, _ = GuardrailEnforcer.before_dispatch(
+        'p', goal_dict=FLAGGED_PLURAL, user_id=None)
+
+    assert allowed is False
+    assert 'user context' in reason
+    assert req_spy.call_count == 0, (
+        "no human to name, so no request can be filed — this is the dead end")
+
+
+def test_daemon_path_passes_the_goals_owner_as_requester():
+    """agent_daemon must not drop the requester it already holds.
+
+    The daemon loop has the goal in hand and AgentGoal.owner_id is a real
+    column, but it used to call before_dispatch(prompt, goal.to_dict()) with no
+    user_id — so on any topology without HEVOLVE_OWNER_USER_ID every
+    consent-flagged goal hit the dead end above. dispatch_goal already passes
+    its user_id (dispatch.py); this pins that the daemon path does too, since a
+    silent regression here stops goals with no way to grant.
+    """
+    import inspect
+    from integrations.agent_engine import agent_daemon
+    src = inspect.getsource(agent_daemon)
+    assert 'user_id=goal.owner_id' in src, (
+        "daemon before_dispatch must pass the goal's owner as the requester, or "
+        "a consent-flagged goal is blocked with nobody to ask")
+    # and no guardrail call may pass the goal WITHOUT naming the requester
+    for seg in src.split('GuardrailEnforcer.before_dispatch(')[1:]:
+        call = seg[:160]
+        if 'goal.to_dict()' in call:
+            assert 'user_id=' in call, (
+                f"requester-less guardrail call is the dead end: {call!r}")
