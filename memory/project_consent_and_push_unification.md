@@ -863,8 +863,13 @@ fold that "looks trivial" in the plan text is exactly the one to check first.
 - **F15** three SMTP senders → one (`email_campaign.py:643`,
   `email_adapter.py:264`, `mailing_list.py:286` — the last is a *prober*, keep it
   separate but say so).
-- **F16** `localStorage` as a push channel (`App.js:56-61`
-  `agent_proactive_message`) → an event.
+- **F16** `localStorage` as a push channel → an event. **PREMISE ACCURATE**
+  (2026-09-22), lines are `hevolve/src/App.js:46-48`, not 56-61:
+  `localStorage.setItem('agent_proactive_message', JSON.stringify(data))` with the
+  comment "Store in localStorage so Agent component picks it up". That is exactly
+  the described defect — localStorage used as an inter-component event bus. Safe to
+  execute; the only caution is that `active_agent_id` is set alongside it at `:47`
+  and `:64`, so the fold must keep whatever reads THAT working.
 - **F17** two public-topic allowlists — **AUDITED 2026-09-22. DO NOT "fold to one
   list". The divergence is DELIBERATE and folding it is a SECURITY REGRESSION.**
 
@@ -907,9 +912,35 @@ fold that "looks trivial" in the plan text is exactly the one to check first.
   through-line: this plan's author read COMMENTS and inferred intent, where the
   comments were in fact recording a deliberate decision. Read the code AND the
   reason before folding anything it calls duplicate.*
-- **F18** `approval.options` is **dead schema** (`liquid_ui_service.py:633`
-  declares it; `AgentOverlay.jsx:269-305` and the desktop shell both ignore it).
-  Either honour it or delete it — dead schema invites the next parallel path.
+- **F18** `approval.options` is **dead schema** — **PREMISE VERIFIED 2026-09-22,
+  end to end. The cleanest fold left in this tier.**
+  Path correction: `integrations/agent_engine/liquid_ui_service.py`, not
+  `integrations/social/`.
+  - DECLARED `:633` — `'approval': {'props': [..., 'options']}`
+  - POPULATED `:1593` — `agent_request_approval()` sets
+    `'options': ['Approve', 'Deny', 'Ask me later']` and pushes via `agent_ui_update`
+  - IGNORED — `Nunba/landing-page/src/components/AgentOverlay/AgentOverlay.jsx`:
+    `ApprovalOverlay` (`:270`, dispatched `:761`) renders the card and never reads
+    `data.options`. Only `data.title` and its own buttons.
+  So the field is produced with real values on every approval request and no
+  consumer looks at it. *Near-miss worth recording: `liquid_ui_service.py:4048` has
+  `const options = opts.options || []` and I briefly took it as a consumer — it is
+  `dsSelect`, a generic select primitive, unrelated to `approval.options`. Checking
+  the enclosing function is what separated a consumer from a coincidence.*
+  Prescription ("honour it or delete it") is SAFE and well posed — the first in
+  this tier that needs no warning. Honouring it means the agent controls the button
+  labels; deleting it means the overlay owns them. A design preference, not a risk.
+
+**PUSH TIER AUDIT COMPLETE except F15.** Premise accuracy across the tier:
+| fold | premise | prescription |
+|---|---|---|
+| F12 | code right, doc reference phantom | **blocked** — needs Nunba's interceptor migrated first or `/chat` loses thinking traces |
+| F13 | paths/names off; "contradiction" already annotated | **half unsafe** — "fix the generic body" leaks content to lock screens |
+| F14 | **fully accurate** (4 files, 2 repos) | cross-repo fold, no trap found |
+| F16 | accurate (line drift 46-48) | safe |
+| F17 | path wrong; comment says the OPPOSITE of the plan | **unsafe** — folding the allowlists leaks per-conversation chat to every SSE client |
+| F18 | **fully accurate**, verified end to end | safe, well posed |
+| F15 | NOT YET AUDITED | — |
 
 ---
 
