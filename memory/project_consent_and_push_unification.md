@@ -865,9 +865,48 @@ fold that "looks trivial" in the plan text is exactly the one to check first.
   separate but say so).
 - **F16** `localStorage` as a push channel (`App.js:56-61`
   `agent_proactive_message`) → an event.
-- **F17** two divergent public-topic allowlists — SSE `events.py:127-138` vs WAMP
-  `realtime.py:43`; `events.py:113-118` admits the divergence is
-  unmaintained-by-construction. Fold to one list, two projections.
+- **F17** two public-topic allowlists — **AUDITED 2026-09-22. DO NOT "fold to one
+  list". The divergence is DELIBERATE and folding it is a SECURITY REGRESSION.**
+
+  Correct locations (the plan's path was wrong): SSE allowlist is
+  `core/platform/events.py:127-138` (`_SSE_GLOBAL_PREFIXES`), NOT
+  `integrations/social/events.py` (that file is ICS calendar parsing). WAMP side is
+  `integrations/social/realtime.py:43` (`_PUBLIC_TOPIC_PREFIXES`) as stated.
+
+  **The plan misread the comment.** It says `:113-118` "admits the divergence is
+  unmaintained-by-construction". What `:116-118` actually says:
+  > "(The two lists **intentionally differ** elsewhere: WAMP also lists
+  > per-conversation chat.social/dm. which are authorized per-subscriber, NOT
+  > SSE-global.)"
+  The comment aligns the two lists for the INFRA subset (`system.`, `model.`,
+  `catalog.`) and documents that they differ on purpose everywhere else.
+
+  **Why folding them leaks.** WAMP authorizes PER-SUBSCRIBER, so it can safely list
+  `chat.social.` and `dm.`. SSE broadcasts GLOBALLY with no per-user scoping —
+  `_is_sse_global` returns "safe to broadcast without a user_id". Merge the lists
+  and per-conversation chat becomes an SSE-global broadcast to every connected
+  client, which is exactly the leak this guard was added to stop (`:98`: without it
+  "an emit_event that forgot to include user_id leaks the payload (e.g. a personal
+  pair-code card) to every connected client").
+  → If anything is done here it is to make the SHARED INFRA SUBSET single-sourced
+  (`system.`/`model.`/`catalog.`/`resource.`/`app.`), leaving each transport's
+  transport-specific entries alone. Not "one list, two projections".
+
+  **A real open item the code already identifies correctly** (`:120-126`):
+  agent/goal/memory-scoped topics (`agent.action.completed` ×4882,
+  `action_state.changed`, `inference.completed`, `memory.item_added`) are
+  DELIBERATELY excluded, because a global SSE broadcast would leak cross-user
+  activity metadata on a multi-tenant node. The comment names the right fix — the
+  PUBLISHER stamps the owning user_id so the event routes per-user — and says it is
+  "tracked separately, NOT bypassed by whitelisting here." That is worth its own
+  fold, and it is the opposite of widening a list.
+
+  *SIXTH premise correction, and the THIRD prescription that would have reduced
+  safety if followed literally (F4 discards live grants, F13 leaks message content
+  to lock screens, F17 leaks per-conversation chat to every SSE client). The
+  through-line: this plan's author read COMMENTS and inferred intent, where the
+  comments were in fact recording a deliberate decision. Read the code AND the
+  reason before folding anything it calls duplicate.*
 - **F18** `approval.options` is **dead schema** (`liquid_ui_service.py:633`
   declares it; `AgentOverlay.jsx:269-305` and the desktop shell both ignore it).
   Either honour it or delete it — dead schema invites the next parallel path.
