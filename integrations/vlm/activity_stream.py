@@ -25,7 +25,9 @@ Shape (one task per RUN, not per step):
 """
 from __future__ import annotations
 
+import contextlib
 import logging
+import uuid
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger('hevolve.vlm.activity')
@@ -173,6 +175,61 @@ def _payload(*, user_id: str, prompt_id: str, run_id: str, task_id: str,
     }
 
 
+def _ribbon(show: bool, text: str = None) -> None:
+    """Nunba's AI-control ribbon — the SECOND surface of an announcement.
+
+    Moved here from local_loop 2026-09-21.  It lived beside the loop and was
+    poked directly at five sites, while record_activity was called at four; the
+    two agreed at exactly ONE of them, so the ribbon and the floating companion
+    window told the owner different stories.  The opening "Starting: ..." line
+    and every shell command reached only the ribbon; a blocked or failed step
+    reached only the topic, leaving the ribbon showing the step's INTENT as if
+    it had happened.  Both surfaces now hang off the one announcement below.
+
+    Why it must exist at all: Nunba shows the ribbon from its /execute route,
+    which only the http tier calls.  The inprocess tier drives pyautogui
+    directly, so a run could type and click with nothing on screen saying the
+    AI was in control: on 2026-09-13 the audit log holds 2,660 VLM actions and
+    gui_app.log holds no "Ribbon indicator shown" line.  A show request also
+    re-arms the ribbon's 15 s inactivity timer, so one rides every step.
+
+    Best effort, and only inside Nunba: standalone HARTOS has no ribbon, and a
+    refused localhost connect costs seconds on Windows.
+    """
+    try:
+        from core.config_cache import is_bundled, _local_base
+        if not is_bundled():
+            return
+        from core.http_pool import pooled_get
+        pooled_get(f"{_local_base()}/indicator/{'show' if show else 'hide'}",
+                   timeout=2, params={'text': text} if text else None)
+    except Exception as e:
+        logger.debug(f"AI-control ribbon {'show' if show else 'hide'} "
+                     f"skipped: {e}")
+
+
+#: Step phases the ribbon speaks, and how.  ``executing`` is the step's intent,
+#: which is what the owner needs while it happens.  ``blocked``/``failed`` are
+#: the outcomes that CONTRADICT that intent, and the loop keeps running after
+#: them, so without this the ribbon would sit there claiming the refused click
+#: happened.  ``completed`` is silent: the next step's intent replaces the line
+#: a moment later, and a tick per step is churn, not information.  ``stopped``
+#: is silent because its caller breaks straight into the run close below, which
+#: takes the ribbon down within milliseconds.
+_RIBBON_PHASES = {'executing', 'blocked', 'failed'}
+
+
+def _ribbon_line(phase: str, caption: str, error: str) -> str:
+    """What the ribbon says for a step, from the same caption the topic gets."""
+    line = str(caption or '').strip()
+    if phase == 'executing':
+        return line
+    detail = str(error or '').strip()
+    outcome = 'refused' if phase == 'blocked' else 'failed'
+    head = f'{line} — {outcome}' if line else outcome.capitalize()
+    return f'{head}: {detail}' if detail else head
+
+
 def _fan_out(user_id: str, payload: Dict[str, Any]) -> None:
     try:
         from integrations.social.realtime import on_notification
@@ -190,18 +247,26 @@ def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
                     agent_id: str = '', steering_agent_id: str = '',
                     audit_ref: Optional[Dict[str, Any]] = None,
                     error: str = '', caption: str = '') -> Optional[Dict[str, Any]]:
-    """Record one step phase on the run's task, then fan it out once.
+    """Announce one step phase: ribbon, then the run's task, then fan out.
 
-    ``phase`` is one of STEP_PHASES.  The run task is created IN_PROGRESS on
-    the first call; later calls rewrite its context.  Only an outcome phase
-    (anything but ``executing``) is written to disk.  The returned dict is
-    the safe client payload.  A failed ledger write returns ``None`` and
-    therefore emits nothing.
+    THE one way to say what the AI is doing.  Callers never touch a surface
+    themselves -- that is what let the ribbon and the companion window drift
+    (see _ribbon).  ``phase`` is one of STEP_PHASES.  The run task is created
+    IN_PROGRESS on the first call; later calls rewrite its context.  Only an
+    outcome phase (anything but ``executing``) is written to disk.  The
+    returned dict is the safe client payload.  A failed ledger write returns
+    ``None`` and therefore fans out nothing.
     """
-    if not user_id or not prompt_id or not run_id:
-        return None
     if phase not in STEP_PHASES:
         logger.warning('computer-use: unknown step phase %r ignored', phase)
+        return None
+    # The ribbon goes first and is never conditional on the durable leg.  It
+    # is the owner's live signal that the AI holds this machine's mouse and
+    # keyboard, so a ledger failure -- or a caller with no run to record
+    # against -- must not leave the screen silent while the pointer moves.
+    if phase in _RIBBON_PHASES:
+        _ribbon(True, _ribbon_line(phase, caption, error))
+    if not user_id or not prompt_id or not run_id:
         return None
     user_id, prompt_id = str(user_id), str(prompt_id)
     action = str(action or '')
@@ -274,7 +339,14 @@ def finish_run(*, user_id: Any, prompt_id: Any, run_id: str, exit_reason: str,
     reason is recorded as FAILED with the reason as the error, never as a
     success.  Returns the safe client payload, or ``None`` when the run has
     no task (nothing was ever recorded) or the ledger write failed.
+
+    Takes the ribbon down first, for the same reason record_activity puts it
+    up first: the run is over, and a ribbon left claiming the AI has the
+    machine is the one failure mode here that the owner cannot ignore.  (It
+    would clear on its own after the 15 s inactivity timer, but only after
+    15 s of lying.)
     """
+    _ribbon(False)
     if not user_id or not prompt_id or not run_id:
         return None
     user_id, prompt_id = str(user_id), str(prompt_id)
@@ -306,3 +378,114 @@ def finish_run(*, user_id: Any, prompt_id: Any, run_id: str, exit_reason: str,
         run_done=True)
     _fan_out(user_id, payload)
     return payload
+
+
+class ActivityRun:
+    """A computer-use run in progress: the ids its steps are announced with.
+
+    Held so a caller never re-derives them, and so ``finish`` can be called
+    unconditionally -- whether this frame opened the run or joined one already
+    running, which is the difference ``open_run`` resolves.
+    """
+
+    __slots__ = ('run_id', 'user_id', 'prompt_id', 'agent_id',
+                 'steering_agent_id', 'owns')
+
+    def __init__(self, *, run_id, user_id, prompt_id, agent_id='',
+                 steering_agent_id='', owns=False):
+        self.run_id = run_id
+        self.user_id = str(user_id or '')
+        self.prompt_id = str(prompt_id or '')
+        self.agent_id = str(agent_id or '')
+        self.steering_agent_id = str(steering_agent_id or '')
+        self.owns = bool(owns)
+
+    def step(self, *, iteration: int, action: str, phase: str,
+             caption: str = '', error: str = '',
+             audit_ref: Optional[Dict[str, Any]] = None):
+        """Announce one step of THIS run.  Binds the run's ids to the one
+        announcer; it is ``record_activity``, not a second implementation."""
+        return record_activity(
+            user_id=self.user_id, prompt_id=self.prompt_id,
+            run_id=self.run_id, iteration=iteration, action=action,
+            phase=phase, agent_id=self.agent_id,
+            steering_agent_id=self.steering_agent_id,
+            audit_ref=audit_ref, error=error, caption=caption)
+
+    def finish(self, *, exit_reason: str, iteration: int = 0,
+               action: str = '', error: str = '', caption: str = ''):
+        """Close the run -- but only if this frame opened it.
+
+        A joined run belongs to the frame above, which is still taking steps;
+        closing it here would take the ribbon down mid-run and move the task
+        to a terminal status the next step could not leave.  That is exactly
+        what the shell tool used to do with its bare ribbon hide.
+        """
+        if not self.owns:
+            return None
+        try:
+            return finish_run(
+                user_id=self.user_id, prompt_id=self.prompt_id,
+                run_id=self.run_id, exit_reason=exit_reason,
+                iteration=iteration, action=action, error=error,
+                agent_id=self.agent_id,
+                steering_agent_id=self.steering_agent_id, caption=caption)
+        finally:
+            with contextlib.suppress(Exception):
+                from hartos.threadlocal import thread_local_data
+                thread_local_data.clear_activity_run()
+
+
+def open_run(*, user_id: Any, prompt_id: Any, agent_id: str = '',
+             steering_agent_id: str = '') -> ActivityRun:
+    """Start a computer-use run.  THE one opener.
+
+    Always owns, and always REPLACES whatever run is stamped on this thread.
+    That replacement is load-bearing, not tidiness: run_local_agentic_loop
+    reaches its close straight-line, with no ``finally`` (the same shape its
+    stop-registry pair already has), so a raise anywhere above that line ends
+    the run with its stamp still on the thread.  Without the overwrite the
+    NEXT run on that thread would join the dead one -- never opening its own
+    ledger task, and never lowering the ribbon, because a joined run's close
+    is deliberately a no-op.  A caller that means "I am a step in whatever is
+    already running" wants ``current_run`` below, which is a different
+    question and says so.
+    """
+    run = ActivityRun(
+        run_id=uuid.uuid4().hex[:12], user_id=user_id, prompt_id=prompt_id,
+        agent_id=agent_id, steering_agent_id=steering_agent_id, owns=True)
+    with contextlib.suppress(Exception):
+        from hartos.threadlocal import thread_local_data
+        thread_local_data.set_activity_run(
+            run.run_id, user_id=run.user_id, prompt_id=run.prompt_id)
+    return run
+
+
+def current_run(*, user_id: Any, prompt_id: Any, agent_id: str = '',
+                steering_agent_id: str = '') -> ActivityRun:
+    """The run this work belongs to: the live one, or a new one for it alone.
+
+    For a tool that may or may not be executing inside a computer-use run and
+    should not have to know which.  The shell tool is the case: it reaches
+    hart_intelligence_entry on the VLM loop's OWN thread during a run, and
+    from a plain chat turn on a thread with no run at all.  Joining means its
+    work is announced as steps of the enclosing run and its close is a no-op,
+    so it cannot take the ribbon down or terminate a task the loop is still
+    using -- which is exactly what its old bare ribbon hide did.
+
+    Opening is delegated to open_run; there is no second opener here.
+    """
+    try:
+        from hartos.threadlocal import thread_local_data
+        joined = thread_local_data.get_activity_run()
+    except Exception:
+        joined = None
+    if joined and joined.get('run_id'):
+        return ActivityRun(
+            run_id=joined['run_id'],
+            user_id=joined.get('user_id') or user_id,
+            prompt_id=joined.get('prompt_id') or prompt_id,
+            agent_id=agent_id, steering_agent_id=steering_agent_id,
+            owns=False)
+    return open_run(user_id=user_id, prompt_id=prompt_id,
+                    agent_id=agent_id, steering_agent_id=steering_agent_id)

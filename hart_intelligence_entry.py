@@ -3338,16 +3338,35 @@ def _handle_shell_command_tool(input_text: str) -> str:
     # shell=True, so the string is not double-parsed.  no_window_kwargs() is
     # applied INSIDE run_bounded; repeating it here would be a second copy of
     # that decision.
-    from integrations.vlm.local_loop import _notify_desktop_indicator
-    _notify_desktop_indicator(True, text=f"Shell command: {text[:60]}")
+    # Announce it like any other computer-use step, instead of poking the
+    # ribbon directly.  Two things were wrong with the bare poke: the floating
+    # companion window, which reads the computer_use.update topic, never heard
+    # shell commands at ALL; and its `finally` hide took the ribbon down even
+    # when this ran INSIDE a VLM run that was still driving the machine.
+    # current_run joins that enclosing run when there is one (this tool
+    # reaches here on the loop's own thread) and opens a run of its own when
+    # there is not, so neither case needs a branch here.
+    from integrations.vlm.activity_stream import current_run
+    _caption = f"Shell command: {text[:60]}"
+    _run = current_run(user_id=thread_local_data.get_user_id() or '',
+                       prompt_id=thread_local_data.get_prompt_id() or '')
+    _run.step(iteration=1, action='shell', phase='executing', caption=_caption)
+    _phase, _err = 'completed', ''
     try:
         proc = run_bounded(argv, timeout=30)
     except FileNotFoundError as e:
+        _phase, _err = 'failed', f'interpreter not found — {e}'
         return f"Shell_Command: interpreter not found — {e}"
     except Exception as e:
+        _phase, _err = 'failed', f'{type(e).__name__}: {str(e)[:200]}'
         return f"Shell_Command error: {type(e).__name__}: {str(e)[:200]}"
     finally:
-        _notify_desktop_indicator(False)
+        _run.step(iteration=1, action='shell', phase=_phase,
+                  caption=_caption, error=_err)
+        # Only closes a run this call opened; inside a VLM run the loop still
+        # owns the ribbon and the ledger task.
+        _run.finish(exit_reason='done' if _phase == 'completed' else 'action_error',
+                    iteration=1, action='shell', error=_err)
 
     # run_bounded never raises TimeoutExpired — it reports the kill this way.
     if proc.timed_out:

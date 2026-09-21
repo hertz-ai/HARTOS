@@ -64,6 +64,27 @@ class ThreadLocalData:
     def get_prompt_id(self):
         return getattr(self._local, 'prompt_id', None)
 
+    # --- Computer-use run context (set by integrations.vlm.local_loop) ---
+    # The run a desktop action belongs to, so a tool that executes DURING a
+    # run can announce itself as a step of that run instead of inventing its
+    # own.  The shell tool is the case that needs it: it reaches
+    # hart_intelligence_entry._handle_shell_command_tool on the loop's OWN
+    # thread (local_loop already relies on that for prompt_id), but the run id
+    # was a bare local in run_local_agentic_loop, so the shell step could only
+    # write the ribbon and never reached the computer_use.update topic.
+
+    def set_activity_run(self, run_id, user_id=None, prompt_id=None):
+        self._local.activity_run = {
+            'run_id': run_id, 'user_id': user_id, 'prompt_id': prompt_id,
+        } if run_id else None
+
+    def get_activity_run(self):
+        """The enclosing run's {run_id, user_id, prompt_id}, or None."""
+        return getattr(self._local, 'activity_run', None)
+
+    def clear_activity_run(self):
+        self._local.activity_run = None
+
     # --- Agent creation signals (set by LangChain Create_Agent tool) ---
 
     def set_creation_requested(self, description=None, autonomous=False):

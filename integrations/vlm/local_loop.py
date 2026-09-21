@@ -14,7 +14,6 @@ import platform
 import time
 import logging
 import re
-import uuid
 
 logger = logging.getLogger('hevolve.vlm.local_loop')
 
@@ -221,36 +220,6 @@ def list_active_sessions() -> list:
         return [tuple(k.split(':', 1)) for k in _vlm_stop_flags.keys()]
 
 
-def _notify_desktop_indicator(show: bool, text: str = None) -> None:
-    """Show or hide Nunba's AI-control ribbon (desktop/indicator_window.py).
-
-    Nunba shows the ribbon from its /execute route, which only the http tier
-    calls.  The inprocess tier drives pyautogui directly, so a run could type
-    and click with nothing on screen saying the AI was in control: on
-    2026-09-13 the audit log holds 2,660 VLM actions and gui_app.log holds no
-    "Ribbon indicator shown" line.  A show request also re-arms the ribbon's
-    15 s inactivity timer, so the loop sends one before every action.
-
-    ``text`` says what the AI is doing now (the step's action and reasoning,
-    _step_caption); the ribbon shows it beside its timer.  Without it the
-    ribbon could only say THAT the AI was in control, and the owner watching
-    the screen had no idea what it was trying to do.
-
-    Best effort, and only inside Nunba: standalone HARTOS has no ribbon, and
-    a refused localhost connect costs seconds on Windows.
-    """
-    try:
-        from core.config_cache import is_bundled, _local_base
-        if not is_bundled():
-            return
-        from core.http_pool import pooled_get
-        pooled_get(f"{_local_base()}/indicator/{'show' if show else 'hide'}",
-                   timeout=2, params={'text': text} if text else None)
-    except Exception as e:
-        logger.debug(f"AI-control ribbon {'show' if show else 'hide'} "
-                     f"skipped: {e}")
-
-
 def _step_caption(action_json: dict, limit: int = 160) -> str:
     """One line a person can read: the step's action, then why.
 
@@ -428,13 +397,21 @@ def _drive_local_agentic_loop(
 
     extracted_responses = []
     start_time = time.time()
-    # Run identity is local to this invocation.  It distinguishes retries of
-    # the same prompt while preserving prompt_id as the cross-surface join key.
-    activity_run_id = uuid.uuid4().hex[:12]
     # Resolve once: the database goal id is only needed for the existing
     # GroupChat steering endpoint, while prompt_id remains the run join key.
-    from integrations.vlm.activity_stream import resolve_steering_agent_id
+    from integrations.vlm.activity_stream import open_run, resolve_steering_agent_id
     steering_agent_id = resolve_steering_agent_id(str(user_id), str(prompt_id))
+    # Run identity is local to this invocation.  It distinguishes retries of
+    # the same prompt while preserving prompt_id as the cross-surface join key.
+    # open_run also publishes it on this thread, so a tool that executes
+    # INSIDE the run -- the shell tool reaches hart_intelligence_entry on this
+    # same thread -- announces its work as a step of this run instead of
+    # writing the ribbon by itself, which is how the two surfaces drifted.
+    run = open_run(
+        user_id=user_id, prompt_id=prompt_id,
+        agent_id=message.get('agent_id') or message.get('daemon_id') or '',
+        steering_agent_id=steering_agent_id)
+    activity_run_id = run.run_id
     # One taskbar shortcut per run — see the pre-check call site below.
     _taskbar_shortcut_used = False
 
@@ -451,10 +428,13 @@ def _drive_local_agentic_loop(
     # previous run that never reached its end.
     from integrations.vlm.safety import reset_session_guard
     reset_session_guard()
-    # The task itself is the first thing the ribbon says; each step's
-    # caption replaces it below.
-    _notify_desktop_indicator(True, text=_step_caption(
-        {'Reasoning': f"Starting: {instruction}"} if instruction else {}))
+    # The task itself is the run's first announcement; each step's caption
+    # replaces it below.  This used to poke the ribbon directly, so the
+    # floating companion window -- which reads the computer_use.update topic
+    # -- never heard a run start, only its second step onwards.
+    run.step(iteration=0, action='', phase='executing',
+             caption=_step_caption(
+                 {'Reasoning': f"Starting: {instruction}"} if instruction else {}))
 
     for iteration in range(max_iterations):
         # User-requested stop wins over every other exit condition.
@@ -859,7 +839,6 @@ def _drive_local_agentic_loop(
                 audit_ref={'activity_id': action_payload['_activity_id']},
                 caption=_caption,
             )
-            _notify_desktop_indicator(True, text=_caption)
 
             # Check stop request again immediately before executing on the OS.
             # If the user clicked "Stop AI control" while screenshotting or VLM inference
@@ -967,18 +946,12 @@ def _drive_local_agentic_loop(
     # Drop this session's stop flag so the registry doesn't grow
     # across runs.  Pairs with _register_session above.
     _unregister_session(user_id, prompt_id)
-    _notify_desktop_indicator(False)
 
     # ONE terminal write for the run's ledger task, from the same exit_reason
-    # the caller receives.  Steps above never change the task's status, so
-    # without this the run would sit IN_PROGRESS forever.
-    from integrations.vlm.activity_stream import finish_run
-    finish_run(
-        user_id=user_id, prompt_id=prompt_id, run_id=activity_run_id,
-        exit_reason=exit_reason, iteration=len(extracted_responses),
-        agent_id=message.get('agent_id') or message.get('daemon_id') or '',
-        steering_agent_id=steering_agent_id,
-    )
+    # the caller receives, and the same call takes the ribbon down.  Steps
+    # above never change the task's status, so without this the run would sit
+    # IN_PROGRESS forever.
+    run.finish(exit_reason=exit_reason, iteration=len(extracted_responses))
 
     # status mirrors exit_reason: only 'done' is a real success. Callers
     # (LangChain router, autogen) can inspect exit_reason to craft an honest
