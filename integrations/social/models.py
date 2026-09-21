@@ -87,6 +87,24 @@ else:
             DB_PATH = _get_db_path('hevolve_database.db')
         except ImportError:
             DB_PATH = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'hevolve_database.db')
+    elif 'pytest' in _sys_models.modules:
+        # Under test with NOTHING configured. Do not fall through to the shared
+        # agent_data database below: that file is real (tens of MB of dev state),
+        # and a suite that writes it leaves state behind for the NEXT run. Two
+        # runs of byte-identical code then disagree, because DB_PATH is resolved
+        # ONCE at import and whichever suite imports this module first decides it
+        # for the whole process. That cost a full evening of false attribution:
+        # a regression AND its "fix" were both credited to code present in both
+        # arms of the comparison.
+        #
+        # A per-process temp FILE rather than ':memory:' on purpose -- it keeps
+        # the file-backed NullPool semantics every suite already runs under
+        # (see the :memory: + StaticPool statement-cache hazard noted above), so
+        # this changes WHERE tests write, never HOW. An explicit HEVOLVE_DB_PATH
+        # still wins; this is only the unconfigured default.
+        import tempfile as _tempfile_models
+        DB_PATH = os.path.join(
+            _tempfile_models.mkdtemp(prefix='hartos_test_'), 'hevolve_database.db')
     else:
         DB_PATH = os.path.join(
             os.path.dirname(__file__), '..', '..', 'agent_data', 'hevolve_database.db')
