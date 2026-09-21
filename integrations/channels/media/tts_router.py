@@ -2120,7 +2120,10 @@ def populate_tts_catalog(catalog) -> int:
     added = 0
     for engine_id, spec in ENGINE_REGISTRY.items():
         # Skip if already registered (preserves user edits from admin UI)
-        if catalog.get(_engine_id_to_catalog_id(engine_id)) is not None:
+        # Ask the CLAIMING question: skipping an engine to preserve the
+        # owner's admin-UI edits still means this populator owns it, and
+        # the catalogue's stale sweep removes what nobody claims.
+        if catalog.already_registered(_engine_id_to_catalog_id(engine_id)):
             continue
 
         device_value = spec.device.value

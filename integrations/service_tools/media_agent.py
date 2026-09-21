@@ -48,6 +48,24 @@ def _can_do(model_type: str, capability: str = None) -> bool:
         return False
 
 
+def _node_has_any(model_type: str) -> bool:
+    """Whether this node has ANY model of a type, fit to run or not.
+
+    Deliberately ignores compute: the question is "is something installed",
+    not "can it run this second".  _can_do() answers the second, and a
+    caller that cannot tell them apart will offer to install what is
+    already here.
+    """
+    try:
+        from integrations.service_tools.model_orchestrator import get_orchestrator
+        catalog = getattr(get_orchestrator(), '_catalog', None)
+        if catalog is None:
+            return False
+        return bool(catalog.list_by_type(model_type))
+    except Exception:
+        return False
+
+
 # ═══════════════════════════════════════════════════════════════
 # Auto-start helpers
 # ═══════════════════════════════════════════════════════════════
@@ -100,7 +118,10 @@ def populate_videogen_catalog(catalog) -> int:
     added = 0
     for (mid, name, vram, ram, disk, quality, speed, min_tier,
          sup_cpu, sup_offload, caps) in videogen_models:
-        if catalog.get(mid) is not None:
+        # Claiming skip -- see ModelCatalog.already_registered: an entry
+        # this populator still owns but does not rewrite would otherwise
+        # be swept as stale on every populate.
+        if catalog.already_registered(mid):
             continue
         entry = ModelEntry(
             id=mid, name=name, model_type=ModelType.VIDEO_GEN,
@@ -154,7 +175,10 @@ def populate_audiogen_catalog(catalog) -> int:
     added = 0
     for (mid, name, vram, ram, disk, quality, speed, min_tier,
          sup_cpu, sup_offload, caps) in audiogen_models:
-        if catalog.get(mid) is not None:
+        # Claiming skip -- see ModelCatalog.already_registered: an entry
+        # this populator still owns but does not rewrite would otherwise
+        # be swept as stale on every populate.
+        if catalog.already_registered(mid):
             continue
         entry = ModelEntry(
             id=mid, name=name, model_type=ModelType.AUDIO_GEN,
@@ -279,7 +303,9 @@ _ABSENT_MARKERS = ('not registered', 'not available', 'no tool',
 _UNREACHABLE_MARKERS = ('connection refused', 'connectionerror', 'timed out',
                         'timeout', 'max retries', 'failed to establish',
                         'actively refused', 'connection aborted',
-                        'name or service not known', 'getaddrinfo')
+                        'name or service not known', 'getaddrinfo',
+                        # installed, but will not fit in memory this instant
+                        'cannot run right now')
 
 
 def classify_error(result) -> str:
@@ -601,9 +627,20 @@ def generate_media(
     }
     check = _MODALITY_TO_CHECK.get(modality)
     if check and not _can_do(*check):
+        # can_do() is "loaded OR can_load", and can_load drops any model that
+        # will not fit in the memory free AT THIS INSTANT.  So a fully
+        # installed engine reads as unavailable while the GPU is busy.  Those
+        # are different problems with different answers -- one is "install
+        # something", the other is "wait or free memory" -- so say which.
+        # Conflating them made a caller offer to install what was already
+        # installed, which is the defect classify_error exists to prevent.
+        installed = _node_has_any(check[0])
         return json.dumps({
             'status': 'unavailable',
-            'error': f'{modality} not available on this node right now.',
+            'error': (
+                f'{modality} is installed on this node but cannot run right '
+                f'now (not enough free memory).' if installed else
+                f'{modality} not available on this node right now.'),
             'modality': modality,
             'suggestion': f'Describe the {modality.replace("_", " ")} in text instead, '
                           f'or delegate to a node with {check[0]} capability.',

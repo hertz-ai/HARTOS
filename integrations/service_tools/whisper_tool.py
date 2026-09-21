@@ -868,7 +868,9 @@ def populate_stt_catalog(catalog) -> int:
 
     added = 0
     for (mid, name, vram, ram, disk, quality, speed, tags, min_tier) in models:
-        if catalog.get(mid) is not None:
+        # Claiming skip -- see populate_tts_catalog for why `get` is not
+        # enough: an entry no populator claims is swept as stale.
+        if catalog.already_registered(mid):
             continue
         entry = ModelEntry(
             id=mid, name=name, model_type=ModelType.STT,
@@ -2234,6 +2236,59 @@ def reset_stt_segment_queue(call_id: str) -> None:
 # ═══════════════════════════════════════════════════════════════
 # Service tool registration
 # ═══════════════════════════════════════════════════════════════
+#
+# The registry reaches an IN-PROCESS tool through `native_handler`, the
+# same contract crawl4ai_tool._native_crawl / gh_pr_tool.gh_pr_open /
+# seo_audit_tool.seo_audit_score already use: registry.
+# create_endpoint_function calls it with `json.dumps(kwargs)` and skips
+# the URL branch entirely.
+#
+# Whisper declares base_url 'inprocess://whisper' but supplied no
+# handler, so every agent-side call through get_autogen_tools() /
+# get_langchain_tools() fell through to pooled_post('inprocess://
+# whisper/transcribe') and came back
+#   {"success": false, "error": "No connection adapters were found for
+#    'inprocess://whisper/transcribe'"}
+# — measured 2026-09-21 right after a setup_tool('whisper') whose own
+# module entry point (whisper_transcribe) transcribed the same file
+# fine.  So STT worked for every direct importer (hart_intelligence_
+# entry, model_bus_service, channels/media/audio, …) and was dead for
+# every LLM-driven agent.  Guarded by
+# tests/unit/test_whisper_native_handler.py.
+
+
+def _native_params(params_json) -> dict:
+    """Parse a registry native_handler payload into a params dict.
+
+    Tolerates a dict handed in directly and a bare string path, matching
+    the leniency of ``crawl4ai_tool._native_crawl`` — one shape rule for
+    in-process handlers, no second convention.
+    """
+    if isinstance(params_json, dict):
+        return params_json
+    try:
+        parsed = json.loads(params_json)
+    except (json.JSONDecodeError, TypeError):
+        return {'audio_path': str(params_json)}
+    return parsed if isinstance(parsed, dict) else {'audio_path': str(parsed)}
+
+
+def _native_transcribe(params_json: str) -> str:
+    """Registry native handler → ``whisper_transcribe`` (in-process).
+
+    Thin adapter only: the worker isolation, engine chain and the
+    silence / annotation gates all stay in whisper_transcribe, so the
+    registry surface and the direct importers run the SAME path.
+    """
+    params = _native_params(params_json)
+    return whisper_transcribe(params.get('audio_path'), params.get('language'))
+
+
+def _native_detect_language(params_json: str) -> str:
+    """Registry native handler → ``whisper_detect_language`` (in-process)."""
+    params = _native_params(params_json)
+    return whisper_detect_language(params.get('audio_path'))
+
 
 class WhisperTool:
     """Register STT as an in-process service tool.
@@ -2277,6 +2332,7 @@ class WhisperTool:
                         "audio_path": {"type": "string", "description": "Path to audio file"},
                         "language": {"type": "string", "description": "Language code (optional)"},
                     },
+                    "native_handler": _native_transcribe,
                 },
                 "detect_language": {
                     "path": "/detect_language",
@@ -2285,6 +2341,7 @@ class WhisperTool:
                     "params_schema": {
                         "audio_path": {"type": "string", "description": "Path to audio file"},
                     },
+                    "native_handler": _native_detect_language,
                 },
             },
             health_endpoint="/health",
