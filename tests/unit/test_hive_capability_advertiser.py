@@ -117,9 +117,29 @@ def _isolated_env(monkeypatch):
         'HEVOLVE_HIVE_AUTH_TOKEN',
         'HEVOLVE_HIVE_ADVERTISE_TIER',
         'HEVOLVE_NODE_ID',
-        'HEVOLVE_HIVE_TRUSTED_PEERS',
     ]:
         monkeypatch.delenv(var, raising=False)
+
+
+def _real_attestation():
+    """This node's signed attestation, from the PRODUCTION producer.
+
+    Reused rather than hand-built: a fixture attestation would have to be signed
+    to pass the gate, and a fixture that skips the signature would only prove the
+    test agrees with itself. Going through ``_origin_attestation`` also means the
+    wrapper-vs-inner-dict unwrap is the one the advert really uses.
+
+    Skips (loudly) when the checkout cannot self-attest — that is an origin
+    problem, not a defect in what these tests cover.
+    """
+    from integrations.agent_engine.hive_capability_advertiser import (
+        _origin_attestation,
+    )
+    att = _origin_attestation()
+    if att is None:
+        pytest.skip('this checkout cannot self-attest (origin verification '
+                    'failed) — unrelated to the behaviour under test')
+    return att
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -427,7 +447,15 @@ class TestBuildPayload:
         assert payload['peer_id'] == 'node-x'
         assert payload['endpoint'] == 'https://node-x.example.com'
         assert payload['auth_token'] == 'tok-xyz'
-        assert payload['trust_signature'] == ''
+        # The signed origin attestation the consumer's trust gate verifies.
+        # Was 'trust_signature': '' — a field no verifier could ever accept.
+        att = payload['origin_attestation']
+        if att is not None:
+            assert 'origin_fingerprint' in att, (
+                'the advert must carry the INNER attestation dict')
+            assert 'attestation' not in att and 'valid' not in att, (
+                "the WRAPPER from get_attestation_for_federation went on the "
+                'wire — the consumer reads that as "not genuine HART OS"')
         assert isinstance(payload['models'], list)
         assert len(payload['models']) == 1
         assert before <= payload['announced_at'] <= after
@@ -632,8 +660,10 @@ class TestSelfEchoGuard:
         )
         from integrations.agent_engine.model_registry import ModelRegistry
         monkeypatch.setenv('HEVOLVE_NODE_ID', 'local')
-        monkeypatch.setenv(
-            'HEVOLVE_HIVE_TRUSTED_PEERS', 'auto-abc123')
+        # A REAL attestation from the production producer, so this is the whole
+        # wire: what the advertiser publishes is what the gate accepts. The env
+        # allowlist this used to set no longer exists.
+        att = _real_attestation()
         disc = HiveExpertDiscovery(registry=ModelRegistry())
         try:
             with patch(
@@ -645,7 +675,7 @@ class TestSelfEchoGuard:
                     'peer_id': 'auto-abc123',
                     'endpoint': 'https://other.example.com',
                     'auth_token': 'tok',
-                    'trust_signature': '',
+                    'origin_attestation': att,
                     'models': [{
                         'model_id': 'qwen-27b', 'tier': 'expert',
                         'verified_baseline': 0.8, 'display_name': 'Q',
@@ -661,7 +691,7 @@ class TestSelfEchoGuard:
         )
         from integrations.agent_engine.model_registry import ModelRegistry
         monkeypatch.setenv('HEVOLVE_NODE_ID', 'node-x')
-        monkeypatch.setenv('HEVOLVE_HIVE_TRUSTED_PEERS', 'node-y')
+        att = _real_attestation()
         disc = HiveExpertDiscovery(registry=ModelRegistry())
         try:
             with patch(
@@ -673,7 +703,7 @@ class TestSelfEchoGuard:
                     'peer_id': 'node-y',  # different from HEVOLVE_NODE_ID
                     'endpoint': 'https://node-y.example.com',
                     'auth_token': 'tok',
-                    'trust_signature': '',
+                    'origin_attestation': att,
                     'models': [{
                         'model_id': 'qwen-27b', 'tier': 'expert',
                         'verified_baseline': 0.8, 'display_name': 'Q',
