@@ -603,11 +603,19 @@ class Task:
         self._record_state_transition(new_status, reason)
         return True
 
-    def _validate_transition(self, new_status: TaskStatus) -> bool:
-        """Validate if transition from current state to new state is allowed."""
+    def transition_refusal(self, new_status: TaskStatus) -> Optional[str]:
+        """Why this transition is refused, or None when it is allowed.
+
+        The DECISION lives here and only here; `_validate_transition`
+        adds the log.  Split because a caller may legitimately want to
+        ASK whether a move is possible without the refusal appearing in
+        the log as though something had tried and failed -- `add_subtasks`
+        does exactly that, and using the logging form as its predicate
+        put back the ~30/min warning that guard exists to remove.
+        """
         # Special case: COMPLETED can transition to ROLLED_BACK
         if self.status == TaskStatus.COMPLETED and new_status == TaskStatus.ROLLED_BACK:
-            return True
+            return None
 
         # Special case: FAILED -> COMPLETED/TERMINATED is a legitimate RECOVERY.
         # The agent retry/fallback FSM (ActionState in lifecycle_hooks) can drive a
@@ -620,11 +628,11 @@ class Task:
         # #59 fast-fail circuit breaker still prevents retry storms.
         if self.status == TaskStatus.FAILED and new_status in (
                 TaskStatus.COMPLETED, TaskStatus.TERMINATED):
-            return True
+            return None
 
         if TaskStatus.is_terminal_state(self.status):
-            logger.warning(f"Cannot transition from terminal state {self.status} to {new_status}")
-            return False
+            return (f"Cannot transition from terminal state {self.status} "
+                    f"to {new_status}")
 
         valid_transitions = {
             TaskStatus.PENDING: {
@@ -665,9 +673,21 @@ class Task:
 
         allowed_states = valid_transitions.get(self.status, set())
         if new_status not in allowed_states:
-            logger.warning(f"Invalid transition from {self.status} to {new_status}")
-            return False
+            return f"Invalid transition from {self.status} to {new_status}"
 
+        return None
+
+    def _validate_transition(self, new_status: TaskStatus) -> bool:
+        """Whether the transition is allowed, logging the refusal.
+
+        Every mover goes through here so a refused move is always
+        visible.  A caller that only wants to ASK uses
+        `transition_refusal` instead.
+        """
+        refusal = self.transition_refusal(new_status)
+        if refusal:
+            logger.warning(refusal)
+            return False
         return True
 
     def start(self, reason: str = "Task execution started") -> bool:
@@ -3343,17 +3363,33 @@ RELATIONSHIP TYPES:
             # no-op, not an outcome.  is_terminal_state already covers
             # COMPLETED, so the old list collapses into it.
             parent_task = self.tasks[parent_task_id]
-            if TaskStatus.is_terminal_state(parent_task.status):
-                logger.warning(
-                    f"Parent {parent_task_id} is {parent_task.status} "
-                    f"(terminal); added {len(subtasks)} subtask(s) but did "
-                    f"not block it. A terminal parent being given children "
-                    f"is an upstream defect, not a ledger one."
-                )
-            elif parent_task.status != TaskStatus.BLOCKED:
+            if parent_task.status == TaskStatus.BLOCKED:
+                pass  # already waiting on children; nothing to do
+            elif parent_task.transition_refusal(TaskStatus.BLOCKED) is None:
                 parent_task.transition_to(
                     TaskStatus.BLOCKED,
                     f"Waiting for {len(subtasks)} subtasks to complete"
+                )
+            else:
+                # Ask the question this guard is named for -- CAN this parent
+                # be blocked -- rather than the narrower "is it terminal".
+                # Only IN_PROGRESS and DELEGATED can be.  The terminal-only
+                # check let five non-terminal statuses through to
+                # transition_to, where they were refused anyway: PENDING,
+                # DEFERRED, PAUSED, USER_STOPPED, RESUMING.  Same refusal,
+                # same unconditional save, under a different log line -- so
+                # it did not show up when grepping for the one that was
+                # measured.  PENDING is the live case: both create_recipe
+                # call sites set the action PENDING immediately after this,
+                # so a repeat requires_breakdown meets a PENDING parent.
+                #
+                # The children still land; they are real work.  What is
+                # refused is moving a parent that cannot move.
+                logger.warning(
+                    f"Parent {parent_task_id} is {parent_task.status}, which "
+                    f"cannot be blocked; added {len(subtasks)} subtask(s) and "
+                    f"left it alone. A parent in this state being given "
+                    f"children is an upstream defect, not a ledger one."
                 )
 
             self.save()
