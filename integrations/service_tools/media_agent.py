@@ -491,7 +491,17 @@ def _generate_audio_music(context: str, input_text: str,
             f"{base_url}/release_task",
             json=payload,
             headers={'Content-Type': 'application/json'},
-            timeout=30,
+            # /release_task only ENQUEUES -- it answers with a task_id and the
+            # composing happens in the background.  But the FIRST call to a
+            # cold sidecar also waits for the model to load, and 30s does not
+            # cover that: MEASURED on this box, a first request timed out at
+            # 30s against a server that was alive and loading (the read timed
+            # out; the connection did not refuse).  The caller then reports a
+            # failure for work that IS proceeding, and the task_id in the
+            # answer we never read is lost, so the composition can never be
+            # polled or claimed -- it runs to completion for nobody.  Matches
+            # the video submit beside it, which learned this already.
+            timeout=120,
         )
         if resp.status_code == 200:
             data = resp.json()
