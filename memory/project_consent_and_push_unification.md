@@ -331,10 +331,35 @@ Track to landed per #119.
   `world_model_bridge.py:248-278` (5-min cache, no sync) vs canonical
   `cloud_egress` (`sync_engine.py:880-1000`). Same file already uses the canonical
   service at `:670-673` — a migration that stopped halfway. Blast: one file.
-- **F6 embodied camera/screen config** — admin toggle writes
-  `embodied_ai_config.json` with **no row** (`admin/api.py:2195-2226`); consent→config
-  is one-way (`consent_service.py:370-400`, which documents the desync at `:558-563`).
-  Fold: route the admin toggle through `record_capability_decision`.
+- **F6 embodied camera/screen config** — **DONE + VERIFIED LIVE (`2907dae2e`)**.
+  Audit found THREE writers of `camera_enabled`/`screen_capture_enabled`, not one:
+  `channels/admin/api.py` toggle (:2209-2219) + the config **PUT** (:2185, whole
+  schema, missed by a flag-name grep), and `hart_intelligence_entry.py:11196-11201`
+  — which turned out to be **already correct**: it is the documented
+  `if _recorded is None:` fallback after `record_capability_decision`, and that
+  guard was the shape to copy rather than a defect.
+  Folded both admin paths onto `record_capability_decision`. Reused, invented
+  nothing: `CAPABILITY_CONSENT_TYPES` already maps the endpoint's own feed names
+  ('camera'/'screen'), `_admin_auth_gate` already puts `g.user_id` + `g.db` on
+  every admin request (so NO env fallback and no `HEVOLVE_OWNER_USER_ID` dead
+  end here, unlike the goal gate), and the recorded decision applies the feed
+  through the same `_apply_embodied_toggle`.
+  Functionality deliberately preserved: 'audio' governs no consent type and is
+  still applied directly; a failed consent write logs and falls back to the old
+  direct apply. Behaviour change named in the commit: a PUT that switches the
+  camera on now actually starts it (it only wrote a flag before), and the PUT
+  records only a CHANGED flag so an ordinary settings save stays a no-op.
+  Tests: extended `tests/unit/test_capability_consent_canonical.py` (33 pass) —
+  real endpoint calls in a Flask request context, not source guards, since
+  `admin.api` is importable; incl. an AST divergence guard (no admin function
+  may set a feed flag without recording) proven RED against the pre-fold file,
+  and an *exactly once* actuator assertion (0 = the toggle stopped working,
+  2 = a second path). 224 pass across the 18 consent/admin suites.
+  Live: patched into the embedded runtime and driven there — row written, feed
+  applied once — against a throwaway DB with the actuator stubbed, because
+  verifying a privacy fix must not itself switch a camera on.
+  *Lesson: grep the flag NAME and the enclosing schema assignment; the PUT wrote
+  the same permission through an object assignment no name-grep would find.*
 - **F7 NodeComputeConfig + `HEVOLVE_*`** (`compute_config.py:16-89`, env > DB >
   defaults). **Distinguish permission from capacity**: fold only the permission-ish
   fields (`allow_metered_for_hive`, `accept_*`) onto consent; leave capacity
@@ -430,6 +455,9 @@ deliberate parallel path and leaving it contradicts rule 3.
   gone (backed up in `scratchpad/canon_wip/peer_wip_backup/`); needs the owner's
   adopt-or-discard call. Split F1a (projection subscriber, clean file) / F1b
   (delete the redundant local writes).
+- **F6 DONE + VERIFIED LIVE** (`2907dae2e`) — the admin camera/screen switch
+  records the owner's decision; three writers folded to one entry.
 - **F3 merged into F5**, blocked on a dirty `world_model_bridge.py` and carrying
   an owner call (hive queries opt-out → opt-in).
-- **NEXT: F5** once its file is clean; otherwise F6.
+- **NEXT: F11** (`HEVOLVE_HIVE_TRUSTED_PEERS` → the `peer_admission` API that now
+  exists), since F5 is still held by another session's edits. Then F8, F9, F7.
