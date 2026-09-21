@@ -156,3 +156,111 @@ def test_there_is_nothing_to_approve_before_anything_is_bound():
 def test_a_game_id_is_required():
     with _agent({}, _media({'status': 'completed', 'results': []})) as tools:
         assert 'game_id' in tools['bind_game_sound']('')
+
+
+# ── the matching rules (spec §4) ──────────────────────────────────────
+
+def test_a_level_without_its_own_sound_matches_the_games():
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct': {'url': 'https://node/correct.mp3'}}}}}}
+
+    with _agent(agent_data, _media({'status': 'completed', 'results': []})) as tools:
+        answer = json.loads(tools['get_game_sound']('eng-01', 'correct', '7'))
+
+    assert answer['status'] == 'bound'
+    assert answer['matched'] == 'game'
+    assert answer['music']['url'] == 'https://node/correct.mp3'
+
+
+def test_a_level_with_its_own_sound_matches_that_one():
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct': {'url': 'https://node/any-level.mp3'},
+        'correct@7': {'url': 'https://node/level7.mp3'}}}}}}
+
+    with _agent(agent_data, _media({'status': 'completed', 'results': []})) as tools:
+        seven = json.loads(tools['get_game_sound']('eng-01', 'correct', '7'))
+        eight = json.loads(tools['get_game_sound']('eng-01', 'correct', '8'))
+
+    assert (seven['matched'], seven['music']['url']) == ('level', 'https://node/level7.mp3')
+    assert (eight['matched'], eight['music']['url']) == ('game', 'https://node/any-level.mp3')
+
+
+def test_a_state_never_reached_is_a_miss_not_a_near_match():
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct': {'url': 'https://node/correct.mp3'}}}}}}
+
+    with _agent(agent_data, _media({'status': 'completed', 'results': []})) as tools:
+        answer = json.loads(tools['get_game_sound']('eng-01', 'wrong'))
+
+    assert answer['status'] == 'unbound'
+
+
+def test_a_state_outside_the_vocabulary_is_refused_not_guessed():
+    with _agent({}, _media({'status': 'completed', 'results': []})) as tools:
+        answer = tools['bind_game_sound']('eng-01', 'happy', '', 'kerfuffle')
+
+    assert 'not one of a game' in answer
+
+
+def test_the_miss_is_memoized_under_the_key_that_was_asked_for():
+    agent_data = {}
+    media = _media({'status': 'completed',
+                    'results': [{'url': 'https://node/level3.mp3'}]})
+
+    with _agent(agent_data, media) as tools:
+        json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct', '3'))
+
+    sounds = agent_data[4242]['games']['eng-01']['sounds']
+    assert 'correct@3' in sounds
+    assert 'correct' not in sounds
+
+
+# ── one person's correction (spec §6.2) ───────────────────────────────
+
+def test_a_persons_correction_is_theirs_and_leaves_the_agents_alone():
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct': {'url': 'https://node/approved.mp3', 'approved_at': 1}}}}}}
+    media = _media({'status': 'completed',
+                    'results': [{'url': 'https://node/mine.mp3'}]})
+
+    with _agent(agent_data, media) as tools:
+        mine = json.loads(tools['bind_game_sound'](
+            'eng-01', 'calm', 'spelling', 'correct', '', 'mine'))
+
+    assert mine['music']['url'] == 'https://node/mine.mp3'
+    # the agent's approved sound is untouched
+    assert agent_data[4242]['games']['eng-01']['sounds']['correct']['url'] == \
+        'https://node/approved.mp3'
+    # and the correction sits under that person
+    assert agent_data[4242]['games']['eng-01']['mine']['user-1']['correct']['url'] == \
+        'https://node/mine.mp3'
+
+
+# ── a rejected take (spec §6.1) ───────────────────────────────────────
+
+def test_the_next_take_is_composed_to_answer_the_rejection():
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/first.mp3', 'variant': 1}}}}}}
+    media = _media({'status': 'completed',
+                    'results': [{'url': 'https://node/second.mp3'}]})
+
+    with _agent(agent_data, media) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too loud and jangly')
+        again = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+
+    prompt = media.generate_media.call_args.kwargs['context']
+    assert 'too loud and jangly' in prompt
+    assert again['music']['variant'] == 2
+
+
+def test_a_rejected_take_is_kept_with_its_reason():
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/first.mp3'}}}}}}
+
+    with _agent(agent_data, _media({'status': 'completed', 'results': []})) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too sad')
+
+    record = agent_data[4242]['games']['eng-01']['sounds']['bgm']
+    assert record['rejected_reason'] == 'too sad'
+    assert record.get('url') is None
+    assert record['rejected_at'] > 0
