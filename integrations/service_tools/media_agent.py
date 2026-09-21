@@ -66,6 +66,18 @@ def _node_has_any(model_type: str) -> bool:
         return False
 
 
+def _degraded_reason(model_type: str, what: str) -> str:
+    """Why a segment was dropped, saying which of the two reasons it is.
+
+    "Offline" reads as "you do not have this"; often the truth is "you have
+    it and the GPU is busy".  A reviewer reading a degraded segment deserves
+    to know which, because only one of them is worth installing anything for.
+    """
+    if _node_has_any(model_type):
+        return f'{what} installed but cannot run right now (no free memory)'
+    return f'{what} service offline'
+
+
 # ═══════════════════════════════════════════════════════════════
 # Auto-start helpers
 # ═══════════════════════════════════════════════════════════════
@@ -856,12 +868,22 @@ def synthesize_multilingual_audio(
     Returns JSON with status, output_path, and degraded_segments (if any
     segment type was unavailable on this node).
     """
-    # Runtime capability gate: check what this node can actually do
+    # Runtime capability gate: check what this node can actually do.
+    # Same two meanings as the modality gate above, and this one carries the
+    # voice of every spoken turn: a node whose GPU is merely busy must not
+    # read as a node with no speech engine, or a caller offers to install
+    # what is already installed.
     if not _can_do('tts'):
+        installed = _node_has_any('tts')
         return json.dumps({
             'status': 'unavailable',
-            'error': 'Audio synthesis not available on this node (text-only mode).',
-            'suggestion': 'Return text content directly — the user will read it.',
+            'error': (
+                'Audio synthesis is installed on this node but cannot run '
+                'right now (not enough free memory).' if installed else
+                'Audio synthesis not available on this node (text-only mode).'),
+            'suggestion': ('Wait for the current work to finish, or return '
+                           'text content directly.' if installed else
+                           'Return text content directly — the user will read it.'),
         })
 
     try:
@@ -884,10 +906,12 @@ def synthesize_multilingual_audio(
                 runnable.append(seg)
             elif seg_type in ('music',) and not _can_do('audio_gen', 'music_gen'):
                 degraded.append({'type': seg_type, 'text': seg.get('text', ''),
-                                 'reason': 'music gen service offline'})
+                                 'reason': _degraded_reason('audio_gen',
+                                                            'music gen')})
             elif seg_type in ('sing', 'lyrics') and not _can_do('audio_gen', 'singing'):
                 degraded.append({'type': seg_type, 'text': seg.get('text', ''),
-                                 'reason': 'singing voice service offline'})
+                                 'reason': _degraded_reason('audio_gen',
+                                                            'singing voice')})
             else:
                 runnable.append(seg)
 

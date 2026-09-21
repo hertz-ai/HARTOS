@@ -222,3 +222,36 @@ def test_no_pinned_port_survives_in_the_media_path():
         assert pinned not in source, (
             f'{pinned} is pinned again; sidecar ports are OS-assigned and '
             f'a blind dial reaches nothing, or something else')
+
+
+def test_a_busy_speech_engine_is_not_an_install_offer():
+    """The gate that carries the voice of every spoken turn.
+
+    hartos-94's generalisation, applied: a capability answer that folds
+    "not present" together with "not possible right now" cannot be the
+    input to an install decision. TTS is the one that would hurt most --
+    the dialer speaks through it on every turn.
+    """
+    busy = {'status': 'unavailable',
+            'error': ('Audio synthesis is installed on this node but cannot '
+                      'run right now (not enough free memory).')}
+
+    assert classify_error(busy) == UNREACHABLE
+    assert classify_error(busy) != ABSENT
+
+
+def test_every_capability_gate_distinguishes_busy_from_absent():
+    """A guard against the next gate someone adds folding them back.
+
+    Each _can_do() gate that reports to a caller must branch on
+    _node_has_any(), or its wording becomes an install offer for something
+    already installed.
+    """
+    import inspect
+    import integrations.service_tools.media_agent as module
+    source = inspect.getsource(module)
+    # every gate that reports outward consults the installed-or-not reader
+    assert source.count('_node_has_any(') >= 4, (
+        'a capability gate stopped distinguishing installed-but-busy from '
+        'absent; see classify_error and the modality gate'
+    )
