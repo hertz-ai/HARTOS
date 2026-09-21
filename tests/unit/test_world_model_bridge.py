@@ -346,6 +346,37 @@ class TestFlushToWorldModel(unittest.TestCase):
             mock_cb.assert_called()
 
 
+def _hevolveai_importable() -> bool:
+    """Is hevolveai available, without exploding at COLLECTION time?
+
+    ``importlib.util.find_spec('hevolveai')`` raises
+    ``ValueError: hevolveai.__spec__ is None`` when the module is already in
+    sys.modules without a spec -- which happens whenever an earlier suite in the
+    same process stubs or side-loads it (hevolveai also ships as a compiled .pyd
+    that shadows the .py, so its spec is not always what an import would build).
+
+    This ran inside a decorator argument, i.e. during class-body evaluation, so
+    the ValueError surfaced as a COLLECTION error rather than a test failure --
+    and pytest aborts the entire run on a collection error unless
+    --continue-on-collection-errors is passed. One unlucky import order in one
+    file therefore stopped all 19,884 tests from running while the summary line
+    ("14 skipped, 4 errors") still read like a pass. The file passes 82/82 on its
+    own, which is why it went unnoticed.
+    """
+    try:
+        import importlib.util
+        return importlib.util.find_spec('hevolveai') is not None
+    except (ValueError, ImportError, AttributeError):
+        # Spec-less means SOMETHING put it in sys.modules, not that it is
+        # installed. tests/unit/test_mode_aware_inference.py:82 stubs
+        # hevolveai submodules with MagicMock, and a mock is not an install:
+        # treating it as one made this test RUN against the mock and fail,
+        # where on a machine without hevolveai it correctly skips. A real
+        # package carries __file__; a Mock raises AttributeError for it.
+        import sys
+        return getattr(sys.modules.get('hevolveai'), '__file__', None) is not None
+
+
 class TestSubmitCorrection(unittest.TestCase):
     """FT/SEC: submit_correction in-process, HTTP, and consent gate."""
 
@@ -384,9 +415,7 @@ class TestSubmitCorrection(unittest.TestCase):
         self.assertFalse(result['success'])
         self.assertIn('500', result['reason'])
 
-    @unittest.skipUnless(
-        __import__('importlib').util.find_spec('hevolveai') is not None,
-        'hevolveai not installed')
+    @unittest.skipUnless(_hevolveai_importable(), 'hevolveai not installed')
     def test_confidence_clamped(self):
         """BND: Confidence is clamped to [0.0, 1.0]."""
         self.bridge._in_process = True
