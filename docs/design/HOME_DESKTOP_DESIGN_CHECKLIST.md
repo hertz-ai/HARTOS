@@ -780,3 +780,22 @@ rules of (f) still hold.
 Audit note: GL1 as shipped changes only the panel's alpha. No new window, no new
 transport, nothing on the hot path, no Win32 call; a platform without
 `-alpha` keeps the solid panel (degrade-not-die).
+
+## 2026-09-21 - The floating glass is GPU-shaded and native on all three desktops
+
+Extends GL1 with the two things it did not say: the glass must be rendered by
+the **GPU compositor**, and it must be native on **Windows, macOS AND Linux**,
+not a Windows-only affordance. GL1's own measurements stand and are not
+reopened; this says what the destination is, so the next attempt does not
+re-run the two Win32 policies GL1 already disproved with pixels.
+
+| # | Captured intent (verbatim quote) | Item | Status | Evidence |
+|---|---|---|---|---|
+| GL2 | The floating surface is translucent GLASS drawn by the platform's own GPU compositor, using whatever each OS provides natively, on all three desktops. *"what transparent window color bug it shd be natively GOU shaded rendering for transculent glass like display using whatever can render them natively across windows Mac and Linux when floating"* [sic: "GOU" = GPU, "transculent" = translucent, the steward's keystrokes] `[steward 2026-09-21]` | GL1 / b3 / f6 | **MISSING (all three platforms)** | Said in answer to this session calling the companion's absence a "transparent window colour bug": a background-colour argument is not translucency, and the correction is that the effect belongs to the compositor, not to a hex string. What each platform provides natively: **Windows** - DirectComposition is the GPU compositor, and the route is hosting the page on a DirectComposition visual via `CoreWebView2CompositionController` (already named as the unbuilt candidate in GL1). The DWM backdrops (`DWMWA_SYSTEMBACKDROP_TYPE`, Mica/Acrylic) ARE the OS's GPU glass, but GL1 measured them painting WHITE behind the page, because WebView2's swapchain under pywebview 6.1's WinForms hosting is opaque and never lets the page's alpha reach DWM; composition hosting is exactly what fixes that, so this is one change, not two. **macOS** - `NSVisualEffectView` (`blendingMode = .behindWindow`) behind a borderless `NSWindow` with `isOpaque=NO` and a clear background, with the WKWebView's `drawsBackground` set NO so the page does not paint over it. That is the same "vibrancy glass" b3 already told us to take from macOS. **Linux** - there is NO universal blur-behind protocol, and that must not be hidden: KWin offers `org_kde_kwin_blur` (Wayland) and `_KDE_NET_WM_BLUR_BEHIND_REGION` (X11), wlroots compositors vary, and GNOME/Mutter publishes none. On HART OS itself we OWN the compositor (hart-comp), so there it is ours to render natively and is the one desktop where this is fully in our hands. DEGRADE LADDER, per GF1 (keep the richness, drop only the per-frame cost): native GPU glass -> layered-window alpha blend (what the ribbon ships today at `PANEL_ALPHA = 0.8`) -> solid tinted panel. GL1's proof rule carries unchanged: a compositor claim is proven by screen pixels over a bright backdrop, never by an API return code. Blocked behind a prior fact: the companion window does not exist in the running process at all (measured 2026-09-21 by enumerating every top-level window of the process serving the app; no window titled 'Nanba', and a hidden one would still enumerate), so there is currently no floating surface to shade. |
+
+Audit note: GL2 is a DESTINATION, not a shipped change - nothing was built for
+it in this edit. It is recorded here because the instruction arrived in chat
+and the rule is that an instruction never lives only in chat. Building it is a
+window-hosting change on each platform (composition hosting on Windows, a
+visual-effect view on macOS, a compositor protocol on Linux), which is well
+outside a colour argument and must be scored against GL1 + GF1 when attempted.
