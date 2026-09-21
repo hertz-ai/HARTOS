@@ -748,3 +748,27 @@ def test_a_composition_with_no_url_offers_no_player(monkeypatch):
     kinds = [c['type'] for c in
              (call.args[1] for call in ui.agent_ui_update.call_args_list)]
     assert 'media' not in kinds, 'offered a player for nothing'
+
+
+def test_the_composer_ask_does_not_route_into_the_tts_venv_repair():
+    """hartos-14's caveat on the capability ask.
+
+    capability_setup's own docstring says `backend` is what the TTS venv
+    repair tool reads, and backend_repair_tools documents TTS engine ids
+    only -- no acestep. Naming a music engine there sent a GRANTED consent
+    into a repair path that cannot install a music model. goal_manager
+    routes subprocess.tool_load to dependency remediation only when no
+    backend is named.
+    """
+    setup = _asked('asked')
+    media = _media({'status': 'unavailable',
+                    'error': 'audio_music not available on this node right now.'})
+
+    with _agent({}, media) as tools,             patch.dict('sys.modules',
+                       {'integrations.agent_engine.capability_setup': setup}):
+        tools['bind_game_sound']('eng-01')
+
+    context = setup.request_capability_setup.call_args.kwargs['context']
+    assert 'backend' not in context, (
+        'a granted consent would be routed to the TTS venv repair tool')
+    assert context['tool'] == 'acestep'

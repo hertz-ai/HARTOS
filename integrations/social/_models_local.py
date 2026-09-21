@@ -418,9 +418,37 @@ class Notification(Base):
 
     user = relationship('User', back_populates='notifications')
 
+    #: What each kind of notification is CALLED, for a human reading it.
+    #: Clients fall back to the raw type when no title is sent (the web
+    #: bell renders `n.title || n.type`), so without this a person saw
+    #: headlines like 'agent_game_sound_review'.  Every type gets a title
+    #: from one place rather than each surface inventing its own.
+    TITLES = {
+        'agent_game_sound_review': 'A new game sound',
+        'agent_consent_request': 'An agent needs your consent',
+        'follow': 'New follower',
+        'like': 'New like',
+        'comment': 'New comment',
+        'mention': 'You were mentioned',
+        'message': 'New message',
+    }
+
+    def title_for_humans(self):
+        """A readable headline, never a raw slug.
+
+        Falls back to the type with its separators softened -- an unknown
+        type then reads as 'Agent game sound review' rather than
+        'agent_game_sound_review', which is wrong but not ugly.
+        """
+        known = self.TITLES.get(self.type)
+        if known:
+            return known
+        return str(self.type or 'Notification').replace('_', ' ').capitalize()
+
     def to_dict(self):
         return {
             'id': self.id, 'user_id': self.user_id, 'type': self.type,
+            'title': self.title_for_humans(),
             'source_user_id': self.source_user_id,
             'target_type': self.target_type, 'target_id': self.target_id,
             'message': self.message, 'is_read': self.is_read,

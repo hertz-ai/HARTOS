@@ -1226,7 +1226,15 @@ def build_core_tool_closures(ctx):
                     reason=(f"To give {slot} its {which} sound I need a music "
                             f"model on this computer. May I set one up?"),
                     category='subprocess.tool_load',
-                    context={'backend': 'acestep', 'game_id': slot,
+                    # NOT 'backend': that key is what the TTS venv repair
+                    # tool reads, and its documented backends are TTS engine
+                    # ids only (backend_repair_tools) -- so naming acestep
+                    # there sent a granted consent into a repair path aimed
+                    # at a tool that cannot install a music model.  With no
+                    # backend, goal_manager routes tool_load to dependency
+                    # remediation instead of a venv rebuild, which is what
+                    # a missing music engine actually needs.
+                    context={'tool': 'acestep', 'game_id': slot,
                              'state': which},
                 )
             except Exception as ask_error:
