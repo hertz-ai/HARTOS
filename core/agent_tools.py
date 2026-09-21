@@ -995,6 +995,154 @@ def build_core_tool_closures(ctx):
             tool_logger.error(error_msg)
             return f"Error: {error_msg} - Data not saved"
 
+    # ------------------------------------------------------------------
+    # bind_game_sound — a game's sounds, composed once and kept
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def bind_game_sound(
+        game_id: Annotated[str, "The game's id as the app knows it (a game config's id, e.g. 'eng-spell-animals-01')"],
+        mood: Annotated[str, "How the game should feel: happy, calm, adventurous, triumphant"] = "happy",
+        description: Annotated[str, "What happens in the game, for the composer"] = "",
+    ) -> str:
+        """Compose this game's background music and bind it to the game.
+
+        Call it in CREATE for each game this agent plays with.  The music
+        is composed by the node's media capability and recorded against
+        this agent, so REUSE plays the same music rather than composing
+        again, and the reviewer approves one piece of music per game.
+
+        Idempotent: once a game is bound, calling it again returns the
+        binding.  If the composer is still working, call it again later
+        with the same game_id and it picks the task back up.
+        """
+        tool_logger.info(f'INSIDE bind_game_sound for game {game_id}')
+        if not game_id or not str(game_id).strip():
+            return "A game_id is required: use the game config's id."
+        slot = str(game_id).strip()
+
+        games = agent_data.setdefault(prompt_id, {}).setdefault('games', {})
+        bound = games.get(slot, {}).get('music') or {}
+        if bound.get('url'):
+            return json.dumps({
+                'status': 'already_bound',
+                'game_id': slot,
+                'music': bound,
+                'note': 'This game already has its music. REUSE will play it.',
+            })
+
+        def _remember(record):
+            games.setdefault(slot, {})['music'] = record
+            try:
+                helper_fun.save_agent_data_to_file(prompt_id, agent_data)
+            except Exception as e:
+                tool_logger.warning(f'bind_game_sound could not persist: {e}')
+            return record
+
+        try:
+            from integrations.service_tools.media_agent import (
+                check_media_status,
+                generate_media,
+            )
+        except ImportError as e:
+            tool_logger.warning(f'bind_game_sound: no media capability ({e})')
+            return ("This node cannot compose music (the media capability is "
+                    "not available here), so the game keeps no sound.")
+
+        prompt = (f"{description or slot} — {mood} background music for a "
+                  f"children's learning game, gentle loop, no vocals")
+        task_id = bound.get('task_id')
+        try:
+            if not task_id:
+                started = json.loads(generate_media(
+                    context=prompt,
+                    output_modality='audio_music',
+                    input_text=prompt,
+                    duration=60,
+                    style=mood,
+                ))
+                if started.get('status') == 'completed':
+                    results = started.get('results') or []
+                    url = results[0].get('url') if results else None
+                    if url:
+                        record = _remember({'url': url, 'mood': mood,
+                                            'prompt': prompt,
+                                            'composed_at': time.time(),
+                                            'approved_at': None})
+                        return json.dumps({'status': 'bound', 'game_id': slot,
+                                           'music': record})
+                    return "The composer answered without any music; nothing bound."
+                if started.get('status') != 'pending':
+                    return (f"The composer refused this game's music: "
+                            f"{started.get('error', 'unknown reason')}")
+                task_id = started.get('task_id')
+                _remember({'task_id': task_id, 'mood': mood, 'prompt': prompt,
+                           'composed_at': None, 'approved_at': None})
+
+            # Give it a while, then hand the task back rather than block.
+            deadline = time.time() + 90
+            while time.time() < deadline:
+                time.sleep(3)
+                progress = json.loads(check_media_status(task_id))
+                state = progress.get('status')
+                if state in ('complete', 'completed', 'done'):
+                    results = progress.get('results') or []
+                    url = (progress.get('url')
+                           or (results[0].get('url') if results else None))
+                    if not url:
+                        return "The composer finished without any music; nothing bound."
+                    record = _remember({'url': url, 'mood': mood, 'prompt': prompt,
+                                        'composed_at': time.time(),
+                                        'approved_at': None})
+                    return json.dumps({'status': 'bound', 'game_id': slot,
+                                       'music': record})
+                if state in ('failed', 'error'):
+                    return (f"The composer failed on this game: "
+                            f"{progress.get('error', 'unknown reason')}")
+            return json.dumps({
+                'status': 'composing',
+                'game_id': slot,
+                'task_id': task_id,
+                'note': 'Still composing. Call bind_game_sound again with the '
+                        'same game_id to finish binding it.',
+            })
+        except Exception as e:
+            tool_logger.warning(f'bind_game_sound failed for {slot}: {e}')
+            return f"Could not bind this game's sound: {e}"
+
+    tools.append((
+        "bind_game_sound",
+        "Compose a kids game's background music and bind it to that game for "
+        "good, so every later run of this agent plays the same music. Pass the "
+        "game's id, a mood and a short description. Call it once per game.",
+        bind_game_sound,
+    ))
+
+    # ------------------------------------------------------------------
+    # get_game_sound — what a game is bound to play
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def get_game_sound(
+        game_id: Annotated[str, "The game's id as the app knows it"],
+    ) -> str:
+        """The music bound to this game, if any. REUSE reads it; it never composes."""
+        slot = str(game_id or '').strip()
+        bound = (agent_data.get(prompt_id, {})
+                 .get('games', {}).get(slot, {}).get('music') or {})
+        if bound.get('url'):
+            return json.dumps({'status': 'bound', 'game_id': slot, 'music': bound})
+        if bound.get('task_id'):
+            return json.dumps({'status': 'composing', 'game_id': slot,
+                               'task_id': bound['task_id']})
+        return json.dumps({'status': 'unbound', 'game_id': slot,
+                           'note': 'No music is bound to this game yet.'})
+
+    tools.append((
+        "get_game_sound",
+        "The music bound to a kids game by this agent, if any. Use it before "
+        "playing a game so the sound stays the one the reviewer approved.",
+        reads_persisted_state(get_game_sound),
+    ))
+
     tools.append((
         "save_data_in_memory",
         "Use this to Store and retrieve data using key-value storage system",
