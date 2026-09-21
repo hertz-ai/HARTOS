@@ -79,6 +79,20 @@ CONSENT_TYPES = frozenset({
                          # file that security.middleware verifies the
                          # phone's signed calls against.  Permanent until
                          # revoked, as the owner ruled.
+    'peer_admission',    # A computer on the network asks to link with this
+                         # one and signed nothing, so it has proved no
+                         # identity at all.  The sibling of 'device_access':
+                         # that one names a phone's verified key, this one
+                         # can only name a network address, and the card
+                         # says so.  Asked because enforcement mode is a
+                         # flag and a flag must not decide alone -- unset, it
+                         # used to ADMIT the stranger silently; fixed to
+                         # 'hard' it would REFUSE just as silently, and the
+                         # owner ruled against both: "do not gulp, the
+                         # consent shd be shown when a flag gates a useful
+                         # logic" (2026-09-21).  The refused attempt is not
+                         # retroactively admitted; an Allow admits the peer
+                         # on its next try, exactly as device_access does.
     'voice_speech',      # Proactive vocal speech and audio narration by the
                          # servicing layer. Asked of the visitor/user as the
                          # first proactive step to respect acoustic privacy

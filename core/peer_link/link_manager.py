@@ -27,7 +27,7 @@ from core.foreground import should_yield_to_user
 
 from .channels import device_may_receive
 from .link import (PeerLink, TrustLevel, LinkState, provable_user_id,
-                   set_device_verifier)
+                   set_device_verifier, set_peer_admission_ask)
 
 logger = logging.getLogger('hevolve.peer_link')
 
@@ -79,6 +79,15 @@ class PeerLinkManager:
         key's fingerprint) on 'ok'.  Until it is installed every device
         HELLO is refused (link.py)."""
         set_device_verifier(fn)
+
+    def set_peer_admission_ask(self, fn: Optional[Callable[[str, str], bool]]) -> None:
+        """Inject the owner's ask for a peer that proved no identity, through
+        the same seam and for the same reason as set_device_verifier.
+        ``fn(peer_id, address)`` returns True when the owner has already
+        granted this peer.  Until it is installed, an unsigned handshake
+        under hard enforcement is refused without the owner being asked
+        (link.py) -- fail closed, but say so in the log."""
+        set_peer_admission_ask(fn)
 
     def start(self):
         """Start the link manager background maintenance."""

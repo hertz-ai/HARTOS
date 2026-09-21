@@ -132,6 +132,47 @@ def _install_device_verifier() -> None:
         logger.critical(f"PeerLink device verifier not installed: {e}")
 
 
+def _install_peer_admission_ask() -> None:
+    """Step 1d: the owner's say on a peer that signed nothing.
+
+    Enforcement mode is a flag, and until today it decided this alone and
+    silently: unset (the state of this desktop and of 192.168.0.15, both
+    measured 2026-09-21) it ADMITTED an unsigned peer, and the fix that
+    makes the default 'hard' would REFUSE one just as silently.  The owner
+    ruled against both -- "do not gulp, the consent shd be shown when a flag
+    gates a useful logic" -- so the refusal files the canonical ask instead,
+    the way a phone's 'pending' verdict already does one screen away.
+
+    Same seam as the device verifier and for the same reason: core.peer_link
+    must not import integrations.  Scope is the peer's HOST, because an
+    unsigned peer has no key to name and the card must not pretend
+    otherwise.  A node with no owner (central) asks nobody and admits
+    nobody.
+    """
+    try:
+        from core.peer_link.link_manager import get_link_manager
+        from integrations.social.consent_service import ConsentService
+        from integrations.social.models import db_session
+
+        def ask(peer_id: str, peer_address: str) -> bool:
+            owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+            if not owner:
+                return False
+            host = (peer_address or '').rsplit(':', 1)[0] or 'unknown'
+            named = f' calling itself {peer_id[:8]}' if peer_id else ''
+            with db_session(commit=True) as db:
+                return ConsentService.check_or_request(
+                    db, owner, 'peer_admission', scope=f'peer:{host}',
+                    reason=(f'A computer at {host}{named} asks to link with '
+                            f'this one. It signed nothing, so it has proved '
+                            f'no identity: allowing trusts whatever answers '
+                            f'at that address on your network.'))
+
+        get_link_manager().set_peer_admission_ask(ask)
+    except Exception as e:
+        logger.critical(f"PeerLink admission ask not installed: {e}")
+
+
 def bootstrap(
     app,
     config: Optional[Mapping[str, Any]] = None,
@@ -251,6 +292,7 @@ def _run_bootstrap(app, cfg: dict) -> None:
             # the ones registered below (see _install_api_gate).
             _install_api_gate(app)
             _install_device_verifier()
+            _install_peer_admission_ask()
             _init_social_subsystem(app)
             _register_core_blueprints(app)
             _run_consumer_hook(app, cfg)
