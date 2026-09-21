@@ -1436,10 +1436,11 @@ class ToolWorker:
         try_free_vram(needed_gb=model_gb, exclude_tool=self.tool_name)
 
     def _get_output_dir(self) -> Path:
-        d = Path(os.environ.get(
-            'HEVOLVE_MODEL_DIR',
-            os.path.expanduser('~/.hevolve/models'),
-        )) / self.output_subdir
+        # HEVOLVE_MODEL_DIR is resolved by model_storage.get_base_dir(),
+        # the single authority for the model-storage root, so a worker's
+        # output/ and its weights can never land on different drives.
+        from integrations.service_tools.model_storage import get_base_dir
+        d = get_base_dir() / self.output_subdir
         d.mkdir(parents=True, exist_ok=True)
         return d
 

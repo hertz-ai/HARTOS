@@ -207,11 +207,55 @@ def _read_page_with(completions_url: str, image_bytes: bytes, prompt: str, *,
 
 
 class MiniCPMBackend(VisionBackend):
-    """Full MiniCPM-V-2 backend — existing sidecar subprocess."""
+    """Full MiniCPM-V-2 backend — existing sidecar subprocess.
+
+    Port resolution, most specific first:
+      1. an explicit `port=` argument, or HEVOLVE_MINICPM_PORT
+      2. the port RuntimeToolManager gave the sidecar it started
+      3. port_registry's 'vision' (9891) — the fixed-port deployment
+         (nixos/modules/hart-vision.nix passes --port explicitly)
+
+    (2) is why this class and RuntimeToolManager used to be two
+    unconnected paths: RTM's contract is "all sidecar servers use dynamic
+    port allocation (no fixed ports)", so a sidecar it starts listens on
+    an OS-assigned high port, while this class only ever looked at 9891.
+    `start_tool('minicpm')` could therefore succeed and `get_vision_backend()`
+    still talk to nobody.  RTM owns the process, so RTM owns the port, and
+    it is asked at call time — a backend object may well be constructed
+    before the sidecar is started.
+    """
 
     def __init__(self, port: int = None):
         from core.port_registry import get_port
-        self._port = int(os.environ.get('HEVOLVE_MINICPM_PORT', port or get_port('vision')))
+        self._explicit_port = (
+            int(os.environ['HEVOLVE_MINICPM_PORT'])
+            if os.environ.get('HEVOLVE_MINICPM_PORT') else port)
+        self._registry_port = int(get_port('vision'))
+        self._port = int(self._explicit_port or self._registry_port)
+
+    def _resolve_port(self) -> int:
+        """The port to talk to RIGHT NOW (see the class docstring).
+
+        Asks RTM only if RTM is ALREADY imported in this process, via
+        sys.modules rather than an `import`.  `_ports` is per-process
+        in-memory state, so a process that never imported the manager
+        cannot have a sidecar it started — the answer would be None
+        anyway — and importing it here would register its atexit
+        `stop_all` hook in every process that merely captions a frame.
+        Same answer, no side effect.
+        """
+        if self._explicit_port:
+            return int(self._explicit_port)
+        try:
+            import sys
+            rm = sys.modules.get('integrations.service_tools.runtime_manager')
+            if rm is not None:
+                live = rm.runtime_tool_manager.get_tool_port('minicpm')
+                if live:
+                    return int(live)
+        except Exception as e:
+            logger.debug(f"RuntimeToolManager port lookup failed: {e}")
+        return self._registry_port
 
     @property
     def name(self) -> str:
@@ -226,29 +270,68 @@ class MiniCPMBackend(VisionBackend):
         return 4000
 
     def is_available(self) -> bool:
+        """A GPU AND the weights on disk.
+
+        Every sibling checks its own prerequisites — Qwen08B wants its
+        GGUF or a live server, MobileVLM wants onnxruntime, CLIP wants
+        torch+clip — but this one asked only "is there a GPU", so any
+        GPU box claimed the MiniCPM backend was available with no weights
+        and no sidecar anywhere.  get_vision_backend()'s catalog branch
+        and its "last resort: try minicpm" both gate on this call, so the
+        answer decided whether a node SELECTED a backend that could not
+        possibly answer a frame.  (MEASURED 2026-09-21 on this box:
+        list_available_backends() reported minicpm available=True while
+        nothing was listening on the vision port — true by luck, since
+        the weights are here.)
+        """
         try:
             from .minicpm_installer import MiniCPMInstaller
             installer = MiniCPMInstaller()
-            return installer.detect_gpu()
+            return bool(installer.detect_gpu()) and installer.is_installed()
         except Exception:
             return False
 
     def describe(self, frame_bytes: bytes, prompt: str = '') -> Optional[str]:
-        import base64
+        """Caption a frame through the MiniCPM sidecar's /describe endpoint.
+
+        The wire shape is dictated by integrations/vision/minicpm_server.py
+        `describe_raw()`: RAW image bytes as the body, the prompt as a QUERY
+        param, and the caption under the key `result`.  This method used to
+        send `{"image": <base64>, "prompt": ...}` as JSON and read a
+        `description` key — the server would have handed that JSON body to
+        PIL.Image.open and answered HTTP 500, and even a hypothetical success
+        carries no `description` key.  Nothing caught it because the only
+        test mocked pooled_post and asserted the invented shape.  The two
+        callers that DO reach this server — VisionService._describe_frame and
+        hart_intelligence_entry's MiniCPM tier — already speak raw-bytes/
+        `result`; this is now the third.
+        """
+        port = self._resolve_port()
+        # 30 s was the old budget and it only ever fit a GPU sidecar.  The
+        # same model on CPU — where VRAMManager.suggest_offload_mode sends it
+        # on an 8 GB card with an LLM resident — is minutes per caption
+        # (MEASURED 2026-09-21: 61 s just to reach the first decode step),
+        # and a client timeout shorter than the server turns a slow success
+        # into a silent None.  HEVOLVE_MINICPM_TIMEOUT_S overrides.
         try:
-            b64 = base64.b64encode(frame_bytes).decode('utf-8')
+            timeout_s = float(os.environ.get('HEVOLVE_MINICPM_TIMEOUT_S', 120))
+        except ValueError:
+            timeout_s = 120.0
+        try:
             resp = pooled_post(
-                f'http://localhost:{self._port}/describe',
-                json={
-                    'image': b64,
-                    'prompt': prompt or 'Describe what you see in this image.',
-                },
-                timeout=30,
+                f'http://localhost:{port}/describe',
+                data=frame_bytes,
+                params={'prompt': prompt or 'Describe what you see in this image.'},
+                headers={'Content-Type': 'application/octet-stream'},
+                timeout=timeout_s,
             )
             if resp.status_code == 200:
-                return resp.json().get('description', '')
+                return resp.json().get('result', '')
+            logger.warning(
+                f"MiniCPM /describe at :{port} returned HTTP "
+                f"{resp.status_code}: {resp.text[:200]}")
         except Exception as e:
-            logger.debug(f"MiniCPM describe error: {e}")
+            logger.debug(f"MiniCPM describe error (port {port}): {e}")
         return None
 
 

@@ -15,12 +15,40 @@ from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Fraction of a model's size that must be free on the GPU for it to run in
+# 'cpu_offload' mode — the rest streams from system RAM.  Named so the
+# threshold that defines the mode is not an unexplained 0.5 literal.
+CPU_OFFLOAD_MIN_FREE_RATIO = 0.5
+
 # VRAM budget table: tool_name -> (min_vram_gb, model_size_gb)
 VRAM_BUDGETS: Dict[str, Tuple[float, float]] = {
     "acestep":              (6.0,  4.0),
     "diffrhythm":           (6.0,  4.0),    # singing voice synthesis
     "wan2gp":               (8.0,  8.0),
-    "ltx2":                 (6.0,  4.0),
+    # LTX-Video (Lightricks/LTX-Video, diffusers LTXPipeline).  MEASURED
+    # 2026-09-21 from the safetensors headers of the downloaded pipeline,
+    # not estimated: text_encoder (T5-XXL) 4.762 B params, transformer
+    # 1.923 B, vae 0.419 B — all stored F32 (28.42 GB on disk), so at the
+    # bf16 the server loads them in, residency is 9.52 + 3.85 + 0.84 =
+    # 14.21 GB, and the largest SINGLE module (the ceiling for
+    # enable_model_cpu_offload, which swaps whole models) is the 9.52 GB
+    # text encoder.
+    #
+    # This row read (6.0, 4.0), which is the transformer alone — it left
+    # out the text encoder that is more than twice its size.  The effect
+    # was not a missing warning but the wrong ROUTE: on this box, with
+    # 2.97 GB free beside a resident LLM, suggest_offload_mode compared
+    # 2.97 against 4.0*0.5 and answered 'cpu_offload', an offload that
+    # needs 9.52 GB and would have OOM'd; _start_sidecar then refused the
+    # spawn anyway because can_fit compared 2.97 against min_vram 6.0.
+    # So the tool neither ran on the GPU nor fell back to the CPU.  With
+    # the measured numbers the same box answers 'cpu_only' and starts.
+    #
+    # min_vram is the least free VRAM at which ANY GPU mode works (the
+    # 9.52 GB offload peak, rounded), matching llm_main's reading of the
+    # field; model_size is full residency, which is what
+    # suggest_offload_mode weighs when choosing gpu vs offload.
+    "ltx2":                 (9.6,  14.2),
     "minicpm":              (6.0,  4.0),
     # Primary LLM (llama-server, Qwen3.5-4B Q4).  It is served by
     # llama_config/llamacpp_manager, not RuntimeToolManager, so nothing
@@ -769,6 +797,11 @@ class VRAMManager:
 
         Uses the measured budget (post first successful load) if present,
         otherwise falls back to the VRAM_BUDGETS declared value.
+
+        This is the FULL-RESIDENCY test (free >= min_vram).  It is the
+        wrong question for a tool that has been told to offload, so
+        _start_sidecar applies it only to offload_mode == 'gpu'; see the
+        comment there for the measurement.
         """
         if tool_name in self._allocations:
             return True  # already allocated
@@ -885,7 +918,7 @@ class VRAMManager:
 
         if free >= model_size:
             return "gpu"
-        elif free >= model_size * 0.5:
+        elif free >= model_size * CPU_OFFLOAD_MIN_FREE_RATIO:
             return "cpu_offload"
         else:
             return "cpu_only"

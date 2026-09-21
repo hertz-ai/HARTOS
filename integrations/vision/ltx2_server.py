@@ -11,17 +11,78 @@ Usage:
     python ltx2_server.py
 """
 
+import logging
 import os
+import socket
 import time
 import uuid
-import torch
-import logging
-from flask import Flask, request, jsonify, send_file
-from threading import Lock
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # G10: Resolve LTX server port from port_registry / env var instead of hardcoded 5002
 _LTX_PORT = int(os.environ.get('HART_LTX_PORT', '5002'))
 _LTX_BASE_URL = os.environ.get('HART_LTX_URL', f'http://localhost:{_LTX_PORT}')
+
+
+def _resolve_port() -> int:
+    """The port this process will bind.
+
+    An explicit ``HART_LTX_PORT`` still wins, for an operator pinning the
+    server.  Otherwise the OS assigns a free one, which is what
+    RuntimeToolManager expects: its module docstring states "All sidecar
+    servers use dynamic port allocation (no fixed ports)", and
+    ``_read_port_from_stdout`` learns the number by reading a
+    ``PORT=NNNNN`` line from the child's stdout (the same contract
+    servers/wan2gp_server.py implements).  Without that line RTM waits
+    out PORT_ANNOUNCE_TIMEOUT_S, kills the process and reports "Server
+    did not report port within Ns" — so a server that only ever bound
+    5002 could not be managed at all, and any caller reaching for a
+    remembered 5002 would be talking to whatever else took it.
+    """
+    env = os.environ.get('HART_LTX_PORT')
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            logger.warning(f"Invalid HART_LTX_PORT={env!r}; using a free port")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+if __name__ == '__main__':
+    # Announce the port BEFORE the heavy imports below.
+    #
+    # RuntimeToolManager._read_port_from_stdout waits a bounded time for
+    # this line and kills the child if it does not arrive.  `import torch`
+    # alone does not fit in that budget on a loaded box: MEASURED
+    # 2026-09-21, this server was reaped at 30 s (684 MB RSS, still
+    # importing) and again at 180 s while four other agents were building,
+    # yet announcing first got the port out in under a second.  So the
+    # announcement must not sit behind the imports.
+    #
+    # The port is only RESERVED here, not served — app.run() binds it at
+    # the bottom.  That gap is why RuntimeToolManager waits for the socket
+    # to accept before it registers the tool (_wait_for_listen); without
+    # that gate a caller would be handed a port nothing answers on yet.
+    #
+    # A second `if __name__` block is unusual, but it is what keeps a
+    # plain `import integrations.vision.ltx2_server` (tests do this) from
+    # printing a port or touching a socket.
+    _LTX_PORT = _resolve_port()
+    if not os.environ.get('HART_LTX_URL'):
+        _LTX_BASE_URL = f'http://localhost:{_LTX_PORT}'
+    print(f"PORT={_LTX_PORT}", flush=True)
+
+
+import torch
+from flask import Flask, request, jsonify, send_file
+from threading import Lock
 
 try:
     from integrations.service_tools.vram_manager import clear_cuda_cache
@@ -34,10 +95,6 @@ except ImportError:
                 torch.mps.empty_cache()
         except Exception:
             pass
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -61,51 +118,112 @@ except Exception:
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+def _model_sources():
+    """Where to load the pipeline from, best first.
+
+    ``LTX2_MODEL_DIR`` comes first because RuntimeToolManager._start_sidecar
+    exports it (``env[f"{tool}_MODEL_DIR"] = storage.get_tool_dir(tool)``)
+    to name the directory it just downloaded the weights into — under
+    HEVOLVE_MODEL_DIR, which is how an operator keeps a 28 GB pipeline off
+    a full system drive.  This server used to ignore it and pass a bare
+    repo id to from_pretrained, so the weights RTM had fetched were dead
+    bytes and the pipeline re-downloaded the same 28 GB into the HF cache
+    on the home drive.  MEASURED 2026-09-21: C: had 23 GB free against
+    F:'s 468 GB, so that second copy could not have fitted.
+
+    The hub ids stay as the fallback for a standalone run with nothing on
+    disk, which is what the __main__ banner promises.
+    """
+    sources = []
+    local = os.environ.get('LTX2_MODEL_DIR')
+    if local and os.path.isfile(os.path.join(local, 'model_index.json')):
+        sources.append(local)
+    elif local:
+        logger.warning(
+            f"LTX2_MODEL_DIR={local} has no model_index.json — "
+            f"falling back to the Hub")
+    sources += [
+        "Lightricks/LTX-Video-0.9.1",  # Stable release
+        "Lightricks/LTX-Video",         # Latest
+    ]
+    return sources
+
+
+def _placement():
+    """(offload_mode, torch_dtype) for this process.
+
+    RuntimeToolManager exports ``LTX2_OFFLOAD`` with the mode its
+    VRAMManager advised — 'gpu', 'cpu_offload' or 'cpu_only'.  The server
+    used to hardcode enable_model_cpu_offload() regardless, which cannot
+    work in the cpu_only case: it is an accelerate hook onto a CUDA
+    device and raises without one.  Honouring the advice is the
+    difference between a box with no free VRAM generating slowly and
+    generating not at all.
+
+    bfloat16 in every mode, including on the CPU, because RESIDENCY is
+    the binding constraint there, not kernel speed.  MEASURED from the
+    pipeline's safetensors headers: the weights ship F32, so loading them
+    as-is is 28.42 GB resident — on a 39.7 GB box that was down to 6.6 GB
+    free, that is a swap storm or an OOM that takes the other work on the
+    machine with it.  bf16 halves it to 14.21 GB.
+    """
+    mode = (os.environ.get('LTX2_OFFLOAD') or '').strip().lower()
+    if not mode:
+        mode = 'cpu_offload' if torch.cuda.is_available() else 'cpu_only'
+    if mode != 'cpu_only' and not torch.cuda.is_available():
+        logger.warning(
+            f"LTX2_OFFLOAD={mode} but torch reports no CUDA "
+            f"(torch {torch.__version__}) — running cpu_only")
+        mode = 'cpu_only'
+    return mode, torch.bfloat16
+
+
 def load_pipeline():
-    """Load LTX-Video pipeline optimized for 8GB VRAM"""
+    """Load LTX-Video pipeline, placed per LTX2_OFFLOAD."""
     global pipeline
 
     if pipeline is not None:
         return pipeline
 
-    logger.info("Loading LTX-Video model (optimized for 8GB VRAM)...")
+    offload_mode, dtype = _placement()
+    logger.info(f"Loading LTX-Video model (mode={offload_mode}, dtype={dtype})...")
 
     try:
         from diffusers import LTXPipeline
 
-        # LTX-Video models that work on 8GB VRAM
-        model_options = [
-            "Lightricks/LTX-Video-0.9.1",  # Stable release
-            "Lightricks/LTX-Video",         # Latest
-        ]
-
-        for model_id in model_options:
+        last_error = None
+        for model_id in _model_sources():
             try:
                 logger.info(f"Trying model: {model_id}")
                 pipeline = LTXPipeline.from_pretrained(
                     model_id,
-                    torch_dtype=torch.bfloat16,
+                    torch_dtype=dtype,
                 )
                 logger.info(f"Loaded: {model_id}")
                 break
             except Exception as e:
+                last_error = e
                 logger.warning(f"Model {model_id} failed: {e}")
                 continue
 
         if pipeline is None:
-            raise RuntimeError("Could not load any LTX-Video model")
+            raise RuntimeError(
+                f"Could not load any LTX-Video model; last error: {last_error}")
 
-        # Memory optimizations for 8GB VRAM
-        logger.info("Applying memory optimizations...")
-
-        # CPU offloading - keeps model in CPU, moves to GPU only during inference
-        pipeline.enable_model_cpu_offload()
+        # Placement
+        if offload_mode == 'cpu_only':
+            pipeline.to('cpu')
+        elif offload_mode == 'gpu':
+            pipeline.to('cuda')
+        else:
+            # CPU offloading - keeps model in CPU, moves to GPU only during inference
+            pipeline.enable_model_cpu_offload()
 
         # VAE optimizations
         pipeline.vae.enable_tiling()
         pipeline.vae.enable_slicing()
 
-        logger.info("LTX-Video ready with CPU offload + VAE tiling/slicing")
+        logger.info(f"LTX-Video ready ({offload_mode}) + VAE tiling/slicing")
         return pipeline
 
     except Exception as e:
@@ -448,9 +566,13 @@ if __name__ == '__main__':
     else:
         print("WARNING: CUDA not available! GPU generation requires CUDA.")
 
+    # _LTX_PORT / _LTX_BASE_URL were resolved and announced at the top of
+    # this file, before the heavy imports.  The response builders read both
+    # globals at call time, so every emitted URL names the port bound here.
     print(f"\nStarting server on {_LTX_BASE_URL}")
     print("Model will be downloaded from HuggingFace on first request...")
-    print("First request may take a few minutes to download the model.\n")
+    print("First request may take a few minutes to download the model.\n",
+          flush=True)
 
     # Run Flask server
-    app.run(host='0.0.0.0', port=_LTX_PORT, threaded=True)
+    app.run(host='127.0.0.1', port=_LTX_PORT, threaded=True)
