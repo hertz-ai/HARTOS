@@ -132,3 +132,38 @@ class TestTheWordingsAreTheModulesOwn:
         assert "HTTP {resp.status_code}" in src, (
             'media_agent no longer emits "<Tool> HTTP <code>"; '
             "classify_error's REFUSED rule must be updated with it")
+
+
+# ── the modality gate (found by rn-1) ─────────────────────────────────
+
+def test_a_modality_this_node_cannot_do_reads_as_absent():
+    """generate_media's own gate answers status='unavailable', not 'error'.
+
+    This is the principal absent case: asking for music on a machine with
+    no music engine.  A reader that looked only at status=='error' called
+    it UNKNOWN, and the caller could not offer to install what is plainly
+    not installed.
+    """
+    gate = {'status': 'unavailable',
+            'error': 'audio_music not available on this node right now.',
+            'modality': 'audio_music'}
+
+    assert classify_error(gate) == ABSENT
+    assert classify_error(json.dumps(gate)) == ABSENT
+
+
+def test_the_speech_gate_reads_as_absent_too():
+    assert classify_error({
+        'status': 'unavailable',
+        'error': 'Audio synthesis not available on this node (text-only mode).',
+    }) == ABSENT
+
+
+def test_the_gate_wording_still_exists_in_the_source():
+    """Guard, in the same spirit as the two already here."""
+    import inspect
+    import integrations.service_tools.media_agent as module
+    source = inspect.getsource(module)
+    assert "'status': 'unavailable'" in source, (
+        "the modality gate no longer answers unavailable; "
+        "classify_error's status allow-list needs revisiting")

@@ -300,7 +300,16 @@ def classify_error(result) -> str:
             result = _json.loads(result)
         except Exception:
             return UNKNOWN
-    if not isinstance(result, dict) or result.get('status') != 'error':
+    if not isinstance(result, dict):
+        return UNKNOWN
+    # 'unavailable' counts as an error to read.  The modality gate in
+    # generate_media returns status='unavailable' (not 'error') when this
+    # node cannot do a modality at all -- which is the PRINCIPAL absent case
+    # and the one a caller most needs to tell apart, e.g. asking for music on
+    # a machine with no music engine.  Reading only status=='error' answered
+    # UNKNOWN there, so the caller could not offer to install what is plainly
+    # not installed.  (Found by rn-1 wiring the game-sound install offer.)
+    if result.get('status') not in ('error', 'unavailable'):
         return UNKNOWN
 
     text = str(result.get('error', '')).lower()

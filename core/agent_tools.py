@@ -852,23 +852,6 @@ from core.game_sound_memo import (  # noqa: E402
 )
 
 
-def _reads_as_no_engine(message):
-    """True when a refusal means this node has no composer at all.
-
-    The media capability answers plainly when a modality is unavailable,
-    and its wording differs by tool ("not available", "no tool", a
-    connection refused to a port nothing is listening on).  A node that
-    simply has nothing installed should ASK for one; an engine that
-    refused a particular prompt should not.
-    """
-    said = (message or '').lower()
-    return any(phrase in said for phrase in (
-        'not available', 'unavailable', 'no tool', 'not installed',
-        'no engine', 'cannot do', 'connection refused', 'failed to establish',
-        'max retries exceeded', 'service not available',
-    ))
-
-
 def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
     """Put a newly composed game sound in front of the person, to hear.
 
@@ -880,28 +863,74 @@ def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
 
     Best-effort by design: a node without that service, or a hive the
     human has halted, must not stop a sound being composed and memoized.
-    Returns True when the offer was accepted for delivery.
+    Returns True when the card itself was accepted for delivery -- and the
+    person is told on their other surfaces either way, because a node with
+    no screen attached is precisely when the phone matters most.
     """
+    shown = False
     try:
         from core.platform.registry import get_registry
         service = get_registry().get('LiquidUIService')
-        if service is None:
-            return False
-        return bool(service.agent_ui_update(user_id, {
-            'type': 'approval',
-            'agent_id': str(prompt_id),
-            'action': f'game_sound:{game_id}:{state}',
-            'description': (
-                f"New {state} sound for {game_id}. Have a listen: keep it, "
-                f"or say what is wrong and I will compose another."
-            ),
-            'options': ['Keep it', 'Compose another'],
-            'media': {'type': 'audio', 'src': record.get('url'),
-                      'controls': True, 'alt': f'{state} sound for {game_id}'},
-        }))
-    except Exception:
+        if service is not None:
+            shown = bool(service.agent_ui_update(user_id, {
+                'type': 'approval',
+                'agent_id': str(prompt_id),
+                'action': f'game_sound:{game_id}:{state}',
+                'description': (
+                    f"New {state} sound for {game_id}. Have a listen: keep "
+                    f"it, or say what is wrong and I will compose another."
+                ),
+                'options': ['Keep it', 'Compose another'],
+                'media': {'type': 'audio', 'src': record.get('url'),
+                          'controls': True,
+                          'alt': f'{state} sound for {game_id}'},
+            }))
+    except Exception as e:
         # never at the cost of the composition that just succeeded
-        return False
+        tool_logger.debug(f'game sound: no card on screen ({e})')
+    _tell_the_person_elsewhere(user_id, prompt_id, game_id, state, record)
+    return shown
+
+
+def _tell_the_person_elsewhere(user_id, prompt_id, game_id, state, record):
+    """Reach the person who is not looking at the screen it was offered on.
+
+    The card above lands where they are logged in; a sound composed while
+    they are away from that screen would otherwise wait unheard.  This is
+    the same pair the consent ask already uses
+    (integrations/social/device_routing_service): a notification record,
+    which every surface of theirs shows, and an FCM push to the phone.
+    Both are best-effort and both no-op cleanly on a node with no push
+    credential.
+    """
+    message = f"A new {state} sound for {game_id} is ready for you to hear."
+    try:
+        from integrations.social.services import NotificationService
+        from integrations.social.models import db_session
+        with db_session() as db:
+            NotificationService.create(
+                db, str(user_id), 'agent_game_sound_review',
+                source_user_id=str(prompt_id), message=message,
+            )
+    except Exception as e:
+        tool_logger.debug(f'game sound: no notification record ({e})')
+    try:
+        from core.fcm_sync import send_fcm_push
+        send_fcm_push(
+            str(user_id),
+            'A new game sound',
+            message,
+            data={
+                'type': 'game_sound_review',
+                'agent_id': str(prompt_id),
+                'game_id': str(game_id),
+                'state': str(state),
+                'url': str(record.get('url') or ''),
+                'topic_reply': f'com.hertzai.pupit.{user_id}',
+            },
+        )
+    except Exception as e:
+        tool_logger.debug(f'game sound: no push to the phone ({e})')
 
 
 def build_core_tool_closures(ctx):
@@ -1134,6 +1163,23 @@ def build_core_tool_closures(ctx):
             return ("This node cannot compose music (the media capability is "
                     "not available here), so the game keeps no sound.")
 
+        def _no_composer_here(result):
+            """How to answer a failure, told apart by the module that wrote it.
+
+            media_agent.classify_error is the reader that lives next to the
+            returns it reads (hartos-94, HARTOS 11d0aebee), and it makes a
+            distinction a prose match here could not: a node with NOTHING
+            installed should be offered an install, while an AceStep that is
+            merely not running must not be -- offering to install what is
+            already installed is its own defect.
+            """
+            try:
+                from integrations.service_tools.media_agent import (
+                    classify_error, ABSENT)
+                return classify_error(result) == ABSENT
+            except Exception:
+                return False
+
         def _ask_for_a_composer(why):
             """Offer to set a music model up, rather than failing quietly.
 
@@ -1208,7 +1254,7 @@ def build_core_tool_closures(ctx):
                     return "The composer answered without any music; nothing bound."
                 if started.get('status') != 'pending':
                     why = str(started.get('error', 'unknown reason'))
-                    if _reads_as_no_engine(why):
+                    if _no_composer_here(started):
                         return _ask_for_a_composer(why)
                     return f"The composer refused this game's music: {why}"
                 task_id = started.get('task_id')
@@ -1238,7 +1284,7 @@ def build_core_tool_closures(ctx):
                                        'state': which, 'music': record})
                 if state in ('failed', 'error'):
                     why = str(progress.get('error', 'unknown reason'))
-                    if _reads_as_no_engine(why):
+                    if _no_composer_here(progress):
                         return _ask_for_a_composer(why)
                     return f"The composer failed on this game: {why}"
             return json.dumps({

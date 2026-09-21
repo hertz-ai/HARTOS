@@ -17,10 +17,22 @@ import core.agent_tools as agent_tools
 
 
 def _media(started, progress=None):
-    """A stand-in for the media capability the agent composes through."""
+    """A stand-in for the media capability the agent composes through.
+
+    Its error READER is the real one (media_agent.classify_error), not a
+    mock: whether a failure means "offer to install a composer" or "one is
+    installed and simply not running" is decided there, next to the returns
+    that produce those wordings, and a stand-in that answered for it would
+    prove nothing about what the agent does in the field.
+    """
     module = MagicMock()
     module.generate_media.return_value = json.dumps(started)
     module.check_media_status.return_value = json.dumps(progress or {})
+    from integrations.service_tools.media_agent import (
+        classify_error, ABSENT, UNREACHABLE, REFUSED, UNKNOWN)
+    module.classify_error = classify_error
+    module.ABSENT, module.UNREACHABLE = ABSENT, UNREACHABLE
+    module.REFUSED, module.UNKNOWN = REFUSED, UNKNOWN
     return module
 
 
@@ -333,7 +345,8 @@ def test_a_node_with_no_music_model_offers_to_set_one_up():
     voice cloner cannot compose a game's sound.  Silence tells the person
     nothing, so the node asks."""
     setup = _asked('asked')
-    media = _media({'status': 'error', 'error': 'audio_music not available on this node'})
+    media = _media({'status': 'unavailable',
+                    'error': 'audio_music not available on this node right now.'})
 
     with _agent({}, media) as tools,             patch.dict('sys.modules',
                        {'integrations.agent_engine.capability_setup': setup}):
@@ -375,7 +388,8 @@ def test_an_engine_that_refuses_one_prompt_is_not_a_missing_engine():
 
 def test_a_node_with_nobody_to_ask_says_so_plainly():
     setup = _asked('unavailable')
-    media = _media({'status': 'error', 'error': 'audio_music unavailable'})
+    media = _media({'status': 'unavailable',
+                    'error': 'audio_music not available on this node right now.'})
 
     with _agent({}, media) as tools,             patch.dict('sys.modules',
                        {'integrations.agent_engine.capability_setup': setup}):
@@ -383,3 +397,101 @@ def test_a_node_with_nobody_to_ask_says_so_plainly():
 
     assert answer['asked'] == 'unavailable'
     assert 'nobody to ask' in answer['note']
+
+
+# ── the offer reaches the person who is not on that screen (goal: "server
+#    fanout sending the notification to user via desktop and phone FCM
+#    paths") ─────────────────────────────────────────────────────────────
+
+def _offer_a_sound(monkeypatch, push=None, notify=None, ui=True):
+    """Run offer_sound_for_review with the two delivery paths observed."""
+    fcm = MagicMock()
+    fcm.send_fcm_push = push or MagicMock(return_value=True)
+    services = MagicMock()
+    services.NotificationService.create = notify or MagicMock()
+    models = MagicMock()
+    registry = MagicMock()
+    registry.get.return_value = (MagicMock() if ui else None)
+    platform_registry = MagicMock()
+    platform_registry.get_registry.return_value = registry
+    with patch.dict('sys.modules', {
+            'core.fcm_sync': fcm,
+            'integrations.social.services': services,
+            'integrations.social.models': models,
+            'core.platform.registry': platform_registry}):
+        shown = agent_tools.offer_sound_for_review(
+            'user-1', 4242, 'eng-01', 'correct',
+            {'url': 'https://node/correct.mp3'})
+    return shown, fcm.send_fcm_push, services.NotificationService.create
+
+
+def test_the_offer_is_pushed_to_the_phone_with_what_it_is_about(monkeypatch):
+    _shown, push, _notify = _offer_a_sound(monkeypatch)
+
+    assert push.called, 'the phone was never told'
+    data = push.call_args.kwargs['data']
+    assert data['type'] == 'game_sound_review'
+    assert data['game_id'] == 'eng-01'
+    assert data['state'] == 'correct'
+    assert data['url'] == 'https://node/correct.mp3'
+
+
+def test_the_offer_is_recorded_so_every_surface_of_theirs_shows_it(monkeypatch):
+    _shown, _push, notify = _offer_a_sound(monkeypatch)
+
+    assert notify.called, 'nothing was recorded for the other surfaces'
+    assert notify.call_args.args[2] == 'agent_game_sound_review'
+
+
+def test_a_node_with_no_push_credential_still_composes(monkeypatch):
+    """send_fcm_push no-ops without a credential; a raise must not either."""
+    angry = MagicMock(side_effect=RuntimeError('no FCM credential here'))
+    shown, push, _notify = _offer_a_sound(monkeypatch, push=angry)
+
+    assert push.called
+    assert shown is True, 'a dead push path swallowed the offer'
+
+
+def test_a_node_with_no_notification_store_still_pushes(monkeypatch):
+    angry = MagicMock(side_effect=RuntimeError('no social database here'))
+    shown, push, notify = _offer_a_sound(monkeypatch, notify=angry)
+
+    assert notify.called
+    assert push.called, 'a missing record stopped the phone being told'
+    assert shown is True
+
+
+def test_the_person_is_still_told_when_no_screen_is_attached(monkeypatch):
+    """No UI service is not "nobody to tell" — the phone is still reachable."""
+    shown, push, notify = _offer_a_sound(monkeypatch, ui=False)
+
+    assert shown is False
+    assert push.called and notify.called
+
+
+def test_a_composer_that_is_merely_not_running_is_not_offered_for_install():
+    """Installed but down is NOT missing.
+
+    hartos-94's point, and the defect this branch exists to avoid: offering
+    to install AceStep when AceStep is already installed and simply is not
+    listening is its own defect.  The reader that tells the two apart lives
+    in media_agent; this asserts the agent acts on the distinction.
+    """
+    media = _media({'status': 'error',
+                    'error': 'AceStep: connection refused (WinError 10061)'})
+
+    with _agent({}, media) as tools:
+        answer = tools['bind_game_sound']('eng-01', 'happy', 'spelling')
+
+    assert 'needs_capability' not in answer
+    assert 'connection refused' in answer.lower()
+
+
+def test_a_composer_that_answered_and_said_no_is_not_offered_for_install():
+    media = _media({'status': 'error', 'error': 'AceStep HTTP 503'})
+
+    with _agent({}, media) as tools:
+        answer = tools['bind_game_sound']('eng-01', 'happy', 'spelling')
+
+    assert 'needs_capability' not in answer
+    assert '503' in answer
