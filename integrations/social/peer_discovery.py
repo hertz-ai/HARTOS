@@ -2520,33 +2520,85 @@ class AutoDiscovery:
                 from security.hive_guardrails import get_guardrail_hash
                 if peer_hash != get_guardrail_hash():
                     logger.debug(f"AutoDiscovery: rejecting beacon from "
-                                 f"{payload.get('node_id', '?')[:8]}: guardrail mismatch")
+                                 f"{node_id[:8]}: guardrail mismatch")
                     return {}
-            except Exception:
-                pass
+            except Exception as e:
+                # Reading OUR OWN guardrail hash failed, which says nothing
+                # about the peer, so the beacon still passes -- refuse on
+                # evidence of badness, never on absence of evidence.  But say
+                # so: this used to be `pass`, and a node whose guardrail hash
+                # could not be read checked no beacon against it and reported
+                # that nowhere.
+                logger.warning(
+                    f"AutoDiscovery: guardrail hash unreadable ({e}); the "
+                    f"beacon from {node_id[:8]} was NOT checked against it")
 
-        # Verify code hash against release hash registry
+        # Code hash: a TRUST SIGNAL, not an admission gate.
+        #
+        # This used to drop the beacon outright whenever the hash was
+        # unrecognised and enforcement was 'hard' -- which is the DEFAULT, so
+        # it fired on every node nobody had configured.  That is the
+        # REJECT-ON-UNKNOWN-HASH pattern release_hash_registry.py's header
+        # documents as SUPERSEDED by ADMIT-AND-RECORD, for reasons that all
+        # still hold here:
+        #
+        #   * code_hash is SELF-REPORTED.  The signature proves this key
+        #     asserted this value, never that it is the code running, so a
+        #     hostile node simply claims a known-good hash.  The gate only
+        #     ever turned away honest nodes on unpublished builds.
+        #   * _KNOWN_HASHES is baked into each build and a tree cannot
+        #     contain its own hash, so a build only ever learns the hashes of
+        #     builds BEFORE it.  Every node on a newer build is unknown to
+        #     every older one by construction.
+        #   * Measured: it held the live network at ZERO federating peers out
+        #     of 69 registered nodes.
+        #
+        # The HTTP admission path already got this right 700 lines above and
+        # carries the long note; this beacon path kept the old behaviour and
+        # pre-empted it, because a dropped beacon never reaches
+        # handle_announce at all.  Measured on the owner's desktop 2026-09-21:
+        # one LAN peer refused 88 times, invisible to them, while the very
+        # same enforcement flag read 'hard' here and (before c3be1b660) read
+        # permissive in PeerLink -- one setting, two answers, on one machine.
+        #
+        # So the beacon is admitted and the hash recorded as what it is.  The
+        # real decision stays where it is documented: handle_announce sets
+        # master_key_verified=False and hash_trusted_source='untrusted', and
+        # every downstream consumer (canary selection, revenue credit, moat
+        # scoring, visibility tier, fraud_score) sees exactly what it saw
+        # before.  Authentication is untouched -- the Ed25519 signature check
+        # below still runs, and a guardrail mismatch above still refuses.
+        #
+        # Strict provenance for a locked cluster is still available, through
+        # the same opt-in the admission site uses so the two cannot disagree:
+        # HEVOLVE_REQUIRE_KNOWN_CODE_HASH=1, guarded by has_trust_basis() so
+        # it cannot be switched on into a vacuum and partition the cluster it
+        # was meant to protect.
         peer_code_hash = payload.get('code_hash', '')
         if peer_code_hash:
             try:
                 from security.release_hash_registry import get_release_hash_registry
-                from security.master_key import get_enforcement_mode
                 registry = get_release_hash_registry()
                 if not registry.is_known_release_hash(peer_code_hash):
-                    enforcement = get_enforcement_mode()
-                    if enforcement == 'hard':
+                    _strict = os.environ.get(
+                        'HEVOLVE_REQUIRE_KNOWN_CODE_HASH', '').lower() in (
+                            '1', 'true', 'yes')
+                    if _strict and registry.has_trust_basis():
                         logger.warning(
                             f"AutoDiscovery: rejecting beacon from "
-                            f"{payload.get('node_id', '?')[:8]}: "
-                            f"unknown code hash {peer_code_hash[:16]}...")
+                            f"{node_id[:8]}: unknown code hash "
+                            f"{peer_code_hash[:16]}... "
+                            f"(HEVOLVE_REQUIRE_KNOWN_CODE_HASH=1)")
                         return {}
-                    elif enforcement in ('soft', 'warn'):
-                        logger.info(
-                            f"AutoDiscovery: unknown code hash from "
-                            f"{payload.get('node_id', '?')[:8]} "
-                            f"(enforcement={enforcement})")
-            except Exception:
-                pass
+                    logger.info(
+                        f"AutoDiscovery: beacon from {node_id[:8]} carries "
+                        f"unrecognised code hash {peer_code_hash[:16]}; "
+                        f"admitting as untrusted, the way the announce path "
+                        f"does")
+            except Exception as e:
+                logger.warning(
+                    f"AutoDiscovery: code hash registry unreadable ({e}); the "
+                    f"beacon from {node_id[:8]} was NOT checked against it")
 
         # Verify Ed25519 signature
         sig = payload.get('signature')
@@ -2659,15 +2711,23 @@ class AutoDiscovery:
             logger.info(f"AutoDiscovery: found node "
                         f"{payload.get('name', node_id[:8])} at {url} via LAN")
 
-            # Feed into gossip
+            # Feed into gossip.  handle_announce is where admission is really
+            # decided (trust signals, tier, certificate); the beacon only gets
+            # the payload to it.  Both calls used to swallow everything, so a
+            # peer that reached this line and was then refused, or crashed the
+            # handler, looked identical to one that joined.
             try:
                 self._gossip.handle_announce(payload)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    f"AutoDiscovery: handing {node_id[:8]} to gossip failed: "
+                    f"{e}")
             try:
                 self._gossip._announce_to_peer(url)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.info(
+                    f"AutoDiscovery: could not announce back to "
+                    f"{node_id[:8]} at {url}: {e}")
 
 
 # Module-level singletons
