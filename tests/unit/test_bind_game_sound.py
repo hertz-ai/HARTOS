@@ -772,3 +772,33 @@ def test_the_composer_ask_does_not_route_into_the_tts_venv_repair():
     assert 'backend' not in context, (
         'a granted consent would be routed to the TTS venv repair tool')
     assert context['tool'] == 'acestep'
+
+
+def test_a_composer_still_downloading_its_model_reads_as_composing():
+    """MEASURED 2026-09-22: a first run fetches ~8.5GB of weights.
+
+    model.safetensors 3.71GB + 4.79GB at ~15MB/s, so ten minutes before
+    AceStep can answer anything. The submit read-times-out against a server
+    that accepted the connection. Calling that a refusal tells the person
+    their composer is broken when it is getting ready -- and leaves the
+    game silent with nothing pending to return to.
+    """
+    media = _media({'status': 'warming_up',
+                    'message': 'The composer is starting up (a first run '
+                               'downloads its model). Ask again shortly.'})
+
+    with _agent({}, media) as tools:
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling'))
+
+    assert answer['status'] == 'composing'
+    assert 'starting up' in answer['note']
+
+
+def test_a_refused_connection_is_still_a_refusal():
+    """The distinction only holds if the other side still reports."""
+    from integrations.service_tools.media_agent import _reads_as_still_waking
+
+    assert _reads_as_still_waking('HTTPConnectionPool: Read timed out.')
+    assert not _reads_as_still_waking(
+        'No connection could be made because the target machine actively '
+        'refused it')

@@ -517,8 +517,36 @@ def _generate_audio_music(context: str, input_text: str,
         return {'status': 'error', 'error': f'AceStep HTTP {resp.status_code}',
                 'output_modality': 'audio_music'}
     except Exception as e:
+        # A READ timeout is not a failure: the connection was accepted, so
+        # the server is there and busy.  On a node composing for the FIRST
+        # time that busy-ness is an ~8.5GB weight download (MEASURED on this
+        # box: model.safetensors 3.71GB + 4.79GB at ~15MB/s, so ten minutes
+        # before it can answer anything).  Reported as an error, the agent
+        # tells the person their composer refused when it is in fact getting
+        # ready -- and the game is left silent with nothing pending.
+        if _reads_as_still_waking(e):
+            return {
+                'status': 'warming_up',
+                'output_modality': 'audio_music',
+                'message': 'The composer is starting up (a first run '
+                           'downloads its model). Ask again shortly.',
+                'model_used': 'acestep',
+            }
         return {'status': 'error', 'error': str(e),
                 'output_modality': 'audio_music'}
+
+
+def _reads_as_still_waking(error) -> bool:
+    """True when a request failed because the server is busy, not absent.
+
+    A read timeout means the TCP connection was ACCEPTED and no answer came
+    back in time -- something is listening. A connection refusal means
+    nothing is. Only the first deserves "wait and ask again".
+    """
+    said = str(error).lower()
+    if 'refused' in said or 'no connection could be made' in said:
+        return False
+    return 'read timed out' in said or 'readtimeout' in said
 
 
 def _generate_video(context: str, input_text: str,

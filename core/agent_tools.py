@@ -1302,6 +1302,19 @@ def build_core_tool_closures(ctx):
                         return json.dumps({'status': 'bound', 'game_id': slot,
                                            'state': which, 'music': record})
                     return "The composer answered without any music; nothing bound."
+                if started.get('status') == 'warming_up':
+                    # Not a refusal: the composer is getting ready, which on
+                    # a first run means downloading its model.  Saying it
+                    # refused would be wrong AND would leave the game with
+                    # nothing pending to come back to.
+                    return json.dumps({
+                        'status': 'composing',
+                        'game_id': slot,
+                        'state': which,
+                        'note': started.get(
+                            'message',
+                            'The composer is starting up; ask again shortly.'),
+                    })
                 if started.get('status') != 'pending':
                     why = str(started.get('error', 'unknown reason'))
                     if _no_composer_here(started):
