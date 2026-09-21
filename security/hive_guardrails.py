@@ -1304,13 +1304,19 @@ class GuardrailEnforcer:
             except ImportError:
                 cfg = (goal_dict.get('config')
                        or goal_dict.get('config_json') or {})
-            # BOTH spellings: goal_seeding writes require_consent (:1745,1863,
-            # 1892,1948,2009) AND requires_consent (:118,514,580), but this was
-            # the only enforcement site and it read the first spelling only — so
-            # every goal seeded with the plural was dispatched UNGATED (#96).
-            # Reading both gates them without touching the producers or the
-            # on-the-wire requires_consent, which is the smaller change.
-            if cfg.get('require_consent') or cfg.get('requires_consent'):
+            # ONE spelling: `require_consent`.  goal_seeding used to write both
+            # it and `requires_consent` (#96) while this was the only
+            # enforcement site and read the singular alone, so every
+            # plural-seeded goal dispatched UNGATED.  The interim fix read both
+            # — a second working vocabulary, i.e. exactly the parallel path this
+            # canonicalisation exists to remove.  The plural had ZERO readers
+            # anywhere, so it was a producer typo, not a contract: the three
+            # producers were corrected and migrations v56 renames the key in
+            # already-seeded rows.  Folding toward the singular leaves this
+            # gate's semantics untouched and keeps the blast radius at 3 seed
+            # sites, per the owner's rule that the lower-blast-radius spelling
+            # becomes canonical.
+            if cfg.get('require_consent'):
                 if not user_id:
                     # Daemon goals carry no requester, which left every
                     # consent-flagged goal in a blocked loop with nobody

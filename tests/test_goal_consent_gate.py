@@ -178,39 +178,50 @@ def test_dispatch_goal_feeds_goal_dict_and_user_to_the_one_gate(monkeypatch):
     assert seen['user_id'] == 'user-1'
 
 
-# ── #96: the plural spelling was written but never enforced ─────────────
-# goal_seeding writes BOTH require_consent (:1745,1863,1892,1948,2009) AND
-# requires_consent (:118,514,580) into config_json, but this gate was the only
-# enforcement site and read the singular only — so every goal seeded with the
-# plural dispatched UNGATED. The gate now reads both spellings.
+# ── #96: ONE spelling, `require_consent` ────────────────────────────────
+# goal_seeding used to write BOTH require_consent (:1745,1863,1892,1948,2009)
+# and requires_consent (:118,514,580) while this gate, the only enforcement
+# site, read the singular alone — so every plural-seeded goal dispatched
+# UNGATED.  The interim fix read both spellings, which made the typo a second
+# working vocabulary.  The plural had no readers anywhere, so the fold goes
+# toward the singular (smaller blast radius, gate semantics untouched): the
+# three producers were corrected and migrations v56 re-keys already-seeded
+# rows.  The two tests below are what keep the gate: the producers can't drift
+# back, and an existing row can't lose its gate in the hand-off.
 FLAGGED_PLURAL = {'config_json': {'requires_consent': True}}
 
 
-def test_plural_spelling_is_also_gated(monkeypatch):
+def test_no_seed_writes_the_plural_spelling():
+    """The producer-side guard.
+
+    A plural key in a seed template is silently unenforced — the exact shape of
+    #96 — and a copy-paste from an old template is how it comes back.  Pinned on
+    the seed source, because that is where the typo is authored.
+    """
+    import inspect
+    from integrations.agent_engine import goal_seeding
+    src = inspect.getsource(goal_seeding)
+    assert "'requires_consent'" not in src and '"requires_consent"' not in src, (
+        "a seed writes requires_consent, which no reader gates on — the goal "
+        "would dispatch with no consent check (#96)")
+
+
+def test_the_gate_reads_exactly_one_spelling():
+    """The reader-side guard: no second vocabulary, in either direction.
+
+    Reading both is what this canonicalisation removed; reading only the plural
+    would silently ungate the five goals that use the canonical key.
+    """
+    import inspect
     from security.hive_guardrails import GuardrailEnforcer
-    _quiet_other_policies(monkeypatch)
-    req_spy = _patch_consent(monkeypatch, granted=False)
-
-    allowed, reason, _ = GuardrailEnforcer.before_dispatch(
-        'p', goal_dict=FLAGGED_PLURAL, user_id='user-1')
-
-    assert allowed is False, (
-        "a goal seeded with requires_consent must be gated too (#96) — it "
-        "dispatched ungated while only require_consent was read")
-    assert 'consent' in reason.lower()
-    assert req_spy.call_count == 1
-
-
-def test_plural_spelling_passes_with_consent(monkeypatch):
-    from security.hive_guardrails import GuardrailEnforcer
-    _quiet_other_policies(monkeypatch)
-    req_spy = _patch_consent(monkeypatch, granted=True)
-
-    allowed, _reason, _ = GuardrailEnforcer.before_dispatch(
-        'p', goal_dict=FLAGGED_PLURAL, user_id='user-1')
-
-    assert allowed is True
-    assert req_spy.call_count == 0
+    src = inspect.getsource(GuardrailEnforcer.before_dispatch)
+    code = '\n'.join(ln for ln in src.splitlines()
+                     if not ln.lstrip().startswith('#'))
+    assert "cfg.get('require_consent')" in code, \
+        "the canonical consent trigger is no longer read — goals are ungated"
+    assert "cfg.get('requires_consent')" not in code, (
+        "the gate reads the legacy spelling again: two vocabularies for one "
+        "trigger is the parallel path this fold removed")
 
 
 def test_gate_files_no_request_when_it_cannot_name_a_human(monkeypatch):
@@ -228,7 +239,7 @@ def test_gate_files_no_request_when_it_cannot_name_a_human(monkeypatch):
     monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
 
     allowed, reason, _ = GuardrailEnforcer.before_dispatch(
-        'p', goal_dict=FLAGGED_PLURAL, user_id=None)
+        'p', goal_dict=FLAGGED, user_id=None)
 
     assert allowed is False
     assert 'user context' in reason
@@ -258,3 +269,96 @@ def test_daemon_path_passes_the_goals_owner_as_requester():
         if 'goal.to_dict()' in call:
             assert 'user_id=' in call, (
                 f"requester-less guardrail call is the dead end: {call!r}")
+
+
+# ── v56: the hand-off, where a gate could be lost ───────────────────────
+# Correcting the producers only fixes goals seeded from here on.  The three
+# plural goals (seo, paper-explainer, demo-video) are ALREADY in every node's
+# DB, and the moment the gate stops reading the plural those rows go ungated
+# unless the data moves with the code.  That is the whole risk of this fold, so
+# it is tested against the real migration and the real gate, not a stub.
+
+def _goals_db(tmp_path, cfg_json):
+    """A stamped-at-55 DB holding one goal with the given raw config_json."""
+    import json
+    from sqlalchemy import create_engine, text
+    from integrations.social import migrations as mig
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'social.db'}")
+    mig.Base.metadata.create_all(engine)
+    mig.set_schema_version(engine, 55)
+    with engine.connect() as conn:
+        conn.execute(
+            text("INSERT INTO agent_goals (id, goal_type, title, status, "
+                 "config_json) VALUES ('g-96', 'marketing', 'seo', 'active', "
+                 ":c)"),
+            {'c': json.dumps(cfg_json)})
+        conn.commit()
+    return engine
+
+
+def _read_cfg(engine, goal_id='g-96'):
+    import json
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        raw = conn.execute(
+            text("SELECT config_json FROM agent_goals WHERE id = :i"),
+            {'i': goal_id}).fetchone()[0]
+    return json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+
+
+def test_v56_rekeys_a_legacy_row_so_it_keeps_its_gate(tmp_path, monkeypatch):
+    from integrations.social import migrations as mig
+    from security.hive_guardrails import GuardrailEnforcer
+
+    engine = _goals_db(tmp_path, {'bootstrap_slug': 'seo',
+                                  'requires_consent': True,
+                                  'enabled': True})
+    monkeypatch.setattr(mig, 'get_engine', lambda: engine)
+    mig.run_migrations()
+
+    cfg = _read_cfg(engine)
+    assert cfg.get('require_consent') is True, "the row lost its consent gate"
+    assert 'requires_consent' not in cfg, "the legacy key survived the migration"
+    assert cfg['bootstrap_slug'] == 'seo' and cfg['enabled'] is True, \
+        "the migration disturbed unrelated config keys"
+    assert mig.get_schema_version(engine) == 56
+
+    # and the migrated row is actually gated by the real gate
+    _quiet_other_policies(monkeypatch)
+    req_spy = _patch_consent(monkeypatch, granted=False)
+    allowed, reason, _ = GuardrailEnforcer.before_dispatch(
+        'p', goal_dict={'config_json': cfg}, user_id='user-1')
+    assert allowed is False and 'consent' in reason.lower()
+    assert req_spy.call_count == 1
+
+
+def test_v56_preserves_a_deliberate_false_and_never_invents_a_gate(
+        tmp_path, monkeypatch):
+    """Renaming a key must not change what it says.
+
+    requires_consent=False is an explicit "no gate"; turning it into True during
+    a rename would block a goal the owner left open, which is the mirror-image
+    failure of #96 and just as wrong.
+    """
+    from integrations.social import migrations as mig
+
+    engine = _goals_db(tmp_path, {'requires_consent': False})
+    monkeypatch.setattr(mig, 'get_engine', lambda: engine)
+    mig.run_migrations()
+
+    cfg = _read_cfg(engine)
+    assert cfg.get('require_consent') is False
+    assert 'requires_consent' not in cfg
+
+
+def test_v56_leaves_an_untouched_row_alone(tmp_path, monkeypatch):
+    """Idempotence + no collateral: a canonical row is not rewritten."""
+    from integrations.social import migrations as mig
+
+    engine = _goals_db(tmp_path, {'require_consent': True, 'other': 'keep'})
+    monkeypatch.setattr(mig, 'get_engine', lambda: engine)
+    mig.run_migrations()
+    mig.run_migrations()   # second pass must be a no-op
+
+    assert _read_cfg(engine) == {'require_consent': True, 'other': 'keep'}

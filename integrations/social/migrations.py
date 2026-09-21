@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 55
+SCHEMA_VERSION = 56
 
 
 # Tables that hold tenant-scoped user content. v40 adds a nullable
@@ -1967,3 +1967,58 @@ def run_migrations():
                 logger.warning("v55 migration: ADD COLUMN user_consents.label "
                                "failed: %s", e)
         set_schema_version(engine, 55)
+
+    if current < 56:
+        # v56 (2026-09-21): agent_goals.config_json consent-trigger key is
+        # `require_consent`, one spelling (#96).  goal_seeding used to emit
+        # `requires_consent` at three sites while the single enforcement site
+        # (security/hive_guardrails.before_dispatch) read the singular alone, so
+        # those goals dispatched with no consent gate at all.  The producers are
+        # corrected; this renames the key in rows already seeded, so no row
+        # loses its gate when the reader stops accepting the plural.
+        #
+        # DATA, not schema: no column changes, and only rows that carry the
+        # legacy key are rewritten.  The stored VALUE is preserved (a deliberate
+        # False stays False); where a row somehow carries both, the canonical
+        # key wins and the legacy one is dropped.
+        logger.info("HevolveSocial: migrating to v56 "
+                    "(agent_goals.config_json require_consent)")
+        import json
+        _renamed = 0
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(text(
+                    "SELECT id, config_json FROM agent_goals "
+                    "WHERE config_json LIKE '%requires_consent%'")).fetchall()
+                for _id, _raw in rows:
+                    if not _raw:
+                        continue
+                    try:
+                        cfg = json.loads(_raw) if isinstance(
+                            _raw, (str, bytes)) else dict(_raw)
+                    except (ValueError, TypeError) as pe:
+                        # Leave an unparseable row exactly as it is: the reader
+                        # gates on the canonical key and a row we cannot read is
+                        # not a row we should rewrite.
+                        logger.warning(
+                            "v56 migration: goal %s config_json unparseable, "
+                            "left unchanged: %s", _id, pe)
+                        continue
+                    if not isinstance(cfg, dict) or 'requires_consent' not in cfg:
+                        continue
+                    legacy = cfg.pop('requires_consent')
+                    cfg.setdefault('require_consent', legacy)
+                    conn.execute(
+                        text("UPDATE agent_goals SET config_json = :c "
+                             "WHERE id = :i"),
+                        {'c': json.dumps(cfg), 'i': _id})
+                    _renamed += 1
+                conn.commit()
+            logger.info("v56 migration: %d goal(s) re-keyed to "
+                        "require_consent", _renamed)
+        except Exception as e:
+            # A fresh DB has no agent_goals row to fix, and a failure here must
+            # not wedge boot — the gate still reads the canonical key either way.
+            logger.warning("v56 migration: config_json re-key failed "
+                           "(%d done): %s", _renamed, e)
+        set_schema_version(engine, 56)

@@ -217,7 +217,9 @@ class TestSeoSeedGoal:
         cfg = self._get_goal()['config']
         assert cfg['repo'] == 'hertz-ai/Hevolve'
         assert cfg['min_seo_score'] == 90
-        assert cfg['requires_consent'] is True
+        # `require_consent`, the one spelling the gate enforces (#96): this
+        # seed used to say `requires_consent`, which no reader gated on.
+        assert cfg['require_consent'] is True
 
     def test_armed_and_the_builder_accepts_the_seed_as_shipped(self):
         """Armed 2026-08-12 (was seeded dormant).

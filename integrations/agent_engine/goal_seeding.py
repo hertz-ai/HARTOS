@@ -115,7 +115,7 @@ SEED_BOOTSTRAP_GOALS = [
             'goal_sub_type': 'content',
             'channels': ['platform', 'twitter', 'linkedin'],
             'media_kind': 'video',
-            'requires_consent': True,
+            'require_consent': True,
         },
         'spark_budget': 250,
         'use_product': True,
@@ -511,7 +511,7 @@ SEED_BOOTSTRAP_GOALS = [
             # human merge remains the only path to a live page, and step 6
             # requires the page to say an agent wrote it.
             'enabled': True,
-            'requires_consent': True,
+            'require_consent': True,
             'continuous': True,
         },
         'spark_budget': 200,
@@ -569,7 +569,7 @@ SEED_BOOTSTRAP_GOALS = [
             # Enabled by the operator on 2026-08-11 so the queued papers
             # drain into pages. The daemon still refuses to dispatch
             # unless the machine is idle (idle_only) and consent is
-            # granted (requires_consent), and every explanation lands
+            # granted (require_consent), and every explanation lands
             # as a pull request for human review, never a direct push.
             'enabled': True,
             # idle_only: the agent_daemon skips this goal unless the
@@ -577,7 +577,7 @@ SEED_BOOTSTRAP_GOALS = [
             # ._idle_only_blocked) — reuses the ONE existing idle detector,
             # no parallel scheduler.
             'idle_only': True,
-            'requires_consent': True,
+            'require_consent': True,
             'continuous': True,
         },
         'spark_budget': 150,
