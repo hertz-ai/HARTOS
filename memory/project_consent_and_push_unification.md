@@ -365,8 +365,36 @@ Track to landed per #119.
   fields (`allow_metered_for_hive`, `accept_*`) onto consent; leave capacity
   numbers (`max_hive_gpu_pct`, `offered_gpu_hours_per_day`) as config. Do not
   over-fold.
-- **F8 ShareEvent(event_type='consent')** — `api_sharing.py:357,384-400`; a third
-  consent store. Fold onto `UserConsent` with a share scope.
+- **F8 ShareEvent(event_type='consent')** — **CLOSED, NOT FOLDED (`afe51600a`)**.
+  Determination: this is **not** the same concern as `UserConsent` and folding it
+  would be over-folding. `UserConsent` is "I permit software to do X to me",
+  keyed UNIQUE(user_id, agent_id, consent_type, scope) with revoke + a
+  privacy-page entry. This is a **viewer acknowledging a notice before seeing
+  someone else's content**: different subject (viewer, not owner), different
+  object (one link, not a capability), unbounded per-link values, and it doubles
+  as the sharer's audit trail. Folding it would list every view acknowledgement
+  on the owner's privacy page and bury the actual camera/screen/copilot grants.
+  F0's own exclusion list already flagged this file as a name collision — F8 and
+  that exclusion contradicted each other; the exclusion was right.
+  **But the audit found two real defects in the same code, so it was not a
+  no-op:** (1) `resolve_share_token` hid only the OG card for a private link and
+  still returned `redirect_url` + `resource_id`, on an `@optional_auth` route,
+  while `/consent` is `@require_auth` — an anonymous caller could read the target
+  and skip consent entirely (same shape as F11: a gate that guards nothing);
+  (2) `requires_consent` was `link.is_private` flat, so an already-consented
+  viewer was re-asked every visit and banked a duplicate ShareEvent.
+  Fixed by withholding the LOCATOR until consent (`resource_type` stays — the
+  consent screen's copy renders it and it is a category, not an address) and by
+  extracting the one `_viewer_has_consented` predicate that `/check-consent`
+  already had and this path did not consult.
+  10 tests (`tests/unit/test_private_share_link_gate.py`), red against the
+  pre-fix file by construction; 143 pass across the four suites touching the
+  module; live-verified in the embedded runtime through the real anonymous
+  `@optional_auth` branch.
+  *Lesson: "a third store for the same concern" can be a third store for a
+  DIFFERENT concern wearing the same word. Check subject/object/lifecycle before
+  folding — and when the answer is "do not fold", still audit the code, because
+  the reason it looked like a consent store is that it gates something.*
 - **F9 two ask paths that write no row** — `_pending_contacts` in-memory dict
   (`Nunba/routes/chatbot_routes.py:4238-4330`, lost on restart) and
   `DeviceRoutingService.request_consent` (`device_routing_service.py:165-261`,
@@ -487,8 +515,11 @@ deliberate parallel path and leaving it contradicts rule 3.
   model. Plan premise was wrong; see F11 above.
 - **F3 merged into F5**, blocked on a dirty `world_model_bridge.py` and carrying
   an owner call (hive queries opt-out → opt-in).
-- **NEXT: F8** (`ShareEvent(event_type='consent')` → `UserConsent` with a share
-  scope), then F9, F7. F5 still held by another session's edits.
+- **F8 CLOSED, NOT FOLDED** (`afe51600a`) — different concern, same word; but the
+  audit found a real bypass (a private link published its target to anonymous
+  callers) and a duplicate-consent bug, both fixed. See F8 above.
+- **NEXT: F9** (the two ask paths that write no row), then F7. F5 still held by
+  another session's edits.
 
 **Verify each remaining fold's premise before executing it** — F11 taught that
 the plan can be wrong about which API exists. Check name, signature, and that the
