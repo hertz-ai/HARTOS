@@ -846,11 +846,45 @@ _DEFAULT_RECEIPT_TEMPLATE = (
 
 from core.game_sound_memo import (  # noqa: E402
     GAME_STATES,
-    game_state_key,
     game_state_sound,
     rejected_take,
     set_game_state_sound,
 )
+
+
+def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
+    """Put a newly composed game sound in front of the person, to hear.
+
+    Creation is meant to be liquid: the reviewer hears the piece and
+    answers it on the surface they are already looking at, rather than
+    being told a URL.  This rides the existing agent-to-UI channel
+    (LiquidUIService.agent_ui_update), which is allow-listed, audited and
+    delivered to web, phone and desktop alike.
+
+    Best-effort by design: a node without that service, or a hive the
+    human has halted, must not stop a sound being composed and memoized.
+    Returns True when the offer was accepted for delivery.
+    """
+    try:
+        from core.platform.registry import get_registry
+        service = get_registry().get('LiquidUIService')
+        if service is None:
+            return False
+        return bool(service.agent_ui_update(user_id, {
+            'type': 'approval',
+            'agent_id': str(prompt_id),
+            'action': f'game_sound:{game_id}:{state}',
+            'description': (
+                f"New {state} sound for {game_id}. Have a listen: keep it, "
+                f"or say what is wrong and I will compose another."
+            ),
+            'options': ['Keep it', 'Compose another'],
+            'media': {'type': 'audio', 'src': record.get('url'),
+                      'controls': True, 'alt': f'{state} sound for {game_id}'},
+        }))
+    except Exception:
+        # never at the cost of the composition that just succeeded
+        return False
 
 
 def build_core_tool_closures(ctx):
@@ -1067,6 +1101,12 @@ def build_core_tool_closures(ctx):
                 tool_logger.warning(f'bind_game_sound could not persist: {e}')
             return record
 
+        def _offer(record):
+            """Hand a finished piece to the person, to hear and answer."""
+            if record.get('url'):
+                offer_sound_for_review(user_id, prompt_id, slot, which, record)
+            return record
+
         try:
             from integrations.service_tools.media_agent import (
                 check_media_status,
@@ -1099,12 +1139,12 @@ def build_core_tool_closures(ctx):
                     results = started.get('results') or []
                     url = results[0].get('url') if results else None
                     if url:
-                        record = _remember({'url': url, 'mood': mood,
+                        record = _offer(_remember({'url': url, 'mood': mood,
                                             'prompt': prompt, 'state': which,
                                             'level': level or None,
                                             'variant': variant,
                                             'composed_at': time.time(),
-                                            'approved_at': None})
+                                            'approved_at': None}))
                         return json.dumps({'status': 'bound', 'game_id': slot,
                                            'state': which, 'music': record})
                     return "The composer answered without any music; nothing bound."
@@ -1129,11 +1169,11 @@ def build_core_tool_closures(ctx):
                            or (results[0].get('url') if results else None))
                     if not url:
                         return "The composer finished without any music; nothing bound."
-                    record = _remember({'url': url, 'mood': mood, 'prompt': prompt,
+                    record = _offer(_remember({'url': url, 'mood': mood, 'prompt': prompt,
                                         'state': which, 'level': level or None,
                                         'variant': variant,
                                         'composed_at': time.time(),
-                                        'approved_at': None})
+                                        'approved_at': None}))
                     return json.dumps({'status': 'bound', 'game_id': slot,
                                        'state': which, 'music': record})
                 if state in ('failed', 'error'):

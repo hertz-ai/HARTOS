@@ -264,3 +264,57 @@ def test_a_rejected_take_is_kept_with_its_reason():
     assert record['rejected_reason'] == 'too sad'
     assert record.get('url') is None
     assert record['rejected_at'] > 0
+
+
+# ── creation is liquid (the reviewer hears it) ────────────────────────
+
+def test_a_new_sound_is_offered_to_the_person_to_hear_and_answer():
+    """A composed piece arrives as something to listen to on the surface
+    the reviewer is already looking at, through the existing agent-to-UI
+    channel, not as a line of text about a URL."""
+    agent_data = {}
+    media = _media({'status': 'completed',
+                    'results': [{'url': 'https://node/eng01.mp3'}]})
+    liquid = MagicMock()
+    liquid.agent_ui_update.return_value = True
+    registry = MagicMock()
+    registry.get.return_value = liquid
+
+    with _agent(agent_data, media) as tools,             patch('core.platform.registry.get_registry', return_value=registry):
+        json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+
+    component = liquid.agent_ui_update.call_args.args[1]
+    assert component['type'] == 'approval'
+    assert component['media']['src'] == 'https://node/eng01.mp3'
+    assert component['media']['controls'] is True
+    assert 'eng-01' in component['action'] and 'correct' in component['action']
+    assert len(component['options']) == 2
+
+
+def test_a_node_without_that_surface_still_composes_and_remembers():
+    agent_data = {}
+    media = _media({'status': 'completed',
+                    'results': [{'url': 'https://node/eng01.mp3'}]})
+    registry = MagicMock()
+    registry.get.return_value = None
+
+    with _agent(agent_data, media) as tools,             patch('core.platform.registry.get_registry', return_value=registry):
+        answer = json.loads(tools['bind_game_sound']('eng-01'))
+
+    assert answer['status'] == 'bound'
+    assert agent_data[4242]['games']['eng-01']['sounds']['bgm']['url'] ==         'https://node/eng01.mp3'
+
+
+def test_a_surface_that_refuses_never_costs_the_composition():
+    agent_data = {}
+    media = _media({'status': 'completed',
+                    'results': [{'url': 'https://node/eng01.mp3'}]})
+    liquid = MagicMock()
+    liquid.agent_ui_update.side_effect = RuntimeError('hive halted')
+    registry = MagicMock()
+    registry.get.return_value = liquid
+
+    with _agent(agent_data, media) as tools,             patch('core.platform.registry.get_registry', return_value=registry):
+        answer = json.loads(tools['bind_game_sound']('eng-01'))
+
+    assert answer['status'] == 'bound'
