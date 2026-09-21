@@ -852,6 +852,23 @@ from core.game_sound_memo import (  # noqa: E402
 )
 
 
+def _reads_as_no_engine(message):
+    """True when a refusal means this node has no composer at all.
+
+    The media capability answers plainly when a modality is unavailable,
+    and its wording differs by tool ("not available", "no tool", a
+    connection refused to a port nothing is listening on).  A node that
+    simply has nothing installed should ASK for one; an engine that
+    refused a particular prompt should not.
+    """
+    said = (message or '').lower()
+    return any(phrase in said for phrase in (
+        'not available', 'unavailable', 'no tool', 'not installed',
+        'no engine', 'cannot do', 'connection refused', 'failed to establish',
+        'max retries exceeded', 'service not available',
+    ))
+
+
 def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
     """Put a newly composed game sound in front of the person, to hear.
 
@@ -1117,6 +1134,47 @@ def build_core_tool_closures(ctx):
             return ("This node cannot compose music (the media capability is "
                     "not available here), so the game keeps no sound.")
 
+        def _ask_for_a_composer(why):
+            """Offer to set a music model up, rather than failing quietly.
+
+            A node with no composer cannot give a game its sounds, and
+            silence tells the person nothing.  The ask is the canonical
+            consent card, scoped to this one capability, and the owner's
+            yes routes into the provisioning that already exists.
+            """
+            try:
+                from integrations.agent_engine.capability_setup import (
+                    request_capability_setup)
+                outcome = request_capability_setup(
+                    'music:acestep',
+                    reason=(f"To give {slot} its {which} sound I need a music "
+                            f"model on this computer. May I set one up?"),
+                    category='subprocess.tool_load',
+                    context={'backend': 'acestep', 'game_id': slot,
+                             'state': which},
+                )
+            except Exception as ask_error:
+                tool_logger.warning(f'could not offer a composer: {ask_error}')
+                outcome = 'unavailable'
+            return json.dumps({
+                'status': 'needs_capability',
+                'capability': 'music:acestep',
+                'game_id': slot,
+                'state': which,
+                'asked': outcome,
+                'why': why,
+                'note': {
+                    'provisioning': 'Setting the music model up now; ask again '
+                                    'once it is ready.',
+                    'asked': 'I have asked the owner of this computer whether '
+                             'I may set a music model up.',
+                    'declined': 'The owner said no to a music model, so this '
+                                'game keeps the sounds it already has.',
+                    'unavailable': 'There is nobody to ask on this node, so no '
+                                   'sound can be composed here.',
+                }.get(outcome, 'No music model is available on this node.'),
+            })
+
         prompt = GAME_STATES[which].format(
             what=description or slot, mood=mood)
         # A take the reviewer rejected is composed again WITH the reason
@@ -1149,8 +1207,10 @@ def build_core_tool_closures(ctx):
                                            'state': which, 'music': record})
                     return "The composer answered without any music; nothing bound."
                 if started.get('status') != 'pending':
-                    return (f"The composer refused this game's music: "
-                            f"{started.get('error', 'unknown reason')}")
+                    why = str(started.get('error', 'unknown reason'))
+                    if _reads_as_no_engine(why):
+                        return _ask_for_a_composer(why)
+                    return f"The composer refused this game's music: {why}"
                 task_id = started.get('task_id')
                 _remember({'task_id': task_id, 'mood': mood, 'prompt': prompt,
                            'state': which, 'level': level or None,
@@ -1177,8 +1237,10 @@ def build_core_tool_closures(ctx):
                     return json.dumps({'status': 'bound', 'game_id': slot,
                                        'state': which, 'music': record})
                 if state in ('failed', 'error'):
-                    return (f"The composer failed on this game: "
-                            f"{progress.get('error', 'unknown reason')}")
+                    why = str(progress.get('error', 'unknown reason'))
+                    if _reads_as_no_engine(why):
+                        return _ask_for_a_composer(why)
+                    return f"The composer failed on this game: {why}"
             return json.dumps({
                 'status': 'composing',
                 'game_id': slot,

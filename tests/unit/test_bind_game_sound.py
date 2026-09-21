@@ -318,3 +318,68 @@ def test_a_surface_that_refuses_never_costs_the_composition():
         answer = json.loads(tools['bind_game_sound']('eng-01'))
 
     assert answer['status'] == 'bound'
+
+
+# ── a node with no composer asks for one (hartos-94's capability_setup) ──
+
+def _asked(outcome='asked'):
+    module = MagicMock()
+    module.request_capability_setup.return_value = outcome
+    return module
+
+
+def test_a_node_with_no_music_model_offers_to_set_one_up():
+    """Measured 2026-09-21: no music model exists on the machine, and a
+    voice cloner cannot compose a game's sound.  Silence tells the person
+    nothing, so the node asks."""
+    setup = _asked('asked')
+    media = _media({'status': 'error', 'error': 'audio_music not available on this node'})
+
+    with _agent({}, media) as tools,             patch.dict('sys.modules',
+                       {'integrations.agent_engine.capability_setup': setup}):
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling'))
+
+    assert answer['status'] == 'needs_capability'
+    assert answer['capability'] == 'music:acestep'
+    assert answer['asked'] == 'asked'
+    scope = setup.request_capability_setup.call_args
+    assert scope.args[0] == 'music:acestep'
+    assert 'eng-01' in scope.kwargs['reason']
+
+
+def test_the_owner_saying_yes_reads_as_provisioning():
+    setup = _asked('provisioning')
+    media = _media({'status': 'error', 'error': 'no tool for audio_music'})
+
+    with _agent({}, media) as tools,             patch.dict('sys.modules',
+                       {'integrations.agent_engine.capability_setup': setup}):
+        answer = json.loads(tools['bind_game_sound']('eng-01'))
+
+    assert answer['asked'] == 'provisioning'
+    assert 'ready' in answer['note']
+
+
+def test_an_engine_that_refuses_one_prompt_is_not_a_missing_engine():
+    """A composer that is present but said no must not raise a consent
+    card asking to install what is already there."""
+    setup = _asked('asked')
+    media = _media({'status': 'error', 'error': 'prompt rejected by safety filter'})
+
+    with _agent({}, media) as tools,             patch.dict('sys.modules',
+                       {'integrations.agent_engine.capability_setup': setup}):
+        answer = tools['bind_game_sound']('eng-01')
+
+    assert 'refused' in answer
+    setup.request_capability_setup.assert_not_called()
+
+
+def test_a_node_with_nobody_to_ask_says_so_plainly():
+    setup = _asked('unavailable')
+    media = _media({'status': 'error', 'error': 'audio_music unavailable'})
+
+    with _agent({}, media) as tools,             patch.dict('sys.modules',
+                       {'integrations.agent_engine.capability_setup': setup}):
+        answer = json.loads(tools['bind_game_sound']('eng-01'))
+
+    assert answer['asked'] == 'unavailable'
+    assert 'nobody to ask' in answer['note']
