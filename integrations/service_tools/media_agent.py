@@ -285,14 +285,38 @@ def _select_video_tool() -> str:
 
 
 def _get_tool_base_url(tool_name: str) -> Optional[str]:
-    """Get the base URL for a registered tool."""
+    """Where a tool is actually listening, asked of both things that know.
+
+    There are TWO registries and they hold different tools:
+
+      * ServiceToolRegistry -- tools declared in service_tools.json,
+        including any an operator started by hand and registered.
+      * RuntimeToolManager  -- the sidecars HARTOS starts itself. It
+        assigns the port at launch (63734 for AceStep on 2026-09-21) and
+        learns it from the child's PORT= line.
+
+    Asking only the first meant every runtime-started sidecar resolved to
+    None, and the caller reported "not running" about a process that was
+    serving happily on a port this machine knew. MEASURED: get_tool_status
+    said running on 63734 while this returned None.
+    """
     try:
         from integrations.service_tools.registry import service_tool_registry
         tool = service_tool_registry._tools.get(tool_name)
-        if tool:
+        if tool and getattr(tool, 'base_url', None):
             return tool.base_url.rstrip('/')
     except Exception:
         logger.exception("_get_tool_base_url: swallowed Exception")
+    try:
+        from integrations.service_tools.runtime_manager import (
+            runtime_tool_manager)
+        status = runtime_tool_manager.get_tool_status(tool_name) or {}
+        port = status.get('port')
+        if status.get('running') and port:
+            return f'http://127.0.0.1:{port}'
+    except Exception as e:
+        logger.warning(f'_get_tool_base_url({tool_name}): runtime manager '
+                       f'could not say where it is ({e})')
     return None
 
 
