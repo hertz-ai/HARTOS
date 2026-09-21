@@ -1229,6 +1229,17 @@ def build_core_tool_closures(ctx):
         variant = int(rejected.get('variant') or 1) + 1 if rejected else 1
         if rejected.get('rejected_reason'):
             prompt = f"{prompt}. Not like the last one: {rejected['rejected_reason']}"
+        # Carried forward, because the new take REPLACES the rejected one at
+        # this key: without this the previous audio would survive exactly
+        # until the next composition and then vanish.
+        previous_takes = list(rejected.get('previous_takes') or [])
+        if rejected.get('rejected_url'):
+            previous_takes.append({
+                'url': rejected['rejected_url'],
+                'variant': int(rejected.get('variant') or 1),
+                'rejected_reason': rejected.get('rejected_reason') or '',
+                'rejected_at': rejected.get('rejected_at'),
+            })
         task_id = bound.get('task_id')
         try:
             if not task_id:
@@ -1247,6 +1258,7 @@ def build_core_tool_closures(ctx):
                                             'prompt': prompt, 'state': which,
                                             'level': level or None,
                                             'variant': variant,
+                                            'previous_takes': previous_takes,
                                             'composed_at': time.time(),
                                             'approved_at': None}))
                         return json.dumps({'status': 'bound', 'game_id': slot,
@@ -1261,6 +1273,7 @@ def build_core_tool_closures(ctx):
                 _remember({'task_id': task_id, 'mood': mood, 'prompt': prompt,
                            'state': which, 'level': level or None,
                            'variant': variant,
+                           'previous_takes': previous_takes,
                            'composed_at': None, 'approved_at': None})
 
             # Give it a while, then hand the task back rather than block.
@@ -1278,6 +1291,7 @@ def build_core_tool_closures(ctx):
                     record = _offer(_remember({'url': url, 'mood': mood, 'prompt': prompt,
                                         'state': which, 'level': level or None,
                                         'variant': variant,
+                                        'previous_takes': previous_takes,
                                         'composed_at': time.time(),
                                         'approved_at': None}))
                     return json.dumps({'status': 'bound', 'game_id': slot,
@@ -1369,11 +1383,15 @@ def build_core_tool_closures(ctx):
             music['approved_at'] = time.time()
             set_game_state_sound(games, slot, which, music, level, mine)
         else:
-            # kept, not deleted: a reviewer can go back to it, and the next
-            # take is composed to answer the reason they gave (spec §6.1)
+            # Kept, not deleted, so a reviewer can go back to it -- which
+            # means keeping the AUDIO, not just the fact of a rejection.
+            # Popping 'url' outright (as this did until now) threw away the
+            # only way back while the comment claimed otherwise.  It moves
+            # aside rather than out: 'url' must go, or the ladder would keep
+            # serving a take the reviewer turned down.
             music['rejected_at'] = time.time()
             music['rejected_reason'] = (reason or '').strip()
-            music.pop('url', None)
+            music['rejected_url'] = music.pop('url', None)
             set_game_state_sound(games, slot, which, music, level, mine)
         try:
             helper_fun.save_agent_data_to_file(prompt_id, agent_data)

@@ -495,3 +495,45 @@ def test_a_composer_that_answered_and_said_no_is_not_offered_for_install():
 
     assert 'needs_capability' not in answer
     assert '503' in answer
+
+
+def test_a_rejected_take_keeps_its_audio_so_a_reviewer_can_go_back():
+    """Review finding against my own code, 2026-09-21.
+
+    approve_game_sound's comment said the rejected take was "kept, not
+    deleted: a reviewer can go back to it" while the line below it popped
+    'url' -- the only way back. Keeping the fact of a rejection is not
+    keeping the take.
+    """
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/first.mp3', 'variant': 1}}}}}}
+
+    with _agent(agent_data, _media({'status': 'completed', 'results': []})) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too jangly')
+
+    record = agent_data[4242]['games']['eng-01']['sounds']['bgm']
+    assert record.get('url') is None, 'the ladder would serve a rejected take'
+    assert record['rejected_url'] == 'https://node/first.mp3'
+
+
+def test_the_take_before_last_survives_the_next_composition():
+    """The new take REPLACES the rejected one at the same key.
+
+    Without carrying the history forward, the previous audio survived
+    exactly until the next composition and then vanished -- so "go back to
+    it" was true for one moment and false thereafter.
+    """
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/first.mp3', 'variant': 1}}}}}}
+    media = _media({'status': 'completed',
+                    'results': [{'url': 'https://node/second.mp3'}]})
+
+    with _agent(agent_data, media) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too jangly')
+        again = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+
+    assert again['music']['url'] == 'https://node/second.mp3'
+    assert again['music']['variant'] == 2
+    previous = again['music']['previous_takes']
+    assert [t['url'] for t in previous] == ['https://node/first.mp3']
+    assert previous[0]['rejected_reason'] == 'too jangly'
