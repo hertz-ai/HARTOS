@@ -162,7 +162,30 @@ reason. This also closes task **#96** (the three goals were ungated in the field
 i.e. the tag IS the commit): `schema_version 56`, **0 legacy plural rows**, 241
 goals. v56 ran itself at boot on production data.
 
-**F0b — OPEN, latent, found by verifying F0 on central.** All 8 consent-gated
+**F0b — DONE + VERIFIED (`a39b1d9d6`). Owner answered 2026-09-21.**
+Asked whether to give central an owner; measured first and found the wall:
+**central has no human account at all** — 45 rows, 36 guests + 2 service
+accounts (`hevolve_system`, `nunba`), no admin role, nothing matching the owner.
+(Also confirmed that IS the live DB: no `HEVOLVE_DB_URL` is set, so central boots
+the SQLite fallback and logs CRITICAL about it every time — its own separate
+misconfiguration, filed nowhere yet.)
+**Owner's decision: run consent-requiring goals on the DESKTOP only.** A node
+with no declared owner does not run work that needs someone asked. So the gate
+now PARKS such a goal via `_park_goal_for_no_owner` — `status='paused'` +
+`config.pause_reason` naming both ways out — instead of refusing silently every
+tick. Written through `GoalManager.update_goal`/`update_goal_status` (no second
+writer), with a NEW dict for the MutableDict trap.
+Desktop is unchanged, which is the property that matters: Nunba's boot exports
+`HEVOLVE_OWNER_USER_ID`, so the gate still takes the ask path there. A test pins
+that a goal whose owner CAN be asked is never parked — parking it would be the
+self-inflicted outage.
+Live: embedded 3.12, owner env unset, real AgentGoal row -> active becomes paused
+with a readable reason, config intact, second tick a no-op. Against a throwaway
+DB on purpose: central's 8 are already paused for other reasons and the helper
+leaves an already-paused goal alone by design, so this stays latent there until
+one is un-paused, which is the correct outcome.
+
+**F0b — original finding (kept for the record):** All 8 consent-gated
 goals there carry **`owner_id = NULL`** (bootstrap seeding calls
 `GoalManager.create_goal(..., created_by='system_bootstrap')` and never passes an
 owner), and central sets no `HEVOLVE_OWNER_USER_ID`. So
