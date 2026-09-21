@@ -295,10 +295,16 @@ def test_a_new_sound_is_offered_to_the_person_to_hear_and_answer():
     with _agent(agent_data, media) as tools,             patch('core.platform.registry.get_registry', return_value=registry):
         json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
 
-    component = liquid.agent_ui_update.call_args.args[1]
-    assert component['type'] == 'approval'
-    assert component['media']['src'] == 'https://node/eng01.mp3'
-    assert component['media']['controls'] is True
+    # Two components: the audio to hear, then the card to answer.  This
+    # used to assert component['media'], an undeclared prop of 'approval'
+    # that no client reads -- it proved the dict was built, not that
+    # anyone could hear it (hartos-14, 2026-09-21).
+    sent = [call.args[1] for call in liquid.agent_ui_update.call_args_list]
+    by_type = {c['type']: c for c in sent}
+    assert by_type['media']['src'] == 'https://node/eng01.mp3'
+    assert by_type['media']['controls'] is True
+
+    component = by_type['approval']
     assert 'eng-01' in component['action'] and 'correct' in component['action']
     assert len(component['options']) == 2
 
@@ -682,3 +688,63 @@ def test_the_shared_verdict_says_when_there_is_nothing_to_judge():
 
     assert record == {}
     assert games == {}, 'minted a memo for a sound that was never composed'
+
+
+def test_the_sound_arrives_as_something_a_client_can_play(monkeypatch):
+    """hartos-14's CRITICAL 3.
+
+    'media' is not a declared prop of the 'approval' component and no
+    client reads one, so the card said "Have a listen" and offered nothing
+    to listen to. The audio now goes as the declared 'media' component
+    (props: type, src, alt, controls) that every client already renders.
+    """
+    fcm = MagicMock()
+    services = MagicMock()
+    models = MagicMock()
+    ui = MagicMock()
+    ui.agent_ui_update.return_value = True
+    registry = MagicMock()
+    registry.get.return_value = ui
+    platform_registry = MagicMock()
+    platform_registry.get_registry.return_value = registry
+    with patch.dict('sys.modules', {
+            'core.fcm_sync': fcm,
+            'integrations.social.services': services,
+            'integrations.social.models': models,
+            'core.platform.registry': platform_registry}):
+        agent_tools.offer_sound_for_review(
+            'user-1', 4242, 'eng-01', 'correct',
+            {'url': 'https://node/correct.mp3'})
+
+    sent = [call.args[1] for call in ui.agent_ui_update.call_args_list]
+    kinds = [c['type'] for c in sent]
+    assert 'media' in kinds, 'nothing playable was ever sent'
+    assert kinds.index('media') < kinds.index('approval'), (
+        'the card asking them to listen arrived before the thing to hear')
+
+    audio = sent[kinds.index('media')]
+    assert audio['src'] == 'https://node/correct.mp3'
+    assert audio['controls'] is True
+    assert audio['media_type'] == 'audio'
+
+    card = sent[kinds.index('approval')]
+    assert 'media' not in card, 'an undeclared prop no client reads'
+
+
+def test_a_composition_with_no_url_offers_no_player(monkeypatch):
+    ui = MagicMock()
+    ui.agent_ui_update.return_value = True
+    registry = MagicMock()
+    registry.get.return_value = ui
+    platform_registry = MagicMock()
+    platform_registry.get_registry.return_value = registry
+    with patch.dict('sys.modules', {
+            'core.fcm_sync': MagicMock(),
+            'integrations.social.services': MagicMock(),
+            'integrations.social.models': MagicMock(),
+            'core.platform.registry': platform_registry}):
+        agent_tools.offer_sound_for_review('user-1', 4242, 'eng-01', 'correct', {})
+
+    kinds = [c['type'] for c in
+             (call.args[1] for call in ui.agent_ui_update.call_args_list)]
+    assert 'media' not in kinds, 'offered a player for nothing'

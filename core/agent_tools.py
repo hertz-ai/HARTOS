@@ -876,6 +876,23 @@ def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
         from core.platform.registry import get_registry
         service = get_registry().get('LiquidUIService')
         if service is not None:
+            # The audio FIRST, as the declared 'media' component every
+            # client already renders (props: type, src, alt, controls).  It
+            # used to ride inside the approval card as an undeclared prop,
+            # which no client reads -- so the card invited someone to "have
+            # a listen" and gave them nothing to listen to.  'media_type'
+            # as well as 'type' because the component's own type key is
+            # 'media' and the clients read the modality from media_type.
+            if record.get('url'):
+                service.agent_ui_update(user_id, {
+                    'type': 'media',
+                    'agent_id': str(prompt_id),
+                    'media_type': 'audio',
+                    'src': record.get('url'),
+                    'controls': True,
+                    'alt': f'{state} sound for {game_id}',
+                    'title': f'{state} sound for {game_id}',
+                })
             shown = bool(service.agent_ui_update(user_id, {
                 'type': 'approval',
                 'agent_id': str(prompt_id),
@@ -885,9 +902,6 @@ def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
                     f"it, or say what is wrong and I will compose another."
                 ),
                 'options': ['Keep it', 'Compose another'],
-                'media': {'type': 'audio', 'src': record.get('url'),
-                          'controls': True,
-                          'alt': f'{state} sound for {game_id}'},
             }))
     except Exception as e:
         # never at the cost of the composition that just succeeded
