@@ -908,9 +908,14 @@ def _tell_the_person_elsewhere(user_id, prompt_id, game_id, state, record):
         from integrations.social.services import NotificationService
         from integrations.social.models import db_session
         with db_session() as db:
+            # target_type/target_id are the schema's own way of saying what
+            # a notification is ABOUT, and the client routes on them.  Without
+            # them the row is inert: it tells the person a sound is ready and
+            # gives them no way to reach it.
             NotificationService.create(
                 db, str(user_id), 'agent_game_sound_review',
                 source_user_id=str(prompt_id), message=message,
+                target_type='agent', target_id=str(prompt_id),
             )
     except Exception as e:
         tool_logger.debug(f'game sound: no notification record ({e})')

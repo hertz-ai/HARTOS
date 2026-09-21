@@ -443,6 +443,19 @@ def test_the_offer_is_recorded_so_every_surface_of_theirs_shows_it(monkeypatch):
     assert notify.call_args.args[2] == 'agent_game_sound_review'
 
 
+def test_the_record_names_what_it_is_about_so_it_can_be_acted_on(monkeypatch):
+    """A row the client cannot route is a dead end.
+
+    Found reviewing this commit: the client routes a notification on
+    target_type/target_id, and without them the person is told a sound is
+    ready and given no way to reach it.
+    """
+    _shown, _push, notify = _offer_a_sound(monkeypatch)
+
+    assert notify.call_args.kwargs['target_type'] == 'agent'
+    assert notify.call_args.kwargs['target_id'] == '4242'
+
+
 def test_a_node_with_no_push_credential_still_composes(monkeypatch):
     """send_fcm_push no-ops without a credential; a raise must not either."""
     angry = MagicMock(side_effect=RuntimeError('no FCM credential here'))
