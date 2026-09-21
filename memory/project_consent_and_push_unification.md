@@ -359,7 +359,11 @@ owner's decision recorded above.
 
 ## TIER 2 — a concern with no canonical store at all
 
-### F4 — the mic has no consent type — **UNBLOCKED 2026-09-21: nobody holds it**
+### F4 — the mic shares the goal gate's consent — **OWNER DECISION 2026-09-21; do not implement**
+Owner asked 2026-09-21 with the three options below costed; answer was **file it, do
+not change behaviour**. So F4 stays open by decision, not by ignorance: the finding
+and its measurements are recorded, nothing is folded, and the next session must NOT
+"just add microphone_capture" without revisiting the grant-migration question.
 The "HELD" premise was wrong. fix-all-log-observed-issues confirms it has **no**
 `consent_service.py` edits and never had any in this session — it only READ the
 file — and `git status`/`git diff` on that path are both empty. So F4 is
@@ -368,8 +372,47 @@ unclaimed and doable now.
 peer who once discussed a file, is not evidence that a session owns work in it.
 Ask, or check authorship, before holding a fold for someone — holding on a false
 attribution costs exactly as much as a real block.*
-`core/ai_sensing.py:27-102` in-process kill switch is the only gate;
-`consent_service.py:136-137` says an ask "belongs here" if built.
+**PREMISE CORRECTED 2026-09-21 — the fold is bigger and needs an owner call.**
+"The mic has no consent type" is WRONG. The mic IS gated, on a SHARED generic
+type, which is worse than ungated because it conflates two capabilities:
+
+    whisper_tool._mic_learning_consented:
+        check_consent(db, user, 'data_access', scope='*')     -> ingest mic PCM
+    hive_guardrails.py:1407-1413:
+        consent_type = cfg.get('consent_type', 'data_access')
+        check_consent(db, user_id, consent_type, scope='*')   -> run a goal
+
+Identical type AND scope. So a user who approves a consent-gated GOAL (whose type
+DEFAULTS to `data_access`) thereby also permits raw mic PCM16 to be ingested into
+HevolveAI's world model for continual learning, and a user who answers the mic ask
+thereby satisfies every default-typed goal gate. The whisper docstring intends the
+second direction on purpose ("a user who has granted the speech-therapy or spoken
+English agent its microphone consent is not asked a second time"); the FIRST
+direction — a goal's data-access approval silently enabling the microphone — reads
+as unintended, and it is the privacy-relevant one.
+
+This blocks the fold on a decision I must not take alone, because BOTH options cost
+something and the owner has reserved exactly this kind of call ("one flag per
+concept; consents have scope+TTL", and "never discard an existing grant without
+knowing its scope+TTL"):
+  (a) switch the mic to `microphone_capture` and re-ask everyone. Honest and
+      separates the concepts, but it revokes de-facto permission that users
+      currently hold and interrupts live voice agents (speech therapy, spoken
+      English) mid-flow. The original F4 text assumed this without noticing it
+      discards grants.
+  (b) accept `microphone_capture` OR a pre-existing `data_access` grant during a
+      migration window. No interruption, but it keeps the conflation alive for as
+      long as the window lasts, and needs a TTL to ever end.
+Whichever is chosen, `ai_sensing` stays as the hard cut (a kill switch that works
+with the DB down is a legitimate second layer, not a parallel store) but must not
+be the only record.
+
+Original notes below, kept because the rest of the fold still applies:
+`core/ai_sensing.py:27-102` in-process kill switch (`_state = {'mic', 'camera',
+'screen'}`, `allowed(sensor)`); `consent_service.py:136-137` says an ask "belongs
+here" if built. Note `screen_capture` IS already in CONSENT_TYPES and
+`CAPABILITY_CONSENT_TYPES` maps camera/screen aliases, so the registry pattern to
+copy for the mic is established.
 Fold: add `microphone_capture` to `CONSENT_TYPES` + `CAPABILITY_CONSENT_TYPES` +
 `consentAsks.js`; the audio path (`whisper_tool.py:1595`) checks it; `ai_sensing`
 stays as the hard cut (legitimate second layer — a kill switch that works with the
@@ -413,11 +456,47 @@ Track to landed per #119.
   verifying a privacy fix must not itself switch a camera on.
   *Lesson: grep the flag NAME and the enclosing schema assignment; the PUT wrote
   the same permission through an object assignment no name-grep would find.*
-- **F7 NodeComputeConfig + `HEVOLVE_*`** (`compute_config.py:16-89`, env > DB >
-  defaults). **Distinguish permission from capacity**: fold only the permission-ish
-  fields (`allow_metered_for_hive`, `accept_*`) onto consent; leave capacity
-  numbers (`max_hive_gpu_pct`, `offered_gpu_hours_per_day`) as config. Do not
-  over-fold.
+- **F7 NodeComputeConfig + `HEVOLVE_*`** — **defect 1 DONE + PUSHED (`a1789b6c2`),
+  defect 2 OPEN (needs an owner call).** Defect 1: the env pin may now only
+  RESTRICT `allow_metered_for_hive`, never grant, via `_ENV_MAY_ONLY_RESTRICT`.
+  Red-first proved the guard discriminates (env=true fix-off -> True, fix-on ->
+  False, env=false -> still restricts); 22 tests pass and the 4 new ones were
+  verified BY NAME. The pre-existing `test_env_allow_metered_override` asserted the
+  GRANT works, i.e. it pinned the defect, and is replaced.
+  Audit detail below stands.
+  *Path in this plan was wrong: it is `integrations/agent_engine/compute_config.py`,
+  not `integrations/social/`. Third premise error caught by checking first.*
+
+  `_DEFAULTS` (`:16-24`), precedence **env > DB > defaults** (`:54-77`), split by
+  kind as the fold intends:
+  | field | kind |
+  |---|---|
+  | `allow_metered_for_hive` (False) | **PERMISSION** — spends the user's metered link |
+  | `accept_thought_experiments` (**True**) | **PERMISSION** — accepts hive work |
+  | `accept_frontier_training` (False) | **PERMISSION** |
+  | `max_hive_gpu_pct` (50), `offered_gpu_hours_per_day` (0.0), `metered_daily_limit_usd` | capacity — LEAVE as config |
+  | `compute_policy`, `hive_compute_policy`, `auto_settle`, `min_settlement_spark` | policy/financial — out of scope |
+
+  **Two real defects found, one of them F2's exact shape:**
+  1. `HEVOLVE_ALLOW_METERED_HIVE` (`:76`) overrides `allow_metered_for_hive`, and
+     env outranks DB — so **an env pin can GRANT a permission the user declined**,
+     which is precisely what F2 fixed for the copilot (`66386a45e`). Same remedy
+     applies verbatim: the override may only ever RESTRICT, never grant. Copy F2's
+     asymmetric predicate and its test shape.
+  2. `accept_thought_experiments` **defaults to True**, so a node accepts hive
+     thought-experiment work with no record that anyone agreed. Permission by
+     default, and nothing to revoke.
+
+  **Do defect 1 first, alone.** It is a strict narrowing with an accepted precedent,
+  so it carries no self-DoS risk. Defect 2 flips a default that other nodes'
+  work depends on, so consent-gating it could stop hive work fleet-wide — that needs
+  BLOCK + ASK + RECOVERY designed before it lands, and probably an owner call on
+  whether existing accepting nodes are grandfathered. Do NOT bundle them.
+
+  Callers to audit before either (the fields are read in 5 non-test files):
+  `hart_intelligence_entry.py`, `compute_config.py`,
+  `integrations/coding_agent/tool_backends.py`, `integrations/social/api_tracker.py`,
+  `integrations/social/_models_local.py`; tests in `tests/unit/test_compute_config.py`.
 - **F8 ShareEvent(event_type='consent')** — **CLOSED, NOT FOLDED (`afe51600a`)**.
   Determination: this is **not** the same concern as `UserConsent` and folding it
   would be over-folding. `UserConsent` is "I permit software to do X to me",
@@ -448,9 +527,9 @@ Track to landed per #119.
   DIFFERENT concern wearing the same word. Check subject/object/lifecycle before
   folding — and when the answer is "do not fold", still audit the code, because
   the reason it looked like a consent store is that it gates something.*
-- **F9 — IMPLEMENTED 2026-09-21, NOT YET COMMITTED** (holding for a clean
-  regression comparison; the owner asked for zero regression and the sweep
-  decides, not my confidence).
+- **F9 — DONE + PUSHED 2026-09-21** (`077b27332`). Zero regression EVIDENCED, not
+  asserted: hermetic A/B of `a34e6489f^` vs this change, fresh pinned
+  `HEVOLVE_DB_PATH` per arm, 254 passed / 0 failed / 0 errors in both arms.
 
   **What it turned out to be, bigger than the audit said.** Implementing half A
   hit `IntegrityError` and exposed a defect in the SHARED writer:
@@ -643,12 +722,142 @@ message *originates* at the canonical entry and picks a transport; nothing else 
 an entry point.
 
 - **F12** legacy `publish_async` bypass (`hart_intelligence_entry.py:3028-3029`,
-  `:11145-11160`) — the migration already tracked in
-  `memory/project_publish_aop_migration.md`. Own it; do not start a rival doc.
-- **F13** FCM three paths → one `send_push` (`core/fcm_sync.py:325-365`,
-  `local_subscribers.py:165-183`, `device_routing_service.py`). Note the
-  self-contradiction to resolve: `local_subscribers.py:40-45` says FCM is
-  cloud-only, `:165-173` then sends FCM. Also fix the hardcoded generic body.
+  `:11145-11160`) — **PREMISE PARTLY WRONG, checked 2026-09-22.**
+  `memory/project_publish_aop_migration.md` **DOES NOT EXIST** — `memory/` holds
+  only this plan, `tool_name_unification_plan.md` and `tool_naming_audit.md`. So
+  there is nothing to "own", and F12 needs its own audit from scratch. The
+  instruction "do not start a rival doc" was predicated on a doc that isn't there;
+  it should not stop the next session from writing the first one.
+  `publish_async` itself DOES exist and has real callers
+  (`core/persona_registry.py:211`, `core/peer_link/crossbar_publish.py:143-148`,
+  `core/peer_link/message_bus.py:135`), several resolving it indirectly through
+  `safe_hartos_attr('publish_async')` — which is the interesting part, because an
+  attr-resolved callable is invisible to a name grep of call sites.
+  ### F12 AUDIT 2026-09-22 — **DO NOT FOLD THE CALL SITES YET. There is a live
+  feature riding on this exact function, and folding it silently breaks it.**
+
+  **Three definitions, and they are NOT rival copies** (my own first reading, and
+  it was wrong):
+  | site | what it is |
+  |---|---|
+  | `hart_intelligence_entry.py:2408` | **the canonical one** |
+  | `hartos/reuse_recipe.py:391` | thin delegator via `safe_hartos_attr('publish_async')` |
+  | `hartos/create_recipe.py:141` | same, and the docstring gives the REASON: a worker eager-importing `hart_intelligence` deadlocks against the canonical loader's import lock |
+  So the duplication is deliberate and load-bearing. Deleting either delegator
+  reintroduces an import deadlock in workers.
+
+  **THE HAZARD, measured in both repos.** Nunba monkey-patches `publish_async`
+  **in place, in all three modules**, to call `_capture_thinking(message)`:
+  `Nunba-HART-Companion/routes/hartos_backend_adapter.py:94` says so outright
+  ("We monkey-patch publish_async in all 3 modules so thinking traces are..."),
+  with `_capture_thinking` at `:107`, the canonical patch at `:222-230` and the
+  per-module loop at `:235-243`. That buffer is what the `/chat` HTTP response
+  embeds as its thinking trace.
+  → **Folding these call sites onto the bus / a canonical push entry silently
+  strips thinking traces from every `/chat` response.** Nothing errors; a feature
+  just goes quiet. Exactly the failure shape the rest of this plan keeps finding.
+  → PREREQUISITE, and it is cross-repo: migrate Nunba's interceptor from an
+  in-place monkey-patch to a bus subscriber on `chat.response` FIRST, ship it, and
+  only then fold HARTOS's call sites. Same ordering constraint as F11 and the WAMP
+  ACL: the consumer moves before the producer.
+
+  **DOUBLE-CAPTURE: mechanically REAL, currently LATENT. Measured, not inferred.**
+  The chain exists, every link read from source:
+  1. Nunba patches the delegators too, not just the canonical
+     (`hartos_backend_adapter.py:235-243`, "all 3 modules").
+  2. A delegator's body resolves the target at CALL time via
+     `safe_hartos_attr('publish_async')`, and `safe_hartos_attr.py:156` is a plain
+     `getattr(mod, name, None)` on `sys.modules['hart_intelligence']` — so it hands
+     back the **patched** canonical, not the original.
+  3. `_capture_thinking` (`:107`) appends with **no dedupe**.
+  So one call through a delegator runs `_capture_thinking` twice on the same
+  message.
+  **But it does not fire today.** The only delegator call site is
+  `create_recipe.py:573` (`send_message_to_user1`, and only under `_bundled`), and
+  its `chat_payload` (`:555-566`) carries NO `priority` and NO `action` key, while
+  `_capture_thinking` records only when `priority == 49 and action == 'Thinking'`.
+  The payload is skipped, so nothing duplicates.
+  → **Latent trap for whoever touches this next**: add `priority: 49` /
+  `action: 'Thinking'` to a delegator-published payload, or route an existing
+  Thinking bubble through a delegator, and traces silently double. Either dedupe in
+  `_capture_thinking` (cheap, by request_id + identity) or have the delegators call
+  the ORIGINAL canonical rather than the patched attribute. Worth doing as part of
+  the interceptor migration, not before it.
+  *Also recorded from that call site's own comment: a previous
+  `from core.message_bus import publish_async` raised ModuleNotFoundError on EVERY
+  call, so bundled mode silently dropped every intermediate chat message. Third
+  silent-drop in this one function's history — this path has a habit of it.*
+
+  **Where the missing doc reference came from**: the canonical docstring itself
+  names `memory/project_publish_aop_migration.md` as "the right long-term shape".
+  So the plan's author copied a pointer out of a docstring, and the doc was never
+  written. The shape was identified and then lost — which is the thing to fix by
+  writing it, not by treating the reference as authoritative.
+
+  `hart_intelligence_entry.py:3029` is the described bypass, inside
+  `_push_workflow_flowchart`:
+  ```python
+  from core.peer_link.message_bus import chat_topic_for
+  publish_async(chat_topic_for(user_id), json.dumps(crossbar_message))
+  except Exception:
+      logging.getLogger(__name__).exception(
+          "_push_workflow_flowchart: swallowed Exception")
+  ```
+  Note the `except Exception` that SWALLOWS: a push that never arrives is visible
+  only in a log nobody reads, which is the same shape as the rest of tonight's
+  findings. Worth folding the delivery AND the silence together.
+  Still to audit next session: where `publish_async` is DEFINED, the second cited
+  site `:11145-11160`, and whether `message_bus.py:245` monkey-patching
+  `hart_intelligence.publish_async` is a third path that any fold must not break.
+
+  *Caution recorded, and then corrected: my first check used a bash `grep` that
+  hit the 120s timeout, and its partial output showed no matches. I began to read
+  that silence as "the function does not exist" — wrong twice over, because the
+  search had not finished AND the function is real. The task completed later and
+  returned the matches above. A search that was cut off is not a negative result,
+  and the fast Grep tool answers this tree in a second where bash grep does not.*
+
+**FOUR of this plan's premises have now been wrong** (F11's API, F4's "no consent
+type", F7's path, F12's doc). The plan was written from recollection, not from
+reading the tree, so roughly half its specific file references do not survive
+checking. **Verify before executing remains the highest-value rule here**, and a
+fold that "looks trivial" in the plan text is exactly the one to check first.
+- **F13** FCM paths → one — **AUDITED 2026-09-22. One instruction in it would be a
+  PRIVACY REGRESSION; do not execute that part without the owner.**
+
+  Names, for accuracy: the canonical pair is `send_fcm_push(user_id, ...)`
+  (`core/fcm_sync.py:325`) and `send_fcm_push_to_node(node_id, ...)` (`:346`), not
+  `send_push`. Those two are different TARGETS (a user vs a node), so per F12's
+  lesson check they are genuinely duplicated before collapsing them — two callers
+  needing two addressing modes is not the same as two rival implementations.
+
+  **The "self-contradiction to resolve" is already resolved, knowingly.**
+  `local_subscribers.py:165-173` says in so many words: "this is the FCM send the
+  class docstring deferred as 'cloud-only'", and explains why a LOCAL send is
+  right (a personal message unconfirmed after TTL means a backgrounded phone never
+  acked; push via the locally-cached token, no crossbar, no cloud round-trip, no-op
+  without a token so it is safe on every node). What remains is one STALE DOCSTRING
+  LINE at `:43` ("no FCM — that's cloud-only"), which is now false. That is a
+  comment fix, not a defect.
+
+  **"Also fix the hardcoded generic body" — DO NOT, not as written.**
+  `body='You have a new notification'` is DELIBERATE, and the code says why:
+  "Generic body — the content renders in-app on open", and
+  `build_fcm_v1_message` (`:242`) defaults `privacy_tier_skipped=True`, stamping
+  `privacy_notice` so the user is TOLD their message used the central relay. So an
+  FCM push is treated as a privacy-tier escalation. Putting message content in that
+  body would send it through Google's infrastructure and onto a lock screen —
+  weakening privacy, not fixing a bug. Same shape as F4: the plan text asks for
+  something that discards a protection the code deliberately holds.
+  → OWNER CALL if a richer body is wanted. Middle grounds that do not leak content:
+  carry the SENDER's name only; or gate previews behind an explicit opt-in consent
+  (which is what this whole plan is building the machinery for). Either way the
+  `privacy_tier_skipped` notice must keep firing.
+
+  *Fifth premise issue in this plan, and the second where following the text
+  literally would have removed a protection. The pattern is now clear enough to
+  state: this plan's DIAGNOSES are good, its PRESCRIPTIONS are not trustworthy
+  without reading what the code already decided and why.*
 - **F14** four desktop-toast emitters → one (`hart-notify.nix:92-124`,
   `shell_os_apis.py:384`, `tray_handler.py:136-146`, `indicator_window.py:108`).
 - **F15** three SMTP senders → one (`email_campaign.py:643`,
@@ -707,10 +916,20 @@ deliberate parallel path and leaving it contradicts rule 3.
 - **F8 CLOSED, NOT FOLDED** (`afe51600a`) — different concern, same word; but the
   audit found a real bypass (a private link published its target to anonymous
   callers) and a duplicate-consent bug, both fixed. See F8 above.
-- **F9 IMPLEMENTED, committed local-only** (`077b27332`) — per-agent consents were
-  askable but not grantable. Pushing waits on the hermetic A/B, not on confidence.
-- **F19 OPEN, blocks honest regression claims in this area** — the consent sweep
-  is not hermetic; see below.
+- **F9 DONE + PUSHED** (`077b27332`) — per-agent consents were askable but not
+  grantable. Hermetic A/B (`a34e6489f^` vs mine, fresh pinned DB per arm):
+  **254 passed / 0 failed / 0 errors in BOTH arms**, so zero regression is
+  evidenced rather than asserted. Landed on the remote via the peer sweep before
+  I pushed, which is its own lesson about this checkout.
+- **F19 DONE + PUSHED** (`828562872`), differently from how it was specified.
+  Neither option (a) nor (b): instead `models.py` resolves DB_PATH to a
+  per-process temp FILE when running under pytest with nothing configured. That
+  covers what per-suite pins could not, because several suites import `models`
+  lazily inside a fixture, long after a module-top pin would have run. A temp
+  file rather than `':memory:'` keeps the file-backed NullPool semantics every
+  suite already runs under. Guarded by `tests/unit/test_consent_sweep_is_hermetic.py`,
+  which also asserts the regression risk directly: a process WITHOUT pytest still
+  resolves to `agent_data`, so no real node's database was repointed.
 - **NEXT after F9: F7**, then F4 (unheld). F5 still held by another session's edits.
 
 ### F19 — the consent test sweep cannot serve as a control — **OPEN, filed 2026-09-21**
