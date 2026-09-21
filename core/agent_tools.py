@@ -846,9 +846,12 @@ _DEFAULT_RECEIPT_TEMPLATE = (
 
 from core.game_sound_memo import (  # noqa: E402
     GAME_STATES,
+    game_state_key,
+    game_state_match,
     game_state_sound,
     rejected_take,
     set_game_state_sound,
+    set_game_state_sound_at,
 )
 
 
@@ -888,7 +891,14 @@ def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
     except Exception as e:
         # never at the cost of the composition that just succeeded
         tool_logger.debug(f'game sound: no card on screen ({e})')
-    _tell_the_person_elsewhere(user_id, prompt_id, game_id, state, record)
+    if not shown:
+        # Only when the card did NOT reach a screen.  A game has fourteen
+        # states, so notifying regardless meant one game cost the person
+        # fourteen phone pushes and fourteen unread rows -- for sounds they
+        # were already being shown one by one.  'shown' was computed and
+        # thrown away; it is the whole signal for whether they need telling
+        # somewhere else.
+        _tell_the_person_elsewhere(user_id, prompt_id, game_id, state, record)
     return shown
 
 
@@ -1338,6 +1348,10 @@ def build_core_tool_closures(ctx):
         """A sound this game is bound to play. REUSE reads it; it never composes."""
         slot = str(game_id or '').strip()
         which = str(state or 'bgm').strip() or 'bgm'
+        if which not in GAME_STATES:
+            return (f"{which} is not one of a game's states. Use one of: "
+                    f"{', '.join(sorted(GAME_STATES))}.")
+        level = str(level or '').strip()
         bound, matched = game_state_sound(
             agent_data.get(prompt_id, {}).get('games', {}), slot, which, level, user_id)
         if bound.get('url'):
@@ -1377,16 +1391,27 @@ def build_core_tool_closures(ctx):
         """
         slot = str(game_id or '').strip()
         which = str(state or 'bgm').strip() or 'bgm'
+        if which not in GAME_STATES:
+            return (f"{which} is not one of a game's states. Use one of: "
+                    f"{', '.join(sorted(GAME_STATES))}.")
+        level = str(level or '').strip()
         mine = user_id if str(scope or 'agent').strip() == 'mine' else None
         games = agent_data.setdefault(prompt_id, {}).setdefault('games', {})
-        music = dict(game_state_sound(games, slot, which, level, mine,
-                                      own_only=bool(mine))[0])
+        # A verdict belongs to the memo it was GIVEN, and the ladder may have
+        # found that under a different key than the one asked for: rejecting
+        # while playing level 3 wrote at 'correct@3' and left 'correct' --
+        # the take actually sounding -- playing on, url intact.  A person
+        # correcting their own copy still writes in their own space.
+        found, matched, matched_key = game_state_match(
+            games, slot, which, level, mine, own_only=bool(mine))
+        music = dict(found)
+        write_key = game_state_key(which, level) if mine else matched_key
         if not music.get('url'):
             return (f"No {which} is bound to {slot or 'that game'} yet, so "
                     f"there is nothing to approve.")
         if approved:
             music['approved_at'] = time.time()
-            set_game_state_sound(games, slot, which, music, level, mine)
+            set_game_state_sound_at(games, slot, write_key, music, mine)
         else:
             # Kept, not deleted, so a reviewer can go back to it -- which
             # means keeping the AUDIO, not just the fact of a rejection.
@@ -1397,7 +1422,7 @@ def build_core_tool_closures(ctx):
             music['rejected_at'] = time.time()
             music['rejected_reason'] = (reason or '').strip()
             music['rejected_url'] = music.pop('url', None)
-            set_game_state_sound(games, slot, which, music, level, mine)
+            set_game_state_sound_at(games, slot, write_key, music, mine)
         try:
             helper_fun.save_agent_data_to_file(prompt_id, agent_data)
         except Exception as e:
@@ -1409,6 +1434,10 @@ def build_core_tool_closures(ctx):
             'music': game_state_sound(games, slot, which, level, mine,
                                       own_only=bool(mine))[0] or None,
             'scope': 'mine' if mine else 'agent',
+            # which memo the verdict landed on, so a caller can see that a
+            # level-3 rejection marked the game-wide take that was playing
+            'matched': matched,
+            'key': write_key,
         })
 
     tools.append((

@@ -426,7 +426,8 @@ def _offer_a_sound(monkeypatch, push=None, notify=None, ui=True):
 
 
 def test_the_offer_is_pushed_to_the_phone_with_what_it_is_about(monkeypatch):
-    _shown, push, _notify = _offer_a_sound(monkeypatch)
+    # with no screen attached: a card that landed needs no push
+    _shown, push, _notify = _offer_a_sound(monkeypatch, ui=False)
 
     assert push.called, 'the phone was never told'
     data = push.call_args.kwargs['data']
@@ -437,7 +438,7 @@ def test_the_offer_is_pushed_to_the_phone_with_what_it_is_about(monkeypatch):
 
 
 def test_the_offer_is_recorded_so_every_surface_of_theirs_shows_it(monkeypatch):
-    _shown, _push, notify = _offer_a_sound(monkeypatch)
+    _shown, _push, notify = _offer_a_sound(monkeypatch, ui=False)
 
     assert notify.called, 'nothing was recorded for the other surfaces'
     assert notify.call_args.args[2] == 'agent_game_sound_review'
@@ -450,7 +451,7 @@ def test_the_record_names_what_it_is_about_so_it_can_be_acted_on(monkeypatch):
     target_type/target_id, and without them the person is told a sound is
     ready and given no way to reach it.
     """
-    _shown, _push, notify = _offer_a_sound(monkeypatch)
+    _shown, _push, notify = _offer_a_sound(monkeypatch, ui=False)
 
     assert notify.call_args.kwargs['target_type'] == 'agent'
     assert notify.call_args.kwargs['target_id'] == '4242'
@@ -459,19 +460,19 @@ def test_the_record_names_what_it_is_about_so_it_can_be_acted_on(monkeypatch):
 def test_a_node_with_no_push_credential_still_composes(monkeypatch):
     """send_fcm_push no-ops without a credential; a raise must not either."""
     angry = MagicMock(side_effect=RuntimeError('no FCM credential here'))
-    shown, push, _notify = _offer_a_sound(monkeypatch, push=angry)
+    shown, push, _notify = _offer_a_sound(monkeypatch, push=angry, ui=False)
 
     assert push.called
-    assert shown is True, 'a dead push path swallowed the offer'
+    assert shown is False
 
 
 def test_a_node_with_no_notification_store_still_pushes(monkeypatch):
     angry = MagicMock(side_effect=RuntimeError('no social database here'))
-    shown, push, notify = _offer_a_sound(monkeypatch, notify=angry)
+    shown, push, notify = _offer_a_sound(monkeypatch, notify=angry, ui=False)
 
     assert notify.called
     assert push.called, 'a missing record stopped the phone being told'
-    assert shown is True
+    assert shown is False
 
 
 def test_the_person_is_still_told_when_no_screen_is_attached(monkeypatch):
@@ -550,3 +551,90 @@ def test_the_take_before_last_survives_the_next_composition():
     previous = again['music']['previous_takes']
     assert [t['url'] for t in previous] == ['https://node/first.mp3']
     assert previous[0]['rejected_reason'] == 'too jangly'
+
+
+def test_a_card_on_screen_costs_no_push(monkeypatch):
+    """A game has fourteen states.
+
+    Notifying regardless meant one game cost the person fourteen phone
+    pushes and fourteen unread rows, for sounds they were already being
+    shown one at a time.
+    """
+    shown, push, notify = _offer_a_sound(monkeypatch, ui=True)
+
+    assert shown is True
+    assert not push.called, 'pushed a sound they were already looking at'
+    assert not notify.called
+
+
+def test_rejecting_while_a_level_plays_silences_the_take_that_is_playing():
+    """hartos-14's CRITICAL 2, measured on this lane 2026-09-21.
+
+    The ladder falls back from 'correct@3' to 'correct'. The verdict was
+    written at the key ASKED FOR, so rejecting while level 3 played wrote a
+    rejection at 'correct@3' and left 'correct' -- the take actually
+    sounding, on level 3 and on every other level -- with its url intact.
+    The reviewer said no and the game went on playing it.
+    """
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct': {'url': 'https://node/take1.mp3', 'variant': 1}}}}}}
+
+    with _agent(agent_data, _media({'status': 'completed', 'results': []})) as tools:
+        answer = json.loads(tools['approve_game_sound'](
+            'eng-01', False, 'correct', 'too harsh', '3'))
+        still_playing = json.loads(tools['get_game_sound']('eng-01', 'correct', '3'))
+
+    assert answer['key'] == 'correct', 'the verdict missed the memo it was given'
+    sounds = agent_data[4242]['games']['eng-01']['sounds']
+    assert sounds['correct'].get('url') is None
+    assert sounds['correct']['rejected_url'] == 'https://node/take1.mp3'
+    assert 'correct@3' not in sounds, 'wrote a verdict at a key nothing lives under'
+    assert still_playing['status'] == 'unbound', 'a rejected take is still playing'
+
+
+def test_approving_while_a_level_plays_approves_the_take_that_is_playing():
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct': {'url': 'https://node/take1.mp3'}}}}}}
+
+    with _agent(agent_data, _media({'status': 'completed', 'results': []})) as tools:
+        answer = json.loads(tools['approve_game_sound'](
+            'eng-01', True, 'correct', '', '7'))
+
+    assert answer['key'] == 'correct'
+    sounds = agent_data[4242]['games']['eng-01']['sounds']
+    assert sounds['correct']['approved_at'] > 0, 'minted a level copy, left the real one unapproved'
+    assert 'correct@7' not in sounds
+
+
+def test_a_persons_correction_still_writes_in_their_own_space():
+    """The fix must not send a personal rejection into the agent's memo."""
+    agent_data = {4242: {'games': {'eng-01': {'mine': {'user-1': {
+        'correct': {'url': 'https://node/mine.mp3'}}},
+        'sounds': {'correct': {'url': 'https://node/agent.mp3',
+                               'approved_at': 1}}}}}}
+
+    with _agent(agent_data, _media({'status': 'completed', 'results': []})) as tools:
+        tools['approve_game_sound']('eng-01', False, 'correct', 'not for me', '', 'mine')
+
+    game = agent_data[4242]['games']['eng-01']
+    assert game['mine']['user-1']['correct'].get('url') is None
+    assert game['sounds']['correct']['url'] == 'https://node/agent.mp3'
+
+
+def test_the_lenient_tools_refuse_a_state_no_game_has():
+    """get/approve could write keys bind_game_sound would never make."""
+    with _agent({}, _media({'status': 'completed', 'results': []})) as tools:
+        assert 'not one of a game' in tools['get_game_sound']('eng-01', 'kerfuffle')
+        assert 'not one of a game' in tools['approve_game_sound'](
+            'eng-01', True, 'kerfuffle')
+
+
+def test_a_padded_level_is_the_same_level():
+    """' 3' and '3' must not split the memo into two compositions."""
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct@3': {'url': 'https://node/level3.mp3'}}}}}}
+
+    with _agent(agent_data, _media({'status': 'completed', 'results': []})) as tools:
+        answer = json.loads(tools['get_game_sound']('eng-01', 'correct', ' 3 '))
+
+    assert answer['music']['url'] == 'https://node/level3.mp3'

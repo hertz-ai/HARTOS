@@ -51,23 +51,7 @@ def game_state_key(state, level=None, variant=None):
     return key
 
 
-def _sounds_of(games, game_id, user_id=None):
-    """Where a game's sounds are kept: the agent's, or one user's own.
-
-    A person correcting a sound while reusing an agent must not change
-    what everybody else hears (spec §6.2), so their correction is kept
-    beside the agent's, under their id.
-    """
-    slot = (games if games is not None else {}).setdefault(str(game_id), {}) \
-        if hasattr(games, 'setdefault') else (games or {}).get(str(game_id), {})
-    if user_id in (None, ''):
-        return slot.setdefault('sounds', {}) if hasattr(slot, 'setdefault') else (slot.get('sounds') or {})
-    if hasattr(slot, 'setdefault'):
-        return slot.setdefault('mine', {}).setdefault(str(user_id), {})
-    return (slot.get('mine') or {}).get(str(user_id), {})
-
-
-def game_state_sound(games, game_id, state, level=None, user_id=None,
+def game_state_match(games, game_id, state, level=None, user_id=None,
                      own_only=False):
     """The sound memoized for a game's state, and what matched (spec §4).
 
@@ -96,20 +80,53 @@ def game_state_sound(games, game_id, state, level=None, user_id=None,
         for key in keys:
             record = sounds.get(key) or {}
             if record.get('url'):
-                return record, source
+                return record, source, key
 
     # the shape written before states existed: a game's music
     if (not own_only and state == 'bgm'
             and isinstance(slot.get('music'), dict) and slot['music'].get('url')):
-        return slot['music'], 'game'
+        return slot['music'], 'game', game_key
 
     # a composition already under way for the exact key is itself the memo,
     # so a second request joins it instead of starting another
     for sounds in (mine, agent_sounds):
         record = sounds.get(level_key) or {}
         if record.get('task_id'):
-            return record, 'composing'
-    return {}, 'miss'
+            return record, 'composing', level_key
+    return {}, 'miss', level_key
+
+
+def game_state_sound(games, game_id, state, level=None, user_id=None,
+                     own_only=False):
+    """What a game plays for this state, and what matched -- the common ask.
+
+    game_state_match answers the same question and also names the KEY it
+    matched, which a verdict needs and a lookup does not.
+    """
+    record, source, _key = game_state_match(
+        games, game_id, state, level, user_id, own_only)
+    return record, source
+
+
+def set_game_state_sound_at(games, game_id, key, record, user_id=None):
+    """Write a record at an EXACT key -- the key a lookup MATCHED.
+
+    A verdict belongs to the memo it was given (spec 6.1), which is not
+    always the key that was asked for: the ladder falls back from
+    'correct@3' to 'correct', so a reviewer rejecting while playing level 3
+    was writing a rejection at 'correct@3' while 'correct' -- the take
+    actually sounding -- kept its url and went on playing. Composing under
+    the key asked for (spec 4) is a different rule for a different path: a
+    miss that composes.
+    """
+    slot = games.setdefault(str(game_id), {})
+    if user_id in (None, ''):
+        slot.setdefault('sounds', {})[key] = record
+        if key == 'bgm' and isinstance(slot.get('music'), dict):
+            slot['music'] = record
+    else:
+        slot.setdefault('mine', {}).setdefault(str(user_id), {})[key] = record
+    return record
 
 
 def set_game_state_sound(games, game_id, state, record, level=None, user_id=None):
