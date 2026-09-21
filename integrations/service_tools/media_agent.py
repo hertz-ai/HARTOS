@@ -305,7 +305,9 @@ _UNREACHABLE_MARKERS = ('connection refused', 'connectionerror', 'timed out',
                         'actively refused', 'connection aborted',
                         'name or service not known', 'getaddrinfo',
                         # installed, but will not fit in memory this instant
-                        'cannot run right now')
+                        'cannot run right now',
+                        # installed, but its sidecar has no registered port
+                        'is not running')
 
 
 def classify_error(result) -> str:
@@ -420,8 +422,14 @@ def _generate_audio_music(context: str, input_text: str,
 
     base_url = _get_tool_base_url('acestep')
     if not base_url:
-        # Try default URL
-        base_url = 'http://localhost:8001'
+        # No pinned fallback.  Sidecar ports are assigned at start (this node
+        # put AceStep on 51168 on 2026-09-21), so dialing a literal 8001
+        # reaches nothing -- or, worse, something else that happens to be
+        # listening.  If the registry has no port, the service is not up, and
+        # saying so is the honest answer.
+        return {'status': 'error',
+                'error': 'AceStep service is not running (no port registered '
+                         'on this node).'}
 
     try:
         from core.http_pool import pooled_post
@@ -525,14 +533,21 @@ def _generate_video_ltx2(prompt: str, duration: int) -> dict:
     """Submit video generation to the LTX2 server.
 
     The base URL comes from the registry, as _generate_video_wan2gp's does.
-    It used to be the literal 'http://localhost:5002', which cannot be
+    It used to be a literal localhost:5002, which cannot be
     right: RuntimeToolManager gives every sidecar an OS-assigned port and
     learns it from the server's PORT= line (MEASURED 2026-09-21: 65523 on
     one run, 64507 on the next), so 5002 named whatever else happened to
     hold it.  The literal survives only as the fallback for a server an
-    operator started by hand with the historical default.
+    no fallback literal: dialing a port the registry does not know is
+    the same blind dial that made AceStep's music path fail against
+    8001 while its sidecar sat on 51168.  An unregistered service is
+    not running, and that is what a caller is told.
     """
-    ltx_url = _get_tool_base_url('ltx2') or 'http://localhost:5002'
+    ltx_url = _get_tool_base_url('ltx2')
+    if not ltx_url:
+        return {'status': 'error',
+                'error': 'LTX2 service is not running (no port registered '
+                         'on this node).'}
     try:
         from core.http_pool import pooled_post
         num_frames = max(49, (duration or 2) * 24 + 1)
@@ -775,19 +790,21 @@ def check_media_status(
         check_path = '/check_result'
     elif tool_prefix == 'acestep':
         base_url = _get_tool_base_url('acestep')
-        if not base_url:
-            base_url = 'http://localhost:8001'
         check_path = '/query_result'
     elif tool_prefix == 'ltx2':
-        base_url = 'http://localhost:5002'
+        base_url = _get_tool_base_url('ltx2')
         check_path = '/check_result'
     else:
         return json.dumps({'status': 'error',
                            'error': f'Unknown tool prefix: {tool_prefix}'})
 
     if not base_url:
+        # "not running", not "not available": the tool is installed, its
+        # service simply has no registered port, and a caller must not be
+        # told to install what is already here.
         return json.dumps({'status': 'error',
-                           'error': f'{tool_prefix} service not available'})
+                           'error': f'{tool_prefix} service is not running '
+                                    f'(no port registered on this node).'})
 
     try:
         from core.http_pool import pooled_post

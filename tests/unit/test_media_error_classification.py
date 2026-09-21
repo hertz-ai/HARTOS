@@ -167,3 +167,58 @@ def test_the_gate_wording_still_exists_in_the_source():
     assert "'status': 'unavailable'" in source, (
         "the modality gate no longer answers unavailable; "
         "classify_error's status allow-list needs revisiting")
+
+
+def test_installed_but_out_of_memory_is_not_an_install_offer():
+    """The gate's OTHER meaning, and the one that would misfire.
+
+    orchestrator.can_do() is "loaded OR can_load", and can_load drops any
+    model that will not fit in the memory free at that instant.  So a fully
+    installed engine reads as unavailable whenever the GPU is busy.  Reading
+    that as ABSENT would ask the owner to install what is already installed
+    -- the very defect this module's reader exists to prevent.
+    """
+    busy = {'status': 'unavailable',
+            'error': ('audio_music is installed on this node but cannot run '
+                      'right now (not enough free memory).'),
+            'modality': 'audio_music'}
+
+    assert classify_error(busy) == UNREACHABLE
+    assert classify_error(busy) != ABSENT
+
+
+def test_the_two_gate_wordings_still_exist_in_the_source():
+    import inspect
+    import integrations.service_tools.media_agent as module
+    source = inspect.getsource(module)
+    assert 'cannot run right ' in source, (
+        'the gate no longer distinguishes installed-but-busy from absent; '
+        'classify_error would send an install offer to a busy node')
+    assert 'not available on this node right now' in source
+
+
+def test_a_sidecar_with_no_registered_port_is_not_an_install_offer():
+    """Ports are assigned at start; a blind dial is not a capability check.
+
+    MEASURED 2026-09-21: this node started AceStep on port 51168 while the
+    music path dialed a literal 8001 and reported connection refused. The
+    honest answer is that the service is not running -- and it must NOT read
+    as absent, because AceStep was downloaded the whole time.
+    """
+    down = {'status': 'error',
+            'error': 'AceStep service is not running (no port registered on '
+                     'this node).'}
+
+    assert classify_error(down) == UNREACHABLE
+    assert classify_error(down) != ABSENT
+
+
+def test_no_pinned_port_survives_in_the_media_path():
+    """The rule is absolute: never pin an IP:port, derive it."""
+    import inspect
+    import integrations.service_tools.media_agent as module
+    source = inspect.getsource(module)
+    for pinned in ('http://localhost:8001', 'http://localhost:5002'):
+        assert pinned not in source, (
+            f'{pinned} is pinned again; sidecar ports are OS-assigned and '
+            f'a blind dial reaches nothing, or something else')
