@@ -448,7 +448,113 @@ Track to landed per #119.
   DIFFERENT concern wearing the same word. Check subject/object/lifecycle before
   folding — and when the answer is "do not fold", still audit the code, because
   the reason it looked like a consent store is that it gates something.*
-- **F9 two ask paths that write no row** — **PREMISE VERIFIED 2026-09-21, both
+- **F9 — IMPLEMENTED 2026-09-21, NOT YET COMMITTED** (holding for a clean
+  regression comparison; the owner asked for zero regression and the sweep
+  decides, not my confidence).
+
+  **What it turned out to be, bigger than the audit said.** Implementing half A
+  hit `IntegrityError` and exposed a defect in the SHARED writer:
+  `request_consent` files a pending row on the very
+  `UNIQUE(user_id, agent_id, consent_type, scope)` key `grant_consent` then
+  inserts on, and SQL treats only NULL as distinct — so **a per-agent consent
+  could be ASKED and then never GRANTED**. The documented workaround (revoke
+  first) cannot help: revoking UPDATES the row rather than freeing the key. That
+  is *why* `record_capability_decision` grants BLANKET — it sidesteps the wall
+  instead of hitting it.
+  Fix: `grant_consent` promotes a never-granted pending row (sets granted +
+  granted_at, clears revoked_at) **only when `agent_id` is not NULL**.
+
+  **My first version regressed a real invariant and a test caught it.**
+  Promoting unconditionally broke `test_grant_after_pending_request_appends_row`
+  — an orchestrator-reviewed semantic (`acd11f55`): with agent_id NULL the
+  pending row must REMAIN as audit history and a new granted row is appended.
+  Narrowing to non-NULL agent_id (where appending is impossible anyway) leaves
+  that invariant and its test untouched. *Lesson: when widening a shared writer,
+  scope the new branch to exactly the case the old one cannot serve.*
+
+  **Two things the tests corrected, not the reverse:**
+  - deny → accept DOES record (a denied ask never had a granted_at, so promotion
+    applies). I had assumed it could not.
+  - the real remaining limitation is narrower: **accept → revoke → accept**
+    cannot be recorded, because promoting a row that HAS a granted_at would
+    rewrite history. Pinned as current behaviour in
+    `Nunba/tests/test_agent_contact_consent_record.py` so fixing it fails loudly
+    rather than drifting. Closing it needs a schema call (a partial unique index
+    that ignores revoked rows, or an explicit re-ask row).
+
+  **Half B**: `DeviceRoutingService.request_consent` now files the canonical row
+  via `ConsentService.request_consent` before its three transport legs (FCM
+  overlay, FleetCommand, notification). NOT renamed on purpose: it has no
+  production callers, only tests, so the hazard was that the two same-named
+  functions DISAGREED (one recorded, one did not). Making them agree removes the
+  hazard; renaming would have moved it.
+
+  **Deliberately left, with its blocker named**: `_pending_contacts` stays as a
+  per-process cache of the ask PAYLOAD, documented as not-the-record. The payload
+  has no durable home — `Notification` has one `message` column and no metadata
+  field, `UserConsent` has no `reason` column — so surviving a restart needs a
+  v57 `notifications.payload_json` (or a table). Also NOT done: suppressing the
+  re-ask when a grant exists, because the live e2e
+  (`landing-page/cypress/e2e/agent-consent-e2e-live.cy.js`) re-runs the same
+  agent+user and then answers the request_id it got back; short-circuiting would
+  404 its respond call. That contract also pins 404-before-400 ordering and a
+  REPLAYABLE accept — all three now asserted in the new pytest so they are
+  checkable without a browser.
+
+  **THIRD self-correction — RETRACTED IN FULL, and the retraction is the lesson.**
+  What stood here first: the sweep went 3 failed / 247 passed / 7 errors, "HEAD
+  measured 253 passed / 1 error", therefore the regression was mine, root-caused
+  to autoflush, fixed by `no_autoflush`. **That whole attribution was wrong.**
+
+  How it fell apart. I diffed the tree I had called "HEAD, none of my changes"
+  against my own version. The only difference was the wrapper itself:
+  ```
+  -            _pending = db.query(UserConsent).filter(
+  +            with db.no_autoflush:
+  +                _pending = db.query(UserConsent).filter(
+  ```
+  The peer sweep commit `a34e6489f` (16:52) had already committed my in-flight
+  `consent_service.py`, so the "baseline at HEAD" I checked out at 17:10
+  **already contained my promotion branch**. 253/1 and 3F/247P/7E were the SAME
+  CODE. There was no measured regression and no measured fix.
+
+  **The real source of the variance: THE CONSENT SWEEP IS NOT HERMETIC.**
+  `integrations/social/models.py` reads `HEVOLVE_DB_PATH` once at import and
+  caches `DB_PATH`. Several suites assign `':memory:'` directly, while
+  `test_consent_api.py` and `test_goal_consent_gate.py` set nothing — so whichever
+  suite imports `models` first decides the DB for the whole process. When a file
+  path wins, the run writes `agent_data/hevolve_database.db`, a real 44MB file
+  (modified 17:31 during this work), and the next run starts on that state. Run
+  order, not code, produced the difference.
+  → Filed as **F19** below. It also means the pass/fail counts used while closing
+  F0 and F6 came out of the same non-hermetic sweep; both folds have independent
+  LIVE verification so their verdicts stand, but their sweep numbers support
+  nothing.
+
+  `no_autoflush` **stays, on principle, not on a measurement**: adding a read to
+  a write path does change flush timing, and guarding it costs nothing. The
+  in-code comment and commit `077b27332` both carry this retraction, so the false
+  claim cannot be re-derived from either.
+
+  **Replacement evidence (the real A/B, hermetic).** `a34e6489f^` (pre-F9) vs my
+  version, 19 suites, a FRESH pinned `HEVOLVE_DB_PATH` per arm:
+  `scratchpad/f9_hermetic_ab.sh`, results in `f9_AB_baseline.txt` /
+  `f9_AB_mine.txt`. Zero-regression is claimable only off that pair.
+
+  *Rules earned, all about evidence rather than SQLAlchemy:*
+  - *Before comparing two trees, PROVE THEY DIFFER — `git diff` them. "I checked
+    out HEAD" is not proof in a checkout other sessions commit into.*
+  - *A suite is a control only when its state is pinned. Where a module caches a
+    DB path at import, import ORDER is an input to the test, so a pass/fail count
+    across runs measures order, not code.*
+  - *I wrote "Measured" into a commit message on the strength of a comparison I
+    had not verified. That is the green-signal failure I keep a rule about,
+    committed by the one keeping the rule.*
+  - *Peers `git stash`/`stash pop` this shared checkout (seen at 17:44, reflog
+    "reset: moving to HEAD"). A file-swap A/B here can be silently reverted
+    mid-run: print the discriminating grep BEFORE AND AFTER each arm.*
+
+- **F9 original audit** — **PREMISE VERIFIED 2026-09-21, both
   files CLEAN, ready to implement. This one IS the same concern as `UserConsent`
   (unlike F8): subject = the human, object = a named agent, revocable, belongs on
   the privacy page.**
@@ -601,8 +707,55 @@ deliberate parallel path and leaving it contradicts rule 3.
 - **F8 CLOSED, NOT FOLDED** (`afe51600a`) — different concern, same word; but the
   audit found a real bypass (a private link published its target to anonymous
   callers) and a duplicate-consent bug, both fixed. See F8 above.
-- **NEXT: F9** (the two ask paths that write no row), then F7. F5 still held by
-  another session's edits.
+- **F9 IMPLEMENTED, committed local-only** (`077b27332`) — per-agent consents were
+  askable but not grantable. Pushing waits on the hermetic A/B, not on confidence.
+- **F19 OPEN, blocks honest regression claims in this area** — the consent sweep
+  is not hermetic; see below.
+- **NEXT after F9: F7**, then F4 (unheld). F5 still held by another session's edits.
+
+### F19 — the consent test sweep cannot serve as a control — **OPEN, filed 2026-09-21**
+
+Not a consent fold; a defect in the instrument every fold here is measured with,
+found by being burned by it (see F9's third self-correction).
+
+**Defect.** `integrations/social/models.py` reads `HEVOLVE_DB_PATH` once at import
+and caches `DB_PATH` at module level. Suites disagree about who sets it:
+several assign `':memory:'` directly, `tests/unit/test_consent_api.py` and
+`tests/test_goal_consent_gate.py` set nothing. In a single pytest process the
+FIRST importer of `models` therefore decides the database for every suite after
+it, and when a file path wins the run mutates `agent_data/hevolve_database.db` —
+a real 44MB checked-in-adjacent file — so the next run starts on the previous
+run's state.
+
+**Consequence.** Two runs of identical code gave 253 passed / 1 error and
+3 failed / 247 passed / 7 errors. Any before/after comparison on this sweep is
+uninterpretable, which is exactly how I came to attribute a regression, and then
+a fix, to code that was byte-identical in both arms.
+
+**Fix (small, no parallel path).** Do NOT add a second env var or a new fixture
+layer. Either (a) make `models.DB_PATH` a function/property read per call so the
+env var is honoured whenever it changes, or (b) have the two unpinned suites use
+the same `':memory:'` pin the others already use, and add one test asserting no
+suite writes `agent_data/hevolve_database.db`. (b) is the smaller blast radius and
+closes the cross-contamination; (a) is the real fix for the import-order
+sensitivity and should follow it.
+
+**Interim rule, in force now.** Any regression claim in this area runs
+`scratchpad/f9_hermetic_ab.sh`: fresh pinned `HEVOLVE_DB_PATH` per arm, the
+discriminating grep printed before AND after each arm (peers stash/pop this
+shared checkout), and both arms' raw output kept.
+
+**The general class, wider than this instance.** `fix-all-log-observed-issues`
+re-measured its own sweep against this finding and its attribution survived a
+fresh DB, because its flake has a DIFFERENT carrier: a process-wide
+`SessionGuard` 100-action cap that is never reset across suites (an in-process
+singleton). Same family — **process-global state surviving a suite boundary** —
+different instance. So fixing `DB_PATH` does not make the test tree hermetic; it
+fixes one carrier. Others to expect: module-level singletons, caches keyed at
+import, and anything read once into a module global from the environment.
+*Corollary for attribution: a same-order, same-file-set A/B with only the code
+varying still controls for the ordering effect, which is why their conclusion
+stands and mine did not — mine had no code difference between the arms at all.*
 
 **Verify each remaining fold's premise before executing it** — F11 taught that
 the plan can be wrong about which API exists. Check name, signature, and that the
