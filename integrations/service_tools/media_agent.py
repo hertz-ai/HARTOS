@@ -55,14 +55,26 @@ def _node_has_any(model_type: str) -> bool:
     not "can it run this second".  _can_do() answers the second, and a
     caller that cannot tell them apart will offer to install what is
     already here.
+
+    Asks the CATALOG, through the catalog's own public accessor.  This
+    used to reach ``get_orchestrator()._catalog``, which is the same
+    object -- the orchestrator is built with ``catalog or get_catalog()``
+    -- but borrowed it from a component that has nothing to do with the
+    question, through a private attribute the orchestrator never promised
+    to keep.  The split is clean and worth keeping that way: the catalog
+    owns "what is installed here", the orchestrator owns "what can run
+    right now", and this function only ever wanted the first.
     """
     try:
-        from integrations.service_tools.model_orchestrator import get_orchestrator
-        catalog = getattr(get_orchestrator(), '_catalog', None)
-        if catalog is None:
-            return False
-        return bool(catalog.list_by_type(model_type))
-    except Exception:
+        from integrations.service_tools.model_catalog import get_catalog
+        return bool(get_catalog().list_by_type(model_type))
+    except Exception as e:
+        # Never silent: this decides whether a caller offers an install,
+        # so "I could not tell" must be visible.  warning, not exception,
+        # because the callers sit on per-segment paths and a traceback
+        # per call would flood the log it is meant to inform.
+        logger.warning("_node_has_any(%r): catalog unreadable (%s); "
+                       "answering 'nothing installed'", model_type, e)
         return False
 
 
