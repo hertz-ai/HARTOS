@@ -380,9 +380,34 @@ Track to landed per #119.
   frames it as consent. Decide: is joining the relay a *consent* (then the store is
   `compute_contribute`/a new `hive_relay` type and `intelligence_preference` keeps
   only routing) or a *preference*? Do not fold until answered.
-- **F11 `HEVOLVE_HIVE_TRUSTED_PEERS`** — `hive_expert_discovery.py:22-23,545,564-566`;
-  its own comment says it is a stopgap "until that API ships". The API now exists
-  (`hartos_bootstrap.py:135-173`, `peer_admission`). Fold onto it.
+- **F11 `HEVOLVE_HIVE_TRUSTED_PEERS`** — **DONE + VERIFIED LIVE (`4ad2cea9e`)**.
+  **This entry's premise was wrong twice over.** `peer_admission`
+  (`hartos_bootstrap.py:135-173`) is the PeerLink device-link consent, a
+  different concern entirely — not this gate's API. And the audit found the gate
+  was not "a stopgap with a working alternative": it had THREE mechanisms for one
+  decision and **all three were dead**, so the path was inert for its whole life.
+  (1) the import was `security.key_delegation.verify_peer_attestation`, which
+  that module does not define → ImportError on every advert; (2) the fallback env
+  allowlist is unset in the field → `peer_id in set()` → no peer ever trusted;
+  (3) the producer sent `trust_signature: ''`, unacceptable to any verifier.
+  Real API: `security.origin_attestation.verify_peer_attestation`, already called
+  correctly by `federated_aggregator.py:863`. Folded onto exactly that — same
+  function, same `origin_attestation` payload key, same `(ok, reason)` contract —
+  and the advertiser publishes `get_attestation_for_federation()`'s output.
+  **Contract trap, cost me a false negative:** the producer returns
+  `{'valid','attestation'}`, the verifier takes the INNER dict, and passing the
+  wrapper fails "Origin fingerprint mismatch" *on a genuine node* — reads exactly
+  like a rejected peer. Unwrap now lives in one helper (`_origin_attestation`),
+  with a test pinning that the wrapper is refused.
+  Live (embedded 3.12, env lever unset): real attestation → expert backend
+  registers (1); forged or absent → 0. 98 tests pass across both suites, **none
+  skipped**; guard red against all three deleted mechanisms pre-fold.
+  *Lesson: a fold's premise can be wrong in the plan. Before folding onto an
+  "existing API", check it exists under that NAME with that SIGNATURE and that
+  the producer half emits what it consumes — and prove the target path works
+  before deleting the operator lever, or the fold just swaps one always-deny for
+  another and removes the only way out.*
+  *Also: a test that sets the env var itself will pass while the path is dead.*
 
 **Legitimately NOT consent stores — do not fold:** `pre_trust_contract.can_join_hive`
 (machine attestation, deliberately human-free), `tool_allowlist`,
@@ -457,7 +482,14 @@ deliberate parallel path and leaving it contradicts rule 3.
   (delete the redundant local writes).
 - **F6 DONE + VERIFIED LIVE** (`2907dae2e`) — the admin camera/screen switch
   records the owner's decision; three writers folded to one entry.
+- **F11 DONE + VERIFIED LIVE** (`4ad2cea9e`) — peer trust is one signed
+  attestation; the path went from inert to actually registering a peer's expert
+  model. Plan premise was wrong; see F11 above.
 - **F3 merged into F5**, blocked on a dirty `world_model_bridge.py` and carrying
   an owner call (hive queries opt-out → opt-in).
-- **NEXT: F11** (`HEVOLVE_HIVE_TRUSTED_PEERS` → the `peer_admission` API that now
-  exists), since F5 is still held by another session's edits. Then F8, F9, F7.
+- **NEXT: F8** (`ShareEvent(event_type='consent')` → `UserConsent` with a share
+  scope), then F9, F7. F5 still held by another session's edits.
+
+**Verify each remaining fold's premise before executing it** — F11 taught that
+the plan can be wrong about which API exists. Check name, signature, and that the
+producer emits what the consumer reads.
