@@ -224,6 +224,127 @@ def test_the_gate_reads_exactly_one_spelling():
         "trigger is the parallel path this fold removed")
 
 
+def test_a_goal_with_nobody_to_ask_is_PAUSED_with_a_reason(monkeypatch):
+    """F0b. The dead end below becomes visible state instead of a log line.
+
+    Owner decision 2026-09-21: a node with no declared owner does not run
+    consent-requiring work; it runs on the desktop where the ask reaches a
+    person. Measured on central: 45 accounts, 36 guests + 2 service accounts,
+    no human at all, so an ask there could never be filed OR answered. Refusing
+    per tick logged to a node whose logs nobody reads.
+    """
+    from security import hive_guardrails as hg
+    _quiet_other_policies(monkeypatch)
+    _patch_consent(monkeypatch, granted=False)
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
+    parked = []
+    monkeypatch.setattr(hg, '_park_goal_for_no_owner',
+                        lambda gd: parked.append(gd.get('id')) or True)
+
+    allowed, reason, _ = hg.GuardrailEnforcer.before_dispatch(
+        'p', goal_dict=dict(FLAGGED, id='g-77'), user_id=None)
+
+    assert allowed is False
+    assert 'user context' in reason
+    assert parked == ['g-77'], (
+        'the goal was refused but not parked — the daemon will re-attempt it '
+        'every tick and nobody will ever see why')
+
+
+def test_a_nameable_human_is_asked_and_the_goal_is_NOT_paused(monkeypatch):
+    """The other half, and the one that must not regress.
+
+    On a desktop HEVOLVE_OWNER_USER_ID is set at Nunba boot, so the gate can
+    ask. Parking there would be a self-inflicted outage: the goal would stop
+    instead of waiting for an answer that is actually coming.
+    """
+    from security import hive_guardrails as hg
+    _quiet_other_policies(monkeypatch)
+    req_spy = _patch_consent(monkeypatch, granted=False)
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'owner-9')
+    parked = []
+    monkeypatch.setattr(hg, '_park_goal_for_no_owner',
+                        lambda gd: parked.append(gd) or True)
+
+    allowed, reason, _ = hg.GuardrailEnforcer.before_dispatch(
+        'p', goal_dict=dict(FLAGGED, id='g-78'), user_id=None)
+
+    assert allowed is False
+    assert 'pending request filed' in reason
+    assert req_spy.call_count == 1
+    assert parked == [], 'a goal whose owner CAN be asked must not be paused'
+
+
+def test_an_unflagged_goal_is_never_parked(monkeypatch):
+    from security import hive_guardrails as hg
+    _quiet_other_policies(monkeypatch)
+    _patch_consent(monkeypatch, granted=False)
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
+    parked = []
+    monkeypatch.setattr(hg, '_park_goal_for_no_owner',
+                        lambda gd: parked.append(gd) or True)
+
+    allowed, _, _ = hg.GuardrailEnforcer.before_dispatch(
+        'p', goal_dict={'id': 'g-79', 'config_json': {}}, user_id=None)
+
+    assert allowed is True
+    assert parked == []
+
+
+def test_parking_writes_pause_reason_and_is_idempotent(monkeypatch):
+    """The writer itself, against a real row.
+
+    Pins the three things that make it safe to call from a guardrail: it uses
+    the canonical writers, it does not rewrite an already-paused goal (so a
+    different pause_reason survives and the row is not touched every tick), and
+    a failure cannot raise into the gate.
+    """
+    import types as _types
+    from security import hive_guardrails as hg
+    from integrations.social import models as social_models
+    from integrations.agent_engine import goal_manager as gm
+
+    goal = _types.SimpleNamespace(
+        id='g-80', status='active', config_json={'require_consent': True})
+    db = MagicMock()
+    db.query.return_value.filter_by.return_value.first.return_value = goal
+
+    @contextlib.contextmanager
+    def db_session(commit=False):
+        yield db
+
+    monkeypatch.setattr(social_models, 'db_session', db_session)
+    writes = {}
+    monkeypatch.setattr(gm.GoalManager, 'update_goal', staticmethod(
+        lambda d, gid, **kw: writes.update(cfg=kw.get('config_json'))
+        or {'success': True}))
+    monkeypatch.setattr(gm.GoalManager, 'update_goal_status', staticmethod(
+        lambda d, gid, st: writes.update(status=st) or {'success': True}))
+
+    assert hg._park_goal_for_no_owner({'id': 'g-80'}) is True
+    assert writes['status'] == 'paused'
+    assert 'no owner to ask' in writes['cfg']['pause_reason']
+    assert writes['cfg']['paused_at']
+    assert writes['cfg']['require_consent'] is True, \
+        'parking dropped the rest of the config'
+    assert writes['cfg'] is not goal.config_json, (
+        'config_json is a MutableDict — writing the SAME dict back makes '
+        'SQLAlchemy see no change and silently drop the write')
+
+    # already paused -> left alone, so a different reason is never overwritten
+    goal.status = 'paused'
+    writes.clear()
+    assert hg._park_goal_for_no_owner({'id': 'g-80'}) is False
+    assert writes == {}
+
+    # no id, and a raising DB: both are no-ops, never exceptions
+    assert hg._park_goal_for_no_owner({}) is False
+    monkeypatch.setattr(social_models, 'db_session',
+                        lambda commit=False: (_ for _ in ()).throw(
+                            RuntimeError('db gone')))
+    assert hg._park_goal_for_no_owner({'id': 'g-80'}) is False
+
+
 def test_gate_files_no_request_when_it_cannot_name_a_human(monkeypatch):
     """The dead end this gate has when nobody can be asked.
 
