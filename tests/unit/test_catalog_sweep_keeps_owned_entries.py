@@ -194,3 +194,58 @@ class TestTheRealPopulatorsClaimWhatTheySkip:
         for cid in present:
             assert catalog.get(cid) is not None, (
                 f'{cid} was in the catalogue and is still in ENGINE_REGISTRY')
+
+
+class TestANodeLearnsAboutModelsShippedLater:
+    """get_catalog() used to populate only `if not list_all()`, so a node
+    that had ever written a catalogue never saw a model added to the code
+    afterwards.  The owner's file was dated 2026-08-16 and was missing six
+    TTS engines the English ladder ranks 2nd through 7th.
+
+    That guard could not be removed on its own: it was the only thing
+    hiding the sweep above, and without claims a refresh DELETED models
+    (measured: one populate added 18 and removed 9).  Both halves, or
+    neither -- which is what these two cases pin.
+    """
+
+    def test_an_existing_catalogue_is_still_repopulated(self, tmp_path,
+                                                        monkeypatch):
+        import integrations.service_tools.model_catalog as mc
+        monkeypatch.setattr('core.platform_paths.get_db_dir',
+                            lambda: str(tmp_path))
+        monkeypatch.setattr(mc, '_catalog_instance', None)
+
+        seeded = mc.ModelCatalog(catalog_path=str(tmp_path / 'model_catalog.json'))
+        seeded.register(_entry('tts-espeak'), persist=True)
+        assert len(seeded.list_all()) == 1
+
+        monkeypatch.setattr(mc, '_catalog_instance', None)
+        live = mc.get_catalog()
+        assert len(live.list_all()) > 1, (
+            'a node with a non-empty catalogue must still learn about models '
+            'shipped since it was written')
+
+    def test_the_refresh_does_not_cost_the_entries_already_there(
+            self, tmp_path, monkeypatch):
+        """The whole reason the guard could not go alone."""
+        import integrations.service_tools.model_catalog as mc
+        from integrations.channels.media.tts_router import (
+            ENGINE_REGISTRY, _engine_id_to_catalog_id,
+        )
+        monkeypatch.setattr('core.platform_paths.get_db_dir',
+                            lambda: str(tmp_path))
+        path = str(tmp_path / 'model_catalog.json')
+
+        seeded = mc.ModelCatalog(catalog_path=path)
+        owned = [_engine_id_to_catalog_id(e) for e in list(ENGINE_REGISTRY)[:4]]
+        for cid in owned:
+            seeded.register(_entry(cid), persist=False)
+        seeded.register(_entry('tts-abandoned-by-everyone'), persist=True)
+
+        monkeypatch.setattr(mc, '_catalog_instance', None)
+        after = {e.id for e in mc.get_catalog().list_all()}
+
+        for cid in owned:
+            assert cid in after, f'{cid} is still owned and must survive'
+        assert 'tts-abandoned-by-everyone' not in after, (
+            'an entry no populator claims is still swept')

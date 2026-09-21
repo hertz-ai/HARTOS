@@ -1209,6 +1209,17 @@ def get_catalog() -> ModelCatalog:
         with _catalog_lock:
             if _catalog_instance is None:
                 _catalog_instance = ModelCatalog()
-                if not _catalog_instance.list_all():
-                    _catalog_instance.populate_from_subsystems()
+                # Populate EVERY time, not only when the file is empty.
+                # The old `if not list_all()` meant a node that had ever
+                # written a catalogue never learned about a model shipped
+                # afterwards: the owner's file was dated 2026-08-16 and was
+                # missing six TTS engines that the English ladder ranks 2nd
+                # through 7th.  That guard was also the only thing hiding a
+                # destructive sweep -- with no refresh, the sweep never ran --
+                # so it could not be removed until entries carried a claim
+                # (0091a0500) and every populator made one.  Measured on a
+                # copy of that live catalogue once both halves were in:
+                # 40 -> 57 entries, nothing lost, user flags intact, and a
+                # second run changes nothing.
+                _catalog_instance.populate_from_subsystems()
     return _catalog_instance

@@ -1136,7 +1136,12 @@ def populate_vlm_catalog(catalog) -> int:
     added = 0
     for (mid, name, vram, ram, disk, quality, speed, min_tier,
          backend, sup_gpu, sup_cpu, caps, tags) in vlm_models:
-        if catalog.get(mid) is not None:
+        # Claiming skip -- see ModelCatalog.already_registered.  Skipping an
+        # entry this populator still owns must not read as abandoning it:
+        # populate_from_subsystems sweeps auto-prefixed entries nobody
+        # claimed, and vlm-minicpm-v2 was OSCILLATING because of this line
+        # (added by one populate, swept by the next, added by the third).
+        if catalog.already_registered(mid):
             continue
         entry = ModelEntry(
             id=mid, name=name, model_type=ModelType.VLM,
