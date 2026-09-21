@@ -158,6 +158,28 @@ and three v56 tests — re-key keeps the gate (fed through the REAL gate),
 the embedded 3.12.6 runtime refuses all three real goal configs with a consent
 reason. This also closes task **#96** (the three goals were ungated in the field).
 
+**Live on CENTRAL too, verified 2026-09-21 10:09Z** (image `langchain_gpt:baca7523`,
+i.e. the tag IS the commit): `schema_version 56`, **0 legacy plural rows**, 241
+goals. v56 ran itself at boot on production data.
+
+**F0b — OPEN, latent, found by verifying F0 on central.** All 8 consent-gated
+goals there carry **`owner_id = NULL`** (bootstrap seeding calls
+`GoalManager.create_goal(..., created_by='system_bootstrap')` and never passes an
+owner), and central sets no `HEVOLVE_OWNER_USER_ID`. So
+`agent_daemon` passes `user_id=goal.owner_id` = None, the env fallback is empty,
+and the gate returns *"consent-flagged goal dispatched without user context"* and
+files **nothing** — blocked, with nobody asked, every tick. Exactly the
+BLOCK-without-ASK failure the owner named.
+**Latent, not active:** all 8 are `paused`, last dispatched Aug 2-30, so nothing
+is being stopped today and F0 broke nothing. It bites the moment the owner
+un-pauses any of them.
+Candidate fix (uses existing machinery, no new path): when the gate cannot name a
+human, **pause the goal with a `pause_reason`** instead of refusing silently on
+every tick — the four existing pause paths already write one, so the dead end
+becomes visible state a human can act on rather than a log line nobody reads.
+Needs the owner's answer to "who is the human for a bootstrap goal on a shared
+cloud node?" before the ASK half can work at all.
+
 Observed, NOT folded (would be scope creep; logged for the inventory): a THIRD
 `requires_consent` vocabulary exists at `security/ai_governance.py:665`
 (`_score_human_consent`, a governance scoring *context*, not a goal config).
