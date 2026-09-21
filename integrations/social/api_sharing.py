@@ -99,6 +99,23 @@ def _resource_route(resource_type, resource_id):
     return routes.get(resource_type, f'/social')
 
 
+def _viewer_has_consented(db, link_id, viewer_id):
+    """Has this viewer already accepted this private link?
+
+    ONE predicate for both the resolve path and /check-consent, which asked the
+    same question with the same query written twice.  An anonymous viewer has
+    never consented — there is no identity to record a consent against, which is
+    why /share/<token>/consent is @require_auth.
+    """
+    if not viewer_id:
+        return False
+    return db.query(ShareEvent).filter_by(
+        link_id=link_id,
+        event_type='consent',
+        viewer_id=viewer_id,
+    ).first() is not None
+
+
 # ═══════════════════════════════════════════════════════════════
 # CREATE / GET SHARE LINK
 # ═══════════════════════════════════════════════════════════════
@@ -257,14 +274,37 @@ def resolve_share_token(token):
             'share_count': link.share_count,
         }
 
-        if link.is_private:
-            # Don't include full OG data for private links until consent
+        _consented = _viewer_has_consented(
+            db, link.id, getattr(g, 'user_id', None))
+        if link.is_private and not _consented:
+            # Withhold the LOCATOR, not just the preview card.
+            #
+            # This used to hide only `og` while still returning `redirect_url`
+            # and `resource_id` for a private link — and this route is
+            # @optional_auth while /consent is @require_auth, so an anonymous
+            # caller could read the target straight out of the resolve response
+            # and open the resource without ever consenting.  The gate was
+            # decorative for anything the resource route does not independently
+            # protect.
+            #
+            # `resource_type` stays: it is the category the consent screen's own
+            # copy needs ("wants to share a post with you"), not a locator.
+            # Everything withheld here is returned by /consent once the viewer
+            # accepts, which is where ShareLandingPage reads it from anyway.
+            result.pop('redirect_url', None)
+            result.pop('resource_id', None)
             result['og'] = {
                 'title': 'Private content shared with you',
                 'description': 'You need to grant consent to view this content.',
                 'image': '',
                 'type': 'website',
             }
+        if link.is_private:
+            # An already-consented viewer is not asked again — the flag used to
+            # be `link.is_private` flat, so a returning viewer re-consented on
+            # every visit and banked a duplicate ShareEvent each time.
+            result['requires_consent'] = not _consented
+            result['already_consented'] = _consented
             # Include sharer info
             if link.created_by:
                 creator = db.query(User).filter_by(id=link.created_by).first()
@@ -348,15 +388,10 @@ def check_consent(token):
         if not link.is_private:
             return _ok({'requires_consent': False, 'is_private': False})
 
-        # Check if user already consented
-        viewer_id = getattr(g, 'user_id', None)
-        already_consented = False
-        if viewer_id:
-            already_consented = db.query(ShareEvent).filter_by(
-                link_id=link.id,
-                event_type='consent',
-                viewer_id=viewer_id,
-            ).first() is not None
+        # Same predicate the resolve path uses — the query used to be written
+        # out twice, which is how the two could have drifted apart.
+        already_consented = _viewer_has_consented(
+            db, link.id, getattr(g, 'user_id', None))
 
         # Sharer info
         shared_by = None
