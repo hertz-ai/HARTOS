@@ -123,6 +123,36 @@ def test_a_composition_still_running_is_handed_back_to_be_finished():
     assert agent_data[4242]['games']['eng-02']['music']['task_id'] == 'acestep_1'
 
 
+def test_the_reviewer_approves_the_music_the_reuser_will_hear():
+    agent_data = {4242: {'games': {'eng-01': {'music': {'url': 'https://node/m.mp3'}}}}}
+
+    with _agent(agent_data, _media({'status': 'completed', 'results': []})) as tools:
+        answer = json.loads(tools['approve_game_sound']('eng-01'))
+        after = json.loads(tools['get_game_sound']('eng-01'))
+
+    assert answer['status'] == 'approved'
+    assert agent_data[4242]['games']['eng-01']['music']['approved_at'] > 0
+    assert after['approved'] is True
+
+
+def test_a_rejected_piece_is_dropped_so_a_new_one_can_be_composed():
+    agent_data = {4242: {'games': {'eng-01': {'music': {'url': 'https://node/m.mp3'}}}}}
+    media = _media({'status': 'completed', 'results': [{'url': 'https://node/second.mp3'}]})
+
+    with _agent(agent_data, media) as tools:
+        rejected = json.loads(tools['approve_game_sound']('eng-01', False))
+        again = json.loads(tools['bind_game_sound']('eng-01'))
+
+    assert rejected['status'] == 'rejected'
+    assert again['status'] == 'bound'
+    assert again['music']['url'] == 'https://node/second.mp3'
+
+
+def test_there_is_nothing_to_approve_before_anything_is_bound():
+    with _agent({}, _media({'status': 'completed', 'results': []})) as tools:
+        assert 'nothing to approve' in tools['approve_game_sound']('eng-09')
+
+
 def test_a_game_id_is_required():
     with _agent({}, _media({'status': 'completed', 'results': []})) as tools:
         assert 'game_id' in tools['bind_game_sound']('')

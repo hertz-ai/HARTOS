@@ -1129,12 +1129,60 @@ def build_core_tool_closures(ctx):
         bound = (agent_data.get(prompt_id, {})
                  .get('games', {}).get(slot, {}).get('music') or {})
         if bound.get('url'):
-            return json.dumps({'status': 'bound', 'game_id': slot, 'music': bound})
+            return json.dumps({
+                'status': 'bound',
+                'game_id': slot,
+                'approved': bool(bound.get('approved_at')),
+                'music': bound,
+            })
         if bound.get('task_id'):
             return json.dumps({'status': 'composing', 'game_id': slot,
                                'task_id': bound['task_id']})
         return json.dumps({'status': 'unbound', 'game_id': slot,
                            'note': 'No music is bound to this game yet.'})
+
+    # ------------------------------------------------------------------
+    # approve_game_sound — the reviewer's word on a game's music
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def approve_game_sound(
+        game_id: Annotated[str, "The game whose music the reviewer just approved"],
+        approved: Annotated[bool, "True when the reviewer accepts this music, False to drop it and compose again"] = True,
+    ) -> str:
+        """Record that the reviewer approved (or rejected) a game's music.
+
+        The reviewer meets this agent in Evaluation Mode after creation and
+        hears the game's music there.  Their word is recorded on the
+        binding, so the person who reuses this agent gets the music that
+        was approved.  A rejection clears the binding, and the next
+        bind_game_sound composes a fresh one.
+        """
+        slot = str(game_id or '').strip()
+        games = agent_data.setdefault(prompt_id, {}).setdefault('games', {})
+        music = games.get(slot, {}).get('music')
+        if not music or not music.get('url'):
+            return f"No music is bound to {slot or 'that game'} yet, so there is nothing to approve."
+        if approved:
+            music['approved_at'] = time.time()
+        else:
+            games[slot]['music'] = {}
+        try:
+            helper_fun.save_agent_data_to_file(prompt_id, agent_data)
+        except Exception as e:
+            tool_logger.warning(f'approve_game_sound could not persist: {e}')
+        return json.dumps({
+            'status': 'approved' if approved else 'rejected',
+            'game_id': slot,
+            'music': games[slot].get('music') or None,
+        })
+
+    tools.append((
+        "approve_game_sound",
+        "Record the reviewer's decision on a kids game's music during review: "
+        "approved keeps it for everyone who reuses this agent, rejected drops "
+        "it so it can be composed again.",
+        approve_game_sound,
+    ))
 
     tools.append((
         "get_game_sound",
