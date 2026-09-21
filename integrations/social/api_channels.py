@@ -230,7 +230,7 @@ def generate_pair_code():
         from integrations.channels.security import PairingManager
         pm = PairingManager()
         code = pm.generate_pairing_code(
-            user_id=int(g.user_id) if g.user_id.isdigit() else hash(g.user_id) % 100000,
+            user_id=g.user_id,
             prompt_id=0,
             expiry_minutes=15,
         )
