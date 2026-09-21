@@ -314,3 +314,213 @@ def test_agent_approval_still_applies_the_feed():
     actually starting the camera."""
     body = _function_src(_hie_source(), 'agent_approval')
     assert '_apply_embodied_toggle' in body
+
+
+# ── 4. the admin settings surface: the last direct flag flipper ─────────
+# /api/agent/approval was migrated; the admin panel was not.  Its toggle set
+# embodied_ai.camera_enabled and started VisionService with NO UserConsent row,
+# so the owner could have a camera running that the privacy page did not list,
+# that nothing could revoke, and that no `consent.granted` ever announced — the
+# same defect as the approval path, on a different surface.  Unlike
+# hart_intelligence_entry, admin.api IS importable, so these drive the real
+# endpoints instead of reading source.
+
+@pytest.fixture
+def admin_ctx(monkeypatch):
+    """A request context shaped like an authenticated admin call.
+
+    _admin_auth_gate has already put the human and their session on `g` by the
+    time a view runs, which is exactly why this fold needs no env fallback and
+    no new identity source.
+    """
+    from flask import Flask, g
+    import integrations.channels.admin.api as admin_api
+
+    applied = []
+
+    class _Cfg:
+        enabled = False
+        camera_enabled = False
+        screen_capture_enabled = False
+        audio_enabled = False
+        hevolveai_url = 'http://127.0.0.1:1'
+
+        def to_dict(self):
+            return {'camera_enabled': self.camera_enabled,
+                    'screen_capture_enabled': self.screen_capture_enabled,
+                    'audio_enabled': self.audio_enabled,
+                    'enabled': self.enabled}
+
+    cfg = _Cfg()
+
+    class _Api:
+        _global_config = type('G', (), {'embodied_ai': cfg})()
+
+        def _save_config(self):
+            pass
+
+    monkeypatch.setattr(admin_api, 'get_api', lambda: _Api())
+    monkeypatch.setattr(admin_api, '_propagate_embodied_config', lambda c: None)
+    monkeypatch.setattr(admin_api, '_apply_embodied_toggle',
+                        lambda feed, on, c: applied.append((feed, on)))
+
+    app = Flask(__name__)
+
+    class _Ctx:
+        api = admin_api
+        config = cfg
+        directly_applied = applied
+
+        def toggle(self, feed, enabled, user='owner-admin'):
+            with app.test_request_context(json={'feed': feed,
+                                                'enabled': enabled}):
+                with db_session(commit=True) as db:
+                    g.db = db
+                    g.user_id = user
+                    return admin_api.toggle_embodied_feed()
+
+        def put(self, body, user='owner-admin'):
+            with app.test_request_context(json=body):
+                with db_session(commit=True) as db:
+                    g.db = db
+                    g.user_id = user
+                    return admin_api.update_embodied_config()
+
+    return _Ctx()
+
+
+def test_admin_toggle_writes_a_consent_row(admin_ctx):
+    """THE DEFECT: turning the camera on from settings left no record."""
+    from integrations.social.consent_service import ConsentService
+
+    admin_ctx.toggle('camera', True)
+
+    with db_session() as db:
+        assert ConsentService.check_consent(
+            db, 'owner-admin', 'camera_capture') is True, (
+            'the admin toggle started a camera with no consent on file — '
+            'nothing to revoke and nothing on the privacy page')
+
+
+def test_admin_toggle_off_records_a_revoke(admin_ctx):
+    from integrations.social.consent_service import ConsentService
+
+    admin_ctx.toggle('camera', True)
+    admin_ctx.toggle('camera', False)
+
+    with db_session() as db:
+        assert ConsentService.check_consent(
+            db, 'owner-admin', 'camera_capture') is False
+        assert ConsentService.declined(db, 'owner-admin', 'camera_capture') is True
+
+
+def test_admin_toggle_applies_the_feed_exactly_once(admin_ctx):
+    """One answer, one start/stop — and it must still actually happen.
+
+    Both routes end at the same _apply_embodied_toggle, which is the point of
+    the fold, so "who called it" is not observable and not the invariant. The
+    invariant is the count: zero means recording the consent replaced the
+    hardware switch (the toggle stops working), two means the endpoint applied
+    it as well as the consent path did.
+    """
+    admin_ctx.toggle('screen', True)
+    assert admin_ctx.directly_applied == [('screen', True)], (
+        'the feed was applied 0 or 2 times, not once: '
+        f'{admin_ctx.directly_applied}')
+
+
+def test_audio_records_nothing_but_is_still_applied(admin_ctx):
+    """No functionality traded for the record.
+
+    'audio' deliberately maps to no consent type (no ask producer), so nothing
+    is recorded — and the endpoint must still apply it, or folding the camera
+    onto consent would silently break the audio switch.
+    """
+    from integrations.social.models import UserConsent
+
+    admin_ctx.toggle('audio', True)
+
+    assert admin_ctx.directly_applied == [('audio', True)], (
+        'audio governs no consent, so the endpoint still owes it the direct '
+        'apply it always had')
+    with db_session() as db:
+        assert db.query(UserConsent).filter_by(user_id='owner-admin').count() == 0
+
+
+def test_all_records_both_feeds(admin_ctx):
+    from integrations.social.consent_service import ConsentService
+
+    admin_ctx.toggle('all', True)
+
+    with db_session() as db:
+        assert ConsentService.check_consent(db, 'owner-admin', 'camera_capture') is True
+        assert ConsentService.check_consent(db, 'owner-admin', 'screen_capture') is True
+
+
+def test_a_consent_write_failure_still_leaves_the_owner_their_toggle(
+        admin_ctx, monkeypatch):
+    """Fail SOFT, deliberately, and say so in the log.
+
+    A consent row that cannot be written is a bookkeeping problem; refusing the
+    owner's own switch over it would be compromising the product to look
+    secure.  The fallback is the pre-fold behaviour, unchanged.
+    """
+    from integrations.social.consent_service import ConsentService
+    monkeypatch.setattr(
+        ConsentService, 'record_capability_decision',
+        staticmethod(lambda *a, **k: (_ for _ in ()).throw(RuntimeError('db gone'))))
+
+    admin_ctx.toggle('camera', True)
+
+    assert admin_ctx.directly_applied == [('camera', True)], (
+        'a failed consent write swallowed the toggle')
+
+
+def test_put_records_only_a_changed_flag(admin_ctx):
+    """The config PUT sets the same flags, so it is the same permission.
+
+    It must record when the owner actually changes the camera, and stay a
+    no-op when a settings save merely re-sends the current value.
+    """
+    from integrations.social.models import UserConsent
+    from integrations.social.consent_service import ConsentService
+
+    # unchanged (both already False) -> nothing recorded
+    admin_ctx.put({'camera_enabled': False, 'screen_capture_enabled': False})
+    with db_session() as db:
+        assert db.query(UserConsent).filter_by(user_id='owner-admin').count() == 0
+
+    # changed -> recorded
+    admin_ctx.put({'camera_enabled': True, 'screen_capture_enabled': False})
+    with db_session() as db:
+        assert ConsentService.check_consent(
+            db, 'owner-admin', 'camera_capture') is True
+        assert ConsentService.check_consent(
+            db, 'owner-admin', 'screen_capture') is False
+
+
+def test_no_admin_path_flips_a_feed_flag_without_recording_it():
+    """Divergence guard on the surface itself.
+
+    Every place admin.api writes camera_enabled / screen_capture_enabled must
+    sit in a function that also records the decision, or a fourth quiet write
+    path has appeared.  _record_feed_consent and _embodied_feed_from_consent are
+    the only writers allowed to exist without one.
+    """
+    src = (Path(__file__).resolve().parents[2]
+           / 'integrations' / 'channels' / 'admin' / 'api.py').read_text(
+               encoding='utf-8')
+    tree = ast.parse(src)
+    lines = src.splitlines()
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        body = '\n'.join(lines[node.lineno - 1:node.end_lineno])
+        writes = re.search(
+            r'\b(camera_enabled|screen_capture_enabled)\s*=\s*(?!=)', body)
+        if writes and '_record_feed_consent' not in body:
+            offenders.append(node.name)
+    assert not offenders, (
+        f'{offenders} set an embodied feed flag without recording the '
+        "owner's decision — that is a feed running on no consent")
