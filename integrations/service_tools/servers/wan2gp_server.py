@@ -52,6 +52,13 @@ _model_dir = None
 _tasks = OrderedDict()  # task_id → {status, result, error}
 _MAX_TASKS = 100
 
+#: Why this sidecar cannot generate.  One string so the refusal, the
+#: pipeline's error and the health probe cannot drift apart.
+_UNIMPLEMENTED = (
+    'Wan2GP video generation is not implemented on this node: no adapter '
+    'to the upstream repo exists yet'
+)
+
 OUTPUT_DIR = os.path.join(Path.home(), '.hevolve', 'outputs', 'wan2gp')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -87,14 +94,20 @@ def _load_pipeline():
             import torch
             offload_mode = os.environ.get('WAN2GP_OFFLOAD', 'gpu')
 
-            # Wan2GP uses mmgp pattern for model management
-            # Actual loading depends on repo structure
+            # NOT LOADED.  Upstream Wan2GP is a Gradio app (wgp.py) with no
+            # importable pipeline and no HTTP generate API, so there is
+            # nothing here to load yet -- an adapter has to be written
+            # first.  This used to build the dict below with 'loaded': True
+            # and log "Wan2GP pipeline loaded", which is how /generate came
+            # to believe it could serve.  Reporting the truth is what lets
+            # the caller fall through to an engine that works.
+            del offload_mode
             _pipeline = {
-                'loaded': True,
+                'loaded': False,
                 'model_dir': model_dir,
-                'offload_mode': offload_mode,
+                'error': _UNIMPLEMENTED,
             }
-            logger.info(f"Wan2GP pipeline loaded (mode: {offload_mode})")
+            logger.warning("Wan2GP pipeline not loaded: %s", _UNIMPLEMENTED)
             return _pipeline
         except Exception as e:
             logger.error(f"Failed to load Wan2GP: {e}")
@@ -103,46 +116,28 @@ def _load_pipeline():
 
 
 def _generate_video_worker(task_id: str, params: dict):
-    """Background worker for video generation."""
-    try:
-        pipeline = _load_pipeline()
-        if not pipeline.get('loaded'):
-            _tasks[task_id] = {
-                'status': 'error',
-                'error': f"Pipeline not loaded: {pipeline.get('error', 'unknown')}",
-            }
-            return
+    """Kept as the single place a real Wan2GP call will land.
 
-        _tasks[task_id]['status'] = 'processing'
-
-        prompt = params.get('prompt', '')
-        num_frames = params.get('num_frames', 49)
-        width = params.get('width', 512)
-        height = params.get('height', 320)
-        steps = params.get('num_inference_steps', 25)
-
-        output_filename = f"video_{task_id}.mp4"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
-
-        # TODO: Replace with actual Wan2GP inference call once repo is cloned
-        # Placeholder: actual generation depends on Wan2GP's API
-        _tasks[task_id] = {
-            'status': 'complete',
-            'video_url': f"/video/{task_id}",
-            'output_path': output_path,
-            'params': params,
-            'message': 'Wan2GP generation placeholder — model integration pending repo clone',
-        }
-
-    except Exception as e:
-        logger.error(f"Video generation failed for task {task_id}: {e}")
-        _tasks[task_id] = {'status': 'error', 'error': str(e)}
+    It records the refusal rather than a result.  The previous body read
+    prompt / num_frames / width / height / steps, discarded all five, wrote
+    no file, and set status 'complete' with a video_url and an output_path
+    that led nowhere -- a caller polling /check_result was told its video
+    was ready.  /generate now refuses before any task is created, so this
+    runs only if something calls it directly.
+    """
+    _tasks[task_id] = {'status': 'error', 'error': _UNIMPLEMENTED}
 
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health check with VRAM stats."""
-    status = {'status': 'ok', 'service': 'wan2gp', 'pending_tasks': sum(1 for t in _tasks.values() if t.get('status') == 'pending')}
+    # `status: ok` means the sidecar answers, NOT that it can generate.
+    # Callers choosing an engine read generate_available; a probe that
+    # said only 'ok' is how a dead generator kept looking healthy.
+    status = {'status': 'ok', 'service': 'wan2gp',
+              'generate_available': False,
+              'generate_unavailable_reason': _UNIMPLEMENTED,
+              'pending_tasks': sum(1 for t in _tasks.values() if t.get('status') == 'pending')}
     try:
         import torch
         if torch.cuda.is_available():
@@ -167,14 +162,19 @@ def generate():
     while len(_tasks) >= _MAX_TASKS:
         _tasks.popitem(last=False)
 
-    task_id = str(uuid.uuid4())[:12]
-    _tasks[task_id] = {'status': 'pending'}
-
-    # Run generation in background thread
-    thread = Thread(target=_generate_video_worker, args=(task_id, data), daemon=True)
-    thread.start()
-
-    return jsonify({'task_id': task_id, 'status': 'pending'})
+    # Refuse BEFORE a task exists.  Handing back a task_id for work that
+    # cannot happen leaves the caller polling /check_result forever, and
+    # the media pipeline treats a pending task as progress.  501 is the
+    # same answer the TTS sidecar gives for an engine it does not have.
+    logger.warning("wan2gp /generate refused: %s", _UNIMPLEMENTED)
+    return jsonify({
+        'error': _UNIMPLEMENTED,
+        'detail': (
+            'Upstream Wan2GP ships wgp.py, a Gradio app with no generate '
+            'API, so this sidecar has no adapter to call. Route video '
+            'generation to ltx2, or write the adapter here.'
+        ),
+    }), 501
 
 
 @app.route('/check_result', methods=['POST'])

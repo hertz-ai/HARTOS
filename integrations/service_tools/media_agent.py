@@ -445,9 +445,19 @@ def _generate_video(context: str, input_text: str,
             tool = 'ltx2'
 
     if tool == 'wan2gp':
-        return _generate_video_wan2gp(prompt, duration)
-    else:
-        return _generate_video_ltx2(prompt, duration)
+        result = _generate_video_wan2gp(prompt, duration)
+        if result.get('status') != 'error':
+            return result
+        # wan2gp answers /generate with 501 -- it has no adapter to the
+        # upstream repo, which ships a Gradio app and no generate API.
+        # The selector still picks it on any card with >=8 GB free, so a
+        # ladder that stopped at the first engine turned a servable
+        # request into an error.  Fall through exactly as the
+        # _ensure_tool_running failure above already does.
+        logger.warning(
+            "wan2gp video generation unavailable (%s); falling back to ltx2",
+            result.get('error'))
+    return _generate_video_ltx2(prompt, duration)
 
 
 def _generate_video_wan2gp(prompt: str, duration: int) -> dict:
