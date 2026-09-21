@@ -75,13 +75,28 @@ def test_on_spawns_as_before():
     assert r['ok'] and r['stdout'] == '4'
 
 
-def test_the_env_pin_on_wins_over_the_marker(monkeypatch):
+def test_the_env_pin_cannot_spawn_what_the_human_revoked(monkeypatch):
+    """The inverse of what this test asserted until 2026-09-21.
+
+    It was named test_the_env_pin_on_wins_over_the_marker and asserted
+    that an ON pin spawned anyway. 66386a45e deliberately removed that,
+    because an environment variable is not a person: a pin must not grant
+    the copilot a human has switched off. The behaviour flipped and this
+    test kept asserting the old contract, so main went red.
+
+    Kept rather than deleted, and kept HERE, because
+    test_copilot_env_cannot_override_revocation.py covers the PREDICATE
+    (copilot_enabled) while this file covers the SPAWN — the boundary
+    where the consequence is visible. A revoked copilot must not reach
+    subprocess at all.
+    """
     cc.set_copilot_enabled(False)
     monkeypatch.setenv('HARTOS_COPILOT_ENABLED', '1')
     with patch('subprocess.run', return_value=_fake_run()) as sr:
         r = cc.invoke_claude('q', mode='inference')
-    sr.assert_called_once()
-    assert r['ok']
+    sr.assert_not_called()
+    assert not r['ok']
+    assert r.get('category') == 'off', r
 
 
 def test_off_classifies_as_its_own_category():
