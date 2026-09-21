@@ -122,6 +122,31 @@ def _internal_auth_headers() -> Optional[Dict[str, str]]:
 _LOCAL_LLM_MAX_CONCURRENT = int(os.environ.get('HEVOLVE_LOCAL_LLM_MAX_CONCURRENT', '1'))
 _local_llm_semaphore = threading.Semaphore(_LOCAL_LLM_MAX_CONCURRENT)
 
+# How many local LLM calls hold a slot right now.  A Semaphore cannot be
+# asked its value without taking it, and taking it to look would steal the
+# slot a user's turn is about to want, so the count is kept beside it: raised
+# after a successful acquire, lowered in the same finally that releases.
+# local_dispatch_llm_busy() reads it, which is how the distributed worker can
+# ask "would a dispatch right now only defer?" before it claims anything.
+_local_llm_inflight = 0
+_local_llm_inflight_lock = threading.Lock()
+
+
+def _enter_local_llm_flight() -> None:
+    """Record that this thread now holds a local LLM slot."""
+    global _local_llm_inflight
+    with _local_llm_inflight_lock:
+        _local_llm_inflight += 1
+
+
+def _leave_local_llm_flight() -> None:
+    """Give the count back.  Never lets it fall below zero: a stray extra
+    call must not make a busy node look idle."""
+    global _local_llm_inflight
+    with _local_llm_inflight_lock:
+        if _local_llm_inflight > 0:
+            _local_llm_inflight -= 1
+
 
 # ── User-priority gate ──────────────────────────────────────────────────
 # When a human user is chatting, daemon dispatch must yield the LLM.
@@ -292,9 +317,17 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
                     f"deferring local /chat for {daemon_id or prompt_id}")
         return 'deferred', None
 
-    # Signal to the watchdog that this thread is in a legitimate LLM call.
-    _notify_watchdog_llm_start()
+    # The slot is held from here.  Count it so local_dispatch_llm_busy() can
+    # answer without touching the semaphore, and enter the try IMMEDIATELY:
+    # everything below must be inside it, because whatever raises, the
+    # finally is the only place that gives the slot back.  The watchdog
+    # notify used to sit between the acquire and the try, so a raise there
+    # leaked the semaphore permanently -- one slot, so the node's background
+    # LLM would have been wedged for the life of the process.
+    _enter_local_llm_flight()
     try:
+        # Signal to the watchdog that this thread is in a legitimate LLM call.
+        _notify_watchdog_llm_start()
         # A daemon-specific request_id keeps background thinking traces out of
         # user responses via drain_thinking_traces(), and is what
         # dispatch.is_genuine_user_request reads to classify the turn.
@@ -309,6 +342,7 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
         logger.warning(f"In-process /chat failed for {daemon_id or prompt_id}: {e}")
         return 'unavailable', None
     finally:
+        _leave_local_llm_flight()
         _local_llm_semaphore.release()
         try:
             _notify_watchdog_llm_end()
@@ -562,6 +596,30 @@ def _dispatch_provider_host(model_config) -> str:
         return provider_host(str(base_url or ''))
     except Exception:
         return ''
+
+
+def local_dispatch_llm_busy() -> bool:
+    """True when every local LLM slot is taken, so a dispatch right now would
+    only be deferred.
+
+    The fourth of local_chat_dispatch's defer conditions, and the one the
+    distributed worker could not ask: measured live 2026-09-21 on the
+    installed build, 18 claims and 18 deferrals in eight minutes, each
+    claiming a task, blocking the full five seconds of
+    ``_local_llm_semaphore.acquire(timeout=5)``, then deferring, and costing
+    the coordinator a claim, a deferral and an undeferral write.
+
+    Reads the count beside the semaphore rather than the semaphore, which
+    cannot be inspected without taking a slot a user's turn may want.  Racy
+    by nature and deliberately so: a stale False claims and defers exactly as
+    before, a stale True skips one tick.  Fail-OPEN like its three siblings
+    -- any read error answers False, "not busy" -- because a capacity check
+    must be able to skip a tick and never to wedge the worker.
+    """
+    try:
+        return _local_llm_inflight >= _LOCAL_LLM_MAX_CONCURRENT
+    except Exception:
+        return False
 
 
 def local_dispatch_provider_breaker_open(model_config=None) -> str:

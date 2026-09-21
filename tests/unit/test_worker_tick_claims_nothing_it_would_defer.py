@@ -59,6 +59,7 @@ def _tick(loop, co, led, **gates):
     """One tick with every gate pinned open unless a test closes one."""
     yield_ = gates.get('yield_', False)
     breaker_host = gates.get('breaker_host', '')
+    llm_busy = gates.get('llm_busy', False)
     adapter = gates.get('adapter', None)     # None = absent (native HARTOS)
     patches = [
         patch.object(loop, '_get_coordinator', return_value=co),
@@ -67,6 +68,8 @@ def _tick(loop, co, led, **gates):
                      return_value='user_active' if yield_ else None),
         patch.object(dispatch, 'local_dispatch_provider_breaker_open',
                      return_value=breaker_host),
+        patch.object(dispatch, 'local_dispatch_llm_busy',
+                     return_value=llm_busy),
         patch.object(dispatch, 'local_chat_dispatch',
                      return_value=('ok', 'a real answer')),
         patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
@@ -115,6 +118,18 @@ def test_an_open_provider_breaker_means_no_claim(world):
     assert saves.call_count == 0
 
 
+def test_a_busy_local_llm_means_no_claim(world):
+    """The fourth condition, added 2026-09-21: the first three shipped and
+    the churn carried on through this hole.  Measured on the installed build,
+    08:54-09:02 IST: 18 claims and 18 deferrals in eight minutes, every one
+    of them claiming a task, blocking the full five seconds of
+    _local_llm_semaphore.acquire(timeout=5) and then deferring."""
+    led, co, loop = world
+    saves = _tick(loop, co, led, llm_busy=True)
+    _untouched(led, co)
+    assert saves.call_count == 0
+
+
 def test_hartos_still_loading_means_no_claim(world):
     led, co, loop = world
     saves = _tick(loop, co, led, adapter=False)
@@ -137,6 +152,98 @@ def test_a_gate_that_cannot_be_read_never_wedges_the_worker(world):
                       side_effect=RuntimeError('signal unreadable')):
         assert DistributedWorkerLoop._dispatch_would_defer() in (
             None, 'hartos_loading')
+
+
+class TestTheSlotCountNeverLeaks:
+    """The hazard in counting slots beside a semaphore: if the count is ever
+    raised without being lowered, local_dispatch_llm_busy() answers True
+    forever, the gate above skips every tick, and the worker silently stops
+    claiming anything.  That failure looks exactly like "the daemon went
+    quiet" and would be brutal to find, so each way a turn can end has its
+    own test.  The dispatch is driven for real; only the route it calls and
+    the watchdog notify are stood in for.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _idle_to_start(self):
+        assert dispatch._local_llm_inflight == 0, 'a prior test leaked a slot'
+        yield
+        dispatch._local_llm_inflight = 0
+
+    @staticmethod
+    def _run(route, notify=lambda: None):
+        with patch.object(dispatch, '_in_process_chat', return_value=route), \
+             patch.object(dispatch, 'is_user_recently_active',
+                          return_value=False), \
+             patch.object(dispatch, 'local_dispatch_provider_breaker_open',
+                          return_value=''), \
+             patch.object(dispatch, '_notify_watchdog_llm_start',
+                          side_effect=notify), \
+             patch.object(dispatch, '_notify_watchdog_llm_end',
+                          side_effect=lambda: None):
+            return dispatch.local_chat_dispatch('p', 'u', 'a',
+                                                native_fallback=False)
+
+    @staticmethod
+    def _slot_is_free() -> bool:
+        """The semaphore itself, not the count: they must agree."""
+        if dispatch._local_llm_semaphore.acquire(blocking=False):
+            dispatch._local_llm_semaphore.release()
+            return True
+        return False
+
+    def test_a_turn_that_raises_gives_its_slot_back(self):
+        def _boom(**kw):
+            raise RuntimeError('the model died mid-turn')
+
+        assert self._run(_boom) == ('unavailable', None)
+        assert dispatch._local_llm_inflight == 0
+        assert dispatch.local_dispatch_llm_busy() is False
+        assert self._slot_is_free()
+
+    def test_a_watchdog_notify_that_raises_gives_its_slot_back(self):
+        """This one used to leak the semaphore itself: the notify sat between
+        the acquire and the try, so a raise there took the node's only local
+        LLM slot for the life of the process."""
+        def _boom():
+            raise RuntimeError('watchdog unavailable')
+
+        assert self._run(lambda **kw: {'response': 'hi'}, notify=_boom) == (
+            'unavailable', None)
+        assert dispatch._local_llm_inflight == 0
+        assert self._slot_is_free()
+
+    def test_a_turn_that_succeeds_gives_its_slot_back(self):
+        status, _ = self._run(lambda **kw: {'response': 'hi'})
+        assert status == 'ok'
+        assert dispatch._local_llm_inflight == 0
+        assert self._slot_is_free()
+
+    def test_the_count_is_raised_while_the_turn_is_in_flight(self):
+        """Otherwise it would answer False during the very window it exists
+        to describe."""
+        seen = {}
+
+        def _look(**kw):
+            seen['inflight'] = dispatch._local_llm_inflight
+            seen['busy'] = dispatch.local_dispatch_llm_busy()
+            return {'response': 'hi'}
+
+        self._run(_look)
+        assert seen['inflight'] == 1
+        assert seen['busy'] is True, (
+            'a turn holding the only slot must read as busy')
+
+    def test_the_count_never_goes_negative(self):
+        dispatch._leave_local_llm_flight()
+        assert dispatch._local_llm_inflight == 0, (
+            'a stray release must not make a busy node look idle')
+
+    def test_an_unreadable_count_reads_as_not_busy(self, monkeypatch):
+        """Fail-open, like its three siblings: a capacity check may skip a
+        tick, never wedge the worker."""
+        monkeypatch.delattr(dispatch, '_LOCAL_LLM_MAX_CONCURRENT')
+        assert dispatch.local_dispatch_llm_busy() is False
 
 
 def test_the_breaker_accessor_is_the_dispatchers_own_check():

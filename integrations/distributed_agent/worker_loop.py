@@ -353,7 +353,9 @@ class DistributedWorkerLoop:
     def _dispatch_would_defer():
         """Why a task claimed right now could only be deferred, or None.
 
-        Three reasons, each read from the component that owns it:
+        Four reasons, each read from the component that owns it, and one per
+        condition local_chat_dispatch can defer on -- the worker asks exactly
+        the questions the dispatcher answers with, never a copy of them:
           * should_yield_to_user(): the ONE gate every background daemon
             consults (a foreground request, a user active in the cooldown,
             model pressure, the governor).  The worker is a daemon and had
@@ -361,6 +363,11 @@ class DistributedWorkerLoop:
           * local_dispatch_provider_breaker_open(): the node's own LLM
             provider refusing the account, the first check
             local_chat_dispatch makes.
+          * local_dispatch_llm_busy(): every local LLM slot taken.  Added
+            2026-09-21 after the first three shipped and the churn carried
+            on through this hole: 18 claims and 18 deferrals in eight
+            minutes on the installed build, each one claiming a task,
+            blocking five seconds on the semaphore and deferring.
           * the Nunba adapter's readiness: the flag behind its
             'hartos_loading' answer.  Absent adapter (native HARTOS) means
             there is no warm-up notice to wait for.
@@ -380,6 +387,13 @@ class DistributedWorkerLoop:
             host = local_dispatch_provider_breaker_open()
             if host:
                 return f'provider breaker open ({host})'
+        except Exception:
+            pass
+        try:
+            from integrations.agent_engine.dispatch import (
+                local_dispatch_llm_busy)
+            if local_dispatch_llm_busy():
+                return 'local LLM busy'
         except Exception:
             pass
         try:
