@@ -118,13 +118,17 @@ class TestEngineSelection:
         # GPU-only Hindi engines excluded
         assert 'indic_parler' not in engine_ids
 
-    def test_always_has_espeak_fallback(self, router):
+    def test_espeak_is_the_fallback_where_espeak_exists(self, router):
+        """espeak is bundled on the shipped OS, so it is the last rung
+        there.  It is NOT unconditional: a desktop without the binary was
+        handed it anyway until 2026-09-21 (see
+        tests/unit/test_tts_engine_availability_is_the_engine.py)."""
         with patch('integrations.channels.media.tts_router._get_gpu_info',
                    return_value={'cuda_available': False}), \
              patch('integrations.channels.media.tts_router._get_compute_policy',
                    return_value={'compute_policy': 'local_only'}), \
              patch('integrations.channels.media.tts_router._is_engine_installed',
-                   return_value=False):
+                   side_effect=lambda eid: eid == 'espeak'):
             candidates = router.select_engines("Hello", language='en')
             engine_ids = [c.engine.engine_id for c in candidates]
             assert 'espeak' in engine_ids
@@ -342,6 +346,13 @@ class TestInstalledCheckHonoursTheVenv:
             return str(tmp_path / backend / 'python.exe')
 
         monkeypatch.setattr('core.venv_paths.venv_python_if_exists', _venv)
+        # The venv must also HOLD the engine: a failed install leaves the
+        # directory behind, and the worker then dies at import after the
+        # turn has already waited on its startup.
+        monkeypatch.setattr('core.venv_paths.venv_site_packages',
+                            lambda backend: str(tmp_path / backend / 'site'))
+        monkeypatch.setattr(tts_router, '_package_importable',
+                            lambda package, search_path=None: True)
         assert tts_router._is_engine_installed('f5_tts') is True
         assert seen == ['f5_tts'], "the check must ask by the engine id the spawn uses"
 
@@ -372,8 +383,8 @@ class TestFallbackChain:
     @patch('integrations.channels.media.tts_router._get_compute_policy',
            return_value={'compute_policy': 'local_only'})
     @patch('integrations.channels.media.tts_router._is_engine_installed',
-           return_value=False)
-    def test_all_engines_unavailable_still_has_espeak(self, mock_inst, mock_pol, mock_gpu, router):
+           side_effect=lambda eid: eid == 'espeak')
+    def test_all_neural_engines_unavailable_still_has_espeak(self, mock_inst, mock_pol, mock_gpu, router):
         candidates = router.select_engines("Hello", language='en')
         assert len(candidates) >= 1
         assert candidates[-1].engine.engine_id == 'espeak'
