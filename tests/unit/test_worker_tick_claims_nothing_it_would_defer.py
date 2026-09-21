@@ -154,21 +154,19 @@ def test_a_gate_that_cannot_be_read_never_wedges_the_worker(world):
             None, 'hartos_loading')
 
 
-class TestTheSlotCountNeverLeaks:
-    """The hazard in counting slots beside a semaphore: if the count is ever
-    raised without being lowered, local_dispatch_llm_busy() answers True
-    forever, the gate above skips every tick, and the worker silently stops
-    claiming anything.  That failure looks exactly like "the daemon went
-    quiet" and would be brutal to find, so each way a turn can end has its
-    own test.  The dispatch is driven for real; only the route it calls and
-    the watchdog notify are stood in for.
+class TestThePermitIsAlwaysGivenBack:
+    """Whatever ends a turn, the semaphore permit must come back.  There is
+    one permit, so a leak wedges every background LLM turn on the node for
+    the life of the process, and it looks exactly like "the daemon went
+    quiet".  Each way a turn can end has its own test.  The dispatch is
+    driven for real; only the route it calls and the watchdog notify are
+    stood in for.
     """
 
     @pytest.fixture(autouse=True)
-    def _idle_to_start(self):
-        assert dispatch._local_llm_inflight == 0, 'a prior test leaked a slot'
+    def _permit_free_to_start(self):
+        assert self._slot_is_free(), 'a prior test leaked the permit'
         yield
-        dispatch._local_llm_inflight = 0
 
     @staticmethod
     def _run(route, notify=lambda: None):
@@ -186,64 +184,110 @@ class TestTheSlotCountNeverLeaks:
 
     @staticmethod
     def _slot_is_free() -> bool:
-        """The semaphore itself, not the count: they must agree."""
         if dispatch._local_llm_semaphore.acquire(blocking=False):
             dispatch._local_llm_semaphore.release()
             return True
         return False
 
-    def test_a_turn_that_raises_gives_its_slot_back(self):
+    def test_a_turn_that_raises_gives_its_permit_back(self):
         def _boom(**kw):
             raise RuntimeError('the model died mid-turn')
 
         assert self._run(_boom) == ('unavailable', None)
-        assert dispatch._local_llm_inflight == 0
-        assert dispatch.local_dispatch_llm_busy() is False
         assert self._slot_is_free()
 
-    def test_a_watchdog_notify_that_raises_gives_its_slot_back(self):
-        """This one used to leak the semaphore itself: the notify sat between
-        the acquire and the try, so a raise there took the node's only local
-        LLM slot for the life of the process."""
+    def test_a_watchdog_notify_that_raises_gives_its_permit_back(self):
+        """This one used to leak: the notify sat between the acquire and the
+        try, so a raise there took the node's only background LLM permit for
+        the life of the process."""
         def _boom():
             raise RuntimeError('watchdog unavailable')
 
         assert self._run(lambda **kw: {'response': 'hi'}, notify=_boom) == (
             'unavailable', None)
-        assert dispatch._local_llm_inflight == 0
         assert self._slot_is_free()
 
-    def test_a_turn_that_succeeds_gives_its_slot_back(self):
+    def test_a_turn_that_succeeds_gives_its_permit_back(self):
         status, _ = self._run(lambda **kw: {'response': 'hi'})
         assert status == 'ok'
-        assert dispatch._local_llm_inflight == 0
         assert self._slot_is_free()
 
-    def test_the_count_is_raised_while_the_turn_is_in_flight(self):
-        """Otherwise it would answer False during the very window it exists
-        to describe."""
-        seen = {}
+    def test_a_busy_stretch_is_waited_out_not_refused(self, monkeypatch):
+        """The measured defect: a flat 5 s turned ordinary contention into a
+        refusal, and the coordinator paid three writes for work that only had
+        to wait.  The wait now comes from what a call really costs here (last
+        4,000 on this node: p50 890 ms, p95 4.8 s, p99 9.7 s, max 28.5 s), so
+        a turn queues through a busy stretch and only a genuinely stuck node
+        defers."""
+        assert dispatch._LOCAL_LLM_WAIT_S >= 15, (
+            'a wait under the p99 call time refuses work that would have '
+            'finished')
+        waited = {}
 
-        def _look(**kw):
-            seen['inflight'] = dispatch._local_llm_inflight
-            seen['busy'] = dispatch.local_dispatch_llm_busy()
-            return {'response': 'hi'}
+        def _slow_acquire(timeout=None):
+            waited['timeout'] = timeout
+            return False
 
-        self._run(_look)
-        assert seen['inflight'] == 1
-        assert seen['busy'] is True, (
-            'a turn holding the only slot must read as busy')
+        monkeypatch.setattr(dispatch._local_llm_semaphore, 'acquire',
+                            _slow_acquire)
+        with patch.object(dispatch, '_in_process_chat',
+                          return_value=lambda **kw: {'response': 'hi'}), \
+             patch.object(dispatch, 'is_user_recently_active',
+                          return_value=False), \
+             patch.object(dispatch, 'local_dispatch_provider_breaker_open',
+                          return_value=''):
+            assert dispatch.local_chat_dispatch(
+                'p', 'u', 'a', native_fallback=False) == ('deferred', None)
+        assert waited['timeout'] == dispatch._LOCAL_LLM_WAIT_S, (
+            'the wait must be the measured one, not a hard-coded 5')
 
-    def test_the_count_never_goes_negative(self):
-        dispatch._leave_local_llm_flight()
-        assert dispatch._local_llm_inflight == 0, (
-            'a stray release must not make a busy node look idle')
 
-    def test_an_unreadable_count_reads_as_not_busy(self, monkeypatch):
+class TestCapacityIsReadFromTheOneController:
+    """local_dispatch_llm_busy asks core.llama_scheduler, the node's single
+    admission controller for the local model, rather than keeping a private
+    tally that could drift from it or leak."""
+
+    def test_a_full_scheduler_reads_as_busy(self, monkeypatch):
+        monkeypatch.setattr('core.llama_scheduler.get_scheduler',
+                            lambda: _FakeSched(n_slots=1, in_flight=1))
+        assert dispatch.local_dispatch_llm_busy() is True
+
+    def test_a_free_slot_reads_as_not_busy(self, monkeypatch):
+        monkeypatch.setattr('core.llama_scheduler.get_scheduler',
+                            lambda: _FakeSched(n_slots=2, in_flight=1))
+        assert dispatch.local_dispatch_llm_busy() is False
+
+    def test_an_unreadable_scheduler_reads_as_not_busy(self, monkeypatch):
         """Fail-open, like its three siblings: a capacity check may skip a
         tick, never wedge the worker."""
-        monkeypatch.delattr(dispatch, '_LOCAL_LLM_MAX_CONCURRENT')
+        def _boom():
+            raise RuntimeError('scheduler unavailable')
+        monkeypatch.setattr('core.llama_scheduler.get_scheduler', _boom)
         assert dispatch.local_dispatch_llm_busy() is False
+
+    def test_it_only_reads_and_never_takes_a_slot(self, monkeypatch):
+        """Slots are keyed by a unique token, so acquiring one here would
+        consume a second slot for the same logical turn and the inner
+        transport acquire would wait out its timeout for a slot this
+        function holds."""
+        sched = _FakeSched(n_slots=1, in_flight=0)
+        monkeypatch.setattr('core.llama_scheduler.get_scheduler',
+                            lambda: sched)
+        dispatch.local_dispatch_llm_busy()
+        assert sched.acquired == 0, 'the predicate must not admit anything'
+
+
+class _FakeSched:
+    def __init__(self, n_slots, in_flight):
+        self._s = {'n_slots': n_slots, 'in_flight': in_flight}
+        self.acquired = 0
+
+    def stats(self):
+        return dict(self._s)
+
+    def acquire(self, *a, **k):
+        self.acquired += 1
+        return object()
 
 
 def test_the_breaker_accessor_is_the_dispatchers_own_check():
