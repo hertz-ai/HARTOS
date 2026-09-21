@@ -284,6 +284,31 @@ def _select_video_tool() -> str:
     return 'ltx2'
 
 
+def _unwrap_envelope(payload) -> dict:
+    """The answer itself, whether or not the sidecar wrapped it.
+
+    AceStep replies {'data': {...}, 'code': 200, 'error': None}; wan2gp and
+    the TTS suite reply flat. Reading the top level of an ENVELOPED answer
+    finds nothing and says so quietly, which is exactly how this failed:
+
+      * the submit read task_id from the envelope, got '', and produced the
+        id 'acestep_' -- so every composition was accepted, generated, and
+        then unpollable and unclaimable. MEASURED tonight: the server
+        answered 200 with a real task_id and the caller kept none of it.
+      * the poll read status from the envelope and answered 'unknown'
+        forever, so nothing ever completed.
+
+    Together they meant a node could compose perfectly and no game would
+    ever hear a note of it.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    inner = payload.get('data')
+    if isinstance(inner, dict) and ('task_id' in inner or 'status' in inner):
+        return inner
+    return payload
+
+
 def _get_tool_base_url(tool_name: str) -> Optional[str]:
     """Where a tool is actually listening, asked of both things that know.
 
@@ -504,8 +529,13 @@ def _generate_audio_music(context: str, input_text: str,
             timeout=120,
         )
         if resp.status_code == 200:
-            data = resp.json()
+            data = _unwrap_envelope(resp.json())
             task_id = data.get('task_id', '')
+            if not task_id:
+                return {'status': 'error',
+                        'error': 'AceStep accepted the job but named no task, '
+                                 'so it could never be collected.',
+                        'output_modality': 'audio_music'}
             return {
                 'status': 'pending',
                 'output_modality': 'audio_music',
@@ -901,11 +931,13 @@ def check_media_status(
             timeout=30,
         )
         if resp.status_code == 200:
-            data = resp.json()
+            data = _unwrap_envelope(resp.json())
             # Normalize response
             status = data.get('status', 'unknown')
             result_url = (data.get('video_url') or data.get('audio_url')
-                          or data.get('url') or data.get('output_url', ''))
+                          or data.get('url') or data.get('output_url')
+                          or data.get('audio_path') or data.get('file_path')
+                          or '')
             progress = data.get('progress', data.get('percentage', 0))
 
             out = {
@@ -913,7 +945,8 @@ def check_media_status(
                 'status': status,
                 'progress': progress,
             }
-            if status in ('completed', 'done', 'finished') and result_url:
+            if status in ('completed', 'complete', 'done', 'finished',
+                          'success') and result_url:
                 media_type = 'video' if tool_prefix in ('wan2gp', 'ltx2') else 'audio'
                 out['results'] = [{'type': media_type, 'url': result_url}]
             return json.dumps(out)

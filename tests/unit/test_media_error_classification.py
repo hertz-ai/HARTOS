@@ -255,3 +255,46 @@ def test_every_capability_gate_distinguishes_busy_from_absent():
         'a capability gate stopped distinguishing installed-but-busy from '
         'absent; see classify_error and the modality gate'
     )
+
+
+# ── the envelope (MEASURED against a live AceStep, 2026-09-22) ────────
+
+def test_an_enveloped_answer_is_opened():
+    """The exact body a live AceStep returned tonight.
+
+    Reading the TOP level of this finds no task_id and no status. That is
+    how every composition was accepted, generated, and then lost: the
+    submit produced the id 'acestep_' with nothing after the underscore,
+    and the poll answered 'unknown' forever. A node could compose
+    perfectly and no game would ever hear a note.
+    """
+    from integrations.service_tools.media_agent import _unwrap_envelope
+
+    live = {'data': {'task_id': 'bf6b362b-99a5-4694-b9b5-9aac486237d8',
+                     'status': 'queued', 'queue_position': 1},
+            'code': 200, 'error': None, 'timestamp': 1790017818443}
+
+    assert live.get('task_id') is None, 'the old read, for the record'
+    assert live.get('status', 'unknown') == 'unknown'
+
+    inner = _unwrap_envelope(live)
+    assert inner['task_id'] == 'bf6b362b-99a5-4694-b9b5-9aac486237d8'
+    assert inner['status'] == 'queued'
+
+
+def test_a_flat_answer_is_left_alone():
+    """wan2gp and the TTS suite answer flat; unwrapping must not break them."""
+    from integrations.service_tools.media_agent import _unwrap_envelope
+
+    flat = {'status': 'completed', 'audio_url': 'https://node/a.mp3'}
+    assert _unwrap_envelope(flat) == flat
+
+
+def test_a_data_field_that_is_not_an_envelope_is_left_alone():
+    """'data' is a common field name; only a task-shaped one is an envelope."""
+    from integrations.service_tools.media_agent import _unwrap_envelope
+
+    payload = {'status': 'completed', 'data': {'samples': 3, 'rate': 44100}}
+    assert _unwrap_envelope(payload) == payload
+    assert _unwrap_envelope({'data': 'a string'}) == {'data': 'a string'}
+    assert _unwrap_envelope(None) == {}
