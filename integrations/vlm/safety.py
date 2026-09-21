@@ -39,10 +39,79 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 logger = logging.getLogger('hevolve.vlm.safety')
+
+
+# Computer-use may receive prose in any language, but the operating-system
+# operations it can ultimately invoke have a finite, stable vocabulary.  This
+# is deliberately an always-on deny policy: consent to control a computer is
+# never consent to power it off, reset it, or erase it.
+_DESTRUCTIVE_COMMAND_RE = re.compile(
+    r'(?imx)(?:'
+    r'(?:^|[;&|]\s*)(?:cmd(?:\.exe)?\s+/c\s+|powershell(?:\.exe)?\s+[^\n]*?\s+)?'
+    r'(?:shutdown(?:\.exe)?\b|restart-computer\b|stop-computer\b|'
+    r'reboot\b|poweroff\b|halt\b|systemctl\s+(?:reboot|poweroff|halt)\b|'
+    r'init\s+[06]\b|adb\s+reboot\b|diskpart\b|mkfs(?:\.[\w-]+)?\b|'
+    r'format(?:\.com)?\s+(?:[a-z]:|/|disk\b|volume\b)|'
+    r'rm\s+-[^\n]*r[^\n]*f\s+(?:[/~]|[a-z]:[\\/]))|'
+    r'\b(?:factory[\s_-]*reset|reset[\s_-]*this[\s_-]*pc)\b)'
+)
+
+# Early refusal for plain-language requests.  The final command/action gate
+# above is authoritative and language-independent; these terms only avoid
+# handing an obviously destructive request to a GUI planner first.
+_DESTRUCTIVE_REQUEST_RE = re.compile(
+    r'(?ix)(?:'
+    r'\b(?:shutdown|shut[\s-]*down|restart|reboot|power[\s-]*off|'
+    r'hibernate|sleep)\b(?:\s+(?:the|this|my))?\s+'
+    r'(?:computer|pc|machine|device|system|windows|phone|tablet)\b|'
+    r'\b(?:computer|pc|machine|device|system|windows|phone|tablet)\b'
+    r'(?:\s+(?:should|must|can|please|now|to))*\s+'
+    r'(?:shutdown|shut[\s-]*down|restart|reboot|power[\s-]*off|hibernate|sleep)\b|'
+    r'\bfactory[\s-]*reset\b|'
+    r'\u91cd\u542f|\u5173\u673a|\u6062\u590d\u51fa\u5382\u8bbe\u7f6e|'
+    r'\u092a\u0941\u0928\u0930\u094d\u092d\u0942\u0924|\u0930\u0940\u0938\u094d\u091f\u093e\u0930\u094d\u091f|'
+    r'\u092c\u0902\u0926\s*\u0915\u0930|'
+    r'\u0440\u0435\u0436\u0438\u043c\s+\u043f\u0435\u0440\u0435\u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0438)'
+)
+
+
+def destructive_computer_operation(value) -> Optional[str]:
+    """Return a refusal reason for a power/reset/erase operation.
+
+    Accepts either a tool instruction or a concrete action dict.  Every
+    computer-use dispatcher calls this same function before it transfers
+    control, and ``execute_action`` calls it again immediately before the OS
+    action so a remote or VLM-generated action cannot bypass the policy.
+    """
+    if isinstance(value, dict):
+        parts = (value.get(key) for key in
+                 ('command', 'text', 'value', 'path', 'reasoning', 'Reasoning'))
+        text = '\n'.join(str(part) for part in parts if part)
+    else:
+        text = '' if value is None else str(value)
+    text = unicodedata.normalize('NFKC', text).casefold()
+    if _DESTRUCTIVE_COMMAND_RE.search(text):
+        return 'destructive_computer_operation: power, reset, erase, or format commands are never agent-executable'
+    if _DESTRUCTIVE_REQUEST_RE.search(text):
+        return 'destructive_computer_operation: power, reset, erase, or format requests require a human to act directly'
+    return None
+
+
+def computer_operation_refusal(value) -> Optional[str]:
+    """Shared synchronous hard-deny policy for every execution hand-off.
+
+    Semantic policy review belongs to the existing CREATE/REUSE StatusVerifier
+    conversation, where it can be attributed and attached to the action
+    ledger.  A dispatcher must never make a separate best-effort model call or
+    infer an allow because that review is unavailable.  Its synchronous job is
+    the deterministic final deny check below.
+    """
+    return destructive_computer_operation(value)
 
 
 # ─── Defaults ─────────────────────────────────────────────────────────
