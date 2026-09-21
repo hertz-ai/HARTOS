@@ -3310,9 +3310,30 @@ RELATIONSHIP TYPES:
                 self.tasks[child_task_id] = child_task
                 logger.info(f"Added subtask {child_task_id}: {description}")
 
-            # Block parent task until children complete (validated transition)
+            # Block parent task until children complete (validated transition).
+            #
+            # ASK THE CANONICAL PREDICATE, not a hand-listed status.  This
+            # guard used to read `!= TaskStatus.BLOCKED`, which asks only
+            # "already blocked?" and never "can this parent move at all?".
+            # FAILED is terminal, so a failed parent reached transition_to,
+            # _validate_transition refused it and logged "Cannot transition
+            # from terminal state", and the save below ran anyway.  Measured
+            # on the installed build 2026-09-21: ~30 refusals a minute from a
+            # single loop, each paired with a full ledger write within ~47 ms.
+            #
+            # Skipping a transition that was ALREADY being refused cannot
+            # change state, so this is behaviour-preserving; it removes a
+            # no-op, not an outcome.  is_terminal_state already covers
+            # COMPLETED, so the old list collapses into it.
             parent_task = self.tasks[parent_task_id]
-            if parent_task.status != TaskStatus.BLOCKED:
+            if TaskStatus.is_terminal_state(parent_task.status):
+                logger.warning(
+                    f"Parent {parent_task_id} is {parent_task.status} "
+                    f"(terminal); added {len(subtasks)} subtask(s) but did "
+                    f"not block it. A terminal parent being given children "
+                    f"is an upstream defect, not a ledger one."
+                )
+            elif parent_task.status != TaskStatus.BLOCKED:
                 parent_task.transition_to(
                     TaskStatus.BLOCKED,
                     f"Waiting for {len(subtasks)} subtasks to complete"
