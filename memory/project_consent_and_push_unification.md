@@ -860,9 +860,22 @@ fold that "looks trivial" in the plan text is exactly the one to check first.
   without reading what the code already decided and why.*
 - **F14** four desktop-toast emitters → one (`hart-notify.nix:92-124`,
   `shell_os_apis.py:384`, `tray_handler.py:136-146`, `indicator_window.py:108`).
-- **F15** three SMTP senders → one (`email_campaign.py:643`,
-  `email_adapter.py:264`, `mailing_list.py:286` — the last is a *prober*, keep it
-  separate but say so).
+- **F15** SMTP senders → one — **PREMISE FULLY ACCURATE 2026-09-22, all three
+  files AND line numbers correct. Prescription is also right, including its
+  caveat.** One refinement from reading them:
+  | site | what it is |
+  |---|---|
+  | `integrations/channels/email_campaign.py:643` | real sender — `smtplib.SMTP(SMTP_HOST, SMTP_PORT)`, `srv.sendmail(...)` at `:655` |
+  | `integrations/channels/extensions/email_adapter.py:264` | real sender — `aiosmtplib.SMTP(`, with a SYNC `smtplib.SMTP` fallback at `:282` |
+  | `integrations/channels/mailing_list.py:286` | **NOT a sender** — catch-all detection prober: `ehlo` / `mail` / `rcpt` and never `sendmail` |
+  So it is **two senders plus a prober**, not three senders. The adapter's
+  async+sync pair is one sender with two transports (same F12 lesson: variants for a
+  real reason are not duplication), so the fold is 2 -> 1 with the prober documented
+  as deliberately separate. The plan already said to keep the prober separate "but
+  say so", which is exactly right.
+  Care warranted regardless: this path sends to the 77,369-address list, and
+  `mailing_list.py` carries measured knowledge (`PROBE_LIARS`, provider behaviour at
+  RCPT TO) that must not be lost in a refactor.
 - **F16** `localStorage` as a push channel → an event. **PREMISE ACCURATE**
   (2026-09-22), lines are `hevolve/src/App.js:46-48`, not 56-61:
   `localStorage.setItem('agent_proactive_message', JSON.stringify(data))` with the
@@ -931,7 +944,10 @@ fold that "looks trivial" in the plan text is exactly the one to check first.
   this tier that needs no warning. Honouring it means the agent controls the button
   labels; deleting it means the overlay owns them. A design preference, not a risk.
 
-**PUSH TIER AUDIT COMPLETE except F15.** Premise accuracy across the tier:
+**PUSH TIER AUDIT COMPLETE — all seven folds checked against the code.**
+With the consent tier already audited, **every fold in this plan now has a verified
+or corrected premise.** Nothing here should be executed off the plan text alone
+again. Premise accuracy across the tier:
 | fold | premise | prescription |
 |---|---|---|
 | F12 | code right, doc reference phantom | **blocked** — needs Nunba's interceptor migrated first or `/chat` loses thinking traces |
@@ -940,7 +956,16 @@ fold that "looks trivial" in the plan text is exactly the one to check first.
 | F16 | accurate (line drift 46-48) | safe |
 | F17 | path wrong; comment says the OPPOSITE of the plan | **unsafe** — folding the allowlists leaks per-conversation chat to every SSE client |
 | F18 | **fully accurate**, verified end to end | safe, well posed |
-| F15 | NOT YET AUDITED | — |
+| F15 | **fully accurate** (3/3 files + lines) | safe, and its caveat is right |
+
+**Verdict for whoever picks this up.** Four of seven premises were accurate (F14,
+F15, F16 with line drift, F18) and three were wrong in ways that matter. Three
+prescriptions would cause harm executed literally (F12 strips `/chat` thinking
+traces, F13 puts message content on lock screens, F17 leaks per-conversation chat to
+every SSE client), and two of those are the plan MISREADING a comment that recorded
+a deliberate decision. **Execute F18 or F16 first** — both safe, both self-contained.
+F15 next (2 senders -> 1, prober left alone). F14 is safe but cross-repo. F12, F13,
+F17 need the owner or a prerequisite, and must not be done as written.
 
 ---
 
