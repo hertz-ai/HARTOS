@@ -344,11 +344,26 @@ def _copilot_switch_path():
 def copilot_enabled():
     """MAY this node use the resident Claude Code copilot (as its expert tier,
     and as an MCP client)?  Distinct from claude_code_available(), which is
-    CAN it.  HARTOS_COPILOT_ENABLED=0/1 pins it for headless installs; else
-    the marker decides."""
+    CAN it.  HARTOS_COPILOT_ENABLED pins it for headless installs, but only ever
+    in the MORE RESTRICTIVE direction: a non-on value still force-DISABLES, while
+    an ON pin may no longer override a present marker.
+
+    Why the asymmetry: the marker is how a REVOKED copilot_access consent is
+    expressed — revoke_consent -> announce_revocation ->
+    ConsentService._copilot_switch_from_consent -> set_copilot_enabled(False)
+    writes it.  An env pin that outranked the marker therefore let a revoked
+    consent keep running the copilot, and this predicate is the single gate that
+    the `claude -p` spawn (invoke_claude), claude_code_available, the MCP bridge
+    and the agent daemon all consult — so one env var silently re-enabled all
+    four against the human's answer.  An override must never grant what the human
+    withdrew; it may only take away.
+
+    Nothing is lost for headless installs: with no marker the node is ALREADY
+    enabled, so an ON pin was a no-op there by construction — its only effect was
+    the override this removes."""
     env = os.environ.get('HARTOS_COPILOT_ENABLED', '').strip().lower()
-    if env:
-        return env in ('1', 'true', 'yes', 'on')
+    if env and env not in ('1', 'true', 'yes', 'on'):
+        return False  # unchanged: an explicit non-on pin disables
     return not os.path.exists(_copilot_switch_path())
 
 
