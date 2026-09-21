@@ -85,6 +85,87 @@ def _is_already_exists_error(exc: Exception) -> bool:
     return any(s in msg for s in signals)
 
 
+def _rekey_legacy_consent_flag(engine) -> tuple:
+    """Rename `requires_consent` -> `require_consent` in agent_goals.config_json.
+
+    One spelling for the consent trigger (#96). `goal_seeding` used to emit the
+    plural at three sites while the single enforcement site
+    (`security/hive_guardrails.before_dispatch`) read the singular alone, so those
+    goals dispatched with no consent gate at all. The producers are corrected;
+    this converges rows that were already seeded, so no row loses its gate now
+    that the reader accepts only the canonical key.
+
+    DATA, not schema: no column changes, and only rows carrying the legacy key are
+    rewritten. The stored VALUE is preserved (a deliberate False stays False), and
+    where a row somehow carries both, the canonical key wins and the legacy one is
+    dropped.
+
+    IDEMPOTENT by design, and called on every migration pass rather than once
+    behind a version check -- see the call site for why that distinction cost a
+    silent gate loss. Returns (renamed, remaining) so a caller can tell "nothing
+    to do" from "tried and failed"; `remaining` is what is still on the legacy key
+    after the attempt, which is the number of goals currently running ungated.
+    """
+    import json
+    renamed = 0
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT id, config_json FROM agent_goals "
+                "WHERE config_json LIKE '%requires_consent%'")).fetchall()
+            for _id, _raw in rows:
+                if not _raw:
+                    continue
+                try:
+                    cfg = json.loads(_raw) if isinstance(
+                        _raw, (str, bytes)) else dict(_raw)
+                except (ValueError, TypeError) as pe:
+                    # Leave an unparseable row exactly as it is: a row we cannot
+                    # read is not a row we should rewrite. It is still counted in
+                    # `remaining` below, because it is still ungated.
+                    logger.warning(
+                        "consent re-key: goal %s config_json unparseable, "
+                        "left unchanged: %s", _id, pe)
+                    continue
+                if not isinstance(cfg, dict) or 'requires_consent' not in cfg:
+                    continue
+                legacy = cfg.pop('requires_consent')
+                cfg.setdefault('require_consent', legacy)
+                conn.execute(
+                    text("UPDATE agent_goals SET config_json = :c "
+                         "WHERE id = :i"),
+                    {'c': json.dumps(cfg), 'i': _id})
+                renamed += 1
+            conn.commit()
+    except Exception as e:
+        # Never wedge boot on this. But do not report success either: fall through
+        # to the count below, which is what decides whether to shout.
+        logger.warning("consent re-key failed after %d row(s): %s", renamed, e)
+
+    remaining = -1
+    try:
+        with engine.connect() as conn:
+            remaining = conn.execute(text(
+                "SELECT COUNT(*) FROM agent_goals "
+                "WHERE config_json LIKE '%requires_consent%'")).scalar() or 0
+    except Exception as e:
+        # A fresh database has no agent_goals table yet; that is not a fault.
+        logger.debug("consent re-key: could not count remaining rows: %s", e)
+        return renamed, remaining
+
+    if remaining:
+        # ERROR, not warning: each of these dispatches with no consent gate, and
+        # the whole point of v56 was that nobody notices a quiet one.
+        logger.error(
+            "consent re-key INCOMPLETE: %d goal(s) still carry the legacy "
+            "`requires_consent` key and therefore dispatch UNGATED. Re-keyed %d "
+            "this pass; will retry on next boot.", remaining, renamed)
+    elif renamed:
+        logger.info("consent re-key: %d goal(s) moved to require_consent",
+                    renamed)
+    return renamed, remaining
+
+
 def get_schema_version(engine) -> int:
     """Get current schema version from DB."""
     try:
@@ -1983,42 +2064,22 @@ def run_migrations():
         # key wins and the legacy one is dropped.
         logger.info("HevolveSocial: migrating to v56 "
                     "(agent_goals.config_json require_consent)")
-        import json
-        _renamed = 0
-        try:
-            with engine.connect() as conn:
-                rows = conn.execute(text(
-                    "SELECT id, config_json FROM agent_goals "
-                    "WHERE config_json LIKE '%requires_consent%'")).fetchall()
-                for _id, _raw in rows:
-                    if not _raw:
-                        continue
-                    try:
-                        cfg = json.loads(_raw) if isinstance(
-                            _raw, (str, bytes)) else dict(_raw)
-                    except (ValueError, TypeError) as pe:
-                        # Leave an unparseable row exactly as it is: the reader
-                        # gates on the canonical key and a row we cannot read is
-                        # not a row we should rewrite.
-                        logger.warning(
-                            "v56 migration: goal %s config_json unparseable, "
-                            "left unchanged: %s", _id, pe)
-                        continue
-                    if not isinstance(cfg, dict) or 'requires_consent' not in cfg:
-                        continue
-                    legacy = cfg.pop('requires_consent')
-                    cfg.setdefault('require_consent', legacy)
-                    conn.execute(
-                        text("UPDATE agent_goals SET config_json = :c "
-                             "WHERE id = :i"),
-                        {'c': json.dumps(cfg), 'i': _id})
-                    _renamed += 1
-                conn.commit()
-            logger.info("v56 migration: %d goal(s) re-keyed to "
-                        "require_consent", _renamed)
-        except Exception as e:
-            # A fresh DB has no agent_goals row to fix, and a failure here must
-            # not wedge boot — the gate still reads the canonical key either way.
-            logger.warning("v56 migration: config_json re-key failed "
-                           "(%d done): %s", _renamed, e)
         set_schema_version(engine, 56)
+
+    # v56's DATA repair, deliberately OUTSIDE the version gate above.
+    #
+    # It used to live inside `if current < 56:` with its exception swallowed and
+    # `set_schema_version(engine, 56)` running unconditionally afterwards. That
+    # combination is the defect: one failed pass marked the migration DONE
+    # FOREVER, and because the reader no longer accepts the plural, every row
+    # left on the legacy key dispatches with NO consent gate -- exactly the harm
+    # v56 exists to prevent. Not hypothetical on this system: the SQLite DB has
+    # held its write lock for hours (#71), and a lock during that one UPDATE was
+    # enough to lose the gate permanently and silently.
+    #
+    # Now it is an idempotent repair that runs on every migration pass. A healthy
+    # database matches zero rows, so the cost is one cheap LIKE per boot, and a
+    # transient failure simply heals on the next boot instead of being recorded
+    # as success. Kept out of the version gate on purpose: bumping the version is
+    # about SCHEMA, and this is DATA that must converge regardless of version.
+    _rekey_legacy_consent_flag(engine)

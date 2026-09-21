@@ -428,6 +428,72 @@ def _read_cfg(engine, goal_id='g-96'):
     return json.loads(raw) if isinstance(raw, (str, bytes)) else raw
 
 
+def test_a_legacy_row_is_repaired_even_when_the_version_says_v56_is_DONE(
+        tmp_path, monkeypatch):
+    """The repair must not be once-and-forget. This is the regression test.
+
+    The original v56 swallowed its exception and then bumped the schema version
+    unconditionally, so ONE failed pass recorded the migration as complete
+    forever. Since the reader accepts only the canonical key, every row left on
+    the legacy spelling then dispatches with NO consent gate -- the exact harm
+    v56 exists to prevent. Not theoretical here: this SQLite database has held
+    its write lock for hours (#71), and a lock during that single UPDATE was
+    enough to lose the gate silently and permanently.
+
+    So: stamp the database at 56 (as a node that already "migrated" would be),
+    leave a row on the legacy key, and require that a later pass still fixes it.
+    """
+    import json
+    from sqlalchemy import text
+    from integrations.social import migrations as mig
+
+    engine = _goals_db(tmp_path, {'bootstrap_slug': 'seo',
+                                  'requires_consent': True,
+                                  'enabled': True})
+    # The state a failed first pass leaves behind: version says done, row does not.
+    mig.set_schema_version(engine, 56)
+    assert mig.get_schema_version(engine) == 56
+    assert 'requires_consent' in _read_cfg(engine), 'precondition not set up'
+
+    monkeypatch.setattr(mig, 'get_engine', lambda: engine)
+    mig.run_migrations()
+
+    cfg = _read_cfg(engine)
+    assert 'requires_consent' not in cfg, (
+        'the version gate skipped the repair, so this goal keeps the legacy key '
+        'and dispatches ungated forever')
+    assert cfg.get('require_consent') is True, 'the gate value was not preserved'
+
+
+def test_the_repair_reports_rows_it_could_not_fix(tmp_path, monkeypatch):
+    """`remaining` must count still-ungated goals, so a failure can be seen.
+
+    A repair that returns nothing measurable is how the first version got away
+    with reporting success it had not achieved.
+    """
+    import json
+    from sqlalchemy import text
+    from integrations.social import migrations as mig
+
+    engine = _goals_db(tmp_path, {'requires_consent': True})
+    # A row whose config_json is not parseable JSON cannot be rewritten, and must
+    # therefore still be COUNTED -- it is ungated either way.
+    with engine.connect() as conn:
+        conn.execute(
+            text("INSERT INTO agent_goals (id, goal_type, title, status, "
+                 "config_json) VALUES ('g-bad', 'marketing', 'x', 'active', "
+                 ":c)"),
+            {'c': '{this is not json, requires_consent'})
+        conn.commit()
+
+    renamed, remaining = mig._rekey_legacy_consent_flag(engine)
+
+    assert renamed == 1, 'the parseable legacy row should have been re-keyed'
+    assert remaining == 1, (
+        'the unparseable row still carries the legacy key and is still ungated, '
+        'so it must be reported as remaining, not silently dropped')
+
+
 def test_v56_rekeys_a_legacy_row_so_it_keeps_its_gate(tmp_path, monkeypatch):
     from integrations.social import migrations as mig
     from security.hive_guardrails import GuardrailEnforcer
