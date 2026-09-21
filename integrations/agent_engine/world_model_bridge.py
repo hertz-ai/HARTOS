@@ -2,7 +2,7 @@
 Unified Agent Goal Engine - World Model Bridge
 
 Bridge between LLM-langchain orchestration and HevolveAI's embodied AI.
-Every agent interaction becomes training data for continuous learning.
+Only evidence-verified agent outcomes become response training data.
 Skills distribute via gossip notification + local RALT ingestion.
 
 Dual-mode operation:
@@ -71,6 +71,7 @@ class WorldModelBridge:
         self._lock = threading.Lock()
         self._stats = {
             'total_recorded': 0,
+            'total_unverified_skipped': 0,
             'total_flushed': 0,
             'total_corrections': 0,
             'total_hivemind_queries': 0,
@@ -686,18 +687,117 @@ class WorldModelBridge:
         except Exception as e:
             logger.debug("[WorldModelBridge] chat-learning submit skipped: %s", e)
 
+    @staticmethod
+    def _validated_training_signal(verification: dict) -> bool:
+        """Accept only evidence-backed outcomes into response training.
+
+        Conversation persistence and consented user-sensor ingestion are
+        separate concerns.  This gate owns the single invariant for the
+        agent-response replay queue, so a raw dispatcher, worker, or peer
+        cannot turn its own ``completed`` claim into a positive example.
+        """
+        if not isinstance(verification, dict):
+            return False
+        if verification.get('verified') is not True:
+            return False
+        if verification.get('source') not in {
+                'status_verifier', 'trusted_tool_receipt',
+                'human_feedback', 'backend_probe'}:
+            return False
+        if verification.get('outcome') not in {'success', 'failure'}:
+            return False
+        action_id = verification.get('action_id')
+        if action_id is None or isinstance(action_id, bool):
+            return False
+        evidence = verification.get('evidence')
+        return isinstance(evidence, dict) and bool(evidence)
+
+    @staticmethod
+    def _verification_metadata(verification: dict) -> dict:
+        """Return non-content provenance safe to export with a replay.
+
+        The full receipt stays in the local ledger.  Replay metadata carries
+        only identifiers needed to audit why training was allowed; arbitrary
+        probe/tool output must not bypass the prompt/response redactor through
+        a nested verification dictionary.
+        """
+        evidence = verification.get('evidence') or {}
+        safe_evidence = {
+            'kind': str(evidence.get('kind') or
+                        verification.get('source'))[:80],
+        }
+        for key in ('message_index', 'receipt_id', 'probe_id'):
+            value = evidence.get(key)
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                safe_evidence[key] = str(value)[:160] if isinstance(value, str) else value
+        return {
+            'verified': True,
+            'source': verification['source'],
+            'outcome': verification['outcome'],
+            'action_id': str(verification['action_id'])[:160],
+            'evidence': safe_evidence,
+        }
+
+    def _queue_training_experience(self, experience: dict) -> None:
+        """Put one verified sample on the canonical bounded replay queue."""
+        batch = []
+        with self._lock:
+            self._experience_queue.append(experience)
+            self._stats['total_recorded'] = (
+                self._stats.get('total_recorded', 0) + 1)
+            if len(self._experience_queue) >= self._flush_batch_size:
+                while (self._experience_queue and
+                       len(batch) < self._flush_batch_size):
+                    batch.append(self._experience_queue.popleft())
+        if batch:
+            self._flush_executor.submit(self._flush_to_world_model, batch)
+
+    @staticmethod
+    def _replay_messages(experience: dict) -> list:
+        """Serialize text and embodied samples through one replay contract."""
+        metadata = {
+            'source': experience.get('source', 'langchain_orchestration'),
+            'user_id': experience.get('user_id'),
+            'prompt_id': experience.get('prompt_id'),
+            'goal_id': experience.get('goal_id'),
+            'model_id': experience.get('model_id'),
+            'latency_ms': experience.get('latency_ms'),
+            'node_id': experience.get('node_id'),
+            'verification': experience.get('verification'),
+        }
+        if experience.get('type') == 'embodied_interaction':
+            metadata['source'] = 'embodied_interaction'
+            prompt = json.dumps({
+                'action': experience.get('action'),
+                'sensor_context': experience.get('sensor_context'),
+            }, default=str)[:5000]
+            response = json.dumps(
+                experience.get('outcome'), default=str)[:5000]
+        else:
+            prompt = experience['prompt']
+            response = experience['response']
+        return [
+            {'role': 'system', 'content': json.dumps(metadata)},
+            {'role': 'user', 'content': prompt},
+            {'role': 'assistant', 'content': response},
+        ]
+
     def record_interaction(self, user_id: str, prompt_id: str,
                            prompt: str, response: str,
                            model_id: str = None, latency_ms: float = 0,
                            node_id: str = None, goal_id: str = None,
                            attribution_chain: dict = None,
-                           escalation_reason: str = None):
-        """Record every agent interaction as training data for HevolveAI.
+                           escalation_reason: str = None,
+                           verification: dict = None,
+                           persist_conversation: bool = True,
+                           ingest_user_utterance: bool = True):
+        """Persist an interaction and train only from a verified outcome.
 
-        Called after EVERY /chat response.  Batches experiences and flushes
-        them to HevolveAI (in-process or HTTP).
-        HevolveAI auto-learns from every completion (3-priority queue:
-        expert > reality > distillation).
+        Callers may invoke this after every response because conversation
+        history and the consented user utterance sensor remain useful.  The
+        assistant response enters HevolveAI's replay queue only when
+        ``verification`` proves the outcome through the canonical verifier,
+        a trusted receipt/probe, or explicit human feedback.
 
         ``escalation_reason`` (optional) — when the speculative dispatcher
         promoted this turn from draft to expert path, the canonical
@@ -746,6 +846,9 @@ class WorldModelBridge:
             experience['attribution_chain'] = attribution_chain
         if escalation_reason:
             experience['escalation_reason'] = escalation_reason
+        if self._validated_training_signal(verification):
+            experience['verification'] = self._verification_metadata(
+                verification)
 
         # PRIVACY: Redact secrets + anonymize user before shared ingestion.
         # The hive must NEVER leak secrets from one user to another.
@@ -755,16 +858,14 @@ class WorldModelBridge:
         except ImportError:
             logger.warning("[WorldModelBridge] secret_redactor unavailable; experience NOT redacted before ingestion")
 
-        self._experience_queue.append(experience)
-        with self._lock:
-            self._stats['total_recorded'] += 1
-
         # [C277] The user's words go to the WORLD MODEL too, not only to the
-        # distillation queue above: as a text sensor reading through the same
+        # verified distillation queue: as a text sensor reading through the same
         # ingest_sensor_batch mouth the mic uses (whisper_tool posts audio +
         # transcript), under the same consent. The redacted prompt, never the
         # raw one. Best-effort on the flush executor; never blocks /chat.
-        self._ingest_user_utterance(str(user_id), experience.get('prompt') or '')
+        if ingest_user_utterance:
+            self._ingest_user_utterance(
+                str(user_id), experience.get('prompt') or '')
 
         # Durable local write: append the user↔assistant pair to
         # ConversationEntry so FULL_HISTORY and the channel unified
@@ -774,24 +875,29 @@ class WorldModelBridge:
         # process exit. Now chat history survives restarts even without
         # a hive connection. Failures here must not break the learning
         # path — wrap in try/except and log at debug level.
-        try:
-            self._persist_to_conversation_entry(
-                user_id=str(user_id), prompt_id=str(prompt_id),
-                prompt=prompt, response=response,
-                model_id=model_id or 'unknown',
-            )
-        except Exception as e:
-            logger.debug(f"ConversationEntry durable write skipped: {e}")
+        if persist_conversation:
+            try:
+                self._persist_to_conversation_entry(
+                    user_id=str(user_id), prompt_id=str(prompt_id),
+                    prompt=prompt, response=response,
+                    model_id=model_id or 'unknown',
+                )
+            except Exception as e:
+                logger.debug(f"ConversationEntry durable write skipped: {e}")
 
-        if len(self._experience_queue) >= self._flush_batch_size:
-            batch = []
-            while self._experience_queue and len(batch) < self._flush_batch_size:
-                try:
-                    batch.append(self._experience_queue.popleft())
-                except IndexError:
-                    break
-            if batch:
-                self._flush_executor.submit(self._flush_to_world_model, batch)
+        if not self._validated_training_signal(
+                experience.get('verification')):
+            with self._lock:
+                self._stats['total_unverified_skipped'] = (
+                    self._stats.get('total_unverified_skipped', 0) + 1)
+            logger.debug(
+                "[WorldModelBridge] response retained as history but skipped "
+                "for training: no canonical verification (%s/%s)",
+                user_id, prompt_id)
+            return False
+
+        self._queue_training_experience(experience)
+        return True
 
     def _persist_to_conversation_entry(
         self, user_id: str, prompt_id: str,
@@ -851,23 +957,7 @@ class WorldModelBridge:
         if self._in_process and self._provider:
             for exp in batch:
                 try:
-                    messages = [
-                        {
-                            'role': 'system',
-                            'content': json.dumps({
-                                'source': exp.get('source',
-                                                  'langchain_orchestration'),
-                                'user_id': exp.get('user_id'),
-                                'prompt_id': exp.get('prompt_id'),
-                                'goal_id': exp.get('goal_id'),
-                                'model_id': exp.get('model_id'),
-                                'latency_ms': exp.get('latency_ms'),
-                                'node_id': exp.get('node_id'),
-                            }),
-                        },
-                        {'role': 'user', 'content': exp['prompt']},
-                        {'role': 'assistant', 'content': exp['response']},
-                    ]
+                    messages = self._replay_messages(exp)
                     self._provider.create_chat_completion(
                         messages=messages,
                         model='hevolve-interaction-replay',
@@ -910,23 +1000,7 @@ class WorldModelBridge:
             try:
                 body = {
                     'model': 'hevolve-interaction-replay',
-                    'messages': [
-                        {
-                            'role': 'system',
-                            'content': json.dumps({
-                                'source': exp.get('source',
-                                                  'langchain_orchestration'),
-                                'user_id': exp.get('user_id'),
-                                'prompt_id': exp.get('prompt_id'),
-                                'goal_id': exp.get('goal_id'),
-                                'model_id': exp.get('model_id'),
-                                'latency_ms': exp.get('latency_ms'),
-                                'node_id': exp.get('node_id'),
-                            }),
-                        },
-                        {'role': 'user', 'content': exp['prompt']},
-                        {'role': 'assistant', 'content': exp['response']},
-                    ],
+                    'messages': self._replay_messages(exp),
                     'temperature': 0,
                     'max_tokens': 1,
                 }
@@ -1386,52 +1460,37 @@ class WorldModelBridge:
         except ImportError:
             logger.warning("[WorldModelBridge] secret_redactor unavailable; query NOT redacted before hivemind send")
 
-        # CONSENT GATE: external HTTP requires consent
-        if self._is_external_target() and user_id:
-            if not self._has_cloud_consent(user_id):
-                return None
-
         # PeerLink path — collect thoughts from connected peers directly
         try:
             from core.peer_link.link_manager import get_link_manager
             mgr = get_link_manager()
-            responses = mgr.collect('hivemind', timeout_ms=timeout_ms)
+            responses = mgr.collect(
+                'hivemind', timeout_ms=timeout_ms,
+                payload={
+                    'type': 'query',
+                    'query': query_text[:2000],
+                    'timeout_ms': timeout_ms,
+                })
             if responses:
                 with self._lock:
                     self._stats['total_hivemind_queries'] += 1
-                # Each peer response is a legitimate (query -> answer) pair.
-                # Feed them as training experiences so the local agent
-                # learns from cross-peer knowledge, not just transient
-                # query-response display. Deduplicated by peer_id +
-                # response-hash in record_interaction's batcher.
-                try:
-                    for idx, peer_resp in enumerate(responses):
-                        if not isinstance(peer_resp, dict):
-                            continue
-                        peer_id = (peer_resp.get('peer_id')
-                                   or peer_resp.get('node_id')
-                                   or f'peer_{idx}')
-                        peer_text = (peer_resp.get('thought')
-                                     or peer_resp.get('response')
-                                     or peer_resp.get('text'))
-                        if not peer_text:
-                            continue
-                        self.record_interaction(
-                            user_id=user_id or 'hive',
-                            prompt_id=f'peerlink_{peer_id}',
-                            prompt=query_text[:2000],
-                            response=str(peer_text)[:5000],
-                            model_id=f'peerlink:{peer_id}',
-                            latency_ms=float(timeout_ms),
-                            node_id=peer_id,
-                        )
-                    with self._lock:
-                        self._stats.setdefault('peerlink_responses_trained', 0)
-                        self._stats['peerlink_responses_trained'] += len(responses)
-                except Exception as train_err:
-                    logger.debug(
-                        f"[Bridge] Failed to feed PeerLink responses to training: {train_err}"
-                    )
+                # A peer thought is evidence that fanout answered, not evidence
+                # that the answer completed the caller's task correctly.  The
+                # outer CREATE/REUSE lifecycle will promote the final result
+                # after StatusVerifier accepts its receipt.  Recording each
+                # raw thought here duplicated the query into chat history,
+                # ingested it as a user sensor once per peer, and (after the
+                # verification gate was added) still claimed it was trained.
+                observed = sum(
+                    1 for peer_resp in responses
+                    if isinstance(peer_resp, dict) and (
+                        peer_resp.get('thought')
+                        or peer_resp.get('response')
+                        or peer_resp.get('text'))
+                )
+                with self._lock:
+                    self._stats.setdefault('peerlink_responses_observed', 0)
+                    self._stats['peerlink_responses_observed'] += observed
                 return {
                     'thoughts': responses,
                     'source': 'peerlink',
@@ -1443,6 +1502,13 @@ class WorldModelBridge:
         # HTTP fallback
         if self._http_disabled or self._cb_is_open():
             return None
+
+        # Cloud consent belongs to the cloud HTTP boundary. The PeerLink
+        # attempt above is already bounded by hive-participation consent, CCT,
+        # channel encryption/trust, and the device exclusion in collect().
+        if self._is_external_target() and user_id:
+            if not self._has_cloud_consent(user_id):
+                return None
 
         try:
             resp = pooled_post(
@@ -2215,17 +2281,26 @@ class WorldModelBridge:
         Stored as experiences in the same queue that text interactions use.
         Same latent space — the world model doesn't distinguish modalities.
         """
+        verification = outcome.get('verification') if isinstance(outcome, dict) else None
+        if not self._validated_training_signal(verification):
+            with self._lock:
+                self._stats['total_unverified_skipped'] = (
+                    self._stats.get('total_unverified_skipped', 0) + 1)
+            return False
+        verification_metadata = self._verification_metadata(verification)
+        safe_outcome = dict(outcome)
+        safe_outcome['verification'] = verification_metadata
         experience = {
             'type': 'embodied_interaction',
             'action': action,
             'sensor_context': sensor_context,
-            'outcome': outcome,
+            'outcome': safe_outcome,
             'timestamp': action.get('timestamp', 0),
             'node_tier': self._node_tier,
+            'verification': verification_metadata,
         }
-        self._experience_queue.append(experience)
-        with self._lock:
-            self._stats['total_recorded'] = self._stats.get('total_recorded', 0) + 1
+        self._queue_training_experience(experience)
+        return True
 
     def emergency_stop(self) -> bool:
         """Send zero-velocity to all actuators via HevolveAI.
@@ -2440,14 +2515,35 @@ class WorldModelBridge:
             )
             return
 
-        # Success without data or pending: record as text interaction
-        self.record_interaction(
+        # A concrete generator completion is a backend receipt.  Pending has
+        # no outcome to learn from and remains observation-only at its caller.
+        if status != 'completed':
+            return False
+        probe_id = (
+            f'output:{output_modality}:'
+            f'{int(time.time() * 1000)}:{model_used}'
+        )
+        return self.record_interaction(
             user_id=user_id,
             prompt_id=f'output_{output_modality}',
             prompt=context[:2000],
             response=f'[{output_modality} {status}] generated by {model_used} in {generation_time_seconds:.1f}s',
             model_id=model_used,
             latency_ms=generation_time_seconds * 1000,
+            verification={
+                'verified': True,
+                'source': 'backend_probe',
+                'outcome': 'success',
+                'action_id': probe_id,
+                'evidence': {
+                    'kind': 'output_generator_status',
+                    'probe_id': probe_id,
+                },
+            },
+            # Media/output callers already own user-visible history and the
+            # original request sensor. This call promotes the backend receipt.
+            persist_conversation=False,
+            ingest_user_utterance=False,
         )
 
     # ─── Federation support ───────────────────────────────────────

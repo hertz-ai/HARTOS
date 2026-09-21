@@ -57,6 +57,16 @@ CONSENT_TYPES = frozenset({
                          # room_presence_service — MUST be registered here or
                          # check_consent's _validate_consent_type rejects it and
                          # the whole T2 read/post subsystem is denied (#review).
+    'agent_contact',     # An agent the user does NOT own asks to message
+                         # them (Nunba /agents/contact, the Instagram-DM-
+                         # request shape).  Keyed per agent_id: the user is
+                         # allowing THAT agent to reach them, not all agents,
+                         # so a grant here is narrow by design.  Before this
+                         # the answer lived only in a module-level dict, so an
+                         # accept was forgotten on restart, the same agent was
+                         # re-asked forever, and a deny was equally
+                         # unrecorded — nothing to revoke and nothing on the
+                         # privacy page.
     'screen_capture',    # The desktop's own screen is captured and described
                          # for the visual agent (VisionService screen channel,
                          # #701).  The capture loop's first denied tick files
@@ -628,6 +638,59 @@ class ConsentService:
         _validate_consent_type(consent_type)
 
         now = datetime.utcnow()
+
+        # PROMOTE A NEVER-ANSWERED ASK instead of inserting beside it.
+        #
+        # request_consent files a PENDING row on the same
+        # (user_id, agent_id, consent_type, scope) key the UNIQUE constraint
+        # covers. With a non-NULL agent_id those keys do NOT stack (SQL treats
+        # only NULL as distinct), so a per-agent consent could be ASKED and then
+        # never GRANTED: the insert below raised IntegrityError, and the
+        # documented workaround — revoke first — cannot help, because revoking
+        # updates the row rather than freeing the key. That is why
+        # record_capability_decision grants BLANKET: it sidesteps this rather
+        # than hitting it. A per-agent ask (agent_contact, and any future one)
+        # needs the answer to land ON the ask.
+        #
+        # The append-only invariant is preserved exactly: promotion is allowed
+        # ONLY while granted_at IS NULL, i.e. this row has never been granted,
+        # so no granted_at is ever rewritten and no history is lost. A row that
+        # was granted before (even if since revoked) still takes the insert path
+        # and still raises, which is the documented re-grant semantics.
+        # ONLY for a non-NULL agent_id, i.e. only where appending is impossible.
+        # With agent_id NULL the keys are distinct (SQL), so the append-only
+        # semantic still holds exactly as acd11f55 specified: the pending row
+        # stays as audit history and a new granted row is inserted beside it.
+        # Narrowing it this way is what keeps that invariant — and its test —
+        # untouched while still making a per-agent ask answerable.
+        _pending = None
+        if agent_id is not None:
+            _pending = db.query(UserConsent).filter(
+                UserConsent.user_id == user_id,
+                UserConsent.agent_id == agent_id,
+                UserConsent.consent_type == consent_type,
+                UserConsent.scope == scope,
+                UserConsent.granted_at.is_(None),
+            ).first()
+        if _pending is not None:
+            _pending.granted = True
+            _pending.granted_at = now
+            _pending.revoked_at = None
+            db.flush()
+            _audit('consent', actor_id=user_id,
+                   action=f'consent.granted:{consent_type}',
+                   detail={'scope': scope, 'agent_id': agent_id,
+                           'promoted_pending_ask': True})
+            _emit('consent.granted', {
+                'user_id': user_id,
+                'consent_type': consent_type,
+                'scope': scope,
+                'agent_id': agent_id,
+            })
+            _copilot_switch_from_consent(consent_type, True)
+            _embodied_feed_from_consent(consent_type, True)
+            return _pending
+
         consent = UserConsent(
             id=str(uuid.uuid4()),
             user_id=user_id,

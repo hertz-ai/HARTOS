@@ -208,10 +208,14 @@ class PeerLinkManager:
         user = inner.get('user_id') if isinstance(inner, dict) else None
         return bool(link.user_id) and str(user) == link.user_id
 
-    def collect(self, channel: str, timeout_ms: int = 1000) -> List[dict]:
+    def collect(self, channel: str, timeout_ms: int = 1000,
+                payload: Optional[dict] = None) -> List[dict]:
         """Broadcast and collect responses from all peers.
 
-        Used by HiveMind for distributed thought fusion.
+        Used by HiveMind for distributed thought fusion. ``payload`` carries
+        the already-redacted query through the same request frame; the former
+        hard-coded ``{'type': 'query'}`` made every receiving peer reason over
+        an empty question. The default preserves existing callers.
         """
         responses = []
 
@@ -224,7 +228,7 @@ class PeerLinkManager:
             if not link.is_connected or link.kind == 'device':
                 continue
             try:
-                result = link.send(channel, {'type': 'query'},
+                result = link.send(channel, payload or {'type': 'query'},
                                   wait_response=True, timeout=timeout_s)
                 if result:
                     responses.append(result)

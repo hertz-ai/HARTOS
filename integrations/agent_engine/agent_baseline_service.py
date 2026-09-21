@@ -203,7 +203,8 @@ class AgentBaselineService:
         counted before it is actually traced.
         """
         try:
-            from integrations.agent_lightning import is_enabled, LightningStore
+            from integrations.agent_lightning import (
+                is_enabled, LightningStore, recipe_assistant_agent_ids)
             if not is_enabled():
                 return {}
 
@@ -213,25 +214,7 @@ class AgentBaselineService:
             durations: List[float] = []
             per_agent: Dict[str, Dict] = {}
             session_key = user_prompt or prompt_id
-            # REVIEW hartos-7c 2026-09-20 (codex's change): AGREED on the
-            # substance -- reading REUSE as well as CREATE, and sorting the
-            # merged reward samples before the first/second-half trend, fixes
-            # a trend that was previously computed across two newest-first
-            # stores.  Verified importable and callable on this box (returns
-            # {} with Lightning off).  Future-proofing nit, CLAUDE.md
-            # "capability-based, not name-based": this hardcodes the two
-            # instrumented agent ids, so a third traced agent is silently
-            # missed until someone edits this list -- exactly the drift your
-            # own docstring warns about.  LightningStore already owns the
-            # naming; a `LightningStore.list_agents(session_key)` (or an
-            # AGENT_ID_BUILDERS tuple beside the instrumentation sites) would
-            # let this discover them instead.  Fine to defer, but please leave
-            # the docstring's "only these two are instrumented" claim tied to
-            # something executable, or it goes stale silently.
-            agent_ids = [
-                f'create_recipe_assistant_{session_key}',
-                f'reuse_recipe_assistant_{session_key}',
-            ]
+            agent_ids = recipe_assistant_agent_ids(session_key)
 
             for agent_id in agent_ids:
                 store = LightningStore(agent_id, backend='json')

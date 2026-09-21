@@ -57,6 +57,16 @@ def _make_bridge(**env_overrides):
     return bridge
 
 
+def _verified(action_id='test-action'):
+    return {
+        'verified': True,
+        'source': 'status_verifier',
+        'outcome': 'success',
+        'action_id': action_id,
+        'evidence': {'kind': 'tool_receipt', 'message_index': 1},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Test suite
 # ---------------------------------------------------------------------------
@@ -149,11 +159,56 @@ class TestRecordInteraction(unittest.TestCase):
         self.bridge = _make_bridge(HEVOLVE_WM_FLUSH_BATCH='3')
         self.bridge._http_disabled = True
 
+    def test_unverified_response_is_history_not_training(self):
+        """SEC: Raw assistant output cannot self-promote into training."""
+        with patch.object(
+                self.bridge, '_persist_to_conversation_entry') as persist:
+            accepted = self.bridge.record_interaction(
+                'u1', 'p1', 'question', 'unverified answer')
+        self.assertFalse(accepted)
+        self.assertEqual(len(self.bridge._experience_queue), 0)
+        self.assertEqual(self.bridge._stats['total_recorded'], 0)
+        self.assertEqual(self.bridge._stats['total_unverified_skipped'], 1)
+        persist.assert_called_once()
+
+    def test_claimed_verification_from_unknown_source_is_rejected(self):
+        claimed = _verified()
+        claimed['source'] = 'assistant_self_attestation'
+        accepted = self.bridge.record_interaction(
+            'u1', 'p1', 'question', 'claimed answer',
+            verification=claimed)
+        self.assertFalse(accepted)
+        self.assertEqual(len(self.bridge._experience_queue), 0)
+
+    def test_training_only_promotion_has_no_duplicate_side_effects(self):
+        with patch.object(
+                self.bridge, '_persist_to_conversation_entry') as persist, \
+             patch.object(self.bridge, '_ingest_user_utterance') as ingest:
+            accepted = self.bridge.record_interaction(
+                'u1', 'p1', 'question', 'receipt',
+                verification=_verified(), persist_conversation=False,
+                ingest_user_utterance=False)
+        self.assertTrue(accepted)
+        persist.assert_not_called()
+        ingest.assert_not_called()
+
+    def test_verification_exports_provenance_not_receipt_content(self):
+        verification = _verified()
+        verification['evidence']['tool_output'] = 'password=do-not-export'
+        accepted = self.bridge.record_interaction(
+            'u1', 'p1', 'question', 'receipt',
+            verification=verification)
+        self.assertTrue(accepted)
+        exported = self.bridge._experience_queue[-1]['verification']
+        self.assertNotIn('tool_output', exported['evidence'])
+        self.assertEqual(exported['evidence']['kind'], 'tool_receipt')
+
     @patch('security.secret_redactor.redact_experience', side_effect=lambda e: e)
     @patch('integrations.agent_engine.world_model_bridge.WorldModelBridge._flush_to_world_model')
     def test_records_experience_to_queue(self, mock_flush, mock_redact):
         """FT: A single interaction is appended to the experience queue."""
-        self.bridge.record_interaction('u1', 'p1', 'hello', 'world')
+        self.bridge.record_interaction(
+            'u1', 'p1', 'hello', 'world', verification=_verified())
         self.assertEqual(len(self.bridge._experience_queue), 1)
         exp = self.bridge._experience_queue[0]
         self.assertEqual(exp['user_id'], 'u1')
@@ -165,7 +220,9 @@ class TestRecordInteraction(unittest.TestCase):
         """BND: Prompt truncated to 2000 chars, response to 5000."""
         long_prompt = 'x' * 5000
         long_response = 'y' * 10000
-        self.bridge.record_interaction('u1', 'p1', long_prompt, long_response)
+        self.bridge.record_interaction(
+            'u1', 'p1', long_prompt, long_response,
+            verification=_verified())
         exp = self.bridge._experience_queue[0]
         self.assertEqual(len(exp['prompt']), 2000)
         self.assertEqual(len(exp['response']), 5000)
@@ -174,13 +231,17 @@ class TestRecordInteraction(unittest.TestCase):
         """FT: Flush fires when queue reaches _flush_batch_size."""
         with patch.object(self.bridge._flush_executor, 'submit') as mock_submit:
             for i in range(3):
-                self.bridge.record_interaction(f'u{i}', 'p1', f'q{i}', f'a{i}')
+                self.bridge.record_interaction(
+                    f'u{i}', 'p1', f'q{i}', f'a{i}',
+                    verification=_verified(i))
             self.assertTrue(mock_submit.called)
 
     def test_stats_total_recorded_increments(self):
         """CTR: total_recorded stat increments per interaction."""
-        self.bridge.record_interaction('u1', 'p1', 'q', 'a')
-        self.bridge.record_interaction('u1', 'p1', 'q2', 'a2')
+        self.bridge.record_interaction(
+            'u1', 'p1', 'q', 'a', verification=_verified(1))
+        self.bridge.record_interaction(
+            'u1', 'p1', 'q2', 'a2', verification=_verified(2))
         self.assertEqual(self.bridge._stats['total_recorded'], 2)
 
     @patch('security.hive_guardrails.ConstitutionalFilter.check_prompt',
@@ -192,13 +253,17 @@ class TestRecordInteraction(unittest.TestCase):
 
     def test_unicode_content(self):
         """BND: Unicode prompts and responses are stored correctly."""
-        self.bridge.record_interaction('u1', 'p1', 'こんにちは世界', '你好世界🌍')
+        self.bridge.record_interaction(
+            'u1', 'p1', 'こんにちは世界', '你好世界🌍',
+            verification=_verified())
         exp = self.bridge._experience_queue[0]
         self.assertIn('こんにちは', exp['prompt'])
 
     def test_none_model_id_defaults_to_unknown(self):
         """BND: None model_id is stored as 'unknown'."""
-        self.bridge.record_interaction('u1', 'p1', 'q', 'a', model_id=None)
+        self.bridge.record_interaction(
+            'u1', 'p1', 'q', 'a', model_id=None,
+            verification=_verified())
         self.assertEqual(self.bridge._experience_queue[0]['model_id'], 'unknown')
 
     def test_lazy_in_process_retry(self):
@@ -697,12 +762,31 @@ class TestRecordEmbodiedInteraction(unittest.TestCase):
         bridge.record_embodied_interaction(
             action={'type': 'grasp'},
             sensor_context={'force': 1.2},
-            outcome={'success': True},
+            outcome={'success': True, 'verification': _verified()},
         )
         self.assertEqual(len(bridge._experience_queue), 1)
         exp = bridge._experience_queue[0]
         self.assertEqual(exp['type'], 'embodied_interaction')
         self.assertEqual(exp['action']['type'], 'grasp')
+
+    def test_verified_embodied_interaction_uses_replay_flush(self):
+        bridge = _make_bridge(HEVOLVE_WM_FLUSH_BATCH='1')
+        bridge._in_process = True
+        bridge._provider = MagicMock()
+        bridge.record_embodied_interaction(
+            action={'type': 'grasp'},
+            sensor_context={'force': 1.2},
+            outcome={'success': True, 'verification': _verified()},
+        )
+        deadline = time.time() + 2
+        while (time.time() < deadline and
+               not bridge._provider.create_chat_completion.called):
+            time.sleep(0.01)
+        bridge._provider.create_chat_completion.assert_called_once()
+        messages = bridge._provider.create_chat_completion.call_args.kwargs[
+            'messages']
+        self.assertIn('grasp', messages[1]['content'])
+        self.assertIn('success', messages[2]['content'])
 
 
 class TestFederation(unittest.TestCase):
@@ -810,7 +894,9 @@ class TestThreadSafety(unittest.TestCase):
 
         def record(i):
             try:
-                bridge.record_interaction(f'u{i}', 'p1', f'q{i}', f'a{i}')
+                bridge.record_interaction(
+                    f'u{i}', 'p1', f'q{i}', f'a{i}',
+                    verification=_verified(i))
             except Exception as e:
                 errors.append(e)
 
@@ -868,6 +954,55 @@ class TestSubmitOutputFeedback(unittest.TestCase):
                 generation_time_seconds=1.5,
             )
             mock_rec.assert_called_once()
+            kwargs = mock_rec.call_args.kwargs
+            self.assertEqual(kwargs['verification']['source'], 'backend_probe')
+            self.assertEqual(kwargs['verification']['outcome'], 'success')
+            self.assertFalse(kwargs['persist_conversation'])
+            self.assertFalse(kwargs['ingest_user_utterance'])
+
+    def test_pending_output_is_not_promoted_as_training(self):
+        bridge = _make_bridge()
+        with patch.object(bridge, 'record_interaction') as mock_rec:
+            accepted = bridge.submit_output_feedback(
+                output_modality='audio_speech', status='pending',
+                context='say hello', model_used='tts-1')
+        self.assertFalse(accepted)
+        mock_rec.assert_not_called()
+
+
+class TestPeerLinkLearningBoundary(unittest.TestCase):
+    """Peer fanout is observed now; final verified work learns later."""
+
+    def test_raw_peer_thoughts_do_not_duplicate_chat_or_claim_training(self):
+        bridge = _make_bridge()
+        manager = MagicMock()
+        manager.collect.return_value = [
+            {'peer_id': 'p1', 'thought': 'candidate one'},
+            {'peer_id': 'p2', 'response': 'candidate two'},
+            {'peer_id': 'p3'},
+        ]
+        with patch(
+                'core.peer_link.link_manager.get_link_manager',
+                return_value=manager), \
+             patch.object(bridge, '_has_hive_participation',
+                          return_value=True), \
+             patch.object(bridge, '_check_cct_access', return_value=True), \
+             patch.object(bridge, 'record_interaction') as record:
+            result = bridge.query_hivemind(
+                'how should this be solved?', user_id='u1')
+
+        self.assertEqual(result['source'], 'peerlink')
+        self.assertEqual(result['peer_count'], 3)
+        manager.collect.assert_called_once_with(
+            'hivemind', timeout_ms=1000,
+            payload={
+                'type': 'query',
+                'query': 'how should this be solved?',
+                'timeout_ms': 1000,
+            })
+        record.assert_not_called()
+        self.assertEqual(bridge._stats['peerlink_responses_observed'], 2)
+        self.assertNotIn('peerlink_responses_trained', bridge._stats)
 
 
 class TestGetLearningFeedback(unittest.TestCase):

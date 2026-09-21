@@ -446,22 +446,14 @@ class AgentAttributionOrchestrator:
                 latency_ms=(action.completed_at - action.started_at) * 1000 if action.completed_at else 0,
                 goal_id=action.goal_id,
                 attribution_chain=chain_summary,
+                verification=(action.outcome or {}).get('verification'),
+                # Attribution is internal telemetry, not another user/chat
+                # turn. Persisting or sensor-ingesting it duplicates the
+                # original interaction and treats a synthetic summary as if
+                # the user said it.
+                persist_conversation=False,
+                ingest_user_utterance=False,
             )
-        except TypeError:
-            # Older WMB without attribution_chain kwarg — fall back to
-            # packing JSON in prompt as before.
-            try:
-                bridge.record_interaction(
-                    user_id=action.agent_id,
-                    prompt_id=action.action_id,
-                    prompt=json.dumps(chain_summary, default=str)[:2000],
-                    response=json.dumps(action.outcome or {}, default=str)[:5000],
-                    model_id=f'{action.agent_id}:{action.action_type}',
-                    latency_ms=(action.completed_at - action.started_at) * 1000 if action.completed_at else 0,
-                    goal_id=action.goal_id,
-                )
-            except Exception as exc:
-                logger.debug("record_interaction fallback failed: %s", exc)
         except Exception as exc:
             logger.debug("record_interaction failed: %s", exc)
 

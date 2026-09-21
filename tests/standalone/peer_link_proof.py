@@ -55,6 +55,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -140,10 +141,15 @@ def _http_json(url: str, timeout: float = 5.0):
         return json.loads(resp.read().decode('utf-8'))
 
 
-def _wait_for_server(port: int, deadline: float = 60.0):
+def _wait_for_server(port: int, deadline: float = 60.0, child=None):
     start = time.time()
     last = None
     while time.time() - start < deadline:
+        if child is not None and child.poll() is not None:
+            tail = '\n'.join(getattr(child, '_proof_output_tail', [])[-40:])
+            raise RuntimeError(
+                f'server exited with code {child.returncode} before binding '
+                f'port {port}:\n{tail}')
         try:
             return _http_json(f'http://127.0.0.1:{port}/proof/identity', 2.0)
         except Exception as exc:
@@ -159,6 +165,32 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _spawn_server(port: int, env: dict):
+    """Start a proof node while continuously draining its output pipe.
+
+    Windows pipe buffers are small enough that verbose imports can fill one
+    before Hypercorn binds. The old proof waited for HTTP while nobody read
+    stdout, so the child blocked forever and the live proof falsely reported a
+    server timeout. Keep a bounded tail for diagnostics and drain concurrently.
+    """
+    child = subprocess.Popen(
+        [sys.executable, __file__, '--serve', '--port', str(port)],
+        env=env, cwd=str(_REPO), stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True)
+    output_tail = []
+
+    def _drain():
+        for line in child.stdout or ():
+            output_tail.append(line.rstrip())
+            if len(output_tail) > 500:
+                del output_tail[:100]
+
+    threading.Thread(
+        target=_drain, name=f'peer-proof-output-{port}', daemon=True).start()
+    child._proof_output_tail = output_tail
+    return child
+
+
 def drive() -> int:
     port = _free_port()
 
@@ -170,14 +202,11 @@ def drive() -> int:
     env['PYTHONPATH'] = str(_REPO) + os.pathsep + env.get('PYTHONPATH', '')
     env.pop('HEVOLVE_ENFORCEMENT_MODE', None)
 
-    child = subprocess.Popen(
-        [sys.executable, __file__, '--serve', '--port', str(port)],
-        env=env, cwd=str(_REPO),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    child = _spawn_server(port, env)
 
     failures = []
     try:
-        ident = _wait_for_server(port)
+        ident = _wait_for_server(port, child=child)
         server_node_id = ident['node_id']
         print(f'[1] server up on {port}, node_id={server_node_id[:8]}')
 
@@ -311,13 +340,10 @@ def _prove_same_user_and_skill_broadcast() -> list:
     env['PYTHONPATH'] = str(_REPO) + os.pathsep + env.get('PYTHONPATH', '')
     env.pop('HEVOLVE_ENFORCEMENT_MODE', None)
 
-    child = subprocess.Popen(
-        [sys.executable, __file__, '--serve', '--port', str(port)],
-        env=env, cwd=str(_REPO),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    child = _spawn_server(port, env)
 
     try:
-        ident = _wait_for_server(port)
+        ident = _wait_for_server(port, child=child)
         node_id = ident['node_id']
 
         # Our half of "same user". The handshake signs this string; the far
@@ -389,8 +415,9 @@ def _report(failures, child) -> int:
             print(f'  - {f}')
         try:
             child.terminate()
-            out = child.communicate(timeout=5)[0]
-            tail = '\n'.join((out or '').strip().splitlines()[-25:])
+            child.wait(timeout=5)
+            tail = '\n'.join(
+                getattr(child, '_proof_output_tail', [])[-25:])
             if tail:
                 print('\n--- server log tail ---')
                 print(tail)

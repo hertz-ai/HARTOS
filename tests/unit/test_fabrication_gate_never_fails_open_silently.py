@@ -145,20 +145,13 @@ def test_the_missing_groupchat_path_announces_itself(fn):
         'UNVERIFIED.' % _FN)
 
 
-def test_the_gate_still_fails_open(fn):
-    """Guards the SHAPE of the fix: louder, not blocking.
-
-    A permanent stall is worse than an unverified advance, and the existing
-    loud-advance path (`_REUSE_FAB_STEER_MAX` spent) already encodes that
-    trade.  This pins that neither fail-open branch was turned into an early
-    `return None, False`, which would wedge every agent whose group chat is
-    not registered.
-    """
-    for handler in (h for n in ast.walk(fn)
-                    if isinstance(n, ast.Try) for h in n.handlers):
-        for inner in ast.walk(handler):
-            assert not isinstance(inner, ast.Return), (
-                'the except branch now returns at line %d -- a gate that '
-                'cannot run must not block the advance, only announce it '
-                '(see the _REUSE_FAB_STEER_MAX loud-advance precedent).'
-                % inner.lineno)
+def test_the_gate_fails_truthfully_when_evidence_is_unavailable(fn):
+    """A missing evidence source must never become a completed action."""
+    source = ast.unparse(fn)
+    assert 'GAVE_UP' in source
+    handlers = [h for n in ast.walk(fn) if isinstance(n, ast.Try)
+                for h in n.handlers]
+    assert any(any(isinstance(inner, ast.Return) for inner in ast.walk(h))
+               for h in handlers), (
+        'the evidence-gate exception must stop the completion path after it '
+        'records the existing retryable GAVE_UP state')

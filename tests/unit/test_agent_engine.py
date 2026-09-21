@@ -24,6 +24,14 @@ from sqlalchemy.orm import sessionmaker
 
 from integrations.social.models import Base, Product, AgentGoal, User
 
+
+def _verified_training(action_id='agent-engine-test'):
+    return {
+        'verified': True, 'source': 'status_verifier',
+        'outcome': 'success', 'action_id': action_id,
+        'evidence': {'kind': 'tool_receipt', 'message_index': 1},
+    }
+
 # ── Deterministic schema against the tenant filter's runtime mutation ──
 # integrations.social.tenant_filter augments the SHARED Base.metadata at
 # runtime (append_column('tenant_id') + mapper.add_property) when anything in
@@ -1743,7 +1751,8 @@ class TestWorldModelBridge:
         bridge.record_interaction(
             user_id='u1', prompt_id='p1',
             prompt='test prompt', response='test response',
-            model_id='qwen3', latency_ms=100)
+            model_id='qwen3', latency_ms=100,
+            verification=_verified_training())
         assert len(bridge._experience_queue) == 1
         assert bridge._stats['total_recorded'] == 1
 
@@ -1927,7 +1936,8 @@ class TestWorldModelBridge:
         for i in range(3):
             bridge.record_interaction(
                 user_id='u1', prompt_id='p1',
-                prompt=f'prompt_{i}', response=f'response_{i}')
+                prompt=f'prompt_{i}', response=f'response_{i}',
+                verification=_verified_training(i))
         assert bridge._stats['total_recorded'] == 3
         # Batch submitted to executor - queue should be drained
         import time
@@ -3095,7 +3105,8 @@ class TestSecretRedactor:
             prompt_id='p1',
             prompt='My API key is AKIAIOSFODNN7EXAMPLE please help',
             response='Sure, I can help with that',
-            model_id='qwen3', latency_ms=100)
+            model_id='qwen3', latency_ms=100,
+            verification=_verified_training())
         assert len(bridge._experience_queue) == 1
         exp = bridge._experience_queue[0]
         # Layer 1: Secret should be redacted

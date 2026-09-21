@@ -18,7 +18,9 @@ dict the child is actually spawned with.
 """
 import os
 import sys
+import tempfile
 import types
+from pathlib import Path
 from unittest.mock import patch
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -68,7 +70,29 @@ def test_flag_rides_the_env_the_child_is_spawned_with():
     sup.api_url, sup.port, sup.pythonpath = 'http://127.0.0.1:8000', 8000, ''
     sup.repo_root, sup.repo_python = None, None
     sup.python_exe = sys.executable
-    with patch.dict(os.environ, {}, clear=False):
+    with tempfile.TemporaryDirectory() as tmp, \
+            patch('core.platform_paths.get_data_dir', return_value=tmp), \
+            patch.dict(os.environ, {}, clear=False):
         os.environ.pop('HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING', None)
         _cmd, kw = _Supervisor._build_popen(sup)
     assert kw['env']['HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING'] == '1'
+    assert kw['cwd'] == str(Path(tmp).resolve())
+
+
+def test_installed_child_uses_canonical_writable_data_cwd():
+    """The bundled Python child must not inherit Program Files as its cwd."""
+    sup = _Supervisor.__new__(_Supervisor)
+    sup.repo_root, sup.repo_python = None, None
+    with tempfile.TemporaryDirectory() as tmp, \
+            patch('core.platform_paths.get_data_dir', return_value=tmp):
+        assert sup._child_working_dir() == str(Path(tmp).resolve())
+
+
+def test_repo_child_keeps_checkout_cwd():
+    """The installed-mode fix must preserve run_server.py repo semantics."""
+    sup = _Supervisor.__new__(_Supervisor)
+    sup.repo_root = Path('C:/work/hevolveai')
+    sup.repo_python = 'C:/Python310/python.exe'
+    with patch('core.platform_paths.get_data_dir') as get_data_dir:
+        assert sup._child_working_dir() == str(sup.repo_root)
+    get_data_dir.assert_not_called()

@@ -1553,6 +1553,16 @@ class SmartLedger:
                     logger.error(f"Unknown status value: {status}")
                     return False
 
+            # Completion publishes dependency/result receipts.  It therefore
+            # owns its write boundary and may not be part of an uncommitted
+            # batch.  No production caller batches this edge; refusing it is
+            # safer than telling subscribers work completed before persistence.
+            if defer_save and status == TaskStatus.COMPLETED:
+                logger.error(
+                    "Deferred save is not supported for completion of %s",
+                    task_id)
+                return False
+
             task = self.tasks[task_id]
 
             # Validate transition (Bug #2 fix — was bypassing _validate_transition)
@@ -1568,23 +1578,12 @@ class SmartLedger:
             before_tasks = None
             before_events = None
             if not defer_save:
-                # REVIEW hartos-7c 2026-09-20 (codex's change): the rollback is
-                # right, but COMPLETED deepcopies EVERY task in the ledger on
-                # every completion, while holding _lock.  That is the shape
-                # #145 was opened about (see add_task's note above: a
-                # full-ledger operation per call starved the UI at ~9k tasks).
-                # It is bounded by ledger size, not by the completion, so it
-                # grows with the run.  Suggestion, no need to block on it:
-                # snapshot only task_id plus the ids _handle_task_completion
-                # can actually touch (its auto_resumed set and their
-                # dependents), or record an undo list of (id, field, value)
-                # instead of whole __dict__ copies.  Please keep the ledger
-                # save-count test (tests/unit/test_computer_use_activity_
-                # stream.py::test_one_disk_write_per_step_not_three) green if
-                # you change it -- it pins the hot path.
+                # Completion can mutate only its dependency closure.  Taking
+                # an undo snapshot of that closure keeps rollback atomic
+                # without deep-copying thousands of unrelated ledger tasks.
                 snapshot_ids = (
-                    list(self.tasks) if status == TaskStatus.COMPLETED
-                    else [task_id]
+                    self._completion_dependency_ids(task)[1] | {task_id}
+                    if status == TaskStatus.COMPLETED else {task_id}
                 )
                 before_tasks = {
                     tid: copy.deepcopy(self.tasks[tid].__dict__)
@@ -1611,22 +1610,8 @@ class SmartLedger:
                             TaskVerification.compute_result_hash(result))
                     except Exception:
                         pass
-                # REVIEW hartos-7c 2026-09-20 (codex's change): splitting the
-                # fan-out out of _handle_task_completion so it fires only
-                # after the durable write is the right call, and I confirmed
-                # _handle_task_completion has exactly ONE production caller
-                # (this line), so dropping its internal save() orphans nobody.
-                # One asymmetry worth a deliberate decision: emit_events is
-                # `defer_save`, so the BATCHED path (defer_save=True) still
-                # emits before its caller's save, which is the very thing this
-                # split fixes for the unbatched path.  submit_goal is the
-                # batch caller and does save at the end, so today the window
-                # is small -- but if that save fails, subscribers have already
-                # been told the task completed.  Either hand the batch caller
-                # an explicit flush (it emits after its own save), or say in
-                # the docstring that batched completion events are advisory.
                 auto_resumed = self._handle_task_completion(
-                    task, emit_events=defer_save)
+                    task, emit_events=False)
 
             if status == TaskStatus.IN_PROGRESS and not task.started_at:
                 task.started_at = datetime.now().isoformat()
@@ -2213,6 +2198,41 @@ class SmartLedger:
 
     # ==================== Dependency Management ====================
 
+    def _completion_dependency_ids(self, task: Task) -> Tuple[set, set]:
+        """Return direct and transitive dependents a completion may touch.
+
+        The dependency handler walks farther only when it auto-resumes a
+        direct dependent.  Computing the full reachable closure here is a
+        conservative undo boundary: it may snapshot a few untouched
+        descendants, but never unrelated tasks in a large ledger.
+        """
+        reverse_prerequisites = {}
+        for candidate in self.tasks.values():
+            for prerequisite_id in candidate.prerequisites:
+                reverse_prerequisites.setdefault(
+                    prerequisite_id, set()).add(candidate.task_id)
+
+        direct = set(task.dependent_task_ids)
+        direct.update(reverse_prerequisites.get(task.task_id, set()))
+        reachable = set()
+        queue = list(direct)
+        while queue:
+            dependent_id = queue.pop(0)
+            if dependent_id in reachable:
+                continue
+            reachable.add(dependent_id)
+            dependent = self.tasks.get(dependent_id)
+            if dependent is None:
+                continue
+            queue.extend(
+                child_id for child_id in dependent.dependent_task_ids
+                if child_id not in reachable)
+            queue.extend(
+                child_id
+                for child_id in reverse_prerequisites.get(dependent_id, set())
+                if child_id not in reachable)
+        return direct, reachable
+
     def _handle_task_completion(self, task: Task,
                                 emit_events: bool = True) -> List[str]:
         """Handle task completion: update dependencies, auto-resume, and unblock
@@ -2242,10 +2262,7 @@ class SmartLedger:
         # Collect ALL tasks that depend on the completed task:
         # 1. Explicitly registered dependents (task.dependent_task_ids)
         # 2. Tasks with this task in their prerequisites list
-        all_dependent_ids = set(task.dependent_task_ids)
-        for t in self.tasks.values():
-            if task.task_id in t.prerequisites:
-                all_dependent_ids.add(t.task_id)
+        all_dependent_ids, _ = self._completion_dependency_ids(task)
 
         auto_resumed = []
         # BFS queue: walk the full prerequisite chain.

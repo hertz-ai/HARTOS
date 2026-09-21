@@ -1035,6 +1035,30 @@ class _Supervisor(ProcessSupervisor):
             kw['start_new_session'] = True
         return kw
 
+    def _child_working_dir(self) -> str:
+        """Return the one writable working directory for this launch mode.
+
+        Repo mode deliberately runs from the checkout because ``run_server.py``
+        and the development checkpoint layout are repo-relative.  The installed
+        package command has no such requirement and must never inherit Nunba's
+        read-only Program Files directory: several HevolveAI components still
+        use relative ``data/``, ``checkpoints/`` and ``proof_reports/`` paths.
+
+        ``get_data_dir`` preserves the existing ``NUNBA_DATA_DIR`` /
+        ``HARTOS_DATA_DIR`` operator overrides.  Directory creation is allowed
+        to fail loudly here; starting the brain in a known read-only directory
+        and then reporting a partially initialized service is worse than a
+        visible supervisor spawn failure.
+        """
+        if (getattr(self, 'repo_root', None) is not None
+                and getattr(self, 'repo_python', None) is not None):
+            return str(self.repo_root)
+
+        from core.platform_paths import get_data_dir
+        data_root = os.path.abspath(get_data_dir())
+        os.makedirs(data_root, exist_ok=True)
+        return data_root
+
     def _register_with_governor(self, pid: int) -> None:
         """Notify the resource governor about the new managed PID so it
         appears in monitor stats.  Best-effort -- never aborts spawn."""
@@ -1126,11 +1150,11 @@ class _Supervisor(ProcessSupervisor):
         cmd = self._build_cmd()
         kw = self._popen_kwargs()
         kw['env'] = self._build_env()
-        if (getattr(self, 'repo_root', None) is not None
-                and getattr(self, 'repo_python', None) is not None):
-            # run_server.py resolves its src/ and data dirs relative to
-            # the repo root, exactly as start.bat's `cd /d %~dp0\..` does.
-            kw['cwd'] = str(self.repo_root)
+        # Always choose the working directory explicitly.  In installed mode
+        # inheriting Nunba's Program Files cwd makes HevolveAI's remaining
+        # relative state paths unwritable.  Repo mode retains its established
+        # checkout cwd through the same resolver.
+        kw['cwd'] = self._child_working_dir()
         return cmd, kw
 
     def _on_started(self, proc) -> None:

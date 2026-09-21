@@ -172,7 +172,11 @@ class RecipeExperienceRecorder:
             # Compute success rate
             outcomes = tel.get('outcomes', [])
             old_successes = int(existing_exp.get('success_rate', 1.0) * old_count)
-            new_successes = sum(1 for o in outcomes if o in ('completed', 'terminated'))
+            # TERMINATED only says the conversation/workflow stopped.  It can
+            # follow a give-up or an unverified path, so counting it as a win
+            # trains reuse from a false success.  Lifecycle records
+            # ``completed`` only after its receipt gate accepts evidence.
+            new_successes = sum(1 for o in outcomes if o == 'completed')
             total_outcomes = old_count + len(outcomes)
             success_rate = (old_successes + new_successes) / total_outcomes if total_outcomes > 0 else 1.0
 

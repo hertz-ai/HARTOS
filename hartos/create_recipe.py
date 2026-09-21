@@ -253,6 +253,7 @@ from hartos.lifecycle_hooks import (
     lifecycle_hook_process_verifier_response,
     lifecycle_hook_track_recipe_completion,
     lifecycle_hook_check_all_actions_terminated, StateTransitionError, lifecycle_hook_validate_final_agent_creation,
+    mark_action_waiting_for_user, resume_blocked_action, resume_from_user_input,
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
@@ -310,7 +311,8 @@ from integrations.ap2 import (
 
 # Agent Lightning - Training and Optimization
 from integrations.agent_lightning import (
-    instrument_autogen_agent, is_enabled as is_agent_lightning_enabled
+    instrument_autogen_agent, is_enabled as is_agent_lightning_enabled,
+    recipe_assistant_agent_id,
 )
 
 # SimpleMem - Long-term memory with semantic compression
@@ -1088,7 +1090,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         try:
             assistant = instrument_autogen_agent(
                 agent=assistant,
-                agent_id=f'create_recipe_assistant_{user_prompt}',
+                agent_id=recipe_assistant_agent_id('create', user_prompt),
                 track_rewards=True,
                 auto_trace=True
             )
@@ -1323,6 +1325,22 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                     or str(instructions)
                 )
 
+            # --- Tool-boundary safety & owner consent checks ---
+            # Never dispatch destructive commands or control user's computer without consent
+            from integrations.vlm.safety import (
+                destructive_computer_operation, computer_control_block)
+            from core.constants import TOOL_FAILURE_RESULTS
+
+            _op_refusal = destructive_computer_operation(instructions)
+            if _op_refusal:
+                tool_logger.warning(f"Computer operation refused: {_op_refusal}")
+                return f"{TOOL_FAILURE_RESULTS[0]}\n{_op_refusal}"
+
+            _consent_refusal = computer_control_block(prompt_id)
+            if _consent_refusal:
+                tool_logger.warning(f"Computer control consent refused: {_consent_refusal}")
+                return f"{TOOL_FAILURE_RESULTS[0]}\n{_consent_refusal}"
+
             user_prompt = f'{user_id}_{prompt_id}'
             role_number = get_current_flow(user_prompt)
 
@@ -1520,6 +1538,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                         vlm_context_parts.append(f"Outcome: {_why}")
 
                     vlm_context = "\n\n".join(vlm_context_parts)
+
+                # Honest failure: if the action was refused or incomplete due to safety/consent,
+                # return TOOL_FAILURE_RESULTS so downstream verifier does not confuse it with success.
+                if vlm_status in ('blocked', 'incomplete') or response.get('exit_reason') in ('consent_required', 'destructive_operation'):
+                    from core.constants import TOOL_FAILURE_RESULTS
+                    from integrations.vlm import response_view as _rv_fail
+                    _why = _rv_fail.outcome_summary(response)
+                    return f"{TOOL_FAILURE_RESULTS[0]}\n{_why or vlm_context or 'Computer action refused'}"
 
                 # Create VLM agent file for future reuse if no matching recipe was found
                 if not matching_recipe and vlm_status == 'success':
@@ -2220,6 +2246,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             f"[LOOP-BREAK] state-set failed: {_stb_err}")
                 else:
                     user_tasks[user_prompt]._needs_user_input_action_id = current_action_id
+                    user_tasks[user_prompt]._needs_user_input_kind = 'recoverable_stall'
                     user_tasks[user_prompt]._needs_help_reason = (
                         'the conversation looped without finishing it')
                     current_app.logger.warning(
@@ -2472,40 +2499,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                         if json_obj['status'].lower() == 'error' and 'message' in json_obj:
                             safe_set_state(user_prompt, current_action_id, ActionState.ERROR, "verifier error")
                             return author
-                        elif json_obj['status'].lower() == 'completed' or json_obj['status'].lower() == 'success':
-                            # The verdict settles the posted action, whatever id it
-                            # names (settled_action_id); it never picks another one.
-                            json_action_id = settled_action_id(json_obj.get('action_id'), current_action_id)
-
-
-                            # Normal Set ActionState To Complete
-                            if json_obj['status'].lower() == 'completed' and 'action_id' in json_obj.keys():
-                                if user_tasks[user_prompt].fallback == False and user_tasks[user_prompt].recipe == False:
-                                    current_app.logger.info('UPDATED TIMER for this action')
-                                    end = time.time()
-                                    task_time[prompt_id]['times'].append(end-task_time[prompt_id]['timer'])
-                                user_tasks[user_prompt].new_json.append(json_obj)
-                                current_app.logger.info(f'CHECKING FOR FALLBACK user_tasks[user_prompt].current_action={user_tasks[user_prompt].current_action} json_obj["action_id"]={json_obj["action_id"]}')
-
-                                # After completion, only request fallback from user if LLM didn't provide one
-                                # This enables autonomous operation - LLM generates fallback strategies automatically
-                                fallback_action = json_obj.get('fallback_action', '').strip()
-                                if not fallback_action or len(fallback_action) == 0:
-                                    current_app.logger.warning(f'Action {json_action_id} completed but no fallback_action provided by StatusVerifier - this should not happen with updated instructions')
-                                    # Request fallback from user only if LLM failed to generate one
-                                    user_tasks[user_prompt].fallback = True
-                                else:
-                                    current_app.logger.info(f'Action {json_action_id} completed with auto-generated fallback: {fallback_action[:100]}...')
-                                    # Fallback was provided by LLM, proceed to recipe phase
-                                    user_tasks[user_prompt].fallback = False
-                                    user_tasks[user_prompt].recipe = True
-
-                                force_state_through_valid_path(user_prompt, json_action_id, ActionState.COMPLETED,"verified complete")
-
-
+                        elif json_obj['status'].lower() in ('completed', 'success'):
+                            # The main-loop lifecycle hook below is the only
+                            # completion owner.  It validates the cited receipt,
+                            # persists it, and advances the ledger; doing that
+                            # here used the verifier JSON itself as proof.
                             return chat_instructor
                         elif json_obj['status'].lower() == 'pending':
-                            safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "verifier pending")
                             # USER-INPUT GATE (code-level enforcement of the
                             # prompt-level rule above):  if the verifier
                             # explicitly returned `can_perform_without_user_input:
@@ -2521,6 +2521,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             # 2026-05-08 langchain.log (Action 3 / Confirm
                             # sitemap looped 8 iterations before
                             # hallucinating user confirmation).
+                            _needs_user_input = False
                             try:
                                 _gate_value = (json_obj.get('can_perform_without_user_input') or '').strip().lower()
                                 # `safe_set_state(..., PENDING)` above is REFUSED on a
@@ -2530,7 +2531,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 # _should_block_on_user_input for the 20-minute live
                                 # stall this closes.
                                 if _should_block_on_user_input(user_prompt, current_action_id, _gate_value):
+                                    _needs_user_input = True
                                     user_tasks[user_prompt]._needs_user_input_action_id = current_action_id
+                                    user_tasks[user_prompt]._needs_user_input_kind = 'human_required'
                                     current_app.logger.info(
                                         f"[USER-INPUT-GATE] Action {current_action_id} flagged "
                                         f"as blocked on user input "
@@ -2548,6 +2551,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 current_app.logger.debug(
                                     f"[USER-INPUT-GATE] flag set failed (non-blocking): {_gate_err}"
                                 )
+                            if _needs_user_input:
+                                mark_action_waiting_for_user(
+                                    user_prompt, current_action_id,
+                                    json_obj.get('message') or 'Waiting for user input')
+                            else:
+                                safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "verifier pending")
                             return assistant
                         elif json_obj['status'].lower() == 'requires_breakdown':
                             # Handle subtask breakdown request from StatusVerifier
@@ -3094,11 +3103,11 @@ def instantiate_status_verifier_agent(user_prompt):
         llm_config=get_llm_config(),
         code_execution_config=False,
         system_message=""""You are a Status Verification Agent in a multi-agent system.
-        AUTONOMOUS MODE: Prefer "completed" over "pending". If the Assistant made a reasonable attempt (even simulated), mark "completed". Do NOT return "pending" just because user preferences are unknown — use sensible defaults.
+        AUTONOMOUS MODE: Use sensible defaults for ordinary preferences, but never treat a plan, a claimed click, a simulated attempt, or a model statement as completion. Mark an action "completed" only when a matching tool receipt or a user-visible result is already present in this conversation. If it is not, return "pending" and state the missing evidence or user input.
         USER-INPUT GATE (HARD RULE): If a previous turn for THIS action returned `can_perform_without_user_input: "no"` (explicitly marked as requiring user input — e.g. "Confirm sitemap with user", "Choose payment method", "Approve plan"), you MUST NOT flip it to `"yes"` and you MUST NOT mark `"status": "completed"` until the user has actually replied. The autonomous-mode preference for "completed" does NOT override an explicit user-input requirement. For these actions, return `"status": "pending"` and keep `can_perform_without_user_input: "no"` until a fresh user message arrives in the conversation. Hallucinating a user confirmation ("user confirmed the structure", "sitemap approved") when the user hasn't actually replied is a contract violation — the user's reply must be visibly present in the message history.
         Role: Track, validate and verify the status of actions performed by other agents. Respond strictly in JSON:
         Response formats:
-            1. Action Completed: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"yes by default. Only no when absolutely impossible (e.g. payment auth, physical access) OR when the action verbatim asks the user to choose/confirm/approve","persona_name":"persona name","fallback_action": "Context-aware retry strategy. NEVER leave empty."}
+            1. Action Completed: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","evidence": {"message_index": 0,"kind": "tool_receipt|user_visible_result"},"can_perform_without_user_input":"yes by default. Only no when absolutely impossible (e.g. payment auth, physical access) OR when the action verbatim asks the user to choose/confirm/approve","persona_name":"persona name","fallback_action": "Context-aware retry strategy. NEVER leave empty."}
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "error details"}
             3. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending","can_perform_without_user_input":"yes/no — must match the prior turn's value if action verbatim asks for user input"}
             4. Requires Breakdown: {"status": "requires_breakdown","action": "current action","action_id": 1/2/3...,"reason": "why","subtasks": [{"subtask_id": "1.1","description": "subtask desc","depends_on": [],"can_perform_autonomously": true}]}
@@ -3106,6 +3115,7 @@ def instantiate_status_verifier_agent(user_prompt):
             - HTTP 403/404/500/401, connection timeouts, permission denied = report "error" (not "pending")
             - Only "pending" for: first attempt, waiting for user, transient rate limits
             - Same failure 2+ times = always "error"
+        Completion evidence rule: for a completed verdict, evidence.message_index must identify an EARLIER conversation message. kind="tool_receipt" may point only to a non-empty role="tool" result. kind="user_visible_result" may point only to a non-empty Assistant result that was already presented as the requested output. Never cite your own verdict, a plan, or an assistant claim of an external side effect as evidence.
         Fallback: Always provide non-empty fallback_action with context-aware recovery strategies.
         Do not perform actions yourself — only report status. Maintain exact JSON structure."""
         + f"\nActions list: {user_tasks[user_prompt].actions}"
@@ -3696,43 +3706,6 @@ def inject_ledger_awareness(message: str, user_prompt: str) -> str:
         return message
 
 
-def complete_action_and_route(user_prompt: str, action_id: int, outcome: str, result: any = None):
-    """
-    Complete an action in the ledger and determine next task.
-
-    Uses the smart routing to respect:
-    - Hierarchical relationships (parent/child)
-    - Prerequisites and dependencies
-    - Outcome-based conditional tasks
-    - Priority ordering
-
-    Args:
-        user_prompt: User prompt identifier
-        action_id: The action ID that completed
-        outcome: 'success' or 'failure'
-        result: Optional result data
-
-    Returns:
-        Next task to execute, or None
-    """
-    if user_prompt not in user_ledgers:
-        return None
-
-    ledger = user_ledgers[user_prompt]
-    task_id = f"action_{action_id}"
-
-    try:
-        next_task = ledger.complete_task_and_route(task_id, outcome, result)
-        if next_task:
-            current_app.logger.info(f"[Ledger Routing] Completed {task_id} -> Next: {next_task.task_id}: {next_task.description}")
-        else:
-            current_app.logger.info(f"[Ledger Routing] Completed {task_id} -> No next task available")
-        return next_task
-    except Exception as e:
-        current_app.logger.error(f"Error in complete_action_and_route: {e}")
-        return None
-
-
 def get_smart_next_task(user_prompt: str):
     """
     Get the next task using smart routing from the ledger.
@@ -4268,6 +4241,108 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
             f"the co-pilot.")
 
 
+def _is_serving_escalation_expert(user_prompt, action_id, request_id):
+    """Whether this daemon turn is the expert assigned to this exact block.
+
+    The goal row is the existing escalation authority used by the daemon to
+    select its model. Checking it here avoids a second flag and prevents an
+    ordinary background retry from clearing either consent or user-input
+    gates. Only recoverable stalls call this helper.
+    """
+    try:
+        from core.chat_client import daemon_goal_id
+        goal_id = daemon_goal_id(request_id)
+        if not goal_id:
+            return False
+        from integrations.social.models import AgentGoal, db_session
+        with db_session(commit=False) as db:
+            goal = db.query(AgentGoal).filter_by(id=goal_id).first()
+            escalation = (
+                (getattr(goal, 'config_json', None) or {}).get('escalation')
+                if goal is not None else None
+            ) or {}
+        return (
+            escalation.get('next') == 'expert'
+            and str(escalation.get('action_id')) == str(action_id)
+            and escalation.get('user_prompt') == user_prompt
+        )
+    except Exception:
+        logging.getLogger(__name__).debug(
+            '[USER-INPUT-GATE] Expert escalation lookup failed',
+            exc_info=True)
+        return False
+
+
+def _resume_prior_user_input_block(user_prompt, text, failure=False):
+    """Resume only a block that predates a genuine inbound user turn.
+
+    ``get_response_group`` can set ``_needs_user_input_action_id`` while its
+    own AutoGen round is running. Clearing the flag after that round treated
+    the request which created the block as the answer to it. Background daemon
+    retries were also able to clear it. Checking at function entry with the
+    canonical request classifier keeps both cases apart.
+    """
+    if failure:
+        return False
+    task = user_tasks.get(user_prompt)
+    action_id = getattr(task, '_needs_user_input_action_id', None)
+    if not isinstance(action_id, int):
+        return False
+    gate_kind = getattr(task, '_needs_user_input_kind', 'human_required')
+    try:
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+        request_id = request_id_list.get(user_prompt)
+        is_user = is_genuine_user_request(request_id)
+        is_expert = (
+            gate_kind == 'recoverable_stall'
+            and _is_serving_escalation_expert(
+                user_prompt, action_id, request_id)
+        )
+        if not is_user and not is_expert:
+            logging.getLogger(__name__).info(
+                '[USER-INPUT-GATE] Keeping action %s blocked: request %r is '
+                'neither a user reply nor its assigned expert turn',
+                action_id, request_id)
+            return False
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            '[USER-INPUT-GATE] Could not classify request; keeping action %s '
+            'blocked: %s', action_id, exc)
+        return False
+
+    if is_user:
+        resumed = resume_from_user_input(
+            user_prompt, action_id,
+            'User supplied input for the blocked action', text)
+    else:
+        resumed = resume_blocked_action(
+            user_prompt, action_id,
+            'Assigned expert is retrying the recoverable stalled action',
+            evidence={
+                'source': 'escalation_expert',
+                'action_id': action_id,
+                'request_id': str(request_id),
+                'timestamp': datetime.utcnow().isoformat(),
+            })
+    # Clear the CREATE-loop gate only after the canonical ledger accepted the
+    # resume.  If storage is unavailable the same attributed answer can be
+    # retried; clearing the marker here would strand the still-BLOCKED task.
+    if not resumed:
+        logging.getLogger(__name__).warning(
+            '[USER-INPUT-GATE] Keeping action %s blocked: durable resume from '
+            '%s failed', action_id,
+            'a genuine user reply' if is_user else 'its assigned expert turn')
+        return False
+    task._needs_user_input_action_id = None
+    task._needs_user_input_kind = None
+    task._needs_help_reason = None
+    logging.getLogger(__name__).info(
+        '[USER-INPUT-GATE] %s action %s from %s',
+        'Resumed', action_id,
+        'a genuine user reply' if is_user else 'its assigned expert turn')
+    return True
+
+
 def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     """
     Handles the response generation process for an agent group.
@@ -4282,6 +4357,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     """
     user_prompt = f'{user_id}_{prompt_id}'
     current_app.logger.info(f"START: get_response_group for user_prompt={user_prompt}, Failure={Failure}")
+    # Run before initiate_chat. A marker created by the upcoming AutoGen round
+    # is a new request for input, not an answer to itself.
+    _resume_prior_user_input_block(user_prompt, text, failure=Failure)
     # Get or create agents for this user
     if user_prompt not in user_agents:
         current_app.logger.info(f"Creating new agents for user_prompt={user_prompt}")
@@ -4412,27 +4490,6 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             group_chat.messages.extend(_chat_history)
             current_app.logger.info(f"[MSG-RECOVERY] Recovered {len(_chat_history)} messages from chat_instructor")
         current_app.logger.info(f"group_chat.messages len={len(group_chat.messages)}")
-
-        # USER-INPUT GATE clear (companion to the gate set in
-        # state_transition's pending handler):  this function is called
-        # from /chat once per user message, so the arrival of THIS call
-        # IS the user's reply.  Clear any sticky `_needs_user_input_action_id`
-        # flag set by a prior call so the OUTER loop doesn't break out
-        # before processing the new user input.
-        try:
-            if hasattr(user_tasks[user_prompt], '_needs_user_input_action_id'):
-                _prior_block = user_tasks[user_prompt]._needs_user_input_action_id
-                user_tasks[user_prompt]._needs_user_input_action_id = None
-                user_tasks[user_prompt]._needs_help_reason = None
-                current_app.logger.info(
-                    f"[USER-INPUT-GATE] Clearing prior block on action "
-                    f"{_prior_block} — fresh /chat call indicates user has "
-                    f"replied; OUTER loop will resume normal iteration."
-                )
-        except Exception as _gate_clear_err:
-            current_app.logger.debug(
-                f"[USER-INPUT-GATE] flag clear failed (non-blocking): {_gate_clear_err}"
-            )
 
         # Main processing loop
         while_loop_iterations = 0
@@ -4623,14 +4680,52 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                 if hook_result['action'] != 'allow':
                     if hook_result['action'] == 'force_fallback':
-                        # Automatically request fallback after completion
-                        safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.FALLBACK_REQUESTED, "hook_result force_fallback")
-                        # Set flags for fallback flow
-                        user_tasks[user_prompt].fallback = True
-                        user_tasks[user_prompt].recipe = False
+                        # The lifecycle hook is the sole owner of the verified
+                        # COMPLETED transition.  Preserve the completion-side
+                        # bookkeeping that used to live in state_transition:
+                        # timing, verdict history, and autonomous fallback
+                        # routing are not duplicate state authorities.
+                        _verified_action_id = settled_action_id(
+                            json_obj.get('action_id'), current_action_id)
+                        if (not user_tasks[user_prompt].fallback
+                                and not user_tasks[user_prompt].recipe
+                                and prompt_id in task_time):
+                            current_app.logger.info(
+                                'UPDATED TIMER for verified action %s',
+                                _verified_action_id)
+                            _timing = task_time[prompt_id]
+                            _timing.setdefault('times', []).append(
+                                time.time() - _timing.get('timer', time.time()))
+                        user_tasks[user_prompt].new_json.append(json_obj)
+
+                        _generated_fallback = str(
+                            json_obj.get('fallback_action') or '').strip()
+                        if _generated_fallback:
+                            # The verifier already supplied the fallback, so
+                            # keep the autonomous path and request the recipe
+                            # directly.  The direct edge is part of the
+                            # canonical lifecycle transition table.
+                            user_tasks[user_prompt].fallback = False
+                            user_tasks[user_prompt].recipe = True
+                            safe_set_state(
+                                user_prompt, _verified_action_id,
+                                ActionState.RECIPE_REQUESTED,
+                                'verified completion supplied fallback')
+                            message = request_recipe_for_action(
+                                _verified_action_id, prompt_id, role,
+                                user_prompt)
+                        else:
+                            safe_set_state(
+                                user_prompt, _verified_action_id,
+                                ActionState.FALLBACK_REQUESTED,
+                                "hook_result force_fallback")
+                            user_tasks[user_prompt].fallback = True
+                            user_tasks[user_prompt].recipe = False
+                            message = hook_result['message']
+                    else:
+                        message = hook_result['message']
 
                     current_app.logger.error(f"lifecycle_hook_check_json_status {hook_result['message']}")
-                    message = hook_result['message']
                     result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False)
                     continue
 
@@ -4792,16 +4887,17 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                 logger=current_app.logger)
                             continue
 
-                        # Only set COMPLETED if not already done by state_transition
+                        # A ledger claim is not a completion receipt.  This
+                        # branch runs after the lifecycle hook; if it did not
+                        # establish COMPLETED, re-drive the canonical verifier
+                        # instead of repairing state drift by fabricating it.
                         _current_state = get_action_state(user_prompt, json_action_id)
                         if _current_state != ActionState.COMPLETED:
-                            force_state_through_valid_path(user_prompt, json_action_id, ActionState.COMPLETED,
-                                                           "verified complete")
-                        # Auto-sync handles ledger update via force_state_through_valid_path above
-
-                        # Use smart ledger routing to complete and find next task
-                        result_data = json_obj.get('result', json_obj.get('output', None))
-                        next_ledger_task = complete_action_and_route(user_prompt, json_action_id, 'success', result_data)
+                            current_app.logger.warning(
+                                '[COMPLETION-GATE] action %s reached ledger routing '
+                                'without lifecycle evidence; leaving it open',
+                                json_action_id)
+                            continue
 
                         # Detect and add any dynamic tasks from the response
                         detect_and_add_dynamic_tasks(user_prompt, json_obj, json_action_id, text)

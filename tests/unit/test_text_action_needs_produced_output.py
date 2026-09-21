@@ -153,7 +153,8 @@ def appctx():
         yield app
 
 
-def _drive(rr, monkeypatch, recipe, messages, action_id=3):
+def _drive(rr, monkeypatch, recipe, messages, action_id=3,
+           completion_commit=None):
     """Call the REAL _advance_reuse_action over a real group history.
 
     Only the two things this test is NOT about are patched: the tool-side
@@ -176,6 +177,9 @@ def _drive(rr, monkeypatch, recipe, messages, action_id=3):
                         lambda *a, **k: True, raising=True)
     monkeypatch.setattr(rr, 'safe_set_state',
                         lambda *a, **k: True, raising=True)
+    monkeypatch.setattr(rr, 'commit_verified_action_completion',
+                        completion_commit or (lambda *a, **k: True),
+                        raising=True)
     monkeypatch.setattr(rr, '_stamp_action_evidence_watermark',
                         lambda *a, **k: None, raising=True)
     rr._reuse_resteer_counts.pop((SESSION, action_id), None)
@@ -222,6 +226,26 @@ class TestATextActionNeedsProducedText:
              dict(LIVE_VERDICT)])
         assert (next_id, advanced) == (4, True), (
             'an action that really wrote its deliverable must not be held')
+
+    def test_real_output_uses_the_canonical_verified_commit(
+            self, rr, appctx, monkeypatch):
+        calls = []
+
+        def commit(*args, **kwargs):
+            calls.append((args, kwargs))
+            return True
+
+        _drive(
+            rr, monkeypatch, TEXT_RECIPE,
+            [dict(LIVE_DISPATCH_ECHO), dict(LIVE_REAL_OUTPUT),
+             dict(LIVE_VERDICT)], completion_commit=commit)
+
+        assert len(calls) == 1
+        assert calls[0][0][:2] == (SESSION, 3)
+        assert calls[0][0][2] == {
+            'message_index': 1,
+            'kind': 'user_visible_result',
+        }
 
     def test_a_tool_declaring_action_is_untouched(self, rr, appctx,
                                                   monkeypatch):

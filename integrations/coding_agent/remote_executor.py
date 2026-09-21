@@ -31,16 +31,18 @@ class RemoteDesktopExecutor:
         Args:
             command: The command to execute
             timeout: Execution timeout in seconds
-            force: If True, bypass destructive command check
+            force: Retained for API compatibility. It never bypasses the
+                destructive-operation policy.
 
         Returns:
             {success, output, returncode?, error?}
         """
-        # Security pre-check: destructive command detection
-        if not force:
-            blocked = self._check_security(command)
-            if blocked:
-                return blocked
+        # Security pre-check.  ``force`` cannot turn a destructive operation
+        # into an executable one; every desktop, Android, local and remote
+        # route applies the same final hard-deny policy.
+        blocked = self._check_security(command)
+        if blocked:
+            return blocked
 
         import requests
 
@@ -194,10 +196,26 @@ class RemoteDesktopExecutor:
         imported we CANNOT verify the command is non-destructive / PII-free.
         In that case we REFUSE to dispatch rather than silently forwarding an
         unchecked command (the old ``except ImportError: pass`` was fail-OPEN).
-        A caller that genuinely needs to bypass the gate passes ``force=True``
-        to :meth:`execute`.
+        ``force`` is retained only so older callers remain compatible.  It
+        cannot bypass this gate.
         """
-        # Action classifier — detect destructive patterns
+        # Shared VLM policy first.  It catches power/reset/erase operations at
+        # the remote transport boundary as well as at the local executor.
+        try:
+            from integrations.vlm.safety import destructive_computer_operation
+            reason = destructive_computer_operation(command)
+            if reason:
+                return {'success': False, 'output': '', 'error': reason}
+        except ImportError as e:
+            logger.error('Shared computer-operation policy unavailable: %s', e)
+            return {
+                'success': False,
+                'output': '',
+                'error': 'Security pre-check unavailable: refusing remote dispatch.',
+            }
+
+        # Action classifier — preserves the existing broader destructive
+        # command and DLP checks.
         try:
             from security.action_classifier import classify_action
             classification = classify_action(command)
@@ -207,7 +225,7 @@ class RemoteDesktopExecutor:
                     'output': '',
                     'error': (
                         f'Destructive command detected: {command[:100]}. '
-                        'Use --force to override.'
+                        'This operation cannot be dispatched by an agent.'
                     ),
                 }
         except ImportError as e:
@@ -220,7 +238,7 @@ class RemoteDesktopExecutor:
                 'error': (
                     'Security pre-check unavailable: action_classifier could '
                     'not be imported. Refusing to dispatch command. '
-                    'Use --force to override.'
+                    'This operation cannot be dispatched by an agent.'
                 ),
             }
 

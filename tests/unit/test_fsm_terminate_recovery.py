@@ -205,6 +205,8 @@ class TestAStaleTerminateIsNotTheCurrentActions:
     def test_a_retry_prefixed_re_post_is_a_dispatch(self):
         assert lh.dispatch_action_id('[retry:exec-6] Execute Action 6: again') == 6
         assert lh.dispatch_action_id('  Execute Action 12: leading space') == 12
+        assert lh.dispatch_action_id(
+            'Perform this action -> Action #7:reuse it') == 7
 
     def test_action_2_is_not_action_20(self):
         up = 'fsm_2_vs_20'
