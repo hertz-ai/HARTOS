@@ -252,6 +252,72 @@ def _get_tool_base_url(tool_name: str) -> Optional[str]:
 # Modality handlers
 # ═══════════════════════════════════════════════════════════════
 
+#: What an error from this module MEANS, told apart without a caller having
+#: to read prose.  The three kinds are real and they want opposite answers:
+#:
+#:   'absent'      no tool is registered, or auto-start failed.  Nothing is
+#:                 installed to do this here.  A caller may reasonably OFFER
+#:                 TO INSTALL one (integrations.agent_engine.capability_setup).
+#:   'unreachable' a tool IS configured but the call did not arrive -- the
+#:                 process is not running, the port refused, it timed out.
+#:                 Offering to install is wrong; it is installed.
+#:   'refused'     the tool answered, and said no (an HTTP status).  The
+#:                 capability exists and works; THIS request was rejected.
+#:   'unknown'     none of the above matched.
+ABSENT, UNREACHABLE, REFUSED, UNKNOWN = (
+    'absent', 'unreachable', 'refused', 'unknown')
+
+#: Wordings this module itself emits for "nothing is installed".  Kept HERE,
+#: next to the returns that produce them, deliberately: a consumer that
+#: matched these strings from another module would silently stop working the
+#: day someone reworded a message, and the person rewording it would have no
+#: way to know. Producer and reader change together in one file.
+_ABSENT_MARKERS = ('not registered', 'not available', 'no tool',
+                   'auto-start failed', 'not installed')
+
+#: Exception text for "configured, but the call did not arrive".
+_UNREACHABLE_MARKERS = ('connection refused', 'connectionerror', 'timed out',
+                        'timeout', 'max retries', 'failed to establish',
+                        'actively refused', 'connection aborted',
+                        'name or service not known', 'getaddrinfo')
+
+
+def classify_error(result) -> str:
+    """Why a generate_media call failed, as one of the four constants above.
+
+    THE POINT: callers must not grep this module's prose for themselves.
+    Deciding whether to offer the owner an install is a real branch -- asking
+    someone to install what is already installed is its own defect -- and it
+    hung on wording that lives in another file. This puts the reader beside
+    the writer so they move together.
+
+    Takes the dict generate_media returns (or its JSON string). Anything that
+    is not an error answers UNKNOWN rather than guessing.
+    """
+    if isinstance(result, str):
+        try:
+            import json as _json
+            result = _json.loads(result)
+        except Exception:
+            return UNKNOWN
+    if not isinstance(result, dict) or result.get('status') != 'error':
+        return UNKNOWN
+
+    text = str(result.get('error', '')).lower()
+    if not text:
+        return UNKNOWN
+    # 'absent' first: "TTS-Audio-Suite not available" would otherwise look
+    # like a transport failure to a naive substring pass.
+    if any(m in text for m in _ABSENT_MARKERS):
+        return ABSENT
+    if any(m in text for m in _UNREACHABLE_MARKERS):
+        return UNREACHABLE
+    # "<Tool> HTTP 503" -- it answered, so it exists and it said no.
+    if 'http' in text and any(c.isdigit() for c in text):
+        return REFUSED
+    return UNKNOWN
+
+
 def _generate_image(context: str, input_text: str, style: str) -> dict:
     """Route to txt2img external service."""
     prompt = input_text or context
@@ -411,8 +477,17 @@ def _generate_video_wan2gp(prompt: str, duration: int) -> dict:
 
 
 def _generate_video_ltx2(prompt: str, duration: int) -> dict:
-    """Submit video generation to LTX2 server (port 5002)."""
-    ltx_url = 'http://localhost:5002'
+    """Submit video generation to the LTX2 server.
+
+    The base URL comes from the registry, as _generate_video_wan2gp's does.
+    It used to be the literal 'http://localhost:5002', which cannot be
+    right: RuntimeToolManager gives every sidecar an OS-assigned port and
+    learns it from the server's PORT= line (MEASURED 2026-09-21: 65523 on
+    one run, 64507 on the next), so 5002 named whatever else happened to
+    hold it.  The literal survives only as the fallback for a server an
+    operator started by hand with the historical default.
+    """
+    ltx_url = _get_tool_base_url('ltx2') or 'http://localhost:5002'
     try:
         from core.http_pool import pooled_post
         num_frames = max(49, (duration or 2) * 24 + 1)
