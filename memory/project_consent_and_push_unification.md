@@ -127,21 +127,109 @@ with the DB down — keep as a second *layer*, not a second *record*),
 
 ## TIER 1 — a withdrawn permission still acts. Highest harm, smallest blast. DO FIRST.
 
-### F0 — consent trigger spelling (close my own "read both") — TODO
+### F0 — consent trigger spelling (close my own "read both") — **DONE + VERIFIED LIVE (fc1edfce1)**
 Parallel: `require_consent` written at `goal_seeding.py:1745,1863,1892,1948,2009`;
 `requires_consent` at `goal_seeding.py:118,514,580`. Sole enforcement
 `hive_guardrails.py:1313` (I widened it to read BOTH — deliberate parallel path).
 Unrelated same-name keys: plan approval `hart_intelligence_entry.py:10722`;
-share-link viewer `api_sharing.py:255,349,372` — **do not touch those**.
-Canonical: keep `requires_consent` (on the wire = least blast per owner's rule).
-Audit: the 8 producers, the 1 reader, and **existing goal rows** whose
-`config_json` already holds the singular (a data migration, or the reader keeps a
-deprecation shim with a removal test).
-Fold: migrate the 5 singular producers → plural; migrate existing rows; reader
-reads ONLY plural. Acceptance: a goal seeded either way is gated; no row loses
-its gate. Blast: `goal_seeding.py` + `hive_guardrails.py` + a data migration.
+share-link viewer `api_sharing.py:255,349,372` — **not touched**.
 
-### F1 — voice: revocation does not take effect — TODO ← **START HERE**
+**This entry's own canonical choice was WRONG and was corrected at execution.**
+It said keep `requires_consent` ("on the wire"). The audit found the plural has
+**zero readers anywhere** — it was never on a wire, it is a producer typo, while
+the singular is the gate's long-standing contract. Blast radius therefore points
+the other way: singular = 3 seed lines + 3 rows, reader untouched; plural would
+have been 5 seed lines + the reader + 5 rows. Per the owner's rule (lowest blast
+radius wins) the fold went to **`require_consent`**.
+*Lesson for the remaining folds: decide the canonical side from the READER count
+found in the audit, not from which spelling looks more like an interface.*
+
+Done: 3 plural producers → singular; `hive_guardrails` reads one key again;
+`migrations.py` **v56** re-keys existing `agent_goals.config_json` rows
+(value preserved — a deliberate `False` stays `False`; canonical wins if both
+present; unparseable rows left untouched and logged).
+Tests (`tests/test_goal_consent_gate.py`, 14 pass; +seo/paper seed-shape suites,
+98 pass total): producer-side guard (no seed may write the plural), reader-side
+guard (exactly one spelling, comment-stripped so prose can still explain it),
+and three v56 tests — re-key keeps the gate (fed through the REAL gate),
+`False` is preserved, and a canonical row is untouched across two passes.
+**Live (bundled node, 2026-09-21):** 3 rows re-keyed 55→56, 0 legacy keys left,
+568 goals unchanged, the 5 always-canonical rows untouched; the patched gate in
+the embedded 3.12.6 runtime refuses all three real goal configs with a consent
+reason. This also closes task **#96** (the three goals were ungated in the field).
+
+Observed, NOT folded (would be scope creep; logged for the inventory): a THIRD
+`requires_consent` vocabulary exists at `security/ai_governance.py:665`
+(`_score_human_consent`, a governance scoring *context*, not a goal config).
+Nothing in the tree builds that context — only its own unit tests do. It is a
+registered scorer with no live producer, so it is a dormant-path question for
+F10/the framework pass, not a gate.
+
+### F1 — voice: revocation does not take effect — **AUDITED, BLOCKED (peer in-flight is doing this fold)**
+
+**Caller audit complete 2026-09-21** (every reader/writer of the two keys):
+- WRITES `nunba_speech_consent`: `LightYourHART.js:929`, `Demopage.js:779`, `:830`
+- READS it: `LightYourHART.js:917` (existing-consent check), `:949` (**the gate**,
+  `=== 'text_only'`), `Demopage.js:741`, `:754` (**the gate**, `=== 'granted'`)
+- WRITES `tts_enabled` (localStorage): `LightYourHART.js:930`, `Demopage.js:780`,
+  `:831`, `:877`; READS: `Demopage.js:743` (legacy fallback)
+- Canonical side already called: `LightYourHART.js:932/934`
+  (`consentApi.grant/revoke voice_speech`, both `.catch(()=>{})`),
+  `Demopage.js:786/788`, `:835/837`, privacy page `PrivacySettingsPage.jsx:1001-1010`,
+  vocabulary `consentAsks.js:86`
+- **NAME COLLISION — do not fold blindly:** `Admin/SettingsPage.js:597-599` uses
+  `media.tts_enabled`, a **server-side media config field**, NOT the localStorage
+  key. Different concern, same name. Folding them breaks the admin toggle.
+
+**BLOCKED, and not by knowledge:** `LightYourHART.js` (+149) and `Demopage.js`
+(+122) are uncommitted-dirty with work that ALREADY implements this fold —
+`handleOnboardingSpeechConsent`, `handleSpeechConsentDecision`,
+`toggleVoiceSpeechConsent`, a `speechConsent` state, `import { consentApi }`, and
+the comment "Sync with canonical HARTOS consent API", with hunks at Demopage
+737-774 and 5729-5827 (the exact region). Two agents implementing one fold in one
+file is the agent-level parallel path. **Do not edit either file.** Defensive
+backup taken (diff + both files) to `scratchpad/canon_wip/peer_wip_backup` —
+uncommitted work in this checkout was destroyed once already today. Ownership
+query sent; `claude-character-call` is no longer in the peer list, so it may be
+orphaned, in which case the owner must decide whether to adopt it (I must not
+commit another session's work as mine, nor discard it).
+
+**My acceptance test stands regardless of who writes the code** (rule: a hand-off
+is not a closure): revoke `voice_speech` on the privacy page → the SPA stops
+speaking **without a reload**. If their change lands without that property, F1 is
+still open.
+
+**DO NOT take the tempting fix** (fix-all, independently verified the citation):
+having `PrivacySettingsPage` also write `nunba_speech_consent` on revoke **mints a
+SECOND writer of the same value and rebuilds the drift one layer up** — the two
+agree only until a third surface appears. Hold the framing literally: localStorage
+is a PROJECTION of the canonical consent with **exactly one writer**, and the
+gates read the projection.
+
+**The copy is currently a promise the code cannot keep** (both of us measured it):
+`PrivacySettingsPage.jsx:1000-1007` `VOICE_SPEECH_CARD` says verbatim *"Revoking
+mutes all voice output immediately, switching to quiet text-only mode."* while
+`grep -c 'nunba_speech_consent\|tts_enabled'` on that file is **0**. Same family
+as a tool reporting success it did not achieve, except pre-printed in the UI. If
+the full fold cannot land yet, the honest interim is to **weaken the copy to match
+the code, never to add a writer** — an over-promising card is worse than an
+under-promising one. (Product-copy change ⇒ owner's call, and it must be reverted
+when the fold lands, so it is recorded here rather than done silently.)
+
+**Blast-radius insight — the fold may not need the orphaned files at all.** The
+two gates (`Demopage.js:754`, `LightYourHART.js:949`) live INSIDE the 271
+uncommitted lines, so editing them collides. But the gates only *read*
+`localStorage.getItem('nunba_speech_consent')` — so a projection writer placed in
+a CLEAN file (e.g. the existing `consent.granted`/`consent.revoked` subscriber
+path reached from `App.js`, which is clean) makes those gates correct **with zero
+edits to either dirty file**. Residue to be explicit about: the dirty files also
+*write* the key today (`LightYourHART.js:929`, `Demopage.js:779/830/877`), so that
+step leaves multiple converging writers — authority is correct, exclusivity is
+not. Therefore F1 is TWO steps and both must be recorded, not one declared done:
+  - **F1a (clean files only):** add the projection subscriber → revocation from any
+    surface mutes the SPA. Closes the user-visible harm.
+  - **F1b (needs the orphan resolved):** delete the redundant local writes so
+    exactly one writer remains. Until F1b lands, F1 is NOT closed.
 Parallel (3 stores): `UserConsent('voice_speech')` vs `nunba_speech_consent`
 localStorage vs `tts_enabled` localStorage.
 Known sites: `Nunba/…/HART/LightYourHART.js:917-937` (writes both, `.catch(()=>{})`
@@ -161,7 +249,26 @@ Acceptance: revoke on the privacy page → speech stops **without a reload**; gr
 → resumes. Test: revocation event clears the key; the gate is false after it.
 Blast: SPA only, no backend change, no new framework.
 
-### F2 — copilot: env var overrides a revoked consent — TODO
+### F2 — copilot: env var overrides a revoked consent — **VERIFIED (66386a45e)**
+
+Caller audit (complete, untruncated): `copilot_enabled()` is the SINGLE gate for
+4 readers — the `claude -p` spawn `claude_code_backend.py:103`,
+`claude_code_available` `:414`, `mcp_http_bridge.py:260`, `agent_daemon.py:252`
+(which additionally reads the consent at `:262/264/268`). One writer:
+`set_copilot_enabled` `:355`, called by `consent_service._copilot_switch_from_consent:360`
+and by the admin page.
+Finding: revocation DOES propagate (the actuator writes the marker) — the hole was
+only that the env was read FIRST and returned early, so `HARTOS_COPILOT_ENABLED=1`
+outranked the marker and re-enabled all four readers against the human's answer.
+Fold: asymmetric override — a non-on pin still force-DISABLES (unchanged), an ON
+pin cannot override a present marker. Safe because with no marker the node is
+already enabled, so an ON pin was a no-op there by construction. No new store, no
+DB read added to the spawn path; the marker remains the derived cache with one
+writer (D1/D6).
+Tests: 15 passed, incl. a shape guard that fails if the env is ever read before
+the marker again. Live-patched + verified in the embedded runtime.
+**NOT folded here (deliberate, avoids widening):** the admin page can still flip
+the marker without filing a consent row — same shape as F6, handled there.
 Parallel (3 stores): `UserConsent('copilot_access')`; `hartos-copilot.off` marker
 (`claude_code_backend.py:337-386`); `HARTOS_COPILOT_ENABLED` (`:347`, logs
 "pinned by").
@@ -177,13 +284,31 @@ the fast/offline cache with consent as authority; the env pin may force OFF but
 Acceptance: revoke → spawn refuses even with `HARTOS_COPILOT_ENABLED=1`; grant →
 runs. Blast: `claude_code_backend.py` + 1 bridge read + a test.
 
-### F3 — `hive_participation` default True inverts the opt-in — TODO
-Parallel: `User.settings['hive_participation']` (default **True**)
-`world_model_bridge.py:281-311`, enforced `:1373`. Canonical
-`compute_contribute` is fail-closed opt-in.
-Fold: read the canonical consent; treat the setting as a legacy override only
-when no row exists; drop the default-True. Acceptance: no consent → no
-contribution. Blast: one file, 2 sites.
+### F3 — `hive_participation` — **RE-SCOPED by its own audit; MERGED INTO F5; file is DIRTY**
+
+Audit 2026-09-21 corrected the plan's own premise — recorded because building on
+the wrong target was the risk:
+- Readers/writers (complete): `world_model_bridge.py:281` `_has_hive_participation`,
+  reads `(user.settings or {}).get('hive_participation', True)` at `:304`, enforced
+  at `:1373`. **No writer anywhere in the codebase** — the key is only ever read,
+  so it can only be set out-of-band. That alone makes it a poor authority.
+- **It is NOT the `compute_contribute` concern.** `:1373` gates `hivemind_query` —
+  whether THIS user's query/data goes OUT to the hive. `compute_contribute`
+  (`compute_mesh_service.py:730`) gates whether PEERS' work runs ON this device.
+  Opposite directions; folding them together would conflate ingress with egress.
+- Its own docstring (`:285`) says "Cached alongside cloud consent (same TTL)", and
+  it shares `self._consent_cache` with `cloud_data_consent` — **the same file's F5
+  store**. So this is the egress concern: it belongs with F5 and the canonical type
+  is `cloud_egress`, not `compute_contribute`.
+- **BLOCKED:** `world_model_bridge.py` is uncommitted-dirty (another session).
+- **OWNER CALL inside it:** default-True means hive queries are opt-OUT. Making
+  them opt-in is a product behaviour change (hive queries stop working until
+  granted), not a refactor — do not fold that silently.
+
+Fold when unblocked, together with F5 (one file, one cache, one fold): both
+`cloud_data_consent` and `hive_participation` become reads of `cloud_egress` via
+the canonical service, the 5-minute private cache goes, and the default is the
+owner's decision recorded above.
 
 ---
 
@@ -294,3 +419,17 @@ F1 → F2 → F3 → F0 → F5 → F6 → F11 → F8 → F9 → F7 → F13 → F
 Rationale: Tier 1 first (a withdrawn permission that still acts is live harm),
 smallest blast within a tier, held/owner-gated last. F0 early because it is my own
 deliberate parallel path and leaving it contradicts rule 3.
+
+### Progress
+- **F2 DONE + VERIFIED** (`66386a45e`) — an env pin can no longer outrank a
+  revoked copilot consent; 15 tests incl. a shape guard.
+- **F0 DONE + VERIFIED LIVE** (`fc1edfce1`) — one consent-trigger spelling, data
+  migrated on the live node, #96 closed. See F0 above for the corrected
+  canonical-choice rule.
+- **F1 BLOCKED** — 271 orphaned uncommitted lines from a peer session that is
+  gone (backed up in `scratchpad/canon_wip/peer_wip_backup/`); needs the owner's
+  adopt-or-discard call. Split F1a (projection subscriber, clean file) / F1b
+  (delete the redundant local writes).
+- **F3 merged into F5**, blocked on a dirty `world_model_bridge.py` and carrying
+  an owner call (hive queries opt-out → opt-in).
+- **NEXT: F5** once its file is clean; otherwise F6.
