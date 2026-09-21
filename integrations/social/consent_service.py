@@ -663,15 +663,34 @@ class ConsentService:
         # stays as audit history and a new granted row is inserted beside it.
         # Narrowing it this way is what keeps that invariant — and its test —
         # untouched while still making a per-agent ask answerable.
+        # no_autoflush on principle, NOT on a measurement.  Adding a SELECT
+        # inside a writer changes flush timing: SQLAlchemy autoflushes the
+        # caller's pending state before answering a query, so without this the
+        # lookup would flush whatever the caller had in flight at a point it
+        # never used to.  That is a real hazard and the guard is cheap, so it
+        # stays.
+        #
+        # Honesty about the evidence: I first wrote that this guard FIXED a
+        # measured 19-suite regression.  It did not, and the claim was wrong —
+        # the two runs I compared (253 passed/1 error vs 3 failed/247/7 errors)
+        # turned out to be THE SAME CODE.  The consent sweep is not hermetic:
+        # some suites pin HEVOLVE_DB_PATH=':memory:' and two do not,
+        # models.py reads that env ONCE at import and caches DB_PATH, so
+        # whichever test module imports first decides the database for the whole
+        # process — and agent_data/hevolve_database.db (44MB, real file) gets
+        # written by the runs that lose that race.  Cross-run comparisons in
+        # this area are therefore not evidence of anything until the DB is
+        # pinned and fresh.
         _pending = None
         if agent_id is not None:
-            _pending = db.query(UserConsent).filter(
-                UserConsent.user_id == user_id,
-                UserConsent.agent_id == agent_id,
-                UserConsent.consent_type == consent_type,
-                UserConsent.scope == scope,
-                UserConsent.granted_at.is_(None),
-            ).first()
+            with db.no_autoflush:
+                _pending = db.query(UserConsent).filter(
+                    UserConsent.user_id == user_id,
+                    UserConsent.agent_id == agent_id,
+                    UserConsent.consent_type == consent_type,
+                    UserConsent.scope == scope,
+                    UserConsent.granted_at.is_(None),
+                ).first()
         if _pending is not None:
             _pending.granted = True
             _pending.granted_at = now
