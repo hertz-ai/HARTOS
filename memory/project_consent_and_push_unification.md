@@ -336,7 +336,15 @@ owner's decision recorded above.
 
 ## TIER 2 — a concern with no canonical store at all
 
-### F4 — the mic has no consent type — HELD (fix-all holds `consent_service.py`)
+### F4 — the mic has no consent type — **UNBLOCKED 2026-09-21: nobody holds it**
+The "HELD" premise was wrong. fix-all-log-observed-issues confirms it has **no**
+`consent_service.py` edits and never had any in this session — it only READ the
+file — and `git status`/`git diff` on that path are both empty. So F4 is
+unclaimed and doable now.
+*Lesson (the second misattribution of the night, both mine): a dirty file, or a
+peer who once discussed a file, is not evidence that a session owns work in it.
+Ask, or check authorship, before holding a fold for someone — holding on a false
+attribution costs exactly as much as a real block.*
 `core/ai_sensing.py:27-102` in-process kill switch is the only gate;
 `consent_service.py:136-137` says an ask "belongs here" if built.
 Fold: add `microphone_capture` to `CONSENT_TYPES` + `CAPABILITY_CONSENT_TYPES` +
