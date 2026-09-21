@@ -638,3 +638,47 @@ def test_a_padded_level_is_the_same_level():
         answer = json.loads(tools['get_game_sound']('eng-01', 'correct', ' 3 '))
 
     assert answer['music']['url'] == 'https://node/level3.mp3'
+
+
+# ── the verdict, as BOTH callers reach it (hartos-14 CRITICAL 1) ──────
+
+def test_the_verdict_has_one_implementation_both_callers_use():
+    """The reviewer's card posts to an endpoint, not to the agent's tool.
+
+    It reached /api/agent/approval, found no mapping for a game sound and
+    returned applied=False -- so a sound could be approved on screen while
+    approved_at stayed null forever, and REUSE could not tell an approved
+    sound from an unreviewed one. The endpoint now calls this, the same
+    function the tool calls, rather than growing a second copy.
+    """
+    from core.game_sound_memo import record_verdict
+
+    games = {'eng-01': {'sounds': {'bgm': {'url': 'https://node/a.mp3'}}}}
+    record, matched, key = record_verdict(games, 'eng-01', 'bgm', True)
+
+    assert record['approved_at'] > 0
+    assert (matched, key) == ('game', 'bgm')
+    assert games['eng-01']['sounds']['bgm']['approved_at'] > 0
+
+
+def test_the_shared_verdict_rejects_with_the_reason_given():
+    from core.game_sound_memo import record_verdict
+
+    games = {'eng-01': {'sounds': {'bgm': {'url': 'https://node/a.mp3'}}}}
+    record, _matched, _key = record_verdict(
+        games, 'eng-01', 'bgm', False, 'too jangly')
+
+    assert record.get('url') is None
+    assert record['rejected_url'] == 'https://node/a.mp3'
+    assert record['rejected_reason'] == 'too jangly'
+
+
+def test_the_shared_verdict_says_when_there_is_nothing_to_judge():
+    """The endpoint must answer applied=False rather than invent a memo."""
+    from core.game_sound_memo import record_verdict
+
+    games = {}
+    record, _matched, _key = record_verdict(games, 'eng-01', 'bgm', True)
+
+    assert record == {}
+    assert games == {}, 'minted a memo for a sound that was never composed'

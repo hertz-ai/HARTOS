@@ -849,6 +849,7 @@ from core.game_sound_memo import (  # noqa: E402
     game_state_key,
     game_state_match,
     game_state_sound,
+    record_verdict,
     rejected_take,
     set_game_state_sound,
     set_game_state_sound_at,
@@ -1402,27 +1403,11 @@ def build_core_tool_closures(ctx):
         # while playing level 3 wrote at 'correct@3' and left 'correct' --
         # the take actually sounding -- playing on, url intact.  A person
         # correcting their own copy still writes in their own space.
-        found, matched, matched_key = game_state_match(
-            games, slot, which, level, mine, own_only=bool(mine))
-        music = dict(found)
-        write_key = game_state_key(which, level) if mine else matched_key
-        if not music.get('url'):
+        music, matched, write_key = record_verdict(
+            games, slot, which, approved, reason, level, mine)
+        if not music:
             return (f"No {which} is bound to {slot or 'that game'} yet, so "
                     f"there is nothing to approve.")
-        if approved:
-            music['approved_at'] = time.time()
-            set_game_state_sound_at(games, slot, write_key, music, mine)
-        else:
-            # Kept, not deleted, so a reviewer can go back to it -- which
-            # means keeping the AUDIO, not just the fact of a rejection.
-            # Popping 'url' outright (as this did until now) threw away the
-            # only way back while the comment claimed otherwise.  It moves
-            # aside rather than out: 'url' must go, or the ladder would keep
-            # serving a take the reviewer turned down.
-            music['rejected_at'] = time.time()
-            music['rejected_reason'] = (reason or '').strip()
-            music['rejected_url'] = music.pop('url', None)
-            set_game_state_sound_at(games, slot, write_key, music, mine)
         try:
             helper_fun.save_agent_data_to_file(prompt_id, agent_data)
         except Exception as e:

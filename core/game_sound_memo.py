@@ -16,6 +16,9 @@ each growing a ladder of its own.  Importing it costs nothing.
 # One vocabulary for every game: the app's own game renderer accepts the
 # same names over its bridge (DynamicGameRenderer ALLOWED_SOUND_EVENTS), so
 # an agent-led sound and a game-led sound are the same sound.
+import time
+
+
 GAME_STATES = {
     'bgm': ("{what} — {mood} background music for a children's learning "
             "game, gentle loop, no vocals"),
@@ -145,6 +148,44 @@ def set_game_state_sound(games, game_id, state, record, level=None, user_id=None
         slot.setdefault('mine', {}).setdefault(str(user_id), {})[
             game_state_key(state, level)] = record
     return record
+
+
+def record_verdict(games, game_id, state, approved, reason='',
+                   level=None, user_id=None):
+    """Mark the memo a reviewer just judged, and say which one it was.
+
+    ONE implementation, deliberately: the agent's approve_game_sound tool
+    calls it, and so does the endpoint the reviewer's card posts to. Before
+    this, the card's answer reached an endpoint with no mapping for a game
+    sound and returned applied=False, so approved_at stayed null forever and
+    REUSE could not tell an approved sound from an unreviewed one. A second
+    copy of this logic over there would have been the parallel path the
+    owner's rule exists to stop.
+
+    The verdict lands on the memo the ladder MATCHED, not the key asked for
+    (spec 6.1), except for a person correcting their own copy, who always
+    writes in their own space (spec 6.2).
+
+    Returns (record, matched, key). An empty record means there was nothing
+    bound to judge.
+    """
+    found, matched, matched_key = game_state_match(
+        games, game_id, state, level, user_id, own_only=bool(user_id))
+    record = dict(found)
+    if not record.get('url'):
+        return {}, matched, matched_key
+    write_key = game_state_key(state, level) if user_id else matched_key
+    if approved:
+        record['approved_at'] = time.time()
+    else:
+        # kept, not deleted: the audio moves aside so a reviewer can go
+        # back to it, but it must leave 'url' or the ladder goes on
+        # serving the take they just turned down
+        record['rejected_at'] = time.time()
+        record['rejected_reason'] = (reason or '').strip()
+        record['rejected_url'] = record.pop('url', None)
+    set_game_state_sound_at(games, game_id, write_key, record, user_id)
+    return record, matched, write_key
 
 
 def rejected_take(games, game_id, state, level=None, user_id=None):
