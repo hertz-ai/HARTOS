@@ -315,3 +315,54 @@ def test_a_result_url_means_done_whatever_the_status_says():
     inner = _unwrap_envelope(live)
     assert inner.get('status') == 1, 'the numeric status is what arrives'
     assert inner.get('audio_url'), 'and the artifact is there alongside it'
+
+
+# ── the finished item, as AceStep actually shapes it (MEASURED 2026-09-22) ──
+
+def _poll_acestep(item):
+    """Run check_media_status against one live-shaped /query_result item."""
+    import json as _j
+    from unittest.mock import MagicMock, patch
+    import integrations.service_tools.media_agent as ma
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {'data': [item], 'code': 200, 'error': None}
+    with patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'),             patch('core.http_pool.pooled_post', return_value=resp):
+        return _j.loads(ma.check_media_status('acestep_abc'))
+
+
+def test_a_finished_task_yields_its_file_from_the_nested_result():
+    """Two WAVs were saved at 10:34:30 and forty polls said composing.
+
+    The path is not a flat url key. It is inside a JSON STRING under
+    'result', at [0]['file'], beside a numeric status (1 = succeeded).
+    """
+    import json as _j
+    item = {'task_id': 'abc', 'status': 1, 'progress_text': 'done',
+            'result': _j.dumps([{'file': r'C:\out\chime.wav', 'wave': '',
+                                 'status': 1, 'metas': {'duration': 5}}])}
+    out = _poll_acestep(item)
+    assert out['status'] == 'completed', out
+    assert out['results'][0]['url'] == r'C:\out\chime.wav'
+
+
+def test_a_failed_task_surfaces_the_nested_error():
+    import json as _j
+    item = {'task_id': 'abc', 'status': 2, 'progress_text': '',
+            'result': _j.dumps([{'file': '', 'status': 2,
+                                 'error': 'CUDA out of memory', 'stage': 'diffusion'}])}
+    out = _poll_acestep(item)
+    assert out['status'] == 'error'
+    assert 'CUDA out of memory' in out['error']
+
+
+def test_the_submit_names_the_duration_field_acestep_reads():
+    """'duration' was silently ignored; every cue came back at 60s."""
+    from unittest.mock import MagicMock, patch
+    import integrations.service_tools.media_agent as ma
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {'data': {'task_id': 't1', 'status': 'queued'}, 'code': 200}
+    with patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'),             patch('core.http_pool.pooled_post', return_value=resp) as post:
+        ma._generate_audio_music('a chime', '', 5, '')
+    payload = post.call_args.kwargs['json']
+    assert payload['audio_duration'] == 5
+    assert 'duration' not in payload

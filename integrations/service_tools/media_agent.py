@@ -529,7 +529,11 @@ def _generate_audio_music(context: str, input_text: str,
         from core.http_pool import pooled_post
         payload = {
             'prompt': prompt,
-            'duration': duration or 30,
+            # AceStep reads 'audio_duration' (release_task_models.py:48), not
+            # 'duration'.  MEASURED 2026-09-22: sending 'duration' was silently
+            # ignored and every game cue came back at the model's 60s default
+            # -- a minute-long "correct answer" chime.
+            'audio_duration': duration or 30,
             # WAV, not AceStep's default of mp3.  MEASURED 2026-09-22: the
             # composition SUCCEEDS ("Done! Generated 2 audio tensors",
             # normalised to peak 0.89) and then the save fails with
@@ -991,10 +995,29 @@ def check_media_status(
             status = data.get('status', 'unknown')
             if tool_prefix == 'acestep' and isinstance(status, int):
                 status = _ACESTEP_STATUS_CODE.get(status, 'failed')
+            # AceStep does not put the artifact at the top of the item.  Its
+            # finished item is {"task_id", "status": <int>, "result": "<JSON
+            # STRING of a list>", "progress_text"} and the path lives INSIDE
+            # that string at [0]["file"] (query_result_service.py:
+            # _build_store_result_payload).  MEASURED 2026-09-22: two WAVs
+            # saved at 10:34:30, and forty polls over the next seventeen
+            # minutes all read "composing" because this looked for a flat
+            # url key that does not exist.  The nested item also carries
+            # "error" and "stage" for an unfinished or failed task.
+            nested = {}
+            if isinstance(data.get('result'), str) and data['result'].strip():
+                try:
+                    items = json.loads(data['result'])
+                    if isinstance(items, list) and items and isinstance(items[0], dict):
+                        nested = items[0]
+                except Exception as e:
+                    logger.debug('check_media_status: result not JSON: %s', e)
+            if nested.get('error') and not data.get('error'):
+                data['error'] = nested['error']
             result_url = (data.get('video_url') or data.get('audio_url')
                           or data.get('url') or data.get('output_url')
                           or data.get('audio_path') or data.get('file_path')
-                          or '')
+                          or nested.get('file') or '')
             progress = data.get('progress', data.get('percentage', 0))
 
             out = {
@@ -1002,6 +1025,17 @@ def check_media_status(
                 'status': status,
                 'progress': progress,
             }
+            # A failure must CARRY its reason.  The agent's poll reads
+            # progress['error'] to decide between "offer to install" and
+            # "the composer refused"; a bare status of 'failed' with no
+            # error field reads as "unknown reason" and neither branch
+            # can act on it.  AceStep puts the reason inside the nested
+            # result item (surfaced into data['error'] above).
+            if status == 'failed' or data.get('error'):
+                out['status'] = 'error'
+                out['error'] = str(data.get('error') or
+                                   f'{tool_prefix} reported failure')
+                return json.dumps(out)
             # An ARTIFACT is the completion signal, whatever the status
             # vocabulary says.  MEASURED 2026-09-22: AceStep answered
             # status=1 -- a numeric code, not one of the words this list
