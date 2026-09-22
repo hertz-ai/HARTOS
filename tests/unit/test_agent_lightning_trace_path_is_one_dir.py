@@ -1,4 +1,4 @@
-﻿"""A span the tracer writes must be a span the store can read.
+"""A span the tracer writes must be a span the store can read.
 
 Agent Lightning has exactly two components that touch the traces directory:
 `LightningTracer._save_span` (the only writer) and `LightningStore` (the only
