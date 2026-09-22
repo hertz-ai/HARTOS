@@ -193,6 +193,14 @@ MODEL_WEIGHT_BYTES = {
     'Tiel-Coder-35B-A3B-UD-Q4_K_XL.gguf':
         (22938 * _MIB, 'estimate: literal 22938, unit undeclared - read as '
                        'MiB, matching the sibling 35B rows it was typed with'),
+    # The ONLY measured row in this table.  Every other entry above is an
+    # estimate inherited from a literal whose unit had to be inferred; this
+    # one is the exact Content-Length the file downloaded at, confirmed
+    # against os.path.getsize after the fetch (2026-09-22).  Recorded in
+    # bytes rather than N * _MIB precisely so the rounding cannot creep back.
+    'Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf':
+        (22749880160, 'MEASURED: HF Content-Length and on-disk size both '
+                      '22749880160 bytes exactly (2026-09-22)'),
 }
 
 
@@ -928,6 +936,45 @@ class ModelCatalog:
              'Tiel-Coder-35B-A3B-UD-Q4_K_XL.gguf',
              'mmproj-Tiel-Coder-35B-A3B-BF16.gguf',
              'full', 90, 0.92, 0.34, ['main'], MIN_BUILD_QWEN35),
+            # Same model, built with the multi-token-prediction head.  It is
+            # a SEPARATE upstream repo (…-GGUF-MTP) with its own file names,
+            # not a quant variant of the row above, so it needs its own row.
+            #
+            # VERIFIED ON DISK 2026-09-22, not inferred from the repo name:
+            # the file carries blk.40.nextn.{eh_proj,enorm,hnorm,
+            # shared_head_norm}.weight — the MTP head — among its 753
+            # tensors. That block is the entire difference and the entire
+            # reason to prefer it.
+            #
+            # It is only worth selecting where the SERVING build can use it:
+            # llama.cpp exposes it as `--spec-type draft-mtp`, present in
+            # build 10330 on this machine and absent from the 7909 binary
+            # that also sits in .nunba/llama.cpp.  MIN_BUILD_QWEN35 (9180)
+            # already gates the family; the MTP path additionally needs a
+            # build carrying draft-mtp, which is NOT expressible in this
+            # row — hence the note rather than a silent assumption.
+            #
+            # Priority 85, NOT the 90 of the row above, and the reason is an
+            # invariant rather than a preference: test_llm_seed_priority_is_
+            # monotonic_with_size requires priority to be non-decreasing when
+            # the seeds are sorted by vram_gb/ram_gb, so that a small model
+            # can never outrank a large one a big box could have run. This
+            # row's MEASURED 21.19 GB puts it BELOW both 35B Qwens (85), so
+            # anything above 85 here breaks the ladder.
+            #
+            # Which surfaces a real defect in the row above, left alone here
+            # deliberately: its 22938 MiB is an ESTIMATE, and the file is
+            # actually 22360478080 bytes = 20.82 GB — overstated by 1.58 GB.
+            # Corrected, that row would sort BELOW the Qwens too and its own
+            # priority 90 would break this same invariant. Its compliance
+            # today rests on a wrong number. Re-ranking the ladder is a
+            # bigger change than adding a row, so it is reported, not
+            # smuggled in beside this.
+            ('llm-tiel-coder-35b-a3b-mtp', 'Tiel-Coder 35B-A3B MoE (MTP)',
+             'peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP',
+             'Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf',
+             'mmproj-Tiel-Coder-35B-A3B-MTP-BF16.gguf',
+             'full', 85, 0.92, 0.34, ['main'], MIN_BUILD_QWEN35),
         ]
         # Rows seeded by an EARLIER version of this method that are now known to
         # be unloadable: google/gemma-*-it are transformers repos with no GGUF,
