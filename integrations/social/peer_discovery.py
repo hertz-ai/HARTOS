@@ -1808,7 +1808,18 @@ class GossipProtocol:
                 logger.warning(f"Unexpected error verifying signature for {node_id[:8]}: {e}")
                 return _reject(f'signature verification errored: {e}')
 
-        integrity_status = 'verified' if signature_valid else 'unverified'
+        # A valid announce signature proves that this KEY asserted this
+        # payload.  It proves nothing about the code the node runs, so it
+        # does not confer proof: 'verified' is written by
+        # IntegrityService.evaluate_challenge_response, on an answered
+        # challenge, and by nothing else (tests/unit/test_peer_trust_requires_proof).
+        # This line used to grant 'verified' here, and the update branch
+        # below re-granted it on every direct announce (~60 s), which undid
+        # the challenge evaluator's withheld grant within a minute of any
+        # inconclusive or failed code_hash_check (self-review of 5e83047b5).
+        # The signature's validity itself is kept in public_key and the
+        # rejection of an INVALID signature above.
+        integrity_status = 'unverified'
 
         # Enforcement gate: reject unsigned peers in hard mode.
         # Skipped for relayed hints, which cannot carry one by construction.
@@ -2011,8 +2022,9 @@ class GossipProtocol:
                 existing.code_hash = peer_data['code_hash']
             if peer_data.get('version'):
                 existing.code_version = peer_data['version']
-            if signature_valid:
-                existing.integrity_status = 'verified'
+            # integrity_status is NOT touched by an announce, signed or not:
+            # a signature is identity, proof is a challenge (see the note at
+            # the new-row assignment above).  Neither granted nor downgraded.
             # A relayed hint must not DOWNGRADE a peer that already proved
             # itself with a direct signed announce. It carries no evidence
             # either way, and letting hearsay clear master_key_verified,

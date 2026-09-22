@@ -224,3 +224,50 @@ def test_a_stats_pass_grants_proof_with_no_hash_check_on_record():
     peer = a_peer(code_hash=OLD, status='claimed')
     res, dec = _stats_probe(peer, latest_hash_verdict=None)
     assert peer.integrity_status == 'verified'
+
+
+# -- the announce path is not a second granter of proof ---------------------
+
+def _announce(status_before):
+    """A direct, validly signed announce for an EXISTING peer row held in a
+    real in-memory sqlite, with an 'inconclusive' code_hash_check on record.
+    Returns the row's integrity_status afterwards."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from integrations.social.models import Base, PeerNode, IntegrityChallenge
+    from integrations.social.peer_discovery import gossip
+    eng = create_engine('sqlite://')
+    Base.metadata.create_all(eng)
+    db = sessionmaker(bind=eng)()
+    db.add(PeerNode(node_id='peer-x', url='http://10.9.9.9:5000', name='x',
+                    status='active', integrity_status=status_before, code_hash=OLD))
+    db.add(IntegrityChallenge(
+        id='c1', challenger_node_id=gossip.node_id, target_node_id='peer-x',
+        challenge_type='code_hash_check', challenge_nonce='n', status='inconclusive'))
+    db.commit()
+    payload = {'node_id': 'peer-x', 'url': 'http://10.9.9.9:5000', 'name': 'x',
+               'version': '1.0.0', 'agent_count': 1, 'post_count': 0,
+               'timestamp': 1, 'public_key': 'cd' * 32, 'signature': 'ef' * 32,
+               'code_hash': OLD}
+    with patch('security.node_integrity.verify_json_signature', return_value=True), \
+            patch('security.master_key.get_enforcement_mode', return_value='soft'):
+        gossip._merge_peer(db, payload)
+    db.commit()
+    status = db.query(PeerNode).filter_by(node_id='peer-x').first().integrity_status
+    db.close()
+    return status
+
+
+def test_a_signed_announce_does_not_grant_proof():
+    """THE SELF-REVIEW FINDING on 5e83047b5: _merge_peer wrote 'verified' on
+    any valid announce signature, so the withheld grant came back on the
+    node's next announce (~60 s). A signature proves identity, not code;
+    proof is written by evaluate_challenge_response and by nothing else."""
+    assert _announce('claimed') == 'claimed', (
+        'a signed announce granted proof to a peer whose code claim is undecided')
+
+
+def test_a_signed_announce_does_not_downgrade_proof():
+    """Preservation: a peer that proved itself keeps its proof when it
+    announces again; the announce path neither grants nor removes it."""
+    assert _announce('verified') == 'verified'

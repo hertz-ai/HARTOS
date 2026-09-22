@@ -869,7 +869,11 @@ class TestGossipSignatureIntegration:
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def test_signed_peer_accepted(self, db):
-        """Peer with valid signature should be accepted and marked verified."""
+        """Peer with a valid signature is accepted, with its key recorded,
+        and is NOT marked verified: a signature proves identity, proof is a
+        challenge answered (tests/unit/test_peer_trust_requires_proof). This
+        test used to assert 'verified' here; that grant undid the challenge
+        evaluator's withheld proof on every announce."""
         from integrations.social.peer_discovery import GossipProtocol
         from security.node_integrity import sign_json_payload, get_public_key_hex
 
@@ -888,11 +892,11 @@ class TestGossipSignatureIntegration:
         is_new = gp._merge_peer(db, peer_data)
         assert is_new is True
 
-        # Check the stored peer has verified status
+        # Accepted and recorded; proof is not granted by an announce.
         from integrations.social.models import PeerNode
         stored = db.query(PeerNode).filter_by(node_id=peer_data['node_id']).first()
         assert stored is not None
-        assert stored.integrity_status == 'verified'
+        assert stored.integrity_status == 'unverified'
         assert stored.public_key == peer_data['public_key']
 
     def test_unsigned_backward_compat(self, db):
