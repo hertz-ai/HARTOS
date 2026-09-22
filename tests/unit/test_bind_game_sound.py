@@ -1010,3 +1010,28 @@ def test_every_state_has_a_length():
     from core.game_sound_memo import GAME_STATES, GAME_STATE_DURATIONS
     assert set(GAME_STATE_DURATIONS) == set(GAME_STATES)
     assert all(0 < v <= 60 for v in GAME_STATE_DURATIONS.values())
+
+
+def test_the_cooldown_holds_on_top_of_a_rejected_take():
+    """The note written over a rejected take is still a submit in flight.
+
+    The merge that keeps the rejection must not cost the cooldown: a second
+    call inside SUBMIT_COOLDOWN_S posts nothing, and the rejected take is
+    still there afterwards.
+    """
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/first.mp3', 'variant': 1}}}}}}
+    cold = _media({'status': 'warming_up', 'message': 'starting up'})
+
+    with _agent(agent_data, cold) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too jangly')
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+        posted = cold.generate_media.call_count
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+
+    assert cold.generate_media.call_count == posted, (
+        'a duplicate went out on top of a rejected take')
+    record = agent_data[4242]['games']['eng-01']['sounds']['bgm']
+    assert record.get('rejected_url') == 'https://node/first.mp3', record
+    assert record.get('variant') == 1, (
+        f'the variant counter moved without a take being made: {record!r}')

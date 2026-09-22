@@ -215,14 +215,28 @@ def record_verdict(games, game_id, state, approved, reason='',
     return record, matched, write_key
 
 
+def game_state_record(games, game_id, state, level=None, user_id=None):
+    """The record at EXACTLY this key, or {} -- no ladder.
+
+    The one reader of the storage shape for every caller that needs the
+    key's own record rather than what the game would play: a take a reviewer
+    turned down (rejected_take), a submit still in flight (agent_tools'
+    _pending_submit), and the note that submit writes, which must land ON
+    TOP of whichever of those is already there.  Before this each of them
+    carried its own copy of the three lines below, and the copy in
+    agent_tools was the fourth reader of a shape this module owns.
+    """
+    slot = (games or {}).get(str(game_id), {})
+    sounds = ((slot.get('mine') or {}).get(str(user_id), {}) if user_id
+              else (slot.get('sounds') or {}))
+    return sounds.get(game_state_key(state, level)) or {}
+
+
 def rejected_take(games, game_id, state, level=None, user_id=None):
     """The take a reviewer turned down for this exact key, if any.
 
     Kept so the next composition can answer the reason they gave, and so a
     reviewer can go back to it (spec §6.1).
     """
-    slot = (games or {}).get(str(game_id), {})
-    sounds = ((slot.get('mine') or {}).get(str(user_id), {}) if user_id
-              else (slot.get('sounds') or {}))
-    record = sounds.get(game_state_key(state, level)) or {}
+    record = game_state_record(games, game_id, state, level, user_id)
     return record if record.get('rejected_at') else {}

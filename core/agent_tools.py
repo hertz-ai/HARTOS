@@ -849,6 +849,7 @@ from core.game_sound_memo import (  # noqa: E402
     GAME_STATES,
     game_state_key,
     game_state_match,
+    game_state_record,
     game_state_sound,
     record_verdict,
     rejected_take,
@@ -869,11 +870,8 @@ def _pending_submit(games, game_id, state, level=None, user_id=None):
 
     A record with 'submitted_at' and neither 'url' nor 'task_id' is a submit
     whose reply timed out.  The ladder ignores it (nothing to play, nothing to
-    poll), so it is read here directly."""
-    slot = (games or {}).get(str(game_id), {})
-    sounds = ((slot.get('mine') or {}).get(str(user_id), {}) if user_id
-              else (slot.get('sounds') or {}))
-    record = sounds.get(game_state_key(state, level)) or {}
+    poll), so it is read at its own key."""
+    record = game_state_record(games, game_id, state, level, user_id)
     if record.get('url') or record.get('task_id'):
         return None
     return record.get('submitted_at')
@@ -1355,11 +1353,18 @@ def build_core_tool_closures(ctx):
                     # refused would be wrong AND would leave the game with
                     # nothing pending to come back to.  And the POST may have
                     # been accepted: remember WHEN it went out, so the next
-                    # call waits instead of queueing a duplicate.
-                    _remember({'submitted_at': time.time(), 'mood': mood,
-                               'prompt': prompt, 'state': which,
+                    # call waits instead of queueing a duplicate.  Written ON
+                    # TOP of what this key already holds: a take the reviewer
+                    # turned down keeps its rejected_url, its reason and its
+                    # variant, so the next call still answers them.  MEASURED
+                    # 2026-09-22 (hartos-14): replacing the record here erased
+                    # all three -- on a node restarted overnight, which is
+                    # exactly when a rejection is waiting.
+                    _remember({'mood': mood, 'prompt': prompt, 'state': which,
                                'level': level or None, 'variant': variant,
-                               'composed_at': None, 'approved_at': None})
+                               'composed_at': None, 'approved_at': None,
+                               **game_state_record(games, slot, which, level, mine),
+                               'submitted_at': time.time()})
                     return json.dumps({
                         'status': 'composing',
                         'game_id': slot,
