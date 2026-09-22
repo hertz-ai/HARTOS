@@ -98,8 +98,17 @@ class TestTheBatchAnswerIsRead:
              patch('core.http_pool.pooled_post', return_value=_resp(payload)):
             out = json.loads(poll(task_id='acestep_abc123'))
 
-        assert out['status'] == 'failed', (
+        # 'error' CARRYING the reason, not the bare word 'failed': that is
+        # the convention every other failure path in check_media_status
+        # already uses, and the agent's poll branch reads progress['error']
+        # to choose between "offer an install" and "the composer refused".
+        # My first version of this test asserted 'failed', a third vocabulary
+        # the function does not otherwise emit -- 65d0cc688 was right to
+        # normalise and this assertion had to follow.
+        assert out['status'] == 'error', (
             f"a failed composition must not read as unknown: {out!r}")
+        assert out['error'] == 'model failed to load', (
+            f"a failure must carry its reason, not just its fact: {out!r}")
 
     def test_the_right_item_is_picked_out_of_a_batch(self, poll):
         payload = {'code': 200, 'data': [
@@ -160,10 +169,14 @@ class TestTheNumericStatusIsTranslated:
         assert out['results'] == [{'type': 'audio',
                                    'url': 'http://node/song.wav'}], out
 
-    def test_two_is_failed(self):
+    def test_two_is_a_reported_failure(self):
+        """Code 2 must be legible as a failure. It surfaces as the house
+        'error' status rather than the word 'failed' -- see the note in
+        test_a_failed_task_reads_failed_not_unknown."""
         out = self._poll({'code': 200, 'data': [
             {'task_id': 'abc123', 'status': 2}]})
-        assert out['status'] == 'failed', out
+        assert out['status'] == 'error', out
+        assert out['status'] != 'unknown', out
 
     def test_zero_is_still_in_flight(self):
         out = self._poll({'code': 200, 'data': [
