@@ -850,3 +850,32 @@ def test_a_reset_from_a_loading_composer_is_not_a_failure():
     assert not _reads_as_still_waking(
         'No connection could be made because the target machine actively '
         'refused it')
+
+
+def test_a_reset_while_polling_keeps_polling_instead_of_failing():
+    """MEASURED 2026-09-22, attempts 9-10 of a live bind.
+
+    The submit path learned that a reset from a loading composer is not a
+    failure; the POLL path had its own failure branch that never asked.
+    A composition mid-generation was reported "failed" on
+    ConnectionResetError 10054 and then finished anyway.
+    """
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct': {'task_id': 'acestep_abc', 'mood': 'happy',
+                    'prompt': 'p', 'state': 'correct'}}}}}}
+    media = _media({'status': 'pending', 'task_id': 'acestep_abc'})
+    # first poll: a reset; second poll: finished
+    media.check_media_status.side_effect = [
+        json.dumps({'status': 'error',
+                    'error': "('Connection aborted.', ConnectionResetError("
+                             "10054, 'An existing connection was forcibly "
+                             "closed by the remote host'))"}),
+        json.dumps({'status': 'completed',
+                    'results': [{'url': 'https://node/finished.wav'}]}),
+    ]
+
+    with _agent(agent_data, media) as tools,             patch('time.sleep', lambda *_a, **_k: None):
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+
+    assert answer['status'] == 'bound', 'a reset mid-poll was reported as failure'
+    assert answer['music']['url'] == 'https://node/finished.wav'

@@ -1186,6 +1186,7 @@ def build_core_tool_closures(ctx):
 
         try:
             from integrations.service_tools.media_agent import (
+                _reads_as_still_waking,
                 check_media_status,
                 generate_media,
             )
@@ -1350,6 +1351,14 @@ def build_core_tool_closures(ctx):
                                        'state': which, 'music': record})
                 if state in ('failed', 'error'):
                     why = str(progress.get('error', 'unknown reason'))
+                    if _reads_as_still_waking(why):
+                        # The POLL can be reset by a busy server just as the
+                        # submit can (MEASURED 2026-09-22: attempts 9-10 of a
+                        # live bind reported "failed" on ConnectionResetError
+                        # 10054 while the composer was mid-generation and went
+                        # on to finish).  Keep polling; the deadline below
+                        # still hands the task back as 'composing'.
+                        continue
                     if _no_composer_here(progress):
                         return _ask_for_a_composer(why)
                     return f"The composer failed on this game: {why}"
