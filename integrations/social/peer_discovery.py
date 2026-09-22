@@ -1852,7 +1852,25 @@ class GossipProtocol:
             integrity_status = 'unverified'
 
         if existing:
-            existing.last_seen = datetime.utcnow()
+            # last_seen is DIRECT evidence of liveness: the node's own announce
+            # (this branch with relayed=False) or a successful ping in the
+            # health round.  A relayed row is a third party's hearsay and must
+            # not move it.  It did, and that was the whole D4 (#62) mechanism:
+            # central relays its entire non-dead table to every node that
+            # exchanges with it, every node hands its own list back, so a row
+            # nobody had reached in months got a fresh last_seen every gossip
+            # round, the health round's age check never tripped, and 1,149
+            # junk rows (369 loopback, 774 private addresses from other LANs)
+            # stayed 'active' on every node forever.  Measured on central
+            # 2026-09-22 once #71 made the loop tick: the health round covered
+            # 3-4 of 1,156 rows per 30s window and the budgeted integrity
+            # round spent each window on one unroutable address.  The
+            # resurrect check below (`now - last_seen < 60`) also read the
+            # value this line had just written, so hearsay brought every dead
+            # row straight back.  A hint still updates the address and still
+            # adds a peer we did not know; it may not vouch for liveness.
+            if not relayed:
+                existing.last_seen = datetime.utcnow()
             existing.url = url
             existing.name = peer_data.get('name', existing.name)
             existing.version = peer_data.get('version', existing.version)

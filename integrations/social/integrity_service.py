@@ -51,6 +51,12 @@ FRAUD_SUSPICIOUS_THRESHOLD = 40.0
 ATTESTATION_EXPIRY_DAYS = 7
 MIN_WITNESS_PEERS = 1
 CHALLENGE_TIMEOUT_SECONDS = 30
+# Connect and read are bounded separately.  One 30s figure let a blackholed
+# address (774 of central's 1,149 'active' rows are private 10.x/192.168.x
+# addresses unroutable from the container, 2026-09-22) spend the full 30s
+# at connect, and inside the integrity round's 30s budget (#71) one such peer
+# was the whole window.  A peer that does connect keeps the full read time.
+CHALLENGE_CONNECT_TIMEOUT_SECONDS = 5
 WITNESS_TIMESTAMP_MAX_AGE = 60  # seconds
 
 # ── Fraud Score Decay ──
@@ -254,7 +260,8 @@ class IntegrityService:
                 f"{target_url}/api/social/integrity/challenge",
                 json={'challenge_id': challenge.id, **challenge_data,
                       'challenger_node_id': challenger_node_id},
-                timeout=CHALLENGE_TIMEOUT_SECONDS,
+                timeout=(CHALLENGE_CONNECT_TIMEOUT_SECONDS,
+                         CHALLENGE_TIMEOUT_SECONDS),
             )
             if resp.status_code == 200:
                 response_data = resp.json()
