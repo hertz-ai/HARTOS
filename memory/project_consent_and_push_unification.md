@@ -860,6 +860,41 @@ fold that "looks trivial" in the plan text is exactly the one to check first.
   without reading what the code already decided and why.*
 - **F14** four desktop-toast emitters → one (`hart-notify.nix:92-124`,
   `shell_os_apis.py:384`, `tray_handler.py:136-146`, `indicator_window.py:108`).
+
+  **DONE 2026-09-22 — VERDICT: NOT four emitters, and DO NOT fold. But the audit
+  found a real GATE BYPASS, which is fixed.**
+
+  What the four sites actually are:
+  | site | what it is |
+  |---|---|
+  | `hart-notify.nix:103-127` | `hart-notify-send`: a CONSENT GATE around the native emitter. Asks `core.ai_sensing.query_authority('screen')` FAIL-CLOSED, exit 77 = REFUSED (the same convention as `hart-screencast-gate`), and only then execs libnotify. NixOS appliance only |
+  | `shell_os_apis.py:359-395` | the Flask route `POST /api/shell/notifications/send`: queues an in-app record AND shells out natively |
+  | `tray_handler.py:136-146` | **macOS** `osascript display notification`, inside `MacOSDummyTray` because AppKit threading forbids a real tray |
+  | `indicator_window.py:108` | **not a toast at all.** That line is `return 1920, 1080`, the screen-size fallback in a Tk `RibbonIndicator` (an always-on ribbon saying what the AI is doing) |
+  So: one gate wrapper, one HTTP route, one macOS platform arm, and one
+  mis-cited line. Three platforms and a gate are not four copies of one thing,
+  and there is nothing to merge.
+
+  **The real finding.** The route called plain `notify-send` directly. But
+  `hart-notify.nix` exists precisely so the AI's native toasts are gated on the
+  human's 'screen' consent, and its own comment says foreign apps keep using the
+  ungated `notify-send`. So HARTOS was painting native toasts *as a foreign app*
+  and escaping the single supreme gate built to stop exactly that -- reachable by
+  anything that can POST the route, with caller-supplied title and body.
+  **Fixed:** the route now prefers `hart-notify-send` when it is present
+  (`shutil.which` as a presence check only, so argv keeps the bare name), and
+  treats exit 77 as `suppressed_by_consent` rather than a failed D-Bus leg. The
+  in-shell queue still carries the record, which is the RECOVERY half of the gate
+  (BLOCK + ASK + RECOVERY). Where the gated binary is absent -- every non-NixOS
+  host -- behaviour is byte-identical to before, so nothing regresses.
+  Reuses the existing gate rather than adding a second check, per its own
+  "no new path, no new gate".
+  Evidence: `test_flow_05_events_and_sinks.py` 12/12 (3 new: the gated emitter is
+  used and the ungated one is NOT also fired; a 77 reads as a refusal, not a
+  failure, with the record kept; and with no gate installed the old path and old
+  reporting are unchanged, including that a 77 from plain `notify-send` is NOT
+  dressed up as consent). Red-first: with the gate mutated out, the two gate tests
+  fail and the no-regression test still passes.
 - **F15** SMTP senders → one — **PREMISE FULLY ACCURATE 2026-09-22, all three
   files AND line numbers correct. Prescription is also right, including its
   caveat.** One refinement from reading them:
