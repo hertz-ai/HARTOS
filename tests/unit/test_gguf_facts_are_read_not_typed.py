@@ -62,10 +62,11 @@ def _tensor_info(name, offset):
 
 
 def write_gguf(path, arch=None, experts_total=None, experts_used=None,
-               nextn=None, pad=0, tensors=None, data_bytes=0, align=32):
+               nextn=None, pad=0, tensors=None, data_bytes=0, align=32,
+               blocks=None):
     """`tensors` is [(name, offset), ...]; sizes come from the GAPS between
     offsets, exactly as the reader derives them, with the last tensor
-    running to `data_bytes`."""
+    running to `data_bytes`.  `blocks` writes `<arch>.block_count`."""
     kvs = b''
     n = 0
     if arch is not None:
@@ -76,6 +77,8 @@ def write_gguf(path, arch=None, experts_total=None, experts_used=None,
         kvs += _kv_u32(f'{arch}.expert_used_count', experts_used); n += 1
     if nextn is not None:
         kvs += _kv_u32(f'{arch}.nextn_predict_layers', nextn); n += 1
+    if blocks is not None:
+        kvs += _kv_u32(f'{arch}.block_count', blocks); n += 1
 
     tensors = tensors or []
     infos = b''.join(_tensor_info(nm, off) for nm, off in tensors)
@@ -121,7 +124,8 @@ def big_moe(tmp_path, monkeypatch):
     facts = {'architecture': 'qwen35moe', 'weight_bytes': 21 * G,
              'moe': True, 'experts_total': 256, 'experts_used': 8,
              'expert_fraction': 8 / 256, 'mtp': True, 'mtp_layers': 1,
-             'expert_bytes': 20 * G, 'non_expert_bytes': 1 * G}
+             'expert_bytes': 20 * G, 'non_expert_bytes': 1 * G,
+             'block_count': 40}
     import integrations.service_tools.model_catalog as mc
     monkeypatch.setattr(mc, 'read_gguf_facts',
                         lambda path: dict(facts) if str(path) == str(p) else {})
@@ -159,6 +163,33 @@ class TestTheFactsThatWereTrackedNowhere:
         f = read_gguf_facts(p)
         assert f['architecture'] == 'llama4moe'
         assert f['experts_total'] == 64 and f['experts_used'] == 2
+
+
+class TestTheBlockCountIsReadNotAssumed:
+    """``--n-gpu-layers N`` counts transformer blocks, and the spawn that
+    picks N for a partial offload (llamacpp_manager.get_optimal_params)
+    assumed "~40 layers" for every model it met.  The file states the
+    number.  The reader reports it, and for a header that does not carry it
+    reports nothing -- a default here would put the 40 back one layer down,
+    where no spawn could tell it from a measurement."""
+
+    def test_the_count_comes_from_the_header(self, tmp_path):
+        p = write_gguf(str(tmp_path / 'b.gguf'), arch='qwen35', blocks=36)
+        assert read_gguf_facts(p)['block_count'] == 36
+
+    def test_a_moe_reports_it_beside_its_experts(self, tmp_path):
+        p = write_gguf(str(tmp_path / 'm.gguf'), arch='qwen35moe',
+                       experts_total=256, experts_used=8, blocks=40)
+        f = read_gguf_facts(p)
+        assert f['block_count'] == 40 and f['moe'] is True
+
+    def test_it_is_found_by_suffix_like_every_other_key(self, tmp_path):
+        p = write_gguf(str(tmp_path / 'o.gguf'), arch='llama4moe',
+                       experts_total=64, experts_used=2, blocks=48)
+        assert read_gguf_facts(p)['block_count'] == 48
+
+    def test_a_header_without_it_reports_no_count(self, dense_gguf):
+        assert 'block_count' not in read_gguf_facts(dense_gguf)
 
 
 class TestTheSplitThatDecidesPlacement:

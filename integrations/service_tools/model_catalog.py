@@ -307,6 +307,19 @@ def read_gguf_facts(path: str) -> dict:
                 return v
         return None
 
+    # How many transformer blocks the file holds -- the unit ``--n-gpu-layers
+    # N`` counts in.  A partial offload that has to pick N used to assume
+    # "~40 layers" for every model it met (llamacpp_manager.get_optimal_params
+    # carried ``int(ratio * 40)``); the file states the real number, so that
+    # guess is now only the fallback for a file this reader could not parse.
+    blocks = _by_suffix('block_count')
+    if blocks is not None:
+        try:
+            facts['block_count'] = int(blocks)
+        except (TypeError, ValueError):
+            logger.warning("read_gguf_facts(%s): block_count %r is not an "
+                           "integer; leaving it unknown", path, blocks)
+
     used, total = _by_suffix('expert_used_count'), _by_suffix('expert_count')
     if total:
         facts['moe'] = True
@@ -422,6 +435,31 @@ def gguf_fits_gpu(free_vram_gb: float, free_ram_gb: float, *,
     if free_vram_gb >= whole_need_gb:
         return True
     return bool(moe) and (free_vram_gb + free_ram_gb) >= whole_need_gb
+
+
+#: Transformer-block count assumed for a PARTIAL offload of a file whose
+#: header ``read_gguf_facts`` could not read.  The real count is
+#: ``read_gguf_facts()['block_count']``; this is reached only for a file the
+#: reader returned {} on.  It is the guess llamacpp_manager applied to EVERY
+#: model as ``int(ratio * 40)  # assume ~40 layers``, kept so an unreadable
+#: file still launches the way it did before, and named so nothing re-types it.
+LAYER_COUNT_FALLBACK = 40
+
+
+def gguf_partial_offload_layers(free_vram_gb: float, size_gb: float,
+                                block_count: Optional[int] = None) -> int:
+    """How many blocks of a model that does NOT fit whole go on the GPU.
+
+    The second half of the placement question ``gguf_fits_gpu`` answers the
+    first half of, and it lives beside it for the same reason: every piece of
+    "how much of this model goes on the GPU" arithmetic has one home, so a
+    source guard can keep it there.  Only called after ``gguf_fits_gpu`` said
+    no.  At least one block, so a spawn that got this far still uses the card.
+    """
+    n_layers = block_count or LAYER_COUNT_FALLBACK
+    if not size_gb or size_gb <= 0:
+        return 1
+    return max(1, int(free_vram_gb / size_gb * n_layers))
 
 
 def moe_offload_args(gguf_path: str, free_vram_gb: float) -> List[str]:
