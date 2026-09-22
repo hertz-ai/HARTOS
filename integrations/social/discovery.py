@@ -448,6 +448,12 @@ def peer_broadcast():
                                   (pulls full packet from the sender's
                                   /v1/ralt/skills/export/<task_id> and
                                   installs it locally via import_skill)
+      * 'recipe_available'      → peer_reuse.on_recipe_available_advert
+                                  (caches the pointer so the daemon can
+                                  pull directly)
+      * 'model_available'       → model_mesh.on_model_available_advert
+                                  (caches the OFFER; registers nothing
+                                  and fetches no weights)
 
     Unknown types are acknowledged but not dispatched, so new gossip
     payload types can be added without wire-breaking older peers.
@@ -485,6 +491,25 @@ def peer_broadcast():
             return jsonify(result), status
         except Exception as e:
             logger.debug(f"peer_broadcast recipe advert dispatch failed: {e}")
+            return jsonify({'success': False, 'reason': str(e)}), 500
+
+    elif msg_type == 'model_available':
+        # MODEL capability mesh: an admitted peer installed a model and
+        # advertised it (model_mesh.announce_model_available). Cache the
+        # OFFER so the Model Management page can show what the hive has
+        # that this node does not. Nothing is registered and no weights
+        # are fetched — select_best() does not filter on `downloaded`,
+        # so a catalog row would be a live selection candidate scored
+        # with numbers a peer chose. Trust + echo-skip live in
+        # on_model_available_advert.
+        try:
+            from integrations.service_tools.model_mesh import (
+                on_model_available_advert)
+            result = on_model_available_advert(msg)
+            status = 200 if result.get('success') else 202
+            return jsonify(result), status
+        except Exception as e:
+            logger.debug(f"peer_broadcast model advert dispatch failed: {e}")
             return jsonify({'success': False, 'reason': str(e)}), 500
 
     # Forward-compatible: ack unknown types without error so older
