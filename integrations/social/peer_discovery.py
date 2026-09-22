@@ -2611,8 +2611,35 @@ class AutoDiscovery:
                     logger.warning(f"AutoDiscovery: invalid signature from "
                                    f"{payload.get('node_id', '?')[:8]}")
                     return {}
-            except Exception:
-                pass
+            except ImportError as e:
+                # OUR verifier is missing, not the peer's fault.  Refusing
+                # here would partition this node off the LAN over a local
+                # packaging fault, which is the thing security must not do.
+                # Admit unverified and SAY SO -- the same choice, and the
+                # same wording, as the code-hash branch above.
+                logger.error(
+                    f"AutoDiscovery: signature verifier unavailable ({e}); "
+                    f"the beacon from {node_id[:8]} was NOT verified. "
+                    f"Admitting as untrusted, the way the announce path does")
+            except Exception as e:
+                # The signature and public key came from the packet, so an
+                # exception here is the SENDER's malformed input -- a
+                # malformed pubkey that makes the verifier raise would
+                # otherwise skip verification entirely and be admitted.
+                # That is evidence of badness, so refuse.
+                #
+                # This gulp was `except Exception: pass`, which returned the
+                # payload with no verification and NO log line.  d6c686197
+                # (mine) demoted the code-hash gate from an admission gate
+                # to a trust signal -- correctly -- which left this check as
+                # the ONLY thing in front of admission, so the silence here
+                # went from bad to load-bearing.  Found by hartos-14.
+                logger.warning(
+                    f"AutoDiscovery: signature check RAISED for "
+                    f"{node_id[:8]} ({e}); the packet's own key or signature "
+                    f"is malformed. Refusing -- an unverifiable signature "
+                    f"must not read as a valid one")
+                return {}
 
         # Reject stale beacons (> 5 minutes old)
         ts = payload.get('timestamp', 0)
