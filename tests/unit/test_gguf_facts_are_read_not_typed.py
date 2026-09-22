@@ -35,7 +35,8 @@ if _ROOT not in sys.path:
 os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
 
 from integrations.service_tools.model_catalog import (  # noqa: E402
-    ModelCatalog, ModelEntry, ModelType, moe_offload_args, read_gguf_facts)
+    ModelCatalog, ModelEntry, ModelType, llama_gguf_compute_requirements,
+    moe_offload_args, read_gguf_facts)
 
 
 # ── minimal GGUF writer ───────────────────────────────────────────────
@@ -407,3 +408,37 @@ class TestTheExpertsGoToRamOnlyWhenTheyMustAndOnlyForAMoE:
         it fits and drop the flag."""
         assert moe_offload_args(big_moe, free_vram_gb=28.0) == ['--cpu-moe']
         assert moe_offload_args(big_moe, free_vram_gb=29.0) == []
+
+
+class TestTheSizingFunctionThatDidNotExist:
+    """llama_gguf_compute_requirements was imported twice by Nunba's
+    main.py -- the quant picker and the hub-install handler -- and defined
+    nowhere. `git log -S "def llama_gguf_compute_requirements"` finds no
+    definition in either repo's history.
+
+    The import sits unconditionally inside _gguf_install_files, before any
+    fit check, and the caller catches only ValueError. So the ImportError
+    propagated and EVERY GGUF install through the Model Management page
+    raised before it could pick a quant. Proven by calling the picker with
+    a real Hub manifest."""
+
+    def test_it_exists_and_returns_a_pair(self):
+        vram, ram = llama_gguf_compute_requirements(10.0)
+        assert (vram, ram) == (13.5, 20.0)
+
+    def test_it_matches_the_literals_the_populator_used(self):
+        """_populate_llm_models computed weights*1.35 and weights*2.0 from
+        bare literals. One function owns that now; if these drift apart,
+        two rows for the same model get two different sizes."""
+        for gb in (0.5, 2.71, 17.6, 21.19):
+            assert llama_gguf_compute_requirements(gb) == (
+                round(gb * 1.35, 1), round(gb * 2.0, 1))
+
+    def test_the_vram_overhead_is_the_same_constant_the_moe_path_uses(self):
+        from integrations.service_tools.model_catalog import (
+            _MOE_VRAM_OVERHEAD)
+        assert llama_gguf_compute_requirements(100.0)[0] == round(
+            100.0 * _MOE_VRAM_OVERHEAD, 1)
+
+    def test_zero_is_not_a_crash(self):
+        assert llama_gguf_compute_requirements(0.0) == (0.0, 0.0)

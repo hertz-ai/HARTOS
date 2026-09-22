@@ -352,6 +352,31 @@ def read_gguf_facts(path: str) -> dict:
     return facts
 
 
+def llama_gguf_compute_requirements(size_gb: float) -> tuple:
+    """(vram_gb, ram_gb) a llama.cpp GGUF of this size needs, fully resident.
+
+    THIS FUNCTION DID NOT EXIST. Nunba's main.py imported it twice --
+    `_gguf_install_files` (the quant picker) and the hub-install handler --
+    and `git log -S` finds no definition anywhere in either repo's history.
+    The import sits unconditionally in the picker, before any fit check, and
+    the caller catches only ValueError, so the ImportError propagated: every
+    GGUF install through the Model Management page raised before it could
+    choose a quant. Proven by calling the picker with a real manifest.
+
+    Defined here because the same two numbers were already being computed
+    from bare literals in _populate_llm_models (weights * 1.35, weights *
+    2.0). One function now owns "a GGUF of size N needs this much", and
+    _MOE_VRAM_OVERHEAD is the same 1.35.
+
+    Fully resident is the DENSE answer, and it is the right default: a dense
+    model touches every parameter on every token, so anything not on the GPU
+    costs a PCIe round trip per token. A mixture of experts is the exception
+    and is handled where the placement is chosen, not here -- see
+    moe_offload_args and ModelEntry.matches_compute.
+    """
+    return (round(size_gb * _MOE_VRAM_OVERHEAD, 1), round(size_gb * 2.0, 1))
+
+
 def moe_offload_args(gguf_path: str, free_vram_gb: float) -> List[str]:
     """llama.cpp flags placing a MoE's experts in system RAM, or [].
 
@@ -1273,11 +1298,12 @@ class ModelCatalog:
                     'mmproj-BF16.gguf' if mmproj.endswith('-BF16.gguf')
                     else 'mmproj-F16.gguf'
                 )
+            _vram_gb, _ram_gb = llama_gguf_compute_requirements(weights_gb)
             _definition = dict(
                 name=name, model_type=ModelType.LLM,
                 source='huggingface', repo_id=repo, files=files,
-                vram_gb=round(weights_gb * 1.35, 1),
-                ram_gb=round(weights_gb * 2.0, 1),
+                vram_gb=_vram_gb,
+                ram_gb=_ram_gb,
                 disk_gb=weights_gb,
                 min_capability_tier=tier,
                 # 'llama.cpp' — the spelling in BACKENDS, in
