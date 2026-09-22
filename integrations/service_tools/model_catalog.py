@@ -207,6 +207,14 @@ MODEL_WEIGHT_BYTES = {
 
 #: GGUF metadata value types, by the enum the format defines.  Only the
 #: fixed-width ones need a struct code; strings and arrays are read by shape.
+_GIB = 1024 ** 3
+
+#: VRAM headroom over a MoE's non-expert weights, covering KV cache and
+#: compute buffers. Same 1.35 the dense path uses, and measured comfortably
+#: above the real ratio: Tiel-Coder-35B-A3B took 2.87 GiB for 2.53 GiB of
+#: non-expert weights at ctx 4096, i.e. 1.135.
+_MOE_VRAM_OVERHEAD = 1.35
+
 _GGUF_SCALAR = {0: '<B', 1: '<b', 2: '<H', 3: '<h', 4: '<I', 5: '<i',
                 6: '<f', 7: '<?', 10: '<Q', 11: '<q', 12: '<d'}
 
@@ -510,7 +518,21 @@ class ModelEntry:
         Returns: 'gpu', 'cpu', 'cpu_offload', or 'impossible'
         """
         if gpu_available and budget_vram_gb >= self.vram_gb:
-            return 'gpu'
+            # A mixture of experts runs its expert tensors from system RAM
+            # (llama.cpp --cpu-moe) with attention resident on the GPU, so
+            # for those rows vram_gb covers only the non-expert weights and
+            # ram_gb the experts. Both have to hold: the experts are mmapped,
+            # so a shortfall does not fail the load, it silently destroys
+            # throughput. MEASURED on this box -- Tiel-Coder-35B-A3B with
+            # 18.64 GiB of experts against ~6.5 GiB of free RAM served 0.95
+            # tokens/sec, because every token faults 8 of 256 experts back
+            # off disk. Fitting is not the same as being able to run it.
+            #
+            # A dense model has no such split, never sets the moe capability,
+            # and is unaffected -- its GPU arm still tests VRAM alone.
+            caps = self.capabilities or {}
+            if not caps.get('moe') or budget_ram_gb >= self.ram_gb:
+                return 'gpu'
         if self.supports_cpu_offload and gpu_available and budget_vram_gb >= self.vram_gb * 0.5:
             return 'cpu_offload'
         if self.supports_cpu and budget_ram_gb >= self.ram_gb:
@@ -784,9 +806,28 @@ class ModelCatalog:
         and the row gains architecture facts read from the artifact instead
         of typed into a table: moe/experts_used/experts_total and mtp.
 
-        Only ADDS keys to capabilities. It never touches vram_gb, ram_gb,
-        disk_gb, priority or the scores, so selection cannot move because of
-        this call -- correcting those is a separate, deliberate change.
+        For a DENSE model it only ADDS capability keys and never touches
+        vram_gb, ram_gb, disk_gb, priority or the scores, so no dense
+        selection can move because of this call.
+
+        For a MIXTURE OF EXPERTS it also corrects vram_gb and ram_gb,
+        because the inherited figures describe a placement that nobody
+        would ever use. ``vram_gb = weights * 1.35`` assumes every weight
+        sits in VRAM, and for a MoE that is the one thing you would not do:
+        the experts belong in system RAM (--cpu-moe) while attention stays
+        on the GPU. For Tiel-Coder-35B-A3B the inherited row claimed 28.6 GB
+        of VRAM against a measured 2.87 GiB -- about 11x, and the reason a
+        machine that can run the model is told it cannot.
+
+        The constants are taken from that measurement, not invented:
+        loading it with ``-ngl 99 --cpu-moe`` moved GPU use from 3321 to
+        6256 MiB, i.e. 2.87 GiB for 2.53 GiB of non-expert weights plus KV
+        cache at ctx 4096 -- a ratio of 1.135. _MOE_VRAM_OVERHEAD keeps the
+        1.35 the dense path already uses, which is comfortably above that
+        and leaves room for a larger context. ram_gb becomes the expert
+        bytes at 1.0: they are mmapped rather than copied, so what matters
+        is that they can stay RESIDENT, and the same run proved what
+        happens when they cannot -- 0.95 tokens/sec.
         """
         entry = self._entries.get(model_id)
         if not entry:
@@ -802,6 +843,22 @@ class ModelCatalog:
                     facts.get('moe'), facts.get('experts_used'),
                     facts.get('experts_total'), facts.get('mtp'),
                     facts.get('weight_bytes'))
+                # Gated on EXPERT bytes, not non-expert: a MoE whose tensor
+                # table could not be read reports expert_bytes == 0 and a
+                # non_expert_bytes of whatever trailed the header, which
+                # would rewrite vram_gb to ~0 and make the model look free.
+                # No measured split means no correction.
+                if facts.get('moe') and facts.get('expert_bytes'):
+                    was = (entry.vram_gb, entry.ram_gb)
+                    entry.vram_gb = round(
+                        facts['non_expert_bytes'] / _GIB
+                        * _MOE_VRAM_OVERHEAD, 1)
+                    entry.ram_gb = round(facts['expert_bytes'] / _GIB, 1)
+                    logger.info(
+                        "%s: MoE placement -- vram %.1f -> %.1f GB (non-expert "
+                        "weights only), ram %.1f -> %.1f GB (experts, which "
+                        "must stay resident)", model_id, was[0], entry.vram_gb,
+                        was[1], entry.ram_gb)
 
     def mark_loaded(self, model_id: str, device: str = 'gpu') -> None:
         entry = self._entries.get(model_id)

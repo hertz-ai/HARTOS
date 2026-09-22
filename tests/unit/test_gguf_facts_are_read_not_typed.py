@@ -235,6 +235,9 @@ class TestEnrichmentCannotMoveSelection:
         return c
 
     def test_facts_are_added_and_scoring_fields_are_not_touched(self, moe_gguf):
+        """This fixture has no tensor table, so there is no measured split
+        and nothing may be rewritten. Ranking inputs are never touched in
+        any case."""
         c = self._cat()
         before = (c._entries['m'].vram_gb, c._entries['m'].ram_gb,
                   c._entries['m'].disk_gb, c._entries['m'].priority,
@@ -245,6 +248,45 @@ class TestEnrichmentCannotMoveSelection:
         assert e.capabilities['chat'] is True       # preserved
         assert (e.vram_gb, e.ram_gb, e.disk_gb, e.priority,
                 e.speed_score, e.quality_score) == before
+
+    def test_a_dense_model_never_has_its_sizing_rewritten(self, dense_gguf):
+        """The owner's constraint: only a MoE may put weights in RAM. A
+        dense model touches every parameter every token, so overflowing it
+        means a PCIe round trip per token. Its numbers must not move."""
+        c = self._cat()
+        before = (c._entries['m'].vram_gb, c._entries['m'].ram_gb)
+        c.mark_downloaded('m', True, gguf_path=dense_gguf)
+        assert (c._entries['m'].vram_gb, c._entries['m'].ram_gb) == before
+
+    def test_a_measured_moe_is_resized_to_its_actual_placement(self,
+                                                               tmp_path):
+        """vram_gb becomes the NON-expert weights (what --cpu-moe leaves on
+        the GPU) and ram_gb the experts (what must stay resident)."""
+        p = write_gguf(str(tmp_path / 'm.gguf'), arch='qwen35moe',
+                       experts_total=256, experts_used=8,
+                       tensors=[('blk.0.attn_q.weight', 0),
+                                ('blk.0.ffn_gate_exps.weight', 1 << 30)],
+                       data_bytes=5 << 30)          # 1 GiB attn, 4 GiB exps
+        c = self._cat()
+        c.mark_downloaded('m', True, gguf_path=p)
+        e = c._entries['m']
+        assert e.vram_gb == pytest.approx(1.0 * 1.35, abs=0.05)
+        assert e.ram_gb == pytest.approx(4.0, abs=0.05)
+        # ranking inputs still untouched
+        assert (e.priority, e.speed_score, e.quality_score) == (85, 0.34, 0.92)
+
+    def test_ranking_is_never_rewritten_even_for_a_moe(self, tmp_path):
+        p = write_gguf(str(tmp_path / 'm.gguf'), arch='qwen35moe',
+                       experts_total=256, experts_used=8,
+                       tensors=[('a.weight', 0),
+                                ('blk.0.ffn_up_exps.weight', 1 << 30)],
+                       data_bytes=3 << 30)
+        c = self._cat()
+        c.mark_downloaded('m', True, gguf_path=p)
+        e = c._entries['m']
+        assert e.priority == 85 and e.quality_score == 0.92
+        assert e.disk_gb == 21.19
+
 
     def test_the_old_two_arg_call_is_unchanged(self):
         """Every existing caller passes no path. It must behave exactly as
@@ -265,3 +307,42 @@ class TestEnrichmentCannotMoveSelection:
     def test_unknown_model_id_is_a_no_op(self, moe_gguf):
         c = self._cat()
         c.mark_downloaded('nope', True, gguf_path=moe_gguf)   # must not raise
+
+
+class TestResidentNotMerelyFitting:
+    """Measured live: Tiel-Coder-35B-A3B with 18.64 GiB of experts against
+    ~6.5 GiB of free RAM served 0.95 tokens/sec, because every token faults
+    8 of 256 experts back off disk. The experts are mmapped, so a RAM
+    shortfall does not fail the load -- it quietly destroys throughput.
+    So the GPU arm has to check RAM too, for a MoE and only for a MoE."""
+
+    def _entry(self, **over):
+        f = dict(id='m', name='M', model_type=ModelType.LLM,
+                 vram_gb=3.4, ram_gb=18.6, capabilities={'moe': True})
+        f.update(over)
+        return ModelEntry(**f)
+
+    def test_a_moe_whose_experts_fit_runs_on_the_gpu(self):
+        assert self._entry().matches_compute(8.0, 32.0, True) == 'gpu'
+
+    def test_a_moe_whose_experts_do_not_fit_is_not_called_gpu(self):
+        """VRAM alone is satisfied here; RAM is not. Before this check the
+        selector would have picked it and served a token per second."""
+        assert self._entry().matches_compute(8.0, 6.5, True) != 'gpu'
+
+    def test_a_dense_model_still_ignores_ram_on_the_gpu_arm(self):
+        """Unchanged behaviour. A dense model that fits in VRAM does not
+        need its weights in RAM as well, and asking would refuse models
+        that run today."""
+        dense = self._entry(capabilities={})
+        assert dense.matches_compute(8.0, 0.5, True) == 'gpu'
+
+    def test_a_row_with_no_moe_key_behaves_exactly_as_before(self):
+        assert self._entry(capabilities=None).matches_compute(
+            8.0, 0.1, True) == 'gpu'
+
+    def test_the_moe_still_falls_through_to_the_cpu_arm(self):
+        """Failing the resident check must not strand the model -- the
+        remaining arms still apply."""
+        e = self._entry(ram_gb=4.0)
+        assert e.matches_compute(1.0, 8.0, True) == 'cpu'
