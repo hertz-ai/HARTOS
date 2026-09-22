@@ -842,21 +842,31 @@ class GossipProtocol:
                     _results = list(_pool.map(_probe, _to_probe))
                     self._heartbeat()
                     for peer, (reachable, responder) in zip(_to_probe, _results):
-                        if reachable and responder == self.node_id:
-                            # The address answers as THIS node: a row that
-                            # advertised localhost, its docker bridge, or this
-                            # host's own LAN address under some other node_id.
-                            # A ping to it succeeds forever, so the age logic
-                            # below keeps it 'active' for good, and the
-                            # integrity round audits and challenges this node as
-                            # a peer of itself (the 133 'passed' rows per pass on
-                            # central).  Measured on central 2026-09-22: 378 such
-                            # rows, http://localhost:5000 x184 and
-                            # http://localhost:6777 x183, each with a distinct
-                            # node_id.  is_unroutable_peer_url keeps loopback on
-                            # purpose (co-located nodes on distinct ports are
-                            # real), so the address alone cannot decide; who
-                            # ANSWERS can.  Delete it like the #38 rows.
+                        if reachable and responder and responder != peer.node_id:
+                            # The address answers, but as a DIFFERENT node than
+                            # the row claims.  Two cases, one rule: it answers
+                            # as THIS node (a row that advertised localhost, its
+                            # docker bridge, or this host's own LAN address under
+                            # some other node_id), or as some other node (a
+                            # reinstall on the same host:port minted a fresh
+                            # identity and the old rows are zombies).  Either
+                            # way the row's address no longer belongs to the
+                            # row's node, a ping to it succeeds forever, so the
+                            # age logic below would keep it 'active' for good,
+                            # and it holds a slot against the per-host cap:
+                            # measured 2026-09-22, the office desktop's sixth
+                            # identity (46329c87) was refused by central while
+                            # five dead identities of its own, all answering as
+                            # 46329c87, sat 'active' at 192.168.0.165:5000.
+                            # Central itself also held 378 loopback rows that
+                            # answered as central (the 133 'passed' self-audits
+                            # per integrity pass).  is_unroutable_peer_url keeps
+                            # loopback on purpose (co-located nodes on distinct
+                            # ports are real), so the address alone cannot
+                            # decide; who ANSWERS can.  The live node announces
+                            # itself; delete the stale row like the #38 rows.
+                            # A reachable answer that carries no node_id (an
+                            # older node) is still a live peer.
                             db.delete(peer)
                             purged += 1
                             self._flush_health_row(db)
@@ -925,10 +935,11 @@ class GossipProtocol:
                     purged += 1
                     continue
                 if self._ping_peer(peer.url):
-                    if self._last_ping_identity() == self.node_id:
-                        # Same self-alias rule as the main loop above: an
-                        # address that answers as this node is not a peer to
-                        # revive, it is a row to drop.
+                    _responder = self._last_ping_identity()
+                    if _responder and _responder != peer.node_id:
+                        # Same rule as the main loop above: an address that
+                        # answers as some other node (this one included) is
+                        # not a peer to revive, it is a stale row to drop.
                         db.delete(peer)
                         purged += 1
                         self._heartbeat()

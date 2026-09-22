@@ -151,8 +151,10 @@ class SelfAliasPurgeTest(unittest.TestCase):
         def json(self):
             return {'node_id': self._node_id, 'status': 'ok'}
 
-    def _run(self, answers):
-        """``answers`` maps peer url -> node_id the health endpoint returns."""
+    def _run(self, rows):
+        """``rows``: (node_id the row claims, url, node_id the health endpoint
+        at that url answers with; None for an older node's answer)."""
+        answers = {url: responder for _, url, responder in rows}
         pd = GossipProtocol.__new__(GossipProtocol)
         pd._running = True
         pd.node_id = 'self'
@@ -167,8 +169,9 @@ class SelfAliasPurgeTest(unittest.TestCase):
         })()
         pd._heartbeat = lambda: None
 
-        peers = [_Peer(i) for i in range(len(answers))]
-        for p, url in zip(peers, answers):
+        peers = [_Peer(i) for i in range(len(rows))]
+        for p, (node_id, url, _) in zip(peers, rows):
+            p.node_id = node_id
             p.url = url
         deleted = []
         calls = {'n': 0}
@@ -201,20 +204,36 @@ class SelfAliasPurgeTest(unittest.TestCase):
         return peers, deleted
 
     def test_row_answering_as_self_is_deleted_and_a_real_peer_kept(self):
-        peers, deleted = self._run({
-            'http://localhost:5000': 'self',          # central, seen as a peer
-            'https://node1.example.net': 'node-1',    # a real remote node
-        })
+        peers, deleted = self._run([
+            ('alias-1', 'http://localhost:5000', 'self'),       # central, seen as a peer
+            ('node-1', 'https://node1.example.net', 'node-1'),  # a real remote node
+        ])
         self.assertEqual([p.url for p in deleted], ['http://localhost:5000'],
                          'the self-alias row was not the one deleted')
         real = [p for p in peers if p.url == 'https://node1.example.net'][0]
         self.assertEqual(real.status, 'active')
         self.assertIsNotNone(real.last_seen, 'a real reachable peer must be stamped seen')
 
+    def test_row_whose_address_answers_as_another_node_is_deleted(self):
+        """A reinstall on the same host:port mints a fresh identity; the old
+        rows then answer their pings AS the new node and would stay 'active'
+        forever, holding the host at the per-host cap.  Measured on central
+        2026-09-22: five dead identities of the office desktop, all answering
+        as its live sixth (46329c87), kept the live one refused until the cap
+        stopped counting them."""
+        peers, deleted = self._run([
+            ('old-id-1', 'http://192.168.0.165:5000', 'new-id'),
+            ('new-id', 'http://192.168.0.165:5000', 'new-id'),
+        ])
+        self.assertEqual([p.node_id for p in deleted], ['old-id-1'],
+                         'the zombie row was not the one deleted')
+        live = [p for p in peers if p.node_id == 'new-id'][0]
+        self.assertEqual(live.status, 'active')
+
     def test_reachable_row_without_a_node_id_is_kept(self):
         """An older node's health answer may carry no node_id; that is not
-        evidence of a self-alias, so the row is treated as reachable."""
-        peers, deleted = self._run({'https://node2.example.net': None})
+        evidence of a stale row, so the row is treated as reachable."""
+        peers, deleted = self._run([('node-2', 'https://node2.example.net', None)])
         self.assertEqual(deleted, [])
         self.assertEqual(peers[0].status, 'active')
 
