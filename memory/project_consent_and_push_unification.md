@@ -944,6 +944,41 @@ fold that "looks trivial" in the plan text is exactly the one to check first.
   this tier that needs no warning. Honouring it means the agent controls the button
   labels; deleting it means the overlay owns them. A design preference, not a risk.
 
+  **DONE + PUSHED 2026-09-22 — HONOURED, and my own audit above was wrong twice.**
+  The caller audit before the fold found what the audit had missed, and it changed
+  the answer from "delete" to "honour":
+  - **Not one consumer, three.** `AgentOverlay.jsx:270` (Nunba), the desktop shell's
+    own JS renderer at `liquid_ui_service.py:7265`, and a server-side HTML fallback at
+    `:7402` that draws **no buttons at all** (so labels do not apply there).
+  - **Not one producer, two.** `core/agent_tools.py:904` sets
+    `'options': ['Keep it', 'Compose another']`. Those are not the three defaults, so
+    the field was never dead — it was a real affordance being dropped. The game-sound
+    card read *"Have a listen: keep it, or say what is wrong and I will compose
+    another"* above buttons saying **Approve** and **Deny**.
+  - **The schema was already tested.** `tests/unit/test_bind_game_sound.py:309` pins
+    `len(component['options']) == 2`. It proved the dict was built, not that anyone
+    could read it — the same shape as the `media` defect its own neighbours record.
+  Contract chosen: `options` labels the three decisions **positionally**
+  `[approve, deny, defer]`; a missing or non-string entry keeps that button's
+  default, so the button SET never shrinks. Two reasons the set must not shrink:
+  an approval card is exempt from the overlay auto-dismiss (`:7328`), so dropping the
+  third button leaves it unclosable; and `/api/agent/approval` (`:7694`) validates
+  `approve|deny|later` and nothing else, so `options` can only ever carry labels.
+  Both existing producers already satisfy this reading, so no producer changed.
+  Escaping: labels are `_esc`'d at the point of use, because the prop pre-escape at
+  the top of `renderAgentOverlay` (`:7063`) walks **string** props only and a LIST
+  prop's entries arrive raw. *Noted while there: the neighbouring list renderer
+  (`:7258-7260`) interpolates `item.label` into the `<li>` body unescaped — same
+  root, separate defect, filed rather than folded in here.*
+  Evidence: `tests/unit/test_shell_custom_render.mjs` drives the REAL renderer on a
+  DOM shim — 25/25 with 12 new assertions; red-first confirmed by restoring one
+  hardcoded label (3 fail). `test_flow_05_events_and_sinks.py` 9/9,
+  `test_shell_custom_render.py` 1/1. The Python AST is identical to HEAD once string
+  constants are normalised, so no Python path moved. HARTOS `1c1881098`.
+  *Lesson for the remaining folds: "declared but nobody reads it" is a claim about
+  EVERY reader and EVERY writer. I had checked one of each. Grep the component type,
+  not just the prop name.*
+
 **PUSH TIER AUDIT COMPLETE — all seven folds checked against the code.**
 With the consent tier already audited, **every fold in this plan now has a verified
 or corrected premise.** Nothing here should be executed off the plan text alone
