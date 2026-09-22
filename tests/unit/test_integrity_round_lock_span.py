@@ -52,7 +52,9 @@ class _LockProbe:
     tries BEGIN IMMEDIATE on a second connection with a short busy timeout
     and records whether the round was holding the write lock at that
     moment.  Then it fails like an unroutable peer does (the timeout path,
-    which is the one that also writes: status='timeout' + fraud score)."""
+    which is the one that also writes: status='timeout' and the peer's
+    last_challenge_at; since 5e83047b5 a timeout scores NO fraud, a timeout
+    being absence of evidence)."""
 
     def __init__(self, path):
         self.path = path
@@ -166,7 +168,12 @@ class CreateChallengeLockSpanTest(_FileDb):
         self.assertEqual(row.status, 'timeout')
         peer = self.db.query(PeerNode).filter_by(node_id='peer-1').one()
         self.assertIsNotNone(peer.last_challenge_at)
-        self.assertGreater(peer.fraud_score, 0.0)
+        # 5e83047b5: a timeout is recorded, never scored.  This line used to
+        # assert fraud_score > 0 (the +5 the timeout path once wrote) and was
+        # missed when that write was removed: a test is a caller of what a
+        # code path writes (review finding, 2026-09-23).
+        self.assertEqual(peer.fraud_score or 0.0, 0.0,
+                         'a timeout scored fraud: %r' % peer.fraud_score)
 
     def test_post_bounds_the_connect_separately_from_the_read(self):
         """A single 30s timeout made an unroutable peer cost the full 30s at
