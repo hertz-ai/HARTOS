@@ -414,7 +414,16 @@ def hevolve_verify_boot():
         _boot_logger.warning(msg)
         return
 
-    current_code_hash = compute_code_hash()
+    # force_walk: the boot check must hash the bytes it is about to run, never
+    # a cache.  compute_code_hash's mtime cache lives in agent_data/, which the
+    # deploy bind-mounts into EVERY container, so the cache one image writes is
+    # read by the next.  Measured 2026-09-22 15:56Z on central: a cancelled
+    # deploy's script kept running and booted its image at 15:37Z, writing the
+    # cache; the next image's checkout carried an earlier mtime (15:32Z, its
+    # git reset), so this line returned the PREVIOUS image's hash, called the
+    # new image tampered ("CODE_HASH mismatch"), and the deploy rolled back
+    # into a crash loop.  A forced walk is a pure read: one directory walk.
+    current_code_hash = compute_code_hash(force_walk=True)
     if d.get("code_hash") != current_code_hash:
         msg = "[HevolveIntegrity] CODE_HASH mismatch"
         if mode == "hard":
