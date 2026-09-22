@@ -7027,7 +7027,14 @@ function _postApproval(agentId, action, decision) {{
 // ═══ Agent Action Floating Overlay Renderer ═══
 var _overlayStack = [];
 // HTML escape — prevents XSS from agent-pushed content
-function _esc(s){{if(!s)return'';var d=document.createElement('div');d.textContent=String(s);return d.innerHTML;}}
+// Escapes for BOTH text and attribute context. textContent->innerHTML neutralises
+// & < > for a text node but leaves quotes alone, and this helper is used inside
+// attribute values throughout (data-item, data-ctype, data-agent-id ...). A value
+// like `x" onmouseover="alert(1)` carries no `<`, so the server-side XSS gate,
+// which anchors its event-handler pattern to a tag, passes it -- and an unescaped
+// quote then closes the attribute and opens a live handler. &quot;/&#39; render
+// identically in text, so escaping them here is safe for every existing caller.
+function _esc(s){{if(!s)return'';var d=document.createElement('div');d.textContent=String(s);return d.innerHTML.replace(/"/g,'&quot;').replace(/'/g,'&#39;');}}
 function _submitA2UIForm(form) {{
   event.preventDefault();
   var action = form.dataset.action || '/api/a2ui';
@@ -7251,13 +7258,16 @@ function renderAgentOverlay(ev) {{
     var ordered = ev.ordered||false;
     var tag = ordered?'ol':'ul';
     html += '<'+tag+' style="margin:0;padding-left:18px;color:var(--hart-text)">';
+    // `items` is a LIST prop, so its entries never went through the string-prop
+    // pre-escape at the top of this function: they arrive raw and must be
+    // escaped at use, in the <li> body as well as the data-item attribute.
     (ev.items||[]).forEach(function(item,i){{
       var text = typeof item === 'string' ? item : (item.label||item.text||item.name||JSON.stringify(item));
       var action = typeof item === 'object' ? item.action : null;
       if(action || ev.interactive) {{
-        html += '<li style="padding:2px 0;cursor:pointer;color:var(--hart-accent)" data-action="'+(action||'/api/a2ui')+'" data-idx="'+i+'" data-item="'+_esc(text)+'" onclick="shellA2UIListSelect(this)">'+(text)+'</li>';
+        html += '<li style="padding:2px 0;cursor:pointer;color:var(--hart-accent)" data-action="'+(action||'/api/a2ui')+'" data-idx="'+i+'" data-item="'+_esc(text)+'" onclick="shellA2UIListSelect(this)">'+_esc(text)+'</li>';
       }} else {{
-        html += '<li style="padding:2px 0">'+(text)+'</li>';
+        html += '<li style="padding:2px 0">'+_esc(text)+'</li>';
       }}
     }});
     html += '</'+tag+'>';
