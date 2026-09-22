@@ -94,18 +94,34 @@ def _degraded_reason(model_type: str, what: str) -> str:
 # Auto-start helpers
 # ═══════════════════════════════════════════════════════════════
 
-def _ensure_tool_running(tool_name: str) -> bool:
-    """Auto-start a tool if it's not running. Returns True if available."""
+def _start_tool(tool_name: str) -> dict:
+    """Start a tool if it is not running, and keep the runtime's reason when
+    it could not.
+
+    The runtime answers a refusal with WHY -- 'Insufficient VRAM for acestep
+    (free=4.9GB); try cpu_only', MEASURED 2026-09-22 with a 3 GB llama-server
+    on the card -- and _ensure_tool_running folded that into a bare False, so
+    a caller could only say "not running".  Same shape as the runtime's own
+    answer: 'running', plus 'error' when it is not.
+    """
     try:
         from integrations.service_tools.runtime_manager import runtime_tool_manager
         status = runtime_tool_manager.get_tool_status(tool_name)
         if status.get('running'):
-            return True
-        result = runtime_tool_manager.setup_tool(tool_name)
-        return result.get('running', False)
+            return {'running': True}
+        result = runtime_tool_manager.setup_tool(tool_name) or {}
+        if not result.get('running') and result.get('error'):
+            # never silent: this is the line an operator greps for
+            logger.warning(f"Auto-start of {tool_name} refused: {result['error']}")
+        return result
     except Exception as e:
         logger.warning(f"Auto-start failed for {tool_name}: {e}")
-        return False
+        return {'running': False, 'error': str(e)}
+
+
+def _ensure_tool_running(tool_name: str) -> bool:
+    """Auto-start a tool if it's not running. Returns True if available."""
+    return bool(_start_tool(tool_name).get('running', False))
 
 
 def populate_videogen_catalog(catalog) -> int:
@@ -513,6 +529,42 @@ def _generate_audio_music(context: str, input_text: str,
     prompt = input_text or context
     if style:
         prompt = f"[{style}] {prompt}"
+
+    # The speech and video paths start their sidecar before dialing it.  This
+    # one dialed straight away, so a composer that was installed and merely
+    # not up answered "not running" to every game, for ever (run 8,
+    # 2026-09-22 -- the proof scripts had been starting it by hand).
+    started = _start_tool('acestep')
+    if not started.get('running'):
+        why = str(started.get('error') or 'auto-start failed')
+        if _node_has_any('audio_gen'):
+            # Installed and will not fit this instant.  Worded so that
+            # classify_error reads UNREACHABLE, never ABSENT: offering to
+            # install what is on the disk is its own defect.
+            return {'status': 'error',
+                    'error': f'AceStep installed but cannot run right now ({why})',
+                    'output_modality': 'audio_music'}
+        return {'status': 'error',
+                'error': f'AceStep not available and auto-start failed ({why})',
+                'output_modality': 'audio_music'}
+
+    # The speech and video paths start their sidecar before dialing it.  This
+    # one dialed straight away, so a composer that was installed and merely
+    # not up answered "not running" to every game, for ever (run 8,
+    # 2026-09-22 -- the proof scripts had been starting it by hand).
+    started = _start_tool('acestep')
+    if not started.get('running'):
+        why = str(started.get('error') or 'auto-start failed')
+        if _node_has_any('audio_gen'):
+            # Installed and will not fit this instant.  Worded so that
+            # classify_error reads UNREACHABLE, never ABSENT: offering to
+            # install what is on the disk is its own defect.
+            return {'status': 'error',
+                    'error': f'AceStep installed but cannot run right now ({why})',
+                    'output_modality': 'audio_music'}
+        return {'status': 'error',
+                'error': f'AceStep not available and auto-start failed ({why})',
+                'output_modality': 'audio_music'}
 
     base_url = _get_tool_base_url('acestep')
     if not base_url:

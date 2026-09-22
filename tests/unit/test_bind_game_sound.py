@@ -1035,3 +1035,26 @@ def test_the_cooldown_holds_on_top_of_a_rejected_take():
     assert record.get('rejected_url') == 'https://node/first.mp3', record
     assert record.get('variant') == 1, (
         f'the variant counter moved without a take being made: {record!r}')
+
+
+def test_a_composer_that_cannot_start_is_waited_for_not_called_a_refusal():
+    """Run 8, 2026-09-22: a 3 GB llama-server on the card made the runtime
+    refuse to start the composer, and the tool told the agent the composer
+    REFUSED the game's music.  Installed-but-not-up is a wait, not a no --
+    and nothing was posted, so nothing may be remembered.
+    """
+    agent_data = {}
+    down = _media({'status': 'error',
+                   'error': 'AceStep installed but cannot run right now '
+                            '(Insufficient VRAM for acestep (free=4.9GB); try cpu_only)'})
+
+    with _agent(agent_data, down) as tools:
+        answer = tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+
+    assert 'refused' not in answer.lower(), answer
+    assert 'not running right now' in answer and 'free=4.9GB' in answer, answer
+    assert 'bind_game_sound' in answer, 'the agent was not told how to come back'
+    sounds = ((((agent_data.get(4242) or {}).get('games') or {})
+               .get('eng-01') or {}).get('sounds') or {})
+    assert 'correct' not in sounds, (
+        f'nothing was posted, yet something was remembered: {sounds!r}')

@@ -1216,22 +1216,41 @@ def build_core_tool_closures(ctx):
             return ("This node cannot compose music (the media capability is "
                     "not available here), so the game keeps no sound.")
 
-        def _no_composer_here(result):
-            """How to answer a failure, told apart by the module that wrote it.
+        def _failure_kind(result):
+            """Why a composer call failed, told apart by the module that wrote it.
 
             media_agent.classify_error is the reader that lives next to the
-            returns it reads (hartos-94, HARTOS 11d0aebee), and it makes a
-            distinction a prose match here could not: a node with NOTHING
-            installed should be offered an install, while an AceStep that is
-            merely not running must not be -- offering to install what is
-            already installed is its own defect.
+            returns it reads (hartos-94, HARTOS 11d0aebee), and it makes
+            distinctions a prose match here could not: a node with NOTHING
+            installed should be offered an install; an AceStep that is
+            installed and merely not running -- or will not fit beside
+            whatever holds the GPU -- must be waited for: not offered again
+            (installing what is on the disk is its own defect) and not
+            reported as a refusal.
             """
             try:
-                from integrations.service_tools.media_agent import (
-                    classify_error, ABSENT)
-                return classify_error(result) == ABSENT
+                from integrations.service_tools.media_agent import classify_error
+                return classify_error(result)
+            except Exception:
+                return None
+
+        def _no_composer_here(result):
+            try:
+                from integrations.service_tools.media_agent import ABSENT
             except Exception:
                 return False
+            return _failure_kind(result) == ABSENT
+
+        def _composer_not_up(result):
+            """Run 8, 2026-09-22: a 3 GB llama-server on the card made the
+            runtime refuse to start the composer, and this tool told the
+            agent the composer REFUSED the game's music.  Nothing was posted,
+            so nothing is remembered; the next call simply asks again."""
+            try:
+                from integrations.service_tools.media_agent import UNREACHABLE
+            except Exception:
+                return False
+            return _failure_kind(result) == UNREACHABLE
 
         def _ask_for_a_composer(why):
             """Offer to set a music model up, rather than failing quietly.
@@ -1377,6 +1396,11 @@ def build_core_tool_closures(ctx):
                     why = str(started.get('error', 'unknown reason'))
                     if _no_composer_here(started):
                         return _ask_for_a_composer(why)
+                    if _composer_not_up(started):
+                        return (f"The composer is installed but not running "
+                                f"right now ({why}). Nothing was started; ask "
+                                f"again in a while by calling bind_game_sound "
+                                f"with the same game_id and state.")
                     return f"The composer refused this game's music: {why}"
                 task_id = started.get('task_id')
                 _remember({'task_id': task_id, 'mood': mood, 'prompt': prompt,

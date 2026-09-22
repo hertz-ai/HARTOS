@@ -74,6 +74,8 @@ def test_compose_memoize_and_replay_through_the_real_code(tmp_path):
     # the task id, the poll question and the nested file), so it is stubbed
     # open: this test proves the cycle, not the weather.
     with patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'), \
+            patch.object(ma, '_start_tool', return_value={'running': True}), \
+            patch.object(ma, '_start_tool', return_value={'running': True}), \
             patch.object(ma, '_can_do', lambda *_a, **_k: True), \
             patch.object(ma, '_node_has_any', lambda *_a, **_k: True), \
             patch('core.http_pool.pooled_post', side_effect=fake_post), \

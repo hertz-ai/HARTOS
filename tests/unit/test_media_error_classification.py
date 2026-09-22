@@ -361,8 +361,69 @@ def test_the_submit_names_the_duration_field_acestep_reads():
     import integrations.service_tools.media_agent as ma
     resp = MagicMock(status_code=200)
     resp.json.return_value = {'data': {'task_id': 't1', 'status': 'queued'}, 'code': 200}
-    with patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'),             patch('core.http_pool.pooled_post', return_value=resp) as post:
+    with patch.object(ma, '_start_tool', return_value={'running': True}), patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'),             patch('core.http_pool.pooled_post', return_value=resp) as post:
         ma._generate_audio_music('a chime', '', 5, '')
     payload = post.call_args.kwargs['json']
     assert payload['audio_duration'] == 5
     assert 'duration' not in payload
+
+
+def test_the_music_path_starts_its_composer_before_dialing_it():
+    """TTS and video start their sidecar first; music dialed straight away.
+
+    So an installed composer that was not up answered "not running" to
+    every game, for ever -- run 8, 2026-09-22.  The proof runs had been
+    starting it by hand, which is why seven of them never noticed.
+    """
+    from unittest.mock import MagicMock, patch
+    import integrations.service_tools.media_agent as ma
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {'data': {'task_id': 't1', 'status': 'queued'}, 'code': 200}
+    with patch.object(ma, '_start_tool', return_value={'running': True}) as start, \
+            patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'), \
+            patch('core.http_pool.pooled_post', return_value=resp):
+        ma._generate_audio_music('a chime', '', 2, '')
+    assert start.call_args.args == ('acestep',)
+
+
+def test_a_composer_the_runtime_will_not_start_is_unreachable_not_absent():
+    """MEASURED 2026-09-22: "Refusing to start acestep: won't fit (free=4.9GB)"
+    with a llama-server on the card.  Installed, so never an install offer;
+    and the runtime's reason travels with the answer instead of dying in a
+    bare False."""
+    from unittest.mock import patch
+    import integrations.service_tools.media_agent as ma
+    refused = {'error': 'Insufficient VRAM for acestep (free=4.9GB); try cpu_only',
+               'oom': True}
+    with patch.object(ma, '_start_tool', return_value=refused), \
+            patch.object(ma, '_node_has_any', return_value=True), \
+            patch.object(ma, '_get_tool_base_url') as dial:
+        out = ma._generate_audio_music('a chime', '', 2, '')
+    assert not dial.called, 'dialed a composer the runtime had just refused to start'
+    assert classify_error(out) == UNREACHABLE, out
+    assert 'free=4.9GB' in out['error'], out
+
+
+def test_a_composer_that_is_not_on_this_node_is_absent():
+    from unittest.mock import patch
+    import integrations.service_tools.media_agent as ma
+    with patch.object(ma, '_start_tool',
+                      return_value={'running': False, 'error': 'no such tool'}), \
+            patch.object(ma, '_node_has_any', return_value=False):
+        out = ma._generate_audio_music('a chime', '', 2, '')
+    assert classify_error(out) == ABSENT, out
+
+
+def test_start_tool_keeps_the_runtime_reason():
+    """_ensure_tool_running folded 'Insufficient VRAM' into a bare False."""
+    from unittest.mock import MagicMock, patch
+    import integrations.service_tools.media_agent as ma
+    rt = MagicMock()
+    rt.get_tool_status.return_value = {'running': False}
+    rt.setup_tool.return_value = {
+        'error': 'Insufficient VRAM for acestep (free=4.9GB); try cpu_only', 'oom': True}
+    fake = MagicMock(runtime_tool_manager=rt)
+    with patch.dict(sys.modules, {'integrations.service_tools.runtime_manager': fake}):
+        out = ma._start_tool('acestep')
+        assert ma._ensure_tool_running('acestep') is False
+    assert 'free=4.9GB' in out['error'], out
