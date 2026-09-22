@@ -224,3 +224,28 @@ class TestTheOutcomeIsReportedHonestly:
             assert out.ok is False
             assert out.port is None, (
                 'a failed swap named a port, which a caller would repoint to')
+
+
+class TestANodeWithoutCudaCanStillSwap:
+    """gguf_fits_gpu answers only the GPU arm and says its callers own the
+    fallback; the swap had none, so CPU-only, Metal and ROCm nodes -- which
+    start() serves through its CPU branch -- could never swap."""
+
+    def test_enough_ram_admits_without_a_gpu(self):
+        rec = Recorder()
+        out = run(rec, gpu_available=False, free_vram_gb=0.0,
+                  free_ram_gb=32.0, vram_need_gb=None, ram_need_gb=6.0)
+        assert out.ok, out.reason
+
+    def test_too_little_ram_refuses_without_a_gpu(self):
+        rec = Recorder()
+        out = run(rec, gpu_available=False, free_vram_gb=0.0,
+                  free_ram_gb=4.0, vram_need_gb=None, ram_need_gb=6.0)
+        assert out.ok is False and out.reason == 'admission'
+        assert rec.calls == []
+
+    def test_an_unknown_ram_need_refuses_without_a_gpu(self):
+        rec = Recorder()
+        out = run(rec, gpu_available=False, free_vram_gb=0.0,
+                  free_ram_gb=64.0, vram_need_gb=None, ram_need_gb=None)
+        assert out.ok is False and out.reason == 'admission'

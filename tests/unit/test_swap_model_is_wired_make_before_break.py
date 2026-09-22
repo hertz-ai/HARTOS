@@ -78,6 +78,11 @@ def mgr(monkeypatch):
     m.published = []
     monkeypatch.setattr(geo, 'publish_geometry',
                         lambda ctx, slots: m.published.append((ctx, slots)))
+    # Nor the endpoint: record what the repoint announces instead.
+    import core.port_registry as pr
+    m.endpoints = []
+    monkeypatch.setattr(pr, 'set_local_llm_url',
+                        lambda url: m.endpoints.append(url))
     return m
 
 
@@ -93,6 +98,7 @@ def arm(m, monkeypatch, *, healthy=True, spawn_ok=True):
     monkeypatch.setattr(m, '_spawn_locked', _spawn)
     monkeypatch.setattr(m, '_check_health', lambda port=None: healthy)
     monkeypatch.setattr(lcm, '_HEALTH_START_TIMEOUT', 1)
+    monkeypatch.setattr(lcm, '_SWAP_LOAD_TIMEOUT', 1)
     return newcomer
 
 
@@ -186,3 +192,99 @@ class TestAFailedSwapLeavesTheNodeServing:
         assert mgr.swap_model(NEW_MODEL) is False
         assert mgr.spawned_on == []
         assert incumbent.terminated is False
+
+
+class TestTheSwapReachesTheUser:
+    """Review findings on 4d6d147e7 (probe-reproduced, 2026-09-22).  The
+    ordering was right; the wiring stranded the node."""
+
+    def test_success_moves_the_canonical_endpoint(self, mgr, monkeypatch):
+        """The newcomer sits on an ephemeral port no resolver candidate
+        lists.  If the canonical URL is not moved, retiring :8080 leaves
+        every /chat dialling a refused port."""
+        arm(mgr, monkeypatch)
+        assert mgr.swap_model(NEW_MODEL) is True
+        assert mgr.endpoints == [f'http://127.0.0.1:{mgr._port}'], (
+            'the swap succeeded but the endpoint still names the old port')
+
+    def test_a_failed_swap_does_not_move_the_endpoint(self, mgr, monkeypatch):
+        arm(mgr, monkeypatch, healthy=False)
+        assert mgr.swap_model(NEW_MODEL) is False
+        assert mgr.endpoints == []
+
+    def test_the_newcomer_is_given_a_load_not_a_launch(self, mgr,
+                                                       monkeypatch):
+        """llama-server answers /health 503 until the weights are loaded;
+        the motivating model took ~7 minutes.  A 30 s window killed every
+        such swap mid-load.  The incumbent keeps serving meanwhile, so a
+        long wait costs nothing."""
+        arm(mgr, monkeypatch)
+        seen = {}
+        real = mgr._wait_for_health
+
+        def spy(proc=None, port=None, timeout=None):
+            seen['timeout'] = timeout
+            return real(proc, port, timeout=timeout)
+        monkeypatch.setattr(mgr, '_wait_for_health', spy)
+        monkeypatch.setattr(lcm, '_SWAP_LOAD_TIMEOUT', 900)
+        assert mgr.swap_model(NEW_MODEL) is True
+        assert seen['timeout'] == 900
+
+
+class TestStopForgetsEvenWhenTheKillHangs:
+    def test_state_is_cleared_when_terminate_raises(self, mgr, monkeypatch):
+        import subprocess as sp
+
+        def boom(proc):
+            raise sp.TimeoutExpired('llama-server', 5)
+        monkeypatch.setattr(lcm.LlamaCppManager, '_terminate',
+                            staticmethod(boom))
+        with pytest.raises(sp.TimeoutExpired):
+            mgr.stop()
+        assert mgr._process is None and mgr._current_model is None
+
+
+class TestTheOnlyCallerHonoursTheOutcome:
+    """model_onboarding.switch_model (the switch_model MCP tool, POST
+    /api/models/switch, `hart model switch`) dropped swap_model's result
+    and reported 'ready' on the OLD port either way."""
+
+    def _run(self, monkeypatch, swapped, port=57855):
+        import integrations.service_tools.model_onboarding as mo
+
+        class _Resolver:
+            def resolve(self, name, quant):
+                from pathlib import Path
+                return Path('F:/models/new-model-Q4_K_M.gguf')
+
+        class _Lcpp:
+            def __init__(self):
+                self.port = port
+
+            def swap_model(self, path):
+                return swapped
+
+        calls = []
+        monkeypatch.setattr(mo, '_get_resolver', lambda: _Resolver())
+        monkeypatch.setattr(mo, '_get_llamacpp_manager', lambda: _Lcpp())
+        monkeypatch.setattr(mo, '_get_catalog', lambda: None)
+        monkeypatch.setattr(mo, '_register_in_catalog',
+                            lambda *a: calls.append(('catalog', a)))
+        monkeypatch.setattr(mo, '_register_in_registry',
+                            lambda *a: calls.append(('registry', a)))
+        monkeypatch.setattr(mo, '_active_model', {'catalog_id': 'old',
+                                                  'port': 8080})
+        return mo.switch_model('org/new-model', 'Q4_K_M'), calls, mo
+
+    def test_a_refused_swap_is_reported_as_an_error(self, monkeypatch):
+        out, calls, mo = self._run(monkeypatch, swapped=False)
+        assert out['status'] == 'error'
+        assert calls == [], 'registered a model that never loaded'
+        assert mo._active_model['catalog_id'] == 'old'
+
+    def test_a_swap_registers_the_port_the_newcomer_is_on(self, monkeypatch):
+        out, calls, _ = self._run(monkeypatch, swapped=True, port=57855)
+        assert out['status'] == 'ready'
+        assert out['endpoint'] == 'http://127.0.0.1:57855'
+        registry = [c for c in calls if c[0] == 'registry']
+        assert registry and registry[-1][1][-1] == 57855, calls

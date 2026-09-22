@@ -46,6 +46,12 @@ _HEALTH_START_TIMEOUT = 30       # Max seconds to wait for server on start
 _HEALTH_POLL_INTERVAL = 0.5      # Initial poll interval (seconds)
 _HEALTH_POLL_MAX_INTERVAL = 2.0  # Max poll interval (exponential backoff cap)
 _HEALTH_CHECK_TIMEOUT = 3        # HTTP timeout for a single health check (seconds)
+# How long a SWAP waits for the newcomer to finish loading.  llama-server
+# answers /health 503 until its weights are in, and a 21.19 GiB model measured
+# ~7 minutes off an external drive; the 30 s start window killed every such
+# swap mid-load.  During a swap the incumbent keeps serving, so waiting costs
+# the user nothing -- only a cold start() has a reason to give up early.
+_SWAP_LOAD_TIMEOUT = 900
 
 # Process shutdown
 _STOP_GRACE_PERIOD = 5  # Seconds to wait after terminate() before kill()
@@ -282,10 +288,19 @@ class LlamaCppManager:
 
             def _serves(handle, port: int) -> bool:
                 proc, _ctx, _slots = handle
-                return self._wait_for_health(proc, port)
+                return self._wait_for_health(proc, port,
+                                             timeout=_SWAP_LOAD_TIMEOUT)
 
             def _repoint(handle, port: int) -> None:
                 proc, ctx_size, slots = handle
+                # Move the CANONICAL endpoint, not just this object's field.
+                # The newcomer is on an ephemeral port that no resolver
+                # candidate lists; set_local_llm_url writes the first
+                # candidate get_local_llm_url consults and drops its cache.
+                # If this raises, swap_main_llm abandons the newcomer and the
+                # incumbent keeps serving on the endpoint it still owns.
+                from core.port_registry import set_local_llm_url
+                set_local_llm_url(f'http://127.0.0.1:{port}')
                 self._process = proc
                 self._port = port
                 self._current_model = new_model_path
@@ -410,8 +425,12 @@ class LlamaCppManager:
         if fp['vram_need_gb'] is None and fp['size_gb'] is not None:
             # The same conservative figure the install path uses, from the
             # one helper, rather than another copy of "x 1.35".
-            fp['whole_need_gb'] = llama_gguf_compute_requirements(
-                fp['size_gb'])[0]
+            vram_est, ram_est = llama_gguf_compute_requirements(fp['size_gb'])
+            fp['whole_need_gb'] = vram_est
+            # The RAM-only arm (no CUDA) needs its own estimate; the GPU arm
+            # ignores ram_need_gb unless the split was measured.
+            if fp['ram_need_gb'] is None:
+                fp['ram_need_gb'] = ram_est
         return fp
 
     def _admission_facts(self, model_path: str) -> Dict[str, Any]:
@@ -980,10 +999,13 @@ class LlamaCppManager:
             logger.debug("No server process to stop")
             return True
 
-        ok = self._terminate(self._process)
-        self._process = None
-        self._current_model = None
-        return ok
+        try:
+            return self._terminate(self._process)
+        finally:
+            # Forget it even if the kill raised (TimeoutExpired after kill()
+            # escapes _terminate); the pre-split code had this finally.
+            self._process = None
+            self._current_model = None
 
     @staticmethod
     def _terminate(proc: subprocess.Popen) -> bool:
@@ -1034,7 +1056,8 @@ class LlamaCppManager:
         return result is not None
 
     def _wait_for_health(self, proc: Optional[subprocess.Popen] = None,
-                         port: Optional[int] = None) -> bool:
+                         port: Optional[int] = None,
+                         timeout: Optional[float] = None) -> bool:
         """Wait until a server SERVES, with exponential backoff.
 
         Polls GET /health up to _HEALTH_START_TIMEOUT seconds.  This is the
@@ -1046,7 +1069,10 @@ class LlamaCppManager:
         callers are unchanged; the swap passes the newcomer's.
         """
         proc = proc if proc is not None else self._process
-        deadline = time.monotonic() + _HEALTH_START_TIMEOUT
+        # ``timeout``: a cold start gives up at _HEALTH_START_TIMEOUT; a swap
+        # passes _SWAP_LOAD_TIMEOUT because its incumbent is still serving.
+        deadline = time.monotonic() + (
+            _HEALTH_START_TIMEOUT if timeout is None else timeout)
         interval = _HEALTH_POLL_INTERVAL
 
         while time.monotonic() < deadline:

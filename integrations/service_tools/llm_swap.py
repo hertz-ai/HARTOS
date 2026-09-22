@@ -128,10 +128,20 @@ def swap_main_llm(
     # 1. ADMISSION.  The incumbent STAYS UP, so the room it occupies is not
     #    available and is not counted.  These figures are the caller's live
     #    reading taken while it is resident.
-    if not gguf_fits_gpu(free_vram_gb, free_ram_gb,
-                         gpu_available=gpu_available, moe=moe,
-                         vram_need_gb=vram_need_gb, ram_need_gb=ram_need_gb,
-                         whole_need_gb=whole_need_gb):
+    #    gguf_fits_gpu answers only the GPU arm and leaves the fallback to its
+    #    callers.  Without CUDA (a CPU-only box, Metal's unified memory, a
+    #    ROCm card detect_gpu reports as non-CUDA) the model runs from system
+    #    RAM, which is exactly how start() serves those nodes, so that is the
+    #    arm asked.  An unknown RAM need still refuses: never assume zero.
+    if gpu_available:
+        fits = gguf_fits_gpu(free_vram_gb, free_ram_gb,
+                             gpu_available=True, moe=moe,
+                             vram_need_gb=vram_need_gb,
+                             ram_need_gb=ram_need_gb,
+                             whole_need_gb=whole_need_gb)
+    else:
+        fits = ram_need_gb is not None and free_ram_gb >= ram_need_gb
+    if not fits:
         logger.info(
             "swap refused for %s: does not fit BESIDE the running model "
             "(%.2f GB VRAM / %.2f GB RAM free, needs %s VRAM / %s RAM / %s "
