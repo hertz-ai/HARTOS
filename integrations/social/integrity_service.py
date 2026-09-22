@@ -270,10 +270,17 @@ class IntegrityService:
                     response_data.get('response', {}),
                     response_data.get('signature', ''))
         except requests.RequestException:
+            # A timeout is absence of evidence, not evidence.  This branch
+            # used to add +5 fraud per challenge type, four types per round,
+            # against a -2 decay: an unreachable peer (private 10.x address,
+            # NAT, offline) was banned inside five rounds.  Measured on
+            # central 2026-09-22: 21,622 of 23,840 fraud alerts were these
+            # timeouts, across ~1,060 nodes; 73 nodes were banned, 72 of them
+            # dead rows now.  The row keeps status='timeout' (countable, and
+            # expired by prune_challenge_history), the peer never becomes
+            # 'verified' without an ANSWERED challenge, and reachability is
+            # the health round's job (stale/dead), not the fraud score's.
             challenge.status = 'timeout'
-            IntegrityService.increase_fraud_score(
-                db, target_node_id, 5.0,
-                f'Challenge timeout: {challenge_type}')
 
         peer = db.query(PeerNode).filter_by(node_id=target_node_id).first()
         if peer:
@@ -409,6 +416,11 @@ class IntegrityService:
 
         # Evaluate based on challenge type
         passed = True
+        # A third verdict beside passed/failed: the node answered (nonce and
+        # signature held, so identity and liveness are proven) but the claim
+        # under test cannot be decided either way.  Nothing is scored and
+        # nothing is proven; the peer is asked to re-prove.
+        inconclusive = False
         details = 'OK'
 
         if challenge.challenge_type == 'agent_count_verify':
@@ -453,21 +465,42 @@ class IntegrityService:
                 # ADVANCES on acceptance, so the next challenge compares
                 # against the new release rather than re-flagging it.
                 known = False
+                old_known = False
                 try:
                     from security.release_hash_registry import (
                         get_release_hash_registry,
                     )
-                    known = get_release_hash_registry() \
-                        .is_known_release_hash(reported_hash)
+                    _registry = get_release_hash_registry()
+                    known = _registry.is_known_release_hash(reported_hash)
+                    old_known = _registry.is_known_release_hash(peer.code_hash)
                 except Exception:
-                    known = False       # no registry -> old behaviour exactly
+                    known = False       # no registry: nothing can be known
                 if known:
                     peer.code_hash = reported_hash
                     details = ('Code hash advanced to a known signed release '
                                '(peer updated)')
-                else:
+                elif old_known:
+                    # The node WAS on a signed release and now runs something
+                    # that is not.  That is evidence: it left the signed set.
                     passed = False
-                    details = 'Code hash changed since last exchange'
+                    details = 'Code hash left the signed release set'
+                else:
+                    # Neither hash is a registered release.  A bundled desktop's
+                    # hash is sha256(exe|mtime), per install, never registered,
+                    # so every reinstall or update of a desktop used to land
+                    # here as a failure: +15 fraud, proof revoked, baseline NOT
+                    # advanced, so the next round failed again.  Measured on
+                    # central 2026-09-22: 1,977 such failures across 25 nodes.
+                    # A change between two unregistered builds is not evidence
+                    # of anything; it is a node that cannot be judged by hash
+                    # and must prove itself the other ways (nonce, signature,
+                    # stats).  So: proof withdrawn, baseline advanced to what
+                    # the node now runs, nothing scored, nothing granted.
+                    inconclusive = True
+                    peer.code_hash = reported_hash
+                    details = ('Code hash changed between two unregistered '
+                               'builds: baseline advanced, proof withdrawn, '
+                               'nothing scored')
 
         elif challenge.challenge_type == 'guardrail_verify':
             reported_hash = response_data.get('guardrail_hash', '')
@@ -486,6 +519,19 @@ class IntegrityService:
                     details = 'Cached vs live guardrail hash mismatch — values may have drifted'
             except Exception:
                 pass
+
+        if inconclusive:
+            challenge.status = 'inconclusive'
+            challenge.result_details = details
+            challenge.evaluated_at = datetime.utcnow()
+            # Same revoke helper as the failure paths: whatever proof the peer
+            # held was about a build it no longer runs.
+            IntegrityService._revoke_proof(
+                db, challenge.target_node_id, details)
+            logger.debug(
+                "Integrity: inconclusive %s for %s (%s)",
+                challenge.challenge_type, challenge.target_node_id[:8], details)
+            return {'passed': False, 'inconclusive': True, 'details': details}
 
         challenge.status = 'passed' if passed else 'failed'
         challenge.result_details = details
@@ -519,10 +565,49 @@ class IntegrityService:
                 db, challenge.target_node_id, 2.0,
                 f'Challenge passed: {challenge.challenge_type}')
             if _peer is not None:
-                _peer.integrity_status = 'verified'
-                _peer.last_attestation_at = datetime.utcnow()
+                # 'verified' is granted by ANY passed challenge type, so a
+                # peer whose code claim is undecided (its latest
+                # code_hash_check was inconclusive or failed) must not earn
+                # proof through a stats probe while that stands, or an
+                # unregistered build could rotate its reported hash at will
+                # and re-earn 'verified' through the other three types.  The
+                # rows already hold the verdict, so nothing new is stored.
+                # An honest desktop pays one round after an update: the
+                # advanced baseline passes the next code_hash_check and the
+                # grant resumes.  The current challenge being that passing
+                # hash check is the grant.
+                if IntegrityService._hash_verdict_withholds_proof(db, challenge):
+                    logger.debug(
+                        "Integrity: proof withheld for %s, latest "
+                        "code_hash_check is not a pass",
+                        challenge.target_node_id[:8])
+                else:
+                    _peer.integrity_status = 'verified'
+                    _peer.last_attestation_at = datetime.utcnow()
 
         return {'passed': passed, 'details': details}
+
+    @staticmethod
+    def _hash_verdict_withholds_proof(db: Session, challenge) -> bool:
+        """True while the peer's latest code_hash_check is not 'passed'.
+
+        The verdict lives on the challenge rows; this reads the newest
+        code_hash_check for the peer.  A peer with no hash check on record is
+        not withheld (nothing undecided about it yet), and the current
+        challenge being a passing code_hash_check never withholds itself.
+        """
+        if challenge.challenge_type == 'code_hash_check':
+            return False
+        try:
+            latest = db.query(IntegrityChallenge).filter(
+                IntegrityChallenge.target_node_id == challenge.target_node_id,
+                IntegrityChallenge.challenge_type == 'code_hash_check',
+                IntegrityChallenge.status != 'pending',
+            ).order_by(IntegrityChallenge.created_at.desc()).first()
+        except Exception:
+            return False
+        status = getattr(latest, 'status', None)
+        return isinstance(status, str) and status in ('inconclusive', 'failed')
 
     # ─── Impression Witnessing ───
 
@@ -1304,10 +1389,11 @@ class IntegrityService:
         unbounded since 2026-06-03.
 
         Only terminal, non-forensic rows are eligible:
-          passed  -> deleted after CHALLENGE_RETENTION_DAYS (default 14)
-          timeout -> deleted after CHALLENGE_TIMEOUT_RETENTION_DAYS (default 30)
-          failed  -> never (evidence of an actual integrity violation)
-          pending -> never (may still be in flight; the timeout path owns it)
+          passed       -> deleted after CHALLENGE_RETENTION_DAYS (default 14)
+          timeout      -> deleted after CHALLENGE_TIMEOUT_RETENTION_DAYS (default 30)
+          inconclusive -> same clock as timeout (nothing was proven either way)
+          failed       -> never (evidence of an actual integrity violation)
+          pending      -> never (may still be in flight; the timeout path owns it)
 
         Deletes in bounded batches and stops at CHALLENGE_PRUNE_MAX_PER_ROUND so
         a large backlog drains over several rounds rather than taking one long
@@ -1320,9 +1406,10 @@ class IntegrityService:
         cutoffs = (
             ('passed', now - timedelta(days=CHALLENGE_RETENTION_DAYS)),
             ('timeout', now - timedelta(days=CHALLENGE_TIMEOUT_RETENTION_DAYS)),
+            ('inconclusive', now - timedelta(days=CHALLENGE_TIMEOUT_RETENTION_DAYS)),
         )
 
-        deleted = {'passed': 0, 'timeout': 0}
+        deleted = {'passed': 0, 'timeout': 0, 'inconclusive': 0}
         budget = CHALLENGE_PRUNE_MAX_PER_ROUND
         more_remaining = False
 
@@ -1355,17 +1442,19 @@ class IntegrityService:
                 # Budget exhausted with rows still matching this cutoff.
                 more_remaining = True
 
-        total = deleted['passed'] + deleted['timeout']
+        total = deleted['passed'] + deleted['timeout'] + deleted['inconclusive']
         if total:
             logger.info(
                 f"Challenge history pruned: {deleted['passed']} passed "
-                f"(>{CHALLENGE_RETENTION_DAYS}d), {deleted['timeout']} timeout "
+                f"(>{CHALLENGE_RETENTION_DAYS}d), {deleted['timeout']} timeout, "
+                f"{deleted['inconclusive']} inconclusive "
                 f"(>{CHALLENGE_TIMEOUT_RETENTION_DAYS}d)"
                 + (", backlog remains" if more_remaining else ""))
 
         return {
             'deleted_passed': deleted['passed'],
             'deleted_timeout': deleted['timeout'],
+            'deleted_inconclusive': deleted['inconclusive'],
             'deleted_total': total,
             'more_remaining': more_remaining,
         }
