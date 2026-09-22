@@ -10,6 +10,7 @@ import random
 import logging
 import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 from core.http_pool import pooled_get, pooled_post
@@ -775,89 +776,132 @@ class GossipProtocol:
                 peers = peers[_cursor:] + peers[:_cursor]
             _examined = 0
 
-            for peer in peers:
-                if not self._running:
-                    break
-                if time.time() - _started > _budget_s:
-                    self._health_cursor = (
-                        getattr(self, '_health_cursor', 0) + _examined)
-                    logger.warning(
-                        "Health round hit its %.0fs budget after %d/%d peers; "
-                        "yielding so the integrity round is not starved "
-                        "(resumes from this point next round)",
-                        _budget_s, _examined, len(peers))
-                    break
-                _examined += 1
-                if peer.node_id == self.node_id:
-                    continue
-                # #38: a structurally-unroutable row (loopback / docker-bridge /
-                # dead :677) can never be a real remote peer, and a local ping
-                # to it SUCCEEDS — so the age logic below would keep it 'active'
-                # forever and inflate every count. Delete it outright rather
-                # than age it out; ingest (_merge_peer) now rejects new ones, so
-                # it will not come back.
-                _bad_url, _ = is_unroutable_peer_url(peer.url)
-                if _bad_url:
-                    db.delete(peer)
-                    purged += 1
-                    self._flush_health_row(db)
-                    continue
+            # Probe a batch concurrently, apply the results one row at a time.
+            #
+            # Probing one row at a time made this round visit 3-5 rows per 30s
+            # window on central once the table's junk stopped being re-stamped
+            # by relays: a private 10.x address from someone else's LAN costs
+            # the full 3s connect timeout, so ~1,000 rows that were all past
+            # dead_threshold took hours to age out (measured 2026-09-22
+            # 13:45-13:52Z: 5, 5, 3, 4 per window), and the integrity round
+            # crawled the same tail behind it.
+            #
+            # Only the network waits overlap.  Every DB change below still
+            # happens on THIS thread, one row at a time, with the same per-row
+            # commit, so the rule that the write lock never spans a network
+            # call (374f5ab6, the comment above _flush_health_row) holds
+            # exactly as before; the budget is checked between batches, so one
+            # batch, i.e. at most one timeout, is the most a round overruns by.
+            _workers = max(1, int(os.environ.get(
+                'HEVOLVE_HEALTH_PING_WORKERS', '8')))
+
+            def _probe(peer):
+                # Runs on a pool thread.  The identity the answer carried is
+                # kept per thread by _ping_peer, so it is read here, on the
+                # same thread, and returned with the verdict.
                 reachable = self._ping_peer(peer.url)
-                self._heartbeat()
-                if reachable and self._last_ping_node_id == self.node_id:
-                    # The address answers as THIS node: a row that advertised
-                    # localhost, its docker bridge, or this host's own LAN
-                    # address under some other node_id.  A ping to it succeeds
-                    # forever, so the age logic below keeps it 'active' for
-                    # good, and the integrity round audits and challenges this
-                    # node as a peer of itself (the 133 'passed' rows per pass
-                    # on central).  Measured on central 2026-09-22: 378 such
-                    # rows, http://localhost:5000 x184 and http://localhost:6777
-                    # x183, each with a distinct node_id.  is_unroutable_peer_url
-                    # keeps loopback on purpose (co-located nodes on distinct
-                    # ports are real), so the address alone cannot decide;
-                    # who ANSWERS can.  Delete it like the #38 rows.
-                    db.delete(peer)
-                    purged += 1
-                    self._flush_health_row(db)
-                    continue
-                live_peers.append(peer)
-                if reachable:
-                    peer.last_seen = now
-                    peer.status = 'active'
-                else:
-                    age = (now - (peer.last_seen or peer.first_seen)).total_seconds()
-                    if age > self.dead_threshold:
-                        peer.status = 'dead'
-                    elif age > self.stale_threshold:
-                        peer.status = 'stale'
-                # Commit THIS row before probing the next peer.
-                #
-                # The round previously accumulated every delete + status change
-                # in one session and committed only after the whole sweep. The
-                # first mutation opens SQLite's single write transaction, so the
-                # write lock was then held across all the remaining _ping_peer
-                # calls. That is a lock held across network I/O.
-                #
-                # It wedged central on 2026-09-01: a probe hung (pooled_get's
-                # timeout=3 bounds the socket, NOT the wait for a free pooled
-                # connection, and a hang raises nothing for the RequestException
-                # handler to catch), the loop never advanced, so the wall-clock
-                # budget below -- which is only checked BETWEEN peers -- never
-                # got to fire. The write lock stayed held for ~2h. The agent
-                # daemon's `UPDATE agent_goals SET last_dispatched_at` lost its
-                # 5s busy_timeout on every tick, which poisoned its session
-                # ("rolled back due to a previous exception during flush") and
-                # aborted the tick. Goals were selected and never recorded:
-                # max(last_dispatched_at) frozen while the daemon looked alive.
-                #
-                # Committing per row keeps the lock held for microseconds
-                # instead of for the length of a network sweep. A hung probe
-                # then stalls only THIS round, which the budget already covers,
-                # rather than every writer in the process. It also means the #38
-                # purge persists incrementally instead of being rolled back
-                # wholesale when the round cannot finish.
-                self._flush_health_row(db)
+                return reachable, self._last_ping_identity()
+
+            _next = 0
+            with ThreadPoolExecutor(max_workers=_workers) as _pool:
+                while _next < len(peers):
+                    if not self._running:
+                        break
+                    if time.time() - _started > _budget_s:
+                        self._health_cursor = (
+                            getattr(self, '_health_cursor', 0) + _examined)
+                        logger.warning(
+                            "Health round hit its %.0fs budget after %d/%d peers; "
+                            "yielding so the integrity round is not starved "
+                            "(resumes from this point next round)",
+                            _budget_s, _examined, len(peers))
+                        break
+                    _batch = peers[_next:_next + _workers]
+                    _next += len(_batch)
+                    _to_probe = []
+                    for peer in _batch:
+                        _examined += 1
+                        if peer.node_id == self.node_id:
+                            continue
+                        # #38: a structurally-unroutable row (docker-bridge /
+                        # dead :677) can never be a real remote peer, and a
+                        # local ping to it SUCCEEDS — so the age logic below
+                        # would keep it 'active' forever and inflate every
+                        # count. Delete it outright rather than age it out;
+                        # ingest (_merge_peer) now rejects new ones, so it will
+                        # not come back.
+                        _bad_url, _ = is_unroutable_peer_url(peer.url)
+                        if _bad_url:
+                            db.delete(peer)
+                            purged += 1
+                            self._flush_health_row(db)
+                            continue
+                        _to_probe.append(peer)
+                    if not _to_probe:
+                        continue
+                    _results = list(_pool.map(_probe, _to_probe))
+                    self._heartbeat()
+                    for peer, (reachable, responder) in zip(_to_probe, _results):
+                        if reachable and responder == self.node_id:
+                            # The address answers as THIS node: a row that
+                            # advertised localhost, its docker bridge, or this
+                            # host's own LAN address under some other node_id.
+                            # A ping to it succeeds forever, so the age logic
+                            # below keeps it 'active' for good, and the
+                            # integrity round audits and challenges this node as
+                            # a peer of itself (the 133 'passed' rows per pass on
+                            # central).  Measured on central 2026-09-22: 378 such
+                            # rows, http://localhost:5000 x184 and
+                            # http://localhost:6777 x183, each with a distinct
+                            # node_id.  is_unroutable_peer_url keeps loopback on
+                            # purpose (co-located nodes on distinct ports are
+                            # real), so the address alone cannot decide; who
+                            # ANSWERS can.  Delete it like the #38 rows.
+                            db.delete(peer)
+                            purged += 1
+                            self._flush_health_row(db)
+                            continue
+                        live_peers.append(peer)
+                        if reachable:
+                            peer.last_seen = now
+                            peer.status = 'active'
+                        else:
+                            age = (now - (peer.last_seen or peer.first_seen)).total_seconds()
+                            if age > self.dead_threshold:
+                                peer.status = 'dead'
+                            elif age > self.stale_threshold:
+                                peer.status = 'stale'
+                        # Commit THIS row before touching the next one.
+                        #
+                        # The round previously accumulated every delete + status
+                        # change in one session and committed only after the
+                        # whole sweep. The first mutation opens SQLite's single
+                        # write transaction, so the write lock was then held
+                        # across all the remaining _ping_peer calls. That is a
+                        # lock held across network I/O.
+                        #
+                        # It wedged central on 2026-09-01: a probe hung
+                        # (pooled_get's timeout=3 bounds the socket, NOT the wait
+                        # for a free pooled connection, and a hang raises nothing
+                        # for the RequestException handler to catch), the loop
+                        # never advanced, so the wall-clock budget -- which is
+                        # only checked BETWEEN batches -- never got to fire. The
+                        # write lock stayed held for ~2h. The agent daemon's
+                        # `UPDATE agent_goals SET last_dispatched_at` lost its 5s
+                        # busy_timeout on every tick, which poisoned its session
+                        # ("rolled back due to a previous exception during
+                        # flush") and aborted the tick. Goals were selected and
+                        # never recorded: max(last_dispatched_at) frozen while
+                        # the daemon looked alive.
+                        #
+                        # Committing per row keeps the lock held for
+                        # microseconds instead of for the length of a network
+                        # sweep. A hung probe then stalls only THIS round, which
+                        # the budget already covers, rather than every writer in
+                        # the process. It also means the #38 purge persists
+                        # incrementally instead of being rolled back wholesale
+                        # when the round cannot finish.
+                        self._flush_health_row(db)
             # Dead is not deleted. The main query above excludes 'dead' rows,
             # so a peer that aged out during an outage was never re-pinged and
             # could only come back via an INBOUND announce — two nodes that
@@ -881,7 +925,7 @@ class GossipProtocol:
                     purged += 1
                     continue
                 if self._ping_peer(peer.url):
-                    if self._last_ping_node_id == self.node_id:
+                    if self._last_ping_identity() == self.node_id:
                         # Same self-alias rule as the main loop above: an
                         # address that answers as this node is not a peer to
                         # revive, it is a row to drop.
@@ -1062,24 +1106,40 @@ class GossipProtocol:
             pass
         return ''
 
+    def _ping_thread_state(self):
+        _tl = getattr(self, '_ping_tl', None)
+        if _tl is None:
+            _tl = self._ping_tl = threading.local()
+        return _tl
+
+    def _last_ping_identity(self):
+        """node_id the last ``_ping_peer`` on THIS thread got back, or None.
+
+        Per thread, because the health round pings a batch of rows
+        concurrently and each worker must read its own answer, not whatever
+        another thread wrote last.
+        """
+        return getattr(self._ping_thread_state(), 'node_id', None)
+
     def _ping_peer(self, peer_url):
         """True when ``peer_url`` answers /api/social/peers/health.
 
-        ``self._last_ping_node_id`` is the responder's node_id from that
-        answer (None when it gave none), read by the health round so a row
+        The responder's node_id from that answer (None when it gave none) is
+        kept per thread and read back with ``_last_ping_identity``, so a row
         whose address answers as THIS node is recognised without a second
         request.
         """
-        self._last_ping_node_id = None
+        _tl = self._ping_thread_state()
+        _tl.node_id = None
         if self._is_peer_backed_off(peer_url):
             return False
         try:
             resp = pooled_get(f"{peer_url}/api/social/peers/health", timeout=3)
             if resp.status_code == 200:
                 try:
-                    self._last_ping_node_id = (resp.json() or {}).get('node_id')
+                    _tl.node_id = (resp.json() or {}).get('node_id')
                 except Exception:
-                    self._last_ping_node_id = None
+                    _tl.node_id = None
                 self._record_peer_success(peer_url)
                 return True
             self._record_peer_failure(peer_url)

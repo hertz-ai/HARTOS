@@ -94,16 +94,21 @@ class HealthRoundBudgetTest(unittest.TestCase):
             elapsed = time.time() - t0
         return pinged['n'], elapsed, pd
 
+    # Pings run 8 to a batch (HEVOLVE_HEALTH_PING_WORKERS) and the budget is
+    # checked between batches, so a cut lands on a batch boundary: 0.2s pings
+    # under a 0.3s budget give exactly two batches, 16 of 40 rows.
+
     def test_round_yields_at_the_budget(self):
-        """40 peers x 0.05s would be 2s; a 0.3s budget must cut it short."""
-        n, elapsed, _ = self._run(n_peers=40, budget=0.3, ping_cost=0.05)
+        """40 peers x 0.2s would be 8s serial, 1s in batches; a 0.3s budget
+        must still cut it short."""
+        n, elapsed, _ = self._run(n_peers=40, budget=0.3, ping_cost=0.2)
         self.assertLess(elapsed, 1.5,
                         'health round ran past its budget and would starve integrity')
         self.assertLess(n, 40, 'every peer was pinged despite the budget')
 
     def test_cursor_advances_so_coverage_rotates(self):
         """A budget cut must not re-check the same prefix forever."""
-        _, _, pd = self._run(n_peers=40, budget=0.3, ping_cost=0.05)
+        _, _, pd = self._run(n_peers=40, budget=0.3, ping_cost=0.2)
         self.assertGreater(getattr(pd, '_health_cursor', 0), 0,
                            'cursor did not advance; the tail is never reached')
 
@@ -111,6 +116,17 @@ class HealthRoundBudgetTest(unittest.TestCase):
         """A node with few peers must still do a full pass."""
         n, elapsed, _ = self._run(n_peers=3, budget=30, ping_cost=0.01)
         self.assertEqual(n, 3)
+
+    def test_a_batch_is_probed_concurrently(self):
+        """Serial probing visited 3-5 rows per 30s window on central (a 3s
+        connect timeout per unroutable private address), so ~1,000 junk rows
+        took hours to age out.  16 peers at 0.25s each is 4s serial; two
+        batches of 8 must finish in well under that, and every peer must still
+        be pinged."""
+        n, elapsed, _ = self._run(n_peers=16, budget=30, ping_cost=0.25)
+        self.assertEqual(n, 16, 'a peer was skipped')
+        self.assertLess(elapsed, 2.0,
+                        'pings ran one after another: %.2fs for 16 x 0.25s' % elapsed)
 
 
 class SelfAliasPurgeTest(unittest.TestCase):
