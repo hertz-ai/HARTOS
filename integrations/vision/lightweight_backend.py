@@ -725,11 +725,15 @@ class Qwen08BBackend(VisionBackend):
     CAPTION_WIDTH = 512
     CAPTION_HEIGHT = 288
     IDLE_TIMEOUT_S = 300  # Unload after 5 min with no frames
+    #: How long a FAILED launch suppresses the next attempt.  Not forever:
+    #: see _ensure_running for why permanence was a defect (#102).
+    LAUNCH_RETRY_S = 120
 
     def __init__(self, port: int = None):
         from core.port_registry import get_port
         self._port = port or get_port('vlm_caption')
         self._launch_attempted = False
+        self._launch_attempted_at = 0.0
         self._last_describe_time = 0.0
         self._server_proc = None  # subprocess.Popen object (not just PID)
 
@@ -744,9 +748,29 @@ class Qwen08BBackend(VisionBackend):
         """
         if self.is_available():
             return True
+        import time as _t
         if self._launch_attempted:
-            return False
+            # A COOLDOWN, not a latch (#102, found by hartos-94).  This flag
+            # was cleared in exactly one place -- the tail of stop() -- and
+            # check_idle only reaches stop() through `if self._server_proc`,
+            # which is None after a FAILED launch.  So one failure set the
+            # flag forever and captioning was dead for the life of the
+            # process, on a backend whose whole design is to start lazily
+            # per frame.
+            #
+            # Transient failure is the normal case here, not the exception:
+            # the event wait below is only 5x1s so a still-booting Nunba
+            # loses the race, the standalone path needs a llama-server
+            # binary that aborts on this box, and it competes for VRAM with
+            # the resident LLM.  Any of those should cost one cooldown, not
+            # the feature.
+            if _t.time() - self._launch_attempted_at < self.LAUNCH_RETRY_S:
+                return False
+            logger.info(
+                f"Qwen3.5-0.8B: retrying launch after "
+                f"{self.LAUNCH_RETRY_S}s cooldown")
         self._launch_attempted = True
+        self._launch_attempted_at = _t.time()
 
         # Emit event — Nunba subscribes in bundled mode and starts the server
         try:

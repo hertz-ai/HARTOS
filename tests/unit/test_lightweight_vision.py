@@ -736,3 +736,54 @@ class TestModelRegistryVisionLite:
             config_list_entry={}, gpu_tdp_watts=0.0,
         )
         assert mb.tier == ModelTier.FAST
+
+
+# ── #102: a failed launch must not kill captioning for good ───────────
+
+def test_a_failed_launch_is_retried_after_the_cooldown():
+    """Found by hartos-94, read from the path and fixed here.
+
+    _launch_attempted was cleared in exactly ONE place -- the tail of
+    stop() -- and check_idle only reaches stop() through
+    `if self._server_proc`, which is None after a FAILED launch. So one
+    failure set the flag forever and captioning was dead for the life of
+    the process, on a backend whose whole design is a lazy per-frame
+    start. Transient failure is the normal case: the event wait is 5x1s,
+    the standalone path needs a llama-server binary that aborts on this
+    box, and it competes for VRAM with the resident LLM.
+    """
+    from integrations.vision.lightweight_backend import Qwen08BBackend
+
+    backend = Qwen08BBackend(port=59999)
+    backend.is_available = lambda: False
+
+    # An ATTEMPT is what moves the timestamp. is_available() is consulted
+    # on every call before the cooldown -- correctly, it is the cheap "is
+    # it already up" check -- so counting it proves nothing about whether
+    # a launch was tried.
+    assert backend._ensure_running() is False
+    first_attempt = backend._launch_attempted_at
+    assert first_attempt > 0, 'never even tried'
+
+    # immediately after: suppressed by the cooldown, as intended
+    assert backend._ensure_running() is False
+    assert backend._launch_attempted_at == first_attempt, (
+        'hammered the launch instead of waiting out the cooldown')
+
+    # once the cooldown has passed, it tries AGAIN rather than latching off
+    backend._launch_attempted_at -= (backend.LAUNCH_RETRY_S + 1)
+    stale = backend._launch_attempted_at
+    assert backend._ensure_running() is False
+    assert backend._launch_attempted_at > stale, (
+        'captioning stayed dead after one failed launch (#102)')
+
+
+def test_the_cooldown_is_not_a_permanent_latch():
+    """A guard on the mechanism itself, since the defect was its permanence."""
+    from integrations.vision.lightweight_backend import Qwen08BBackend
+
+    assert isinstance(Qwen08BBackend.LAUNCH_RETRY_S, (int, float))
+    assert Qwen08BBackend.LAUNCH_RETRY_S > 0
+    backend = Qwen08BBackend(port=59998)
+    assert hasattr(backend, '_launch_attempted_at'), (
+        'without a timestamp the flag can only be permanent')
