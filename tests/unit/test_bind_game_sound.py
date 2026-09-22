@@ -916,3 +916,97 @@ def test_after_the_cooldown_one_more_submit_is_allowed():
         tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
 
     assert media.generate_media.call_count == 2
+
+
+def test_a_rejection_survives_a_composer_that_is_still_warming_up():
+    """The cooldown placeholder must not overwrite the take under review.
+
+    04b8bd86e made a timed-out submit remember WHEN it went out, so the next
+    call waits rather than queueing a duplicate -- right, and measured.  But
+    it writes that note as a whole NEW record at the state's key, and every
+    other _remember in the function carries `previous_takes` forward while
+    this one does not.  So a rejected take plus a cold composer -- a node
+    restarted overnight, which is exactly when a composer is warming up --
+    silently erased the rejection: the audio the reviewer asked to go back
+    to, the reason they gave, and the variant counter with it.
+
+    Sibling of test_the_take_before_last_survives_the_next_composition,
+    which pins the same guarantee against a composer that answers at once.
+    """
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/first.mp3', 'variant': 1}}}}}}
+    cold = _media({'status': 'warming_up', 'message': 'starting up'})
+
+    with _agent(agent_data, cold) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too jangly')
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+
+    record = agent_data[4242]['games']['eng-01']['sounds']['bgm']
+    assert record.get('submitted_at'), 'the cooldown note was not written'
+    assert record.get('rejected_url') == 'https://node/first.mp3', (
+        'the take the reviewer turned down is gone, so "go back to it" '
+        f'cannot be honoured: {record!r}')
+    assert record.get('rejected_reason') == 'too jangly', (
+        f'the reason the next composition must answer is gone: {record!r}')
+
+
+def test_the_reason_still_reaches_the_composer_after_it_warms_up():
+    """What the erased rejection costs: the same take, asked for again.
+
+    With the rejection gone the next call computes variant 1 and a prompt
+    with no "not like the last one", so the composer is asked for precisely
+    what the reviewer turned down, and nothing records that they did.
+    """
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/first.mp3', 'variant': 1}}}}}}
+    cold = _media({'status': 'warming_up', 'message': 'starting up'})
+
+    with _agent(agent_data, cold) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too jangly')
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+
+    # the composer warms up; the cooldown has passed
+    import core.agent_tools as at
+    agent_data[4242]['games']['eng-01']['sounds']['bgm']['submitted_at'] -= (
+        at.SUBMIT_COOLDOWN_S + 1)
+    warm = _media({'status': 'completed',
+                   'results': [{'url': 'https://node/second.mp3'}]})
+
+    with _agent(agent_data, warm) as tools:
+        again = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+
+    asked = warm.generate_media.call_args.kwargs['context']
+    assert 'too jangly' in asked, (
+        f'the composer was asked again with no memory of the rejection: {asked!r}')
+    assert again['music']['variant'] == 2, (
+        f"the variant counter reset, so this reads as a first take: {again['music']!r}")
+    assert [t['url'] for t in again['music']['previous_takes']] == [
+        'https://node/first.mp3'], f"the earlier audio vanished: {again['music']!r}"
+
+
+def test_a_cue_is_composed_short_and_a_loop_long():
+    """MEASURED 2026-09-22: every state was composed at 60 seconds.
+
+    Both WAVs from the live run were 60.00s -- for "a bright two-note
+    chime for a correct answer" -- because bind_game_sound asked for 60
+    regardless of state. A cue that outlasts the moment it marks is worse
+    than no cue.
+    """
+    media = _media({'status': 'completed',
+                    'results': [{'url': 'https://node/x.mp3'}]})
+
+    with _agent({}, media) as tools:
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+        correct = media.generate_media.call_args.kwargs['duration']
+        tools['bind_game_sound']('eng-02', 'calm', 'spelling', 'bgm')
+        bgm = media.generate_media.call_args.kwargs['duration']
+
+    assert correct <= 3, f'a correct-answer chime asked for {correct}s'
+    assert bgm >= 20, f'background music asked for only {bgm}s'
+
+
+def test_every_state_has_a_length():
+    """A new state must get a prompt AND a length in the same place."""
+    from core.game_sound_memo import GAME_STATES, GAME_STATE_DURATIONS
+    assert set(GAME_STATE_DURATIONS) == set(GAME_STATES)
+    assert all(0 < v <= 60 for v in GAME_STATE_DURATIONS.values())

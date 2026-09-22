@@ -38,6 +38,33 @@ GAME_STATES = {
 }
 
 
+#: How long each state's sound should be, in seconds.  MEASURED
+#: 2026-09-22: every state -- including "a bright two-note chime for a
+#: correct answer" -- was composed at 60 seconds, because the tool asked
+#: for 60 regardless of state.  A cue that outlasts the moment it marks is
+#: worse than no cue.  bgm is a loop and may be long; everything that
+#: marks an instant is short.  Kept beside GAME_STATES so a new state gets
+#: a prompt and a length in the same place.
+GAME_STATE_DURATIONS = {
+    'bgm': 30,
+    'intro': 6,
+    'complete': 6,
+    'streak': 3,
+    'countdownEnd': 3,
+    'correct': 2,
+    'wrong': 2,
+    'starEarned': 2,
+    'matchFound': 2,
+    'cardFlip': 1,
+    'dragStart': 1,
+    'dragDrop': 1,
+    'countdownTick': 1,
+    'tap': 1,
+}
+assert set(GAME_STATE_DURATIONS) == set(GAME_STATES), (
+    'every state needs a length: ' + str(set(GAME_STATES) ^ set(GAME_STATE_DURATIONS)))
+
+
 def game_state_key(state, level=None, variant=None):
     """The memo key for a game's state (spec §3).
 

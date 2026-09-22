@@ -845,6 +845,7 @@ _DEFAULT_RECEIPT_TEMPLATE = (
 
 
 from core.game_sound_memo import (  # noqa: E402
+    GAME_STATE_DURATIONS,
     GAME_STATES,
     game_state_key,
     game_state_match,
@@ -1330,7 +1331,8 @@ def build_core_tool_closures(ctx):
                     context=prompt,
                     output_modality='audio_music',
                     input_text=prompt,
-                    duration=60,
+                    # per state: a chime is two seconds, a loop is thirty (spec 3).
+                    duration=GAME_STATE_DURATIONS.get(which, 30),
                     style=mood,
                 ))
                 if started.get('status') == 'completed':
