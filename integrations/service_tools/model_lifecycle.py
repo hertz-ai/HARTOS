@@ -1841,6 +1841,24 @@ class ModelLifecycleManager:
         if mmproj_path:
             cmd.extend(['--mmproj', mmproj_path])
 
+        # The THIRD spawn path, and it has to place a mixture of experts the
+        # same way the other two do. The catalog admits a 35B on an 8 GB card
+        # because it is sized for --cpu-moe placement; a restart that drops
+        # the flag would try to put all 21 GiB on the card, so the model
+        # would survive selection and die on the recovery that was meant to
+        # save it. Asked of the shared helper, never decided here.
+        if gpu_layers:
+            try:
+                from integrations.service_tools.model_catalog import (
+                    moe_offload_args)
+                from integrations.service_tools.vram_manager import (
+                    vram_manager)
+                cmd.extend(moe_offload_args(
+                    model_path, float(vram_manager.get_free_vram())))
+            except Exception as e:
+                logger.info("MoE placement probe skipped on restart (%s); "
+                            "launching with unchanged flags", e)
+
         log_path = os.path.join(
             os.environ.get('TEMP', '/tmp'), f'llama_{port}.log')
         log_fh = None
