@@ -831,7 +831,13 @@ def _register_in_catalog(catalog_id: str, model_name: str, quant: str,
     )
 
     catalog.register(entry)
-    catalog.mark_downloaded(catalog_id)
+    # The resolved weight file, which this function has had as a parameter
+    # all along and was discarding. Recording it is what lets the row learn
+    # what the artifact SAYS about itself -- architecture, the MoE expert
+    # split, an MTP head -- instead of only what was typed into it. It also
+    # populates the local_path that LlamaInstaller.get_model_path's
+    # "canonical catalog lookup first" branch reads.
+    catalog.mark_downloaded(catalog_id, local_path=str(gguf_path))
     catalog.mark_loaded(catalog_id, device='gpu')
     logger.info(f"Registered {catalog_id} in model catalog")
 

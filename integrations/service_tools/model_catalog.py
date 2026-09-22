@@ -517,6 +517,16 @@ class ModelEntry:
     repo_id: str = ''                    # HuggingFace repo, Ollama model name, pip package
     files: Dict[str, str] = field(default_factory=dict)
     download_url: str = ''               # For custom_url source
+    # Where the weights actually landed. The loader that fetched them sets
+    # it; everything that needs to READ the artifact goes through here.
+    #
+    # This field is not new in intent, only in existence. LlamaInstaller
+    # .get_model_path already documents "1. Canonical ModelCatalog entry by
+    # display name -- if HARTOS has the model registered as installed with a
+    # local_path, use that", and that branch has never run: ModelEntry had
+    # no local_path, so the lookup fell through to a filename walk across
+    # ~/.nunba, ~/.trueflow, ~/.ollama and the HF cache on every call.
+    local_path: str = ''
 
     # ── Compute Requirements ──────────────────────────────────────
     vram_gb: float = 0.0                 # GPU VRAM needed (0 = CPU-capable)
@@ -908,15 +918,29 @@ class ModelCatalog:
     # ── State updates ─────────────────────────────────────────────
 
     def mark_downloaded(self, model_id: str, downloaded: bool = True,
-                        gguf_path: Optional[str] = None) -> None:
-        """Mark a row downloaded, and — when the caller knows where the file
-        landed — record what the file SAYS about itself.
+                        local_path: Optional[str] = None) -> None:
+        """Mark a row downloaded, and — when we know where the file landed —
+        record what the file SAYS about itself.
 
-        ``gguf_path`` is optional and defaults to the old behaviour exactly,
-        so every existing caller is unchanged. A caller that has the path
-        (the downloader does; the notify_* sync points do not) can pass it
-        and the row gains architecture facts read from the artifact instead
-        of typed into a table: moe/experts_used/experts_total and mtp.
+        ``local_path`` is optional and defaults to the old behaviour
+        exactly, so every existing caller is unchanged. It is persisted on
+        the row, which is what makes LlamaInstaller.get_model_path's
+        documented "canonical catalog lookup first" branch able to run at
+        all — it reads entry.local_path, a field that until now did not
+        exist, so that lookup always fell through to a filename walk across
+        ~/.nunba, ~/.trueflow, ~/.ollama and the HF cache.
+
+        A caller that does not pass one falls back to whatever the row
+        already holds, so the loader that fetched the weights can record
+        the path itself and every later call benefits without threading it
+        through. The row then gains architecture facts read FROM the
+        artifact rather than typed into a table: moe / experts_used /
+        experts_total / mtp and the expert split.
+
+        Engine-agnostic by construction: read_gguf_facts returns {} for
+        anything that is not a GGUF, so a torch, onnx or sidecar model
+        records its path and learns nothing further, which is exactly
+        right. No per-backend code.
 
         For a DENSE model it only ADDS capability keys and never touches
         vram_gb, ram_gb, disk_gb, priority or the scores, so no dense
@@ -945,8 +969,11 @@ class ModelCatalog:
         if not entry:
             return
         entry.downloaded = downloaded
-        if downloaded and gguf_path:
-            facts = read_gguf_facts(gguf_path)
+        if local_path:
+            entry.local_path = str(local_path)
+        path = local_path or entry.local_path
+        if downloaded and path:
+            facts = read_gguf_facts(path)
             if facts:
                 entry.capabilities = {**(entry.capabilities or {}), **facts}
                 logger.info(

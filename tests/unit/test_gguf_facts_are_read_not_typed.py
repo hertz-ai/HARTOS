@@ -268,7 +268,7 @@ class TestEnrichmentCannotMoveSelection:
         before = (c._entries['m'].vram_gb, c._entries['m'].ram_gb,
                   c._entries['m'].disk_gb, c._entries['m'].priority,
                   c._entries['m'].speed_score, c._entries['m'].quality_score)
-        c.mark_downloaded('m', True, gguf_path=moe_gguf)
+        c.mark_downloaded('m', True, local_path=moe_gguf)
         e = c._entries['m']
         assert e.capabilities['moe'] is True        # added
         assert e.capabilities['chat'] is True       # preserved
@@ -281,7 +281,7 @@ class TestEnrichmentCannotMoveSelection:
         means a PCIe round trip per token. Its numbers must not move."""
         c = self._cat()
         before = (c._entries['m'].vram_gb, c._entries['m'].ram_gb)
-        c.mark_downloaded('m', True, gguf_path=dense_gguf)
+        c.mark_downloaded('m', True, local_path=dense_gguf)
         assert (c._entries['m'].vram_gb, c._entries['m'].ram_gb) == before
 
     def test_a_measured_moe_is_resized_to_its_actual_placement(self, big_moe):
@@ -295,7 +295,7 @@ class TestEnrichmentCannotMoveSelection:
         facts; the PARSER that produces them is covered above with real
         bytes at KB scale."""
         c = self._cat()
-        c.mark_downloaded('m', True, gguf_path=big_moe)
+        c.mark_downloaded('m', True, local_path=big_moe)
         e = c._entries['m']
         assert e.vram_gb == pytest.approx(1.0 * 1.35, abs=0.05)
         assert e.ram_gb == pytest.approx(20.0, abs=0.05)
@@ -304,7 +304,7 @@ class TestEnrichmentCannotMoveSelection:
 
     def test_ranking_is_never_rewritten_even_for_a_moe(self, big_moe):
         c = self._cat()
-        c.mark_downloaded('m', True, gguf_path=big_moe)
+        c.mark_downloaded('m', True, local_path=big_moe)
         e = c._entries['m']
         assert e.priority == 85 and e.quality_score == 0.92
         assert e.disk_gb == 21.19
@@ -322,13 +322,13 @@ class TestEnrichmentCannotMoveSelection:
         """A bad path is a bookkeeping problem, not a reason to lose the
         download flag."""
         c = self._cat()
-        c.mark_downloaded('m', True, gguf_path=str(tmp_path / 'gone.gguf'))
+        c.mark_downloaded('m', True, local_path=str(tmp_path / 'gone.gguf'))
         assert c._entries['m'].downloaded is True
         assert c._entries['m'].capabilities == {'chat': True}
 
     def test_unknown_model_id_is_a_no_op(self, moe_gguf):
         c = self._cat()
-        c.mark_downloaded('nope', True, gguf_path=moe_gguf)   # must not raise
+        c.mark_downloaded('nope', True, local_path=moe_gguf)   # must not raise
 
 
 class TestResidentNotMerelyFitting:
@@ -481,7 +481,7 @@ class TestTheResidencyRecordIsModelAwareNotSlotAware:
         """read_gguf_facts predicts from the file; this observes after the
         load. Same row, same key, so predicted vs observed is one place."""
         c = self._cat()
-        c.mark_downloaded('m', True, gguf_path=big_moe)
+        c.mark_downloaded('m', True, local_path=big_moe)
         c.record_residency('m', vram_gb=2.87)
         caps = c._entries['m'].capabilities
         assert caps['non_expert_bytes'] == 1 * (1024 ** 3)   # predicted
@@ -560,3 +560,82 @@ class TestTheResidencyRecordIsModelAwareNotSlotAware:
         machine, not about the model. The mesh whitelist must exclude it."""
         from integrations.service_tools.model_mesh import _FACT_KEYS
         assert 'residency' not in _FACT_KEYS
+
+
+class TestTheChainIsActuallyWired:
+    """The defect this closes: read_gguf_facts, the MoE sizing correction
+    and the matches_compute RAM check were all correct and NONE of them
+    could fire, because every mark_downloaded call site passed only the id.
+    The live catalog showed 0 rows with moe:True and that looked like
+    safety; it was the symptom.
+
+    `local_path` is not a new concept. LlamaInstaller.get_model_path
+    already documents "1. Canonical ModelCatalog entry by display name --
+    if HARTOS has the model registered as installed with a local_path, use
+    that", and ModelEntry never had the field, so that branch always fell
+    through to a filename walk across ~/.nunba, ~/.trueflow, ~/.ollama and
+    the HF cache."""
+
+    def _cat(self):
+        c = ModelCatalog.__new__(ModelCatalog)
+        c._entries, c._populators = {}, {}
+        c._lock = __import__('threading').RLock()
+        c._entries['m'] = ModelEntry(
+            id='m', name='M', model_type=ModelType.LLM,
+            backend='llama.cpp', files={'model': 'm.gguf'},
+            vram_gb=28.6, ram_gb=42.4, disk_gb=21.19, priority=85,
+            quality_score=0.92, speed_score=0.34)
+        return c
+
+    def test_the_path_is_persisted_on_the_row(self, big_moe):
+        c = self._cat()
+        c.mark_downloaded('m', True, local_path=big_moe)
+        assert c._entries['m'].local_path == big_moe
+
+    def test_a_later_call_needs_no_path_because_the_row_holds_it(self,
+                                                                 big_moe):
+        """The loader that fetched the weights records the path once; every
+        later mark_downloaded benefits without threading it through."""
+        c = self._cat()
+        c._entries['m'].local_path = big_moe
+        c.mark_downloaded('m', True)                    # no path passed
+        assert c._entries['m'].capabilities.get('moe') is True
+
+    def test_recording_the_path_makes_the_whole_chain_fire(self, big_moe):
+        """One call, and all three dormant pieces come alive at once."""
+        c = self._cat()
+        before = c._entries['m'].matches_compute(8.0, 32.0, True)
+        c.mark_downloaded('m', True, local_path=big_moe)
+        e = c._entries['m']
+        assert before == 'impossible'                   # was unreachable
+        assert e.capabilities['moe'] is True            # facts read
+        assert (e.vram_gb, e.ram_gb) == (1.4, 20.0)     # sizing corrected
+        assert e.matches_compute(8.0, 32.0, True) == 'gpu'
+
+    def test_the_moe_ram_check_can_now_actually_reject(self, big_moe):
+        """It could never fire before, because nothing set moe:True."""
+        c = self._cat()
+        c.mark_downloaded('m', True, local_path=big_moe)
+        assert c._entries['m'].matches_compute(8.0, 4.0, True) != 'gpu'
+
+    def test_a_non_gguf_records_its_path_and_learns_nothing_more(self,
+                                                                 tmp_path):
+        """Engine-agnostic by construction. A torch / onnx / sidecar model
+        keeps its path and gains no facts, with no per-backend code."""
+        p = tmp_path / 'model.safetensors'
+        p.write_bytes(b'not a gguf')
+        c = self._cat()
+        before = (c._entries['m'].vram_gb, c._entries['m'].ram_gb)
+        c.mark_downloaded('m', True, local_path=str(p))
+        e = c._entries['m']
+        assert e.local_path == str(p)
+        assert 'moe' not in e.capabilities
+        assert (e.vram_gb, e.ram_gb) == before
+
+    def test_the_path_survives_serialization(self):
+        """get_model_path reads it from a row loaded off disk, so it has to
+        round-trip."""
+        c = self._cat()
+        c.mark_downloaded('m', True, local_path='/models/m.gguf')
+        revived = ModelEntry.from_dict(c._entries['m'].to_dict())
+        assert revived.local_path == '/models/m.gguf'
