@@ -113,6 +113,96 @@ class HealthRoundBudgetTest(unittest.TestCase):
         self.assertEqual(n, 3)
 
 
+class SelfAliasPurgeTest(unittest.TestCase):
+    """A row whose address answers as THIS node is dropped, not kept alive.
+
+    Measured on central 2026-09-22: 378 non-dead loopback rows
+    (http://localhost:5000 x184, http://localhost:6777 x183), each a distinct
+    node_id that some remote node once advertised as its own localhost.  From
+    inside central's container those addresses are central itself, so every
+    ping succeeded, the age logic re-stamped them 'active' forever, and the
+    integrity round audited and challenged central as a peer of itself (the
+    133 'passed' rows per pass).  is_unroutable_peer_url keeps loopback on
+    purpose (co-located nodes on distinct ports are real), so the address
+    cannot decide; the node_id in the health answer can.
+    """
+
+    class _Resp:
+        def __init__(self, node_id):
+            self.status_code = 200
+            self._node_id = node_id
+
+        def json(self):
+            return {'node_id': self._node_id, 'status': 'ok'}
+
+    def _run(self, answers):
+        """``answers`` maps peer url -> node_id the health endpoint returns."""
+        pd = GossipProtocol.__new__(GossipProtocol)
+        pd._running = True
+        pd.node_id = 'self'
+        pd.dead_threshold = 900
+        pd.stale_threshold = 300
+        pd._health_cursor = 0
+        pd._peer_backoff = type('B', (), {
+            'prune_expired': lambda s: None,
+            'is_backed_off': lambda s, url: False,
+            'record_success': lambda s, url: None,
+            'record_failure': lambda s, url: None,
+        })()
+        pd._heartbeat = lambda: None
+
+        peers = [_Peer(i) for i in range(len(answers))]
+        for p, url in zip(peers, answers):
+            p.url = url
+        deleted = []
+        calls = {'n': 0}
+
+        class _Q:
+            def __init__(self, rows): self._rows = rows
+            def filter(self, *a, **k): return self
+            def all(self): return self._rows
+            def first(self): return None
+
+        class _DB:
+            def query(self, *a, **k):
+                calls['n'] += 1
+                return _Q(peers if calls['n'] == 1 else [])
+            def delete(self, row): deleted.append(row)
+            def commit(self): pass
+            def rollback(self): pass
+            def close(self): pass
+
+        def fake_get(url, **kw):
+            base = url.rsplit('/api/social/peers/health', 1)[0]
+            return self._Resp(answers[base])
+
+        with patch('integrations.social.models.get_db', return_value=_DB()), \
+             patch('integrations.social.peer_discovery.pooled_get', fake_get), \
+             patch('integrations.social.peer_discovery.is_unroutable_peer_url',
+                   return_value=(False, '')):
+            os.environ['HEVOLVE_HEALTH_ROUND_BUDGET_S'] = '30'
+            pd._health_check_round()
+        return peers, deleted
+
+    def test_row_answering_as_self_is_deleted_and_a_real_peer_kept(self):
+        peers, deleted = self._run({
+            'http://localhost:5000': 'self',          # central, seen as a peer
+            'https://node1.example.net': 'node-1',    # a real remote node
+        })
+        self.assertEqual([p.url for p in deleted], ['http://localhost:5000'],
+                         'the self-alias row was not the one deleted')
+        real = [p for p in peers if p.url == 'https://node1.example.net'][0]
+        self.assertEqual(real.status, 'active')
+        self.assertIsNotNone(real.last_seen, 'a real reachable peer must be stamped seen')
+
+    def test_reachable_row_without_a_node_id_is_kept(self):
+        """An older node's health answer may carry no node_id; that is not
+        evidence of a self-alias, so the row is treated as reachable."""
+        peers, deleted = self._run({'https://node2.example.net': None})
+        self.assertEqual(deleted, [])
+        self.assertEqual(peers[0].status, 'active')
+
+
 class BudgetWiringTest(unittest.TestCase):
 
     def test_budget_is_env_overridable(self):

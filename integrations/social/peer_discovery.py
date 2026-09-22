@@ -802,9 +802,26 @@ class GossipProtocol:
                     purged += 1
                     self._flush_health_row(db)
                     continue
-                live_peers.append(peer)
                 reachable = self._ping_peer(peer.url)
                 self._heartbeat()
+                if reachable and self._last_ping_node_id == self.node_id:
+                    # The address answers as THIS node: a row that advertised
+                    # localhost, its docker bridge, or this host's own LAN
+                    # address under some other node_id.  A ping to it succeeds
+                    # forever, so the age logic below keeps it 'active' for
+                    # good, and the integrity round audits and challenges this
+                    # node as a peer of itself (the 133 'passed' rows per pass
+                    # on central).  Measured on central 2026-09-22: 378 such
+                    # rows, http://localhost:5000 x184 and http://localhost:6777
+                    # x183, each with a distinct node_id.  is_unroutable_peer_url
+                    # keeps loopback on purpose (co-located nodes on distinct
+                    # ports are real), so the address alone cannot decide;
+                    # who ANSWERS can.  Delete it like the #38 rows.
+                    db.delete(peer)
+                    purged += 1
+                    self._flush_health_row(db)
+                    continue
+                live_peers.append(peer)
                 if reachable:
                     peer.last_seen = now
                     peer.status = 'active'
@@ -864,6 +881,14 @@ class GossipProtocol:
                     purged += 1
                     continue
                 if self._ping_peer(peer.url):
+                    if self._last_ping_node_id == self.node_id:
+                        # Same self-alias rule as the main loop above: an
+                        # address that answers as this node is not a peer to
+                        # revive, it is a row to drop.
+                        db.delete(peer)
+                        purged += 1
+                        self._heartbeat()
+                        continue
                     peer.last_seen = now
                     peer.status = 'active'
                     logger.info("Dead peer revived by re-probe: %s", peer.url)
@@ -871,8 +896,9 @@ class GossipProtocol:
             db.commit()
             if purged:
                 logger.info(
-                    "Peer purge (#38): removed %d unroutable rows "
-                    "(loopback / docker-172.17 / dead :677)", purged)
+                    "Peer purge (#38): removed %d rows that are structurally "
+                    "unroutable (docker-172.17 / dead :677) or answer as this "
+                    "node itself", purged)
             # Update contribution scores for active/stale peers (live rows only;
             # purged rows are gone from the session).
             try:
@@ -1037,11 +1063,23 @@ class GossipProtocol:
         return ''
 
     def _ping_peer(self, peer_url):
+        """True when ``peer_url`` answers /api/social/peers/health.
+
+        ``self._last_ping_node_id`` is the responder's node_id from that
+        answer (None when it gave none), read by the health round so a row
+        whose address answers as THIS node is recognised without a second
+        request.
+        """
+        self._last_ping_node_id = None
         if self._is_peer_backed_off(peer_url):
             return False
         try:
             resp = pooled_get(f"{peer_url}/api/social/peers/health", timeout=3)
             if resp.status_code == 200:
+                try:
+                    self._last_ping_node_id = (resp.json() or {}).get('node_id')
+                except Exception:
+                    self._last_ping_node_id = None
                 self._record_peer_success(peer_url)
                 return True
             self._record_peer_failure(peer_url)
