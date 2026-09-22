@@ -264,6 +264,23 @@ def read_gguf_facts(path: str) -> dict:
             for _ in range(n_kv):
                 key = _s()
                 kv[key] = _v(_u('<I'))
+
+            # The tensor table follows the metadata. Read it ONLY for a
+            # mixture of experts, where the expert/non-expert split is the
+            # number that decides placement -- for a dense model every byte
+            # has to be resident anyway, so the split says nothing.
+            spans = None
+            if any(k.endswith('.expert_count') for k in kv):
+                offsets = []
+                for _ in range(_n_tensor):
+                    t_name = _s()
+                    for _ in range(_u('<I')):    # dims
+                        _u('<Q')
+                    _u('<I')                     # ggml type
+                    offsets.append((t_name, _u('<Q')))
+                align = kv.get('general.alignment') or 32
+                data_start = (f.tell() + align - 1) // align * align
+                spans = (offsets, size - data_start)
     except (OSError, struct.error, KeyError, UnicodeDecodeError) as e:
         logger.warning("read_gguf_facts(%s): unreadable (%s); returning no "
                        "facts rather than guessing", path, e)
@@ -292,6 +309,29 @@ def read_gguf_facts(path: str) -> dict:
             # both operands came out of the file, so rounding here would be
             # re-introducing the hand-typed approximation this replaces.
             facts['expert_fraction'] = used / total
+        # What actually has to sit in VRAM. llama.cpp's --cpu-moe keeps the
+        # expert tensors (the '_exps' ones) in system RAM and leaves
+        # attention, embeddings and norms on the GPU, so a MoE's VRAM cost
+        # is the NON-expert bytes plus KV cache -- not the file size. For
+        # Tiel-Coder-35B-A3B that is 2.53 GiB of a 21.19 GiB file: sizing it
+        # at weights * 1.35 overstates the requirement by about 11x and is
+        # why a machine that can run this model is told it cannot.
+        #
+        # Sizes come from consecutive tensor OFFSETS rather than a GGML
+        # quant-type table: the file states its own layout, so this cannot
+        # drift from upstream type definitions. Inter-tensor padding counts
+        # into the preceding tensor, which errs high -- the safe direction
+        # for a fit decision.
+        if spans:
+            offsets, data_bytes = spans
+            ordered = sorted(offsets, key=lambda t: t[1])
+            expert = 0
+            for i, (t_name, off) in enumerate(ordered):
+                nxt = ordered[i + 1][1] if i + 1 < len(ordered) else data_bytes
+                if '_exps' in t_name:
+                    expert += nxt - off
+            facts['expert_bytes'] = expert
+            facts['non_expert_bytes'] = data_bytes - expert
     elif arch:
         facts['moe'] = False
 

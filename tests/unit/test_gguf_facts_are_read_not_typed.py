@@ -53,8 +53,18 @@ def _kv_u32(key, val):
             struct.pack('<I', 4) + struct.pack('<I', val))
 
 
+def _tensor_info(name, offset):
+    """name, n_dims=1, dims=[1], type=0, offset — the layout the reader walks."""
+    return (struct.pack('<Q', len(name)) + name.encode() +
+            struct.pack('<I', 1) + struct.pack('<Q', 1) +
+            struct.pack('<I', 0) + struct.pack('<Q', offset))
+
+
 def write_gguf(path, arch=None, experts_total=None, experts_used=None,
-               nextn=None, pad=0):
+               nextn=None, pad=0, tensors=None, data_bytes=0, align=32):
+    """`tensors` is [(name, offset), ...]; sizes come from the GAPS between
+    offsets, exactly as the reader derives them, with the last tensor
+    running to `data_bytes`."""
     kvs = b''
     n = 0
     if arch is not None:
@@ -65,8 +75,18 @@ def write_gguf(path, arch=None, experts_total=None, experts_used=None,
         kvs += _kv_u32(f'{arch}.expert_used_count', experts_used); n += 1
     if nextn is not None:
         kvs += _kv_u32(f'{arch}.nextn_predict_layers', nextn); n += 1
+
+    tensors = tensors or []
+    infos = b''.join(_tensor_info(nm, off) for nm, off in tensors)
+    header = (b'GGUF' + struct.pack('<IQQ', 3, len(tensors), n) + kvs + infos)
     with open(path, 'wb') as f:
-        f.write(b'GGUF' + struct.pack('<IQQ', 3, 0, n) + kvs + b'\0' * pad)
+        f.write(header)
+        if tensors:
+            start = (len(header) + align - 1) // align * align
+            f.write(b'\0' * (start - len(header)))   # alignment padding
+            f.write(b'\0' * data_bytes)
+        else:
+            f.write(b'\0' * pad)
     return path
 
 
@@ -113,6 +133,71 @@ class TestTheFactsThatWereTrackedNowhere:
         f = read_gguf_facts(p)
         assert f['architecture'] == 'llama4moe'
         assert f['experts_total'] == 64 and f['experts_used'] == 2
+
+
+class TestTheSplitThatDecidesPlacement:
+    """llama.cpp's --cpu-moe keeps the '_exps' tensors in system RAM and
+    leaves attention, embeddings and norms on the GPU. So a MoE's VRAM cost
+    is the NON-expert bytes, not the file size, and that is the difference
+    between "this machine cannot run a 35B" and "it can".
+
+    Measured on the real Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL: 18.64 GiB of
+    experts against 2.53 GiB of everything else, from a 21.19 GiB file.
+    Sizing it at weights * 1.35 claims 28.6 GB of VRAM -- about 11x the
+    truth."""
+
+    @pytest.fixture
+    def split_gguf(self, tmp_path):
+        # gaps: attn 1024, gate_exps 4096, down_exps 4096, output 1024
+        return write_gguf(
+            str(tmp_path / 'split.gguf'), arch='qwen35moe',
+            experts_total=256, experts_used=8,
+            tensors=[('blk.0.attn_q.weight', 0),
+                     ('blk.0.ffn_gate_exps.weight', 1024),
+                     ('blk.0.ffn_down_exps.weight', 5120),
+                     ('output.weight', 9216)],
+            data_bytes=10240)
+
+    def test_expert_and_non_expert_bytes_are_measured(self, split_gguf):
+        f = read_gguf_facts(split_gguf)
+        assert f['expert_bytes'] == 8192         # the two _exps tensors
+        assert f['non_expert_bytes'] == 2048     # attn + output
+
+    def test_the_two_halves_account_for_the_whole_data_section(self,
+                                                               split_gguf):
+        f = read_gguf_facts(split_gguf)
+        assert f['expert_bytes'] + f['non_expert_bytes'] == 10240
+
+    def test_sizes_come_from_offset_gaps_not_a_quant_type_table(self,
+                                                                tmp_path):
+        """Every tensor here declares ggml type 0 and a single dim of 1. If
+        sizes were computed from the type they would all be tiny and equal;
+        they are not, because the file's own layout states them."""
+        p = write_gguf(str(tmp_path / 'g.gguf'), arch='qwen35moe',
+                       experts_total=8, experts_used=2,
+                       tensors=[('blk.0.ffn_up_exps.weight', 0),
+                                ('output.weight', 7000)],
+                       data_bytes=8000)
+        f = read_gguf_facts(p)
+        assert f['expert_bytes'] == 7000
+        assert f['non_expert_bytes'] == 1000
+
+    def test_a_dense_model_pays_none_of_this(self, dense_gguf):
+        """No split is emitted for a dense model -- every byte has to be
+        resident anyway, so the number would mean nothing. It also means
+        the tensor table is not walked for the common case."""
+        f = read_gguf_facts(dense_gguf)
+        assert 'expert_bytes' not in f
+        assert 'non_expert_bytes' not in f
+
+    def test_a_moe_with_no_tensor_table_still_reports_its_kv_facts(self,
+                                                                   moe_gguf):
+        """The existing fixture writes tensor_count=0. The split is absent
+        but moe/experts/mtp must survive -- a missing tensor table is not a
+        reason to lose the metadata."""
+        f = read_gguf_facts(moe_gguf)
+        assert f['moe'] is True and f['experts_used'] == 8
+        assert f['expert_bytes'] == 0
 
 
 class TestUnreadableMeansUnknownNeverFalse:
