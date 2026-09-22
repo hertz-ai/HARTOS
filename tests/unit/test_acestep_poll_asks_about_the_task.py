@@ -192,6 +192,13 @@ class TestTheNumericStatusIsTranslated:
         believes it has music it was never given."""
         out = self._poll({'code': 200, 'data': [
             {'task_id': 'abc123', 'status': 1}]})
-        assert out['status'] != 'completed', (
-            f'succeeded-with-no-artifact must not read as completed: {out!r}')
+        # == 'error', not merely != 'completed': the untranslated
+        # 'succeeded' already satisfies "not completed", so the weaker
+        # assertion stayed green with this branch deleted (fix-all's
+        # cross-review, 2026-09-23). A poller treats only a FAILED status as
+        # terminal, so 'succeeded' with nothing saved would be polled to its
+        # deadline.
+        assert out['status'] == 'error', (
+            f'succeeded-with-no-artifact must read as a failure: {out!r}')
+        assert 'saved no artifact' in out.get('error', ''), out
         assert 'results' not in out, out
