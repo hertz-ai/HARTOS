@@ -999,6 +999,40 @@ class ModelCatalog:
                         "must stay resident)", model_id, was[0], entry.vram_gb,
                         was[1], entry.ram_gb)
 
+    def get_by_weight_file(self, weight_file: str) -> Optional['ModelEntry']:
+        """The entry whose ``files['model']`` is this weight file, or None.
+
+        A KEY, not a fifth heuristic. Four places already match a preset to
+        an entry and they use three different rules -- name-only, name-or-
+        file, and name-or-substring-of-id (see #112) -- so a caller holding
+        only a path would otherwise have to pick one and add a fourth. A
+        weight file is unambiguous where a display name is not: the name can
+        drift, be re-cased or be edited by the admin UI, while the file is
+        what the loader actually opens.
+
+        Matches on the BASENAME, because callers hold a full path (the
+        spawn) or a bare name (the catalog row), and the row stores the
+        bare name.
+
+        Returns None when two rows claim the same file. The catalog has
+        known self-duplicate pairs (#107), and "I do not know which" is the
+        honest answer -- guessing would attach a measurement to the wrong
+        model, which is worse than having none.
+        """
+        name = os.path.basename(str(weight_file or '').strip())
+        if not name:
+            return None
+        hits = [e for e in self._entries.values()
+                if (e.files or {}).get('model') == name]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            logger.info(
+                "get_by_weight_file(%r): %d rows claim this file (%s); "
+                "answering 'unknown' rather than picking one", name,
+                len(hits), ', '.join(e.id for e in hits))
+        return None
+
     def record_residency(self, model_id: str, vram_gb: Optional[float] = None,
                          ram_gb: Optional[float] = None,
                          weight_file: Optional[str] = None) -> bool:

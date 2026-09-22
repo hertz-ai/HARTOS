@@ -639,3 +639,63 @@ class TestTheChainIsActuallyWired:
         c.mark_downloaded('m', True, local_path='/models/m.gguf')
         revived = ModelEntry.from_dict(c._entries['m'].to_dict())
         assert revived.local_path == '/models/m.gguf'
+
+
+class TestTheWeightFileIsAKeyNotAFifthHeuristic:
+    """#112: four places match a preset to an entry, using THREE different
+    rules -- name-only, name-or-file, name-or-substring-of-id. A caller
+    holding a path had no way to ask without inventing a fourth.
+
+    get_by_weight_file is a KEY. The display name drifts, is re-cased and
+    is editable from the admin UI; the weight file is what the loader
+    actually opens."""
+
+    def _cat(self, *rows):
+        c = ModelCatalog.__new__(ModelCatalog)
+        c._entries, c._populators = {}, {}
+        c._lock = __import__('threading').RLock()
+        for mid, fname in rows:
+            c._entries[mid] = ModelEntry(
+                id=mid, name=mid.upper(), model_type=ModelType.LLM,
+                backend='llama.cpp', files={'model': fname})
+        return c
+
+    def test_finds_the_row_that_owns_the_file(self):
+        c = self._cat(('a', 'tiel-q4.gguf'), ('b', 'qwen-4b.gguf'))
+        assert c.get_by_weight_file('qwen-4b.gguf').id == 'b'
+
+    def test_a_full_path_resolves_to_the_same_row(self):
+        """The spawn holds an absolute path; the row holds a bare name."""
+        c = self._cat(('a', 'tiel-q4.gguf'))
+        assert c.get_by_weight_file(
+            r'F:\hevolve\models\tiel-q4.gguf').id == 'a'
+        assert c.get_by_weight_file('/mnt/models/tiel-q4.gguf').id == 'a'
+
+    def test_two_rows_claiming_one_file_answer_unknown(self):
+        """The catalog has known self-duplicate pairs (#107). Guessing
+        would attach a measurement to the wrong model."""
+        c = self._cat(('a', 'same.gguf'), ('b', 'same.gguf'))
+        assert c.get_by_weight_file('same.gguf') is None
+
+    def test_unknown_file_is_none(self):
+        assert self._cat(('a', 'x.gguf')).get_by_weight_file(
+            'nope.gguf') is None
+
+    def test_empty_and_none_are_none_not_a_lucky_match(self):
+        c = self._cat(('a', 'x.gguf'))
+        for bad in ('', '   ', None):
+            assert c.get_by_weight_file(bad) is None
+
+    def test_a_row_with_no_files_is_never_matched(self):
+        c = self._cat(('a', 'x.gguf'))
+        c._entries['b'] = ModelEntry(id='b', name='B',
+                                     model_type=ModelType.LLM)
+        assert c.get_by_weight_file('x.gguf').id == 'a'
+
+    def test_it_closes_the_gap_that_blocked_the_residency_record(self):
+        """The spawn has a path and record_residency needs an id. This is
+        the whole reason the lookup exists."""
+        c = self._cat(('tiel', 'tiel-q4.gguf'))
+        entry = c.get_by_weight_file(r'F:\hevolve\models\tiel-q4.gguf')
+        assert c.record_residency(entry.id, vram_gb=2.87, ram_gb=18.64)
+        assert c.residency('tiel')['vram_gb'] == 2.87
