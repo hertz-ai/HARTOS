@@ -93,6 +93,36 @@ def test_writing_to_an_unreachable_dir_fails_honestly(unreachable):
     assert storage.base_dir == unreachable, 'must not have moved elsewhere'
 
 
-def test_reading_an_unreachable_dir_answers_empty_rather_than_crashing(unreachable):
+def test_reading_an_unreachable_dir_does_not_crash_and_says_so(unreachable):
+    """Reading must not crash -- and must not be MISTAKEN for an empty store.
+    This test used to assert only the empty manifest, which quietly encoded
+    "drive unplugged" as "no models installed". fix-all's review caught it: an
+    empty answer is what makes a caller decide to fetch the models again."""
     storage = ModelStorageManager(base_dir=unreachable)
     assert storage.get_manifest() == {'tools': {}}
+    assert storage.is_reachable() is False
+
+
+def test_an_unplugged_drive_is_distinguishable_from_an_empty_store(
+        unreachable, tmp_path):
+    """The two truths an empty manifest used to hide: nothing is installed, or
+    the drive holding the models is not there. Only the first means 'go get
+    them'."""
+    empty = ModelStorageManager(base_dir=tmp_path / 'fresh' / 'models')
+    gone = ModelStorageManager(base_dir=unreachable)
+    assert empty.is_reachable() is True
+    assert gone.is_reachable() is False
+    assert empty.get_manifest() == gone.get_manifest() == {'tools': {}}, (
+        'both read as empty -- so the manifest alone cannot tell them apart')
+
+
+def test_an_existing_store_is_reachable(tmp_path):
+    store = tmp_path / 'models'
+    store.mkdir()
+    assert ModelStorageManager(base_dir=store).is_reachable() is True
+
+
+def test_a_store_path_that_is_a_file_is_not_reachable(tmp_path):
+    f = tmp_path / 'models'
+    f.write_text('not a directory')
+    assert ModelStorageManager(base_dir=f).is_reachable() is False

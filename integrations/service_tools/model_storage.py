@@ -72,6 +72,29 @@ class ModelStorageManager:
 
     # ── Path helpers ──────────────────────────────────────────────
 
+    def is_reachable(self) -> bool:
+        """Can models be stored here at all -- as opposed to "none are here"?
+
+        An empty manifest cannot tell those apart: an unplugged external
+        drive (HEVOLVE_MODEL_DIR) reads as empty, exactly like a fresh
+        install. Only the fresh install means "go download them"; the
+        unplugged drive means "the models exist, they are just not
+        attached". Callers that would act on "not downloaded" -- fetching
+        again, or telling the person a model is missing -- ask this first.
+
+        True when base_dir is a directory, or when its nearest existing
+        ancestor is a directory (so the first write can create it). False
+        when no ancestor exists (a drive that is not there) or the nearest
+        one is a file.
+        """
+        for candidate in (self.base_dir, *self.base_dir.parents):
+            try:
+                if candidate.exists():
+                    return candidate.is_dir()
+            except OSError:
+                return False
+        return False
+
     def get_tool_dir(self, tool_name: str) -> Path:
         """Return the storage directory for a given tool."""
         return self.base_dir / tool_name
