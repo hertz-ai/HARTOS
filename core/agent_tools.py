@@ -420,6 +420,135 @@ def defer_helper_schema(helper, names):
     return removed
 
 
+def fit_schema_to_ctx(agent, protect=(), room=None):
+    """Defer tool schemas from ``agent`` until they fit the LIVE n_ctx.
+
+    The budget half of :func:`defer_helper_schema`.  That function answers
+    "drop THESE names"; a caller still has to know which names, and every
+    caller so far has answered from a static list.  This answers it from the
+    server: how much room the schema actually has right now, measured, and
+    which tools fit in it.  It does the removal THROUGH ``defer_helper_schema``
+    — one remover, so the deferral contract (execution survives on the
+    executor's ``_function_map``, ``request_tools`` is never dropped,
+    ``update_tool_signature`` keeps the client snapshot in step) holds here
+    without being restated.
+
+    WHY IT EXISTS, measured 2026-09-22 on this box (``llm_outbound.jsonl`` +
+    its ``.old`` rotation, 1,184 records).  Every HTTP 400 is
+    ``source=autogen.reuse`` — 60 of them — and every one is the HELPER seat
+    carrying 50-65 tools, while the 972 passing reuse calls are the ASSISTANT
+    seat carrying exactly the 23 of MAIN_LEG_CORE_TOOLS.  ``register_dual``
+    puts the schema on the helper, so the helper accumulates AP2 payments, A2A
+    delegation, outreach CRM, memory-graph, model-lifecycle, service and skill
+    families that the bounded assistant never sees.
+
+    But the COUNT is not the rule, and this is why the fix has to read the
+    server rather than cap a number.  The same helper bodies returned 200 all
+    morning and 400 from 08:04 onward with no code change between them:
+
+        >=50-tool bodies   04-07h: 200 x50, 500 x2      08-10h: 400 x62
+        llama_server_8080.log, started 08:04:
+            srv load_model: initializing, n_slots = 1, n_ctx_slot = 4096
+
+    The tool set is fixed at agent construction; the context moved under it,
+    and nothing in the selection path was reading it.  The wire layer knew and
+    could only complain — ``wire-trim: the TOOL SCHEMA alone is 6849 tokens
+    against an n_ctx of 4096 (60 tool(s)) ... Prune the tool list for this
+    agent`` — because by then the set has already been chosen.  This is the
+    pruning that log line asks for, at the layer that can do it.
+
+    ``room`` defaults to ``llm_outbound_logger.schema_token_room()``: the live
+    per-slot n_ctx minus the message floor the wire trim reserves.  Imported
+    rather than recomputed so the wire's floor and this ceiling are the same
+    number by construction — the precedent is
+    ``hart_intelligence_entry.py:6052``, which imports ``_trim_to_budget`` from
+    the same module for the same "one budget authority" reason.  Prompt-side
+    only; see that function for why ``max_tokens`` is not subtracted.
+
+    KEEP ORDER, most-load-bearing first, because what survives matters as much
+    as that something does:
+
+      1. ``request_tools`` — the escape that makes deferral recoverable
+         (``defer_helper_schema`` protects it whatever this function decides).
+      2. ``protect`` — the names THIS action's own recipe declares, which
+         ``attach_for_names`` attached precisely because the recipe names them.
+         Pruning them would undo the one authoritative selector.
+      3. ``MAIN_LEG_CORE_TOOLS`` — the set the leg is built around and the
+         only set the passing bodies carry.
+      4. everything else, in the order the agent already holds it (stable, so
+         two turns with the same geometry prune the same way).
+
+    Returns the set of names deferred — empty when the set already fits, when
+    the geometry cannot be read, or when the agent has no schema.  NEVER
+    raises: it runs on the per-turn dispatch path, and a token optimisation may
+    not be the reason a turn dies.
+    """
+    try:
+        block = ((getattr(agent, 'llm_config', None) or {}).get('tools')
+                 if isinstance(getattr(agent, 'llm_config', None), dict)
+                 else None)
+        if not isinstance(block, list) or not block:
+            return set()
+        from core.llm_outbound_logger import _schema_tokens, schema_token_room
+        if room is None:
+            room = schema_token_room()
+        room = int(room)
+
+        keep_first = {'request_tools'} | {str(p) for p in (protect or ()) if p}
+
+        def _rank(item):
+            idx, entry = item
+            name = ((entry.get('function') or {}).get('name')
+                    if isinstance(entry, dict) else None)
+            if name in keep_first:
+                return (0, idx)
+            if name in MAIN_LEG_CORE_TOOLS:
+                return (1, idx)
+            return (2, idx)
+
+        ranked = sorted(enumerate(block), key=_rank)
+        used, kept, drop = 0, [], set()
+        for _idx, entry in ranked:
+            name = ((entry.get('function') or {}).get('name')
+                    if isinstance(entry, dict) else None)
+            cost = _schema_tokens({'tools': [entry]})
+            if used + cost <= room:
+                used += cost
+                kept.append((entry, name))
+                continue
+            if name:
+                drop.add(name)
+        # Per-entry costs are measured one entry at a time, so they miss the
+        # separators of the assembled array and come out ~0.2% OPTIMISTIC (24
+        # kept entries summed to 3072 against a real block of 3078).  A budget
+        # that is optimistic by any margin is the failure mode this function
+        # exists to end, so settle it against the REAL block and pop the
+        # lowest-priority survivors until it is true.  Usually zero iterations.
+        while kept:
+            total = _schema_tokens({'tools': [e for e, _ in kept]})
+            if total <= room:
+                used = total
+                break
+            _, name = kept.pop()
+            if name:
+                drop.add(name)
+        else:
+            used = 0
+        if not drop:
+            return set()
+        removed = defer_helper_schema(agent, drop)
+        if removed:
+            tool_logger.info(
+                "tool schema bounded to the live n_ctx: kept ~%d tok of %d "
+                "available, deferred %d tool(s) -- still executable and "
+                "re-attachable via request_tools: %s",
+                used, room, len(removed), ', '.join(sorted(removed)))
+        return removed
+    except Exception as e:
+        tool_logger.warning(f"tool schema ctx-fit skipped: {e}")
+        return set()
+
+
 def main_leg_core_tools(tools):
     """The subset of ``tools`` the main helper/assistant leg registers.
 

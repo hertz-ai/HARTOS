@@ -588,6 +588,44 @@ def _get_budget_per_slot() -> int:
         return LLAMA_CTX_SIZE_DEFAULT
 
 
+def _min_message_budget(per_slot: int) -> int:
+    """Tokens the MESSAGES must always be left, whatever the schema costs.
+
+    The floor the degrade branch of :func:`_trim_to_budget` already fell back
+    to; named here so the two callers cannot drift.  The second caller is
+    ``core.agent_tools.fit_schema_to_ctx``, which subtracts this from the live
+    n_ctx to learn how much a tool schema may spend — so the wire's floor and
+    the selection path's ceiling are the same number by construction.
+    """
+    return max(512, int(per_slot) // 4)
+
+
+def schema_token_room() -> int:
+    """Tokens a request's tool schema may spend against the LIVE n_ctx.
+
+    ``_get_budget_per_slot()`` minus :func:`_min_message_budget`.  Public
+    because the SELECTION path (core.agent_tools) has to ask it before it
+    offers a tool set; everything about the answer — the live ``/props`` probe,
+    the ``HEVOLVE_LLAMA_CTX_SIZE`` override, the constant backstop — stays here,
+    where the wire already computes it.
+
+    PROMPT-SIDE ONLY, and deliberately so.  ``max_tokens`` and
+    ``WIRE_TRIM_SAFETY_MARGIN_TOKENS`` are NOT subtracted: llama-server's 400
+    is ``n_prompt_tokens >= n_ctx``, and reserving the 2,048-token generation
+    budget as well would put the room at 4096-2048-2816-1024 = -1792 and prune
+    the 23-tool set that measurably works.  Measured 2026-09-22 against both
+    populations at n_ctx 4096 (room 3072):
+
+        23 tools = 2489 tok -> fits    (516 such bodies returned 200)
+        50 tools = 5782 tok -> prune   ( 20 such bodies returned 400)
+        60 tools = 7712 tok -> prune   ( 16 such bodies returned 400)
+
+    Generation overrun is the OTHER failure and the trim still reserves for it.
+    """
+    per_slot = _get_budget_per_slot()
+    return per_slot - _min_message_budget(per_slot)
+
+
 def _schema_tokens(body: dict, model=None) -> int:
     """Prompt-token cost of EVERY schema block on the request.
 
@@ -919,7 +957,7 @@ def _trim_to_budget(body: dict) -> tuple:
                 "Prune the tool list for this agent; the request will be rejected "
                 "as over-length.",
                 tools_tokens, _get_budget_per_slot(), len(body.get('tools') or []))
-        budget = max(512, _get_budget_per_slot() // 4)
+        budget = _min_message_budget(_get_budget_per_slot())
 
     est_before = count_tokens_for_messages(messages, model)
     if est_before <= budget:
@@ -1136,6 +1174,62 @@ def _ts() -> str:
 # runaway blob cannot eat the file's size budget (PERF-2).
 _RESP_ARG_CAP = 600
 
+# Per-error-string cap.  Long enough for llama-server's whole overflow
+# sentence (~130 chars) and a hosted provider's JSON error object, short
+# enough that an HTML error page cannot eat the file's size budget (PERF-2).
+_RESP_ERROR_CAP = 1200
+
+
+def _response_error(response, status) -> Optional[str]:
+    """What the server SAID on a non-2xx, from an ALREADY-BUFFERED body.
+
+    ``None`` when there is nothing to report — a 2xx, or a body that was never
+    buffered.  Absent stays visibly different from empty, for the reason
+    :func:`_response_tool_calls` keeps that distinction.
+
+    WHY THIS EXISTS (measured 2026-09-22, this box).  Across 1,184 records in
+    ``llm_outbound.jsonl`` + its ``.old`` rotation, 60 carry
+    ``response_status: 400`` and every one of them stores only the status code.
+    The cause — ``request (6249 tokens) exceeds the available context size
+    (4096 tokens)`` — existed only in ``logs/llama_server_8080.log``, so
+    attributing those 400s to the tool schema was a CORRELATION between tool
+    counts (23 passing vs 50-65 failing) rather than a quotation.  This file is
+    the one place that sees every framework's response; recording the refusal
+    here is what makes that inference unnecessary next time.
+
+    Same read discipline as the tool-call extractor: only ``_content``, which
+    httpx sets when a non-streaming ``send`` has already buffered the body.
+    Touching ``.content`` would raise on an unread response and drain the bytes
+    the real caller is waiting for.
+
+    Prefers the provider's own ``error`` object (llama-server, OpenAI and Azure
+    all use it) and falls back to the raw text, so a proxy's HTML 502 is still
+    an answer rather than "unparseable, therefore nothing happened".
+    """
+    try:
+        if isinstance(status, int) and 200 <= status < 300:
+            return None
+        raw = getattr(response, '_content', None)
+        if raw is None:
+            return None
+        text = bytes(raw).decode('utf-8', 'replace').strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            err = data.get('error', data)
+            text = (json.dumps(err, ensure_ascii=False, default=str)
+                    if not isinstance(err, str) else err)
+        if len(text) > _RESP_ERROR_CAP:
+            text = text[:_RESP_ERROR_CAP] + '...[cut]'
+        return text
+    except Exception:
+        # A logging hook may never fail an LLM call.
+        return None
+
 
 def _response_tool_calls(response) -> Optional[list]:
     """Tool-call names + RAW ``arguments`` strings from an ALREADY-BUFFERED
@@ -1201,7 +1295,8 @@ def log_outbound(body: dict, *,
                  response_status: Any = None,
                  latency_ms: Optional[float] = None,
                  source: Optional[str] = None,
-                 response_tools: Optional[list] = None) -> None:
+                 response_tools: Optional[list] = None,
+                 response_error: Optional[str] = None) -> None:
     """Public hook for non-httpx callers (dispatcher's raw
     ``requests.post`` draft path).  Writes one JSONL record; never
     raises.
@@ -1212,7 +1307,11 @@ def log_outbound(body: dict, *,
 
     ``response_tools`` is ``_response_tool_calls``' output; the key is
     omitted entirely when it is ``None`` so "not readable" stays visibly
-    different from "read it, no tool calls" (``[]``)."""
+    different from "read it, no tool calls" (``[]``).
+
+    ``response_error`` is ``_response_error``' output — what the server said
+    when it refused.  Same omit-when-None rule, and never written on a 2xx, so
+    grepping the field finds exactly the failures."""
     try:
         record = {
             'ts': _ts(),
@@ -1224,6 +1323,8 @@ def log_outbound(body: dict, *,
         }
         if response_tools is not None:
             record['response_tool_calls'] = response_tools
+        if response_error is not None:
+            record['response_error'] = response_error
         line = json.dumps(record, default=str, ensure_ascii=False) + '\n'
         with _file_lock:
             fh = _open_log_handle()
@@ -1395,12 +1496,14 @@ def _install_sync_patch(httpx_module) -> None:
                 response = _orig_send(send_client, request, **kwargs)
             # Local llama-server is a provider too (host 127.0.0.1); feed the
             # breaker the real status (#106b b) before logging.
-            _feed_provider_breaker(request.url, getattr(response, 'status_code', None))
+            _status = getattr(response, 'status_code', None)
+            _feed_provider_breaker(request.url, _status)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
-                         response_status=getattr(response, 'status_code', None),
+                         response_status=_status,
                          latency_ms=round(elapsed, 1),
-                         response_tools=_response_tool_calls(response))
+                         response_tools=_response_tool_calls(response),
+                         response_error=_response_error(response, _status))
             return response
         except Exception as e:
             elapsed = (time.time() - start) * 1000
@@ -1439,12 +1542,14 @@ def _install_async_patch(httpx_module) -> None:
         start = time.time()
         try:
             response = await _orig(self, request, **kwargs)
-            _feed_provider_breaker(request.url, getattr(response, 'status_code', None))
+            _status = getattr(response, 'status_code', None)
+            _feed_provider_breaker(request.url, _status)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
-                         response_status=getattr(response, 'status_code', None),
+                         response_status=_status,
                          latency_ms=round(elapsed, 1),
-                         response_tools=_response_tool_calls(response))
+                         response_tools=_response_tool_calls(response),
+                         response_error=_response_error(response, _status))
             return response
         except Exception as e:
             elapsed = (time.time() - start) * 1000
@@ -1541,11 +1646,13 @@ def _install_urllib_patch(urllib_request_module) -> None:
             # HTTPResponse carries no buffered `_content`, so it reports None
             # and the key is omitted; the alternative (read it here) would
             # drain the body the caller has not read yet.
+            _status = getattr(response, 'status', None)
             log_outbound(body or {},
                          source=(_get_source() or 'urllib'),
-                         response_status=getattr(response, 'status', None),
+                         response_status=_status,
                          latency_ms=round(elapsed, 1),
-                         response_tools=_response_tool_calls(response))
+                         response_tools=_response_tool_calls(response),
+                         response_error=_response_error(response, _status))
             return response
         except Exception as e:
             elapsed = (time.time() - start) * 1000

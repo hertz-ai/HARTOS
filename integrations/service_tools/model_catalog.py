@@ -117,6 +117,110 @@ def backend_requires_torch(backend) -> bool:
     return (backend or 'torch') not in TORCHLESS_BACKENDS
 
 
+# ── How big is a model? ONE table, ONE unit ──────────────────────
+#
+# Keyed by GGUF file name because that is the identity both repos already
+# share: HARTOS's LLM ladder below and Nunba's MODEL_PRESETS name the same
+# artifacts, and until 2026-09-22 each kept its own column of sizes. The
+# literals were byte-identical (550, 1100, 1340, 2910, 6113, 18022, 22733,
+# 22630, 22938) and four months apart in age: Nunba's since its first commit
+# (96661414e, 2026-03-16), HARTOS's since 80c703b6c (2026-07-27). Two tables
+# of the same numbers always drift; this is the surviving one.
+#
+# WHY HERE and not in Nunba, which wrote them first: the import direction
+# decides. Nunba imports HARTOS (models/catalog.py imports this module at
+# module scope); HARTOS imports nothing from Nunba (MEASURED: zero hits for
+# `ModelPreset` in this tree). A shared table can only live at the end both
+# sides can reach.
+#
+# THE UNIT IS BYTES, and for good reason. The field this replaces was named
+# `size_mb` and its meaning changed row to row. MEASURED 2026-09-22 against
+# every .gguf on the author's box:
+#
+#   file                                    literal   bytes          MiB      MB(dec)
+#   Qwen3.5-4B-UD-Q4_K_XL.gguf                2910   2,912,109,728   2777.2   2912.1
+#   Qwen3.5-2B-UD-Q4_K_XL.gguf                1340   1,339,752,704   1277.7   1339.8
+#   Qwen3.5-0.8B-UD-Q4_K_XL.gguf               550     558,772,480    532.9    558.8
+#   Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf      1500   1,129,709,248   1077.4   1129.7
+#
+# The 4B and 2B rows are the decimal-MB reading (copied from HuggingFace's
+# file listing, which is decimal). The 1500 row matches NEITHER — 39% over
+# MiB, 33% over decimal — it was simply wrong. And the large rows were typed
+# the other way, carrying their author's own arithmetic in the comment:
+# `6113,  # 5.97 GB` is 6113/1024, i.e. MiB. One field, three vocabularies,
+# no single divisor correct for all of them.
+#
+# Bytes is the only reading that cannot be misread, so bytes is what is
+# stored. Every row states its PROVENANCE, because the distinction between
+# a measurement and an estimate is exactly what got lost before:
+#
+#   'measured …'  the file was stat'd; the number is that file's size.
+#   'estimate …'  NOT CHECKED — no file on the box that produced this table.
+#                 The literal is preserved and the unit it was typed in is
+#                 named, so the guess is never mistaken for a fact.
+_MIB = 1024 ** 2
+
+MODEL_WEIGHT_BYTES = {
+    # ── MEASURED 2026-09-22 — files present, stat'd, byte-exact ──
+    'Qwen3.5-4B-UD-Q4_K_XL.gguf':
+        (2_912_109_728, 'measured 2026-09-22 (~/.trueflow/models)'),
+    'Qwen3.5-2B-UD-Q4_K_XL.gguf':
+        (1_339_752_704, 'measured 2026-09-22 (~/.trueflow/models)'),
+    'Qwen3.5-0.8B-UD-Q4_K_XL.gguf':
+        (558_772_480, 'measured 2026-09-22 (~/.nunba/models)'),
+    'Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf':
+        (1_129_709_248, 'measured 2026-09-22 (~/.trueflow/models); the 1500 '
+                        'literal it replaces matched neither MB nor MiB'),
+
+    # ── NOT CHECKED — no file on this box. Literals preserved, each
+    # converted from the unit its author used. Do not promote any of
+    # these to "measured" without stat'ing the actual download.
+    'Qwen3-2B-Instruct-Q4_K_M.gguf':
+        (1100 * _MIB, 'estimate: literal 1100, unit undeclared by its author '
+                      '- read as MiB, the over-stating reading'),
+    'Qwen3.5-9B-UD-Q4_K_XL.gguf':
+        (6113 * _MIB, 'estimate: literal 6113 MiB (author comment "# 5.97 GB" '
+                      '= 6113/1024)'),
+    'Qwen3.5-27B-UD-Q4_K_XL.gguf':
+        (18022 * _MIB, 'estimate: literal 18022 MiB (author comment '
+                       '"# 17.6 GB" = 18022/1024)'),
+    'Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf':
+        (22733 * _MIB, 'estimate: literal 22733 MiB (author comment '
+                       '"# 22.2 GB" = 22733/1024)'),
+    'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf':
+        (22630 * _MIB, 'estimate: literal 22630, unit undeclared - read as '
+                       'MiB, matching the sibling 35B rows it was typed with'),
+    'Tiel-Coder-35B-A3B-UD-Q4_K_XL.gguf':
+        (22938 * _MIB, 'estimate: literal 22938, unit undeclared - read as '
+                       'MiB, matching the sibling 35B rows it was typed with'),
+}
+
+
+def model_weight_bytes(file_name: str) -> Optional[int]:
+    """Size of a model's weight file in BYTES, or None if unregistered.
+
+    The single reader of MODEL_WEIGHT_BYTES. Returns bytes because bytes is
+    the one unit that needs no divisor and can carry no ambiguity; callers
+    that want GiB or MiB divide once, at the point of comparison, against a
+    figure whose unit they can state.
+
+    None (not 0) for an unknown file: a missing size must be visible to the
+    caller, because 0 silently "fits" every budget check in the codebase.
+    """
+    row = MODEL_WEIGHT_BYTES.get(file_name)
+    return row[0] if row else None
+
+
+def model_weight_provenance(file_name: str) -> Optional[str]:
+    """Where a registered weight size came from — 'measured …' or 'estimate …'.
+
+    Kept beside the number rather than in a comment so a caller (or a test)
+    can tell a stat'd fact from a preserved guess at runtime.
+    """
+    row = MODEL_WEIGHT_BYTES.get(file_name)
+    return row[1] if row else None
+
+
 # Download sources
 SOURCES = {
     'huggingface': 'HuggingFace Hub',
@@ -786,40 +890,44 @@ class ModelCatalog:
         # plus ~35% for KV cache and context, CPU needs roughly double the
         # weights to stay comfortable. Extending: add a row.
         MIN_BUILD_QWEN35 = 8148          # llama.cpp b8148+ required by Qwen3.5
-        # (id, name, repo, gguf, mmproj|None, size_mb, tier, prio, quality,
+        # (id, name, repo, gguf, mmproj|None, tier, prio, quality,
         #  speed, purposes, min_build)
+        #
+        # No size column. Weight sizes live in MODEL_WEIGHT_BYTES at the top of
+        # this module, keyed by the gguf name already in each row — this table
+        # used to restate them, and Nunba's MODEL_PRESETS restated them again.
         _llms = [
             ('llm-qwen3.5-0.8b', 'Qwen3.5 0.8B VL', 'unsloth/Qwen3.5-0.8B-GGUF',
              'Qwen3.5-0.8B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-0.8B-F16.gguf',
-             550, 'lite', 30, 0.45, 0.95, ['draft'], MIN_BUILD_QWEN35),
+             'lite', 30, 0.45, 0.95, ['draft'], MIN_BUILD_QWEN35),
             ('llm-qwen3-2b-text', 'Qwen3 2B (text only)',
              'unsloth/Qwen3-2B-Instruct-GGUF', 'Qwen3-2B-Instruct-Q4_K_M.gguf',
-             None, 1100, 'lite', 35, 0.50, 0.88, ['main'], None),
+             None, 'lite', 35, 0.50, 0.88, ['main'], None),
             ('llm-qwen3.5-2b', 'Qwen3.5 2B VL', 'unsloth/Qwen3.5-2B-GGUF',
              'Qwen3.5-2B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-2B-F16.gguf',
-             1340, 'lite', 45, 0.55, 0.85, ['main'], MIN_BUILD_QWEN35),
+             'lite', 45, 0.55, 0.85, ['main'], MIN_BUILD_QWEN35),
             ('llm-qwen3.5-4b', 'Qwen3.5 4B VL', 'unsloth/Qwen3.5-4B-GGUF',
              'Qwen3.5-4B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-4B-F16.gguf',
-             2910, 'standard', 60, 0.60, 0.70, ['main'], MIN_BUILD_QWEN35),
+             'standard', 60, 0.60, 0.70, ['main'], MIN_BUILD_QWEN35),
             ('llm-qwen3.5-9b', 'Qwen3.5 9B VL', 'unsloth/Qwen3.5-9B-GGUF',
              'Qwen3.5-9B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-9B-F16.gguf',
-             6113, 'standard', 70, 0.72, 0.50, ['main'], MIN_BUILD_QWEN35),
+             'standard', 70, 0.72, 0.50, ['main'], MIN_BUILD_QWEN35),
             ('llm-qwen3.5-27b', 'Qwen3.5 27B VL', 'unsloth/Qwen3.5-27B-GGUF',
              'Qwen3.5-27B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-27B-F16.gguf',
-             18022, 'full', 80, 0.85, 0.30, ['main'], MIN_BUILD_QWEN35),
+             'full', 80, 0.85, 0.30, ['main'], MIN_BUILD_QWEN35),
             ('llm-qwen3.5-35b-a3b', 'Qwen3.5 35B-A3B MoE',
              'unsloth/Qwen3.5-35B-A3B-GGUF', 'Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf',
              'mmproj-Qwen3.5-35B-A3B-F16.gguf',
-             22733, 'full', 85, 0.88, 0.35, ['main'], MIN_BUILD_QWEN35),
+             'full', 85, 0.88, 0.35, ['main'], MIN_BUILD_QWEN35),
             ('llm-qwen3.6-35b-a3b', 'Qwen3.6 35B-A3B MoE',
              'unsloth/Qwen3.6-35B-A3B-GGUF', 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf',
              'mmproj-Qwen3.6-35B-A3B-F16.gguf',
-             22630, 'full', 85, 0.91, 0.36, ['main'], MIN_BUILD_QWEN35),
+             'full', 85, 0.91, 0.36, ['main'], MIN_BUILD_QWEN35),
             ('llm-tiel-coder-35b-a3b', 'Tiel-Coder 35B-A3B MoE',
              'peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF',
              'Tiel-Coder-35B-A3B-UD-Q4_K_XL.gguf',
              'mmproj-Tiel-Coder-35B-A3B-BF16.gguf',
-             22938, 'full', 90, 0.92, 0.34, ['main'], MIN_BUILD_QWEN35),
+             'full', 90, 0.92, 0.34, ['main'], MIN_BUILD_QWEN35),
         ]
         # Rows seeded by an EARLIER version of this method that are now known to
         # be unloadable: google/gemma-*-it are transformers repos with no GGUF,
@@ -831,9 +939,21 @@ class ModelCatalog:
                 logger.info("Removed unloadable seeded LLM row %s (no GGUF in repo)", _bad)
 
         added = 0
-        for (mid, name, repo, gguf, mmproj, size_mb, tier, prio,
+        for (mid, name, repo, gguf, mmproj, tier, prio,
              quality, speed, purposes, min_build) in _llms:
-            weights_gb = round(size_mb / 1024.0, 2)
+            # ONE lookup, in bytes, then ONE division at the point of use.
+            # A row whose gguf is absent from MODEL_WEIGHT_BYTES is a bug in
+            # this file, not a runtime condition: skip it loudly rather than
+            # seed a 0 GB entry that "fits" every compute budget there is.
+            weight_bytes = model_weight_bytes(gguf)
+            if not weight_bytes:
+                logger.error(
+                    "LLM row %s names %s, which has no entry in "
+                    "MODEL_WEIGHT_BYTES - skipping rather than registering it "
+                    "with a zero size that would pass every budget check",
+                    mid, gguf)
+                continue
+            weights_gb = round(weight_bytes / (1024 ** 3), 2)
             files = {'model': gguf}
             if mmproj:
                 # Local name is model-specific; source name is what the repo
@@ -850,13 +970,26 @@ class ModelCatalog:
                 ram_gb=round(weights_gb * 2.0, 1),
                 disk_gb=weights_gb,
                 min_capability_tier=tier,
-                backend='llama_cpp',
+                # 'llama.cpp' — the spelling in BACKENDS, in
+                # TORCHLESS_BACKENDS and in ModelEntry._DOWNLOADED_BACKENDS.
+                # This row said 'llama_cpp', which is in none of them, so
+                # these entries were the only LLM rows in the catalogue that
+                # (a) named a backend the registry does not define,
+                # (b) answered TRUE to backend_requires_torch — the precise
+                #     mis-provisioning TORCHLESS_BACKENDS exists to stop —
+                # and (c) skipped validate()'s files['model'] requirement,
+                # which is what makes an undownloadable row refusable.
+                backend='llama.cpp',
                 supports_gpu=True, supports_cpu=True,
                 supports_cpu_offload=True, cpu_offload_method='restart_cpu',
                 min_build=min_build,
+                # weight_bytes, not size_mb: disk_gb is rounded to 2 decimals
+                # for display, so anything reconstructing a size from it loses
+                # ~5 MiB. Carrying the exact count makes the
+                # entry -> preset -> entry round trip lossless.
                 capabilities={'chat': True, 'vision': bool(mmproj),
                               'quant': 'Q4_K_M' if mmproj is None else 'UD-Q4_K_XL',
-                              'size_mb': size_mb},
+                              'weight_bytes': weight_bytes},
                 quality_score=quality, speed_score=speed, priority=prio,
                 purposes=list(purposes),
                 tags=['local', 'chat', 'qwen'] + (['vision'] if mmproj else []),

@@ -416,9 +416,15 @@ class LlamaCppManager:
             Dict with keys: n_gpu_layers, ctx_size, threads, flash_attn,
             host, port, and any additional flags.
         """
+        from core.llama_geometry import (clamp_ctx_for_ram, ctx_for_role,
+                                         derive_ctx_size)
+
         params: Dict[str, Any] = {
             'n_gpu_layers': 0,
-            'ctx_size': 4096,
+            # The unmeasured default, named once: core.llama_geometry
+            # .CTX_FALLBACK.  Every branch below overwrites it; it only
+            # survives if the GPU probe itself raises.
+            'ctx_size': ctx_for_role('main'),
             'threads': max(1, (os.cpu_count() or 4) // 2),
             'flash_attn': False,
             'host': '127.0.0.1',
@@ -460,21 +466,26 @@ class LlamaCppManager:
                 # Unknown model size, try full offload
                 params['n_gpu_layers'] = -1
 
-            # Context size: balance between LLM capability and leaving VRAM for TTS.
-            # Reserve ~3GB for TTS (Indic Parler ~1.2GB model + ~2GB inference).
-            # KV cache memory ≈ ctx * layers * hidden_dim * 2 * 2 bytes (FP16).
-            # Qwen 4B: 32 layers × 2560 dim × 2 heads × 2 bytes ≈ 0.3MB per 1K ctx.
-            vram_after_model = free_vram - model_size_gb
-            tts_reserve_gb = 3.0  # Reserve for GPU TTS (Indic Parler, F5, etc.)
-            vram_for_ctx = vram_after_model - tts_reserve_gb
-            if vram_for_ctx >= 3.0:
-                params['ctx_size'] = 10240  # 10K — good balance
-            elif vram_for_ctx >= 1.5:
-                params['ctx_size'] = 8192
-            elif vram_for_ctx >= 0.5:
-                params['ctx_size'] = 4096
-            else:
-                params['ctx_size'] = 2048
+            # Context size: the ONE tier table, core.llama_geometry.CTX_TIERS.
+            #
+            # This used to be a private ladder (10240 / 8192 / 4096 / 2048)
+            # against `free - model - 3.0`, where the 3.0 was a hardcoded "TTS
+            # reserve".  Two defects, both invisible from inside this file:
+            #
+            #   1. It was the THIRD independent answer to "how big is n_ctx",
+            #      and it could not agree with the one the wire trimmer budgets
+            #      against.  10240 is not even a value any other site can
+            #      produce, so a model onboarded here served a window no other
+            #      component believed in.
+            #   2. The TTS reserve was double-counted.  CTX_TIERS already
+            #      encodes headroom for the rest of the GPU stack (TTS, the
+            #      0.8B draft, KV buffers) IN its thresholds rather than as a
+            #      subtraction — that is what "≥2 GiB remaining → 8192,
+            #      <2 → 4096 (preserves VRAM for TTS/STT)" means.  Subtracting
+            #      3.0 first and then applying a ladder reserves for TTS twice.
+            #
+            # So: pass the raw headroom and let the shared table decide.
+            params['ctx_size'] = derive_ctx_size(free_vram, model_size_gb)
 
             # Flash attention: available on modern NVIDIA GPUs (Ampere+)
             # Heuristic: if GPU name contains known architectures
@@ -489,9 +500,10 @@ class LlamaCppManager:
                 logger.info(f"Enabling flash attention for {gpu_info.get('name')}")
 
         else:
-            # CPU-only mode
+            # CPU-only mode — core.llama_geometry.CPU_ONLY_CTX (still 2048;
+            # the number moved, it did not change).
             params['n_gpu_layers'] = 0
-            params['ctx_size'] = 2048  # Conservative for CPU
+            params['ctx_size'] = ctx_for_role('main', on_gpu=False)
             # Use more threads on CPU-only
             params['threads'] = max(1, (os.cpu_count() or 4) - 1)
             logger.info("CPU-only mode: no GPU available")
@@ -505,16 +517,24 @@ class LlamaCppManager:
                         params['threads'], max_threads, total_cores)
             params['threads'] = max_threads
 
-        # Cap context size based on available RAM (avoid low-memory warnings)
+        # Cap context size based on available RAM (avoid low-memory warnings).
+        #
+        # core.llama_geometry.RAM_CLAMPS — a SEPARATE constraint from the tier
+        # table, not a competing one: the tiers ask whether the GPU has
+        # headroom, this asks whether the host survives the allocation.
+        #
+        # The if/elif this replaces had a dead branch: any box under 2.0 GiB is
+        # also under 4.0 GiB, so it matched the first arm and the 2048 clamp
+        # was unreachable.  A 1.5 GiB box got 4096 while the code read as
+        # though it promised 2048.  As a table every row can fire.
         try:
             import psutil
             avail_gb = psutil.virtual_memory().available / (1024**3)
-            if avail_gb < 4.0 and params['ctx_size'] > 4096:
-                params['ctx_size'] = 4096
-                logger.info("Capping ctx_size to 4096 (only %.1fGB RAM available)", avail_gb)
-            elif avail_gb < 2.0 and params['ctx_size'] > 2048:
-                params['ctx_size'] = 2048
-                logger.info("Capping ctx_size to 2048 (only %.1fGB RAM available)", avail_gb)
+            _before = params['ctx_size']
+            params['ctx_size'] = clamp_ctx_for_ram(_before, avail_gb)
+            if params['ctx_size'] != _before:
+                logger.info("Capping ctx_size %d -> %d (only %.1fGB RAM available)",
+                            _before, params['ctx_size'], avail_gb)
         except ImportError:
             logger.debug("get_optimal_params: swallowed ImportError")
 
@@ -540,6 +560,35 @@ class LlamaCppManager:
                 self._process.pid)
             return False
 
+        # ADOPT, never duplicate — owner ruling 2026-09-13
+        # (memory/feedback_one_llama_server_single_chokepoint.md): ONE
+        # llama-server, reached through one chokepoint.
+        #
+        # The `self._process` check above only knows about servers THIS manager
+        # started.  The live reachable caller is model_onboarding.switch_model
+        # (exposed as the `switch_model` MCP tool and POST /api/models/switch),
+        # and unlike its sibling `onboard` it carries no _is_nunba_bundled()
+        # guard — so on the desktop an agent calling that tool would have
+        # launched a SECOND main llama-server on the port Nunba's is already
+        # serving.  That is precisely the 2026-09-13 incident: a second server
+        # took :8080 with a 4096 ctx and every agent call returned HTTP 400
+        # ("TOOL SCHEMA alone is 4745 tokens against an n_ctx of 4096").
+        #
+        # Same primitive model_lifecycle._launch_llama_server_direct already
+        # uses, so there is one definition of "is a main engine serving".
+        try:
+            from core.health_probe import probe_llm
+            if (probe_llm() or {}).get('status') == 'up':
+                logger.info(
+                    "a main llama-server is already serving — not launching a "
+                    "second one.  Change models through the owner of that "
+                    "server (Nunba's model settings / LlamaConfig.switch_model)")
+                return False
+        except ImportError:
+            pass          # no canonical prober here; fall through to launching
+        except Exception as exc:
+            logger.debug("adopt-probe skipped: %r", exc)
+
         # Validate model file
         if not os.path.isfile(model_path):
             logger.error(f"Model file not found: {model_path}")
@@ -564,15 +613,34 @@ class LlamaCppManager:
         params.update(kwargs)
         params['port'] = port
 
-        # Build command
+        # Build command.  ctx_size is always present (get_optimal_params seeds
+        # it from core.llama_geometry before any branch), so the `.get` default
+        # here was a FOURTH place a context size could be written — and being a
+        # default that never fires, nothing would ever have caught it drifting.
+        from core.llama_geometry import (ctx_for_role, publish_geometry,
+                                         slots_from_env)
+        ctx_size = int(params.get('ctx_size') or ctx_for_role('main'))
+        # core.constants.LLAMA_SLOTS_DEFAULT (1) unless an operator has
+        # published otherwise — one source for the slot count too.
+        slots = int(params.get('parallel') or slots_from_env())
         cmd = [
             str(binary),
             '--model', str(model_path),
             '--host', str(params.get('host', '0.0.0.0')),
             '--port', str(params['port']),
-            '--ctx-size', str(params.get('ctx_size', 4096)),
+            '--ctx-size', str(ctx_size),
             '--threads', str(params.get('threads', 2)),
             '--n-gpu-layers', str(params.get('n_gpu_layers', 0)),
+            # Explicit slot count, for the same reason Nunba's spawn pins it.
+            # Leaving --parallel off does NOT mean one slot: llama-server
+            # defaults it to "auto" and picked 4 on the reference box
+            # (llama_server_8080.log:8, "n_parallel is set to auto, using
+            # n_parallel = 4 and kv_unified = true").  Under kv_unified the
+            # whole n_ctx is ONE shared KV pool across all slots, so 4 slots
+            # over-subscribe it and the server logs "failed to find free space
+            # in the KV cache" -> truncation + HTTP 503.  Pinning it also makes
+            # the publish below a measurement rather than a guess.
+            '--parallel', str(slots),
         ]
 
         if params.get('flash_attn'):
@@ -621,6 +689,18 @@ class LlamaCppManager:
             logger.info(
                 f"llama-server ready on port {port} "
                 f"(model: {os.path.basename(model_path)})")
+            # Publish only now that a server is CONFIRMED serving this
+            # geometry.  HARTOS's wire trimmer
+            # (core.llm_outbound_logger._get_budget_per_slot) prefers the
+            # published env over its live /props probe, so announcing a spawn
+            # that then failed health would leave every request budgeted
+            # against a window nothing is serving — the 2026-09-11 shape
+            # (trimmer believed 12288, the server ran 8192) with the sign
+            # flipped.  Announce what exists, not what was attempted.
+            #
+            # The G3 fallback in model_lifecycle deliberately does NOT publish:
+            # it passes no --parallel, so it has no honest slot count to state.
+            publish_geometry(ctx_size, slots)
             return True
         else:
             logger.error(

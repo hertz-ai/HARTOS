@@ -661,65 +661,14 @@ class Qwen08BBackend(VisionBackend):
                 "Qwen3.5-0.8B not running — will start on first frame")
         return True  # Stay selected; lazy start in describe().
 
-        # Find llama-server binary (reuse model_lifecycle's finder)
-
-        # Find llama-server binary (reuse model_lifecycle's finder)
-        try:
-            from integrations.service_tools.model_lifecycle import ModelLifecycleManager
-            server = ModelLifecycleManager._find_llama_server_binary()
-        except Exception:
-            server = None
-        if not server:
-            logger.info("Qwen3.5-0.8B: llama-server binary not found — caption disabled")
-            return False
-
-        # Find 0.8B model + mmproj (fixed filenames, known locations)
-        home = os.path.expanduser('~')
-        model = mmproj = None
-        for d in [os.path.join(home, '.nunba', 'models'),
-                  os.path.join(home, '.trueflow', 'models')]:
-            p = os.path.join(d, 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf')
-            if os.path.isfile(p) and not model:
-                model = p
-            p = os.path.join(d, 'qwen08b', 'mmproj-F16.gguf')
-            if os.path.isfile(p) and not mmproj:
-                mmproj = p
-
-        if not model or not mmproj:
-            logger.info("Qwen3.5-0.8B: model files not found — run 'python scripts/setup_vlm.py'")
-            return False
-
-        import subprocess, time
-        cmd = [server, '--model', model, '--mmproj', mmproj,
-               '--port', str(self._port), '--ctx-size', '512',
-               '--n-gpu-layers', '99', '--threads', '4', '--flash-attn', 'on']
-        log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
-        try:
-            # APPEND mode — caption-server can crash + respawn; each
-            # restart's truncation erased the previous crash evidence.
-            # Root-cause class: truncate-on-restart log loss.
-            _log_fh = open(log_path, 'a')
-            try:
-                import datetime as _lb_dt
-                _log_fh.write(
-                    f"\n===== llama-caption (lightweight) session "
-                    f"{_lb_dt.datetime.now().isoformat()} port={self._port} =====\n"
-                )
-                _log_fh.flush()
-            except Exception:
-                pass
-            _kw = dict(stdout=_log_fh, stderr=subprocess.STDOUT)
-            if os.name == 'nt':
-                _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
-            subprocess.Popen(cmd, **_kw)
-            for _ in range(30):
-                time.sleep(1)
-                if self.is_available():
-                    logger.info(f"Qwen3.5-0.8B caption server started on port {self._port}")
-                    return True
-        except Exception as e:
-            logger.error(f"Qwen3.5-0.8B start failed: {e}")
-        return False
+        # DELETED 2026-09-22: ~60 lines of a SECOND caption-server launcher
+        # used to sit here, after that unconditional `return True`.  It was
+        # unreachable — dead since the lazy-start contract moved the launch
+        # into _ensure_running — but it was a byte-for-byte duplicate of the
+        # launcher below, including its own hardcoded 512-token window.  A dead
+        # parallel path still costs: it is the copy a reader greps up first,
+        # and it is the copy a future edit lands in.  The live launcher is
+        # _ensure_running; there is now exactly one.
 
     # 0.8B optimal: 512x288 (11KB JPEG) — only needs scene understanding, not coords
     CAPTION_WIDTH = 512
@@ -810,8 +759,24 @@ class Qwen08BBackend(VisionBackend):
                 return False
 
             import subprocess
+            # 512 is correct for this backend and is NOT a main-model size:
+            # a caption turn is one 512x288 JPEG plus one sentence of prompt,
+            # and the whole point of the 0.8B captioner is that it costs
+            # almost nothing.  It is a legitimately separate model class, so
+            # it keeps a fixed small window — what it must not keep is its own
+            # copy of that number.  core.llama_geometry.ROLE_CTX['caption'] is
+            # where the value lives, beside the tier table, so "the captioner
+            # runs at 512" is a policy statement one grep can answer rather
+            # than a literal repeated at each subprocess.Popen.
+            #
+            # This spawn also does NOT publish_geometry: it is a caption
+            # server on the vlm_caption port, not the main engine, and
+            # publishing 512 would tell HARTOS's wire trimmer that every
+            # agentic request must fit in 512 tokens.
+            from core.llama_geometry import ctx_for_role
             cmd = [server, '--model', model, '--mmproj', mmproj,
-                   '--port', str(self._port), '--ctx-size', '512',
+                   '--port', str(self._port),
+                   '--ctx-size', str(ctx_for_role('caption')),
                    '--n-gpu-layers', '99', '--threads', '4', '--flash-attn', 'on']
             log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
             # APPEND mode — same root-cause class as the caption-server

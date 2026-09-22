@@ -5539,16 +5539,19 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # with the advance path: see _narrow_assistant_to_current_action.
                 _narrow_assistant_to_current_action(user_prompt)
 
-                # ONE call, not the six lines that used to sit here.  They ran
-                # exactly once per entry into this function while the walk
-                # advances many actions in the loop below, so actions 2..N were
-                # dispatched with action 1's tools -- see the helper's docstring
-                # for the two-line live measurement.  The second caller is
-                # _advance_or_steer, the one door every advance goes through.
-                _attach_named_tools_for_action(user_prompt)
-
                 # (b) TAGS — unchanged fallback for capability families the
                 # recipe never mentions but the conversation drifted into.
+                #
+                # ORDER: this now runs BEFORE the named attach, and that is
+                # load-bearing rather than cosmetic.  The named attach is the
+                # one door that reconciles the session's tool schema with the
+                # live n_ctx (fit_schema_to_ctx, at its tail), so anything
+                # attached AFTER it would be offered unbounded for this turn's
+                # dispatch — which is the whole defect being fixed here.  The
+                # two attaches are order-independent in outcome: both are
+                # idempotent against the same _hart_attached_tools ledger, one
+                # selects by exact name and the other by capability tag, so the
+                # union is the same either way.
                 _new = [t for t in detect_goal_tags(message or '')
                         if t not in _unlocked]
                 if _new:
@@ -5563,6 +5566,16 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     _unlocked.update(_new)
                     current_app.logger.info(
                         f"Tier-1 turn attach: +{_new} -> {_n} tools")
+
+                # ONE call, not the six lines that used to sit here.  They ran
+                # exactly once per entry into this function while the walk
+                # advances many actions in the loop below, so actions 2..N were
+                # dispatched with action 1's tools -- see the helper's docstring
+                # for the two-line live measurement.  The second caller is
+                # _advance_or_steer, the one door every advance goes through.
+                # It is also where the set is bounded to the live n_ctx, so it
+                # goes LAST of the three.
+                _attach_named_tools_for_action(user_prompt)
         except Exception as _e:
             # WARNING, not debug -- same class as d6495f499.  This handler
             # wraps the narrow, the named attach and the tag attach, so a
@@ -7116,6 +7129,7 @@ def _attach_named_tools_for_action(user_prompt):
 
         from integrations.service_tools import service_tool_registry
         _named = _reuse_action_tool_names(user_prompt, _aid)
+        _nn = 0
         if _named:
             from core.agent_tools import attach_for_names
             _nn = attach_for_names(_named, helper, assistant,
@@ -7140,37 +7154,65 @@ def _attach_named_tools_for_action(user_prompt):
             _ctx_safe_log('info',
                           f"Tier-1 named attach: action {_aid} names {_named} "
                           f"-> {_nn} tools for session: {user_prompt}")
-            return _nn
-        # INFO, not debug.  gui_app.log captured ZERO "- DEBUG -" lines
-        # across the whole 2026-09-11 drive (0 of 45,599), so at debug this
-        # branch never reaches production and a resolved-nothing round stays
-        # indistinguishable from one that never ran -- the exact gap the
-        # both-outcomes logging was added to close.  Measured rid
-        # d62-232532: "Tier-1 prompt narrow" fired for actions 1,2,3,4 and
-        # "Tier-1 named attach" for action 1 only, with nothing saying why.
+        else:
+            # INFO, not debug.  gui_app.log captured ZERO "- DEBUG -" lines
+            # across the whole 2026-09-11 drive (0 of 45,599), so at debug this
+            # branch never reaches production and a resolved-nothing round stays
+            # indistinguishable from one that never ran -- the exact gap the
+            # both-outcomes logging was added to close.  Measured rid
+            # d62-232532: "Tier-1 prompt narrow" fired for actions 1,2,3,4 and
+            # "Tier-1 named attach" for action 1 only, with nothing saying why.
+            #
+            # The COUNT is what separates []'s causes, which is why it is in the
+            # line: 0 = no recipe stored for this session (the helper's `except`
+            # swallowed a KeyError), n < _aid = the id is past the end of the
+            # stored list, n >= _aid = the action genuinely names no tool.
+            # Offline against the real recipe the helper returns non-empty for
+            # every one of actions 1,2,3,4,9, so live [] is the STORE, not the
+            # helper -- five hypotheses were eliminated for want of this one
+            # number (#828).
+            # ...and the SESSION KEY, because the count alone is not attributable
+            # on a live box.  Measured 2026-09-11 on the first drive that carried
+            # this line: five occurrences all read "holds 1 action(s)" while the
+            # agent under test (88719487304) has NINE actions in both its flow
+            # recipes on disk -- and the surrounding log showed a rival driver
+            # plus daemon traffic in the same window.  444 of 880 stored agents
+            # are single-action stubs (#758), so "holds 1" is the NORMAL reading
+            # for a stub and says nothing about this agent.
+            _store = (recipes.get(user_prompt) or {}).get('actions') or []
+            _ctx_safe_log('info',
+                          f"Tier-1 named attach: action {_aid} names no tool "
+                          f"(recipes store holds {len(_store)} action(s)) "
+                          f"for session: {user_prompt}")
+
+        # ── and RECONCILE the set with the server before it is offered ─────
+        # The attach above only ever GROWS the schema, and until now nothing
+        # downstream shrank it: measured 2026-09-22 on this box, ALL 60 HTTP
+        # 400s in llm_outbound.jsonl + its .old rotation are autogen.reuse
+        # Helper-seat bodies of 50-65 tools (6,067-7,712 schema tokens) against
+        # an n_ctx of 4,096, while all 972 passing reuse calls are the
+        # Assistant seat carrying the bounded 23 of MAIN_LEG_CORE_TOOLS.
         #
-        # The COUNT is what separates []'s causes, which is why it is in the
-        # line: 0 = no recipe stored for this session (the helper's `except`
-        # swallowed a KeyError), n < _aid = the id is past the end of the
-        # stored list, n >= _aid = the action genuinely names no tool.
-        # Offline against the real recipe the helper returns non-empty for
-        # every one of actions 1,2,3,4,9, so live [] is the STORE, not the
-        # helper -- five hypotheses were eliminated for want of this one
-        # number (#828).
-        # ...and the SESSION KEY, because the count alone is not attributable
-        # on a live box.  Measured 2026-09-11 on the first drive that carried
-        # this line: five occurrences all read "holds 1 action(s)" while the
-        # agent under test (88719487304) has NINE actions in both its flow
-        # recipes on disk -- and the surrounding log showed a rival driver
-        # plus daemon traffic in the same window.  444 of 880 stored agents
-        # are single-action stubs (#758), so "holds 1" is the NORMAL reading
-        # for a stub and says nothing about this agent.
-        _store = (recipes.get(user_prompt) or {}).get('actions') or []
-        _ctx_safe_log('info',
-                      f"Tier-1 named attach: action {_aid} names no tool "
-                      f"(recipes store holds {len(_store)} action(s)) "
-                      f"for session: {user_prompt}")
-        return 0
+        # The count is not the rule -- the SAME 50-74-tool helper bodies
+        # returned 200 from 04:59 to 08:04 and 400 afterwards, with no code
+        # change between: llama_server_8080.log records the restart at 08:04
+        # with n_ctx_slot = 4096.  The tool set is fixed at construction and
+        # the context moved under it, so the reconciliation has to read the
+        # live server, which fit_schema_to_ctx does.
+        #
+        # HERE, at the end of the one per-turn attach door, for exactly the
+        # reason this function exists: it is the only place both walk loops and
+        # all six advance sites pass through, so one call covers every
+        # dispatch.  Deferral, not exclusion -- the callables stay in the
+        # executors' _function_map and request_tools re-arms anything the agent
+        # asks for (see core.agent_tools.defer_helper_schema).  The action's
+        # own named tools are protected, so the authoritative selector above is
+        # never undone by the budget below it.
+        from core.agent_tools import fit_schema_to_ctx
+        _protect = set(_named or ()) | {'send_message_to_user'}
+        fit_schema_to_ctx(helper, protect=_protect)
+        fit_schema_to_ctx(assistant, protect=_protect)
+        return _nn
     except Exception as err:
         # WARNING, not debug -- same class as d6495f499.  A failure here
         # means the action is about to be dispatched without the tools its

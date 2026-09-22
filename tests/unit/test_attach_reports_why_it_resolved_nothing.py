@@ -66,9 +66,21 @@ def _empty_branch(src):
     goes through -- because inline it ran once per CALL while the walk
     advances many actions inside that call (2 attach lines across two live
     drives, both action 1, 6-9 actions walked each time).  The branch is now
-    the fall-through after the ``if _named:`` half returns, so the bound is
+    the fall-through after the ``if _named:`` half returns, so the bound was
     ``return _nn`` .. ``except Exception``.  Same code, same contract, one
     caller became two; this guard follows it rather than pinning it in place.
+
+    RE-POINTED AGAIN 2026-09-22, for the second time and the same way.  The
+    ``if _named: ... return _nn`` / fall-through shape became a plain
+    ``if/else``, because the function gained a tail that must run for BOTH
+    halves: ``fit_schema_to_ctx``, which reconciles the session's tool schema
+    with the live n_ctx before the turn is offered (all 60 measured HTTP 400s
+    were reuse Helper bodies of 50-65 tools against n_ctx 4096).  With a
+    ``return`` inside the ``if``, that tail could only ever run on the
+    resolved-nothing path.  The branch is therefore now the ``else:`` half,
+    bounded by ``else:`` .. ``fit_schema_to_ctx`` and scoped to the function
+    so a stray ``else:`` elsewhere in a 7,300-line module cannot be matched.
+    Same code, same contract, same log line.
 
     Bounded by real anchors, not by a blank line or a char budget.  The first
     cut of this helper used ``(.{0,400}?)\\n\\s*\\n``; when the block grew past
@@ -77,7 +89,12 @@ def _empty_branch(src):
     measuring an empty string.  A bound that can silently return nothing turns
     every assertion below vacuous, so the callers assert on the capture first.
     """
-    m = re.search(r'\breturn _nn\b(.*?)except Exception', src, re.S)
+    fn = re.search(
+        r'^def _attach_named_tools_for_action\(.*\n(?:(?:[ \t].*)?\n)*',
+        src, re.M)
+    if not fn:
+        return ''
+    m = re.search(r'\n        else:\n(.*?)fit_schema_to_ctx', fn.group(0), re.S)
     return m.group(1) if m else ''
 
 
