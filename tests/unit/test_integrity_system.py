@@ -356,6 +356,24 @@ class TestFraudAlert:
 # 6. TestChallengeResponse (6 tests)
 # =====================================================================
 
+# The unpatched binding, captured before any fixture swaps it, for the one
+# test in the patched classes that is about the binding itself.
+from integrations.social.integrity_service import IntegrityService as _IS  # noqa: E402
+_REAL_ANSWER_NOT_FROM_TARGET = _IS._answer_not_from_target
+
+
+@pytest.fixture
+def answers_come_from_the_target():
+    """The answers in these classes are the TARGET's own; the tests judge their
+    content. The binding of an answer to its target (#140) is pinned with real
+    keys in test_challenge_answer_is_bound_to_the_target.py."""
+    from integrations.social.integrity_service import IntegrityService
+    with patch.object(IntegrityService, '_answer_not_from_target',
+                      return_value=None):
+        yield
+
+
+@pytest.mark.usefixtures('answers_come_from_the_target')
 class TestChallengeResponse:
     """Challenge-response protocol tests."""
 
@@ -446,12 +464,22 @@ class TestChallengeResponse:
         )
         db.add(ch)
         db.flush()
+        # Undo the class fixture: this test is about the binding itself.
+        # A signature that does not verify against the target's stored key is
+        # evidence that someone else answered, not about the target (#140):
+        # not passed, nothing scored.
         response_data = {'nonce': nonce, 'agent_count': 5, 'public_key': 'bad_key'}
-        with patch('security.node_integrity.verify_json_signature', return_value=False):
+        peer.public_key = 'aa' * 32
+        db.flush()
+        with patch.object(IntegrityService, '_answer_not_from_target',
+                          _REAL_ANSWER_NOT_FROM_TARGET), \
+                patch('security.node_integrity.verify_json_signature', return_value=False):
             result = IntegrityService.evaluate_challenge_response(
                 db, ch.id, response_data, 'fake_sig')
         assert result['passed'] is False
-        assert 'Invalid signature' in result['details']
+        assert result.get('inconclusive') is True
+        assert "not signed by the target's key" in result['details']
+        assert (peer.fraud_score or 0.0) == 0.0
 
 
 # =====================================================================
@@ -1000,6 +1028,7 @@ class TestMigrationV11:
 # updates pass (and advance the baseline); unknown hashes fail exactly as
 # before.
 
+@pytest.mark.usefixtures('answers_come_from_the_target')
 class TestCodeHashCheckVsUpdates:
 
     def _challenge(self, db, peer, nonce='ch_nonce'):

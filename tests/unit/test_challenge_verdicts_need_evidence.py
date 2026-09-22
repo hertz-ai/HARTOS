@@ -43,6 +43,19 @@ OLD = 'ab' * 32
 NEW = 'cd' * 32
 
 
+@pytest.fixture(autouse=True)
+def _answers_come_from_the_target():
+    """Every answer here is the TARGET's own; these tests judge its content.
+
+    Whether an answer is bound to the target (#140) is its own contract,
+    pinned with real keys in test_challenge_answer_is_bound_to_the_target.py.
+    """
+    from integrations.social.integrity_service import IntegrityService
+    with patch.object(IntegrityService, '_answer_not_from_target',
+                      return_value=None):
+        yield
+
+
 def a_peer(code_hash=OLD, status='verified'):
     p = MagicMock()
     p.code_hash = code_hash

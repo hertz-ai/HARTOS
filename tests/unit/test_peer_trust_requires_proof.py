@@ -44,6 +44,17 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 
+@pytest.fixture(autouse=True)
+def _answers_come_from_the_target():
+    """Every answer here is the TARGET's own; these tests judge what a verdict
+    writes. The binding of an answer to its target (#140) is pinned with real
+    keys in test_challenge_answer_is_bound_to_the_target.py."""
+    from integrations.social.integrity_service import IntegrityService
+    with patch.object(IntegrityService, '_answer_not_from_target',
+                      return_value=None):
+        yield
+
+
 def a_peer(code_hash='ab' * 32, status=None):
     p = MagicMock()
     p.code_hash = code_hash

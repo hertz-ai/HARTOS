@@ -400,7 +400,36 @@ class IntegrityService:
         challenge.response_signature = response_signature
         challenge.responded_at = datetime.utcnow()
 
-        # Verify nonce
+        # Bind the answer to the TARGET before judging anything in it (#140).
+        #
+        # The signature used to be checked against response_data['public_key'],
+        # the key the RESPONDER sent, and skipped when either was missing. So
+        # whoever answered at a row's address passed for that row's identity:
+        # measured on central 2026-09-22, ~110 rows at localhost:6777 were
+        # answered by central itself, 76 challenges passed that way in six
+        # hours, and one node was scored +15 four times on central's stats.
+        # Since 61c8ce4a6 'verified' is written only by an answered challenge,
+        # so the answer has to come from the identity it credits.
+        #
+        # An answer not signed by the target's STORED key is evidence that
+        # someone answered at the target's address, not evidence about the
+        # target: inconclusive, nothing scored, no proof granted or revoked.
+        # Scoring it would let anyone who can point a row's url at themselves
+        # drive an honest node to a ban (cc12). This includes the nonce: a
+        # wrong nonce from someone else is not the target's mistake, so the
+        # nonce is judged only after the binding holds.
+        _unproven = IntegrityService._answer_not_from_target(
+            db, challenge.target_node_id, response_data, response_signature)
+        if _unproven:
+            challenge.status = 'inconclusive'
+            challenge.result_details = f'Unproven answer: {_unproven}; nothing scored'
+            challenge.evaluated_at = datetime.utcnow()
+            logger.debug("Integrity: unproven answer for %s (%s)",
+                         challenge.target_node_id[:8], _unproven)
+            return {'passed': False, 'inconclusive': True,
+                    'details': challenge.result_details}
+
+        # Verify nonce: the target itself signed this, so a mismatch is its own.
         if response_data.get('nonce') != challenge.challenge_nonce:
             challenge.status = 'failed'
             challenge.result_details = 'Nonce mismatch'
@@ -410,23 +439,6 @@ class IntegrityService:
             IntegrityService._revoke_proof(
                 db, challenge.target_node_id, 'nonce mismatch')
             return {'passed': False, 'details': 'Nonce mismatch'}
-
-        # Verify signature if public key available
-        public_key = response_data.get('public_key', '')
-        if public_key and response_signature:
-            try:
-                from security.node_integrity import verify_json_signature
-                if not verify_json_signature(public_key, response_data, response_signature):
-                    challenge.status = 'failed'
-                    challenge.result_details = 'Invalid signature'
-                    IntegrityService.increase_fraud_score(
-                        db, challenge.target_node_id, FRAUD_WEIGHTS['challenge_fail'],
-                        'Challenge failed: invalid signature')
-                    IntegrityService._revoke_proof(
-                        db, challenge.target_node_id, 'invalid signature')
-                    return {'passed': False, 'details': 'Invalid signature'}
-            except Exception:
-                pass
 
         # Evaluate based on challenge type
         passed = True
@@ -613,6 +625,32 @@ class IntegrityService:
                     _peer.last_attestation_at = datetime.utcnow()
 
         return {'passed': passed, 'details': details}
+
+    @staticmethod
+    def _answer_not_from_target(db: Session, target_node_id: str,
+                                response_data: dict,
+                                response_signature: str) -> Optional[str]:
+        """Why this answer cannot be attributed to the target, or None if it can.
+
+        The one binding rule (#140): an answer speaks for the target only when
+        it verifies against the key STORED for the target, never a key the
+        answer carries. A missing signature, a target with no stored key, a
+        verifier that raises and a signature under any other key are all
+        reasons, and every reason means inconclusive, never scored.
+        """
+        if not response_signature:
+            return 'unsigned'
+        peer = db.query(PeerNode).filter_by(node_id=target_node_id).first()
+        stored_key = getattr(peer, 'public_key', None) or ''
+        if not stored_key:
+            return 'no stored key for the target'
+        try:
+            from security.node_integrity import verify_json_signature
+            ok = verify_json_signature(stored_key, response_data,
+                                       response_signature)
+        except Exception as e:
+            return f'verifier error ({type(e).__name__})'
+        return None if ok else "not signed by the target's key"
 
     @staticmethod
     def _hash_verdict_withholds_proof(db: Session, challenge) -> bool:
