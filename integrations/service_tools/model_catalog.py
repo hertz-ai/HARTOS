@@ -377,6 +377,53 @@ def llama_gguf_compute_requirements(size_gb: float) -> tuple:
     return (round(size_gb * _MOE_VRAM_OVERHEAD, 1), round(size_gb * 2.0, 1))
 
 
+def gguf_fits_gpu(free_vram_gb: float, free_ram_gb: float, *,
+                  gpu_available: bool, moe: bool = False,
+                  vram_need_gb: Optional[float] = None,
+                  ram_need_gb: Optional[float] = None,
+                  whole_need_gb: Optional[float] = None) -> bool:
+    """Can this machine run this GGUF with attention resident on the GPU?
+
+    ONE rule, asked at TWO knowledge levels. It used to be two hand-written
+    rules in two repos, and they disagreed: for Tiel-Coder-35B-A3B at 4.7 GB
+    free VRAM and 21.4 GB free RAM the install path answered no while the
+    selector answered yes -- the install path refusing to fetch the model
+    the selector would pick.
+
+    SPLIT KNOWN (``vram_need_gb`` given). The model is downloaded and
+    read_gguf_facts has measured it, so the row states what actually goes
+    where: attention in VRAM, experts in system RAM under --cpu-moe. Both
+    pools must hold for a mixture of experts. A dense model has no split
+    and tests VRAM alone -- it touches every parameter on every token, so
+    moving any of it to RAM costs a PCIe round trip per token.
+
+    SPLIT UNKNOWN (``whole_need_gb`` given). Pre-download, only the file
+    size is knowable, so a MoE is judged on the COMBINED budget -- the
+    "fits" figure a GGUF publisher quotes. This is deliberately more
+    conservative than the measured rule (it demands 28.6 GB where the truth
+    is 3.4 + 18.6) and that asymmetry is kept, not smoothed away: you
+    cannot know the split before you have the file, and over-demanding
+    picks a smaller quant rather than a model that will not run.
+
+    Returns only whether the GPU arm holds. Callers own their own
+    fallbacks -- matches_compute continues down its mode ladder, the
+    installer falls back to its RAM-only arm.
+    """
+    if not gpu_available:
+        return False
+    if vram_need_gb is not None:
+        if free_vram_gb < vram_need_gb:
+            return False
+        if moe and ram_need_gb is not None and free_ram_gb < ram_need_gb:
+            return False
+        return True
+    if whole_need_gb is None:
+        return False
+    if free_vram_gb >= whole_need_gb:
+        return True
+    return bool(moe) and (free_vram_gb + free_ram_gb) >= whole_need_gb
+
+
 def moe_offload_args(gguf_path: str, free_vram_gb: float) -> List[str]:
     """llama.cpp flags placing a MoE's experts in system RAM, or [].
 
@@ -583,22 +630,21 @@ class ModelEntry:
 
         Returns: 'gpu', 'cpu', 'cpu_offload', or 'impossible'
         """
-        if gpu_available and budget_vram_gb >= self.vram_gb:
-            # A mixture of experts runs its expert tensors from system RAM
-            # (llama.cpp --cpu-moe) with attention resident on the GPU, so
-            # for those rows vram_gb covers only the non-expert weights and
-            # ram_gb the experts. Both have to hold: the experts are mmapped,
-            # so a shortfall does not fail the load, it silently destroys
-            # throughput. MEASURED on this box -- Tiel-Coder-35B-A3B with
-            # 18.64 GiB of experts against ~6.5 GiB of free RAM served 0.95
-            # tokens/sec, because every token faults 8 of 256 experts back
-            # off disk. Fitting is not the same as being able to run it.
-            #
-            # A dense model has no such split, never sets the moe capability,
-            # and is unaffected -- its GPU arm still tests VRAM alone.
-            caps = self.capabilities or {}
-            if not caps.get('moe') or budget_ram_gb >= self.ram_gb:
-                return 'gpu'
+        # The GPU arm is gguf_fits_gpu's to answer -- the same function the
+        # installer asks, so selection and install cannot drift apart. This
+        # row is downloaded, so it passes the MEASURED split: vram_gb is the
+        # non-expert weights, ram_gb the experts that --cpu-moe puts in
+        # system RAM. Both must hold for a MoE, because the experts are
+        # mmapped and a shortfall does not fail the load, it silently
+        # destroys throughput (measured: 0.95 tok/s with 18.64 GiB of
+        # experts against ~6.5 GiB free). A dense model never sets the moe
+        # capability and still tests VRAM alone.
+        if gguf_fits_gpu(budget_vram_gb, budget_ram_gb,
+                         gpu_available=gpu_available,
+                         moe=bool((self.capabilities or {}).get('moe')),
+                         vram_need_gb=self.vram_gb,
+                         ram_need_gb=self.ram_gb):
+            return 'gpu'
         if self.supports_cpu_offload and gpu_available and budget_vram_gb >= self.vram_gb * 0.5:
             return 'cpu_offload'
         if self.supports_cpu and budget_ram_gb >= self.ram_gb:
