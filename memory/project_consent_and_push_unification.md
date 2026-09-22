@@ -883,6 +883,70 @@ fold that "looks trivial" in the plan text is exactly the one to check first.
   the described defect — localStorage used as an inter-component event bus. Safe to
   execute; the only caution is that `active_agent_id` is set alongside it at `:47`
   and `:64`, so the fold must keep whatever reads THAT working.
+
+  **DONE 2026-09-22 — and the caution was empty, because there is no reader.**
+  The caller audit found the defect is deeper than "wrong channel":
+  - **Nothing reads either key.** Three `setItem` calls across the whole repo
+    (`:47`, `:48`, `:64`), zero `getItem`. I enumerated every `localStorage.getItem`
+    in `src/` and checked the two dynamic-key reads: `Demopage.js:1356` is
+    `getChatStorageKey(promptId)` (chat history) and the other is in a test. The
+    comment "so Agent component picks it up" describes a reader that was never
+    written; `Agent.js` reads `device_id`, `access_token`, `guest_mode`,
+    `guest_user_id`, `user_id`, `email_address` and nothing else.
+  - **The event IS produced — I got this wrong first and must record it.** I searched
+    HARTOS for a `type: 'agent_message'` emitter, found none, and wrote that the
+    handler had no producer. Wrong root: the producer is in **Nunba**, at
+    `routes/chatbot_routes.py:4297-4306`, where an OWNED agent
+    (`creator_user_id == target_user_id`, so no consent step) delivers straight
+    through `on_notification(target_user_id, {'type': 'agent_message', 'agent_name':
+    ..., 'message': ..., 'reason': ..., 'request_id': ...})`.
+    What caught it: the plan's own F9 entry (`:641`) names
+    `Nunba/routes/chatbot_routes.py` for the sibling `agent_contact_request`. The
+    subscriber I was about to keep and the one I was deleting come from the SAME file,
+    and I had searched only one of the two repos.
+    **And the clobber from F16's deferred defect is exactly what makes this work:**
+    `on_notification` does `{'type': 'notification', **notification_dict}`, so
+    `'agent_message'` overwrites the envelope and becomes the event name
+    `realtimeService.js:178` dispatches on. The handler FIRED. It was live.
+  So the handler was live, the payload carried everything a card needs
+  (`agent_name` + `message`), and it still died — because the localStorage key it
+  wrote has no reader in this repo. **The fold is therefore DELIVERY, not deletion.**
+  `src/components/Agent/AgentMessageToast.js` (new) subscribes and raises a toast via
+  the existing `ToastProvider`, giving that provider its first consumer; App.js renders
+  it INSIDE the provider because `App` renders the provider and so cannot call
+  `useToast` itself. `showToast` is destructured, not held as the context object,
+  because `ToastProvider` passes a fresh `value={{...}}` literal and re-renders on
+  every toast — holding the object would resubscribe each time.
+  - **`:64` LEFT ALONE deliberately.** It writes `active_agent_id` in the
+    accept-contact flow and is followed by `navigate('/')`, so it encodes an intent
+    ("open this agent on landing") that is also unimplemented. Deleting it would erase
+    the breadcrumb without delivering the feature, and it is a different flow from the
+    one this fold names. Recorded rather than silently kept or silently cut.
+  - **What the fold DEFERRED, filed as its own unit:** the canonical channel does not
+    reach the client either. `on_notification` builds
+    `{'type': 'notification', **notification_dict}`, and `to_dict()` always carries
+    `'type'` (the KIND, e.g. `agent_game_sound_review`), so the spread OVERWRITES the
+    envelope and `on('notification')` never fires — the unread badge only moves on the
+    30s poll. `realtimeService.js:147` tries to force the envelope and loses to the same
+    spread order, and the sub-type branch at `:181-187` reads `payload.data?.type` on a
+    flat payload, so it is dead twice. `on('achievement')` works only BY ACCIDENT of
+    this bug. Meanwhile `ToastProvider` wraps the whole app with **zero** `useToast`
+    consumers, so notification content is counted and never shown. That is a separate
+    defect with a client half (safe) and a producer half (a wire-contract change
+    affecting the RN app and the web bell, so an owner decision). Not folded in here.
+  *Lessons, two of them, and the second is about my own error:*
+  *(1) The mirror of F18: there I assumed one reader and found three; here I was told
+  to preserve a reader and found none. Enumerate, do not trust the description — the
+  code's own comment named a reader that was never written.*
+  *(2) **A negative result is scoped to where you looked.** "No producer" was true of
+  HARTOS and false of the system, because this event crosses repos. I even validated
+  my search METHOD against a known-good emitter, which made the negative feel earned —
+  but a correct method on an incomplete corpus still yields a wrong answer, and the
+  validation gave it false authority. Before asserting that nothing produces or reads
+  something, state the set of repos searched: here hevolve + HARTOS + Nunba, and the
+  answer lived in the third. The tell I walked past: the sibling subscriber in the same
+  `useEffect` had a producer I could not find either, and two unexplained absences in
+  one file is a signal about the search, not about the code.*
 - **F17** two public-topic allowlists — **AUDITED 2026-09-22. DO NOT "fold to one
   list". The divergence is DELIBERATE and folding it is a SECURITY REGRESSION.**
 
