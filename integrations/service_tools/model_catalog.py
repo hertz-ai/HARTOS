@@ -352,6 +352,47 @@ def read_gguf_facts(path: str) -> dict:
     return facts
 
 
+def moe_offload_args(gguf_path: str, free_vram_gb: float) -> List[str]:
+    """llama.cpp flags placing a MoE's experts in system RAM, or [].
+
+    THE one answer to "should this model's experts go to CPU". Three places
+    decide how to place a model -- the main server spawn, the caption/draft
+    spawn, and model_lifecycle's restart -- and each already carries its own
+    copy of `-ngl 99`. A fourth independent answer here is how those got out
+    of step; they call this instead.
+
+    Only a mixture of experts qualifies. A dense model touches every
+    parameter on every token, so moving any of it off the GPU costs a PCIe
+    round trip per token and the user experience collapses. A MoE activates
+    8 of 256 experts and keeps attention resident, so the trade is sound.
+
+    Returns [] when the whole model already fits in VRAM: at that point
+    keeping the experts on the GPU is strictly faster, and --cpu-moe would
+    be giving away performance for nothing.
+
+    Answers from the artifact -- the caller has the path, and the file
+    states whether it is a MoE -- so this cannot disagree with the catalog
+    row that admitted the model, which was sized from the same read.
+    """
+    facts = read_gguf_facts(gguf_path)
+    if not facts.get('moe'):
+        return []
+    whole_model_gb = facts.get('weight_bytes', 0) / _GIB * _MOE_VRAM_OVERHEAD
+    if free_vram_gb >= whole_model_gb:
+        logger.info(
+            "%s: MoE fits VRAM whole (%.1f GB free >= %.1f GB); keeping "
+            "experts on the GPU", os.path.basename(gguf_path),
+            free_vram_gb, whole_model_gb)
+        return []
+    logger.info(
+        "%s: MoE experts to system RAM (--cpu-moe); %.2f GiB of experts "
+        "off the GPU, %.2f GiB of attention stays",
+        os.path.basename(gguf_path),
+        facts.get('expert_bytes', 0) / _GIB,
+        facts.get('non_expert_bytes', 0) / _GIB)
+    return ['--cpu-moe']
+
+
 def model_weight_bytes(file_name: str) -> Optional[int]:
     """Size of a model's weight file in BYTES, or None if unregistered.
 

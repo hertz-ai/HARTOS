@@ -35,7 +35,7 @@ if _ROOT not in sys.path:
 os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
 
 from integrations.service_tools.model_catalog import (  # noqa: E402
-    ModelCatalog, ModelEntry, ModelType, read_gguf_facts)
+    ModelCatalog, ModelEntry, ModelType, moe_offload_args, read_gguf_facts)
 
 
 # ── minimal GGUF writer ───────────────────────────────────────────────
@@ -100,6 +100,31 @@ def moe_gguf(tmp_path):
 @pytest.fixture
 def dense_gguf(tmp_path):
     return write_gguf(str(tmp_path / 'dense.gguf'), arch='qwen35', pad=512)
+
+
+@pytest.fixture
+def big_moe(tmp_path, monkeypatch):
+    """A 21 GiB MoE -- 1 GiB non-expert, 20 GiB experts -- WITHOUT writing
+    21 GiB.
+
+    Sizing and placement only become interesting at GiB scale, and an
+    earlier draft of these tests wrote those bytes for real: 144 files and
+    29 GB of them, which filled the disk mid-run. The parser is proven
+    against real GGUF bytes above; everything downstream consumes a facts
+    dict, so that is what gets injected here.
+
+    Returns a path that exists (callers may stat it) but holds nothing."""
+    p = tmp_path / 'big.gguf'
+    p.write_bytes(b'GGUF')
+    G = 1024 ** 3
+    facts = {'architecture': 'qwen35moe', 'weight_bytes': 21 * G,
+             'moe': True, 'experts_total': 256, 'experts_used': 8,
+             'expert_fraction': 8 / 256, 'mtp': True, 'mtp_layers': 1,
+             'expert_bytes': 20 * G, 'non_expert_bytes': 1 * G}
+    import integrations.service_tools.model_catalog as mc
+    monkeypatch.setattr(mc, 'read_gguf_facts',
+                        lambda path: dict(facts) if str(path) == str(p) else {})
+    return str(p)
 
 
 class TestTheFactsThatWereTrackedNowhere:
@@ -258,31 +283,27 @@ class TestEnrichmentCannotMoveSelection:
         c.mark_downloaded('m', True, gguf_path=dense_gguf)
         assert (c._entries['m'].vram_gb, c._entries['m'].ram_gb) == before
 
-    def test_a_measured_moe_is_resized_to_its_actual_placement(self,
-                                                               tmp_path):
+    def test_a_measured_moe_is_resized_to_its_actual_placement(self, big_moe):
         """vram_gb becomes the NON-expert weights (what --cpu-moe leaves on
-        the GPU) and ram_gb the experts (what must stay resident)."""
-        p = write_gguf(str(tmp_path / 'm.gguf'), arch='qwen35moe',
-                       experts_total=256, experts_used=8,
-                       tensors=[('blk.0.attn_q.weight', 0),
-                                ('blk.0.ffn_gate_exps.weight', 1 << 30)],
-                       data_bytes=5 << 30)          # 1 GiB attn, 4 GiB exps
+        the GPU) and ram_gb the experts (what must stay resident).
+
+        The facts are injected rather than written to disk. A model big
+        enough to exercise this is GiB-scale, and an earlier draft of this
+        test wrote those bytes for real -- 144 files and 29 GB of them,
+        which filled the disk. What is under test here is arithmetic on
+        facts; the PARSER that produces them is covered above with real
+        bytes at KB scale."""
         c = self._cat()
-        c.mark_downloaded('m', True, gguf_path=p)
+        c.mark_downloaded('m', True, gguf_path=big_moe)
         e = c._entries['m']
         assert e.vram_gb == pytest.approx(1.0 * 1.35, abs=0.05)
-        assert e.ram_gb == pytest.approx(4.0, abs=0.05)
+        assert e.ram_gb == pytest.approx(20.0, abs=0.05)
         # ranking inputs still untouched
         assert (e.priority, e.speed_score, e.quality_score) == (85, 0.34, 0.92)
 
-    def test_ranking_is_never_rewritten_even_for_a_moe(self, tmp_path):
-        p = write_gguf(str(tmp_path / 'm.gguf'), arch='qwen35moe',
-                       experts_total=256, experts_used=8,
-                       tensors=[('a.weight', 0),
-                                ('blk.0.ffn_up_exps.weight', 1 << 30)],
-                       data_bytes=3 << 30)
+    def test_ranking_is_never_rewritten_even_for_a_moe(self, big_moe):
         c = self._cat()
-        c.mark_downloaded('m', True, gguf_path=p)
+        c.mark_downloaded('m', True, gguf_path=big_moe)
         e = c._entries['m']
         assert e.priority == 85 and e.quality_score == 0.92
         assert e.disk_gb == 21.19
@@ -346,3 +367,43 @@ class TestResidentNotMerelyFitting:
         remaining arms still apply."""
         e = self._entry(ram_gb=4.0)
         assert e.matches_compute(1.0, 8.0, True) == 'cpu'
+
+
+class TestTheExpertsGoToRamOnlyWhenTheyMustAndOnlyForAMoE:
+    """moe_offload_args is the ONE answer to "should this model's experts
+    go to CPU". Three spawn paths ask it -- the main server, the
+    caption/draft server, and model_lifecycle's restart -- and each already
+    carries its own copy of `-ngl 99`; a second answer here is exactly how
+    those drifted apart.
+
+    Without it the fix is half-shipped: the catalog now admits a 35B on an
+    8 GB card BECAUSE it is sized for --cpu-moe placement, and a spawn that
+    omits the flag would try to put all 21 GiB on the card."""
+
+    def test_a_moe_too_big_for_vram_sends_its_experts_to_ram(self, big_moe):
+        assert moe_offload_args(big_moe, free_vram_gb=8.0) == ['--cpu-moe']
+
+    def test_a_moe_that_fits_whole_keeps_them_on_the_gpu(self, big_moe):
+        """On a card with room, --cpu-moe would give away performance for
+        nothing -- the experts are faster in VRAM."""
+        assert moe_offload_args(big_moe, free_vram_gb=64.0) == []
+
+    def test_a_dense_model_never_gets_the_flag(self, dense_gguf):
+        """The owner's constraint, at the spawn. Offloading a dense model
+        costs a PCIe round trip per token because every parameter is
+        touched every token."""
+        assert moe_offload_args(dense_gguf, free_vram_gb=0.1) == []
+
+    def test_an_unreadable_model_launches_unchanged(self, tmp_path):
+        """No facts means no flag: a probe failure must not alter a spawn
+        that works today."""
+        assert moe_offload_args(str(tmp_path / 'gone.gguf'), 8.0) == []
+
+    def test_the_threshold_uses_the_whole_file_not_the_non_expert_part(
+            self, big_moe):
+        """21 GiB * 1.35 = 28.4, so 28 GB of VRAM is still not enough to
+        hold it whole and the experts still belong in RAM. Comparing
+        against the 1 GiB non-expert figure instead would wrongly conclude
+        it fits and drop the flag."""
+        assert moe_offload_args(big_moe, free_vram_gb=28.0) == ['--cpu-moe']
+        assert moe_offload_args(big_moe, free_vram_gb=29.0) == []
