@@ -284,7 +284,7 @@ def _select_video_tool() -> str:
     return 'ltx2'
 
 
-def _unwrap_envelope(payload) -> dict:
+def _unwrap_envelope(payload, task_id: str = '') -> dict:
     """The answer itself, whether or not the sidecar wrapped it.
 
     AceStep replies {'data': {...}, 'code': 200, 'error': None}; wan2gp and
@@ -306,6 +306,19 @@ def _unwrap_envelope(payload) -> dict:
     inner = payload.get('data')
     if isinstance(inner, dict) and ('task_id' in inner or 'status' in inner):
         return inner
+    if isinstance(inner, list):
+        # /query_result is a BATCH endpoint: wrap_response(data_list) puts a
+        # LIST under 'data', one item per requested id
+        # (acestep/api/http/query_result_route.py:66). Reading the outer
+        # envelope found no 'status' and answered 'unknown' for every
+        # outcome -- completed and failed alike.
+        if task_id:
+            for item in inner:
+                if isinstance(item, dict) and item.get('task_id') == task_id:
+                    return item
+        if len(inner) == 1 and isinstance(inner[0], dict):
+            return inner[0]
+        return {}
     return payload
 
 
@@ -924,14 +937,28 @@ def check_media_status(
 
     try:
         from core.http_pool import pooled_post
+        # AceStep's /query_result reads 'task_id_list' and parses a missing
+        # key as '[]' (query_result_route.py:57 -> parse_task_id_list), so a
+        # bare 'task_id' asked about NO tasks: the answer was an empty batch
+        # and every state -- completed, failed -- read as 'unknown'. The
+        # other two tools use /check_result, a different contract.
+        body = ({'task_id_list': [raw_id]} if tool_prefix == 'acestep'
+                else {'task_id': raw_id})
         resp = pooled_post(
             f"{base_url}{check_path}",
-            json={'task_id': raw_id},
+            json=body,
             headers={'Content-Type': 'application/json'},
             timeout=30,
         )
         if resp.status_code == 200:
-            data = _unwrap_envelope(resp.json())
+            data = _unwrap_envelope(resp.json(), task_id=raw_id)
+            if not data:
+                # The server answered, and said nothing about this id. That is
+                # not a state to report -- inventing one is what hid the bug.
+                return json.dumps({
+                    'status': 'error',
+                    'error': f'{tool_prefix} knows nothing about task {raw_id}',
+                })
             # Normalize response
             status = data.get('status', 'unknown')
             result_url = (data.get('video_url') or data.get('audio_url')
