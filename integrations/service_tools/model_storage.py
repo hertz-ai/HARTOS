@@ -60,7 +60,15 @@ class ModelStorageManager:
         # by the launching process is honoured by default construction.
         self.base_dir = Path(base_dir) if base_dir else get_base_dir()
         self.manifest_file = self.base_dir / 'manifest.json'
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        # The directory is created LAZILY, on the first write
+        # (_write_manifest, and the per-tool writers that already mkdir with
+        # parents=True), never here.  This constructor runs at IMPORT through
+        # the module singleton below, and base_dir can be a user path on an
+        # external drive (HEVOLVE_MODEL_DIR).  An eager mkdir turned an
+        # unplugged drive into "cannot import model_storage", which took
+        # vram_manager and Nunba's TTS down with it (2026-09-23).  Nor is
+        # there a fallback to the home directory: that would make the
+        # person's models "disappear" and could re-download them onto C:.
 
     # ── Path helpers ──────────────────────────────────────────────
 
@@ -79,6 +87,9 @@ class ModelStorageManager:
         return {"tools": {}}
 
     def _write_manifest(self, data: Dict) -> None:
+        # The one writer that goes straight into base_dir, so it makes the
+        # directory; an unreachable one raises here, honestly (see __init__).
+        self.base_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_file.write_text(json.dumps(data, indent=2))
 
     def get_manifest(self) -> Dict:
