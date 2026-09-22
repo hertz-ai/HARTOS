@@ -876,6 +876,40 @@ fold that "looks trivial" in the plan text is exactly the one to check first.
   Care warranted regardless: this path sends to the 77,369-address list, and
   `mailing_list.py` carries measured knowledge (`PROBE_LIARS`, provider behaviour at
   RCPT TO) that must not be lost in a refactor.
+
+  **DONE 2026-09-22 — VERDICT: DO NOT FOLD 2 -> 1. The fourth harmful prescription
+  in this plan, after F12, F13 and F17. And my own audit above was ALSO wrong.**
+
+  Correction to my own table: `email_adapter.py:264` is **not a sender**. It is
+  inside `_test_smtp()`, which connects, logs in and quits. Its "sync fallback at
+  `:282`" is that same test's sync arm. The real sender is `_send_smtp` at
+  **`:841`** (async) / **`:859`** (sync), inside `send_message` (declared `:647`).
+  I recorded a line number without reading its enclosing function, which is the
+  exact mistake F18's near-miss taught, one fold earlier.
+
+  Full sweep for real send calls across HARTOS (`.sendmail(` / `smtp.send_message(`):
+  **exactly two sites**, so the picture is now complete rather than assumed:
+  | site | what it is |
+  |---|---|
+  | `email_campaign.py:655` | BULK. One connection per `per_conn` chunk, `delay` between addresses, dated sent-log so the daily cap survives a restart, halt on `MAX_CONSECUTIVE_FAILURES` for sender reputation, PID lock because two runs double-send |
+  | `email_adapter.py:841/859` | ONE conversational message per call, per-instance `email_config`, part of the channel adapter interface (reply_to, attachments, typing). The async/sync pair is one sender with two transports |
+  | `mailing_list.py:297-300` | NOT a sender: ehlo/mail/rcpt, never DATA |
+
+  **Why folding harms.** A shared "open a connection and send this message" helper
+  opens one connection PER ADDRESS, which throws away the batching and pacing the
+  bulk path has specifically for deliverability; pushing the lock, cap and dated log
+  onto a single chat reply is as wrong in the other direction. The only thing the two
+  share is that both call `smtplib` -- the same argument would merge every HTTP
+  caller because they all use `requests`. Nor is the MIME builder shared in substance:
+  one builds a bulk marketing message per campaign, the other a conversational reply
+  with attachments and In-Reply-To.
+
+  **What was done instead**, since the plan's own instruction was "keep the prober
+  separate but say so": each of the three sites now carries a docstring naming the
+  other two and why it differs, so the next reader does not have to redo this audit
+  before deciding not to merge them. Proven safe: all three files are **AST-identical
+  to HEAD once string constants are normalised**, so nothing on a 77,369-address send
+  path changed behaviour. No send was triggered to verify this, by design.
 - **F16** `localStorage` as a push channel → an event. **PREMISE ACCURATE**
   (2026-09-22), lines are `hevolve/src/App.js:46-48`, not 56-61:
   `localStorage.setItem('agent_proactive_message', JSON.stringify(data))` with the
