@@ -238,6 +238,88 @@ class SelfAliasPurgeTest(unittest.TestCase):
         self.assertEqual(peers[0].status, 'active')
 
 
+class DeadRowReprobeTest(unittest.TestCase):
+    """The dead-row re-probe applies the same identity rule as the main loop.
+
+    e7c87ddc0 and 5fe8f8901 added the "answers as another node -> delete"
+    guard at two sites: the main health loop and the re-probe of 'dead' rows.
+    Only the main-loop site had a test; a reviewer mutated the dead-row site
+    to `if False:` and this file stayed green (2026-09-23 review ring). A
+    regression there revives a dead row whose address now belongs to another
+    node, reopening #62 on exactly the path that re-probes dead rows every
+    round.
+    """
+
+    class _Resp:
+        def __init__(self, node_id):
+            self.status_code = 200
+            self._node_id = node_id
+
+        def json(self):
+            return {'node_id': self._node_id, 'status': 'ok'}
+
+    def _run(self, row_node_id, responder):
+        pd = GossipProtocol.__new__(GossipProtocol)
+        pd._running = True
+        pd.node_id = 'self'
+        pd.dead_threshold = 900
+        pd.stale_threshold = 300
+        pd._health_cursor = 0
+        pd._peer_backoff = type('B', (), {
+            'prune_expired': lambda s: None,
+            'is_backed_off': lambda s, url: False,
+            'record_success': lambda s, url: None,
+            'record_failure': lambda s, url: None,
+        })()
+        pd._heartbeat = lambda: None
+
+        dead = _Peer(7)
+        dead.node_id = row_node_id
+        dead.url = 'https://node7.example.net'
+        dead.status = 'dead'
+        deleted = []
+
+        class _Q:
+            def __init__(self, kind): self._kind = kind
+            def filter(self, *a, **k): return self
+            def all(self):
+                # main active/stale query: nothing; dead-id query: our row
+                return [(dead.id,)] if self._kind == 'ids' else []
+            def first(self): return dead
+
+        class _DB:
+            def query(self, what, *a, **k):
+                # db.query(PeerNode.id) selects the dead ids; every other
+                # query is the main loop or the per-id fetch.
+                return _Q('ids' if getattr(what, 'key', None) == 'id' else 'rows')
+            def delete(self, row): deleted.append(row)
+            def commit(self): pass
+            def rollback(self): pass
+            def close(self): pass
+
+        with patch('integrations.social.models.get_db', return_value=_DB()), \
+             patch('integrations.social.peer_discovery.pooled_get',
+                   lambda url, **kw: self._Resp(responder)), \
+             patch('integrations.social.peer_discovery.is_unroutable_peer_url',
+                   return_value=(False, '')):
+            os.environ['HEVOLVE_HEALTH_ROUND_BUDGET_S'] = '30'
+            pd._health_check_round()
+        return dead, deleted
+
+    def test_dead_row_answering_as_another_node_is_deleted_not_revived(self):
+        dead, deleted = self._run('old-identity', 'new-identity')
+        self.assertEqual(deleted, [dead],
+                         'a dead row whose address answers as another node '
+                         'was not deleted')
+        self.assertEqual(dead.status, 'dead', 'it was revived instead')
+
+    def test_dead_row_answering_as_itself_is_revived(self):
+        """Preservation: a dead peer that comes back as itself is revived."""
+        dead, deleted = self._run('peer-7', 'peer-7')
+        self.assertEqual(deleted, [])
+        self.assertEqual(dead.status, 'active')
+
+
 class BudgetWiringTest(unittest.TestCase):
 
     def test_budget_is_env_overridable(self):
