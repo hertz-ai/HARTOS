@@ -967,9 +967,18 @@ fold that "looks trivial" in the plan text is exactly the one to check first.
   Both existing producers already satisfy this reading, so no producer changed.
   Escaping: labels are `_esc`'d at the point of use, because the prop pre-escape at
   the top of `renderAgentOverlay` (`:7063`) walks **string** props only and a LIST
-  prop's entries arrive raw. *Noted while there: the neighbouring list renderer
-  (`:7258-7260`) interpolates `item.label` into the `<li>` body unescaped — same
-  root, separate defect, filed rather than folded in here.*
+  prop's entries arrive raw.
+  **Correction to `1c1881098`'s commit message, made minutes later:** it calls the
+  neighbouring list renderer (`:7258-7260`, which interpolates `item.label` into the
+  `<li>` body unescaped) "an injection sink". That overstates it. `_a2ui_has_xss`
+  (`:107-115`) recurses into **lists** as well as dicts, so script-bearing entries are
+  REJECTED server-side before any push — the comment at `:97` says reject-not-escape
+  is deliberate, to avoid double-escaping legitimate content. So the unescaped `<li>`
+  is a defence-in-depth weakness behind a denylist regex, not a live hole, and my
+  `_esc` on the option labels is belt-and-braces rather than the only guard. Worth
+  hardening because a denylist has gaps by construction (`:100` lists six tags; a
+  `<link>`, `<base>` or `<form action>` carries no `on\w+=`), but it is not the
+  emergency the commit message implies. Filed separately, not folded in here.
   Evidence: `tests/unit/test_shell_custom_render.mjs` drives the REAL renderer on a
   DOM shim — 25/25 with 12 new assertions; red-first confirmed by restoring one
   hardcoded label (3 fail). `test_flow_05_events_and_sinks.py` 9/9,
