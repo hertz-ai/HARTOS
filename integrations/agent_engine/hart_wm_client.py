@@ -312,7 +312,7 @@ class HartWmClient:
     # takes an int ``con_id`` and a command string. The public signature and
     # the returned shape are identical either way, so nothing above this line
     # knows which compositor answered.
-    def subscribe_events(self, on_event) -> bool:
+    def subscribe_events(self, on_event, on_close=None) -> bool:
         """Listen for unsolicited compositor events, calling ``on_event(dict)`` per frame.
 
         The compositor has had an event fan-out (`events.subscribe`, IPC_PROTOCOL §4.10)
@@ -330,6 +330,15 @@ class HartWmClient:
         `on_event` runs ON THIS THREAD, so it must be quick and must not raise. Anything
         it throws is swallowed and logged rather than killing the listener, because losing
         the subscription would silently make the native desktop unclickable again.
+
+        `on_close`, if given, runs once on the same thread after the socket has closed,
+        for whatever reason it closed. That is the hook a caller needs to re-listen,
+        and it exists because of what the box showed on 2026-09-22: the subscription
+        goes THROUGH the root relay (HART_COMP_SOCK), whose per-connection unit is
+        capped at 60 s for one-shot queries, so the listener was killed a minute after
+        every boot and, with nobody told, was never re-established. A compositor
+        restart ends here the same way. The pump does not reconnect on its own; the
+        caller decides, and this is how it finds out.
         """
         if not hasattr(socket, 'AF_UNIX'):
             return False
@@ -390,6 +399,11 @@ class HartWmClient:
                 except OSError:
                     pass
                 logger.info('hart-comp event subscription closed')
+                if on_close is not None:
+                    try:
+                        on_close()
+                    except Exception as e:
+                        logger.debug('on_close raised: %s', e)
 
         t = threading.Thread(target=_pump, name='hart-comp-events', daemon=True)
         t.start()

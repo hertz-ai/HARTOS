@@ -1695,7 +1695,8 @@ class LiquidUIService:
             return True
         try:
             from integrations.agent_engine.hart_wm_client import get_wm_client
-            started = get_wm_client().subscribe_events(self._on_compositor_event)
+            started = get_wm_client().subscribe_events(
+                self._on_compositor_event, on_close=self._on_native_input_relay_closed)
         except Exception as e:
             logger.debug("native input relay not started: %s", e)
             return False
@@ -1703,6 +1704,43 @@ class LiquidUIService:
         if started:
             logger.info("native input relay listening for shell.activate")
         return self._native_input_relay
+
+    # Retry delays after the listener closes, in seconds; the last one repeats. Short
+    # first so a compositor restart costs one second of unclickable desktop, capped
+    # so a box with no compositor is not polled hard forever. Tests shrink it.
+    _NATIVE_RELAY_RETRY_S = (1, 2, 4, 8, 16, 30)
+
+    def _on_native_input_relay_closed(self) -> None:
+        """The listener's socket closed; get it back, or the desktop is unclickable.
+
+        Runs on the dying subscriber thread. Before this existed the latch above
+        stayed True after the pump had exited, so nothing ever re-subscribed and the
+        chain a press depends on was dead for the rest of the boot. On the box that
+        happened one minute after EVERY boot: the subscription goes through the root
+        relay, whose per-connection unit was capped at 60 s. The cap is gone from the
+        hart-comp relay, but a compositor restart ends the socket the same way, so
+        the shell re-listens on its own rather than waiting for the next compose.
+        """
+        self._native_input_relay = False
+        if getattr(self, '_native_relay_reconnecting', False):
+            return
+        self._native_relay_reconnecting = True
+
+        def _relisten():
+            delays = self._NATIVE_RELAY_RETRY_S
+            i = 0
+            try:
+                while True:
+                    time.sleep(delays[min(i, len(delays) - 1)])
+                    i += 1
+                    if self._ensure_native_input_relay():
+                        logger.info('native input relay re-established after %d tries', i)
+                        return
+            finally:
+                self._native_relay_reconnecting = False
+
+        threading.Thread(target=_relisten, name='hart-comp-events-relisten',
+                         daemon=True).start()
 
     def _on_compositor_event(self, frame: dict) -> None:
         """One compositor event. Runs on the subscriber thread, so it stays cheap."""

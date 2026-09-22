@@ -518,3 +518,33 @@ def test_no_transport_at_all_says_so():
     with patch.object(wm, '_run', return_value=None):
         r = c.switch_workspace(2)
     assert r['ok'] is False and 'no window-manager transport' in r['error']
+
+
+@needs_af_unix
+def test_a_closed_subscription_tells_its_caller_so_it_can_re_listen(tmp_path, monkeypatch):
+    """The pump does not reconnect; the caller does, and only if it is TOLD.
+
+    Live on the box 2026-09-22: the subscription rides the root relay, whose
+    per-connection unit was capped at 60 s, so the listener died a minute after
+    boot and nothing heard about it. The fake here answers events.subscribe and
+    then closes the connection, exactly what the relay's kill looks like from
+    this side, and the hook must fire once on that."""
+    closed = threading.Event()
+    calls = []
+    srv = _FakeCompositor(tmp_path, _ok_reply({'subscribed': True}))
+    try:
+        monkeypatch.setenv('HART_COMP_SOCK', srv.path)
+        c = HartWmClient()
+        c._backend = 'hart-comp'
+        c._hc_path = srv.path
+        assert c.subscribe_events(lambda f: None,
+                                  on_close=lambda: (calls.append(1), closed.set())) is True
+        assert closed.wait(5), "on_close never fired after the server closed the socket"
+        c._event_thread.join(5)
+        assert not c._event_thread.is_alive()
+    finally:
+        srv.close()
+    assert calls == [1], "on_close must fire exactly once"
+    methods = [q['method'] for q in srv.requests]
+    # The constructor's detection probe (window.list) comes first; ONE subscribe.
+    assert methods.count('events.subscribe') == 1 and methods[-1] == 'events.subscribe'
