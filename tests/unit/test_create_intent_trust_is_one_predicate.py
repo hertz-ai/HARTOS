@@ -14,7 +14,7 @@ Why, in hart_intelligence_entry.py's draft-first elif chain:
 
   2. `elif _vision_keyword_override(prompt)`  -> False.
 
-  3. `elif delegate in ('local','hive') and not is_casual
+  3. `elif _draft_delegates(result)   # is_casual no longer a veto (2026-09-22)
         and not is_create_agent`
      -> False, blocked SOLELY by the raw flag being truthy.
 
@@ -48,9 +48,14 @@ _SRC = open(os.path.join(ROOT, 'hart_intelligence_entry.py'),
 
 
 def _delegate_branch_condition():
-    """Source text of the `delegate in ('local','hive')` elif condition."""
+    """Source text of branch 3's elif condition.
+
+    Since 2026-09-22 the branch opens with `_draft_delegates(result)` (one
+    predicate, escalation_reasons.draft_delegates; is_casual no longer a
+    veto).  What this test guards is unchanged: the REST of the condition
+    must gate on _create_intent_actionable, never the raw flag."""
     m = re.search(
-        r"elif \(result\.get\('delegate'\) in \('local', 'hive'\)(.*?)\):",
+        r"elif \(_draft_delegates\(result\)(.*?)\):",
         _SRC, re.DOTALL)
     assert m, "delegate local/hive branch not found — chain was restructured"
     return m.group(1)
@@ -107,7 +112,7 @@ def test_pinned_log_substring_is_preserved():
     'is_create_agent=False' in the message now reads as "no ACTIONABLE
     create intent" — the condition changed, the pinned string did not.
     """
-    assert 'is_casual=False, is_create_agent=False — routing to "' in _SRC, (
+    assert 'is_create_agent=False — routing to "' in _SRC, (
         'pinned log substring changed — this breaks '
         'test_casual_conv_classifier_override.test_no_classifier_override_'
         'of_casual_conv, which greps for it')

@@ -8640,6 +8640,27 @@ def _vision_keyword_override(prompt: str) -> bool:
         return False
 
 
+def _draft_delegates(result: dict) -> bool:
+    """The draft's own envelope says a bigger model must take this turn.
+
+    ONE reader for that field: escalation_reasons.draft_delegates, in the
+    module that already names delegate='local'/'hive' the baseline
+    escalation (CLASSIFIER_DELEGATE).  is_casual has NO vote here.  The
+    two fields are emitted independently and can contradict, and when
+    they did, the casual verdict won.  MEASURED 2026-09-22 08:52:39
+    (speculation c77082b0-af7): delegate='local' AND is_casual=true on
+    "great open a notepad and type hi in it" -> the branch below was
+    skipped -> the draft's "I've opened a notepad for you and typed 'hi'
+    inside" shipped as the final answer and was spoken by TTS.  No tool
+    ran; Computer_Action was in the is_first set that turn would have
+    loaded.  Believing is_casual ships a tool-less model's description of
+    work as if the work had happened; believing delegate costs one slower
+    turn.  See tests/unit/test_draft_delegate_is_not_vetoed_by_casual.py.
+    """
+    from integrations.agent_engine.escalation_reasons import draft_delegates
+    return draft_delegates(result.get('delegate'))
+
+
 def _chat_reply(user_id, request_id, response_text: str, **payload):
     """Return a /chat JSON response AND fire TTS synthesis in the background.
 
@@ -10015,8 +10036,7 @@ def chat():
                     # Fall through — do NOT return the draft standby
                     # reply; the tool-based path below will run and the
                     # VLM tool will produce a grounded answer.
-                elif (result.get('delegate') in ('local', 'hive')
-                      and not result.get('is_casual')
+                elif (_draft_delegates(result)
                       and not _create_intent_actionable):
                     # Draft self-assessed: this is a non-casual TASK
                     # that needs more capability than the 0.8B has
@@ -10050,7 +10070,7 @@ def chat():
                     app.logger.info(
                         f"draft classifier: delegate="
                         f"{result.get('delegate')!r} "
-                        f"is_casual=False, is_create_agent=False — routing to "
+                        f"is_casual={result.get('is_casual')!r} (no veto), is_create_agent=False — routing to "
                         f"the langchain chat (get_ans), NOT autogen CREATE. "
                         f"get_ans carries FULL_HISTORY (date-recall via "
                         f"parsing_string -> get_time_based_history SimpleMem) "
