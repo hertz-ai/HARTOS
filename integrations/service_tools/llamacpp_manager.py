@@ -217,21 +217,154 @@ class LlamaCppManager:
         }
 
     def swap_model(self, new_model_path: str, **kwargs) -> bool:
-        """Hot-swap: stop the current model and start with a new one.
+        """Replace the running model without the node ever losing its LLM.
+
+        MAKE-BEFORE-BREAK.  This used to be ``_stop_locked()`` followed by
+        ``_start_locked()`` on the SAME port: stop, then hope.  If the
+        newcomer failed to start, :8080 was empty and the node had no local
+        model at all — and a 21.19 GiB model measured ~7 MINUTES to become
+        ready off an external drive, so the window was minutes even when it
+        worked.  Owner directive 2026-09-22: "at any point in time some LLM
+        shd be running for the nunba to work locally except central".
+
+        The ordering lives in ``llm_swap.swap_main_llm`` because Nunba's
+        ``LlamaConfig`` owns the same problem on the desktop and the two
+        had already drifted into different failure modes.  What is HERE is
+        only what is specific to a process THIS manager owns.
+
+        OWNERSHIP IS THE PRECONDITION.  We swap only a server we started.
+        A server we did not start is someone else's (on the desktop it is
+        Nunba's), and for that one, both halves are wrong: we cannot stop
+        it — ``_stop_locked`` works off ``self._process`` and would silently
+        no-op — and launching a second main server beside it is the
+        2026-09-13 incident, where a second :8080 server with a 4096 ctx
+        turned every agent call into an HTTP 400.  So we refuse and say who
+        to ask instead.  This is the same rule ``_start_locked``'s adopt
+        probe enforces, applied one level up where the decision belongs:
+        the probe cannot tell "a server is running" from "a server I own",
+        and that distinction is the whole difference between a swap and a
+        duplicate.
+
+        NOT EVICTION.  ``model_lifecycle.request_swap`` excludes the main
+        LLM on purpose and is not involved.  In particular the incumbent's
+        reclaim is NOT part of the budget below: it is still serving and
+        must keep serving, so what it holds is not available.
 
         Args:
             new_model_path: Path to the new .gguf model file.
             **kwargs: Additional server param overrides.
 
         Returns:
-            True if the new model started successfully.
+            True only if the new model is SERVING and is now the endpoint.
         """
+        from core.port_registry import find_free_port
+
+        from .llm_swap import swap_main_llm
+
         with self._lock:
-            port = self._port
+            incumbent = self._process
+            if incumbent is None or incumbent.poll() is not None:
+                logger.info(
+                    "not swapping %s: this manager does not own a running "
+                    "llama-server.  Whoever owns the serving model owns the "
+                    "swap — on the desktop that is Nunba's model settings "
+                    "(LlamaConfig.switch_model).  Stopping a process we did "
+                    "not start is not possible here, and starting a second "
+                    "main server beside it is the 2026-09-13 duplicate.",
+                    os.path.basename(new_model_path))
+                return False
+
             logger.info(
                 f"Swapping model: {self._current_model} -> {new_model_path}")
-            self._stop_locked()
-            return self._start_locked(new_model_path, port, **kwargs)
+
+            def _spawn(port: int):
+                return self._spawn_locked(new_model_path, port, **kwargs)
+
+            def _serves(handle, port: int) -> bool:
+                proc, _ctx, _slots = handle
+                return self._wait_for_health(proc, port)
+
+            def _repoint(handle, port: int) -> None:
+                proc, ctx_size, slots = handle
+                self._process = proc
+                self._port = port
+                self._current_model = new_model_path
+                # Announce the geometry only now that this server is both
+                # serving AND the endpoint — same rule as _start_locked.
+                from core.llama_geometry import publish_geometry
+                publish_geometry(ctx_size, slots)
+
+            outcome = swap_main_llm(
+                label=os.path.basename(new_model_path),
+                **self._admission_facts(new_model_path),
+                pick_port=find_free_port,
+                spawn=_spawn,
+                serves=_serves,
+                repoint=_repoint,
+                retire=lambda: self._terminate(incumbent),
+                abandon=lambda handle: self._terminate(handle[0]),
+            )
+            return outcome.ok
+
+    def _admission_facts(self, model_path: str) -> Dict[str, Any]:
+        """What the swap needs to know to decide "does it fit BESIDE?".
+
+        Live readings, taken with the incumbent resident, plus the
+        newcomer's footprint at the best knowledge level available:
+
+          MEASURED (``vram_need_gb``) — ``record_residency`` banked what this
+          exact weight file actually cost on this card last time it loaded.
+          Quant-aware, so a row re-pointed from Q4 to Q8 reads as unknown
+          rather than as the old number.
+
+          ESTIMATED (``whole_need_gb``) — never loaded here, so only the file
+          size is knowable.  Deliberately more conservative.
+
+          UNKNOWN — neither, so ``gguf_fits_gpu`` returns False and the swap
+          is refused.  An unknown footprint is not a free model: refusing
+          costs the user a swap, guessing costs them the node.
+        """
+        gpu = self._get_gpu_info()
+        facts: Dict[str, Any] = {
+            'free_vram_gb': gpu.get('free_gb', 0.0),
+            'free_ram_gb': 0.0,
+            'gpu_available': bool(gpu.get('cuda_available')),
+            'moe': False,
+            'vram_need_gb': None,
+            'ram_need_gb': None,
+            'whole_need_gb': None,
+        }
+
+        try:
+            import psutil
+            facts['free_ram_gb'] = psutil.virtual_memory().available / (1024 ** 3)
+        except ImportError:
+            logger.debug("_admission_facts: psutil unavailable; RAM unknown")
+
+        try:
+            from .model_catalog import (get_catalog,
+                                        llama_gguf_compute_requirements,
+                                        read_gguf_facts)
+            facts['moe'] = bool(read_gguf_facts(model_path).get('moe'))
+
+            catalog = get_catalog()
+            entry = catalog.get_by_weight_file(model_path)
+            banked = catalog.residency(entry.id) if entry else None
+            if banked and banked.get('vram_gb') is not None:
+                facts['vram_need_gb'] = banked.get('vram_gb')
+                facts['ram_need_gb'] = banked.get('ram_gb')
+            else:
+                size_gb = os.path.getsize(model_path) / (1024 ** 3)
+                # The same conservative figure the install path uses, from
+                # the one helper, rather than a fourth copy of "x 1.35".
+                facts['whole_need_gb'] = llama_gguf_compute_requirements(
+                    size_gb)[0]
+        except Exception:
+            logger.exception(
+                "_admission_facts: could not size %s; the swap will be "
+                "refused rather than attempted blind", model_path)
+
+        return facts
 
     def get_server_binary(self) -> Optional[Path]:
         """Locate the llama-server binary on this system.
@@ -589,10 +722,67 @@ class LlamaCppManager:
         except Exception as exc:
             logger.debug("adopt-probe skipped: %r", exc)
 
+        spawned = self._spawn_locked(model_path, port, **kwargs)
+        if spawned is None:
+            return False
+        proc, ctx_size, slots = spawned
+
+        # Adopt it as OUR server before waiting: _stop_locked() on a failed
+        # health check works off self._process, and is_running() must see the
+        # process we just launched.
+        self._process = proc
+        self._port = port
+        self._current_model = model_path
+
+        if self._wait_for_health(proc, port):
+            logger.info(
+                f"llama-server ready on port {port} "
+                f"(model: {os.path.basename(model_path)})")
+            # Publish only now that a server is CONFIRMED serving this
+            # geometry.  HARTOS's wire trimmer
+            # (core.llm_outbound_logger._get_budget_per_slot) prefers the
+            # published env over its live /props probe, so announcing a spawn
+            # that then failed health would leave every request budgeted
+            # against a window nothing is serving — the 2026-09-11 shape
+            # (trimmer believed 12288, the server ran 8192) with the sign
+            # flipped.  Announce what exists, not what was attempted.
+            #
+            # The G3 fallback in model_lifecycle deliberately does NOT publish:
+            # it passes no --parallel, so it has no honest slot count to state.
+            from core.llama_geometry import publish_geometry
+            publish_geometry(ctx_size, slots)
+            return True
+
+        logger.error(
+            f"llama-server health check failed after {_HEALTH_START_TIMEOUT}s "
+            "-- stopping process")
+        self._stop_locked()
+        return False
+
+    def _spawn_locked(self, model_path: str, port: int,
+                      **kwargs) -> Optional[tuple]:
+        """Launch a llama-server process.  Caller must hold self._lock.
+
+        LAUNCH ONLY — it does not wait for health, and it does not touch
+        ``self._process`` / ``self._port`` / ``self._current_model``.  Both
+        of those are the caller's business, and they have to be, because a
+        SWAP runs two servers at once: the newcomer must come up without
+        displacing the handle for the incumbent that is still serving.
+
+        Split out of ``_start_locked`` on 2026-09-22 so that ``start()`` and
+        ``swap_model()`` share ONE spawn rather than growing a second copy
+        that drifts (the two main-LLM swaps in this codebase had already
+        drifted into two different failure modes before this).
+
+        Returns ``(process, ctx_size, slots)``, or None if it did not launch.
+        The geometry is returned rather than published here: it must be
+        announced only when this server becomes THE endpoint, which for a
+        swap is later.
+        """
         # Validate model file
         if not os.path.isfile(model_path):
             logger.error(f"Model file not found: {model_path}")
-            return False
+            return None
 
         # Find or download binary
         binary = self.get_server_binary()
@@ -603,9 +793,7 @@ class LlamaCppManager:
                 logger.error(
                     "Cannot start: llama-server binary not available. "
                     "Install manually or check network.")
-                return False
-
-        self._port = port
+                return None
 
         # Calculate params
         params = self.get_optimal_params(model_path)
@@ -617,8 +805,7 @@ class LlamaCppManager:
         # it from core.llama_geometry before any branch), so the `.get` default
         # here was a FOURTH place a context size could be written — and being a
         # default that never fires, nothing would ever have caught it drifting.
-        from core.llama_geometry import (ctx_for_role, publish_geometry,
-                                         slots_from_env)
+        from core.llama_geometry import ctx_for_role, slots_from_env
         ctx_size = int(params.get('ctx_size') or ctx_for_role('main'))
         # core.constants.LLAMA_SLOTS_DEFAULT (1) unless an operator has
         # published otherwise — one source for the slot count too.
@@ -668,70 +855,57 @@ class LlamaCppManager:
             popen_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
 
         try:
-            self._process = subprocess.Popen(cmd, **popen_kwargs)
-            logger.info(f"llama-server started (PID {self._process.pid})")
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+            logger.info(f"llama-server started (PID {proc.pid}) on port {port}")
         except FileNotFoundError:
             logger.error(f"Binary not found or not executable: {binary}")
-            self._process = None
-            return False
+            return None
         except PermissionError:
             logger.error(f"Permission denied executing: {binary}")
-            self._process = None
-            return False
+            return None
         except OSError as exc:
             logger.error(f"Failed to start llama-server: {exc}")
-            self._process = None
-            return False
+            return None
 
-        # Wait for health endpoint with exponential backoff
-        self._current_model = model_path
-        if self._wait_for_health():
-            logger.info(
-                f"llama-server ready on port {port} "
-                f"(model: {os.path.basename(model_path)})")
-            # Publish only now that a server is CONFIRMED serving this
-            # geometry.  HARTOS's wire trimmer
-            # (core.llm_outbound_logger._get_budget_per_slot) prefers the
-            # published env over its live /props probe, so announcing a spawn
-            # that then failed health would leave every request budgeted
-            # against a window nothing is serving — the 2026-09-11 shape
-            # (trimmer believed 12288, the server ran 8192) with the sign
-            # flipped.  Announce what exists, not what was attempted.
-            #
-            # The G3 fallback in model_lifecycle deliberately does NOT publish:
-            # it passes no --parallel, so it has no honest slot count to state.
-            publish_geometry(ctx_size, slots)
-            return True
-        else:
-            logger.error(
-                f"llama-server health check failed after {_HEALTH_START_TIMEOUT}s "
-                "-- stopping process")
-            self._stop_locked()
-            return False
+        return proc, ctx_size, slots
 
     def _stop_locked(self) -> bool:
-        """Stop the server (caller must hold self._lock)."""
+        """Stop OUR server and forget it (caller must hold self._lock)."""
         if self._process is None:
             logger.debug("No server process to stop")
             return True
 
-        pid = self._process.pid
+        ok = self._terminate(self._process)
+        self._process = None
+        self._current_model = None
+        return ok
+
+    @staticmethod
+    def _terminate(proc: subprocess.Popen) -> bool:
+        """Stop one llama-server process.  Owns no instance state.
+
+        Separated from ``_stop_locked`` because a swap has TWO processes to
+        end in different circumstances -- retiring the incumbent once the
+        newcomer serves, or abandoning a newcomer that never did -- and
+        neither is "stop the server this manager currently points at".
+        """
+        pid = proc.pid
         logger.info(f"Stopping llama-server (PID {pid})...")
 
         try:
             # Graceful shutdown: terminate (SIGTERM on Unix, TerminateProcess on Windows)
-            self._process.terminate()
+            proc.terminate()
 
             try:
-                self._process.wait(timeout=_STOP_GRACE_PERIOD)
+                proc.wait(timeout=_STOP_GRACE_PERIOD)
                 logger.info(f"llama-server (PID {pid}) terminated gracefully")
             except subprocess.TimeoutExpired:
                 # Force kill
                 logger.warning(
                     f"llama-server (PID {pid}) did not exit in "
                     f"{_STOP_GRACE_PERIOD}s -- force killing")
-                self._process.kill()
-                self._process.wait(timeout=5)
+                proc.kill()
+                proc.wait(timeout=5)
                 logger.info(f"llama-server (PID {pid}) killed")
 
         except ProcessLookupError:
@@ -739,41 +913,52 @@ class LlamaCppManager:
         except OSError as exc:
             logger.error(f"Error stopping llama-server (PID {pid}): {exc}")
             return False
-        finally:
-            self._process = None
-            self._current_model = None
 
         return True
 
-    def _check_health(self) -> bool:
-        """Single health check against /health endpoint."""
-        url = f'http://127.0.0.1:{self._port}/health'
+    def _check_health(self, port: Optional[int] = None) -> bool:
+        """Single health check against /health endpoint.
+
+        ``port`` defaults to this manager's own server.  A SWAP asks about a
+        newcomer on a DIFFERENT port while the incumbent still holds
+        ``self._port``, so the port has to be an argument rather than
+        instance state.
+        """
+        url = f'http://127.0.0.1:{port or self._port}/health'
         result = _http_get(url, timeout=_HEALTH_CHECK_TIMEOUT)
         return result is not None
 
-    def _wait_for_health(self) -> bool:
-        """Wait for the server health endpoint with exponential backoff.
+    def _wait_for_health(self, proc: Optional[subprocess.Popen] = None,
+                         port: Optional[int] = None) -> bool:
+        """Wait until a server SERVES, with exponential backoff.
 
-        Polls GET /health up to _HEALTH_START_TIMEOUT seconds.
+        Polls GET /health up to _HEALTH_START_TIMEOUT seconds.  This is the
+        capability probe, not a liveness check: a process that starts and
+        never answers is exactly the case that turns break-before-make into
+        an outage (#99).
+
+        ``proc``/``port`` default to this manager's own server so existing
+        callers are unchanged; the swap passes the newcomer's.
         """
+        proc = proc if proc is not None else self._process
         deadline = time.monotonic() + _HEALTH_START_TIMEOUT
         interval = _HEALTH_POLL_INTERVAL
 
         while time.monotonic() < deadline:
             # Check if process died
-            if self._process is not None and self._process.poll() is not None:
-                rc = self._process.returncode
+            if proc is not None and proc.poll() is not None:
+                rc = proc.returncode
                 logger.error(f"llama-server exited prematurely (code {rc})")
                 # Try to read stderr for diagnostics
                 try:
-                    stderr = self._process.stderr.read().decode('utf-8', errors='replace')
+                    stderr = proc.stderr.read().decode('utf-8', errors='replace')
                     if stderr:
                         logger.error(f"llama-server stderr: {stderr[:1000]}")
                 except Exception:
                     logger.exception("_wait_for_health: swallowed Exception")
                 return False
 
-            if self._check_health():
+            if self._check_health(port):
                 return True
 
             time.sleep(interval)
