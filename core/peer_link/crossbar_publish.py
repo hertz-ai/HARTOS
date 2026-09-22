@@ -31,13 +31,48 @@ import logging
 import uuid
 from typing import Any
 
+from core.chat_client import daemon_goal_id
 from core.constants import (
     CHAT_ACTION_STATUS,
     CHAT_ACTION_THINKING,
     CHAT_BUBBLE_PRIORITY,
 )
+from core.peer_link.message_bus import chat_topic_for
 
 logger = logging.getLogger(__name__)
+
+
+def trace_audience(user_id: Any, request_id: Any) -> str:
+    """The user a thinking bubble is delivered to.
+
+    The caller's ``user_id`` is who the turn RAN AS.  For a person's own
+    chat turn that is the person.  For a daemon dispatch it is the agent
+    row the daemon picked (agent_daemon.py: ``dispatch_goal(prompt,
+    agent['user_id'], goal.id, ...)``), and no human subscribes to an
+    agent's chat topic: measured 2026-09-23 on the owner's desktop, 176 of
+    the day's 182 chat.response broadcasts went to ``hevolve_system_agent``
+    with ``targeted=0`` while both windows sat subscribed under the owner.
+
+    A daemon request is recognisable by its id (``daemon_<goal_id>``,
+    core.chat_client.daemon_request_id), so the goal's human is resolved
+    through the ONE attribution resolver every other per-agent event uses
+    (core.event_attribution.owner_user_id: goal owner, then the sole local
+    user, then the boot-declared desktop owner).  Anything else, and a
+    daemon goal with no resolvable human, keeps the caller's user: the
+    envelope, its ``request_id`` and ``bot_type`` are untouched, so a
+    consumer can still tell a background trace from its own turn
+    (Demopage drops traces whose request_id is not the current turn's).
+    """
+    goal_id = daemon_goal_id(request_id)
+    if not goal_id:
+        return str(user_id)
+    try:
+        from core.event_attribution import owner_user_id
+        owner = owner_user_id(goal_id=goal_id)
+    except Exception as e:
+        logger.debug("trace_audience: owner lookup failed for %s: %s", goal_id, e)
+        owner = None
+    return str(owner) if owner else str(user_id)
 
 # Zoom-box stub — autogen FULL shape ships this so the avatar /
 # book-parsing UI sees a stable schema.  All-zero coords mean
@@ -146,7 +181,7 @@ def publish_thinking_trace(
                 "publish_thinking_trace: HARTOS publish_async unresolvable")
             return False
         publish_async(
-            f'com.hertzai.hevolve.chat.{user_id}',
+            chat_topic_for(trace_audience(user_id, request_id)),
             json.dumps(envelope),
         )
         return True

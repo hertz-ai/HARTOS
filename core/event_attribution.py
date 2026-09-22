@@ -15,6 +15,7 @@ exactly as before: no regression, no leak.
 Single source: every publisher that needs per-user routing calls this, rather
 than each re-deriving the owner.
 """
+import os
 import time
 from typing import Optional
 
@@ -104,6 +105,21 @@ def owner_user_id(user_prompt=None, goal_id=None, metadata=None) -> Optional[str
     #    _SSE_GLOBAL_PREFIXES: the comment at core/platform/events.py:112 forbids
     #    exactly that, because it would leak cross-user activity metadata.
     uid = _sole_local_user_id()
+    if uid:
+        return uid
+
+    # 5. The desktop's owner, declared at boot.  Nunba exports
+    #    HEVOLVE_OWNER_USER_ID (main.py _export_owner_identity: the signed-in
+    #    user, else this desktop's guest); the consent gate already asks that
+    #    person for a goal with no owner (hive_guardrails.before_dispatch).
+    #    Central and regional set it nowhere, so there this step is inert and
+    #    the P3a refusal stands.  Needed because step 4 answers None on a
+    #    desktop whose users table holds more than one human row: measured
+    #    2026-09-23 on the owner's box, 287 'human' + 21 'guest' rows (test
+    #    accounts and old guests), so every daemon-run trace was addressed to
+    #    the agent that ran it (176 of 182 chat.response broadcasts that day,
+    #    targeted=0 each) and the floating window never saw an agent think.
+    uid = os.environ.get('HEVOLVE_OWNER_USER_ID', '').strip()
     if uid:
         return uid
 

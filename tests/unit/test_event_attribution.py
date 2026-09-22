@@ -237,3 +237,49 @@ def test_multi_tenant_negative_is_still_cached(monkeypatch):
 
     assert ea._sole_local_user_id() is None
     assert ea._SOLE_USER_CACHE == [None], "multi-tenant must pay exactly one query"
+
+
+# ── 5. the boot-declared desktop owner is the LAST resort ─────────────────
+#
+# Measured 2026-09-23 on the owner's desktop: 287 'human' + 21 'guest' rows
+# (test accounts, old guests), so the sole-user rule answered None, and every
+# daemon-run thinking trace was addressed to the agent that ran it -- 176 of
+# 182 chat.response broadcasts that day, targeted=0 each.  Nunba declares the
+# desktop's owner at boot (HEVOLVE_OWNER_USER_ID); the consent gate already
+# asks that person for an owner-less goal, so the attribution resolver names
+# the same person, after every context-bearing step has had its turn.
+
+def test_desktop_owner_is_the_last_resort(monkeypatch):
+    ea = _install_fake_db(monkeypatch, [_FakeUser('h1', 'human'), _FakeUser('h2', 'human')])
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'owner-9')
+
+    assert ea.owner_user_id() == 'owner-9'
+    assert ea.owner_user_id(goal_id='goal-with-no-owner') == 'owner-9'
+
+
+def test_no_declared_owner_still_refuses(monkeypatch):
+    """Central and regional never set the variable: multi-tenant behaviour
+    is unchanged there, the P3a refusal stands."""
+    ea = _install_fake_db(monkeypatch, [_FakeUser('h1', 'human'), _FakeUser('h2', 'human')])
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
+
+    assert ea.owner_user_id() is None
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', '   ')
+    assert ea.owner_user_id() is None, 'a blank declaration is no declaration'
+
+
+def test_desktop_owner_never_outranks_a_resolved_owner(monkeypatch):
+    ea = _install_fake_db(monkeypatch, [_FakeUser('h1', 'human'), _FakeUser('h2', 'human')])
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'owner-9')
+
+    assert ea.owner_user_id(user_prompt='u1_123') == 'u1'
+    assert ea.owner_user_id(metadata={'user_id': 'u2'}) == 'u2'
+
+
+def test_the_sole_local_user_outranks_the_declared_owner(monkeypatch):
+    """An appliance with exactly one human keeps resolving to that human,
+    whatever the environment says: step 4 stays ahead of step 5."""
+    ea = _install_fake_db(monkeypatch, [_FakeUser('only-one', 'human')])
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'owner-9')
+
+    assert ea.owner_user_id() == 'only-one'
