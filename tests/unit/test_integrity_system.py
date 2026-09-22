@@ -774,14 +774,18 @@ class TestCodeHashVerification:
             result = IntegrityService.verify_code_hash(db, peer.node_id)
         assert result['verified'] is True
 
-    def test_hash_mismatch_flagged(self, db):
+    def test_hash_mismatch_is_inconclusive_not_scored(self, db):
+        """An unregistered hash that differs from ours is not evidence: a
+        bundled desktop's hash is per install. Same verdict as the challenge
+        path's code_hash_check (5e83047b5); this test used to assert +fraud."""
         from integrations.social.integrity_service import IntegrityService
         peer = _make_peer(db, code_hash='aaaa' * 16, fraud_score=0.0)
         with patch('security.node_integrity.compute_code_hash', return_value='bbbb' * 16):
             result = IntegrityService.verify_code_hash(db, peer.node_id)
         assert result['verified'] is False
+        assert result.get('inconclusive') is True
         db.refresh(peer)
-        assert peer.fraud_score > 0
+        assert (peer.fraud_score or 0.0) == 0.0
 
     def test_registry_fetch_mocked(self, db):
         from integrations.social.integrity_service import IntegrityService

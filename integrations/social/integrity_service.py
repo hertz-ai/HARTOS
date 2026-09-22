@@ -185,11 +185,25 @@ class IntegrityService:
                     'details': 'Code hash matches (self-reported -- awaiting '
                                'challenge for proof)'}
         else:
-            IntegrityService.increase_fraud_score(
-                db, node_id, FRAUD_WEIGHTS['hash_mismatch'],
-                f'Code hash mismatch: expected {expected[:16]}..., got {peer.code_hash[:16]}...',
-                {'expected': expected, 'reported': peer.code_hash})
-            return {'verified': False, 'details': 'Code hash mismatch'}
+            # Reaching here means the peer's self-reported hash is NOT a
+            # registered release (Priority 0 above returned for those) and
+            # differs from THIS node's expected hash.  That is not evidence of
+            # tampering: a bundled desktop's hash is sha256(exe|mtime), per
+            # install, never registered, and a node on a newer or older
+            # release than this one differs by construction; a hostile node,
+            # meanwhile, simply reports a registered hash.  Scoring it (+30,
+            # ban at 80) penalised honest reporters of unregistered builds.
+            # Same verdict as the challenge path's code_hash_check
+            # (5e83047b5): inconclusive, nothing scored, nothing granted.  The
+            # two doors used to disagree on the same input (ring review,
+            # 2026-09-23).
+            logger.debug(
+                "Integrity: code hash of %s is unregistered and differs from "
+                "the expected %s: inconclusive, not scored",
+                node_id[:8], expected[:16])
+            return {'verified': False, 'inconclusive': True,
+                    'details': ('Code hash is unregistered and differs from the '
+                                'expected release: inconclusive, not scored')}
 
     @staticmethod
     def fetch_expected_hash(registry_url: str, version: str) -> Optional[str]:

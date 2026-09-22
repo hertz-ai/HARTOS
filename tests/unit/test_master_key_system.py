@@ -532,7 +532,11 @@ class TestIntegrityServiceMasterKey:
                 assert result['verified'] is True
 
     def test_verify_code_hash_mismatch_via_manifest(self, db, master_keypair):
-        """Code hash mismatch against master manifest should increase fraud score."""
+        """An unregistered hash that differs from the master manifest is
+        inconclusive and NOT scored: it is what every bundled desktop
+        (per-install hash) and every node on another release reports, and a
+        hostile node reports a registered hash instead. Same verdict as the
+        challenge path (5e83047b5); this test used to assert +fraud."""
         node_id = _uid()
         peer = PeerNode(
             node_id=node_id,
@@ -551,9 +555,9 @@ class TestIntegrityServiceMasterKey:
             with patch('security.master_key.verify_release_manifest', return_value=True):
                 result = IntegrityService.verify_code_hash(db, node_id)
                 assert result['verified'] is False
-                # Fraud score should have increased
+                assert result.get('inconclusive') is True
                 db.refresh(peer)
-                assert peer.fraud_score > 0
+                assert (peer.fraud_score or 0.0) == 0.0
 
 
 # =====================================================================

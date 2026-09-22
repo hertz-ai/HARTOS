@@ -226,6 +226,31 @@ def test_a_stats_pass_grants_proof_with_no_hash_check_on_record():
     assert peer.integrity_status == 'verified'
 
 
+# -- the audit door agrees with the challenge door -------------------------
+
+def test_the_audit_door_renders_the_same_verdict_as_the_challenge_door():
+    """Two functions judge "is this peer's code hash acceptable": the challenge
+    evaluator (code_hash_check) and IntegrityService.verify_code_hash (the
+    audit door, via run_full_audit and verify_post_update). After 5e83047b5
+    the first called an unregistered hash inconclusive while the second still
+    scored it +30 hash_mismatch (ring review, 2026-09-23). Same input, same
+    verdict, nothing scored."""
+    from integrations.social.integrity_service import IntegrityService
+    peer = a_peer(code_hash=NEW, status='claimed')
+    db = MagicMock()
+    db.query.return_value.filter_by.return_value.first.return_value = peer
+    with patch('security.release_hash_registry.get_release_hash_registry',
+               return_value=_registry(set())), \
+            patch('security.master_key.load_release_manifest',
+                  return_value={'code_hash': OLD}), \
+            patch('security.master_key.verify_release_manifest', return_value=True), \
+            patch.object(IntegrityService, 'increase_fraud_score') as inc:
+        res = IntegrityService.verify_code_hash(db, 'node_x')
+    assert res['verified'] is False
+    assert res.get('inconclusive') is True, res
+    inc.assert_not_called()
+
+
 # -- the announce path is not a second granter of proof ---------------------
 
 def _announce(status_before):
