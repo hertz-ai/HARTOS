@@ -1024,18 +1024,29 @@ class TestCodeHashCheckVsUpdates:
         assert peer.code_hash == 'new_release_hash', \
             'the baseline must advance or the next challenge re-flags the same release'
 
-    def test_unknown_hash_still_fails(self, db):
+    def test_unknown_hash_off_a_registered_release_is_not_proven(self, db):
+        """A node that WAS on a registered release now reports a hash the
+        registry does not know. Since 5e83047b5/b8b1b14ff that is inconclusive,
+        not a failure: it is also what a fleet rollout looks like until the
+        registry catches up. What must still hold is what this test always
+        protected: the unregistered hash is not accepted as the new reference
+        and the peer is not proven. (The mock used to say "every hash is
+        unknown", so the 'release' baseline was itself unregistered and the
+        case fell into the unknown-to-unknown branch; ring review 2026-09-23.)"""
         from integrations.social.integrity_service import IntegrityService
-        peer = _make_peer(db, code_hash='old_release_hash')
+        peer = _make_peer(db, code_hash='old_release_hash', fraud_score=0.0)
         ch = self._challenge(db, peer)
         with patch('security.release_hash_registry.get_release_hash_registry') as reg:
-            reg.return_value.is_known_release_hash.return_value = False
+            reg.return_value.is_known_release_hash.side_effect = \
+                lambda h: h == 'old_release_hash'
             result = IntegrityService.evaluate_challenge_response(
                 db, ch.id, {'nonce': 'ch_nonce', 'code_hash': 'tampered_hash'}, '')
         assert result['passed'] is False
-        assert 'Code hash changed' in result['details']
+        assert result.get('inconclusive') is True
         assert peer.code_hash == 'old_release_hash', \
-            'a REJECTED hash must not advance the baseline'
+            'an unregistered hash must not become the reference'
+        assert peer.integrity_status != 'verified'
+        assert (peer.fraud_score or 0.0) == 0.0
 
     def test_registry_unavailable_keeps_old_behaviour(self, db):
         from integrations.social.integrity_service import IntegrityService
