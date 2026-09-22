@@ -607,7 +607,17 @@ def _reads_as_still_waking(error) -> bool:
     said = str(error).lower()
     if 'refused' in said or 'no connection could be made' in said:
         return False
-    return 'read timed out' in said or 'readtimeout' in said
+    # A RESET is also "busy", not "gone".  MEASURED 2026-09-22: the server
+    # dropped the connection at 09:42 while loading its vae and text
+    # encoder, and at 09:43:30 logged "Generating audio... (DiT backend:
+    # PyTorch (cuda))" and carried on to completion.  Reported as a failure,
+    # the caller abandoned a composition that was working -- and the memo
+    # never filled for a sound that did get made.
+    return ('read timed out' in said
+            or 'readtimeout' in said
+            or 'connection aborted' in said
+            or 'connectionreset' in said
+            or '10054' in said)
 
 
 def _generate_video(context: str, input_text: str,

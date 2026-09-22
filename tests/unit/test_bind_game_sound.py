@@ -829,3 +829,24 @@ def test_calling_again_finishes_a_composition_instead_of_reporting_it():
     assert answer['music']['url'] == 'https://node/finished.mp3'
     # and it did NOT start a second composition for the same state
     assert not media.generate_media.called, 'composed twice for one state'
+
+
+def test_a_reset_from_a_loading_composer_is_not_a_failure():
+    """MEASURED 2026-09-22 with timestamps from the live server.
+
+    It dropped the connection at 09:42 while loading its vae and text
+    encoder, then at 09:43:30 logged "Generating audio... (DiT backend:
+    PyTorch (cuda))" and ran to completion. Calling that a failure made
+    the caller abandon a composition that was working, so the memo never
+    filled for a sound that did get made.
+    """
+    from integrations.service_tools.media_agent import _reads_as_still_waking
+
+    reset = ("('Connection aborted.', ConnectionResetError(10054, 'An "
+             "existing connection was forcibly closed by the remote host'))")
+    assert _reads_as_still_waking(reset)
+    assert _reads_as_still_waking('HTTPConnectionPool: Read timed out.')
+    # but a refusal still means nothing is listening
+    assert not _reads_as_still_waking(
+        'No connection could be made because the target machine actively '
+        'refused it')
