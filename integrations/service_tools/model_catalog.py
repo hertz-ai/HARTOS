@@ -926,6 +926,104 @@ class ModelCatalog:
                         "must stay resident)", model_id, was[0], entry.vram_gb,
                         was[1], entry.ram_gb)
 
+    def record_residency(self, model_id: str, vram_gb: Optional[float] = None,
+                         ram_gb: Optional[float] = None,
+                         weight_file: Optional[str] = None) -> bool:
+        """Record what THIS model actually took when we brought it up.
+
+        The reclaim figure has to come from what we started, not from the
+        driver and not from a slot. Measured: `nvidia-smi
+        --query-compute-apps=pid,used_memory` returns [N/A] on Windows
+        WDDM, so per-process VRAM is not obtainable from hardware at all.
+        And vram_manager's ledger is keyed by TOOL -- VRAM_BUDGETS holds
+        "acestep"/"wan2gp"/..., record_actual_usage takes the GPUWorker's
+        name -- so every model loading into the `llm` slot overwrites one
+        entry. That makes can_fit('llm') unable to tell "can the 4B fit"
+        from "can the 35B fit", and leaves the reclaim figure describing
+        whichever model happened to load last.
+
+        This record is keyed by MODEL and lives on the model's own row, so
+        it sits beside the PREDICTED facts read_gguf_facts took from the
+        file. Predicted and observed, one place, per model.
+
+        ``weight_file`` is recorded and checked on read because one
+        catalog row can be re-pointed at a different quant, and a Q4 and a
+        Q8 of the same repo have wildly different footprints. A record
+        that describes a quant the row no longer uses is worse than no
+        record.
+
+        Callers obtain the numbers by DELTA around the spawn -- free
+        memory before, free memory once the server answers -- which is how
+        the 2.87 GiB figure for Tiel-Coder was measured. Nothing else can
+        supply it on this platform.
+
+        Returns True when something was recorded.
+        """
+        entry = self._entries.get(model_id)
+        if entry is None:
+            logger.info("record_residency: %r is not in the catalog",
+                        model_id)
+            return False
+        if vram_gb is None and ram_gb is None:
+            return False
+
+        rec = dict(entry.capabilities.get('residency') or {})
+        # A negative or absurd delta means something else moved during the
+        # measurement window. Drop it rather than poison the record: the
+        # next load measures again, while a bad number would be persisted
+        # and planned against.
+        for key, val in (('vram_gb', vram_gb), ('ram_gb', ram_gb)):
+            if val is None:
+                continue
+            try:
+                gb = float(val)
+            except (TypeError, ValueError):
+                continue
+            if gb <= 0 or gb > 512:
+                logger.info("record_residency: %s %s=%r out of range; "
+                            "ignored", model_id, key, val)
+                continue
+            rec[key] = round(gb, 2)
+        if not rec:
+            return False
+
+        rec['weight_file'] = (weight_file
+                              or (entry.files or {}).get('model') or '')
+        rec['at'] = time.time()
+        entry.capabilities = {**(entry.capabilities or {}),
+                              'residency': rec}
+        logger.info("%s: residency recorded -- vram %s GB, ram %s GB (%s)",
+                    model_id, rec.get('vram_gb'), rec.get('ram_gb'),
+                    rec['weight_file'] or 'no weight file')
+        return True
+
+    def residency(self, model_id: str) -> Optional[dict]:
+        """What this model took last time we brought it up, or None.
+
+        None means "not known" and callers fall back to the catalog
+        estimate -- never to zero. A model whose footprint is unknown is
+        not a model that is free.
+
+        Returns None when the row now points at a DIFFERENT weight file
+        than the record was taken against: the row was re-pointed at
+        another quant and the old number describes weights that are no
+        longer there.
+        """
+        entry = self._entries.get(model_id)
+        if entry is None:
+            return None
+        rec = (entry.capabilities or {}).get('residency')
+        if not rec:
+            return None
+        current = (entry.files or {}).get('model') or ''
+        recorded = rec.get('weight_file') or ''
+        if current and recorded and current != recorded:
+            logger.info(
+                "%s: residency record is for %r but the row now uses %r; "
+                "treating as unknown", model_id, recorded, current)
+            return None
+        return dict(rec)
+
     def mark_loaded(self, model_id: str, device: str = 'gpu') -> None:
         entry = self._entries.get(model_id)
         if entry:

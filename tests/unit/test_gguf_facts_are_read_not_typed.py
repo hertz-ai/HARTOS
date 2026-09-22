@@ -442,3 +442,121 @@ class TestTheSizingFunctionThatDidNotExist:
 
     def test_zero_is_not_a_crash(self):
         assert llama_gguf_compute_requirements(0.0) == (0.0, 0.0)
+
+
+class TestTheResidencyRecordIsModelAwareNotSlotAware:
+    """What a model took when WE brought it up, keyed by the model.
+
+    The reclaim figure cannot come from anywhere else. Measured:
+    `nvidia-smi --query-compute-apps=pid,used_memory` returns [N/A] on
+    Windows WDDM, so per-process VRAM is not obtainable from hardware.
+    And vram_manager's ledger is keyed by TOOL, so every model loading
+    into the `llm` slot overwrites one entry -- which is why can_fit('llm')
+    cannot tell a 4B from a 35B.
+
+    Eviction and swap are separate concerns (owner, 2026-09-22) and ask
+    opposite questions of this same data: eviction asks what it gets back
+    if a model goes, swap asks whether a newcomer can come up alongside.
+    The record serves both; neither owns it."""
+
+    def _cat(self, **over):
+        c = ModelCatalog.__new__(ModelCatalog)
+        c._entries, c._populators = {}, {}
+        c._lock = __import__('threading').RLock()
+        f = dict(id='m', name='M', model_type=ModelType.LLM,
+                 backend='llama.cpp', files={'model': 'tiel-q4.gguf'},
+                 vram_gb=3.4, ram_gb=18.6, capabilities={'moe': True})
+        f.update(over)
+        c._entries['m'] = ModelEntry(**f)
+        return c
+
+    def test_what_we_brought_up_is_read_back(self):
+        c = self._cat()
+        assert c.record_residency('m', vram_gb=2.87, ram_gb=4.26) is True
+        r = c.residency('m')
+        assert (r['vram_gb'], r['ram_gb']) == (2.87, 4.26)
+        assert r['weight_file'] == 'tiel-q4.gguf'
+
+    def test_it_sits_beside_the_predicted_facts(self, big_moe):
+        """read_gguf_facts predicts from the file; this observes after the
+        load. Same row, same key, so predicted vs observed is one place."""
+        c = self._cat()
+        c.mark_downloaded('m', True, gguf_path=big_moe)
+        c.record_residency('m', vram_gb=2.87)
+        caps = c._entries['m'].capabilities
+        assert caps['non_expert_bytes'] == 1 * (1024 ** 3)   # predicted
+        assert caps['residency']['vram_gb'] == 2.87          # observed
+
+    def test_unknown_is_none_and_never_zero(self):
+        """A model whose footprint is unknown is not a model that is
+        free. Zero would let a planner admit anything."""
+        assert self._cat().residency('m') is None
+
+    def test_an_unknown_model_id_records_nothing(self):
+        assert self._cat().record_residency('nope', vram_gb=2.0) is False
+
+    def test_a_record_for_a_different_quant_is_not_trusted(self):
+        """One row can be re-pointed at another quant, and Q4 vs Q8 of the
+        same repo differ hugely. A record describing weights that are no
+        longer there is worse than no record."""
+        c = self._cat()
+        c.record_residency('m', vram_gb=2.87)
+        c._entries['m'].files['model'] = 'tiel-q8.gguf'
+        assert c.residency('m') is None
+
+    def test_re_recording_against_the_new_quant_restores_it(self):
+        c = self._cat()
+        c.record_residency('m', vram_gb=2.87)
+        c._entries['m'].files['model'] = 'tiel-q8.gguf'
+        c.record_residency('m', vram_gb=9.1)
+        assert c.residency('m')['vram_gb'] == 9.1
+
+    def test_both_dimensions_are_kept_and_can_arrive_separately(self):
+        """A MoE's footprint is two numbers -- attention in VRAM, experts
+        in RAM -- and the caller may learn them at different moments."""
+        c = self._cat()
+        c.record_residency('m', vram_gb=2.87)
+        c.record_residency('m', ram_gb=18.64)
+        r = c.residency('m')
+        assert (r['vram_gb'], r['ram_gb']) == (2.87, 18.64)
+
+    def test_a_polluted_measurement_is_dropped_not_stored(self):
+        """The numbers come from a DELTA around the spawn, so another
+        process moving during the window can produce a negative or absurd
+        figure. Dropping it means the next load measures again; storing it
+        would be persisted and planned against."""
+        c = self._cat()
+        for bad in (-1.0, 0.0, 9999.0, 'nonsense', None):
+            c.record_residency('m', vram_gb=bad)
+        assert c.residency('m') is None
+
+    def test_a_bad_value_does_not_destroy_a_good_one(self):
+        c = self._cat()
+        c.record_residency('m', vram_gb=2.87)
+        c.record_residency('m', vram_gb=-5.0)
+        assert c.residency('m')['vram_gb'] == 2.87
+
+    def test_recording_does_not_touch_the_planning_estimates(self):
+        """The record informs a planner; it does not silently become the
+        row's declared size. Those are corrected deliberately, from the
+        file, by mark_downloaded."""
+        c = self._cat()
+        before = (c._entries['m'].vram_gb, c._entries['m'].ram_gb,
+                  c._entries['m'].priority)
+        c.record_residency('m', vram_gb=2.87, ram_gb=4.26)
+        e = c._entries['m']
+        assert (e.vram_gb, e.ram_gb, e.priority) == before
+
+    def test_it_survives_serialization(self):
+        """The next swap plans without re-measuring, so it has to persist
+        with the catalog."""
+        c = self._cat()
+        c.record_residency('m', vram_gb=2.87, ram_gb=4.26)
+        revived = ModelEntry.from_dict(c._entries['m'].to_dict())
+        assert revived.capabilities['residency']['vram_gb'] == 2.87
+
+    def test_it_is_not_relayed_to_peers(self):
+        """A measurement taken on an 8 GB card is a fact about THIS
+        machine, not about the model. The mesh whitelist must exclude it."""
+        from integrations.service_tools.model_mesh import _FACT_KEYS
+        assert 'residency' not in _FACT_KEYS
