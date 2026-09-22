@@ -124,18 +124,30 @@ def test_an_unknown_hash_replacing_an_unknown_hash_is_inconclusive():
     assert ch.status == 'inconclusive'
 
 
-def test_leaving_a_known_release_is_still_a_failure():
-    """Preservation: a node that was on a signed release and now is not."""
-    from integrations.social.integrity_service import FRAUD_WEIGHTS
+def test_leaving_a_known_release_is_inconclusive_and_keeps_the_reference():
+    """A fleet rollout looks like this from central until the registry catches
+    up (it learns a release from the release-sign commit, its own manifest, or
+    upgrade_orchestrator; it has no revocation list), so it is not evidence.
+    The registered hash stays the reference so the check re-asks every round."""
     peer = a_peer(code_hash=OLD, status='verified')
     res, inc, dec, ch = _evaluate(peer, known={OLD})
     assert res['passed'] is False
-    assert not res.get('inconclusive')
-    inc.assert_called_once()
-    assert inc.call_args[0][2] == FRAUD_WEIGHTS['challenge_fail']
-    assert peer.code_hash == OLD, 'a failed check must not advance the baseline'
-    assert peer.integrity_status == 'claimed'
-    assert ch.status == 'failed'
+    assert res.get('inconclusive') is True, res
+    inc.assert_not_called()
+    dec.assert_not_called()
+    assert peer.code_hash == OLD, 'the registered reference must not move to an unregistered hash'
+    assert peer.integrity_status == 'claimed', 'proof must be withdrawn'
+    assert ch.status == 'inconclusive'
+
+
+def test_the_registry_catching_up_turns_the_move_into_a_pass():
+    """The round after the release-sign commit lands: same peer, same new
+    hash, now known -> passed, baseline advanced, proof resumes."""
+    peer = a_peer(code_hash=OLD, status='claimed')
+    res, inc, dec, ch = _evaluate(peer, known={OLD, NEW})
+    assert res['passed'] is True
+    assert peer.code_hash == NEW
+    assert peer.integrity_status == 'verified'
 
 
 def test_an_update_to_a_known_release_still_passes():

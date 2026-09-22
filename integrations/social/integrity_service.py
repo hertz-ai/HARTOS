@@ -480,10 +480,23 @@ class IntegrityService:
                     details = ('Code hash advanced to a known signed release '
                                '(peer updated)')
                 elif old_known:
-                    # The node WAS on a signed release and now runs something
-                    # that is not.  That is evidence: it left the signed set.
-                    passed = False
-                    details = 'Code hash left the signed release set'
+                    # The node WAS on a registered release and now reports a
+                    # hash this registry does not know.  That is what a fleet
+                    # rollout looks like from central for as long as the
+                    # registry has not caught up: it learns a release from the
+                    # release-sign commit landing here, from its own manifest,
+                    # or from upgrade_orchestrator.add_runtime_hash, and it has
+                    # no revocation list, so "unknown this round" is not
+                    # evidence of tampering (hartos-14's review of 5e83047b5).
+                    # Inconclusive, and the registered hash STAYS the
+                    # reference: every round re-asks the registry, the moment
+                    # it knows the new hash this becomes a pass and the
+                    # baseline advances; a build that never registers is never
+                    # proven again, and never banned for it either.
+                    inconclusive = True
+                    details = ('Code hash moved off a registered release to an '
+                               'unregistered one: proof withheld until the '
+                               'registry knows it, reference kept, nothing scored')
                 else:
                     # Neither hash is a registered release.  A bundled desktop's
                     # hash is sha256(exe|mtime), per install, never registered,
