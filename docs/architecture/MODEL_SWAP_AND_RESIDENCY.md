@@ -23,7 +23,99 @@ to be wired unless it says so.
 | trigger | memory pressure | a job needs a different model |
 | nature | involuntary | deliberate |
 | main LLM | **excluded** (`state.pinned = True`) | **the whole point** |
-| machinery | `_detect_*_pressure`, `_respond_to_*_pressure`, `_evict_idle_models` | does not exist yet |
+| machinery | `_detect_*_pressure`, `_respond_to_*_pressure`, `_evict_idle_models`, `request_swap` | `llamacpp_manager.swap_model` |
+
+**Correction, 2026-09-22.** An earlier draft of this document said the
+swap machinery "does not exist yet". That was written without checking,
+and it is wrong twice over.
+
+`request_swap` / `_process_swap_queue` / `_attempt_swap` are all on the
+EVICTION side — they make room by evicting GPU **sidecars**, and they
+exclude the main LLM explicitly:
+
+```python
+# LLMs are owned by llama-server (separate process); evicting
+# them from the registry doesn't free VRAM.
+# Skip them as swap candidates so we never burn down the
+# active LLM in exchange for a TTS that still won't fit.
+and not s.name.startswith('llm-')
+and s.model_type != 'llm'
+```
+
+The main-LLM swap **does** exist. There are **two** implementations, one
+per server owner, and on 2026-09-22 neither one worked.
+
+### 1.1 The desktop path — reports success, changes nothing
+
+`POST /api/llm/switch` → `main.py:2163` builds a **fresh `LlamaConfig()`
+per request** → `LlamaConfig.switch_model(n)`:
+
+```
+1. self.stop_server()
+      `if self.server_process:` — and server_process is assigned ONLY in
+      __init__ (None) and in THIS instance's own Popen (:2565).  Nothing
+      restores it from the status file.  On a per-request instance it is
+      None, so the incumbent is NEVER STOPPED.
+
+2. config['selected_model_index'] = n ; _save_config()
+
+3. start_server(preset) -> _do_start_server
+      scans [desired_port, 8080, 8081], finds the incumbent STILL RUNNING,
+      check_server_type -> EXTERNAL_LLAMA -> adopts it, and its "sync
+      catalog with the ACTUAL running model" block REWRITES
+      selected_model_index back to the incumbent's index (:1949-1950)
+      -> returns True
+```
+
+The endpoint returns `{"success": true, "model_name": <the NEW model>}`,
+`orch.notify_loaded` books the **new** model's VRAM in the catalog, the
+config self-heals back to the **old** index, and the server is still
+serving the **old** model. Nothing changed and every surface says it did.
+
+Branch conditions confirmed live on the reference box, read-only:
+llama-server on :8080 answers `{"status":"ok"}` → `EXTERNAL_LLAMA` → the
+adopt branch fires; running model `Qwen3.5-4B-UD-Q4_K_XL.gguf`;
+`server_port` 8080, `selected_model_index` 0.
+
+**Same defect, second entry point.** `models/orchestrator.py`
+`LlamaLoader.load()` also calls `config.start_server(preset)` on a fresh
+`LlamaConfig` → same adopt → `True`; and `LlamaLoader.unload()` calls
+`config.stop_server()` on a fresh instance → also a no-op. So Model
+Management can neither swap nor unload the LLM. This corroborates
+`model_lifecycle._record_llm_alive`'s pin comment — *"an EXTERNAL adopted
+llama-server the lifecycle CANNOT actually unload"* — which turns out to
+describe a defect, not a property.
+
+### 1.2 The HARTOS path — goes dark, but only where it can run
+
+```
+llamacpp_manager.swap_model(new_model_path)     <- self._port defaults to 8080
+    self._stop_locked()
+    return self._start_locked(new_model_path, port, **kwargs)
+
+called from model_onboarding.py:321 — switch_model(), i.e. the
+`switch_model` MCP tool and POST /api/models/switch
+```
+
+Break-before-make on a single port. On the **desktop** it is inert:
+`_start_locked`'s adopt guard (`probe_llm()` status `up`, placed after the
+2026-09-13 second-server incident) returns `False` before anything
+starts — so it cannot go dark there, and it cannot swap either. On a
+**standalone HARTOS node**, where this manager owns the process, it does
+go dark, for the ~7 minutes a large model takes to load, with no
+rollback.
+
+### 1.3 Why make-before-break is not a drop-in
+
+`_start_locked` refuses twice over — once if `self._process` is live
+(*"stop first or use swap_model()"*), once if any main server answers the
+canonical probe. Both guards encode "exactly one server, owned by this
+object". A swap needs two, transiently. The guards are right about
+accidents and wrong about a deliberate replacement; the distinction they
+are missing is **ownership**, not intent.
+
+So the work is not a new planner beside the existing ones. It is one
+sequence, placed where both owners can drive it.
 
 The pin is not an obstacle to the swap. The swap never asks the evictor, so
 there is nothing to bypass. The pin earned its place: it fixed an incident
