@@ -2078,32 +2078,72 @@ class GossipProtocol:
             if active_peers:
                 from .integrity_service import IntegrityService
 
-                # 1. Guardrail audit: re-verify ALL active peers' guardrail hashes.
-                #    This is the continuous audit - every node checks every other node.
+                # 1+2. Guardrail audit (GET) and deep challenge (POST): ONE
+                #    pass, both steps per peer, under a WALL-CLOCK BUDGET with
+                #    a resume cursor -- the isolation-against-duration the
+                #    health round has (see _health_check_round), for the same
+                #    reason.  This is the continuous audit: every node checks
+                #    every other node, and each peer gets a different challenge
+                #    type per pass (round-robin).
                 #
-                #    Commit after EVERY peer, in this loop and the next.  Both
-                #    make one network call per active peer and used to commit
-                #    once after the whole loop, so from the first fraud-score
-                #    flush onward the round held SQLite's single write lock
-                #    across every remaining probe (5s GET here, a 30s POST
-                #    below).  Measured on a desktop 2026-09-02: 525 active
-                #    peers, most unroutable, one round ran for hours,
-                #    integrity_interval is 300s, and the agent daemon logged
-                #    "database is locked" on every tick with zero goal updates
-                #    persisted (#71).  Same shape, same fix as the health
-                #    round (374f5ab6); create_challenge also commits its own
-                #    row before it POSTs.
-                for peer in active_peers:
+                #    Commit after EVERY peer.  Both steps make one network call
+                #    per active peer and used to commit once after the whole
+                #    loop, so from the first fraud-score flush onward the round
+                #    held SQLite's single write lock across every remaining
+                #    probe (5s GET, 30s POST).  Measured on a desktop
+                #    2026-09-02: 525 active peers, most unroutable, one round
+                #    ran for hours, integrity_interval is 300s, and the agent
+                #    daemon logged "database is locked" on every tick with zero
+                #    goal updates persisted (#71).  Same shape, same fix as the
+                #    health round (374f5ab6); create_challenge also commits its
+                #    own row before it POSTs.
+                #
+                #    The per-row commit fixed the LOCK and left the DURATION.
+                #    Measured on central 2026-09-22: 1,149 'active' rows, 774
+                #    of them private 10.x/192.168.x addresses unroutable from
+                #    the container, so the audit pass alone ate ~65 min (774 x
+                #    5s) before the FIRST challenge row could exist, then the
+                #    challenge pass ran ~30s per peer: one "300s" round took
+                #    ~10h, and gossip and health (same thread, in sequence)
+                #    did not run either.  Under a deploy cadence of a container
+                #    every 20-60 min the challenge pass was never reached:
+                #    newest row 2026-09-21 21:50Z, zero rows across the next 13
+                #    containers, one health-round line in 45 min of log.  So:
+                #    audit AND challenge each peer as it comes (challenges
+                #    begin inside the first window), stop at the budget,
+                #    remember where we were, resume there next tick.  A
+                #    structurally-unroutable row (#38) is skipped, not probed:
+                #    the health round deletes those, and a call to nowhere is
+                #    exactly the cost this budget exists to bound.
+                challenge_types = ['agent_count_verify', 'code_hash_check',
+                                   'stats_probe', 'guardrail_verify']
+                _budget_s = float(os.environ.get(
+                    'HEVOLVE_INTEGRITY_ROUND_BUDGET_S', '30'))
+                _started = time.time()
+                _cursor = getattr(self, '_integrity_cursor', 0) % len(active_peers)
+                _ordered = active_peers[_cursor:] + active_peers[:_cursor]
+                _examined = 0
+                for i, peer in enumerate(_ordered):
+                    if not self._running:
+                        break
+                    if time.time() - _started > _budget_s:
+                        self._integrity_cursor = (
+                            getattr(self, '_integrity_cursor', 0) + _examined)
+                        logger.warning(
+                            "Integrity round hit its %.0fs budget after %d/%d "
+                            "peers; yielding so the gossip and health rounds "
+                            "are not starved (resumes from this point next "
+                            "round)", _budget_s, _examined, len(_ordered))
+                        break
+                    _examined += 1
+                    _bad_url, _ = is_unroutable_peer_url(peer.url)
+                    if _bad_url:
+                        continue
                     self._audit_peer_guardrails(db, peer)
                     self._flush_health_row(db, round_name='Integrity round')
                     self._heartbeat()
-
-                # 2. Deep challenge: cycle through challenge types across all peers.
-                #    Each peer gets a different challenge type per round (round-robin).
-                challenge_types = ['agent_count_verify', 'code_hash_check',
-                                   'stats_probe', 'guardrail_verify']
-                for i, peer in enumerate(active_peers):
-                    challenge_type = challenge_types[i % len(challenge_types)]
+                    challenge_type = challenge_types[
+                        (_cursor + i) % len(challenge_types)]
                     try:
                         IntegrityService.create_challenge(
                             db, self.node_id, peer.node_id,
