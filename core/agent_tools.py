@@ -856,6 +856,28 @@ from core.game_sound_memo import (  # noqa: E402
 )
 
 
+#: How long a timed-out submit is assumed to still be queued server-side
+#: before this client will submit the same state again.  AceStep's own
+#: /v1/stats reported avg_job_seconds 907 on a shared GPU; the value is a
+#: floor on duplicates, not a promise about completion.
+SUBMIT_COOLDOWN_S = 600
+
+
+def _pending_submit(games, game_id, state, level=None, user_id=None):
+    """When this state's last submit went out with no id learned, else None.
+
+    A record with 'submitted_at' and neither 'url' nor 'task_id' is a submit
+    whose reply timed out.  The ladder ignores it (nothing to play, nothing to
+    poll), so it is read here directly."""
+    slot = (games or {}).get(str(game_id), {})
+    sounds = ((slot.get('mine') or {}).get(str(user_id), {}) if user_id
+              else (slot.get('sounds') or {}))
+    record = sounds.get(game_state_key(state, level)) or {}
+    if record.get('url') or record.get('task_id'):
+        return None
+    return record.get('submitted_at')
+
+
 def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
     """Put a newly composed game sound in front of the person, to hear.
 
@@ -1283,6 +1305,27 @@ def build_core_tool_closures(ctx):
         task_id = bound.get('task_id')
         try:
             if not task_id:
+                # A submit whose RESPONSE timed out may still have been
+                # ACCEPTED.  MEASURED 2026-09-22 on a live AceStep: two
+                # 'warming_up' answers, then a third submit that got an id --
+                # and /v1/stats reported FIVE jobs from this one caller
+                # (2 succeeded, 1 running, 2 queued, avg 907s each).  Every
+                # retry had enqueued a real job the client never learned the
+                # id of, and the one id it did hold sat "queued" behind its
+                # own orphans.  /release_task takes no idempotency key, so
+                # the only dedupe is here: after a timed-out submit, do not
+                # submit again for this state until a cooldown has passed.
+                _pending = _pending_submit(games, slot, which, level, mine)
+                if _pending and time.time() - _pending < SUBMIT_COOLDOWN_S:
+                    return json.dumps({
+                        'status': 'composing',
+                        'game_id': slot,
+                        'state': which,
+                        'note': ("A submission for this state may already be "
+                                 "in the composer's queue (the last one was "
+                                 "accepted but its reply timed out); waiting "
+                                 "for it rather than queueing a second."),
+                    })
                 started = json.loads(generate_media(
                     context=prompt,
                     output_modality='audio_music',
@@ -1308,7 +1351,13 @@ def build_core_tool_closures(ctx):
                     # Not a refusal: the composer is getting ready, which on
                     # a first run means downloading its model.  Saying it
                     # refused would be wrong AND would leave the game with
-                    # nothing pending to come back to.
+                    # nothing pending to come back to.  And the POST may have
+                    # been accepted: remember WHEN it went out, so the next
+                    # call waits instead of queueing a duplicate.
+                    _remember({'submitted_at': time.time(), 'mood': mood,
+                               'prompt': prompt, 'state': which,
+                               'level': level or None, 'variant': variant,
+                               'composed_at': None, 'approved_at': None})
                     return json.dumps({
                         'status': 'composing',
                         'game_id': slot,

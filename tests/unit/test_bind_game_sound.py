@@ -879,3 +879,40 @@ def test_a_reset_while_polling_keeps_polling_instead_of_failing():
 
     assert answer['status'] == 'bound', 'a reset mid-poll was reported as failure'
     assert answer['music']['url'] == 'https://node/finished.wav'
+
+
+def test_a_timed_out_submit_is_not_submitted_again_inside_the_cooldown():
+    """MEASURED 2026-09-22: /v1/stats reported FIVE jobs from one caller.
+
+    Two 'warming_up' answers (the submit's reply timed out), then a third
+    submit that got an id -- and every one had been ACCEPTED server-side.
+    The id the client finally held sat "queued" behind its own orphans.
+    /release_task has no idempotency key, so the dedupe lives here.
+    """
+    media = _media({'status': 'warming_up',
+                    'message': 'The composer is starting up. Ask again shortly.'})
+
+    with _agent({}, media) as tools:
+        first = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+        second = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+
+    assert first['status'] == 'composing'
+    assert second['status'] == 'composing'
+    assert 'queue' in second['note'].lower()
+    assert media.generate_media.call_count == 1, (
+        'a timed-out submit was retried and queued a duplicate job')
+
+
+def test_after_the_cooldown_one_more_submit_is_allowed():
+    """The cooldown is a floor on duplicates, not a permanent latch."""
+    import core.agent_tools as at
+    media = _media({'status': 'warming_up', 'message': 'starting up'})
+    agent_data = {}
+
+    with _agent(agent_data, media) as tools:
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+        rec = agent_data[4242]['games']['eng-01']['sounds']['correct']
+        rec['submitted_at'] -= (at.SUBMIT_COOLDOWN_S + 1)
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+
+    assert media.generate_media.call_count == 2
