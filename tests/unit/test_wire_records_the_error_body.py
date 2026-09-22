@@ -52,9 +52,30 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+import urllib.request  # noqa: E402
+
+import pytest  # noqa: E402
+
+import core  # noqa: E402
+import core.llm_outbound_logger  # noqa: E402
 from tests.unit.test_llm_outbound_logger import (  # noqa: E402
     _FakeResponse, _drive_one_send,
 )
+
+
+@pytest.fixture(autouse=True)
+def _restore_the_logger_module(monkeypatch):
+    """Each test here re-imports the logger (``_reset_module`` deletes it from
+    sys.modules) and ``install()`` wraps the real ``urllib.request.urlopen``.
+    Neither was undone, so the next file's ``outbound`` alias and the
+    backend's fresh ``from core.llm_outbound_logger import`` saw two
+    different modules: test_copilot_outbound_record went 11/11 alone, 5/11
+    after this file.  Registering the current values with monkeypatch puts
+    them back at teardown."""
+    orig = sys.modules['core.llm_outbound_logger']
+    monkeypatch.setitem(sys.modules, 'core.llm_outbound_logger', orig)
+    monkeypatch.setattr(core, 'llm_outbound_logger', orig)
+    monkeypatch.setattr(urllib.request, 'urlopen', urllib.request.urlopen)
 
 # The exact shape llama-server returns for the overflow that produced all 60
 # of the measured 400s.
