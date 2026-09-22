@@ -1159,15 +1159,16 @@ def build_core_tool_closures(ctx):
                 'music': bound,
                 'note': f'This game already has its {which}; it is never composed twice.',
             })
-        if matched == 'composing':
-            return json.dumps({
-                'status': 'composing',
-                'game_id': slot,
-                'state': which,
-                'task_id': bound.get('task_id'),
-                'note': 'A composition for this exact state is already running; '
-                        'call again with the same arguments to finish it.',
-            })
+        # NO early return for a composition already under way.  It used to
+        # return here saying "call again with the same arguments to finish
+        # it" -- and calling again hit this same branch and said it again,
+        # forever.  MEASURED 2026-09-22: twelve consecutive calls, the
+        # composition finishing on the server in the middle of them, and the
+        # memo never receiving the url.  The resume path below (`task_id =
+        # bound.get('task_id')`, which skips the submit and polls the
+        # existing task) was unreachable, so the note was a promise the code
+        # could not keep.  Falling through IS the dedupe: an existing
+        # task_id means poll it, never start a second composition.
 
         def _remember(record):
             set_game_state_sound(games, slot, which, record, level, mine)

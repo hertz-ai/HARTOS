@@ -802,3 +802,30 @@ def test_a_refused_connection_is_still_a_refusal():
     assert not _reads_as_still_waking(
         'No connection could be made because the target machine actively '
         'refused it')
+
+
+def test_calling_again_finishes_a_composition_instead_of_reporting_it():
+    """MEASURED 2026-09-22 against a live composer.
+
+    bind_game_sound returned "call again with the same arguments to finish
+    it" and calling again hit the same branch and said it again -- twelve
+    times, while the composition finished on the server in the middle of
+    them and the memo never received the url. The resume path was
+    unreachable behind an early return, so the note was a promise the code
+    could not keep.
+    """
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct': {'task_id': 'acestep_abc', 'mood': 'happy',
+                    'prompt': 'p', 'state': 'correct'}}}}}}
+    media = _media({'status': 'pending', 'task_id': 'acestep_abc'},
+                   {'status': 'completed',
+                    'results': [{'url': 'https://node/finished.mp3'}]})
+
+    with _agent(agent_data, media) as tools:
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+
+    assert answer['status'] == 'bound', (
+        'a finished composition still reported as composing')
+    assert answer['music']['url'] == 'https://node/finished.mp3'
+    # and it did NOT start a second composition for the same state
+    assert not media.generate_media.called, 'composed twice for one state'
