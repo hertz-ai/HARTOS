@@ -780,3 +780,100 @@ rules of (f) still hold.
 Audit note: GL1 as shipped changes only the panel's alpha. No new window, no new
 transport, nothing on the hot path, no Win32 call; a platform without
 `-alpha` keeps the solid panel (degrade-not-die).
+
+## 2026-09-21 - The floating glass is GPU-shaded and native on all three desktops
+
+Extends GL1 with the two things it did not say: the glass must be rendered by
+the **GPU compositor**, and it must be native on **Windows, macOS AND Linux**,
+not a Windows-only affordance. GL1's own measurements stand and are not
+reopened; this says what the destination is, so the next attempt does not
+re-run the two Win32 policies GL1 already disproved with pixels.
+
+| # | Captured intent (verbatim quote) | Item | Status | Evidence |
+|---|---|---|---|---|
+| GL2 | The floating surface is translucent GLASS drawn by the platform's own GPU compositor, using whatever each OS provides natively, on all three desktops. *"what transparent window color bug it shd be natively GOU shaded rendering for transculent glass like display using whatever can render them natively across windows Mac and Linux when floating"* [sic: "GOU" = GPU, "transculent" = translucent, the steward's keystrokes] `[steward 2026-09-21]` | GL1 / b3 / f6 | **WINDOWS REACHED (measured in pixels 2026-09-21); macOS unproven; Linux MISSING** | Said in answer to this session calling the companion's absence a "transparent window colour bug": a background-colour argument is not translucency, and the correction is that the effect belongs to the compositor, not to a hex string. What each platform provides natively: **Windows** - DirectComposition is the GPU compositor, and the route is hosting the page on a DirectComposition visual via `CoreWebView2CompositionController` (already named as the unbuilt candidate in GL1). The DWM backdrops (`DWMWA_SYSTEMBACKDROP_TYPE`, Mica/Acrylic) ARE the OS's GPU glass, but GL1 measured them painting WHITE behind the page, because WebView2's swapchain under pywebview 6.1's WinForms hosting is opaque and never lets the page's alpha reach DWM; composition hosting is exactly what fixes that, so this is one change, not two. **macOS** - `NSVisualEffectView` (`blendingMode = .behindWindow`) behind a borderless `NSWindow` with `isOpaque=NO` and a clear background, with the WKWebView's `drawsBackground` set NO so the page does not paint over it. That is the same "vibrancy glass" b3 already told us to take from macOS. **Linux** - there is NO universal blur-behind protocol, and that must not be hidden: KWin offers `org_kde_kwin_blur` (Wayland) and `_KDE_NET_WM_BLUR_BEHIND_REGION` (X11), wlroots compositors vary, and GNOME/Mutter publishes none. On HART OS itself we OWN the compositor (hart-comp), so there it is ours to render natively and is the one desktop where this is fully in our hands. DEGRADE LADDER, per GF1 (keep the richness, drop only the per-frame cost): native GPU glass -> layered-window alpha blend (what the ribbon ships today at `PANEL_ALPHA = 0.8`) -> solid tinted panel. GL1's proof rule carries unchanged: a compositor claim is proven by screen pixels over a bright backdrop, never by an API return code. Blocked behind a prior fact: the companion window does not exist in the running process at all (measured 2026-09-21 by enumerating every top-level window of the process serving the app; no window titled 'Nanba', and a hidden one would still enumerate), so there is currently no floating surface to shade. |
+
+| GL3 | The glass is ONE code path for every platform, not one per platform. *"okay so why are we not using one code for all platforms design?"* `[steward 2026-09-21]` | GL2 / GF1 | **PARTIAL** | Asked after this session described a three-backend plan, and the steward was right about more than they knew: the LOOK was defined THREE times, and not per platform - three times over for one platform. Measured: HARTOS's canonical `.glass` (liquid_ui_service.py) over tokens whose RUNTIME values theme_service.py:131-132 emits (blur 20px, saturation 180%, radius 16px, panel opacity 0.65, glass rgb 18,19,28); Nunba VoiceOrbPage.jsx:80-82,634 (blur 24px, radius 24, its own gradient); Nunba AgentOverlay.jsx:37-44 (blur 20px, radius 16, rgba(20,20,30,0.92)). Three blur radii for one surface family. THE SPLIT THAT IS REAL: the look is CSS in a webview and renders identically on all three desktops, so it must never fork - what is irreducibly per-platform is ONE question, "can this OS put the desktop behind my window so the page's blur has something to blur", which is an OS capability and not our styling. desktop/glass.py (Nunba 2bcd0d97) answers exactly that and holds no colours, no blur radii and no opacity defaults, enforced by two guards. THE UNIVERSAL OPTION, named so it is a decision and not an oversight: capture the region behind the window and blur it in-page needs no compositor cooperation and would be one code path everywhere - and it turns a decorative effect into continuous screen capture, which this product governs with the `screen_capture` consent type. That trade is the steward's to make, not a session's. DONE since this row was written: the look-vocabularies HAVE collapsed — `landing-page/src/theme/hartGlass.js` (Nunba 4a3129cc) is now the one definition, naming HARTOS `theme_service.py` as the source of every number rather than leaving the agreement to coincidence, and AgentOverlay, VoiceOrbPage, socialTokens and themePresets all read it (two guards). It was FOUR copies, not three: `themePresets.shell` restated the canonical numbers a fourth time. `COMPANION_CARD_RADIUS = 24` stays as a documented exception because it is the native window clip, not a look choice. Remaining is therefore ONLY the steward's call above (capture-and-blur as the universal path, against the `screen_capture` consent it would require) — nothing further is in a session's hands. |
+
+Audit note: GL2 is a DESTINATION; the window-capability half of it landed as
+Nunba 2bcd0d97 and the look half is GL3. Scored against GL1 + GF1:
+
+- **The proof rule (GL1) is now enforceable, not just written down.** Nunba
+  tests/glass_probe.py classifies a surface from screen pixels as OPAQUE /
+  ALPHA / GLASS / UNCERTAIN, and it earns that by measuring transmittance as
+  the CHANGE between a black and a white backdrop (blind to the surface's own
+  tint) and detail as surviving stripe amplitude, with the verdict from their
+  RATIO - a blend passes light and detail in proportion, a blur passes the
+  light and keeps none. It was wrong three times before it was right, each
+  found by measuring surfaces of KNOWN nature rather than by reading it: DPI
+  virtualisation made it read a different region than the one under test; the
+  backdrop was destroyed before the reading that needed it; and presence-by-
+  brightness called the ribbon's own #1E1E1E panel 23% see-through. Validated
+  end to end and physically exact - a window at -alpha 0.8 measures
+  transmittance 0.200. tests/glass_probe_selfcheck.py is that validation,
+  COMMITTED rather than left in a scratchpad, because GL1's own probe
+  (glass_probe2.py) died with its session and had to be rebuilt from nothing.
+- **Rungs per platform, today.** macOS NATIVE_GLASS is reachable and
+  pywebview already builds it (NSVisualEffectView behindWindow under a
+  transparent WKWebView, gated on a `vibrancy` creation kwarg the companion
+  never passed) - claimed from creation flags, with the returned note saying
+  it is owed a pixel proof on a Mac. **Windows NATIVE_GLASS, reached and
+  measured (below).** Linux SOLID with the seam named.
+- **GF1 held**: the ladder degrades (native glass -> layered alpha -> solid)
+  rather than gutting the look, and no backend returns a rung it did not
+  achieve - each declares a ceiling and a test proves none exceeds it with
+  every OS call mocked to succeed.
+- **Not done**: the macOS pixel proof; the Linux backends; and the companion
+  window does not currently exist in the running process at all, so none of
+  this is yet visible to the steward.
+
+### 2026-09-21 (later) - Windows NATIVE_GLASS, proven in pixels
+
+MEASURED on Windows 11 25H2 (build 26200, transparency effects on, AC power,
+not a remote session) by `Nunba tests/glass_native_demo.py`, which builds a
+window, hands it to the one `desktop/glass.py`, and hands the result to
+`tests/glass_probe.py` untouched: **GLASS, transmittance 0.831, detail 0.047,
+retention 0.057** - the light comes through and the detail does not. Repeated
+4/4 across cold starts; 12/12 on a live window. With the product's kind of
+translucent card on the page: GLASS, 0.637 / 0.133 / 0.209.
+
+It takes TWO halves, and the second one contradicts what GL2 predicted:
+
+1. **Composition hosting works, exactly as GL2 said it would.** The page on a
+   DirectComposition visual via `CoreWebView2CompositionController` (a
+   `DCompositionCreateDevice` device, `CreateTargetForHwnd`, `CreateVisual`,
+   the visual marshalled to the controller's `RootVisualTarget`,
+   `DefaultBackgroundColor = Transparent`, `Commit`) makes the page's alpha a
+   PERFECT hole: transmittance 1.000, detail 1.000, measured with no material
+   behind it. That is the half GL1 said was missing, and it is fixed.
+2. **The DWM system backdrop is NOT the material.** `DWMWA_SYSTEMBACKDROP_TYPE`
+   paints a FLAT, fully opaque solid over that composed page - one grey, zero
+   variance over a striped backdrop, transmittance 0.000 - for Acrylic(3),
+   Mica(2) and Tabbed(4) alike, with and without `DwmExtendFrameIntoClientArea`
+   (the frame extension ALONE leaves the window transmitting 1.000, so the
+   attribute is the opaque one). GL1's "flat grey" was never about the
+   hosting. What does work is the accent policy's acrylic blur-behind
+   (`SetWindowCompositionAttribute`, `ACCENT_ENABLE_ACRYLICBLURBEHIND`) asked
+   for with **no accent flags** - the flag value that circulates online
+   collapses it to 0.032. GL1 measured that policy painting an opaque white
+   sheet, under the OLD hosting; composition hosting is what changed its
+   outcome, so this does not reopen GL1, it completes it.
+
+Instrument validated before the verdict, per the standing rule: the Win11
+taskbar - the OS's own acrylic, which nobody would call a bug - measures the
+same shape under the same method (its pixels move 56.6 -> 65.3 between a black
+and a white backdrop while a striped one adds it no detail), so the probe
+sees real blur-behind when real blur-behind is there.
+
+**Windows joins macOS in deciding the rung at BIRTH.**
+`WS_EX_NOREDIRECTIONBITMAP` is a `CreateWindowEx` style with no pywebview
+kwarg behind it, and without it the window's own GDI redirection surface sits
+opaque behind the page: same window, same calls, one flag - 0.075 and sharp
+without it, 0.831 and blurred with it. `desktop/glass.py` now REFUSES the
+composition rung on a window that lacks it, and on a window that already
+hosts a browser of its own, so a pywebview window still gets LAYERED_ALPHA
+rather than a rung the screen would not support.
+
+**Still not done here**: the companion is a pywebview window, so it cannot
+take this rung as it is built today; reaching the steward's eyes needs the
+companion created as a composition host instead of by `webview.create_window`.

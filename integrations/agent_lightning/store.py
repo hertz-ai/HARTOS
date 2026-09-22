@@ -78,10 +78,12 @@ class LightningStore:
 
         elif self.backend == 'json':
             # Ensure storage directory exists
-            self.storage_path = AGENT_LIGHTNING_CONFIG.get(
-                'traces_path',
-                './agent_data/lightning_traces'
-            )
+            # ONE resolver, shared with LightningTracer._save_span (the only
+            # writer).  Reading the config key literally here meant a
+            # CWD-relative default, i.e. a different directory from the one
+            # the tracer redirected to — every read came back empty.
+            from integrations.agent_lightning.config import get_traces_path
+            self.storage_path = get_traces_path()
             os.makedirs(self.storage_path, exist_ok=True)
             logger.info(f"Using JSON backend at {self.storage_path}")
 
@@ -219,6 +221,12 @@ class LightningStore:
                     span_id = filename[:-5]  # Remove .json
                     span = self.load_span(span_id)
                     if span:
+                        # JSON uses one shared trace directory.  Unlike Redis
+                        # (whose set key is already agent-scoped), it must
+                        # enforce ownership after loading or one agent's
+                        # baseline/training data silently includes another's.
+                        if span.get('agent_id') != self.agent_id:
+                            continue
                         # Apply filters
                         if span_type and span.get('span_type') != span_type:
                             continue

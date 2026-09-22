@@ -48,6 +48,16 @@ if _ROOT not in sys.path:
 from integrations.agent_engine import world_model_bridge as wmb
 
 
+def _verified(action_id):
+    return {
+        'verified': True,
+        'source': 'status_verifier',
+        'outcome': 'success',
+        'action_id': action_id,
+        'evidence': {'kind': 'tool_receipt', 'message_index': 1},
+    }
+
+
 @pytest.fixture
 def in_process_bridge(monkeypatch):
     """Construct a fresh bridge with an in-process stub provider.
@@ -110,6 +120,7 @@ def test_record_interaction_flushes_to_provider(in_process_bridge):
         user_id='u1', prompt_id='p1',
         prompt='hello hive', response='hello human',
         model_id='qwen-3.5-4b',
+        verification=_verified('p1'),
     )
     # Flush happens synchronously on the executor — poll for up to 2s
     deadline = time.time() + 2
@@ -137,6 +148,7 @@ def test_hundred_interactions_each_hit_provider(in_process_bridge):
             prompt=f'question number {i}',
             response=f'answer number {i}',
             model_id='qwen-3.5-4b',
+            verification=_verified(i),
         )
     deadline = time.time() + 10
     while time.time() < deadline and len(calls) < 100:
@@ -184,6 +196,7 @@ def test_attribution_chain_flows_through(in_process_bridge):
         model_id='qwen',
         goal_id='goal-42',
         attribution_chain={'step': 'decompose', 'credit': 0.8},
+        verification=_verified('goal-42'),
     )
     deadline = time.time() + 2
     while time.time() < deadline and not calls:

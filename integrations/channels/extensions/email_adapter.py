@@ -820,7 +820,23 @@ class EmailAdapter(ChannelAdapter):
         to_address: str,
         msg: email.message.Message,
     ) -> SendResult:
-        """Send email via SMTP."""
+        """Send email via SMTP.
+
+        ONE OF TWO SENDERS, AND DELIBERATELY NOT SHARED (audited 2026-09-22).
+        The other is `channels/email_campaign._run_sends`, which is BULK: it holds
+        one connection open for a chunk of addresses, paces between them, keeps a
+        dated log so a daily cap survives a restart, halts on consecutive failures
+        to protect sender reputation, and takes a PID lock because two concurrent
+        runs double-send to the same list. None of that belongs on a single
+        conversational reply, and a shared helper that opens one connection per
+        message would throw away the batching the bulk path needs. Both call
+        smtplib; that is not the same as being the same sender.
+
+        The async/sync pair below is ONE sender with two transports (aiosmtplib
+        when the loop can carry it, smtplib in an executor otherwise), not
+        duplication. `_test_smtp` above has the same pair for the same reason and
+        sends NOTHING -- it connects, logs in and quits.
+        """
         try:
             host = self._get_smtp_host()
             port = self.email_config.smtp_port

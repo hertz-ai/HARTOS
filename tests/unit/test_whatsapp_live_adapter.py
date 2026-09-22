@@ -78,6 +78,13 @@ def _raise_boom(*_args, **_kwargs):
     raise RuntimeError('boom')
 
 
+@pytest.fixture(autouse=True)
+def no_live_gateway_identity_request():
+    """Keep the wiring suite deterministic when a gateway is or is not live."""
+    with patch('urllib.request.urlopen', side_effect=_raise_boom):
+        yield
+
+
 def _register(client, username='wa_live_tester'):
     resp = client.post('/api/social/auth/register', json={
         'username': username,
@@ -160,14 +167,19 @@ class TestEnsureWhatsappLiveAdapter:
         integration.registry.register.assert_not_called()
         run_coro.assert_not_called()
 
-    def test_reports_failure_when_loop_not_running(self):
+    def test_starts_integration_when_loop_not_running(self):
         """If FlaskChannelIntegration.start() was never called (event loop
-        thread not up), fail loudly instead of silently no-op'ing — the
-        old register_channel-only path failed exactly this silently."""
+        thread not up), start it here rather than failing or silently
+        no-op'ing: the standalone entrypoint never runs the boot sequence,
+        and the old register_channel-only path left the adapter registered
+        but never started."""
         from hart_intelligence_entry import _ensure_whatsapp_live_adapter
 
         integration = _mock_integration(existing_adapter=None)
         integration._loop = None
+        live_loop = MagicMock()
+        live_loop.is_running.return_value = True
+        integration.start.side_effect = lambda: setattr(integration, '_loop', live_loop)
 
         with patch(
             'integrations.channels.flask_integration.get_channel_integration',
@@ -175,11 +187,65 @@ class TestEnsureWhatsappLiveAdapter:
         ), patch(
             'integrations.channels.whatsapp_adapter.create_whatsapp_adapter',
             return_value=MagicMock(),
-        ):
+        ), patch('asyncio.run_coroutine_threadsafe') as run_coro:
             result = _ensure_whatsapp_live_adapter('u1', sid='user_u1')
 
-        assert result['success'] is False
-        assert 'event loop' in result['error']
+        assert result['success'] is True
+        integration.start.assert_called_once()
+        run_coro.assert_not_called()
+
+    def test_registered_adapter_adopts_owner_identity_on_a_later_poll(self):
+        """The gateway was still linking when the adapter registered, so it
+        carried no owner identity and self-chat detection was off.  A later
+        poll (the mobile app polls every ~3 s) must adopt the identity on the
+        SAME adapter; before this, every later poll returned 'already
+        registered' and the process stayed blind until a restart."""
+        import io
+        import json
+        pytest.importorskip('aiohttp')
+        from hart_intelligence_entry import _ensure_whatsapp_live_adapter
+        from integrations.channels.whatsapp_adapter import create_whatsapp_adapter
+
+        # Registered while the gateway had no identity yet: the real adapter,
+        # the real config, no owner.
+        live = create_whatsapp_adapter(
+            api_url='http://127.0.0.1:3000', account_id='user_u1',
+            phone_number=None, owner_lid=None)
+        assert live.has_owner_identity() is False
+        integration = _mock_integration(existing_adapter=live)
+
+        class _Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        body = json.dumps({'own_jid': '15551234567:25@s.whatsapp.net',
+                           'own_lid': '73203573633275:25@lid'}).encode()
+        with patch(
+            'integrations.channels.flask_integration.get_channel_integration',
+            return_value=integration,
+        ), patch('urllib.request.urlopen', return_value=_Resp(body)) as fetch, \
+                patch('asyncio.run_coroutine_threadsafe') as run_coro:
+            result = _ensure_whatsapp_live_adapter(
+                'u1', sid='user_u1', base='http://127.0.0.1:3000')
+
+        assert result['success'] is True
+        assert fetch.call_args.args[0] == 'http://127.0.0.1:3000/api/sessions/user_u1/status'
+        assert live.config.extra['phone_number'] == '15551234567:25@s.whatsapp.net'
+        assert live.config.extra['owner_lid'] == '73203573633275:25@lid'
+        assert live.has_owner_identity() is True
+        integration.registry.register.assert_not_called()   # still ONE adapter
+        run_coro.assert_not_called()
+
+        # Once adopted, later polls stop asking the gateway.
+        with patch(
+            'integrations.channels.flask_integration.get_channel_integration',
+            return_value=integration,
+        ), patch('urllib.request.urlopen') as fetch_again:
+            _ensure_whatsapp_live_adapter('u1', sid='user_u1', base='http://127.0.0.1:3000')
+        fetch_again.assert_not_called()
 
     def test_default_sid_derivation(self):
         """sid defaults to user_<id> unless already prefixed — must match

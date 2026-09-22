@@ -939,8 +939,8 @@ class TestBeaconHashVerification:
         assert payload['code_hash'] == 'ch123'
         assert payload['release_version'] == '1.0'
 
-    def test_parse_beacon_rejects_unknown_hash_hard(self):
-        """Beacon with unknown code hash rejected in hard enforcement."""
+    @staticmethod
+    def _unknown_hash_beacon():
         import json as _json
         from integrations.social.peer_discovery import AutoDiscovery
         ad = AutoDiscovery.__new__(AutoDiscovery)
@@ -948,24 +948,97 @@ class TestBeaconHashVerification:
         mock_gossip.node_id = 'self_node'
         ad._gossip = mock_gossip
         ad.BEACON_MAGIC = b'HEVOLVE_DISCO_V1'
-
         payload = {
             'type': 'hevolve-discovery',
             'node_id': 'remote_peer',
             'url': 'http://remote:6777',
             'timestamp': int(__import__('time').time()),
             'guardrail_hash': 'gh_match',
-            'code_hash': 'unknown_evil_hash',
+            'code_hash': 'unknown_hash',
         }
-        data = ad.BEACON_MAGIC + _json.dumps(payload).encode('utf-8')
+        return ad, ad.BEACON_MAGIC + _json.dumps(payload).encode('utf-8')
 
+    def test_parse_beacon_admits_unknown_hash_and_records_it(self):
+        """An unrecognised code hash does NOT drop the beacon.
+
+        This test asserted the opposite until 2026-09-21, pinning the
+        REJECT-ON-UNKNOWN-HASH pattern that release_hash_registry.py's header
+        documents as superseded by ADMIT-AND-RECORD.  The reasons are in that
+        header: code_hash is self-reported, so the gate never stopped an
+        attacker; _KNOWN_HASHES is baked into a build that cannot contain its
+        own hash, so every newer peer is unknown to every older one by
+        construction; and it held the live network at zero federating peers
+        out of 69.  The HTTP announce path was corrected then and this beacon
+        path was not, so a dropped beacon never reached the corrected code.
+
+        Measured on the owner's desktop the day this changed: one LAN peer
+        refused 88 times under the DEFAULT enforcement mode, with nothing
+        shown to them.
+        """
+        ad, data = self._unknown_hash_beacon()
         with patch('security.hive_guardrails.get_guardrail_hash',
-                   return_value='gh_match'):
-            with patch('security.release_hash_registry.get_release_hash_registry') as mock_reg:
-                mock_reg.return_value.is_known_release_hash.return_value = False
-                with patch('security.master_key.get_enforcement_mode',
-                           return_value='hard'):
-                    result = ad._parse_beacon(data)
+                   return_value='gh_match'), \
+             patch('security.release_hash_registry'
+                   '.get_release_hash_registry') as mock_reg:
+            mock_reg.return_value.is_known_release_hash.return_value = False
+            result = ad._parse_beacon(data)
+        assert result.get('node_id') == 'remote_peer', (
+            'an unrecognised build is admitted and recorded; admission is '
+            'decided by handle_announce, which the beacon must be able to '
+            'reach')
+
+    def test_parse_beacon_still_refuses_unknown_hash_in_strict_mode(self):
+        """A locked cluster keeps its gate, through the SAME opt-in the
+        announce path reads, so the two cannot disagree."""
+        ad, data = self._unknown_hash_beacon()
+        with patch('security.hive_guardrails.get_guardrail_hash',
+                   return_value='gh_match'), \
+             patch.dict(os.environ,
+                        {'HEVOLVE_REQUIRE_KNOWN_CODE_HASH': '1'}), \
+             patch('security.release_hash_registry'
+                   '.get_release_hash_registry') as mock_reg:
+            mock_reg.return_value.is_known_release_hash.return_value = False
+            mock_reg.return_value.has_trust_basis.return_value = True
+            result = ad._parse_beacon(data)
+        assert result == {}
+
+    def test_strict_mode_needs_a_trust_basis(self):
+        """Strict cannot be switched on into a vacuum: with no authoritative
+        basis for judging a hash, the gate would partition the very cluster
+        it was meant to protect."""
+        ad, data = self._unknown_hash_beacon()
+        with patch('security.hive_guardrails.get_guardrail_hash',
+                   return_value='gh_match'), \
+             patch.dict(os.environ,
+                        {'HEVOLVE_REQUIRE_KNOWN_CODE_HASH': '1'}), \
+             patch('security.release_hash_registry'
+                   '.get_release_hash_registry') as mock_reg:
+            mock_reg.return_value.is_known_release_hash.return_value = False
+            mock_reg.return_value.has_trust_basis.return_value = False
+            result = ad._parse_beacon(data)
+        assert result.get('node_id') == 'remote_peer'
+
+    def test_an_unreadable_registry_does_not_drop_the_beacon(self):
+        """A local failure to read OUR registry says nothing about the peer.
+        It must be logged, not swallowed, but it must not refuse: refuse on
+        evidence of badness, never on absence of evidence."""
+        ad, data = self._unknown_hash_beacon()
+        with patch('security.hive_guardrails.get_guardrail_hash',
+                   return_value='gh_match'), \
+             patch('security.release_hash_registry'
+                   '.get_release_hash_registry',
+                   side_effect=RuntimeError('registry is down')):
+            result = ad._parse_beacon(data)
+        assert result.get('node_id') == 'remote_peer'
+
+    def test_a_guardrail_mismatch_still_refuses(self):
+        """The constitutional-rules hash stays a gate.  A peer running
+        different guardrails is evidence of badness, not absence of it, and
+        nothing in this change touches that."""
+        ad, data = self._unknown_hash_beacon()
+        with patch('security.hive_guardrails.get_guardrail_hash',
+                   return_value='a_different_hash'):
+            result = ad._parse_beacon(data)
         assert result == {}
 
     def test_parse_beacon_accepts_known_hash(self):

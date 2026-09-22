@@ -376,6 +376,35 @@ class TestWorldModelBridgeIntegration(unittest.TestCase):
         self.assertIn('success_score', chain)
         self.assertIn('benchmark_prover', call_kwargs['prompt'])
         self.assertIn('benchmark_run', call_kwargs['prompt'])
+        self.assertIsNone(call_kwargs['verification'])
+        self.assertFalse(call_kwargs['persist_conversation'])
+        self.assertFalse(call_kwargs['ingest_user_utterance'])
+
+    def test_verified_outcome_is_the_only_training_signal_forwarded(self):
+        orch = AgentAttributionOrchestrator()
+        mock_bridge = MagicMock()
+        verification = {
+            'verified': True,
+            'source': 'status_verifier',
+            'outcome': 'success',
+            'action_id': 'action_7',
+            'evidence': {'kind': 'tool_receipt', 'message_index': 12},
+        }
+        aid = orch.begin_action('helper', 'tool_execution', goal_id='g7')
+        orch.record_step(aid, 'ran tool')
+
+        with patch(
+            'integrations.agent_engine.world_model_bridge.get_world_model_bridge',
+            return_value=mock_bridge,
+        ), patch.object(orch, '_emit_completion_event'):
+            orch.complete_action(aid, outcome={
+                'status': 'completed', 'verification': verification,
+            })
+
+        kwargs = mock_bridge.record_interaction.call_args.kwargs
+        self.assertEqual(kwargs['verification'], verification)
+        self.assertFalse(kwargs['persist_conversation'])
+        self.assertFalse(kwargs['ingest_user_utterance'])
 
 
 class TestEventBusEmission(unittest.TestCase):

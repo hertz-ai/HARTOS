@@ -65,6 +65,56 @@ class TestTTSEngineRegistry:
                     f"{lang} should have cosyvoice3, got {engines}"
 
 
+def _installed_engines_for(lang='en'):
+    """The engines on THIS node's ladder for ``lang``, measured.
+
+    These are functional tests: they drive the real router against the real
+    machine, with nothing mocked.  Until 2026-09-21 select_engines appended
+    espeak unconditionally, so they could assert ">= 1 candidate" and
+    "espeak is always present" on any box.  That floor was a fabrication --
+    the ladder offered an engine it had already been told was absent, and a
+    voiced turn then spent its time failing on it (c9bbcd91b).  espeak is
+    bundled on the shipped OS, so the guarantee is real THERE; on a bare dev
+    box nothing is installed and the honest answer is an empty ladder.
+
+    So the shape assertions below run where a node has something to offer,
+    and TestBareNodeIsHonest covers the other case.
+    """
+    from integrations.channels.media.tts_router import (
+        LANG_ENGINE_PREFERENCE, _DEFAULT_PREFERENCE, _is_engine_installed,
+    )
+    ladder = LANG_ENGINE_PREFERENCE.get(lang, _DEFAULT_PREFERENCE)
+    return [e for e in ladder if _is_engine_installed(e)]
+
+
+def _node_can_serve(lang='en'):
+    """Whether this node can offer ANY engine for ``lang`` right now.
+
+    Installed is not the predicate -- fitting is.  Measured on the owner's
+    desktop 2026-09-21: chatterbox_turbo IS installed, in its own venv, and
+    is GPU-only against 2.97 GB free beside a resident LLM, so the ladder is
+    correctly empty even though an engine is on disk.  Gating on
+    "is something installed" would have kept these tests red for a router
+    that was behaving exactly right.
+    """
+    from integrations.channels.media.tts_router import TTSRouter
+    return bool(TTSRouter().select_engines('Hello', language=lang))
+
+
+needs_an_installed_engine = pytest.mark.skipif(
+    not _node_can_serve('en'),
+    reason='no TTS engine on this node can serve English right now, so the '
+           'ladder is correctly empty -- see TestBareNodeIsHonest',
+)
+
+needs_espeak = pytest.mark.skipif(
+    'espeak' not in _installed_engines_for('en'),
+    reason='espeak-ng is not on this box; it is bundled on the shipped OS, '
+           'where this guarantee holds',
+)
+
+
+@needs_an_installed_engine
 class TestTTSRouterSelection:
     """T16: TTS engine selection under various constraints."""
 
@@ -77,7 +127,8 @@ class TestTTSRouterSelection:
         candidates = router.select_engines("Hello world", language="en")
         assert len(candidates) >= 1, "Should return at least one candidate"
 
-    def test_select_english_espeak_always_present(self, router):
+    @needs_espeak
+    def test_select_english_espeak_is_the_floor_where_it_exists(self, router):
         candidates = router.select_engines("Hello world", language="en")
         names = [c.engine.engine_id if hasattr(c.engine, 'engine_id') else c.engine for c in candidates]
         assert 'espeak' in names, f"espeak should always be a candidate, got {names}"
@@ -116,6 +167,7 @@ class TestTTSRouterSelection:
         assert len(clone_capable) >= 1, "Should have at least one clone-capable engine"
 
 
+@needs_an_installed_engine
 class TestTTSResourceConstraints:
     """T16: Simulated resource constraints."""
 
@@ -194,3 +246,33 @@ class TestTTSQualityBaselines:
             for i in range(len(scores) - 1):
                 if scores[i] < scores[i + 1] - 0.1:
                     pass  # Allow some flexibility in ordering
+
+
+class TestBareNodeIsHonest:
+    """A node with no TTS engine must say so rather than offer one.
+
+    The counterpart to the skips above: where those classes have nothing to
+    assert, this is what the router owes the caller instead.
+    """
+
+    @pytest.fixture
+    def router(self):
+        from integrations.channels.media.tts_router import TTSRouter
+        return TTSRouter()
+
+    @pytest.mark.skipif(
+        _node_can_serve('en'),
+        reason='this node can serve English, so the bare-node path is not live here',
+    )
+    def test_no_engine_means_no_candidates(self, router):
+        assert router.select_engines('Hello', language='en') == []
+
+    def test_synthesize_names_the_absence_rather_than_a_failure(self, router):
+        """Distinguishing "nothing is installed" from "engines were tried and
+        failed" is what lets the caller offer a setup instead of a shrug."""
+        from unittest.mock import patch
+        with patch('integrations.channels.media.tts_router._is_engine_installed',
+                   return_value=False):
+            result = router.synthesize('Hello', language='en')
+        assert result.error == 'No TTS engine is installed for this language'
+        assert result.path == ''

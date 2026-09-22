@@ -246,7 +246,19 @@ NETWORK_PROTECTED_PATHS = ('/chat', '/time_agent', '/visual_agent',
 PROTECTED_PATHS = ADMIN_PATHS + NETWORK_PROTECTED_PATHS
 
 EXEMPT_PREFIXES = ('/status', '/a2a/', '/api/social/', '/.well-known/',
-                   '/prompts/public')
+                   '/prompts/public',
+                   # A phone that found this desktop on the LAN GETs /health
+                   # before adopting the node (PeerLinkDiscovery.isHealthy;
+                   # measured 2026-09-16: 401 here kept every phone on the
+                   # cloud).  On HARTOS's own app it is the liveness probe
+                   # ({'status': 'alive'}); on Nunba's app, the one a desktop
+                   # advertises, it aliases /backend/health: GPU tier, name
+                   # and VRAM figures -- no secret, path or identifier, and
+                   # the class of facts the node already advertises to peers
+                   # in the announce (has_gpu, vram_free_gb).  Reads are
+                   # cached, so a LAN caller runs no GPU probe.  /ready,
+                   # which reports DB and identity checks, stays gated.
+                   '/health')
 
 
 def _apply_api_auth(app: Flask, register: bool = True):
@@ -360,15 +372,16 @@ def _apply_api_auth(app: Flask, register: bool = True):
             return refused
         token = auth_header[7:]
         try:
-            from integrations.social.auth import verify_device_jwt
+            from integrations.social.auth import (
+                file_device_access_ask, verify_device_jwt)
             from integrations.social.models import db_session
             with db_session(commit=True) as db:
                 verdict = verify_device_jwt(db, token, owner)
                 if verdict['status'] == 'pending':
                     from integrations.social.discovery import _check_announce_rate
                     if _check_announce_rate(request.remote_addr or ''):
-                        _file_device_ask(db, owner, verdict['public_key'],
-                                         verdict.get('claims') or {})
+                        file_device_access_ask(db, owner, verdict['public_key'],
+                                               verdict.get('claims') or {})
                     else:
                         logger.warning("device ask from %s not filed: rate limit",
                                        request.remote_addr)
@@ -401,18 +414,6 @@ def _apply_api_auth(app: Flask, register: bool = True):
                                        "this phone"}), 403
         return refused
 
-    def _file_device_ask(db, owner, public_key, claims):
-        """File (or re-send) the owner's ask for this phone.  The person's
-        name comes from the token's own username claim, which the phone
-        signed; nothing of the key is shown, the card names the person."""
-        from integrations.social.consent_service import (
-            ConsentService, device_scope)
-        name = ' '.join(str(claims.get('username') or '').split())[:100]
-        who = f"{name}'s phone" if name else "A phone"
-        ConsentService.request_consent(
-            db, owner, 'device_access', scope=device_scope(public_key),
-            reason=f"{who} asks to use this computer's agents from the network.",
-            requester_name=name)
 
     def _expected_api_key() -> str:
         """HEVOLVE_API_KEY, the one credential both branches below accept."""

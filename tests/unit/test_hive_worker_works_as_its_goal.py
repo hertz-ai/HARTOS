@@ -23,6 +23,7 @@ for p in (_ROOT, os.path.join(_ROOT, 'agent-ledger-opensource')):
         sys.path.insert(0, p)
 
 from agent_ledger.core import SmartLedger, TaskStatus  # noqa: E402
+import pytest
 
 # The three continuous goals on central and the prompt_id each row stores.
 _CENTRAL_GOALS = {
@@ -31,6 +32,22 @@ _CENTRAL_GOALS = {
     'eb67a57b-2cfa-497a-a999-4c04d2bcf61c': '66722327257',  # Hive Model Trainer
 }
 _GOAL = '960a8332-0aec-48cb-9558-e2ef2fa31f92'
+
+
+@pytest.fixture(autouse=True)
+def _worker_may_claim(monkeypatch):
+    """Precondition these tests always assumed: the daemon gate is open.
+
+    Since 2026-09-20 the worker asks should_yield_to_user, the provider
+    breaker and the adapter's readiness BEFORE claiming (a claim the
+    dispatcher would defer is three full ledger writes for nothing), so a
+    test that drives _tick on a live box would otherwise inherit that box's
+    pressure readings.  The gate itself is pinned in
+    tests/unit/test_worker_tick_claims_nothing_it_would_defer.py.
+    """
+    from integrations.distributed_agent.worker_loop import DistributedWorkerLoop
+    monkeypatch.setattr(DistributedWorkerLoop, '_dispatch_would_defer',
+                        staticmethod(lambda: None))
 
 
 class _MemBackend:
@@ -171,3 +188,33 @@ def test_two_goals_never_share_one_agent():
             _loop()._execute_task(task)
         seen.add(chat.call_args.args[2])
     assert seen == set(_CENTRAL_GOALS.values())
+
+
+def test_loading_agent_turn_is_deferred_not_completed_or_orphaned():
+    """A warm-up notice is availability state, not a receipt of completed
+    work.  It must use the coordinator's DEFERRED lifecycle and become
+    claimable again only after its declared retry time."""
+    led, co = _coordinator_with_goal()
+    loop = _loop()
+    with _allow_dispatch(), \
+         patch('integrations.agent_engine.dispatch.local_chat_dispatch',
+               return_value=('deferred', None)):
+        task = co.claim_next_task(loop._node_id, loop._capabilities)
+        outcome = loop._execute_task(task)
+    assert outcome.__class__.__name__ == 'DeferredForRetry'
+    assert co.defer_task(task.task_id, loop._node_id, outcome.reason)
+    assert led.get_task(task.task_id).status == TaskStatus.DEFERRED
+    assert co.claim_next_task(loop._node_id, loop._capabilities) is None
+    led.get_task(task.task_id).deferred_until = '2000-01-01T00:00:00'
+    assert co.claim_next_task(loop._node_id, loop._capabilities).task_id == task.task_id
+
+
+def test_worker_re_resolves_identity_at_start_after_import_time_race():
+    """The module singleton may be built before SyncEngine joins gossip."""
+    loop = _loop()
+    loop._node_id = ''
+    with patch('integrations.distributed_agent.worker_loop._worker_node_id',
+               return_value='canonical-node-7'), \
+         patch.object(loop, '_is_enabled', return_value=False):
+        loop.start()
+    assert loop._node_id == 'canonical-node-7'

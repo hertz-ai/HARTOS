@@ -15,6 +15,7 @@ Features:
 - Framework agnostic - works with any agent system
 """
 
+import copy
 import json
 import os
 import re
@@ -602,11 +603,19 @@ class Task:
         self._record_state_transition(new_status, reason)
         return True
 
-    def _validate_transition(self, new_status: TaskStatus) -> bool:
-        """Validate if transition from current state to new state is allowed."""
+    def transition_refusal(self, new_status: TaskStatus) -> Optional[str]:
+        """Why this transition is refused, or None when it is allowed.
+
+        The DECISION lives here and only here; `_validate_transition`
+        adds the log.  Split because a caller may legitimately want to
+        ASK whether a move is possible without the refusal appearing in
+        the log as though something had tried and failed -- `add_subtasks`
+        does exactly that, and using the logging form as its predicate
+        put back the ~30/min warning that guard exists to remove.
+        """
         # Special case: COMPLETED can transition to ROLLED_BACK
         if self.status == TaskStatus.COMPLETED and new_status == TaskStatus.ROLLED_BACK:
-            return True
+            return None
 
         # Special case: FAILED -> COMPLETED/TERMINATED is a legitimate RECOVERY.
         # The agent retry/fallback FSM (ActionState in lifecycle_hooks) can drive a
@@ -619,11 +628,11 @@ class Task:
         # #59 fast-fail circuit breaker still prevents retry storms.
         if self.status == TaskStatus.FAILED and new_status in (
                 TaskStatus.COMPLETED, TaskStatus.TERMINATED):
-            return True
+            return None
 
         if TaskStatus.is_terminal_state(self.status):
-            logger.warning(f"Cannot transition from terminal state {self.status} to {new_status}")
-            return False
+            return (f"Cannot transition from terminal state {self.status} "
+                    f"to {new_status}")
 
         valid_transitions = {
             TaskStatus.PENDING: {
@@ -638,7 +647,8 @@ class Task:
             TaskStatus.IN_PROGRESS: {
                 TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.PAUSED,
                 TaskStatus.USER_STOPPED, TaskStatus.BLOCKED, TaskStatus.TERMINATED,
-                TaskStatus.NOT_APPLICABLE, TaskStatus.DELEGATED
+                TaskStatus.NOT_APPLICABLE, TaskStatus.DELEGATED,
+                TaskStatus.DEFERRED
             },
             TaskStatus.DELEGATED: {
                 TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.IN_PROGRESS,
@@ -663,9 +673,21 @@ class Task:
 
         allowed_states = valid_transitions.get(self.status, set())
         if new_status not in allowed_states:
-            logger.warning(f"Invalid transition from {self.status} to {new_status}")
-            return False
+            return f"Invalid transition from {self.status} to {new_status}"
 
+        return None
+
+    def _validate_transition(self, new_status: TaskStatus) -> bool:
+        """Whether the transition is allowed, logging the refusal.
+
+        Every mover goes through here so a refused move is always
+        visible.  A caller that only wants to ASK uses
+        `transition_refusal` instead.
+        """
+        refusal = self.transition_refusal(new_status)
+        if refusal:
+            logger.warning(refusal)
+            return False
         return True
 
     def start(self, reason: str = "Task execution started") -> bool:
@@ -766,7 +788,8 @@ class Task:
 
     def defer(self, reason: str = "Task deferred", until: Optional[str] = None) -> bool:
         """
-        Defer task for later execution (PENDING/PAUSED/BLOCKED -> DEFERRED).
+        Defer task for later execution
+        (PENDING/IN_PROGRESS/PAUSED/BLOCKED -> DEFERRED).
 
         Args:
             reason: Why the task is being deferred
@@ -1464,12 +1487,25 @@ class SmartLedger:
             }
         # Serialize + write outside self._lock — a slow save no longer blocks
         # add_task / get_task / update_task_status on another thread.
+        # REVIEW hartos-7c 2026-09-20 (codex's change): AGREED, and the
+        # contract change is safe.  save() used to return None on success and
+        # swallow the exception, so no caller could tell a rejected write from
+        # a good one.  I audited every caller that reads the result: all 7 use
+        # `is False` (core 1603/2017/2036, lifecycle_hooks 195/212/459/1453),
+        # which stays correct for the None that the early-return path can
+        # still produce.  Nothing does `if not ledger.save()`.
         with self._io_lock:
             try:
-                self.backend.save(self.ledger_key, data)
+                saved = self.backend.save(self.ledger_key, data)
+                if saved is False:
+                    logger.error(
+                        "Backend rejected save for ledger %s", self.ledger_key)
+                    return False
                 logger.info(f"Saved {len(data['tasks'])} tasks to ledger")
+                return True
             except Exception as e:
                 logger.error(f"Failed to save ledger: {e}")
+                return False
 
     def enable_pubsub(self, redis_client) -> None:
         """Enable distributed notifications via Redis PUBSUB."""
@@ -1552,6 +1588,16 @@ class SmartLedger:
                     logger.error(f"Unknown status value: {status}")
                     return False
 
+            # Completion publishes dependency/result receipts.  It therefore
+            # owns its write boundary and may not be part of an uncommitted
+            # batch.  No production caller batches this edge; refusing it is
+            # safer than telling subscribers work completed before persistence.
+            if defer_save and status == TaskStatus.COMPLETED:
+                logger.error(
+                    "Deferred save is not supported for completion of %s",
+                    task_id)
+                return False
+
             task = self.tasks[task_id]
 
             # Validate transition (Bug #2 fix — was bypassing _validate_transition)
@@ -1561,14 +1607,46 @@ class SmartLedger:
                 )
                 return False
 
+            # Do not report a state change that the backend rejected. A
+            # completion can also mutate dependent tasks, so that edge keeps a
+            # snapshot of the affected graph for rollback on I/O failure.
+            before_tasks = None
+            before_events = None
+            if not defer_save:
+                # Completion can mutate only its dependency closure.  Taking
+                # an undo snapshot of that closure keeps rollback atomic
+                # without deep-copying thousands of unrelated ledger tasks.
+                snapshot_ids = (
+                    self._completion_dependency_ids(task)[1] | {task_id}
+                    if status == TaskStatus.COMPLETED else {task_id}
+                )
+                before_tasks = {
+                    tid: copy.deepcopy(self.tasks[tid].__dict__)
+                    for tid in snapshot_ids if tid in self.tasks
+                }
+                before_events = copy.deepcopy(getattr(self, 'events', []))
+
             # Record in state history before changing status
             transition_reason = reason or f"Status updated to {status.value}"
             task._record_state_transition(status, transition_reason)
 
+            auto_resumed = []
             if status == TaskStatus.COMPLETED:
                 task.completed_at = task.updated_at
                 task.result = result
-                self._handle_task_completion(task)
+                # Keep result verification in the one atomic completion path.
+                # complete_task used to add this after publishing completion
+                # and perform a second save, which could leave a durable
+                # completion without its receipt hash.
+                if result is not None:
+                    try:
+                        from agent_ledger.verification import TaskVerification
+                        task.context["result_hash"] = (
+                            TaskVerification.compute_result_hash(result))
+                    except Exception:
+                        pass
+                auto_resumed = self._handle_task_completion(
+                    task, emit_events=False)
 
             if status == TaskStatus.IN_PROGRESS and not task.started_at:
                 task.started_at = datetime.now().isoformat()
@@ -1577,7 +1655,19 @@ class SmartLedger:
                 task.error_message = error_message
 
             if not defer_save:
-                self.save()
+                if self.save() is False:
+                    for tid, snapshot in before_tasks.items():
+                        current = self.tasks.get(tid)
+                        if current is not None:
+                            current.__dict__.clear()
+                            current.__dict__.update(snapshot)
+                    self.events = before_events
+                    logger.error(
+                        "Rolled back status update for %s after persistence "
+                        "failed", task_id)
+                    return False
+                if status == TaskStatus.COMPLETED:
+                    self._emit_completion_events(task, auto_resumed)
             logger.info(f"Updated task {task_id} status to {status}")
             return True
 
@@ -1599,6 +1689,30 @@ class SmartLedger:
         """Get specific task."""
         with self._lock:
             return self.tasks.get(task_id)
+
+    def update_task_context(self, task_id: str, context: Dict[str, Any],
+                            defer_save: bool = False) -> bool:
+        """Replace a task's structured context and persist it atomically.
+
+        Context is the extension point for task-specific state such as a
+        computer-use action.  Keeping this mutation here preserves the same
+        lock, integrity, and persistence contract as every other task update.
+
+        defer_save=True applies the change in memory only, the same knob
+        add_task and update_task_status expose: a hot-path caller that
+        updates context several times per step (the computer-use loop) must
+        not pay a full-ledger json.dump on every call (#145).
+        """
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                return False
+            task.context = dict(context or {})
+            task.updated_at = datetime.now().isoformat()
+            task.seal_integrity()
+        if not defer_save:
+            self.save()
+        return True
 
     def get_tasks_by_status(self, status: TaskStatus) -> List[Task]:
         """Get all tasks with specific status."""
@@ -1801,22 +1915,19 @@ class SmartLedger:
 
     def complete_task(self, task_id: str, result: Any = None) -> bool:
         """Mark task as completed with optional result."""
-        task = self.get_task(task_id)
-        if not task:
-            logger.error(f"Task {task_id} not found")
-            return False
-        success = task.complete(result)
-        if success:
-            # Auto-compute result hash for distributed verification
-            if result is not None:
-                try:
-                    from agent_ledger.verification import TaskVerification
-                    task.context["result_hash"] = TaskVerification.compute_result_hash(result)
-                except Exception:
-                    pass  # verification module not available or result not serializable
-            self._handle_task_completion(task)
-            self.save()
-        return success
+        # REVIEW hartos-7c 2026-09-20 (codex's change): AGREED, this is the
+        # parallel-path removal CLAUDE.md Gate 4 asks for -- completion now
+        # has ONE implementation, so the result-hash receipt and the rollback
+        # cannot drift between the two entry points again.  Verified by
+        # running, not reading: pristine HEAD and your working tree both fail
+        # the SAME 12 tests in agent-ledger-opensource (4 are this venv's
+        # shutil.rmtree/_walk_symlinks_as_files defect, 7 are `No module named
+        # hartos` when pytest runs from that subdir, 1 -- test_sequential_
+        # chain_uses_record_transition -- already failed at HEAD), and your
+        # tree passes 133 where HEAD passes 84.  Zero regressions.
+        return self.update_task_status(
+            task_id, TaskStatus.COMPLETED, result=result,
+            reason="Task completed successfully")
 
     def fail_task(self, task_id: str, error: str) -> bool:
         """Mark task as failed with error message."""
@@ -1960,25 +2071,41 @@ class SmartLedger:
 
     def defer_task(self, task_id: str, reason: str = "Task deferred", until: Optional[str] = None) -> bool:
         """Defer a task for later execution."""
-        task = self.get_task(task_id)
-        if not task:
-            logger.error(f"Task {task_id} not found")
-            return False
-        success = task.defer(reason, until)
-        if success:
-            self.save()
-        return success
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if not task:
+                logger.error(f"Task {task_id} not found")
+                return False
+            before = copy.deepcopy(task.__dict__)
+            if not task.defer(reason, until):
+                return False
+            if self.save() is False:
+                task.__dict__.clear()
+                task.__dict__.update(before)
+                logger.error(
+                    "Rolled back deferral for %s after persistence failed",
+                    task_id)
+                return False
+            return True
 
     def undefer_task(self, task_id: str, reason: str = "Task undeferred") -> bool:
         """Undefer a deferred task back to pending."""
-        task = self.get_task(task_id)
-        if not task:
-            logger.error(f"Task {task_id} not found")
-            return False
-        success = task.undefer(reason)
-        if success:
-            self.save()
-        return success
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if not task:
+                logger.error(f"Task {task_id} not found")
+                return False
+            before = copy.deepcopy(task.__dict__)
+            if not task.undefer(reason):
+                return False
+            if self.save() is False:
+                task.__dict__.clear()
+                task.__dict__.update(before)
+                logger.error(
+                    "Rolled back undefer for %s after persistence failed",
+                    task_id)
+                return False
+            return True
 
     def delegate_task(
         self,
@@ -2008,10 +2135,16 @@ class SmartLedger:
         if not task:
             logger.error(f"Task {task_id} not found")
             return False
-        success = task.complete_delegation(result, reason)
-        if success:
-            self._handle_task_completion(task)
-            self.save()
+        if task.status != TaskStatus.DELEGATED:
+            logger.warning(
+                f"Cannot complete delegation for non-delegated task: {task.status}")
+            return False
+        before_delegation_result = task.delegation_result
+        task.delegation_result = result
+        success = self.update_task_status(
+            task_id, TaskStatus.COMPLETED, result=result, reason=reason)
+        if not success:
+            task.delegation_result = before_delegation_result
         return success
 
     def reclaim_delegation(self, task_id: str, reason: str = "Delegation reclaimed") -> bool:
@@ -2100,7 +2233,43 @@ class SmartLedger:
 
     # ==================== Dependency Management ====================
 
-    def _handle_task_completion(self, task: Task):
+    def _completion_dependency_ids(self, task: Task) -> Tuple[set, set]:
+        """Return direct and transitive dependents a completion may touch.
+
+        The dependency handler walks farther only when it auto-resumes a
+        direct dependent.  Computing the full reachable closure here is a
+        conservative undo boundary: it may snapshot a few untouched
+        descendants, but never unrelated tasks in a large ledger.
+        """
+        reverse_prerequisites = {}
+        for candidate in self.tasks.values():
+            for prerequisite_id in candidate.prerequisites:
+                reverse_prerequisites.setdefault(
+                    prerequisite_id, set()).add(candidate.task_id)
+
+        direct = set(task.dependent_task_ids)
+        direct.update(reverse_prerequisites.get(task.task_id, set()))
+        reachable = set()
+        queue = list(direct)
+        while queue:
+            dependent_id = queue.pop(0)
+            if dependent_id in reachable:
+                continue
+            reachable.add(dependent_id)
+            dependent = self.tasks.get(dependent_id)
+            if dependent is None:
+                continue
+            queue.extend(
+                child_id for child_id in dependent.dependent_task_ids
+                if child_id not in reachable)
+            queue.extend(
+                child_id
+                for child_id in reverse_prerequisites.get(dependent_id, set())
+                if child_id not in reachable)
+        return direct, reachable
+
+    def _handle_task_completion(self, task: Task,
+                                emit_events: bool = True) -> List[str]:
         """Handle task completion: update dependencies, auto-resume, and unblock
         the full prerequisite chain (not just immediate dependents).
 
@@ -2128,10 +2297,7 @@ class SmartLedger:
         # Collect ALL tasks that depend on the completed task:
         # 1. Explicitly registered dependents (task.dependent_task_ids)
         # 2. Tasks with this task in their prerequisites list
-        all_dependent_ids = set(task.dependent_task_ids)
-        for t in self.tasks.values():
-            if task.task_id in t.prerequisites:
-                all_dependent_ids.add(t.task_id)
+        all_dependent_ids, _ = self._completion_dependency_ids(task)
 
         auto_resumed = []
         # BFS queue: walk the full prerequisite chain.
@@ -2161,11 +2327,6 @@ class SmartLedger:
                 if success:
                     auto_resumed.append(dependent_id)
                     logger.info(f"Auto-resumed task {dependent_id}")
-                    self._generate_event("task_auto_resumed", {
-                        "task_id": dependent_id,
-                        "trigger": f"dependency_{task.task_id}_completed",
-                        "reason": "All dependencies met"
-                    })
                     # This newly-unblocked task may itself have dependents that
                     # were blocked by it.  Enqueue them for evaluation.
                     for next_dep_id in dependent.dependent_task_ids:
@@ -2175,13 +2336,24 @@ class SmartLedger:
                         if dependent_id in t.prerequisites and t.task_id not in visited:
                             queue.append(t.task_id)
 
+        if emit_events:
+            self._emit_completion_events(task, auto_resumed)
+        return auto_resumed
+
+    def _emit_completion_events(self, task: Task,
+                                auto_resumed: List[str]) -> None:
+        """Publish completion only after the owning durable write commits."""
+        for dependent_id in auto_resumed:
+            self._generate_event("task_auto_resumed", {
+                "task_id": dependent_id,
+                "trigger": f"dependency_{task.task_id}_completed",
+                "reason": "All dependencies met"
+            })
         self._generate_event("task_completed", {
             "task_id": task.task_id,
             "result": task.result,
             "auto_resumed_tasks": auto_resumed
         })
-
-        self.save()
 
     def _generate_event(self, event_type: str, event_data: Dict[str, Any]):
         """Generate an event for observation. Broadcasts via PubSub if enabled."""
@@ -3190,12 +3362,49 @@ RELATIONSHIP TYPES:
                 self.tasks[child_task_id] = child_task
                 logger.info(f"Added subtask {child_task_id}: {description}")
 
-            # Block parent task until children complete (validated transition)
+            # Block parent task until children complete (validated transition).
+            #
+            # ASK THE CANONICAL PREDICATE, not a hand-listed status.  This
+            # guard used to read `!= TaskStatus.BLOCKED`, which asks only
+            # "already blocked?" and never "can this parent move at all?".
+            # FAILED is terminal, so a failed parent reached transition_to,
+            # _validate_transition refused it and logged "Cannot transition
+            # from terminal state", and the save below ran anyway.  Measured
+            # on the installed build 2026-09-21: ~30 refusals a minute from a
+            # single loop, each paired with a full ledger write within ~47 ms.
+            #
+            # Skipping a transition that was ALREADY being refused cannot
+            # change state, so this is behaviour-preserving; it removes a
+            # no-op, not an outcome.  is_terminal_state already covers
+            # COMPLETED, so the old list collapses into it.
             parent_task = self.tasks[parent_task_id]
-            if parent_task.status != TaskStatus.BLOCKED:
+            if parent_task.status == TaskStatus.BLOCKED:
+                pass  # already waiting on children; nothing to do
+            elif parent_task.transition_refusal(TaskStatus.BLOCKED) is None:
                 parent_task.transition_to(
                     TaskStatus.BLOCKED,
                     f"Waiting for {len(subtasks)} subtasks to complete"
+                )
+            else:
+                # Ask the question this guard is named for -- CAN this parent
+                # be blocked -- rather than the narrower "is it terminal".
+                # Only IN_PROGRESS and DELEGATED can be.  The terminal-only
+                # check let five non-terminal statuses through to
+                # transition_to, where they were refused anyway: PENDING,
+                # DEFERRED, PAUSED, USER_STOPPED, RESUMING.  Same refusal,
+                # same unconditional save, under a different log line -- so
+                # it did not show up when grepping for the one that was
+                # measured.  PENDING is the live case: both create_recipe
+                # call sites set the action PENDING immediately after this,
+                # so a repeat requires_breakdown meets a PENDING parent.
+                #
+                # The children still land; they are real work.  What is
+                # refused is moving a parent that cannot move.
+                logger.warning(
+                    f"Parent {parent_task_id} is {parent_task.status}, which "
+                    f"cannot be blocked; added {len(subtasks)} subtask(s) and "
+                    f"left it alone. A parent in this state being given "
+                    f"children is an upstream defect, not a ledger one."
                 )
 
             self.save()

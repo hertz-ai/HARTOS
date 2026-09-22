@@ -844,6 +844,125 @@ _DEFAULT_RECEIPT_TEMPLATE = (
 )
 
 
+from core.game_sound_memo import (  # noqa: E402
+    GAME_STATES,
+    game_state_key,
+    game_state_match,
+    game_state_sound,
+    record_verdict,
+    rejected_take,
+    set_game_state_sound,
+    set_game_state_sound_at,
+)
+
+
+def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
+    """Put a newly composed game sound in front of the person, to hear.
+
+    Creation is meant to be liquid: the reviewer hears the piece and
+    answers it on the surface they are already looking at, rather than
+    being told a URL.  This rides the existing agent-to-UI channel
+    (LiquidUIService.agent_ui_update), which is allow-listed, audited and
+    delivered to web, phone and desktop alike.
+
+    Best-effort by design: a node without that service, or a hive the
+    human has halted, must not stop a sound being composed and memoized.
+    Returns True when the card itself was accepted for delivery -- and the
+    person is told on their other surfaces either way, because a node with
+    no screen attached is precisely when the phone matters most.
+    """
+    shown = False
+    try:
+        from core.platform.registry import get_registry
+        service = get_registry().get('LiquidUIService')
+        if service is not None:
+            # The audio FIRST, as the declared 'media' component every
+            # client already renders (props: type, src, alt, controls).  It
+            # used to ride inside the approval card as an undeclared prop,
+            # which no client reads -- so the card invited someone to "have
+            # a listen" and gave them nothing to listen to.  'media_type'
+            # as well as 'type' because the component's own type key is
+            # 'media' and the clients read the modality from media_type.
+            if record.get('url'):
+                service.agent_ui_update(user_id, {
+                    'type': 'media',
+                    'agent_id': str(prompt_id),
+                    'media_type': 'audio',
+                    'src': record.get('url'),
+                    'controls': True,
+                    'alt': f'{state} sound for {game_id}',
+                    'title': f'{state} sound for {game_id}',
+                })
+            shown = bool(service.agent_ui_update(user_id, {
+                'type': 'approval',
+                'agent_id': str(prompt_id),
+                'action': f'game_sound:{game_id}:{state}',
+                'description': (
+                    f"New {state} sound for {game_id}. Have a listen: keep "
+                    f"it, or say what is wrong and I will compose another."
+                ),
+                'options': ['Keep it', 'Compose another'],
+            }))
+    except Exception as e:
+        # never at the cost of the composition that just succeeded
+        tool_logger.debug(f'game sound: no card on screen ({e})')
+    if not shown:
+        # Only when the card did NOT reach a screen.  A game has fourteen
+        # states, so notifying regardless meant one game cost the person
+        # fourteen phone pushes and fourteen unread rows -- for sounds they
+        # were already being shown one by one.  'shown' was computed and
+        # thrown away; it is the whole signal for whether they need telling
+        # somewhere else.
+        _tell_the_person_elsewhere(user_id, prompt_id, game_id, state, record)
+    return shown
+
+
+def _tell_the_person_elsewhere(user_id, prompt_id, game_id, state, record):
+    """Reach the person who is not looking at the screen it was offered on.
+
+    The card above lands where they are logged in; a sound composed while
+    they are away from that screen would otherwise wait unheard.  This is
+    the same pair the consent ask already uses
+    (integrations/social/device_routing_service): a notification record,
+    which every surface of theirs shows, and an FCM push to the phone.
+    Both are best-effort and both no-op cleanly on a node with no push
+    credential.
+    """
+    message = f"A new {state} sound for {game_id} is ready for you to hear."
+    try:
+        from integrations.social.services import NotificationService
+        from integrations.social.models import db_session
+        with db_session() as db:
+            # target_type/target_id are the schema's own way of saying what
+            # a notification is ABOUT, and the client routes on them.  Without
+            # them the row is inert: it tells the person a sound is ready and
+            # gives them no way to reach it.
+            NotificationService.create(
+                db, str(user_id), 'agent_game_sound_review',
+                source_user_id=str(prompt_id), message=message,
+                target_type='agent', target_id=str(prompt_id),
+            )
+    except Exception as e:
+        tool_logger.debug(f'game sound: no notification record ({e})')
+    try:
+        from core.fcm_sync import send_fcm_push
+        send_fcm_push(
+            str(user_id),
+            'A new game sound',
+            message,
+            data={
+                'type': 'game_sound_review',
+                'agent_id': str(prompt_id),
+                'game_id': str(game_id),
+                'state': str(state),
+                'url': str(record.get('url') or ''),
+                'topic_reply': f'com.hertzai.pupit.{user_id}',
+            },
+        )
+    except Exception as e:
+        tool_logger.debug(f'game sound: no push to the phone ({e})')
+
+
 def build_core_tool_closures(ctx):
     """Build session-scoped tool closures.  Returns list of (name, desc, func).
 
@@ -994,6 +1113,368 @@ def build_core_tool_closures(ctx):
             error_msg = f"Unexpected error saving data: {str(e)}"
             tool_logger.error(error_msg)
             return f"Error: {error_msg} - Data not saved"
+
+    # ------------------------------------------------------------------
+    # bind_game_sound — a game's sounds, composed once and kept
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def bind_game_sound(
+        game_id: Annotated[str, "The game's id as the app knows it (a game config's id, e.g. 'eng-spell-animals-01')"],
+        mood: Annotated[str, "How the game should feel: happy, calm, adventurous, triumphant"] = "happy",
+        description: Annotated[str, "What happens in the game, for the composer"] = "",
+        state: Annotated[str, "Which state of the game: bgm for the music under the game, or correct, wrong, streak, complete, starEarned, intro, countdownTick, countdownEnd, cardFlip, matchFound, dragStart, dragDrop, tap"] = "bgm",
+        level: Annotated[str, "Only when THIS level needs its own sound; leave empty so every level of the game shares one"] = "",
+        scope: Annotated[str, "'agent' binds it for everyone who reuses this agent; 'mine' is a correction for this person alone"] = "agent",
+    ) -> str:
+        """Compose this game's background music and bind it to the game.
+
+        Call it in CREATE for each game this agent plays with.  The music
+        is composed by the node's media capability and recorded against
+        this agent, so REUSE plays the same music rather than composing
+        again, and the reviewer approves one piece of music per game.
+
+        Idempotent: once a game is bound, calling it again returns the
+        binding.  If the composer is still working, call it again later
+        with the same game_id and it picks the task back up.
+        """
+        tool_logger.info(f'INSIDE bind_game_sound for game {game_id}')
+        if not game_id or not str(game_id).strip():
+            return "A game_id is required: use the game config's id."
+        slot = str(game_id).strip()
+
+        which = str(state or 'bgm').strip() or 'bgm'
+        if which not in GAME_STATES:
+            return (f"{which} is not one of a game's states. Use one of: "
+                    f"{', '.join(sorted(GAME_STATES))}.")
+        mine = user_id if str(scope or 'agent').strip() == 'mine' else None
+        games = agent_data.setdefault(prompt_id, {}).setdefault('games', {})
+        bound, matched = game_state_sound(games, slot, which, level, mine,
+                                          own_only=bool(mine))
+        if bound.get('url'):
+            return json.dumps({
+                'status': 'already_bound',
+                'game_id': slot,
+                'state': which,
+                'matched': matched,
+                'music': bound,
+                'note': f'This game already has its {which}; it is never composed twice.',
+            })
+        # NO early return for a composition already under way.  It used to
+        # return here saying "call again with the same arguments to finish
+        # it" -- and calling again hit this same branch and said it again,
+        # forever.  MEASURED 2026-09-22: twelve consecutive calls, the
+        # composition finishing on the server in the middle of them, and the
+        # memo never receiving the url.  The resume path below (`task_id =
+        # bound.get('task_id')`, which skips the submit and polls the
+        # existing task) was unreachable, so the note was a promise the code
+        # could not keep.  Falling through IS the dedupe: an existing
+        # task_id means poll it, never start a second composition.
+
+        def _remember(record):
+            set_game_state_sound(games, slot, which, record, level, mine)
+            try:
+                helper_fun.save_agent_data_to_file(prompt_id, agent_data)
+            except Exception as e:
+                tool_logger.warning(f'bind_game_sound could not persist: {e}')
+            return record
+
+        def _offer(record):
+            """Hand a finished piece to the person, to hear and answer."""
+            if record.get('url'):
+                offer_sound_for_review(user_id, prompt_id, slot, which, record)
+            return record
+
+        try:
+            from integrations.service_tools.media_agent import (
+                check_media_status,
+                generate_media,
+            )
+        except ImportError as e:
+            tool_logger.warning(f'bind_game_sound: no media capability ({e})')
+            return ("This node cannot compose music (the media capability is "
+                    "not available here), so the game keeps no sound.")
+
+        def _no_composer_here(result):
+            """How to answer a failure, told apart by the module that wrote it.
+
+            media_agent.classify_error is the reader that lives next to the
+            returns it reads (hartos-94, HARTOS 11d0aebee), and it makes a
+            distinction a prose match here could not: a node with NOTHING
+            installed should be offered an install, while an AceStep that is
+            merely not running must not be -- offering to install what is
+            already installed is its own defect.
+            """
+            try:
+                from integrations.service_tools.media_agent import (
+                    classify_error, ABSENT)
+                return classify_error(result) == ABSENT
+            except Exception:
+                return False
+
+        def _ask_for_a_composer(why):
+            """Offer to set a music model up, rather than failing quietly.
+
+            A node with no composer cannot give a game its sounds, and
+            silence tells the person nothing.  The ask is the canonical
+            consent card, scoped to this one capability, and the owner's
+            yes routes into the provisioning that already exists.
+            """
+            try:
+                from integrations.agent_engine.capability_setup import (
+                    request_capability_setup)
+                outcome = request_capability_setup(
+                    'music:acestep',
+                    reason=(f"To give {slot} its {which} sound I need a music "
+                            f"model on this computer. May I set one up?"),
+                    category='subprocess.tool_load',
+                    # NOT 'backend': that key is what the TTS venv repair
+                    # tool reads, and its documented backends are TTS engine
+                    # ids only (backend_repair_tools) -- so naming acestep
+                    # there sent a granted consent into a repair path aimed
+                    # at a tool that cannot install a music model.  With no
+                    # backend, goal_manager routes tool_load to dependency
+                    # remediation instead of a venv rebuild, which is what
+                    # a missing music engine actually needs.
+                    context={'tool': 'acestep', 'game_id': slot,
+                             'state': which},
+                )
+            except Exception as ask_error:
+                tool_logger.warning(f'could not offer a composer: {ask_error}')
+                outcome = 'unavailable'
+            return json.dumps({
+                'status': 'needs_capability',
+                'capability': 'music:acestep',
+                'game_id': slot,
+                'state': which,
+                'asked': outcome,
+                'why': why,
+                'note': {
+                    'provisioning': 'Setting the music model up now; ask again '
+                                    'once it is ready.',
+                    'asked': 'I have asked the owner of this computer whether '
+                             'I may set a music model up.',
+                    'declined': 'The owner said no to a music model, so this '
+                                'game keeps the sounds it already has.',
+                    'unavailable': 'There is nobody to ask on this node, so no '
+                                   'sound can be composed here.',
+                }.get(outcome, 'No music model is available on this node.'),
+            })
+
+        prompt = GAME_STATES[which].format(
+            what=description or slot, mood=mood)
+        # A take the reviewer rejected is composed again WITH the reason
+        # they gave, and kept as the next variant (spec §6.1).
+        rejected = rejected_take(games, slot, which, level, mine)
+        variant = int(rejected.get('variant') or 1) + 1 if rejected else 1
+        if rejected.get('rejected_reason'):
+            prompt = f"{prompt}. Not like the last one: {rejected['rejected_reason']}"
+        # Carried forward, because the new take REPLACES the rejected one at
+        # this key: without this the previous audio would survive exactly
+        # until the next composition and then vanish.
+        previous_takes = list(rejected.get('previous_takes') or [])
+        if rejected.get('rejected_url'):
+            previous_takes.append({
+                'url': rejected['rejected_url'],
+                'variant': int(rejected.get('variant') or 1),
+                'rejected_reason': rejected.get('rejected_reason') or '',
+                'rejected_at': rejected.get('rejected_at'),
+            })
+        task_id = bound.get('task_id')
+        try:
+            if not task_id:
+                started = json.loads(generate_media(
+                    context=prompt,
+                    output_modality='audio_music',
+                    input_text=prompt,
+                    duration=60,
+                    style=mood,
+                ))
+                if started.get('status') == 'completed':
+                    results = started.get('results') or []
+                    url = results[0].get('url') if results else None
+                    if url:
+                        record = _offer(_remember({'url': url, 'mood': mood,
+                                            'prompt': prompt, 'state': which,
+                                            'level': level or None,
+                                            'variant': variant,
+                                            'previous_takes': previous_takes,
+                                            'composed_at': time.time(),
+                                            'approved_at': None}))
+                        return json.dumps({'status': 'bound', 'game_id': slot,
+                                           'state': which, 'music': record})
+                    return "The composer answered without any music; nothing bound."
+                if started.get('status') == 'warming_up':
+                    # Not a refusal: the composer is getting ready, which on
+                    # a first run means downloading its model.  Saying it
+                    # refused would be wrong AND would leave the game with
+                    # nothing pending to come back to.
+                    return json.dumps({
+                        'status': 'composing',
+                        'game_id': slot,
+                        'state': which,
+                        'note': started.get(
+                            'message',
+                            'The composer is starting up; ask again shortly.'),
+                    })
+                if started.get('status') != 'pending':
+                    why = str(started.get('error', 'unknown reason'))
+                    if _no_composer_here(started):
+                        return _ask_for_a_composer(why)
+                    return f"The composer refused this game's music: {why}"
+                task_id = started.get('task_id')
+                _remember({'task_id': task_id, 'mood': mood, 'prompt': prompt,
+                           'state': which, 'level': level or None,
+                           'variant': variant,
+                           'previous_takes': previous_takes,
+                           'composed_at': None, 'approved_at': None})
+
+            # Give it a while, then hand the task back rather than block.
+            deadline = time.time() + 90
+            while time.time() < deadline:
+                time.sleep(3)
+                progress = json.loads(check_media_status(task_id))
+                state = progress.get('status')
+                if state in ('complete', 'completed', 'done'):
+                    results = progress.get('results') or []
+                    url = (progress.get('url')
+                           or (results[0].get('url') if results else None))
+                    if not url:
+                        return "The composer finished without any music; nothing bound."
+                    record = _offer(_remember({'url': url, 'mood': mood, 'prompt': prompt,
+                                        'state': which, 'level': level or None,
+                                        'variant': variant,
+                                        'previous_takes': previous_takes,
+                                        'composed_at': time.time(),
+                                        'approved_at': None}))
+                    return json.dumps({'status': 'bound', 'game_id': slot,
+                                       'state': which, 'music': record})
+                if state in ('failed', 'error'):
+                    why = str(progress.get('error', 'unknown reason'))
+                    if _no_composer_here(progress):
+                        return _ask_for_a_composer(why)
+                    return f"The composer failed on this game: {why}"
+            return json.dumps({
+                'status': 'composing',
+                'game_id': slot,
+                'state': which,
+                'task_id': task_id,
+                'note': 'Still composing. Call bind_game_sound again with the '
+                        'same game_id and state to finish binding it.',
+            })
+        except Exception as e:
+            tool_logger.warning(f'bind_game_sound failed for {slot}: {e}')
+            return f"Could not bind this game's sound: {e}"
+
+    tools.append((
+        "bind_game_sound",
+        "Compose a kids game's background music and bind it to that game for "
+        "good, so every later run of this agent plays the same music. Pass the "
+        "game's id, a mood and a short description. Call it once per game.",
+        bind_game_sound,
+    ))
+
+    # ------------------------------------------------------------------
+    # get_game_sound — what a game is bound to play
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def get_game_sound(
+        game_id: Annotated[str, "The game's id as the app knows it"],
+        state: Annotated[str, "Which state of the game: bgm, correct, wrong, complete, intro…"] = "bgm",
+        level: Annotated[str, "The level being played, when levels have their own sounds"] = "",
+    ) -> str:
+        """A sound this game is bound to play. REUSE reads it; it never composes."""
+        slot = str(game_id or '').strip()
+        which = str(state or 'bgm').strip() or 'bgm'
+        if which not in GAME_STATES:
+            return (f"{which} is not one of a game's states. Use one of: "
+                    f"{', '.join(sorted(GAME_STATES))}.")
+        level = str(level or '').strip()
+        bound, matched = game_state_sound(
+            agent_data.get(prompt_id, {}).get('games', {}), slot, which, level, user_id)
+        if bound.get('url'):
+            return json.dumps({
+                'status': 'bound',
+                'game_id': slot,
+                'state': which,
+                'matched': matched,
+                'approved': bool(bound.get('approved_at')),
+                'music': bound,
+            })
+        if bound.get('task_id'):
+            return json.dumps({'status': 'composing', 'game_id': slot,
+                               'state': which, 'task_id': bound['task_id']})
+        return json.dumps({'status': 'unbound', 'game_id': slot, 'state': which,
+                           'note': f'No {which} is bound to this game yet.'})
+
+    # ------------------------------------------------------------------
+    # approve_game_sound — the reviewer's word on a game's music
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def approve_game_sound(
+        game_id: Annotated[str, "The game whose sound the reviewer just approved"],
+        approved: Annotated[bool, "True when the reviewer accepts this sound, False to drop it so it can be composed again"] = True,
+        state: Annotated[str, "Which state of the game: bgm, correct, wrong, complete, intro…"] = "bgm",
+        reason: Annotated[str, "Why it was rejected, in the reviewer's words — the next take is composed to answer it"] = "",
+        level: Annotated[str, "The level, when this sound belongs to one level"] = "",
+        scope: Annotated[str, "'agent' is the reviewer deciding for everyone; 'mine' is this person correcting their own copy"] = "agent",
+    ) -> str:
+        """Record that the reviewer approved (or rejected) a game's music.
+
+        The reviewer meets this agent in Evaluation Mode after creation and
+        hears the game's music there.  Their word is recorded on the
+        binding, so the person who reuses this agent gets the music that
+        was approved.  A rejection clears the binding, and the next
+        bind_game_sound composes a fresh one.
+        """
+        slot = str(game_id or '').strip()
+        which = str(state or 'bgm').strip() or 'bgm'
+        if which not in GAME_STATES:
+            return (f"{which} is not one of a game's states. Use one of: "
+                    f"{', '.join(sorted(GAME_STATES))}.")
+        level = str(level or '').strip()
+        mine = user_id if str(scope or 'agent').strip() == 'mine' else None
+        games = agent_data.setdefault(prompt_id, {}).setdefault('games', {})
+        # A verdict belongs to the memo it was GIVEN, and the ladder may have
+        # found that under a different key than the one asked for: rejecting
+        # while playing level 3 wrote at 'correct@3' and left 'correct' --
+        # the take actually sounding -- playing on, url intact.  A person
+        # correcting their own copy still writes in their own space.
+        music, matched, write_key = record_verdict(
+            games, slot, which, approved, reason, level, mine)
+        if not music:
+            return (f"No {which} is bound to {slot or 'that game'} yet, so "
+                    f"there is nothing to approve.")
+        try:
+            helper_fun.save_agent_data_to_file(prompt_id, agent_data)
+        except Exception as e:
+            tool_logger.warning(f'approve_game_sound could not persist: {e}')
+        return json.dumps({
+            'status': 'approved' if approved else 'rejected',
+            'game_id': slot,
+            'state': which,
+            'music': game_state_sound(games, slot, which, level, mine,
+                                      own_only=bool(mine))[0] or None,
+            'scope': 'mine' if mine else 'agent',
+            # which memo the verdict landed on, so a caller can see that a
+            # level-3 rejection marked the game-wide take that was playing
+            'matched': matched,
+            'key': write_key,
+        })
+
+    tools.append((
+        "approve_game_sound",
+        "Record the reviewer's decision on a kids game's music during review: "
+        "approved keeps it for everyone who reuses this agent, rejected drops "
+        "it so it can be composed again.",
+        approve_game_sound,
+    ))
+
+    tools.append((
+        "get_game_sound",
+        "The music bound to a kids game by this agent, if any. Use it before "
+        "playing a game so the sound stays the one the reviewer approved.",
+        reads_persisted_state(get_game_sound),
+    ))
 
     tools.append((
         "save_data_in_memory",

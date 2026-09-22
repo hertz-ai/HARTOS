@@ -223,7 +223,17 @@ class TestRecordEmbodiedInteraction:
         bridge.record_embodied_interaction(
             action={'type': 'motor', 'target': 'wheel', 'params': {'velocity': 0.5}},
             sensor_context={'imu': {'accel_x': 0.1}},
-            outcome={'reached_target': True, 'distance_error': 0.02},
+            outcome={
+                'reached_target': True,
+                'distance_error': 0.02,
+                'verification': {
+                    'verified': True,
+                    'source': 'backend_probe',
+                    'outcome': 'success',
+                    'action_id': 'motor-test',
+                    'evidence': {'distance_error': 0.02},
+                },
+            },
         )
         assert len(bridge._experience_queue) >= 1
         latest = bridge._experience_queue[-1]

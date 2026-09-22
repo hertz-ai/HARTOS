@@ -87,18 +87,121 @@ class TestMiniCPMBackend:
             assert backend._port == 9999
 
     def test_describe_http_call(self):
-        """describe() makes HTTP POST to MiniCPM sidecar."""
+        """describe() makes HTTP POST to MiniCPM sidecar.
+
+        The response key is `result` — that is what minicpm_server.py's
+        describe_raw() returns.  This test used to assert `description`,
+        a key no HART OS server has ever produced, so the mock agreed
+        with the client while the client disagreed with the server.
+        test_describe_matches_the_real_sidecar_contract (below) is the
+        one that can catch that, because it drives the real server view.
+        """
         import integrations.vision.lightweight_backend as lvb
         backend = MiniCPMBackend(port=9891)
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {'description': 'A cat sitting on a desk'}
+        mock_resp.json.return_value = {'result': 'A cat sitting on a desk'}
 
         with patch.object(lvb, 'pooled_post',
                           return_value=mock_resp) as mock_post:
             result = backend.describe(b'fake_jpeg_bytes')
             assert result == 'A cat sitting on a desk'
             mock_post.assert_called_once()
+
+    def test_describe_matches_the_real_sidecar_contract(self):
+        """The request describe() builds is one minicpm_server actually serves.
+
+        Both halves are real: MiniCPMBackend.describe builds the request,
+        and integrations.vision.minicpm_server's own Flask view handles it
+        (only the weights are stubbed).  A base64-JSON body — what this
+        client sent before 2026-09-21 — reaches PIL.Image.open as JSON
+        text and comes back HTTP 500, so this fails on the old shape.
+        """
+        import integrations.vision.lightweight_backend as lvb
+        from integrations.vision import minicpm_server
+
+        png = (b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00'
+               b'\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx'
+               b'\x9cc```\x00\x00\x00\x04\x00\x01\xf6\x178U\x00\x00\x00\x00I'
+               b'END\xaeB`\x82')
+        client = minicpm_server.app.test_client()
+        seen = {}
+
+        def _forward(url, **kwargs):
+            seen['url'] = url
+            resp = client.post(
+                '/describe',
+                data=kwargs.get('data'),
+                query_string=kwargs.get('params') or {},
+                headers=kwargs.get('headers') or {},
+            )
+            out = MagicMock()
+            out.status_code = resp.status_code
+            out.json.return_value = resp.get_json()
+            out.text = resp.get_data(as_text=True)
+            return out
+
+        with patch.object(minicpm_server, '_process_image_sync',
+                          lambda image, prompt: f'a 1x1 image; asked: {prompt}'), \
+             patch.object(lvb, 'pooled_post', _forward):
+            result = MiniCPMBackend(port=9891).describe(png, 'What is this?')
+
+        assert result == 'a 1x1 image; asked: What is this?'
+        assert seen['url'].endswith('/describe')
+
+    def test_is_available_needs_the_weights_not_just_a_gpu(self):
+        """A GPU with no MiniCPM weights is not a MiniCPM node.
+
+        get_vision_backend() gates its catalog branch and its last-resort
+        branch on this, so a True here made a node SELECT a backend with
+        nothing behind it.
+        """
+        from integrations.vision import minicpm_installer as mi
+
+        backend = MiniCPMBackend()
+        with patch.object(mi.MiniCPMInstaller, 'detect_gpu', return_value=True), \
+             patch.object(mi.MiniCPMInstaller, 'is_installed', return_value=False):
+            assert backend.is_available() is False
+        with patch.object(mi.MiniCPMInstaller, 'detect_gpu', return_value=True), \
+             patch.object(mi.MiniCPMInstaller, 'is_installed', return_value=True):
+            assert backend.is_available() is True
+        with patch.object(mi.MiniCPMInstaller, 'detect_gpu', return_value=False), \
+             patch.object(mi.MiniCPMInstaller, 'is_installed', return_value=True):
+            assert backend.is_available() is False
+
+    def test_resolve_port_prefers_the_sidecar_runtime_manager_started(self):
+        """A RUNNING RTM sidecar's dynamic port wins over the fixed 9891.
+
+        RTM allocates an OS-assigned port; before this, MiniCPMBackend only
+        ever read port_registry's 'vision', so start_tool('minicpm') could
+        succeed while the backend posted into a dead port.
+        """
+        from integrations.service_tools import runtime_manager as rm
+
+        backend = MiniCPMBackend()
+        registry_port = backend._registry_port
+
+        fake_rtm = MagicMock()
+        fake_rtm.get_tool_port.return_value = 55897
+        with patch.object(rm, 'runtime_tool_manager', fake_rtm):
+            assert backend._resolve_port() == 55897
+        fake_rtm.get_tool_port.assert_called_with('minicpm')
+
+        # Nothing running -> fall back to the fixed-port deployment
+        fake_rtm.get_tool_port.return_value = None
+        with patch.object(rm, 'runtime_tool_manager', fake_rtm):
+            assert backend._resolve_port() == registry_port
+
+    def test_explicit_port_outranks_the_runtime_manager(self):
+        """HEVOLVE_MINICPM_PORT / port= is an operator override; it wins."""
+        from integrations.service_tools import runtime_manager as rm
+
+        fake_rtm = MagicMock()
+        fake_rtm.get_tool_port.return_value = 55897
+        with patch.object(rm, 'runtime_tool_manager', fake_rtm):
+            assert MiniCPMBackend(port=9999)._resolve_port() == 9999
+            with patch.dict(os.environ, {'HEVOLVE_MINICPM_PORT': '7777'}):
+                assert MiniCPMBackend()._resolve_port() == 7777
 
     def test_describe_failure_returns_none(self):
         import integrations.vision.lightweight_backend as lvb
@@ -633,3 +736,54 @@ class TestModelRegistryVisionLite:
             config_list_entry={}, gpu_tdp_watts=0.0,
         )
         assert mb.tier == ModelTier.FAST
+
+
+# ── #102: a failed launch must not kill captioning for good ───────────
+
+def test_a_failed_launch_is_retried_after_the_cooldown():
+    """Found by hartos-94, read from the path and fixed here.
+
+    _launch_attempted was cleared in exactly ONE place -- the tail of
+    stop() -- and check_idle only reaches stop() through
+    `if self._server_proc`, which is None after a FAILED launch. So one
+    failure set the flag forever and captioning was dead for the life of
+    the process, on a backend whose whole design is a lazy per-frame
+    start. Transient failure is the normal case: the event wait is 5x1s,
+    the standalone path needs a llama-server binary that aborts on this
+    box, and it competes for VRAM with the resident LLM.
+    """
+    from integrations.vision.lightweight_backend import Qwen08BBackend
+
+    backend = Qwen08BBackend(port=59999)
+    backend.is_available = lambda: False
+
+    # An ATTEMPT is what moves the timestamp. is_available() is consulted
+    # on every call before the cooldown -- correctly, it is the cheap "is
+    # it already up" check -- so counting it proves nothing about whether
+    # a launch was tried.
+    assert backend._ensure_running() is False
+    first_attempt = backend._launch_attempted_at
+    assert first_attempt > 0, 'never even tried'
+
+    # immediately after: suppressed by the cooldown, as intended
+    assert backend._ensure_running() is False
+    assert backend._launch_attempted_at == first_attempt, (
+        'hammered the launch instead of waiting out the cooldown')
+
+    # once the cooldown has passed, it tries AGAIN rather than latching off
+    backend._launch_attempted_at -= (backend.LAUNCH_RETRY_S + 1)
+    stale = backend._launch_attempted_at
+    assert backend._ensure_running() is False
+    assert backend._launch_attempted_at > stale, (
+        'captioning stayed dead after one failed launch (#102)')
+
+
+def test_the_cooldown_is_not_a_permanent_latch():
+    """A guard on the mechanism itself, since the defect was its permanence."""
+    from integrations.vision.lightweight_backend import Qwen08BBackend
+
+    assert isinstance(Qwen08BBackend.LAUNCH_RETRY_S, (int, float))
+    assert Qwen08BBackend.LAUNCH_RETRY_S > 0
+    backend = Qwen08BBackend(port=59998)
+    assert hasattr(backend, '_launch_attempted_at'), (
+        'without a timestamp the flag can only be permanent')

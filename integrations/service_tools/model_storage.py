@@ -10,6 +10,7 @@ Pattern from: integrations/vision/minicpm_installer.py
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -19,15 +20,45 @@ from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-BASE_DIR = Path.home() / '.hevolve' / 'models'
+DEFAULT_BASE_DIR = Path.home() / '.hevolve' / 'models'
+
+# Back-compat alias.  Import-time constant, so it does NOT see a
+# HEVOLVE_MODEL_DIR set after this module is imported — call
+# get_base_dir() instead of reading this.
+BASE_DIR = DEFAULT_BASE_DIR
 MANIFEST_FILE = BASE_DIR / 'manifest.json'
+
+
+def get_base_dir() -> Path:
+    """Return the model-storage root, honouring ``HEVOLVE_MODEL_DIR``.
+
+    THE single resolver for "where models live".  gpu_worker's
+    ToolWorker._get_output_dir already read HEVOLVE_MODEL_DIR to place a
+    tool's ``output/`` subdirectory, but ModelStorageManager pinned
+    ~/.hevolve/models unconditionally — so the env var moved a tool's
+    OUTPUT while its WEIGHTS still landed on the home drive.  Measured
+    2026-09-21 on this box: C: had 23 GB free against F:'s 468 GB, and
+    every production caller constructs RuntimeToolManager() with
+    defaults, so a 10 GB download had no way to be steered off C:.
+    Resolved here once; gpu_worker imports this instead of re-reading
+    the variable.
+
+    An unset/blank value keeps the historical default, so existing
+    installs do not move.
+    """
+    raw = os.environ.get('HEVOLVE_MODEL_DIR', '').strip()
+    if not raw:
+        return DEFAULT_BASE_DIR
+    return Path(os.path.expanduser(raw))
 
 
 class ModelStorageManager:
     """Centralized model storage with manifest tracking."""
 
     def __init__(self, base_dir: Path = None):
-        self.base_dir = base_dir or BASE_DIR
+        # Resolved per-instance (not at import) so a HEVOLVE_MODEL_DIR set
+        # by the launching process is honoured by default construction.
+        self.base_dir = Path(base_dir) if base_dir else get_base_dir()
         self.manifest_file = self.base_dir / 'manifest.json'
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -85,14 +116,25 @@ class ModelStorageManager:
         return any(p.is_file() for p in tool_dir.rglob("*"))
 
     def mark_downloaded(self, tool_name: str, source_url: str,
-                        size_bytes: int = 0) -> None:
-        """Record that a tool's models have been downloaded."""
+                        size_bytes: int = 0, patterns=None) -> None:
+        """Record that a tool's models have been downloaded.
+
+        ``patterns`` is the ``allow_patterns`` the fetch ran with (None =
+        the whole repo).  It is recorded because the receipt otherwise
+        cannot say WHAT it is a receipt for: a fetch narrowed to
+        ``model_index.json`` writes the same row shape as a fetch of the
+        full 28 GB pipeline, and the next caller asking for the pipeline
+        would be told it already has it.  Self-caught 2026-09-21 — an
+        instrument check that pulled 4 config files (2,194 bytes) left a
+        row that made the real download a no-op.
+        """
         manifest = self._read_manifest()
         manifest.setdefault("tools", {})[tool_name] = {
             "source_url": source_url,
             "size_bytes": size_bytes,
             "downloaded_at": datetime.now().isoformat(),
             "path": str(self.get_tool_dir(tool_name)),
+            "patterns": sorted(patterns) if patterns else None,
         }
         self._write_manifest(manifest)
         logger.info(f"Marked {tool_name} as downloaded ({size_bytes / 1e9:.2f} GB)")
@@ -168,6 +210,54 @@ class ModelStorageManager:
 
     # ── HuggingFace download ─────────────────────────────────────
 
+    # A download is "complete" only within this margin of the byte count
+    # mark_downloaded() recorded on the run that finished.  Not 1.0: the
+    # receipt is written from get_tool_size() AFTER the fetch, so a tool
+    # that writes a log line or an output/ file later grows past its own
+    # receipt, and a hair under is ordinary filesystem noise.
+    _COMPLETE_SIZE_RATIO = 0.99
+
+    def hf_download_is_complete(self, tool_name: str,
+                                allow_patterns=None) -> bool:
+        """True when the recorded download is still all there on disk.
+
+        ``is_downloaded()`` answers "are there files", which is the right
+        question for its callers and must not change (its own docstring
+        records why it trusts the disk over the manifest).  It is the
+        WRONG question for "may I skip the fetch", because ANY one file
+        answers it.  MEASURED 2026-09-21 on this box:
+        ~/.hevolve/models/ltx2 carried a manifest row reading
+        28,405,153,793 bytes from 2026-04-16 while the directory held
+        1,336,240,620 — 4.7% — everything but a stray LoRA having been
+        reclaimed by the 2026-09-13 disk-full triage.  is_downloaded()
+        said True, so download_hf_model returned early and the 27 GB
+        could never come back: an interrupted or pruned fetch was
+        permanent, and the tool it belonged to could never start.
+
+        Requiring the receipt AND the bytes makes the repair automatic —
+        snapshot_download re-runs and skips the files that survived, so
+        resuming costs only what is actually missing.  A tool with files
+        but no receipt (weights placed by some other path, the case
+        is_downloaded exists for) also re-runs, which is a metadata call
+        and no re-transfer.
+        """
+        row = self._read_manifest().get("tools", {}).get(tool_name)
+        if not row:
+            return False
+        # A receipt covers only the pattern set it was taken under.  A
+        # narrower one (or one from before patterns were recorded, which
+        # reads as the whole repo) cannot vouch for a wider request.
+        if "patterns" in row:
+            want = sorted(allow_patterns) if allow_patterns else None
+            if row.get("patterns") != want:
+                return False
+        recorded = row.get("size_bytes") or 0
+        if recorded <= 0:
+            # Older receipts carry no size; fall back to presence so we
+            # do not re-fetch a download that predates size tracking.
+            return self.is_downloaded(tool_name)
+        return self.get_tool_size(tool_name) >= recorded * self._COMPLETE_SIZE_RATIO
+
     def download_hf_model(self, tool_name: str, repo_id: str,
                           **kwargs) -> Optional[Path]:
         """Download a HuggingFace model using snapshot_download.
@@ -176,8 +266,9 @@ class ModelStorageManager:
         Returns the tool directory on success, None on failure.
         """
         tool_dir = self.get_tool_dir(tool_name)
+        allow_patterns = kwargs.get("allow_patterns")
 
-        if self.is_downloaded(tool_name):
+        if self.hf_download_is_complete(tool_name, allow_patterns):
             logger.info(f"HF model for {tool_name} already downloaded")
             return tool_dir
 
@@ -193,12 +284,26 @@ class ModelStorageManager:
                 **kwargs,
             )
             size = self.get_tool_size(tool_name)
-            self.mark_downloaded(tool_name, f"hf://{repo_id}", size)
+            self.mark_downloaded(tool_name, f"hf://{repo_id}", size,
+                                 patterns=allow_patterns)
             return tool_dir
         except ImportError:
             logger.error("huggingface_hub not installed. pip install huggingface_hub")
             return None
         except Exception as e:
+            # A fetch that cannot reach the Hub must not destroy an install
+            # that already works offline.  setup_tool no longer pre-checks
+            # is_downloaded for hf tools, so without this an air-gapped or
+            # briefly-offline boot would turn every already-present model
+            # (whisper, minicpm, ...) into "Download failed".  Degraded, and
+            # said so: the files are there, their completeness is unproven.
+            if self.is_downloaded(tool_name):
+                logger.warning(
+                    f"HF download failed for {tool_name}: {e} — keeping the "
+                    f"{self.get_tool_size(tool_name) / 1e9:.2f} GB already in "
+                    f"{tool_dir}; completeness UNVERIFIED this run"
+                )
+                return tool_dir
             logger.error(f"HF download failed for {tool_name}: {e}")
             return None
 

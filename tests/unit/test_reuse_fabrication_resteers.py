@@ -66,12 +66,12 @@ class ReuseFabricationResteers(unittest.TestCase):
                       "each refusal must record WHICH tools never ran so the "
                       "caller can name them when steering")
 
-    def test_fail_open_is_loud_and_honest(self):
-        # After the budget it still advances (never a permanent stall) but must
-        # say so at error level and mark the output as not tool-backed.
-        self.assertIn('NOT tool-backed', self.src,
-                      "the post-budget advance must declare that the action's "
-                      "output is not tool-backed, never advance silently")
+    def test_exhausted_evidence_records_retryable_failure(self):
+        self.assertIn('ActionState.GAVE_UP', self.src,
+                      "missing evidence after the steer budget must use the "
+                      "existing honest-failure state, never complete")
+        self.assertNotIn('advancing to avoid a permanent stall', self.src,
+                         "the old false-success tradeoff must not return")
 
     # --- Fix B: refusal is distinguishable and every caller re-steers ---
     def test_steer_message_helper_defined_once(self):

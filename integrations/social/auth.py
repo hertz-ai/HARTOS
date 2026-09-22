@@ -259,6 +259,23 @@ def verify_device_jwt(db, token: str, owner_id: str) -> dict:
     return {'status': 'ok', 'payload': payload, 'public_key': granted_key}
 
 
+def file_device_access_ask(db, owner_id: str, public_key: str, claims: dict) -> None:
+    """File the one canonical owner-consent ask for a proven phone key.
+
+    Both the HTTP gate and PeerLink admission call this only after
+    ``verify_device_jwt`` has verified proof of possession.  Keeping the
+    wording, scope, record, and realtime fanout here prevents the two
+    transports from drifting into separate device-trust flows.
+    """
+    from .consent_service import ConsentService, device_scope
+
+    name = ' '.join(str(claims.get('username') or '').split())[:100]
+    who = f'A phone calling itself "{name}"' if name else 'An unnamed phone'
+    ConsentService.request_consent(
+        db, owner_id, 'device_access', scope=device_scope(public_key),
+        reason=f"{who} asks to use this computer's agents from the network.",
+        requester_name=name)
+
 def generate_token_pair(user_id: str, username: str, role: str = 'flat') -> dict:
     """Generate access + refresh token pair."""
     mgr = _get_jwt_manager()

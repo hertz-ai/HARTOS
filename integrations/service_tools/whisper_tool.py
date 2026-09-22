@@ -203,16 +203,82 @@ def _record_whisper_success() -> None:
 # faster-whisper (primary engine)
 # ═══════════════════════════════════════════════════════════════
 
-# Default faster-whisper model size. Can be overridden by the user via the
-# admin Model Management UI, which sets HEVOLVE_STT_MODEL_SIZE in the
-# orchestrator and then stops the worker so the next call respawns with
-# the new value picked up at subprocess startup.
-_FASTER_WHISPER_MODEL_SIZE = os.environ.get(
-    'HEVOLVE_STT_MODEL_SIZE', 'base',
-)  # CPU int8 — preserves GPU VRAM for TTS/VLM
+# The size faster-whisper loads when nothing better fits: the CPU rung of the
+# module's ladder (CPU, 4-8 GB -> base), and the rung a failed CUDA load
+# falls back to.
+STT_CPU_MODEL_SIZE = 'base'
 
 
-def _get_faster_whisper_model(model_size: str = "base"):
+def faster_whisper_model_size() -> str:
+    """The faster-whisper size to load on this box -- the ONE resolver.
+
+    1. ``HEVOLVE_STT_MODEL_SIZE`` when set: the admin's explicit choice.
+    2. Else the catalog's best faster-whisper entry for the current compute
+       state (``ModelOrchestrator.select_best('stt')``, sherpa-onnx ids
+       excluded so the answer is in this engine's namespace), mapped
+       through ``_CATALOG_ID_TO_FASTER_WHISPER_SIZE``.  The catalog already
+       encodes the ladder: medium/large are GPU-only and need their VRAM
+       free after the main LLM's reserve, so a CPU box or a full GPU gets
+       small/base from the same call.
+    3. Else ``STT_CPU_MODEL_SIZE``.
+
+    Two guards on the catalog's answer, both from measurements on the
+    owner's RTX 3070 box (2026-09-16):
+      - never below ``STT_CPU_MODEL_SIZE``: with the main LLM resident the
+        catalog's budget is 0.00 GB (its 4.3 GB llm_main reserve is taken
+        again although free VRAM already excludes the loaded LLM) and a
+        zero-VRAM entry scores as a GPU fit, so it answers 'tiny' -- a
+        downgrade from the 'base' every box ran until now;
+      - an upgrade only when its model is already on disk: a size never
+        fetched is downloaded inside the 180 s request window (#677).
+        No STT loader is registered with the orchestrator, so the admin
+        download path cannot fetch a size yet; that producer is open.
+
+    Until 2026-09-16 the size was this env's default 'base' and nothing in
+    either repo ever set the env (the comment beside it named an admin UI
+    producer that was never written).  The parent resolves this once per
+    worker life (``_stt_call``); a per-request re-resolve would reload -- or
+    download -- a different size every time free VRAM moved.
+    """
+    override = (os.environ.get('HEVOLVE_STT_MODEL_SIZE') or '').strip()
+    if override:
+        return override
+    entry = _catalog_stt_entry(exclude=list(_CATALOG_ID_TO_SHERPA))
+    size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(getattr(entry, 'id', None))
+    ladder = list(_CATALOG_ID_TO_FASTER_WHISPER_SIZE.values())   # tiny .. large-v3
+    if size is None or ladder.index(size) <= ladder.index(STT_CPU_MODEL_SIZE):
+        return STT_CPU_MODEL_SIZE
+    if not _faster_whisper_model_cached(size):
+        logger.info("STT: catalog picks faster-whisper '%s' but it is not "
+                    "downloaded; staying on '%s'", size, STT_CPU_MODEL_SIZE)
+        return STT_CPU_MODEL_SIZE
+    return size
+
+
+def _faster_whisper_model_cached(model_size: str) -> bool:
+    """True when faster-whisper's repo for ``model_size`` is in the local
+    HuggingFace cache (the same lookup WhisperModel resolves through).
+    Pure huggingface_hub -- no ctranslate2 DLLs enter the parent process."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        hit = try_to_load_from_cache(f'Systran/faster-whisper-{model_size}', 'model.bin')
+        return isinstance(hit, str)
+    except Exception as e:
+        logger.debug("_faster_whisper_model_cached(%s): %s", model_size, e)
+        return False
+
+
+def _vram_key_for_size(model_size: str) -> str:
+    """The ``VRAM_BUDGETS`` key for a faster-whisper size, via the
+    orchestrator's catalog-id -> budget-key map (no second table)."""
+    from .model_orchestrator import ModelOrchestrator
+    for catalog_id, size in _CATALOG_ID_TO_FASTER_WHISPER_SIZE.items():
+        if size == model_size:
+            return ModelOrchestrator._CATALOG_TO_VRAM_KEY.get(catalog_id, 'whisper_base')
+    return 'whisper_base'
+
+
+def _get_faster_whisper_model(model_size: str = STT_CPU_MODEL_SIZE):
     """Lazy-load faster-whisper model (CTranslate2, auto-downloads from HuggingFace).
 
     Device selection:
@@ -260,32 +326,39 @@ def _get_faster_whisper_model(model_size: str = "base"):
 
     # Detect if CUDA is available for CTranslate2 (separate from torch CUDA).
     #
-    # CTranslate2 is the engine faster-whisper actually runs on, so its
-    # supported-compute-types probe is the AUTHORITATIVE GPU gate — torch
-    # CUDA being present is neither necessary nor sufficient.  When the probe
-    # says no CUDA, we fall back to CPU int8 AND emit ONE clear warning naming
-    # WHY, so an operator on a CUDA box (e.g. RTX 3070) immediately sees that
-    # the GPU isn't engaged and what to install — instead of only the bare
-    # INFO "loaded on cpu" that today gives no actionable signal.
+    # CTranslate2 is the engine faster-whisper actually runs on, so its own
+    # probe is the AUTHORITATIVE GPU gate — torch CUDA being present is
+    # neither necessary nor sufficient.  ``get_cuda_device_count()`` says
+    # whether a usable device exists; ``get_supported_compute_types('cuda')``
+    # then says which precisions it can run and picks float16 when offered.
+    # (Until 2026-09-16 this tested ``'cuda' in get_supported_compute_types
+    # ('cuda')`` -- a set of compute TYPES never contains the device name, so
+    # the GPU branch was unreachable and an RTX 3070 box decoded on CPU int8
+    # while warning that ctranslate2 had no CUDA.)  When the probe says no
+    # CUDA, we fall back to CPU int8 AND emit ONE clear warning naming WHY, so
+    # an operator on a CUDA box immediately sees that the GPU isn't engaged
+    # and what to install.
     device = "cpu"
     compute_type = "int8"
     _cuda_reason = ""
     try:
         import ctranslate2
-        if 'cuda' in ctranslate2.get_supported_compute_types('cuda'):
+        if ctranslate2.get_cuda_device_count() > 0:
             device = "cuda"
-            compute_type = "float16"
+            _types = set(ctranslate2.get_supported_compute_types('cuda'))
+            compute_type = "float16" if "float16" in _types else (
+                "int8_float16" if "int8_float16" in _types else "float32")
             logger.info("CTranslate2 CUDA available — loading faster-whisper on GPU")
         else:
             _cuda_reason = (
-                "ctranslate2 reports no CUDA compute types "
+                "ctranslate2 reports no CUDA device "
                 "(CPU-only ctranslate2 build, or no NVIDIA driver/runtime)"
             )
     except ImportError as e:
         _cuda_reason = f"ctranslate2 not importable ({e})"
     except Exception as e:
-        # get_supported_compute_types can raise on a broken CUDA runtime;
-        # treat as CPU and surface the reason rather than silently swallowing.
+        # The probes can raise on a broken CUDA runtime; treat as CPU and
+        # surface the reason rather than silently swallowing.
         _cuda_reason = f"ctranslate2 CUDA probe failed ({e})"
 
     if device == "cpu":
@@ -296,25 +369,50 @@ def _get_faster_whisper_model(model_size: str = "base"):
             _cuda_reason or "reason unknown",
         )
 
+    loaded_size = model_size
     logger.info(f"Loading faster-whisper model '{model_size}' on {device} ({compute_type})...")
     try:
         _faster_whisper_model = WhisperModel(
             model_size, device=device, compute_type=compute_type
         )
     except Exception as e:
-        reason = f"WhisperModel({model_size}, {device}, {compute_type}) failed: {e}"
-        logger.warning(reason)
-        _record_whisper_failure(reason)
-        raise
+        if device != "cuda":
+            reason = f"WhisperModel({model_size}, {device}, {compute_type}) failed: {e}"
+            logger.warning(reason)
+            _record_whisper_failure(reason)
+            raise
+        # A CUDA load that fails (out of memory, a missing cuBLAS DLL) must
+        # not take STT down: retry the CPU rung.  The cache below is keyed
+        # by the REQUESTED size, so the next request for the same size
+        # reuses this model instead of re-running the failing CUDA load on
+        # every 2 s interim window; the worker's idle restart (5 min) is
+        # when CUDA gets tried again.
+        logger.warning(
+            "faster-whisper '%s' failed to load on cuda (%s) — falling back "
+            "to '%s' on CPU (int8) until the STT worker restarts",
+            model_size, e, STT_CPU_MODEL_SIZE)
+        device, compute_type, loaded_size = "cpu", "int8", STT_CPU_MODEL_SIZE
+        try:
+            _faster_whisper_model = WhisperModel(
+                loaded_size, device=device, compute_type=compute_type
+            )
+        except Exception as e2:
+            reason = f"WhisperModel({loaded_size}, cpu, int8) failed after the cuda failure: {e2}"
+            logger.warning(reason)
+            _record_whisper_failure(reason)
+            raise
     _faster_whisper_model_size = model_size
-    logger.info(f"faster-whisper model '{model_size}' loaded on {device}")
+    logger.info(f"faster-whisper model '{loaded_size}' loaded on {device}")
     _record_whisper_success()
 
-    # Register with central lifecycle tracker via orchestrator
+    # Register with the orchestrator, which books the VRAM from the catalog
+    # entry's own budget row (notify_loaded -> _register_vram -> _vram_key);
+    # its device vocabulary is 'gpu' | 'cpu', not ctranslate2's 'cuda'.
     try:
         from .model_orchestrator import get_orchestrator
-        get_orchestrator().notify_loaded('stt', f'whisper-{model_size}',
-                                         device=device, vram_gb=3.0 if device == 'cuda' else 0)
+        get_orchestrator().notify_loaded(
+            'stt', f'whisper-{loaded_size}',
+            device='gpu' if device == 'cuda' else 'cpu')
     except Exception:
         logger.exception("_get_faster_whisper_model: swallowed Exception")
 
@@ -440,8 +538,13 @@ def _drop_non_speech_text(text: str) -> str:
     return text
 
 
-def _faster_whisper_transcribe(audio_path: str, language: str = None) -> Optional[str]:
+def _faster_whisper_transcribe(audio_path: str, language: str = None,
+                               model_size: Optional[str] = None) -> Optional[str]:
     """Transcribe using faster-whisper. Returns JSON string or None on failure.
+
+    ``model_size`` is the size the parent decided for this worker's life
+    (stamped on the request by ``_stt_call``); a caller without one gets
+    the same resolver's answer.
 
     Symptom #10 guard (2026-04-16): each call is gated by the module
     circuit breaker, so after N consecutive load failures we refuse
@@ -454,7 +557,7 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None) -> Optiona
         return None
 
     try:
-        model = _get_faster_whisper_model(_FASTER_WHISPER_MODEL_SIZE)
+        model = _get_faster_whisper_model(model_size or faster_whisper_model_size())
     except Exception as e:
         # _get_faster_whisper_model already records the failure +
         # emits one warning. Don't re-log at 2Hz here.
@@ -765,7 +868,9 @@ def populate_stt_catalog(catalog) -> int:
 
     added = 0
     for (mid, name, vram, ram, disk, quality, speed, tags, min_tier) in models:
-        if catalog.get(mid) is not None:
+        # Claiming skip -- see populate_tts_catalog for why `get` is not
+        # enough: an entry no populator claims is swept as stale.
+        if catalog.already_registered(mid):
             continue
         entry = ModelEntry(
             id=mid, name=name, model_type=ModelType.STT,
@@ -817,6 +922,19 @@ _CATALOG_ID_TO_FASTER_WHISPER_SIZE = {
 }
 
 
+def _catalog_stt_entry(exclude=None):
+    """The catalog's best STT entry for the current compute state, or None
+    when the catalog is unavailable or nothing fits.  The ONE catalog query
+    for STT: select_whisper_model (sherpa key or size) and
+    faster_whisper_model_size (faster-whisper size) both read through it."""
+    try:
+        from integrations.service_tools.model_orchestrator import get_orchestrator
+        return get_orchestrator().select_best('stt', exclude=exclude)
+    except Exception:
+        logger.exception("_catalog_stt_entry: swallowed Exception")
+        return None
+
+
 def select_whisper_model() -> str:
     """Select best STT model for this hardware.
 
@@ -827,25 +945,20 @@ def select_whisper_model() -> str:
     is available, or an openai-whisper model name as a legacy fallback.
     """
     # ── Primary path: ask the catalog ───────────────────────────────────────
-    try:
-        from integrations.service_tools.model_orchestrator import get_orchestrator
-        orch = get_orchestrator()
-        entry = orch.select_best('stt')
-        if entry:
-            # Map catalog entry ID back to the engine-specific key
-            sherpa_key = _CATALOG_ID_TO_SHERPA.get(entry.id)
-            if sherpa_key and sherpa_key in _SHERPA_MODELS:
-                try:
-                    import sherpa_onnx  # noqa: F401
-                    return sherpa_key
-                except ImportError:
-                    logger.debug("select_whisper_model: swallowed ImportError")
-            # faster-whisper size
-            fw_size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(entry.id)
-            if fw_size:
-                return fw_size
-    except Exception:
-        logger.exception("select_whisper_model: swallowed Exception")
+    entry = _catalog_stt_entry()
+    if entry:
+        # Map catalog entry ID back to the engine-specific key
+        sherpa_key = _CATALOG_ID_TO_SHERPA.get(entry.id)
+        if sherpa_key and sherpa_key in _SHERPA_MODELS:
+            try:
+                import sherpa_onnx  # noqa: F401
+                return sherpa_key
+            except ImportError:
+                logger.debug("select_whisper_model: swallowed ImportError")
+        # faster-whisper size
+        fw_size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(entry.id)
+        if fw_size:
+            return fw_size
 
     # ── Fallback: direct VRAM query (no catalog dependency) ─────────────────
     try:
@@ -895,10 +1008,13 @@ _stt_tool = ToolWorker(
 )
 
 
-def _run_engine_chain(audio_path: str, language: str = None) -> str:
+def _run_engine_chain(audio_path: str, language: str = None,
+                      model_size: Optional[str] = None) -> str:
     """Try each STT engine in priority order; return the first that answers.
 
     Engine priority: faster-whisper → sherpa-onnx → openai-whisper.
+    ``model_size`` is the faster-whisper size the parent decided for this
+    worker (see ``_stt_call``); the other engines pick their own.
 
     Returns JSON string with 'text' and 'language' keys.  Callers should go
     through _transcribe_impl, which post-filters this result.
@@ -906,7 +1022,7 @@ def _run_engine_chain(audio_path: str, language: str = None) -> str:
     # 1. Try faster-whisper (preferred — CTranslate2, 4x faster, multilingual)
     try:
         import faster_whisper  # noqa: F401
-        result = _faster_whisper_transcribe(audio_path, language)
+        result = _faster_whisper_transcribe(audio_path, language, model_size)
         if result:
             return result
     except ImportError:
@@ -964,7 +1080,8 @@ def _run_engine_chain(audio_path: str, language: str = None) -> str:
     return json.dumps({"error": "No STT engine available (install faster-whisper)"})
 
 
-def _transcribe_impl(audio_path: str, language: str = None) -> str:
+def _transcribe_impl(audio_path: str, language: str = None,
+                     model_size: Optional[str] = None) -> str:
     """Transcribe audio — runs inside the worker subprocess.
 
     The ONE place every engine's result is post-filtered.  Both callers reach
@@ -975,7 +1092,7 @@ def _transcribe_impl(audio_path: str, language: str = None) -> str:
 
     Returns JSON string with 'text' and 'language' keys.
     """
-    raw = _run_engine_chain(audio_path, language)
+    raw = _run_engine_chain(audio_path, language, model_size)
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
@@ -1010,6 +1127,30 @@ def _transcribe_impl(audio_path: str, language: str = None) -> str:
     return json.dumps(payload)
 
 
+# The faster-whisper size the live worker was spawned for.  Decided by
+# _stt_call at the request that (re)spawns the worker and held for the
+# worker's life, so free-VRAM movement between requests cannot flip the
+# worker between sizes (each flip is a reload; a size never fetched is a
+# download inside the request window, #677).
+_stt_worker_size: Optional[str] = None
+
+
+def _stt_call(req: dict) -> dict:
+    """The ONE parent-side entry to the STT worker.
+
+    Every STT request (file transcribe, language detect, the streaming
+    buffer) goes through here so each carries the faster-whisper size the
+    parent decided for this worker, and the worker's VRAM booking key
+    matches that size before the spawn books it.
+    """
+    global _stt_worker_size
+    if not _stt_tool.is_alive() or _stt_worker_size is None:
+        _stt_worker_size = faster_whisper_model_size()
+        _stt_tool.vram_budget = _vram_key_for_size(_stt_worker_size)
+    req['model_size'] = _stt_worker_size
+    return _stt_tool.call(req)
+
+
 def whisper_transcribe(audio_path: str, language: str = None) -> str:
     """Transcribe audio file to text (subprocess-isolated).
 
@@ -1024,7 +1165,7 @@ def whisper_transcribe(audio_path: str, language: str = None) -> str:
     Returns:
         JSON string with 'text' and 'language' keys.
     """
-    result = _stt_tool.call({
+    result = _stt_call({
         'op': 'transcribe',
         'audio_path': audio_path,
         'language': language,
@@ -1034,7 +1175,7 @@ def whisper_transcribe(audio_path: str, language: str = None) -> str:
     return result.get('raw_json', json.dumps(result))
 
 
-def _detect_language_impl(audio_path: str) -> str:
+def _detect_language_impl(audio_path: str, model_size: Optional[str] = None) -> str:
     """Language detection — runs inside the worker subprocess.
 
     Returns JSON string with 'language' and 'probability' keys.
@@ -1042,7 +1183,7 @@ def _detect_language_impl(audio_path: str) -> str:
     # Try faster-whisper first (has built-in language detection)
     try:
         from faster_whisper import WhisperModel  # noqa: F401
-        model = _get_faster_whisper_model(_FASTER_WHISPER_MODEL_SIZE)
+        model = _get_faster_whisper_model(model_size or faster_whisper_model_size())
         _, info = model.transcribe(audio_path, beam_size=1)
         return json.dumps({
             "language": info.language if info.language else "unknown",
@@ -1085,7 +1226,7 @@ def _detect_language_impl(audio_path: str) -> str:
 
 def whisper_detect_language(audio_path: str) -> str:
     """Detect the language of an audio file (subprocess-isolated)."""
-    result = _stt_tool.call({
+    result = _stt_call({
         'op': 'detect_language',
         'audio_path': audio_path,
     })
@@ -1842,7 +1983,7 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False,
             wf.writeframes(buf_bytes)
         tmp.close()
 
-        result = _stt_tool.call({
+        result = _stt_call({
             'op': 'transcribe',
             'audio_path': tmp.name,
             'language': language,
@@ -2095,6 +2236,59 @@ def reset_stt_segment_queue(call_id: str) -> None:
 # ═══════════════════════════════════════════════════════════════
 # Service tool registration
 # ═══════════════════════════════════════════════════════════════
+#
+# The registry reaches an IN-PROCESS tool through `native_handler`, the
+# same contract crawl4ai_tool._native_crawl / gh_pr_tool.gh_pr_open /
+# seo_audit_tool.seo_audit_score already use: registry.
+# create_endpoint_function calls it with `json.dumps(kwargs)` and skips
+# the URL branch entirely.
+#
+# Whisper declares base_url 'inprocess://whisper' but supplied no
+# handler, so every agent-side call through get_autogen_tools() /
+# get_langchain_tools() fell through to pooled_post('inprocess://
+# whisper/transcribe') and came back
+#   {"success": false, "error": "No connection adapters were found for
+#    'inprocess://whisper/transcribe'"}
+# — measured 2026-09-21 right after a setup_tool('whisper') whose own
+# module entry point (whisper_transcribe) transcribed the same file
+# fine.  So STT worked for every direct importer (hart_intelligence_
+# entry, model_bus_service, channels/media/audio, …) and was dead for
+# every LLM-driven agent.  Guarded by
+# tests/unit/test_whisper_native_handler.py.
+
+
+def _native_params(params_json) -> dict:
+    """Parse a registry native_handler payload into a params dict.
+
+    Tolerates a dict handed in directly and a bare string path, matching
+    the leniency of ``crawl4ai_tool._native_crawl`` — one shape rule for
+    in-process handlers, no second convention.
+    """
+    if isinstance(params_json, dict):
+        return params_json
+    try:
+        parsed = json.loads(params_json)
+    except (json.JSONDecodeError, TypeError):
+        return {'audio_path': str(params_json)}
+    return parsed if isinstance(parsed, dict) else {'audio_path': str(parsed)}
+
+
+def _native_transcribe(params_json: str) -> str:
+    """Registry native handler → ``whisper_transcribe`` (in-process).
+
+    Thin adapter only: the worker isolation, engine chain and the
+    silence / annotation gates all stay in whisper_transcribe, so the
+    registry surface and the direct importers run the SAME path.
+    """
+    params = _native_params(params_json)
+    return whisper_transcribe(params.get('audio_path'), params.get('language'))
+
+
+def _native_detect_language(params_json: str) -> str:
+    """Registry native handler → ``whisper_detect_language`` (in-process)."""
+    params = _native_params(params_json)
+    return whisper_detect_language(params.get('audio_path'))
+
 
 class WhisperTool:
     """Register STT as an in-process service tool.
@@ -2138,6 +2332,7 @@ class WhisperTool:
                         "audio_path": {"type": "string", "description": "Path to audio file"},
                         "language": {"type": "string", "description": "Language code (optional)"},
                     },
+                    "native_handler": _native_transcribe,
                 },
                 "detect_language": {
                     "path": "/detect_language",
@@ -2146,6 +2341,7 @@ class WhisperTool:
                     "params_schema": {
                         "audio_path": {"type": "string", "description": "Path to audio file"},
                     },
+                    "native_handler": _native_detect_language,
                 },
             },
             health_endpoint="/health",
@@ -2174,10 +2370,11 @@ def _load():
 def _synthesize(_model, req: dict) -> dict:
     """Dispatch STT requests inside the worker subprocess."""
     op = req.get('op', 'transcribe')
+    model_size = req.get('model_size')     # stamped by the parent's _stt_call
     if op == 'transcribe':
-        raw = _transcribe_impl(req.get('audio_path'), req.get('language'))
+        raw = _transcribe_impl(req.get('audio_path'), req.get('language'), model_size)
     elif op == 'detect_language':
-        raw = _detect_language_impl(req.get('audio_path'))
+        raw = _detect_language_impl(req.get('audio_path'), model_size)
     else:
         return {'error': f'Unknown op: {op}'}
     # Return both the raw JSON (for pass-through) and parsed fields

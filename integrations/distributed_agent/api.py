@@ -388,7 +388,14 @@ def submit_task_result(task_id):
     if result is None:
         return jsonify({'success': False, 'error': 'result is required'}), 400
 
-    info = coordinator.submit_result(task_id, agent_id, result)
+    # A completion the ledger could not persist is not a completion: the
+    # coordinator releases the worker's claim and raises rather than answer
+    # "completed" for work the durable ledger still shows IN_PROGRESS.  The
+    # worker loop catches that; this route did not.
+    try:
+        info = coordinator.submit_result(task_id, agent_id, result)
+    except RuntimeError as e:
+        return jsonify({'success': False, 'error': str(e)}), 503
     return jsonify({'success': True, **info})
 
 
@@ -429,7 +436,23 @@ def submit_goal():
     if not tasks:
         return jsonify({'success': False, 'error': 'tasks list is required'}), 400
 
-    goal_id = coordinator.submit_goal(objective, tasks, context)
+    # submit_goal refuses with an exception instead of answering with a goal
+    # that is missing children: HiveDepthExceeded for a hop past the
+    # published topology, RuntimeError when a child id collides with a task
+    # the ledger already holds ("Could not stage ...") or when the ledger
+    # cannot persist the set ("Could not persist ...").  Every other caller
+    # guards the call (dispatch.py's distributed dispatch, announce_tasks
+    # above); this route answered a bare 500.  Same envelope as the rest of
+    # the route: 400 for the client's hop, 409 for the client's id, 503 when
+    # the node cannot write.  (Found in review by hartos-7c, 2026-09-20.)
+    from .task_coordinator import HiveDepthExceeded
+    try:
+        goal_id = coordinator.submit_goal(objective, tasks, context)
+    except HiveDepthExceeded as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except RuntimeError as e:
+        status = 503 if 'persist' in str(e) else 409
+        return jsonify({'success': False, 'error': str(e)}), status
 
     # Announce to peers via gossip if we have peers
     try:

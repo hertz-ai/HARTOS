@@ -48,6 +48,48 @@ def _can_do(model_type: str, capability: str = None) -> bool:
         return False
 
 
+def _node_has_any(model_type: str) -> bool:
+    """Whether this node has ANY model of a type, fit to run or not.
+
+    Deliberately ignores compute: the question is "is something installed",
+    not "can it run this second".  _can_do() answers the second, and a
+    caller that cannot tell them apart will offer to install what is
+    already here.
+
+    Asks the CATALOG, through the catalog's own public accessor.  This
+    used to reach ``get_orchestrator()._catalog``, which is the same
+    object -- the orchestrator is built with ``catalog or get_catalog()``
+    -- but borrowed it from a component that has nothing to do with the
+    question, through a private attribute the orchestrator never promised
+    to keep.  The split is clean and worth keeping that way: the catalog
+    owns "what is installed here", the orchestrator owns "what can run
+    right now", and this function only ever wanted the first.
+    """
+    try:
+        from integrations.service_tools.model_catalog import get_catalog
+        return bool(get_catalog().list_by_type(model_type))
+    except Exception as e:
+        # Never silent: this decides whether a caller offers an install,
+        # so "I could not tell" must be visible.  warning, not exception,
+        # because the callers sit on per-segment paths and a traceback
+        # per call would flood the log it is meant to inform.
+        logger.warning("_node_has_any(%r): catalog unreadable (%s); "
+                       "answering 'nothing installed'", model_type, e)
+        return False
+
+
+def _degraded_reason(model_type: str, what: str) -> str:
+    """Why a segment was dropped, saying which of the two reasons it is.
+
+    "Offline" reads as "you do not have this"; often the truth is "you have
+    it and the GPU is busy".  A reviewer reading a degraded segment deserves
+    to know which, because only one of them is worth installing anything for.
+    """
+    if _node_has_any(model_type):
+        return f'{what} installed but cannot run right now (no free memory)'
+    return f'{what} service offline'
+
+
 # ═══════════════════════════════════════════════════════════════
 # Auto-start helpers
 # ═══════════════════════════════════════════════════════════════
@@ -100,7 +142,10 @@ def populate_videogen_catalog(catalog) -> int:
     added = 0
     for (mid, name, vram, ram, disk, quality, speed, min_tier,
          sup_cpu, sup_offload, caps) in videogen_models:
-        if catalog.get(mid) is not None:
+        # Claiming skip -- see ModelCatalog.already_registered: an entry
+        # this populator still owns but does not rewrite would otherwise
+        # be swept as stale on every populate.
+        if catalog.already_registered(mid):
             continue
         entry = ModelEntry(
             id=mid, name=name, model_type=ModelType.VIDEO_GEN,
@@ -154,7 +199,10 @@ def populate_audiogen_catalog(catalog) -> int:
     added = 0
     for (mid, name, vram, ram, disk, quality, speed, min_tier,
          sup_cpu, sup_offload, caps) in audiogen_models:
-        if catalog.get(mid) is not None:
+        # Claiming skip -- see ModelCatalog.already_registered: an entry
+        # this populator still owns but does not rewrite would otherwise
+        # be swept as stale on every populate.
+        if catalog.already_registered(mid):
             continue
         entry = ModelEntry(
             id=mid, name=name, model_type=ModelType.AUDIO_GEN,
@@ -236,21 +284,170 @@ def _select_video_tool() -> str:
     return 'ltx2'
 
 
+#: AceStep answers with an INTEGER status, not a word
+#: (acestep/api/server_utils.py:10 STATUS_MAP, and map_status() maps anything
+#: unrecognised to 2 == failed). Without this translation a finished
+#: composition came back as `1`, matched none of the completed words, and read
+#: as unfinished -- a second way for a real outcome to be unreadable.
+_ACESTEP_STATUS_CODE = {0: 'processing', 1: 'succeeded', 2: 'failed'}
+
+
+def _unwrap_envelope(payload, task_id: str = '') -> dict:
+    """The answer itself, whether or not the sidecar wrapped it.
+
+    AceStep replies {'data': {...}, 'code': 200, 'error': None}; wan2gp and
+    the TTS suite reply flat. Reading the top level of an ENVELOPED answer
+    finds nothing and says so quietly, which is exactly how this failed:
+
+      * the submit read task_id from the envelope, got '', and produced the
+        id 'acestep_' -- so every composition was accepted, generated, and
+        then unpollable and unclaimable. MEASURED tonight: the server
+        answered 200 with a real task_id and the caller kept none of it.
+      * the poll read status from the envelope and answered 'unknown'
+        forever, so nothing ever completed.
+
+    Together they meant a node could compose perfectly and no game would
+    ever hear a note of it.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    inner = payload.get('data')
+    if isinstance(inner, dict) and ('task_id' in inner or 'status' in inner):
+        return inner
+    if isinstance(inner, list):
+        # /query_result is a BATCH endpoint: wrap_response(data_list) puts a
+        # LIST under 'data', one item per requested id
+        # (acestep/api/http/query_result_route.py:66). Reading the outer
+        # envelope found no 'status' and answered 'unknown' for every
+        # outcome -- completed and failed alike.
+        if task_id:
+            for item in inner:
+                if isinstance(item, dict) and item.get('task_id') == task_id:
+                    return item
+        if len(inner) == 1 and isinstance(inner[0], dict):
+            return inner[0]
+        return {}
+    return payload
+
+
 def _get_tool_base_url(tool_name: str) -> Optional[str]:
-    """Get the base URL for a registered tool."""
+    """Where a tool is actually listening, asked of both things that know.
+
+    There are TWO registries and they hold different tools:
+
+      * ServiceToolRegistry -- tools declared in service_tools.json,
+        including any an operator started by hand and registered.
+      * RuntimeToolManager  -- the sidecars HARTOS starts itself. It
+        assigns the port at launch (63734 for AceStep on 2026-09-21) and
+        learns it from the child's PORT= line.
+
+    Asking only the first meant every runtime-started sidecar resolved to
+    None, and the caller reported "not running" about a process that was
+    serving happily on a port this machine knew. MEASURED: get_tool_status
+    said running on 63734 while this returned None.
+    """
     try:
         from integrations.service_tools.registry import service_tool_registry
         tool = service_tool_registry._tools.get(tool_name)
-        if tool:
+        if tool and getattr(tool, 'base_url', None):
             return tool.base_url.rstrip('/')
     except Exception:
         logger.exception("_get_tool_base_url: swallowed Exception")
+    try:
+        from integrations.service_tools.runtime_manager import (
+            runtime_tool_manager)
+        status = runtime_tool_manager.get_tool_status(tool_name) or {}
+        port = status.get('port')
+        if status.get('running') and port:
+            return f'http://127.0.0.1:{port}'
+    except Exception as e:
+        logger.warning(f'_get_tool_base_url({tool_name}): runtime manager '
+                       f'could not say where it is ({e})')
     return None
 
 
 # ═══════════════════════════════════════════════════════════════
 # Modality handlers
 # ═══════════════════════════════════════════════════════════════
+
+#: What an error from this module MEANS, told apart without a caller having
+#: to read prose.  The three kinds are real and they want opposite answers:
+#:
+#:   'absent'      no tool is registered, or auto-start failed.  Nothing is
+#:                 installed to do this here.  A caller may reasonably OFFER
+#:                 TO INSTALL one (integrations.agent_engine.capability_setup).
+#:   'unreachable' a tool IS configured but the call did not arrive -- the
+#:                 process is not running, the port refused, it timed out.
+#:                 Offering to install is wrong; it is installed.
+#:   'refused'     the tool answered, and said no (an HTTP status).  The
+#:                 capability exists and works; THIS request was rejected.
+#:   'unknown'     none of the above matched.
+ABSENT, UNREACHABLE, REFUSED, UNKNOWN = (
+    'absent', 'unreachable', 'refused', 'unknown')
+
+#: Wordings this module itself emits for "nothing is installed".  Kept HERE,
+#: next to the returns that produce them, deliberately: a consumer that
+#: matched these strings from another module would silently stop working the
+#: day someone reworded a message, and the person rewording it would have no
+#: way to know. Producer and reader change together in one file.
+_ABSENT_MARKERS = ('not registered', 'not available', 'no tool',
+                   'auto-start failed', 'not installed')
+
+#: Exception text for "configured, but the call did not arrive".
+_UNREACHABLE_MARKERS = ('connection refused', 'connectionerror', 'timed out',
+                        'timeout', 'max retries', 'failed to establish',
+                        'actively refused', 'connection aborted',
+                        'name or service not known', 'getaddrinfo',
+                        # installed, but will not fit in memory this instant
+                        'cannot run right now',
+                        # installed, but its sidecar has no registered port
+                        'is not running')
+
+
+def classify_error(result) -> str:
+    """Why a generate_media call failed, as one of the four constants above.
+
+    THE POINT: callers must not grep this module's prose for themselves.
+    Deciding whether to offer the owner an install is a real branch -- asking
+    someone to install what is already installed is its own defect -- and it
+    hung on wording that lives in another file. This puts the reader beside
+    the writer so they move together.
+
+    Takes the dict generate_media returns (or its JSON string). Anything that
+    is not an error answers UNKNOWN rather than guessing.
+    """
+    if isinstance(result, str):
+        try:
+            import json as _json
+            result = _json.loads(result)
+        except Exception:
+            return UNKNOWN
+    if not isinstance(result, dict):
+        return UNKNOWN
+    # 'unavailable' counts as an error to read.  The modality gate in
+    # generate_media returns status='unavailable' (not 'error') when this
+    # node cannot do a modality at all -- which is the PRINCIPAL absent case
+    # and the one a caller most needs to tell apart, e.g. asking for music on
+    # a machine with no music engine.  Reading only status=='error' answered
+    # UNKNOWN there, so the caller could not offer to install what is plainly
+    # not installed.  (Found by rn-1 wiring the game-sound install offer.)
+    if result.get('status') not in ('error', 'unavailable'):
+        return UNKNOWN
+
+    text = str(result.get('error', '')).lower()
+    if not text:
+        return UNKNOWN
+    # 'absent' first: "TTS-Audio-Suite not available" would otherwise look
+    # like a transport failure to a naive substring pass.
+    if any(m in text for m in _ABSENT_MARKERS):
+        return ABSENT
+    if any(m in text for m in _UNREACHABLE_MARKERS):
+        return UNREACHABLE
+    # "<Tool> HTTP 503" -- it answered, so it exists and it said no.
+    if 'http' in text and any(c.isdigit() for c in text):
+        return REFUSED
+    return UNKNOWN
+
 
 def _generate_image(context: str, input_text: str, style: str) -> dict:
     """Route to txt2img external service."""
@@ -319,14 +516,30 @@ def _generate_audio_music(context: str, input_text: str,
 
     base_url = _get_tool_base_url('acestep')
     if not base_url:
-        # Try default URL
-        base_url = 'http://localhost:8001'
+        # No pinned fallback.  Sidecar ports are assigned at start (this node
+        # put AceStep on 51168 on 2026-09-21), so dialing a literal 8001
+        # reaches nothing -- or, worse, something else that happens to be
+        # listening.  If the registry has no port, the service is not up, and
+        # saying so is the honest answer.
+        return {'status': 'error',
+                'error': 'AceStep service is not running (no port registered '
+                         'on this node).'}
 
     try:
         from core.http_pool import pooled_post
         payload = {
             'prompt': prompt,
             'duration': duration or 30,
+            # WAV, not AceStep's default of mp3.  MEASURED 2026-09-22: the
+            # composition SUCCEEDS ("Done! Generated 2 audio tensors",
+            # normalised to peak 0.89) and then the save fails with
+            # "ffmpeg executable not found -- MP3 export failed without
+            # fallback", so the finished music is discarded at the last
+            # step.  ffmpeg is not on PATH on this box and is not one of
+            # the tool's declared dependencies; wav needs no encoder at
+            # all.  A game can play wav, and the memo stores a path, so
+            # nothing downstream cares which of the two it is.
+            'audio_format': 'wav',
         }
         if style:
             payload['genre'] = style
@@ -334,11 +547,26 @@ def _generate_audio_music(context: str, input_text: str,
             f"{base_url}/release_task",
             json=payload,
             headers={'Content-Type': 'application/json'},
-            timeout=30,
+            # /release_task only ENQUEUES -- it answers with a task_id and the
+            # composing happens in the background.  But the FIRST call to a
+            # cold sidecar also waits for the model to load, and 30s does not
+            # cover that: MEASURED on this box, a first request timed out at
+            # 30s against a server that was alive and loading (the read timed
+            # out; the connection did not refuse).  The caller then reports a
+            # failure for work that IS proceeding, and the task_id in the
+            # answer we never read is lost, so the composition can never be
+            # polled or claimed -- it runs to completion for nobody.  Matches
+            # the video submit beside it, which learned this already.
+            timeout=120,
         )
         if resp.status_code == 200:
-            data = resp.json()
+            data = _unwrap_envelope(resp.json())
             task_id = data.get('task_id', '')
+            if not task_id:
+                return {'status': 'error',
+                        'error': 'AceStep accepted the job but named no task, '
+                                 'so it could never be collected.',
+                        'output_modality': 'audio_music'}
             return {
                 'status': 'pending',
                 'output_modality': 'audio_music',
@@ -350,8 +578,46 @@ def _generate_audio_music(context: str, input_text: str,
         return {'status': 'error', 'error': f'AceStep HTTP {resp.status_code}',
                 'output_modality': 'audio_music'}
     except Exception as e:
+        # A READ timeout is not a failure: the connection was accepted, so
+        # the server is there and busy.  On a node composing for the FIRST
+        # time that busy-ness is an ~8.5GB weight download (MEASURED on this
+        # box: model.safetensors 3.71GB + 4.79GB at ~15MB/s, so ten minutes
+        # before it can answer anything).  Reported as an error, the agent
+        # tells the person their composer refused when it is in fact getting
+        # ready -- and the game is left silent with nothing pending.
+        if _reads_as_still_waking(e):
+            return {
+                'status': 'warming_up',
+                'output_modality': 'audio_music',
+                'message': 'The composer is starting up (a first run '
+                           'downloads its model). Ask again shortly.',
+                'model_used': 'acestep',
+            }
         return {'status': 'error', 'error': str(e),
                 'output_modality': 'audio_music'}
+
+
+def _reads_as_still_waking(error) -> bool:
+    """True when a request failed because the server is busy, not absent.
+
+    A read timeout means the TCP connection was ACCEPTED and no answer came
+    back in time -- something is listening. A connection refusal means
+    nothing is. Only the first deserves "wait and ask again".
+    """
+    said = str(error).lower()
+    if 'refused' in said or 'no connection could be made' in said:
+        return False
+    # A RESET is also "busy", not "gone".  MEASURED 2026-09-22: the server
+    # dropped the connection at 09:42 while loading its vae and text
+    # encoder, and at 09:43:30 logged "Generating audio... (DiT backend:
+    # PyTorch (cuda))" and carried on to completion.  Reported as a failure,
+    # the caller abandoned a composition that was working -- and the memo
+    # never filled for a sound that did get made.
+    return ('read timed out' in said
+            or 'readtimeout' in said
+            or 'connection aborted' in said
+            or 'connectionreset' in said
+            or '10054' in said)
 
 
 def _generate_video(context: str, input_text: str,
@@ -370,9 +636,19 @@ def _generate_video(context: str, input_text: str,
             tool = 'ltx2'
 
     if tool == 'wan2gp':
-        return _generate_video_wan2gp(prompt, duration)
-    else:
-        return _generate_video_ltx2(prompt, duration)
+        result = _generate_video_wan2gp(prompt, duration)
+        if result.get('status') != 'error':
+            return result
+        # wan2gp answers /generate with 501 -- it has no adapter to the
+        # upstream repo, which ships a Gradio app and no generate API.
+        # The selector still picks it on any card with >=8 GB free, so a
+        # ladder that stopped at the first engine turned a servable
+        # request into an error.  Fall through exactly as the
+        # _ensure_tool_running failure above already does.
+        logger.warning(
+            "wan2gp video generation unavailable (%s); falling back to ltx2",
+            result.get('error'))
+    return _generate_video_ltx2(prompt, duration)
 
 
 def _generate_video_wan2gp(prompt: str, duration: int) -> dict:
@@ -411,8 +687,24 @@ def _generate_video_wan2gp(prompt: str, duration: int) -> dict:
 
 
 def _generate_video_ltx2(prompt: str, duration: int) -> dict:
-    """Submit video generation to LTX2 server (port 5002)."""
-    ltx_url = 'http://localhost:5002'
+    """Submit video generation to the LTX2 server.
+
+    The base URL comes from the registry, as _generate_video_wan2gp's does.
+    It used to be a literal localhost:5002, which cannot be
+    right: RuntimeToolManager gives every sidecar an OS-assigned port and
+    learns it from the server's PORT= line (MEASURED 2026-09-21: 65523 on
+    one run, 64507 on the next), so 5002 named whatever else happened to
+    hold it.  The literal survives only as the fallback for a server an
+    no fallback literal: dialing a port the registry does not know is
+    the same blind dial that made AceStep's music path fail against
+    8001 while its sidecar sat on 51168.  An unregistered service is
+    not running, and that is what a caller is told.
+    """
+    ltx_url = _get_tool_base_url('ltx2')
+    if not ltx_url:
+        return {'status': 'error',
+                'error': 'LTX2 service is not running (no port registered '
+                         'on this node).'}
     try:
         from core.http_pool import pooled_post
         num_frames = max(49, (duration or 2) * 24 + 1)
@@ -507,9 +799,20 @@ def generate_media(
     }
     check = _MODALITY_TO_CHECK.get(modality)
     if check and not _can_do(*check):
+        # can_do() is "loaded OR can_load", and can_load drops any model that
+        # will not fit in the memory free AT THIS INSTANT.  So a fully
+        # installed engine reads as unavailable while the GPU is busy.  Those
+        # are different problems with different answers -- one is "install
+        # something", the other is "wait or free memory" -- so say which.
+        # Conflating them made a caller offer to install what was already
+        # installed, which is the defect classify_error exists to prevent.
+        installed = _node_has_any(check[0])
         return json.dumps({
             'status': 'unavailable',
-            'error': f'{modality} not available on this node right now.',
+            'error': (
+                f'{modality} is installed on this node but cannot run right '
+                f'now (not enough free memory).' if installed else
+                f'{modality} not available on this node right now.'),
             'modality': modality,
             'suggestion': f'Describe the {modality.replace("_", " ")} in text instead, '
                           f'or delegate to a node with {check[0]} capability.',
@@ -644,34 +947,54 @@ def check_media_status(
         check_path = '/check_result'
     elif tool_prefix == 'acestep':
         base_url = _get_tool_base_url('acestep')
-        if not base_url:
-            base_url = 'http://localhost:8001'
         check_path = '/query_result'
     elif tool_prefix == 'ltx2':
-        base_url = 'http://localhost:5002'
+        base_url = _get_tool_base_url('ltx2')
         check_path = '/check_result'
     else:
         return json.dumps({'status': 'error',
                            'error': f'Unknown tool prefix: {tool_prefix}'})
 
     if not base_url:
+        # "not running", not "not available": the tool is installed, its
+        # service simply has no registered port, and a caller must not be
+        # told to install what is already here.
         return json.dumps({'status': 'error',
-                           'error': f'{tool_prefix} service not available'})
+                           'error': f'{tool_prefix} service is not running '
+                                    f'(no port registered on this node).'})
 
     try:
         from core.http_pool import pooled_post
+        # AceStep's /query_result reads 'task_id_list' and parses a missing
+        # key as '[]' (query_result_route.py:57 -> parse_task_id_list), so a
+        # bare 'task_id' asked about NO tasks: the answer was an empty batch
+        # and every state -- completed, failed -- read as 'unknown'. The
+        # other two tools use /check_result, a different contract.
+        body = ({'task_id_list': [raw_id]} if tool_prefix == 'acestep'
+                else {'task_id': raw_id})
         resp = pooled_post(
             f"{base_url}{check_path}",
-            json={'task_id': raw_id},
+            json=body,
             headers={'Content-Type': 'application/json'},
             timeout=30,
         )
         if resp.status_code == 200:
-            data = resp.json()
+            data = _unwrap_envelope(resp.json(), task_id=raw_id)
+            if not data:
+                # The server answered, and said nothing about this id. That is
+                # not a state to report -- inventing one is what hid the bug.
+                return json.dumps({
+                    'status': 'error',
+                    'error': f'{tool_prefix} knows nothing about task {raw_id}',
+                })
             # Normalize response
             status = data.get('status', 'unknown')
+            if tool_prefix == 'acestep' and isinstance(status, int):
+                status = _ACESTEP_STATUS_CODE.get(status, 'failed')
             result_url = (data.get('video_url') or data.get('audio_url')
-                          or data.get('url') or data.get('output_url', ''))
+                          or data.get('url') or data.get('output_url')
+                          or data.get('audio_path') or data.get('file_path')
+                          or '')
             progress = data.get('progress', data.get('percentage', 0))
 
             out = {
@@ -679,9 +1002,34 @@ def check_media_status(
                 'status': status,
                 'progress': progress,
             }
-            if status in ('completed', 'done', 'finished') and result_url:
+            # An ARTIFACT is the completion signal, whatever the status
+            # vocabulary says.  MEASURED 2026-09-22: AceStep answered
+            # status=1 -- a numeric code, not one of the words this list
+            # knows -- so a finished job read as unfinished and a caller
+            # polled it forever.  I did not guess what 1 means; a result
+            # url is unambiguous in a way a status enum I cannot find the
+            # definition of is not.
+            if result_url:
+                status = 'completed'
+            _done_words = ('completed', 'complete', 'done', 'finished',
+                           'success', 'succeeded')
+            if status in _done_words and result_url:
                 media_type = 'video' if tool_prefix in ('wan2gp', 'ltx2') else 'audio'
                 out['results'] = [{'type': media_type, 'url': result_url}]
+                out['status'] = 'completed'
+            elif status in _done_words:
+                # Succeeded with NOTHING SAVED. This really happens: AceStep
+                # generated two audio tensors and then "MP3 export failed
+                # without fallback: ffmpeg executable not found" threw them
+                # away, while still reporting success. Reporting 'completed'
+                # here would tell the caller it has music it was never given
+                # -- the same "cannot tell done from nothing" this whole fix
+                # is about.
+                out['status'] = 'error'
+                out['error'] = (
+                    f'{tool_prefix} reported success but saved no artifact '
+                    f'(a missing encoder does this: mp3/opus/aac need ffmpeg '
+                    f'on PATH; wav and flac do not)')
             return json.dumps(out)
 
         return json.dumps({'status': 'error',
@@ -708,12 +1056,22 @@ def synthesize_multilingual_audio(
     Returns JSON with status, output_path, and degraded_segments (if any
     segment type was unavailable on this node).
     """
-    # Runtime capability gate: check what this node can actually do
+    # Runtime capability gate: check what this node can actually do.
+    # Same two meanings as the modality gate above, and this one carries the
+    # voice of every spoken turn: a node whose GPU is merely busy must not
+    # read as a node with no speech engine, or a caller offers to install
+    # what is already installed.
     if not _can_do('tts'):
+        installed = _node_has_any('tts')
         return json.dumps({
             'status': 'unavailable',
-            'error': 'Audio synthesis not available on this node (text-only mode).',
-            'suggestion': 'Return text content directly — the user will read it.',
+            'error': (
+                'Audio synthesis is installed on this node but cannot run '
+                'right now (not enough free memory).' if installed else
+                'Audio synthesis not available on this node (text-only mode).'),
+            'suggestion': ('Wait for the current work to finish, or return '
+                           'text content directly.' if installed else
+                           'Return text content directly — the user will read it.'),
         })
 
     try:
@@ -736,10 +1094,12 @@ def synthesize_multilingual_audio(
                 runnable.append(seg)
             elif seg_type in ('music',) and not _can_do('audio_gen', 'music_gen'):
                 degraded.append({'type': seg_type, 'text': seg.get('text', ''),
-                                 'reason': 'music gen service offline'})
+                                 'reason': _degraded_reason('audio_gen',
+                                                            'music gen')})
             elif seg_type in ('sing', 'lyrics') and not _can_do('audio_gen', 'singing'):
                 degraded.append({'type': seg_type, 'text': seg.get('text', ''),
-                                 'reason': 'singing voice service offline'})
+                                 'reason': _degraded_reason('audio_gen',
+                                                            'singing voice')})
             else:
                 runnable.append(seg)
 

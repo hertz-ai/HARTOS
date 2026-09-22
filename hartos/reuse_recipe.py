@@ -304,7 +304,8 @@ from integrations.ap2 import (
 
 # Agent Lightning - Training and Optimization
 from integrations.agent_lightning import (
-    instrument_autogen_agent, is_enabled as is_agent_lightning_enabled
+    instrument_autogen_agent, is_enabled as is_agent_lightning_enabled,
+    recipe_assistant_agent_id,
 )
 
 # SimpleMem - Long-term memory with semantic compression
@@ -347,7 +348,8 @@ from hartos.helper_ledger import (
 from hartos.lifecycle_hooks import (
     sync_action_state_to_ledger, register_ledger_for_session,
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
-    clear_action_states, settled_action_id,
+    clear_action_states, settled_action_id, commit_verified_action_completion,
+    dispatch_action_id,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -1739,7 +1741,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         try:
             assistant = instrument_autogen_agent(
                 agent=assistant,
-                agent_id=f'reuse_recipe_assistant_{user_prompt}',
+                agent_id=recipe_assistant_agent_id('reuse', user_prompt),
                 track_rewards=True,
                 auto_trace=True
             )
@@ -2027,6 +2029,23 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         # crash: instructions arrived as a dict and :1508's .lower()
         # raised AttributeError, killing the tool before the VLM loop.
         instructions = _coerce_instruction_text(instructions)
+
+        # --- Tool-boundary safety & owner consent checks ---
+        # Never dispatch destructive commands or control user's computer without consent
+        from integrations.vlm.safety import (
+            destructive_computer_operation, computer_control_block)
+        from core.constants import TOOL_FAILURE_RESULTS
+
+        _op_refusal = destructive_computer_operation(instructions)
+        if _op_refusal:
+            current_app.logger.warning(f"Computer operation refused: {_op_refusal}")
+            return f"{TOOL_FAILURE_RESULTS[0]}\n{_op_refusal}"
+
+        _consent_refusal = computer_control_block(prompt_id)
+        if _consent_refusal:
+            current_app.logger.warning(f"Computer control consent refused: {_consent_refusal}")
+            return f"{TOOL_FAILURE_RESULTS[0]}\n{_consent_refusal}"
+
         # Generate a unique key for this command
         command_key = f"windows_command_{user_id}_{prompt_id}"
 
@@ -2160,11 +2179,18 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                 current_app.logger.info(f"Created enhanced instruction with {len(matching_recipe.get('recipe', []))} steps")
 
             # Prepare VLM message (shared across all tiers)
+            from integrations.vlm.vlm_adapter import resolve_task_workspace
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
                 'prompt_id': prompt_id,
                 'instruction_to_vlm_agent': instructions,
+                # The VLM shell must work in the tree the agent was assigned
+                # (the goal's repo_path), never the service's launch
+                # directory: a bare filename resolved there can fail or pick
+                # a stale checkout, and in the frozen build it is Program
+                # Files.  ONE resolver with the /chat computer-use tool.
+                'workspace_root': resolve_task_workspace(prompt_id=prompt_id),
                 'os_to_control': os_to_control,
                 'actions_available_in_os': [],
                 'max_ETA_in_seconds': 1800,
@@ -3927,9 +3953,9 @@ def _giveup_current_reuse_action(user_prompt: str, reason: str) -> None:
         except Exception:
             pass
 # Re-steer budget per (user_prompt, action_id) for the fabrication gate in
-# _advance_reuse_action.  Each refusal steers the agent to actually call the
-# unrun tool; after _REUSE_FAB_STEER_MAX the gate advances anyway (loudly), so
-# it can never loop or permanently stall an action.
+# _advance_reuse_action. Each refusal steers the agent to actually call the
+# unrun tool; after _REUSE_FAB_STEER_MAX the existing GAVE_UP terminal records
+# an honest, retryable failure instead of fabricating completion.
 _reuse_resteer_counts = {}
 _REUSE_FAB_STEER_MAX = 3
 
@@ -4910,6 +4936,76 @@ def _reuse_written_answer(group_chat):
                 return None
             if _reuse_message_is_user_answer(msg):
                 return msg
+        return None
+    except Exception:
+        return None
+
+
+def _reuse_completion_evidence(user_prompt, action_id, group_chat):
+    """Locate the canonical GroupChat receipt the REUSE gate just proved.
+
+    The fabrication gate remains the one judge of whether every tool named by
+    the action produced a real result.  This helper only projects that existing
+    judgment into lifecycle_hooks' shared ``{message_index, kind}`` envelope so
+    REUSE and CREATE persist and learn from completion through the same path.
+    """
+    try:
+        messages = getattr(group_chat, 'messages', None)
+        if not isinstance(messages, list):
+            return None
+
+        dispatch_index = None
+        for idx in range(len(messages) - 1, -1, -1):
+            if dispatch_action_id((messages[idx] or {}).get('content')) == action_id:
+                dispatch_index = idx
+                break
+        if dispatch_index is None:
+            return None
+
+        task = user_tasks.get(user_prompt)
+        action_text = str(task.get_action(int(action_id) - 1) or '').lower() \
+            if task else ''
+        agents = list(getattr(group_chat, 'agents', None) or [])
+        _all_names, referenced = _reuse_registered_and_referenced_tools(
+            agents, action_text)
+
+        if referenced:
+            wanted = set(referenced)
+            call_fn = _reuse_call_id_to_tool_name([messages])
+            seen = getattr(task, 'evidence_seen_call_ids', set()) if task else set()
+            seen = seen if isinstance(seen, (set, frozenset)) else set()
+            for idx in range(len(messages) - 1, dispatch_index, -1):
+                msg = messages[idx]
+                if not isinstance(msg, dict) or msg.get('role') != 'tool':
+                    continue
+                responses = msg.get('tool_responses')
+                entries = responses if isinstance(responses, list) and responses else [msg]
+                for result in entries:
+                    if not isinstance(result, dict):
+                        continue
+                    call_id = result.get('tool_call_id') or msg.get('tool_call_id')
+                    body = str(result.get('content') or msg.get('content') or '')
+                    if call_id in seen or HISTORICAL_TOOL_PLACEHOLDER in body:
+                        continue
+                    if any(failure in body for failure in TOOL_FAILURE_RESULTS):
+                        continue
+                    name = call_fn.get(call_id) or result.get('name')
+                    if name in wanted:
+                        return {'message_index': idx, 'kind': 'tool_receipt'}
+            return None
+
+        answer = _reuse_written_answer(group_chat)
+        if not isinstance(answer, dict):
+            return None
+        for idx in range(len(messages) - 1, dispatch_index, -1):
+            if messages[idx] is answer or messages[idx] == answer:
+                if (answer.get('role') == 'assistant'
+                        and answer.get('name') == 'Assistant'):
+                    return {
+                        'message_index': idx,
+                        'kind': 'user_visible_result',
+                    }
+                return None
         return None
     except Exception:
         return None
@@ -6978,9 +7074,9 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
     # action whose tool had still not executed — exactly the "force-completed by
     # a nudge" the verification contract forbids.  Now each refusal records the
     # unrun tools so the caller can steer the agent to actually call them
-    # (_reuse_fab_steer_message); only after _REUSE_FAB_STEER_MAX real re-steers
-    # do we advance anyway — and then LOUDLY, so a non-tool-backed action is
-    # never reported as verified.
+    # (_reuse_fab_steer_message); after _REUSE_FAB_STEER_MAX real re-steers,
+    # the existing GAVE_UP terminal records a retryable failure. It must never
+    # be mapped to COMPLETED just to escape a stalled conversation.
     try:
         from hartos.lifecycle_hooks import get_registered_groupchat
         _gc = get_registered_groupchat(user_prompt)
@@ -7009,8 +7105,12 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                 current_app.logger.error(
                     f"[FABRICATED-COMPLETE] action {current_action_id} still claims "
                     f"completion with tool(s) {_fab} producing no real result after "
-                    f"{_REUSE_FAB_STEER_MAX} re-steers — advancing to avoid a "
-                    f"permanent stall; this action's output is NOT tool-backed")
+                    f"{_REUSE_FAB_STEER_MAX} re-steers — recording GAVE_UP for "
+                    f"retry; this action's output is NOT tool-backed")
+                force_state_through_valid_path(
+                    user_prompt, current_action_id, ActionState.GAVE_UP,
+                    f"{reason}: missing evidence for {', '.join(_fab)}")
+                return None, False
             elif not _reuse_action_declares_tool(user_prompt, current_action_id) \
                     and _reuse_written_answer(_gc) is None:
                 # SAME GATE, THE OTHER HALF OF THE EVIDENCE.  The tool check
@@ -7055,15 +7155,17 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                 current_app.logger.error(
                     f"[FABRICATED-COMPLETE] action {current_action_id} still "
                     f"claims completion with no output produced after "
-                    f"{_REUSE_FAB_STEER_MAX} re-steers — advancing to avoid a "
-                    f"permanent stall; this action's output does NOT exist")
+                    f"{_REUSE_FAB_STEER_MAX} re-steers — recording GAVE_UP for "
+                    f"retry; this action's output does NOT exist")
+                force_state_through_valid_path(
+                    user_prompt, current_action_id, ActionState.GAVE_UP,
+                    f"{reason}: no user-visible result")
+                return None, False
         else:
             # NO GROUP CHAT = NO EVIDENCE.  Every check above reads the group
-            # chat, so with _gc None the gate does not run and the pointer
-            # moves on the model's word alone.  Failing open is deliberate (a
-            # permanent stall is worse, same trade as the _REUSE_FAB_STEER_MAX
-            # advance above) — but it used to happen with no log of any kind,
-            # so the advance was indistinguishable from a tool-backed one.
+            # chat, so with _gc None no completion can be grounded. This path
+            # now fails closed as GAVE_UP, leaving the action retryable instead
+            # of moving the pointer on the model's word alone.
             #
             # Measured 2026-09-11 on the installed build: agent 25214546249
             # reached "[REUSE] All 9 actions completed" (20:13:26) with a
@@ -7073,11 +7175,14 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             # actions 5 and 6, 1-2s apart.  The force/stuck-loop guard fired
             # zero times in that window, so these were not force-completions;
             # they were advances past a gate that never ran.
-            current_app.logger.warning(
-                f"[FAB-GUARD] action {current_action_id} advancing UNVERIFIED: "
-                f"no group chat is registered for this session, so the "
-                f"fabrication gate could not read any tool evidence — this "
-                f"action's output is NOT tool-backed for session: {user_prompt}")
+            current_app.logger.error(
+                f"[FAB-GUARD] action {current_action_id} has no registered "
+                f"group chat, so the fabrication gate cannot read unverified "
+                f"evidence — recording GAVE_UP for retry")
+            force_state_through_valid_path(
+                user_prompt, current_action_id, ActionState.GAVE_UP,
+                f"{reason}: evidence conversation unavailable")
+            return None, False
     except Exception as _fg_err:
         # WARNING, not debug.  The shipped app emits nothing below INFO
         # (measured 2026-09-11: 0 DEBUG lines across 12 rotated gui_app.log
@@ -7085,15 +7190,42 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
         # and leave no trace — "advance-gate skipped" appeared 0 times, which
         # was equally consistent with "never fired" and "fired and filtered".
         # A safety gate that fails open must say so at a level that is read.
-        current_app.logger.warning(
-            f"[FAB-GUARD] action {current_action_id} advancing UNVERIFIED: "
-            f"advance-gate skipped ({_fg_err!r}) — this action's output is "
-            f"NOT tool-backed for session: {user_prompt}")
-    # Mark current action done
-    ok1 = force_state_through_valid_path(user_prompt, current_action_id,
-                                         ActionState.COMPLETED, f"{reason}: confirmed")
-    ok2 = force_state_through_valid_path(user_prompt, current_action_id,
-                                         ActionState.TERMINATED, f"{reason}: done")
+        current_app.logger.error(
+            f"[FAB-GUARD] action {current_action_id} gate failed "
+            f"({_fg_err!r}) — recording GAVE_UP for retry")
+        force_state_through_valid_path(
+            user_prompt, current_action_id, ActionState.GAVE_UP,
+            f"{reason}: evidence gate error")
+        return None, False
+    # Project the deterministic fabrication gate's proof into the ONE lifecycle
+    # completion boundary.  The model verdict chooses when to inspect; it never
+    # writes success itself.  If the proof cannot be localized in the canonical
+    # GroupChat, fail truthfully instead of synthesizing intermediate states.
+    evidence = _reuse_completion_evidence(
+        user_prompt, current_action_id, _gc)
+    if not evidence:
+        current_app.logger.error(
+            f"[REUSE-VERIFY] action {current_action_id} passed the fabrication "
+            f"gate but has no canonical receipt in its dispatch window; "
+            f"recording GAVE_UP for retry")
+        force_state_through_valid_path(
+            user_prompt, current_action_id, ActionState.GAVE_UP,
+            f"{reason}: canonical receipt unavailable")
+        return None, False
+
+    if get_action_state(user_prompt, current_action_id) != \
+            ActionState.STATUS_VERIFICATION_REQUESTED:
+        if not safe_set_state(
+                user_prompt, current_action_id,
+                ActionState.STATUS_VERIFICATION_REQUESTED,
+                f"{reason}: verifier returned terminal verdict"):
+            return None, False
+    ok1 = commit_verified_action_completion(
+        user_prompt, current_action_id, evidence,
+        f"{reason}: evidence-backed completion")
+    ok2 = ok1 and safe_set_state(
+        user_prompt, current_action_id, ActionState.TERMINATED,
+        f"{reason}: done")
     if not ok1 or not ok2:
         # Check actual state — if already TERMINATED, idempotent (safe to advance).
         # If stuck in ERROR or another state, don't advance — ledger would desync.
@@ -7718,181 +7850,6 @@ def _attach_named_tools_for_action(user_prompt):
         _ctx_safe_log('warning',
                       f"named attach skipped: {err} for session: {user_prompt}")
         return False
-
-
-# =============================================================================
-# SMART LEDGER INTEGRATION HELPERS (same as create_recipe.py)
-# =============================================================================
-
-def inject_ledger_awareness(message: str, user_prompt: str) -> str:
-    """
-    Inject ledger awareness context into an action message.
-
-    This gives the agent full visibility into:
-    - Previously executed tasks and their outcomes
-    - Currently executing tasks
-    - Next course of action
-
-    Args:
-        message: Original action message
-        user_prompt: User prompt identifier
-
-    Returns:
-        Message with ledger awareness injected
-    """
-    if user_prompt not in user_ledgers:
-        return message
-
-    ledger = user_ledgers[user_prompt]
-    try:
-        awareness_text = ledger.get_awareness_text()
-        # Inject awareness as context before the action
-        return f"{awareness_text}\n\nNOW EXECUTE:\n{message}"
-    except Exception as e:
-        current_app.logger.warning(f"Failed to inject ledger awareness: {e}")
-        return message
-
-
-def complete_action_and_route(user_prompt: str, action_id: int, outcome: str, result: any = None):
-    """
-    Complete an action in the ledger and determine next task.
-
-    Uses the smart routing to respect:
-    - Hierarchical relationships (parent/child)
-    - Prerequisites and dependencies
-    - Outcome-based conditional tasks
-    - Priority ordering
-
-    Args:
-        user_prompt: User prompt identifier
-        action_id: The action ID that completed
-        outcome: 'success' or 'failure'
-        result: Optional result data
-
-    Returns:
-        Next task to execute, or None
-    """
-    if user_prompt not in user_ledgers:
-        return None
-
-    ledger = user_ledgers[user_prompt]
-    task_id = f"action_{action_id}"
-
-    try:
-        next_task = ledger.complete_task_and_route(task_id, outcome, result)
-        if next_task:
-            current_app.logger.info(f"[Ledger Routing] Completed {task_id} -> Next: {next_task.task_id}: {next_task.description}")
-        else:
-            current_app.logger.info(f"[Ledger Routing] Completed {task_id} -> No next task available")
-        return next_task
-    except Exception as e:
-        current_app.logger.error(f"Error in complete_action_and_route: {e}")
-        return None
-
-
-def get_smart_next_task(user_prompt: str):
-    """
-    Get the next task using smart routing from the ledger.
-
-    This replaces simple get_ready_tasks with intelligent routing that considers:
-    - Task relationships and dependencies
-    - Outcome-based conditions
-    - Priority and execution mode
-
-    Args:
-        user_prompt: User prompt identifier
-
-    Returns:
-        Next executable Task, or None
-    """
-    if user_prompt not in user_ledgers:
-        return None
-
-    ledger = user_ledgers[user_prompt]
-    return ledger.get_next_executable_task()
-
-
-def detect_and_add_dynamic_tasks(user_prompt: str, json_response: dict, current_action_id: int, user_message: str = ""):
-    """
-    Detect dynamically discovered tasks from LLM response and add to ledger.
-
-    When the LLM identifies new tasks during execution, this function:
-    1. Detects task-like content in the response
-    2. Uses LLM classification to determine relationships
-    3. Adds tasks to the ledger with proper wiring
-
-    Args:
-        user_prompt: User prompt identifier
-        json_response: Parsed JSON response from LLM
-        current_action_id: Current action being executed
-        user_message: Latest user message for context
-
-    Returns:
-        List of created Task objects
-    """
-    if user_prompt not in user_ledgers:
-        return []
-
-    ledger = user_ledgers[user_prompt]
-    created_tasks = []
-
-    # Check for dynamic_tasks field in response
-    if 'dynamic_tasks' in json_response:
-        for task_desc in json_response['dynamic_tasks']:
-            context = {
-                'current_action_id': current_action_id,
-                'previous_outcome': None,
-                'user_message': user_message,
-                'discovered_by': 'llm_response'
-            }
-            try:
-                task = ledger.add_dynamic_task(task_desc, context)
-                if task:
-                    created_tasks.append(task)
-                    current_app.logger.info(f"[Dynamic Task] Added: {task.task_id}: {task_desc}")
-            except Exception as e:
-                current_app.logger.warning(f"Failed to add dynamic task: {e}")
-
-    # Check for follow_up_actions field
-    if 'follow_up_actions' in json_response:
-        for action in json_response['follow_up_actions']:
-            action_desc = action if isinstance(action, str) else action.get('description', str(action))
-            context = {
-                'current_action_id': current_action_id,
-                'previous_outcome': json_response.get('status', 'unknown'),
-                'user_message': user_message,
-                'discovered_by': 'follow_up'
-            }
-            try:
-                task = ledger.add_dynamic_task(action_desc, context)
-                if task:
-                    created_tasks.append(task)
-                    current_app.logger.info(f"[Follow-up Task] Added: {task.task_id}: {action_desc}")
-            except Exception as e:
-                current_app.logger.warning(f"Failed to add follow-up task: {e}")
-
-    return created_tasks
-
-
-def get_ledger_status_for_logging(user_prompt: str) -> str:
-    """
-    Get a compact ledger status string for logging.
-
-    Args:
-        user_prompt: User prompt identifier
-
-    Returns:
-        Status string like "Ledger: 5 tasks (2 done, 1 running, 2 pending)"
-    """
-    if user_prompt not in user_ledgers:
-        return "Ledger: not initialized"
-
-    ledger = user_ledgers[user_prompt]
-    try:
-        summary = ledger.get_execution_summary()
-        return f"Ledger: {summary['total']} tasks ({len(summary['completed'])} done, {len(summary['in_progress'])} running, {len(summary['pending'])} pending)"
-    except Exception:
-        return "Ledger: status unavailable"
 
 
 from core.llm_outbound_logger import with_llm_context as _with_llm_context

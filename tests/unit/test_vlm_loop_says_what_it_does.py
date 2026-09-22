@@ -1,10 +1,14 @@
 """The AI-control ribbon is told what each VLM step does.
 
-_notify_desktop_indicator used to carry only show/hide, so the ribbon could
-say THAT the AI was in control and nothing else; the step's action and
-reasoning stayed in the log.  Now each show request carries a one-line
-caption (_step_caption) as ``?text=``, which Nunba's /indicator/show puts on
-the ribbon beside its timer.
+The ribbon used to carry only show/hide, so it could say THAT the AI was in
+control and nothing else; the step's action and reasoning stayed in the log.
+Now each show request carries a one-line caption (_step_caption) as
+``?text=``, which Nunba's /indicator/show puts on the ribbon beside its timer.
+
+The caption BUILDER stays here with the loop that produces it; the ribbon
+itself moved to activity_stream 2026-09-21, because it is one of the two
+surfaces of a single announcement -- see
+test_one_announcement_two_surfaces.py.
 """
 import os
 import sys
@@ -14,6 +18,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
+from integrations.vlm import activity_stream as acts  # noqa: E402
 from integrations.vlm import local_loop as ll  # noqa: E402
 
 
@@ -40,9 +45,9 @@ def test_show_request_carries_the_caption_and_hide_carries_none():
             patch('core.config_cache._local_base', return_value='http://127.0.0.1:5000'), \
             patch('core.http_pool.pooled_get',
                   lambda url, timeout=None, **kw: calls.append((url, kw))):
-        ll._notify_desktop_indicator(True, text='Open Settings (left_click)')
-        ll._notify_desktop_indicator(True)
-        ll._notify_desktop_indicator(False)
+        acts._ribbon(True, text='Open Settings (left_click)')
+        acts._ribbon(True)
+        acts._ribbon(False)
     assert calls[0] == ('http://127.0.0.1:5000/indicator/show',
                         {'params': {'text': 'Open Settings (left_click)'}})
     assert calls[1] == ('http://127.0.0.1:5000/indicator/show', {'params': None})
@@ -52,5 +57,5 @@ def test_show_request_carries_the_caption_and_hide_carries_none():
 def test_outside_nunba_nothing_is_sent():
     with patch('core.config_cache.is_bundled', return_value=False), \
             patch('core.http_pool.pooled_get') as get:
-        ll._notify_desktop_indicator(True, text='anything')
+        acts._ribbon(True, text='anything')
     get.assert_not_called()

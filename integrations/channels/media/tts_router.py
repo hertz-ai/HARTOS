@@ -10,8 +10,12 @@ Decision factors (in priority order):
 7. Hive peers — offload to GPU peer when local can't serve
 """
 
+import importlib.machinery
+import importlib.util
 import json
 import logging
+import os
+import shutil
 import time
 from dataclasses import dataclass, field, replace as _dc_replace
 from enum import Enum
@@ -67,6 +71,22 @@ class TTSEngineSpec:
                                              # for engines whose deps are
                                              # bundled (e.g. piper) or CPU-only
                                              # with no extra deps.
+    required_symbol: Optional[str] = None    # attribute that must resolve on
+                                             # `required_package` for the
+                                             # engine to actually serve.  Only
+                                             # needed where the package is
+                                             # shared with the rest of the app
+                                             # and can be present but broken:
+                                             # `transformers` imports fine with
+                                             # a huggingface_hub newer than
+                                             # _HF_HUB_PIN, and only fails when
+                                             # a model class is touched
+                                             # (measured 2026-09-21:
+                                             # `module 'huggingface_hub.
+                                             # constants' has no attribute
+                                             # 'HF_HUB_CACHE'`).  Leave None
+                                             # when the package being present
+                                             # is the whole answer.
     pip_install_plan: Tuple[str, ...] = ()   # canonical pip-spec list to make
                                              # `required_package` actually
                                              # importable + synth-functional —
@@ -357,6 +377,11 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         latency_cloud_ms=0,
         tool_module='integrations.service_tools.pocket_tts_tool',
         tool_function='pocket_tts_synthesize',
+        # `pocket-tts` on PyPI ships the `pocket_tts` import root.  Declared
+        # so the installed check can ask for the ENGINE: the wrapper module
+        # is HARTOS source and always imports, which is what made this
+        # engine read installed on every node that had never installed it.
+        required_package='pocket_tts',
         pip_install_plan=('pocket-tts',),
     ),
     # NeuTTS Air — Neuphonic 748M-param Qwen2 backbone with NeuCodec
@@ -629,6 +654,10 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         tool_function='mms_tts_synthesize',
         tool_worker_attr='_tool',
         required_package='transformers',  # already bundled — no install plan
+        # transformers is shared with the rest of the app, so its presence
+        # says nothing about whether it works: resolve the model class this
+        # engine actually needs.
+        required_symbol='VitsModel',
         pip_install_plan=(
             _HF_HUB_PIN,
             'soundfile',                  # for WAV write
@@ -699,7 +728,12 @@ LANG_ENGINE_PREFERENCE: Dict[str, List[str]] = {
     # JSON; ladder traverses to next engine — verified against
     # tts/package_installer.py per-engine independent install
     # contract + tts_engine._synthesize_with_fallback ladder walk.
-    'en': ['chatterbox_turbo', 'omnivoice', 'neutts_air', 'melotts', 'xtts_v2', 'kokoro', 'pocket_tts', 'cosyvoice3', 'mms_tts', 'piper', 'espeak'],
+    # f5_tts (English + Chinese voice clone, 2.5 GB, quality 0.91) sits
+    # right after xtts_v2 (0.92).  It was missing from this ladder while
+    # listed for 'zh': on an 8 GB card with the LLM resident (3.2 GB free,
+    # 2026-09-20) it is the only cloner whose budget fits, and the voiced
+    # turn that day never considered it (owner: "f5 tts shd be started").
+    'en': ['chatterbox_turbo', 'omnivoice', 'neutts_air', 'melotts', 'xtts_v2', 'f5_tts', 'kokoro', 'pocket_tts', 'cosyvoice3', 'mms_tts', 'piper', 'espeak'],
     # Indic languages — omnivoice replaces indic_parler as the primary
     # (parler kept as fallback for one release cycle).  OmniVoice has
     # 100-400 training hours per major Indic language vs parler's ~10,
@@ -914,8 +948,91 @@ _engine_available_cache: Dict[str, Tuple[bool, float]] = {}
 _CACHE_TTL = 60.0  # seconds
 
 
+def _package_importable(package: str,
+                        search_path: Optional[List[str]] = None) -> bool:
+    """Whether ``package`` resolves as a top-level import.
+
+    ``search_path`` restricts the search to those directories, which is how
+    a venv-quarantined engine is looked for in ITS venv rather than in this
+    interpreter.  Nothing is imported: only the finder runs, so a heavyweight
+    engine is never loaded to answer a routing question.
+
+    An ``pip install -e`` editable install writes a ``.pth`` that only the
+    ``site`` module processes at interpreter start, so it is invisible to a
+    ``search_path`` lookup.  No engine installs that way into a venv today
+    (the git_clone engine resolves through this interpreter, where ``site``
+    has already run); an engine that starts to would need its own probe.
+    """
+    if not package:
+        return False
+    try:
+        if search_path is None:
+            return importlib.util.find_spec(package) is not None
+        return importlib.machinery.PathFinder.find_spec(
+            package, search_path) is not None
+    except (ImportError, ValueError, AttributeError, OSError) as e:
+        logger.debug("%s not resolvable in %s: %s", package,
+                     search_path or 'this interpreter', e)
+        return False
+
+
+def _symbol_resolves(package: str, symbol: str) -> bool:
+    """Whether ``symbol`` can be reached on ``package``.
+
+    Unlike ``_package_importable`` this DOES import, because that is the
+    point: a shared package can be installed and still be unusable, and the
+    only way to find out is to touch the attribute the engine needs.
+    """
+    try:
+        module = importlib.import_module(package)
+        getattr(module, symbol)
+        return True
+    except Exception as e:
+        logger.debug("%s.%s does not resolve: %s", package, symbol, e)
+        return False
+
+
+def _bundled_engine_present(engine_id: str) -> bool:
+    """Whether an engine that ships with the host is on THIS node.
+
+    'Bundled' is a promise the shipped OS keeps and a desktop may not, so it
+    is measured rather than assumed.
+    """
+    if engine_id == 'espeak':
+        return (shutil.which('espeak-ng') is not None
+                or shutil.which('espeak') is not None)
+    # piper is synthesised in-process by the Nunba host and this router has
+    # no dispatch branch for it, so HARTOS never offers it: claiming it would
+    # put a candidate on the ladder that `_execute` answers with
+    # 'Unknown engine'.
+    return False
+
+
+def _cloud_engine_configured(engine_id: str) -> bool:
+    """Whether a cloud engine has somewhere to send a request.  A cloud
+    engine is configured, never installed; there is nothing on disk."""
+    if engine_id == 'makeittalk':
+        return bool(os.environ.get('MAKEITTALK_API_URL'))
+    return False
+
+
 def _is_engine_installed(engine_id: str) -> bool:
-    """Check if a TTS engine's Python package is available.
+    """Whether this node can actually run ``engine_id`` right now.
+
+    Answered from the spec the engine already carries -- ``install_target``
+    says WHERE it lives, ``required_package`` says WHAT has to be there --
+    so adding an engine means declaring it once, not writing a branch here.
+
+    Until 2026-09-21 this was a per-engine if/elif, and several of its
+    branches imported the HARTOS wrapper (``integrations.service_tools.
+    pocket_tts_tool``) instead of the engine.  Those modules are HARTOS
+    source: they always import, so the engine always read installed.
+    Measured that day on the owner's desktop with no `pocket_tts` package
+    and no espeak binary, the English ladder offered exactly pocket_tts and
+    espeak, tried both, and returned 'All TTS engines failed' in 0.1 s --
+    while `clone_engines_not_installed` skipped pocket_tts as installed, so
+    the on-demand setup card for the one engine that fits this machine was
+    never filed.
 
     TODO REFACTOR: move to model_catalog as ModelEntry.is_installed() —
     a model that isn't pip-importable shouldn't be selectable by any caller.
@@ -926,54 +1043,48 @@ def _is_engine_installed(engine_id: str) -> bool:
         return cached[0]
 
     spec = ENGINE_REGISTRY.get(engine_id)
-    if not spec or not spec.tool_module:
+    if spec is None:
         _engine_available_cache[engine_id] = (False, now)
         return False
 
-    available = False
+    target = getattr(spec, 'install_target', 'main')
     try:
-        if engine_id == 'espeak':
-            # espeak availability checked via shutil
-            import shutil
-            available = shutil.which('espeak-ng') is not None or shutil.which('espeak') is not None
-        elif engine_id == 'pocket_tts':
-            from integrations.service_tools.pocket_tts_tool import pocket_tts_synthesize  # noqa: F401
-            available = True
-        elif engine_id == 'luxtts':
-            from integrations.service_tools.luxtts_tool import luxtts_synthesize  # noqa: F401
-            available = True
-        elif engine_id == 'cosyvoice3':
-            from integrations.service_tools.cosyvoice_tool import cosyvoice_synthesize  # noqa: F401
-            available = True
-        elif engine_id == 'indic_parler':
-            from integrations.service_tools.indic_parler_tool import indic_parler_synthesize  # noqa: F401
-            available = True
-        elif engine_id in ('chatterbox_turbo', 'chatterbox_ml'):
-            from integrations.service_tools.chatterbox_tool import chatterbox_synthesize  # noqa: F401
-            available = True
-        elif engine_id == 'f5_tts':
-            from integrations.service_tools.f5_tts_tool import f5_synthesize  # noqa: F401
-            available = True
-        elif engine_id == 'kokoro':
-            from integrations.service_tools.kokoro_tool import kokoro_synthesize  # noqa: F401
-            available = True
-        elif engine_id == 'melotts':
-            # `melotts` PyPI package ships the `melo` import root.
-            import importlib.util as _ils
-            available = _ils.find_spec('melo') is not None
-        elif engine_id == 'xtts_v2':
-            # `coqui-tts` PyPI package ships `from TTS.api import TTS`.
-            import importlib.util as _ils
-            available = _ils.find_spec('TTS') is not None
-        elif engine_id == 'mms_tts':
-            # transformers is bundled; check the VitsModel symbol so we
-            # detect outright-broken transformers installs early.
-            from transformers import VitsModel  # noqa: F401
-            available = True
-        elif engine_id == 'makeittalk':
-            import os
-            available = bool(os.environ.get('MAKEITTALK_API_URL'))
-    except (ImportError, Exception):
+        if target == 'cloud':
+            available = _cloud_engine_configured(engine_id)
+        elif target == 'bundled':
+            available = _bundled_engine_present(engine_id)
+        elif not spec.required_package:
+            # An engine that names nothing to look for cannot be found, and
+            # saying yes here is the wrapper-import lie this function was
+            # rewritten to remove.  Foreign catalog entries land here.
+            logger.debug(
+                "%s names no required_package, so this node cannot tell "
+                "whether it is installed; treating it as absent", engine_id)
+            available = False
+        elif target == 'venv':
+            # The worker runs from its own venv, so the engine is looked for
+            # THERE, through the same resolver the spawn and the installer
+            # share (core.venv_paths).  The venv existing only proves a
+            # directory: a failed install leaves one behind, and the turn
+            # then pays a worker startup to die at import.
+            from core.venv_paths import (
+                venv_python_if_exists, venv_site_packages,
+            )
+            if venv_python_if_exists(engine_id) is None:
+                available = False
+            else:
+                available = _package_importable(
+                    spec.required_package, [venv_site_packages(engine_id)])
+        else:
+            # 'main' and 'git_clone' both resolve in this interpreter.
+            available = _package_importable(spec.required_package)
+            if available and spec.required_symbol:
+                available = _symbol_resolves(
+                    spec.required_package, spec.required_symbol)
+    except Exception as e:
+        logger.warning(
+            "%s: cannot tell whether it is installed (%s); treating the "
+            "engine as absent", engine_id, e)
         available = False
 
     _engine_available_cache[engine_id] = (available, now)
@@ -988,6 +1099,45 @@ def _get_gpu_info() -> Dict[str, Any]:
         return mgr.detect_gpu()
     except (ImportError, Exception):
         return {'cuda_available': False, 'total_gb': 0, 'free_gb': 0}
+
+
+def clone_engines_not_installed(language: Optional[str] = None) -> List[str]:
+    """The cloning engines this node could run for ``language`` but has not
+    installed, in ladder order.
+
+    A different question from ``select_engines``, which answers "what can I
+    use right now".  This one answers "what would have to be set up before a
+    voice can be cloned here", so an on-demand setup offer
+    (integrations.agent_engine.capability_setup) can name the engine that
+    will actually work on this machine instead of the first one in the list.
+
+    It applies exactly the gates installing cannot change -- the language
+    ladder, ``voice_clone``, and, for a GPU-only engine, whether its budget
+    fits this card right now -- and no others.  So the list never offers a
+    12 GB engine to an 8 GB machine that is already holding an LLM, and a
+    cloud engine, which is not a local setup, is never in it.
+
+    Measured 2026-09-20 on the owner's desktop: no cloning engine was
+    installed, every one of them was skipped, and each voiced turn fell to
+    the default voice without saying why.
+    """
+    lang = (language or 'en')[:2].lower()
+    has_gpu = _get_gpu_info().get('cuda_available', False)
+    missing: List[str] = []
+    for engine_id in LANG_ENGINE_PREFERENCE.get(lang, _DEFAULT_PREFERENCE):
+        spec = ENGINE_REGISTRY.get(engine_id)
+        if spec is None or not spec.voice_clone:
+            continue
+        if spec.device == TTSDevice.CLOUD:
+            continue
+        if _is_engine_installed(engine_id):
+            continue
+        if spec.device == TTSDevice.GPU_ONLY and not (
+                has_gpu and _can_fit_on_gpu(engine_id)):
+            continue
+        if engine_id not in missing:
+            missing.append(engine_id)
+    return missing
 
 
 def _can_fit_on_gpu(engine_id: str) -> bool:  # TODO REFACTOR: remove — duplicates catalog.matches_compute()
@@ -1096,7 +1246,10 @@ class TTSRouter:
             require_clone: Only return engines with voice cloning
 
         Returns:
-            Ranked list of TTSCandidate (best first), never empty
+            Ranked list of TTSCandidate (best first).  EMPTY when this node
+            has nothing that can serve the language -- the caller offers to
+            set an engine up rather than being handed a candidate that is
+            known to be absent.
         """
         # Step 1: Detect language
         lang = language or detect_language(text)
@@ -1206,8 +1359,16 @@ class TTSRouter:
                     ))
                 continue
 
-        # Step 5: Always ensure espeak as ultimate fallback
-        if not any(c.engine.engine_id == 'espeak' for c in candidates):
+        # Step 5: espeak is the ultimate fallback WHERE IT EXISTS.  It is
+        # bundled on the shipped OS, so the rung is nearly always there; a
+        # desktop without the binary is the exception, and appending it
+        # anyway put a candidate on the ladder the router had just been told
+        # was missing.  Measured 2026-09-21: selection returned espeak plus
+        # one other absent engine, tried both, and answered 'All TTS engines
+        # failed' in 0.1 s.  An empty list is the honest answer, and it is
+        # what lets the caller offer to set an engine up.
+        if (not any(c.engine.engine_id == 'espeak' for c in candidates)
+                and _is_engine_installed('espeak')):
             espeak_spec = ENGINE_REGISTRY['espeak']
             candidates.append(TTSCandidate(
                 engine=espeak_spec,
@@ -1217,6 +1378,12 @@ class TTSRouter:
                 quality_score=espeak_spec.quality,
                 warnings=['Fallback: no neural TTS available for this language'],
             ))
+
+        if not candidates:
+            logger.warning(
+                "no TTS engine on this node can serve %r: nothing in its "
+                "ladder is installed and espeak is not present either", lang)
+            return candidates
 
         # Step 6: Sort by urgency-weighted score
         if urgency == 'instant':
@@ -1361,12 +1528,16 @@ class TTSRouter:
                 all_warnings.append(f"{candidate.engine.engine_id} error: {e}")
                 logger.debug("TTS engine %s failed: %s", candidate.engine.engine_id, e)
 
-        # All engines failed
+        # Nothing served the turn.  Say WHICH of the two it was: no engine
+        # is installed here (the owner can be offered one), or engines were
+        # tried and failed (a defect in one of them).  'All TTS engines
+        # failed' read as the second while it was usually the first.
         return TTSResult(
             path='', duration=0, engine_id='none', device='none',
             location='none', latency_ms=0, sample_rate=0, voice='',
             quality_score=0, warnings=all_warnings,
-            error='All TTS engines failed',
+            error=('No TTS engine is installed for this language'
+                   if not candidates else 'All TTS engines failed'),
         )
 
     def _execute(
@@ -1949,7 +2120,10 @@ def populate_tts_catalog(catalog) -> int:
     added = 0
     for engine_id, spec in ENGINE_REGISTRY.items():
         # Skip if already registered (preserves user edits from admin UI)
-        if catalog.get(_engine_id_to_catalog_id(engine_id)) is not None:
+        # Ask the CLAIMING question: skipping an engine to preserve the
+        # owner's admin-UI edits still means this populator owns it, and
+        # the catalogue's stale sweep removes what nobody claims.
+        if catalog.already_registered(_engine_id_to_catalog_id(engine_id)):
             continue
 
         device_value = spec.device.value

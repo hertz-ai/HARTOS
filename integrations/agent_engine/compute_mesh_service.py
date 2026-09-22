@@ -740,9 +740,18 @@ class ComputeMeshService:
         try:
             from integrations.social.models import db_session, UserConsent
             with db_session(commit=False) as db:
+                # revoked_at IS NULL is load-bearing, not belt-and-braces:
+                # revoke_consent() sets revoked_at and LEAVES granted=True, so
+                # filtering on granted alone treated a REVOKED compute_contribute
+                # consent as live and kept serving peer compute after the human
+                # withdrew it. Same "active" predicate ConsentService.active_grant
+                # and check_consent use (granted AND NOT revoked); kept as a
+                # device-level query here because any granted row authorises the
+                # device, which check_consent's per-user signature cannot express.
                 return db.query(UserConsent).filter(
                     UserConsent.consent_type == 'compute_contribute',
                     UserConsent.granted == True,
+                    UserConsent.revoked_at.is_(None),
                 ).first() is not None
         except Exception:
             return False

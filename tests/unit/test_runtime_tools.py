@@ -432,6 +432,139 @@ class TestRuntimeToolManager:
         assert 'tts_audio_suite' in service_tool_registry._tools
         service_tool_registry._tools.pop('tts_audio_suite', None)
 
+    def test_register_tool_at_port_acestep(self, rtm):
+        """A started ACE-Step must register at its DYNAMIC port.
+
+        Regression 2026-09-21: _register_tool_at_port had no acestep
+        branch, so it logged "No tool wrapper for acestep" and the
+        registry kept AceStepTool.DEFAULT_URL (localhost:8001) — the
+        agent held a music tool aimed at a port nothing listened on.
+        """
+        from integrations.service_tools.registry import service_tool_registry
+        service_tool_registry._tools.pop('acestep', None)
+
+        rtm._register_tool_at_port('acestep', 55557)
+        assert 'acestep' in service_tool_registry._tools
+        assert service_tool_registry._tools['acestep'].base_url == \
+            'http://127.0.0.1:55557'
+        service_tool_registry._tools.pop('acestep', None)
+
+    def test_register_tool_at_port_diffrhythm(self, rtm):
+        from integrations.service_tools.registry import service_tool_registry
+        service_tool_registry._tools.pop('diffrhythm', None)
+
+        rtm._register_tool_at_port('diffrhythm', 55558)
+        assert 'diffrhythm' in service_tool_registry._tools
+        assert service_tool_registry._tools['diffrhythm'].base_url == \
+            'http://127.0.0.1:55558'
+        service_tool_registry._tools.pop('diffrhythm', None)
+
+    def test_acestep_start_spawns_instead_of_missing_script(self, rtm):
+        """setup_tool('acestep') must REACH the spawn, not bail on config.
+
+        Regression 2026-09-21: TOOL_CONFIGS['acestep'] carried a
+        `run_command` key nothing read, and no `server_script`, so
+        _start_sidecar returned {'error': 'Server script not found:
+        None'} and ACE-Step could never start through the manager.
+        """
+        tool_dir = rtm.storage.get_tool_dir('acestep')
+        tool_dir.mkdir(parents=True)
+        (tool_dir / 'pyproject.toml').write_text('x')
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 4242
+        mock_proc.poll.return_value = None
+
+        with patch('integrations.service_tools.runtime_manager'
+                   '.subprocess.Popen', return_value=mock_proc) as mock_popen, \
+             patch.object(rtm, '_read_port_from_stdout', return_value=51234), \
+             patch.object(rtm, '_drain_pipes'), \
+             patch.object(rtm, '_wait_for_listen', return_value=True):
+            result = rtm.setup_tool('acestep')
+
+        assert 'error' not in result, result
+        assert result['running'] is True
+        assert result['port'] == 51234
+
+        spawn_argv = mock_popen.call_args[0][0]
+        assert spawn_argv[1].endswith('acestep_server.py')
+        # The dead config pinned 8001; the contract is OS-assigned.
+        assert '8001' not in ' '.join(spawn_argv)
+
+        from integrations.service_tools.registry import service_tool_registry
+        service_tool_registry._tools.pop('acestep', None)
+
+    def test_live_port_replaces_a_stale_default_registration(self, rtm):
+        """RTM's port must beat an earlier DEFAULT_URL registration.
+
+        Regression 2026-09-21: register_tool() returns early with
+        "already registered, skipping".  create_recipe.py:1793 and
+        reuse_recipe.py:2623 call AceStepTool.register() with no
+        base_url at agent-construction time, pinning localhost:8001.
+        If agents were built before the sidecar started, that stale
+        entry won and the agent kept calling a dead port.
+        """
+        from integrations.service_tools.registry import service_tool_registry
+        from integrations.service_tools.acestep_tool import AceStepTool
+
+        service_tool_registry._tools.pop('acestep', None)
+        AceStepTool.register()  # the stale localhost:8001 entry
+        assert service_tool_registry._tools['acestep'].base_url == \
+            AceStepTool.DEFAULT_URL
+
+        rtm._register_tool_at_port('acestep', 50001)
+
+        assert service_tool_registry._tools['acestep'].base_url == \
+            'http://127.0.0.1:50001'
+        service_tool_registry._tools.pop('acestep', None)
+
+    def test_resolve_python_prefers_tool_venv(self, rtm):
+        """A tool that pins an incompatible dep set gets its own venv.
+
+        ACE-Step requires torch==2.7.1+cu128 while the host runs
+        torch 2.3.0+cpu, so its sidecar must not launch on the host
+        interpreter.
+        """
+        tool_dir = rtm.storage.get_tool_dir('acestep')
+        sub = 'Scripts' if sys.platform == 'win32' else 'bin'
+        name = 'python.exe' if sys.platform == 'win32' else 'python'
+        venv_py = tool_dir / '.venv' / sub / name
+        venv_py.parent.mkdir(parents=True)
+        venv_py.write_text('#!/bin/sh\n')
+
+        assert rtm._resolve_python_for('acestep') == str(venv_py)
+
+    def test_resolve_python_falls_back_to_host(self, rtm):
+        """No tool venv -> the running interpreter, as before."""
+        assert rtm._resolve_python_for('wan2gp') == sys.executable
+
+    def test_drain_pipes_forwards_child_output(self, rtm, caplog):
+        """Sidecar output must keep being read after PORT= is seen.
+
+        Regression 2026-09-21: nothing read stdout/stderr once
+        _read_port_from_stdout returned, so a chatty child filled the
+        OS pipe buffer and blocked forever on its next write.
+        """
+        import io
+        import logging as _logging
+
+        proc = MagicMock()
+        proc.stdout = io.StringIO('generating step 1\ngenerating step 2\n')
+        proc.stderr = io.StringIO('a warning\n')
+
+        with caplog.at_level(_logging.INFO,
+                             logger='integrations.service_tools.runtime_manager'):
+            rtm._drain_pipes('acestep', proc)
+            deadline = time.time() + 5
+            while time.time() < deadline and \
+                    len([r for r in caplog.records if '[acestep]' in r.message]) < 3:
+                time.sleep(0.05)
+
+        msgs = [r.message for r in caplog.records if '[acestep]' in r.message]
+        assert '[acestep] generating step 1' in msgs
+        assert '[acestep] generating step 2' in msgs
+        assert '[acestep] a warning' in msgs
+
 
 # ══════════════════════════════════════════════════════════════════
 # Dynamic Port Tests
@@ -735,21 +868,25 @@ class TestMediaAgent:
 
     @patch('integrations.service_tools.media_agent._get_tool_base_url')
     @patch('core.http_pool.pooled_post')
-    def test_check_media_status_acestep_default_url(self, mock_post, mock_url):
+    def test_check_media_status_unregistered_tool_is_not_dialed_blind(
+            self, mock_post, mock_url):
+        """An unregistered tool has no address, and guessing one is worse
+        than saying so.
+
+        This used to assert that a missing registration fell back to
+        http://localhost:8001. RuntimeToolManager gives every sidecar an
+        OS-assigned port and learns it from the child's PORT= line --
+        measured across runs: 54257, 65523, 64507, 65410 -- so 8001 named
+        whatever else happened to hold it, and a status poll against a
+        stranger's port can only mislead. 6da9c5cdd removed the literal;
+        this asserts what replaced it.
+        """
         from integrations.service_tools.media_agent import check_media_status
-        mock_url.return_value = None  # not registered → use default
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            'status': 'processing', 'progress': 50,
-        }
-        mock_post.return_value = mock_resp
+        mock_url.return_value = None  # the tool is not registered
         result = json.loads(check_media_status(task_id="acestep_abc"))
-        assert result['status'] == 'processing'
-        assert result['progress'] == 50
-        # Should use default URL http://localhost:8001
-        call_url = mock_post.call_args[0][0]
-        assert 'localhost:8001' in call_url
+        assert result.get('status') == 'error', result
+        assert not mock_post.called, (
+            'nothing may be dialed when the tool has no registered address')
 
     def test_register_media_tools(self):
         """Verify register_media_tools registers all 3 tools."""

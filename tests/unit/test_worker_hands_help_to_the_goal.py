@@ -46,6 +46,23 @@ for p in (_ROOT, os.path.join(_ROOT, 'agent-ledger-opensource')):
         sys.path.insert(0, p)
 
 from agent_ledger.core import SmartLedger, TaskStatus  # noqa: E402
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _worker_may_claim(monkeypatch):
+    """Precondition these tests always assumed: the daemon gate is open.
+
+    Since 2026-09-20 the worker asks should_yield_to_user, the provider
+    breaker and the adapter's readiness BEFORE claiming (a claim the
+    dispatcher would defer is three full ledger writes for nothing), so a
+    test that drives _tick on a live box would otherwise inherit that box's
+    pressure readings.  The gate itself is pinned in
+    tests/unit/test_worker_tick_claims_nothing_it_would_defer.py.
+    """
+    from integrations.distributed_agent.worker_loop import DistributedWorkerLoop
+    monkeypatch.setattr(DistributedWorkerLoop, '_dispatch_would_defer',
+                        staticmethod(lambda: None))
 
 
 class _Task:

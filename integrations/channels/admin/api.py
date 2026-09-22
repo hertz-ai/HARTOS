@@ -2182,8 +2182,24 @@ def update_embodied_config():
     data = request.get_json()
     if not data:
         raise ValueError("Request body required")
+    _before = api._global_config.embodied_ai
+    _was = {'camera': bool(_before.camera_enabled),
+            'screen': bool(_before.screen_capture_enabled)}
     api._global_config.embodied_ai = EmbodiedAIConfigSchema(**data)
     api._save_config()
+
+    # This endpoint can set camera_enabled / screen_capture_enabled too, so it
+    # is the same permission and takes the same one write path as the toggle —
+    # otherwise a flag could be left ON here with no consent on file, and
+    # _apply_embodied_toggle's `want_running` reads those flags, so the feed
+    # would later run on an unrecorded permission.  Only a CHANGED flag is the
+    # owner answering for that feed: a settings save that does not touch the
+    # camera records nothing and stays the no-op it was.
+    cfg = api._global_config.embodied_ai
+    for _feed, _now in (('camera', bool(cfg.camera_enabled)),
+                        ('screen', bool(cfg.screen_capture_enabled))):
+        if _now != _was[_feed]:
+            _record_feed_consent(_feed, _now)
 
     # Propagate to HevolveAI runtime if reachable
     _propagate_embodied_config(api._global_config.embodied_ai)
@@ -2222,8 +2238,53 @@ def toggle_embodied_feed():
 
     api._save_config()
     _propagate_embodied_config(cfg)
-    _apply_embodied_toggle(feed, enabled, cfg)
+    # The owner's answer becomes a consent row, and that path applies the feed
+    # through this same actuator — so only apply here for what it did not cover
+    # ('audio', or a failed write).  Identical `_recorded` guard to
+    # /api/agent/approval (hart_intelligence_entry), for the identical reason:
+    # applying again would be the second path.
+    if not _record_feed_consent(feed, enabled):
+        _apply_embodied_toggle(feed, enabled, cfg)
     return {"feed": feed, "enabled": enabled, "config": cfg.to_dict()}
+
+
+def _record_feed_consent(feed: str, enabled: bool) -> set:
+    """Write the owner's camera/screen answer as a CONSENT ROW, not just a flag.
+
+    Same reason /api/agent/approval was migrated onto
+    ``ConsentService.record_capability_decision``: a feed that is running has to
+    have a consent on file, or the privacy page under-reports what the machine
+    is doing, there is nothing to revoke, and no ``consent.granted`` reaches the
+    other surfaces so their copy of the card never goes away.  The admin
+    settings toggle was the last surface still flipping the flag directly, which
+    made it a second way to turn the camera on — one that left no trace.
+
+    No new vocabulary: ``CAPABILITY_CONSENT_TYPES`` already maps this
+    endpoint's own feed names ('camera', 'screen').  No new identity: every
+    admin request is authenticated and ``_admin_auth_gate`` has already put the
+    human and their session on ``g``.  'audio' governs no consent type and
+    records nothing, so the caller still applies it itself.
+
+    Returns the feeds whose decision was recorded — and therefore already
+    applied through ConsentService's actuator, which is the SAME
+    ``_apply_embodied_toggle`` below.  Best effort: a consent-write problem
+    must never cost the owner their toggle, so the caller falls back to
+    applying the feed directly, exactly as it did before.
+    """
+    from flask import g
+    recorded = set()
+    feeds = ('camera', 'screen') if feed == 'all' else (feed,)
+    try:
+        from integrations.social.consent_service import ConsentService
+        for one in feeds:
+            if ConsentService.record_capability_decision(
+                    g.db, str(g.user_id), one, bool(enabled)):
+                recorded.add(one)
+    except Exception as e:
+        logger.warning(
+            "embodied feed %s: consent row not written (%s) — applying the "
+            "toggle directly", feed, e)
+    return recorded
 
 
 def _apply_embodied_toggle(feed: str, enabled: bool, cfg) -> None:

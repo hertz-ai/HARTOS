@@ -57,6 +57,16 @@ CONSENT_TYPES = frozenset({
                          # room_presence_service — MUST be registered here or
                          # check_consent's _validate_consent_type rejects it and
                          # the whole T2 read/post subsystem is denied (#review).
+    'agent_contact',     # An agent the user does NOT own asks to message
+                         # them (Nunba /agents/contact, the Instagram-DM-
+                         # request shape).  Keyed per agent_id: the user is
+                         # allowing THAT agent to reach them, not all agents,
+                         # so a grant here is narrow by design.  Before this
+                         # the answer lived only in a module-level dict, so an
+                         # accept was forgotten on restart, the same agent was
+                         # re-asked forever, and a deny was equally
+                         # unrecorded — nothing to revoke and nothing on the
+                         # privacy page.
     'screen_capture',    # The desktop's own screen is captured and described
                          # for the visual agent (VisionService screen channel,
                          # #701).  The capture loop's first denied tick files
@@ -79,7 +89,82 @@ CONSENT_TYPES = frozenset({
                          # file that security.middleware verifies the
                          # phone's signed calls against.  Permanent until
                          # revoked, as the owner ruled.
+    'peer_admission',    # A computer on the network asks to link with this
+                         # one and signed nothing, so it has proved no
+                         # identity at all.  The sibling of 'device_access':
+                         # that one names a phone's verified key, this one
+                         # can only name a network address, and the card
+                         # says so.  Asked because enforcement mode is a
+                         # flag and a flag must not decide alone -- unset, it
+                         # used to ADMIT the stranger silently; fixed to
+                         # 'hard' it would REFUSE just as silently, and the
+                         # owner ruled against both: "do not gulp, the
+                         # consent shd be shown when a flag gates a useful
+                         # logic" (2026-09-21).  The refused attempt is not
+                         # retroactively admitted; an Allow admits the peer
+                         # on its next try, exactly as device_access does.
+    'voice_speech',      # Proactive vocal speech and audio narration by the
+                         # servicing layer. Asked of the visitor/user as the
+                         # first proactive step to respect acoustic privacy
+                         # and enable browser autoplay.
+    'camera_capture',    # An agent sees through this computer's camera
+                         # (VisionService camera channel).  The sibling of
+                         # 'screen_capture': the screen had a type since #701
+                         # and the camera had none, which is why the camera
+                         # ask could not be filed canonically and went out as
+                         # a bare LiquidUI 'approval' component instead --
+                         # unrecorded, unrevocable, and invisible to every
+                         # surface but AgentOverlay (#863).
+    'capability_setup',  # An agent provisions a capability this machine does
+                         # not have yet: a voice engine's private venv, the
+                         # packages it pins and its model weights, downloaded
+                         # and installed here.  Asked of the desktop owner,
+                         # whose disk and bandwidth it is, and scoped to the
+                         # ONE capability ('tts:f5_tts'), so a yes to a 2.5 GB
+                         # voice is never a yes to a 12 GB one.  The ask is
+                         # raised by the task that needed the capability and
+                         # could not do it -- a voiced reply with no cloning
+                         # engine installed -- never at boot and never as a
+                         # blanket.  This type records only whether the owner
+                         # wants it; the work itself is the provisioning path
+                         # that already exists (a self_heal goal the agent
+                         # daemon paces, repair_backend_venv ->
+                         # install_backend_full, the same function the
+                         # "Set up TTS" UI calls).
 })
+
+#: The capability an agent asks for, keyed by the ``action`` its ask carries,
+#: mapped to the consent type that records the answer.  ONE map, read by both
+#: halves of the flow -- the ask (hart_intelligence_entry._request_consent,
+#: behind the Request_Camera_Access / Request_Screen_Access tools) and the
+#: answer (record_capability_decision, behind every approval surface) -- so a
+#: capability cannot end up filed under one name and granted under another.
+#: The keys are exactly the aliases /api/agent/approval already accepted.
+#:
+#: 'enable_audio' / 'mic' are deliberately ABSENT: no code asks for them, and
+#: minting a consent type for an ask nobody makes would record a grant the
+#: owner was never shown.  The mic is governed by core.ai_sensing's
+#: kill-switch today; if an ask is ever built for it, it belongs here.
+CAPABILITY_CONSENT_TYPES = {
+    'enable_camera': 'camera_capture',
+    'camera': 'camera_capture',
+    'vision': 'camera_capture',
+    'enable_screen': 'screen_capture',
+    'screen': 'screen_capture',
+    'computer_use': 'screen_capture',
+}
+
+
+def consent_type_for_action(action) -> str:
+    """The consent type an approval ``action`` records against, or None.
+
+    Case and surrounding space do not matter: /api/agent/approval lowercases
+    and strips before it dispatches, and the ask side must agree with it
+    without having to remember to.
+    """
+    if not isinstance(action, str):
+        return None
+    return CAPABILITY_CONSENT_TYPES.get(action.strip().lower())
 
 #: A device is identified by its Ed25519 public key (the PeerLink identity
 #: every phone already has); the consent scope carries the whole key so no
@@ -97,6 +182,26 @@ def device_scope(public_key_hex):
     if not _DEVICE_KEY_RE.fullmatch(key):
         return None
     return f'{DEVICE_SCOPE_PREFIX}{key}'
+
+
+def device_fingerprint(scope_or_key):
+    """What the owner reads to tell one phone from another: the key's first
+    16 hex in four groups ('3f9a 1c02 77de b4e1'), from a device scope or a
+    bare key; None for anything else.
+
+    The name a phone signs into its ask is self-asserted, so the card and
+    the trusted-phones list show this beside it, and the phone shows its own
+    key the same way (PeerLinkCrypto.getEd25519PublicHex), so the two can be
+    matched by eye.  The same 16 hex are the phone's node_id.
+    """
+    if not isinstance(scope_or_key, str):
+        return None
+    key = scope_or_key.lower()
+    if key.startswith(DEVICE_SCOPE_PREFIX):
+        key = key[len(DEVICE_SCOPE_PREFIX):]
+    if not _DEVICE_KEY_RE.fullmatch(key):
+        return None
+    return ' '.join(key[i:i + 4] for i in range(0, 16, 4))
 
 
 def _audit(event_type: str, actor_id: str, action: str, detail: dict):
@@ -132,11 +237,13 @@ def _emit(topic: str, data: dict, msg_id: str = None):
     id (e.g. the consent row id) lets a producer re-emit the same ask on every
     poll for reliable delivery while the UI still shows exactly one card.  A
     ``None`` msg_id falls through to a fresh per-emit id (one-shot events)."""
+    bus = note_sent = False
     try:
         from core.platform.events import emit_event
         emit_event(topic, data)
+        bus = True
     except Exception:
-        pass
+        _logger.warning("consent %s: event bus leg failed", topic, exc_info=True)
     # Also push as a notification to the user's frontend (Nunba, Hevolve, Android)
     # so consent dialogs can appear on any platform
     user_id = data.get('user_id', '')
@@ -152,15 +259,29 @@ def _emit(topic: str, data: dict, msg_id: str = None):
             }
             # The agent's own name (agent_display_name): the card shows it,
             # never the id, which is a prompt id and means nothing to a person.
-            # A device ask names the person whose phone asks the same way.
-            for name_key in ('agent_name', 'requester_name'):
+            # A device ask names the person whose phone asks the same way,
+            # with the key's fingerprint beside the self-asserted name.
+            for name_key in ('agent_name', 'requester_name', 'requester_fingerprint'):
                 if data.get(name_key):
                     note[name_key] = data[name_key]
             if msg_id:
                 note['msg_id'] = msg_id
             on_notification(user_id, note)
+            note_sent = True
         except Exception:
-            pass
+            _logger.warning("consent %s: notification leg failed for user %s",
+                            topic, user_id, exc_info=True)
+    # ONE line per emit, naming what actually left.  Both legs used to be
+    # `except Exception: pass` with no log at all, so "the ask was delivered",
+    # "the ask was built but no leg worked" and "no ask was ever filed" all
+    # produced identical (empty) logs -- there was nothing to measure a live
+    # consent drive against, and a silent delivery failure was indisguishable
+    # from a gate that never asked.
+    _logger.info("consent emit %s type=%s scope=%s agent=%s user=%s "
+                 "bus=%s notification=%s msg_id=%s",
+                 topic, data.get('consent_type'), data.get('scope', '*'),
+                 data.get('agent_id'), user_id or '(none)',
+                 bus, note_sent, msg_id)
 
 
 def _validate_consent_type(consent_type: str):
@@ -251,6 +372,44 @@ def _copilot_switch_from_consent(consent_type: str, granted: bool) -> None:
         _logger.warning("copilot switch from consent %s failed: %s", consent_type, e)
 
 
+#: Which embodied_ai feed a capability consent governs.  Inverse of
+#: CAPABILITY_CONSENT_TYPES' values, kept next to the switch it drives.
+_CONSENT_FEED = {'camera_capture': 'camera', 'screen_capture': 'screen'}
+
+
+def _embodied_feed_from_consent(consent_type: str, granted: bool) -> None:
+    """The owner's answer to a camera or screen ask acts on the feed itself.
+
+    Sibling of _copilot_switch_from_consent, and it exists for the same
+    reason: the answer can arrive on any surface -- the privacy page, a
+    consent card on the desktop, the same card on the floating companion, a
+    phone -- and every one of them must start or stop the ONE feed, through
+    the ONE lifecycle path the admin settings toggle uses
+    (channels.admin.api._apply_embodied_toggle).  Before this, only
+    /api/agent/approval applied a feed, so a grant made anywhere else was a
+    row that turned nothing on.
+
+    The persisted flag is written too, so a restart sees the same answer and
+    get_embodied_status reports it.  Best effort: the consent row is already
+    written, and a switch that cannot be applied is logged here.
+    """
+    feed = _CONSENT_FEED.get(consent_type)
+    if feed is None:
+        return
+    try:
+        from integrations.channels.admin.api import get_api, _apply_embodied_toggle
+        cfg = get_api()._global_config.embodied_ai
+        setattr(cfg, 'camera_enabled' if feed == 'camera' else 'screen_capture_enabled',
+                bool(granted))
+        get_api()._save_config()
+        _apply_embodied_toggle(feed, bool(granted), cfg)
+        _logger.info("consent %s -> embodied feed %s=%s",
+                     consent_type, feed, bool(granted))
+    except Exception as e:
+        _logger.warning("embodied feed %s from consent %s failed: %s",
+                        feed, consent_type, e)
+
+
 def _named(db, data: dict, agent_id) -> dict:
     """``data`` with 'agent_name' added when the agent has one: the ask and
     the notices then share one shape, and an unnamed agent carries no key."""
@@ -272,7 +431,11 @@ class ConsentService:
         Returns existing record if one already exists for this combination.
         ``reason`` rides on the ask, so the card can say what is asked for.
         ``requester_name`` is the person asking when the asker is not an
-        agent (a device ask: the phone's owner), shown like agent_name.
+        agent (a device ask: the phone's owner), shown like agent_name.  It
+        is also written to the new row as its ``label``, once: the name the
+        phone signed into its first ask stands, a later ask cannot rename
+        the row (the label is a hint beside the fingerprint, never
+        identity).
         """
         _validate_consent_type(consent_type)
 
@@ -286,6 +449,9 @@ class ConsentService:
             ask['reason'] = reason
         if requester_name:
             ask['requester_name'] = requester_name
+        fingerprint = device_fingerprint(scope) if consent_type == 'device_access' else None
+        if fingerprint:
+            ask['requester_fingerprint'] = fingerprint
         # Who is asking, by name: the card says "<name> asks to ...".
         _named(db, ask, agent_id)
 
@@ -332,6 +498,7 @@ class ConsentService:
             consent_type=consent_type,
             scope=scope,
             granted=False,
+            label=requester_name[:100] if requester_name else None,
         )
         db.add(consent)
         db.flush()
@@ -360,6 +527,59 @@ class ConsentService:
                                        agent_id=agent_id, reason=reason,
                                        requester_name=requester_name)
         return False
+
+    @staticmethod
+    def record_capability_decision(db, user_id: str, action: str,
+                                   granted: bool, agent_id=None):
+        """Write the owner's Approve / Deny on a capability ask.  Returns the
+        consent type recorded, or None when the action governs no consent.
+
+        ONE implementation, for every approval surface: /api/agent/approval on
+        the brain (AgentOverlay's card, the Android client) and the same route
+        on the LiquidUI shell.  Before this, those surfaces flipped
+        embodied_ai.*_enabled directly, so the owner's answer existed only as
+        a config flag and a log line -- no row, so nothing to revoke, nothing
+        on the privacy page, no `consent.granted` for the other surfaces to
+        drop their copy of the card on, and a Deny that the next poll simply
+        re-asked because nothing recorded it as decided.
+
+        A grant is BLANKET (no agent, scope '*'), matching what the SPA's own
+        grant writes (consent_api.grant_consent) and what its button promises
+        ("Allow ALL agents to ..."): the capability is the camera, not one
+        agent's use of it, and check_consent's blanket step is what the
+        per-agent asks then match against.  A grant that is already active is
+        left alone rather than appended -- the supported pattern from
+        grant_consent's own docstring, since re-granting is what trips the
+        UNIQUE constraint.
+
+        A denial revokes for the ask's own agent when one is named, matching
+        the card's "Don't allow this agent", and blanket otherwise.
+        """
+        consent_type = consent_type_for_action(action)
+        if consent_type is None:
+            _logger.info("capability decision ignored: action %r governs no "
+                         "consent type", action)
+            return None
+        if granted:
+            if ConsentService.active_grant(db, user_id, consent_type) is None:
+                # grant_consent applies the feed and emits consent.granted.
+                ConsentService.grant_consent(db, user_id, consent_type)
+            else:
+                # Already allowed, so no second row (the UNIQUE constraint
+                # rejects it) -- but the owner just pressed Approve, and the
+                # feed may have been stopped from admin settings while the
+                # grant stood, so re-assert it.  Exclusive with the branch
+                # above, so the feed is never applied twice for one answer.
+                _embodied_feed_from_consent(consent_type, True)
+        elif ConsentService.revoke_consent(db, user_id, consent_type,
+                                           agent_id=agent_id) is None:
+            # Nothing on file to revoke -- a client that answers without
+            # having been asked here.  The answer still has to stop the feed
+            # and still has to reach the other surfaces so their copy of the
+            # card goes away, which is exactly what announce_revocation does.
+            ConsentService.announce_revocation(user_id, consent_type,
+                                               agent_id=agent_id)
+        return consent_type
 
     @staticmethod
     def declined(db, user_id: str, consent_type: str, scope: str = '*',
@@ -418,6 +638,78 @@ class ConsentService:
         _validate_consent_type(consent_type)
 
         now = datetime.utcnow()
+
+        # PROMOTE A NEVER-ANSWERED ASK instead of inserting beside it.
+        #
+        # request_consent files a PENDING row on the same
+        # (user_id, agent_id, consent_type, scope) key the UNIQUE constraint
+        # covers. With a non-NULL agent_id those keys do NOT stack (SQL treats
+        # only NULL as distinct), so a per-agent consent could be ASKED and then
+        # never GRANTED: the insert below raised IntegrityError, and the
+        # documented workaround — revoke first — cannot help, because revoking
+        # updates the row rather than freeing the key. That is why
+        # record_capability_decision grants BLANKET: it sidesteps this rather
+        # than hitting it. A per-agent ask (agent_contact, and any future one)
+        # needs the answer to land ON the ask.
+        #
+        # The append-only invariant is preserved exactly: promotion is allowed
+        # ONLY while granted_at IS NULL, i.e. this row has never been granted,
+        # so no granted_at is ever rewritten and no history is lost. A row that
+        # was granted before (even if since revoked) still takes the insert path
+        # and still raises, which is the documented re-grant semantics.
+        # ONLY for a non-NULL agent_id, i.e. only where appending is impossible.
+        # With agent_id NULL the keys are distinct (SQL), so the append-only
+        # semantic still holds exactly as acd11f55 specified: the pending row
+        # stays as audit history and a new granted row is inserted beside it.
+        # Narrowing it this way is what keeps that invariant — and its test —
+        # untouched while still making a per-agent ask answerable.
+        # no_autoflush on principle, NOT on a measurement.  Adding a SELECT
+        # inside a writer changes flush timing: SQLAlchemy autoflushes the
+        # caller's pending state before answering a query, so without this the
+        # lookup would flush whatever the caller had in flight at a point it
+        # never used to.  That is a real hazard and the guard is cheap, so it
+        # stays.
+        #
+        # Honesty about the evidence: I first wrote that this guard FIXED a
+        # measured 19-suite regression.  It did not, and the claim was wrong —
+        # the two runs I compared (253 passed/1 error vs 3 failed/247/7 errors)
+        # turned out to be THE SAME CODE.  The consent sweep is not hermetic:
+        # some suites pin HEVOLVE_DB_PATH=':memory:' and two do not,
+        # models.py reads that env ONCE at import and caches DB_PATH, so
+        # whichever test module imports first decides the database for the whole
+        # process — and agent_data/hevolve_database.db (44MB, real file) gets
+        # written by the runs that lose that race.  Cross-run comparisons in
+        # this area are therefore not evidence of anything until the DB is
+        # pinned and fresh.
+        _pending = None
+        if agent_id is not None:
+            with db.no_autoflush:
+                _pending = db.query(UserConsent).filter(
+                    UserConsent.user_id == user_id,
+                    UserConsent.agent_id == agent_id,
+                    UserConsent.consent_type == consent_type,
+                    UserConsent.scope == scope,
+                    UserConsent.granted_at.is_(None),
+                ).first()
+        if _pending is not None:
+            _pending.granted = True
+            _pending.granted_at = now
+            _pending.revoked_at = None
+            db.flush()
+            _audit('consent', actor_id=user_id,
+                   action=f'consent.granted:{consent_type}',
+                   detail={'scope': scope, 'agent_id': agent_id,
+                           'promoted_pending_ask': True})
+            _emit('consent.granted', {
+                'user_id': user_id,
+                'consent_type': consent_type,
+                'scope': scope,
+                'agent_id': agent_id,
+            })
+            _copilot_switch_from_consent(consent_type, True)
+            _embodied_feed_from_consent(consent_type, True)
+            return _pending
+
         consent = UserConsent(
             id=str(uuid.uuid4()),
             user_id=user_id,
@@ -426,6 +718,9 @@ class ConsentService:
             scope=scope,
             granted=True,
             granted_at=now,
+            # a phone keeps the name its ask was filed under (#111)
+            label=(ConsentService._label_on_file(db, user_id, consent_type, scope)
+                   if consent_type == 'device_access' else None),
         )
         db.add(consent)
         db.flush()
@@ -440,6 +735,7 @@ class ConsentService:
             'agent_id': agent_id,
         })
         _copilot_switch_from_consent(consent_type, True)
+        _embodied_feed_from_consent(consent_type, True)
 
         # Up-sync the now-public agents (gap #4): agents are almost always
         # created BEFORE the owner grants public_exposure, so the
@@ -459,6 +755,19 @@ class ConsentService:
                 pass
 
         return consent
+
+    @staticmethod
+    def _label_on_file(db, user_id: str, consent_type: str, scope: str):
+        """The label the most recent row for (user, type, scope) carries, so
+        a grant, and a re-allow after a revoke, keep the name the ask was
+        filed under; None when no row has one."""
+        row = db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == consent_type,
+            UserConsent.scope == scope,
+            UserConsent.label.isnot(None),
+        ).order_by(UserConsent.created_at.desc()).first()
+        return row.label if row is not None else None
 
     @staticmethod
     def auto_grant_with_notice(db, user_id: str, consent_type: str,
@@ -598,6 +907,7 @@ class ConsentService:
             'agent_id': agent_id,
         })
         _copilot_switch_from_consent(consent_type, False)
+        _embodied_feed_from_consent(consent_type, False)
 
     @staticmethod
     def active_grant(db, user_id: str, consent_type: str,

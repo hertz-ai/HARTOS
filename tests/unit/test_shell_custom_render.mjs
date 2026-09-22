@@ -143,5 +143,61 @@ h = lastOverlayHTML();
 ok(h.indexOf('onclick="shellA2UIEmit(this)"') >= 0 && h.indexOf('data-ctype="metric"') >= 0,
    'G5: the metric builtin emits its declared click on tap');
 
+// ── 4. F18: the `approval` card HONOURS its declared `options` prop ───────────
+// `options` was declared on the component and populated by two producers, while
+// both renderers hardcoded Approve/Deny/Later -- so the game-sound card said
+// "keep it, or say what is wrong and I will compose another" over buttons
+// reading Approve/Deny. The contract: labels POSITIONALLY [approve, deny,
+// defer], a missing entry keeps its default, the button SET never shrinks.
+
+// 4a. No options -> the three defaults, each wired to its own decision.
+sandbox.renderAgentOverlay({ type: 'approval', agent_id: 'ag2', action: 'act', _ts: 7 });
+h = lastOverlayHTML();
+ok(h.indexOf('<span>Approve</span>') >= 0 && h.indexOf('<span>Deny</span>') >= 0
+   && h.indexOf('<span>Later</span>') >= 0, 'F18: approval with no options keeps the three default labels');
+ok(h.indexOf('_doApproval(this,&quot;approve&quot;)') >= 0
+   && h.indexOf('_doApproval(this,&quot;deny&quot;)') >= 0,
+   'F18: the default card still wires approve + deny decisions');
+
+// 4b. The game-sound producer's two labels are honoured; the defer button keeps
+//     its default, so the card is still dismissable.
+sandbox.renderAgentOverlay({
+  type: 'approval', agent_id: 'ag3', action: 'game_sound:pong:win', _ts: 8,
+  options: ['Keep it', 'Compose another'],
+});
+h = lastOverlayHTML();
+ok(h.indexOf('<span>Keep it</span>') >= 0, 'F18: options[0] labels the approve button');
+ok(h.indexOf('<span>Compose another</span>') >= 0, 'F18: options[1] labels the deny button');
+ok(h.indexOf('<span>Later</span>') >= 0, 'F18: a short options list leaves the defer button (card stays dismissable)');
+ok(h.indexOf('<span>Approve</span>') < 0, 'F18: the overridden default label is GONE (the prop is really read)');
+ok(h.indexOf('_doApproval(this,&quot;approve&quot;)') >= 0,
+   'F18: relabelling does not change the POSTed decision vocabulary');
+
+// 4c. XSS in an option LABEL is escaped. This is the sharp edge: the prop
+//     pre-escape at the top of renderAgentOverlay only walks STRING props, so
+//     entries of a LIST prop arrive raw and must be _esc'd at use.
+sandbox.renderAgentOverlay({
+  type: 'approval', agent_id: 'ag4', action: 'act', _ts: 9,
+  options: ['<img src=x onerror=alert(1)>', 'ok'],
+});
+h = lastOverlayHTML();
+ok(h.indexOf('<img src=x') < 0, 'F18: a malicious option label is escaped, not injected as markup');
+ok(h.indexOf('&lt;img src=x') >= 0, 'F18: ...and still rendered as visible text');
+
+// 4d. A non-list / non-string entry falls back rather than printing junk.
+sandbox.renderAgentOverlay({
+  type: 'approval', agent_id: 'ag5', action: 'act', _ts: 10, options: 'Approve,Deny',
+});
+h = lastOverlayHTML();
+ok(h.indexOf('<span>Approve</span>') >= 0 && h.indexOf('<span>Later</span>') >= 0,
+   'F18: a non-list options value falls back to all three defaults');
+sandbox.renderAgentOverlay({
+  type: 'approval', agent_id: 'ag6', action: 'act', _ts: 11, options: [null, 42],
+});
+h = lastOverlayHTML();
+ok(h.indexOf('<span>Approve</span>') >= 0 && h.indexOf('<span>Deny</span>') >= 0,
+   'F18: non-string entries fall back per-button (no "null"/"42" labels)');
+ok(h.indexOf('>null<') < 0 && h.indexOf('>42<') < 0, 'F18: ...and nothing junk is printed');
+
 console.log('\nRESULT: ' + (failures ? 'FAIL' : 'ALL PASS'));
 process.exit(failures ? 1 : 0);

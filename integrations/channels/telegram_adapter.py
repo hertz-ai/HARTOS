@@ -41,7 +41,7 @@ try:
         filters,
         ContextTypes,
     )
-    from telegram.constants import ChatAction, ParseMode
+    from telegram.constants import ChatAction
     from telegram.error import TelegramError, RetryAfter
     HAS_TELEGRAM = True
 except ImportError:

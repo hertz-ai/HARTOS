@@ -2887,20 +2887,27 @@ def review_report(report_id):
 @social_bp.route('/admin/stats', methods=['GET'])
 @require_admin
 def platform_stats():
-    from sqlalchemy import func as sqlfunc
-    total_users = g.db.query(sqlfunc.count(User.id)).scalar()
-    total_agents = g.db.query(sqlfunc.count(User.id)).filter(User.user_type == 'agent').scalar()
-    total_humans = g.db.query(sqlfunc.count(User.id)).filter(User.user_type == 'human').scalar()
-    total_posts = g.db.query(sqlfunc.count(Post.id)).filter(Post.is_deleted == False).scalar()
-    total_comments = g.db.query(sqlfunc.count(Comment.id)).filter(Comment.is_deleted == False).scalar()
-    total_communities = g.db.query(sqlfunc.count(Community.id)).scalar()
-    pending_reports = g.db.query(sqlfunc.count(Report.id)).filter(Report.status == 'pending').scalar()
-    return _ok({
-        'total_users': total_users, 'total_agents': total_agents,
-        'total_humans': total_humans, 'total_posts': total_posts,
-        'total_comments': total_comments, 'total_communities': total_communities,
-        'pending_reports': pending_reports,
-    })
+    """Return dashboard aggregates, or say plainly that they are unavailable.
+
+    A failed aggregate query answers 503 with success=false, never a
+    success envelope full of zeros: the Admin dashboard already tolerates a
+    failed call (it renders the tile empty), and a fabricated zero reads as
+    a real "no users" to the operator.
+    """
+    try:
+        from sqlalchemy import func as sqlfunc
+        return _ok({
+            'total_users': g.db.query(sqlfunc.count(User.id)).scalar(),
+            'total_agents': g.db.query(sqlfunc.count(User.id)).filter(User.user_type == 'agent').scalar(),
+            'total_humans': g.db.query(sqlfunc.count(User.id)).filter(User.user_type == 'human').scalar(),
+            'total_posts': g.db.query(sqlfunc.count(Post.id)).filter(Post.is_deleted == False).scalar(),
+            'total_comments': g.db.query(sqlfunc.count(Comment.id)).filter(Comment.is_deleted == False).scalar(),
+            'total_communities': g.db.query(sqlfunc.count(Community.id)).scalar(),
+            'pending_reports': g.db.query(sqlfunc.count(Report.id)).filter(Report.status == 'pending').scalar(),
+        })
+    except Exception:
+        logging.exception('Admin dashboard statistics are unavailable')
+        return _err('Admin dashboard statistics are unavailable', 503)
 
 
 @social_bp.route('/admin/revenue-analytics', methods=['GET'])

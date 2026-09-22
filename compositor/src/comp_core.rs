@@ -5906,6 +5906,15 @@ mod native_render_tests {
                 .collect()
         };
 
+        // The orb is held STILL (`animate = false`) for BOTH lowerings. With motion on,
+        // `OrbCache::current` reads the wall clock from its own epoch, so two lowerings
+        // a few hundred milliseconds apart on a loaded runner catch the breath at
+        // different scales and the orb's slot rounds to a different pixel size: on CI
+        // 2026-09-16 the 200x200 orb came back 201x201 with no hover involved, and
+        // the gate stayed red for a week on a test that was racing a clock. Motion is
+        // time, not hover, and it is not what this test measures. With it off the orb
+        // rests at one scale (an_orb_with_motion_off_rests_rather_than_freezing_mid_breath
+        // pins that), so a geometry difference here can only come from the hover.
         let mut plain: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
         lower_scene(
             &home,
@@ -5918,7 +5927,7 @@ mod native_render_tests {
             0.5,
             None,
             false,
-            true,
+            false,
             &crate::scene::RowScroll::default(),
             &mut plain,
         );
@@ -5942,7 +5951,7 @@ mod native_render_tests {
             0.5,
             Some(centre),
             false,
-            true,
+            false,
             &crate::scene::RowScroll::default(),
             &mut hovered,
         );

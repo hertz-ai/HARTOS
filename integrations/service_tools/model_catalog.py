@@ -287,6 +287,10 @@ class ModelCatalog:
         self._entries: Dict[str, ModelEntry] = {}
         self._lock = threading.Lock()
         self._dirty = False
+        #: Ids a populator has emitted or claimed during the CURRENT
+        #: populate_from_subsystems run; None outside one.  See
+        #: `already_registered` for why claiming exists.
+        self._claimed_this_run: Optional[set] = None
         self._populators: List = []  # list of (name, callable)
         self._load()
 
@@ -308,6 +312,13 @@ class ModelCatalog:
         with self._lock:
             self._entries[entry.id] = entry
             self._dirty = True
+            if self._claimed_this_run is not None:
+                # Inside a populate: whoever registered this still owns it,
+                # so the stale sweep must not treat it as abandoned.  An
+                # overwrite of an existing id changes nothing about the key
+                # set, which is how the sweep came to delete entries the
+                # same run had just re-emitted.
+                self._claimed_this_run.add(entry.id)
         if persist:
             self._save()
         logger.info(f"Registered model: {entry.id} ({entry.model_type}, {entry.backend})")
@@ -362,6 +373,27 @@ class ModelCatalog:
     def get(self, model_id: str) -> Optional[ModelEntry]:
         """Get a model by ID."""
         return self._entries.get(model_id)
+
+    def already_registered(self, model_id: str) -> bool:
+        """Whether ``model_id`` is in the catalogue -- the question a
+        populator asks about an entry it has emitted before.
+
+        Asking during a populate run also CLAIMS the entry.  A populator
+        that skips an id to preserve the owner's admin-UI edits still owns
+        it, and without the claim the sweep below reads the skip as
+        abandonment: `touched_this_boot` is `ids_after - ids_before`, which
+        holds only NEW entries, so anything that already existed was
+        deleted by the very run that was populating it.  MEASURED
+        2026-09-21 on the owner's 40-entry catalogue: one populate added 18
+        and removed 9, among them every real TTS engine.
+
+        Outside a populate run it is just a question and records nothing,
+        so no caller elsewhere can accidentally protect an entry.
+        """
+        present = self._entries.get(model_id) is not None
+        if present and self._claimed_this_run is not None:
+            self._claimed_this_run.add(model_id)
+        return present
 
     def list_all(self) -> List[ModelEntry]:
         """All registered models."""
@@ -590,33 +622,48 @@ class ModelCatalog:
         ids_before = set(self._entries.keys())
 
         added = 0
-        # Run application-registered populators (LLM, TTS, etc.)
-        for name, fn in self._populators:
-            try:
-                count = fn(self)
-                added += count
-                if count:
-                    logger.info(f"Populator '{name}' added {count} entries")
-            except Exception as e:
-                logger.debug(f"Populator '{name}' failed: {e}")
-        # Built-in entries that don't depend on application modules
-        added += self._populate_llm_models()
-        added += self._populate_tts_models()
-        added += self._populate_stt_models()
-        added += self._populate_vlm_models()
-        added += self._populate_embodied_models()
-        added += self._populate_videogen_models()
-        added += self._populate_audiogen_models()
+        # Collect what the populators emit or claim, for the sweep below.
+        self._claimed_this_run = set()
+        try:
+            # Run application-registered populators (LLM, TTS, etc.)
+            for name, fn in self._populators:
+                try:
+                    count = fn(self)
+                    added += count
+                    if count:
+                        logger.info(f"Populator '{name}' added {count} entries")
+                except Exception as e:
+                    logger.debug(f"Populator '{name}' failed: {e}")
+            # Built-in entries that don't depend on application modules
+            added += self._populate_llm_models()
+            added += self._populate_tts_models()
+            added += self._populate_stt_models()
+            added += self._populate_vlm_models()
+            added += self._populate_embodied_models()
+            added += self._populate_videogen_models()
+            added += self._populate_audiogen_models()
+            claimed = self._claimed_this_run
+        finally:
+            # Claims never outlive the run that made them, or an entry
+            # abandoned later would stay protected by a stale claim.
+            self._claimed_this_run = None
 
         # Cleanup: remove stale auto-entries that no populator emitted this boot.
         # An entry is "auto-populated" if its ID starts with a known prefix and
         # it wasn't modified by the user (no custom tags, no non-default purposes,
         # not pinned).  Stale = prefix-matched but not re-registered this boot.
         ids_after = set(self._entries.keys())
-        touched_this_boot = ids_after - ids_before  # new in this run
-        # For entries that existed before AND still exist, populator.register()
-        # would have overwritten them — so check timestamps on _entries that
-        # weren't touched but have auto-populatable prefixes.
+        # Everything a populator emitted (register) or claimed
+        # (already_registered) this run, NEW OR NOT.  It used to be
+        # `ids_after - ids_before`, which holds only new entries: an entry
+        # that already existed was never in it, whether its populator
+        # re-registered it (register overwrites in place, so the key set
+        # does not change) or deliberately skipped it to preserve the
+        # owner's admin-UI edits.  Either way the sweep read "still owned"
+        # as "abandoned" and deleted it.  MEASURED 2026-09-21 on the
+        # owner's catalogue: one populate added 18 entries and removed 9,
+        # including every TTS engine and vlm-minicpm-v2.
+        touched_this_boot = (ids_after - ids_before) | claimed
         AUTO_PREFIXES = ('tts-', 'stt-', 'vlm-', 'video_gen-', 'audio_gen-', 'embodied-')
         stale = []
         for eid, entry in list(self._entries.items()):
@@ -674,7 +721,9 @@ class ModelCatalog:
             ('stt-whisper-large',  'Whisper Large v3 (faster-whisper)', 3.0, 4.0,  0.93, 0.5),
         ]
         for mid, name, vram, ram, quality, speed in _fallback:
-            if mid in self._entries:
+            # Claiming skip: an entry no populator claims is swept as
+            # stale at the end of populate_from_subsystems.
+            if self.already_registered(mid):
                 continue
             entry = ModelEntry(
                 id=mid, name=name, model_type=ModelType.STT,
@@ -721,8 +770,9 @@ class ModelCatalog:
         # Rows are DOWNLOAD-COMPLETE on purpose: repo_id alone is not enough to
         # fetch a GGUF, so each carries the exact file name and, for the VL
         # models, the mmproj projector. mmproj has TWO names because the file is
-        # published as mmproj-F16.gguf in every repo and must be stored under a
+        # usually published as mmproj-F16.gguf and must be stored under a
         # model-specific name locally or the second model overwrites the first.
+        # Tiel-Coder is the exception: its upstream projector is BF16-only.
         #
         # Sourced from Nunba's llama/llama_installer.py MODEL_PRESETS, which is
         # what actually downloads today. NOT from core/hub_allowlist.py: that is
@@ -761,6 +811,15 @@ class ModelCatalog:
              'unsloth/Qwen3.5-35B-A3B-GGUF', 'Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf',
              'mmproj-Qwen3.5-35B-A3B-F16.gguf',
              22733, 'full', 85, 0.88, 0.35, ['main'], MIN_BUILD_QWEN35),
+            ('llm-qwen3.6-35b-a3b', 'Qwen3.6 35B-A3B MoE',
+             'unsloth/Qwen3.6-35B-A3B-GGUF', 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf',
+             'mmproj-Qwen3.6-35B-A3B-F16.gguf',
+             22630, 'full', 85, 0.91, 0.36, ['main'], MIN_BUILD_QWEN35),
+            ('llm-tiel-coder-35b-a3b', 'Tiel-Coder 35B-A3B MoE',
+             'peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF',
+             'Tiel-Coder-35B-A3B-UD-Q4_K_XL.gguf',
+             'mmproj-Tiel-Coder-35B-A3B-BF16.gguf',
+             22938, 'full', 90, 0.92, 0.34, ['main'], MIN_BUILD_QWEN35),
         ]
         # Rows seeded by an EARLIER version of this method that are now known to
         # be unloadable: google/gemma-*-it are transformers repos with no GGUF,
@@ -780,7 +839,10 @@ class ModelCatalog:
                 # Local name is model-specific; source name is what the repo
                 # publishes. Collapsing them overwrites across models.
                 files['mmproj'] = mmproj
-                files['mmproj_source'] = 'mmproj-F16.gguf'
+                files['mmproj_source'] = (
+                    'mmproj-BF16.gguf' if mmproj.endswith('-BF16.gguf')
+                    else 'mmproj-F16.gguf'
+                )
             _definition = dict(
                 name=name, model_type=ModelType.LLM,
                 source='huggingface', repo_id=repo, files=files,
@@ -827,7 +889,9 @@ class ModelCatalog:
 
         # Minimal fallback — MiniCPM only
         added = 0
-        if 'vlm-minicpm-v2' not in self._entries:
+        # Claiming question -- this method owns the id whether or not it
+        # has to write it again, and the sweep removes what nobody claims.
+        if not self.already_registered('vlm-minicpm-v2'):
             entry = ModelEntry(
                 id='vlm-minicpm-v2', name='MiniCPM-V-2',  # 4GB VRAM → standard tier
                 model_type=ModelType.VLM, source='huggingface',
@@ -923,7 +987,9 @@ class ModelCatalog:
         ]
         added = 0
         for spec in specs:
-            if spec['id'] in self._entries:
+            # Claiming skip: an entry no populator claims is swept as
+            # stale at the end of populate_from_subsystems.
+            if self.already_registered(spec['id']):
                 continue
             caps = {**bridge_caps, **spec.pop('capabilities')}
             self.register(ModelEntry(capabilities=caps, **common, **spec),
@@ -950,7 +1016,9 @@ class ModelCatalog:
             ('video_gen-ltx2',   'LTX2',    4.0,  8.0, 0.75, 0.80),
         ]
         for mid, name, vram, ram, quality, speed in _fallback:
-            if mid in self._entries:
+            # Claiming skip: an entry no populator claims is swept as
+            # stale at the end of populate_from_subsystems.
+            if self.already_registered(mid):
                 continue
             entry = ModelEntry(
                 id=mid, name=name, model_type=ModelType.VIDEO_GEN,
@@ -993,7 +1061,9 @@ class ModelCatalog:
             ('audio_gen-diffrhythm', 'DiffRhythm v1.2', 4.0, 4.0, 0.80, 0.75),
         ]
         for mid, name, vram, ram, quality, speed in _fallback:
-            if mid in self._entries:
+            # Claiming skip: an entry no populator claims is swept as
+            # stale at the end of populate_from_subsystems.
+            if self.already_registered(mid):
                 continue
             entry = ModelEntry(
                 id=mid, name=name, model_type=ModelType.AUDIO_GEN,
@@ -1139,6 +1209,17 @@ def get_catalog() -> ModelCatalog:
         with _catalog_lock:
             if _catalog_instance is None:
                 _catalog_instance = ModelCatalog()
-                if not _catalog_instance.list_all():
-                    _catalog_instance.populate_from_subsystems()
+                # Populate EVERY time, not only when the file is empty.
+                # The old `if not list_all()` meant a node that had ever
+                # written a catalogue never learned about a model shipped
+                # afterwards: the owner's file was dated 2026-08-16 and was
+                # missing six TTS engines that the English ladder ranks 2nd
+                # through 7th.  That guard was also the only thing hiding a
+                # destructive sweep -- with no refresh, the sweep never ran --
+                # so it could not be removed until entries carried a claim
+                # (0091a0500) and every populator made one.  Measured on a
+                # copy of that live catalogue once both halves were in:
+                # 40 -> 57 entries, nothing lost, user flags intact, and a
+                # second run changes nothing.
+                _catalog_instance.populate_from_subsystems()
     return _catalog_instance

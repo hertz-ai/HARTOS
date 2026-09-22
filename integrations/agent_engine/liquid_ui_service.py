@@ -7263,13 +7263,24 @@ function renderAgentOverlay(ev) {{
     html += '</'+tag+'>';
 
   }} else if(type === 'approval') {{
+    // `options` labels the three decisions POSITIONALLY: [approve, deny, defer].
+    // A missing or non-string entry keeps that button's default label, so the
+    // button SET never shrinks -- an approval card is exempt from auto-dismiss
+    // below, so dropping the third button would leave it unclosable -- and
+    // /api/agent/approval keeps its fixed approve|deny|later vocabulary.
+    // Escaped explicitly: the prop sweep at the top of this function only
+    // _esc's STRING props, so entries of a LIST prop arrive raw.
+    var _lbl = function(i, dflt) {{
+      var o = Array.isArray(ev.options) ? ev.options[i] : null;
+      return (typeof o === 'string' && o) ? _esc(o) : dflt;
+    }};
     html += '<div class="ds-body-md" style="font-weight:600;margin-bottom:4px">Approval Required</div>';
     html += '<div class="ds-body-sm ds-text-muted" style="margin-bottom:8px">'+(ev.description||ev.action||'An agent requests your approval.')+'</div>';
     if(ev.agent_id) html += '<div class="ds-label-sm ds-text-muted" style="margin-bottom:6px">Agent: '+(ev.agent_id)+'</div>';
     html += '<div style="display:flex;gap:6px;justify-content:flex-end" data-agent-id="'+(ev.agent_id||'')+'" data-action="'+(ev.action||'')+'">';
-    html += '<button class="ds-btn ds-btn-primary ds-btn-sm" onclick="dsRipple(event);_doApproval(this,&quot;approve&quot;)"><span>Approve</span></button>';
-    html += '<button class="ds-btn ds-btn-outline ds-btn-sm" onclick="dsRipple(event);_doApproval(this,&quot;deny&quot;)"><span>Deny</span></button>';
-    html += '<button class="ds-btn ds-btn-ghost ds-btn-sm" onclick="dsRipple(event);this.closest(&quot;.agent-overlay&quot;).remove()"><span>Later</span></button>';
+    html += '<button class="ds-btn ds-btn-primary ds-btn-sm" onclick="dsRipple(event);_doApproval(this,&quot;approve&quot;)"><span>'+_lbl(0,'Approve')+'</span></button>';
+    html += '<button class="ds-btn ds-btn-outline ds-btn-sm" onclick="dsRipple(event);_doApproval(this,&quot;deny&quot;)"><span>'+_lbl(1,'Deny')+'</span></button>';
+    html += '<button class="ds-btn ds-btn-ghost ds-btn-sm" onclick="dsRipple(event);this.closest(&quot;.agent-overlay&quot;).remove()"><span>'+_lbl(2,'Later')+'</span></button>';
     html += '</div>';
 
   }} else if(type === 'navigate') {{

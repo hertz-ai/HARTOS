@@ -3059,35 +3059,77 @@ def _push_workflow_flowchart(user_id, prompt_id, request_id=None):
         logging.getLogger(__name__).exception("_push_workflow_flowchart: swallowed Exception")
 
 
-def _request_consent(agent_id: str, action: str, label: str, input_text: str) -> str:
-    """Request capability consent from user via approval card (Liquid UI → SSE fallback)."""
-    user_id = thread_local_data.get_user_id()
-    description = f'{label} access needed: {input_text}'
-    # Primary: Liquid UI (reaches Android/web/desktop)
+def _request_consent(action: str, label: str, input_text: str) -> str:
+    """Ask this computer's owner for a capability, through ConsentService.
+
+    Same canonical path as every other ask -- integrations.vlm.safety
+    .computer_control_block, vision_service's capture loop, whisper_tool,
+    social/auth, ai_governance, hive_guardrails -- so the ask is a
+    UserConsent row the owner can see on the privacy page and revoke, it
+    carries an immutable audit entry, and it leaves as `consent.request`,
+    the one payload type every surface renders.
+
+    It used to push a bare `{'type': 'approval'}` component through
+    LiquidUIService with a broadcast_sse_safe fallback and touch no database
+    at all.  That meant: nothing to revoke, nothing on the privacy page, and
+    a payload only AgentOverlay knows -- so the floating companion, which
+    exists precisely for when Nunba is NOT the window in front, dropped every
+    camera and screen ask (#863).  The canonical emit that fixed the sibling
+    asks landed upstream on 2026-08-26 (e991309da); this path never migrated.
+
+    Whose permission: the owner of this desktop (HEVOLVE_OWNER_USER_ID, which
+    Nunba exports at boot), never the caller -- the camera and the screen are
+    this machine's, and a remote user must not be asked to lend them.  Same
+    rule and same fail-closed answer as computer_control_block and
+    /visual_agent (#66).  Which agent is asking comes from the request's own
+    prompt id, not the capability label the tool wrapper passes.
+    """
+    from integrations.social.consent_service import (
+        ConsentService, consent_type_for_action)
+    from integrations.social.models import db_session
+    # ONE normaliser for "is this a real agent id", shared with the
+    # computer_control ask rather than copied (it already handles the '0'
+    # and 'None' spellings this codebase passes around).
+    from integrations.vlm.safety import _known_agent
+
+    log = logging.getLogger(__name__)
+    consent_type = consent_type_for_action(action)
+    if consent_type is None:
+        log.error('_request_consent: %r maps to no consent type', action)
+        return (f"Could not request {label.lower()} access — this computer "
+                f"records no permission for '{action}'.")
+
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    if not owner:
+        log.warning('%s consent not asked: no owner identity '
+                    '(HEVOLVE_OWNER_USER_ID is not set)', label)
+        return (f"Not asked: nobody is signed in on this computer who could "
+                f"allow {label.lower()} access.")
+
+    agent = _known_agent(thread_local_data.get_prompt_id())
+    reason = f'{label} access needed: {input_text}'.strip()
     try:
-        from core.platform.registry import ServiceRegistry
-        svc = ServiceRegistry.get('LiquidUIService')
-        if svc:
-            svc.agent_request_approval(agent_id=agent_id, action=action, description=description)
-            return f"{label} access request sent to user. Waiting for approval."
+        with db_session(commit=True) as db:
+            if ConsentService.check_or_request(db, owner, consent_type,
+                                               agent_id=agent, reason=reason):
+                return f"{label} access is already allowed — go ahead."
+            if ConsentService.declined(db, owner, consent_type, agent_id=agent):
+                return (f"The owner of this computer said no to "
+                        f"{label.lower()} access.")
     except Exception:
-        logging.getLogger(__name__).exception("_request_consent: swallowed Exception")
-    # Fallback: SSE (Nunba desktop WebView2)
-    from core.platform.events import broadcast_sse_safe
-    if broadcast_sse_safe('agent.ui.update', {
-        'type': 'approval', 'agent_id': agent_id,
-        'action': action, 'description': description,
-    }, user_id=str(user_id)):
-        return f"{label} access request sent to user. Waiting for approval."
-    return f"Could not request {label.lower()} access — notification system unavailable."
+        log.exception('_request_consent: %s ask could not be filed', label)
+        return (f"Could not request {label.lower()} access — the permission "
+                f"system is unavailable.")
+    return (f"{label} access request sent to the owner of this computer. "
+            f"Waiting for their answer.")
 
 
 def _request_capability_consent(input_text: str) -> str:
-    return _request_consent('vision', 'enable_camera', 'Camera', input_text)
+    return _request_consent('enable_camera', 'Camera', input_text)
 
 
 def _request_screen_consent(input_text: str) -> str:
-    return _request_consent('computer_use', 'enable_screen', 'Screen', input_text)
+    return _request_consent('enable_screen', 'Screen', input_text)
 
 
 
@@ -3324,12 +3366,35 @@ def _handle_shell_command_tool(input_text: str) -> str:
     # shell=True, so the string is not double-parsed.  no_window_kwargs() is
     # applied INSIDE run_bounded; repeating it here would be a second copy of
     # that decision.
+    # Announce it like any other computer-use step, instead of poking the
+    # ribbon directly.  Two things were wrong with the bare poke: the floating
+    # companion window, which reads the computer_use.update topic, never heard
+    # shell commands at ALL; and its `finally` hide took the ribbon down even
+    # when this ran INSIDE a VLM run that was still driving the machine.
+    # current_run joins that enclosing run when there is one (this tool
+    # reaches here on the loop's own thread) and opens a run of its own when
+    # there is not, so neither case needs a branch here.
+    from integrations.vlm.activity_stream import current_run
+    _caption = f"Shell command: {text[:60]}"
+    _run = current_run(user_id=thread_local_data.get_user_id() or '',
+                       prompt_id=thread_local_data.get_prompt_id() or '')
+    _run.step(iteration=1, action='shell', phase='executing', caption=_caption)
+    _phase, _err = 'completed', ''
     try:
         proc = run_bounded(argv, timeout=30)
     except FileNotFoundError as e:
+        _phase, _err = 'failed', f'interpreter not found — {e}'
         return f"Shell_Command: interpreter not found — {e}"
     except Exception as e:
+        _phase, _err = 'failed', f'{type(e).__name__}: {str(e)[:200]}'
         return f"Shell_Command error: {type(e).__name__}: {str(e)[:200]}"
+    finally:
+        _run.step(iteration=1, action='shell', phase=_phase,
+                  caption=_caption, error=_err)
+        # Only closes a run this call opened; inside a VLM run the loop still
+        # owns the ribbon and the ledger task.
+        _run.finish(exit_reason='done' if _phase == 'completed' else 'action_error',
+                    iteration=1, action='shell', error=_err)
 
     # run_bounded never raises TimeoutExpired — it reports the kill this way.
     if proc.timed_out:
@@ -3385,7 +3450,8 @@ def _handle_computer_action_tool(input_text: str) -> str:
     prompt_id = thread_local_data.get_prompt_id()
     try:
         os.environ.setdefault('HEVOLVE_VLM_UNIFIED', 'true')
-        from integrations.vlm.vlm_adapter import execute_vlm_instruction
+        from integrations.vlm.vlm_adapter import (
+            execute_vlm_instruction, resolve_task_workspace)
         # 180s is the floor for cold-start runs: first VLM forward pass alone
         # can take 8-15s on the 4B model, and a realistic 12-iteration loop
         # needs ~2.5 minutes. HEVOLVE_COMPUTER_ACTION_ETA lets the user raise
@@ -3393,6 +3459,7 @@ def _handle_computer_action_tool(input_text: str) -> str:
         max_eta = int(os.environ.get('HEVOLVE_COMPUTER_ACTION_ETA', '180'))
         message = {
             'instruction_to_vlm_agent': input_text,
+            'workspace_root': resolve_task_workspace(prompt_id=prompt_id),
             'user_id': str(user_id or 'guest'),
             'prompt_id': str(prompt_id or 0),
             'os_to_control': 'windows' if sys.platform == 'win32' else (
@@ -3930,6 +3997,31 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
 _whatsapp_adapter_lock = threading.Lock()
 
 
+def _fetch_whatsapp_own_identity(gw_base: str, sid: str) -> dict:
+    """GET the gateway's own-identity for ``sid``.
+
+    Returns ``{'own_jid': ..., 'own_lid': ...}`` (either may be None while
+    the gateway is still linking), or ``{}`` on any failure, logged.  ONE
+    bounded request; the caller decides when to try again.
+    """
+    import json as _json
+    import urllib.request as _urlreq
+    log = logging.getLogger(__name__)
+    try:
+        with _urlreq.urlopen(
+            f"{gw_base.rstrip('/')}/api/sessions/{sid}/status",
+            timeout=5.0,
+        ) as _resp:
+            _status = _json.loads(_resp.read().decode('utf-8', errors='replace'))
+        return {'own_jid': _status.get('own_jid'), 'own_lid': _status.get('own_lid')}
+    except Exception as _status_err:
+        log.warning(
+            "_ensure_whatsapp_live_adapter: could not fetch own identity "
+            "from gateway (self-chat detection is off until a later poll "
+            "fetches it): %s", _status_err)
+        return {}
+
+
 def _ensure_whatsapp_live_adapter(
     user_id, sid: str = None, base: str = None,
 ) -> dict:
@@ -3980,9 +4072,27 @@ def _ensure_whatsapp_live_adapter(
         # makes the whole check+register sequence atomic so only ONE
         # adapter (and one WebSocket connection) is ever created per
         # process, no matter how many requests race here.
+        gw_base = base or _os.environ.get(
+            'WHATSAPP_GATEWAY_URL',
+            f"http://127.0.0.1:"
+            f"{_os.environ.get('WHATSAPP_GATEWAY_PORT', '3000')}",
+        )
         with _whatsapp_adapter_lock:
             existing = integration.registry.get('whatsapp')
             if existing is not None:
+                # A gateway that was still linking when the adapter was
+                # registered gave no identity.  The adapter stays (messages
+                # must flow), and because every later poll lands here, this
+                # is the only place the identity can still be adopted: one
+                # bounded fetch per poll until the adapter carries one.
+                if not existing.has_owner_identity():
+                    identity = _fetch_whatsapp_own_identity(gw_base, sid)
+                    if identity.get('own_jid') or identity.get('own_lid'):
+                        existing.set_owner_identity(
+                            identity.get('own_jid'), identity.get('own_lid'))
+                        log.info(
+                            "whatsapp adapter adopted its owner identity on a "
+                            "later poll (account_id=%s)", sid)
                 return {
                     'success': True,
                     'message': f'whatsapp adapter already registered '
@@ -3992,41 +4102,23 @@ def _ensure_whatsapp_live_adapter(
             from integrations.channels.whatsapp_adapter import (
                 create_whatsapp_adapter,
             )
-            gw_base = base or _os.environ.get(
-                'WHATSAPP_GATEWAY_URL',
-                f"http://127.0.0.1:"
-                f"{_os.environ.get('WHATSAPP_GATEWAY_PORT', '3000')}",
-            )
             # Fetch the gateway's own-identity lookup so self-chat detection
             # (SelfChatHandler.is_self_message) has something to match against
             # — without this, owner_phone/owner_lid are never set and a
             # self-chat message can never be recognized, regardless of which
             # JID scheme WhatsApp uses for that account (own_jid for
             # phone-based accounts, own_lid for LID/privacy-ID accounts).
-            own_jid = own_lid = None
-            try:
-                import json as _json
-                import urllib.request as _urlreq
-                with _urlreq.urlopen(
-                    f"{gw_base.rstrip('/')}/api/sessions/{sid}/status",
-                    timeout=5.0,
-                ) as _resp:
-                    _status = _json.loads(_resp.read().decode('utf-8', errors='replace'))
-                own_jid = _status.get('own_jid')
-                own_lid = _status.get('own_lid')
-            except Exception as _status_err:
-                log.warning(
-                    "_ensure_whatsapp_live_adapter: could not fetch own "
-                    "identity from gateway (self-chat detection will be "
-                    "unavailable until it succeeds): %s", _status_err)
+            identity = _fetch_whatsapp_own_identity(gw_base, sid)
 
             adapter = create_whatsapp_adapter(
                 api_url=gw_base, account_id=sid,
-                phone_number=own_jid, owner_lid=own_lid,
+                phone_number=identity.get('own_jid'),
+                owner_lid=identity.get('own_lid'),
             )
             integration.registry.register(adapter)
 
             loop = integration._loop
+            started_integration = False
             if not (loop and loop.is_running()):
                 # Entrypoints that skip hartos_bootstrap's full sequence (e.g.
                 # the standalone hart_intelligence_entry.py used for local/dev
@@ -4038,6 +4130,7 @@ def _ensure_whatsapp_live_adapter(
                 # the first time), so it's safe to trigger on-demand here
                 # rather than requiring the full boot sequence to have run.
                 integration.start()
+                started_integration = True
                 for _ in range(50):  # ~5s for the background thread to spin up
                     loop = integration._loop
                     if loop and loop.is_running():
@@ -4050,7 +4143,11 @@ def _ensure_whatsapp_live_adapter(
                                  '(FlaskChannelIntegration.start() ran but '
                                  '_loop never became live)',
                     }
-            _aio.run_coroutine_threadsafe(adapter.start(), loop)
+            # A newly started integration invokes registry.start_all(), which
+            # starts this adapter exactly once. An already-running loop needs
+            # this explicit start because registry.start_all() has completed.
+            if not started_integration:
+                _aio.run_coroutine_threadsafe(adapter.start(), loop)
             log.info(
                 "whatsapp live adapter registration scheduled "
                 "(account_id=%s, base=%s)", sid, gw_base,
@@ -4488,16 +4585,32 @@ def _handle_join_external_room_tool(input_text: str) -> str:
                 from core.platform.registry import ServiceRegistry
                 _lui = ServiceRegistry.get('LiquidUIService')
                 if _lui:
+                    # A NOTIFICATION, not an approval card: the gate already
+                    # decided, and this only points the owner at where to
+                    # grant.  It was typed 'approval', which renders
+                    # AgentOverlay's ApprovalOverlay -- a card that reads
+                    # `description` (absent here, so a blank body), never
+                    # renders `actions` at all, and offers Approve/Deny
+                    # buttons that POST agent_id=undefined, action=undefined
+                    # to /api/agent/approval.  'notification' is the type
+                    # whose contract is exactly this payload's shape:
+                    # title + message + severity + actions
+                    # (liquid_ui_service COMPONENT_TYPES).
+                    #
+                    # And the action key is `kind`, not `action`: the
+                    # renderer dispatches on kind=='navigate' and falls
+                    # through to an "unhandled action" warning otherwise, so
+                    # the button did nothing even once the type was right.
                     _lui.agent_ui_update(
                         str(uid),
                         {
-                            'type': 'approval',
+                            'type': 'notification',
                             'title': 'Permission needed',
                             'message': reason,
                             'severity': 'info',
                             'actions': [
                                 {'label': 'Open Privacy Settings',
-                                 'action': 'navigate',
+                                 'kind': 'navigate',
                                  'target': '/social/settings/privacy'},
                             ],
                         },
@@ -8765,6 +8878,28 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     return jsonify(payload)
 
 
+def _offer_voice_clone_setup(language):
+    """This turn wanted a recorded voice and spoke in the default one: offer
+    to set a cloning engine up, on the demand of the turn that needed it.
+
+    The offer is the canonical consent card (capability_setup.
+    offer_voice_clone_setup -> ConsentService), and the owner's Allow starts
+    the provisioning goal the agent daemon paces.  Nothing here waits and
+    nothing here can fail the reply: the audio is already on its way in the
+    default voice, and an offer that cannot be made is a debug line.
+    """
+    try:
+        from integrations.agent_engine.capability_setup import (
+            offer_voice_clone_setup,
+        )
+        outcome = offer_voice_clone_setup(language)
+        if outcome in ('asked', 'provisioning'):
+            app.logger.info(
+                f"TTS: no cloning engine here; voice-clone setup {outcome}")
+    except Exception as e:
+        app.logger.debug(f"TTS: voice-clone setup offer skipped: {e}")
+
+
 def _speak_in_voice(text, language, voice):
     """Speak ``text`` in the recorded ``voice``; returns the audio path, or
     None for the default voice.
@@ -8805,11 +8940,13 @@ def _speak_in_voice(text, language, voice):
     if result.error or not result.path or not os.path.isfile(result.path):
         app.logger.info(f"TTS: voiced synthesis gave no audio "
                         f"({result.error or result.path!r}); default voice")
+        _offer_voice_clone_setup(language)
         return None
     spec = ENGINE_REGISTRY.get(result.engine_id)
     if spec is None or not spec.voice_clone:
         app.logger.info(f"TTS: {result.engine_id} cannot clone a voice; "
                         f"default voice")
+        _offer_voice_clone_setup(language)
         return None
     # Served by Nunba's /tts/audio/<basename>: a cloning engine's ToolWorker
     # writes under HEVOLVE_MODEL_DIR (default ~/.hevolve/models)/<tool>/output,
@@ -8991,11 +9128,37 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                 else:
                     audio_url = f'/tts/audio/{audio_filename}'
                 app.logger.info(f"TTS async: publishing audio {audio_url} to pupit.{user_id}")
+                # A phone reads the bundle shape central's lip-sync service
+                # publishes (Android VideoUrl: aud_url + face data); with
+                # aud_url alone it plays the voice over the idle avatar
+                # (HARTOS #111, owner: audio only for now, every later
+                # capability on the same delivery).  Additive beside the
+                # SPA's generated_audio_url.  The url is absolute on the
+                # address this node advertises: a phone gets the bundle over
+                # its device link and has no origin to resolve a path
+                # against, while the SPA keeps the relative url (its own
+                # origin is the loopback the LAN gate trusts).
+                try:
+                    from core.port_registry import get_advertisable_base_url
+                    _phone_audio_url = (audio_url if _ext_url
+                                        else f'{get_advertisable_base_url().rstrip("/")}{audio_url}')
+                except Exception as e:
+                    app.logger.warning(
+                        f"TTS async: no advertisable base url for the phone's "
+                        f"bundle ({e}); sending {audio_url} as is")
+                    _phone_audio_url = audio_url
                 _tts_payload = {
                     'text': [text[:200]],
                     'generated_audio_url': audio_url,
                     'request_id': str(request_id),
                     'action': 'TTS',
+                    'video_link': {
+                        'aud_url': _phone_audio_url,
+                        'request_id': str(request_id),
+                        'action': 'TTS',
+                        'is_cartoon': True,
+                        'priority': 0,
+                    },
                 }
                 publish_async(f'com.hertzai.pupit.{user_id}', json.dumps(_tts_payload))
                 # Also push via SSE directly — publish_async → MessageBus/WAMP doesn't
@@ -11032,7 +11195,17 @@ def agent_approval():
 
     Both route through _apply_embodied_toggle in the channels admin API
     so the manual settings toggle and the agentic approval path share
-    ONE start/stop implementation — no parallel lifecycle.
+    ONE start/stop implementation — no parallel lifecycle.  Since the
+    consent migration that path is reached through ConsentService
+    (_embodied_feed_from_consent), which every answer surface shares:
+    this route, the privacy page, and a consent card answered on the
+    desktop, on the floating companion or on a phone.
+
+    The DECISION itself is recorded as a UserConsent row by
+    ConsentService.record_capability_decision.  It used to exist only as a
+    config flag and a log line here, so an approval could not be revoked,
+    never appeared on the privacy page, left no audit entry, and a Deny was
+    re-asked on the very next poll because nothing marked it decided.
     """
     try:
         data = request.get_json(silent=True) or {}
@@ -11042,6 +11215,64 @@ def agent_approval():
         if decision not in ('approve', 'approved', 'allow', 'yes', 'deny', 'denied', 'no'):
             return jsonify({'status': 'error', 'reason': 'invalid decision'}), 400
         approved = decision in ('approve', 'approved', 'allow', 'yes')
+        # Record first, on BOTH branches: the row is the answer, and writing
+        # it also stops or starts the feed through the one actuator and tells
+        # every other surface to drop its copy of the card.  The owner of
+        # this desktop owns the camera and the screen, so the row is theirs
+        # — never the caller's user_id (#66).
+        _owner_id = os.environ.get('HEVOLVE_OWNER_USER_ID')
+        _recorded = None
+        if _owner_id:
+            try:
+                from integrations.social.models import db_session
+                from integrations.social.consent_service import ConsentService
+                with db_session(commit=True) as _cdb:
+                    _recorded = ConsentService.record_capability_decision(
+                        _cdb, _owner_id, action, approved,
+                        agent_id=agent_id or None)
+            except Exception as _consent_exc:
+                # A recording failure must not swallow the owner's answer —
+                # but it must be loud, because an unrecorded grant is one
+                # that cannot be revoked.
+                app.logger.error('agent_approval: consent not recorded for '
+                                 'action=%s: %s', action, _consent_exc)
+        else:
+            app.logger.warning('agent_approval: consent not recorded — no '
+                               'owner identity (HEVOLVE_OWNER_USER_ID unset)')
+        if not approved and str(action or '').startswith('game_sound:'):
+            # A reviewer turning down a game's music is not a consent
+            # denial.  Falling through to the branch below published
+            # {'type':'consent', 'decision':'denied'} on the VISION topic
+            # for a piece of music -- wrong noun, wrong topic -- while the
+            # memo kept serving the take they had just refused.
+            parts = str(action).split(':')
+            sound_game = parts[1] if len(parts) > 1 else ''
+            sound_state = parts[2] if len(parts) > 2 else 'bgm'
+            reason = str(data.get('reason') or data.get('note') or '').strip()
+            try:
+                from core.game_sound_memo import record_verdict
+                from hartos.helper import (
+                    load_agent_data_from_file, save_agent_data_to_file)
+                _pid = int(agent_id)
+                _data = {}
+                load_agent_data_from_file(_pid, _data)
+                _games = _data.setdefault(_pid, {}).setdefault('games', {})
+                _record, _matched, _key = record_verdict(
+                    _games, sound_game, sound_state, False, reason)
+                if _record:
+                    save_agent_data_to_file(_pid, _data)
+                app.logger.info(
+                    f'agent_approval: agent={agent_id} rejected game sound '
+                    f'{sound_game}/{sound_state} at memo {_key}')
+                return jsonify({'status': 'rejected', 'action': action,
+                                'applied': bool(_record), 'key': _key,
+                                'matched': _matched}), 200
+            except Exception as _gs_exc:
+                app.logger.warning(
+                    f'agent_approval: game sound rejection failed: {_gs_exc}')
+                return jsonify({'status': 'rejected', 'action': action,
+                                'applied': False, 'error': str(_gs_exc)}), 200
+
         if not approved:
             # Stage-C (Symptom #6): publish the deny event on WAMP too
             # so subscribers (VisionService, UI) can tear down cleanly
@@ -11063,6 +11294,50 @@ def agent_approval():
                 app.logger.debug(f"agent_approval deny WAMP publish failed: {_pub_exc}")
             app.logger.info(f'agent_approval: agent={agent_id} action={action} DENIED')
             return jsonify({'status': 'denied', 'action': action}), 200
+
+        # A reviewer's word on a game's sound.  The card an agent raises
+        # carries action 'game_sound:{game_id}:{state}' (core/agent_tools
+        # .offer_sound_for_review), and until now it fell through to the
+        # no-mapping branch below and returned applied=False -- so a sound
+        # could be approved on screen and approved_at stayed null forever,
+        # leaving REUSE unable to tell an approved sound from an unreviewed
+        # one.  The verdict itself lives in core.game_sound_memo, called
+        # from here and from the agent's own tool, so there is one
+        # implementation rather than two.
+        if str(action or '').startswith('game_sound:'):
+            parts = str(action).split(':')
+            sound_game = parts[1] if len(parts) > 1 else ''
+            sound_state = parts[2] if len(parts) > 2 else 'bgm'
+            try:
+                from core.game_sound_memo import record_verdict
+                from hartos.helper import (
+                    load_agent_data_from_file, save_agent_data_to_file)
+                _pid = int(agent_id)
+                _data = {}
+                load_agent_data_from_file(_pid, _data)
+                _games = _data.setdefault(_pid, {}).setdefault('games', {})
+                _record, _matched, _key = record_verdict(
+                    _games, sound_game, sound_state, True)
+                if not _record:
+                    app.logger.info(
+                        f'agent_approval: game sound {sound_game}/{sound_state} '
+                        f'has nothing bound to approve')
+                    return jsonify({'status': 'approved', 'action': action,
+                                    'applied': False,
+                                    'reason': 'nothing bound'}), 200
+                save_agent_data_to_file(_pid, _data)
+                app.logger.info(
+                    f'agent_approval: agent={agent_id} approved game sound '
+                    f'{sound_game}/{sound_state} at memo {_key}')
+                return jsonify({'status': 'approved', 'action': action,
+                                'applied': True, 'key': _key,
+                                'matched': _matched}), 200
+            except Exception as _gs_exc:
+                app.logger.warning(
+                    f'agent_approval: game sound verdict failed: {_gs_exc}')
+                return jsonify({'status': 'approved', 'action': action,
+                                'applied': False,
+                                'error': str(_gs_exc)}), 200
 
         # Map the approval to a feed toggle and reuse the single
         # _apply_embodied_toggle codepath admin settings use.
@@ -11086,16 +11361,24 @@ def agent_approval():
             )
             api = get_api()
             cfg = api._global_config.embodied_ai
-            # Flip the persisted flag so the next restart sees it and so
-            # get_embodied_status reports the right state.
-            if feed == 'camera':
-                cfg.camera_enabled = True
-            elif feed == 'screen':
-                cfg.screen_capture_enabled = True
-            elif feed == 'audio':
-                cfg.audio_enabled = True
-            api._save_config()
-            _apply_embodied_toggle(feed, True, cfg)
+            if _recorded is None:
+                # Either this capability records no consent ('audio' has no
+                # ask producer, so no consent type) or the write above
+                # failed.  Apply it here so the owner's click still acts,
+                # exactly as it did before the migration.  When _recorded is
+                # set, ConsentService already drove this same actuator from
+                # the grant — applying again here would be the second path.
+                #
+                # Flip the persisted flag so the next restart sees it and so
+                # get_embodied_status reports the right state.
+                if feed == 'camera':
+                    cfg.camera_enabled = True
+                elif feed == 'screen':
+                    cfg.screen_capture_enabled = True
+                elif feed == 'audio':
+                    cfg.audio_enabled = True
+                api._save_config()
+                _apply_embodied_toggle(feed, True, cfg)
             # Stage-C (Symptom #6, 2026-04-16) — publish the consent
             # event on Crossbar WAMP so subscribers (VisionService,
             # frontend, mobile) never have to poll or watch a raw WS

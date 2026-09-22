@@ -262,6 +262,14 @@ class TestModuleConstants:
         assert "shell" in _VLM_ACTION_LIST
         assert "open_file_gui" in _VLM_ACTION_LIST
 
+    def test_bare_file_resolution_stays_in_the_declared_workspace(self):
+        instruction = _VLM_ACTION_LIST.lower()
+        assert "bare file" in instruction
+        assert "declared workspace" in instruction
+        assert "resolved path" in instruction
+        assert "different checkout" in instruction
+
+
 
 # ============================================================
 # run_local_agentic_loop (mocked)

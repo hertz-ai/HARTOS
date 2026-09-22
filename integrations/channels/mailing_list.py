@@ -282,6 +282,16 @@ def domain_is_catchall(domain: str, *, timeout: int = 20,
 
     Determine this ONCE per domain. It is a property of the server, and
     re-probing per address multiplies the load for no extra information.
+
+    NOT A SENDER, and must never be folded into one (audited 2026-09-22). It
+    speaks ehlo/mail/rcpt and stops: there is no DATA and no sendmail, because
+    the whole point is to ask the server a question without delivering anything.
+    The two real senders are `channels/email_campaign._run_sends` (bulk) and
+    `channels/extensions/email_adapter._send_smtp` (one conversational message);
+    both are documented as deliberately separate from each other too. The
+    measured knowledge here -- PROBE_LIARS, CONFIRMED_HONEST, and the RCPT TO
+    behaviour each was falsified against -- is the asset; a refactor that loses
+    it costs real deliverability, not just tidiness.
     """
     import smtplib
 

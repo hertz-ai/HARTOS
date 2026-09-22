@@ -357,6 +357,15 @@ def execute_action(action: dict, tier: str, *,
         'status', 'translated_from', 'translated_to', 'verify_diff',
         'safety_block' (when safety=True and a guard refused).
     """
+    # Mandatory operation policy.  It is intentionally outside ``safety``:
+    # disabling rate/window checks must never make shutdown, reset, erase or
+    # format executable.
+    from integrations.vlm.safety import destructive_computer_operation
+    _operation_block = destructive_computer_operation(action)
+    if _operation_block is not None:
+        return {'output': '', 'status': 'safety_blocked',
+                'error': _operation_block, 'safety_block': _operation_block}
+
     _mismatch = _check_reasoning_mismatch(action)
 
     # Phase 4: per-window translation + occlusion handling.  Mutates

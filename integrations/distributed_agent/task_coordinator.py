@@ -16,10 +16,11 @@ Workflow:
 5. Progress is baselined periodically
 """
 
+import copy
 import logging
 import uuid
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from agent_ledger.core import (
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 # every 90s by a heartbeat thread, so 2x the TTL means several missed
 # renewals: the owner is not slow, it is gone.
 _ORPHAN_AFTER_S = int(os.environ.get('HEVOLVE_TASK_ORPHAN_AFTER_S', '600'))
+_DEFER_RETRY_S = int(os.environ.get('HEVOLVE_TASK_DEFER_RETRY_S', '60'))
 
 
 def _claim_age_seconds(task):
@@ -54,6 +56,22 @@ def _claim_age_seconds(task):
         return None
 
 
+def _defer_is_due(task) -> bool:
+    """Whether a deliberately deferred task may return to the ready queue.
+
+    A malformed/missing timestamp is treated as due, so an old catalog entry
+    cannot be stranded forever.  It is never used to recover IN_PROGRESS
+    work; that has the stricter orphan evidence in ``_claim_age_seconds``.
+    """
+    until = getattr(task, 'deferred_until', None)
+    if not until:
+        return True
+    try:
+        return datetime.now() >= datetime.fromisoformat(str(until))
+    except (TypeError, ValueError):
+        return True
+
+
 class HiveDepthExceeded(ValueError):
     """Raised when a propagation request exceeds HIVE_DEPTH hops.
 
@@ -62,6 +80,10 @@ class HiveDepthExceeded(ValueError):
     surfaces this as a dedicated exception so callers can log a structured
     audit event rather than silently eating a generic ValueError.
     """
+
+
+class _ClaimStageError(RuntimeError):
+    """A distributed lock was acquired but its ledger claim could not stage."""
 
 
 class DistributedTaskCoordinator:
@@ -84,6 +106,87 @@ class DistributedTaskCoordinator:
         self._lock = task_lock
         self._verifier = verifier or TaskVerification()
         self._baseline = baseline or TaskBaseline(ledger.backend)
+
+    def _snapshot_tasks(self, tasks) -> Dict[str, Dict[str, Any]]:
+        """Capture only tasks touched by a coordinator transaction."""
+        return {
+            task.task_id: copy.deepcopy(task.__dict__)
+            for task in tasks if task is not None
+        }
+
+    def _restore_tasks(self, snapshots: Dict[str, Dict[str, Any]]) -> None:
+        """Restore task objects in place so existing references stay valid."""
+        with self._ledger._lock:
+            for task_id, snapshot in snapshots.items():
+                task = self._ledger.tasks.get(task_id)
+                if task is not None:
+                    task.__dict__.clear()
+                    task.__dict__.update(copy.deepcopy(snapshot))
+
+    def _discard_added_tasks(self, task_ids) -> None:
+        """Undo a deferred batch of new tasks without disturbing other work."""
+        ids = set(task_ids)
+        with self._ledger._lock:
+            for task_id in ids:
+                self._ledger.tasks.pop(task_id, None)
+            self._ledger.task_order[:] = [
+                task_id for task_id in self._ledger.task_order
+                if task_id not in ids
+            ]
+
+    def _commit_deferred(
+        self,
+        operation: str,
+        snapshots: Optional[Dict[str, Dict[str, Any]]] = None,
+        added_task_ids=None,
+    ) -> bool:
+        """Commit one coordinator batch or restore its exact in-memory state."""
+        if self._ledger.save() is not False:
+            return True
+        if snapshots:
+            self._restore_tasks(snapshots)
+        if added_task_ids:
+            self._discard_added_tasks(added_task_ids)
+        logger.error("Rolled back %s after ledger persistence failed", operation)
+        return False
+
+    def _stage_task_claim(
+        self,
+        task: Task,
+        agent_id: str,
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Acquire a distributed lock and stage its matching ledger claim.
+
+        ``None`` means another worker owns the lock. Once this worker acquires
+        it, every failure restores the task and releases the lock before an
+        error is raised. Normal and parallel claims therefore share one state
+        transition and attribution path.
+        """
+        task_id = task.task_id
+        if not self._lock.try_claim_task(task_id, agent_id, heartbeat=True):
+            return None
+
+        snapshots = self._snapshot_tasks([task])
+        try:
+            if not self._ledger.update_task_status(
+                    task_id, TaskStatus.IN_PROGRESS, defer_save=True):
+                raise _ClaimStageError(
+                    f"Ledger refused claim transition for {task_id}")
+            task.context["claimed_by"] = agent_id
+            task.context["claimed_at"] = datetime.now().isoformat()
+            return snapshots
+        except Exception as exc:
+            self._restore_tasks(snapshots)
+            self._lock.release_task(task_id, agent_id)
+            if isinstance(exc, _ClaimStageError):
+                raise
+            raise _ClaimStageError(
+                f"Could not stage ledger claim for {task_id}") from exc
+
+    def _release_staged_claims(self, tasks, agent_id: str) -> None:
+        """Release all distributed locks acquired for an uncommitted batch."""
+        for task in tasks:
+            self._lock.release_task(task.task_id, agent_id)
 
     def submit_goal(
         self,
@@ -175,8 +278,14 @@ class DistributedTaskCoordinator:
         # save() below. Without it each add re-serialized the whole ledger —
         # K+3 GIL-held json.dumps per goal, the json.dump storm py-spy caught
         # pinning the CPU + starving the UI ~5 min after boot (2026-06-13, #145).
-        self._ledger.add_task(parent, defer_save=True)
-        self._ledger.update_task_status(goal_id, TaskStatus.IN_PROGRESS, defer_save=True)
+        added_task_ids = []
+        if not self._ledger.add_task(parent, defer_save=True):
+            raise RuntimeError(f"Could not stage distributed goal {goal_id}")
+        added_task_ids.append(goal_id)
+        if not self._ledger.update_task_status(
+                goal_id, TaskStatus.IN_PROGRESS, defer_save=True):
+            self._discard_added_tasks(added_task_ids)
+            raise RuntimeError(f"Could not start distributed goal {goal_id}")
 
         # Create child tasks
         for task_def in decomposed_tasks:
@@ -190,10 +299,17 @@ class DistributedTaskCoordinator:
             # Inherit parent context so children know the domain
             child.context.update(context)
             child.parent_task_id = goal_id
-            self._ledger.add_task(child, defer_save=True)
+            if not self._ledger.add_task(child, defer_save=True):
+                self._discard_added_tasks(added_task_ids)
+                raise RuntimeError(
+                    f"Could not stage distributed task {child_id} for {goal_id}")
+            added_task_ids.append(child_id)
             parent.child_task_ids.append(child_id)
 
-        self._ledger.save()
+        if not self._commit_deferred(
+                f"submission of distributed goal {goal_id}",
+                added_task_ids=added_task_ids):
+            raise RuntimeError(f"Could not persist distributed goal {goal_id}")
 
         # Create initial baseline
         self._baseline.create_snapshot(self._ledger, label=f"goal_submitted_{goal_id}")
@@ -222,6 +338,7 @@ class DistributedTaskCoordinator:
         """
         parent = self._ledger.get_task(goal_id)
         healed = 0
+        snapshots = {}
         for child_id in list(getattr(parent, 'child_task_ids', None) or []):
             child = self._ledger.get_task(child_id)
             if child is None or child.status != TaskStatus.PENDING:
@@ -234,11 +351,13 @@ class DistributedTaskCoordinator:
             if (not goal_type or goal_type not in demanded
                     or goal_type in HIVE_WORKER_CAPABILITIES):
                 continue
+            snapshots.update(self._snapshot_tasks([child]))
             ctx['capabilities_required'] = [
                 c for c in demanded if c != goal_type]
             healed += 1
-        if healed:
-            self._ledger.save()
+        if healed and not self._commit_deferred(
+                f"capability healing for goal {goal_id}", snapshots):
+            return 0
         return healed
 
     def _reopen_finished_run(self, goal_id: str) -> int:
@@ -267,12 +386,17 @@ class DistributedTaskCoordinator:
                 c is None or c.status != TaskStatus.COMPLETED for c in children):
             return 0
         reopened = 0
+        snapshots = self._snapshot_tasks(children)
         for child in children:
             if not self._ledger.reopen_task(
                     child.task_id,
                     reason='continuous goal: re-armed for its next run',
                     defer_save=True):
-                continue
+                self._restore_tasks(snapshots)
+                logger.error(
+                    "Rolled back continuous-goal reopen for %s because task "
+                    "%s refused the transition", goal_id, child.task_id)
+                return 0
             ctx = child.context
             prev_hash = ctx.pop('result_hash', None)
             if prev_hash:
@@ -281,8 +405,9 @@ class DistributedTaskCoordinator:
             ctx.pop('claimed_at', None)
             ctx['runs'] = int(ctx.get('runs', 0) or 0) + 1
             reopened += 1
-        if reopened:
-            self._ledger.save()
+        if reopened and not self._commit_deferred(
+                f"continuous-goal reopen for {goal_id}", snapshots):
+            return 0
         return reopened
 
     def _release_held_tasks(self, goal_id: str) -> int:
@@ -304,18 +429,27 @@ class DistributedTaskCoordinator:
         counter and the state history record each return.
         """
         parent = self._ledger.get_task(goal_id)
-        released = 0
+        candidates = []
         for child_id in list(getattr(parent, 'child_task_ids', None) or []):
             child = self._ledger.get_task(child_id)
             if (child is None or child.status != TaskStatus.BLOCKED
                     or child.blocked_reason != BlockedReason.INPUT_REQUIRED.value):
                 continue
+            candidates.append(child)
+
+        snapshots = self._snapshot_tasks(candidates)
+        released = 0
+        for child in candidates:
             if not self._ledger.update_task_status(
-                    child_id, TaskStatus.PENDING,
+                    child.task_id, TaskStatus.PENDING,
                     reason='the goal was dispatched again: the help it '
                            'asked for is in',
                     defer_save=True):
-                continue
+                self._restore_tasks(snapshots)
+                logger.error(
+                    "Rolled back held-task release for %s because task %s "
+                    "refused the transition", goal_id, child.task_id)
+                return 0
             child.set_blocked_reason(None)
             child.error_message = None
             child.started_at = None
@@ -324,8 +458,9 @@ class DistributedTaskCoordinator:
             ctx.pop('claimed_at', None)
             ctx['runs'] = int(ctx.get('runs', 0) or 0) + 1
             released += 1
-        if released:
-            self._ledger.save()
+        if released and not self._commit_deferred(
+                f"held-task release for goal {goal_id}", snapshots):
+            return 0
         return released
 
     def claim_next_task(
@@ -342,6 +477,13 @@ class DistributedTaskCoordinator:
             task = self._ledger.get_task(task_id)
             if not task:
                 continue
+
+            if task.status == TaskStatus.DEFERRED:
+                if not _defer_is_due(task):
+                    continue
+                if not self._ledger.undefer_task(
+                        task_id, reason='temporary worker deferral elapsed'):
+                    continue
 
             # ORPHAN RECOVERY: a task whose worker died is IN_PROGRESS in the
             # ledger with no lock in Redis, and nothing ever put it back.
@@ -386,10 +528,37 @@ class DistributedTaskCoordinator:
                         logger.warning(
                             "Task %s was IN_PROGRESS with no lock (worker "
                             "died); returning it to PENDING", task_id)
-                        self._ledger.update_task_status(
-                            task_id, TaskStatus.PENDING)
+                        # Preserve the ledger's validated lifecycle.  A direct
+                        # IN_PROGRESS -> PENDING transition is rejected, which
+                        # left an orphan permanently unclaimable despite this
+                        # recovery branch finding it.  BLOCKED -> PENDING is
+                        # the canonical recovery route and leaves an auditable
+                        # reason in the task history.
+                        snapshots = self._snapshot_tasks([task])
+                        recovered = self._ledger.update_task_status(
+                            task_id, TaskStatus.BLOCKED,
+                            error_message="worker claim expired",
+                            reason="orphan recovery: worker claim expired",
+                            defer_save=True)
+                        if not recovered:
+                            self._restore_tasks(snapshots)
+                            continue
+                        task.set_blocked_reason(
+                            BlockedReason.RESOURCE_UNAVAILABLE.value)
+                        recovered = self._ledger.update_task_status(
+                            task_id, TaskStatus.PENDING,
+                            reason="orphan recovery: task available for a new worker",
+                            defer_save=True)
+                        if not recovered:
+                            self._restore_tasks(snapshots)
+                            continue
+                        task.set_blocked_reason(None)
+                        task.error_message = None
                         task.context.pop("claimed_by", None)
-                        self._ledger.save()
+                        task.context.pop("claimed_at", None)
+                        if not self._commit_deferred(
+                                f"orphan recovery for {task_id}", snapshots):
+                            continue
                     else:
                         continue        # genuinely in flight elsewhere
                 except Exception as e:
@@ -410,13 +579,26 @@ class DistributedTaskCoordinator:
             # Try atomic claim — with heartbeat so the lock is renewed
             # every HEARTBEAT_INTERVAL until submit_result / release_task.
             # Protects tasks that run longer than DEFAULT_TTL (5 min).
-            if self._lock.try_claim_task(task_id, agent_id, heartbeat=True):
-                self._ledger.update_task_status(task_id, TaskStatus.IN_PROGRESS)
-                task.context["claimed_by"] = agent_id
-                task.context["claimed_at"] = datetime.now().isoformat()
-                self._ledger.save()
-                logger.info(f"Task {task_id} claimed by {agent_id}")
-                return task
+            try:
+                snapshots = self._stage_task_claim(task, agent_id)
+            except _ClaimStageError as exc:
+                logger.error("Could not claim task %s: %s", task_id, exc)
+                continue
+            if snapshots is None:
+                continue
+            if not self._commit_deferred(
+                    f"claim of task {task_id} by {agent_id}", snapshots):
+                # The lock is held but the ledger could not record the claim;
+                # keeping it would run work the ledger still shows as PENDING
+                # and, on Redis, renew that lock for as long as this worker
+                # lives.  Persistence is ledger-wide, so stop here rather than
+                # try the next task: each further attempt is another full-
+                # ledger serialization against the same failing backend, and
+                # touches a task this tick will never claim.
+                self._lock.release_task(task_id, agent_id)
+                return None
+            logger.info(f"Task {task_id} claimed by {agent_id}")
+            return task
 
         logger.debug(f"No available tasks for agent {agent_id}")
         return None
@@ -443,6 +625,7 @@ class DistributedTaskCoordinator:
         from agent_ledger.core import ExecutionMode
 
         claimed = []
+        snapshots = {}
         for task_id in self._ledger.task_order:
             if len(claimed) >= max_tasks:
                 break
@@ -462,14 +645,25 @@ class DistributedTaskCoordinator:
                     continue
 
             # Try atomic claim (heartbeat-protected, see claim_next_task)
-            if self._lock.try_claim_task(task_id, agent_id, heartbeat=True):
-                self._ledger.update_task_status(task_id, TaskStatus.IN_PROGRESS)
-                task.context["claimed_by"] = agent_id
-                task.context["claimed_at"] = datetime.now().isoformat()
-                claimed.append(task)
+            try:
+                task_snapshot = self._stage_task_claim(task, agent_id)
+            except _ClaimStageError as exc:
+                self._restore_tasks(snapshots)
+                self._release_staged_claims(claimed, agent_id)
+                logger.error(
+                    "Rolled back parallel claim by %s after task %s failed: %s",
+                    agent_id, task_id, exc)
+                return []
+            if task_snapshot is None:
+                continue
+            snapshots.update(task_snapshot)
+            claimed.append(task)
 
         if claimed:
-            self._ledger.save()
+            if not self._commit_deferred(
+                    f"parallel claim by {agent_id}", snapshots):
+                self._release_staged_claims(claimed, agent_id)
+                return []
             logger.info(
                 f"{len(claimed)} parallel tasks claimed by {agent_id}: "
                 f"{[t.task_id for t in claimed]}")
@@ -489,14 +683,22 @@ class DistributedTaskCoordinator:
         """
         result_hash = TaskVerification.compute_result_hash(result)
 
-        self._ledger.complete_task(task_id, result=result)
-        self._lock.release_task(task_id, agent_id)
+        try:
+            completed = self._ledger.complete_task(task_id, result=result)
+        finally:
+            # A rejected write, invalid transition, or backend exception must
+            # never leave a heartbeat renewing a claim the worker cannot finish.
+            self._lock.release_task(task_id, agent_id)
+        if not completed:
+            # Do not publish, notify, or tell the worker it completed work the
+            # durable ledger rejected. Normal orphan recovery can then retry
+            # the still-IN_PROGRESS task.
+            raise RuntimeError(
+                f"Could not persist completion for distributed task {task_id}")
 
-        # Store result_hash so verify_result() can compare later
+        # SmartLedger's canonical completion path persists this same hash in
+        # the completion transaction; no second mutation/save is needed here.
         task = self._ledger.get_task(task_id)
-        if task:
-            task.context["result_hash"] = result_hash
-            self._ledger.save()
 
         # Publish verification request if pubsub is enabled
         if hasattr(self._ledger, '_pubsub') and self._ledger._pubsub:
@@ -529,6 +731,41 @@ class DistributedTaskCoordinator:
         """
         self._lock.release_task(task_id, agent_id)
 
+    def defer_task(self, task_id: str, agent_id: str, reason: str,
+                   retry_after_s: int = _DEFER_RETRY_S) -> bool:
+        """Return a known temporary outcome to the canonical ready queue.
+
+        This is intentionally separate from ``abandon_task``.  A user-active
+        LLM or a warming HARTOS service is an expected retryable condition,
+        while abandon/orphan recovery means ownership was genuinely lost.
+        SmartLedger owns the single IN_PROGRESS -> DEFERRED transition and its
+        durable rollback.  The coordinator only adds worker attribution around
+        that canonical state change.
+        """
+        task = self._ledger.get_task(task_id)
+        if task is None:
+            return False
+        until = (datetime.now() + timedelta(
+            seconds=max(1, retry_after_s))).isoformat()
+        # The attribution comes off in the same durable write as the DEFERRED
+        # edge, so a reload never shows a deferred task still owned by the
+        # node that gave it back.  No blocked_reason: DEFERRED carries its own
+        # deferred_reason (Task.defer), and a BlockedReason left here would
+        # survive undefer -> PENDING -> IN_PROGRESS and be reported on a
+        # running task (api_tracker exports the field verbatim).
+        snapshots = self._snapshot_tasks([task])
+        task.context.pop('claimed_by', None)
+        task.context.pop('claimed_at', None)
+        moved = self._ledger.defer_task(
+            task_id, reason='temporary worker deferral: ' + reason,
+            until=until)
+        if not moved:
+            # SmartLedger.defer_task undid its own transition; this puts the
+            # attribution popped above back with it.
+            self._restore_tasks(snapshots)
+        self._lock.release_task(task_id, agent_id)
+        return bool(moved)
+
     def hold_task(self, task_id: str, agent_id: str, reason: str) -> bool:
         """A worker holds a task whose action was handed to a person or an
         expert (create_recipe._ask_for_help; the goal is parked or the expert
@@ -545,16 +782,27 @@ class DistributedTaskCoordinator:
         PENDING and recovers only IN_PROGRESS, so a held task waits until
         _release_held_tasks puts it back on the goal's next dispatch.
         """
-        ok = self._ledger.update_task_status(
-            task_id, TaskStatus.BLOCKED, error_message=reason,
-            reason='held for help: the action was handed to a person or an '
-                   'expert', defer_save=True)
         task = self._ledger.get_task(task_id)
-        if ok and task is not None:
+        if task is None:
+            self._lock.release_task(task_id, agent_id)
+            return False
+        snapshots = self._snapshot_tasks([task])
+        try:
+            ok = self._ledger.update_task_status(
+                task_id, TaskStatus.BLOCKED, error_message=reason,
+                reason='held for help: the action was handed to a person or an '
+                       'expert', defer_save=True)
+            if not ok:
+                self._restore_tasks(snapshots)
+                return False
             task.set_blocked_reason(BlockedReason.INPUT_REQUIRED.value)
-        self._ledger.save()
-        self._lock.release_task(task_id, agent_id)
-        return ok
+            return self._commit_deferred(
+                f"hold of task {task_id}", snapshots)
+        except Exception:
+            self._restore_tasks(snapshots)
+            raise
+        finally:
+            self._lock.release_task(task_id, agent_id)
 
     def _notify_goal_contribution(self, task_id: str, agent_id: str, task_description: str):
         """Notify the user who owns the agent that their agent contributed to a goal."""
@@ -567,7 +815,23 @@ class DistributedTaskCoordinator:
                 return
 
             objective = parent.context.get("objective", parent.description)
-            user_id = agent_id  # agent_id IS str(g.user.id) — set in api.py
+            # ``agent_id`` is the claiming WORKER NODE (see worker_loop), not
+            # the human who submitted the goal.  The dispatch path stamps the
+            # requester into the inherited task context; use that canonical
+            # ownership field so a completed remote task is reported to its
+            # owner rather than creating a notification for a node id such as
+            # ``unknown``.
+            user_id = task.context.get("user_id") or parent.context.get("user_id")
+            if not user_id:
+                logger.debug("No human owner for goal contribution task %s; "
+                             "skipping user notification", task_id)
+                return
+            from core.constants import MACHINE_GOAL_AUTHORS
+            if user_id in MACHINE_GOAL_AUTHORS:
+                logger.debug("System-owned goal contribution for %s has no "
+                             "human notification target", task_id)
+                return
+            user_id = str(user_id)
 
             # Use Flask request context db if available, else open a fresh session
             try:

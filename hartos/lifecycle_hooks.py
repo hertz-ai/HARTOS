@@ -7,10 +7,13 @@ It also provides functions to sync ActionState with SmartLedger TaskStatus.
 """
 
 from enum import Enum
+import copy
+import hashlib
 import logging
 import os
 import re
 import threading
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any
 from core.session_cache import TTLCache
 
@@ -110,7 +113,8 @@ def _get_node_id():
     return platform.node()
 
 
-def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState'):
+def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState',
+                         result: Any = None):
     """Auto-sync state change to ledger if registered.
 
     Wires v2.0 ledger features using KNOWN stateful variables in scope:
@@ -120,16 +124,26 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
     """
     ledger = _ledger_registry.get(user_prompt)
     if ledger is None:
-        return  # No ledger registered, skip sync
+        return True  # Legacy/direct callers may not own a ledger.
 
+    task = None
+    task_snapshot = None
     try:
         LedgerTaskStatus = _get_ledger_task_status()
         task_id = f"action_{action_id}"
 
         if task_id not in ledger.tasks:
-            return  # Task doesn't exist in ledger
+            return True  # No ledger projection exists for this action.
 
         task = ledger.tasks[task_id]
+        # Direct resume paths predate SmartLedger's atomic status method.
+        # Keep the complete object so a rejected save also rolls back claim,
+        # history, and reason mutations in memory.
+        task_snapshot = copy.deepcopy(task.__dict__)
+
+        def _rollback_task():
+            task.__dict__.clear()
+            task.__dict__.update(copy.deepcopy(task_snapshot))
 
         # Map ActionState to LedgerTaskStatus — complete 1:1 coverage
         STATE_MAP = {
@@ -173,16 +187,31 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
             # the state machine — go through PENDING first)
             if (ledger_status == LedgerTaskStatus.IN_PROGRESS
                     and task.status in (LedgerTaskStatus.PAUSED, LedgerTaskStatus.USER_STOPPED)):
-                task.resume(reason=f"Resumed via ActionState.{state.value}")
+                if not task.resume(
+                        reason=f"Resumed via ActionState.{state.value}"):
+                    _rollback_task()
+                    return False
                 task.blocked_reason = None
-                ledger.save()
+                if ledger.save() is False:
+                    _rollback_task()
+                    return False
             elif (ledger_status == LedgerTaskStatus.IN_PROGRESS
                     and task.status == LedgerTaskStatus.BLOCKED):
                 # BLOCKED -> PENDING -> IN_PROGRESS (validated 2-step path)
-                task.transition_to(LedgerTaskStatus.PENDING, f"Unblocked via ActionState.{state.value}")
-                task.transition_to(LedgerTaskStatus.IN_PROGRESS, f"Resumed via ActionState.{state.value}")
+                if not task.transition_to(
+                        LedgerTaskStatus.PENDING,
+                        f"Unblocked via ActionState.{state.value}"):
+                    _rollback_task()
+                    return False
+                if not task.transition_to(
+                        LedgerTaskStatus.IN_PROGRESS,
+                        f"Resumed via ActionState.{state.value}"):
+                    _rollback_task()
+                    return False
                 task.blocked_reason = None
-                ledger.save()
+                if ledger.save() is False:
+                    _rollback_task()
+                    return False
             elif task.status != ledger_status:
                 # Skip no-op transitions (e.g. IN_PROGRESS → IN_PROGRESS when
                 # multiple ActionStates map to the same LedgerTaskStatus).
@@ -253,7 +282,13 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                                 "(ActionState %s authoritative — recovered work).",
                                 task_id, state.value)
                     if _apply:
-                        ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
+                        if not ledger.update_task_status(
+                                task_id, ledger_status,
+                                result=(result if state == ActionState.COMPLETED
+                                        else None),
+                                reason=f"ActionState: {state.value}"):
+                            _rollback_task()
+                            return False
 
             # === BLOCKED REASON: set specific reason based on ActionState source ===
             if ledger_status == LedgerTaskStatus.BLOCKED:
@@ -262,7 +297,11 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                 elif state == ActionState.FALLBACK_REQUESTED:
                     task.set_blocked_reason('input_required')
                 elif state == ActionState.PENDING:
-                    task.set_blocked_reason('dependency')
+                    # ``block_for_user_input`` runs immediately before the
+                    # state projection.  Do not overwrite its specific human
+                    # dependency with the generic pending reason.
+                    if task.blocked_reason != 'input_required':
+                        task.set_blocked_reason('dependency')
 
             # === FAILURE REASON: the same courtesy for the FAILED terminal ===
             # BLOCKED recorded WHY; FAILED recorded nothing, so a reader could
@@ -281,39 +320,71 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                     # MAX_RETRIES_EXCEEDED would be true.
                     task.set_failure_reason('abandoned')
 
-            # === HEARTBEAT: every state change records liveness ===
-            task.heartbeat()
+            # === BOOKKEEPING: liveness, SLA, ownership ===
+            # These run AFTER the durable write and must never vote on
+            # whether it succeeded.  They used to sit under the same blanket
+            # `except Exception` as the persistence above, so one malformed
+            # value -- a bad started_at reaching _dt.fromisoformat below is
+            # the cheapest example -- made this function return False.  Since
+            # set_action_state now RAISES on a false return, that turned a
+            # stale timestamp into a StateTransitionError that blocked every
+            # transition for the action, including its terminal one: the work
+            # was done and persisted, and the agent still could not say so.
+            # Narrowed so only the transition and the save decide the verdict.
+            try:
+                task.heartbeat()
 
-            # === SLA CHECK: flag breach, post status request, emit notification ===
-            if task.is_sla_breached() and not task.sla_breached:
-                task.mark_sla_breached()
-                task.post_status("SLA breached — requesting status update from agent")
-                logger.warning(f"SLA breached for {task_id}")
-                try:
-                    from core.platform.events import emit_event
-                    emit_event('task.sla_breached', {
-                        'task_id': task_id,
-                        'prompt': user_prompt,
-                        'sla_target_s': task.sla_target_s,
-                        'deadline': task.deadline,
-                        'action': 'status_request',
-                    })
-                except Exception:
-                    pass
+                # SLA: flag breach, post status request, emit notification.
+                if task.is_sla_breached() and not task.sla_breached:
+                    task.mark_sla_breached()
+                    task.post_status("SLA breached — requesting status update from agent")
+                    logger.warning(f"SLA breached for {task_id}")
+                    try:
+                        from core.platform.events import emit_event
+                        emit_event('task.sla_breached', {
+                            'task_id': task_id,
+                            'prompt': user_prompt,
+                            'sla_target_s': task.sla_target_s,
+                            'deadline': task.deadline,
+                            'action': 'status_request',
+                        })
+                    except Exception:
+                        pass
 
-            # === RELEASE OWNERSHIP on terminal states ===
-            if LedgerTaskStatus.is_terminal_state(ledger_status) and task.is_owned:
-                # Record time spent using known started_at from scope
-                if task.started_at:
-                    from datetime import datetime as _dt
-                    elapsed = (_dt.now() - _dt.fromisoformat(task.started_at)).total_seconds()
-                    task.record_spend(time_s=elapsed)
-                task.release()
-                logger.info(f"Released ownership of {task_id}")
+                # Release ownership on terminal states.
+                if LedgerTaskStatus.is_terminal_state(ledger_status) and task.is_owned:
+                    # Record time spent using known started_at from scope
+                    if task.started_at:
+                        from datetime import datetime as _dt
+                        try:
+                            elapsed = (_dt.now() - _dt.fromisoformat(
+                                task.started_at)).total_seconds()
+                            task.record_spend(time_s=elapsed)
+                        except (TypeError, ValueError):
+                            # A stale or hand-edited started_at costs the
+                            # spend figure, never the release or the verdict.
+                            logger.warning(
+                                "%s has an unparseable started_at (%r); "
+                                "releasing without a time_s spend record",
+                                task_id, task.started_at)
+                    task.release()
+                    logger.info(f"Released ownership of {task_id}")
+            except Exception as _bookkeeping_err:
+                logger.warning(
+                    "Ledger bookkeeping after a COMMITTED write failed for "
+                    "%s (%s); the state change itself stands",
+                    task_id, _bookkeeping_err, exc_info=True)
 
             logger.info(f"Auto-synced {task_id} -> {ledger_status.value} (ActionState: {state.value})")
     except Exception as e:
+        if task is not None and task_snapshot is not None:
+            try:
+                task.__dict__.clear()
+                task.__dict__.update(task_snapshot)
+            except Exception:
+                pass
         logger.error(f"Failed to auto-sync to ledger: {e}", exc_info=True)
+        return False
 
     # Audit log: record state transition
     try:
@@ -341,6 +412,8 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
     except Exception:
         pass
 
+    return True
+
 # Import ledger types for sync function (lazy import to avoid circular deps)
 def _get_ledger_task_status():
     """Lazy import to avoid circular dependencies"""
@@ -348,7 +421,8 @@ def _get_ledger_task_status():
     return LedgerTaskStatus
 
 
-def block_for_user_input(user_prompt: str, action_id: int, reason: str = "Waiting for user input"):
+def block_for_user_input(user_prompt: str, action_id: int,
+                         reason: str = "Waiting for user input") -> bool:
     """Block a task in the ledger when the agent needs user consent/input.
 
     Call this when send_message_to_user is invoked and the action's
@@ -357,36 +431,92 @@ def block_for_user_input(user_prompt: str, action_id: int, reason: str = "Waitin
     """
     ledger = _ledger_registry.get(user_prompt)
     if not ledger:
-        return
+        return False
     LedgerTaskStatus = _get_ledger_task_status()
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id)
     if not task or task.status != LedgerTaskStatus.IN_PROGRESS:
-        return
-    task.block(reason)
+        return False
+    before = copy.deepcopy(task.__dict__)
+    if not task.block(reason):
+        return False
     task.set_blocked_reason('input_required')
-    ledger.save()
+    if ledger.save() is False:
+        task.__dict__.clear()
+        task.__dict__.update(before)
+        logger.error(
+            "Refusing user-input block for %s: ledger persistence failed",
+            task_id)
+        return False
     logger.info(f"Blocked {task_id} for user input: {reason}")
+    return True
 
 
-def resume_from_user_input(user_prompt: str, action_id: int, reason: str = "User responded"):
-    """Resume a task that was blocked waiting for user input.
+def mark_action_waiting_for_user(user_prompt: str, action_id: int, reason: str) -> bool:
+    """Project an existing input dependency into both lifecycle authorities.
 
-    Call this when the user responds to a send_message_to_user request
-    or when PREVIEW_APPROVED is received.
+    The ledger is blocked first while the action is still in progress; then
+    the canonical ActionState projection becomes ``PENDING``.  This preserves
+    the existing ``input_required`` reason instead of creating a second queue
+    or allowing the generic pending projection to relabel it as a dependency.
+    """
+    if not block_for_user_input(user_prompt, action_id, reason):
+        return False
+    return safe_set_state(user_prompt, action_id, ActionState.PENDING, reason)
+
+
+def resume_blocked_action(user_prompt: str, action_id: int,
+                          reason: str = "Block resolved",
+                          evidence: Optional[Dict[str, Any]] = None,
+                          evidence_key: str = 'unblock_evidence') -> bool:
+    """Resume one BLOCKED ledger task through its validated transition.
+
+    User replies and an assigned expert turn are different authorities, but
+    both resolve the same ledger block. Typed evidence is optional; callers
+    must never label an expert response as human input.
     """
     ledger = _ledger_registry.get(user_prompt)
     if not ledger:
-        return
+        return False
     LedgerTaskStatus = _get_ledger_task_status()
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id)
     if not task or task.status != LedgerTaskStatus.BLOCKED:
-        return
-    task.resume(reason)
+        return False
+    before = copy.deepcopy(task.__dict__)
+    if not task.resume(reason):
+        return False
+    evidence_items = None
+    if evidence is not None:
+        context = getattr(task, 'context', None)
+        if isinstance(context, dict):
+            evidence_items = context.setdefault(evidence_key, [])
+            evidence_items.append(evidence)
     task.blocked_reason = None
-    ledger.save()
-    logger.info(f"Resumed {task_id} from user input: {reason}")
+    if ledger.save() is False:
+        task.__dict__.clear()
+        task.__dict__.update(before)
+        logger.error(
+            "Refusing unblock for %s: ledger persistence failed", task_id)
+        return False
+    logger.info(f"Resumed blocked {task_id}: {reason}")
+    return True
+
+
+def resume_from_user_input(user_prompt: str, action_id: int,
+                           reason: str = "User responded",
+                           answer: Optional[str] = None) -> bool:
+    """Resume a blocked task with evidence from a genuine user turn."""
+    evidence = None
+    if answer is not None:
+        evidence = {
+            'action_id': action_id,
+            'answer': str(answer),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        }
+    return resume_blocked_action(
+        user_prompt, action_id, reason, evidence=evidence,
+        evidence_key='user_input_evidence')
 
 # Add new states to ActionState enum:
 class FlowState(Enum):
@@ -753,7 +883,8 @@ class StateTransitionError(Exception):
 
 
 # 2. UPDATE your set_action_state function to enforce transitions:
-def set_action_state(user_prompt: str, action_id: int, state: ActionState, reason: str = ""):
+def set_action_state(user_prompt: str, action_id: int, state: ActionState,
+                     reason: str = "", result: Any = None):
     """Set state of an action with validation."""
     current_state = get_action_state(user_prompt, action_id)
 
@@ -766,6 +897,22 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
         raise StateTransitionError(
             f"Invalid transition: Action {action_id} cannot go from {current_state.value} to {state.value}")
 
+    # The durable ledger is the lifecycle authority. Project ActionState only
+    # after that write commits; otherwise callers could receive True while the
+    # task remained unfinished on disk.
+    #
+    # Keep persistence failure explicit for every state, including terminal
+    # ones.  Returning false here would be ignored by direct callers and would
+    # recreate a silent completion.  The current call graph has one public
+    # wrapper (safe_set_state) and one multi-step wrapper
+    # (force_state_through_valid_path); both translate this exception to False.
+    # The only remaining direct call is the idempotent assignment hook.
+    if not _auto_sync_to_ledger(
+            user_prompt, action_id, state, result=result):
+        raise StateTransitionError(
+            f"Ledger persistence failed for Action {action_id} -> "
+            f"{state.value}")
+
     # Perform transition (lock protects check-then-act on shared dict)
     with _state_lock:
         if user_prompt not in action_states:
@@ -773,18 +920,26 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
         action_states[user_prompt][action_id] = state
     logger.info(f"[TARGET] Action {action_id}: {current_state.value} → {state.value} ({reason})")
 
-    # Auto-sync to ledger if registered
-    _auto_sync_to_ledger(user_prompt, action_id, state)
-
     # Advisory consent check — log when data_access consent is missing (never blocks)
     if state == ActionState.IN_PROGRESS:
         try:
             from integrations.social.consent_service import ConsentService
             from integrations.social.models import db_session
             with db_session(commit=False) as db:
-                if not ConsentService.check_consent(db, user_prompt, 'data_access'):
+                # user_prompt is the SESSION KEY f"{user_id}_{prompt_id}";
+                # check_consent's parameter is a USER ID and it matches against
+                # user_consents.user_id, which holds bare uuids written by the
+                # consent UI. Passing the session key made this branch
+                # unsatisfiable -- it logged 415 false "no consent" lines over
+                # Sep 18-19 while a granted data_access row sat in the table --
+                # so resolve the owner with the helper already in this file
+                # (:102) instead of inventing a second parse.
+                _consent_user, _ = _extract_ownership_from_prompt(user_prompt)
+                if not ConsentService.check_consent(db, _consent_user,
+                                                    'data_access'):
                     logger.info(
-                        f"[CONSENT] No data_access consent for user={user_prompt}, "
+                        f"[CONSENT] No data_access consent for "
+                        f"user={_consent_user} (session={user_prompt}), "
                         f"action={action_id} (advisory only)")
         except Exception:
             pass  # Consent check is advisory, never blocks execution
@@ -803,10 +958,12 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
 
 
 # 3. ADD these wrapper functions for safe state updates:
-def safe_set_state(user_prompt: str, action_id: int, new_state: ActionState, reason: str = ""):
+def safe_set_state(user_prompt: str, action_id: int, new_state: ActionState,
+                   reason: str = "", result: Any = None):
     """Safely set state with error handling"""
     try:
-        set_action_state(user_prompt, action_id, new_state, reason)
+        set_action_state(user_prompt, action_id, new_state, reason,
+                         result=result)
         return True
     except StateTransitionError as e:
         logger.error(f"[ERROR] {e}")
@@ -1258,6 +1415,235 @@ def lifecycle_hook_track_status_verification_request(user_prompt: str, user_task
     return False
 
 
+def _verifier_completion_has_conversation_evidence(
+        user_prompt: str, action_id: int, json_obj: dict) -> bool:
+    """Return whether a completion cites a real, earlier GroupChat result.
+
+    The StatusVerifier JSON alone is never a receipt. The GroupChat registry is
+    already the canonical conversation projection used by the Admin agent
+    drawer, so this creates no second evidence store.
+    """
+    evidence = json_obj.get('evidence')
+    if not isinstance(evidence, dict):
+        return False
+    index = evidence.get('message_index')
+    kind = evidence.get('kind')
+    if not isinstance(index, int) or isinstance(index, bool):
+        return False
+    if kind not in ('tool_receipt', 'user_visible_result'):
+        return False
+    group_chat = get_registered_groupchat(user_prompt)
+    messages = getattr(group_chat, 'messages', None)
+    if not isinstance(messages, list) or index < 0 or index >= len(messages):
+        return False
+    message = messages[index]
+    if not isinstance(message, dict) or not str(message.get('content') or '').strip():
+        return False
+    # Bind the receipt to the action window already used by the stale-verdict
+    # guard.  Otherwise a verifier can cite action 1's valid receipt while
+    # completing action 2.  A missing dispatch marker is not evidence.
+    if latest_dispatch_before(messages, index + 1) != action_id:
+        return False
+    if kind == 'tool_receipt':
+        return message.get('role') == 'tool'
+    return (message.get('role') == 'assistant'
+            and message.get('name') == 'Assistant')
+
+
+def _record_verifier_evidence(user_prompt: str, action_id: int,
+                              json_obj: dict) -> bool:
+    """Persist the same receipt the completion gate accepted.
+
+    ``verification_evidence`` is the existing distributed-verification field.
+    Recording the accepted receipt there lets later recipe and learning code use
+    one durable outcome instead of treating an LLM verdict as evidence.
+    """
+    ledger = get_registered_ledger(user_prompt)
+    if ledger is None:
+        # This is the verified-completion boundary, not a generic state helper.
+        # Its only production callers are CREATE and REUSE, and both register
+        # their ledger before execution.  Advancing without that durable
+        # authority would turn an in-memory/model verdict into completion.
+        logger.error(
+            'Cannot persist verifier evidence: no ledger registered for %s',
+            user_prompt)
+        return False
+    task = getattr(ledger, 'tasks', {}).get(f'action_{action_id}')
+    if task is None:
+        logger.error(
+            'Cannot persist verifier evidence: action_%s missing from %s',
+            action_id, user_prompt)
+        return False
+    context = getattr(task, 'context', None)
+    if not isinstance(context, dict):
+        logger.error(
+            'Cannot persist verifier evidence: action_%s has no context',
+            action_id)
+        return False
+    evidence = json_obj['evidence']
+    group_chat = get_registered_groupchat(user_prompt)
+    messages = getattr(group_chat, 'messages', None)
+    receipt = messages[evidence['message_index']]
+    receipt_text = str(receipt.get('content') or '')
+    receipt_hash = hashlib.sha256(receipt_text.encode('utf-8')).hexdigest()
+    record = {
+        'agent': 'StatusVerifier',
+        'verdict': True,
+        'action_id': action_id,
+        'evidence': evidence,
+        'receipt_sha256': receipt_hash,
+        'receipt_role': str(receipt.get('role') or ''),
+        'receipt_agent': str(receipt.get('name') or ''),
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+    }
+    records = context.setdefault('verification_evidence', [])
+    already_persisted = any(
+        isinstance(item, dict)
+        and item.get('action_id') == action_id
+        and item.get('receipt_sha256') == receipt_hash
+        for item in records
+    )
+    if not already_persisted:
+        records.append(record)
+        if ledger.save() is False:
+            records.remove(record)
+            logger.error(
+                'Refusing completion: verifier evidence was not persisted '
+                'for action %s in %s', action_id, user_prompt)
+            return False
+    return True
+
+
+def _promote_verified_outcome(user_prompt: str, action_id: int,
+                              json_obj: dict) -> None:
+    """Credit one outcome after evidence and lifecycle completion commit."""
+    ledger = get_registered_ledger(user_prompt)
+    task = (getattr(ledger, 'tasks', {}).get(f'action_{action_id}')
+            if ledger is not None else None)
+    context = getattr(task, 'context', None)
+    if not isinstance(context, dict):
+        context = {}
+    # CREATE and REUSE already declare these two assistant identities when
+    # instrumenting their real GroupChat participant.  Award only wrappers
+    # that are live for this session; a verifier verdict remains insufficient.
+    try:
+        from integrations.agent_lightning import record_verified_outcome_for_agents
+        outcome_context = {
+            'user_prompt': user_prompt,
+            'action_id': action_id,
+            'evidence': json_obj['evidence'],
+        }
+        group_chat = get_registered_groupchat(user_prompt)
+        credited = record_verified_outcome_for_agents(
+            getattr(group_chat, 'agents', None), True, outcome_context)
+        if not credited:
+            # A False here is NOT "the reward was recorded".  It means no live
+            # wrapper owned this chat, which happens whenever Agent Lightning
+            # is off (the code default) or the session's wrapper has gone.
+            # Phase 3 of the recovery plan requires that we say so rather than
+            # let the caller read silence as learning.
+            from integrations.agent_lightning.config import is_enabled
+            if is_enabled():
+                logger.warning(
+                    'Verified outcome for action %s in %s was NOT credited: '
+                    'Agent Lightning is enabled but no instrumented wrapper '
+                    'owns this GroupChat', action_id, user_prompt)
+            else:
+                logger.debug(
+                    'Verified outcome for action %s in %s not credited: '
+                    'Agent Lightning is disabled', action_id, user_prompt)
+    except Exception:
+        logger.exception('Unable to record verified Agent Lightning outcome')
+    # Promote the already-persisted action/result pair through the one world
+    # model bridge only after this exact receipt committed COMPLETED.  The
+    # bridge independently checks the verification envelope, so no dispatcher
+    # or worker can bypass the lifecycle by self-attesting success.
+    try:
+        evidence = json_obj['evidence']
+        group_chat = get_registered_groupchat(user_prompt)
+        messages = getattr(group_chat, 'messages', None)
+        index = evidence.get('message_index')
+        receipt = messages[index]
+        user_id, prompt_id = _extract_ownership_from_prompt(user_prompt)
+        from integrations.agent_engine.world_model_bridge import (
+            get_world_model_bridge,
+        )
+        get_world_model_bridge().record_interaction(
+            user_id=user_id,
+            prompt_id=prompt_id or user_prompt,
+            prompt=str(getattr(task, 'description', '') or
+                       f'Complete action {action_id}'),
+            response=str(receipt.get('content') or ''),
+            model_id=str(receipt.get('name') or 'verified-agent'),
+            goal_id=(context.get('goal_id') or context.get('parent_task_id')),
+            verification={
+                'verified': True,
+                'source': 'status_verifier',
+                'outcome': 'success',
+                'action_id': action_id,
+                'evidence': evidence,
+            },
+            # The raw chat path already owns history and user-sensor writes.
+            # This call promotes that result; it must not duplicate either.
+            persist_conversation=False,
+            ingest_user_utterance=False,
+        )
+    except Exception:
+        logger.exception('Unable to record verified world-model outcome')
+
+
+def commit_verified_action_completion(user_prompt: str, action_id: int,
+                                      evidence: dict,
+                                      reason: str = 'verified complete') -> bool:
+    """Commit one evidence-backed successful action through the canonical FSM.
+
+    CREATE and REUSE use different non-deterministic conversations, but a
+    successful action has one deterministic boundary: it must already be in
+    ``STATUS_VERIFICATION_REQUESTED`` and cite a receipt from that action's
+    current dispatch window.  Keeping the state write, durable ledger evidence,
+    Agent Lightning reward, and world-model promotion together prevents a
+    caller from advancing the pointer while silently skipping the flywheel.
+    """
+    if get_action_state(user_prompt, action_id) != \
+            ActionState.STATUS_VERIFICATION_REQUESTED:
+        logger.warning(
+            "Refusing verified completion for action %s in %s from state %s",
+            action_id, user_prompt,
+            get_action_state(user_prompt, action_id).value)
+        return False
+
+    verdict = {
+        'status': 'completed',
+        'action_id': action_id,
+        'evidence': evidence,
+    }
+    if not _verifier_completion_has_conversation_evidence(
+            user_prompt, action_id, verdict):
+        logger.warning(
+            "Refusing ungrounded completed verdict for action %s in %s",
+            action_id, user_prompt)
+        return False
+    if not validate_state_transition(
+            user_prompt, action_id, ActionState.COMPLETED):
+        return False
+    group_chat = get_registered_groupchat(user_prompt)
+    receipt = group_chat.messages[evidence['message_index']]
+    # The proof must be durable before a completion can release dependents or
+    # feed any learning system. A retry deduplicates the same receipt hash.
+    if not _record_verifier_evidence(user_prompt, action_id, verdict):
+        return False
+    if not safe_set_state(
+            user_prompt, action_id, ActionState.COMPLETED, reason,
+            result=str(receipt.get('content') or '')):
+        return False
+
+    # Learning follows both durable evidence and the successful canonical
+    # state write. Never credit a receipt which failed either boundary.
+    _promote_verified_outcome(user_prompt, action_id, verdict)
+    retry_tracker.reset_count(user_prompt, action_id)
+    return True
+
+
 def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, user_tasks) -> dict:
     """4-6. Process verifier response: completed/pending/error"""
     # isinstance before the membership test: helper.retrieve_json returns
@@ -1289,16 +1675,22 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
     if current_state != ActionState.STATUS_VERIFICATION_REQUESTED:
         return {'action': 'allow', 'message': None}
 
-    if status == 'completed':
-        # Reset retry counter on completion
-        retry_tracker.reset_count(user_prompt, current_action_id)
-        if validate_state_transition(user_prompt, current_action_id, ActionState.COMPLETED):
-            safe_set_state(user_prompt, current_action_id, ActionState.COMPLETED,"hook tracking lifecycle_hook_process_verifier_response")
-            # Automatically request fallback after completion
+    if status in ('completed', 'success'):
+        if not commit_verified_action_completion(
+                user_prompt, current_action_id, json_obj.get('evidence'),
+                "hook tracking lifecycle_hook_process_verifier_response"):
             return {
-                'action': 'force_fallback',
-                'message': f"Action {current_action_id} fallback: ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversation to StatusVerifier agent"
+                'action': 'force_completion',
+                'message': (
+                    f"Action {current_action_id} is not complete yet: the "
+                    "StatusVerifier must cite an earlier tool receipt or "
+                    "user-visible result from this conversation.")
             }
+        # Automatically request fallback after completion
+        return {
+            'action': 'force_fallback',
+            'message': f"Action {current_action_id} fallback: ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversation to StatusVerifier agent"
+        }
 
     elif status == 'pending':
         # SAFETY NET: Check if pending count exceeded (prevents infinite retry loops)
@@ -1311,10 +1703,22 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
 
         if status == 'pending':  # Still pending (not overridden)
             if validate_state_transition(user_prompt, current_action_id, ActionState.PENDING):
-                safe_set_state(user_prompt, current_action_id, ActionState.PENDING,"hook tracking lifecycle_hook_process_verifier_response")
+                needs_user = str(
+                    json_obj.get('can_perform_without_user_input') or ''
+                ).strip().lower().startswith('no')
+                if needs_user:
+                    mark_action_waiting_for_user(
+                        user_prompt, current_action_id,
+                        json_obj.get('message') or 'Waiting for user input')
+                else:
+                    safe_set_state(user_prompt, current_action_id, ActionState.PENDING,"hook tracking lifecycle_hook_process_verifier_response")
                 return {
                     'action': 'force_completion',
-                    'message': f"Complete pending steps for action {current_action_id} and ask @StatusVerifier to verify completion"
+                    'message': (
+                        (json_obj.get('message') or f'Action {current_action_id} needs user input')
+                        if needs_user else
+                        f"Complete pending steps for action {current_action_id} and ask @StatusVerifier to verify completion"
+                    )
                 }
 
     if status == 'error':  # Separated to allow fall-through from pending override
@@ -1438,16 +1842,21 @@ def lifecycle_hook_track_recipe_completion(user_prompt: str, json_obj: dict, use
     return {'action': 'allow', 'message': None}
 
 
-# "Execute Action N:" is how the create loop posts an action to the group,
-# also as "Properly Execute Action N:" and as a re-post that send_retry
-# prefixed with "[retry:<tag>]".  Only a LEADING marker is a dispatch: the
+# "Execute Action N:" is how CREATE posts an action, while REUSE uses
+# "Perform this action -> Action #N:".  Both are projections of the same
+# lifecycle dispatch and therefore share this parser.  CREATE also emits
+# "Properly Execute Action N:" and retry posts prefixed with "[retry:<tag>]".
+# Only a LEADING marker is a dispatch: the
 # [EXECUTE-PENDING] dispatch appends the user's text after its own marker, and
 # that text can quote an earlier one ("... ,Latest User message: Properly
 # Execute Action 6: ...", the Failure=True retry text), so a marker later in a
 # message says nothing about which action it posts.  Colon-delimited, so
 # action 2 never matches action 20.
 _DISPATCH_MARKER = re.compile(
-    r'\s*(?:\[retry:[^\]]*\]\s*)?(?:Properly\s+)?Execute Action (\d+):')
+    r'\s*(?:'
+    r'(?:\[retry:[^\]]*\]\s*)?(?:Properly\s+)?Execute Action '
+    r'|Perform this action -> Action #'
+    r')(?P<action_id>\d+):')
 
 
 def dispatch_action_id(content) -> Optional[int]:
@@ -1455,7 +1864,7 @@ def dispatch_action_id(content) -> Optional[int]:
     if not isinstance(content, str):
         return None
     m = _DISPATCH_MARKER.match(content)
-    return int(m.group(1)) if m else None
+    return int(m.group('action_id')) if m else None
 
 
 def latest_dispatch_before(messages, index) -> Optional[int]:

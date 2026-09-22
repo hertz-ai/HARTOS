@@ -15,12 +15,40 @@ from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Fraction of a model's size that must be free on the GPU for it to run in
+# 'cpu_offload' mode — the rest streams from system RAM.  Named so the
+# threshold that defines the mode is not an unexplained 0.5 literal.
+CPU_OFFLOAD_MIN_FREE_RATIO = 0.5
+
 # VRAM budget table: tool_name -> (min_vram_gb, model_size_gb)
 VRAM_BUDGETS: Dict[str, Tuple[float, float]] = {
     "acestep":              (6.0,  4.0),
     "diffrhythm":           (6.0,  4.0),    # singing voice synthesis
     "wan2gp":               (8.0,  8.0),
-    "ltx2":                 (6.0,  4.0),
+    # LTX-Video (Lightricks/LTX-Video, diffusers LTXPipeline).  MEASURED
+    # 2026-09-21 from the safetensors headers of the downloaded pipeline,
+    # not estimated: text_encoder (T5-XXL) 4.762 B params, transformer
+    # 1.923 B, vae 0.419 B — all stored F32 (28.42 GB on disk), so at the
+    # bf16 the server loads them in, residency is 9.52 + 3.85 + 0.84 =
+    # 14.21 GB, and the largest SINGLE module (the ceiling for
+    # enable_model_cpu_offload, which swaps whole models) is the 9.52 GB
+    # text encoder.
+    #
+    # This row read (6.0, 4.0), which is the transformer alone — it left
+    # out the text encoder that is more than twice its size.  The effect
+    # was not a missing warning but the wrong ROUTE: on this box, with
+    # 2.97 GB free beside a resident LLM, suggest_offload_mode compared
+    # 2.97 against 4.0*0.5 and answered 'cpu_offload', an offload that
+    # needs 9.52 GB and would have OOM'd; _start_sidecar then refused the
+    # spawn anyway because can_fit compared 2.97 against min_vram 6.0.
+    # So the tool neither ran on the GPU nor fell back to the CPU.  With
+    # the measured numbers the same box answers 'cpu_only' and starts.
+    #
+    # min_vram is the least free VRAM at which ANY GPU mode works (the
+    # 9.52 GB offload peak, rounded), matching llm_main's reading of the
+    # field; model_size is full residency, which is what
+    # suggest_offload_mode weighs when choosing gpu vs offload.
+    "ltx2":                 (9.6,  14.2),
     "minicpm":              (6.0,  4.0),
     # Primary LLM (llama-server, Qwen3.5-4B Q4).  It is served by
     # llama_config/llamacpp_manager, not RuntimeToolManager, so nothing
@@ -33,9 +61,13 @@ VRAM_BUDGETS: Dict[str, Tuple[float, float]] = {
     # with "request (6477 tokens) exceeds the available context size".
     # model 2.8 GB + ~1.5 GB KV at the 12288 ctx cap = 4.3 GB min_vram.
     "llm_main":             (4.3,  2.8),
-    # STT engines
+    # STT engines -- one row per faster-whisper size the catalog can pick
+    # (model_orchestrator._CATALOG_TO_VRAM_KEY names all five; the tiny and
+    # small rows were missing, so a small-on-GPU worker booked nothing).
     "whisper":              (2.0,  1.5),
+    "whisper_tiny":         (0.3,  0.1),    # faster-whisper tiny
     "whisper_base":         (0.5,  0.2),    # faster-whisper base (CPU-friendly)
+    "whisper_small":        (1.0,  0.5),    # faster-whisper small
     "whisper_medium":       (2.0,  1.5),    # faster-whisper medium
     "whisper_large":        (4.0,  3.0),    # faster-whisper large-v3-turbo
     # TTS engines
@@ -196,13 +228,65 @@ def _win_gpu_vram_gb_from_registry() -> float:
     return round(best_bytes / (1024 ** 3), 1) if best_bytes else 0.0
 
 
+class _AllocationLedger(dict):
+    """tool -> GB reserved, plus a revision that moves on every real change.
+
+    A load or unload is the state transition that makes a cached GPU
+    reading wrong (see refresh_gpu_info for the measured spawn case, and
+    detect_gpu for the load case), and this dict is the manager's own
+    record of those transitions.  Its writers do not all go through
+    allocate()/release(): ModelOrchestrator._release_vram pops rows, and
+    Nunba's llama_config writes/pops the 'llm' row directly.  So the
+    revision is kept in the dict itself, where every writer lands.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.changed_seq: int = 0
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.changed_seq += 1
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self.changed_seq += 1
+
+    def pop(self, key, *default):
+        present = key in self
+        value = super().pop(key, *default)
+        if present:
+            self.changed_seq += 1
+        return value
+
+    def popitem(self):
+        item = super().popitem()
+        self.changed_seq += 1
+        return item
+
+    def clear(self):
+        if self:
+            self.changed_seq += 1
+        super().clear()
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        self.changed_seq += 1
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self.changed_seq += 1
+        return super().setdefault(key, default)
+
+
 class VRAMManager:
     """GPU memory tracking and allocation decisions."""
 
     def __init__(self):
-        self._allocations: Dict[str, float] = {}  # tool → GB reserved
+        self._allocations: Dict[str, float] = _AllocationLedger()  # tool → GB reserved
         self._gpu_info: Optional[Dict] = None
         self._gpu_info_ts: float = 0.0  # timestamp of last nvidia-smi call
+        self._gpu_info_seq: int = 0     # ledger revision the memo was read at
         # None = not yet checked; True = neither nvidia-smi nor rocm-smi is on PATH,
         # so the vendor probes are skipped PERMANENTLY (see detect_gpu). Survives the
         # `refresh_gpu_info` TTL reset on purpose — that reset is what let the
@@ -356,15 +440,36 @@ class VRAMManager:
 
     # ── GPU Detection ────────────────────────────────────────────
 
+    def _memo_is_current(self) -> bool:
+        """The cached reading is usable only if nothing was loaded or
+        unloaded since it was taken.  MEASURED 2026-09-16 (live app, PID
+        26452): llama-server booked ``_allocations['llm'] = 2.84`` after
+        its health check, and a pre-load reading of 7.5 GB free, 40 s old
+        and inside the 120 s TTL, was what the next STT/TTS selection saw.
+        The ledger revision is the record of that transition."""
+        return (self._gpu_info is not None
+                and self._gpu_info_seq == self._allocations.changed_seq)
+
     def detect_gpu(self) -> Dict:
         """Detect GPU and return info dict.
 
         Priority: nvidia-smi (no deps) → PyTorch (if already loaded) → macOS Metal.
         Returns: {name, total_gb, free_gb, cuda_available}
-        """
-        if self._gpu_info is not None:
-            return self._gpu_info
 
+        Memoised: the probe re-runs only when the memo predates the last
+        allocation change (_memo_is_current); refresh_gpu_info adds the
+        TTL on top.  The revision is read BEFORE the probe so a change
+        that lands while nvidia-smi runs still invalidates the result.
+        """
+        if self._memo_is_current():
+            return self._gpu_info
+        seq = self._allocations.changed_seq
+        info = self._probe_gpu()
+        self._gpu_info_seq = seq
+        return info
+
+    def _probe_gpu(self) -> Dict:
+        """Run the vendor probes and store the result in the memo."""
         # ── ABSENT VENDOR TOOLS ARE A PERMANENT FACT — never re-probe them ──────
         # (2026-08-12 real-HW finding on an Intel-only laptop.) `refresh_gpu_info`
         # nulls `_gpu_info` every TTL, so WITHOUT this guard the full probe re-ran
@@ -656,7 +761,7 @@ class VRAMManager:
         """
         import time as _t
         now = _t.monotonic()
-        if (not force and self._gpu_info is not None
+        if (not force and self._memo_is_current()
                 and (now - self._gpu_info_ts) < self._refresh_ttl):
             return self._gpu_info  # recent enough — skip subprocess
         self._gpu_info = None
@@ -692,6 +797,11 @@ class VRAMManager:
 
         Uses the measured budget (post first successful load) if present,
         otherwise falls back to the VRAM_BUDGETS declared value.
+
+        This is the FULL-RESIDENCY test (free >= min_vram).  It is the
+        wrong question for a tool that has been told to offload, so
+        _start_sidecar applies it only to offload_mode == 'gpu'; see the
+        comment there for the measurement.
         """
         if tool_name in self._allocations:
             return True  # already allocated
@@ -808,7 +918,7 @@ class VRAMManager:
 
         if free >= model_size:
             return "gpu"
-        elif free >= model_size * 0.5:
+        elif free >= model_size * CPU_OFFLOAD_MIN_FREE_RATIO:
             return "cpu_offload"
         else:
             return "cpu_only"

@@ -377,22 +377,49 @@ def register_shell_os_routes(app):
         }
         _notification_queue.append(notif)
 
-        # Try D-Bus delivery
+        # Try D-Bus delivery, THROUGH THE AI'S OWN CONSENT GATE where one is
+        # installed. `hart-notify-send` (nixos/modules/hart-notify.nix) consults
+        # core.ai_sensing.query_authority('screen') fail-closed and exits 77 when
+        # the human has cut the AI's 'screen' sense; on allow it execs the plain
+        # libnotify client. This route used to call `notify-send` directly, which
+        # meant HARTOS painted native toasts as if it were a foreign app and
+        # escaped the gate that exists precisely to stop the AI doing that. The
+        # gate's own comment says "no new path, no new gate" -- so use it rather
+        # than adding a second check here.
+        #
+        # The gated binary only exists on the NixOS appliance. Everywhere else
+        # `which` misses it and we fall back to plain notify-send, which is the
+        # previous behaviour exactly: nothing regresses on a non-NixOS host.
+        # `which` is a PRESENCE check only; argv keeps the bare name so the
+        # boundary reads the same as the ungated call it replaces.
+        gated = shutil.which('hart-notify-send') is not None
+        emitter = 'hart-notify-send' if gated else 'notify-send'
         dbus_sent = False
+        suppressed = False
         try:
             result = subprocess.run(
-                ['notify-send', '-u', urgency, '-i', icon,
+                [emitter, '-u', urgency, '-i', icon,
                  '-t', str(timeout), title, body],
                 capture_output=True, timeout=5, **no_window_kwargs())
             dbus_sent = result.returncode == 0
+            # 77 is the gate's REFUSED convention, shared with
+            # hart-screencast-gate. A refusal is the system working, not a
+            # delivery failure, and must not be reported as either success or
+            # error -- the in-shell queue above still carries the message.
+            suppressed = gated and result.returncode == 77
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
-        return jsonify({
+        body_out = {
             'sent': True,
             'dbus_delivered': dbus_sent,
             'notification': notif,
-        })
+        }
+        if suppressed:
+            body_out['suppressed_by_consent'] = True
+            body_out['reason'] = ("native toast withheld: the human has cut the "
+                                  "AI's 'screen' sense")
+        return jsonify(body_out)
 
     @app.route('/api/shell/notifications/read', methods=['POST'])
     def shell_notification_mark_read():

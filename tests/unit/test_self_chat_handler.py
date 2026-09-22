@@ -82,6 +82,8 @@ def handler(fake_registry):
     ("+1 555 123 4567",                "15551234567"),
     ("15551234567@c.us",                "15551234567"),
     ("15551234567@s.whatsapp.net",      "15551234567"),
+    ("15551234567:25@s.whatsapp.net",   "15551234567"),
+    ("73203573633275:25@lid",            "73203573633275"),
     ("+15551234567",                    "15551234567"),
     ("5551234567",                      "5551234567"),
     ("",                                ""),
@@ -94,6 +96,13 @@ def test_normalize_phone(given, expected):
 
 # ─── is_self_message ─────────────────────────────────────────────
 def test_is_self_message_matches(handler, fake_message):
+    assert handler.is_self_message(fake_message) is True
+
+
+def test_is_self_message_matches_owner_lid(handler, fake_message,
+                                            fake_adapter_with_owner):
+    fake_adapter_with_owner.config.extra['owner_lid'] = '73203573633275:25@lid'
+    fake_message.sender_id = '73203573633275@lid'
     assert handler.is_self_message(fake_message) is True
 
 

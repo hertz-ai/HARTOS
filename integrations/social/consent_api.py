@@ -66,7 +66,7 @@ from flask import Blueprint, g, jsonify, request
 
 from .auth import require_auth
 from .models import UserConsent
-from .consent_service import ConsentService
+from .consent_service import ConsentService, device_fingerprint
 
 logger = logging.getLogger('hevolve_social')
 
@@ -101,8 +101,13 @@ def _row_to_dict(row: UserConsent) -> dict[str, Any]:
     Avoids leaking columns the UI doesn't need (created_at,
     updated_at, agent_id) while staying compatible with
     UserConsent.to_dict() callers elsewhere in the codebase.
+
+    A device_access row is the trusted-phones listing (#111): its scope is
+    the phone's key, unreadable, so it carries the ``label`` the phone
+    signed into its ask (self-asserted) and the key's ``fingerprint``, the
+    thing to match against the phone.
     """
-    return {
+    out = {
         'id': row.id,
         'consent_type': row.consent_type,
         'scope': row.scope,
@@ -110,6 +115,10 @@ def _row_to_dict(row: UserConsent) -> dict[str, Any]:
         'granted_at': row.granted_at.isoformat() if row.granted_at else None,
         'revoked_at': row.revoked_at.isoformat() if row.revoked_at else None,
     }
+    if row.consent_type == 'device_access':
+        out['label'] = row.label
+        out['fingerprint'] = device_fingerprint(row.scope)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -141,6 +150,11 @@ def grant_consent():
         return _err('consent_type exceeds 30 chars')
     if len(scope) > 100:
         return _err('scope exceeds 100 chars')
+    # A phone is allowed by its key, never by a blanket: the gate reads the
+    # key back from the granted row (auth.verify_device_jwt), so a '*' row
+    # admits no phone and would only look like "all phones allowed".
+    if consent_type == 'device_access' and device_fingerprint(scope) is None:
+        return _err('device_access is granted per phone: scope must be device:<key>')
 
     # Delegate the WRITE to the canonical ConsentService so this UI surface gets
     # the SAME immutable-audit entry, `consent.granted` event, consent-type
@@ -311,7 +325,8 @@ def list_consents():
                      revoked_at IS NULL (default: return all rows)
 
     Returns: {consents: [{id, consent_type, scope, granted,
-                          granted_at, revoked_at}, ...]}
+                          granted_at, revoked_at}, ...]}; a device_access
+             row also carries label + fingerprint (#111).
     """
     uid = _user_id()
     if uid is None:

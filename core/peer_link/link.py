@@ -43,6 +43,36 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 logger = logging.getLogger('hevolve.peer_link')
 
 
+def _enforcement_mode() -> str:
+    """This node's enforcement mode, from the ONE resolver that owns it.
+
+    ``security.master_key.get_enforcement_mode`` defaults to 'hard' and says
+    why: hard is the correct default for Sybil resistance, and soft or warn
+    are for local dev.  Both handshake checks below used to read
+    ``os.environ.get('HEVOLVE_ENFORCEMENT_MODE') == 'hard'`` instead, which
+    inverts that default -- with the variable unset the comparison is False,
+    so an unsigned handshake was ACCEPTED on exactly the nodes that had never
+    been configured.  Measured 2026-09-21: unset on the owner's main desktop
+    (process, machine and user scopes all empty) and on the laptop at
+    192.168.0.15, so both were accepting unsigned handshakes while every
+    other caller of get_enforcement_mode() on the same machine read 'hard'.
+
+    Fail-CLOSED on a resolver that cannot be reached: a node that cannot
+    determine its own posture must not assume the weakest one.
+    """
+    try:
+        from security.master_key import get_enforcement_mode
+        return get_enforcement_mode()
+    except Exception as e:
+        logger.warning(
+            "peer_link: enforcement mode unreadable (%s); assuming 'hard'", e)
+        return 'hard'
+
+
+def _enforcement_is_hard() -> bool:
+    return _enforcement_mode() == 'hard'
+
+
 #: Consecutive immediate empty receives before `_receive_loop` calls the link
 #: dead. With a 60s recv timeout, a healthy idle link produces one per minute,
 #: so reaching this many in quick succession means the socket is not blocking at
@@ -105,7 +135,51 @@ class LinkState(Enum):
 
 # Channel IDs for binary frames — single source of truth is CHANNEL_REGISTRY
 # in core.peer_link.channels. Re-exported here for backwards compatibility.
-from core.peer_link.channels import CHANNEL_IDS, CHANNEL_NAMES  # noqa: E402
+from core.peer_link.channels import (  # noqa: E402
+    CHANNEL_IDS, CHANNEL_NAMES, device_may_send)
+
+#: Verifies a phone's device_token from a HELLO (HARTOS #111): callable(token, peer_address)
+#: -> the verdict shape of integrations.social.auth.verify_device_jwt, plus
+#: 'peer_id' (the key's fingerprint) on 'ok'.  Injected by the host at boot
+#: (PeerLinkManager.set_device_verifier, next to the API gate), the way
+#: MessageBus.set_http_transport is: core must not import integrations.  No
+#: verifier means a device HELLO is refused -- fail closed.
+_DEVICE_VERIFIER: Optional[Callable[[str, str], dict]] = None
+
+
+def set_device_verifier(fn: Optional[Callable[[str, str], dict]]) -> None:
+    global _DEVICE_VERIFIER
+    _DEVICE_VERIFIER = fn
+
+
+#: Asks the owner about a peer that proved no identity: callable(peer_id,
+#: address) -> True when the owner has already said yes to this peer, False
+#: when they have not (the ask is filed and the card is in front of them).
+#: Injected beside _DEVICE_VERIFIER and for the same reason -- core must not
+#: import integrations.
+#:
+#: WHY an unsigned handshake asks instead of just refusing.  Enforcement mode
+#: is a flag, and a flag that gates something useful must not decide alone:
+#: before this, an unset flag ACCEPTED the stranger silently, and merely
+#: fixing the default would have REFUSED them just as silently.  Both are the
+#: same defect -- the owner is never shown a decision made on their behalf --
+#: and the owner ruled against it: "do not gulp, the consent shd be shown
+#: when a flag gates a useful logic" (2026-09-21).  The device path 60 lines
+#: below has always worked this way: a phone whose key is not yet granted
+#: files an ask and is refused THIS time, and the owner's Allow admits it on
+#: the next attempt.  Measured 11:22:36 that day -- consent.request emitted
+#: for device_access, two clients targeted, then "Device HELLO refused:
+#: pending".  This is that same shape for the peer that never proved
+#: anything, so one refusal in this function does not gulp while its
+#: neighbour asks.
+#:
+#: No hook installed means refuse -- fail closed, like the device verifier.
+_PEER_ADMISSION_ASK: Optional[Callable[[str, str], bool]] = None
+
+
+def set_peer_admission_ask(fn: Optional[Callable[[str, str], bool]]) -> None:
+    global _PEER_ADMISSION_ASK
+    _PEER_ADMISSION_ASK = fn
 
 # Key rotation interval (seconds)
 KEY_ROTATION_INTERVAL = 3600
@@ -142,6 +216,13 @@ class PeerLink:
     - PEER/RELAY: AES-256-GCM with session key from X25519 ECDH
     """
 
+    # 'node', or 'device' for a person's phone admitted on its HELLO's
+    # device_token (HARTOS #111); user_id is that token's user, '' on a node.
+    # Class-level so every reader of a link, and a mock built on the class,
+    # sees a node unless the handshake said otherwise.
+    kind = 'node'
+    user_id = ''
+
     def __init__(self, peer_id: str, address: str, trust: TrustLevel,
                  x25519_public_hex: str = '', ed25519_public_hex: str = '',
                  capabilities: Optional[dict] = None):
@@ -151,6 +232,13 @@ class PeerLink:
         self.peer_x25519_public = x25519_public_hex
         self.peer_ed25519_public = ed25519_public_hex
         self.capabilities = capabilities or {}
+        # A device is that user's own device (SAME_USER trust for delivery)
+        # and never a node: channels.py's device policy bounds what it sends
+        # and receives, and link_manager keeps it out of node authority, the
+        # budget and eviction.
+        self.kind = 'node'
+        self.user_id = ''
+        self._device_channel_warned: set = set()
 
         # G9: Trust ratchet — once trust is established at a level,
         # it can only be UPGRADED (never downgraded) during this session.
@@ -552,10 +640,14 @@ class PeerLink:
             if not verify_json_signature(peer_ed25519, resp, peer_sig):
                 logger.warning(f"Handshake signature verification failed for {self.peer_id[:8]}")
                 return False
-        elif os.environ.get('HEVOLVE_ENFORCEMENT_MODE') == 'hard':
-            # Hard mode: reject unsigned handshakes
-            logger.warning(f"Unsigned handshake rejected (hard enforcement) for {self.peer_id[:8]}")
-            return False
+        elif _enforcement_is_hard():
+            if not self._owner_admits_unsigned():
+                return False
+        else:
+            logger.warning(
+                f"Accepting an UNSIGNED handshake from {self.peer_id[:8]}: "
+                f"enforcement is '{_enforcement_mode()}', not 'hard'. This "
+                f"peer has proved no identity.")
 
         # Store peer's keys
         self.peer_ed25519_public = peer_ed25519
@@ -584,14 +676,130 @@ class PeerLink:
             if not verify_json_signature(peer_ed25519, hello_data, peer_sig):
                 logger.warning("Incoming handshake signature verification failed")
                 return False
-        elif os.environ.get('HEVOLVE_ENFORCEMENT_MODE') == 'hard':
-            logger.warning("Unsigned incoming handshake rejected (hard enforcement)")
-            return False
+        elif _enforcement_is_hard():
+            if not self._owner_admits_unsigned():
+                return False
+        else:
+            logger.warning(
+                f"Accepting an UNSIGNED incoming handshake from "
+                f"{self.address}: enforcement is '{_enforcement_mode()}', not "
+                f"'hard'. This peer has proved no identity.")
 
         self.peer_ed25519_public = peer_ed25519
         self.peer_x25519_public = hello_data.get('x25519_public', '')
         self.capabilities = hello_data.get('capabilities', {})
 
+        # A phone's HELLO carries its device_token (HARTOS #111): the same
+        # credential its HTTP calls bear, verified by the same verifier the
+        # gate uses.  The signature above bound the HELLO to peer_ed25519;
+        # the verdict's key must be that key, so token and socket are one
+        # identity.  Only 'ok' admits; pending, denied and invalid close the
+        # socket, and the phone learns its state over HTTP, where the ask is
+        # filed and paced.  Trust is SAME_USER -- the owner said this device
+        # is theirs -- with kind 'device' bounding everything else.
+        device_token = hello_data.get('device_token')
+        if device_token:
+            if not self._admit_device(peer_ed25519, peer_sig, str(device_token)):
+                return False
+        elif not self._decide_node_trust(hello_data, peer_ed25519):
+            return False
+
+        # Send ack
+        ack = {
+            'type': 'hello_ack',
+            'ed25519_public': get_public_key_hex(),
+            'x25519_public': get_x25519_public_hex(),
+            'protocol_version': 1,
+            'capabilities': self._get_local_capabilities(),
+            'timestamp': time.time(),
+        }
+        ack['signature'] = sign_json_payload(ack)
+
+        ack_bytes = json.dumps(ack, separators=(',', ':')).encode('utf-8')
+        self._ws_send(ack_bytes)
+
+        # Derive session key for PEER/RELAY trust
+        if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self.peer_x25519_public:
+            self._derive_session_key()
+
+        return True
+
+    def _owner_admits_unsigned(self) -> bool:
+        """Hard enforcement met an unsigned handshake: ask, don't just drop.
+
+        True only when the owner has already said yes to this peer.  False
+        refuses THIS attempt -- which is the whole point, since nothing has
+        been proved -- but by then the ask is filed and the card is in front
+        of them, so an Allow admits the peer on its next try.  That is the
+        device path's behaviour (``_admit_device`` -> 'pending' -> ask ->
+        refuse -> granted -> admitted), and these two refusals sit in the
+        same function; only one of them used to speak.
+
+        Refuses quietly-but-loggedly when no ask hook is installed, which is
+        the fail-closed default and the same rule _DEVICE_VERIFIER follows.
+        An ask that raises refuses too: a broken consent path must not
+        become an admission path.
+        """
+        who = self.peer_id[:8] if self.peer_id else self.address
+        if _PEER_ADMISSION_ASK is None:
+            logger.warning(
+                f"Unsigned handshake from {who} refused (hard enforcement); "
+                f"the owner was NOT asked -- no admission ask installed. "
+                f"This peer has proved no identity.")
+            return False
+        try:
+            if _PEER_ADMISSION_ASK(self.peer_id or '', self.address):
+                logger.warning(
+                    f"Admitting an UNSIGNED peer {who} at {self.address}: the "
+                    f"owner granted it explicitly. It has proved no identity; "
+                    f"the grant is on its network address alone.")
+                return True
+        except Exception as e:
+            logger.warning(
+                f"Unsigned handshake from {who} refused: the admission ask "
+                f"failed ({e}). Refusing is the safe side of a broken ask.")
+            return False
+        logger.info(
+            f"Unsigned handshake from {who} at {self.address} refused (hard "
+            f"enforcement); the owner has been asked and can admit it.")
+        return False
+
+    def _admit_device(self, peer_ed25519: str, peer_sig: str, device_token: str) -> bool:
+        """The verifier's word on a device HELLO (HARTOS #111): 'ok' for the
+        key that signed the HELLO opens a SAME_USER link of kind 'device' for
+        the token's user; anything else, or no verifier, refuses."""
+        if not (peer_ed25519 and peer_sig):
+            logger.warning("Device HELLO without a signed key refused")
+            return False
+        if _DEVICE_VERIFIER is None:
+            logger.warning("Device HELLO refused: no device verifier installed")
+            return False
+        try:
+            verdict = _DEVICE_VERIFIER(device_token, self.address) or {}
+        except Exception as e:
+            logger.warning(f"Device verifier failed; refusing: {e}")
+            return False
+        if verdict.get('status') != 'ok':
+            logger.info(f"Device HELLO refused: {verdict.get('status', 'invalid')}")
+            return False
+        if str(verdict.get('public_key', '')).lower() != str(peer_ed25519).lower():
+            logger.warning("Device HELLO refused: token key is not the socket's key")
+            return False
+        user_id = str((verdict.get('payload') or {}).get('user_id') or '')
+        if not user_id:
+            logger.warning("Device HELLO refused: token names no user")
+            return False
+        self.kind = 'device'
+        self.user_id = user_id
+        if verdict.get('peer_id'):
+            self.peer_id = str(verdict['peer_id'])
+        if not self.set_trust(TrustLevel.SAME_USER):
+            logger.warning("Trust ratchet rejected SAME_USER for a device (should not happen)")
+            return False
+        return True
+
+    def _decide_node_trust(self, hello_data: dict, peer_ed25519: str) -> bool:
+        """A node's HELLO: trust decided locally, then its pre-trust contract."""
         # Determine trust LOCALLY — never accept trust_requested from wire.
         # SAME_USER requires proof: peer must present a user_id_signature
         # signed by the same user key we hold. Without proof → PEER.
@@ -641,25 +849,19 @@ class PeerLink:
             except ImportError:
                 pass  # Module not available — allow legacy connections
 
-        # Send ack
-        ack = {
-            'type': 'hello_ack',
-            'ed25519_public': get_public_key_hex(),
-            'x25519_public': get_x25519_public_hex(),
-            'protocol_version': 1,
-            'capabilities': self._get_local_capabilities(),
-            'timestamp': time.time(),
-        }
-        ack['signature'] = sign_json_payload(ack)
-
-        ack_bytes = json.dumps(ack, separators=(',', ':')).encode('utf-8')
-        self._ws_send(ack_bytes)
-
-        # Derive session key for PEER/RELAY trust
-        if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self.peer_x25519_public:
-            self._derive_session_key()
-
         return True
+
+    def _device_may_send(self, channel: str) -> bool:
+        """Inbound frames from a device link reach a handler only on a
+        channel the registry opens to devices; the first refusal per channel
+        is logged, the rest are dropped quietly."""
+        if self.kind != 'device' or device_may_send(channel):
+            return True
+        if channel not in self._device_channel_warned:
+            self._device_channel_warned.add(channel)
+            logger.warning(f"Device {self.peer_id} sent on '{channel}', "
+                           "which devices may not; dropped")
+        return False
 
     def _derive_session_key(self):
         """Derive AES-256-GCM session key from X25519 ECDH."""
@@ -845,6 +1047,8 @@ class PeerLink:
                         continue
 
                     # Dispatch to handlers
+                    if not self._device_may_send(channel):
+                        continue
                     handlers = self._message_handlers.get(channel, [])
                     for handler in handlers:
                         try:
@@ -860,6 +1064,8 @@ class PeerLink:
                     ch_id = raw[0]
                     channel = CHANNEL_NAMES.get(ch_id, 'unknown')
                     payload = raw[5:]  # skip channel_id + msg_id_hash
+                    if not self._device_may_send(channel):
+                        continue
                     handlers = self._message_handlers.get(channel, [])
                     for handler in handlers:
                         try:

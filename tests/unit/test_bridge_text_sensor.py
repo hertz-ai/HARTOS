@@ -14,7 +14,8 @@ Asserted:
       user holds data_access '*' consent, and nothing when the user does not;
   (3) HEVOLVE_CHAT_LEARNING=0 switches the leg off; a consent machinery
       error fails closed (no ingest);
-  (4) the distillation queue still receives the experience either way.
+  (4) the unverified assistant response never enters distillation, while the
+      consented user utterance remains an independent reality sensor.
 """
 import base64
 import sys
@@ -105,14 +106,15 @@ def test_record_interaction_posts_the_prompt_under_consent(bridge, monkeypatch):
     # the redactor is exercised for real if present; the prompt has no secret
     _consent(monkeypatch, True)
     b.record_interaction('u1', 'p1', 'mama gives baby milk', 'ok')
-    assert len(b._experience_queue) == 1, 'distillation still receives the pair'
+    assert len(b._experience_queue) == 0, 'unverified response must not train'
+    assert b._stats['total_unverified_skipped'] == 1
     assert [p[1]['text'] for p in posts] == ['mama gives baby milk']
     assert posts[0][1]['session_id'].startswith('chat_u1')
 
     posts.clear()
     _consent(monkeypatch, False)
     b.record_interaction('u1', 'p2', 'no consent here', 'ok')
-    assert posts == [] and len(b._experience_queue) == 2
+    assert posts == [] and len(b._experience_queue) == 0
 
 
 def test_flag_off_and_consent_error_both_fail_closed(bridge, monkeypatch):
@@ -125,7 +127,8 @@ def test_flag_off_and_consent_error_both_fail_closed(bridge, monkeypatch):
     _consent(monkeypatch, RuntimeError('db down'))
     b.record_interaction('u1', 'p4', 'consent machinery broken', 'ok')
     assert posts == [], 'a consent error must mean no ingest'
-    assert len(b._experience_queue) == 2
+    assert len(b._experience_queue) == 0
+    assert b._stats['total_unverified_skipped'] == 2
 
 
 # ---------------------------------------------------------------------------

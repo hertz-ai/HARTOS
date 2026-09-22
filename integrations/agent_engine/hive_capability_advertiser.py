@@ -189,6 +189,38 @@ def _local_auth_token() -> str:
     return (os.environ.get('HEVOLVE_HIVE_AUTH_TOKEN') or '').strip()
 
 
+def _origin_attestation():
+    """This node's signed origin attestation, or None when it cannot attest.
+
+    The ONE place that unwraps it.  ``get_attestation_for_federation`` returns
+    ``{'valid': bool, 'attestation': {...}}`` while
+    ``verify_peer_attestation`` takes the INNER dict, and handing it the wrapper
+    fails with "Origin fingerprint mismatch" on a perfectly genuine node — a
+    caller bug that reads exactly like a rejected peer.  Publishing through this
+    helper means the unwrap exists once instead of at every producer.
+
+    None when the node cannot attest (origin verification failed, or the
+    security module is absent): the advert still goes out and the consumer
+    denies it, which is the honest outcome — better a peer that is refused for a
+    stated reason than one trusted on an empty field.
+    """
+    try:
+        from security.origin_attestation import get_attestation_for_federation
+        wrapper = get_attestation_for_federation() or {}
+        att = wrapper.get('attestation')
+        if not att:
+            logger.warning(
+                "HiveCapabilityAdvertiser: no origin attestation to advertise "
+                "(%s) — peers will refuse this node",
+                wrapper.get('reason', 'unknown'))
+            return None
+        return att
+    except Exception as e:
+        logger.warning(
+            "HiveCapabilityAdvertiser: origin attestation unavailable: %s", e)
+        return None
+
+
 class HiveCapabilityAdvertiser:
     """Emits ``peer.capability.announce`` every
     ``_ADVERTISE_INTERVAL_S`` seconds with this node's expert-eligible
@@ -406,11 +438,12 @@ class HiveCapabilityAdvertiser:
             'peer_id': self._peer_id(),
             'endpoint': endpoint,
             'auth_token': _local_auth_token(),
-            # Trust signature: empty for now.  The env-var allowlist on
-            # the consumer side is what gates trust in this rollout.
-            # When ``security.key_delegation.sign_peer_announce`` lands,
-            # this becomes ``sign_peer_announce(payload)``.
-            'trust_signature': '',
+            # The consumer's whole trust decision (hive_expert_discovery.
+            # _verify_peer_trust).  Same key and same producer the federated
+            # delta path already uses, so there is one attestation shape on the
+            # wire, not two.  Replaces 'trust_signature': '' — a field no
+            # reader could ever have accepted.
+            'origin_attestation': _origin_attestation(),
             'models': models,
             'announced_at': time.time(),
         }

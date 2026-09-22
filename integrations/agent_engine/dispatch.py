@@ -148,6 +148,42 @@ def _internal_auth_headers(user_id: str = 'system_daemon',
 _LOCAL_LLM_MAX_CONCURRENT = int(os.environ.get('HEVOLVE_LOCAL_LLM_MAX_CONCURRENT', '1'))
 _local_llm_semaphore = threading.Semaphore(_LOCAL_LLM_MAX_CONCURRENT)
 
+# How long a daemon turn WAITS for that permit before giving up.
+#
+# It was a flat 5 seconds, which turned ordinary contention into refusal: the
+# turn was handed back as 'deferred' and the coordinator paid a claim, a
+# deferral and an undeferral for work that only needed to wait its turn
+# (measured 2026-09-21: 18 such cycles in eight minutes).  The number now
+# comes from what a local model call actually costs on this node rather than
+# from taste -- 24,384 'total time' lines in llama_server_8080.log, the
+# server's own per-task figure:
+#
+#            whole file      last 4,000 calls
+#   p50         2.3 s              5.4 s
+#   p90         5.0 s             10.1 s
+#   p95         6.5 s             13.3 s
+#   p99        11.8 s             48.0 s
+#   longest    80.6 s             80.6 s
+#
+# So 5 s was not a rare miss: 2,475 of the last 4,000 calls (62%) run longer
+# than that, and the waiter gave up on most of them.  30 s covers 98.4% of
+# recent calls -- it is a real timeout, not a cover-everything one, and 66 of
+# those 4,000 would still expire it.  That is deliberate: past half a minute
+# the blocked worker thread costs more than the re-claim does.
+#
+# Read the two columns as a warning, not a trend.  The recent tail is
+# inflated by the runaway reuse loop still live on this node, which is
+# hammering the one slot; sizing this constant off that window alone would
+# bake a defect into a default.  HEVOLVE_LOCAL_LLM_WAIT_S overrides it on a
+# node whose model is slower or faster.
+#
+# Still fail-CLOSED: when the wait really does expire the answer is
+# 'deferred', never "proceed anyway".  Unbounded daemon concurrency is what
+# drove the llama-server watchdog-restart cascade this module was built
+# around, and the scheduler's own fail-open (right at the transport, where a
+# queue must never block a call) would be wrong here.
+_LOCAL_LLM_WAIT_S = float(os.environ.get('HEVOLVE_LOCAL_LLM_WAIT_S', '30'))
+
 
 # ── User-priority gate ──────────────────────────────────────────────────
 # When a human user is chatting, daemon dispatch must yield the LLM.
@@ -287,16 +323,12 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
     # is the sole resolver of the half-open probe); HALF_OPEN falls through and
     # lets one turn run.  Keyed by the same _dispatch_provider_host as the feed;
     # try/except so a check error never blocks a dispatch.
-    try:
-        from core.circuit_breaker import llm_provider_breaker, CircuitState
-        _prov_host = _dispatch_provider_host(model_config)
-        if _prov_host and llm_provider_breaker.state(_prov_host) == CircuitState.OPEN:
-            logger.info(f"Provider {_prov_host} refusing the account (breaker "
-                        f"open), deferring local /chat for "
-                        f"{daemon_id or prompt_id}")
-            return 'deferred', None
-    except Exception:
-        pass  # a breaker-check error must never block a dispatch
+    _prov_host = local_dispatch_provider_breaker_open(model_config)
+    if _prov_host:
+        logger.info(f"Provider {_prov_host} refusing the account (breaker "
+                    f"open), deferring local /chat for "
+                    f"{daemon_id or prompt_id}")
+        return 'deferred', None
 
     # Any error resolving the path still lets the caller fall through to its
     # HTTP tier (bounded-safe).
@@ -317,14 +349,21 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
                     f"deferring local /chat for {daemon_id or prompt_id}")
         return 'deferred', None
 
-    if not _local_llm_semaphore.acquire(timeout=5):
-        logger.info(f"LLM busy ({_LOCAL_LLM_MAX_CONCURRENT} in flight), "
-                    f"deferring local /chat for {daemon_id or prompt_id}")
+    if not _local_llm_semaphore.acquire(timeout=_LOCAL_LLM_WAIT_S):
+        logger.info(f"LLM busy ({_LOCAL_LLM_MAX_CONCURRENT} in flight) for "
+                    f"{_LOCAL_LLM_WAIT_S:.0f}s, deferring local /chat for "
+                    f"{daemon_id or prompt_id}")
         return 'deferred', None
 
-    # Signal to the watchdog that this thread is in a legitimate LLM call.
-    _notify_watchdog_llm_start()
+    # The permit is held from here, so enter the try IMMEDIATELY: everything
+    # below must be inside it, because whatever raises, the finally is the
+    # only place that gives the permit back.  The watchdog notify used to sit
+    # between the acquire and the try, so a raise there leaked the semaphore
+    # permanently -- one permit, so the node's background LLM would have been
+    # wedged for the life of the process.
     try:
+        # Signal to the watchdog that this thread is in a legitimate LLM call.
+        _notify_watchdog_llm_start()
         # A daemon-specific request_id keeps background thinking traces out of
         # user responses via drain_thinking_traces(), and is what
         # dispatch.is_genuine_user_request reads to classify the turn.
@@ -346,6 +385,17 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
             pass
 
     result = result or {}
+    # The Nunba adapter explicitly stamps an agent-addressed request made
+    # during HARTOS warm-up as loading.  That text is an availability notice,
+    # not work performed by the agent.  Returning it as ``ok`` let distributed
+    # workers submit it as a completed ledger result, which in turn emitted a
+    # success notification and polluted verified-learning inputs.  Keep the
+    # existing deferred outcome: every caller already knows it means retry
+    # later without falling through to a weaker, non-agent HTTP path.
+    if result.get('loading') or result.get('source') == 'hartos_loading':
+        logger.info('HARTOS still loading; deferring agent turn for %s',
+                    daemon_id or prompt_id)
+        return 'deferred', None
     return 'ok', (result.get('text') or result.get('response', ''))
 
 
@@ -581,6 +631,63 @@ def _dispatch_provider_host(model_config) -> str:
         return provider_host(str(base_url or ''))
     except Exception:
         return ''
+
+
+def local_dispatch_llm_busy() -> bool:
+    """True when every local LLM slot is taken, so a dispatch right now would
+    only be deferred.
+
+    The fourth of local_chat_dispatch's defer conditions, and the one the
+    distributed worker could not ask: measured live 2026-09-21 on the
+    installed build, 18 claims and 18 deferrals in eight minutes, each
+    claiming a task, blocking the full five seconds of
+    ``_local_llm_semaphore.acquire(timeout=5)``, then deferring, and costing
+    the coordinator a claim, a deferral and an undeferral write.
+
+    Asks core.llama_scheduler, the node's one admission controller for the
+    local model: it already knows the server's real slot count and what holds
+    each slot, and it is where every llama call is admitted regardless of
+    transport.  Reading it rather than a private counter here means the
+    worker and the dispatcher cannot disagree about capacity, and there is no
+    second tally to drift or leak.
+
+    Not re-entrant, which is why this only READS.  A slot is keyed by a
+    unique token, so acquiring one here would consume a second slot for the
+    same logical turn, and on a one-slot node the inner transport acquire
+    would then wait out its whole timeout for a slot this function is
+    holding.
+
+    Racy by nature and deliberately so: a stale False claims and defers
+    exactly as before, a stale True skips one tick.  Fail-OPEN like its three
+    siblings -- any read error answers False, "not busy" -- because a
+    capacity check must be able to skip a tick and never to wedge the worker.
+    """
+    try:
+        from core.llama_scheduler import get_scheduler
+        s = get_scheduler().stats()
+        return int(s.get('in_flight', 0)) >= int(s.get('n_slots', 1))
+    except Exception:
+        return False
+
+
+def local_dispatch_provider_breaker_open(model_config=None) -> str:
+    """The host whose provider breaker is OPEN for this dispatch, else ''.
+
+    The check local_chat_dispatch makes first (#106b b), in one place so the
+    distributed worker can ask it BEFORE claim_next_task: a claim the
+    dispatcher would only defer costs the coordinator ledger three full
+    writes (claim, defer, undefer).  state() is non-consuming: the httpx feed
+    stays the sole resolver of the half-open probe.  A check error is '' --
+    a breaker-check error must never block a dispatch.
+    """
+    try:
+        from core.circuit_breaker import llm_provider_breaker, CircuitState
+        host = _dispatch_provider_host(model_config)
+        if host and llm_provider_breaker.state(host) == CircuitState.OPEN:
+            return host
+    except Exception:
+        pass
+    return ''
 
 
 # Concurrency ceiling for autonomous dispatch — single source both daemons call

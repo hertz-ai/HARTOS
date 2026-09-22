@@ -495,6 +495,27 @@ class GPUWorker:
             return
         self._self_heal_seen_modules.add(pkg)
 
+        # A module this process imports from its OWN tree cannot be
+        # missing from the child for lack of a dependency: the child's
+        # module path is wrong.  pip has nothing to install (measured
+        # 2026-09-20: ``pip install integrations`` rc=1, then an agentic
+        # self-heal goal dispatched for a path defect), so say what is
+        # wrong and stop here.
+        try:
+            from core.venv_paths import parent_package_root_of
+            app_root = parent_package_root_of(pkg)
+        except Exception as e:
+            logger.debug(f"{self.name}: parent-package check skipped: {e}")
+            app_root = None
+        if app_root:
+            logger.error(
+                f"{self.name}: worker interpreter {self.python_exe} cannot "
+                f"import '{pkg}', which this process loads from {app_root}: "
+                f"that is the worker's module path, not a missing "
+                f"dependency; no pip install, no self-heal goal"
+            )
+            return
+
         logger.warning(
             f"{self.name}: subprocess missing Python package '{pkg}' — "
             f"dispatching to error_advice + deterministic self-heal"
@@ -513,15 +534,20 @@ class GPUWorker:
         def _install_async():
             rc = None
             try:
-                # `--target` to user-site keeps it consistent with
-                # tts.package_installer's existing pattern: bundled
-                # python-embed is read-only on Program Files installs,
-                # so user-writable site-packages is required.  We rely
-                # on the user-site already being on sys.path (set by
-                # platform_paths.ensure_user_site_on_path at boot) and
-                # inherited by future worker spawns via PYTHONPATH (see
-                # _spawn).
-                target = self._user_site_packages_dir()
+                # Install where the CHILD reads.  For a python-embed
+                # worker that is the user site (`--target`, the pattern
+                # tts.package_installer uses: bundled python-embed is
+                # read-only under Program Files, and the child reaches
+                # the user site through python-embed's sitecustomize).
+                # A per-backend venv never sees the user site (isolated
+                # interpreter, measured 2026-09-20), so a --target there
+                # would land a package the worker can never import; its
+                # own site-packages is user-writable, so pip's default
+                # destination under the venv's python is the right one.
+                if self._child_is_backend_venv():
+                    target = None
+                else:
+                    target = self._user_site_packages_dir()
                 pip_args = [
                     self.python_exe, '-m', 'pip', 'install',
                     '--no-build-isolation', '--progress-bar', 'off',
@@ -529,9 +555,11 @@ class GPUWorker:
                 ]
                 if target:
                     pip_args.extend(['--target', target])
-                pip_args.append(pkg)
+                dist = self._pip_name_for(pkg)
+                pip_args.append(dist)
                 logger.info(
-                    f"{self.name}: deterministic pip install: {pkg} → "
+                    f"{self.name}: deterministic pip install: {dist}"
+                    f"{'' if dist == pkg else f' (import {pkg})'} → "
                     f"{target or '<default site>'}"
                 )
                 rc = subprocess.run(
@@ -607,6 +635,41 @@ class GPUWorker:
             target=_install_async, daemon=True,
             name=f"self-heal-{self.name}-{pkg}",
         ).start()
+
+    @staticmethod
+    def _pip_name_for(import_name: str) -> str:
+        """The distribution to pip-install for a missing import: Nunba's
+        one alias table (``tts.package_installer._PIP_TO_IMPORT``, read
+        backwards by ``pip_name_for_import``) when present, else the
+        import name itself, which pip reads with '-' and '_' alike.
+        Measured 2026-09-20: `import coqpit` failed, the heal installed
+        the PyPI package `coqpit`, and coqui-tts, which needs the fork
+        `coqpit-config`, then refused to import at all."""
+        try:
+            from tts.package_installer import pip_name_for_import  # type: ignore
+            return pip_name_for_import(import_name)
+        except Exception as e:
+            logger.debug(
+                f"pip name for '{import_name}' fell back to the import "
+                f"name: {e}"
+            )
+            return import_name
+
+    def _child_is_backend_venv(self) -> bool:
+        """True when this worker's interpreter is the per-backend venv
+        for ``self.name`` (``core.venv_paths``), which does not read the
+        user site-packages that python-embed workers share with the
+        parent."""
+        try:
+            from core.venv_paths import venv_python_if_exists
+            venv_py = venv_python_if_exists(self.name)
+        except Exception as e:
+            logger.debug(f"{self.name}: backend venv lookup skipped: {e}")
+            return False
+        if not venv_py or not self.python_exe:
+            return False
+        return (os.path.normcase(os.path.abspath(venv_py))
+                == os.path.normcase(os.path.abspath(self.python_exe)))
 
     def _user_site_packages_dir(self) -> Optional[str]:
         """Return the user-writable site-packages dir for runtime
@@ -927,9 +990,22 @@ def _resolve_backend_venv_python(tool_name: Optional[str]) -> Optional[str]:
     The single source of truth lives in ``core.venv_paths`` and is
     shared with ``tts.backend_venv`` so install + spawn paths can
     never drift apart.
+
+    When a venv exists, its ``nunba_parent_packages.pth`` is brought up
+    to date first (``core.venv_paths.ensure_parent_packages_visible``).
+    A venv made from python-embed runs isolated and ignores the
+    PYTHONPATH that ``_spawn`` sets (measured 2026-09-20), so that file
+    is the only way the worker can import the dispatcher it is started
+    with.  Venvs created before the file existed (chatterbox_turbo,
+    2026-05-03) are repaired here on their next spawn.
     """
-    from core.venv_paths import venv_python_if_exists
-    return venv_python_if_exists(tool_name)
+    from core.venv_paths import (
+        ensure_parent_packages_visible, venv_python_if_exists,
+    )
+    python_exe = venv_python_if_exists(tool_name)
+    if python_exe:
+        ensure_parent_packages_visible(tool_name)
+    return python_exe
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1360,10 +1436,11 @@ class ToolWorker:
         try_free_vram(needed_gb=model_gb, exclude_tool=self.tool_name)
 
     def _get_output_dir(self) -> Path:
-        d = Path(os.environ.get(
-            'HEVOLVE_MODEL_DIR',
-            os.path.expanduser('~/.hevolve/models'),
-        )) / self.output_subdir
+        # HEVOLVE_MODEL_DIR is resolved by model_storage.get_base_dir(),
+        # the single authority for the model-storage root, so a worker's
+        # output/ and its weights can never land on different drives.
+        from integrations.service_tools.model_storage import get_base_dir
+        d = get_base_dir() / self.output_subdir
         d.mkdir(parents=True, exist_ok=True)
         return d
 
