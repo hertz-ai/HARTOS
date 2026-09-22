@@ -29,6 +29,15 @@ proven in ``tests/unit/test_get_optimal_params_asks_the_one_fit_rule.py``;
 the rule itself in ``test_gguf_fit_is_one_rule.py``.  What only this file
 can catch is the NEXT private copy, in a file nothing tests yet.
 
+SCOPE -- read before trusting it further than it goes.  This is one
+fit-COMPARISON authority, not one PLACEMENT authority.  A spawn that
+hard-codes ``--n-gpu-layers 99`` answers "how much goes on the GPU" without
+comparing anything, so it is outside this guard by construction.  The census
+of placement sites (cross-review, 2026-09-22) found five: the four main-LLM
+spawns all carry MoE placement, and the fifth -- lightweight_backend's
+0.8B caption server -- is a literal 99 with no fit check and no MoE args,
+which is intended for a small dense model and is NOT policed here.
+
 Modelled on ``test_source_guard_one_ctx_size_authority.py``: one cached scan
 per repo, the Nunba half reported as skipped-with-a-reason when absent, and
 the instrument proven against the positive case before it is trusted
