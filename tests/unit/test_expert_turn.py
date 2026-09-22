@@ -17,6 +17,7 @@ does.
 """
 import os
 import sys
+import tempfile
 import types
 from unittest.mock import patch
 
@@ -26,17 +27,27 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
+# The expert turn consults the owner's copilot switch, a marker in Claude's
+# config dir; since 66386a45e an ON env pin no longer overrides a present
+# marker.  Redirect the config dir before the daemon (and through it the
+# backend) is imported, as test_copilot_switch_stops_spawn does, so the
+# switch is this file's precondition and not the developer's own setting.
+os.environ['CLAUDE_CONFIG_DIR'] = tempfile.mkdtemp(prefix='expert_turn_')
+
+import integrations.coding_agent.claude_code_backend as cc  # noqa: E402
 from integrations.agent_engine import agent_daemon as daemon  # noqa: E402
 from integrations.agent_engine.model_registry import ModelBackend, ModelTier  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _copilot_on(monkeypatch):
-    """The expert turn consults the owner's copilot switch first, a marker in
-    the real ~/.claude: pin it on so these tests exercise the turn itself
-    and not the developer's own setting.  Off has its own tests in
+    """The expert turn consults the owner's copilot switch first: the marker
+    in CLAUDE_CONFIG_DIR (redirected above).  The env pin can no longer turn
+    it on, so it is cleared and the switch is set directly, and these tests
+    exercise the turn itself.  Off has its own tests in
     test_copilot_consent_gate."""
-    monkeypatch.setenv('HARTOS_COPILOT_ENABLED', '1')
+    monkeypatch.delenv('HARTOS_COPILOT_ENABLED', raising=False)
+    cc.set_copilot_enabled(True)
 
 _GM = 'integrations.agent_engine.goal_manager.GoalManager.escalate_goal'
 _GET = 'integrations.agent_engine.model_registry.model_registry.get_model'

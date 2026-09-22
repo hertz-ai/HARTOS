@@ -8,20 +8,32 @@ Covers the two no-parallel-path guarantees and the resilience contract:
 All `claude -p` calls are stubbed — no subprocess, no network.
 """
 import json
+import os
+import tempfile
 from unittest.mock import patch
 
-import pytest
+# The owner's off-switch is a marker in Claude's config dir, and since
+# 66386a45e an ON env pin no longer overrides a present marker.  Point the
+# config dir at an empty temp dir BEFORE the backend is imported, as
+# test_copilot_switch_stops_spawn does, so the switch is this file's
+# precondition and not the developer's own setting (on the owner's desktop
+# the marker exists -- revoked 2026-09-16 -- and 3 of these 9 read 'off' as
+# a defect in the tool gating).
+os.environ['CLAUDE_CONFIG_DIR'] = tempfile.mkdtemp(prefix='claude_code_frontier_')
 
-import integrations.coding_agent.claude_code_backend as be
+import pytest  # noqa: E402
+
+import integrations.coding_agent.claude_code_backend as be  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _copilot_on(monkeypatch):
-    """invoke_claude refuses when the owner's switch is off, and the switch is
-    a marker in the real ~/.claude: pin it on so these spawn-stubbed tests do
-    not depend on the developer's own setting.  The off behaviour has its own
-    file, test_copilot_switch_stops_spawn."""
-    monkeypatch.setenv('HARTOS_COPILOT_ENABLED', '1')
+    """invoke_claude refuses when the owner's switch is off.  The switch is
+    the marker in CLAUDE_CONFIG_DIR (redirected above); the env pin can no
+    longer turn it on, so it is cleared and the switch is set directly.  The
+    off behaviour has its own file, test_copilot_switch_stops_spawn."""
+    monkeypatch.delenv('HARTOS_COPILOT_ENABLED', raising=False)
+    be.set_copilot_enabled(True)
 
 
 # ─── the shared invocation primitive ─────────────────────────────────────────
