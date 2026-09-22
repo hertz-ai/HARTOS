@@ -522,6 +522,16 @@ def _generate_audio_music(context: str, input_text: str,
         payload = {
             'prompt': prompt,
             'duration': duration or 30,
+            # WAV, not AceStep's default of mp3.  MEASURED 2026-09-22: the
+            # composition SUCCEEDS ("Done! Generated 2 audio tensors",
+            # normalised to peak 0.89) and then the save fails with
+            # "ffmpeg executable not found -- MP3 export failed without
+            # fallback", so the finished music is discarded at the last
+            # step.  ffmpeg is not on PATH on this box and is not one of
+            # the tool's declared dependencies; wav needs no encoder at
+            # all.  A game can play wav, and the memo stores a path, so
+            # nothing downstream cares which of the two it is.
+            'audio_format': 'wav',
         }
         if style:
             payload['genre'] = style
@@ -972,6 +982,15 @@ def check_media_status(
                 'status': status,
                 'progress': progress,
             }
+            # An ARTIFACT is the completion signal, whatever the status
+            # vocabulary says.  MEASURED 2026-09-22: AceStep answered
+            # status=1 -- a numeric code, not one of the words this list
+            # knows -- so a finished job read as unfinished and a caller
+            # polled it forever.  I did not guess what 1 means; a result
+            # url is unambiguous in a way a status enum I cannot find the
+            # definition of is not.
+            if result_url:
+                status = 'completed'
             if status in ('completed', 'complete', 'done', 'finished',
                           'success') and result_url:
                 media_type = 'video' if tool_prefix in ('wan2gp', 'ltx2') else 'audio'

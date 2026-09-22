@@ -298,3 +298,20 @@ def test_a_data_field_that_is_not_an_envelope_is_left_alone():
     assert _unwrap_envelope(payload) == payload
     assert _unwrap_envelope({'data': 'a string'}) == {'data': 'a string'}
     assert _unwrap_envelope(None) == {}
+
+
+def test_a_result_url_means_done_whatever_the_status_says():
+    """MEASURED 2026-09-22: AceStep answered status=1, a numeric code.
+
+    The completed-status list knows words. A numeric status meant a
+    finished job read as unfinished and the caller polled it forever. An
+    artifact is unambiguous where a status vocabulary is not.
+    """
+    from integrations.service_tools.media_agent import _unwrap_envelope
+
+    # the shape the live server returned, with an artifact present
+    live = {'data': [{'task_id': 'abc', 'status': 1,
+                      'audio_url': 'F:/out/chime.wav'}], 'code': 200}
+    inner = _unwrap_envelope(live)
+    assert inner.get('status') == 1, 'the numeric status is what arrives'
+    assert inner.get('audio_url'), 'and the artifact is there alongside it'
