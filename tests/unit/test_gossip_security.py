@@ -148,6 +148,70 @@ class TestSybilProtection:
 
         assert result is False
 
+    # The cap counts NEW identities per host.  Measured on central 2026-09-22:
+    # it counted a node's own row against it, so once a host held five rows
+    # none of them could ever announce again (36,777 rejections in 40 min,
+    # 1,246 distinct ids, this office's desktop refused since 09-19 with its
+    # five known rows named in the log), and dead rows kept the host full
+    # forever.
+
+    def test_known_node_is_not_counted_against_its_own_host(self):
+        """A node we already hold re-announcing from a full host is an
+        UPDATE, not a sixth identity: the cap does not apply to it."""
+        from integrations.social.models import PeerNode
+        gossip = _make_gossip()
+        db = _mock_db_sybil_full(5)
+        row = PeerNode(node_id='known-on-full-host', url='http://10.0.0.5:6777',
+                       status='active', integrity_status='unverified')
+        db.query.return_value.filter.return_value.first.return_value = row
+        reasons = []
+        with patch('security.master_key.get_enforcement_mode', side_effect=ImportError):
+            with patch('security.hive_guardrails.get_guardrail_hash', side_effect=ImportError):
+                result = gossip._merge_peer(db, {
+                    'node_id': 'known-on-full-host',
+                    'url': 'http://10.0.0.5:6778',
+                }, reasons=reasons)
+        assert result is False, 'a known row is an update, never a new peer'
+        assert not any('sybil' in r.lower() for r in reasons), reasons
+        assert row.url == 'http://10.0.0.5:6778', 'the update branch was never reached'
+
+    def test_dead_rows_do_not_hold_a_slot(self):
+        """The cap bounds LIVE identities: the count excludes dead rows."""
+        gossip = _make_gossip()
+        db = _mock_db_sybil_full(5)
+        gossip._merge_peer(db, {
+            'node_id': 'sybil-node-002',
+            'url': 'http://10.0.0.5:6777',
+        })
+        criteria = ' '.join(
+            str(c) for call in db.query.return_value.filter.call_args_list
+            for c in call.args)
+        assert 'peer_nodes.status !=' in criteria, criteria
+
+    def test_refused_relayed_hint_is_not_a_warning(self, caplog):
+        """Hundreds of relayed rows are refused per exchange; only a refused
+        DIRECT announce (a node turned away) earns a WARNING line."""
+        import logging
+        gossip = _make_gossip()
+        db = _mock_db_sybil_full(5)
+        with caplog.at_level(logging.DEBUG):
+            gossip._merge_peer(db, {
+                'node_id': 'relayed-on-full-host',
+                'url': 'http://10.0.0.5:6777',
+            }, relayed=True)
+        assert not [r for r in caplog.records
+                    if r.levelno >= logging.WARNING and 'Sybil limit' in r.getMessage()], \
+            'a refused relayed hint logged at WARNING'
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            gossip._merge_peer(db, {
+                'node_id': 'direct-on-full-host',
+                'url': 'http://10.0.0.5:6777',
+            })
+        assert [r for r in caplog.records
+                if r.levelno >= logging.WARNING and 'Sybil limit' in r.getMessage()], \
+            'a refused direct announce must still warn'
+
 
 # ═══════════════════════════════════════════════════════════════
 # 2. Tampered Payload Tests

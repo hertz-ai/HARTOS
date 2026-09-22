@@ -1662,7 +1662,17 @@ class GossipProtocol:
         if _bad_url:
             return _reject('unroutable peer url (%s)' % _bad_why)
 
-        # Sybil protection: max 5 nodes per IP/hostname.
+        # A node we already hold is not a NEW identity for its host, so the
+        # per-host cap below does not apply to it.  Looked up here, before the
+        # cap, because counting a node's own row against it meant that once a
+        # host had max_per_ip rows none of them could ever announce again:
+        # their own row was among the count.  Measured on central 2026-09-22:
+        # 36,777 "Sybil limit" rejections in 40 minutes, 1,246 distinct node
+        # ids, and this office's desktop refused since 09-19 with exactly its
+        # five known rows named in the log.
+        existing = db.query(PeerNode).filter(PeerNode.node_id == node_id).first()
+
+        # Sybil protection: max 5 LIVE nodes per IP/hostname.
         # Loopback addresses are exempt - single-user dev installs
         # naturally accumulate many node_ids on localhost (one per
         # reboot / data-dir reset / clean-install), and rejecting
@@ -1675,15 +1685,25 @@ class GossipProtocol:
             _is_loopback = host in (
                 'localhost', '127.0.0.1', '::1', '0.0.0.0',
             ) or host.startswith('127.')
-            if host and not _is_loopback:
-                from .models import PeerNode
+            if host and not _is_loopback and existing is None:
                 same_host_count = db.query(PeerNode).filter(
                     PeerNode.url.contains(host),
                     PeerNode.integrity_status != 'banned',
+                    # Dead rows hold no slot: the cap bounds LIVE identities,
+                    # or a host that reinstalled five times (one node_id per
+                    # data-dir reset, normal for a dev install) is locked out
+                    # forever, long after every old identity has aged out.
+                    PeerNode.status != 'dead',
                 ).count()
                 max_per_ip = int(os.environ.get('HEVOLVE_MAX_PEERS_PER_IP', '5'))
                 if same_host_count >= max_per_ip:
-                    logger.warning(f"Sybil limit: {same_host_count} nodes from {host}, rejecting {node_id[:8]}")
+                    # A refused relayed hint is routine (a peer list carries
+                    # every row its sender holds, hundreds per exchange); a
+                    # refused DIRECT announce is a node turned away, worth a
+                    # line.  At WARNING for both, central wrote ~15 of these a
+                    # second.
+                    _log = logger.debug if relayed else logger.warning
+                    _log(f"Sybil limit: {same_host_count} nodes from {host}, rejecting {node_id[:8]}")
                     return _reject(
                         f'sybil limit: {same_host_count} nodes already '
                         f'registered from {host}, max {max_per_ip}')
@@ -1691,7 +1711,6 @@ class GossipProtocol:
             pass  # URL parsing failed — proceed with other checks
 
         # Reject banned nodes
-        existing = db.query(PeerNode).filter(PeerNode.node_id == node_id).first()
         if existing and existing.integrity_status == 'banned':
             logger.debug(f"Rejecting banned node: {node_id[:8]}")
             return _reject('node is banned')
