@@ -284,6 +284,14 @@ def _select_video_tool() -> str:
     return 'ltx2'
 
 
+#: AceStep answers with an INTEGER status, not a word
+#: (acestep/api/server_utils.py:10 STATUS_MAP, and map_status() maps anything
+#: unrecognised to 2 == failed). Without this translation a finished
+#: composition came back as `1`, matched none of the completed words, and read
+#: as unfinished -- a second way for a real outcome to be unreadable.
+_ACESTEP_STATUS_CODE = {0: 'processing', 1: 'succeeded', 2: 'failed'}
+
+
 def _unwrap_envelope(payload, task_id: str = '') -> dict:
     """The answer itself, whether or not the sidecar wrapped it.
 
@@ -971,6 +979,8 @@ def check_media_status(
                 })
             # Normalize response
             status = data.get('status', 'unknown')
+            if tool_prefix == 'acestep' and isinstance(status, int):
+                status = _ACESTEP_STATUS_CODE.get(status, 'failed')
             result_url = (data.get('video_url') or data.get('audio_url')
                           or data.get('url') or data.get('output_url')
                           or data.get('audio_path') or data.get('file_path')
@@ -991,10 +1001,25 @@ def check_media_status(
             # definition of is not.
             if result_url:
                 status = 'completed'
-            if status in ('completed', 'complete', 'done', 'finished',
-                          'success') and result_url:
+            _done_words = ('completed', 'complete', 'done', 'finished',
+                           'success', 'succeeded')
+            if status in _done_words and result_url:
                 media_type = 'video' if tool_prefix in ('wan2gp', 'ltx2') else 'audio'
                 out['results'] = [{'type': media_type, 'url': result_url}]
+                out['status'] = 'completed'
+            elif status in _done_words:
+                # Succeeded with NOTHING SAVED. This really happens: AceStep
+                # generated two audio tensors and then "MP3 export failed
+                # without fallback: ffmpeg executable not found" threw them
+                # away, while still reporting success. Reporting 'completed'
+                # here would tell the caller it has music it was never given
+                # -- the same "cannot tell done from nothing" this whole fix
+                # is about.
+                out['status'] = 'error'
+                out['error'] = (
+                    f'{tool_prefix} reported success but saved no artifact '
+                    f'(a missing encoder does this: mp3/opus/aac need ffmpeg '
+                    f'on PATH; wav and flac do not)')
             return json.dumps(out)
 
         return json.dumps({'status': 'error',
