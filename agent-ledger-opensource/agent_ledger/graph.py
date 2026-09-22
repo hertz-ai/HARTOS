@@ -15,7 +15,8 @@ Features:
 from typing import Dict, List, Set, Optional, Tuple, Any
 from collections import deque, defaultdict
 
-from .core import Task, TaskStatus, ExecutionMode, SmartLedger
+from .core import (Task, TaskStatus, ExecutionMode, SmartLedger,
+                   transition_refusal_between)
 
 
 class TaskGraph:
@@ -244,48 +245,15 @@ class TaskStateMachine:
     provides hooks for state change callbacks.
     """
 
+    # DERIVED from core.transition_refusal_between -- the one table.  This
+    # used to be a hand-copied second table; it drifted by three moves
+    # (in_progress->deferred, failed->completed, failed->terminated) and
+    # said 'refused' for transitions the ledger performs (measured
+    # 2026-09-23).  Kept as a public attribute for existing readers.
     TRANSITIONS = {
-        TaskStatus.PENDING: [
-            TaskStatus.IN_PROGRESS, TaskStatus.PAUSED, TaskStatus.CANCELLED,
-            TaskStatus.SKIPPED, TaskStatus.NOT_APPLICABLE, TaskStatus.DEFERRED,
-            TaskStatus.DELEGATED,
-        ],
-        TaskStatus.DEFERRED: [
-            TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED,
-            TaskStatus.SKIPPED, TaskStatus.NOT_APPLICABLE,
-        ],
-        TaskStatus.IN_PROGRESS: [
-            TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.PAUSED,
-            TaskStatus.USER_STOPPED, TaskStatus.BLOCKED, TaskStatus.TERMINATED,
-            TaskStatus.NOT_APPLICABLE, TaskStatus.DELEGATED,
-        ],
-        TaskStatus.DELEGATED: [
-            TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.IN_PROGRESS,
-            TaskStatus.CANCELLED, TaskStatus.BLOCKED,
-        ],
-        TaskStatus.PAUSED: [
-            TaskStatus.RESUMING, TaskStatus.CANCELLED, TaskStatus.TERMINATED,
-            TaskStatus.NOT_APPLICABLE, TaskStatus.SKIPPED, TaskStatus.DEFERRED,
-        ],
-        TaskStatus.USER_STOPPED: [
-            TaskStatus.RESUMING, TaskStatus.CANCELLED, TaskStatus.TERMINATED,
-            TaskStatus.NOT_APPLICABLE, TaskStatus.SKIPPED, TaskStatus.DEFERRED,
-        ],
-        TaskStatus.BLOCKED: [
-            TaskStatus.PENDING, TaskStatus.RESUMING, TaskStatus.FAILED,
-            TaskStatus.CANCELLED, TaskStatus.NOT_APPLICABLE, TaskStatus.DEFERRED,
-        ],
-        TaskStatus.RESUMING: [
-            TaskStatus.IN_PROGRESS, TaskStatus.PAUSED, TaskStatus.FAILED,
-        ],
-        # Terminal states — no transitions out (except COMPLETED → ROLLED_BACK)
-        TaskStatus.COMPLETED: [TaskStatus.ROLLED_BACK],
-        TaskStatus.FAILED: [],
-        TaskStatus.CANCELLED: [],
-        TaskStatus.TERMINATED: [],
-        TaskStatus.SKIPPED: [],
-        TaskStatus.NOT_APPLICABLE: [],
-        TaskStatus.ROLLED_BACK: [],
+        _from: [_to for _to in TaskStatus
+                if _to != _from and transition_refusal_between(_from, _to) is None]
+        for _from in TaskStatus
     }
 
     @classmethod
@@ -293,8 +261,8 @@ class TaskStateMachine:
         """
         Check if a status transition is valid.
 
-        Delegates to Task._validate_transition() logic via the TRANSITIONS dict
-        which covers all 15 TaskStatus states.
+        Asks core.transition_refusal_between, the one table every reader
+        uses (Task.transition_refusal included).
 
         Args:
             from_status: Current status
@@ -306,7 +274,7 @@ class TaskStateMachine:
         if from_status == to_status:
             return True
 
-        return to_status in cls.TRANSITIONS.get(from_status, [])
+        return transition_refusal_between(from_status, to_status) is None
 
     @classmethod
     def get_allowed_transitions(cls, current_status: TaskStatus) -> List[TaskStatus]:

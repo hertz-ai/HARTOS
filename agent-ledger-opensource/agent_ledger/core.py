@@ -195,6 +195,83 @@ class ExecutionMode(str, Enum):
     SEQUENTIAL = "sequential"  # Must wait for prerequisites
 
 
+def transition_refusal_between(from_status: 'TaskStatus',
+                               new_status: 'TaskStatus') -> Optional[str]:
+    """THE transition table: why from_status -> new_status is refused, or
+    None when it is allowed.
+
+    The one decision for every reader.  Task.transition_refusal asks it for
+    the task's own status; graph.TaskStateMachine derives its TRANSITIONS
+    from it.  graph used to carry a hand-copied second table that had
+    drifted by three moves (in_progress->deferred and the FAILED recovery
+    moves; measured 2026-09-23), so it said 'refused' for moves the ledger
+    performs.
+    """
+    # Special case: COMPLETED can transition to ROLLED_BACK
+    if from_status == TaskStatus.COMPLETED and new_status == TaskStatus.ROLLED_BACK:
+        return None
+
+    # Special case: FAILED -> COMPLETED/TERMINATED is a legitimate RECOVERY.
+    # The agent retry/fallback FSM (ActionState in lifecycle_hooks) can drive a
+    # task that was transiently marked FAILED — e.g. reaped by zombie_reaper
+    # while merely stalled in recipe_requested — to genuine success. When that
+    # happens the ledger's FAILED is stale and must follow, otherwise the
+    # recovered work reads as failed forever and the goal-completion count
+    # never moves. Only FORWARD recovery to a SUCCESS terminal is permitted;
+    # FAILED never goes back into active work (IN_PROGRESS/RESUMING), so the
+    # #59 fast-fail circuit breaker still prevents retry storms.
+    if from_status == TaskStatus.FAILED and new_status in (
+            TaskStatus.COMPLETED, TaskStatus.TERMINATED):
+        return None
+
+    if TaskStatus.is_terminal_state(from_status):
+        return (f"Cannot transition from terminal state {from_status} "
+                f"to {new_status}")
+
+    valid_transitions = {
+        TaskStatus.PENDING: {
+            TaskStatus.IN_PROGRESS, TaskStatus.PAUSED, TaskStatus.CANCELLED,
+            TaskStatus.SKIPPED, TaskStatus.NOT_APPLICABLE, TaskStatus.DEFERRED,
+            TaskStatus.DELEGATED
+        },
+        TaskStatus.DEFERRED: {
+            TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED,
+            TaskStatus.SKIPPED, TaskStatus.NOT_APPLICABLE
+        },
+        TaskStatus.IN_PROGRESS: {
+            TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.PAUSED,
+            TaskStatus.USER_STOPPED, TaskStatus.BLOCKED, TaskStatus.TERMINATED,
+            TaskStatus.NOT_APPLICABLE, TaskStatus.DELEGATED,
+            TaskStatus.DEFERRED
+        },
+        TaskStatus.DELEGATED: {
+            TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.IN_PROGRESS,
+            TaskStatus.CANCELLED, TaskStatus.BLOCKED
+        },
+        TaskStatus.PAUSED: {
+            TaskStatus.RESUMING, TaskStatus.CANCELLED, TaskStatus.TERMINATED,
+            TaskStatus.NOT_APPLICABLE, TaskStatus.SKIPPED, TaskStatus.DEFERRED
+        },
+        TaskStatus.USER_STOPPED: {
+            TaskStatus.RESUMING, TaskStatus.CANCELLED, TaskStatus.TERMINATED,
+            TaskStatus.NOT_APPLICABLE, TaskStatus.SKIPPED, TaskStatus.DEFERRED
+        },
+        TaskStatus.BLOCKED: {
+            TaskStatus.PENDING, TaskStatus.RESUMING, TaskStatus.FAILED,
+            TaskStatus.CANCELLED, TaskStatus.NOT_APPLICABLE, TaskStatus.DEFERRED
+        },
+        TaskStatus.RESUMING: {
+            TaskStatus.IN_PROGRESS, TaskStatus.PAUSED, TaskStatus.FAILED
+        }
+    }
+
+    allowed_states = valid_transitions.get(from_status, set())
+    if new_status not in allowed_states:
+        return f"Invalid transition from {from_status} to {new_status}"
+
+    return None
+
+
 class Task:
     """Individual task representation with full lifecycle management."""
 
@@ -606,76 +683,15 @@ class Task:
     def transition_refusal(self, new_status: TaskStatus) -> Optional[str]:
         """Why this transition is refused, or None when it is allowed.
 
-        The DECISION lives here and only here; `_validate_transition`
+        The DECISION lives in `transition_refusal_between` (the one table,
+        which graph.TaskStateMachine also reads); `_validate_transition`
         adds the log.  Split because a caller may legitimately want to
         ASK whether a move is possible without the refusal appearing in
         the log as though something had tried and failed -- `add_subtasks`
         does exactly that, and using the logging form as its predicate
         put back the ~30/min warning that guard exists to remove.
         """
-        # Special case: COMPLETED can transition to ROLLED_BACK
-        if self.status == TaskStatus.COMPLETED and new_status == TaskStatus.ROLLED_BACK:
-            return None
-
-        # Special case: FAILED -> COMPLETED/TERMINATED is a legitimate RECOVERY.
-        # The agent retry/fallback FSM (ActionState in lifecycle_hooks) can drive a
-        # task that was transiently marked FAILED — e.g. reaped by zombie_reaper
-        # while merely stalled in recipe_requested — to genuine success. When that
-        # happens the ledger's FAILED is stale and must follow, otherwise the
-        # recovered work reads as failed forever and the goal-completion count
-        # never moves. Only FORWARD recovery to a SUCCESS terminal is permitted;
-        # FAILED never goes back into active work (IN_PROGRESS/RESUMING), so the
-        # #59 fast-fail circuit breaker still prevents retry storms.
-        if self.status == TaskStatus.FAILED and new_status in (
-                TaskStatus.COMPLETED, TaskStatus.TERMINATED):
-            return None
-
-        if TaskStatus.is_terminal_state(self.status):
-            return (f"Cannot transition from terminal state {self.status} "
-                    f"to {new_status}")
-
-        valid_transitions = {
-            TaskStatus.PENDING: {
-                TaskStatus.IN_PROGRESS, TaskStatus.PAUSED, TaskStatus.CANCELLED,
-                TaskStatus.SKIPPED, TaskStatus.NOT_APPLICABLE, TaskStatus.DEFERRED,
-                TaskStatus.DELEGATED
-            },
-            TaskStatus.DEFERRED: {
-                TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED,
-                TaskStatus.SKIPPED, TaskStatus.NOT_APPLICABLE
-            },
-            TaskStatus.IN_PROGRESS: {
-                TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.PAUSED,
-                TaskStatus.USER_STOPPED, TaskStatus.BLOCKED, TaskStatus.TERMINATED,
-                TaskStatus.NOT_APPLICABLE, TaskStatus.DELEGATED,
-                TaskStatus.DEFERRED
-            },
-            TaskStatus.DELEGATED: {
-                TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.IN_PROGRESS,
-                TaskStatus.CANCELLED, TaskStatus.BLOCKED
-            },
-            TaskStatus.PAUSED: {
-                TaskStatus.RESUMING, TaskStatus.CANCELLED, TaskStatus.TERMINATED,
-                TaskStatus.NOT_APPLICABLE, TaskStatus.SKIPPED, TaskStatus.DEFERRED
-            },
-            TaskStatus.USER_STOPPED: {
-                TaskStatus.RESUMING, TaskStatus.CANCELLED, TaskStatus.TERMINATED,
-                TaskStatus.NOT_APPLICABLE, TaskStatus.SKIPPED, TaskStatus.DEFERRED
-            },
-            TaskStatus.BLOCKED: {
-                TaskStatus.PENDING, TaskStatus.RESUMING, TaskStatus.FAILED,
-                TaskStatus.CANCELLED, TaskStatus.NOT_APPLICABLE, TaskStatus.DEFERRED
-            },
-            TaskStatus.RESUMING: {
-                TaskStatus.IN_PROGRESS, TaskStatus.PAUSED, TaskStatus.FAILED
-            }
-        }
-
-        allowed_states = valid_transitions.get(self.status, set())
-        if new_status not in allowed_states:
-            return f"Invalid transition from {self.status} to {new_status}"
-
-        return None
+        return transition_refusal_between(self.status, new_status)
 
     def _validate_transition(self, new_status: TaskStatus) -> bool:
         """Whether the transition is allowed, logging the refusal.
