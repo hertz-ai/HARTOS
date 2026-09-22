@@ -307,6 +307,16 @@ def _select_video_tool() -> str:
 #: as unfinished -- a second way for a real outcome to be unreadable.
 _ACESTEP_STATUS_CODE = {0: 'processing', 1: 'succeeded', 2: 'failed'}
 
+#: Every status check_media_status reports for a job that FAILED and will not
+#: recover -- the one definition every poller tests against. check_media_status
+#: turns an AceStep failure, a "succeeded but saved nothing" and an unknown task
+#: into the house ``'error'``; the video sidecars pass their own ``'failed'``
+#: through. A caller that tested only one of them polled a dead job to its
+#: deadline: Nunba's tts_engine branched on ``== 'failed'`` and spent 120 s on
+#: every failed composition (finding N1, 2026-09-23). Test ``in`` this, never a
+#: literal, so the pollers cannot drift apart again.
+MEDIA_FAILED_STATUSES = frozenset({'failed', 'error'})
+
 
 def _unwrap_envelope(payload, task_id: str = '') -> dict:
     """The answer itself, whether or not the sidecar wrapped it.

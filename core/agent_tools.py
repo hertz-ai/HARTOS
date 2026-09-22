@@ -1336,6 +1336,7 @@ def build_core_tool_closures(ctx):
 
         try:
             from integrations.service_tools.media_agent import (
+                MEDIA_FAILED_STATUSES,
                 _reads_as_still_waking,
                 check_media_status,
                 generate_media,
@@ -1558,7 +1559,7 @@ def build_core_tool_closures(ctx):
                                         'approved_at': None}))
                     return json.dumps({'status': 'bound', 'game_id': slot,
                                        'state': which, 'music': record})
-                if state in ('failed', 'error'):
+                if state in MEDIA_FAILED_STATUSES:
                     why = str(progress.get('error', 'unknown reason'))
                     if _reads_as_still_waking(why):
                         # The POLL can be reset by a busy server just as the
