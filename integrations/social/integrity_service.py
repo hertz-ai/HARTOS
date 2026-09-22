@@ -773,7 +773,17 @@ class IntegrityService:
         if not peer:
             return None
 
-        metadata = peer.metadata_json or {}
+        # A NEW dict, never the row's own.  PeerNode.metadata_json is a plain
+        # Column(JSON) with no mutation tracking, so writing into the loaded
+        # dict and assigning that same object back is invisible to the ORM
+        # (old == new, no UPDATE).  That is how every baseline on central
+        # stayed at its first write, 2026-08-06: the office desktop grew from
+        # 25 to 285 agents over six weeks and was flagged "+10 score_jump:
+        # Agent count jumped from 25 to 285" on EVERY integrity round from
+        # 08-08 to 09-22 (201 alerts, fail2ban offence #127, banned until
+        # 10-22).  Same idiom as the observed_url writer in
+        # peer_discovery._merge_peer, on this same table.
+        metadata = dict(peer.metadata_json or {})
         prev_agents = metadata.get('_prev_agent_count', 0)
         prev_posts = metadata.get('_prev_post_count', 0)
         current_agents = peer.agent_count or 0
@@ -796,8 +806,6 @@ class IntegrityService:
                 {'prev': prev_posts, 'current': current_posts, 'field': 'post_count'})
 
         # Store current values as previous for next check
-        if not metadata:
-            metadata = {}
         metadata['_prev_agent_count'] = current_agents
         metadata['_prev_post_count'] = current_posts
         metadata['_last_score_check'] = datetime.utcnow().isoformat()
