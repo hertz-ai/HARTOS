@@ -100,6 +100,30 @@ in
 
         PYTHONDONTWRITEBYTECODE = "1";
         PYTHONUNBUFFERED = "1";
+
+        # ── The port the FULL boot binds ──────────────────────────────
+        # ExecStart runs `python hart_intelligence_entry.py` (main()), which
+        # binds core.port_registry.get_port('backend') rather than taking a
+        # --port flag the way `waitress --port=` did. get_port's resolution
+        # order is: explicit override -> ENV -> OS-mode default (677) ->
+        # app-mode default (6777). Exporting this keeps cfg.ports.backend
+        # authoritative exactly as the old flag did; without it a node
+        # configured off the default would silently move to 677.
+        HARTOS_BACKEND_PORT = toString cfg.ports.backend;
+
+        # Variant thread budget, carried across the server swap.
+        # NOT the same unit as the old `waitress --threads`: waitress held
+        # one thread PER CONNECTION, so that number capped concurrent
+        # clients. Hypercorn multiplexes connection IO on the event loop and
+        # uses this pool only for SYNC Flask handlers, so the same number now
+        # caps concurrent slow handlers (LLM inference, /tts/setup-engine)
+        # while idle keep-alive and SSE clients cost no thread at all. The
+        # figures are kept because they encode each variant's resource
+        # budget, and they sit under the module's own TasksMax (edge 64).
+        HEVOLVE_WORKER_THREADS =
+          if cfg.variant == "edge" then "4"
+          else if cfg.variant == "desktop" then "24"
+          else "50";
       };
 
       serviceConfig = {
@@ -107,21 +131,48 @@ in
         User = "hart";
         Group = "hart";
         WorkingDirectory = hartApp;
-        # Thread count scales by variant: edge=4, server=50, desktop=24
-        ExecStart = let
-          threads = if cfg.variant == "edge" then "4"
-                    else if cfg.variant == "desktop" then "24"
-                    else "50";
-        in "${hartApp.python}/bin/python -m waitress --port=${toString cfg.ports.backend} --threads=${threads} hart_intelligence_entry:app";
+        # Run main(), NOT `waitress hart_intelligence_entry:app`.
+        #
+        # MEASURED 2026-09-22 on the live LAN: this OS was not a hive node.
+        # A HART OS box answered HTTP, held a keypair and exchanged peer
+        # records, yet reported nodes_with_intelligence=0 and never appeared
+        # in any census -- while the docker central node, whose CMD is
+        # `python hart_intelligence_entry.py`, reported intelligence=1.
+        #
+        # Serving the `app` OBJECT through a WSGI server skips main()
+        # entirely, and main() IS the node: hevolve_verify_boot(), the
+        # guardrail hash enforcement, _validate_startup(), the EventBus,
+        # local Crossbar subscribers, runtime-tools restoration, the
+        # agent-engine daemon, the HevolveAI supervisor (which exports
+        # HEVOLVEAI_API_URL and is the only reason WorldModelBridge does not
+        # set _http_disabled and stop learning), and the canonical consent
+        # ask installed by hartos_bootstrap. None of it ran here.
+        #
+        # It also could not federate at all: waitress is WSGI, so the
+        # /peer_link websocket listener that main() -> _serve_app mounts on
+        # hypercorn was absent -- no peer links, no device links, no phone.
+        #
+        # The Dockerfile already warns about exactly this shape for the
+        # OTHER variant: "deploy/cloud/Dockerfile.prod ... serves
+        # hart_intelligence_entry:app through gunicorn, which skips main()
+        # entirely and cannot serve websockets." This module had drifted into
+        # the same pattern; nothing in its history says that was intended.
+        #
+        # HARTOS is one runtime everywhere. Only the CLIENT differs -- Nunba
+        # on Windows/macOS/Linux, the OS itself here -- so the boot must be
+        # the same boot. Port and thread budget move to the environment block
+        # above, since main() reads them from there rather than from flags.
+        ExecStart = "${hartApp.python}/bin/python hart_intelligence_entry.py";
 
         # Environment file for API keys (optional, user-provided)
         EnvironmentFile = lib.mkIf (builtins.pathExists "/etc/hart/hart.env") "/etc/hart/hart.env";
 
         Restart = "on-failure";
         RestartSec = 5;
-        # No WatchdogSec: waitress never sends sd_notify(WATCHDOG=1), so a watchdog
-        # timer would SIGABRT the backend every 120s once it is actually serving.
-        # Restart=on-failure still covers real crashes.
+        # No WatchdogSec: neither server sends sd_notify(WATCHDOG=1) -- that was
+        # true of waitress and is equally true of the hypercorn that main() now
+        # boots -- so a watchdog timer would SIGABRT the backend every 120s once
+        # it is actually serving. Restart=on-failure still covers real crashes.
         # 600s (not 30s): the backend imports langchain + chromadb + autogen at
         # startup, which alone can take ~170s frozen and is far slower on USB /
         # SD-card live media. A 30s start timeout SIGKILLs the process mid-import
