@@ -1144,6 +1144,24 @@ a deliberate decision. **Execute F18 or F16 first** — both safe, both self-con
 F15 next (2 senders -> 1, prober left alone). F14 is safe but cross-repo. F12, F13,
 F17 need the owner or a prerequisite, and must not be done as written.
 
+**PUSH TIER CLOSED 2026-09-22. Final tally, and it is worse than the line above
+says: of seven premises, THREE that I had marked accurate were not.**
+- **F18** DONE, honoured. My audit named one consumer; there are three, plus a
+  second producer with different labels. Not dead schema at all (`1c1881098`).
+- **F16** DONE, delivery added. My audit said the event had no producer; it has one,
+  in **Nunba**, because I searched only HARTOS (hevolve `7ec0550`).
+- **F15** DO NOT FOLD. My audit named `email_adapter.py:264` a sender; it is a
+  connection test. Documented at all three sites instead (`45adee977`).
+- **F14** NOT four emitters, and a real **gate bypass** found and fixed: the shell
+  route painted native toasts around the AI's own 'screen' consent gate
+  (`305b7f3a4`).
+- **F12 / F13 / F17** unchanged: must not be done as written; owner or prerequisite.
+So four of seven prescriptions were harmful as written, not three, and the three
+premise errors on top of the original three mean **six of seven entries needed
+correcting**. The pattern in every case: a line number recorded without reading its
+enclosing function, or an absence asserted from one repo. Both are cheap to check
+and neither was checked. **Read the enclosing function; name the repos you searched.**
+
 ---
 
 ## The owner-facing ask surface (for floating open questions with options)
@@ -1204,7 +1222,7 @@ deliberate parallel path and leaving it contradicts rule 3.
   resolves to `agent_data`, so no real node's database was repointed.
 - **NEXT after F9: F7**, then F4 (unheld). F5 still held by another session's edits.
 
-### F19 — the consent test sweep cannot serve as a control — **OPEN, filed 2026-09-21**
+### F19 — the consent test sweep cannot serve as a control — **DONE + PUSHED 2026-09-22** (header was stale; the fix and its hermetic A/B evidence are recorded further down this section)
 
 Not a consent fold; a defect in the instrument every fold here is measured with,
 found by being burned by it (see F9's third self-correction).
