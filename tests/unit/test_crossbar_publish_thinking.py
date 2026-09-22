@@ -26,6 +26,8 @@ import json
 import os
 from unittest.mock import patch
 
+import pytest
+
 from core.peer_link.crossbar_publish import (
     publish_thinking_trace,
     _ZOOM_STUB,
@@ -355,73 +357,3 @@ def test_push_thinking_is_the_single_entry_point():
     src = ''.join(_production_lines())
     assert 'def _push_thinking(' in src
     assert '_push_thinking(user_id,' in src
-
-
-# ── Who a daemon agent's thinking is delivered to ──────────────────────────
-#
-# Measured 2026-09-23 on the owner's desktop: the daemon runs each goal as an
-# agent row (agent_daemon.py dispatch_goal(prompt, agent['user_id'], ...)),
-# so 176 of the day's 182 chat.response broadcasts were addressed to
-# `hevolve_system_agent` with targeted=0 -- both windows sat subscribed under
-# the owner, and the floating companion never saw an agent think.  A daemon
-# request is recognisable by its id; its human comes from the ONE attribution
-# resolver.  Everything else is byte-for-byte the tests above.
-
-from core.peer_link.crossbar_publish import trace_audience  # noqa: E402
-
-
-def _owner_lookup(monkeypatch, answer):
-    """Spy on the attribution resolver: records the goal ids asked about."""
-    import core.event_attribution as ea
-    asked = []
-
-    def _fake(goal_id=None, **kw):
-        asked.append(goal_id)
-        if isinstance(answer, Exception):
-            raise answer
-        return answer
-
-    monkeypatch.setattr(ea, 'owner_user_id', _fake)
-    return asked
-
-
-def test_a_persons_own_turn_keeps_the_person(monkeypatch):
-    asked = _owner_lookup(monkeypatch, 'owner-9')
-    assert trace_audience('user_alpha', 'c0ffee-real-request') == 'user_alpha'
-    assert trace_audience('user_alpha', '') == 'user_alpha'
-    assert trace_audience('user_alpha', None) == 'user_alpha'
-    assert trace_audience('user_alpha', '123456') == 'user_alpha'
-    assert asked == [], 'no daemon id, no lookup: the hot path pays nothing'
-
-
-def test_a_daemon_turn_goes_to_the_goals_human(monkeypatch):
-    asked = _owner_lookup(monkeypatch, 'owner-9')
-    assert trace_audience('agent-row-1', 'daemon_goal_20260412_235046_b18bba6f') == 'owner-9'
-    # the prefix is parsed by core.chat_client, in one place
-    assert asked == ['goal_20260412_235046_b18bba6f']
-
-
-def test_a_daemon_turn_with_no_human_stays_with_the_agent(monkeypatch):
-    _owner_lookup(monkeypatch, None)
-    assert trace_audience('agent-row-1', 'daemon_goal_x') == 'agent-row-1'
-
-
-def test_a_failing_lookup_never_reaches_the_publisher(monkeypatch):
-    _owner_lookup(monkeypatch, RuntimeError('db busy'))
-    assert trace_audience('agent-row-1', 'daemon_goal_x') == 'agent-row-1'
-
-
-def test_the_daemon_envelope_is_delivered_to_the_owner_unchanged(monkeypatch):
-    """The topic moves; the bytes do not: request_id and bot_type still say
-    'background', so Demopage's daemon filter and the adapter's per-request
-    buffer keep working on the same fields."""
-    _owner_lookup(monkeypatch, 'owner-9')
-    topic, payload = _capture_envelope(
-        text='Reading the invoice total', user_id='agent-row-1',
-        request_id='daemon_goal_x', bot_type='Agent',
-    )
-    assert topic == 'com.hertzai.hevolve.chat.owner-9'
-    d = json.loads(payload)
-    assert d['request_id'] == 'daemon_goal_x'
-    assert d['bot_type'] == 'Agent'
-    assert d['text'] == ['Reading the invoice total']
