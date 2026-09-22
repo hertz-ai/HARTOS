@@ -104,22 +104,34 @@ in
         # ── The port the FULL boot binds ──────────────────────────────
         # ExecStart runs `python hart_intelligence_entry.py` (main()), which
         # binds core.port_registry.get_port('backend') rather than taking a
-        # --port flag the way `waitress --port=` did. get_port's resolution
-        # order is: explicit override -> ENV -> OS-mode default (677) ->
-        # app-mode default (6777). Exporting this keeps cfg.ports.backend
-        # authoritative exactly as the old flag did; without it a node
-        # configured off the default would silently move to 677.
-        HARTOS_BACKEND_PORT = toString cfg.ports.backend;
+        # --port flag the way `waitress --port=` did. get_port's order is:
+        # explicit override -> ENV -> OS-mode default (677) -> app-mode
+        # default (6777), and HARTOS_BACKEND_PORT is ALREADY exported at the
+        # top of this same block, so cfg.ports.backend stays authoritative
+        # with nothing further to add here. Re-declaring it is not merely
+        # redundant: a duplicate attribute in one Nix attrset is a hard eval
+        # error ("attribute already defined") that fails the whole build.
 
-        # Variant thread budget, carried across the server swap.
-        # NOT the same unit as the old `waitress --threads`: waitress held
-        # one thread PER CONNECTION, so that number capped concurrent
-        # clients. Hypercorn multiplexes connection IO on the event loop and
-        # uses this pool only for SYNC Flask handlers, so the same number now
-        # caps concurrent slow handlers (LLM inference, /tts/setup-engine)
-        # while idle keep-alive and SSE clients cost no thread at all. The
-        # figures are kept because they encode each variant's resource
-        # budget, and they sit under the module's own TasksMax (edge 64).
+        # Variant thread budget. NOT optional -- this export is what makes
+        # the ExecStart change safe.
+        #
+        # Nothing sets this in code; hart_intelligence_entry.py:13491 only
+        # READS it, defaulting to 256. The old `waitress --threads` flag
+        # disappeared with the flag, so leaving this unset would hand every
+        # variant a 256-thread executor -- against TasksMax=64 on edge
+        # (:271). That is precisely the failure this module already
+        # documents at :253: the cgroup denies new thread stacks and the
+        # backend dies at boot with "RuntimeError: can't start new thread".
+        # Edge would not survive the first request.
+        #
+        # The figures are the old ones because they encode each variant's
+        # resource budget, but the UNIT changed: waitress held one thread
+        # PER CONNECTION, so the number capped concurrent clients. Hypercorn
+        # multiplexes connection IO on the event loop and uses this pool
+        # only for SYNC Flask handlers, so the same number now caps
+        # concurrent SLOW handlers (LLM inference, /tts/setup-engine) while
+        # idle keep-alive and SSE clients cost no thread at all. That is a
+        # strictly better trade at the same thread count.
         HEVOLVE_WORKER_THREADS =
           if cfg.variant == "edge" then "4"
           else if cfg.variant == "desktop" then "24"
