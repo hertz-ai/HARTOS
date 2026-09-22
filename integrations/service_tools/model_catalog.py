@@ -16,6 +16,7 @@ This is purely metadata + state tracking.
 import json
 import logging
 import os
+import struct
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -202,6 +203,105 @@ MODEL_WEIGHT_BYTES = {
         (22749880160, 'MEASURED: HF Content-Length and on-disk size both '
                       '22749880160 bytes exactly (2026-09-22)'),
 }
+
+
+#: GGUF metadata value types, by the enum the format defines.  Only the
+#: fixed-width ones need a struct code; strings and arrays are read by shape.
+_GGUF_SCALAR = {0: '<B', 1: '<b', 2: '<H', 3: '<h', 4: '<I', 5: '<i',
+                6: '<f', 7: '<?', 10: '<Q', 11: '<q', 12: '<d'}
+
+
+def read_gguf_facts(path: str) -> dict:
+    """Architecture facts read FROM the file, never typed by a human.
+
+    Everything this returns is stated in the GGUF's own metadata header, so
+    it cannot drift from the artifact the way a hand-written table does.
+    That matters here: the sizes in MODEL_WEIGHT_BYTES above are estimates
+    inherited from literals whose unit had to be guessed, and one of them is
+    1.58 GB wrong -- which inverts the size ordering of two real models and,
+    through the priority ladder, changes which one a machine is offered.
+
+    The two facts that drive behaviour and were previously tracked NOWHERE:
+
+    ``moe`` / ``experts_used`` / ``experts_total``
+        Generation throughput with weights resident is bounded by memory
+        bandwidth times ACTIVE parameters per token. A 35B mixture-of-experts
+        using 8 of 256 experts touches a small fraction of what a dense 27B
+        touches per token, so it is materially FASTER despite being the
+        larger file. speed_score currently says the opposite.
+
+    ``mtp``
+        Whether the weights carry a multi-token-prediction head. Only a model
+        that has one benefits from ``--spec-type draft-mtp``; passing the
+        flag for a plain GGUF is accepted and buys nothing.
+
+    Returns {} for anything unreadable -- an absent file, a truncated header,
+    a non-GGUF. Callers treat {} as "not known", never as "not MoE".
+    """
+    facts: dict = {}
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as f:
+            magic, _ver, _n_tensor, n_kv = struct.unpack('<4sIQQ', f.read(24))
+            if magic != b'GGUF':
+                return {}
+
+            def _u(fmt):
+                return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+
+            def _s():
+                return f.read(_u('<Q')).decode('utf-8', 'replace')
+
+            def _v(t):
+                if t == 8:
+                    return _s()
+                if t == 9:                       # array: elem type, count
+                    et, n = _u('<I'), _u('<Q')
+                    return [_v(et) for _ in range(n)]
+                return _u(_GGUF_SCALAR[t])
+
+            kv = {}
+            for _ in range(n_kv):
+                key = _s()
+                kv[key] = _v(_u('<I'))
+    except (OSError, struct.error, KeyError, UnicodeDecodeError) as e:
+        logger.warning("read_gguf_facts(%s): unreadable (%s); returning no "
+                       "facts rather than guessing", path, e)
+        return {}
+
+    arch = kv.get('general.architecture')
+    if arch:
+        facts['architecture'] = arch
+    facts['weight_bytes'] = size
+
+    # Keys are namespaced by architecture (qwen35moe.expert_count), so find
+    # them by suffix rather than assuming the prefix.
+    def _by_suffix(suffix):
+        for k, v in kv.items():
+            if k.endswith('.' + suffix):
+                return v
+        return None
+
+    used, total = _by_suffix('expert_used_count'), _by_suffix('expert_count')
+    if total:
+        facts['moe'] = True
+        facts['experts_total'] = total
+        if used:
+            facts['experts_used'] = used
+            # The number that actually predicts throughput. Stored exact --
+            # both operands came out of the file, so rounding here would be
+            # re-introducing the hand-typed approximation this replaces.
+            facts['expert_fraction'] = used / total
+    elif arch:
+        facts['moe'] = False
+
+    nextn = _by_suffix('nextn_predict_layers')
+    if nextn is not None:
+        facts['mtp'] = bool(nextn)
+        facts['mtp_layers'] = nextn
+    elif arch:
+        facts['mtp'] = False
+    return facts
 
 
 def model_weight_bytes(file_name: str) -> Optional[int]:
@@ -633,10 +733,35 @@ class ModelCatalog:
 
     # ── State updates ─────────────────────────────────────────────
 
-    def mark_downloaded(self, model_id: str, downloaded: bool = True) -> None:
+    def mark_downloaded(self, model_id: str, downloaded: bool = True,
+                        gguf_path: Optional[str] = None) -> None:
+        """Mark a row downloaded, and — when the caller knows where the file
+        landed — record what the file SAYS about itself.
+
+        ``gguf_path`` is optional and defaults to the old behaviour exactly,
+        so every existing caller is unchanged. A caller that has the path
+        (the downloader does; the notify_* sync points do not) can pass it
+        and the row gains architecture facts read from the artifact instead
+        of typed into a table: moe/experts_used/experts_total and mtp.
+
+        Only ADDS keys to capabilities. It never touches vram_gb, ram_gb,
+        disk_gb, priority or the scores, so selection cannot move because of
+        this call -- correcting those is a separate, deliberate change.
+        """
         entry = self._entries.get(model_id)
-        if entry:
-            entry.downloaded = downloaded
+        if not entry:
+            return
+        entry.downloaded = downloaded
+        if downloaded and gguf_path:
+            facts = read_gguf_facts(gguf_path)
+            if facts:
+                entry.capabilities = {**(entry.capabilities or {}), **facts}
+                logger.info(
+                    "%s: read from the file -- arch=%s moe=%s experts=%s/%s "
+                    "mtp=%s bytes=%s", model_id, facts.get('architecture'),
+                    facts.get('moe'), facts.get('experts_used'),
+                    facts.get('experts_total'), facts.get('mtp'),
+                    facts.get('weight_bytes'))
 
     def mark_loaded(self, model_id: str, device: str = 'gpu') -> None:
         entry = self._entries.get(model_id)
