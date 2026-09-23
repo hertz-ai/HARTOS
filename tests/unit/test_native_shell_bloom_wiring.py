@@ -90,7 +90,13 @@ def test_bloom_is_the_bottom_element():
     code = _strip_rust_comments(_read("comp_core.rs"))
     body = code[code.index("pub fn build_frame_elements"):]
     body = body[: body.index("\n}")]
-    bloom_at = body.index("bloom_mut()")
+    # The PUSH is the `.get(...)` that fetches the composed backdrop buffer. The
+    # cache is also touched at the top of the builder (`bloom_mut().begin_frame()`
+    # ages the frosted-crop pool), so anchoring on the accessor alone read that
+    # bookkeeping as the push and went red on a correct order (release run
+    # 35917397640). tests/unit/test_bloom_guard_mutation.py proves this anchor
+    # still fails when the push really moves.
+    bloom_at = body.index("bloom_mut().get(")
     # Every other element push must come BEFORE the bloom push.
     for marker in ("HartRenderElement::Surface", "HartRenderElement::Solid"):
         if marker in body:
