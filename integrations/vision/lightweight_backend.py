@@ -718,6 +718,17 @@ class Qwen08BBackend(VisionBackend):
             logger.info(
                 f"Qwen3.5-0.8B: retrying launch after "
                 f"{self.LAUNCH_RETRY_S}s cooldown")
+            if self._server_proc is not None:
+                # The process WE launched is still not serving after a whole
+                # cooldown: wedged, not slow.  Relaunching over it spawned a
+                # second llama-server every LAUNCH_RETRY_S and leaked the
+                # first process and its log handle (hartos-3a F7).  Stop it
+                # through the one stop path first.
+                logger.warning(
+                    f"Qwen3.5-0.8B: PID={self._server_proc.pid} still not "
+                    f"serving after {self.LAUNCH_RETRY_S}s; stopping it "
+                    f"before relaunching")
+                self.stop()
         self._launch_attempted = True
         self._launch_attempted_at = _t.time()
 
