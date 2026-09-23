@@ -342,28 +342,23 @@ impl MapAnim {
 /// than in a static, mirroring how `black_buffer` is already owned.
 #[derive(Default)]
 pub struct BloomCache {
-    /// Resolved ONCE, not per frame. `bloom::theme_palette` reads a JSON file off
-    /// disk; doing that at 60Hz would be a syscall storm behind a static image.
-    palette: Option<crate::bloom::BloomPalette>,
     key: Option<(i32, i32, crate::bloom::BloomPalette)>,
     buffer: Option<MemoryRenderBuffer>,
 }
 
 impl BloomCache {
-    // KNOWN GAP, deliberately not papered over with an unused method: the
-    // palette is resolved once and never re-read, so a theme change at runtime
-    // ("switch theme" through the agent) will not restyle this backdrop until
-    // the compositor restarts. An `invalidate()` was written here and removed
-    // again because nothing calls it, and a dead pub method is worse than an
-    // absent one: it warns on every build and reads as though the wiring exists.
-    // Whoever lands the theme-change signal adds it back with a caller.
-
     /// The backdrop for this size, composing only on a genuine miss.
     ///
     /// Returns `None` for a degenerate output size (a disconnected or
     /// not-yet-moded connector reports 0x0). The caller simply paints no
     /// backdrop then and the clear colour still covers the frame, so a bad mode
     /// can never panic the render loop.
+    ///
+    /// `base` is the theme's own field, handed in by the caller from the theme watch
+    /// (`theme_now().bloom`), which is what closed the gap this cache used to document:
+    /// the palette was resolved once and never re-read, so a theme change restyled
+    /// nothing until a restart. Now a changed theme file yields a changed `base`, the
+    /// key misses once, and the field recomposes once.
     ///
     /// `mood` is the composed home's resolved palette, folded over the theme's own
     /// hues (`BloomPalette::with_mood`). It is part of the key, so a new mood
@@ -373,14 +368,12 @@ impl BloomCache {
         &mut self,
         w: i32,
         h: i32,
+        base: crate::bloom::BloomPalette,
         mood: Option<&crate::scene::MoodPalette>,
     ) -> Option<&MemoryRenderBuffer> {
         if w <= 0 || h <= 0 {
             return None;
         }
-        // `BloomPalette` is `Copy`, so this reads the cached value and does NOT
-        // hold the borrow across the compose below.
-        let base = *self.palette.get_or_insert_with(crate::bloom::theme_palette);
         let pal = match mood {
             Some(m) => base.with_mood(m),
             None => base,
@@ -3323,49 +3316,176 @@ where
 }
 
 /// Lower a `HomeCompose` to render elements against the concrete caches — the
-/// Does the active THEME ask for the reduced-effects tier? Resolved once, beside the
-/// others, and carrying the same restart-to-change gap.
+/// Everything the theme files decide, read together so the four consumers (the scene's
+/// colours, the backdrop's field, the potato tier, reduced motion) can never disagree
+/// about which version of the files they saw.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThemeSnapshot {
+    pub theme: crate::scene::Theme,
+    pub bloom: crate::bloom::BloomPalette,
+    /// `performance.disable_blur`, half of the shell's `is_potato`; the other half is
+    /// the software floor, which the compositor knows directly. Only `potato.json` sets
+    /// it today. Its sibling `disable_animations` is NOT read, deliberately: nothing in
+    /// the tree reads it either, so honouring it natively would invent a behaviour the
+    /// shell does not have.
+    pub potato: bool,
+    /// `reduced_motion` from the accessibility file, the ledger's third motion switch.
+    pub reduced_motion: bool,
+}
+
+/// How often the theme files are stat'd, at most. One second is the conky Lua's own
+/// cadence for `active_theme.json` ("read by Conky Lua every 5s" in theme_service.py is
+/// the slow end); a theme applied in the customization hub restyles the native desktop
+/// within a second, and a still desktop pays one `stat` a second, never a read.
+const THEME_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The theme, HOT RELOADABLE: what the files say now, re-read when they change.
 ///
-/// `performance.disable_blur` is half of the shell's `is_potato`; the other half is the
-/// software floor, which the compositor knows directly. Only `potato.json` sets it today.
+/// This replaced three `OnceLock`s (the scene's `Theme`, `disable_blur`, `reduced_motion`)
+/// and the once-resolved palette inside `BloomCache`, all of which carried the same
+/// documented gap: resolved once, never re-read, so a theme change at runtime restyled
+/// nothing until the compositor restarted. The customization hub applies a theme by
+/// rewriting `active_theme.json`, and the shell restyles itself on the next render; the
+/// native desktop stayed on the theme it booted with.
 ///
-/// Its sibling `performance.disable_animations` is NOT read here, deliberately: nothing
-/// in the tree reads it either, so it is a dead key rather than a contract, and honouring
-/// it natively would invent a behaviour the shell does not have.
+/// WHY A WATCH ON THE FILES rather than a `shell.theme` verb over the socket: the shell
+/// already tells the compositor nothing about themes, the file IS the channel both
+/// renderers read (Gate 4: one palette source), and a verb would have landed in ipc.rs
+/// while another stream was adding `shell.chrome` there. A watch needs no producer and
+/// notices every writer: the hub, an agent's `update_custom`, a hand edit.
+///
+/// The frame path never reads the disk for this: `poll` stats the files at most once
+/// per `THEME_RECHECK`, compares modification times, and only re-reads on a change.
+/// `Instant` is passed in so the rate limit is testable without waiting.
+pub struct ThemeWatch {
+    /// In priority order; the first that reads is the theme. Every one is stamped, so
+    /// a file APPEARING (the first theme ever applied) is a change too.
+    theme_paths: Vec<std::path::PathBuf>,
+    a11y_path: std::path::PathBuf,
+    snapshot: ThemeSnapshot,
+    stamps: Vec<Option<std::time::SystemTime>>,
+    last_check: Option<Instant>,
+    reloads: u64,
+}
+
+impl ThemeWatch {
+    /// Watch these files, reading them once now.
+    pub fn new(theme_paths: Vec<std::path::PathBuf>, a11y_path: std::path::PathBuf) -> ThemeWatch {
+        let mut w = ThemeWatch {
+            theme_paths,
+            a11y_path,
+            snapshot: ThemeSnapshot {
+                theme: crate::scene::Theme::cosmic_default(),
+                bloom: crate::bloom::BloomPalette::default(),
+                potato: false,
+                reduced_motion: false,
+            },
+            stamps: Vec::new(),
+            last_check: None,
+            reloads: 0,
+        };
+        w.stamps = w.read_stamps();
+        w.reload();
+        w
+    }
+
+    /// The watch the compositor runs: the shell's own theme paths and its a11y file.
+    pub fn from_env() -> ThemeWatch {
+        ThemeWatch::new(
+            crate::bloom::theme_paths(),
+            std::path::PathBuf::from(crate::bloom::A11Y_SETTINGS_PATH),
+        )
+    }
+
+    fn read_stamps(&self) -> Vec<Option<std::time::SystemTime>> {
+        self.theme_paths
+            .iter()
+            .chain(std::iter::once(&self.a11y_path))
+            .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+            .collect()
+    }
+
+    /// Read the files and fold them, the one place all four consumers are derived.
+    fn reload(&mut self) {
+        let file = crate::bloom::SettingsFile::first_of(&self.theme_paths);
+        let a11y = crate::bloom::SettingsFile::load(&self.a11y_path);
+        self.snapshot = ThemeSnapshot {
+            theme: theme_from_files(&file, &a11y),
+            bloom: crate::bloom::palette_from(&file),
+            potato: file.flag("disable_blur").unwrap_or(false),
+            reduced_motion: crate::bloom::reduced_motion_in(&a11y),
+        };
+        self.reloads += 1;
+    }
+
+    /// Notice a change, at most once per `THEME_RECHECK`. Returns whether the snapshot
+    /// changed, which the caller does not need (the caches key on the values), but a
+    /// test does.
+    pub fn poll(&mut self, now: Instant) -> bool {
+        if let Some(t) = self.last_check {
+            if now.saturating_duration_since(t) < THEME_RECHECK {
+                return false;
+            }
+        }
+        self.last_check = Some(now);
+        let stamps = self.read_stamps();
+        if stamps == self.stamps {
+            return false;
+        }
+        self.stamps = stamps;
+        let before = self.snapshot;
+        self.reload();
+        let changed = self.snapshot != before;
+        if changed {
+            info!(reloads = self.reloads, "theme.reloaded (a theme file changed; the native desktop restyles on this frame)");
+        }
+        changed
+    }
+
+    pub fn snapshot(&self) -> ThemeSnapshot {
+        self.snapshot
+    }
+
+    /// How many times the files were read (test hook: a still desktop reads once).
+    pub fn reloads(&self) -> u64 {
+        self.reloads
+    }
+}
+
+/// The process's one theme watch, polled on every read and rate limited inside.
+///
+/// A `Mutex` rather than a `OnceLock` because the value CHANGES; it is uncontended (the
+/// render loop is one thread) and held for a stat at most, once a second. A poisoned
+/// lock is recovered rather than propagated: this runs in the process that owns
+/// scanout, and a panic elsewhere must not take the theme with it.
+fn theme_now() -> ThemeSnapshot {
+    static WATCH: std::sync::Mutex<Option<ThemeWatch>> = std::sync::Mutex::new(None);
+    let mut guard = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    let watch = guard.get_or_insert_with(ThemeWatch::from_env);
+    watch.poll(Instant::now());
+    watch.snapshot()
+}
+
+/// Does the active THEME ask for the reduced-effects tier? Live, see `ThemeWatch`.
 fn theme_potato() -> bool {
-    static POTATO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *POTATO.get_or_init(|| {
-        crate::bloom::SettingsFile::active()
-            .flag("disable_blur")
-            .unwrap_or(false)
-    })
+    theme_now().potato
 }
 
-/// Has the user declared reduced motion? Resolved ONCE, like the theme beside it, and
-/// carrying the same documented gap: a runtime PUT to /api/shell/accessibility lives in
-/// the shell process's memory and reaches this at the next start.
-///
-/// A `OnceLock` because the frame path must not touch the disk, and the answer is a
-/// declarative setting rather than something that changes under us.
+/// Has the user declared reduced motion? Live, see `ThemeWatch`. A runtime PUT to
+/// /api/shell/accessibility still lives in the shell process's memory until it writes
+/// the file, which is the shell's half of the same gap.
 fn motion_reduced() -> bool {
-    static REDUCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *REDUCED.get_or_init(crate::bloom::reduced_motion)
+    theme_now().reduced_motion
 }
 
-/// The scene's colours, resolved ONCE from the same theme file the backdrop reads.
+/// The scene's colours, from the same theme file the backdrop reads, live.
 ///
-/// A `OnceLock` rather than a per-frame call because resolving it touches the disk, and
-/// the frame path must not. This carries the SAME known gap `BloomCache` documents beside
-/// it: resolved once and never re-read, so a theme change at runtime does not restyle the
-/// native desktop until the compositor restarts. Whoever lands the theme-change signal
-/// invalidates both together, and they are wrong in the same direction meanwhile, which
-/// is the point of them reading one file.
-fn active_theme() -> &'static crate::scene::Theme {
-    static ACTIVE: std::sync::OnceLock<crate::scene::Theme> = std::sync::OnceLock::new();
-    ACTIVE.get_or_init(|| {
-        let file = crate::bloom::SettingsFile::active();
-        theme_from_file(&file)
-    })
+/// By value: `Theme` is `Copy` and small, and a reference into the watch would pin the
+/// lock across a frame. `SceneCache` keys on the value, so a changed theme rebuilds the
+/// tree once; the tile and text caches key on colour, so recoloured surfaces compose
+/// once each; the theme that did not change costs a compare.
+fn active_theme() -> crate::scene::Theme {
+    theme_now().theme
 }
 
 /// The accessibility FONT SCALE applied to a theme metric, exactly as the shell applies
@@ -3501,7 +3621,7 @@ where
     // text caches key on colour, so the recoloured surfaces compose once each.
     let theme = match home.palette.as_ref() {
         Some(mood) => active_theme().with_mood(mood),
-        None => *active_theme(),
+        None => active_theme(),
     };
     // Which bands the chrome payload composes fully, read BEFORE the tree is borrowed
     // out of the cache: it gates the bar claims in the walk below, and it is a property
@@ -4056,11 +4176,15 @@ where
         // and must follow the mood the shell's would have. `MoodPalette` is `Copy`, so
         // this ends the shared borrow of `state` before `bloom_mut` takes it mutably.
         let mood = state.native_home().and_then(|h| h.palette);
+        // The theme's own field, from the same watch the scene's colours come from, so
+        // the backdrop and the desktop restyle on the same frame when the theme file
+        // changes. Not a disk read: the watch stats its files at most once a second.
+        let base = theme_now().bloom;
         // Split the borrow: `bloom_mut` holds `state` mutably, and
         // `MemoryRenderBufferRenderElement::from_buffer` needs the buffer while
         // `renderer` is also borrowed. They are disjoint (`renderer` is a separate
         // parameter, not a `state` field), so this type-checks and stays short.
-        if let Some(buffer) = state.bloom_mut().get(size.w, size.h, mood.as_ref()) {
+        if let Some(buffer) = state.bloom_mut().get(size.w, size.h, base, mood.as_ref()) {
             let origin: Point<f64, Physical> = Point::from((0.0, 0.0));
             match MemoryRenderBufferRenderElement::from_buffer(
                 renderer,
@@ -5610,6 +5734,151 @@ mod tests {
         );
     }
 
+    // ── THEME HOT RELOAD: the watch that replaced the OnceLocks ─────────────────────
+
+    /// A temp dir of its own per test, so parallel tests never share a file.
+    fn theme_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hart_theme_watch_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write `text` and give the file a modification time of `epoch + secs`, so two
+    /// writes inside one tick still carry two different stamps (the watch compares
+    /// stamps, and a filesystem with coarse mtimes would otherwise hide the second).
+    fn write_stamped(path: &std::path::Path, text: &str, secs: u64) {
+        std::fs::write(path, text).unwrap();
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + secs)).unwrap();
+    }
+
+    #[test]
+    fn a_theme_file_edited_on_disk_restyles_the_native_desktop_and_its_backdrop() {
+        // The gap every theme reader documented: resolved once, never re-read, so the
+        // customization hub changed the WebView and the native desktop kept the theme
+        // it booted with. The watch notices the file change and folds the new colours
+        // through the same paths, and the caches keyed on the values recompose once.
+        let dir = theme_dir("edit");
+        let theme = dir.join("active_theme.json");
+        let a11y = dir.join("accessibility.json");
+        write_stamped(&theme, r#"{"colors":{"accent":"00E6C3","background":"04050B"}}"#, 1);
+        let mut watch = ThemeWatch::new(vec![theme.clone()], a11y.clone());
+        let t0 = Instant::now();
+        let before = watch.snapshot();
+        assert_eq!(before.theme.accent, crate::scene::Color::from_hex("#00E6C3").unwrap());
+        assert_eq!(before.bloom.base, [0x04, 0x05, 0x0B]);
+        assert!(!before.reduced_motion && !before.potato);
+        assert_eq!(watch.reloads(), 1, "read once at construction");
+
+        // The scene tree is retained on this theme.
+        let home = crate::scene::HomeCompose::demo();
+        let mut scenes = crate::scene::SceneCache::default();
+        let scroll = crate::scene::RowScroll::default();
+        let _ = scenes.tree_for(1280.0, 800.0, &home, &before.theme, &scroll, &mut crate::scene::MonoMeasure);
+        let _ = scenes.tree_for(1280.0, 800.0, &home, &before.theme, &scroll, &mut crate::scene::MonoMeasure);
+        assert_eq!(scenes.rebuilds(), 1);
+
+        // The user applies sunset in the hub, and declares reduced motion.
+        write_stamped(&theme, r#"{"colors":{"accent":"FF8A4C","background":"160910"},"performance":{"disable_blur":true}}"#, 2);
+        write_stamped(&a11y, r#"{"reduced_motion":true}"#, 3);
+        assert!(watch.poll(t0 + THEME_RECHECK), "a changed stamp is a reload");
+        let after = watch.snapshot();
+        assert_eq!(after.theme.accent, crate::scene::Color::from_hex("#FF8A4C").unwrap(), "the scene's accent moved");
+        assert_eq!(after.bloom.base, [0x16, 0x09, 0x10], "and the backdrop's ground");
+        assert!(after.potato, "the potato tier is live too");
+        assert!(after.reduced_motion, "and the accessibility switch");
+        assert_eq!(watch.reloads(), 2);
+
+        // The retained tree rebuilds ONCE for the new theme, then holds.
+        let _ = scenes.tree_for(1280.0, 800.0, &home, &after.theme, &scroll, &mut crate::scene::MonoMeasure);
+        assert_eq!(scenes.rebuilds(), 2, "a theme change is one rebuild");
+        let _ = scenes.tree_for(1280.0, 800.0, &home, &after.theme, &scroll, &mut crate::scene::MonoMeasure);
+        assert_eq!(scenes.rebuilds(), 2, "and no more");
+        // And the backdrop recomposes once for the new base (BloomCache keys on it).
+        let mut bloom = BloomCache::default();
+        assert!(bloom.get(64, 40, before.bloom, None).is_some());
+        let k1 = bloom.key;
+        assert!(bloom.get(64, 40, after.bloom, None).is_some());
+        assert_ne!(bloom.key, k1, "the field recomposes for the new theme");
+        let k2 = bloom.key;
+        assert!(bloom.get(64, 40, after.bloom, None).is_some());
+        assert_eq!(bloom.key, k2, "once");
+    }
+
+    #[test]
+    fn the_watch_stats_at_most_once_a_second_and_reads_only_on_a_change() {
+        // The frame path must not touch the disk: a stat per frame at 60Hz is the
+        // syscall storm the OnceLocks existed to avoid. So the poll is rate limited on
+        // the clock it is handed, and a stat that finds the same stamps reads nothing.
+        let dir = theme_dir("rate");
+        let theme = dir.join("active_theme.json");
+        write_stamped(&theme, r#"{"colors":{"accent":"00E6C3"}}"#, 1);
+        let mut watch = ThemeWatch::new(vec![theme.clone()], dir.join("a11y.json"));
+        let t0 = Instant::now();
+        assert!(!watch.poll(t0), "nothing changed");
+        write_stamped(&theme, r#"{"colors":{"accent":"FF8A4C"}}"#, 2);
+        assert!(!watch.poll(t0 + std::time::Duration::from_millis(200)), "inside the interval: not even a stat");
+        assert_eq!(watch.reloads(), 1);
+        assert!(watch.poll(t0 + THEME_RECHECK + std::time::Duration::from_millis(1)), "past it: the change is seen");
+        assert_eq!(watch.reloads(), 2);
+        assert_eq!(watch.snapshot().theme.accent, crate::scene::Color::from_hex("#FF8A4C").unwrap());
+        // A still desktop: many polls, no reads.
+        for i in 0..10u64 {
+            assert!(!watch.poll(t0 + THEME_RECHECK * (2 + i as u32)));
+        }
+        assert_eq!(watch.reloads(), 2, "unchanged stamps never re-read the file");
+        // A touch that changes the stamp but not the content is a stat and a read, but
+        // the snapshot is unchanged and the caller is told so.
+        write_stamped(&theme, r#"{"colors":{"accent":"FF8A4C"}}"#, 3);
+        assert!(!watch.poll(t0 + THEME_RECHECK * 20), "same content, no change reported");
+        assert_eq!(watch.reloads(), 3);
+    }
+
+    #[test]
+    fn a_first_applied_theme_takes_over_the_shipped_preset() {
+        // Before the first apply there is no active_theme.json, only the preset the
+        // environment names; the theme service writes the active file on the first
+        // apply. The watch stamps BOTH paths, so the file appearing is a change like
+        // any other, and the active theme wins from then on, exactly as the shell's
+        // own get_active_theme prefers it.
+        let dir = theme_dir("appear");
+        let active = dir.join("active_theme.json");
+        let preset = dir.join("aura.json");
+        write_stamped(&preset, r#"{"colors":{"accent":"00E6C3","background":"04050B"}}"#, 1);
+        let mut watch = ThemeWatch::new(vec![active.clone(), preset.clone()], dir.join("a11y.json"));
+        assert_eq!(watch.snapshot().theme.accent, crate::scene::Color::from_hex("#00E6C3").unwrap(), "the preset seeds");
+        let t0 = Instant::now();
+        write_stamped(&active, r#"{"colors":{"accent":"5B8CFF","background":"0A0E1F"}}"#, 5);
+        assert!(watch.poll(t0 + THEME_RECHECK));
+        assert_eq!(watch.snapshot().theme.accent, crate::scene::Color::from_hex("#5B8CFF").unwrap(), "the applied theme wins");
+        assert_eq!(watch.snapshot().bloom.base, [0x0A, 0x0E, 0x1F]);
+        // And gone again (a reset to defaults): back to the preset, never to a void.
+        std::fs::remove_file(&active).unwrap();
+        assert!(watch.poll(t0 + THEME_RECHECK * 2));
+        assert_eq!(watch.snapshot().theme.accent, crate::scene::Color::from_hex("#00E6C3").unwrap());
+        // No file at all anywhere: the shipped look, byte for byte.
+        let none = ThemeWatch::new(vec![dir.join("nope.json")], dir.join("nope2.json"));
+        assert_eq!(none.snapshot().theme, crate::scene::Theme::cosmic_default());
+        assert_eq!(none.snapshot().bloom, crate::bloom::BloomPalette::default());
+    }
+
+    #[test]
+    fn the_theme_paths_prefer_the_running_theme_over_the_seed() {
+        // bloom::theme_paths is the one list every reader resolves through: the active
+        // file in the data dir first, the environment's preset second. The data dir
+        // follows theme_service.py's own order. Read here without touching the
+        // environment (tests share a process): the default is the module's.
+        let paths = crate::bloom::theme_paths();
+        assert!(paths.len() >= 1);
+        assert!(paths[0].ends_with(crate::bloom::ACTIVE_THEME_FILE), "{:?}", paths[0]);
+        if std::env::var_os("HEVOLVE_DATA_DIR").is_none() && std::env::var_os("HART_DATA_DIR").is_none() {
+            assert_eq!(crate::bloom::data_dir(), std::path::PathBuf::from("/var/lib/hart"), "hart-base.nix's dataDir default");
+        }
+        assert_eq!(crate::bloom::preset_path_in("/t", "aura"), Some(std::path::PathBuf::from("/t/aura.json")));
+        assert_eq!(crate::bloom::preset_path_in("/t", "../x"), None, "an id cannot leave the dir");
+    }
+
     // ── CARD ART: the bundled SVGs, decoded by the compositor itself ─────────────
 
     fn no_fonts() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
@@ -6958,10 +7227,11 @@ mod native_render_tests {
         // it and never again for the same mood, and a home without one composes the
         // theme's own field, byte-identical to before moods existed.
         let mut cache = BloomCache::default();
+        let base = crate::bloom::BloomPalette::default();
         let (w, h) = (96, 54);
-        assert!(cache.get(w, h, None).is_some());
+        assert!(cache.get(w, h, base, None).is_some());
         let plain_key = cache.key;
-        assert!(cache.get(w, h, None).is_some());
+        assert!(cache.get(w, h, base, None).is_some());
         assert_eq!(cache.key, plain_key, "no mood, no recompose");
 
         let sunset = crate::scene::MoodPalette {
@@ -6969,7 +7239,7 @@ mod native_render_tests {
             ambient: [crate::scene::Color::from_hex("#FF8A4C"), None, None, None],
             ..Default::default()
         };
-        assert!(cache.get(w, h, Some(&sunset)).is_some());
+        assert!(cache.get(w, h, base, Some(&sunset)).is_some());
         let sunset_key = cache.key;
         assert_ne!(sunset_key, plain_key, "a mood recomposes the field");
         assert_eq!(
@@ -6977,10 +7247,19 @@ mod native_render_tests {
             Some([0x16, 0x09, 0x0F]),
             "on the mood's own ground"
         );
-        assert!(cache.get(w, h, Some(&sunset)).is_some());
+        assert!(cache.get(w, h, base, Some(&sunset)).is_some());
         assert_eq!(cache.key, sunset_key, "the same mood again does not recompose");
-        assert!(cache.get(w, h, None).is_some());
+        assert!(cache.get(w, h, base, None).is_some());
         assert_eq!(cache.key, plain_key, "and dropping the mood returns to the theme's field");
+        // And a THEME change (a different base from the watch) recomposes once too,
+        // which is the half a restart used to be needed for.
+        let mut moss = base;
+        moss.base = [0x01, 0x02, 0x03];
+        assert!(cache.get(w, h, moss, None).is_some());
+        assert_ne!(cache.key, plain_key, "a changed theme field recomposes");
+        let moss_key = cache.key;
+        assert!(cache.get(w, h, moss, None).is_some());
+        assert_eq!(cache.key, moss_key, "and only once");
     }
 
     /// A temp static root holding ONE card SVG at the served path `rel`, so the art

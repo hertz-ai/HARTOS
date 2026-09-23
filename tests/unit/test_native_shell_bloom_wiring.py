@@ -114,15 +114,40 @@ def test_both_backends_implement_the_accessor():
 
 
 def test_the_palette_is_not_read_from_disk_every_frame():
-    """bloom::theme_palette opens a JSON file. build_frame_elements runs per
-    frame, so calling it there would be a file read at 60Hz behind a static
-    image, breaking the compose-once contract the module documents."""
+    """build_frame_elements runs per frame, so reading a theme file there would
+    be a file read at 60Hz behind a static image, breaking the compose-once
+    contract the module documents. The palette used to be resolved ONCE inside
+    BloomCache (and a theme change needed a restart); now it comes from the theme
+    watch, which is allowed on the frame path only because its poll is rate
+    limited: a `stat` at most once per THEME_RECHECK, a read only on a changed
+    modification time. Pin both halves: no reader in the frame builder, and the
+    watch really rate limits."""
     code = _strip_rust_comments(_read("comp_core.rs"))
     body = code[code.index("pub fn build_frame_elements"):]
     body = body[: body.index("\n}")]
-    assert "theme_palette()" not in body, (
-        "build_frame_elements calls bloom::theme_palette() directly, which reads "
-        "a theme file on every frame. Resolve it once inside BloomCache instead."
+    for reader in ("theme_palette()", "SettingsFile::", "fs::read", "fs::metadata"):
+        assert reader not in body, (
+            "build_frame_elements reaches %r directly, which touches a file on "
+            "every frame. Go through theme_now(), whose watch is rate limited." % reader
+        )
+    assert "theme_now()" in body, (
+        "build_frame_elements no longer takes the backdrop palette from the theme "
+        "watch, so a theme change would not restyle the backdrop"
+    )
+    watch = code[code.index("pub struct ThemeWatch"):]
+    poll = watch[watch.index("pub fn poll"):]
+    poll = poll[: poll.index("\n    }")]
+    assert re.search(r"< THEME_RECHECK", poll), (
+        "ThemeWatch::poll no longer rate limits on THEME_RECHECK, so the frame "
+        "path stats the theme files at 60Hz"
+    )
+    assert re.search(r"THEME_RECHECK: std::time::Duration = std::time::Duration::from_secs\(1\)", code), (
+        "the recheck interval moved; a shorter one is a stat storm, a longer one "
+        "makes a theme apply feel broken"
+    )
+    assert "if stamps == self.stamps" in poll, (
+        "the poll no longer compares modification times before reading, so every "
+        "recheck would re-read and re-fold the theme"
     )
 
 
