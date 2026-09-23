@@ -90,6 +90,95 @@ def _write_all_fixtures():
     _write_fixture(_sanitized(), FIXTURE_DEFAULT)
     _write_fixture(_sanitized_classic_mood(), FIXTURE_CLASSIC_MOOD)
     _write_fixture(_composed_chrome(), FIXTURE_CHROME)
+    _write_art_fixture()
+
+
+# -- THE CARD ART CONTRACT ------------------------------------------------------
+#
+# The compositor now rasterises the bundled card SVGs itself (NATIVE_OS_PROGRAM 3.2,
+# decision (a)). The files live outside the crate, and both the deepbox loop and the
+# crane source filter ship `compositor/` alone, so a Rust test "over the directory"
+# cannot see the directory. The same answer as the wire payload: pin every asset,
+# verbatim, into the generated module, and let the Rust side decode every one of them.
+# This half pins that the module IS the directory; the other half pins that each
+# decodes to pixels. An asset added or edited without regenerating fails here; one the
+# rasteriser cannot render fails there.
+ART_DIR = os.path.join(REPO, "integrations", "agent_engine", "static", "app_art")
+ART_CONST = "pub const BUNDLED_CARD_ART: &[(&str, &str)] = &["
+ART_CLOSE = "\n];"
+
+# The SVG vocabulary the compositor's rasteriser is asked to cover, and the elements
+# it is deliberately NOT asked to: usvg renders filters, masks and patterns too, but
+# each is a per-pixel pass the compose-once budget never priced, and `<image>` would
+# be a raster decoder the build leaves out. An asset that reaches for one fails here,
+# in review, rather than as a card that quietly rendered without it.
+ART_ALLOWED_TAGS = {
+    "svg", "defs", "linearGradient", "radialGradient", "stop", "rect", "circle",
+    "ellipse", "g", "path", "line", "polyline", "polygon", "text", "title", "desc",
+}
+
+
+def _bundled_art():
+    """(relative path, source) for every bundled SVG, sorted, slashes forward."""
+    out = []
+    for root, _dirs, files in os.walk(ART_DIR):
+        for name in files:
+            if not name.endswith(".svg"):
+                continue
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, ART_DIR).replace(os.sep, "/")
+            with open(full, encoding="utf-8") as f:
+                out.append((rel, f.read()))
+    return sorted(out)
+
+
+def _art_fixture_body():
+    lines = []
+    for rel, src in _bundled_art():
+        assert '"##' not in src and "\r" not in src, rel
+        lines.append('    (%s, r##"%s"##),' % (json.dumps(rel), src.rstrip("\n")))
+    return "\n".join(lines)
+
+
+def _write_art_fixture():
+    src = open(FIXTURE, encoding="utf-8").read()
+    i = src.index(ART_CONST) + len(ART_CONST)
+    j = src.index(ART_CLOSE, i)
+    with open(FIXTURE, "w", encoding="utf-8", newline="\n") as f:
+        f.write(src[:i] + "\n" + _art_fixture_body() + src[j:])
+
+
+def test_the_art_fixture_is_every_bundled_card_svg_verbatim():
+    src = open(FIXTURE, encoding="utf-8").read()
+    i = src.index(ART_CONST) + len(ART_CONST)
+    j = src.index(ART_CLOSE, i)
+    assert src[i + 1:j] == _art_fixture_body(), (
+        "compositor/src/wire_fixture.rs is stale for the card art: an asset under "
+        "static/app_art was added, removed or edited. Regenerate with the same "
+        "_write_all_fixtures command, then read the diff.")
+    names = [rel for rel, _ in _bundled_art()]
+    assert len(names) == 51, "the program counts 51 bundled assets: %d" % len(names)
+    assert "apps/com.brave.Browser.svg" in names and "app-files.svg" in names
+
+
+def test_every_bundled_card_svg_stays_inside_the_vocabulary_the_compositor_renders():
+    import xml.etree.ElementTree as ET
+    seen_text = 0
+    for rel, src in _bundled_art():
+        root = ET.fromstring(src)
+        for el in root.iter():
+            tag = el.tag.split("}", 1)[-1]
+            assert tag in ART_ALLOWED_TAGS, (
+                "%s uses <%s>, which the native art path does not render" % (rel, tag))
+            for attr in el.attrib:
+                assert attr.split("}", 1)[-1] not in ("filter", "mask", "clip-path",
+                                                       "style"), (rel, tag, attr)
+            if tag == "text":
+                seen_text += 1
+    # The parity program recorded "ZERO uses of <text>". That was wrong for the 39
+    # app icons, which is why the build carries usvg's text feature; pin the fact so
+    # the next inventory does not repeat the miss.
+    assert seen_text == 39, "expected the 39 app initials as <text>, found %d" % seen_text
 
 # A realistic LLM-authored home, chosen to carry every shape that has ever
 # decoded wrong or that the native scene treats specially:
@@ -435,7 +524,7 @@ def test_the_attributable_components_are_the_ones_the_native_shell_draws():
     """
     keys = set(_component_keys())
     assert keys == {"orb", "top-bar", "omnibox", "taskbar", "home-card",
-                    "home-row"}, (
+                    "home-row", "toast", "context-menu"}, (
         "the set of attributable native surfaces changed: %s. That is allowed, "
         "but a new one must be a surface the native scene actually DRAWS and "
         "must have a row in latency_budgets.json." % sorted(keys))

@@ -537,13 +537,7 @@ fn rounded_rect_rgba(
             // Pixel centre relative to the rect centre.
             let px = x as f32 + 0.5 - hw;
             let py = y as f32 + 0.5 - hh;
-            // Rounded-box SDF (<=0 inside): distance to the shape's edge.
-            let qx = px.abs() - (hw - r);
-            let qy = py.abs() - (hh - r);
-            let dist =
-                (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
-            // ~1px anti-aliased coverage across the edge.
-            let cov = (0.5 - dist).clamp(0.0, 1.0);
+            let cov = rounded_coverage(px, py, hw, hh, r);
             if cov <= 0.0 {
                 continue;
             }
@@ -578,6 +572,20 @@ fn rounded_rect_rgba(
         }
     }
     rgba
+}
+
+/// The ~1px anti-aliased coverage of a rounded box at a pixel centre `(px, py)` relative
+/// to the box's centre, for a box of half-extents `(hw, hh)` and corner radius `r`.
+///
+/// A rounded-box signed-distance field (<= 0 inside), the ONE corner rule the tiles use.
+/// Factored out of `rounded_rect_rgba` when the card art gained a photo: the photo is
+/// clipped to the same corner as the tile beneath it, and a second SDF for the same
+/// shape is how two surfaces of one card get two different corners.
+fn rounded_coverage(px: f32, py: f32, hw: f32, hh: f32, r: f32) -> f32 {
+    let qx = px.abs() - (hw - r);
+    let qy = py.abs() - (hh - r);
+    let dist = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
+    (0.5 - dist).clamp(0.0, 1.0)
 }
 
 /// Rasterize a DROP SHADOW: the rounded box, blurred, into a premultiplied buffer.
@@ -656,6 +664,165 @@ pub struct RectCache {
     /// proof: a rounded rect is a per-pixel SDF rasterize, so recomposing one per frame
     /// would be far more expensive than the solid pool it sits beside.
     rounded_composes: u64,
+    /// CARD ART: a bundled SVG rasterised once per (source, size, radius), the photo
+    /// layer `.hh-card-art img` fades in over the gradient. Same compose-once contract
+    /// as the tiles, same cache, a separate map because the key is a path.
+    ///
+    /// A MISS is cached too (`None`): a source that does not resolve, does not read or
+    /// does not parse is remembered so the frame path never touches the disk twice for
+    /// it. Without that a card naming a file that is not there would stat it at 60Hz.
+    ///
+    /// BOUNDED, unlike the tile map, and for the reason the text cache is: the key
+    /// comes from the FEED. An agent-written home can name a fresh source on every
+    /// compose, and a map keyed on what the agent writes grows with what the agent
+    /// writes. See `MAX_CACHED_ART`.
+    art: std::collections::HashMap<(String, u32, u32, u32), Option<MemoryRenderBuffer>>,
+    /// How many SVGs were ever rasterised (test hook for the compose-once proof).
+    art_composes: u64,
+    /// The font database the SVG `<text>` runs shape against, loaded from the system
+    /// ONCE, on the first art compose, and never on the frame path after that. 39 of
+    /// the 51 bundled assets carry their app's initial as text; without a database
+    /// they still decode, as a letterless tile.
+    art_fonts: Option<std::sync::Arc<resvg::usvg::fontdb::Database>>,
+    /// Where a card's served photo path lives on disk. Public so a test can point it
+    /// at a temp dir; the frame path never changes it.
+    pub art_roots: ArtRoots,
+}
+
+/// The most art buffers held at once. A desktop shows at most three rows of about
+/// seven cards, so this is several desktops' worth; past it the map is dropped
+/// wholesale and the live set recomposes once, exactly as the text cache does.
+const MAX_CACHED_ART: usize = 64;
+
+/// Where the two served photo prefixes the sanitizer allows resolve on disk.
+///
+/// `_home_sanitize_card` lets a card's `image` name exactly two prefixes:
+/// `/shell/static/app_art/...` (the shell's own static dir) and `/shell/agent-art/<slug>`
+/// (`HART_AGENT_ART_DIR`, default `/var/lib/hart/agent-art`, then the bundled
+/// `app_art/agents`). The browser fetches those over HTTP; the compositor has no HTTP
+/// and wants none, so it reads the same files by path, and the root of the static dir
+/// is a DEPLOYMENT FACT handed in as `HART_SHELL_STATIC_DIR` (the parity program's own
+/// phrase for it). Unset, no photo is lowered and every card is its gradient, which is
+/// a correct card rather than a hole.
+///
+/// Only `.svg` is decoded: every bundled asset is one, and the raster decoders were
+/// left out of the build on purpose. A central drop of `auto-research.png` shows in
+/// the browser and not natively, which is stated here rather than discovered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtRoots {
+    pub static_dir: Option<std::path::PathBuf>,
+    pub agent_art_dir: Option<std::path::PathBuf>,
+}
+
+impl Default for ArtRoots {
+    /// From the environment, exactly as the shell resolves its own two roots.
+    fn default() -> Self {
+        let dir = |var: &str| std::env::var_os(var).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+        ArtRoots {
+            static_dir: dir("HART_SHELL_STATIC_DIR"),
+            agent_art_dir: dir("HART_AGENT_ART_DIR")
+                .or_else(|| Some(std::path::PathBuf::from("/var/lib/hart/agent-art"))),
+        }
+    }
+}
+
+impl ArtRoots {
+    /// The file a served photo path names, or None when the path is outside the two
+    /// prefixes, could leave its root, or is not an SVG.
+    ///
+    /// PURE (no disk): the sanitizer already constrains the prefix, but `image` is a
+    /// string the LLM wrote and the only thing between it and `read` is this, so `..`
+    /// and absolute segments are refused here regardless of what upstream allowed.
+    pub fn resolve(&self, source: &str) -> Option<std::path::PathBuf> {
+        fn safe_rel(rel: &str) -> bool {
+            !rel.is_empty()
+                && rel.ends_with(".svg")
+                && rel
+                    .split('/')
+                    .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains('\\'))
+        }
+        if let Some(rel) = source.strip_prefix("/shell/static/") {
+            if !safe_rel(rel) {
+                return None;
+            }
+            return self.static_dir.as_ref().map(|d| d.join(rel));
+        }
+        if let Some(slug) = source.strip_prefix("/shell/agent-art/") {
+            // The route's own contract: `[a-z0-9-]` only, extension resolved server side.
+            if slug.is_empty() || !slug.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+                return None;
+            }
+            let file = format!("{slug}.svg");
+            let drop = self.agent_art_dir.as_ref().map(|d| d.join(&file));
+            let bundled = self.static_dir.as_ref().map(|d| d.join("app_art").join("agents").join(&file));
+            // First found wins, the same order the route searches. Existence is the one
+            // disk touch here, and it happens once per source because the miss is cached.
+            return drop
+                .filter(|p| p.is_file())
+                .or(bundled);
+        }
+        None
+    }
+}
+
+/// Rasterise an SVG into a premultiplied [B,G,R,A] buffer of `w` x `h`, COVERING the box
+/// (`object-fit: cover`, the shell's `.hh-card-art img`: scaled to fill, centred, the
+/// overflow cropped) and clipped to the tile's corner radius.
+///
+/// `None` when the data is not an SVG usvg accepts, or has no size. The text runs shape
+/// against `fonts`; an empty database renders them as nothing rather than failing.
+fn svg_rgba(
+    data: &[u8],
+    w: u32,
+    h: u32,
+    radius: f32,
+    fonts: &std::sync::Arc<resvg::usvg::fontdb::Database>,
+) -> Option<Vec<u8>> {
+    use resvg::tiny_skia;
+    use resvg::usvg;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut opt = usvg::Options::default();
+    opt.fontdb = fonts.clone();
+    let tree = usvg::Tree::from_data(data, &opt).ok()?;
+    let size = tree.size();
+    let (sw, sh) = (size.width(), size.height());
+    if !(sw > 0.0 && sh > 0.0) {
+        return None;
+    }
+    let scale = (w as f32 / sw).max(h as f32 / sh);
+    let tx = (w as f32 - sw * scale) * 0.5;
+    let ty = (h as f32 - sh * scale) * 0.5;
+    let mut pixmap = tiny_skia::Pixmap::new(w, h)?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, tx, ty),
+        &mut pixmap.as_mut(),
+    );
+    // tiny-skia hands back PREMULTIPLIED RGBA8; the buffer wants premultiplied BGRA
+    // (Argb8888 little-endian), so this is a channel swap plus the corner coverage,
+    // which scales every channel alike because the data is already premultiplied.
+    let hw = w as f32 / 2.0;
+    let hh = h as f32 / 2.0;
+    let r = radius.clamp(0.0, hw.min(hh));
+    let src = pixmap.data();
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            let cov = rounded_coverage(x as f32 + 0.5 - hw, y as f32 + 0.5 - hh, hw, hh, r);
+            if cov <= 0.0 {
+                continue;
+            }
+            let k = |v: u8| (v as f32 * cov) as u8;
+            out[i] = k(src[i + 2]);
+            out[i + 1] = k(src[i + 1]);
+            out[i + 2] = k(src[i]);
+            out[i + 3] = k(src[i + 3]);
+        }
+    }
+    Some(out)
 }
 
 impl RectCache {
@@ -852,6 +1019,89 @@ impl RectCache {
     /// compose-once proof).
     pub fn rounded_composes(&self) -> u64 {
         self.rounded_composes
+    }
+
+    /// The photo for a card's art tile: `source` (the served path the feed carries)
+    /// rasterised at `w` x `h` under the tile's corner, composed on first use and
+    /// cached, miss included, forever after. `None` when the source is outside the
+    /// roots, unreadable, not an SVG, or degenerate; the card is then its gradient.
+    pub fn art(&mut self, source: &str, w: i32, h: i32, radius: f32) -> Option<&MemoryRenderBuffer> {
+        if w < 1 || h < 1 || source.is_empty() {
+            return None;
+        }
+        let key = (source.to_string(), w as u32, h as u32, radius.to_bits());
+        if !self.art.contains_key(&key) {
+            if self.art.len() >= MAX_CACHED_ART {
+                self.art.clear();
+            }
+            let composed = self.compose_art(source, w as u32, h as u32, radius);
+            self.art.insert(key.clone(), composed);
+        }
+        self.art.get(&key).and_then(Option::as_ref)
+    }
+
+    /// Resolve, read, decode. The only disk touches on the art path, and each source
+    /// takes them once because the result, either way, goes into the map.
+    fn compose_art(&mut self, source: &str, w: u32, h: u32, radius: f32) -> Option<MemoryRenderBuffer> {
+        let path = match self.art_roots.resolve(source) {
+            Some(p) => p,
+            None => {
+                debug!(source, "card art: source is outside the served roots, or no root is set");
+                return None;
+            }
+        };
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(err) => {
+                warn!(?err, ?path, "card art: unreadable, the card keeps its gradient");
+                return None;
+            }
+        };
+        let fonts = self.art_fonts.get_or_insert_with(|| {
+            let started = Instant::now();
+            let mut db = resvg::usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            info!(
+                faces = db.len(),
+                took_ms = started.elapsed().as_millis() as u64,
+                "card art: font database loaded once for the SVG text runs"
+            );
+            std::sync::Arc::new(db)
+        });
+        let started = Instant::now();
+        let rgba = match svg_rgba(&data, w, h, radius, fonts) {
+            Some(px) => px,
+            None => {
+                warn!(?path, "card art: not an SVG the rasteriser accepts, the card keeps its gradient");
+                return None;
+            }
+        };
+        self.art_composes += 1;
+        debug!(
+            ?path,
+            w,
+            h,
+            took_ms = started.elapsed().as_millis() as u64,
+            "card art: composed once (cached until the size or the feed changes)"
+        );
+        Some(MemoryRenderBuffer::from_slice(
+            &rgba,
+            Fourcc::Argb8888,
+            (w as i32, h as i32),
+            1,
+            Transform::Normal,
+            None,
+        ))
+    }
+
+    /// Total SVGs ever rasterised (test hook for the compose-once proof).
+    pub fn art_composes(&self) -> u64 {
+        self.art_composes
+    }
+
+    /// How many art entries are held, misses included (test hook for the bound).
+    pub fn cached_art(&self) -> usize {
+        self.art.len()
     }
 }
 
@@ -3238,6 +3488,8 @@ where
     // claim that is missing leaves TWO orbs breathing on top of each other with the
     // WebView still paying the per-frame cost the native orb exists to remove.
     let mut emitted: u8 = 0;
+    // Where this scene's elements begin in the frame list; see the reversal at the end.
+    let first = elements.len();
 
     // RETAINED TREE (zero-per-frame-alloc, step two): the layout is rebuilt only when the
     // size, the composed home, or the theme changes, so a steady desktop reuses the tree
@@ -3404,11 +3656,11 @@ where
                 to,
                 angle_deg,
                 radius,
-                // The photo is not lowered yet (M3 remainder). The gradient beneath it is
-                // what the shell paints first and never removes, so the card is a card
-                // with or without one; before this, a card the feed gave a picture drew
-                // its picture's ABSENCE, and a ranked card drew nothing whatsoever.
-                photo: _,
+                // The photo, lowered OVER the gradient below. The gradient is what the
+                // shell paints first and never removes, so the card is a card with or
+                // without one; the photo is `.hh-card-art img` fading in on top, which
+                // here is one more cached buffer at the same rect.
+                photo,
             } => {
                 if rect.w < 1.0 || rect.h < 1.0 {
                     return;
@@ -3448,6 +3700,31 @@ where
                     ) {
                         Ok(e) => { elements.push(HartRenderElement::Memory(e)); emitted |= leaf_bits; }
                         Err(err) => warn!(?err, "native scene: card art import failed"),
+                    }
+                }
+                // The photo layer (M3's last remainder). Only a source under the two
+                // served roots decodes; a remote `image_url` is never fetched here and
+                // so lowers to nothing, exactly as the gradient-only card it is. Pushed
+                // AFTER the gradient, so it paints over it and under the scrim the
+                // layout emits next, which is the shell's own stacking.
+                if let Some(source) = photo {
+                    if let Some(buffer) =
+                        rect_cache.art(source, rect.w as i32, rect.h as i32, *radius)
+                    {
+                        let origin: Point<f64, Physical> =
+                            Point::from((rect.x as f64, rect.y as f64));
+                        match MemoryRenderBufferRenderElement::from_buffer(
+                            renderer,
+                            origin,
+                            buffer,
+                            Some(1.0),
+                            None,
+                            Some((rect.w as i32, rect.h as i32).into()),
+                            Kind::Unspecified,
+                        ) {
+                            Ok(e) => { elements.push(HartRenderElement::Memory(e)); emitted |= leaf_bits; }
+                            Err(err) => warn!(?err, "native scene: card photo import failed"),
+                        }
                     }
                 }
             }
@@ -3533,6 +3810,25 @@ where
             _ => {}
         }
     });
+    // TWO CONVENTIONS MEET HERE, and until 2026-09-24 they met the wrong way round.
+    // The scene walks its leaves in PAINT order, back to front: the bar's fill first,
+    // its text after, a card's shadow, then its tile, its art, its scrim, its title.
+    // The frame list is the OPPOSITE: smithay's `draw_render_elements` and the
+    // DrmCompositor both take index 0 as the TOP-MOST element (each element's opaque
+    // region occludes every element after it, and the draw runs in reverse), which is
+    // why `build_frame_elements` puts the cursor at 0 and the bloom last. Pushing the
+    // leaves in walk order therefore stacked the whole native scene upside down: every
+    // fill above its own text, every card's tile above its art and its title, and the
+    // omnibox pill under the bar it sits on. No headless proof had read a pixel whose
+    // colour depended on the order, and no screenshot exists from the DRM backend, so
+    // it survived every gate; the first photo lowered onto a card is what found it,
+    // painted under the tile it belonged over.
+    //
+    // Reversed IN PLACE, on this frame's own slice, so the fix allocates nothing per
+    // frame and leaves every element identity where it was (damage tracking compares
+    // identities, not positions). The pooled solids are still handed out in walk
+    // order, so the same rect gets the same buffer frame after frame.
+    elements[first..].reverse();
     emitted
 }
 
@@ -5313,6 +5609,140 @@ mod tests {
             "from == to must fill flat"
         );
     }
+
+    // ── CARD ART: the bundled SVGs, decoded by the compositor itself ─────────────
+
+    fn no_fonts() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
+        std::sync::Arc::new(resvg::usvg::fontdb::Database::new())
+    }
+
+    #[test]
+    fn every_bundled_card_svg_decodes_to_real_pixels_under_the_tiles_corner() {
+        // "Every bundled asset decodes": all 51, verbatim from the shell's static dir
+        // via the pinned fixture, through the SAME rasteriser the frame path uses, at
+        // the card's own size. Each must cover the tile (a real fraction of opaque
+        // pixels), keep the corner cut (the pixel in the corner is clear), and be
+        // opaque at the centre (the assets are backdrops, not line art). Run with an
+        // EMPTY font database on purpose: the 39 app icons carry a `<text>` initial,
+        // and the tile must still be a tile on a box with no fonts installed.
+        let fonts = no_fonts();
+        let (w, h) = (258u32, 150u32);
+        let assets = crate::wire_fixture::BUNDLED_CARD_ART;
+        assert_eq!(assets.len(), 51, "the program counts 51 bundled assets");
+        for (name, svg) in assets {
+            let px = svg_rgba(svg.as_bytes(), w, h, 16.0, &fonts)
+                .unwrap_or_else(|| panic!("{name} did not decode"));
+            assert_eq!(px.len(), (w * h * 4) as usize);
+            let alpha = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+            let opaque = px.chunks_exact(4).filter(|p| p[3] > 250).count();
+            assert!(
+                opaque > (w * h) as usize * 8 / 10,
+                "{name} covers only {opaque} of {} px; a card photo fills its tile",
+                w * h
+            );
+            assert_eq!(alpha(0, 0), 0, "{name}: the corner must be cut to the radius");
+            assert!(alpha(w / 2, h / 2) > 250, "{name}: opaque at the centre");
+            // Premultiplied: no channel may exceed its alpha, or the import will
+            // composite a colour brighter than the pixel's coverage allows.
+            for p in px.chunks_exact(4) {
+                assert!(p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3], "{name}: not premultiplied");
+            }
+        }
+    }
+
+    #[test]
+    fn the_photo_covers_the_tile_the_way_object_fit_cover_does() {
+        // `.hh-card-art img { object-fit: cover }`: the picture is scaled to FILL the
+        // box and centred, the overflow cropped, never letterboxed. A 480x300 asset on
+        // a 258x150 tile therefore scales by the HEIGHT (150/300 = 0.5 beats 258/480)
+        // and loses 24px of width on each side. Prove it with an SVG that is red on
+        // its left tenth and blue on its right tenth: neither edge colour survives on
+        // the tile, the middle is what remains.
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 480 300' width='480' height='300'>\
+                   <rect width='480' height='300' fill='#00FF00'/>\
+                   <rect width='48' height='300' fill='#FF0000'/>\
+                   <rect x='432' width='48' height='300' fill='#0000FF'/></svg>";
+        let (w, h) = (258u32, 150u32);
+        let px = svg_rgba(svg.as_bytes(), w, h, 0.0, &no_fonts()).expect("decodes");
+        let at = |x: u32, y: u32| -> (u8, u8, u8) {
+            let i = ((y * w + x) * 4) as usize;
+            (px[i + 2], px[i + 1], px[i])
+        };
+        // COVER takes the LARGER ratio: 258/480 = 0.5375 beats 150/300 = 0.5, so the
+        // asset is scaled by width, fills the tile edge to edge (the strips ARE the
+        // edges) and loses 5px of height top and bottom. A letterbox would take the
+        // smaller ratio and leave 9px of nothing either side, which is what a card
+        // photo must never do.
+        assert_eq!(at(0, h / 2), (255, 0, 0), "the left edge is the asset's left edge");
+        assert_eq!(at(w - 1, h / 2), (0, 0, 255), "and the right its right");
+        assert_eq!(at(w / 2, h / 2), (0, 255, 0));
+        assert!(px.chunks_exact(4).all(|p| p[3] == 255), "no letterbox: every pixel covered");
+        // A box the asset is much WIDER than scales by height and crops the sides: on
+        // a 100x300 box the scale is 1.0, the visible slice is the asset's middle, and
+        // neither strip survives. A letterbox would show both strips and empty rows.
+        let tall = svg_rgba(svg.as_bytes(), 100, 300, 0.0, &no_fonts()).expect("decodes");
+        let at2 = |x: u32, y: u32| -> (u8, u8, u8) {
+            let i = ((y * 100 + x) * 4) as usize;
+            (tall[i + 2], tall[i + 1], tall[i])
+        };
+        assert_eq!(at2(0, 150), (0, 255, 0), "the red strip is cropped away");
+        assert_eq!(at2(99, 150), (0, 255, 0), "and the blue one");
+        assert!(tall.chunks_exact(4).all(|p| p[3] == 255), "every row covered");
+    }
+
+    #[test]
+    fn a_photo_path_never_leaves_its_root_and_only_an_svg_is_decoded() {
+        let roots = ArtRoots {
+            static_dir: Some(std::path::PathBuf::from("/srv/static")),
+            agent_art_dir: Some(std::path::PathBuf::from("/var/lib/hart/agent-art")),
+        };
+        let p = |s: &str| roots.resolve(s).map(|p| p.to_string_lossy().replace('\\', "/"));
+        assert_eq!(p("/shell/static/app_art/app-files.svg"), Some("/srv/static/app_art/app-files.svg".into()));
+        assert_eq!(p("/shell/static/app_art/apps/com.brave.Browser.svg"),
+                   Some("/srv/static/app_art/apps/com.brave.Browser.svg".into()));
+        // The feed's string is LLM-written; the sanitizer checks a prefix, this checks
+        // the rest. None of these may name a file.
+        for bad in [
+            "/shell/static/../../etc/shadow.svg",
+            "/shell/static/app_art/../../secrets.svg",
+            "/shell/static//etc/passwd.svg",
+            "/shell/static/app_art/./a.svg",
+            "/shell/static/app_art/a.png",
+            "/shell/static/app_art/a.svg/",
+            "/shell/static/",
+            "/shell/agent-art/Auto Research",
+            "/shell/agent-art/../x",
+            "/shell/agent-art/",
+            "https://example.invalid/a.svg",
+            "/etc/passwd",
+            "",
+        ] {
+            assert_eq!(p(bad), None, "{bad:?} must not resolve");
+        }
+        // An agent slug falls back to the bundled agents dir when the drop has no file.
+        assert_eq!(
+            p("/shell/agent-art/auto-research"),
+            Some("/srv/static/app_art/agents/auto-research.svg".into())
+        );
+        // No static root at all: nothing under it resolves, and a card is its gradient.
+        let none = ArtRoots { static_dir: None, agent_art_dir: None };
+        assert_eq!(none.resolve("/shell/static/app_art/app-files.svg"), None);
+        assert_eq!(none.resolve("/shell/agent-art/auto-research"), None);
+    }
+
+    #[test]
+    fn junk_and_degenerate_sizes_decode_to_nothing_rather_than_panicking() {
+        let fonts = no_fonts();
+        assert!(svg_rgba(b"not svg at all", 10, 10, 0.0, &fonts).is_none());
+        assert!(
+            svg_rgba(b"<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'/>", 10, 10, 0.0, &fonts).is_none(),
+            "a zero-sized document has nothing to cover a tile with"
+        );
+        let ok = b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 2 2' width='2' height='2'><rect width='2' height='2' fill='#fff'/></svg>";
+        assert!(svg_rgba(ok, 0, 10, 0.0, &fonts).is_none());
+        assert!(svg_rgba(ok, 10, 0, 0.0, &fonts).is_none());
+        assert!(svg_rgba(ok, 3, 3, 0.0, &fonts).is_some());
+    }
 }
 
 // NATIVE SHELL PARITY PROGRAM, M3 render proof. Gated on `smithay` because it uses
@@ -6401,6 +6831,7 @@ mod native_render_tests {
     fn composite_home(
         home: &crate::scene::HomeCompose,
         size: Size<i32, Physical>,
+        rects: &mut RectCache,
     ) -> (Vec<u8>, crate::scene::SceneNode) {
         use smithay::backend::renderer::utils::draw_render_elements;
         use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen};
@@ -6408,11 +6839,10 @@ mod native_render_tests {
         let buf_size: Size<i32, BufferCoord> = (size.w, size.h).into();
         let mut rasterizer = crate::text_render::TextRasterizer::new();
         let mut orb = OrbCache::default();
-        let mut rects = RectCache::default();
         let mut scenes = crate::scene::SceneCache::default();
         let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
         lower_scene(
-            home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
+            home, size, &mut renderer, &mut rasterizer, &mut orb, rects, &mut scenes,
             0.0, None, false, false, &crate::scene::RowScroll::default(), &mut elements,
         );
         let tree = scenes.tree().expect("lowering built the tree").clone();
@@ -6467,7 +6897,7 @@ mod native_render_tests {
         // has all but reached the accent.
         let size: Size<i32, Physical> = (1280, 800).into();
         let mut home = crate::scene::HomeCompose::demo();
-        let (plain, tree) = composite_home(&home, size);
+        let (plain, tree) = composite_home(&home, size, &mut RectCache::default());
         let cta = primary_cta_rect(&tree);
         let px = |bytes: &[u8]| -> (u8, u8, u8) {
             let x = (cta.x + cta.w - 4.0) as usize;
@@ -6489,7 +6919,7 @@ mod native_render_tests {
                 crate::scene::Color::from_hex("#FFB330"),
             ],
         });
-        let (aurora, tree_a) = composite_home(&home, size);
+        let (aurora, tree_a) = composite_home(&home, size, &mut RectCache::default());
         assert_eq!(primary_cta_rect(&tree_a), cta, "a mood moves no geometry");
         let (r1, g1, b1) = px(&aurora);
         assert!(
@@ -6510,7 +6940,7 @@ mod native_render_tests {
                 None,
             ],
         });
-        let (sunset, tree_s) = composite_home(&home, size);
+        let (sunset, tree_s) = composite_home(&home, size, &mut RectCache::default());
         assert_eq!(primary_cta_rect(&tree_s), cta, "a mood moves no geometry");
         let (r2, g2, b2) = px(&sunset);
         assert!(
@@ -6551,5 +6981,156 @@ mod native_render_tests {
         assert_eq!(cache.key, sunset_key, "the same mood again does not recompose");
         assert!(cache.get(w, h, None).is_some());
         assert_eq!(cache.key, plain_key, "and dropping the mood returns to the theme's field");
+    }
+
+    /// A temp static root holding ONE card SVG at the served path `rel`, so the art
+    /// path can be driven end to end with no environment and no bundled file.
+    fn art_root_with(rel: &str, svg: &str) -> ArtRoots {
+        let dir = std::env::temp_dir().join(format!("hart_art_{}", std::process::id()));
+        let file = dir.join(rel);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, svg).unwrap();
+        ArtRoots { static_dir: Some(dir), agent_art_dir: None }
+    }
+
+    #[test]
+    fn a_cards_photo_reaches_the_pixels_over_its_gradient_and_under_its_scrim() {
+        // THE PIXEL PROOF for the photo layer, the last M3 remainder. A card whose
+        // `image` names a served SVG must composite that SVG over its brand gradient:
+        // the same home with and without the photo differs INSIDE the card's art box
+        // and nowhere else, and the pixel at the box's centre carries the SVG's own
+        // colour, a red no card gradient contains. The scrim still paints over it, so
+        // the sample is taken above the scrim's clear stop, where the title is not.
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let mut home = crate::scene::HomeCompose::demo();
+        let rel = "app_art/proof.svg";
+        home.rows[0].cards[0].photo = Some(format!("/shell/static/{rel}"));
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10' width='10' height='10'>\
+                   <rect width='10' height='10' fill='#FF0000'/></svg>";
+
+        let mut with_art = RectCache::default();
+        with_art.art_roots = art_root_with(rel, svg);
+        let (pictured, tree) = composite_home(&home, size, &mut with_art);
+        assert_eq!(with_art.art_composes(), 1, "the photo composed exactly once");
+
+        let mut no_root = RectCache::default();
+        no_root.art_roots = ArtRoots { static_dir: None, agent_art_dir: None };
+        let (bare, _) = composite_home(&home, size, &mut no_root);
+        assert_eq!(no_root.art_composes(), 0, "with no root there is nothing to decode");
+
+        // The first card's art box, read from the tree the lowering laid out.
+        let mut art_box = None;
+        tree.for_each_leaf(&mut |_, leaf| {
+            if let crate::scene::SceneNode::Fill { rect, photo: Some(_), .. } = leaf {
+                if art_box.is_none() {
+                    art_box = Some(*rect);
+                }
+            }
+        });
+        let b = art_box.expect("the card carries its photo on its art tile");
+        let px = |bytes: &[u8], x: f32, y: f32| -> (u8, u8, u8) {
+            let i = ((y as usize) * size.w as usize + x as usize) * 4;
+            (bytes[i + 2], bytes[i + 1], bytes[i]) // R, G, B
+        };
+        let (cx, cy) = (b.x + b.w * 0.5, b.y + b.h * 0.2);
+        let (r, g, bl) = px(&pictured, cx, cy);
+        assert!(
+            r > 200 && g < 40 && bl < 40,
+            "the photo's red must reach the card: got {:?} at ({cx},{cy})",
+            (r, g, bl)
+        );
+        let (r0, g0, b0) = px(&bare, cx, cy);
+        assert!(r0 < 200, "without a root the card is its gradient, not red: {:?}", (r0, g0, b0));
+
+        // The corner is CLIPPED to the tile's radius: just inside the box's top-left
+        // corner the photo is absent and the pixel is whatever was behind the card.
+        assert_eq!(px(&pictured, b.x + 1.0, b.y + 1.0), px(&bare, b.x + 1.0, b.y + 1.0),
+                   "the photo must not square off the card's rounded corner");
+        // And nothing OUTSIDE the box moved: the bars, the hero, the other cards.
+        let (w, h) = (size.w as usize, size.h as usize);
+        let mut moved_outside = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                let inside = x as f32 >= b.x && (x as f32) < b.right() && y as f32 >= b.y && (y as f32) < b.bottom();
+                if inside {
+                    continue;
+                }
+                let i = (y * w + x) * 4;
+                if pictured[i..i + 4] != bare[i..i + 4] {
+                    moved_outside += 1;
+                }
+            }
+        }
+        assert_eq!(moved_outside, 0, "a photo changes its own card and nothing else");
+    }
+
+    #[test]
+    fn the_scene_stacks_the_way_it_is_walked_so_the_pill_sits_on_the_bar() {
+        // THE Z-ORDER PROOF, in pixels. The frame list is top-most first (smithay's
+        // convention, the reason the cursor is inserted at 0 and the bloom pushed last)
+        // and the scene walks its leaves bottom-most first, so the lowering has to turn
+        // its slice around. It did not, and every headless proof passed: none had read
+        // a pixel whose colour depended on what was on top. This one does. The omnibox
+        // pill is a translucent white over the bar's opaque fill and is walked AFTER
+        // it, so a pixel inside the pill must be lighter than the bar beside it. With
+        // the slice upside down the fill covers the pill and the two are equal.
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let home = crate::scene::HomeCompose::demo();
+        let (bytes, tree) = composite_home(&home, size, &mut RectCache::default());
+        let theme = crate::scene::Theme::cosmic_default();
+        // The pill: the one rounded Rect in the bar band painted in the omnibox ground.
+        let mut pill = None;
+        tree.for_each_leaf(&mut |_, leaf| {
+            if let crate::scene::SceneNode::Rect { rect, color, radius } = leaf {
+                if *color == theme.omnibox_bg && *radius > 0.0 && rect.y < theme.top_bar_h
+                    && rect.w > 100.0 && pill.is_none()
+                {
+                    pill = Some(*rect);
+                }
+            }
+        });
+        let p = pill.expect("the bar draws its omnibox pill");
+        let lum = |x: f32, y: f32| -> u32 {
+            let i = ((y as usize) * size.w as usize + x as usize) * 4;
+            bytes[i] as u32 + bytes[i + 1] as u32 + bytes[i + 2] as u32
+        };
+        let inside = lum(p.x + p.w * 0.5, p.y + p.h * 0.5);
+        // The bar beside the pill, same row, clear of the tabs: 20px right of the pill.
+        let beside = lum(p.right() + 20.0, p.y + p.h * 0.5);
+        assert!(
+            inside > beside + 20,
+            "the pill must sit ON the bar (inside {inside} vs bar {beside}); equal means \
+             the scene is stacked upside down and the fill covers everything on it"
+        );
+    }
+
+    #[test]
+    fn a_steady_desktop_with_photos_composes_each_once_and_never_retries_a_miss() {
+        let rel = "app_art/once.svg";
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4' width='4' height='4'>\
+                   <rect width='4' height='4' fill='#00FF00'/></svg>";
+        let mut rects = RectCache::default();
+        rects.art_roots = art_root_with(rel, svg);
+        for _ in 0..5 {
+            assert!(rects.art(&format!("/shell/static/{rel}"), 258, 150, 16.0).is_some());
+        }
+        assert_eq!(rects.art_composes(), 1, "five frames, one compose");
+        // A second size is a second buffer, as the tiles are.
+        assert!(rects.art(&format!("/shell/static/{rel}"), 174, 150, 16.0).is_some());
+        assert_eq!(rects.art_composes(), 2);
+        // A source that is not there is remembered as a miss: no compose, and the
+        // entry exists so the frame path never touches the disk for it again.
+        let held = rects.cached_art();
+        for _ in 0..3 {
+            assert!(rects.art("/shell/static/app_art/missing.svg", 258, 150, 16.0).is_none());
+        }
+        assert_eq!(rects.cached_art(), held + 1, "one entry for the miss");
+        assert_eq!(rects.art_composes(), 2, "a miss composes nothing");
+        // Bounded: an agent that names a fresh source per compose cannot grow this
+        // without limit. Past the cap the map is dropped and starts again.
+        for i in 0..(MAX_CACHED_ART * 2) {
+            let _ = rects.art(&format!("/shell/static/app_art/agent-{i}.svg"), 258, 150, 16.0);
+        }
+        assert!(rects.cached_art() <= MAX_CACHED_ART, "the art cache is bounded");
     }
 }
