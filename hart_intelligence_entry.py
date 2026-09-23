@@ -915,17 +915,52 @@ stream_handler.setFormatter(formatter)
 # handlers owned by anyone else.
 _HARTOS_HANDLER_TAG = '_hartos_root_handler'
 
-_root = logging.getLogger()
-for _existing in list(_root.handlers):
-    if getattr(_existing, _HARTOS_HANDLER_TAG, False):
-        _root.removeHandler(_existing)
-_root.setLevel(logging.INFO)
 
-if _is_bundled:
-    setattr(handler, _HARTOS_HANDLER_TAG, True)
-    setattr(stream_handler, _HARTOS_HANDLER_TAG, True)
-    _root.addHandler(handler)
-    _root.addHandler(stream_handler)
+def _install_root_handlers(root, bundled, file_handler, console_handler):
+    """Attach this module's handlers to the ROOT logger, without stealing anyone's.
+
+    Three launch shapes, three answers:
+      * bundled (cx_Freeze): root gets file + console, so every module logger
+        lands in langchain.log and the console;
+      * a host that already configured root (Nunba's gui_app.log/server.log,
+        pytest's capture): root is left exactly as found, per the 2026-08-03
+        incident above;
+      * a bare root with NO handler at all: root gets the console handler.
+
+    The third case is the OS and Docker launch (`python hart_intelligence_entry.py`
+    under systemd). Before 2026-09-24 it got nothing, so every INFO line the
+    root logger saw during main() went to Python's lastResort handler, which
+    prints WARNING and above only. Measured on the hart-ota-central nixos test
+    (2026-09-23 run, shard 0): "STARTUP VALIDATION WARNINGS" reached the journal
+    as bare text, and "[Guardrail] hash verified", "Platform bootstrapped" and
+    "Local subscribers bootstrapped: ... ota-push" never appeared at all, until a
+    background thread's import called logging.basicConfig() some two seconds
+    after Waitress bound and INFO started flowing in basicConfig's format. The
+    OTA test waited 240 s for a line the process had already dropped, and the
+    boot narrative that hart-backend.nix exempts from the journald rate limit
+    was never being written in the first place.
+
+    Attaching only when root is empty is the same rule basicConfig() follows, so
+    a later basicConfig() call becomes the no-op it was always meant to be and
+    the journal keeps ONE format (the RequestID/threadName one) end to end.
+    """
+    for existing in list(root.handlers):
+        if getattr(existing, _HARTOS_HANDLER_TAG, False):
+            root.removeHandler(existing)
+    root.setLevel(logging.INFO)
+
+    if bundled:
+        setattr(file_handler, _HARTOS_HANDLER_TAG, True)
+        setattr(console_handler, _HARTOS_HANDLER_TAG, True)
+        root.addHandler(file_handler)
+        root.addHandler(console_handler)
+    elif not root.handlers:
+        setattr(console_handler, _HARTOS_HANDLER_TAG, True)
+        root.addHandler(console_handler)
+
+
+_root = logging.getLogger()
+_install_root_handlers(_root, _is_bundled, handler, stream_handler)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)

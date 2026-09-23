@@ -492,11 +492,22 @@ in
           # cause, and it STILL times out -- so the number is a guess that is
           # already wrong once.
           #
-          # DO NOT just raise it again. Either measure what the backend is doing
-          # between unit-active and this log line, or assert the wiring property
-          # far more cheaply than by racing a full boot: this subtest only needs
-          # to know that the OTA leg was registered with the existing bus, which
-          # does not require waiting for the whole backend to finish starting.
+          # MEASURED 2026-09-24 (shard 0 of the first nixosTests run since
+          # 08-14, journal of this very VM): the backend was NOT slow. main()
+          # reached _validate_startup at 29 s and Waitress bound :6777 at
+          # 31.8 s, so bootstrap_local_subscribers ran in between and its line
+          # was emitted, then DROPPED. In the CLI launch the entry attached no
+          # handler to the root logger (only the bundle did), so root INFO went
+          # to Python's lastResort handler, which prints WARNING and above:
+          # "STARTUP VALIDATION WARNINGS" arrived as bare text, "[Guardrail]",
+          # "Platform bootstrapped" and this line never arrived at all, and two
+          # seconds after the bind a background import's basicConfig() finally
+          # gave root a handler ("INFO:waitress:Serving on" is in that format).
+          # 240 s was never going to see a line the process had already thrown
+          # away. Fixed in hart_intelligence_entry._install_root_handlers: a
+          # bare root now gets the console handler at import, so the proof is
+          # in the journal by ~31 s. The 240 s stays as headroom for a loaded
+          # runner, it is no longer load-bearing.
           jb = node.wait_until_succeeds(
               "journalctl -u hart-backend --no-pager | "
               "grep -i 'Local subscribers bootstrapped' | tail -1",
