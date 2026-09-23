@@ -634,16 +634,83 @@ impl Theme {
         self.omnibox_bg = keep_alpha(self.omnibox_bg, surface);
         self
     }
+
+    /// This theme with a composed MOOD folded in: the colours the shell resolved the
+    /// `mood` id to, over the theme file's own.
+    ///
+    /// `mood` was decoded and dropped for a year of this program, so every
+    /// agent-composed mood rendered identically natively. Resolving it here would have
+    /// meant a copy of `HART_PALETTES` in Rust, which is a second palette table (Gate
+    /// 4), so the shell, which owns that table, sends what the id MEANS on the same
+    /// `shell.compose` payload and this folds it through the SAME path a theme file
+    /// takes (`with_theme_colors`), never a parallel one.
+    ///
+    /// The rule the shell applies is preserved by construction rather than repeated:
+    /// `paintPalette` sets `--hart-accent` to `p.accent || p.a`, so for the six Aura
+    /// moods the accent that arrives IS teal and the quad drives only the ambient field
+    /// (the bloom, and the live dot that rides `--hart-amb-4`), while the ten classic
+    /// palettes arrive with the accent set from their lead hue. Nothing here knows which
+    /// kind it was handed; it paints what it was sent.
+    ///
+    /// Alpha stays the surface's, exactly as `with_theme_colors` keeps it.
+    pub fn with_mood(self, mood: &MoodPalette) -> Theme {
+        let mut t = self.with_theme_colors(
+            mood.background,
+            mood.accent,
+            mood.secondary,
+            None,
+            None,
+            None,
+        );
+        // `.hh-dot` reads `--hart-amb-4`, which paintPalette writes from `p.a4`. The
+        // ten classic palettes carry no a4, so the theme's own dot stands for them.
+        if let Some(d) = mood.ambient[3] {
+            t.live_dot = Color::rgba(d.r, d.g, d.b, t.live_dot.a);
+        }
+        t
+    }
+}
+
+/// A composed mood, RESOLVED: the colours `HartPalette.paint` sets for a mood id,
+/// sent by the shell beside the id because the compositor keeps no palette table.
+///
+/// The keys are the theme file's own (`accent`, `secondary`, `background`,
+/// `ambient_1..4`), which is what lets `Theme::with_mood` and the bloom fold them
+/// through the paths a theme file already takes. Every field is optional: a classic
+/// palette names no `a3`/`a4`, and the theme's ambient stands where the mood is silent,
+/// on both renderers.
+///
+/// `Copy`, deliberately: it is seven optional colours, and the frame path reads it
+/// out of the composed home beside the caches without a clone.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MoodPalette {
+    pub accent: Option<Color>,
+    pub secondary: Option<Color>,
+    pub background: Option<Color>,
+    pub ambient: [Option<Color>; 4],
+}
+
+impl MoodPalette {
+    /// Whether the mood names any colour at all. An empty resolution is treated as no
+    /// mood, so a payload carrying `"palette": {}` changes nothing rather than resetting.
+    pub fn is_empty(&self) -> bool {
+        self.accent.is_none()
+            && self.secondary.is_none()
+            && self.background.is_none()
+            && self.ambient.iter().all(Option::is_none)
+    }
 }
 
 /// The decoded `home_compose` A2UI payload. Mirrors the props allowlisted in
 /// liquid_ui_service.py (`home_compose {hero, rows, mood}`). `mood` stays a raw id
-/// string owned by the palette layer, not resolved here.
+/// string owned by the palette layer, not resolved here; `palette` is that id
+/// resolved BY that layer, which is the only way it reaches native pixels.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HomeCompose {
     pub hero: Hero,
     pub rows: Vec<Row>,
     pub mood: Option<String>,
+    pub palette: Option<MoodPalette>,
 }
 
 impl HomeCompose {
@@ -735,6 +802,7 @@ impl HomeCompose {
                 },
             ],
             mood: None,
+            palette: None,
         }
     }
 }
@@ -2915,6 +2983,29 @@ pub fn decode_home_compose(v: &serde_json::Value) -> HomeCompose {
         hero,
         rows,
         mood: v.get("mood").and_then(Value::as_str).map(str::to_string),
+        palette: v.get("palette").and_then(decode_mood_palette),
+    }
+}
+
+/// `palette` -> MoodPalette, tolerant like everything above it: a key that is absent
+/// or not a `#RRGGBB` leaves that colour None, and a palette that resolves to nothing
+/// at all is None rather than an empty mood that would still count as one.
+///
+/// The keys are the sanitizer's, which are the theme file's: `_home_resolve_mood`
+/// emits exactly these names so that one vocabulary crosses the wire, and the
+/// classic-mood wire fixture pins them from the real producer.
+fn decode_mood_palette(v: &serde_json::Value) -> Option<MoodPalette> {
+    let hex = |key: &str| v.get(key).and_then(serde_json::Value::as_str).and_then(Color::from_hex);
+    let m = MoodPalette {
+        accent: hex("accent"),
+        secondary: hex("secondary"),
+        background: hex("background"),
+        ambient: [hex("ambient_1"), hex("ambient_2"), hex("ambient_3"), hex("ambient_4")],
+    };
+    if m.is_empty() {
+        None
+    } else {
+        Some(m)
     }
 }
 
@@ -2973,6 +3064,102 @@ mod tests {
                 },
             ],
             mood: Some("cosmic".into()),
+            palette: None,
+        }
+    }
+
+    /// An Aura-style resolution: the functional accent pinned TEAL while the quad leads
+    /// violet, which is what `_home_resolve_mood("aurora")` emits and what the default
+    /// wire fixture carries.
+    fn aura_mood() -> MoodPalette {
+        MoodPalette {
+            accent: Color::from_hex("#00E6C3"),
+            secondary: Color::from_hex("#00DDF9"),
+            background: Color::from_hex("#04050B"),
+            ambient: [
+                Color::from_hex("#B182FF"),
+                Color::from_hex("#00DDF9"),
+                Color::from_hex("#FB66B6"),
+                Color::from_hex("#FFB330"),
+            ],
+        }
+    }
+
+    /// A classic resolution (`sunset`): the accent IS the lead hue, and no a3/a4.
+    fn classic_mood() -> MoodPalette {
+        MoodPalette {
+            accent: Color::from_hex("#FF8A4C"),
+            secondary: Color::from_hex("#FF2E9A"),
+            background: Color::from_hex("#16090F"),
+            ambient: [Color::from_hex("#FF8A4C"), Color::from_hex("#FF2E9A"), None, None],
+        }
+    }
+
+    #[test]
+    fn an_aura_mood_keeps_the_functional_accent_teal_and_a_classic_one_sets_it() {
+        // The internal rule of HART_PALETTES, which the shell applies and the wire
+        // carries resolved: the six Aura moods pin the accent to teal and let their
+        // quad drive ONLY the ambient field; the ten classic palettes set the accent
+        // itself. The compositor must paint what it is sent, and what it is sent must
+        // land on the surfaces the shell's own tokens land on.
+        let base = Theme::cosmic_default();
+        let teal = base.accent;
+
+        let aura = base.with_mood(&aura_mood());
+        assert_eq!(aura.accent, teal, "an Aura mood leaves every functional signifier teal");
+        assert_eq!(aura.spectrum[0], teal, "and the spectrum still leads with it");
+        assert_eq!(aura.accent2, Color::from_hex("#00DDF9").unwrap(), "--hart-a2 follows p.a2");
+        assert_eq!(
+            (aura.live_dot.r, aura.live_dot.g, aura.live_dot.b),
+            (1.0, 0xB3 as f32 / 255.0, 0x30 as f32 / 255.0),
+            "the live dot is --hart-amb-4, the mood's a4"
+        );
+        assert_eq!(aura.live_dot.a, base.live_dot.a, "alpha stays the surface's");
+
+        let classic = base.with_mood(&classic_mood());
+        assert_ne!(classic.accent, teal, "a classic palette moves the accent");
+        assert_eq!(classic.accent, Color::from_hex("#FF8A4C").unwrap());
+        assert_eq!(classic.spectrum[0], classic.accent, "the spectrum leads with it too");
+        assert_eq!(classic.live_dot, base.live_dot, "no a4 means the theme's own dot stands");
+        // The two moods must not paint the same desktop, or `mood` is still dropped.
+        assert_ne!(aura, classic);
+        // And what the mood does NOT touch stays the theme's: text, muted, surface.
+        assert_eq!(classic.card_ink, base.card_ink);
+        assert_eq!(classic.hero_copy, base.hero_copy);
+        assert_eq!(classic.card_bg.a, base.card_bg.a);
+        assert_eq!(
+            (classic.bar_bg.r, classic.bar_bg.a),
+            (0x16 as f32 / 255.0, base.bar_bg.a),
+            "the ground takes the mood's hue at the surface's own opacity"
+        );
+    }
+
+    #[test]
+    fn decode_reads_a_resolved_palette_and_ignores_junk_in_it() {
+        let v = serde_json::json!({
+            "rows": [],
+            "mood": "aurora",
+            "palette": {
+                "accent": "#00E6C3", "secondary": "#00DDF9", "background": "#04050B",
+                "ambient_1": "#B182FF", "ambient_2": "not a colour", "ambient_4": "#FFB330"
+            }
+        });
+        let hc = decode_home_compose(&v);
+        let m = hc.palette.expect("a resolved palette decodes");
+        assert_eq!(m, MoodPalette {
+            accent: Color::from_hex("#00E6C3"),
+            secondary: Color::from_hex("#00DDF9"),
+            background: Color::from_hex("#04050B"),
+            ambient: [Color::from_hex("#B182FF"), None, None, Color::from_hex("#FFB330")],
+        });
+        // No palette, an empty one, a wrong-typed one: all None, never an empty mood.
+        for bad in [
+            serde_json::json!({"rows": [], "mood": "x"}),
+            serde_json::json!({"rows": [], "palette": {}}),
+            serde_json::json!({"rows": [], "palette": "aurora"}),
+            serde_json::json!({"rows": [], "palette": {"accent": 5, "ambient_1": ""}}),
+        ] {
+            assert_eq!(decode_home_compose(&bad).palette, None, "{bad}");
         }
     }
 
@@ -4394,6 +4581,19 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
             Some("/shell/static/app_art/a.svg"),
             "and a same-origin `image` is the same photo slot"
         );
+        // The mood, RESOLVED by the shell: what was decoded and dropped now decodes to
+        // colours. An Aura mood arrives with the accent pinned teal and its quad set.
+        let mood = home.palette.expect("the sanitizer resolves `aurora` beside the id");
+        assert_eq!(home.mood.as_deref(), Some("aurora"), "the id still rides along");
+        assert_eq!(mood.accent, Color::from_hex("#00E6C3"), "Aura: the accent stays teal");
+        assert_eq!(mood.ambient[0], Color::from_hex("#B182FF"), "while the quad leads violet");
+        assert_eq!(mood.ambient[3], Color::from_hex("#FFB330"));
+        assert_eq!(mood.background, Color::from_hex("#04050B"));
+        assert_eq!(
+            Theme::cosmic_default().with_mood(&mood).accent,
+            Theme::cosmic_default().accent,
+            "and folding it in leaves the functional accent where it was"
+        );
 
         // Every one of those must actually be DRAWN, not merely decoded.
         let root =
@@ -4427,6 +4627,50 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
                 "the shell sent {want:?} and the native desktop never drew it"
             );
         }
+    }
+
+    #[test]
+    fn the_classic_mood_fixture_moves_the_accent_and_names_real_bundled_art() {
+        // The SECOND fixture from the real producer: a classic mood (`sunset`), whose
+        // accent is its lead hue rather than the pinned teal, and two cards whose
+        // photos name bundled SVGs by their served paths. The Python side pins that
+        // those files exist; this pins that the decoder reads both shapes and that the
+        // desktop they lay out is the mood's, not the shipped default's.
+        let v: serde_json::Value =
+            serde_json::from_str(crate::wire_fixture::HOME_COMPOSE_SANITIZED_CLASSIC_MOOD)
+                .expect("the classic-mood fixture is the sanitizer's own output");
+        let home = decode_home_compose(&v);
+        assert_eq!(home.mood.as_deref(), Some("sunset"));
+        let mood = home.palette.expect("a classic mood resolves too");
+        let orange = Color::from_hex("#FF8A4C");
+        assert_eq!(mood.accent, orange, "a classic palette's accent is its lead hue");
+        assert_eq!(mood.ambient[0], orange);
+        assert_eq!(mood.ambient[2], None, "no a3 on a classic palette");
+        assert_eq!(mood.ambient[3], None, "no a4 either, so the theme's dot stands");
+        let themed = Theme::cosmic_default().with_mood(&mood);
+        assert_eq!(themed.accent, orange.unwrap());
+        assert_ne!(themed.accent, Theme::cosmic_default().accent, "the accent MOVED");
+
+        // The photos are the served paths, verbatim, ready for the art lowering.
+        let photos: Vec<&str> = home
+            .rows
+            .iter()
+            .flat_map(|r| r.cards.iter())
+            .filter_map(|c| c.photo.as_deref())
+            .collect();
+        assert_eq!(
+            photos,
+            ["/shell/static/app_art/apps/com.brave.Browser.svg", "/shell/static/app_art/app-files.svg"]
+        );
+
+        // And it lays out as a desktop in the mood's colours: the eyebrow and the
+        // See-all take the accent, so they must be orange here and teal by default.
+        let root = layout_home(1920.0, 1080.0, &home, &themed, &RowScroll::default(), &mut MonoMeasure);
+        let runs = drawn_runs(&root);
+        let of = |t: &str| runs.iter().find(|(s, _, _, _)| s == t).map(|r| r.3);
+        assert_eq!(of("EARNED ON THE HIVE"), orange, ".hh-eyebrow takes --hart-accent");
+        assert_eq!(of(SEE_ALL), orange, "and so does .hh-see-all");
+        assert!(drawn_texts(&root).iter().any(|t| t == "Brave"), "the photo card still draws");
     }
 
     #[test]

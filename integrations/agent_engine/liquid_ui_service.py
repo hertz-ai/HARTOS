@@ -1624,6 +1624,15 @@ class LiquidUIService:
         # untouched. The XSS gate + slug sanitize already vetted it upstream.
         if mood:
             component['mood'] = mood
+            # And what the id RESOLVES to, for the consumer that has no palette
+            # table of its own. Derived HERE from the mood, never accepted from a
+            # caller: the HTTP route hands this function a raw body, and a palette
+            # a client could dictate would be a way around the one table. Unknown
+            # ids resolve to nothing, exactly as HartPalette.byId answers null.
+            resolved = _home_resolve_mood(
+                re.sub(r'[^a-z0-9_-]', '', str(mood).strip().lower())[:24])
+            if resolved:
+                component['palette'] = resolved
         accepted = self.agent_ui_update(agent_id, component)
         if accepted:
             # SECOND CONSUMER, SAME PAYLOAD. The native scene reads the identical
@@ -1662,7 +1671,11 @@ class LiquidUIService:
             reply = get_wm_client().shell_compose(
                 hero=component.get('hero'),
                 rows=component.get('rows'),
-                mood=component.get('mood'))
+                mood=component.get('mood'),
+                # The mood's resolved colours ride the same verb. The compositor
+                # keeps no palette table, so without these `mood` was decoded and
+                # dropped and every agent-composed mood rendered identically.
+                palette=component.get('palette'))
         except Exception as e:
             logger.debug("native scene compose skipped: %s", e)
             return False
@@ -9700,7 +9713,88 @@ def _sanitize_home_payload(payload) -> Optional[dict]:
         slug = re.sub(r'[^a-z0-9_-]', '', mood.strip().lower())[:24]
         if slug:
             out['mood'] = slug
+            # The SAME mood, resolved to colours, for the consumer that cannot
+            # resolve it itself. The browser owns HART_PALETTES and paints the id;
+            # the compositor's native scene has no copy of that table (Gate 4: no
+            # second palette table in Rust), so it is handed what the id MEANS
+            # over the same wire. Absent when the id is not one the table knows,
+            # which is exactly the browser's own no-op for an unknown mood.
+            resolved = _home_resolve_mood(slug)
+            if resolved:
+                out['palette'] = resolved
     return out
+
+
+# The palette table the moods resolve against, read ONCE from the file that owns
+# it. hartPersonalize.js declares `PALETTES = window.HART_PALETTES` as "the
+# authoritative client list", and HART_MOOD_PALETTE_IDS above mirrors only its
+# IDS for the LLM prompt. Resolving an id to colours server-side needs the
+# colours too, and a second copy of sixteen hex quads would be the drift the
+# source-shape guard in test_home_producer exists to stop. So the server READS the
+# JS table rather than restating it: one table, one owner, two readers.
+_HOME_MOOD_PALETTES: Optional[Dict[str, Dict[str, str]]] = None
+_HOME_MOOD_PALETTES_JS = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'static', 'hartPersonalize.js')
+_HOME_MOOD_PALETTES_RE = re.compile(
+    r'var PALETTES\s*=\s*window\.HART_PALETTES\s*=\s*\[(.*?)\];', re.S)
+_HOME_MOOD_HEX_RE = re.compile(r'^#[0-9A-Fa-f]{6}$')
+
+
+def _home_mood_palettes() -> Dict[str, Dict[str, str]]:
+    """HART_PALETTES by lowercase id, each entry its `key: 'value'` fields."""
+    global _HOME_MOOD_PALETTES
+    if _HOME_MOOD_PALETTES is None:
+        table: Dict[str, Dict[str, str]] = {}
+        try:
+            with open(_HOME_MOOD_PALETTES_JS, 'r', encoding='utf-8') as f:
+                m = _HOME_MOOD_PALETTES_RE.search(f.read())
+            for entry in re.finditer(r'\{([^{}]*)\}', m.group(1) if m else ''):
+                fields = dict(re.findall(r"(\w+):\s*'([^']*)'", entry.group(1)))
+                pid = (fields.get('id') or '').strip().lower()
+                if pid:
+                    table[pid] = fields
+        except OSError as e:
+            logger.warning("mood palettes unavailable (%s): moods will not "
+                           "resolve for the native scene", e)
+        _HOME_MOOD_PALETTES = table
+    return _HOME_MOOD_PALETTES
+
+
+def _home_resolve_mood(slug: str) -> Optional[dict]:
+    """A mood id resolved to the colours `HartPalette.paint` would set for it.
+
+    The rule is paintPalette's own, not a re-derivation of it: the FUNCTIONAL
+    accent is `p.accent || p.a`, so the six Aura moods (which pin `accent` to
+    teal) keep teal on every functional signifier while their `a..a4` quad drives
+    only the ambient field, and the ten classic palettes set the accent from
+    their lead hue. The keys are the theme file's own (`accent`, `secondary`,
+    `background`, `ambient_1..4`), which is what lets the compositor fold them
+    through the same path a theme file takes rather than a second one.
+
+    Only present, well-formed `#RRGGBB` values are emitted: an absent `a3`/`a4`
+    leaves the theme's own ambient in place on both renderers, and a malformed
+    literal in the table costs one colour rather than the palette.
+    """
+    p = _home_mood_palettes().get(slug)
+    if not p:
+        return None
+
+    def hexv(key: str) -> Optional[str]:
+        v = p.get(key)
+        return v.upper() if isinstance(v, str) and _HOME_MOOD_HEX_RE.match(v) else None
+
+    out: Dict[str, str] = {}
+    accent = hexv('accent') or hexv('a')
+    if accent:
+        out['accent'] = accent
+    if hexv('a2'):
+        out['secondary'] = hexv('a2')
+    if hexv('b'):
+        out['background'] = hexv('b')
+    for i, key in enumerate(('a', 'a2', 'a3', 'a4'), 1):
+        if hexv(key):
+            out['ambient_%d' % i] = hexv(key)
+    return out or None
 
 
 def _home_extract_json_obj(text: str):

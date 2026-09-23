@@ -410,7 +410,8 @@ class HartWmClient:
         self._event_thread = t
         return True
 
-    def shell_compose(self, hero=None, rows=None, mood=None) -> Dict[str, Any]:
+    def shell_compose(self, hero=None, rows=None, mood=None,
+                      palette=None) -> Dict[str, Any]:
         """Hand the composed HOME payload to the compositor's native scene.
 
         The SAME payload the WebView shell consumes, over the compositor's own IPC.
@@ -438,6 +439,11 @@ class HartWmClient:
         # which is what the compositor's decoder expects too.
         if mood:
             args['mood'] = mood
+        # Optional: that id resolved to colours by the shell, which owns the
+        # palette table. The compositor decodes `palette`, not `mood`, into paint:
+        # it has no table to resolve an id against and must not grow one.
+        if isinstance(palette, dict) and palette:
+            args['palette'] = palette
         if not args:
             return {'ok': False, 'error': 'nothing to compose'}
         return self._hc('shell.compose', args)

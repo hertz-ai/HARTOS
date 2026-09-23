@@ -316,13 +316,27 @@ impl BloomCache {
     /// not-yet-moded connector reports 0x0). The caller simply paints no
     /// backdrop then and the clear colour still covers the frame, so a bad mode
     /// can never panic the render loop.
-    pub fn get(&mut self, w: i32, h: i32) -> Option<&MemoryRenderBuffer> {
+    ///
+    /// `mood` is the composed home's resolved palette, folded over the theme's own
+    /// hues (`BloomPalette::with_mood`). It is part of the key, so a new mood
+    /// recomposes the field exactly once and the same mood never recomposes it; a
+    /// home without one paints the theme's field, which is the aura default today.
+    pub fn get(
+        &mut self,
+        w: i32,
+        h: i32,
+        mood: Option<&crate::scene::MoodPalette>,
+    ) -> Option<&MemoryRenderBuffer> {
         if w <= 0 || h <= 0 {
             return None;
         }
         // `BloomPalette` is `Copy`, so this reads the cached value and does NOT
         // hold the borrow across the compose below.
-        let pal = *self.palette.get_or_insert_with(crate::bloom::theme_palette);
+        let base = *self.palette.get_or_insert_with(crate::bloom::theme_palette);
+        let pal = match mood {
+            Some(m) => base.with_mood(m),
+            None => base,
+        };
         if self.key != Some((w, h, pal)) {
             let started = Instant::now();
             let rgba = crate::bloom::compose(w, h, &pal);
@@ -3182,7 +3196,13 @@ where
     // it already owns instead of allocating a fresh one every frame. The pointer is NOT a
     // key, so hover costs no rebuild. `scene_cache` is a disjoint field borrow, so holding
     // the tree across the loop does not conflict with the buffer caches below.
-    let theme = *active_theme();
+    // With the composed home's MOOD folded over it. `SceneCache` keys on the theme, so a
+    // new mood rebuilds the tree once, exactly as a new compose does, and the tile and
+    // text caches key on colour, so the recoloured surfaces compose once each.
+    let theme = match home.palette.as_ref() {
+        Some(mood) => active_theme().with_mood(mood),
+        None => *active_theme(),
+    };
     // The rasterizer doubles as the layout's text measure (it already shapes), so the bar
     // can butt one run against another. It is a disjoint borrow from `scene_cache`, and
     // the reborrow ends when `tree_for` returns, leaving it free for the lowering below.
@@ -3680,11 +3700,17 @@ where
     // Cheap by construction: `BloomCache::get` is a key comparison on every
     // frame but the first at a given size/theme.
     if !state.capture_blocked() {
+        // The composed home's MOOD recolours the field, whether or not the native
+        // scene is on: the compositor claims the bloom on every tier and the shell
+        // hides its own on that claim, so the native field is the only one on screen
+        // and must follow the mood the shell's would have. `MoodPalette` is `Copy`, so
+        // this ends the shared borrow of `state` before `bloom_mut` takes it mutably.
+        let mood = state.native_home().and_then(|h| h.palette);
         // Split the borrow: `bloom_mut` holds `state` mutably, and
         // `MemoryRenderBufferRenderElement::from_buffer` needs the buffer while
         // `renderer` is also borrowed. They are disjoint (`renderer` is a separate
         // parameter, not a `state` field), so this type-checks and stays short.
-        if let Some(buffer) = state.bloom_mut().get(size.w, size.h) {
+        if let Some(buffer) = state.bloom_mut().get(size.w, size.h, mood.as_ref()) {
             let origin: Point<f64, Physical> = Point::from((0.0, 0.0));
             match MemoryRenderBufferRenderElement::from_buffer(
                 renderer,
@@ -6098,5 +6124,163 @@ mod native_render_tests {
             mid > w,
             "the content band painted only {mid} px, so nothing but the bars drew"
         );
+    }
+
+    /// Composite a lowered home into an offscreen pixman image and hand back the bytes
+    /// (Argb8888 little-endian: B, G, R, A per pixel) beside the retained tree it was
+    /// laid out from, so a test can find a surface by its geometry and read its pixel.
+    fn composite_home(
+        home: &crate::scene::HomeCompose,
+        size: Size<i32, Physical>,
+    ) -> (Vec<u8>, crate::scene::SceneNode) {
+        use smithay::backend::renderer::utils::draw_render_elements;
+        use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen};
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let buf_size: Size<i32, BufferCoord> = (size.w, size.h).into();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
+            0.0, None, false, false, &crate::scene::RowScroll::default(), &mut elements,
+        );
+        let tree = scenes.tree().expect("lowering built the tree").clone();
+        let mut image = renderer
+            .create_buffer(Fourcc::Argb8888, buf_size)
+            .expect("offscreen image");
+        let mut target = renderer.bind(&mut image).expect("bind offscreen");
+        let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
+        {
+            let mut frame = renderer
+                .render(&mut target, size, Transform::Normal)
+                .expect("begin frame");
+            frame
+                .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[full])
+                .expect("clear");
+            draw_render_elements(&mut frame, 1.0, &elements, &[full]).expect("draw scene");
+            let _ = frame.finish().expect("finish frame");
+        }
+        let region: Rectangle<i32, BufferCoord> = Rectangle::from_size(buf_size);
+        let mapping = renderer
+            .copy_framebuffer(&target, region, Fourcc::Argb8888)
+            .expect("copy_framebuffer");
+        let bytes = renderer.map_texture(&mapping).expect("map_texture").to_vec();
+        (bytes, tree)
+    }
+
+    /// The primary CTA's pill: the ONE `Fill` on the desktop shaped as a full-round pill
+    /// wider than it is tall (card art and the chrome strips have other corners). Found
+    /// by SHAPE rather than by colour, because its colour is what the test reads.
+    fn primary_cta_rect(tree: &crate::scene::SceneNode) -> crate::scene::Rect {
+        let mut found = None;
+        tree.for_each_leaf(&mut |_, leaf| {
+            if let crate::scene::SceneNode::Fill { rect, radius, .. } = leaf {
+                if (radius - rect.h * 0.5).abs() < 0.01 && rect.w > rect.h {
+                    found = Some(*rect);
+                }
+            }
+        });
+        found.expect("the demo home draws the lit Resume pill")
+    }
+
+    #[test]
+    fn a_composed_mood_reaches_the_pixels_and_teal_survives_an_aura_mood() {
+        // THE PIXEL PROOF. `mood` was decoded and dropped, so every agent-composed
+        // mood rendered identically. Now the shell sends the id resolved, and this
+        // composites the same home under an Aura mood and a classic one and READS the
+        // framebuffer at the primary CTA, the surface `--hart-accent` paints:
+        //   * under the classic `sunset` the pill goes ORANGE (the accent moved), and
+        //   * under `aurora` it stays TEAL (the Aura rule: the accent is pinned and the
+        //     quad drives only the ambient field, which the bloom test covers).
+        // Sampled near the pill's far end, where the ramp from the fixed bright teal
+        // has all but reached the accent.
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let mut home = crate::scene::HomeCompose::demo();
+        let (plain, tree) = composite_home(&home, size);
+        let cta = primary_cta_rect(&tree);
+        let px = |bytes: &[u8]| -> (u8, u8, u8) {
+            let x = (cta.x + cta.w - 4.0) as usize;
+            let y = (cta.y + cta.h * 0.5) as usize;
+            let i = (y * size.w as usize + x) * 4;
+            (bytes[i + 2], bytes[i + 1], bytes[i]) // R, G, B
+        };
+        let (r0, g0, b0) = px(&plain);
+        assert!(g0 > b0 && b0 > r0, "no mood: the pill is the brand teal, got {:?}", (r0, g0, b0));
+
+        home.palette = Some(crate::scene::MoodPalette {
+            accent: crate::scene::Color::from_hex("#00E6C3"),
+            secondary: crate::scene::Color::from_hex("#00DDF9"),
+            background: crate::scene::Color::from_hex("#04050B"),
+            ambient: [
+                crate::scene::Color::from_hex("#B182FF"),
+                crate::scene::Color::from_hex("#00DDF9"),
+                crate::scene::Color::from_hex("#FB66B6"),
+                crate::scene::Color::from_hex("#FFB330"),
+            ],
+        });
+        let (aurora, tree_a) = composite_home(&home, size);
+        assert_eq!(primary_cta_rect(&tree_a), cta, "a mood moves no geometry");
+        let (r1, g1, b1) = px(&aurora);
+        assert!(
+            g1 > b1 && b1 > r1,
+            "under an Aura mood the functional accent must SURVIVE teal, got {:?}",
+            (r1, g1, b1)
+        );
+        assert_eq!((r1, g1, b1), (r0, g0, b0), "aurora's accent IS the brand teal");
+
+        home.palette = Some(crate::scene::MoodPalette {
+            accent: crate::scene::Color::from_hex("#FF8A4C"),
+            secondary: crate::scene::Color::from_hex("#FF2E9A"),
+            background: crate::scene::Color::from_hex("#16090F"),
+            ambient: [
+                crate::scene::Color::from_hex("#FF8A4C"),
+                crate::scene::Color::from_hex("#FF2E9A"),
+                None,
+                None,
+            ],
+        });
+        let (sunset, tree_s) = composite_home(&home, size);
+        assert_eq!(primary_cta_rect(&tree_s), cta, "a mood moves no geometry");
+        let (r2, g2, b2) = px(&sunset);
+        assert!(
+            r2 > g2 && g2 > b2,
+            "under a classic mood the accent must MOVE, the pill reads orange: {:?}",
+            (r2, g2, b2)
+        );
+        assert!(r2 > r0 + 100, "and it is a different colour from the teal, not a tint");
+    }
+
+    #[test]
+    fn the_backdrop_follows_the_mood_and_recomposes_once_per_mood() {
+        // The bloom half through the CACHE, which is what the frame path actually
+        // calls: a mood is part of the key, so it composes on the first frame carrying
+        // it and never again for the same mood, and a home without one composes the
+        // theme's own field, byte-identical to before moods existed.
+        let mut cache = BloomCache::default();
+        let (w, h) = (96, 54);
+        assert!(cache.get(w, h, None).is_some());
+        let plain_key = cache.key;
+        assert!(cache.get(w, h, None).is_some());
+        assert_eq!(cache.key, plain_key, "no mood, no recompose");
+
+        let sunset = crate::scene::MoodPalette {
+            background: crate::scene::Color::from_hex("#16090F"),
+            ambient: [crate::scene::Color::from_hex("#FF8A4C"), None, None, None],
+            ..Default::default()
+        };
+        assert!(cache.get(w, h, Some(&sunset)).is_some());
+        let sunset_key = cache.key;
+        assert_ne!(sunset_key, plain_key, "a mood recomposes the field");
+        assert_eq!(
+            sunset_key.map(|k| k.2.base),
+            Some([0x16, 0x09, 0x0F]),
+            "on the mood's own ground"
+        );
+        assert!(cache.get(w, h, Some(&sunset)).is_some());
+        assert_eq!(cache.key, sunset_key, "the same mood again does not recompose");
+        assert!(cache.get(w, h, None).is_some());
+        assert_eq!(cache.key, plain_key, "and dropping the mood returns to the theme's field");
     }
 }
