@@ -330,19 +330,58 @@ def _poll_acestep(item):
         return _j.loads(ma.check_media_status('acestep_abc'))
 
 
-def test_a_finished_task_yields_its_file_from_the_nested_result():
+def test_a_finished_task_yields_its_file_from_the_nested_result(tmp_path, monkeypatch):
     """Two WAVs were saved at 10:34:30 and forty polls said composing.
 
     The path is not a flat url key. It is inside a JSON STRING under
-    'result', at [0]['file'], beside a numeric status (1 = succeeded).
+    'result', at [0]['file'], beside a numeric status (1 = succeeded) --
+    and that `file` is AceStep's OWN url, `/v1/audio?path=<temp file>`
+    (MEASURED 2026-09-22), which only its sidecar can serve.
     """
     import json as _j
+    import urllib.parse
+    import integrations.service_tools.media_agent as ma
+    temp = tmp_path / 'acestep_tmp' / '6ac56af6.wav'
+    temp.parent.mkdir()
+    temp.write_bytes(b'RIFF\x00\x00\x00\x00WAVE')
+    kept_dir = tmp_path / 'acestep' / 'output'
+    monkeypatch.setattr(ma, 'composer_output_dir', lambda: kept_dir)
+    file_value = '/v1/audio?path=' + urllib.parse.quote(str(temp))
     item = {'task_id': 'abc', 'status': 1, 'progress_text': 'done',
-            'result': _j.dumps([{'file': r'C:\out\chime.wav', 'wave': '',
+            'result': _j.dumps([{'file': file_value, 'wave': '',
                                  'status': 1, 'metas': {'duration': 5}}])}
     out = _poll_acestep(item)
     assert out['status'] == 'completed', out
-    assert out['results'][0]['url'] == r'C:\out\chime.wav'
+    assert out['results'][0]['url'] == '/api/voice/audio/6ac56af6.wav', out
+    kept = kept_dir / '6ac56af6.wav'
+    assert out['results'][0]['path'] == str(kept)
+    assert kept.read_bytes()[:4] == b'RIFF', 'the composition was not kept'
+
+
+def test_a_composition_whose_file_is_gone_is_not_reported_done(tmp_path, monkeypatch):
+    """hartos-3a F1: a url nothing can fetch must not reach the memo."""
+    import json as _j
+    import integrations.service_tools.media_agent as ma
+    monkeypatch.setattr(ma, 'composer_output_dir', lambda: tmp_path / 'out')
+    item = {'task_id': 'abc', 'status': 1, 'progress_text': 'done',
+            'result': _j.dumps([{'file': '/v1/audio?path=C%3A%5Cgone%5Cx.wav',
+                                 'status': 1}])}
+    out = _poll_acestep(item)
+    assert out['status'] == 'error', out
+    assert 'results' not in out or not out['results'], out
+
+
+def test_the_music_path_starts_its_composer_exactly_once():
+    """2475ff19e applied its auto-start block twice; one copy hid the other."""
+    from unittest.mock import MagicMock, patch
+    import integrations.service_tools.media_agent as ma
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {'data': {'task_id': 't1', 'status': 'queued'}, 'code': 200}
+    with patch.object(ma, '_start_tool', return_value={'running': True}) as start, \
+            patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'), \
+            patch('core.http_pool.pooled_post', return_value=resp):
+        ma._generate_audio_music('a chime', '', 2, '')
+    assert start.call_count == 1, start.call_count
 
 
 def test_a_failed_task_surfaces_the_nested_error():

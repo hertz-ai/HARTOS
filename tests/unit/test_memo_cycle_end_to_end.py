@@ -13,6 +13,7 @@ defect in that half hid behind a mock of exactly the boundary it lived at
 a JSON string). This pins the whole cycle with those boundaries real.
 """
 import json
+import urllib.parse
 import os
 import struct
 import wave
@@ -40,7 +41,10 @@ def _agent_tools_over_live_wire(wav_path):
     finished = MagicMock(status_code=200)
     finished.json.return_value = {'data': [{
         'task_id': 'live-1', 'status': 1, 'progress_text': 'done',
-        'result': json.dumps([{'file': wav_path, 'wave': '', 'status': 1,
+        # AceStep's own shape (MEASURED 2026-09-22): its sidecar url for a
+        # temp file, not the path -- hartos-3a F1.
+        'result': json.dumps([{'file': '/v1/audio?path=' + urllib.parse.quote(wav_path),
+                               'wave': '', 'status': 1,
                                'metas': {'duration': 5}}])}],
         'code': 200, 'error': None}
 
@@ -73,9 +77,10 @@ def test_compose_memoize_and_replay_through_the_real_code(tmp_path):
     # memory gate is not one of the boundaries under test here (those are
     # the task id, the poll question and the nested file), so it is stubbed
     # open: this test proves the cycle, not the weather.
+    kept_dir = tmp_path / 'kept'
     with patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'), \
             patch.object(ma, '_start_tool', return_value={'running': True}), \
-            patch.object(ma, '_start_tool', return_value={'running': True}), \
+            patch.object(ma, 'composer_output_dir', lambda: kept_dir), \
             patch.object(ma, '_can_do', lambda *_a, **_k: True), \
             patch.object(ma, '_node_has_any', lambda *_a, **_k: True), \
             patch('core.http_pool.pooled_post', side_effect=fake_post), \
@@ -91,17 +96,17 @@ def test_compose_memoize_and_replay_through_the_real_code(tmp_path):
 
     # CREATE: composed once, the path read from inside AceStep's nested result
     assert bound['status'] == 'bound', bound
-    assert bound['music']['url'] == wav
+    # the node's own url for a kept copy, never AceStep's sidecar temp url
+    assert bound['music']['url'] == '/api/voice/audio/correct.wav', bound
     # never composed twice for the same state
     assert again['status'] == 'already_bound'
     assert submit.json.call_count == 1
     # REUSE: the memo replays exactly what create bound
     assert replay['status'] == 'bound'
     assert replay['matched'] == 'game'
-    assert replay['music']['url'] == wav
-    # and it is real audio on disk, not a string
-    memo = agent_data[4242]['games']['eng-01']['sounds']['correct']
-    b = open(memo['url'], 'rb').read(44)
+    assert replay['music']['url'] == '/api/voice/audio/correct.wav'
+    # and it is real audio on disk where the node's audio route looks
+    b = open(kept_dir / 'correct.wav', 'rb').read(44)
     assert b[:4] == b'RIFF' and b[8:12] == b'WAVE'
     _, ch, rate = struct.unpack('<HHI', b[20:28])
     assert (ch, rate) == (2, 48000)

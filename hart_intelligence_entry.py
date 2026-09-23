@@ -12712,6 +12712,13 @@ def voice_audio(filename):
         _os.path.expanduser('~/.hevolve/models/f5_tts/output'),
         _os.environ.get('TTS_TEMP_DIR', '/tmp/tts'),
     ]
+    # A game's composed sounds (media_agent keeps them there; hartos-3a F1).
+    try:
+        from integrations.service_tools.media_agent import composer_output_dir
+        search_dirs.append(str(composer_output_dir()))
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            'voice_audio: composer output dir unavailable: %s', e)
     for d in search_dirs:
         fpath = _os.path.join(d, safe_name)
         if _os.path.isfile(fpath):

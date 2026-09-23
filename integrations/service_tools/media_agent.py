@@ -119,6 +119,45 @@ def _start_tool(tool_name: str) -> dict:
         return {'running': False, 'error': str(e)}
 
 
+def composer_output_dir():
+    """Where a finished composition is kept on this node.
+
+    AceStep saves into a TEMP dir and serves it only through its own
+    sidecar, on a port assigned at start.  A game's memo must outlive both,
+    so the poll copies the file here, and the node's existing audio route
+    (/api/voice/audio, hart_intelligence_entry) serves it from here.  One
+    answer, asked by both the writer and the route.
+    """
+    from integrations.service_tools.model_storage import model_storage
+    return model_storage.get_tool_dir('acestep') / 'output'
+
+
+def _keep_composition(file_value):
+    """(node url, local path) for a finished AceStep file, or None.
+
+    AceStep reports the file as `/v1/audio?path=<absolute temp path>`
+    (MEASURED 2026-09-22), sometimes as the bare path.  Either way the
+    bytes are on this machine; they are copied out of the temp dir so a
+    replay next week still has them.
+    """
+    import os
+    import shutil
+    import urllib.parse
+    src = str(file_value or '')
+    if 'path=' in src:
+        query = urllib.parse.urlparse(src).query
+        src = (urllib.parse.parse_qs(query).get('path') or [''])[0]
+    if not src or not os.path.isfile(src):
+        logger.warning("_keep_composition: %r is not a file on this node", file_value)
+        return None
+    out = composer_output_dir()
+    out.mkdir(parents=True, exist_ok=True)
+    dest = out / os.path.basename(src)
+    if not dest.exists():
+        shutil.copy2(src, dest)
+    return f'/api/voice/audio/{dest.name}', str(dest)
+
+
 def _ensure_tool_running(tool_name: str) -> bool:
     """Auto-start a tool if it's not running. Returns True if available."""
     return bool(_start_tool(tool_name).get('running', False))
@@ -539,24 +578,6 @@ def _generate_audio_music(context: str, input_text: str,
     prompt = input_text or context
     if style:
         prompt = f"[{style}] {prompt}"
-
-    # The speech and video paths start their sidecar before dialing it.  This
-    # one dialed straight away, so a composer that was installed and merely
-    # not up answered "not running" to every game, for ever (run 8,
-    # 2026-09-22 -- the proof scripts had been starting it by hand).
-    started = _start_tool('acestep')
-    if not started.get('running'):
-        why = str(started.get('error') or 'auto-start failed')
-        if _node_has_any('audio_gen'):
-            # Installed and will not fit this instant.  Worded so that
-            # classify_error reads UNREACHABLE, never ABSENT: offering to
-            # install what is on the disk is its own defect.
-            return {'status': 'error',
-                    'error': f'AceStep installed but cannot run right now ({why})',
-                    'output_modality': 'audio_music'}
-        return {'status': 'error',
-                'error': f'AceStep not available and auto-start failed ({why})',
-                'output_modality': 'audio_music'}
 
     # The speech and video paths start their sidecar before dialing it.  This
     # one dialed straight away, so a composer that was installed and merely
@@ -1109,7 +1130,20 @@ def check_media_status(
                 status = 'completed'
             _done_words = ('completed', 'complete', 'done', 'finished',
                            'success', 'succeeded')
-            if status in _done_words and result_url:
+            if status in _done_words and result_url and tool_prefix == 'acestep':
+                # AceStep's own value is a sidecar-relative temp path that
+                # nothing off the sidecar can fetch (hartos-3a F1): keep the
+                # file, report the node's url for it.
+                kept = _keep_composition(result_url)
+                if kept:
+                    out['results'] = [{'type': 'audio', 'url': kept[0],
+                                       'path': kept[1]}]
+                    out['status'] = 'completed'
+                else:
+                    out['status'] = 'error'
+                    out['error'] = ('acestep finished but its file is not on '
+                                    f'this node: {result_url}')
+            elif status in _done_words and result_url:
                 media_type = 'video' if tool_prefix in ('wan2gp', 'ltx2') else 'audio'
                 out['results'] = [{'type': media_type, 'url': result_url}]
                 out['status'] = 'completed'
