@@ -890,6 +890,136 @@ pub struct Card {
     pub photo: Option<String>,
 }
 
+// ── THE CHROME PAYLOAD: `shell.chrome` (IPC_PROTOCOL.md 4.13) ─────────────────────────
+//
+// What the bars show that `home_compose` never carried. The parity program's
+// obligation 3 named three surfaces the compositor could not see (the taskbar's chips
+// are DOM inside the shell's one surface, the agent cluster is an HTTP poll, the clock
+// is local time an `unsafe_code = "deny"` crate cannot format) and settled the choice
+// between growing the A2UI feed and adding a verb: a sibling verb, fed by the ONE
+// producer that already computes every one of these for the WebView bar.
+//
+// Every part is an `Option`, and that is the contract rather than a convenience:
+// ABSENT and EMPTY are different answers. `tasks: Some(vec![])` is a composed taskbar
+// with nothing open; `tasks: None` is a taskbar the shell did not compose. The claim
+// rule (`coverage`) reads exactly that difference, because a band drawn from a partial
+// payload must never be claimed: a claimed band makes the shell stop painting its own,
+// and a bar missing its clock is the empty-desktop failure in a smaller hat.
+
+/// The `shell.chrome` payload, decoded. See the block comment above.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShellChrome {
+    /// `.top-bar-right .clock`, pre-formatted by the shell.
+    pub clock: Option<Clock>,
+    /// The `hartConnectivity.js` cluster, as ligature names the shell already resolved.
+    pub tray: Option<Tray>,
+    /// Unread count behind the `#notif-badge` dot.
+    pub notifications: Option<u32>,
+    /// `#agent-status`: the running agents' names, filtered and clipped by the producer.
+    pub agents: Option<Vec<String>>,
+    /// The `.taskbar-chip` row, one per open panel. `None` until the shell reports it.
+    pub tasks: Option<Vec<TaskChip>>,
+    /// Whether the start menu is open. Carried, not drawn: the shell paints no distinct
+    /// start-button state for it, and inventing one here would be a look of its own.
+    pub start_open: bool,
+    /// One `showToast(title, message, severity)`.
+    pub toast: Option<Toast>,
+    /// One open `HartCtxMenu`.
+    pub menu: Option<ContextMenu>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Clock {
+    pub time: String,
+    pub date: String,
+}
+
+/// Four Material LIGATURE NAMES and the battery text, resolved by the producer with the
+/// same thresholds `wifiGlyph`/`btGlyph`/`batGlyph`/`volGlyph` use. `live` is whether
+/// any domain is available; the shell dims the cluster otherwise (`#hc-cluster.hc-dim`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Tray {
+    pub wifi: String,
+    pub bluetooth: String,
+    pub volume: String,
+    pub battery: String,
+    pub battery_pct: String,
+    pub live: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TaskChip {
+    pub id: String,
+    pub title: String,
+    /// A ligature name, drawn in the icon face when one is loaded.
+    pub icon: Option<String>,
+    /// `.taskbar-chip.active`: the focused panel.
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Toast {
+    pub title: String,
+    pub message: String,
+    pub severity: Severity,
+}
+
+/// `showToast`'s four severities, each a colour role in the shell (`--hart-accent`,
+/// `--hart-caution`, `--hart-error`, `--hart-active`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Severity {
+    #[default]
+    Info,
+    Warning,
+    Error,
+    Success,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ContextMenu {
+    /// Viewport position, as `HartCtxMenu.open(items, x, y)` takes it.
+    pub x: f32,
+    pub y: f32,
+    pub items: Vec<MenuItem>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MenuItem {
+    Row {
+        label: String,
+        icon: Option<String>,
+        danger: bool,
+        disabled: bool,
+    },
+    Sep,
+}
+
+/// Which bands the payload composes FULLY, which is the only state in which a band may
+/// be claimed on the native-chrome bridge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChromeCoverage {
+    pub top_bar: bool,
+    pub taskbar: bool,
+}
+
+impl ShellChrome {
+    /// The claim rule, PURE so both the lowering and the tests read one definition.
+    ///
+    /// The top bar is composed when everything the shell's bar shows that the home feed
+    /// does not carry is present: the clock, the tray, the badge and the agent cluster.
+    /// The taskbar is composed when the chip list is present, empty or not. `start_open`,
+    /// the toast and the menu do not gate a band: none of them is part of a bar.
+    pub fn coverage(&self) -> ChromeCoverage {
+        ChromeCoverage {
+            top_bar: self.clock.is_some()
+                && self.tray.is_some()
+                && self.notifications.is_some()
+                && self.agents.is_some(),
+            taskbar: self.tasks.is_some(),
+        }
+    }
+}
+
 /// Which named surface of the desktop a point belongs to, for LATENCY ATTRIBUTION.
 ///
 /// docs/architecture/latency_budgets.json carries a per-component budget table with 23
@@ -1830,6 +1960,26 @@ pub fn layout_home(
     scroll: &RowScroll,
     measure: &mut dyn TextMeasure,
 ) -> SceneNode {
+    // The home alone: the bars come up as the fixed strips with nothing the shell has
+    // not sent yet, which is what every caller before `shell.chrome` existed got.
+    layout_desktop(output_w, output_h, home, &ShellChrome::default(), theme, scroll, measure)
+}
+
+/// The whole desktop: the home from `shell.compose` AND the bar content from
+/// `shell.chrome`. ONE layout; `layout_home` is this with an empty chrome payload.
+pub fn layout_desktop(
+    output_w: f32,
+    output_h: f32,
+    home: &HomeCompose,
+    chrome: &ShellChrome,
+    theme: &Theme,
+    scroll: &RowScroll,
+    measure: &mut dyn TextMeasure,
+) -> SceneNode {
+    // Read in slice 2 (the native bars drawn from it). Bound here so the layout's
+    // signature is the contract from the first commit and the cache key already moves
+    // with the payload.
+    let _ = chrome;
     let mut root: Vec<SceneNode> = Vec::new();
     // Asked ONCE for the whole layout rather than per glyph: it walks the font database,
     // and the answer cannot change within a single layout pass. Every icon on this
@@ -2798,10 +2948,36 @@ pub struct SceneCache {
     /// `Theme` has no `Default`, so the key starts as None and the first call is a miss.
     key_theme: Option<Theme>,
     key_scroll: RowScroll,
+    /// The latest `shell.chrome` payload, and the one the retained tree was built from.
+    ///
+    /// Held HERE rather than threaded through `tree_for`'s signature because the IPC
+    /// verb reaches the cache through `CompState::native_scene_caches` already, so the
+    /// payload has a home without a new accessor on the backend-agnostic trait, and the
+    /// lowering's call site does not change for a datum it never reads itself.
+    chrome: ShellChrome,
+    key_chrome: ShellChrome,
     rebuilds: u64,
 }
 
 impl SceneCache {
+    /// Replace the chrome payload. Answers which bands it composes fully, so the verb
+    /// can echo the claim rule to its caller.
+    pub fn set_chrome(&mut self, chrome: ShellChrome) -> ChromeCoverage {
+        let cov = chrome.coverage();
+        self.chrome = chrome;
+        cov
+    }
+
+    pub fn chrome(&self) -> &ShellChrome {
+        &self.chrome
+    }
+
+    /// The claim rule for the payload the NEXT tree is built from. Read by the lowering
+    /// before it borrows the tree, which is why it is a separate accessor.
+    pub fn chrome_coverage(&self) -> ChromeCoverage {
+        self.chrome.coverage()
+    }
+
     /// The tree for this size/home/theme, rebuilding only when one of them changed.
     /// The comparison walks a handful of short strings; the rebuild it avoids allocates
     /// the whole node tree and re-clones every label, so the compare is the cheap side.
@@ -2825,14 +3001,16 @@ impl SceneCache {
             || self.key_h != h
             || self.key_theme != Some(*theme)
             || self.key_scroll != *scroll
-            || self.key_home != *home;
+            || self.key_home != *home
+            || self.key_chrome != self.chrome;
         if stale {
-            self.tree = Some(layout_home(w, h, home, theme, scroll, measure));
+            self.tree = Some(layout_desktop(w, h, home, &self.chrome, theme, scroll, measure));
             self.key_w = w;
             self.key_h = h;
             self.key_theme = Some(*theme);
             self.key_scroll = *scroll;
             self.key_home = home.clone();
+            self.key_chrome = self.chrome.clone();
             self.rebuilds += 1;
         }
         self.tree
@@ -3006,6 +3184,130 @@ fn decode_mood_palette(v: &serde_json::Value) -> Option<MoodPalette> {
         None
     } else {
         Some(m)
+    }
+}
+
+// ── `shell.chrome` decode -> ShellChrome. Tolerant the same way `decode_home_compose`
+//    is (an unknown key is ignored, a wrong type is dropped), with one rule the home
+//    decoder does not need: a MISSING section decodes as `None`, never as an empty
+//    default, because `coverage` reads absence as "the shell did not compose this". ──
+pub fn decode_shell_chrome(v: &serde_json::Value) -> ShellChrome {
+    use serde_json::Value;
+    let text = |x: Option<&Value>| -> String { x.and_then(Value::as_str).unwrap_or("").to_string() };
+    let opt_text = |x: Option<&Value>| -> Option<String> {
+        x.and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string)
+    };
+
+    // A clock with no time is not a clock: the section is present only when it can draw.
+    let clock = v.get("clock").and_then(|c| {
+        let time = text(c.get("time"));
+        if time.is_empty() {
+            return None;
+        }
+        Some(Clock {
+            time,
+            date: text(c.get("date")),
+        })
+    });
+
+    let tray = v.get("tray").filter(|t| t.is_object()).map(|t| Tray {
+        wifi: text(t.get("wifi")),
+        bluetooth: text(t.get("bluetooth")),
+        volume: text(t.get("volume")),
+        battery: text(t.get("battery")),
+        battery_pct: text(t.get("battery_pct")),
+        live: t.get("live").and_then(Value::as_bool).unwrap_or(false),
+    });
+
+    // A count, never a bool: the badge is a dot today but the number is what the
+    // producer knows, and a future count badge should not need a second key.
+    let notifications = v
+        .get("notifications")
+        .and_then(|n| n.get("unread"))
+        .and_then(Value::as_u64)
+        .map(|n| n.min(u32::MAX as u64) as u32);
+
+    let agents = v.get("agents").and_then(Value::as_array).map(|arr| {
+        arr.iter()
+            .filter_map(|a| a.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    });
+
+    // Present when the array is, EMPTY OR NOT. A chip needs a title to be a chip; its id
+    // falls back to the title so an activation can still name it.
+    let tasks = v.get("tasks").and_then(Value::as_array).map(|arr| {
+        arr.iter()
+            .filter_map(|t| {
+                let title = opt_text(t.get("title"))?;
+                Some(TaskChip {
+                    id: opt_text(t.get("id")).unwrap_or_else(|| title.clone()),
+                    title,
+                    icon: opt_text(t.get("icon")),
+                    active: t.get("active").and_then(Value::as_bool).unwrap_or(false),
+                })
+            })
+            .collect()
+    });
+
+    let start_open = v
+        .get("start")
+        .and_then(|s| s.get("open"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let toast = v.get("toast").and_then(|t| {
+        let title = text(t.get("title"));
+        let message = text(t.get("message"));
+        if title.is_empty() && message.is_empty() {
+            return None;
+        }
+        Some(Toast {
+            title,
+            message,
+            // `showToast` falls back to info for an unknown severity, so this does too.
+            severity: match t.get("severity").and_then(Value::as_str) {
+                Some("warning") => Severity::Warning,
+                Some("error") => Severity::Error,
+                Some("success") => Severity::Success,
+                _ => Severity::Info,
+            },
+        })
+    });
+
+    let menu = v.get("menu").and_then(|m| {
+        let x = m.get("x").and_then(Value::as_f64)? as f32;
+        let y = m.get("y").and_then(Value::as_f64)? as f32;
+        let items = m
+            .get("items")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(|it| {
+                if it.get("sep").and_then(Value::as_bool).unwrap_or(false) {
+                    return Some(MenuItem::Sep);
+                }
+                let label = opt_text(it.get("label"))?;
+                Some(MenuItem::Row {
+                    label,
+                    icon: opt_text(it.get("icon")),
+                    danger: it.get("danger").and_then(Value::as_bool).unwrap_or(false),
+                    disabled: it.get("disabled").and_then(Value::as_bool).unwrap_or(false),
+                })
+            })
+            .collect();
+        Some(ContextMenu { x, y, items })
+    });
+
+    ShellChrome {
+        clock,
+        tray,
+        notifications,
+        agents,
+        tasks,
+        start_open,
+        toast,
+        menu,
     }
 }
 
@@ -4671,6 +4973,143 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
         assert_eq!(of("EARNED ON THE HIVE"), orange, ".hh-eyebrow takes --hart-accent");
         assert_eq!(of(SEE_ALL), orange, "and so does .hh-see-all");
         assert!(drawn_texts(&root).iter().any(|t| t == "Brave"), "the photo card still draws");
+    }
+
+    /// The bar-content fixture the REAL producer wrote (`compose_shell_chrome`).
+    fn chrome_fixture() -> ShellChrome {
+        let v: serde_json::Value =
+            serde_json::from_str(crate::wire_fixture::SHELL_CHROME_COMPOSED)
+                .expect("the chrome fixture is the producer's own output");
+        decode_shell_chrome(&v)
+    }
+
+    #[test]
+    fn every_chrome_field_the_shell_actually_sends_is_decoded() {
+        // The `shell.chrome` half of the wire contract: each datum the bar shows, as the
+        // producer spells it. A key read under an imagined name would decode to None
+        // here, which is the whole class of bug the home decoder had four of.
+        let c = chrome_fixture();
+        let clock = c.clock.as_ref().expect("the clock");
+        assert_eq!(clock.time, "02:05 PM", "tickClock's 12-hour, zero-padded form");
+        assert_eq!(clock.date, "Wednesday, September 23");
+        let tray = c.tray.as_ref().expect("the tray");
+        assert_eq!(
+            (tray.wifi.as_str(), tray.bluetooth.as_str(), tray.volume.as_str(), tray.battery.as_str()),
+            ("network_wifi_3_bar", "bluetooth_connected", "volume_down", "battery_4_bar"),
+            "the four glyphs are the shell's own resolver output, by name"
+        );
+        assert_eq!(tray.battery_pct, "64%");
+        assert!(tray.live, "a live domain lights the cluster");
+        assert_eq!(c.notifications, Some(2), "a count, not a bool");
+        assert_eq!(
+            c.agents.as_deref(),
+            Some(&["Scout", "summarise_inbox_", "Archivist", "Cartographer"].map(String::from)[..]),
+            "running only, clipped, four at most, in the producer's order"
+        );
+        let tasks = c.tasks.as_ref().expect("the chip list is composed");
+        assert_eq!(tasks.len(), 3);
+        assert_eq!((tasks[0].id.as_str(), tasks[0].title.as_str(), tasks[0].active), ("files", "Files", true));
+        assert_eq!(tasks[0].icon.as_deref(), Some("folder"));
+        assert_eq!(tasks[2].icon, None, "a chip without an icon stays a chip");
+        assert_eq!(tasks[2].id, "web#2", "an instance id survives verbatim");
+        assert!(!c.start_open);
+        let toast = c.toast.as_ref().expect("the toast");
+        assert_eq!((toast.title.as_str(), toast.message.as_str()), ("Bluetooth", "Not available"));
+        assert_eq!(toast.severity, Severity::Warning);
+        let menu = c.menu.as_ref().expect("the menu");
+        assert_eq!((menu.x, menu.y), (412.0, 300.0));
+        assert_eq!(menu.items.len(), 4);
+        assert!(matches!(&menu.items[0], MenuItem::Row { label, icon: Some(i), danger: false, .. }
+                         if label == "Open" && i == "open_in_new"));
+        assert_eq!(menu.items[1], MenuItem::Sep);
+        assert!(matches!(&menu.items[2], MenuItem::Row { danger: true, .. }));
+        assert!(matches!(&menu.items[3], MenuItem::Row { disabled: true, .. }));
+        // The fixture composes BOTH bands, so the claim rule says both.
+        assert_eq!(c.coverage(), ChromeCoverage { top_bar: true, taskbar: true });
+    }
+
+    #[test]
+    fn a_missing_chrome_section_is_absent_not_empty_and_gates_its_band() {
+        // The rule the claim stands on: `tasks: []` is a composed, empty taskbar and no
+        // `tasks` at all is a taskbar the shell did not compose. Collapsing the two would
+        // let the compositor claim a bar it drew nothing on.
+        let none = decode_shell_chrome(&serde_json::json!({}));
+        assert_eq!(none, ShellChrome::default());
+        assert_eq!(none.coverage(), ChromeCoverage::default());
+        let empty = decode_shell_chrome(&serde_json::json!({"tasks": [], "agents": []}));
+        assert_eq!(empty.tasks, Some(vec![]));
+        assert_eq!(empty.agents, Some(vec![]));
+        assert!(empty.coverage().taskbar, "an empty chip list is still a composed taskbar");
+        assert!(!empty.coverage().top_bar, "with no clock, tray or badge the bar is not");
+        // Every one of the four is required for the top bar; drop any one and it is not.
+        let full = chrome_fixture();
+        for missing in ["clock", "tray", "notifications", "agents"] {
+            let mut v: serde_json::Value =
+                serde_json::from_str(crate::wire_fixture::SHELL_CHROME_COMPOSED).unwrap();
+            v.as_object_mut().unwrap().remove(missing);
+            let c = decode_shell_chrome(&v);
+            assert!(!c.coverage().top_bar, "without {missing} the top bar must not be claimable");
+            assert!(c.coverage().taskbar, "and the taskbar's rule is independent of it");
+        }
+        assert!(full.coverage().top_bar);
+    }
+
+    #[test]
+    fn chrome_decode_is_tolerant_of_junk_and_ignores_unknown_keys() {
+        // Same posture as `decode_home_compose`: a wrong type drops the datum, a stray
+        // key is ignored, and nothing here can panic inside the process that owns scanout.
+        let c = decode_shell_chrome(&serde_json::json!({
+            "clock": {"time": ""},
+            "tray": "not an object",
+            "notifications": {"unread": -4},
+            "agents": "Scout",
+            "tasks": [{"icon": "folder"}, {"title": "Files"}, 7],
+            "start": {"open": "yes"},
+            "toast": {"severity": "warning"},
+            "menu": {"x": 1, "items": []},
+            "wallpaper": "ignored",
+        }));
+        assert_eq!(c.clock, None, "a clock with no time is not a clock");
+        assert_eq!(c.tray, None);
+        assert_eq!(c.notifications, None, "a negative count is not a count");
+        assert_eq!(c.agents, None);
+        let tasks = c.tasks.expect("the array is present");
+        assert_eq!(tasks.len(), 1, "a chip needs a title; junk entries are skipped");
+        assert_eq!(tasks[0].id, "Files", "the id falls back to the title");
+        assert!(!c.start_open, "a non-bool is not open");
+        assert_eq!(c.toast, None, "a toast with no words is not on screen");
+        assert_eq!(c.menu, None, "a menu with no y has no position");
+        let sev = |s: &str| decode_shell_chrome(&serde_json::json!({"toast": {"title": "t", "severity": s}}))
+            .toast.unwrap().severity;
+        assert_eq!(sev("error"), Severity::Error);
+        assert_eq!(sev("success"), Severity::Success);
+        assert_eq!(sev("shout"), Severity::Info, "unknown falls back to info, as showToast does");
+    }
+
+    #[test]
+    fn the_scene_cache_rebuilds_when_the_chrome_payload_moves() {
+        // The chrome is a LAYOUT input (the clock's text changes the bar), so it has to
+        // be part of the retained tree's key, or a new time would draw the old one until
+        // something else happened to change.
+        let theme = Theme::cosmic_default();
+        let home = sample();
+        let mut cache = SceneCache::default();
+        let _ = cache.tree_for(1600.0, 900.0, &home, &theme, &RowScroll::default(), &mut MonoMeasure);
+        assert_eq!(cache.rebuilds(), 1);
+        let cov = cache.set_chrome(chrome_fixture());
+        assert_eq!(cov, ChromeCoverage { top_bar: true, taskbar: true });
+        let _ = cache.tree_for(1600.0, 900.0, &home, &theme, &RowScroll::default(), &mut MonoMeasure);
+        assert_eq!(cache.rebuilds(), 2, "a new chrome payload rebuilds the tree");
+        // Re-setting an IDENTICAL payload is not a change: the pump sends only on change,
+        // but the cache must not depend on that.
+        cache.set_chrome(chrome_fixture());
+        let _ = cache.tree_for(1600.0, 900.0, &home, &theme, &RowScroll::default(), &mut MonoMeasure);
+        assert_eq!(cache.rebuilds(), 2, "the same payload again is a cache hit");
+        let mut moved = chrome_fixture();
+        moved.clock.as_mut().unwrap().time = "02:06 PM".into();
+        cache.set_chrome(moved);
+        let _ = cache.tree_for(1600.0, 900.0, &home, &theme, &RowScroll::default(), &mut MonoMeasure);
+        assert_eq!(cache.rebuilds(), 3, "a minute ticking over rebuilds the bar");
     }
 
     #[test]

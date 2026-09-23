@@ -548,3 +548,37 @@ def test_a_closed_subscription_tells_its_caller_so_it_can_re_listen(tmp_path, mo
     methods = [q['method'] for q in srv.requests]
     # The constructor's detection probe (window.list) comes first; ONE subscribe.
     assert methods.count('events.subscribe') == 1 and methods[-1] == 'events.subscribe'
+
+
+# -- shell.chrome: the bar content, the sibling of shell.compose ---------------
+
+def test_shell_chrome_hands_the_composed_bar_to_the_compositor_verbatim():
+    """`shell_chrome` passes the producer's dict through untouched: which keys it
+    carries IS the contract (an absent key tells the compositor the shell did not
+    compose that datum, and the compositor claims a band only when every datum it
+    needs is present), so the client must never fill a gap on the producer's
+    behalf. Windows-runnable: the socket half is proven by the live-socket tests
+    beside it, this pins the verb name and the argument identity."""
+    c = HartWmClient()
+    c._backend = 'hart-comp'
+    c._hc_path = '/nonexistent/hart-comp.sock'
+    sent = []
+    c._hc = lambda method, args=None: (sent.append((method, args)) or {'ok': True,
+                                       'composed': True, 'top_bar': True, 'taskbar': False})
+    chrome = {'clock': {'time': '02:05 PM', 'date': 'Wednesday, September 23'},
+              'tray': {'wifi': 'wifi', 'live': True}, 'agents': [],
+              'notifications': {'unread': 0}, 'start': {'open': False}}
+    reply = c.shell_chrome(chrome)
+    assert reply['ok'] is True and reply['top_bar'] is True and reply['taskbar'] is False
+    assert sent == [('shell.chrome', chrome)], "the verb name ipc.rs dispatches on, args verbatim"
+    assert 'tasks' not in sent[0][1], "an absent datum stays absent on the wire"
+
+
+def test_shell_chrome_refuses_an_empty_composition_without_touching_the_socket():
+    c = HartWmClient()
+    c._backend = 'hart-comp'
+    called = []
+    c._hc = lambda *a, **k: called.append(a) or {'ok': True}
+    assert c.shell_chrome({})['ok'] is False
+    assert c.shell_chrome(None)['ok'] is False
+    assert not called, "nothing to compose means no request"

@@ -399,6 +399,22 @@ fn dispatch_request<S: CompState>(
             Response::ok(id, json!({ "composed": true }))
         }
 
+        // ── shell.chrome(clock, tray, notifications, agents, tasks, start, toast, menu):
+        //    the bar content the home feed does not carry (IPC_PROTOCOL.md 4.13). Same
+        //    producer as the WebView bar, same socket as shell.compose. Stored on the
+        //    retained scene cache, which is the one place the layout reads and the one
+        //    the IPC already reaches through `native_scene_caches`, so no new accessor
+        //    lands on the backend-agnostic trait. ──
+        "shell.chrome" | "ShellChrome" => {
+            let chrome = crate::scene::decode_shell_chrome(args);
+            let cov = shell_chrome_apply(state, chrome);
+            Response::ok(id, json!({
+                "composed": true,
+                "top_bar": cov.top_bar,
+                "taskbar": cov.taskbar,
+            }))
+        }
+
         // â”€â”€ Â§4.2 window.focus(handle) â€” keyboard focus + raise â”€â”€
         "window.focus" | "FocusWindow" => match arg_handle(args) {
             Some(h) => {
@@ -562,6 +578,19 @@ fn dispatch_request<S: CompState>(
 
         other => Response::err(id, "unsupported", format!("unknown method: {other}")),
     }
+}
+
+/// Store a decoded `shell.chrome` payload on the scene cache and answer the claim rule.
+///
+/// Its own function so the verb's one decision beyond storage has a home: the scene
+/// cache is reached through `native_scene_caches`, the accessor the lowering already
+/// uses, which is what keeps this datum off the backend-agnostic trait.
+fn shell_chrome_apply<S: CompState>(
+    state: &mut S,
+    chrome: crate::scene::ShellChrome,
+) -> crate::scene::ChromeCoverage {
+    let (_, _, _, _, cache) = state.native_scene_caches();
+    cache.set_chrome(chrome)
 }
 
 /// PURE: did a flag flip actually happen? The rule is the whole honesty of

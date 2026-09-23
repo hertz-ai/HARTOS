@@ -55,6 +55,8 @@ _RAW_CLOSE = '"##;'
 # shape, and the mood set is a different shape from the aurora default.
 FIXTURE_DEFAULT = "HOME_COMPOSE_SANITIZED"
 FIXTURE_CLASSIC_MOOD = "HOME_COMPOSE_SANITIZED_CLASSIC_MOOD"
+# The bar content (`shell.chrome`), the sibling contract: see THE CHROME CONTRACT below.
+FIXTURE_CHROME = "SHELL_CHROME_COMPOSED"
 
 
 def _literal_span(src, name):
@@ -87,6 +89,7 @@ def _write_all_fixtures():
     """Regenerate every named literal from its SAMPLE. The one command to run."""
     _write_fixture(_sanitized(), FIXTURE_DEFAULT)
     _write_fixture(_sanitized_classic_mood(), FIXTURE_CLASSIC_MOOD)
+    _write_fixture(_composed_chrome(), FIXTURE_CHROME)
 
 # A realistic LLM-authored home, chosen to carry every shape that has ever
 # decoded wrong or that the native scene treats specially:
@@ -509,3 +512,223 @@ def test_the_instrument_and_the_scene_agree_on_the_surface_names():
         assert name in labels, (
             "%r is exempted from the scene bridge but latency.rs no longer names "
             "it; drop the exemption" % name)
+
+
+# -- THE CHROME CONTRACT -------------------------------------------------------
+#
+# `shell.chrome` (IPC_PROTOCOL.md 4.13) is the sibling of the home feed: the bar
+# content the home never carried (clock, tray glyphs, badge, agent cluster, task
+# chips, start state, a toast, a context menu). `compose_shell_chrome` is its single
+# producer, the way `_sanitize_home_payload` is the home's, and this pins what it
+# SENDS into compositor/src/wire_fixture.rs for scene.rs to decode and draw. Same
+# failure class, same cure: a bar decoder written against an imagined payload would
+# pass every Rust test while drawing the wrong glyph names on the box.
+
+import datetime as _dt
+
+# 14:05 so the 12-hour clock has to carry its PM and its leading zero; a Wednesday
+# so the date's weekday and month are both long words.
+CHROME_NOW = _dt.datetime(2026, 9, 23, 14, 5, 0)
+# A connectivity summary in the exact shape _ConnectivityCache.summary() returns,
+# chosen so every glyph resolver takes a NON-default branch: a joined wifi at a
+# middling signal, a powered adapter with a device connected, a battery on its way
+# down, a quiet but unmuted volume.
+CHROME_CONNECTIVITY = {
+    'wifi': {'available': True, 'enabled': True, 'connected': True,
+             'ssid': 'hive', 'signal': 62, 'blocked': None},
+    'bluetooth': {'available': True, 'powered': True, 'connected_count': 1},
+    'battery': {'available': True, 'percent': 64, 'plugged_in': False,
+                'state': 'discharging'},
+    'volume': {'available': True, 'volume': 35, 'muted': False},
+}
+# Dashboard agent rows: one idle (filtered), one with only a goal_type (the JS's
+# fallback name), one with a name past the 16-character clip, and more running
+# than the four chips the bar shows.
+CHROME_AGENTS = [
+    {'name': 'Scout', 'status': 'running'},
+    {'name': 'Napping', 'status': 'idle'},
+    {'goal_type': 'summarise_inbox_for_me', 'status': 'running'},
+    {'name': 'Archivist', 'status': 'running'},
+    {'name': 'Cartographer', 'status': 'running'},
+    {'name': 'Fifth wheel', 'status': 'running'},
+]
+CHROME_TASKS = [
+    {'id': 'files', 'title': 'Files', 'icon': 'folder', 'active': True},
+    {'id': 'terminal', 'title': 'Terminal', 'icon': 'terminal'},
+    # An instance id, markup in the title, and an icon that is not a ligature name.
+    {'id': 'web#2', 'title': 'Hevolve <b>docs</b>', 'icon': 'Not A Ligature'},
+]
+CHROME_TOAST = {'title': 'Bluetooth', 'message': 'Not available',
+                'severity': 'warning'}
+CHROME_MENU = {'x': 412, 'y': 300, 'items': [
+    {'label': 'Open', 'icon': 'open_in_new'},
+    {'sep': True},
+    {'label': 'Delete', 'danger': True},
+    {'label': 'Rename', 'disabled': True},
+]}
+
+
+def _composed_chrome():
+    return L.compose_shell_chrome(
+        CHROME_NOW, CHROME_CONNECTIVITY, CHROME_AGENTS, 2, tasks=CHROME_TASKS,
+        start_open=False, toast=CHROME_TOAST, menu=CHROME_MENU)
+
+
+def test_the_chrome_fixture_is_still_what_the_producer_actually_emits():
+    """THE CONTRACT, bar half. Regenerate with the same command as the home:
+
+        python -c "import sys; sys.path.insert(0,'.'); \\
+          from tests.unit.test_native_wire_contract import _write_all_fixtures; \\
+          _write_all_fixtures()"
+
+    then teach scene.rs to decode and DRAW whatever is new, and read the diff
+    before trusting it.
+    """
+    assert _fixture_json(FIXTURE_CHROME) == _composed_chrome(), (
+        "compositor/src/wire_fixture.rs is stale for the chrome fixture: the bar "
+        "producer now emits a different shape than the native bars are tested against")
+
+
+def test_the_chrome_fixture_carries_the_shapes_the_bars_show():
+    """Guard the guard: a fixture that lost its interesting cases would still pass
+    the comparison above. Each of these is a datum the WebView bar shows today."""
+    c = _composed_chrome()
+    assert c['clock'] == {'time': '02:05 PM', 'date': 'Wednesday, September 23'}, (
+        "the clock is the 12-hour, zero-padded, long-weekday form tickClock renders")
+    tray = c['tray']
+    assert tray['wifi'] == 'network_wifi_3_bar', "a 62 signal is three bars"
+    assert tray['bluetooth'] == 'bluetooth_connected'
+    assert tray['battery'] == 'battery_4_bar' and tray['battery_pct'] == '64%'
+    assert tray['volume'] == 'volume_down' and tray['live'] is True
+    assert c['notifications'] == {'unread': 2}, "a badge with something behind it"
+    assert c['agents'] == ['Scout', 'summarise_inbox_', 'Archivist', 'Cartographer'], (
+        "running only, the goal_type fallback, the 16-character clip, four at most")
+    assert c['tasks'][0] == {'id': 'files', 'title': 'Files', 'icon': 'folder',
+                             'active': True}, "an active chip with its icon"
+    assert c['tasks'][2] == {'id': 'web#2', 'title': 'Hevolve bdocs/b', 'active': False}, (
+        "markup stripped, a non-ligature icon dropped, an instance id kept")
+    assert c['start'] == {'open': False}
+    assert c['toast'] == CHROME_TOAST
+    assert c['menu']['items'][1] == {'sep': True} and c['menu']['items'][2]['danger']
+    assert c['menu']['items'][3]['disabled'] and c['menu']['x'] == 412
+
+
+def test_the_chrome_producer_leaves_absent_what_it_was_not_given():
+    """The claim rule reads ABSENCE. A datum the shell could not compose must be
+    missing from the wire, never an empty stand-in, or the compositor would claim
+    a band that is not fully drawn and the shell would stop painting its own."""
+    c = L.compose_shell_chrome(None, None, None, None)
+    for key in ('clock', 'tray', 'notifications', 'agents', 'tasks', 'toast', 'menu'):
+        assert key not in c, "%s was invented from nothing" % key
+    assert c == {'start': {'open': False}}, "only the start state has a default"
+    # An empty agent list and an empty panel list are COMPOSED, not absent.
+    c = L.compose_shell_chrome(None, None, [], 0, tasks=[])
+    assert c['agents'] == [] and c['tasks'] == [] and c['notifications'] == {'unread': 0}
+    # A count must be a count.
+    assert 'notifications' not in L.compose_shell_chrome(None, None, None, True)
+    assert 'notifications' not in L.compose_shell_chrome(None, None, None, -1)
+    # A toast with no words and a menu with no rows are not on screen.
+    c = L.compose_shell_chrome(None, None, None, None, toast={'severity': 'error'},
+                               menu={'x': 1, 'y': 1, 'items': [{'sep': True}]})
+    assert 'toast' not in c
+    assert 'menu' in c, "a divider-only menu still has geometry"
+    assert 'menu' not in L.compose_shell_chrome(None, None, None, None,
+                                                menu={'x': 1, 'items': []})
+
+
+def test_the_chrome_producer_drops_what_it_promises_to_drop():
+    """The native bars draw what they are given, so this is the only thing between
+    a hostile panel title or agent name and the top of the screen."""
+    c = L.compose_shell_chrome(
+        None, None,
+        [{'name': '<img onerror=x>', 'status': 'running'}], None,
+        toast={'title': '<b>x</b>', 'message': 'y', 'severity': 'shout'},
+        menu={'x': 1, 'y': 2, 'items': [{'label': '<i>Open</i>', 'icon': 'Not A Name'}]})
+    assert c['agents'] == ['img onerror=x'], "angle brackets never reach the bar"
+    assert c['toast']['severity'] == 'info', "an unknown severity falls back, as showToast does"
+    assert c['toast']['title'] == 'bx/b'
+    assert c['menu']['items'][0] == {'label': 'iOpen/i'}, "a non-ligature icon is dropped"
+    # An unavailable domain reads as its neutral glyph, never as a guess.
+    c = L.compose_shell_chrome(None, {'wifi': {}, 'bluetooth': None,
+                                      'battery': {'available': True, 'percent': 'lots'},
+                                      'volume': {'available': True, 'volume': 0}}, None, None)
+    assert c['tray'] == {'wifi': 'wifi_off', 'bluetooth': 'bluetooth_disabled',
+                         'battery': 'battery_unknown', 'battery_pct': '',
+                         'volume': 'volume_off', 'live': True}
+
+
+CONNECTIVITY_JS = os.path.join(REPO, "integrations", "agent_engine", "static",
+                               "hartConnectivity.js")
+
+
+def _js_resolver(src, name):
+    m = re.search(r"function %s\([^)]*\) \{(.*?)\n  \}" % name, src, re.S)
+    assert m, "hartConnectivity.js no longer has %s" % name
+    return m.group(1)
+
+
+def test_the_tray_glyphs_are_hartconnectivity_own_resolvers():
+    """The tray is rendered by hartConnectivity.js and the native tray must show the
+    SAME glyph for the same summary. The Python mirror cannot import the JS, so this
+    pins both halves: every glyph name and threshold the mirror uses is read out of
+    the JS resolvers, and the resolvers' branches are exercised as a table."""
+    js = open(CONNECTIVITY_JS, encoding="utf-8").read()
+    wifi = _js_resolver(js, "wifiGlyph")
+    for floor, glyph in L._TRAY_WIFI_BARS:
+        assert "return '%s'" % glyph in wifi, "wifiGlyph no longer returns %s" % glyph
+        if floor:
+            assert "sgl >= %d" % floor in wifi, "wifi threshold %d moved" % floor
+    assert "return 'wifi_off'" in wifi and "return 'wifi_find'" in wifi
+    bt = _js_resolver(js, "btGlyph")
+    for glyph in ("bluetooth_disabled", "bluetooth_connected", "bluetooth"):
+        assert "return '%s'" % glyph in bt
+    bat = _js_resolver(js, "batGlyph")
+    for floor, glyph in L._TRAY_BATTERY_BARS:
+        assert "return '%s'" % glyph in bat, "batGlyph no longer returns %s" % glyph
+        if floor >= 0:
+            assert "p > %d" % floor in bat, "battery threshold %d moved" % floor
+    assert "return 'battery_charging_full'" in bat and "return 'battery_unknown'" in bat
+    vol = _js_resolver(js, "volGlyph")
+    assert "v.volume < %d" % L._TRAY_VOLUME_DOWN_BELOW in vol
+    for glyph in ("volume_up", "volume_off", "volume_down"):
+        assert "return '%s'" % glyph in vol
+
+    # The branches, as a table read off the JS above.
+    W = L._tray_wifi_glyph
+    assert W(None) == 'wifi_off'
+    assert W({'available': True, 'enabled': False}) == 'wifi_off'
+    assert W({'available': True, 'enabled': True, 'connected': False}) == 'wifi_find'
+    for sig, want in ((100, 'wifi'), (75, 'wifi'), (74, 'network_wifi_3_bar'),
+                      (50, 'network_wifi_3_bar'), (49, 'network_wifi_2_bar'),
+                      (25, 'network_wifi_2_bar'), (24, 'network_wifi_1_bar'),
+                      (0, 'network_wifi_1_bar'), (None, 'wifi')):
+        assert W({'available': True, 'enabled': True, 'connected': True,
+                  'signal': sig}) == want, (sig, want)
+    B = L._tray_bluetooth_glyph
+    assert B({'available': True, 'powered': False}) == 'bluetooth_disabled'
+    assert B({'available': True, 'powered': True, 'connected_count': 0}) == 'bluetooth'
+    T = L._tray_battery_glyph
+    assert T({'available': True, 'percent': 10, 'state': 'charging'}) == 'battery_charging_full'
+    assert T({'available': True, 'percent': 10, 'plugged_in': True}) == 'battery_charging_full'
+    for pct, want in ((100, 'battery_full'), (91, 'battery_full'), (90, 'battery_6_bar'),
+                      (71, 'battery_6_bar'), (70, 'battery_4_bar'), (51, 'battery_4_bar'),
+                      (50, 'battery_3_bar'), (31, 'battery_3_bar'), (30, 'battery_2_bar'),
+                      (16, 'battery_2_bar'), (15, 'battery_alert'), (0, 'battery_alert')):
+        assert T({'available': True, 'percent': pct, 'state': 'discharging'}) == want, (pct, want)
+    V = L._tray_volume_glyph
+    assert V({'available': True, 'volume': 50, 'muted': True}) == 'volume_off'
+    assert V({'available': True, 'volume': 39}) == 'volume_down'
+    assert V({'available': True, 'volume': 40}) == 'volume_up'
+
+
+def test_the_agent_cluster_mirrors_refreshagentstatus():
+    """`refreshAgentStatus` in the served shell filters to running, shows four chips
+    and clips each name at 16. The producer's constants are read against that JS."""
+    src = open(os.path.join(REPO, "integrations", "agent_engine",
+                            "liquid_ui_service.py"), encoding="utf-8").read()
+    i = src.index("function refreshAgentStatus()")
+    body = src[i:i + 900]
+    assert "a.status==='running'" in body
+    assert "slice(0,%d)" % L.CHROME_AGENTS_MAX in body, "the chip count moved"
+    assert "substring(0,%d)" % L.CHROME_AGENT_NAME_MAX in body, "the name clip moved"
+    assert "a.name||a.goal_type||'agent'" in body, "the fallback name order moved"

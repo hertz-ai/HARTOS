@@ -246,6 +246,198 @@ def publish_panel_reservation(css_vars: str) -> dict:
     return reservation
 
 
+# ── The bar CONTENT: shell -> compositor, the sibling of the home feed ─────────
+# publish_panel_reservation above hands the compositor the bars' GEOMETRY. This
+# hands it what the bars SHOW that the home feed never carried: the clock, the tray
+# glyphs, the notification badge, the agent cluster, the taskbar chips (IPC_PROTOCOL
+# 4.13 `shell.chrome`). One producer, this module, because it is already the one
+# that serves every one of these to the WebView bar; the compositor must not grow
+# an HTTP client or a timezone to learn them itself (parity program, obligation 3).
+#
+# compose_shell_chrome is PURE and is the single authority on the wire shape, the
+# way _sanitize_home_payload is for the home: tests/unit/test_native_wire_contract.py
+# runs it and pins the result into compositor/src/wire_fixture.rs, which scene.rs's
+# tests decode and draw. A key it omits tells the compositor "not composed", and the
+# compositor claims a band only when every datum the band needs is present, so
+# nothing here may fill a gap with an empty default: tasks is None until the shell
+# reports its open panels, and the taskbar is not claimed until then.
+
+# hartConnectivity.js's four glyph resolvers, mirrored threshold for threshold. The
+# JS stays the WebView tray's own renderer; this copy exists because the resolver
+# cannot run in this process and the compositor must not learn the thresholds itself
+# (that would be a second table, in Rust). The wire-contract test pins every glyph
+# name and threshold below against the JS source, so the two cannot drift silently.
+_TRAY_WIFI_BARS = ((75, 'wifi'), (50, 'network_wifi_3_bar'),
+                   (25, 'network_wifi_2_bar'), (0, 'network_wifi_1_bar'))
+_TRAY_BATTERY_BARS = ((90, 'battery_full'), (70, 'battery_6_bar'),
+                      (50, 'battery_4_bar'), (30, 'battery_3_bar'),
+                      (15, 'battery_2_bar'), (-1, 'battery_alert'))
+_TRAY_VOLUME_DOWN_BELOW = 40
+
+
+def _tray_wifi_glyph(w) -> str:
+    w = w if isinstance(w, dict) else {}
+    if not w.get('available') or not w.get('enabled'):
+        return 'wifi_off'
+    if not w.get('connected'):
+        return 'wifi_find'
+    sgl = w.get('signal')
+    sgl = sgl if isinstance(sgl, (int, float)) and not isinstance(sgl, bool) else 100
+    for floor, glyph in _TRAY_WIFI_BARS:
+        if sgl >= floor:
+            return glyph
+    return _TRAY_WIFI_BARS[-1][1]
+
+
+def _tray_bluetooth_glyph(b) -> str:
+    b = b if isinstance(b, dict) else {}
+    if not b.get('available') or not b.get('powered'):
+        return 'bluetooth_disabled'
+    if (b.get('connected_count') or 0) > 0:
+        return 'bluetooth_connected'
+    return 'bluetooth'
+
+
+def _tray_battery_glyph(bat) -> str:
+    bat = bat if isinstance(bat, dict) else {}
+    pct = bat.get('percent')
+    if (not bat.get('available') or not isinstance(pct, (int, float))
+            or isinstance(pct, bool)):
+        return 'battery_unknown'
+    if bat.get('state') in ('charging', 'full') or bat.get('plugged_in'):
+        return 'battery_charging_full'
+    for floor, glyph in _TRAY_BATTERY_BARS:
+        if pct > floor:
+            return glyph
+    return _TRAY_BATTERY_BARS[-1][1]
+
+
+def _tray_volume_glyph(v) -> str:
+    v = v if isinstance(v, dict) else {}
+    vol = v.get('volume')
+    if not v.get('available') or not isinstance(vol, (int, float)) or isinstance(vol, bool):
+        return 'volume_up'
+    if v.get('muted') or vol == 0:
+        return 'volume_off'
+    if vol < _TRAY_VOLUME_DOWN_BELOW:
+        return 'volume_down'
+    return 'volume_up'
+
+
+# A Material ligature name, the same rule _home_sanitize_card applies to a card icon
+# and hartContextMenu.js applies before adding the icon-font class.
+_CHROME_LIGATURE_RE = re.compile(r'^[a-z0-9_]+$')
+# refreshAgentStatus: four chips at most, each name clipped to 16 characters.
+CHROME_AGENTS_MAX = 4
+CHROME_AGENT_NAME_MAX = 16
+CHROME_TOAST_SEVERITIES = ('info', 'warning', 'error', 'success')
+
+
+def compose_shell_chrome(now, connectivity, agents, unread, tasks=None,
+                         start_open=False, toast=None, menu=None) -> dict:
+    """The `shell.chrome` payload, from the same inputs the WebView bar reads.
+
+    `now` is a local datetime; `connectivity` the _ConnectivityCache summary;
+    `agents` the dashboard's agent rows (status, name, goal_type); `unread` the
+    notification count or None when the store could not be asked; `tasks` the open
+    panels as {id, title, icon, active} or None when the shell has not reported
+    them; `toast` a {title, message, severity}; `menu` a {x, y, items}.
+
+    Every string is passed through _home_clean_text, so a hostile panel title or
+    agent name can no more reach the native bar than a card title can reach the
+    home. Keys are OMITTED, never emptied, when their input is None: that absence
+    is what stops the compositor claiming a band the shell did not compose.
+    """
+    out = {}
+    if now is not None:
+        # tickClock: toLocaleTimeString({hour:'2-digit',minute:'2-digit'}) and
+        # toLocaleDateString({weekday:'long',month:'long',day:'numeric'}), in the
+        # en-US forms the box renders them; the day carries no leading zero.
+        out['clock'] = {'time': now.strftime('%I:%M %p'),
+                        'date': '%s, %s %d' % (now.strftime('%A'),
+                                               now.strftime('%B'), now.day)}
+    if isinstance(connectivity, dict):
+        bat = connectivity.get('battery') or {}
+        pct = bat.get('percent')
+        has_pct = (bat.get('available') and isinstance(pct, (int, float))
+                   and not isinstance(pct, bool))
+        out['tray'] = {
+            'wifi': _tray_wifi_glyph(connectivity.get('wifi')),
+            'bluetooth': _tray_bluetooth_glyph(connectivity.get('bluetooth')),
+            'volume': _tray_volume_glyph(connectivity.get('volume')),
+            'battery': _tray_battery_glyph(bat),
+            # hc-bat-pct: the percent beside the glyph, blank without a battery.
+            'battery_pct': ('%d%%' % int(pct)) if has_pct else '',
+            # #hc-cluster.hc-dim: the cluster dims when no domain is live.
+            'live': any(bool((connectivity.get(k) or {}).get('available'))
+                        for k in ('wifi', 'bluetooth', 'battery', 'volume')),
+        }
+    if isinstance(unread, int) and not isinstance(unread, bool) and unread >= 0:
+        out['notifications'] = {'unread': unread}
+    if isinstance(agents, list):
+        names = []
+        for a in agents:
+            if not isinstance(a, dict) or a.get('status') != 'running':
+                continue
+            nm = _home_clean_text(a.get('name') or a.get('goal_type') or 'agent',
+                                  CHROME_AGENT_NAME_MAX)
+            if nm:
+                names.append(nm)
+            if len(names) >= CHROME_AGENTS_MAX:
+                break
+        out['agents'] = names
+    if isinstance(tasks, list):
+        chips = []
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+            title = _home_clean_text(t.get('title'), 40)
+            if not title:
+                continue
+            chip = {'id': _home_clean_text(t.get('id'), 60) or title,
+                    'title': title, 'active': bool(t.get('active'))}
+            icon = _home_clean_text(t.get('icon'), 40)
+            if icon and _CHROME_LIGATURE_RE.match(icon):
+                chip['icon'] = icon
+            chips.append(chip)
+        out['tasks'] = chips
+    out['start'] = {'open': bool(start_open)}
+    if isinstance(toast, dict):
+        title = _home_clean_text(toast.get('title'), 60)
+        message = _home_clean_text(toast.get('message'), 200)
+        if title or message:
+            sev = toast.get('severity')
+            out['toast'] = {
+                'title': title, 'message': message,
+                'severity': sev if sev in CHROME_TOAST_SEVERITIES else 'info',
+            }
+    if isinstance(menu, dict):
+        x, y = menu.get('x'), menu.get('y')
+        items = []
+        for it in (menu.get('items') or []):
+            if not isinstance(it, dict):
+                continue
+            if it.get('sep') is True:
+                items.append({'sep': True})
+                continue
+            label = _home_clean_text(it.get('label'), 60)
+            if not label:
+                continue
+            row = {'label': label}
+            icon = _home_clean_text(it.get('icon'), 40)
+            if icon and _CHROME_LIGATURE_RE.match(icon):
+                row['icon'] = icon
+            if it.get('danger') is True:
+                row['danger'] = True
+            if it.get('disabled') is True:
+                row['disabled'] = True
+            items.append(row)
+        if (isinstance(x, (int, float)) and isinstance(y, (int, float))
+                and not isinstance(x, bool) and not isinstance(y, bool) and items):
+            out['menu'] = {'x': int(x), 'y': int(y), 'items': items}
+    return out
+
+
 # /run/hart/session (0770, group-writable) NOT /run/hart (0750, owner-only): the
 # session HOST runs as hart-admin (in the `hart` group, not the `hart` OWNER), so it
 # can only write the group-writable session dir -- the SAME dir + reason shell-ready /
@@ -1689,7 +1881,143 @@ class LiquidUIService:
             # init on purpose: at init the compositor may not exist yet, and a subscription
             # that failed once would need a retry loop nobody would ever see fail.
             self._ensure_native_input_relay()
+            # And the moment to start feeding it the bar content the home feed does not
+            # carry (`shell.chrome`), for the same reason.
+            self._ensure_native_chrome_pump()
         return ok
+
+    # ── The bar content: the `shell.chrome` producer, beside the home producer ──
+    #
+    # How often the bar is recomposed and, when it changed, re-sent. The WebView bar
+    # polls its three sources at 5 s (agents), 8 s (connectivity) and 1 min (clock);
+    # 5 s is the fastest of them, so the native bar is never staler than the DOM one,
+    # and an unchanged composition is not re-sent at all, so a steady desktop costs
+    # one dict compare per tick and no IPC.
+    _NATIVE_CHROME_PUMP_S = 5.0
+    # `showToast` keeps a toast on screen 5 s (slideInRight .3 s, then the .3 s fade
+    # after a 4.7 s delay), so a notification older than that is not a toast any more.
+    _NATIVE_TOAST_LIFE_S = 5.0
+
+    def _compose_native_chrome(self) -> dict:
+        """Gather the bar's inputs from the SAME sources the WebView bar reads, then
+        compose the wire payload with `compose_shell_chrome`.
+
+        Each source is read exactly the way its DOM consumer reads it: the tray from
+        the connectivity cache the summary route serves; the agent cluster from the
+        dashboard's agent rows through ContextEngine; the badge from the notification
+        store; a toast from the newest accepted A2UI `notification`, which is what
+        `_applyEvent` turns into `showToast`. Two things the bar shows are NOT known
+        here and are therefore left ABSENT rather than faked, which keeps the taskbar
+        unclaimable: the open-panel list lives in the browser's `panels` registry and
+        nothing reports it to the server yet (`tasks`), and so does a context menu
+        (`menu`). When a reporter lands it feeds `_shell_panels` and this composes them.
+        """
+        import datetime as _dt
+        # Idempotent: the prober is normally lazy-started by the first summary poll,
+        # but once the WebView bar stands down nobody polls, and the native tray must
+        # not freeze on the last snapshot the browser happened to ask for.
+        _connectivity_cache.start()
+        summary = _connectivity_cache.summary()
+        agents = None
+        try:
+            agents = self.context_engine._get_agent_context().get('agents')
+        except Exception as e:
+            logger.debug("native chrome: agent context unavailable: %s", e)
+        return compose_shell_chrome(
+            now=_dt.datetime.now(),
+            connectivity=summary,
+            agents=agents if isinstance(agents, list) else [],
+            unread=self._native_chrome_unread(),
+            tasks=getattr(self, '_shell_panels', None),
+            start_open=bool(getattr(self, '_shell_start_open', False)),
+            toast=self._native_chrome_toast(),
+            menu=None,
+        )
+
+    def _native_chrome_unread(self):
+        """The unread count behind the badge, from the same store the notifications
+        route reads. 0 when the DB path is unavailable, which is also what the badge
+        shows today (its DOM toggle is never set), and None only for a store that
+        answered something that is not a count."""
+        if getattr(self, '_native_chrome_unread_off', False):
+            return 0
+        try:
+            from integrations.social.services import NotificationService
+            from integrations.social.models import db_session
+            with db_session() as db:
+                rows = NotificationService.get_for_user(
+                    db, 1, unread_only=True, limit=99)
+                return len(rows) if isinstance(rows, list) else 0
+        except Exception as e:
+            # Once, not every five seconds: the route logs the same fallback per
+            # request and a DB that is down stays down for the session.
+            self._native_chrome_unread_off = True
+            logger.debug("native chrome: notification store unavailable (%s); "
+                         "the badge reads 0", e)
+            return 0
+
+    def _native_chrome_toast(self):
+        """The newest accepted `notification` component still within a toast's life,
+        or None. Read under the same lock agent_ui_update writes under."""
+        newest = None
+        with self._lock:
+            for comps in self._agent_components.values():
+                for c in comps:
+                    if c.get('type') != 'notification':
+                        continue
+                    if newest is None or (c.get('_ts') or 0) > (newest.get('_ts') or 0):
+                        newest = c
+        if newest is None:
+            return None
+        if time.time() - float(newest.get('_ts') or 0) > self._NATIVE_TOAST_LIFE_S:
+            return None
+        return {'title': newest.get('title') or newest.get('_agent_id') or 'Notification',
+                'message': newest.get('message') or '',
+                'severity': newest.get('severity') or 'info'}
+
+    def _push_chrome_to_native_scene(self, chrome: dict) -> dict:
+        """Forward one composed bar payload. Best-effort and silent, exactly like
+        `_push_home_to_native_scene`: the WebView bar is unaffected either way."""
+        try:
+            from integrations.agent_engine.hart_wm_client import get_wm_client
+            reply = get_wm_client().shell_chrome(chrome)
+        except Exception as e:
+            logger.debug("native chrome push skipped: %s", e)
+            return {'ok': False, 'error': str(e)}
+        if not (reply and reply.get('ok')):
+            logger.debug("native chrome not applied: %s", (reply or {}).get('error'))
+        return reply or {'ok': False}
+
+    def _ensure_native_chrome_pump(self) -> bool:
+        """Start the bar producer's pump once; a compositor without the verb stops it
+        again (an older binary), and the next accepted compose re-arms it, which is
+        also what a compositor restart with a newer binary looks like from here."""
+        if getattr(self, '_native_chrome_pump', False):
+            return True
+        self._native_chrome_pump = True
+        threading.Thread(target=self._native_chrome_pump_loop,
+                         name='hart-comp-chrome', daemon=True).start()
+        return True
+
+    def _native_chrome_pump_loop(self) -> None:
+        last = None
+        try:
+            while True:
+                try:
+                    chrome = self._compose_native_chrome()
+                    if chrome != last:
+                        reply = self._push_chrome_to_native_scene(chrome)
+                        if reply.get('ok'):
+                            last = chrome
+                        elif reply.get('error') == 'unsupported':
+                            logger.info("native chrome: this compositor has no "
+                                        "shell.chrome; the WebView bar stays")
+                            return
+                except Exception as e:
+                    logger.debug("native chrome pump: %s", e)
+                time.sleep(self._NATIVE_CHROME_PUMP_S)
+        finally:
+            self._native_chrome_pump = False
 
     def _ensure_native_input_relay(self) -> bool:
         """Listen for `shell.activate` from the compositor, at most one listener.

@@ -154,3 +154,81 @@ pub const HOME_COMPOSE_SANITIZED_CLASSIC_MOOD: &str = r##"{
     }
   ]
 }"##;
+
+/// The verbatim output of the BAR-content producer, `compose_shell_chrome`: the
+/// `shell.chrome` half of the same contract (IPC_PROTOCOL.md 4.13), pinned by the same
+/// Python test for the same reason. The bars' decoder must be tested against what the
+/// shell SENDS, and the shell's tray glyphs, agent chips and clock text are exactly the
+/// kind of thing a hand-written fixture gets plausibly wrong. Test-only.
+#[cfg(test)]
+pub const SHELL_CHROME_COMPOSED: &str = r##"{
+  "agents": [
+    "Scout",
+    "summarise_inbox_",
+    "Archivist",
+    "Cartographer"
+  ],
+  "clock": {
+    "date": "Wednesday, September 23",
+    "time": "02:05 PM"
+  },
+  "menu": {
+    "items": [
+      {
+        "icon": "open_in_new",
+        "label": "Open"
+      },
+      {
+        "sep": true
+      },
+      {
+        "danger": true,
+        "label": "Delete"
+      },
+      {
+        "disabled": true,
+        "label": "Rename"
+      }
+    ],
+    "x": 412,
+    "y": 300
+  },
+  "notifications": {
+    "unread": 2
+  },
+  "start": {
+    "open": false
+  },
+  "tasks": [
+    {
+      "active": true,
+      "icon": "folder",
+      "id": "files",
+      "title": "Files"
+    },
+    {
+      "active": false,
+      "icon": "terminal",
+      "id": "terminal",
+      "title": "Terminal"
+    },
+    {
+      "active": false,
+      "id": "web#2",
+      "title": "Hevolve bdocs/b"
+    }
+  ],
+  "toast": {
+    "message": "Not available",
+    "severity": "warning",
+    "title": "Bluetooth"
+  },
+  "tray": {
+    "battery": "battery_4_bar",
+    "battery_pct": "64%",
+    "bluetooth": "bluetooth_connected",
+    "live": true,
+    "volume": "volume_down",
+    "wifi": "network_wifi_3_bar"
+  }
+}"##;

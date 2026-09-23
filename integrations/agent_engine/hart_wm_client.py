@@ -448,6 +448,29 @@ class HartWmClient:
             return {'ok': False, 'error': 'nothing to compose'}
         return self._hc('shell.compose', args)
 
+    def shell_chrome(self, chrome: Dict[str, Any]) -> Dict[str, Any]:
+        """Hand the BAR content to the compositor's native scene (IPC 4.13).
+
+        The sibling of `shell_compose`. That one carries the home the A2UI feed
+        composes; this carries what the bars show that the feed never did: the
+        clock, the tray glyphs, the notification badge, the agent cluster, the
+        taskbar chips, the start-menu state, a toast, a context menu. Same
+        producer as the WebView bar (liquid_ui_service composes both), same
+        socket, same request/response, so there is no second feed.
+
+        `chrome` is the composed dict, passed through verbatim: which keys it
+        carries IS the contract. An absent key tells the compositor the shell did
+        not compose that datum, and the compositor claims a band only when every
+        datum the band needs is present, so this must never fill a gap with an
+        empty default on the producer's behalf.
+
+        Best-effort like every verb here: no compositor, an older one without the
+        verb, or a dead socket answer `ok: False` and the WebView bar carries on.
+        """
+        if not isinstance(chrome, dict) or not chrome:
+            return {'ok': False, 'error': 'nothing to compose'}
+        return self._hc('shell.chrome', chrome)
+
     def focus_window(self, con_id: int) -> Dict[str, Any]:
         if self._backend == 'hart-comp':
             return self._hc('window.focus', {'handle': str(con_id)})
