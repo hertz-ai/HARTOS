@@ -1579,6 +1579,22 @@ fn gles_should_demote(is_render_frame_variant: bool) -> bool {
     is_render_frame_variant
 }
 
+/// What one tick's presentation attempt tells the scheduler.
+///
+/// Two independent facts, because they drive two different reactions in `render_all`:
+/// a renderer fault demotes GLES to the pixman floor; a deferral keeps the frame-budget
+/// scheduler dirty so the damage this tick was built for is presented on the tick after
+/// the vblank instead of waiting for the idle heartbeat.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PresentOutcome {
+    /// A `RenderFrameError::RenderFrame` was seen: the renderer itself faulted.
+    renderer_fault: bool,
+    /// At least one CRTC could not take this tick's frame because its previous flip was
+    /// still in flight (the F1 gate held, the vblank was not lost). The frame was built
+    /// and NOT queued, so nothing this tick was built for has reached a swapchain.
+    deferred: bool,
+}
+
 /// Present the built element list to every active DRM surface that is NOT mid-flip:
 /// `render_frame` (composite into the primary swapchain buffer) → `queue_frame` (page-flip)
 /// → gate on vblank (F1, #166; the `frame_submitted` half is driven by `reap_completed_
@@ -1586,8 +1602,9 @@ fn gles_should_demote(is_render_frame_variant: bool) -> bool {
 /// PixmanRenderer software floor OR the GlesRenderer GPU path — it never names a concrete
 /// renderer, so there is no parallel present path. EVERY render/flip error degrades (log +
 /// skip + retry next tick) and KEEPS THE COMPOSITOR ALIVE — never a `panic!`/`.unwrap()`
-/// death (F2/F3, #186). Returns `true` if a RENDERER fault (`RenderFrameError::RenderFrame`)
-/// was seen, so the caller can demote a GLES renderer to the pixman floor (degrade-not-die).
+/// death (F2/F3, #186). Reports a RENDERER fault (`RenderFrameError::RenderFrame`) so the
+/// caller can demote a GLES renderer to the pixman floor (degrade-not-die), and whether any
+/// CRTC DEFERRED the frame behind an in-flight flip, so the caller keeps the damage pending.
 fn present_surfaces<R>(
     devices: &mut HashMap<DrmNode, DeviceData>,
     renderer: &mut R,
@@ -1603,13 +1620,13 @@ fn present_surfaces<R>(
     // wlr-layer surface is not in the map we send callbacks to.
     space_count: usize,
     layer_count: usize,
-) -> bool
+) -> PresentOutcome
 where
     R: Renderer + Bind<Dmabuf>,
     R::TextureId: Texture + Clone + Send + 'static,
     HartRenderElement<R>: RenderElement<R>,
 {
-    let mut renderer_fault = false;
+    let mut outcome = PresentOutcome::default();
     for device in devices.values_mut() {
         // Self-healing DRM master retry (THE fresh-boot recovery, fix (a)): the construction-time
         // drmSetMaster inside DrmDevice::new may have lost the boot-VT master race ("Unable to
@@ -1643,6 +1660,14 @@ where
                     .map(|t| now.duration_since(t) >= VBLANK_STALL_TIMEOUT)
                     .unwrap_or(true);
                 if !stalled {
+                    // The frame this tick built is NOT going to this CRTC. Say so, or the
+                    // scheduler records the tick as painted, clears its dirty latch, and
+                    // the damage waits out the 200 ms idle heartbeat: the 220 ms tail
+                    // measured on the box 2026-09-11 (VERIFICATION.md). The 16 ms
+                    // dispatch tick and the 16.7 ms refresh drift past each other, so
+                    // roughly every other tick lands here, and the last input of every
+                    // gesture did too.
+                    outcome.deferred = true;
                     continue;
                 }
                 // Clearing our gate alone ORPHANS smithay's pending_frame here, and from
@@ -1787,7 +1812,7 @@ where
                     // case #1006 describes, and the one worth counting.
                     note_render_pass(false);
                     if gles_should_demote(matches!(err, RenderFrameError::RenderFrame(_))) {
-                        renderer_fault = true;
+                        outcome.renderer_fault = true;
                         warn!(?err, ?crtc, "HART-comp DRM: render_frame RENDERER fault (RenderFrame) — degrading; caller may demote to the pixman floor");
                     } else {
                         warn!(?err, ?crtc, "HART-comp DRM: render_frame failed (PrepareFrame transient) — degrading, retry next frame");
@@ -1796,7 +1821,7 @@ where
             }
         }
     }
-    renderer_fault
+    outcome
 }
 
 /// Render every active DRM surface this tick: build the FULL z-order element list (the
@@ -1875,11 +1900,11 @@ fn render_all(
         map.layers().count()
     };
 
-    let mut demote_gles = false;
+    let mut outcome = PresentOutcome::default();
     if let Some(renderer) = gles.as_mut() {
         let elements: Vec<HartRenderElement<GlesRenderer>> =
             comp_core::build_frame_elements(state, renderer, size);
-        demote_gles = present_surfaces(devices, renderer, &elements, clear, now, space_count, layer_count);
+        outcome = present_surfaces(devices, renderer, &elements, clear, now, space_count, layer_count);
     } else {
         // ── Pixman software-floor path (the never-fail renderer of record) ── The renderer
         // lives ON `state`, but `build_frame_elements` needs BOTH `&mut state` (reads the
@@ -1897,20 +1922,25 @@ fn render_all(
         };
         let elements: Vec<HartRenderElement<PixmanRenderer>> =
             comp_core::build_frame_elements(state, &mut renderer, size);
-        // The pixman floor has NO lower renderer to demote to, so its renderer-fault return
-        // is ignored (a pixman RenderFrame fault is a transient retried next tick — there is
-        // no GL context to lose on the CPU path).
-        let _ = present_surfaces(devices, &mut renderer, &elements, clear, now, space_count, layer_count);
+        // The pixman floor has NO lower renderer to demote to, so its renderer-fault flag
+        // is ignored below (a pixman RenderFrame fault is a transient retried next tick;
+        // there is no GL context to lose on the CPU path). Its deferral is not ignored:
+        // the pixman floor has the same one-flip-in-flight gate.
+        outcome = present_surfaces(devices, &mut renderer, &elements, clear, now, space_count, layer_count);
+        outcome.renderer_fault = false;
         // Restore the real renderer (keeping the ORIGINAL instance avoids re-allocating its
         // internal caches every tick).
         state.renderer = renderer;
     }
+    let demote_gles = outcome.renderer_fault;
 
     // #137 — this tick composited: record the paint so the idle heartbeat is measured from
     // now, and clear the dirty latch (so the NEXT static tick can be skipped) UNLESS an effect
     // is still animating, in which case dirty is re-armed to keep the fade playing frame-by-
-    // frame. This is the single place the frame-budget scheduler is told "a frame went out".
-    state.repaint.note_painted(now, effects_animating);
+    // frame, OR the frame was deferred behind an in-flight flip, in which case the damage has
+    // not been presented and must survive to the tick after the vblank. This is the single
+    // place the frame-budget scheduler is told what happened to the frame.
+    state.repaint.note_painted(now, effects_animating, outcome.deferred);
 
     // ── GLES → pixman demotion (degrade-not-die) ── A renderer fault was seen on the GPU
     // path: drop the GLES renderer so EVERY subsequent tick paints via the pixman renderer

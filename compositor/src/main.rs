@@ -736,14 +736,27 @@ impl RepaintScheduler {
         self.wants_paint(effects_animating, since)
     }
 
-    /// Call AFTER a tick actually composited. Records the paint time for the heartbeat
+    /// Call AFTER a tick ran the composite. Records the paint time for the heartbeat
     /// and clears the dirty latch — UNLESS an effect is still animating, which must keep
-    /// painting next tick (so a fade is never frozen mid-way). Keeping `dirty` in lockstep
-    /// with `effects_animating` here is what lets an in-flight crossfade play frame-by-
-    /// frame with no separate scheduling, exactly as the old unconditional loop did.
-    fn note_painted(&mut self, now: Instant, effects_animating: bool) {
+    /// painting next tick (so a fade is never frozen mid-way), OR the frame was DEFERRED.
+    /// Keeping `dirty` in lockstep with `effects_animating` here is what lets an in-flight
+    /// crossfade play frame-by-frame with no separate scheduling, exactly as the old
+    /// unconditional loop did.
+    ///
+    /// `deferred` is the fix for the 220 ms tail measured on hardware 2026-09-11
+    /// (VERIFICATION.md, "The 220ms tail every measurement has carried is the IDLE
+    /// HEARTBEAT"). A CRTC takes one flip at a time (the F1 torn-frame gate), so a tick
+    /// that lands while the previous flip is still in flight builds its frame and then
+    /// queues NOTHING. This method used to clear `dirty` on that tick anyway, as if the
+    /// damage had been presented, and the next tick found a clean scheduler: the input
+    /// that caused the damage then waited for the 200 ms heartbeat, plus one frame, which
+    /// is the 216.7 ms the box measured as its max. Under continuous motion each new
+    /// event re-dirtied the scheduler and hid the loss; the LAST event of every gesture
+    /// paid it in full. With `deferred` the damage survives to the tick after the vblank,
+    /// so the worst case is one refresh interval of waiting, not one heartbeat.
+    fn note_painted(&mut self, now: Instant, effects_animating: bool, deferred: bool) {
         self.last_paint = Some(now);
-        self.dirty = effects_animating;
+        self.dirty = effects_animating || deferred;
     }
 }
 
@@ -1623,7 +1636,7 @@ mod tests {
         // A clean (already-painted, not-dirtied) scheduler with no animation and the last
         // paint well within the heartbeat MUST skip — this is the whole frame-budget win.
         let mut s = RepaintScheduler::new();
-        s.note_painted(Instant::now(), false); // clears dirty, records the paint
+        s.note_painted(Instant::now(), false, false); // clears dirty, records the paint
         assert!(!s.wants_paint(false, Some(Duration::from_millis(16))), "clean + static + fresh paint → skip");
         assert!(!s.wants_paint(false, Some(IDLE_HEARTBEAT - Duration::from_millis(1))), "just under the heartbeat → still skip");
     }
@@ -1633,7 +1646,7 @@ mod tests {
         // A commit / input / map / kill-switch edge marks dirty → the next tick paints even
         // when the clock says "idle" (last paint 1ms ago). This is interactive latency = 0.
         let mut s = RepaintScheduler::new();
-        s.note_painted(Instant::now(), false);
+        s.note_painted(Instant::now(), false, false);
         assert!(!s.wants_paint(false, Some(Duration::from_millis(1))), "clean → would skip");
         s.mark_damaged();
         assert!(s.wants_paint(false, Some(Duration::from_millis(1))), "a damage edge forces a paint on the very next tick");
@@ -1645,7 +1658,7 @@ mod tests {
         // keeps painting; and `note_painted(animating=true)` re-arms dirty so the NEXT tick also
         // paints (the crossfade is never frozen mid-way).
         let mut s = RepaintScheduler::new();
-        s.note_painted(Instant::now(), true); // painted a fade frame; still animating
+        s.note_painted(Instant::now(), true, false); // painted a fade frame; still animating
         assert!(s.dirty, "note_painted keeps dirty while an effect animates");
         assert!(s.wants_paint(true, Some(Duration::from_millis(1))), "an animating effect paints every tick");
     }
@@ -1656,7 +1669,7 @@ mod tests {
         // animating), once the heartbeat elapses the tick force-repaints — so a missed
         // mark_damaged() is at worst a ≤200ms stutter, never a frozen screen.
         let mut s = RepaintScheduler::new();
-        s.note_painted(Instant::now(), false);
+        s.note_painted(Instant::now(), false, false);
         assert!(!s.wants_paint(false, Some(IDLE_HEARTBEAT - Duration::from_millis(1))), "under heartbeat → skip");
         assert!(s.wants_paint(false, Some(IDLE_HEARTBEAT)), "at the heartbeat → force a repaint (self-heal)");
         assert!(s.wants_paint(false, Some(IDLE_HEARTBEAT + Duration::from_secs(5))), "long past the heartbeat → always paint");
@@ -1669,8 +1682,46 @@ mod tests {
         let mut s = RepaintScheduler::new();
         s.mark_damaged();
         assert!(s.dirty);
-        s.note_painted(Instant::now(), false);
+        s.note_painted(Instant::now(), false, false);
         assert!(!s.dirty, "painting a static frame clears the dirty latch → next static tick is skippable");
+    }
+
+    #[test]
+    fn damage_that_lands_while_a_flip_is_in_flight_paints_on_the_next_tick_not_the_heartbeat() {
+        // THE 220 ms TAIL (VERIFICATION.md 2026-09-11: max 218.4 / 220.0 / 225.5 ms across
+        // three windows, collapsing to 40-66 ms the moment anything animates). Replayed
+        // tick by tick on the pure scheduler, the way the DRM loop actually drives it.
+        let t0 = Instant::now();
+        let ms = |n: u64| Duration::from_millis(n);
+        let mut s = RepaintScheduler::new();
+
+        // Tick 0: a frame is built and queued; its flip is now in flight to the CRTC.
+        s.note_painted(t0, false, false);
+        // An input lands 8 ms later (the last event of a hover gesture).
+        s.mark_damaged();
+        // Tick 1 (16 ms): the scheduler wants to paint, the tick builds the frame, but
+        // the CRTC is still awaiting the vblank of tick 0's flip (16.7 ms > 16 ms), so
+        // present_surfaces queues nothing. That is a DEFERRED tick.
+        assert!(s.wants_paint(false, Some(ms(16))));
+        s.note_painted(t0 + ms(16), false, /* deferred = */ true);
+        // Tick 2 (32 ms): the vblank has been reaped. The damage must still be pending,
+        // so this tick paints and the input binds to a frame ~33 ms after it landed.
+        assert!(
+            s.wants_paint(false, Some(ms(16))),
+            "the deferred damage must paint on the tick after the vblank"
+        );
+        s.note_painted(t0 + ms(32), false, false);
+        assert!(!s.wants_paint(false, Some(ms(16))), "and the desktop goes idle again after it");
+
+        // The old contract, stated so a revert is caught: a deferred tick that clears
+        // dirty leaves the input waiting for the heartbeat. 200 ms plus one 16.7 ms
+        // frame is the 216.7 ms the box measured.
+        let mut old = RepaintScheduler::new();
+        old.note_painted(t0, false, false);
+        old.mark_damaged();
+        old.note_painted(t0 + ms(16), false, false); // deferred, but recorded as painted
+        assert!(!old.wants_paint(false, Some(ms(16))), "this is the gap: nothing paints");
+        assert!(old.wants_paint(false, Some(IDLE_HEARTBEAT)), "until the heartbeat");
     }
 
     #[test]
@@ -1687,6 +1738,15 @@ mod tests {
                     "dirty={dirty} animating={animating}: an elapsed heartbeat must always repaint (never wedge)"
                 );
             }
+        }
+        // And the deferred path cannot wedge the OTHER way: a tick that is deferred
+        // forever (a CRTC whose vblank never comes) keeps dirty set, which only ever
+        // means "paint", and the lost-vblank hatch in udev.rs retires the flip after
+        // VBLANK_STALL_TIMEOUT so the deferral itself is bounded.
+        let mut s = RepaintScheduler::new();
+        for i in 0..100u64 {
+            s.note_painted(Instant::now(), false, true);
+            assert!(s.wants_paint(false, Some(Duration::from_millis(i))), "deferred never means idle");
         }
     }
 
