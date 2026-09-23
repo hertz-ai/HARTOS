@@ -378,7 +378,7 @@ def test_the_music_path_starts_its_composer_exactly_once():
     resp = MagicMock(status_code=200)
     resp.json.return_value = {'data': {'task_id': 't1', 'status': 'queued'}, 'code': 200}
     with patch.object(ma, '_start_tool', return_value={'running': True}) as start, \
-            patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'), \
+            patch.object(ma, '_node_has_any', return_value=True), patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'), \
             patch('core.http_pool.pooled_post', return_value=resp):
         ma._generate_audio_music('a chime', '', 2, '')
     assert start.call_count == 1, start.call_count
@@ -400,7 +400,7 @@ def test_the_submit_names_the_duration_field_acestep_reads():
     import integrations.service_tools.media_agent as ma
     resp = MagicMock(status_code=200)
     resp.json.return_value = {'data': {'task_id': 't1', 'status': 'queued'}, 'code': 200}
-    with patch.object(ma, '_start_tool', return_value={'running': True}), patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'),             patch('core.http_pool.pooled_post', return_value=resp) as post:
+    with patch.object(ma, '_start_tool', return_value={'running': True}), patch.object(ma, '_node_has_any', return_value=True), patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'),             patch('core.http_pool.pooled_post', return_value=resp) as post:
         ma._generate_audio_music('a chime', '', 5, '')
     payload = post.call_args.kwargs['json']
     assert payload['audio_duration'] == 5
@@ -419,7 +419,7 @@ def test_the_music_path_starts_its_composer_before_dialing_it():
     resp = MagicMock(status_code=200)
     resp.json.return_value = {'data': {'task_id': 't1', 'status': 'queued'}, 'code': 200}
     with patch.object(ma, '_start_tool', return_value={'running': True}) as start, \
-            patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'), \
+            patch.object(ma, '_node_has_any', return_value=True), patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'), \
             patch('core.http_pool.pooled_post', return_value=resp):
         ma._generate_audio_music('a chime', '', 2, '')
     assert start.call_args.args == ('acestep',)
@@ -493,3 +493,30 @@ def test_a_reused_temp_name_never_replaces_a_kept_take(tmp_path, monkeypatch):
     assert (out / 'take.wav').read_bytes() == b'RIFF-first'
     # the same bytes again reuse the name they already have
     assert ma._keep_composition(str(src))[0] == '/api/voice/audio/take-1.wav'
+
+
+def test_listed_is_not_installed():
+    """hartos-3a F4: the catalog lists every engine; only a downloaded one is here."""
+    from unittest.mock import MagicMock, patch
+    import integrations.service_tools.media_agent as ma
+    listed = MagicMock(downloaded=False)
+    here = MagicMock(downloaded=True)
+    cat = MagicMock()
+    cat.list_by_type.return_value = [listed]
+    with patch('integrations.service_tools.model_catalog.get_catalog', return_value=cat):
+        assert ma._node_has_any('audio_gen') is False
+        cat.list_by_type.return_value = [listed, here]
+        assert ma._node_has_any('audio_gen') is True
+
+
+def test_nothing_downloaded_asks_instead_of_downloading():
+    """Owner 2026-09-23: ask once, then set up. The music path must not
+    start (and so download) a composer that is not on the disk; its answer
+    is ABSENT, which is what brings up the consent card."""
+    from unittest.mock import patch
+    import integrations.service_tools.media_agent as ma
+    with patch.object(ma, '_node_has_any', return_value=False),             patch.object(ma, '_start_tool') as start:
+        out = ma._generate_audio_music('a chime', '', 2, '')
+    assert not start.called, 'a download was started without consent'
+    assert classify_error(out) == ABSENT, out
+

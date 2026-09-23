@@ -67,7 +67,13 @@ def _node_has_any(model_type: str) -> bool:
     """
     try:
         from integrations.service_tools.model_catalog import get_catalog
-        return bool(get_catalog().list_by_type(model_type))
+        # DOWNLOADED, not listed: the catalog registers every known engine
+        # (populate_audiogen_catalog lists acestep either way), so "listed"
+        # was True on a node with nothing on its disk -- the agent told the
+        # person the composer was installed and busy, and the "may I set one
+        # up?" card could never be reached (hartos-3a F4, CONFIRMED).
+        return any(getattr(e, 'downloaded', False)
+                   for e in get_catalog().list_by_type(model_type))
     except Exception as e:
         # Never silent: this decides whether a caller offers an install,
         # so "I could not tell" must be visible.  warning, not exception,
@@ -598,6 +604,14 @@ def _generate_audio_music(context: str, input_text: str,
     # one dialed straight away, so a composer that was installed and merely
     # not up answered "not running" to every game, for ever (run 8,
     # 2026-09-22 -- the proof scripts had been starting it by hand).
+    # Nothing downloaded: say so, and start nothing.  _start_tool would
+    # download ~10 GB without asking; the owner's ruling (2026-09-23) is
+    # ask once, then set up -- so this answer is ABSENT, which is what
+    # routes the agent to the consent card (capability_setup).
+    if not _node_has_any('audio_gen'):
+        return {'status': 'error',
+                'error': 'AceStep not available on this node (not downloaded)',
+                'output_modality': 'audio_music'}
     started = _start_tool('acestep')
     if not started.get('running'):
         why = str(started.get('error') or 'auto-start failed')
