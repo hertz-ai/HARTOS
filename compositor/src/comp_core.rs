@@ -6008,6 +6008,125 @@ mod native_render_tests {
         );
     }
 
+    /// Composite `elements` over a magenta sentinel and hand back the framebuffer bytes
+    /// (Argb8888 little-endian, [B,G,R,A]). The same steps the demo proof below takes,
+    /// extracted so a proof can ask about a REGION rather than the whole frame.
+    fn composite_to_bytes(
+        renderer: &mut PixmanRenderer,
+        size: Size<i32, Physical>,
+        elements: &[HartRenderElement<PixmanRenderer>],
+    ) -> Vec<u8> {
+        use smithay::backend::renderer::utils::draw_render_elements;
+        use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen};
+        let buf_size: Size<i32, BufferCoord> = (size.w, size.h).into();
+        let mut image = renderer
+            .create_buffer(Fourcc::Argb8888, buf_size)
+            .expect("offscreen image");
+        let mut target = renderer.bind(&mut image).expect("bind offscreen");
+        let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
+        {
+            let mut frame = renderer
+                .render(&mut target, size, Transform::Normal)
+                .expect("begin frame");
+            frame
+                .clear(Color32F::new(1.0, 0.0, 1.0, 1.0), &[full])
+                .expect("clear to sentinel");
+            draw_render_elements(&mut frame, 1.0, elements, &[full]).expect("draw scene");
+            let _ = frame.finish().expect("finish frame");
+        }
+        let region: Rectangle<i32, BufferCoord> = Rectangle::from_size(buf_size);
+        let mapping = renderer
+            .copy_framebuffer(&target, region, Fourcc::Argb8888)
+            .expect("copy_framebuffer");
+        renderer.map_texture(&mapping).expect("map_texture").to_vec()
+    }
+
+    /// How many pixels inside `r` differ from the pixel just LEFT of it (the strip's
+    /// own fill), i.e. how many a run painted.
+    fn painted_in(bytes: &[u8], w: usize, r: crate::scene::Rect) -> usize {
+        let x0 = r.x.max(0.0) as usize;
+        let y0 = r.y.max(0.0) as usize;
+        let x1 = (r.x + r.w).min(w as f32) as usize;
+        let y1 = (r.y + r.h) as usize;
+        let reference = {
+            let i = (y0 * w + x0.saturating_sub(2)) * 4;
+            bytes[i..i + 3].to_vec()
+        };
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * w + x) * 4;
+                if bytes[i..i + 3] != reference[..] {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn the_native_bar_paints_the_clock_and_the_tray_it_was_given() {
+        // The headless pixel proof for `shell.chrome`: the layout tests prove the runs
+        // are EMITTED; this proves they reach a framebuffer as pixels that differ from
+        // the strip they sit on. Text, not coverage, is what a bar with a blank clock
+        // slot would fail.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 400).into();
+        let home = crate::scene::HomeCompose::demo();
+        let chrome: crate::scene::ShellChrome = crate::scene::decode_shell_chrome(
+            &serde_json::from_str(crate::wire_fixture::SHELL_CHROME_COMPOSED).unwrap(),
+        );
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let has_face = crate::scene::TextMeasure::has_icon_face(&rasterizer);
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        let cov = scenes.set_chrome(chrome);
+        assert!(cov.top_bar && cov.taskbar, "the fixture composes both bands");
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
+            0.5, None, false, true, &crate::scene::RowScroll::default(), &mut elements,
+        );
+        let bytes = composite_to_bytes(&mut renderer, size, &elements);
+
+        // Every text run in the two strips, by what it says.
+        let tree = scenes.tree().expect("the tree was built by the lowering");
+        let mut runs: Vec<(String, bool, crate::scene::Rect)> = Vec::new();
+        tree.for_each_leaf(&mut |_, leaf| {
+            if let crate::scene::SceneNode::Text { rect, text, icon, .. } = leaf {
+                let in_bar = rect.y < crate::scene::TOP_BAR_H
+                    || rect.y >= size.h as f32 - crate::scene::TASKBAR_H;
+                if in_bar {
+                    runs.push((text.clone(), *icon, *rect));
+                }
+            }
+        });
+        let run = |t: &str| runs.iter().find(|(s, _, _)| s == t).map(|(_, _, r)| *r);
+        let w = size.w as usize;
+        for want in ["02:05 PM", "64%", "Scout", "Files"] {
+            let r = run(want).unwrap_or_else(|| panic!("the bar never laid out {want:?}"));
+            let n = painted_in(&bytes, w, r);
+            assert!(n > 8, "{want:?} laid out at {r:?} but painted only {n} px");
+        }
+        // The glyphs are ligature names in the Material face. Where that face is
+        // loaded they must paint; where it is not, the layout must not have asked for
+        // them at all (a run of the literal word "network_wifi_3_bar" across the tray
+        // is the fresh-ISO failure this rule exists for).
+        let glyphs = ["network_wifi_3_bar", "bluetooth_connected", "volume_down", "battery_4_bar", "folder"];
+        if has_face {
+            for g in glyphs {
+                let r = run(g).unwrap_or_else(|| panic!("the face is loaded but {g:?} was not laid out"));
+                assert!(painted_in(&bytes, w, r) > 4, "{g:?} laid out but painted nothing");
+            }
+        } else {
+            for g in glyphs {
+                assert!(run(g).is_none(), "no icon face, yet {g:?} was laid out as a word");
+            }
+            eprintln!("note: no Material face on this host, so the glyph half of this proof ran as its absence rule");
+        }
+    }
+
     #[test]
     fn demo_scene_composites_visible_pixels_on_pixman() {
         // Color32F / Frame / draw_render_elements are cfg-gated to the winit path in

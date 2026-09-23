@@ -231,6 +231,13 @@ pub struct Theme {
     /// The live indicator dot (the shell's `--hart-amb-4`), which rides the ambient mood
     /// rather than the functional accent, so it stays distinct from a badge.
     pub live_dot: Color,
+    /// The shell's three STATUS roles, `--hart-active`, `--hart-caution` and
+    /// `--hart-error`: the agent chip's dot, a warning toast's edge, the badge dot and an
+    /// error toast's edge. Roles, not hues, like everything else here; the built-in
+    /// css_vars literals are the fallbacks the browser renders with.
+    pub active: Color,
+    pub caution: Color,
+    pub error: Color,
     /// The translucent ground a live tag sits on, dark enough to read over card art.
     pub chip_bg: Color,
     /// The leaderboard rank numeral's outline. Faint on purpose: it sits BEHIND the card's
@@ -453,6 +460,10 @@ impl Theme {
             // reads as the same component rather than a lookalike.
             on_accent_ink: palette("#04140F", Color::rgba(0.0, 0.0, 0.0, 1.0)),
             live_dot: palette("#FF2E9A", Color::rgba(0.5, 0.5, 0.5, 1.0)),
+            // --hart-active: #00e676, --hart-caution: #ffab40, --hart-error: #FF6B6B.
+            active: palette("#00E676", Color::rgba(0.5, 0.5, 0.5, 1.0)),
+            caution: palette("#FFAB40", Color::rgba(0.5, 0.5, 0.5, 1.0)),
+            error: palette("#FF6B6B", Color::rgba(0.5, 0.5, 0.5, 1.0)),
             chip_bg: Color::rgba(0.031, 0.047, 0.078, 0.72),
             // rgba(255,255,255,0.30), the shell's own -webkit-text-stroke colour.
             rank_ink: Color::rgba(1.0, 1.0, 1.0, 0.30),
@@ -1583,6 +1594,67 @@ const ACTIVE_TAB: usize = 0;
 /// `.tb-tab { font-size: 13px }`, and `.top-bar-nav { gap: 2px }` between them.
 const TAB_PX: f32 = 13.0;
 const TAB_GAP: f32 = 2.0;
+/// `.tb-tab { height: 30px; border-radius: 9px }`, and `.tb-tab.tb-active`'s accent
+/// wash (`rgba(0,230,195,.14)`) inside its inset ring (`rgba(0,230,195,.34)`).
+const TAB_H: f32 = 30.0;
+const TAB_RADIUS: f32 = 9.0;
+const TAB_ACTIVE_WASH_A: f32 = 0.14;
+const TAB_ACTIVE_RING_A: f32 = 0.34;
+/// `.top-bar { gap: 8px }`: between the bar's flex children.
+const BAR_GAP: f32 = 8.0;
+/// `.top-bar .start-btn { padding: 4px 12px; gap: 6px }` around `.start-logo { width:
+/// 20px }` and the wordmark. The logo's slot is kept while the image waits on lowering.
+const START_PAD_X: f32 = 12.0;
+const START_LOGO: f32 = 20.0;
+const START_GAP: f32 = 6.0;
+/// `.top-bar-omni { height: 34px; gap: 9px; padding: 0 14px }`, `.top-bar-omni .mi {
+/// font-size: 18px }`, and the prompt's own words from the shell's markup.
+const OMNIBOX_H: f32 = 34.0;
+const OMNIBOX_GAP: f32 = 9.0;
+const OMNIBOX_PAD_X: f32 = 14.0;
+const OMNIBOX_GLYPH_PX: f32 = 18.0;
+const OMNIBOX_PROMPT: &str = "Ask or search anything";
+/// `.tbo-kbd { padding: 1px 6px; border-radius: 6px }`.
+const KBD_PAD_X: f32 = 6.0;
+const KBD_PAD_Y: f32 = 1.0;
+const KBD_RADIUS: f32 = 6.0;
+/// `.top-bar-right .clock { font-size: 12px; padding: 0 8px }`.
+const CLOCK_PX: f32 = 12.0;
+const CLOCK_PAD_X: f32 = 8.0;
+/// `#hc-cluster { gap: 2px }`, `#hc-bat-pct { font-size: 10px }`, `.hc-dim { opacity: .55 }`.
+const HC_GAP: f32 = 2.0;
+const HC_PCT_PX: f32 = 10.0;
+const HC_DIM: f32 = 0.55;
+/// `.badge { top: 2px; right: 2px; width: 8px; height: 8px }`, on this tray button.
+const BADGE_D: f32 = 8.0;
+const BADGE_INSET: f32 = 2.0;
+const TRAY_NOTIFICATIONS: &str = "notifications";
+/// `.top-bar-center { gap: 6px; padding: 0 12px; font-size: 12px }`, its `.agent-chip {
+/// gap: 4px; padding: 2px 8px; border-radius: 10px; font-size: 11px }` and `.dot { 6px }`,
+/// and the words `refreshAgentStatus` writes when nothing is running.
+const AGENT_PAD_X: f32 = 12.0;
+const AGENT_GAP: f32 = 6.0;
+const AGENT_PX: f32 = 12.0;
+const AGENT_CHIP_PX: f32 = 11.0;
+const AGENT_CHIP_PAD_X: f32 = 8.0;
+const AGENT_CHIP_PAD_Y: f32 = 2.0;
+const AGENT_CHIP_RADIUS: f32 = 10.0;
+const AGENT_DOT: f32 = 6.0;
+const AGENT_DOT_GAP: f32 = 4.0;
+const AGENTS_EMPTY: &str = "No agents running";
+/// `.taskbar { gap: 2px; padding: 0 8px }`, `.taskbar-chip { height: 34px; padding: 0
+/// 12px; gap: 4px; border-radius: 8px; font-size: 12px }`, `.taskbar-chip .mi { 16px }`,
+/// `.chip-label { max-width: 100px }`, `.taskbar-chip.active { border-bottom: 2px }`.
+const TASKBAR_PAD_X: f32 = 8.0;
+const TASKBAR_CHIP_GAP: f32 = 2.0;
+const CHIP_H: f32 = 34.0;
+const CHIP_PAD_X: f32 = 12.0;
+const CHIP_GAP: f32 = 4.0;
+const CHIP_RADIUS: f32 = 8.0;
+const CHIP_PX: f32 = 12.0;
+const CHIP_ICON_PX: f32 = 16.0;
+const CHIP_LABEL_MAX: f32 = 100.0;
+const CHIP_ACTIVE_RULE: f32 = 2.0;
 /// TWO measurements under one name, which is the `EDGE_PAD` shape again and is NOT fixed
 /// here because unpicking it is a visual call the box has to settle.
 ///
@@ -1976,10 +2048,6 @@ pub fn layout_desktop(
     scroll: &RowScroll,
     measure: &mut dyn TextMeasure,
 ) -> SceneNode {
-    // Read in slice 2 (the native bars drawn from it). Bound here so the layout's
-    // signature is the contract from the first commit and the cache key already moves
-    // with the payload.
-    let _ = chrome;
     let mut root: Vec<SceneNode> = Vec::new();
     // Asked ONCE for the whole layout rather than per glyph: it walks the font database,
     // and the answer cannot change within a single layout pass. Every icon on this
@@ -1988,33 +2056,37 @@ pub fn layout_desktop(
     // The shell's two media queries, resolved ONCE for this output (see `HomeMetrics`).
     let m = HomeMetrics::for_output(output_w, output_h);
 
-    // ── Top bar (fixed, 40px): background, centre omnibox pill, right orb-sm. ──
+    // ── Top bar (fixed, 40px), laid out as the shell's flex row: start button | nav
+    //    tabs | the agent cluster, which is the row's one `flex: 1` column | omnibox
+    //    pill | orb-sm | avatar | tray. The RIGHT cluster is measured first because
+    //    everything to its left ends where it begins, exactly as a flex row with one
+    //    flexible column resolves; the pill is therefore right-packed against the orb,
+    //    not centred, and the tabs and the cluster take what is left. The geometry
+    //    follows the shell's CSS literals rather than a design of its own for a reason
+    //    beyond parity: while the native bar routes no presses of its own, a press on
+    //    it falls through to the shell's bar underneath, and it must land on the same
+    //    control. ──
     let bar = Rect::new(0.0, 0.0, output_w, theme.top_bar_h);
     let mut bar_children = vec![chrome_fill_node(bar, theme)];
+
     // ── Brand wordmark (P5, the shell's start-btn treatment): "HART" in the accent then
     //    "OS" in the second brand hue. Two runs, so the second must begin exactly where
-    //    the first ends. This is the layout that was impossible before `TextMeasure`:
-    //    without a width there is no way to butt one run against another. The logo IMAGE
-    //    beside it in the HTML shell waits on Image lowering (the image-source contract).
-    // The omnibox pill is computed HERE, before the wordmark and tabs are placed, because
-    // the tabs need to know where the pill starts in order to stop short of it. It is
-    // still PUSHED in paint order below.
-    // `.top-bar-omni { min-width: 220px; max-width: 360px }` in a flex row: it takes the
-    // max where there is room and is squeezed no further than the min. Centring it on the
-    // output is what the flex centre column resolves to on a bar this simple.
-    let pill_w = OMNIBOX_W.min(output_w).max(m.omnibox_min_w.min(output_w));
-    let pill = Rect::new((output_w - pill_w) * 0.5, 6.0, pill_w, theme.top_bar_h - 12.0);
+    //    the first ends, which is the layout `TextMeasure` made possible. The logo
+    //    IMAGE before it waits on Image lowering; its 20px slot is kept, so the wordmark
+    //    and every tab after it sit where the shell's do.
     let mark_h = WORDMARK_PX * 1.3;
     let mark_y = (theme.top_bar_h - mark_h) * 0.5;
-    let hart_w = measure.text_width("HART", WORDMARK_PX, 600, WORDMARK_PX * 0.02);
-    let gap_w = measure.text_width(" ", WORDMARK_PX, 600, WORDMARK_PX * 0.02);
-    let os_w = measure.text_width("OS", WORDMARK_PX, 600, WORDMARK_PX * 0.02);
+    let track = WORDMARK_PX * 0.02;
+    let hart_w = measure.text_width("HART", WORDMARK_PX, 600, track);
+    let gap_w = measure.text_width(" ", WORDMARK_PX, 600, track);
+    let os_w = measure.text_width("OS", WORDMARK_PX, 600, track);
+    let mark_x = BAR_PAD_X + START_PAD_X + START_LOGO + START_GAP;
     // A shaped run needs its whole advance to fit the buffer it is composed into, so the
     // box is the measured width rounded up with a pixel of slack rather than trusting an
     // exact float to survive the f32 -> i32 the lowering does.
     bar_children.push(SceneNode::Text {
         icon: false,
-        rect: Rect::new(BAR_PAD_X, mark_y, hart_w.ceil() + 2.0, mark_h),
+        rect: Rect::new(mark_x, mark_y, hart_w.ceil() + 2.0, mark_h),
         text: "HART".to_string(),
         size_px: WORDMARK_PX,
         color: theme.accent,
@@ -2022,16 +2094,11 @@ pub fn layout_desktop(
         // .top-bar .start-btn span
         weight: 600,
         // .start-btn span letter-spacing: .02em
-        letter_spacing: WORDMARK_PX * 0.02,
+        letter_spacing: track,
     });
     bar_children.push(SceneNode::Text {
         icon: false,
-        rect: Rect::new(
-            BAR_PAD_X + hart_w + gap_w,
-            mark_y,
-            os_w.ceil() + 2.0,
-            mark_h,
-        ),
+        rect: Rect::new(mark_x + hart_w + gap_w, mark_y, os_w.ceil() + 2.0, mark_h),
         text: "OS".to_string(),
         size_px: WORDMARK_PX,
         color: theme.accent2,
@@ -2039,150 +2106,102 @@ pub fn layout_desktop(
         // .top-bar .start-btn span
         weight: 600,
         // .start-btn span letter-spacing: .02em
-        letter_spacing: WORDMARK_PX * 0.02,
+        letter_spacing: track,
     });
+    let start_end = mark_x + hart_w + gap_w + os_w + START_PAD_X;
 
-    // ── Nav tabs (P5): the shell's five primary destinations, each sized to its own
-    //    label, which is the second thing the measure buys. A tab is emitted only while
-    //    it fits BEFORE the omnibox pill, the same discipline the card rows use for the
-    //    taskbar, so a narrow output drops tabs from the right instead of drawing them
-    //    under the pill. They are deliberately NOT hover targets: nothing routes a tab
-    //    activation yet, and an affordance that reacts but does nothing is a lie. Wrap
-    //    them as interactive groups when a tab actually navigates.
-    let tab_h = TAB_PX * 2.0;
-    let tab_y = (theme.top_bar_h - tab_h) * 0.5;
-    let tab_ink_h = TAB_PX * 1.3;
-    let tab_ink_y = (theme.top_bar_h - tab_ink_h) * 0.5;
-    let mut tab_x = BAR_PAD_X + hart_w + gap_w + os_w + BAR_PAD_X;
-    for (i, label) in NAV_TABS.iter().take(m.nav_tabs).enumerate() {
-        let ink_w = measure.text_width(label, TAB_PX, 600, 0.0);
-        let slot = ink_w.ceil() + 2.0 * m.tab_pad_x;
-        if tab_x + slot > pill.x - TAB_GAP {
-            break;
-        }
-        // The active tab carries the same faint surface the omnibox pill does, so the
-        // bar reads as one material rather than two.
-        if i == ACTIVE_TAB {
-            bar_children.push(SceneNode::Rect {
-                rect: Rect::new(tab_x, tab_y, slot, tab_h),
-                color: theme.omnibox_bg,
-                radius: tab_h * 0.5,
-            });
-        }
+    // ── The right cluster, from the right edge inward, which is the shell's order read
+    //    right to left: the clock, the connectivity cluster, the three tray buttons,
+    //    the avatar, the orb-sm. `.top-bar-right { gap: 8px }` between its children and
+    //    `.top-bar { gap: 8px }` between the bar's, so one gap serves both. ──
+    let mut right_x = output_w - BAR_PAD_X;
+    let btn_y = (theme.top_bar_h - TRAY_BTN) * 0.5;
+    if let Some(clock) = &chrome.clock {
+        // `.top-bar-right .clock { font-size: 12px; font-weight: 500; padding: 0 8px }`.
+        // Outermost, as in the shell; it used to be absent here because the scene had
+        // no time source, and its slot was deliberately not reserved meanwhile.
+        let cw = measure.text_width(&clock.time, CLOCK_PX, 500, 0.0).ceil() + 2.0;
+        right_x -= CLOCK_PAD_X + cw + CLOCK_PAD_X;
         bar_children.push(SceneNode::Text {
             icon: false,
-            rect: Rect::new(tab_x + m.tab_pad_x, tab_ink_y, ink_w.ceil() + 2.0, tab_ink_h),
-            text: label.to_string(),
-            size_px: TAB_PX,
-            color: if i == ACTIVE_TAB {
-                theme.bar_ink
-            } else {
-                theme.omnibox_ink
-            },
-            stroke: 0.0,
-            // .tb-tab
-            weight: 600,
-            letter_spacing: 0.0,
-        });
-        tab_x += slot + TAB_GAP;
-    }
-
-    // The pill and the three runs inside it are ONE surface (`.top-bar-omni`), so they
-    // are one group. They used to be four siblings of the bar's other children, which is
-    // why the omnibox could not be named even though the latency budget table has a row
-    // for it; collecting them here costs one node and makes the pill addressable.
-    let mut pill_children = vec![SceneNode::Rect {
-        rect: pill,
-        color: theme.omnibox_bg,
-        radius: (theme.top_bar_h - 12.0) * 0.5,
-    }];
-    // Inside the pill, the shell's own three parts: a search glyph, the prompt, and the
-    // shortcut hint pushed to the far end. The hint is right-anchored, which is the
-    // measure again; before it there was nowhere to put it.
-    let pill_ink_y = (theme.top_bar_h - OMNIBOX_PX * 1.3) * 0.5;
-    let mut pill_x = pill.x + 12.0;
-    if icons_available {
-        let gw = measure.icon_width(OMNIBOX_GLYPH, OMNIBOX_PX);
-        pill_children.push(SceneNode::Text {
-            icon: true,
-            rect: Rect::new(pill_x, pill_ink_y, gw.ceil() + 2.0, OMNIBOX_PX * 1.3),
-            text: OMNIBOX_GLYPH.to_string(),
-            size_px: OMNIBOX_PX,
-            color: theme.omnibox_ink,
-            stroke: 0.0,
-            // a ligature glyph, the icon face has one weight
-            weight: 400,
-            letter_spacing: 0.0,
-        });
-        pill_x += gw + 8.0;
-    }
-    pill_children.push(SceneNode::Text {
-        icon: false,
-        rect: Rect::new(
-            pill_x,
-            pill_ink_y,
-            (pill.right() - 12.0 - pill_x).max(0.0),
-            OMNIBOX_PX * 1.3,
-        ),
-        text: "Ask or search anything".to_string(),
-        size_px: OMNIBOX_PX,
-        color: theme.omnibox_ink,
-        stroke: 0.0,
-        // .top-bar-omni
-        weight: 500,
-        letter_spacing: 0.0,
-    });
-    let kbd_w = measure.text_width(OMNIBOX_KBD, KBD_PX, 700, 0.0);
-    let kbd_x = pill.right() - 12.0 - kbd_w;
-    if m.show_kbd && kbd_x > pill_x {
-        pill_children.push(SceneNode::Text {
-            icon: false,
             rect: Rect::new(
-                kbd_x,
-                (theme.top_bar_h - KBD_PX * 1.3) * 0.5,
-                kbd_w.ceil() + 2.0,
-                KBD_PX * 1.3,
+                right_x + CLOCK_PAD_X,
+                (theme.top_bar_h - CLOCK_PX * 1.3) * 0.5,
+                cw,
+                CLOCK_PX * 1.3,
             ),
-            text: OMNIBOX_KBD.to_string(),
-            size_px: KBD_PX,
-            color: theme.omnibox_ink,
+            text: clock.time.clone(),
+            size_px: CLOCK_PX,
+            color: theme.bar_ink,
             stroke: 0.0,
-            // .top-bar-omni .tbo-kbd
-            weight: 700,
+            // .top-bar-right .clock
+            weight: 500,
             letter_spacing: 0.0,
         });
+        right_x -= TRAY_GAP;
     }
-    // `.top-bar { border-bottom: 1px solid var(--hart-glass-border) }`, and nothing else:
-    // the rule explicitly sets `border-top: 0` and `border-radius: 0`, so the bar has ONE
-    // edge. Without it the strip simply ends wherever its translucency stops, which is
-    // the difference between chrome that sits on the desktop and chrome that dissolves
-    // into it.
-    bar_children.push(SceneNode::Rect {
-        rect: Rect::new(
-            0.0,
-            theme.top_bar_h - theme.chrome_rule_px,
-            output_w,
-            theme.chrome_rule_px,
-        ),
-        color: theme.chrome_border,
-        radius: 0.0,
-    });
-    bar_children.push(SceneNode::Container {
-        rect: pill,
-        // Not a hover target: nothing routes an omnibox activation yet, and an
-        // affordance that reacts but does nothing is a lie (the same rule the nav tabs
-        // follow). It is a named SURFACE either way, which is what attribution needs.
-        interactive: false,
-        component: Some(Component::Omnibox),
-        children: pill_children,
-    });
-
-    // ── The bar's right cluster, laid out from the RIGHT EDGE inward so it stays put as
-    //    the output widens: tray glyphs, then the avatar, then the orb-sm, which is the
-    //    shell's order read right to left. The clock sits outermost in the shell and is
-    //    absent here: it needs a time source the scene has no input for, and reserving a
-    //    slot for something that never draws would leave a hole in the cluster.
-    let mut right_x = output_w - BAR_PAD_X;
+    if let Some(tray) = &chrome.tray {
+        // The `hartConnectivity.js` cluster, inserted before the clock: four 32px
+        // indicators (wifi, bluetooth, volume, battery) at `#hc-cluster { gap: 2px }`
+        // and the battery percent after them. The glyphs are ligature names and need
+        // the icon face; the percent is text and draws without it. `#hc-cluster.hc-dim
+        // { opacity: .55 }` when no domain is live.
+        let ink = if tray.live {
+            theme.omnibox_ink
+        } else {
+            Color::rgba(theme.omnibox_ink.r, theme.omnibox_ink.g, theme.omnibox_ink.b, theme.omnibox_ink.a * HC_DIM)
+        };
+        let mut x = right_x;
+        let mut placed = 0usize;
+        if !tray.battery_pct.is_empty() {
+            let pw = measure.text_width(&tray.battery_pct, HC_PCT_PX, 600, 0.0).ceil() + 2.0;
+            x -= pw;
+            bar_children.push(SceneNode::Text {
+                icon: false,
+                rect: Rect::new(x, (theme.top_bar_h - HC_PCT_PX * 1.3) * 0.5, pw, HC_PCT_PX * 1.3),
+                text: tray.battery_pct.clone(),
+                size_px: HC_PCT_PX,
+                color: ink,
+                stroke: 0.0,
+                // #hc-bat-pct
+                weight: 600,
+                letter_spacing: 0.0,
+            });
+            placed += 1;
+        }
+        if icons_available {
+            for glyph in [&tray.battery, &tray.volume, &tray.bluetooth, &tray.wifi] {
+                if glyph.is_empty() {
+                    continue;
+                }
+                if placed > 0 {
+                    x -= HC_GAP;
+                }
+                x -= TRAY_BTN;
+                bar_children.push(SceneNode::Text {
+                    icon: true,
+                    rect: centered_box(
+                        measure.icon_width(glyph, theme.icon_px),
+                        x,
+                        TRAY_BTN,
+                        (theme.top_bar_h - theme.icon_px * 1.3) * 0.5,
+                        theme.icon_px * 1.3,
+                    ),
+                    text: glyph.clone(),
+                    size_px: theme.icon_px,
+                    color: ink,
+                    stroke: 0.0,
+                    // a ligature glyph, the icon face has one weight
+                    weight: 400,
+                    letter_spacing: 0.0,
+                });
+                placed += 1;
+            }
+        }
+        if placed > 0 {
+            right_x = x - TRAY_GAP;
+        }
+    }
     if icons_available {
         for glyph in TRAY_GLYPHS.iter().rev() {
             right_x -= TRAY_BTN;
@@ -2204,6 +2223,22 @@ pub fn layout_desktop(
                 weight: 400,
                 letter_spacing: 0.0,
             });
+            // `#notif-badge`: `.badge { top: 2px; right: 2px; width: 8px; height: 8px;
+            // border-radius: 50%; background: var(--hart-error) }` on the notifications
+            // button, shown when something is unread. A dot, not a count: that is what
+            // the shell's markup is, and the count rides the wire for the day it grows.
+            if *glyph == TRAY_NOTIFICATIONS && chrome.notifications.unwrap_or(0) > 0 {
+                bar_children.push(SceneNode::Rect {
+                    rect: Rect::new(
+                        right_x + TRAY_BTN - BADGE_INSET - BADGE_D,
+                        btn_y + BADGE_INSET,
+                        BADGE_D,
+                        BADGE_D,
+                    ),
+                    color: theme.error,
+                    radius: BADGE_D * 0.5,
+                });
+            }
             right_x -= TRAY_GAP;
         }
     }
@@ -2234,9 +2269,256 @@ pub fn layout_desktop(
         letter_spacing: 0.0,
     });
     right_x -= TRAY_GAP;
-
     right_x -= ORB_SM;
     let orb_sm_rect = Rect::new(right_x, (theme.top_bar_h - ORB_SM) * 0.5, ORB_SM, ORB_SM);
+    right_x -= BAR_GAP;
+
+    // ── The omnibox pill (`.top-bar-omni`): an inline-flex BUTTON sized to its content
+    //    (an 18px glyph, a 9px gap, the prompt, and the kbd hint pushed to the far end)
+    //    on a 14px pad inside a 1px rule, clamped to [min-width, 360px], and right-packed
+    //    against the orb because the cluster before it is the row's flexible column.
+    //    It was drawn centred at its maximum width, which is where a 360px pill would
+    //    sit if nothing else in the row could flex; the cluster can, so in the shell it
+    //    never sits there. ──
+    let glyph_w = if icons_available {
+        measure.icon_width(OMNIBOX_GLYPH, OMNIBOX_GLYPH_PX).ceil() + 2.0
+    } else {
+        0.0
+    };
+    let prompt_w = measure.text_width(OMNIBOX_PROMPT, OMNIBOX_PX, 500, 0.0).ceil() + 2.0;
+    let kbd_w = measure.text_width(OMNIBOX_KBD, KBD_PX, 700, 0.0).ceil() + 2.0;
+    let kbd_box_w = kbd_w + 2.0 * KBD_PAD_X + 2.0 * CHROME_RULE;
+    let mut content_w = 2.0 * OMNIBOX_PAD_X + 2.0 * CHROME_RULE + prompt_w;
+    if icons_available {
+        content_w += glyph_w + OMNIBOX_GAP;
+    }
+    if m.show_kbd {
+        content_w += OMNIBOX_GAP + kbd_box_w;
+    }
+    let pill_w = content_w.clamp(m.omnibox_min_w, OMNIBOX_W).min(output_w.max(0.0));
+    right_x -= pill_w;
+    let pill = Rect::new(right_x.max(0.0), (theme.top_bar_h - OMNIBOX_H) * 0.5, pill_w, OMNIBOX_H);
+    // `border: 1px solid var(--hh-bord)` then `background: rgba(255,255,255,0.05)`: the
+    // ring, and the fill inset inside it, the same two shapes a chip is made of.
+    let mut pill_children = vec![
+        SceneNode::Rect {
+            rect: pill,
+            color: theme.chrome_border,
+            radius: OMNIBOX_H * 0.5,
+        },
+        SceneNode::Rect {
+            rect: pill.inset(CHROME_RULE),
+            color: theme.omnibox_bg,
+            radius: (OMNIBOX_H * 0.5 - CHROME_RULE).max(0.0),
+        },
+    ];
+    let mut pill_x = pill.x + CHROME_RULE + OMNIBOX_PAD_X;
+    if icons_available {
+        pill_children.push(SceneNode::Text {
+            icon: true,
+            rect: Rect::new(
+                pill_x,
+                (theme.top_bar_h - OMNIBOX_GLYPH_PX * 1.3) * 0.5,
+                glyph_w,
+                OMNIBOX_GLYPH_PX * 1.3,
+            ),
+            text: OMNIBOX_GLYPH.to_string(),
+            size_px: OMNIBOX_GLYPH_PX,
+            color: theme.omnibox_ink,
+            stroke: 0.0,
+            // a ligature glyph, the icon face has one weight
+            weight: 400,
+            letter_spacing: 0.0,
+        });
+        pill_x += glyph_w + OMNIBOX_GAP;
+    }
+    let kbd_x = pill.right() - CHROME_RULE - OMNIBOX_PAD_X - kbd_box_w;
+    let prompt_right = if m.show_kbd { kbd_x - OMNIBOX_GAP } else { pill.right() - CHROME_RULE - OMNIBOX_PAD_X };
+    pill_children.push(SceneNode::Text {
+        icon: false,
+        rect: Rect::new(
+            pill_x,
+            (theme.top_bar_h - OMNIBOX_PX * 1.3) * 0.5,
+            (prompt_right - pill_x).min(prompt_w).max(0.0),
+            OMNIBOX_PX * 1.3,
+        ),
+        text: OMNIBOX_PROMPT.to_string(),
+        size_px: OMNIBOX_PX,
+        color: theme.omnibox_ink,
+        stroke: 0.0,
+        // .top-bar-omni
+        weight: 500,
+        letter_spacing: 0.0,
+    });
+    if m.show_kbd && kbd_x > pill_x {
+        // `.tbo-kbd { border: 1px solid var(--hh-bord); border-radius: 6px; padding: 1px
+        // 6px }`: its own small ring, the hint inside it.
+        let kbd_h = KBD_PX * 1.3 + 2.0 * (KBD_PAD_Y + CHROME_RULE);
+        let kbd_y = (theme.top_bar_h - kbd_h) * 0.5;
+        pill_children.push(SceneNode::Rect {
+            rect: Rect::new(kbd_x, kbd_y, kbd_box_w, kbd_h),
+            color: theme.chrome_border,
+            radius: KBD_RADIUS,
+        });
+        pill_children.push(SceneNode::Rect {
+            rect: Rect::new(kbd_x, kbd_y, kbd_box_w, kbd_h).inset(CHROME_RULE),
+            color: theme.omnibox_bg,
+            radius: (KBD_RADIUS - CHROME_RULE).max(0.0),
+        });
+        pill_children.push(SceneNode::Text {
+            icon: false,
+            rect: Rect::new(
+                kbd_x + CHROME_RULE + KBD_PAD_X,
+                (theme.top_bar_h - KBD_PX * 1.3) * 0.5,
+                kbd_w,
+                KBD_PX * 1.3,
+            ),
+            text: OMNIBOX_KBD.to_string(),
+            size_px: KBD_PX,
+            color: theme.omnibox_ink,
+            stroke: 0.0,
+            // .top-bar-omni .tbo-kbd
+            weight: 700,
+            letter_spacing: 0.0,
+        });
+    }
+
+    // ── Nav tabs (P5): the shell's five primary destinations, each sized to its own
+    //    label, `.tb-tab { height: 30px; padding: 0 13px; border-radius: 9px }` at
+    //    `.top-bar-nav { gap: 2px }`, starting one bar gap after the start button. A tab
+    //    is emitted only while it fits BEFORE the pill, the same discipline the card
+    //    rows use, so a narrow output drops tabs from the right instead of drawing them
+    //    under the pill. They are deliberately NOT hover targets: nothing routes a tab
+    //    activation yet, and an affordance that reacts but does nothing is a lie. ──
+    let tab_y = (theme.top_bar_h - TAB_H) * 0.5;
+    let tab_ink_h = TAB_PX * 1.3;
+    let tab_ink_y = (theme.top_bar_h - tab_ink_h) * 0.5;
+    let mut tab_x = start_end + BAR_GAP;
+    for (i, label) in NAV_TABS.iter().take(m.nav_tabs).enumerate() {
+        let ink_w = measure.text_width(label, TAB_PX, 600, 0.0);
+        let slot = ink_w.ceil() + 2.0 * m.tab_pad_x;
+        if tab_x + slot > pill.x - BAR_GAP {
+            break;
+        }
+        if i == ACTIVE_TAB {
+            // `.tb-tab.tb-active { background: rgba(0,230,195,.14); box-shadow: inset 0 0
+            // 0 1px rgba(0,230,195,.34) }`: the accent as a wash inside an accent ring.
+            let tab = Rect::new(tab_x, tab_y, slot, TAB_H);
+            bar_children.push(SceneNode::Rect {
+                rect: tab,
+                color: Color::rgba(theme.accent.r, theme.accent.g, theme.accent.b, TAB_ACTIVE_RING_A),
+                radius: TAB_RADIUS,
+            });
+            bar_children.push(SceneNode::Rect {
+                rect: tab.inset(CHROME_RULE),
+                color: Color::rgba(theme.accent.r, theme.accent.g, theme.accent.b, TAB_ACTIVE_WASH_A),
+                radius: (TAB_RADIUS - CHROME_RULE).max(0.0),
+            });
+        }
+        bar_children.push(SceneNode::Text {
+            icon: false,
+            rect: Rect::new(tab_x + m.tab_pad_x, tab_ink_y, ink_w.ceil() + 2.0, tab_ink_h),
+            text: label.to_string(),
+            size_px: TAB_PX,
+            color: if i == ACTIVE_TAB {
+                theme.bar_ink
+            } else {
+                theme.omnibox_ink
+            },
+            stroke: 0.0,
+            // .tb-tab
+            weight: 600,
+            letter_spacing: 0.0,
+        });
+        tab_x += slot + TAB_GAP;
+    }
+
+    // ── The agent cluster (`#agent-status`, `.top-bar-center { flex: 1; gap: 6px;
+    //    padding: 0 12px; font-size: 12px; color: var(--hart-muted) }`): the running
+    //    agents as chips, or the bar's own words when there are none. Drawn only when
+    //    the shell composed it; an absent list is not an empty one. Chips are emitted
+    //    while they fit before the pill, the tabs' discipline again. ──
+    if let Some(agents) = &chrome.agents {
+        let cluster_x = tab_x - TAB_GAP + BAR_GAP + AGENT_PAD_X;
+        let cluster_right = pill.x - BAR_GAP - AGENT_PAD_X;
+        if agents.is_empty() {
+            // `<span style="opacity:0.5">No agents running</span>`.
+            let ew = measure.text_width(AGENTS_EMPTY, AGENT_PX, 400, 0.0).ceil() + 2.0;
+            if cluster_x + ew <= cluster_right {
+                bar_children.push(SceneNode::Text {
+                    icon: false,
+                    rect: Rect::new(cluster_x, (theme.top_bar_h - AGENT_PX * 1.3) * 0.5, ew, AGENT_PX * 1.3),
+                    text: AGENTS_EMPTY.to_string(),
+                    size_px: AGENT_PX,
+                    color: Color::rgba(theme.hero_copy.r, theme.hero_copy.g, theme.hero_copy.b, theme.hero_copy.a * 0.5),
+                    stroke: 0.0,
+                    // .top-bar-center inherits
+                    weight: 400,
+                    letter_spacing: 0.0,
+                });
+            }
+        } else {
+            // `.agent-chip { gap: 4px; padding: 2px 8px; border-radius: 10px;
+            // background: var(--hart-surface); font-size: 11px }` with a 6px
+            // `--hart-active` dot: the same component the card's live tag is, in the
+            // bar's colours, through the same helper.
+            let chip_h = AGENT_CHIP_PX * 1.3 + 2.0 * AGENT_CHIP_PAD_Y;
+            let mut x = cluster_x;
+            for name in agents {
+                let spec = Chip {
+                    label: name,
+                    px: AGENT_CHIP_PX,
+                    // .top-bar-center .agent-chip inherits
+                    weight: 400,
+                    h: chip_h,
+                    radius: AGENT_CHIP_RADIUS,
+                    pad_x: AGENT_CHIP_PAD_X,
+                    bg: theme.omnibox_bg,
+                    ink: theme.hero_copy,
+                    border: None,
+                    dot: Some((AGENT_DOT, AGENT_DOT_GAP, theme.active)),
+                };
+                let w = chip_width(&spec, measure);
+                if x + w > cluster_right {
+                    break;
+                }
+                push_chip(
+                    &mut bar_children,
+                    x,
+                    (theme.top_bar_h - chip_h) * 0.5,
+                    &spec,
+                    theme.chrome_rule_px,
+                    measure,
+                );
+                x += w + AGENT_GAP;
+            }
+        }
+    }
+
+    // `.top-bar { border-bottom: 1px solid var(--hart-glass-border) }`, and nothing else:
+    // the rule explicitly sets `border-top: 0` and `border-radius: 0`, so the bar has ONE
+    // edge. Without it the strip simply ends wherever its translucency stops, which is
+    // the difference between chrome that sits on the desktop and chrome that dissolves
+    // into it.
+    bar_children.push(SceneNode::Rect {
+        rect: Rect::new(
+            0.0,
+            theme.top_bar_h - theme.chrome_rule_px,
+            output_w,
+            theme.chrome_rule_px,
+        ),
+        color: theme.chrome_border,
+        radius: 0.0,
+    });
+    bar_children.push(SceneNode::Container {
+        rect: pill,
+        // Not a hover target: nothing routes an omnibox activation yet, and an
+        // affordance that reacts but does nothing is a lie (the same rule the nav tabs
+        // follow). It is a named SURFACE either way, which is what attribution needs.
+        interactive: false,
+        component: Some(Component::Omnibox),
+        children: pill_children,
+    });
     bar_children.push(SceneNode::OrbSlot {
         rect: orb_sm_rect,
         compact: true,
@@ -2895,22 +3177,120 @@ pub fn layout_desktop(
         cursor_y += row_block_h + ROW_GAP;
     }
 
-    // ── Taskbar (fixed, 44px, bottom). ──
+    // ── Taskbar (fixed, 44px, bottom): `.taskbar { display: flex; gap: 2px; padding: 0
+    //    8px }` of `.taskbar-chip`s, one per open panel, drawn only when the shell
+    //    composed the list. An absent list leaves the strip as it was, empty, and the
+    //    band unclaimable; an empty list is a composed taskbar with nothing open. ──
     let taskbar = Rect::new(0.0, output_h - TASKBAR_H, output_w, TASKBAR_H);
+    let mut taskbar_children = vec![
+        chrome_fill_node(taskbar, theme),
+        // `.taskbar { border-top: 1px solid var(--hart-glass-border) }`: the mirror of
+        // the top bar's rule, on the edge that faces the desktop.
+        SceneNode::Rect {
+            rect: Rect::new(taskbar.x, taskbar.y, taskbar.w, theme.chrome_rule_px),
+            color: theme.chrome_border,
+            radius: 0.0,
+        },
+    ];
+    if let Some(tasks) = &chrome.tasks {
+        // `.taskbar-chip { height: 34px; padding: 0 12px; gap: 4px; border-radius: 8px;
+        // font-size: 12px; border: 1px solid transparent }` on `.glass`, whose no-blur
+        // floor is the same three-stop ramp the strips take, inside the `.glass` 1px
+        // rule; `.active { border-bottom: 2px solid var(--hart-accent); background:
+        // var(--hart-surface) }`. The icon is `.mi { font-size: 16px; color: accent }`
+        // and the label `.chip-label { max-width: 100px }`, clipped rather than wrapped.
+        let chip_y = taskbar.y + (TASKBAR_H - CHIP_H) * 0.5;
+        let mut x = taskbar.x + TASKBAR_PAD_X;
+        let right = taskbar.right() - TASKBAR_PAD_X;
+        for task in tasks {
+            let icon_w = if icons_available && task.icon.is_some() {
+                measure.icon_width(task.icon.as_deref().unwrap_or(""), CHIP_ICON_PX).ceil() + 2.0
+            } else {
+                0.0
+            };
+            let label_w = (measure.text_width(&task.title, CHIP_PX, 400, 0.0).ceil() + 2.0)
+                .min(CHIP_LABEL_MAX);
+            let mut w = 2.0 * CHIP_PAD_X + label_w;
+            if icon_w > 0.0 {
+                w += icon_w + CHIP_GAP;
+            }
+            if x + w > right {
+                break;
+            }
+            let chip = Rect::new(x, chip_y, w, CHIP_H);
+            taskbar_children.push(SceneNode::Rect {
+                rect: chip,
+                color: theme.chrome_border,
+                radius: CHIP_RADIUS,
+            });
+            if task.active {
+                taskbar_children.push(SceneNode::Rect {
+                    rect: chip.inset(CHROME_RULE),
+                    color: theme.omnibox_bg,
+                    radius: (CHIP_RADIUS - CHROME_RULE).max(0.0),
+                });
+                // The 2px accent rule along the bottom edge, inside the corner.
+                taskbar_children.push(SceneNode::Rect {
+                    rect: Rect::new(
+                        chip.x + CHIP_RADIUS,
+                        chip.bottom() - CHIP_ACTIVE_RULE,
+                        (chip.w - 2.0 * CHIP_RADIUS).max(0.0),
+                        CHIP_ACTIVE_RULE,
+                    ),
+                    color: theme.accent,
+                    radius: 0.0,
+                });
+            } else {
+                taskbar_children.push(SceneNode::Fill {
+                    rect: chip.inset(CHROME_RULE),
+                    from: theme.chrome_fill[0],
+                    mid: theme.chrome_fill[1],
+                    mid_at: theme.chrome_fill_at,
+                    to: theme.chrome_fill[2],
+                    angle_deg: theme.chrome_fill_angle,
+                    radius: (CHIP_RADIUS - CHROME_RULE).max(0.0),
+                    photo: None,
+                });
+            }
+            let mut ink_x = chip.x + CHIP_PAD_X;
+            if icon_w > 0.0 {
+                taskbar_children.push(SceneNode::Text {
+                    icon: true,
+                    rect: Rect::new(
+                        ink_x,
+                        chip.y + (CHIP_H - CHIP_ICON_PX * 1.3) * 0.5,
+                        icon_w,
+                        CHIP_ICON_PX * 1.3,
+                    ),
+                    text: task.icon.clone().unwrap_or_default(),
+                    size_px: CHIP_ICON_PX,
+                    color: theme.accent,
+                    stroke: 0.0,
+                    // a ligature glyph, the icon face has one weight
+                    weight: 400,
+                    letter_spacing: 0.0,
+                });
+                ink_x += icon_w + CHIP_GAP;
+            }
+            taskbar_children.push(SceneNode::Text {
+                icon: false,
+                rect: Rect::new(ink_x, chip.y + (CHIP_H - CHIP_PX * 1.3) * 0.5, label_w, CHIP_PX * 1.3),
+                text: task.title.clone(),
+                size_px: CHIP_PX,
+                color: theme.bar_ink,
+                stroke: 0.0,
+                // .taskbar-chip inherits
+                weight: 400,
+                letter_spacing: 0.0,
+            });
+            x += w + TASKBAR_CHIP_GAP;
+        }
+    }
     root.push(SceneNode::Container {
         rect: taskbar,
         interactive: false,
         component: Some(Component::Taskbar),
-        children: vec![
-            chrome_fill_node(taskbar, theme),
-            // `.taskbar { border-top: 1px solid var(--hart-glass-border) }`: the mirror of
-            // the top bar's rule, on the edge that faces the desktop.
-            SceneNode::Rect {
-                rect: Rect::new(taskbar.x, taskbar.y, taskbar.w, theme.chrome_rule_px),
-                color: theme.chrome_border,
-                radius: 0.0,
-            },
-        ],
+        children: taskbar_children,
     });
 
     SceneNode::Container {
@@ -3925,6 +4305,265 @@ mod tests {
         out
     }
 
+    /// The omnibox pill's box, read off the tree rather than recomputed from the layout
+    /// constants: where the pill sits is the layout's decision (right-packed against
+    /// the orb, as the shell's flex row resolves), and a test that re-derives it pins
+    /// a formula instead of the bar.
+    fn omnibox_rect(root: &SceneNode) -> Rect {
+        let mut all: Vec<&SceneNode> = Vec::new();
+        walk_groups(root, &mut all);
+        all.iter()
+            .find_map(|c| match c {
+                SceneNode::Container {
+                    component: Some(Component::Omnibox),
+                    rect,
+                    ..
+                } => Some(*rect),
+                _ => None,
+            })
+            .expect("the bar lays out an omnibox")
+    }
+
+    /// The bar's runs when the shell has composed the bar content too.
+    fn chrome_bar_runs(w: f32, measure: &mut dyn TextMeasure) -> (SceneNode, Vec<(String, Rect)>) {
+        let root = layout_desktop(
+            w,
+            900.0,
+            &sample(),
+            &chrome_fixture(),
+            &Theme::cosmic_default(),
+            &RowScroll::default(),
+            measure,
+        );
+        let runs = bar_runs(&root);
+        (root, runs)
+    }
+
+    #[test]
+    fn the_native_bars_draw_what_the_shell_composed() {
+        // The `shell.chrome` half of the wire contract, DRAWN: every datum the fixture
+        // carries reaches the bar as a run, in the shell's own order.
+        let (root, runs) = chrome_bar_runs(1600.0, &mut IconMeasure);
+        let at = |t: &str| runs.iter().find(|(s, _)| s == t).map(|(_, r)| *r);
+        let clock = at("02:05 PM").expect("the clock draws");
+        assert!(
+            runs.iter().all(|(_, r)| r.right() <= clock.right() + 0.01),
+            "the clock is the bar's outermost run, as `.clock` is last in `.top-bar-right`"
+        );
+        assert!(clock.right() <= 1600.0 - BAR_PAD_X + 0.01, "inside the bar's pad");
+        // The connectivity cluster sits inside the clock, in hartConnectivity's order
+        // read right to left: percent, battery, volume, bluetooth, wifi.
+        let pct = at("64%").expect("the battery percent");
+        let bat = at("battery_4_bar").expect("the battery glyph");
+        let vol = at("volume_down").expect("the volume glyph");
+        let bt = at("bluetooth_connected").expect("the bluetooth glyph");
+        let wifi = at("network_wifi_3_bar").expect("the wifi glyph");
+        for (a, b) in [(clock, pct), (pct, bat), (bat, vol), (vol, bt), (bt, wifi)] {
+            assert!(b.right() <= a.x + 0.01, "{:?} must sit left of {:?}", (b.x, b.w), (a.x, a.w));
+        }
+        // Then the three tray buttons, then the avatar, as before.
+        let shield = at("shield").expect("the shield glyph");
+        assert!(shield.right() <= wifi.x + 0.01, "the cluster is inserted BEFORE the clock, after the tray");
+        assert!(at(AVATAR_INITIAL).unwrap().x < at("notifications").unwrap().x);
+        // The agent cluster: the four running names, between the tabs and the pill.
+        let pill = omnibox_rect(&root);
+        for name in ["Scout", "summarise_inbox_", "Archivist", "Cartographer"] {
+            let r = at(name).unwrap_or_else(|| panic!("agent chip {name} draws"));
+            assert!(r.right() <= pill.x, "{name} stays before the pill");
+            assert!(r.x > at("Earn").unwrap().right(), "{name} sits after the last tab");
+        }
+        assert!(at(AGENTS_EMPTY).is_none(), "with agents running the empty words do not draw");
+        // The taskbar chips, inside the bottom strip, labels and icons.
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        leaves_of(&root, is_taskbar, &mut leaves);
+        let chip_texts: Vec<String> = leaves
+            .iter()
+            .filter_map(|n| match n {
+                SceneNode::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        for want in ["Files", "Terminal", "Hevolve bdocs/b", "folder", "terminal"] {
+            assert!(chip_texts.iter().any(|t| t == want), "the taskbar never drew {want:?}");
+        }
+        for n in &leaves {
+            let r = n.rect();
+            assert!(r.y >= 900.0 - TASKBAR_H - 0.01 && r.bottom() <= 900.0 + 0.01, "{r:?} escapes the taskbar");
+        }
+        // The active chip carries its 2px accent rule; exactly one chip is active.
+        let theme = Theme::cosmic_default();
+        let rules = leaves
+            .iter()
+            .filter(|n| matches!(n, SceneNode::Rect { rect, color, .. }
+                                 if *color == theme.accent && (rect.h - CHIP_ACTIVE_RULE).abs() < 0.01))
+            .count();
+        assert_eq!(rules, 1, "one active chip, one accent rule");
+    }
+
+    #[test]
+    fn the_badge_dot_draws_only_when_something_is_unread() {
+        let theme = Theme::cosmic_default();
+        let dots = |chrome: &ShellChrome| {
+            let root = layout_desktop(1600.0, 900.0, &sample(), chrome, &theme, &RowScroll::default(), &mut IconMeasure);
+            let mut leaves: Vec<&SceneNode> = Vec::new();
+            leaves_of(&root, is_top_bar, &mut leaves);
+            leaves
+                .iter()
+                .filter_map(|n| match n {
+                    SceneNode::Rect { rect, color, .. }
+                        if *color == theme.error && (rect.w - BADGE_D).abs() < 0.01 => Some(*rect),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut c = chrome_fixture();
+        let with = dots(&c);
+        assert_eq!(with.len(), 1, "two unread means the dot");
+        // On the notifications button: inside its 32px box, at its top right.
+        let root = layout_desktop(1600.0, 900.0, &sample(), &c, &theme, &RowScroll::default(), &mut IconMeasure);
+        let notif = bar_runs(&root).iter().find(|(t, _)| t == "notifications").map(|(_, r)| *r).unwrap();
+        assert!(with[0].x > notif.x && with[0].right() <= notif.right() + TRAY_BTN, "the dot rides the notifications button");
+        assert!(with[0].y < notif.y + 4.0, "at its top");
+        c.notifications = Some(0);
+        assert!(dots(&c).is_empty(), "nothing unread, no dot");
+        c.notifications = None;
+        assert!(dots(&c).is_empty(), "and nothing composed, no dot");
+        // Without the icon face there is no button to ride, so no dot either.
+        c.notifications = Some(5);
+        let root = layout_desktop(1600.0, 900.0, &sample(), &c, &theme, &RowScroll::default(), &mut MonoMeasure);
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        leaves_of(&root, is_top_bar, &mut leaves);
+        assert!(!leaves.iter().any(|n| matches!(n, SceneNode::Rect { color, .. } if *color == theme.error)));
+    }
+
+    #[test]
+    fn an_empty_agent_list_says_so_and_an_absent_one_says_nothing() {
+        let theme = Theme::cosmic_default();
+        let texts = |chrome: &ShellChrome| {
+            let root = layout_desktop(1600.0, 900.0, &sample(), chrome, &theme, &RowScroll::default(), &mut MonoMeasure);
+            bar_runs(&root).into_iter().map(|(t, _)| t).collect::<Vec<_>>()
+        };
+        let mut c = chrome_fixture();
+        c.agents = Some(vec![]);
+        assert!(texts(&c).contains(&AGENTS_EMPTY.to_string()), "refreshAgentStatus's own words");
+        c.agents = None;
+        let t = texts(&c);
+        assert!(!t.contains(&AGENTS_EMPTY.to_string()) && !t.contains(&"Scout".to_string()),
+                "an absent cluster draws nothing rather than claiming there are no agents");
+        // The words are the shell's, not a paraphrase: pinned to the JS by the Python
+        // guard, and here to the constant the layout actually emits.
+        assert_eq!(AGENTS_EMPTY, "No agents running");
+    }
+
+    #[test]
+    fn the_bar_keeps_its_strips_when_nothing_was_composed() {
+        // `layout_home` is `layout_desktop` with an empty payload, and an empty payload
+        // draws exactly the bar that existed before `shell.chrome`: no clock slot held
+        // open, no chip, no cluster. This is the no-regression half of the contract.
+        let before = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut IconMeasure);
+        let empty = layout_desktop(1600.0, 900.0, &sample(), &ShellChrome::default(), &Theme::cosmic_default(), &RowScroll::default(), &mut IconMeasure);
+        assert_eq!(before, empty);
+        let runs = bar_runs(&before);
+        let texts: Vec<&str> = runs.iter().map(|(t, _)| t.as_str()).collect();
+        for absent in ["02:05 PM", "64%", "Files", AGENTS_EMPTY, "Scout"] {
+            assert!(!texts.contains(&absent), "{absent:?} drew with nothing composed");
+        }
+        // And the shield is still the outermost run: the clock's slot is NOT reserved.
+        let shield = runs.iter().find(|(t, _)| t == "shield").map(|(_, r)| *r).unwrap();
+        assert!(runs.iter().all(|(_, r)| r.right() <= shield.right() + 0.01));
+    }
+
+    #[test]
+    fn the_pill_is_right_packed_against_the_orb_as_the_shells_flex_row_is() {
+        // `.top-bar` is a flex row whose one `flex: 1` column is `#agent-status`, so the
+        // omnibox sits against the orb-sm with the bar's 8px gap between them, sized to
+        // its content inside [min-width, 360]. It was drawn centred at 360px, which is
+        // where nothing in the shell ever puts it, and a press on the native pill would
+        // then have fallen through onto the shell's agent cluster.
+        for w in [1920.0, 1600.0, 1280.0, 1100.0] {
+            let root = layout_home(w, 900.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut IconMeasure);
+            let pill = omnibox_rect(&root);
+            let mut leaves: Vec<&SceneNode> = Vec::new();
+            root.flatten(&mut leaves);
+            let orb = leaves
+                .iter()
+                .find_map(|n| match n {
+                    SceneNode::OrbSlot { rect, compact: true } => Some(*rect),
+                    _ => None,
+                })
+                .expect("the orb-sm");
+            assert!((orb.x - pill.right() - BAR_GAP).abs() < 0.01, "at {w}: pill {pill:?} orb {orb:?}");
+            assert_eq!(pill.h, OMNIBOX_H, ".top-bar-omni is 34px tall");
+            let m = HomeMetrics::for_output(w, 900.0);
+            assert!(pill.w >= m.omnibox_min_w - 0.01 && pill.w <= OMNIBOX_W + 0.01);
+            assert!(pill.w < OMNIBOX_W, "content-sized: the prompt and hint do not fill 360px");
+        }
+    }
+
+    #[test]
+    fn the_tabs_start_where_the_shells_start_button_ends() {
+        // `.start-btn { padding: 4px 12px; gap: 6px }` around a 20px logo and the
+        // wordmark, then the bar's 8px gap. The logo is not drawn yet; its slot is, so
+        // a press on the native "Agents" lands on the shell's "Agents" underneath.
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
+        let runs = bar_runs(&root);
+        let at = |t: &str| runs.iter().find(|(s, _)| s == t).map(|(_, r)| *r).unwrap();
+        let track = WORDMARK_PX * 0.02;
+        let hart_w = MonoMeasure.text_width("HART", WORDMARK_PX, 600, track);
+        let gap_w = MonoMeasure.text_width(" ", WORDMARK_PX, 600, track);
+        let os_w = MonoMeasure.text_width("OS", WORDMARK_PX, 600, track);
+        assert!((at("HART").x - (BAR_PAD_X + START_PAD_X + START_LOGO + START_GAP)).abs() < 0.01);
+        let start_end = BAR_PAD_X + START_PAD_X + START_LOGO + START_GAP + hart_w + gap_w + os_w + START_PAD_X;
+        let m = HomeMetrics::for_output(1600.0, 900.0);
+        assert!((at("Home").x - (start_end + BAR_GAP + m.tab_pad_x)).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_chip_list_that_does_not_fit_is_cut_not_overlapped() {
+        let mut c = chrome_fixture();
+        c.tasks = Some((0..40).map(|i| TaskChip { id: format!("p{i}"), title: format!("Panel {i}"), icon: Some("web_asset".into()), active: i == 3 }).collect());
+        let root = layout_desktop(800.0, 600.0, &sample(), &c, &Theme::cosmic_default(), &RowScroll::default(), &mut IconMeasure);
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        leaves_of(&root, is_taskbar, &mut leaves);
+        let labels: Vec<Rect> = leaves
+            .iter()
+            .filter_map(|n| match n {
+                SceneNode::Text { rect, text, .. } if text.starts_with("Panel ") => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert!(!labels.is_empty() && labels.len() < 40, "some chips fit, not all: {}", labels.len());
+        for r in &labels {
+            assert!(r.right() <= 800.0 - TASKBAR_PAD_X + 0.01, "a chip ran off the strip: {r:?}");
+        }
+        for w in labels.windows(2) {
+            assert!(w[1].x > w[0].right(), "chips never overlap");
+        }
+    }
+
+    #[test]
+    fn the_bar_runs_the_chrome_adds_carry_their_shell_weights() {
+        // The same rule `every_run_is_set_in_the_weight_its_shell_rule_asks_for` states,
+        // applied to the runs only a composed bar has. Clock 500, percent 600, and the
+        // two genuinely inheriting surfaces at 400: the agent cluster (12px, the muted
+        // role) and the chip label (12px, the bar ink).
+        let theme = Theme::cosmic_default();
+        let root = layout_desktop(1600.0, 900.0, &sample(), &chrome_fixture(), &theme, &RowScroll::default(), &mut IconMeasure);
+        let runs = drawn_runs(&root);
+        let of = |t: &str| runs.iter().find(|(s, _, _, _)| s == t).unwrap_or_else(|| panic!("no run drew {t:?}"));
+        assert_eq!(of("02:05 PM").1, 500, ".top-bar-right .clock");
+        assert_eq!(of("64%").1, 600, "#hc-bat-pct");
+        assert_eq!((of("Files").1, of("Files").3), (400, theme.bar_ink), ".taskbar-chip inherits");
+        assert_eq!((of("Scout").1, of("Scout").3), (400, theme.hero_copy), ".agent-chip inherits the muted role");
+        let hue = |c: &Color| (c.r, c.g, c.b);
+        for (t, w, _, c) in runs.iter().filter(|(_, w, _, _)| *w == 400) {
+            let is_icon = !t.is_empty() && t.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_');
+            let is_meta = hue(c) == hue(&theme.meta_ink) || hue(c) == hue(&theme.hero_copy);
+            let is_chip = *c == theme.bar_ink && t.chars().any(|ch| ch.is_ascii_uppercase());
+            assert!(is_icon || is_meta || is_chip, "{t:?} at 400 ({w}) is not an inheriting bar run");
+        }
+    }
+
     #[test]
     fn the_nav_tabs_are_laid_out_left_to_right_each_sized_to_its_own_label() {
         let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
@@ -3949,8 +4588,10 @@ mod tests {
         // Sized to the LABEL, not a uniform slot: Agents is wider than Apps.
         let width_of = |name: &str| tabs.iter().find(|(t, _)| t == name).unwrap().1.w;
         assert!(width_of("Agents") > width_of("Apps"));
-        // They stop short of the omnibox pill and stay inside the strip.
-        let pill_x = (1600.0 - OMNIBOX_W) * 0.5;
+        // They stop short of the omnibox pill and stay inside the strip. The pill's
+        // position is read off the tree: it is right-packed against the orb, where the
+        // shell's flex row puts it, not centred.
+        let pill_x = omnibox_rect(&root).x;
         for (label, r) in &tabs {
             assert!(r.right() <= pill_x, "{label} runs under the omnibox");
             assert!(r.y >= 0.0 && r.bottom() <= TOP_BAR_H + 0.01);
@@ -3974,7 +4615,7 @@ mod tests {
             &mut MonoMeasure,
         );
         let runs = bar_runs(&root);
-        let pill_x = ((OMNIBOX_W + 120.0) - OMNIBOX_W) * 0.5;
+        let pill_x = omnibox_rect(&root).x;
         for (label, r) in &runs {
             if NAV_TABS.contains(&label.as_str()) {
                 assert!(r.right() <= pill_x, "{label} overlapped the omnibox");
@@ -4275,7 +4916,7 @@ mod tests {
         assert!(prompt.x > glyph.x, "the prompt follows the glyph");
         assert!(kbd.x > prompt.x, "the hint is pushed to the far end");
 
-        let pill_right = (1600.0 - OMNIBOX_W) * 0.5 + OMNIBOX_W;
+        let pill_right = omnibox_rect(&root).right();
         assert!(
             kbd.right() <= pill_right - 6.0,
             "the hint stays inside the pill, ended at {} against {pill_right}",
@@ -5272,8 +5913,11 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
         // The top bar, and the omnibox INSIDE it, because deepest wins: a pill that
         // reported `top-bar` would hide the omnibox's own budget behind the bar's.
         assert_eq!(root.component_at(4.0, 4.0), Some(Component::TopBar));
-        let pill_x = 1600.0 * 0.5;
-        assert_eq!(root.component_at(pill_x, TOP_BAR_H * 0.5), Some(Component::Omnibox));
+        let pill = omnibox_rect(&root);
+        assert_eq!(
+            root.component_at(pill.x + pill.w * 0.5, TOP_BAR_H * 0.5),
+            Some(Component::Omnibox)
+        );
 
         // The taskbar strip.
         assert_eq!(
