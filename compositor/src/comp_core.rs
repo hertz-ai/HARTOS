@@ -1555,23 +1555,32 @@ pub fn process_input_event<S: CompState, B: InputBackend>(state: &mut S, event: 
     }
 }
 
-/// One-shot input-liveness beacon (#134/#128). On the FIRST real pointer/keyboard event,
-/// log a journal line and best-effort touch `/run/hart/session/input-alive` — the marker
-/// the out-of-process session supervisor / HARTLOG can later read to tell a
-/// painted-but-input-starved boot (HEALTHY paint, dead seat) apart from a working desktop,
-/// and drop a tier next time. The flag is a single relaxed atomic: the marker write fires
-/// exactly once and every later event is one atomic load. The file write is best-effort
-/// (a missing `/run/hart/session` dir on the dev box, or a read-only FS, just leaves the
-/// journal line as the signal); it never blocks and never aborts the compositor.
+/// Input-liveness beacon (#134/#128), and the heartbeat the governor reads.
+///
+/// On the FIRST real pointer/keyboard event, log a journal line and best-effort write the
+/// input-alive marker, the file the out-of-process session supervisor reads by EXISTENCE
+/// to tell a painted-but-input-starved boot (HEALTHY paint, dead seat) apart from a
+/// working desktop. From then on, while input keeps flowing, the marker is touched again
+/// at most once per `INPUT_ALIVE_HEARTBEAT`, so its mtime says when a person last touched
+/// the box. The decision (once-only line, unconditional first write, paced touches) is the
+/// pure `InputAliveBeacon` in main.rs, tested there; the path honours
+/// `HART_INPUT_ALIVE_FLAG` like the sibling markers. Every event inside the heartbeat costs
+/// one atomic load and a subtraction. The write is best-effort (a missing
+/// `/run/hart/session` on the dev box, a read-only FS) and never blocks the input path.
 fn note_input_alive() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static INPUT_SEEN: AtomicBool = AtomicBool::new(false);
-    if INPUT_SEEN.swap(true, Ordering::Relaxed) {
-        return;
+    static BEACON: crate::InputAliveBeacon = crate::InputAliveBeacon::new();
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let now = BASE.get_or_init(Instant::now).elapsed();
+    match BEACON.note(now) {
+        crate::InputAliveWrite::Skip => return,
+        crate::InputAliveWrite::First => {
+            info!("hart-comp: first seat input delivered — libinput/Seat path is LIVE (#134 liveness beacon)");
+        }
+        crate::InputAliveWrite::Touch => {}
     }
-    info!("hart-comp: first seat input delivered — libinput/Seat path is LIVE (#134 liveness beacon)");
-    if let Err(err) = std::fs::write("/run/hart/session/input-alive", b"1\n") {
-        debug!(?err, "note_input_alive: could not write the input-alive marker (the journal line above is the primary signal)");
+    let path = crate::input_alive_marker_path();
+    if !crate::write_scanout_marker(&path) {
+        debug!(marker = %path, "note_input_alive: could not write the input-alive marker (the journal line is the primary signal)");
     }
 }
 
