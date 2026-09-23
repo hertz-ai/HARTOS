@@ -1078,6 +1078,12 @@ pub enum Component {
     /// decides, which is the mistake that left `EDGE_PAD` at a value belonging to neither
     /// of its two jobs. It does not affect the budget key: every row is `home-row`.
     HomeRow(usize),
+    /// A toast (`showToast`) and an open context menu (`HartCtxMenu`), drawn from the
+    /// `shell.chrome` payload. Both had `animate-start` budget rows and no scene
+    /// component, so a sample could never reach them; as components, the frame that
+    /// first shows one can be attributed to the input that asked for it.
+    Toast,
+    ContextMenu,
 }
 
 impl Component {
@@ -1096,6 +1102,8 @@ impl Component {
             Component::Taskbar => crate::latency::Surface::Taskbar,
             Component::HomeCard(..) => crate::latency::Surface::HomeCard,
             Component::HomeRow(_) => crate::latency::Surface::HomeRow,
+            Component::Toast => crate::latency::Surface::Toast,
+            Component::ContextMenu => crate::latency::Surface::ContextMenu,
         }
     }
 
@@ -1655,6 +1663,40 @@ const CHIP_PX: f32 = 12.0;
 const CHIP_ICON_PX: f32 = 16.0;
 const CHIP_LABEL_MAX: f32 = 100.0;
 const CHIP_ACTIVE_RULE: f32 = 2.0;
+/// `.toast-container { top: calc(var(--hart-topbar-height) + 12px); right: 16px }` and
+/// `.toast { padding: 12px 16px; border-radius: 12px; max-width: 340px; font-size: 12px }`
+/// on `.glass`, with `showToast`'s software-floor form: a 3px severity-coloured left
+/// edge, the title at 600 (`margin-bottom: 2px`), the message in the body ink.
+const TOAST_TOP_GAP: f32 = 12.0;
+const TOAST_RIGHT: f32 = 16.0;
+const TOAST_PAD_X: f32 = 16.0;
+const TOAST_PAD_Y: f32 = 12.0;
+const TOAST_RADIUS: f32 = 12.0;
+const TOAST_MAX_W: f32 = 340.0;
+const TOAST_PX: f32 = 12.0;
+const TOAST_EDGE: f32 = 3.0;
+const TOAST_TITLE_GAP: f32 = 2.0;
+/// `hartContextMenu.js`'s own style: `min-width: 190px; max-width: 300px; padding: 6px;
+/// border-radius: 14px` inside a 1px rule; `.hart-ctx-item { padding: 8px 12px 8px 10px;
+/// gap: 10px; border-radius: 9px; font: 13px/1.4 }` with `.mi { font-size: 18px; width:
+/// 20px }` in the accent, `.danger` in the error role, `.disabled { opacity: .4 }`, and
+/// `.hart-ctx-sep { height: 1px; margin: 5px 8px }`.
+const MENU_MIN_W: f32 = 190.0;
+const MENU_MAX_W: f32 = 300.0;
+const MENU_PAD: f32 = 6.0;
+const MENU_RADIUS: f32 = 14.0;
+const MENU_ITEM_PAD_L: f32 = 10.0;
+const MENU_ITEM_PAD_R: f32 = 12.0;
+const MENU_ITEM_PAD_Y: f32 = 8.0;
+const MENU_ITEM_GAP: f32 = 10.0;
+const MENU_PX: f32 = 13.0;
+const MENU_LINE: f32 = 1.4;
+const MENU_ICON_PX: f32 = 18.0;
+const MENU_ICON_W: f32 = 20.0;
+const MENU_DISABLED_A: f32 = 0.4;
+const MENU_SEP_H: f32 = 1.0;
+const MENU_SEP_MARGIN_Y: f32 = 5.0;
+const MENU_SEP_MARGIN_X: f32 = 8.0;
 /// TWO measurements under one name, which is the `EDGE_PAD` shape again and is NOT fixed
 /// here because unpicking it is a visual call the box has to settle.
 ///
@@ -3293,12 +3335,243 @@ pub fn layout_desktop(
         children: taskbar_children,
     });
 
+    // ── Toast and context menu: transient surfaces drawn LAST so they paint over
+    //    everything, exactly as their z-indices (9500 and 12000) put them in the shell.
+    //    Each is its own tagged group, which is what lets the frame that first shows
+    //    one be attributed to the `animate-start` row it has had all along. ──
+    if let Some(toast) = &chrome.toast {
+        push_toast(&mut root, toast, output_w, theme, measure);
+    }
+    if let Some(menu) = &chrome.menu {
+        push_context_menu(&mut root, menu, output_w, output_h, theme, icons_available, measure);
+    }
+
     SceneNode::Container {
         rect: Rect::new(0.0, 0.0, output_w, output_h),
         interactive: false,
         component: None,
         children: root,
     }
+}
+
+/// One toast in the software-floor form `showToast` builds (`toast glass` with a 3px
+/// severity edge), anchored to the top-right corner under the bar.
+fn push_toast(
+    root: &mut Vec<SceneNode>,
+    toast: &Toast,
+    output_w: f32,
+    theme: &Theme,
+    measure: &mut dyn TextMeasure,
+) {
+    let edge = match toast.severity {
+        Severity::Info => theme.accent,
+        Severity::Warning => theme.caution,
+        Severity::Error => theme.error,
+        Severity::Success => theme.active,
+    };
+    let title_h = if toast.title.is_empty() { 0.0 } else { TOAST_PX * 1.3 };
+    let msg_h = if toast.message.is_empty() { 0.0 } else { TOAST_PX * 1.3 };
+    let gap = if title_h > 0.0 && msg_h > 0.0 { TOAST_TITLE_GAP } else { 0.0 };
+    let title_w = measure.text_width(&toast.title, TOAST_PX, 600, 0.0).ceil() + 2.0;
+    let msg_w = measure.text_width(&toast.message, TOAST_PX, 400, 0.0).ceil() + 2.0;
+    let inner_w = title_w.max(msg_w).min(TOAST_MAX_W - 2.0 * TOAST_PAD_X - TOAST_EDGE);
+    let w = (inner_w + 2.0 * TOAST_PAD_X + TOAST_EDGE).min(TOAST_MAX_W).min(output_w.max(0.0));
+    let h = 2.0 * TOAST_PAD_Y + title_h + gap + msg_h;
+    let x = (output_w - TOAST_RIGHT - w).max(0.0);
+    let y = theme.top_bar_h + TOAST_TOP_GAP;
+    let box_ = Rect::new(x, y, w, h);
+    let mut children = vec![
+        // The `.glass` rule and its no-blur floor fill, the same two shapes the strips are.
+        SceneNode::Rect {
+            rect: box_,
+            color: theme.chrome_border,
+            radius: TOAST_RADIUS,
+        },
+        SceneNode::Fill {
+            rect: box_.inset(CHROME_RULE),
+            from: theme.chrome_fill[0],
+            mid: theme.chrome_fill[1],
+            mid_at: theme.chrome_fill_at,
+            to: theme.chrome_fill[2],
+            angle_deg: theme.chrome_fill_angle,
+            radius: (TOAST_RADIUS - CHROME_RULE).max(0.0),
+            photo: None,
+        },
+        // `border-left: 3px solid <severity colour>`.
+        SceneNode::Rect {
+            rect: Rect::new(box_.x, box_.y + TOAST_RADIUS, TOAST_EDGE, (box_.h - 2.0 * TOAST_RADIUS).max(0.0)),
+            color: edge,
+            radius: 0.0,
+        },
+    ];
+    let ink_x = box_.x + TOAST_EDGE + TOAST_PAD_X;
+    let mut ink_y = box_.y + TOAST_PAD_Y;
+    if title_h > 0.0 {
+        children.push(SceneNode::Text {
+            icon: false,
+            rect: Rect::new(ink_x, ink_y, title_w.min(inner_w), title_h),
+            text: toast.title.clone(),
+            size_px: TOAST_PX,
+            // The severity colour is the title's ink too (`_tt.style.color = color`).
+            color: edge,
+            stroke: 0.0,
+            // .ds-tt inline font-weight
+            weight: 600,
+            letter_spacing: 0.0,
+        });
+        ink_y += title_h + gap;
+    }
+    if msg_h > 0.0 {
+        children.push(SceneNode::Text {
+            icon: false,
+            rect: Rect::new(ink_x, ink_y, msg_w.min(inner_w), msg_h),
+            text: toast.message.clone(),
+            size_px: TOAST_PX,
+            color: theme.bar_ink,
+            stroke: 0.0,
+            // .ds-tm inherits
+            weight: 400,
+            letter_spacing: 0.0,
+        });
+    }
+    root.push(SceneNode::Container {
+        rect: box_,
+        interactive: false,
+        component: Some(Component::Toast),
+        children,
+    });
+}
+
+/// One open context menu in `hartContextMenu.js`'s own form, at the viewport point it
+/// was opened at, clamped so it never renders off-screen (the module's own rule).
+fn push_context_menu(
+    root: &mut Vec<SceneNode>,
+    menu: &ContextMenu,
+    output_w: f32,
+    output_h: f32,
+    theme: &Theme,
+    icons_available: bool,
+    measure: &mut dyn TextMeasure,
+) {
+    let row_h = MENU_PX * MENU_LINE + 2.0 * MENU_ITEM_PAD_Y;
+    let sep_h = MENU_SEP_H + 2.0 * MENU_SEP_MARGIN_Y;
+    // Width from the widest row: the icon column is reserved for every row when any row
+    // has an icon, which is what a flex row of `width: 20px` glyphs resolves to.
+    let any_icon = icons_available
+        && menu.items.iter().any(|it| matches!(it, MenuItem::Row { icon: Some(_), .. }));
+    let icon_col = if any_icon { MENU_ICON_W + MENU_ITEM_GAP } else { 0.0 };
+    let mut widest: f32 = 0.0;
+    let mut h = 2.0 * MENU_PAD + 2.0 * CHROME_RULE;
+    for it in &menu.items {
+        match it {
+            MenuItem::Row { label, .. } => {
+                let lw = measure.text_width(label, MENU_PX, 400, 0.0).ceil() + 2.0;
+                widest = widest.max(lw);
+                h += row_h;
+            }
+            MenuItem::Sep => h += sep_h,
+        }
+    }
+    let w = (widest + icon_col + MENU_ITEM_PAD_L + MENU_ITEM_PAD_R + 2.0 * MENU_PAD + 2.0 * CHROME_RULE)
+        .clamp(MENU_MIN_W, MENU_MAX_W)
+        .min(output_w.max(0.0));
+    let x = menu.x.clamp(0.0, (output_w - w).max(0.0));
+    let y = menu.y.clamp(0.0, (output_h - h).max(0.0));
+    let box_ = Rect::new(x, y, w, h);
+    let mut children = vec![
+        SceneNode::Rect {
+            rect: box_,
+            color: theme.chrome_border,
+            radius: MENU_RADIUS,
+        },
+        SceneNode::Fill {
+            rect: box_.inset(CHROME_RULE),
+            from: theme.chrome_fill[0],
+            mid: theme.chrome_fill[1],
+            mid_at: theme.chrome_fill_at,
+            to: theme.chrome_fill[2],
+            angle_deg: theme.chrome_fill_angle,
+            radius: (MENU_RADIUS - CHROME_RULE).max(0.0),
+            photo: None,
+        },
+    ];
+    let inner_x = box_.x + CHROME_RULE + MENU_PAD;
+    let inner_w = (box_.w - 2.0 * (CHROME_RULE + MENU_PAD)).max(0.0);
+    let mut cy = box_.y + CHROME_RULE + MENU_PAD;
+    let dim = |c: Color, disabled: bool| {
+        if disabled {
+            Color::rgba(c.r, c.g, c.b, c.a * MENU_DISABLED_A)
+        } else {
+            c
+        }
+    };
+    for it in &menu.items {
+        match it {
+            MenuItem::Sep => {
+                children.push(SceneNode::Rect {
+                    rect: Rect::new(
+                        inner_x + MENU_SEP_MARGIN_X,
+                        cy + MENU_SEP_MARGIN_Y,
+                        (inner_w - 2.0 * MENU_SEP_MARGIN_X).max(0.0),
+                        MENU_SEP_H,
+                    ),
+                    color: theme.chrome_border,
+                    radius: 0.0,
+                });
+                cy += sep_h;
+            }
+            MenuItem::Row { label, icon, danger, disabled } => {
+                let ink = dim(if *danger { theme.error } else { theme.bar_ink }, *disabled);
+                let mut ix = inner_x + MENU_ITEM_PAD_L;
+                if any_icon {
+                    if let Some(name) = icon {
+                        children.push(SceneNode::Text {
+                            icon: true,
+                            rect: centered_box(
+                                measure.icon_width(name, MENU_ICON_PX),
+                                ix,
+                                MENU_ICON_W,
+                                cy + (row_h - MENU_ICON_PX * 1.3) * 0.5,
+                                MENU_ICON_PX * 1.3,
+                            ),
+                            text: name.clone(),
+                            size_px: MENU_ICON_PX,
+                            color: dim(if *danger { theme.error } else { theme.accent }, *disabled),
+                            stroke: 0.0,
+                            // a ligature glyph, the icon face has one weight
+                            weight: 400,
+                            letter_spacing: 0.0,
+                        });
+                    }
+                    ix += icon_col;
+                }
+                let lw = measure.text_width(label, MENU_PX, 400, 0.0).ceil() + 2.0;
+                children.push(SceneNode::Text {
+                    icon: false,
+                    rect: Rect::new(
+                        ix,
+                        cy + MENU_ITEM_PAD_Y,
+                        lw.min((inner_x + inner_w - MENU_ITEM_PAD_R - ix).max(0.0)),
+                        MENU_PX * MENU_LINE,
+                    ),
+                    text: label.clone(),
+                    size_px: MENU_PX,
+                    color: ink,
+                    stroke: 0.0,
+                    // .hart-ctx-item inherits
+                    weight: 400,
+                    letter_spacing: 0.0,
+                });
+                cy += row_h;
+            }
+        }
+    }
+    root.push(SceneNode::Container {
+        rect: box_,
+        interactive: false,
+        component: Some(Component::ContextMenu),
+        children,
+    });
 }
 
 /// The demo home as a process-wide singleton, so the render path can fall back to it
@@ -4401,6 +4674,89 @@ mod tests {
     }
 
     #[test]
+    fn a_toast_and_a_context_menu_are_drawn_as_their_own_components() {
+        // The two surfaces whose budget rows had `animate-start` and nothing to attribute
+        // it to. From the real producer's payload they lay out as tagged groups, painted
+        // last, at the places the shell puts them.
+        let theme = Theme::cosmic_default();
+        let (w, h) = (1600.0, 900.0);
+        let root = layout_desktop(w, h, &sample(), &chrome_fixture(), &theme, &RowScroll::default(), &mut IconMeasure);
+        let mut groups: Vec<&SceneNode> = Vec::new();
+        walk_groups(&root, &mut groups);
+        let find = |want: Component| {
+            groups.iter().find_map(|c| match c {
+                SceneNode::Container { component: Some(cc), rect, children, .. } if *cc == want => {
+                    Some((*rect, children.clone()))
+                }
+                _ => None,
+            })
+        };
+        let (toast, tchildren) = find(Component::Toast).expect("the toast group");
+        // `.toast-container { top: bar + 12px; right: 16px }`, `max-width: 340px`.
+        assert!((toast.right() - (w - TOAST_RIGHT)).abs() < 0.01, "anchored to the right edge");
+        assert!((toast.y - (theme.top_bar_h + TOAST_TOP_GAP)).abs() < 0.01, "under the bar");
+        assert!(toast.w <= TOAST_MAX_W && toast.w > 100.0);
+        let ttexts: Vec<(String, Color, u16)> = tchildren
+            .iter()
+            .filter_map(|n| match n {
+                SceneNode::Text { text, color, weight, .. } => Some((text.clone(), *color, *weight)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ttexts[0].0, "Bluetooth");
+        assert_eq!((ttexts[0].1, ttexts[0].2), (theme.caution, 600), "a warning title in the caution role, at 600");
+        assert_eq!(ttexts[1].0, "Not available");
+        assert!(
+            tchildren.iter().any(|n| matches!(n, SceneNode::Rect { color, rect, .. }
+                                              if *color == theme.caution && rect.w == TOAST_EDGE)),
+            "the 3px severity edge"
+        );
+        assert_eq!(root.component_at(toast.x + 5.0, toast.y + 5.0), Some(Component::Toast));
+
+        let (menu, mchildren) = find(Component::ContextMenu).expect("the menu group");
+        assert_eq!((menu.x, menu.y), (412.0, 300.0), "at the point it was opened");
+        assert!(menu.w >= MENU_MIN_W && menu.w <= MENU_MAX_W);
+        let mtexts: Vec<(String, Color)> = mchildren
+            .iter()
+            .filter_map(|n| match n {
+                SceneNode::Text { text, color, icon: false, .. } => Some((text.clone(), *color)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mtexts.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["Open", "Delete", "Rename"]);
+        assert_eq!(mtexts[0].1, theme.bar_ink);
+        assert_eq!(mtexts[1].1, theme.error, "a danger row in the error role");
+        assert!(mtexts[2].1.a < theme.bar_ink.a, "a disabled row is dimmed");
+        assert!(mchildren.iter().any(|n| matches!(n, SceneNode::Text { text, icon: true, .. } if text == "open_in_new")));
+        let seps = mchildren.iter().filter(|n| matches!(n, SceneNode::Rect { rect, .. } if rect.h == MENU_SEP_H)).count();
+        assert_eq!(seps, 1, "one divider");
+        assert_eq!(root.component_at(menu.x + 5.0, menu.y + 5.0), Some(Component::ContextMenu));
+        // Painted LAST: the menu's leaves are the final ones in paint order.
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        root.flatten(&mut leaves);
+        assert!(matches!(leaves.last(), Some(SceneNode::Text { text, .. }) if text == "Rename"));
+
+        // Neither draws when the payload carries neither, and a menu opened near an
+        // edge is clamped onto the screen, the module's own rule.
+        let mut c = chrome_fixture();
+        c.toast = None;
+        c.menu.as_mut().unwrap().x = w - 5.0;
+        c.menu.as_mut().unwrap().y = h - 5.0;
+        let root = layout_desktop(w, h, &sample(), &c, &theme, &RowScroll::default(), &mut IconMeasure);
+        let mut groups: Vec<&SceneNode> = Vec::new();
+        walk_groups(&root, &mut groups);
+        assert!(!groups.iter().any(|g| matches!(g, SceneNode::Container { component: Some(Component::Toast), .. })));
+        let clamped = groups
+            .iter()
+            .find_map(|g| match g {
+                SceneNode::Container { component: Some(Component::ContextMenu), rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("the menu");
+        assert!(clamped.right() <= w + 0.01 && clamped.bottom() <= h + 0.01, "never off-screen: {clamped:?}");
+    }
+
+    #[test]
     fn the_badge_dot_draws_only_when_something_is_unread() {
         let theme = Theme::cosmic_default();
         let dots = |chrome: &ShellChrome| {
@@ -4555,12 +4911,17 @@ mod tests {
         assert_eq!(of("64%").1, 600, "#hc-bat-pct");
         assert_eq!((of("Files").1, of("Files").3), (400, theme.bar_ink), ".taskbar-chip inherits");
         assert_eq!((of("Scout").1, of("Scout").3), (400, theme.hero_copy), ".agent-chip inherits the muted role");
+        // Compared by HUE, alpha aside: a disabled menu row and the empty agent words are
+        // the same ink dimmed, not a different colour.
         let hue = |c: &Color| (c.r, c.g, c.b);
         for (t, w, _, c) in runs.iter().filter(|(_, w, _, _)| *w == 400) {
             let is_icon = !t.is_empty() && t.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_');
             let is_meta = hue(c) == hue(&theme.meta_ink) || hue(c) == hue(&theme.hero_copy);
-            let is_chip = *c == theme.bar_ink && t.chars().any(|ch| ch.is_ascii_uppercase());
-            assert!(is_icon || is_meta || is_chip, "{t:?} at 400 ({w}) is not an inheriting bar run");
+            // Chip labels, the toast message and menu rows inherit the body ink; a
+            // danger row inherits the error role. All of them are Capitalised words.
+            let is_body = (hue(c) == hue(&theme.bar_ink) || hue(c) == hue(&theme.error))
+                && t.chars().any(|ch| ch.is_ascii_uppercase());
+            assert!(is_icon || is_meta || is_body, "{t:?} at 400 ({w}) is not an inheriting bar run");
         }
     }
 
@@ -6056,9 +6417,15 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
             Component::Omnibox,
             Component::Taskbar,
             Component::HomeCard(0, 0),
+            Component::HomeRow(0),
+            Component::Toast,
+            Component::ContextMenu,
         ];
         let labels: Vec<&str> = all.iter().map(|c| c.surface().label()).collect();
-        assert_eq!(labels, ["orb", "top-bar", "omnibox", "taskbar", "home-card"]);
+        assert_eq!(
+            labels,
+            ["orb", "top-bar", "omnibox", "taskbar", "home-card", "home-row", "toast", "context-menu"]
+        );
         for (i, a) in labels.iter().enumerate() {
             for b in labels.iter().skip(i + 1) {
                 assert_ne!(a, b, "two components share a budget row");

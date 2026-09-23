@@ -194,6 +194,11 @@ pub enum Surface {
     Taskbar,
     HomeCard,
     HomeRow,
+    /// A toast and a context menu, native scene components since `shell.chrome` carries
+    /// them. Their budget rows had `animate-start` from the start and nothing could ever
+    /// attribute a sample to them; the surface is what makes the row reachable.
+    Toast,
+    ContextMenu,
 }
 
 impl Surface {
@@ -208,9 +213,11 @@ impl Surface {
             Surface::Taskbar => "taskbar",
             Surface::HomeCard => "home-card",
             Surface::HomeRow => "home-row",
+            Surface::Toast => "toast",
+            Surface::ContextMenu => "context-menu",
         }
     }
-    const ALL: [Surface; 8] = [
+    const ALL: [Surface; 10] = [
         Surface::Shell,
         Surface::WorkspaceSwitch,
         Surface::Orb,
@@ -219,6 +226,8 @@ impl Surface {
         Surface::Taskbar,
         Surface::HomeCard,
         Surface::HomeRow,
+        Surface::Toast,
+        Surface::ContextMenu,
     ];
     fn idx(self) -> usize {
         match self {
@@ -230,6 +239,8 @@ impl Surface {
             Surface::Taskbar => 5,
             Surface::HomeCard => 6,
             Surface::HomeRow => 7,
+            Surface::Toast => 8,
+            Surface::ContextMenu => 9,
         }
     }
 }
@@ -461,10 +472,10 @@ pub struct LatencyCore {
     renders_attempted: u64,
     renders_unchanged: u64,
     stall_reported_at: u64,
-    /// [surface][kind]. Forty-two fixed buckets, allocated once and reused: an input
-    /// rate this cannot cover does not exist, and a map would put an allocation on the
-    /// input path for no benefit.
-    window: [[Vec<u64>; 6]; 8],
+    /// [surface][kind]. Sixty fixed buckets, allocated once and reused: an input rate
+    /// this cannot cover does not exist, and a map would put an allocation on the input
+    /// path for no benefit.
+    window: [[Vec<u64>; 6]; 10],
     /// Frame times (tick start to `queue_frame` Ok) in the open window, same cap as the
     /// latency buckets.
     frame_window: Vec<u64>,
@@ -1345,7 +1356,7 @@ mod tests {
         assert_eq!(
             labels,
             ["shell", "workspace-switch", "orb", "top-bar", "omnibox", "taskbar",
-             "home-card", "home-row"]
+             "home-card", "home-row", "toast", "context-menu"]
         );
         for (i, a) in labels.iter().enumerate() {
             assert!(!a.is_empty() && !a.contains(' '), "{a:?} is not a bare slug");
@@ -1355,7 +1366,7 @@ mod tests {
         }
         // The index each one buckets under must be unique and in range, since the window
         // is a fixed array rather than a map.
-        let mut seen = [false; 8];
+        let mut seen = [false; 10];
         for s in Surface::ALL {
             assert!(!seen[s.idx()], "two surfaces share bucket {}", s.idx());
             seen[s.idx()] = true;
