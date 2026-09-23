@@ -20,9 +20,19 @@ function matches(el, sel) {
   if (!el || !el._attrs) return false;
   // A comma list: any branch matches.
   if (sel.indexOf(',') >= 0) return sel.split(',').some((s) => matches(el, s.trim()));
-  if (sel[0] === '#') return el._attrs.id === sel.slice(1);
-  if (sel[0] === '.') return sel.slice(1).split('.').every((c) => clsOf(el).indexOf(c) >= 0);
-  return el.tagName === sel.toUpperCase();
+  // Attribute filters: [attr] or [attr="value"], any number, after the rest.
+  let rest = sel;
+  let am;
+  while ((am = /\[([\w-]+)(?:="([^"]*)")?\]$/.exec(rest))) {
+    const have = el._attrs[am[1]];
+    if (have === undefined) return false;
+    if (am[2] !== undefined && have !== am[2]) return false;
+    rest = rest.slice(0, am.index);
+  }
+  if (!rest) return true;
+  if (rest[0] === '#') return el._attrs.id === rest.slice(1);
+  if (rest[0] === '.') return rest.slice(1).split('.').every((c) => clsOf(el).indexOf(c) >= 0);
+  return el.tagName === rest.toUpperCase();
 }
 
 export function makeEl(tag, state) {
@@ -30,7 +40,9 @@ export function makeEl(tag, state) {
     tagName: (tag || 'div').toUpperCase(),
     _attrs: {}, _kids: [], _listeners: {}, _rect: null,
     style: {}, dataset: {}, value: '', placeholder: '', textContent: '', _innerHTML: '',
-    parentNode: null, offsetWidth: 200, offsetHeight: 120, offsetParent: {},
+    parentNode: null, offsetParent: {}, offsetLeft: 0, offsetTop: 0,
+    offsetWidth: (state && state.offsetWidth) || 200, offsetHeight: (state && state.offsetHeight) || 120,
+    _bySel: {},
     classList: {
       _s: new Set(),
       add(...cs) { cs.forEach((c) => this._s.add(c)); el._syncClass(); },
@@ -47,7 +59,7 @@ export function makeEl(tag, state) {
     // A string set wins; otherwise mirror textContent so the shell's esc()
     // idiom (set textContent, read innerHTML) yields the text, not ''.
     get innerHTML() { return this._innerHTML || this.textContent || ''; },
-    set innerHTML(v) { this._innerHTML = String(v); this._kids = []; },
+    set innerHTML(v) { this._innerHTML = String(v); this._kids = []; this._bySel = {}; },
     get children() { return this._kids; },
     get firstChild() { return this._kids[0] || null; },
     setAttribute(k, v) {
@@ -78,7 +90,21 @@ export function makeEl(tag, state) {
       return null;
     },
     matches(sel) { return matches(el, sel); },
-    querySelector(sel) { const out = []; walk(el, sel, out, 1); return out[0] || null; },
+    querySelector(sel) {
+      const out = []; walk(el, sel, out, 1);
+      if (out[0]) return out[0];
+      // Opt-in (makeRealm({ stubMissing: true })): a module that paints through
+      // innerHTML strings and then queries INTO them (hartDesktop's icon tiles)
+      // gets a stable stub per selector instead of null, reset on innerHTML set.
+      // An attribute selector is an EXISTENCE probe ('.desktop-icon[data-id=x]':
+      // is it pinned already?), so it must answer null; only bare class and id
+      // lookups (the parts of a painted tile) get a stub.
+      if (state && state.stubMissing && sel.indexOf('[') < 0) {
+        if (!this._bySel[sel]) { const s = makeEl('div', state); s.parentNode = el; this._bySel[sel] = s; }
+        return this._bySel[sel];
+      }
+      return null;
+    },
     querySelectorAll(sel) { const out = []; walk(el, sel, out, 0); return out; },
     addEventListener(t, fn, cap) { (this._listeners[t] = this._listeners[t] || []).push({ fn, cap: !!(cap && (cap === true || cap.capture)) }); },
     removeEventListener(t, fn) { if (this._listeners[t]) this._listeners[t] = this._listeners[t].filter((l) => l.fn !== fn); },
@@ -126,7 +152,10 @@ export function mkEv(target, extra) {
 }
 
 /**
- * makeRealm({ w, h }) -> a fresh vm context with window === sandbox.
+ * makeRealm({ w, h, offsetWidth, offsetHeight, stubMissing }) -> a fresh vm
+ * context with window === sandbox. offsetWidth/Height set every element's
+ * measured size (the context menu's edge-flip tests need a known box);
+ * stubMissing makes querySelector return a stable stub instead of null.
  *
  *   R.el(id)            register an element reachable by getElementById (appended to body)
  *   R.document.dispatch('pointerdown', ev)   run document listeners, capture ones first
@@ -137,7 +166,8 @@ export function mkEv(target, extra) {
  */
 export function makeRealm(opts) {
   opts = opts || {};
-  const state = { active: null };
+  const state = { active: null, offsetWidth: opts.offsetWidth, offsetHeight: opts.offsetHeight,
+                  stubMissing: !!opts.stubMissing };
   const registry = {};
   const docEl = makeEl('html', state);
   const head = makeEl('head', state);

@@ -25,76 +25,29 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import vm from 'node:vm';
+import { makeRealm, makeEl as shimEl, mkEv } from '../unit/shell_dom_shim.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const STATIC = join(HERE, '..', '..', 'integrations', 'agent_engine', 'static');
 const SRC_CTX = join(STATIC, 'hartContextMenu.js');
 const SRC_DESK = join(STATIC, 'hartDesktop.js');
+const SRC_BRAND = join(STATIC, 'hartBrandArt.js');   // shared brand-art (glyph + gradient), loaded before hartDesktop
 
 let passes = 0, failures = 0;
 function ok(cond, msg) { if (cond) { passes++; console.log('  OK   ' + msg); } else { failures++; console.log(' FAIL  ' + msg); } }
 function eq(a, b, msg) { ok(a === b, msg + '  (got ' + JSON.stringify(a) + ', want ' + JSON.stringify(b) + ')'); }
 
-// ── Minimal DOM shim ───────────────────────────────────────────────────────
-// Query membership is resolved against the className STRING (clsOf); the
-// classList Set is a SEPARATE live store the modules mutate (add/remove/toggle).
+// ── DOM shim: the shared one (tests/unit/shell_dom_shim.mjs) ───────────────
+// This file carried its own shim and went stale with it (no getBoundingClientRect,
+// no brand-art load). The shared shim models what the modules touch; the realm
+// options below give the context menu a known 200x250 box for the edge-flip
+// tests and let hartDesktop query INTO the icon tiles it paints as strings.
+const R = makeRealm({ w: 1200, h: 800, offsetWidth: 200, offsetHeight: 250, stubMissing: true });
+const makeEl = (tag) => shimEl(tag, R.state);
+function baseEvent(target) { return mkEv(target); }
+// Class membership read from the class ATTRIBUTE (the shim keeps classList and
+// the attribute in step), used by the assertions below.
 function clsOf(el) { return (el._attrs.class || '').split(/\s+/); }
-function makeEl(tag) {
-  const el = {
-    tagName: (tag || 'div').toUpperCase(),
-    _attrs: {}, _kids: [], _bySel: {}, _listeners: {},
-    style: {}, offsetWidth: 200, offsetHeight: 250, offsetLeft: 0, offsetTop: 0,
-    classList: { _s: new Set(),
-      add(c) { this._s.add(c); }, remove(c) { this._s.delete(c); },
-      toggle(c, on) { if (on === undefined) { if (this._s.has(c)) this._s.delete(c); else this._s.add(c); } else if (on) this._s.add(c); else this._s.delete(c); },
-      contains(c) { return this._s.has(c); } },
-    textContent: '', value: '', _innerHTML: '', parentNode: null,
-    get innerHTML() { return this._innerHTML; },
-    set innerHTML(v) { this._innerHTML = v; this._kids = []; this._bySel = {}; },
-    setAttribute(k, v) { this._attrs[k] = String(v); },
-    getAttribute(k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; },
-    removeAttribute(k) { delete this._attrs[k]; },
-    hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this._attrs, k); },
-    appendChild(c) { c.parentNode = el; this._kids.push(c); return c; },
-    removeChild(c) { this._kids = this._kids.filter(k => k !== c); c.parentNode = null; return c; },
-    insertBefore(c) { c.parentNode = el; this._kids.push(c); return c; },
-    contains(node) {
-      if (node === el) return true;
-      for (const k of el._kids) { if (k === node) return true; if (k.contains && k.contains(node)) return true; }
-      return false;
-    },
-    addEventListener(t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); },
-    removeEventListener(t, fn) { if (this._listeners[t]) this._listeners[t] = this._listeners[t].filter(f => f !== fn); },
-    dispatch(t, ev) { (this._listeners[t] || []).slice().forEach(fn => fn(ev || baseEvent(el))); },
-    click() { this.dispatch('click', baseEvent(this)); },
-    focus() {}, select() {}, setPointerCapture() {}, releasePointerCapture() {},
-    closest() { return null; },
-    querySelector(sel) {
-      for (const k of this._kids) if (k._attrs.id && ('#' + k._attrs.id) === sel) return k;
-      const m = /^\.desktop-icon\[data-id="(.+)"\]$/.exec(sel);
-      if (m) return this._kids.find(k => k._attrs['data-id'] === m[1] && clsOf(k).includes('desktop-icon')) || null;
-      if (!this._bySel[sel]) { const s = makeEl('div'); s.parentNode = el; this._bySel[sel] = s; }
-      return this._bySel[sel];
-    },
-    querySelectorAll(sel) {
-      if (sel === '.desktop-icon') return this._kids.filter(k => clsOf(k).includes('desktop-icon'));
-      if (sel === '.desktop-icon.selected') return this._kids.filter(k => k.classList.contains('selected'));
-      if (sel.indexOf('hart-ctx-item') >= 0) {
-        const noDis = sel.indexOf(':not(.disabled)') >= 0;
-        return this._kids.filter(k => clsOf(k).includes('hart-ctx-item') && (!noDis || !clsOf(k).includes('disabled')));
-      }
-      return [];
-    },
-    get className() { return this._attrs.class || ''; },
-    set className(v) { this._attrs.class = v; },
-    get id() { return this._attrs.id || ''; },
-    set id(v) { this._attrs.id = String(v); }
-  };
-  return el;
-}
-function baseEvent(target) {
-  return { target: target, button: 0, preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {} };
-}
 // A target whose .closest()/.classList answer a scripted map (used by the
 // document-level contextmenu handler that resolves titlebar / wallpaper).
 function fakeTarget(opts) {
@@ -106,31 +59,15 @@ function fakeTarget(opts) {
   };
 }
 
-const registry = {};
-const document = {
-  readyState: 'complete',
-  documentElement: makeEl('html'),
-  head: makeEl('head'),
-  body: makeEl('body'),
-  _listeners: {},
-  createElement: (t) => makeEl(t),
-  getElementById(id) {
-    if (registry[id]) return registry[id];
-    const walk = (n) => { for (const k of n._kids) { if (k._attrs.id === id) return k; const r = walk(k); if (r) return r; } return null; };
-    return walk(this.body) || walk(this.head);
-  },
-  addEventListener(t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); },
-  removeEventListener(t, fn) { if (this._listeners[t]) this._listeners[t] = this._listeners[t].filter(f => f !== fn); },
-  dispatch(t, ev) { (this._listeners[t] || []).slice().forEach(fn => fn(ev)); }
-};
-const layer = makeEl('div'); layer.setAttribute('id', 'hart-desktop'); registry['hart-desktop'] = layer;
-const ctxMenu = makeEl('div'); ctxMenu.setAttribute('id', 'ctx-menu'); registry['ctx-menu'] = ctxMenu;
-document.body.appendChild(layer);
+const registry = R.registry;
+const document = R.document;
+const layer = R.el('hart-desktop');
+R.el('ctx-menu');
 
 // ── Controllable timers (a long-press must NOT auto-fire inside a quick tap) ──
-let timerSeq = 1;
-const timers = new Map();
-function flushTimers() { const fns = Array.from(timers.values()); timers.clear(); fns.forEach(f => { try { f(); } catch (e) {} }); }
+// The realm records every setTimeout; flushTimers() fires what is pending and
+// a clearTimeout() neutralises its callback, so a cleared long-press no-ops.
+function flushTimers() { R.flushTimers(); }
 
 // ── Spies / mocks (the side-effects we assert) ──
 const opened = [];
@@ -139,14 +76,7 @@ const fetchCalls = [];
 let lastSaved = null;
 const sessionBlob = {};
 
-const sandbox = {
-  document, console,
-  innerWidth: 1200, innerHeight: 800,
-  setTimeout: (fn) => { const id = timerSeq++; timers.set(id, fn); return id; },
-  clearTimeout: (id) => { timers.delete(id); },
-  requestAnimationFrame: () => 0, cancelAnimationFrame: () => {},
-  matchMedia: () => ({ matches: false }),
-  getComputedStyle: () => ({ getPropertyValue: () => '' }),
+const sandbox = Object.assign(R.sandbox, {
   location: { reload() {} },
   confirm: () => true,                       // uninstall path: themed dsConfirm absent -> native confirm
   fetch: (url, opts) => { fetchCalls.push({ url: url, opts: opts }); return Promise.resolve({ ok: true }); },
@@ -162,17 +92,17 @@ const sandbox = {
   closePanel: (id) => { calls.closePanel.push(id); },
   minimizePanel: (id) => { calls.minimizePanel.push(id); },
   toggleMax: (id) => { calls.toggleMax.push(id); },
-  addEventListener() {}, removeEventListener() {},
   HartSession: {
     ready(cb) { cb(sessionBlob); },
     get(k, d) { return Object.prototype.hasOwnProperty.call(sessionBlob, k) ? sessionBlob[k] : d; },
     set(k, v) { sessionBlob[k] = v; if (k === 'desktop_icons') lastSaved = v; }
   }
-};
-sandbox.window = sandbox;
-vm.createContext(sandbox);
+});
 // Load order matters: the ctx-menu module must define window.HartCtxMenu BEFORE
 // hartDesktop's injectCtxMenu runs (it then skips the async <script> inject).
+// hartDesktop renders icon glyphs/art tiles through the shared window.HartBrandArt
+// (loaded first in the real shell), so define it here before the module runs.
+vm.runInContext(readFileSync(SRC_BRAND, 'utf8'), sandbox, { filename: 'hartBrandArt.js' });
 // The dismissal set the menu arms lives in hartDismiss.js (extracted 2026-09-23);
 // it loads deferred before the menu in the served shell, so mirror that order.
 vm.runInContext(readFileSync(join(STATIC, 'hartDismiss.js'), 'utf8'), sandbox, { filename: 'hartDismiss.js' });
