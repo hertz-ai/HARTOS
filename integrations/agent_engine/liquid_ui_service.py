@@ -4108,6 +4108,12 @@ function dsSlider(opts) {{
   const unit = opts.unit || '';
   const oninput = opts.oninput || '';
   let html = '<div class="ds-flex ds-gap-3" style="align-items:center">';
+<!-- ONE dismissal set for every floating sheet (outside press / Escape / scroll /
+     resize / window blur, the last being what fires when a press lands in an
+     iframe or on another surface). Loaded before every sheet that arms it:
+     the start menu (inline), hartSenses.js, hartConnectivity.js and the
+     dynamically injected hartContextMenu.js. -->
+<script defer src="/shell/static/hartDismiss.js"></script>
   if(label) html += '<span class="ds-label-sm ds-text-muted" style="min-width:80px">'+label+'</span>';
   html += '<input type="range" class="ds-slider" min="'+min+'" max="'+max+'" value="'+value+'"'+
     (id?' id="'+id+'"':'')+
@@ -4530,7 +4536,14 @@ function toggleStartMenu() {{
   const m = document.getElementById('start-menu');
   startOpen = !startOpen;
   m.classList.toggle('open', startOpen);
-  if(startOpen) document.getElementById('start-search').focus();
+  if(_startDisarm) {{ const d = _startDisarm; _startDisarm = null; d(); }}
+  if(startOpen) {{
+    document.getElementById('start-search').focus();
+    if(window.HartDismiss) _startDisarm = window.HartDismiss.arm({{
+      els: [m, function(){{ return document.querySelector('.start-btn'); }}],
+      onDismiss: function(){{ if(startOpen) toggleStartMenu(); }}
+    }});
+  }}
 }}
 
 function filterStart(q) {{
@@ -4867,6 +4880,12 @@ function _dragFrame() {{
   if(!d) return;
   d.raf = 0;
   const p = panels[d.id];
+// The start menu closes through the shell's ONE dismissal set (hartDismiss.js):
+// outside press, Escape, scroll, resize and window blur. The old closer was a
+// bubbling click on this document, so a press on another surface or inside an
+// iframed panel (neither reaches this document) left the menu open on the box
+// (2026-09-22). The start button is inside the set so its click stays ONE toggle.
+let _startDisarm = null;
   if(!p) return;
   if(d.mode==='move') {{
     // GPU-composited move — translate only, no layout. left/top commit on drop.
@@ -6740,8 +6759,6 @@ document.addEventListener('keydown', e => {{
   // Super+Up — maximize, Super+Down — minimize
   if(e.key==='ArrowUp'&&e.metaKey&&focusedPanel) {{ e.preventDefault(); toggleMax(focusedPanel); }}
   if(e.key==='ArrowDown'&&e.metaKey&&focusedPanel) {{ e.preventDefault(); minimizePanel(focusedPanel); }}
-  // Escape — close start menu
-  if(e.key==='Escape'&&startOpen) toggleStartMenu();
   // F11 — fullscreen focused
   if(e.key==='F11'&&focusedPanel) {{ e.preventDefault(); toggleMax(focusedPanel); }}
 }});
@@ -6783,14 +6800,6 @@ function launchApp(appId) {{
     headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{app_id:appId,subsystem:'linux'}})}}).catch(()=>{{}});
 }}
-
-// ═══ Close start menu on outside click ═══
-document.addEventListener('click', e => {{
-  if(startOpen && !document.getElementById('start-menu').contains(e.target) &&
-     !e.target.closest('.start-btn')) {{
-    toggleStartMenu();
-  }}
-}});
 
 // ═══ Voice I/O (push-to-talk + TTS) ═══
 let mediaRecorder = null;

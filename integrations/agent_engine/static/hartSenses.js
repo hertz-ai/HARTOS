@@ -86,9 +86,32 @@
         apply(st);
         if (window.showToast) window.showToast('AI senses',
           cut ? 'Shut - eyes & ears closed' : 'Awake', cut ? 'warning' : 'success');
-        var panel = document.getElementById('hart-senses-panel');
-        if (panel) panel.classList.toggle('open', cut);   // reveal the proof when cut
+        setProofOpen(cut);                                // reveal the proof when cut
       }).catch(function (e) { console.error('hartSenses: senses toggle POST failed', e); });
+  }
+
+  // The proof popover: ONE open/close path, armed on the shell's shared
+  // dismissal set (hartDismiss.js) so it closes on an outside press, Escape,
+  // scroll, resize and window blur like every other sheet. The whole pod
+  // (#hart-senses) is inside the set: a press on the eye, the mic or the drag
+  // grip never dismisses, so the pod can be dragged with the proof open.
+  var _proofDisarm = null;
+  function proofOpen() {
+    var p = document.getElementById('hart-senses-panel');
+    return !!(p && p.classList.contains('open'));
+  }
+  function setProofOpen(on) {
+    var p = document.getElementById('hart-senses-panel');
+    if (!p) return;
+    p.classList.toggle('open', !!on);
+    var d = _proofDisarm; _proofDisarm = null;
+    if (d) d();
+    if (on && window.HartDismiss) {
+      _proofDisarm = window.HartDismiss.arm({
+        els: [function () { return document.getElementById('hart-senses'); }, p],
+        onDismiss: function () { setProofOpen(false); }
+      });
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -194,7 +217,7 @@
     btn.addEventListener('click', toggle);
     btn.addEventListener('contextmenu', function (e) {   // right-click = peek at proof
       e.preventDefault();
-      var p = document.getElementById('hart-senses-panel'); if (p) p.classList.toggle('open');
+      setProofOpen(!proofOpen());
     });
     refresh();
     timer = setInterval(refresh, 4000);                  // keep the proof live

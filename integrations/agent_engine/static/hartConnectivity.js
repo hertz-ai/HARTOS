@@ -387,26 +387,31 @@
     p.style.left = 'auto';
   }
 
+  // Dismissal is the shell's ONE shared set (hartDismiss.js): outside press,
+  // Escape, scroll, resize and window blur. Blur is the half this popover was
+  // missing: a press on another surface or inside an iframed panel never
+  // reaches this document, so the old mousedown closer left it open (box,
+  // 2026-09-22). The tray cluster is inside the set so its click is one toggle.
+  var _disarm = null;
   function openPopover() {
     var p = ensurePopover();
     renderPopover();
     p.classList.add('open');
     positionPopover();
     refresh();   // freshen the data the moment it opens
-    setTimeout(function () { document.addEventListener('mousedown', onOutside, true); }, 0);
+    if (_disarm) { _disarm(); _disarm = null; }
+    if (window.HartDismiss) {
+      _disarm = window.HartDismiss.arm({
+        els: [p, function () { return document.getElementById('hc-cluster'); }],
+        onDismiss: closePopover
+      });
+    }
   }
   function closePopover() {
     var p = document.getElementById('hc-popover');
     if (p) p.classList.remove('open');
-    document.removeEventListener('mousedown', onOutside, true);
-  }
-  function onOutside(e) {
-    var p = document.getElementById('hc-popover');
-    var cluster = document.getElementById('hc-cluster');
-    if (!p) return;
-    if (p.contains(e.target)) return;
-    if (cluster && cluster.contains(e.target)) return;
-    closePopover();
+    var d = _disarm; _disarm = null;
+    if (d) d();
   }
   function togglePopover() {
     if (popoverOpen()) closePopover(); else openPopover();
@@ -496,10 +501,8 @@
 
     refresh();
     pollTimer = setInterval(refresh, 8000);   // keep the indicators live
-    window.addEventListener('resize', function () { if (popoverOpen()) positionPopover(); });
-    document.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape' && popoverOpen()) closePopover();
-    });
+    // Escape and resize while open are the shared dismissal set's job (armed in
+    // openPopover); a resize simply closes the sheet, as it does the context menu.
   }
 
   // Expose a tiny handle for other shell code / tests (no behaviour leaks).

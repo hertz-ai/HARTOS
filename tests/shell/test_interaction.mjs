@@ -173,6 +173,9 @@ sandbox.window = sandbox;
 vm.createContext(sandbox);
 // Load order matters: the ctx-menu module must define window.HartCtxMenu BEFORE
 // hartDesktop's injectCtxMenu runs (it then skips the async <script> inject).
+// The dismissal set the menu arms lives in hartDismiss.js (extracted 2026-09-23);
+// it loads deferred before the menu in the served shell, so mirror that order.
+vm.runInContext(readFileSync(join(STATIC, 'hartDismiss.js'), 'utf8'), sandbox, { filename: 'hartDismiss.js' });
 vm.runInContext(readFileSync(SRC_CTX, 'utf8'), sandbox, { filename: 'hartContextMenu.js' });
 vm.runInContext(readFileSync(SRC_DESK, 'utf8'), sandbox, { filename: 'hartDesktop.js' });
 
