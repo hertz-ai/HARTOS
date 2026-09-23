@@ -498,9 +498,31 @@ class TestSecurityHardening:
         assert 'ProtectSystem = "strict"' in content, (
             f"{module}: the marker dir is declared BECAUSE the unit is strict; "
             "loosening ProtectSystem is not the way to make it writable")
-        assert '"/run/hart/session"' in self._read_write_paths(content), (
+        rw = self._read_write_paths(content)
+        assert '"-/run/hart/session"' in rw, (
             f"{module} writes session markers under ProtectSystem=strict and "
-            "must list /run/hart/session in ReadWritePaths")
+            "must list /run/hart/session in ReadWritePaths, with the leading "
+            "'-' so systemd ignores it where the dir does not exist")
+        assert '"/run/hart/session"' not in rw, (
+            f"{module}: a plain (non '-') /run/hart/session entry takes the unit "
+            "down on every variant without a session supervisor: measured on "
+            "the 2026-09-24 nixosTests run, hart-server-boot and "
+            "hart-peer-discovery both red with 'Failed to set up mount "
+            "namespacing: /run/hart/session: No such file or directory'")
+
+    def test_backend_creates_the_marker_dir_where_no_supervisor_does(self):
+        """Server and edge have no session supervisor, so nothing created
+        /run/hart/session there and the cross-process chat markers had nowhere
+        to land. The backend module declares the dir, gated so the desktop
+        (where the supervisor already declares the identical line) does not
+        get a duplicate tmpfiles line on every boot."""
+        backend = read_nix(os.path.join(MODULES_DIR, "hart-backend.nix"))
+        m = re.search(
+            r'systemd\.tmpfiles\.rules = lib\.mkIf \(!\(config\.hart\.sessionSupervisor\.enable or false\)\) \[(.*?)\];',
+            backend, re.S)
+        assert m, "hart-backend.nix must declare /run/hart/session for variants without a supervisor"
+        assert '"d /run/hart/session 0770 hart hart -"' in m.group(1), (
+            "the backend's rule must be the SAME 0770 hart:hart line the supervisor uses")
 
     def test_session_marker_dir_is_the_one_the_supervisor_declares(self):
         """The dir the units open for writing is the dir the session

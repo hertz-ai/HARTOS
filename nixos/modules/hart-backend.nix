@@ -11,6 +11,18 @@ in
 {
   config = lib.mkIf cfg.enable {
 
+    # The session marker dir on variants that have no session supervisor (server,
+    # edge). hart-session-supervisor.nix declares the identical 0770 hart:hart line
+    # for the desktop; declaring it twice on the desktop would make
+    # systemd-tmpfiles log a duplicate on every boot, so this one is gated the
+    # opposite way. core.foreground.session_marker_dir resolves the dir by
+    # existence, so with it present the backend's foreground-active and
+    # user-chat markers reach hart-agent-daemon on every variant.
+    systemd.tmpfiles.rules = lib.mkIf (!(config.hart.sessionSupervisor.enable or false)) [
+      "d /run/hart         0750 hart hart -"
+      "d /run/hart/session 0770 hart hart -"
+    ];
+
     systemd.services.hart-backend = {
       description = "HART OS Backend (Flask/Waitress)";
       documentation = [ "https://github.com/hertz-ai/HARTOS" ];
@@ -249,7 +261,19 @@ in
           # read-only but for this list, so without this line the marker write
           # fails (logged once at WARNING) and the daemon runs inference
           # through the person's turns.
-          "/run/hart/session"
+          #
+          # The leading "-" makes systemd IGNORE the entry when the path does
+          # not exist instead of refusing to build the namespace. Only the
+          # session supervisor creates the dir, and only the desktop enables
+          # the supervisor: on the server and edge variants the plain entry
+          # took the backend down at boot ("Failed to set up mount
+          # namespacing: /run/hart/session: No such file or directory", every
+          # restart, hart-server-boot and hart-peer-discovery red on the
+          # 2026-09-24 nixosTests run of babefb0). The tmpfiles rule below
+          # creates the dir on those variants anyway, so the cross-process
+          # chat markers work there too; the "-" is the guard that keeps a
+          # missing dir from ever being fatal again.
+          "-/run/hart/session"
         ];
         PrivateTmp = true;
         ProtectClock = true;

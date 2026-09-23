@@ -67,7 +67,9 @@ in
           # also imports (dispatch._native_chat) shares ONE writable dir
           # with the backend rather than a per-unit exception: a genuine
           # user turn served through it lands where every reader looks.
-          "/run/hart/session"
+          # "-": ignored when the dir is absent (see hart-backend.nix for the
+          # server/edge boot failure the plain entry caused).
+          "-/run/hart/session"
         ];
         PrivateTmp = true;
         ProtectClock = true;
