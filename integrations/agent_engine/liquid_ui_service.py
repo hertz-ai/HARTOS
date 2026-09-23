@@ -544,6 +544,10 @@ class _ConnectivityCache:
         self._wifi = {'networks': [], 'connected': {}}
         self._absent = set()  # tool names that raised FileNotFoundError once
         self._running = False
+        # Change subscribers (subscribe()): called with a COPY of the summary
+        # whenever a refresh produced a different one. This is how the shell's
+        # SSE stream learns of a change without any document polling for it.
+        self._listeners = []
 
     @staticmethod
     def _empty_summary():
@@ -775,8 +779,27 @@ class _ConnectivityCache:
         }
         wifi_list = self._probe_wifi_list()
         with self._lock:
+            changed = summary != self._summary
             self._summary = summary
             self._wifi = wifi_list
+            listeners = list(self._listeners)
+        # Notify OUTSIDE the lock (a subscriber may take its own locks), and
+        # only on a real change: an identical snapshot every 9 s is exactly the
+        # idle churn the push exists to remove. One subscriber's bug must not
+        # stop the others, nor the prober.
+        if changed:
+            for fn in listeners:
+                try:
+                    fn(copy.deepcopy(summary))
+                except Exception:
+                    logger.exception("_ConnectivityCache: subscriber raised")
+
+    def subscribe(self, fn):
+        """Call ``fn(summary_copy)`` after every refresh whose summary differs
+        from the previous one. Idempotent per callable."""
+        with self._lock:
+            if fn not in self._listeners:
+                self._listeners.append(fn)
 
     def summary(self):
         with self._lock:
@@ -803,6 +826,76 @@ class _ConnectivityCache:
             except Exception:
                 logger.exception("_loop: swallowed Exception")
             time.sleep(self.REFRESH_INTERVAL_S)
+
+
+def read_system_metrics() -> dict:
+    """The box's live metrics, ONE implementation for two readers: the
+    /api/shell/system/metrics route (the System panel and the shell's slow
+    fallback poll) and the shell-state sampler that pushes the widget's slice
+    of it over the SSE stream. Never raises: a missing psutil is reported in
+    the payload, a partition that cannot be read is skipped.
+
+    NON-BLOCKING CPU sample (interval=None): return CPU% since the last call
+    instead of sleeping 0.5 s on the caller. This used to be POLLED every 4 s
+    by hartSessionUI from every document; a blocking 0.5 s here pinned a
+    waitress worker for 0.5 s out of every 4 s forever (12.5% of a 1-thread
+    pool), a recurring mid-session micro-freeze. The first call after boot
+    reads 0.0 and every subsequent call is an accurate delta.
+    """
+    metrics = {}
+    try:
+        import psutil
+        metrics['cpu_percent'] = psutil.cpu_percent(interval=None)
+        metrics['cpu_count'] = psutil.cpu_count()
+        mem = psutil.virtual_memory()
+        metrics['ram'] = {
+            'total_gb': round(mem.total / (1024**3), 1),
+            'used_gb': round(mem.used / (1024**3), 1),
+            'percent': mem.percent,
+        }
+        disks = []
+        for part in psutil.disk_partitions():
+            try:
+                usage = psutil.disk_usage(part.mountpoint)
+                disks.append({
+                    'mount': part.mountpoint,
+                    'device': part.device,
+                    'total_gb': round(usage.total / (1024**3), 1),
+                    'used_gb': round(usage.used / (1024**3), 1),
+                    'percent': usage.percent,
+                })
+            except (PermissionError, OSError):
+                logger.warning("read_system_metrics: swallowed PermissionError, OSError", exc_info=True)
+        metrics['disks'] = disks
+        net = psutil.net_io_counters()
+        metrics['network'] = {
+            'bytes_sent': net.bytes_sent,
+            'bytes_recv': net.bytes_recv,
+        }
+        metrics['load_avg'] = list(psutil.getloadavg()) if hasattr(psutil, 'getloadavg') else []
+        metrics['uptime_seconds'] = int(time.time() - psutil.boot_time())
+        # Temperatures if available
+        try:
+            temps = psutil.sensors_temperatures()
+            if temps:
+                metrics['temperatures'] = {
+                    name: [{'label': s.label, 'current': s.current}
+                           for s in sensors[:3]]
+                    for name, sensors in temps.items()
+                }
+        except (AttributeError, Exception):
+            logger.exception("read_system_metrics: swallowed AttributeError, Exception")
+    except ImportError:
+        metrics['error'] = 'psutil not installed'
+    # GPU: ONE shape, shared with /api/shell/gpu (task #25). gpu_status()
+    # distinguishes a CPU-only box from a failed probe (available/present) and
+    # never raises, so the two GPU surfaces cannot drift apart.
+    try:
+        from integrations.agent_engine.shell_system_apis import gpu_status
+        metrics['gpu'] = gpu_status()
+    except Exception:
+        logger.debug("read_system_metrics: gpu_status unavailable", exc_info=True)
+    return metrics
 
 
 # One process-wide prober, lazy-started (idempotently) by the connectivity
@@ -1227,6 +1320,18 @@ class LiquidUIService:
         self._running = False
         self._model_available = False
 
+        # Shell-state push (the poll diet, 2026-09-23). kind -> the last pushed
+        # `shell_state` event, read by the SSE producer's _collect alongside the
+        # agent components and sent whole to a freshly connected stream. The
+        # sampler thread runs only while _shell_state_clients > 0, so a box
+        # with no shell open samples nothing.
+        self._shell_state: Dict[str, dict] = {}
+        self._shell_state_fp: Dict[str, str] = {}
+        self._shell_state_clients = 0
+        self._shell_state_wake = threading.Event()
+        self._shell_state_thread = None
+        self._shell_state_wired = False
+
         # Session state (panel positions restored on login)
         self._data_dir = os.environ.get(
             'HEVOLVE_DATA_DIR', os.environ.get(
@@ -1257,6 +1362,172 @@ class LiquidUIService:
         logger.info(
             "LiquidUIService initialized: port=%d, renderer=%s, "
             "voice=%s, haptic=%s", port, renderer, voice_enabled, haptic_enabled)
+
+    # ─── Shell-state push (the idle poll diet) ────────────────────────
+    # MEASURED on the box 2026-09-22: ~18 GETs per 5 s at idle from four
+    # pollers in every shell document (metrics 4 s, ai-sensing 4 s,
+    # connectivity 8 s, agents 5 s), for state the server already keeps fresh
+    # itself. The server now samples ONCE per box, only while a stream is
+    # open, and pushes `shell_state` events on /api/notifications/stream, the
+    # stream the shell already holds. The modules keep a 30 s fallback poll
+    # that runs only while that stream is down.
+
+    #: Sampling cadence while at least one stream is open. Matches the old
+    #: per-document metrics/senses poll, so nothing the user sees gets slower;
+    #: it is simply one reader per box instead of one per document.
+    SHELL_STATE_SAMPLE_S = 4.0
+
+    def push_shell_state(self, kind: str, payload) -> bool:
+        """Publish one kind of shell state to every open stream.
+
+        Deduplicated: an unchanged payload is not re-pushed, because an
+        identical frame every few seconds is precisely the idle churn this
+        replaces. Stamped with the `_ts` cursor the producer keys on and woken
+        through the same condition agent_ui_update uses. Returns True when a
+        push happened."""
+        try:
+            fp = json.dumps(payload, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            fp = repr(payload)
+        with self._ui_event_cv:
+            if self._shell_state_fp.get(kind) == fp:
+                return False
+            self._shell_state_fp[kind] = fp
+            self._shell_state[kind] = {
+                'type': 'shell_state', 'kind': kind, 'payload': payload,
+                'agent': 'shell', '_ts': time.time(),
+            }
+            self._ui_event_cv.notify_all()
+        return True
+
+    def _shell_state_client_enter(self) -> None:
+        """An SSE stream opened: count it, wire the pushers once, wake the
+        sampler so the first frame after the snapshot is not a full period away."""
+        with self._ui_event_cv:
+            self._shell_state_clients += 1
+        self._start_shell_state_sampler()
+        self._shell_state_wake.set()
+
+    def _shell_state_client_leave(self) -> None:
+        with self._ui_event_cv:
+            self._shell_state_clients = max(0, self._shell_state_clients - 1)
+
+    def _start_shell_state_sampler(self) -> None:
+        """Idempotent. Subscribes to the connectivity prober (the reader that
+        already polls the hardware) and starts the sampler thread for the two
+        readers with no thread of their own (metrics, senses) plus the agents
+        probe. Started by the first stream, never at app build, so a process
+        that never serves a shell spawns nothing."""
+        cache = _connectivity_cache
+        if not self._shell_state_wired:
+            self._shell_state_wired = True
+            subscribe = getattr(cache, 'subscribe', None)
+            if callable(subscribe):
+                import weakref
+                ref = weakref.ref(self)
+
+                def _on_connectivity(summary):
+                    svc = ref()
+                    if svc is not None:
+                        svc.push_shell_state('connectivity', summary)
+                subscribe(_on_connectivity)
+        try:
+            cache.start()
+            self.push_shell_state('connectivity', cache.summary())
+        except Exception:
+            logger.debug("shell-state: connectivity cache unavailable", exc_info=True)
+        if self._shell_state_thread is None or not self._shell_state_thread.is_alive():
+            self._shell_state_thread = threading.Thread(
+                target=self._shell_state_loop, name='hart-shell-state', daemon=True)
+            self._shell_state_thread.start()
+
+    def _shell_state_loop(self) -> None:
+        while True:
+            self._shell_state_wake.wait(timeout=self.SHELL_STATE_SAMPLE_S)
+            self._shell_state_wake.clear()
+            try:
+                self._sample_shell_state()
+            except Exception:
+                logger.debug("shell-state: sample failed", exc_info=True)
+
+    def _sample_shell_state(self) -> List[str]:
+        """One tick: read each kind and push what changed. Returns the kinds
+        pushed. With no stream open it reads NOTHING (no psutil, no backend
+        GET), which is what makes an unattended box idle."""
+        if self._shell_state_clients <= 0:
+            return []
+        pushed = []
+        for kind, reader in (('metrics', self._read_shell_metrics),
+                             ('senses', self._read_shell_senses),
+                             ('agents', lambda: self._reduce_shell_agents(
+                                 self._read_shell_agents()))):
+            try:
+                payload = reader()
+            except Exception:
+                logger.debug("shell-state: %s reader failed", kind, exc_info=True)
+                continue
+            if payload is None:
+                continue
+            if self.push_shell_state(kind, payload):
+                pushed.append(kind)
+        return pushed
+
+    @staticmethod
+    def _read_shell_metrics() -> dict:
+        """read_system_metrics() reduced to the three bars the desktop widget
+        paints (hartSessionUI.js reads cpu_percent, ram.percent, disk_percent),
+        so a push is a few numbers, not the full partition table."""
+        m = read_system_metrics()
+        disks = m.get('disks') or []
+        ram = m.get('ram') or {}
+        return {
+            'cpu_percent': round(float(m.get('cpu_percent') or 0.0), 1),
+            'ram': {'percent': ram.get('percent')},
+            'disk_percent': disks[0].get('percent') if disks else None,
+        }
+
+    @staticmethod
+    def _read_shell_senses() -> dict:
+        from core.ai_sensing import status
+        return status()
+
+    def _read_shell_agents(self):
+        """The backend's dashboard/agents answer, or None when it is not
+        reachable (the bar then keeps its last state, as the old poll did).
+        One localhost GET per box per tick instead of one per document."""
+        from core.http_pool import pooled_get
+        try:
+            resp = pooled_get(
+                f'http://localhost:{self.backend_port}/api/social/dashboard/agents',
+                timeout=3)
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+        except Exception:
+            logger.debug("shell-state: agents probe failed", exc_info=True)
+            return None
+
+    @staticmethod
+    def _reduce_shell_agents(data):
+        """The running agents reduced to what the top bar paints (up to four
+        16-character names plus the count); the same reduction the inline
+        refreshAgentStatus applies to its own fallback GET."""
+        if not data:
+            return None
+        agents = [a for a in (data.get('agents') or []) if a.get('status') == 'running']
+        return {
+            'count': len(agents),
+            'names': [str(a.get('name') or a.get('goal_type') or 'agent')[:CHROME_AGENT_NAME_MAX]
+                      for a in agents[:CHROME_AGENTS_MAX]],
+        }
+
+    @staticmethod
+    def _model_check_interval(available: bool) -> float:
+        """Seconds between model-bus /v1/status probes. 10 s while the bus is
+        not yet up (boot: the UI wants to know soon), 30 s once it is (one
+        localhost GET every 10 s forever was part of the idle HTTP measured on
+        the box, and a bus that is up does not need re-asking that often)."""
+        return 30.0 if available else 10.0
 
     # ─── UI Generation (preserved) ────────────────────────────
 
@@ -4344,7 +4615,7 @@ window.miStyle = miStyle;
 const PERF = {{
   potato: {'true' if is_potato else 'false'},
   clockMs: {perf.get('clock_interval_ms', 1000)},
-  agentStatusMs: {perf.get('agent_status_interval_ms', 5000)},
+  agentStatusMs: {perf.get('agent_status_interval_ms', 30000)},
   maxPanels: {perf.get('max_open_panels', 20)},
   destroyMinimized: {'true' if perf.get('destroy_minimized_iframes') else 'false'},
   lazyIframes: {'true' if perf.get('lazy_load_iframes') else 'false'},
@@ -4819,10 +5090,17 @@ function snapPanel(id, side) {{
 window.snapPanel = snapPanel;
 
 // ═══ Clock ═══
+// A minute clock ticking once a second: write the DOM only when the text
+// CHANGES. Re-setting textContent to the same string still replaces the text
+// node and invalidates the top bar, and on the software-paint rung every such
+// invalidation is a repaint; 59 of every 60 were for nothing.
+let _clockLast = '';
 function tickClock() {{
   const now = new Date();
   const t = now.toLocaleTimeString([], {{hour:'2-digit',minute:'2-digit'}});
   const d = now.toLocaleDateString([], {{weekday:'long',month:'long',day:'numeric'}});
+  if(t === _clockLast) return;
+  _clockLast = t;
   const el = document.getElementById('clock');
   if(el) el.textContent = t;
   const lc = document.getElementById('lock-clock');
@@ -4833,21 +5111,66 @@ function tickClock() {{
 setInterval(tickClock, PERF.clockMs);
 try {{ tickClock(); }} catch(e) {{ console.error('[HART] tickClock:', e); }}
 
+// ═══ Shell state bus (server pushes -> shell modules) ═══
+// The idle shell used to poll four read-only endpoints from EVERY document
+// (metrics 4 s, ai-sensing 4 s, connectivity 8 s, agents 5 s: ~18 GETs per 5 s
+// measured on the box 2026-09-22) for state the server keeps fresh itself.
+// The server now pushes each as a `shell_state` event on the one SSE stream
+// below (kind + payload); the stream handler publishes them here and the
+// modules subscribe (hartSessionUI metrics, hartSenses senses, hartConnectivity
+// connectivity, the agent status just below). Each module keeps a SLOW
+// fallback poll (30 s) that runs only while sseUp() is false, and only in the
+// HOST document: an iframed copy of the shell never polls (isHost() is false
+// there; its host already owns the state). ONE bus, defined before the
+// deferred modules run; a late subscriber is replayed the last payload.
+window.HartShellState = (function() {{
+  var last = {{}}, subs = {{}}, up = false;
+  function emit(kind, fn) {{
+    try {{ fn(last[kind]); }} catch(e) {{ console.debug('[HART] shell-state subscriber failed', kind, e); }}
+  }}
+  return {{
+    publish: function(kind, payload) {{
+      last[kind] = payload;
+      (subs[kind] || []).forEach(function(fn) {{ emit(kind, fn); }});
+    }},
+    on: function(kind, fn) {{
+      (subs[kind] = subs[kind] || []).push(fn);
+      if(Object.prototype.hasOwnProperty.call(last, kind)) emit(kind, fn);
+    }},
+    last: function(kind) {{ return last[kind]; }},
+    sseUp: function() {{ return up; }},
+    setSse: function(v) {{ up = !!v; }},
+    isHost: function() {{ try {{ return window.self === window.top; }} catch(e) {{ return true; }} }}
+  }};
+}})();
+
 // ═══ Agent Status (top bar) ═══
+// The fallback GET (the server pushes 'agents' on the stream; this runs while
+// the stream is down). Same reduction the server applies (_reduce_shell_agents):
+// running only, four chips, names clipped at 16. The native chrome producer
+// reads these constants against this function (test_native_wire_contract).
 function refreshAgentStatus() {{
   fetch(BACKEND+'/api/social/dashboard/agents',{{signal:_sig(3000)}})
     .then(r=>r.json()).then(data=>{{
-      const bar = document.getElementById('agent-status');
       const agents = (data.agents||[]).filter(a=>a.status==='running');
-      if(agents.length===0){{bar.innerHTML='<span style="opacity:0.5">No agents running</span>';return;}}
-      bar.innerHTML = agents.slice(0,4).map(a=>
-        '<span class="agent-chip"><span class="dot"></span>'+
-        (a.name||a.goal_type||'agent').substring(0,16)+'</span>'
-      ).join('');
+      paintAgentStatus(agents.map(a=>(a.name||a.goal_type||'agent').substring(0,16)));
     }}).catch(()=>{{}});
 }}
-setInterval(refreshAgentStatus, PERF.agentStatusMs);
-try {{ refreshAgentStatus(); }} catch(e) {{ console.error('[HART] refreshAgentStatus:', e); }}
+function paintAgentStatus(names) {{
+  const bar = document.getElementById('agent-status');
+  if(!bar) return;
+  if(!names || names.length===0){{bar.innerHTML='<span style="opacity:0.5">No agents running</span>';return;}}
+  bar.innerHTML = names.slice(0,4).map(n=>
+    '<span class="agent-chip"><span class="dot"></span>'+n+'</span>'
+  ).join('');
+}}
+HartShellState.on('agents', function(p){{ paintAgentStatus(p && p.names); }});
+if(HartShellState.isHost()) {{
+  setInterval(function(){{ if(!HartShellState.sseUp()) refreshAgentStatus(); }}, PERF.agentStatusMs);
+  if(!HartShellState.last('agents')) {{
+    try {{ refreshAgentStatus(); }} catch(e) {{ console.error('[HART] refreshAgentStatus:', e); }}
+  }}
+}}
 
 // ═══ Start Menu ═══
 function buildStartMenu() {{
@@ -7334,9 +7657,11 @@ function speakText(text, source) {{
 // ═══ SSE Live Agent Action Stream ═══
 // Renders ALL agent components as floating overlay fragments in real-time.
 // Notification = toast. Everything else = floating glass panel overlay.
-if(!PERF.potato) {{
+if(!PERF.potato && HartShellState.isHost()) {{
   try {{
     const evtSrc = new EventSource(SHELL+'/api/notifications/stream');
+    // The stream's state gates the modules' fallback polls (HartShellState).
+    evtSrc.onopen = function() {{ HartShellState.setSse(true); }};
     // ── Apply events across FRAMES, never in one synchronous run ──
     // Every branch of _applyEvent below is DOM work (toasts, icon pins, a full
     // home recompose, palette repaint, overlay render). Applying a whole message
@@ -7372,7 +7697,11 @@ if(!PERF.potato) {{
     function _applyEvent(ev) {{
       {{
           const type = ev.type || 'notification';
-          if(type === 'notification') {{
+          if(type === 'shell_state') {{
+            // Pushed read-only state (metrics / senses / connectivity / agents):
+            // published on the bus, painted by whichever module subscribed.
+            HartShellState.publish(ev.kind, ev.payload);
+          }} else if(type === 'notification') {{
             showToast(ev.title||ev.agent||'Notification', ev.message||'', ev.severity||'info');
           }} else if(type === 'app_installed') {{
             // Installed app -> live desktop icon. Reuse hartDesktop's manifest
@@ -7408,6 +7737,7 @@ if(!PERF.potato) {{
       }}
     }}
     evtSrc.onmessage = function(e) {{
+      HartShellState.setSse(true);
       try {{
         const events = JSON.parse(e.data);
         // ENQUEUE, never apply inline. The parse is cheap; the DOM work is not.
@@ -7418,7 +7748,7 @@ if(!PERF.potato) {{
         }}
       }} catch(err) {{}}
     }};
-    evtSrc.onerror = function() {{ /* SSE reconnects automatically */ }};
+    evtSrc.onerror = function() {{ HartShellState.setSse(false); /* SSE reconnects automatically; the fallback polls run meanwhile */ }};
   }} catch(err) {{}}
 }}
 
@@ -9087,71 +9417,13 @@ function renderAgentOverlay(ev) {{
         # (the app store). Removed the inline duplicate; the canonical one wins.
 
         # ── Shell APIs: System Metrics ──
+        # The body lives in read_system_metrics() (module level) because the
+        # shell-state sampler reads the SAME function and pushes the widget's
+        # slice of it over SSE; this route is now the 30 s fallback poll and
+        # the System panel's full read.
         @app.route('/api/shell/system/metrics', methods=['GET'])
         def shell_system_metrics():
-            metrics = {}
-            try:
-                import psutil
-                # NON-BLOCKING sample (interval=None): return CPU% since the last
-                # call instead of sleeping 0.5s on the request thread. This route
-                # is POLLED every 4s by hartSessionUI; a blocking 0.5s here pinned
-                # a waitress worker for 0.5s out of every 4s forever (12.5% of a
-                # 1-thread pool) — a recurring mid-session micro-freeze. The 4s
-                # poll cadence is a fine sampling window; the first call after boot
-                # reads 0.0 and every subsequent poll is an accurate delta.
-                metrics['cpu_percent'] = psutil.cpu_percent(interval=None)
-                metrics['cpu_count'] = psutil.cpu_count()
-                mem = psutil.virtual_memory()
-                metrics['ram'] = {
-                    'total_gb': round(mem.total / (1024**3), 1),
-                    'used_gb': round(mem.used / (1024**3), 1),
-                    'percent': mem.percent,
-                }
-                disks = []
-                for part in psutil.disk_partitions():
-                    try:
-                        usage = psutil.disk_usage(part.mountpoint)
-                        disks.append({
-                            'mount': part.mountpoint,
-                            'device': part.device,
-                            'total_gb': round(usage.total / (1024**3), 1),
-                            'used_gb': round(usage.used / (1024**3), 1),
-                            'percent': usage.percent,
-                        })
-                    except (PermissionError, OSError):
-                        logger.warning("shell_system_metrics: swallowed PermissionError, OSError", exc_info=True)
-                metrics['disks'] = disks
-                net = psutil.net_io_counters()
-                metrics['network'] = {
-                    'bytes_sent': net.bytes_sent,
-                    'bytes_recv': net.bytes_recv,
-                }
-                metrics['load_avg'] = list(psutil.getloadavg()) if hasattr(psutil, 'getloadavg') else []
-                metrics['uptime_seconds'] = int(
-                    __import__('time').time() - psutil.boot_time())
-                # Temperatures if available
-                try:
-                    temps = psutil.sensors_temperatures()
-                    if temps:
-                        metrics['temperatures'] = {
-                            name: [{'label': s.label, 'current': s.current}
-                                   for s in sensors[:3]]
-                            for name, sensors in temps.items()
-                        }
-                except (AttributeError, Exception):
-                    logger.exception("shell_system_metrics: swallowed AttributeError, Exception")
-            except ImportError:
-                metrics['error'] = 'psutil not installed'
-            # GPU — ONE shape, shared with /api/shell/gpu (task #25).
-            # This used to call the detector itself and attach metrics['gpu']
-            # only when a name came back, so a CPU-only box and a box whose
-            # probe FAILED were indistinguishable: the key was simply absent in
-            # both cases. gpu_status() distinguishes them (available/present)
-            # and never raises, so no try/except is needed around it and the
-            # two GPU surfaces cannot drift apart.
-            from integrations.agent_engine.shell_system_apis import gpu_status
-            metrics['gpu'] = gpu_status()
-            return jsonify(metrics)
+            return jsonify(read_system_metrics())
 
         @app.route('/api/shell/system/processes', methods=['GET'])
         def shell_system_processes():
@@ -9288,6 +9560,11 @@ function renderAgentOverlay(ev) {{
                             event = dict(c)
                             event['agent'] = agent_id
                             out.append(event)
+                # The pushed shell state (push_shell_state): one entry per kind,
+                # replaced in place, so a burst can never pile up here.
+                for ev in list(self._shell_state.values()):
+                    if ev.get('_ts', 0) > since:
+                        out.append(dict(ev))
                 return out
 
             def generate():
@@ -9301,43 +9578,66 @@ function renderAgentOverlay(ev) {{
                 # whose wake latency we had just fixed upstream. An SSE comment is
                 # the canonical fix: 6 bytes, ignored by every conforming client
                 # (it carries no "event:"/"data:" field, so no handler ever sees it).
-                yield ": ok\n\n"
-                last_check = _time.time()
-                # EVENT-DRIVEN (was a 2s server-side poll that capped the latency of
-                # every A2UI card / notification / desktop compose — the "Liquid UI
-                # is the heart" path). Block on the CV until agent_ui_update pushes a
-                # component (woken instantly); the 15s timeout is a safety net +
-                # SSE keep-alive that self-heals a missed wake. The check-then-wait
-                # is atomic under the CV so a push between them can't be lost. The
-                # producer holds ONLY the CV (never self._lock) -> no deadlock with
-                # the writer's lock order.
-                # THE BOUNDED BATCH (the 2026-08-30 desktop freeze). This loop
-                # used to emit every pending event as ONE array and set the cursor
-                # to now; the browser applied that whole array on its main thread
-                # and the desktop froze for the duration. Federation backfill on a
-                # fresh install produced dozens inside one second — measured on
-                # .69 with every OS-level process idle while the UI was dead.
-                #
-                # collect + decide + advance all happen UNDER THE CV, and only the
-                # yield is outside it. That split is load-bearing in both
-                # directions: a push landing between the release and the cursor
-                # assignment would get a _ts below the new cursor and be skipped
-                # forever (a silent drop), while holding the CV across the socket
-                # write would block every pusher behind a slow client.
-                while True:
-                    with self._ui_event_cv:
-                        events = _collect(last_check)
-                        if not events:
-                            self._ui_event_cv.wait(timeout=15.0)
+                self._shell_state_client_enter()
+                try:
+                    yield ": ok\n\n"
+                    last_check = _time.time()
+                    first = True
+                    # EVENT-DRIVEN (was a 2s server-side poll that capped the latency of
+                    # every A2UI card / notification / desktop compose — the "Liquid UI
+                    # is the heart" path). Block on the CV until agent_ui_update pushes a
+                    # component (woken instantly); the 15s timeout is a safety net +
+                    # SSE keep-alive that self-heals a missed wake. The check-then-wait
+                    # is atomic under the CV so a push between them can't be lost. The
+                    # producer holds ONLY the CV (never self._lock) -> no deadlock with
+                    # the writer's lock order.
+                    # THE BOUNDED BATCH (the 2026-08-30 desktop freeze). This loop
+                    # used to emit every pending event as ONE array and set the cursor
+                    # to now; the browser applied that whole array on its main thread
+                    # and the desktop froze for the duration. Federation backfill on a
+                    # fresh install produced dozens inside one second — measured on
+                    # .69 with every OS-level process idle while the UI was dead.
+                    #
+                    # collect + decide + advance all happen UNDER THE CV, and only the
+                    # yield is outside it. That split is load-bearing in both
+                    # directions: a push landing between the release and the cursor
+                    # assignment would get a _ts below the new cursor and be skipped
+                    # forever (a silent drop), while holding the CV across the socket
+                    # write would block every pusher behind a slow client.
+                    while True:
+                        with self._ui_event_cv:
                             events = _collect(last_check)
-                        batch, last_check = sse_next_batch(
-                            events, last_check, _time.time())
-                    if batch:
-                        yield f"data: {json.dumps(batch)}\n\n"
-                    else:
-                        # SSE comment: keeps the stream warm through proxies,
-                        # ignored by the browser EventSource.
-                        yield ": hb\n\n"
+                            if first:
+                                # THE SNAPSHOT (the poll diet). A client that has
+                                # just connected would otherwise have to poll for
+                                # the state it needs to paint (metrics, senses,
+                                # connectivity, agents), which is the traffic
+                                # this stream exists to remove. The current
+                                # shell-state entries ride the FIRST collect,
+                                # re-stamped at the cursor so the decision below
+                                # neither rewinds the cursor to their real, older
+                                # _ts (which would re-send old agent events) nor
+                                # skips them. Entries already newer than the
+                                # cursor are in `events` and are not doubled.
+                                first = False
+                                events += [dict(ev, _ts=last_check)
+                                           for ev in self._shell_state.values()
+                                           if ev.get('_ts', 0) <= last_check]
+                            if not events:
+                                self._ui_event_cv.wait(timeout=15.0)
+                                events = _collect(last_check)
+                            batch, last_check = sse_next_batch(
+                                events, last_check, _time.time())
+                        if batch:
+                            yield f"data: {json.dumps(batch)}\n\n"
+                        else:
+                            # SSE comment: keeps the stream warm through proxies,
+                            # ignored by the browser EventSource.
+                            yield ": hb\n\n"
+                finally:
+                    # The stream closed (client gone, GeneratorExit): release the
+                    # client so a box with no shell open samples nothing.
+                    self._shell_state_client_leave()
             return Response(
                 generate(), mimetype='text/event-stream',
                 headers={
@@ -9517,7 +9817,7 @@ function renderAgentOverlay(ev) {{
                         resp.json().get('backend_count', 0) > 0)
                 except Exception:
                     self._model_available = False
-                time.sleep(10)
+                time.sleep(self._model_check_interval(self._model_available))
 
         threading.Thread(target=_model_check_loop, daemon=True).start()
 
