@@ -4319,6 +4319,20 @@ where
             AsRenderElements::<R>::render_elements(window, renderer, phys, Scale::from(1.0), alpha);
         elements.extend(win_elems.into_iter().map(HartRenderElement::Surface));
 
+        // ── 3a. NATIVE GLASS under the toplevel (checklist GL2, Linux). ──
+        // The frosted desktop, cropped to the window's geometry and pushed right after
+        // its surfaces so it sits directly beneath them. An opaque app covers it and
+        // costs nothing but the crop; a translucent one (the shell's panels, a
+        // companion window painting `--hart-glass-bg`) gets the blur-behind its CSS
+        // asks for from the platform compositor, which on HART OS is this one. It
+        // fades with the window so a map-in never pops a slab under a fading surface.
+        // Skipped under the killswitch for the same reason the bloom is.
+        if !state.capture_blocked() {
+            if let Some(geo) = state.space().element_geometry(window) {
+                let rect: Rectangle<i32, Physical> = geo.to_physical_precise_round(1.0);
+                push_frosted_backdrop(state, renderer, &mut elements, rect, alpha, size);
+            }
+        }
     }
 
     // ── 3c. NATIVE SHELL M3 scene: the DESKTOP PLANE, below windows, above the shell. ──
@@ -7932,6 +7946,81 @@ mod glass_tests {
         let none: Rectangle<i32, Physical> = Rectangle::new((0, 0).into(), (0, 10).into());
         assert!(cache.frosted_crop(w, h, bright(), None, sharper, none).is_none());
         assert!(cache.frosted_crop(0, 0, bright(), None, sharper, a).is_none());
+    }
+
+    // ── GL1: pixels over a bright backdrop ──
+
+    #[test]
+    fn a_translucent_client_over_the_frosted_field_shows_the_field_through_its_tint() {
+        // The proof rule verbatim: a bright backdrop behind the probe, and the pixels of
+        // the probe read against it. The "client" is a buffer painting the shell's own
+        // tint (`--hart-glass-rgb` 18,19,28 at `--hart-panel-opacity` 0.65, the numbers
+        // theme_service.py emits, liquid_ui_service's `.glass`) with nothing else, so
+        // what is read back is tint over whatever the compositor put beneath it.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (320, 200).into();
+        let (w, h) = (320usize, 200usize);
+        let pal = bright();
+        let look = GlassLook::default();
+        let mut cache = BloomCache::default();
+        cache.begin_frame();
+        let win: Rectangle<i32, Physical> = Rectangle::new((40, 30).into(), (200, 120).into());
+        let frosted = frosted_field_rgba(size.w, size.h, &pal, look);
+        let field = crate::bloom::compose(size.w, size.h, &pal);
+
+        let tint = [18u8, 19, 28];
+        let opacity = 0.65f32;
+        let client = MemoryRenderBuffer::from_slice(
+            &tinted_strip_rgba(200, 120, 0, tint, opacity),
+            Fourcc::Argb8888,
+            (200, 120),
+            1,
+            Transform::Normal,
+            None,
+        );
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        elements.push(memory_element(&mut renderer, &client, (40, 30), 1.0, None));
+        let crop = cache
+            .frosted_crop(size.w, size.h, pal, None, look, win)
+            .expect("the crop under the window")
+            .clone();
+        elements.push(memory_element(&mut renderer, &crop, (40, 30), 1.0, None));
+        let bloom = cache.get(size.w, size.h, pal, None).expect("the field").clone();
+        elements.push(memory_element(&mut renderer, &bloom, (0, 0), 1.0, None));
+        let bytes = composite_to_bytes(&mut renderer, size, &elements);
+
+        // Inside the window: tint over the FROSTED field, within blending rounding.
+        let mut worst = 0i32;
+        for y in 30..150usize {
+            for x in 40..240usize {
+                let got = px(&bytes, w, x, y);
+                let under = px(&frosted, w, x, y);
+                assert_eq!(got[3], 255, "opaque at ({x},{y})");
+                let want = |c: usize| {
+                    // Bytes are B,G,R; the tint is R,G,B.
+                    let t = tint[2 - c] as f32;
+                    (t * opacity + under[c] as f32 * (1.0 - opacity)).round() as i32
+                };
+                for c in 0..3 {
+                    worst = worst.max((got[c] as i32 - want(c)).abs());
+                }
+            }
+        }
+        assert!(worst <= 3, "the window is the shell's tint over the frosted field (worst channel error {worst})");
+        // See-through: two points of the window over different field colours read
+        // differently. A slab would read the same everywhere.
+        let p1 = px(&bytes, w, 60, 50);
+        let p2 = px(&bytes, w, 220, 140);
+        assert_ne!(p1, p2, "the field shows through the tint");
+        // Outside the window: the sharp field, untouched.
+        for (x, y) in [(5usize, 5usize), (300, 190), (20, 100)] {
+            let got = px(&bytes, w, x, y);
+            let raw = px(&field, w, x, y);
+            for c in 0..3 {
+                assert!((got[c] as i32 - raw[c] as i32).abs() <= 1, "outside the window at ({x},{y}) is the field");
+            }
+        }
+        let _ = h;
     }
 
     // ── the damage-race probe (S2, COMPOSITOR_PLAN C2) ──
