@@ -582,6 +582,12 @@ class ResourceGovernor:
         self._gpu_allowed: bool = False
         self._last_user_activity: float = time.monotonic()
         self._idle_threshold_seconds: float = idle_threshold_seconds
+        # The monitor's last sampled answer to "is a person at the desk",
+        # None until the monitor has sampled once. user_present() reads it;
+        # the yield gate asks. Kept apart from _mode on purpose: MODE_ACTIVE
+        # is also the constructor default and also what external load
+        # produces, so "mode == ACTIVE" cannot mean "someone is here".
+        self._last_user_idle: Optional[bool] = None
 
         # Threading
         self._proactive_thread: Optional[threading.Thread] = None
@@ -786,6 +792,35 @@ class ResourceGovernor:
         """Current mode: 'active', 'idle', or 'sleep'."""
         return self._mode
 
+    def user_present(self) -> bool:
+        """True when the LIVE monitor last saw a person at the desk.
+
+        This is the signal the yield gate (dispatch.should_yield_to_user)
+        reads, and it is deliberately not derived from get_throttle() or
+        get_mode():
+
+        * get_throttle() in ACTIVE mode returns ACTIVE_CPU_LIMIT, which is
+          0.50 by default ("at keyboard: usable"), above the gate's 0.3
+          floor. So the gate's 'governor_throttle' reason has NOT fired for
+          a person at the desk since that default was raised; measured on
+          the Samsung box 2026-09-24 on generation 11: this governor logged
+          idle -> active at 22:37:26 and held ACTIVE for seven minutes of
+          continuous input, and the in-process agent daemon kept ticking a
+          278-token llama call every minute through all of it, package at
+          94 C, clock 1.1 GHz, press latency p50 600-1500 ms.
+        * get_mode() == MODE_ACTIVE is also the constructor default and
+          also what foreign CPU load produces, so a governor that was never
+          started would read as "person present" forever and silently
+          stall every daemon (the false-healthy class).
+
+        So: False unless the monitor thread is alive AND its last sample
+        said not idle. A process with no monitor gets the old behaviour.
+        """
+        t = self._monitor_thread
+        if not self._running or t is None or not t.is_alive():
+            return False
+        return self._last_user_idle is False
+
     def get_throttle(self) -> float:
         """Current throttle factor 0.0 (full stop) to 1.0 (unlimited).
 
@@ -942,6 +977,7 @@ class ResourceGovernor:
                 self._refresh_cpu_attribution()
                 mem = self._get_memory_pressure()
                 user_idle = self._detect_user_idle()
+                self._last_user_idle = user_idle
                 battery_level, on_battery = self._get_battery_status()
                 ext_cpu = self._cached_external_cpu
 
@@ -1496,7 +1532,10 @@ class ResourceGovernor:
     def _calculate_throttle(self) -> float:
         """Combine all signals into a single throttle factor 0.0 - 1.0.
 
-        ACTIVE mode:  0.05 — bare minimum for event processing
+        ACTIVE mode:  ACTIVE_CPU_LIMIT (0.50 by default; HEVOLVE_ACTIVE_CPU_LIMIT)
+                      NOTE this is ABOVE the yield gate's 0.3 floor, so the
+                      gate does not learn "person at the desk" from here;
+                      it asks user_present() for that.
         IDLE + low CPU: 1.0 — full speed
         IDLE + moderate CPU: 0.5
         SLEEP: 0.0 — suspend everything
@@ -1508,7 +1547,7 @@ class ResourceGovernor:
             return 0.0
 
         if mode == MODE_ACTIVE:
-            return ACTIVE_CPU_LIMIT  # 0.05
+            return ACTIVE_CPU_LIMIT  # 0.50 by default, see the docstring
 
         # IDLE mode — scale based on current resource usage.  Use EXTERNAL
         # cpu (total - HARTOS's own tree): scaling on total here would make

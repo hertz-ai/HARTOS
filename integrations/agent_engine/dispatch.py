@@ -742,6 +742,19 @@ def should_yield_to_user() -> bool:
 
     1. ``is_user_recently_active()`` — user chatted in the last 10
        minutes or a CREATE pipeline is running.
+    1b. ``ResourceGovernor.user_present()`` — a person is AT THE DESK:
+       the governor's live monitor last read the OS idle probe (the
+       compositor's input-alive heartbeat on HART OS, GetLastInputInfo
+       on Windows, IOHIDSystem on macOS) as not idle. Chatting is not
+       the only way to be present; clicking around the desktop is the
+       common one, and it was invisible here until 2026-09-24. Reason
+       #3 was supposed to cover it (ACTIVE mode -> throttle 0.05) but
+       ACTIVE_CPU_LIMIT has been 0.50 by default, above the 0.3 floor,
+       so it never fired for presence. Measured on generation 11 of the
+       Samsung box: llama calls once a minute through seven minutes of
+       continuous input, 94 C, 1.1 GHz, press p50 600-1500 ms. A governor
+       with no live monitor answers False, so a process that never
+       started one keeps the old behaviour instead of stalling.
     2. ``model_lifecycle.get_system_pressure().throttle_factor < 0.1``
        — VRAM/CPU pressure is so high the LLM throttle factor has
        collapsed; running another LLM call would saturate the
@@ -791,6 +804,16 @@ def should_yield_to_user() -> bool:
         except Exception:
             pass
     # Reason #2 — LLM throttle collapsed under VRAM/CPU pressure.
+    if reason is None:
+        try:
+            from core.resource_governor import get_governor
+            _present = getattr(get_governor(), 'user_present', None)
+            # `is True`, not truthiness: a fake governor in a test is often a
+            # MagicMock, whose every attribute call is truthy.
+            if callable(_present) and _present() is True:
+                reason = 'user_present'
+        except Exception:
+            pass
     if reason is None:
         try:
             from integrations.service_tools.model_lifecycle import (
