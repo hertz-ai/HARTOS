@@ -205,7 +205,24 @@ jobs:
           # patch-time. Tracked non-blocking.
           set -eo pipefail
           # Deterministic file sharding — sorted, then round-robin.
-          mapfile -t ALL < <(find tests/unit tests/functional -name 'test_*.py' | sort)
+          #
+          # THE ROOT OF tests/ IS GATED TOO (2026-09-24). 70 test_*.py files
+          # sat directly under tests/ (the social phases 7 to 9, the mailing
+          # list, the supervisors, the security modules, the goal consent
+          # gate, 963 tests) and this find never looked there, so they ran in
+          # no CI job at all. Running every one of them per file on the dev
+          # box found eight red, all stale in the way an ungated test goes
+          # stale: helpers shadowed, dates hard-coded, a gate the code grew
+          # that the test never learned about. Each is fixed or given a
+          # documented skip in the same change. -maxdepth 1 keeps the root
+          # pass to the root: integration/ and e2e/ stay best-effort below,
+          # and standalone/ is conftest-excluded by design (live-server
+          # proof scripts with module-level sys.exit, run by hand and cited
+          # in VERIFICATION.md). tests/meta (the DRY audit) and tests/probes
+          # (the OS pillar proofs) are gated with the same line for the same
+          # reason: both were green and both were being run by nobody.
+          mapfile -t ALL < <({ find tests -maxdepth 1 -name 'test_*.py'; \
+                               find tests/unit tests/functional tests/meta tests/probes -name 'test_*.py'; } | sort)
           TOTAL=${#ALL[@]}
           echo "discovered $TOTAL test files"
           if [[ "$TOTAL" -eq 0 ]]; then

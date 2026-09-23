@@ -111,8 +111,14 @@ def test_explain_decision_function_source(tool):
 def test_explain_decision_fuzzy_prefix_match(tool):
     """Partial topic names should match (e.g. 'draft' → 'draft_gate')."""
     result = tool.explain_decision('draft')
-    # Either exact miss or prefix-matched to draft_gate
-    assert result.get('topic') == 'draft_gate' or 'Unknown decision topic' in result.get('summary', '')
+    # The prefix must resolve to draft_gate. When its module imports, the
+    # envelope names the topic; when `llama.llama_config` is not importable
+    # (this repo does not ship it, so CI never can), the ImportError envelope
+    # carries no topic but still names THAT module, which only the draft_gate
+    # entry has. Either way the fuzzy match is proven to have landed; an
+    # "Unknown decision topic" answer would mean it did not.
+    assert (result.get('topic') == 'draft_gate'
+            or 'llama.llama_config' in result.get('summary', '')), result
 
 
 # ── Graceful degradation ──────────────────────────────────────────

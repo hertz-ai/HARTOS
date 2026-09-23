@@ -54,7 +54,19 @@ def test_bad_port_falls_back_to_8000(monkeypatch):
 
 # -- supervisor_should_run opt-out gating ------------------------------
 
+def _brain_is_installed(monkeypatch):
+    """supervisor_should_run grew two availability gates after these tests
+    were written (hevolveai importable, the child can import torch), so on a
+    box without the brain the "default true" contract read as red for a
+    reason unrelated to the opt-out logic under test. tests/unit/
+    test_hevolveai_supervisor_fastfail.py owns those gates; here they are
+    held open so the opt-out gating is what decides."""
+    monkeypatch.setattr(_sup, "_hevolveai_available", lambda: True)
+    monkeypatch.setattr(_sup, "_child_can_import_torch", lambda: True)
+
+
 def test_should_run_default_true(monkeypatch):
+    _brain_is_installed(monkeypatch)
     monkeypatch.delenv("HEVOLVE_SKIP_HEVOLVEAI_SPAWN", raising=False)
     monkeypatch.delenv("HEVOLVEAI_API_URL", raising=False)
     assert _sup.supervisor_should_run() is True
@@ -73,6 +85,7 @@ def test_should_run_false_for_remote_url(monkeypatch):
 
 
 def test_should_run_true_for_localhost_url(monkeypatch):
+    _brain_is_installed(monkeypatch)
     monkeypatch.delenv("HEVOLVE_SKIP_HEVOLVEAI_SPAWN", raising=False)
     monkeypatch.setenv("HEVOLVEAI_API_URL", "http://127.0.0.1:8000")
     assert _sup.supervisor_should_run() is True
