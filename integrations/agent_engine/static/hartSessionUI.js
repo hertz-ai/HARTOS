@@ -98,11 +98,44 @@
       : (window.HartLock.hasPassword() ? '' : 'No password set - press Enter to enter');
     var pw = $('lock-pw');
     if (pw) { pw.value = ''; pw.placeholder = setup ? 'New password' : 'Password'; }
+    // The setup prompt must be DECLINABLE by a mouse-only user: a visible
+    // "Not now" beside the status line (Escape is the keyboard equivalent).
+    // Only an explicit decline records lock_setup_skipped; see maybeSetup().
+    var skip = $('lock-skip');
+    if (!skip && setup) {
+      skip = document.createElement('button');
+      skip.type = 'button';
+      skip.id = 'lock-skip';
+      skip.className = 'ds-btn ds-btn-text lock-skip';
+      skip.textContent = 'Not now';
+      skip.addEventListener('click', declineSetup);
+      if (st && st.parentNode) st.parentNode.insertBefore(skip, st.nextSibling);
+      else ls.appendChild(skip);
+    }
+    if (skip) skip.style.display = setup ? '' : 'none';
     ls.classList.add('active');
     if (pw) setTimeout(function () { pw.focus(); }, 50);
   }
   window.HartLock.show = function () { showLock(false); };
   window.HartLock.promptSetup = function () { showLock(true); };
+
+  // An explicit decline of the first-run setup: the ONE place the skipped flag
+  // is written. Being offered the prompt writes nothing (the 2026-09-22 defect:
+  // one offer used to hide the prompt forever, answered or not).
+  function declineSetup() {
+    var ls = $('lock-screen');
+    if (!ls || !ls.classList.contains('setup')) return;
+    if (window.HartSession) window.HartSession.set('lock_setup_skipped', true);
+    ls.classList.remove('setup', 'active');
+  }
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' && e.key !== 'Esc') return;
+    var ls = $('lock-screen');
+    if (ls && ls.classList.contains('setup') && ls.classList.contains('active')) {
+      e.preventDefault();
+      declineSetup();
+    }
+  });
 
   function onEnter() {
     var ls = $('lock-screen'), pw = $('lock-pw'), st = $('lock-status');
@@ -177,9 +210,13 @@
       var bootPw = $('lock-pw');
       if (bootPw) setTimeout(function () { try { bootPw.focus(); } catch (e) { console.debug('hartSessionUI: lock password focus failed', e); } }, 60);
     }
-    // First-run: if onboarding is already done but no lock password exists yet,
-    // offer to set one. hartOnboarding.js removes .onboarding-active when it
-    // finishes; we wait for that, then prompt once.
+    // First-run: if onboarding is done but no lock password exists yet, offer to
+    // set one. Offered at most ONCE per session ('prompted'), and the offer
+    // itself writes nothing: only declineSetup() records lock_setup_skipped, so
+    // an offer nobody answered is made again next boot instead of vanishing.
+    // (Before 2026-09-23 the flag was written the moment the prompt was
+    // OFFERED, and the check ran exactly once, 4 s after the session loaded,
+    // so a user still inside onboarding at that moment was never asked.)
     var prompted = false;
     function maybeSetup() {
       if (prompted) return;
@@ -187,11 +224,21 @@
       if (!onboarding && window.HartSession && !window.HartLock.hasPassword()
           && !window.HartSession.get('lock_setup_skipped')) {
         prompted = true;
-        if (window.HartSession) window.HartSession.set('lock_setup_skipped', true);
         window.HartLock.promptSetup();
       }
     }
     if (window.HartSession) window.HartSession.ready(function () { setTimeout(maybeSetup, 4000); });
+    // Re-check when onboarding ENDS. hartOnboarding.js removes .onboarding-active
+    // from <html> both when the ceremony finishes and on its Esc hatch (which
+    // does not mark the user onboarded), so the class change is the one signal
+    // that covers both. Observed, never polled.
+    try {
+      if (typeof MutationObserver !== 'undefined') {
+        new MutationObserver(function () {
+          if (!document.documentElement.classList.contains('onboarding-active')) maybeSetup();
+        }).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+      }
+    } catch (e) { console.debug('hartSessionUI: onboarding-end observer unavailable', e); }
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
