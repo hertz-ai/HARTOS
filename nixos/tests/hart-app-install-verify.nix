@@ -143,15 +143,30 @@ print("RESULT snap " + ("refused" if snap_ok else "FAILED"))
 if not snap_ok:
     fails.append("snap")
 
-# missing tool: empty PATH -> graceful honest failure, never an exception
+# missing tool: the tool is ABSENT -> graceful honest failure, never an exception.
+#
+# Emptying PATH stopped simulating that on 2026-09-07 (f0969ec): the installer
+# now builds its subprocess PATH from core.subprocess_safe.system_search_path(),
+# which appends /run/current-system/sw/bin whenever that directory exists, so
+# on a NixOS node an empty PATH still finds nix-env and the arm ran a REAL
+# `nix-env -iA hello` instead. First seen on the first fleet run in six weeks
+# (run 35911836772, shard 2): "RESULT missing-tool FAILED" with no reason,
+# because this arm never printed one. Hold the search path empty too, which is
+# what a node without the tool looks like to the installer, and print the
+# error so the next failure names itself.
+import core.subprocess_safe as _ss
 saved = os.environ["PATH"]
+saved_search = _ss.system_search_path
 os.environ["PATH"] = ""
+_ss.system_search_path = lambda base=None: ""
 try:
     res = inst._install_nix(InstallRequest(source="nixpkgs.hello"))
 finally:
     os.environ["PATH"] = saved
+    _ss.system_search_path = saved_search
 graceful = (not res.success) and ("not available" in res.error.lower())
-print("RESULT missing-tool " + ("graceful" if graceful else "FAILED"))
+print("RESULT missing-tool " + ("graceful" if graceful else "FAILED")
+      + " (success=%r error=%r)" % (res.success, (res.error or "")[:160]))
 if not graceful:
     fails.append("missing-tool")
 
