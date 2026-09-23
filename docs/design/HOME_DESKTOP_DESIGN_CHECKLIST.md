@@ -877,3 +877,25 @@ rather than a rung the screen would not support.
 **Still not done here**: the companion is a pywebview window, so it cannot
 take this rung as it is built today; reaching the steward's eyes needs the
 companion created as a composition host instead of by `webview.create_window`.
+
+## 2026-09-24 - The shell hot-path diet: idle motion pauses, the orb keeps breathing
+
+Stream S6 of `docs/architecture/NATIVE_OS_PROGRAM.md`. Measured on the box
+2026-09-22: the idle shell issued about 18 GETs per 5 s from four pollers in
+every document, and the WebKit main thread spent its frame clock on pulses
+nobody was watching. Read-only on the box 2026-09-24 before this landed:
+WebKitWebProcess at 1.5 percent of a core over 10 s, because the served
+webkit-flat gate already carries `lg-pulse`; the rows below make that true on
+every rung and keep it true.
+
+Rules honoured: c2 / c8 (the orb breathes, default ON) are untouched; only the
+chrome's decorative pulses pause. i3 (instant paint, no network on the hot
+path, no continuous timers) is extended to the whole shell. GF1 (the software
+floor degrades gracefully) keeps its gate unchanged.
+
+| Item | Rule | Refines | Status | Evidence |
+|---|---|---|---|---|
+| S6-1 | The decorative pulses that are NOT the orb (the senses eye `lg-pulse`, the hero live dot, the send-button glow, the skeleton shimmer) pause under `html[data-idle="1"]`, the visibility engine's own 6 s idle stamp, on every rung. Only the play state changes: colour stays, motion resumes on the first input. | c2/c8, i3, GF1 | **APPLIED** | idle rule in `liquid_ui_service.py`; `tests/unit/test_liquid_ui_idle_motion_gate.py` now enumerates every infinite animation in every served stylesheet (inline, hartHome.css, hartResponsive.css, the JS-injected CSS) and fails on one that neither pauses at idle nor sits in a keep-list with a reason (the orb family, the state-driven cues). |
+| S6-2 | The idle shell issues no HTTP: metrics, senses, connectivity and agent status are pushed on the one SSE stream from the readers the server already runs; a 30 s fallback poll runs only while the stream is down; an iframed shell never polls; the two clocks write the DOM only when their text changes. | i3 | **APPLIED** | `tests/unit/test_shell_idle_http_budget.py` (a poller under 30 s, or one not gated on the stream, fails), `test_shell_poll_diet.mjs`, `test_shell_state_push.py`. On-box figure after the next OTA is the N2 line: under 1 GET per 10 s per document. |
+| S6-3 | Every floating sheet (context menu, quick settings, senses proof, start menu) closes through one dismissal set, including window blur, so a press on another surface or inside an iframe closes it. | f (interaction: taps register where they land) | **APPLIED** | `hartDismiss.js`, `tests/unit/test_shell_dismiss_sheets.mjs`. |
+| S6-4 | The first-run password prompt records a decline, never an offer, and re-checks when onboarding ends (finish or the Esc hatch), so nobody is silently never asked. | h (onboarding) | **APPLIED** | `hartSessionUI.js`, `tests/unit/test_shell_password_prompt.mjs`. |

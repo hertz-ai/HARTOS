@@ -3718,7 +3718,7 @@ html.a11y-rmotion .hart-hero-orbwrap[data-orb-state="listening"]::after{animatio
 .hart-senses.dragging .hart-senses-grip{cursor:grabbing;opacity:1;color:var(--hart-text);background:rgba(255,255,255,0.06)}
 /* EYE — deterministic 3-state (was only .off red) */
 .hart-senses-btn.is-sensing{background:rgba(var(--lg-vision-rgb),.16);border-color:rgb(var(--lg-vision-rgb));box-shadow:var(--lg-ring-vision)}
-.hart-senses-btn.is-sensing .mi{color:rgb(var(--lg-vision-rgb));animation:lg-pulse 2.4s var(--lg-breathe) infinite}
+.hart-senses-btn.is-sensing .mi{color:rgb(var(--lg-vision-rgb));animation:lg-pulse 2.4s var(--lg-breathe) infinite;animation-play-state:var(--hart-motion-detail,running)}
 .hart-senses-btn.off{background:rgba(var(--lg-blind-rgb),.20);border-color:rgb(var(--lg-blind-rgb))}
 .hart-senses-btn.off .mi{color:rgb(var(--lg-blind-rgb))}
 /* MIC — listening cyan (supersede the legacy red .hart-senses-mic.listening :1343) */
@@ -3744,6 +3744,19 @@ html[data-busy="1"] .hart-hero-chips,html[data-panels="1"] .hart-hero-chips,html
 /* Sensory pod: SAFETY control — dims when idle, NEVER hides; full while sensing/voice */
 .hart-senses{transition:opacity var(--t-reveal) var(--lg-glide)}
 html[data-idle="1"] .hart-senses{opacity:.55}
+/* IDLE MOTION (the shell hot-path diet, 2026-09-24). The same engine stamps
+   data-idle after 6 s without input. The decorative pulses that are NOT the
+   orb's breathing (checklist c2/c8: the orb breathes, default ON; the chrome
+   around it does not) pause while nobody is at the desk, on EVERY rung: the
+   senses eye, the hero live dot, the send-button glow and the skeleton
+   shimmer. Only the play state changes, so each signal keeps its colour and
+   resumes on the first input. webkit-flat already stops them by selector;
+   this is the GPU rung's idle frame clock. test_liquid_ui_idle_motion_gate
+   enumerates every infinite animation the shell serves against this rule. */
+html[data-idle="1"] .hart-senses-btn.is-sensing .mi,
+html[data-idle="1"] .hart-hero-hevolve .dot,
+html[data-idle="1"] .hart-hero-go,
+html[data-idle="1"] .ds-skeleton{animation-play-state:paused}
 html[data-voice="1"] .hart-senses,html[data-blind="1"] .hart-senses{opacity:1}
 /* Pager: hidden only on a pristine, empty desktop; reveals as soon as the virtual-
    desktop feature is USABLE — any window is open OR you've navigated off desktop 1
