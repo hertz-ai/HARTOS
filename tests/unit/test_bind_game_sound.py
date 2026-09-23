@@ -1058,3 +1058,26 @@ def test_a_composer_that_cannot_start_is_waited_for_not_called_a_refusal():
                .get('eng-01') or {}).get('sounds') or {})
     assert 'correct' not in sounds, (
         f'nothing was posted, yet something was remembered: {sounds!r}')
+
+
+def test_a_verdict_lands_on_every_state_the_card_can_name():
+    """hartos-3a F5: 7 of 14 states are camelCase; the endpoint lowercased
+    the action, so 'starEarned' became 'starearned' and the verdict never
+    landed.  The card's action round-trips through the one producer and the
+    one parser with its case intact, and record_verdict applies for EVERY
+    state."""
+    from core.game_sound_memo import (
+        GAME_STATES, game_sound_action, parse_game_sound_action, record_verdict)
+    for state in GAME_STATES:
+        games = {'eng-01': {'sounds': {state: {'url': '/api/voice/audio/x.wav'}}}}
+        game_id, parsed = parse_game_sound_action(game_sound_action('eng-01', state))
+        assert (game_id, parsed) == ('eng-01', state)
+        record, matched, _key = record_verdict(games, game_id, parsed, True)
+        assert record.get('approved_at'), f'the verdict did not land on {state!r}'
+
+
+def test_the_action_prefix_is_matched_without_case_but_the_state_is_not():
+    from core.game_sound_memo import parse_game_sound_action
+    assert parse_game_sound_action('GAME_SOUND:eng-01:starEarned') == ('eng-01', 'starEarned')
+    assert parse_game_sound_action('game_sound:eng-01') == ('eng-01', 'bgm')
+    assert parse_game_sound_action('camera:on') is None

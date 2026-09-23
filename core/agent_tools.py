@@ -977,6 +977,7 @@ from core.game_sound_memo import (  # noqa: E402
     GAME_STATE_DURATIONS,
     GAME_STATES,
     game_state_key,
+    game_sound_action,
     game_state_match,
     game_state_record,
     game_state_sound,
@@ -1046,7 +1047,7 @@ def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
             shown = bool(service.agent_ui_update(user_id, {
                 'type': 'approval',
                 'agent_id': str(prompt_id),
-                'action': f'game_sound:{game_id}:{state}',
+                'action': game_sound_action(game_id, state),
                 'description': (
                     f"New {state} sound for {game_id}. Have a listen: keep "
                     f"it, or say what is wrong and I will compose another."

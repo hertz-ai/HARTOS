@@ -177,6 +177,34 @@ def set_game_state_sound(games, game_id, state, record, level=None, user_id=None
     return record
 
 
+#: What a reviewer's card names a game sound by.  agent_tools builds it with
+#: game_sound_action and the approval endpoint reads it with
+#: parse_game_sound_action -- one producer, one reader.
+GAME_SOUND_ACTION = 'game_sound:'
+
+
+def game_sound_action(game_id, state):
+    """The action a reviewer's card carries for this game's state."""
+    return f'{GAME_SOUND_ACTION}{game_id}:{state}'
+
+
+def parse_game_sound_action(action):
+    """(game_id, state) from a card's action, CASE KEPT, or None.
+
+    States are camelCase ('starEarned', 'countdownTick') and memo keys are
+    exact.  The approval endpoint lowercased the action before parsing it,
+    so a verdict on 7 of the 14 states matched nothing and never landed
+    (hartos-3a F5, CONFIRMED).  Only the prefix is compared without case.
+    """
+    text = str(action or '').strip()
+    if not text.lower().startswith(GAME_SOUND_ACTION):
+        return None
+    parts = text.split(':')
+    game_id = parts[1] if len(parts) > 1 else ''
+    state = parts[2] if len(parts) > 2 and parts[2] else 'bgm'
+    return game_id, state
+
+
 def record_verdict(games, game_id, state, approved, reason='',
                    level=None, user_id=None):
     """Mark the memo a reviewer just judged, and say which one it was.

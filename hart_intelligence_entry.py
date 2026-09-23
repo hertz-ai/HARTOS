@@ -11139,7 +11139,10 @@ def agent_approval():
     try:
         data = request.get_json(silent=True) or {}
         agent_id = data.get('agent_id', '')
-        action = str(data.get('action', '')).strip().lower()
+        # kept as sent as well: a game sound's state is camelCase and its
+        # memo key exact (hartos-3a F5)
+        action_raw = str(data.get('action', '')).strip()
+        action = action_raw.lower()
         decision = str(data.get('decision', '')).strip().lower()
         if decision not in ('approve', 'approved', 'allow', 'yes', 'deny', 'denied', 'no'):
             return jsonify({'status': 'error', 'reason': 'invalid decision'}), 400
@@ -11174,9 +11177,8 @@ def agent_approval():
             # {'type':'consent', 'decision':'denied'} on the VISION topic
             # for a piece of music -- wrong noun, wrong topic -- while the
             # memo kept serving the take they had just refused.
-            parts = str(action).split(':')
-            sound_game = parts[1] if len(parts) > 1 else ''
-            sound_state = parts[2] if len(parts) > 2 else 'bgm'
+            from core.game_sound_memo import parse_game_sound_action
+            sound_game, sound_state = parse_game_sound_action(action_raw)
             reason = str(data.get('reason') or data.get('note') or '').strip()
             try:
                 from core.game_sound_memo import record_verdict
@@ -11234,9 +11236,8 @@ def agent_approval():
         # from here and from the agent's own tool, so there is one
         # implementation rather than two.
         if str(action or '').startswith('game_sound:'):
-            parts = str(action).split(':')
-            sound_game = parts[1] if len(parts) > 1 else ''
-            sound_state = parts[2] if len(parts) > 2 else 'bgm'
+            from core.game_sound_memo import parse_game_sound_action
+            sound_game, sound_state = parse_game_sound_action(action_raw)
             try:
                 from core.game_sound_memo import record_verdict
                 from hartos.helper import (
