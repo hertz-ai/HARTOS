@@ -13544,8 +13544,23 @@ def _serve_app(app, host: str, port: int) -> None:
         log.warning(
             f"Hypercorn unavailable ({exc}) — falling back to Waitress")
 
-    log.info(f"Starting Waitress (WSGI) on {host}:{port} (threads=50)")
-    serve(app, host=host, port=port, threads=50)
+    # The variant thread budget applies HERE too. hart-backend.nix exports
+    # HEVOLVE_WORKER_THREADS as each variant's budget and says that export is what
+    # keeps ExecStart safe against TasksMax; hart-app ships no hypercorn, so every
+    # OS node takes this path, and a hard-coded 50 (plus the import threads) is
+    # more than edge's TasksMax=64. Measured in CI 2026-09-24 (nixosTests
+    # hart-peer-discovery): the edge backend died five times with "can't start
+    # new thread" and "fork rejected by pids controller", then hit its start
+    # limit. Unset (dev box, the Nunba bundle) keeps the old 50, unchanged.
+    raw_budget = os.environ.get('HEVOLVE_WORKER_THREADS')
+    try:
+        waitress_threads = int(raw_budget) if raw_budget else 50
+    except ValueError:
+        waitress_threads = 50
+    if waitress_threads < 1:
+        waitress_threads = 1
+    log.info(f"Starting Waitress (WSGI) on {host}:{port} (threads={waitress_threads})")
+    serve(app, host=host, port=port, threads=waitress_threads)
 
 
 if __name__ == '__main__':
