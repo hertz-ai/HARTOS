@@ -4108,6 +4108,12 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script defer src="/shell/static/lottie.min.js"></script>
 <script defer src="/shell/static/hartBootSplash.js"></script>
 <script defer src="/shell/static/hartSession.js"></script>
+<!-- ONE dismissal set for every floating sheet (outside press / Escape / scroll /
+     resize / window blur, the last being what fires when a press lands in an
+     iframe or on another surface). Loaded before every sheet that arms it:
+     the start menu (inline), hartSenses.js, hartConnectivity.js and the
+     dynamically injected hartContextMenu.js. -->
+<script defer src="/shell/static/hartDismiss.js"></script>
 <script defer src="/shell/static/hartOSBridge.js"></script>
 <script defer src="/shell/static/voiceOrbViz.js"></script>
 <script defer src="/shell/static/hartHero.js"></script>
@@ -4449,12 +4455,6 @@ function dsSlider(opts) {{
   const unit = opts.unit || '';
   const oninput = opts.oninput || '';
   let html = '<div class="ds-flex ds-gap-3" style="align-items:center">';
-<!-- ONE dismissal set for every floating sheet (outside press / Escape / scroll /
-     resize / window blur, the last being what fires when a press lands in an
-     iframe or on another surface). Loaded before every sheet that arms it:
-     the start menu (inline), hartSenses.js, hartConnectivity.js and the
-     dynamically injected hartContextMenu.js. -->
-<script defer src="/shell/static/hartDismiss.js"></script>
   if(label) html += '<span class="ds-label-sm ds-text-muted" style="min-width:80px">'+label+'</span>';
   html += '<input type="range" class="ds-slider" min="'+min+'" max="'+max+'" value="'+value+'"'+
     (id?' id="'+id+'"':'')+
@@ -4873,6 +4873,12 @@ function buildStartMenu() {{
 }}
 try {{ buildStartMenu(); }} catch(e) {{ console.error('[HART] buildStartMenu:', e); }}
 
+// The start menu closes through the shell's ONE dismissal set (hartDismiss.js):
+// outside press, Escape, scroll, resize and window blur. The old closer was a
+// bubbling click on this document, so a press on another surface or inside an
+// iframed panel (neither reaches this document) left the menu open on the box
+// (2026-09-22). The start button is inside the set so its click stays ONE toggle.
+let _startDisarm = null;
 function toggleStartMenu() {{
   const m = document.getElementById('start-menu');
   startOpen = !startOpen;
@@ -5221,12 +5227,6 @@ function _dragFrame() {{
   if(!d) return;
   d.raf = 0;
   const p = panels[d.id];
-// The start menu closes through the shell's ONE dismissal set (hartDismiss.js):
-// outside press, Escape, scroll, resize and window blur. The old closer was a
-// bubbling click on this document, so a press on another surface or inside an
-// iframed panel (neither reaches this document) left the menu open on the box
-// (2026-09-22). The start button is inside the set so its click stays ONE toggle.
-let _startDisarm = null;
   if(!p) return;
   if(d.mode==='move') {{
     // GPU-composited move — translate only, no layout. left/top commit on drop.
