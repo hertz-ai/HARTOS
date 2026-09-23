@@ -989,6 +989,10 @@ fn device_added(
         let wl_mode = WlMode::from(mode);
         output.set_preferred(wl_mode);
         output.change_current_state(Some(wl_mode), Some(Transform::Normal), None, Some((0, 0).into()));
+        // The refresh period is what "this flip missed its vblank" is measured against
+        // in the frame-time instrument; tell it the mode actually set rather than
+        // letting it assume 60 Hz.
+        crate::latency::on_output_refresh_mhz(wl_mode.refresh.max(0) as u64);
         // Swap the State's output to the real one (Stage A drives a single display).
         state.space.unmap_output(&state.output);
         state.space.map_output(&output, (0, 0));
@@ -1230,9 +1234,21 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
                 // photon side of every input bound to the frame it completes.
                 // Summaries surface once per 10s window; the journal line is
                 // the harness §3 contract, greppable as `hart-latency`.
-                let (summaries, drops) = crate::latency::on_frame_presented();
+                let (summaries, drops, frames) = crate::latency::on_frame_presented();
                 for s in summaries {
                     info!("{}", s.journal_line());
+                }
+                // The frame-time summary for the same 10 s window: the compositor's
+                // own p50/p99/max against the 16.6 ms budget, the count over it, and
+                // the flips that missed their vblank. A FAIL is a `warn!` for the
+                // same reason the drop record is: a window that broke the frame
+                // budget should not read like one that kept it.
+                if let Some(f) = frames {
+                    if f.pass {
+                        info!("{}", f.journal_line());
+                    } else {
+                        warn!("{}", f.journal_line());
+                    }
                 }
                 // Rare by construction: the instrument only refuses samples when
                 // vblanks stop being reaped or frames stop being queued, which are
@@ -1767,8 +1783,15 @@ where
                         // even though presentation is proven only at the
                         // vblank: the batch rides FIFO and is measured against
                         // the flip that actually completes (harness M0).
+                        //
+                        // And the frame TIME: `now` was read at the top of
+                        // render_all, before build_frame_elements, so this is
+                        // build + composite + the queue ioctl, the compositor's
+                        // own cost per frame, which is what the 16.6 ms budget
+                        // bounds. The flip's own wait is measured separately, at
+                        // the vblank, as the dropped-frame count.
                         note_render_pass(false);
-                        crate::latency::on_frame_queued();
+                        crate::latency::on_frame_queued(now.elapsed().as_micros() as u64);
                         // `last_flip_at` and `publish_native_chrome()` USED TO BE HERE
                         // and have moved to `reap_completed_vblanks`, because this Ok
                         // does NOT mean the frame reached the screen. smithay's
