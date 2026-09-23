@@ -344,6 +344,143 @@ impl MapAnim {
 pub struct BloomCache {
     key: Option<(i32, i32, crate::bloom::BloomPalette)>,
     buffer: Option<MemoryRenderBuffer>,
+    /// The FROSTED twin of `buffer` (see `frosted_crop`): the same field, blurred and
+    /// saturated the way the shell's `.glass` backdrop-filter would have, composed once
+    /// per (size, palette, look) as bytes, then handed out as per-region crops. Same
+    /// compose-once contract as the field itself.
+    frosted_key: Option<(i32, i32, crate::bloom::BloomPalette, GlassLook)>,
+    frosted_rgba: Vec<u8>,
+    /// One buffer per region that currently sits on the frosted field, keyed by its
+    /// rect. A crop rather than the full buffer with a `src` window because a render
+    /// element's damage id IS its buffer's id: two crops of one buffer would share an id,
+    /// and the damage tracker would then see one element that moves every frame. Each
+    /// crop keeps its own id and its own commit, so a still window costs the tracker
+    /// nothing and a moved one costs one memcpy plus one texture upload, never a compose.
+    /// Stamped with the frame it was last used on; crops nothing has drawn for a while
+    /// are dropped at the next insert.
+    crops: std::collections::HashMap<(i32, i32, i32, i32), (MemoryRenderBuffer, u64)>,
+    frame: u64,
+}
+
+/// The two glass numbers the compositor CONSUMES, read from the same theme file
+/// theme_service.py emits them from: `shell.blur_radius` (`--hart-blur`) and
+/// `shell.saturation` (`--hart-saturation`). hartGlass.js, the one look definition
+/// (checklist GL3), names theme_service as the source of every glass number; this reads
+/// that source, not a copy of it.
+///
+/// Deliberately NOT here: `shell.glass_rgb` and `shell.panel_opacity`, the tint. The
+/// split checklist GL3 arrived at is that the look is the client's CSS and the one
+/// irreducibly platform question is "can this OS put the desktop behind my window so the
+/// page's blur has something to blur". On HART OS the compositor answers it by putting
+/// the FROSTED desktop behind a translucent client region; the client paints its own
+/// `--hart-glass-bg` over it, exactly as the shell's `.taskbar.glass` already does. So
+/// the tint never exists twice, and a theme that moves it moves it in one place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GlassLook {
+    /// `--hart-blur` in px. 0 means no blur (the frosted field IS the field).
+    pub blur_px: u16,
+    /// `--hart-saturation` in percent. 100 means untouched.
+    pub saturation_pct: u16,
+}
+
+impl Default for GlassLook {
+    /// theme_service.py's own fallbacks (`shell.get("blur_radius", 20)`,
+    /// `shell.get("saturation", 180)`), so a theme that omits them is pixel-identical to
+    /// the browser's rendering of the same omission.
+    fn default() -> Self {
+        GlassLook { blur_px: 20, saturation_pct: 180 }
+    }
+}
+
+impl GlassLook {
+    /// From the active theme file, each key None-tolerant and clamped: these cross a
+    /// process boundary as a file, and a blur of a million pixels would be a compose that
+    /// never finishes on the frame path.
+    pub fn from_file(file: &crate::bloom::SettingsFile) -> GlassLook {
+        let d = GlassLook::default();
+        GlassLook {
+            blur_px: file
+                .num("blur_radius")
+                .map(|b| b.clamp(0.0, 128.0).round() as u16)
+                .unwrap_or(d.blur_px),
+            saturation_pct: file
+                .num("saturation")
+                .map(|s| s.clamp(0.0, 400.0).round() as u16)
+                .unwrap_or(d.saturation_pct),
+        }
+    }
+
+    /// The downsample factor the blur becomes. A box blur of radius r is well approximated
+    /// by averaging over r-wide cells and interpolating between them, and the field is
+    /// smooth enough that the difference is invisible; what matters is that this costs
+    /// one compose, not a kernel pass per frame (bloom.rs's own contract).
+    fn downsample(&self) -> usize {
+        (self.blur_px as usize / 2).max(1)
+    }
+}
+
+/// The frosted field: `bloom::compose` at 1/`downsample` resolution (the blur), sampled
+/// back up bilinearly, with CSS `saturate()` applied per pixel. Rows of opaque Argb8888,
+/// the layout `MemoryRenderBuffer::from_slice` expects, the same as the field itself.
+///
+/// Why the blur is a downsample rather than a kernel: the field is resolution
+/// independent (`bloom::compose` places its blobs as fractions of the size), so composing
+/// it small IS averaging it, for free, and bilinear upsampling of a 1/10 field is a
+/// 10 px wide tent filter, which on a field with no edges reads as the 20 px Gaussian the
+/// shell asks for. A `look` of blur 0 and saturation 100 is the identity, which the
+/// proof below pins so nobody can mistake this for a tint.
+pub fn frosted_field_rgba(
+    width: i32,
+    height: i32,
+    pal: &crate::bloom::BloomPalette,
+    look: GlassLook,
+) -> Vec<u8> {
+    let w = width.max(1) as usize;
+    let h = height.max(1) as usize;
+    let s = look.downsample();
+    if s == 1 && look.saturation_pct == 100 {
+        return crate::bloom::compose(width, height, pal);
+    }
+    let lw = w.div_ceil(s).max(1);
+    let lh = h.div_ceil(s).max(1);
+    let low = crate::bloom::compose(lw as i32, lh as i32, pal);
+    let sat = look.saturation_pct as f32 / 100.0;
+    let mut out = vec![0u8; w * h * 4];
+    // Sample the low-res field at the centre of each output pixel, mapped into low-res
+    // pixel centres, clamped at the edges so the border never reads outside.
+    let at = |x: usize, y: usize| -> [f32; 3] {
+        let i = (y * lw + x) * 4;
+        [low[i] as f32, low[i + 1] as f32, low[i + 2] as f32]
+    };
+    for y in 0..h {
+        let fy = ((y as f32 + 0.5) / s as f32 - 0.5).clamp(0.0, (lh - 1) as f32);
+        let y0 = fy.floor() as usize;
+        let y1 = (y0 + 1).min(lh - 1);
+        let ty = fy - y0 as f32;
+        let row = y * w * 4;
+        for x in 0..w {
+            let fx = ((x as f32 + 0.5) / s as f32 - 0.5).clamp(0.0, (lw - 1) as f32);
+            let x0 = fx.floor() as usize;
+            let x1 = (x0 + 1).min(lw - 1);
+            let tx = fx - x0 as f32;
+            let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+            let mut px = [0f32; 3];
+            for ch in 0..3 {
+                let top = a[ch] + (b[ch] - a[ch]) * tx;
+                let bot = c[ch] + (d[ch] - c[ch]) * tx;
+                px[ch] = top + (bot - top) * ty;
+            }
+            // CSS saturate(): Rec. 709 luma held, chroma scaled about it. Bytes are
+            // B,G,R here (Argb8888 little-endian), so the luma weights follow that order.
+            let luma = 0.0722 * px[0] + 0.7152 * px[1] + 0.2126 * px[2];
+            let i = row + x * 4;
+            for ch in 0..3 {
+                out[i + ch] = (luma + (px[ch] - luma) * sat).round().clamp(0.0, 255.0) as u8;
+            }
+            out[i + 3] = 255;
+        }
+    }
+    out
 }
 
 impl BloomCache {
@@ -398,6 +535,90 @@ impl BloomCache {
             );
         }
         self.buffer.as_ref()
+    }
+
+    /// Start a frame for the crop pool: crops untouched for `CROP_TTL_FRAMES` are
+    /// evicted at the next insert. Called once per lowering, like `RectCache::begin_frame`.
+    pub fn begin_frame(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+    }
+
+    /// The crop of the frosted field under `rect` (output pixels, already clipped to the
+    /// output), composing the full frosted field only on a genuine miss of
+    /// (size, palette, look) and copying the crop only on a miss of the rect. A still
+    /// desktop does neither; a window that moves pays a memcpy; a theme that changes its
+    /// blur, its saturation or its palette pays one compose and one memcpy per region.
+    pub fn frosted_crop(
+        &mut self,
+        w: i32,
+        h: i32,
+        base: crate::bloom::BloomPalette,
+        mood: Option<&crate::scene::MoodPalette>,
+        look: GlassLook,
+        rect: Rectangle<i32, Physical>,
+    ) -> Option<&MemoryRenderBuffer> {
+        if w <= 0 || h <= 0 || rect.size.w <= 0 || rect.size.h <= 0 {
+            return None;
+        }
+        let pal = match mood {
+            Some(m) => base.with_mood(m),
+            None => base,
+        };
+        if self.frosted_key != Some((w, h, pal, look)) {
+            let started = Instant::now();
+            self.frosted_rgba = frosted_field_rgba(w, h, &pal, look);
+            self.frosted_key = Some((w, h, pal, look));
+            // Every crop was cut from the old field: none of them is right any more.
+            self.crops.clear();
+            info!(
+                width = w,
+                height = h,
+                blur_px = look.blur_px,
+                saturation_pct = look.saturation_pct,
+                took_ms = started.elapsed().as_millis() as u64,
+                "glass.composed (the frosted desktop under translucent regions; cached until the mode, theme or look changes)"
+            );
+        }
+        let key = (rect.loc.x, rect.loc.y, rect.size.w, rect.size.h);
+        let frame = self.frame;
+        if !self.crops.contains_key(&key) {
+            const CROP_TTL_FRAMES: u64 = 120;
+            self.crops
+                .retain(|_, (_, used)| frame.wrapping_sub(*used) <= CROP_TTL_FRAMES);
+            let (x0, y0, cw, ch) = (
+                rect.loc.x.clamp(0, w) as usize,
+                rect.loc.y.clamp(0, h) as usize,
+                rect.size.w.min(w - rect.loc.x.clamp(0, w)) as usize,
+                rect.size.h.min(h - rect.loc.y.clamp(0, h)) as usize,
+            );
+            if cw == 0 || ch == 0 {
+                return None;
+            }
+            let stride = w as usize * 4;
+            let mut rgba = vec![0u8; cw * ch * 4];
+            for row in 0..ch {
+                let s = (y0 + row) * stride + x0 * 4;
+                let d = row * cw * 4;
+                rgba[d..d + cw * 4].copy_from_slice(&self.frosted_rgba[s..s + cw * 4]);
+            }
+            let buffer = MemoryRenderBuffer::from_slice(
+                &rgba,
+                Fourcc::Argb8888,
+                (cw as i32, ch as i32),
+                1,
+                Transform::Normal,
+                None,
+            );
+            self.crops.insert(key, (buffer, frame));
+        }
+        let (buffer, used) = self.crops.get_mut(&key)?;
+        *used = frame;
+        Some(&*buffer)
+    }
+
+    /// How many crops are pooled right now (test hook for the compose-once proof).
+    pub fn crops_pooled(&self) -> usize {
+        self.crops.len()
     }
 }
 
@@ -3082,6 +3303,72 @@ where
     painted
 }
 
+/// Put the FROSTED desktop under `rect` (checklist GL2 on HART OS: the compositor is
+/// the platform's own GPU compositor, so the blur-behind a translucent surface needs is
+/// ours to draw). One crop of the compose-once frosted field, blended per frame by the
+/// renderer at `alpha`; the client paints its own tint over it (see `GlassLook` for why
+/// the tint is not here). `elements` is TOP→bottom, so the caller pushes this right
+/// AFTER the surface it sits under. Clipped to the output; returns whether it was pushed.
+///
+/// What this rung IS and IS NOT, stated so nobody reads a claim into it: the blur is of
+/// the compositor's own desktop field, composed once. It is not a per-frame blur of the
+/// live pixels beneath the region (other windows, the WebView's cards); those show the
+/// frosted field in their place while a translucent window covers them. The per-frame
+/// rung is a render-to-texture pass over the elements below the region and belongs to
+/// the GLES path alone; this one is what both renderers can afford on every frame
+/// (checklist GF1: keep the richness, drop only the per-frame cost).
+fn push_frosted_backdrop<S, R>(
+    state: &mut S,
+    renderer: &mut R,
+    elements: &mut Vec<HartRenderElement<R>>,
+    rect: Rectangle<i32, Physical>,
+    alpha: f32,
+    output: Size<i32, Physical>,
+) -> bool
+where
+    S: CompState,
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Send + Clone + 'static,
+{
+    let bounds: Rectangle<i32, Physical> = Rectangle::from_size(output);
+    let rect = match rect.intersection(bounds) {
+        Some(r) if r.size.w > 0 && r.size.h > 0 => r,
+        _ => return false,
+    };
+    // The same mood and theme field the bloom below is composed from, so the frosted
+    // field is that field and not a second palette.
+    let mood = state.native_home().and_then(|h| h.palette);
+    let snap = theme_now();
+    let buffer = match state
+        .bloom_mut()
+        .frosted_crop(output.w, output.h, snap.bloom, mood.as_ref(), snap.glass, rect)
+    {
+        Some(b) => b,
+        None => return false,
+    };
+    let origin: Point<f64, Physical> = Point::from((rect.loc.x as f64, rect.loc.y as f64));
+    match MemoryRenderBufferRenderElement::from_buffer(
+        renderer,
+        origin,
+        buffer,
+        Some(alpha),
+        None,
+        None,
+        Kind::Unspecified,
+    ) {
+        Ok(e) => {
+            elements.push(HartRenderElement::Memory(e));
+            true
+        }
+        // Never fatal: a region without its frosting shows the sharp desktop, which is
+        // exactly what it showed before this existed.
+        Err(err) => {
+            warn!(?err, "glass: failed to import the frosted field; the region shows the sharp desktop");
+            false
+        }
+    }
+}
+
 /// Build the FULL frame element list in z-order (TOP→bottom; `draw_render_elements`
 /// paints index 0 first = top-most): killswitch → cursor → Top/Overlay layers →
 /// windows (faded) → Bottom/Background layers.
@@ -3331,6 +3618,10 @@ pub struct ThemeSnapshot {
     pub potato: bool,
     /// `reduced_motion` from the accessibility file, the ledger's third motion switch.
     pub reduced_motion: bool,
+    /// `shell.blur_radius` + `shell.saturation`: what the compositor frosts the desktop
+    /// with under a translucent client region (see `GlassLook`). Read in the same reload
+    /// as everything above, so a theme change restyles the glass on the same frame.
+    pub glass: GlassLook,
 }
 
 /// How often the theme files are stat'd, at most. One second is the conky Lua's own
@@ -3379,6 +3670,7 @@ impl ThemeWatch {
                 bloom: crate::bloom::BloomPalette::default(),
                 potato: false,
                 reduced_motion: false,
+                glass: GlassLook::default(),
             },
             stamps: Vec::new(),
             last_check: None,
@@ -3414,6 +3706,7 @@ impl ThemeWatch {
             bloom: crate::bloom::palette_from(&file),
             potato: file.flag("disable_blur").unwrap_or(false),
             reduced_motion: crate::bloom::reduced_motion_in(&a11y),
+            glass: GlassLook::from_file(&file),
         };
         self.reloads += 1;
     }
@@ -3967,6 +4260,8 @@ where
     // are actually pushed (never on a failed import), and published at the end
     // for the backend's flip handler to turn into the shell's verdict file.
     let mut native_mask: u8 = 0;
+    // The frosted-field crop pool ages by frame (see `BloomCache::frosted_crop`).
+    state.bloom_mut().begin_frame();
 
     // ── 0. KILLSWITCH (top): a full-output opaque black solid ABOVE all windows. ──
     if state.capture_blocked() {
@@ -4023,6 +4318,7 @@ where
         let win_elems: Vec<WaylandSurfaceRenderElement<R>> =
             AsRenderElements::<R>::render_elements(window, renderer, phys, Scale::from(1.0), alpha);
         elements.extend(win_elems.into_iter().map(HartRenderElement::Surface));
+
     }
 
     // ── 3c. NATIVE SHELL M3 scene: the DESKTOP PLANE, below windows, above the shell. ──
@@ -4089,13 +4385,35 @@ where
     // ── 4. BOTTOM / BACKGROUND layer surfaces — BELOW the toplevels. ──
     // This is the desktop plane: the HART glass shell anchors here, which is what
     // makes it the desktop rather than an app.
-    layers_painted += push_layer_elements(
+    let layers_below = push_layer_elements(
         renderer, &mut elements, &output, ws_alpha, /* above_windows = */ false);
+    layers_painted += layers_below;
     {
         let prev = LAYERS_PAINTED.swap(layers_painted, std::sync::atomic::Ordering::Relaxed);
         if prev != layers_painted {
             info!(layers_painted, "layer.composited (wlr-layer surfaces now in the rendered frame)");
         }
+    }
+
+    // ── 4a. THE TASKBAR BASE: the frosted desktop under the shell's strip. ──
+    // The shell's taskbar is `<div class="taskbar glass">`: `--hart-glass-bg` at
+    // `--hart-panel-opacity` (0.65) over `backdrop-filter: blur() saturate()`. With the
+    // bloom claimed its wallpaper is `transparent`, so the buffer the WebView commits is
+    // 65 percent opaque in its bottom strip on EVERY commit, and what the browser's
+    // backdrop-filter blurs behind it is nothing at all: the other 35 percent was whatever
+    // the compositor had under the strip, the sharp field and, across a dropped frame,
+    // anything else the z-order below held. This puts the frosted field there, opaque,
+    // the exact thing the CSS meant to blur, so the strip composes to tint-over-frosted
+    // field on every frame and nothing beneath this element can ever show through it
+    // (the probe in `glass_tests` drives the orb under the strip and reads it). Only
+    // when a Background/Bottom surface is painted: no shell, no strip to base. Under the
+    // native scene's own opaque taskbar it is covered, and under a shell that paints an
+    // opaque wallpaper it is covered too, so neither pays anything but the crop.
+    if !state.capture_blocked() && layers_below > 0 {
+        let strip_h = crate::scene::TASKBAR_H.round() as i32;
+        let strip: Rectangle<i32, Physical> =
+            Rectangle::new((0, size.h - strip_h).into(), (size.w, strip_h).into());
+        push_frosted_backdrop(state, renderer, &mut elements, strip, 1.0, size);
     }
 
     // ── 3b. NATIVE ORB (NATIVE SHELL M2), above the backdrop, below the shell. ──
@@ -6859,8 +7177,9 @@ mod native_render_tests {
 
     /// Composite `elements` over a magenta sentinel and hand back the framebuffer bytes
     /// (Argb8888 little-endian, [B,G,R,A]). The same steps the demo proof below takes,
-    /// extracted so a proof can ask about a REGION rather than the whole frame.
-    fn composite_to_bytes(
+    /// extracted so a proof can ask about a REGION rather than the whole frame. Shared
+    /// with `glass_tests` below, which reads pixels the same way.
+    pub(super) fn composite_to_bytes(
         renderer: &mut PixmanRenderer,
         size: Size<i32, Physical>,
         elements: &[HartRenderElement<PixmanRenderer>],
@@ -7411,5 +7730,315 @@ mod native_render_tests {
             let _ = rects.art(&format!("/shell/static/app_art/agent-{i}.svg"), 258, 150, 16.0);
         }
         assert!(rects.cached_art() <= MAX_CACHED_ART, "the art cache is bounded");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// NATIVE GLASS (checklist GL1/GL2/GL3, NATIVE_OS_PROGRAM 3.3) and the taskbar-strip
+// probe S2 asked for. Pixel proofs on the pixman floor: the SAME renderer the DRM path
+// paints with when there is no GPU, composited headless and READ BACK, because GL1's
+// rule is that a glass claim is proven by screen pixels over a bright backdrop, never
+// by an API return.
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(all(test, feature = "smithay"))]
+mod glass_tests {
+    use super::native_render_tests::composite_to_bytes;
+    use super::*;
+    use smithay::backend::renderer::pixman::PixmanRenderer;
+
+    /// A BRIGHT field, so every proof here runs over a bright backdrop: a light grey base
+    /// with the four ambient hues fully saturated.
+    fn bright() -> crate::bloom::BloomPalette {
+        crate::bloom::BloomPalette {
+            base: [0x90, 0x90, 0x9A],
+            amb: [[0xFF, 0x30, 0x30], [0x30, 0xFF, 0x30], [0x30, 0x30, 0xFF], [0xFF, 0xD0, 0x30]],
+        }
+    }
+
+    fn px(bytes: &[u8], w: usize, x: usize, y: usize) -> [u8; 4] {
+        let i = (y * w + x) * 4;
+        [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]
+    }
+
+    /// A premultiplied Argb8888 buffer of `w`x`h` whose rows at or below `from_y` carry
+    /// `rgba` and whose rows above are fully transparent: the shape of the buffer the
+    /// shell commits when its wallpaper is `transparent` and its strip is `.glass`.
+    fn tinted_strip_rgba(w: usize, h: usize, from_y: usize, rgb: [u8; 3], a: f32) -> Vec<u8> {
+        let mut v = vec![0u8; w * h * 4];
+        for y in from_y..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                v[i] = (rgb[2] as f32 * a).round() as u8;
+                v[i + 1] = (rgb[1] as f32 * a).round() as u8;
+                v[i + 2] = (rgb[0] as f32 * a).round() as u8;
+                v[i + 3] = (255.0 * a).round() as u8;
+            }
+        }
+        v
+    }
+
+    fn memory_element(
+        renderer: &mut PixmanRenderer,
+        buffer: &MemoryRenderBuffer,
+        at: (i32, i32),
+        alpha: f32,
+        size: Option<Size<i32, Logical>>,
+    ) -> HartRenderElement<PixmanRenderer> {
+        let origin: Point<f64, Physical> = Point::from((at.0 as f64, at.1 as f64));
+        HartRenderElement::Memory(
+            MemoryRenderBufferRenderElement::from_buffer(
+                renderer, origin, buffer, Some(alpha), None, size, Kind::Unspecified,
+            )
+            .expect("memory buffer imports on pixman"),
+        )
+    }
+
+    // ── the frosted field itself ──
+
+    #[test]
+    fn the_frosted_field_is_the_field_averaged_and_saturated_never_a_slab_or_a_tint() {
+        let pal = bright();
+        let (w, h) = (320, 200);
+        let field = crate::bloom::compose(w, h, &pal);
+
+        // Identity: no blur and 100 percent saturation is the field itself, byte for
+        // byte. This is what stops anyone mistaking the frosting for a tint.
+        let plain = GlassLook { blur_px: 0, saturation_pct: 100 };
+        assert_eq!(frosted_field_rgba(w, h, &pal, plain), field);
+
+        let look = GlassLook { blur_px: 20, saturation_pct: 180 };
+        let frosted = frosted_field_rgba(w, h, &pal, look);
+        assert_eq!(frosted.len(), field.len());
+        assert!(frosted.chunks(4).all(|p| p[3] == 255), "the frosted field is opaque");
+
+        // Not a slab: it varies across the output like the field it comes from.
+        let distinct: std::collections::HashSet<[u8; 3]> =
+            frosted.chunks(4).map(|p| [p[0], p[1], p[2]]).collect();
+        assert!(distinct.len() > 200, "a frosted field is a field, not a colour: {} colours", distinct.len());
+
+        // Blurred: it is different from the sharp field somewhere real...
+        let max_diff = frosted
+            .chunks(4)
+            .zip(field.chunks(4))
+            .map(|(a, b)| (0..3).map(|c| (a[c] as i32 - b[c] as i32).abs()).max().unwrap())
+            .max()
+            .unwrap();
+        assert!(max_diff > 4, "blur 20 at 180 percent must move pixels, moved at most {max_diff}");
+        // ...and the blur is an AVERAGE of a coarser field, not a recolour: at 100
+        // percent saturation each cell centre reads the coarse compose's own value.
+        let only_blur = GlassLook { blur_px: 20, saturation_pct: 100 };
+        let s = only_blur.downsample();
+        assert_eq!(s, 10, "a 20 px blur averages over 10 px cells");
+        let coarse = crate::bloom::compose((w as usize).div_ceil(s) as i32, (h as usize).div_ceil(s) as i32, &pal);
+        let cw = (w as usize).div_ceil(s);
+        let blurred = frosted_field_rgba(w, h, &pal, only_blur);
+        // No output pixel sits exactly on a cell centre (10 px cells, half-pixel
+        // sampling), so the nearest one is 5 percent of the way to its neighbour: a few
+        // levels on the steepest blob edge, hence the tolerance.
+        for (cx, cy) in [(3usize, 4usize), (12, 9), (25, 15), (0, 0)] {
+            let centre = px(&blurred, w as usize, cx * s + s / 2, cy * s + s / 2);
+            let cell = px(&coarse, cw, cx, cy);
+            for c in 0..3 {
+                assert!(
+                    (centre[c] as i32 - cell[c] as i32).abs() <= 4,
+                    "cell ({cx},{cy}) channel {c}: frosted centre {} vs coarse {}", centre[c], cell[c]
+                );
+            }
+        }
+        // A wider blur flattens the peaks: the widest look has less range than the field.
+        let wide = frosted_field_rgba(w, h, &pal, GlassLook { blur_px: 128, saturation_pct: 100 });
+        let range = |b: &[u8]| {
+            let luma: Vec<i32> = b.chunks(4).map(|p| p[0] as i32 + p[1] as i32 + p[2] as i32).collect();
+            luma.iter().max().unwrap() - luma.iter().min().unwrap()
+        };
+        assert!(range(&wide) < range(&field), "a 128 px blur must flatten the field's peaks");
+
+        // Saturated: chroma rises against the same field blurred at 100 percent.
+        let chroma = |b: &[u8]| -> f64 {
+            b.chunks(4)
+                .map(|p| (p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap()) as f64)
+                .sum::<f64>()
+                / (b.len() / 4) as f64
+        };
+        assert!(
+            chroma(&frosted) > chroma(&blurred) * 1.2,
+            "180 percent saturation must lift chroma: {} vs {}", chroma(&frosted), chroma(&blurred)
+        );
+    }
+
+    #[test]
+    fn the_glass_look_is_read_from_the_keys_theme_service_emits_and_defaults_to_its_fallbacks() {
+        let dir = std::env::temp_dir().join(format!("hart_glass_look_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let themed = dir.join("themed.json");
+        // `shell.blur_radius` and `shell.saturation` are exactly what theme_service.py
+        // turns into --hart-blur and --hart-saturation (test_panel_reservation.py pins
+        // the same reader idiom for the three metrics next to them).
+        std::fs::write(&themed, r#"{"shell":{"blur_radius": 24, "saturation": 140, "border_radius": 12}}"#).unwrap();
+        assert_eq!(
+            GlassLook::from_file(&crate::bloom::SettingsFile::load(&themed)),
+            GlassLook { blur_px: 24, saturation_pct: 140 }
+        );
+        // A theme that says nothing renders like the browser's own omission of the
+        // tokens: theme_service's `shell.get("blur_radius", 20)` / `("saturation", 180)`.
+        let bare = dir.join("bare.json");
+        std::fs::write(&bare, r#"{"colors":{"accent":"00E6C3"}}"#).unwrap();
+        assert_eq!(
+            GlassLook::from_file(&crate::bloom::SettingsFile::load(&bare)),
+            GlassLook { blur_px: 20, saturation_pct: 180 }
+        );
+        assert_eq!(GlassLook::default(), GlassLook { blur_px: 20, saturation_pct: 180 });
+        // A file value is clamped: a blur of a million pixels would be a compose that
+        // never finishes on the frame path.
+        let absurd = dir.join("absurd.json");
+        std::fs::write(&absurd, r#"{"shell":{"blur_radius": 1000000, "saturation": -5}}"#).unwrap();
+        assert_eq!(
+            GlassLook::from_file(&crate::bloom::SettingsFile::load(&absurd)),
+            GlassLook { blur_px: 128, saturation_pct: 0 }
+        );
+        // And it rides the same reload as the palette: a watch on the file sees it.
+        let a11y = dir.join("absent-a11y.json");
+        let watch = ThemeWatch::new(vec![themed.clone()], a11y);
+        assert_eq!(watch.snapshot().glass, GlassLook { blur_px: 24, saturation_pct: 140 });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_frosted_field_composes_once_and_a_still_region_reuses_its_crop() {
+        let mut cache = BloomCache::default();
+        let (w, h) = (200, 120);
+        let look = GlassLook::default();
+        let a: Rectangle<i32, Physical> = Rectangle::new((10, 10).into(), (50, 40).into());
+        let b: Rectangle<i32, Physical> = Rectangle::new((0, 76).into(), (200, 44).into());
+        for _ in 0..5 {
+            cache.begin_frame();
+            assert!(cache.frosted_crop(w, h, bright(), None, look, a).is_some());
+            assert!(cache.frosted_crop(w, h, bright(), None, look, b).is_some());
+        }
+        assert_eq!(cache.crops_pooled(), 2, "two still regions, two crops, five frames");
+        // A changed look recomposes the field and drops every crop cut from the old one.
+        cache.begin_frame();
+        let sharper = GlassLook { blur_px: 4, saturation_pct: 120 };
+        assert!(cache.frosted_crop(w, h, bright(), None, sharper, a).is_some());
+        assert_eq!(cache.crops_pooled(), 1, "the crops of the old field are gone");
+        // A region nothing has drawn for long enough is evicted at the next insert.
+        for _ in 0..200 {
+            cache.begin_frame();
+            assert!(cache.frosted_crop(w, h, bright(), None, sharper, a).is_some());
+        }
+        assert!(cache.frosted_crop(w, h, bright(), None, sharper, b).is_some());
+        assert_eq!(cache.crops_pooled(), 2, "a is live, b is fresh, nothing stale is kept");
+        // Degenerate input never panics and never pools.
+        let none: Rectangle<i32, Physical> = Rectangle::new((0, 0).into(), (0, 10).into());
+        assert!(cache.frosted_crop(w, h, bright(), None, sharper, none).is_none());
+        assert!(cache.frosted_crop(0, 0, bright(), None, sharper, a).is_none());
+    }
+
+    // ── the damage-race probe (S2, COMPOSITOR_PLAN C2) ──
+
+    #[test]
+    fn the_taskbar_strip_stays_opaque_across_dropped_frames_and_the_orb_never_shows_through() {
+        // WHAT THIS SETTLES. The shell's strip is `.taskbar.glass`: 65 percent tint over a
+        // wallpaper that is `transparent` while the bloom is claimed, so the buffer the
+        // WebView commits is 35 percent open in its bottom band on every commit, and the
+        // strip shows whatever the compositor has under it. This composes the frame the
+        // way `build_frame_elements` orders it (shell, base, orb, bloom) across a sequence
+        // where the orb, driven UNDER the strip, breathes and then the shell's element
+        // drops out of a frame, and reads the strip each time.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (480, 270).into();
+        let w = 480usize;
+        let strip_h = crate::scene::TASKBAR_H.round() as i32;
+        let strip_y = (size.h - strip_h) as usize;
+        let pal = bright();
+        let look = GlassLook::default();
+
+        let shell = MemoryRenderBuffer::from_slice(
+            &tinted_strip_rgba(480, 270, strip_y, [18, 19, 28], 0.65),
+            Fourcc::Argb8888,
+            (480, 270),
+            1,
+            Transform::Normal,
+            None,
+        );
+        let orb_side = 160;
+        let orb = MemoryRenderBuffer::from_slice(
+            &crate::orb::compose(orb_side, &crate::orb::OrbPalette::default()),
+            Fourcc::Argb8888,
+            (orb_side, orb_side),
+            1,
+            Transform::Normal,
+            None,
+        );
+        // The orb's top-left, chosen so its lower half sits UNDER the strip.
+        let orb_at = (160, 150);
+        let mut cache = BloomCache::default();
+        let bloom = cache.get(size.w, size.h, pal, None).expect("the field").clone();
+
+        let strip_of = |bytes: &[u8]| bytes[strip_y * w * 4..].to_vec();
+        let frame = |renderer: &mut PixmanRenderer,
+                         cache: &mut BloomCache,
+                         with_shell: bool,
+                         with_base: bool,
+                         orb_alpha: f32,
+                         orb_scale: f32|
+         -> Vec<u8> {
+            cache.begin_frame();
+            let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+            if with_shell {
+                elements.push(memory_element(renderer, &shell, (0, 0), 1.0, None));
+            }
+            if with_base {
+                let strip: Rectangle<i32, Physical> =
+                    Rectangle::new((0, size.h - strip_h).into(), (size.w, strip_h).into());
+                let crop = cache
+                    .frosted_crop(size.w, size.h, pal, None, look, strip)
+                    .expect("the base crop")
+                    .clone();
+                elements.push(memory_element(renderer, &crop, (0, size.h - strip_h), 1.0, None));
+            }
+            let drawn = (orb_side as f32 * orb_scale) as i32;
+            elements.push(memory_element(
+                renderer, &orb, orb_at, orb_alpha, Some((drawn, drawn).into()),
+            ));
+            elements.push(memory_element(renderer, &bloom, (0, 0), 1.0, None));
+            composite_to_bytes(renderer, size, &elements)
+        };
+
+        // The sequence: rest, peak of the breath, and a frame that lost the shell.
+        let rest = frame(&mut renderer, &mut cache, true, true, 0.85, 1.0);
+        let peak = frame(&mut renderer, &mut cache, true, true, 1.0, 1.08);
+        let dropped = frame(&mut renderer, &mut cache, false, true, 1.0, 1.08);
+        let base_only = frame(&mut renderer, &mut cache, false, true, 0.0, 1.0);
+
+        for (name, f) in [("rest", &rest), ("peak", &peak), ("dropped", &dropped)] {
+            assert!(
+                strip_of(f).chunks(4).all(|p| p[3] == 255),
+                "{name}: the strip is opaque in every frame"
+            );
+        }
+        assert_eq!(
+            strip_of(&rest),
+            strip_of(&peak),
+            "the orb breathing under the strip never changes a strip pixel"
+        );
+        assert_eq!(
+            strip_of(&dropped),
+            strip_of(&base_only),
+            "a frame without the shell shows the frosted base, never the orb"
+        );
+        // The orb really was under the strip: above the strip it is visible and moving.
+        let above = |f: &[u8]| f[(strip_y - 20) * w * 4..strip_y * w * 4].to_vec();
+        assert_ne!(above(&rest), above(&peak), "the probe drove the orb through the strip's edge");
+
+        // THE OPPOSING DIRECTION, so the probe is known to see the leak it guards against:
+        // without the base, the shell's 35 percent window lets the orb's breath through.
+        let rest_open = frame(&mut renderer, &mut cache, true, false, 0.85, 1.0);
+        let peak_open = frame(&mut renderer, &mut cache, true, false, 1.0, 1.08);
+        assert_ne!(
+            strip_of(&rest_open),
+            strip_of(&peak_open),
+            "without the base the strip changes with the orb: the leak this base closes"
+        );
     }
 }
