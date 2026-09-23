@@ -726,8 +726,12 @@ def test_the_agent_cluster_mirrors_refreshagentstatus():
     and clips each name at 16. The producer's constants are read against that JS."""
     src = open(os.path.join(REPO, "integrations", "agent_engine",
                             "liquid_ui_service.py"), encoding="utf-8").read()
+    # The filter, the clip and the chip cap may live in refreshAgentStatus itself or in
+    # the paintAgentStatus it hands names to (the SSE push shares that painter), so
+    # the window covers both.
     i = src.index("function refreshAgentStatus()")
-    body = src[i:i + 900]
+    j = src.rfind("function paintAgentStatus", 0, i)
+    body = src[(j if j >= 0 else i):i + 900]
     assert "a.status==='running'" in body
     assert "slice(0,%d)" % L.CHROME_AGENTS_MAX in body, "the chip count moved"
     assert "substring(0,%d)" % L.CHROME_AGENT_NAME_MAX in body, "the name clip moved"

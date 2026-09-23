@@ -1536,6 +1536,13 @@ fn claim_names(next: u8) -> String {
     if next & crate::comp_core::NATIVE_CHROME_HOME != 0 {
         names.push("home");
     }
+    // The bars, per band: the names liquid_ui_service.read_native_chrome accepts.
+    if next & crate::comp_core::NATIVE_CHROME_TOPBAR != 0 {
+        names.push("topbar");
+    }
+    if next & crate::comp_core::NATIVE_CHROME_TASKBAR != 0 {
+        names.push("taskbar");
+    }
     names.join(",")
 }
 
@@ -2523,6 +2530,15 @@ mod tests {
             "bloom,orb"
         );
         assert_eq!(claim_names(0), "");
+        // The bands, each its own name, in a fixed order after the older three.
+        use crate::comp_core::{NATIVE_CHROME_HOME, NATIVE_CHROME_TASKBAR, NATIVE_CHROME_TOPBAR};
+        assert_eq!(claim_names(NATIVE_CHROME_TOPBAR), "topbar");
+        assert_eq!(claim_names(NATIVE_CHROME_TASKBAR), "taskbar");
+        assert_eq!(
+            claim_names(NATIVE_CHROME_BLOOM | NATIVE_CHROME_ORB | NATIVE_CHROME_HOME
+                        | NATIVE_CHROME_TOPBAR | NATIVE_CHROME_TASKBAR),
+            "bloom,orb,home,topbar,taskbar"
+        );
     }
 
     #[test]

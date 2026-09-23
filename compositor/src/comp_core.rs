@@ -182,10 +182,58 @@ pub const NATIVE_CHROME_ORB: u8 = 1 << 1;
 /// that a `unsafe_code = "deny"` crate cannot format. So the compositor takes the half it
 /// can draw correctly and the shell keeps the half it alone knows.
 ///
-/// There is deliberately no TOPBAR or TASKBAR bit yet. The native bars draw, but the
-/// native taskbar is an empty strip, so claiming it would take the user's window and panel
-/// switching away. A bit nothing can honestly claim is worse than no bit.
+/// The bars have their own bits now (below), each claimed only when its band is FULLY
+/// composed by `shell.chrome` and pixels landed in it; the rule is `leaf_claim`.
 pub const NATIVE_CHROME_HOME: u8 = 1 << 2;
+/// The TOP BAR band and the TASKBAR band, claimed per band and never partially.
+///
+/// A claimed band makes the shell stop painting its own, so the claim must mean "the
+/// native bar carries everything the shell's did": the clock, the tray, the badge and
+/// the agent cluster for the top bar; the chip list for the taskbar. Those come over
+/// `shell.chrome`, and `scene::ShellChrome::coverage` says which bands the payload
+/// composes fully. That answer gates the bit; the pixels in the band earn it. A bar drawn
+/// from a partial payload (a strip with tabs but no clock, a taskbar with no chip list)
+/// therefore claims nothing, which is the same rule the home bit follows for the same
+/// reason: over-claiming costs an empty desktop the paint watchdog cannot see.
+pub const NATIVE_CHROME_TOPBAR: u8 = 1 << 3;
+pub const NATIVE_CHROME_TASKBAR: u8 = 1 << 4;
+
+/// Whether a lowered leaf lies WHOLLY inside the top bar band.
+pub fn in_top_band(rect: crate::scene::Rect, top_h: f32) -> bool {
+    rect.h > 0.0 && rect.w > 0.0 && rect.y >= 0.0 && rect.y + rect.h <= top_h
+}
+
+/// Whether a lowered leaf lies WHOLLY inside the taskbar band.
+pub fn in_taskbar_band(rect: crate::scene::Rect, taskbar_y: f32) -> bool {
+    rect.h > 0.0 && rect.w > 0.0 && rect.y >= taskbar_y
+}
+
+/// Every NATIVE_CHROME_* bit one lowered leaf earns. PURE, so the whole claim rule is
+/// testable without a renderer: the home bit is geometric (see `in_home_band`); the two
+/// bar bits are geometric AND gated on the band being fully composed, because pixels in
+/// a strip are not evidence that the strip carries what the shell's does. On an output
+/// too short for the two strips to be distinct bands nothing bar-shaped is claimed at
+/// all, since a leaf could then sit in both.
+pub fn leaf_claim(
+    rect: crate::scene::Rect,
+    top_h: f32,
+    taskbar_y: f32,
+    cov: crate::scene::ChromeCoverage,
+) -> u8 {
+    let mut mask = 0;
+    if in_home_band(rect, top_h, taskbar_y) {
+        mask |= NATIVE_CHROME_HOME;
+    }
+    if taskbar_y > top_h {
+        if cov.top_bar && in_top_band(rect, top_h) {
+            mask |= NATIVE_CHROME_TOPBAR;
+        }
+        if cov.taskbar && in_taskbar_band(rect, taskbar_y) {
+            mask |= NATIVE_CHROME_TASKBAR;
+        }
+    }
+    mask
+}
 
 /// Whether a lowered leaf lies WHOLLY inside the home band. PURE, so the rule is testable
 /// without a renderer.
@@ -3203,6 +3251,10 @@ where
         Some(mood) => active_theme().with_mood(mood),
         None => *active_theme(),
     };
+    // Which bands the chrome payload composes fully, read BEFORE the tree is borrowed
+    // out of the cache: it gates the bar claims in the walk below, and it is a property
+    // of the payload, not of the pixels.
+    let chrome_cov = scene_cache.chrome_coverage();
     // The rasterizer doubles as the layout's text measure (it already shapes), so the bar
     // can butt one run against another. It is a disjoint borrow from `scene_cache`, and
     // the reborrow ends when `tree_for` returns, leaving it free for the lowering below.
@@ -3241,7 +3293,9 @@ where
     let home_top = theme.top_bar_h;
     let home_bottom = size.h as f32 - crate::scene::TASKBAR_H;
     tree.for_each_leaf(&mut |idx, leaf| {
-        let home_leaf = in_home_band(leaf.rect(), home_top, home_bottom);
+        // Every bit this leaf can earn, home and bars alike, resolved once by the pure
+        // rule; each arm below ORs it in exactly where an element is actually pushed.
+        let leaf_bits = leaf_claim(leaf.rect(), home_top, home_bottom, chrome_cov);
         match leaf {
             crate::scene::SceneNode::Rect { rect, color, radius } => {
                 if rect.w < 1.0 || rect.h < 1.0 {
@@ -3280,7 +3334,7 @@ where
                             Some((rect.w as i32, rect.h as i32).into()),
                             Kind::Unspecified,
                         ) {
-                            Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
+                            Ok(e) => { elements.push(HartRenderElement::Memory(e)); emitted |= leaf_bits; }
                             Err(err) => warn!(?err, "native scene: rounded rect import failed"),
                         }
                     }
@@ -3301,7 +3355,7 @@ where
                         Kind::Unspecified,
                     );
                     elements.push(HartRenderElement::Solid(el));
-                    if home_leaf { emitted |= NATIVE_CHROME_HOME; }
+                    emitted |= leaf_bits;
                 }
             }
             crate::scene::SceneNode::Text {
@@ -3338,7 +3392,7 @@ where
                     Some((rect.w as i32, rect.h as i32).into()),
                     Kind::Unspecified,
                 ) {
-                    Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
+                    Ok(e) => { elements.push(HartRenderElement::Memory(e)); emitted |= leaf_bits; }
                     Err(err) => warn!(?err, "native scene: text run import failed"),
                 }
             }
@@ -3392,7 +3446,7 @@ where
                         Some((rect.w as i32, rect.h as i32).into()),
                         Kind::Unspecified,
                     ) {
-                        Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
+                        Ok(e) => { elements.push(HartRenderElement::Memory(e)); emitted |= leaf_bits; }
                         Err(err) => warn!(?err, "native scene: card art import failed"),
                     }
                 }
@@ -3433,7 +3487,7 @@ where
                         Some(side.into()),
                         Kind::Unspecified,
                     ) {
-                        Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
+                        Ok(e) => { elements.push(HartRenderElement::Memory(e)); emitted |= leaf_bits; }
                         Err(err) => warn!(?err, "native scene: card shadow import failed"),
                     }
                 }
@@ -3468,7 +3522,7 @@ where
                     ) {
                         Ok(e) => {
                             elements.push(HartRenderElement::Memory(e));
-                            if home_leaf { emitted |= NATIVE_CHROME_HOME; }
+                            emitted |= leaf_bits;
                             emitted |= NATIVE_CHROME_ORB;
                         }
                         Err(err) => warn!(?err, "native scene: orb import failed"),
@@ -5324,6 +5378,102 @@ mod native_render_tests {
             0,
             "a painted desktop must claim the home surface, or the shell draws a second one"
         );
+    }
+
+    /// Lower the demo home with `chrome` at `size` and answer the claim mask.
+    fn claim_with(chrome: crate::scene::ShellChrome, size: Size<i32, Physical>) -> u8 {
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        scenes.set_chrome(chrome);
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        let mask = lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects,
+            &mut scenes, 0.5, None, false, true,
+            &crate::scene::RowScroll::default(), &mut elements,
+        );
+        assert!(!elements.is_empty(), "the bars paint at {size:?}");
+        mask
+    }
+
+    fn full_chrome() -> crate::scene::ShellChrome {
+        crate::scene::decode_shell_chrome(
+            &serde_json::from_str(crate::wire_fixture::SHELL_CHROME_COMPOSED).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_bar_drawn_from_a_partial_payload_is_never_claimed() {
+        // THE RULE THE PARITY PROGRAM STATES: claim whole bands only. A strip with tabs
+        // and a wordmark but no clock is a bar the shell's bar beats, and claiming it
+        // would make the shell stop painting the clock the user still sees. So the
+        // pixels in the band are necessary and not sufficient: the payload must have
+        // composed the band fully. Each datum the top bar needs is dropped in turn.
+        let size: Size<i32, Physical> = (1280, 800).into();
+        for missing in ["clock", "tray", "notifications", "agents"] {
+            let mut v: serde_json::Value =
+                serde_json::from_str(crate::wire_fixture::SHELL_CHROME_COMPOSED).unwrap();
+            v.as_object_mut().unwrap().remove(missing);
+            let mask = claim_with(crate::scene::decode_shell_chrome(&v), size);
+            assert_eq!(
+                mask & NATIVE_CHROME_TOPBAR, 0,
+                "without {missing} the top bar drew and must NOT be claimed"
+            );
+            assert_ne!(
+                mask & NATIVE_CHROME_TASKBAR, 0,
+                "the taskbar's rule is its own: the chip list is present, so it is claimed"
+            );
+        }
+        // And the taskbar's half: no chip list, no taskbar claim, whatever the strip drew.
+        let mut c = full_chrome();
+        c.tasks = None;
+        let mask = claim_with(c, size);
+        assert_eq!(mask & NATIVE_CHROME_TASKBAR, 0, "an unreported chip list is not a taskbar");
+        assert_ne!(mask & NATIVE_CHROME_TOPBAR, 0, "the top bar's rule is unaffected");
+        // With nothing composed at all, the strips draw and neither band is claimed:
+        // today's desktop, byte for byte.
+        let mask = claim_with(crate::scene::ShellChrome::default(), size);
+        assert_eq!(mask & (NATIVE_CHROME_TOPBAR | NATIVE_CHROME_TASKBAR), 0);
+        assert_ne!(mask & NATIVE_CHROME_HOME, 0, "and the home claim is as before");
+    }
+
+    #[test]
+    fn a_fully_composed_bar_is_claimed_on_the_pixels_it_paints() {
+        // The other direction, or the claim would be unreachable and the shell would
+        // paint two bars forever: the real producer's payload composes both bands, and
+        // a lowering that put elements in both must claim both.
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let mask = claim_with(full_chrome(), size);
+        assert_ne!(mask & NATIVE_CHROME_TOPBAR, 0, "a full top bar is claimed");
+        assert_ne!(mask & NATIVE_CHROME_TASKBAR, 0, "a full taskbar is claimed");
+        assert_ne!(mask & NATIVE_CHROME_HOME, 0);
+        // On an output too short for the two strips to be distinct bands, a leaf could
+        // sit in both, so neither bar is claimed however complete the payload.
+        let tiny: Size<i32, Physical> = (3, 3).into();
+        let mask = claim_with(full_chrome(), tiny);
+        assert_eq!(mask & (NATIVE_CHROME_TOPBAR | NATIVE_CHROME_TASKBAR), 0);
+    }
+
+    #[test]
+    fn the_leaf_claim_rule_is_geometric_and_gated() {
+        use crate::scene::{ChromeCoverage, Rect};
+        let both = ChromeCoverage { top_bar: true, taskbar: true };
+        let none = ChromeCoverage::default();
+        let (top_h, taskbar_y) = (40.0, 756.0);
+        // A leaf wholly in each band, with and without the gate.
+        assert_eq!(leaf_claim(Rect::new(0.0, 0.0, 100.0, 40.0), top_h, taskbar_y, both), NATIVE_CHROME_TOPBAR);
+        assert_eq!(leaf_claim(Rect::new(0.0, 0.0, 100.0, 40.0), top_h, taskbar_y, none), 0);
+        assert_eq!(leaf_claim(Rect::new(0.0, 756.0, 100.0, 44.0), top_h, taskbar_y, both), NATIVE_CHROME_TASKBAR);
+        assert_eq!(leaf_claim(Rect::new(0.0, 756.0, 100.0, 44.0), top_h, taskbar_y, none), 0);
+        assert_eq!(leaf_claim(Rect::new(0.0, 100.0, 100.0, 100.0), top_h, taskbar_y, none), NATIVE_CHROME_HOME);
+        // A leaf straddling a boundary claims nothing on either side of it.
+        assert_eq!(leaf_claim(Rect::new(0.0, 30.0, 100.0, 20.0), top_h, taskbar_y, both), 0);
+        assert_eq!(leaf_claim(Rect::new(0.0, 750.0, 100.0, 20.0), top_h, taskbar_y, both), 0);
+        // Degenerate: bands that are not distinct claim no bar at all.
+        assert_eq!(leaf_claim(Rect::new(0.0, 0.0, 3.0, 3.0), 40.0, -41.0, both) & (NATIVE_CHROME_TOPBAR | NATIVE_CHROME_TASKBAR), 0);
     }
 
     #[test]

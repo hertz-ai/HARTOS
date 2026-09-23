@@ -165,9 +165,11 @@ def read_gpu_render_mode() -> str:
 _NATIVE_CHROME_FILE = '/run/hart/session/native-chrome'
 
 # What this shell knows how to stand down for. A name the shell does not
-# recognise is IGNORED rather than trusted: a newer compositor claiming
-# `taskbar` must not make an older shell hide a taskbar it still owns.
-_NATIVE_CHROME_KNOWN = frozenset({'bloom', 'orb', 'home'})
+# recognise is IGNORED rather than trusted: a newer compositor claiming a
+# band this shell has no stand-down for must not make it hide something it
+# still owns. `topbar` and `taskbar` are the two bands the compositor claims
+# only when `shell.chrome` composed them fully (IPC_PROTOCOL 4.13).
+_NATIVE_CHROME_KNOWN = frozenset({'bloom', 'orb', 'home', 'topbar', 'taskbar'})
 
 
 def read_native_chrome() -> frozenset:
@@ -2527,6 +2529,25 @@ class LiquidUIService:
         native_home_css = ''
         if 'home' in native_chrome:
             native_home_css = '#hart-home{visibility:hidden}'
+        # The BARS, per band, claimed by the compositor only for a frame that carried
+        # a bar composed FULLY from `shell.chrome` (clock, tray, badge and agent
+        # cluster for the top bar; the chip list for the taskbar), so standing down
+        # loses the user nothing that was showing. See IPC_PROTOCOL.md 4.13.
+        #
+        # opacity, NOT visibility, and this is the one place the choice differs from
+        # every neighbour above, on purpose: the native bar routes no presses yet. A
+        # press on it falls through to THIS bar, which must therefore keep its hit
+        # targets at the same geometry (the native layout follows the shell's CSS
+        # literals for exactly that reason). `visibility:hidden` removes an element
+        # from hit testing; `opacity:0` keeps every control clickable while the
+        # browser skips painting a fully transparent layer. When native activations
+        # for the bar controls land, this can become visibility like the others.
+        native_bars_css = ''
+        if 'topbar' in native_chrome:
+            native_bars_css += '.top-bar{opacity:0}'
+        if 'taskbar' in native_chrome:
+            native_bars_css += '.taskbar{opacity:0}'
+        native_home_css += native_bars_css
         # The SAME verdict, handed to script as well as to CSS. The CSS above
         # stops the canvas painting; only this can stop the canvas being DRAWN
         # INTO. See the window.HART_NATIVE_CHROME comment below for the measured
