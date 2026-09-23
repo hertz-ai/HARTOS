@@ -1006,6 +1006,23 @@ class ModelCatalog:
         entry = self._entries.get(model_id)
         if not entry:
             return
+        persisted_before = entry.to_dict()
+        try:
+            self._apply_download(entry, downloaded, local_path)
+        finally:
+            # local_path, the facts and the MoE sizing are persisted fields;
+            # `downloaded` is runtime state (to_dict drops it).  Save only on
+            # a real change: boot calls this with a bare id per model, and
+            # rewriting the whole catalog each time for nothing is waste.
+            if entry.to_dict() != persisted_before:
+                self._dirty = True
+                self._save()
+
+    @staticmethod
+    def _apply_download(entry: 'ModelEntry', downloaded: bool,
+                        local_path: Optional[str]) -> None:
+        """mark_downloaded's in-memory half (it owns persistence)."""
+        model_id = entry.id
         entry.downloaded = downloaded
         if local_path:
             entry.local_path = str(local_path)
@@ -1137,6 +1154,11 @@ class ModelCatalog:
         rec['at'] = time.time()
         entry.capabilities = {**(entry.capabilities or {}),
                               'residency': rec}
+        self._dirty = True
+        # The next swap plans from this without re-measuring, which it can
+        # only do if the record outlives the process (#110: it never reached
+        # the disk on its own).
+        self._save()
         logger.info("%s: residency recorded -- vram %s GB, ram %s GB (%s)",
                     model_id, rec.get('vram_gb'), rec.get('ram_gb'),
                     rec['weight_file'] or 'no weight file')
@@ -1581,6 +1603,17 @@ class ModelCatalog:
                 # written and makes the catalog uncorrectable. User-owned flags
                 # (enabled / pinned / auto_load) and runtime state (downloaded /
                 # loaded) are NOT in _definition, so they survive untouched.
+                #
+                # Nor does what this machine MEASURED: the residency record
+                # lives in capabilities, which the seed replaces whole, so
+                # every boot erased it (#110, measured). It is carried
+                # forward; residency() already refuses a record taken
+                # against a different weight file, so a re-pointed seed
+                # cannot put a stale number into use.
+                kept = (self._entries[mid].capabilities or {}).get('residency')
+                if kept:
+                    _definition['capabilities'] = {
+                        **_definition['capabilities'], 'residency': kept}
                 self.override(mid, persist=False, **_definition)
                 continue
             self.register(ModelEntry(id=mid, **_definition), persist=False)

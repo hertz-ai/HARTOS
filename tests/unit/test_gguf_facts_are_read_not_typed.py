@@ -593,6 +593,57 @@ class TestTheResidencyRecordIsModelAwareNotSlotAware:
         assert 'residency' not in _FACT_KEYS
 
 
+class TestTheRecordOutlivesTheProcess:
+    """#110, MEASURED 2026-09-23 against a real catalog file: the record
+    never reached the disk on its own (record_residency had no _save), and
+    when an unrelated save did carry it, the next boot erased it --
+    get_catalog() runs populate_from_subsystems on every boot, and the LLM
+    populator re-applied its seeded `capabilities` over the row.
+
+    test_it_survives_serialization above round-trips to_dict/from_dict in
+    memory, which is a copy of persistence, not persistence. These go
+    through the file and a second boot, which is what the next swap reads."""
+
+    MID = 'llm-qwen3.5-4b'   # a seeded row: the populator owns its definition
+
+    def _booted(self, path):
+        c = ModelCatalog(str(path))
+        c._populate_llm_models()       # what get_catalog() does every boot
+        return c
+
+    def test_a_record_reaches_the_disk_by_itself(self, tmp_path):
+        p = tmp_path / 'model_catalog.json'
+        c = self._booted(p)
+        assert c.record_residency(self.MID, vram_gb=3.1, ram_gb=0.4)
+        r = ModelCatalog(str(p)).residency(self.MID)
+        assert r is not None and (r['vram_gb'], r['ram_gb']) == (3.1, 0.4)
+
+    def test_the_next_boot_does_not_erase_it(self, tmp_path):
+        p = tmp_path / 'model_catalog.json'
+        self._booted(p).record_residency(self.MID, vram_gb=3.1)
+        assert self._booted(p).residency(self.MID)['vram_gb'] == 3.1
+
+    def test_the_next_boot_still_owns_the_seeded_facts(self, tmp_path):
+        """Keeping the measurement must not freeze the seed: a corrected
+        definition still reaches a box that persisted the old one."""
+        p = tmp_path / 'model_catalog.json'
+        c = self._booted(p)
+        c._entries[self.MID].capabilities['quant'] = 'stale'
+        c.record_residency(self.MID, vram_gb=3.1)
+        caps = self._booted(p)._entries[self.MID].capabilities
+        assert caps['quant'] == 'UD-Q4_K_XL'
+        assert caps['residency']['vram_gb'] == 3.1
+
+    def test_a_recorded_path_reaches_the_disk_by_itself(self, tmp_path):
+        """mark_downloaded's local_path is what get_model_path's catalog
+        branch reads off disk; it had the same missing save."""
+        p = tmp_path / 'model_catalog.json'
+        c = self._booted(p)
+        c.mark_downloaded(self.MID, True, local_path=str(tmp_path / 'x.gguf'))
+        assert (ModelCatalog(str(p)).get(self.MID).local_path
+                == str(tmp_path / 'x.gguf'))
+
+
 class TestTheChainIsActuallyWired:
     """The defect this closes: read_gguf_facts, the MoE sizing correction
     and the matches_compute RAM check were all correct and NONE of them
