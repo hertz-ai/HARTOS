@@ -1412,6 +1412,26 @@ class AgentDaemon:
                     return
             except Exception:
                 pass
+            # A person at the desk is neither a foreground request nor
+            # "recently active" (that means chatted), so neither check above
+            # sees them.  The ResourceGovernor is the ONE idle detector (its
+            # Linux backend reads the compositor's input-alive marker), and a
+            # forced tick is idle-only work by definition, so it goes through
+            # the SAME reader every idle_only goal goes through:
+            # _idle_only_blocked, get_mode() != MODE_IDLE, fail closed when
+            # the governor cannot be consulted.  Measured 2026-09-22 on the
+            # Samsung box: this override force-ticked every 120 s on
+            # 'model_pressure' and put llama-server at 207 percent CPU once a
+            # minute while the owner was clicking around the desktop; press
+            # p50 122 ms against a 25 ms budget, clock 1.3 GHz of 3.4,
+            # package 94 C.  With the daemons paused for 120 s: 3.19 GHz,
+            # 84 C, press p50 12 ms.  That headroom belongs to the person.
+            if _idle_only_blocked({'idle_only': True}):
+                logger.debug(
+                    "Agent daemon: governor says the machine is not idle, "
+                    "yielding on '%s' (starvation override suppressed)",
+                    _yreason)
+                return
             _override_active = True
             logger.warning(
                 "Agent daemon: STARVATION OVERRIDE — yield gate has blocked "

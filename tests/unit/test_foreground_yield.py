@@ -102,3 +102,133 @@ def test_mark_view_balances_on_exception():
     with pytest.raises(ValueError):
         boom()
     assert foreground_active() is False and in_flight() == 0
+
+
+# ── The override block itself (agent_daemon._tick) ─────────────────────────
+#
+# The tests above pin the SIGNAL and the GATE.  These drive the real _tick and
+# pin what the STARVATION OVERRIDE does with them: it fires only after the
+# starvation window, never during a foreground request, and, since 2026-09-22,
+# never while the ResourceGovernor says the machine is not idle.
+#
+# Measured that day on the Samsung box (NATIVE_OS_PROGRAM.md section 1): the
+# override force-ticked every 120 s on 'model_pressure' with the owner at the
+# desk, llama-server at 207 percent CPU once a minute, press p50 122 ms against
+# a 25 ms budget; with the daemons paused, 12 ms.  A person clicking around the
+# desktop is neither a foreground request nor "recently active" (that means
+# chatted), so the governor, whose Linux backend reads the compositor's
+# input-alive marker, is the reader the override has to honour.  It does so
+# through _idle_only_blocked, the one reader every idle_only goal already uses.
+
+import logging
+import time
+from unittest.mock import MagicMock
+
+
+@pytest.fixture
+def governor_mode():
+    """Pin the governor's mode for one test, restoring it afterwards (the
+    same idiom tests/unit/test_paper_explanation_goal.py uses)."""
+    from core.resource_governor import get_governor
+    gov = get_governor()
+    prev = gov._mode
+
+    def _set(mode):
+        gov._mode = mode
+
+    yield _set
+    gov._mode = prev
+
+
+@pytest.fixture
+def starved_daemon(monkeypatch):
+    """A daemon whose yield gate has said 'model_pressure' for longer than the
+    starvation window.  Everything past the override is stubbed so _tick
+    either returns at the gate, or proves it went through by opening the DB
+    (the first thing the tick does after the gate)."""
+    from integrations.agent_engine import dispatch, agent_daemon
+    import integrations.social.models as models
+    import security.hive_guardrails as hg
+    import integrations.service_tools.model_lifecycle as ml
+
+    monkeypatch.setattr(dispatch, 'should_yield_to_user', lambda: True)
+    monkeypatch.setattr(dispatch, 'get_last_yield_reason',
+                        lambda: 'model_pressure')
+    monkeypatch.setattr(hg.HiveCircuitBreaker, 'is_halted',
+                        classmethod(lambda cls: False))
+    monkeypatch.setattr(
+        ml, 'get_model_lifecycle_manager',
+        lambda: MagicMock(get_system_pressure=lambda: {'throttle_factor': 0.05}))
+
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = []
+    opened = {'n': 0}
+
+    def _get_db():
+        opened['n'] += 1
+        return db
+
+    monkeypatch.setattr(models, 'get_db', _get_db)
+
+    d = agent_daemon.AgentDaemon()
+    d._last_tick_completed_at = time.monotonic() - (d._starvation_s + 60)
+    return d, opened
+
+
+def test_override_fires_when_the_governor_says_idle(starved_daemon, governor_mode):
+    from core.resource_governor import MODE_IDLE
+    daemon, opened = starved_daemon
+    governor_mode(MODE_IDLE)
+    daemon._tick()
+    assert opened['n'] == 1, (
+        "starved, nobody at the desk, no foreground request: the override "
+        "must force the tick through to the goal query")
+
+
+@pytest.mark.parametrize('mode', ['active', 'sleep'])
+def test_override_yields_while_the_governor_says_not_idle(
+        starved_daemon, governor_mode, caplog, mode):
+    daemon, opened = starved_daemon
+    governor_mode(mode)
+    caplog.set_level(logging.DEBUG, logger='hevolve_social')
+    daemon._tick()
+    assert opened['n'] == 0, (
+        f"governor mode {mode!r}: the override must not force inference "
+        f"onto a machine the one idle detector says is in use")
+    assert any('starvation override suppressed' in r.getMessage()
+               and 'governor' in r.getMessage() for r in caplog.records), (
+        "the yield must be logged like its foreground sibling, naming the "
+        "governor so the journal says why the queue did not drain")
+
+
+def test_override_fails_closed_when_the_governor_is_unreadable(starved_daemon):
+    daemon, opened = starved_daemon
+    with patch('core.resource_governor.get_governor',
+               side_effect=RuntimeError('governor down')):
+        daemon._tick()
+    assert opened['n'] == 0, (
+        "same contract as _idle_only_blocked: idle means PROVEN idle; an "
+        "unreadable governor is not a licence to run inference at the desk")
+
+
+def test_override_stays_suppressed_by_a_foreground_request_even_when_idle(
+        starved_daemon, governor_mode):
+    """B1 is kept: the governor check is added after it, not instead of it."""
+    from core.resource_governor import MODE_IDLE
+    from core.foreground import foreground_request
+    daemon, opened = starved_daemon
+    governor_mode(MODE_IDLE)
+    with foreground_request():
+        daemon._tick()
+    assert opened['n'] == 0
+
+
+def test_no_override_before_the_starvation_window(starved_daemon, governor_mode):
+    from core.resource_governor import MODE_IDLE
+    daemon, opened = starved_daemon
+    governor_mode(MODE_IDLE)
+    daemon._last_tick_completed_at = time.monotonic()
+    daemon._tick()
+    assert opened['n'] == 0, (
+        "a gate that has only just started blocking is honoured as is; the "
+        "override is for STARVATION, and idle alone does not shorten the window")
