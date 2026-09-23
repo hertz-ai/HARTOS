@@ -10,7 +10,9 @@
  *   window.HartSession      — the single state blob (stores lock_pw_hash, salt)
  *   window.HartTimeoutSignal — WebKitGTK-safe fetch timeout
  *   #lock-screen / #lock-pw  — the existing lock overlay (we drive it)
- *   /api/shell/system/metrics — the existing CPU/RAM/disk source
+ *   window.HartShellState    — the server's 'metrics' push (the SSE stream);
+ *                               /api/shell/system/metrics is the 30 s fallback
+ *                               poll for a stream that is down (poll diet)
  *
  * The lock is a UX lock (per-user shell state), NOT the OS security boundary —
  * that remains the display-manager login. Password is stored only as a salted
@@ -69,6 +71,10 @@
 
   // ── live clock (lock screen + desktop widget) ─────────────────────────────
   function pad(n) { return (n < 10 ? '0' : '') + n; }
+  // Write the DOM only when the text CHANGES: a minute clock ticking once a
+  // second re-set four elements to the same strings 59 times out of 60, and on
+  // the software-paint rung each re-set is a repaint (poll diet, 2026-09-23).
+  var lastTime = '', lastDate = '';
   function tick() {
     var d = new Date();
     var hh = d.getHours(), mm = pad(d.getMinutes());
@@ -82,6 +88,8 @@
     var time12 = pad((hh % 12) || 12) + ':' + mm + ' ' + (hh < 12 ? 'AM' : 'PM');
     var date = d.toLocaleDateString(undefined,
       { weekday: 'long', month: 'long', day: 'numeric' });
+    if (time12 === lastTime && date === lastDate) return;
+    lastTime = time12; lastDate = date;
     [['lock-clock', time12], ['lock-date', date],
      ['hw-clock-time', time12], ['hw-clock-date', date]].forEach(function (p) {
       var el = $(p[0]); if (el) el.textContent = p[1];
@@ -164,22 +172,33 @@
       '">' + Math.round(pct) + '%</span></div><div class="hw-bar"><i style="width:' +
       Math.max(0, Math.min(100, pct)) + '%"></i></div>';
   }
+  // ONE painter for both sources: the server's 'metrics' push (cpu_percent,
+  // ram.percent, disk_percent) and the fallback GET of the full route.
+  function paintMetrics(m) {
+    if (!m) return;
+    // /api/shell/system/metrics returns cpu_percent (flat), ram.percent
+    // (NESTED — not a flat memory_percent), and a disks[] array. The live
+    // floor boot showed Memory stuck at 0% reading the flat key; read
+    // ram.percent first (fall back to the flat key for any other source).
+    var cpu = m.cpu_percent || 0;
+    var mem = (m.ram && m.ram.percent) || m.memory_percent || 0;
+    var disk = m.disk_percent;
+    if (disk == null && m.disks && m.disks.length) disk = m.disks[0].percent;
+    var el = $('hw-sys-body');
+    if (el) el.innerHTML = bar(cpu, 'CPU') + bar(mem, 'Memory') + bar(disk || 0, 'Disk');
+  }
   function pollMetrics() {
     fetch(SHELL + '/api/shell/system/metrics', { signal: ts(4000) })
       .then(function (r) { return r.json(); })
-      .then(function (m) {
-        // /api/shell/system/metrics returns cpu_percent (flat), ram.percent
-        // (NESTED — not a flat memory_percent), and a disks[] array. The live
-        // floor boot showed Memory stuck at 0% reading the flat key; read
-        // ram.percent first (fall back to the flat key for any other source).
-        var cpu = m.cpu_percent || 0;
-        var mem = (m.ram && m.ram.percent) || m.memory_percent || 0;
-        var disk = m.disk_percent;
-        if (disk == null && m.disks && m.disks.length) disk = m.disks[0].percent;
-        var el = $('hw-sys-body');
-        if (el) el.innerHTML = bar(cpu, 'CPU') + bar(mem, 'Memory') + bar(disk || 0, 'Disk');
-      }).catch(function (e) { console.debug('hartSessionUI: system metrics fetch failed', e); });
+      .then(paintMetrics)
+      .catch(function (e) { console.debug('hartSessionUI: system metrics fetch failed', e); });
   }
+  // The poll diet: the stream pushes 'metrics' every few seconds; this GET is
+  // the fallback for a stream that is down, and an iframed shell never polls.
+  var FALLBACK_POLL_MS = 30000;
+  function bus() { return window.HartShellState || null; }
+  function sseUp() { var b = bus(); return !!(b && b.sseUp()); }
+  function isHost() { var b = bus(); return b ? b.isHost() : true; }
 
   function mountWidgets() {
     var host = $('hart-widgets');
@@ -193,8 +212,11 @@
       '  <div class="hw-title">System</div>' +
       '  <div id="hw-sys-body"><div class="hw-row"><span>loading…</span></div></div>' +
       '</div>';
-    pollMetrics();
-    setInterval(pollMetrics, 4000);
+    if (!isHost()) return;                         // the host document owns the polls
+    var b = bus();
+    if (b) b.on('metrics', paintMetrics);
+    if (!(b && b.last('metrics'))) pollMetrics();  // first paint before the stream's snapshot lands
+    setInterval(function () { if (!sseUp()) pollMetrics(); }, FALLBACK_POLL_MS);
   }
 
   // ── boot ──────────────────────────────────────────────────────────────────

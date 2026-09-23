@@ -169,5 +169,101 @@ class GateConsumerWiringTests(unittest.TestCase):
         )
 
 
+class UserChatMarkerTests(unittest.TestCase):
+    """The user-chat marker: the cross-process copy of _last_user_chat_at.
+
+    hart-agent-daemon runs in its own process, where this module's timestamp
+    is the daemon's own never-stamped copy, so is_user_recently_active()
+    could never say yes there.  mark_user_chat_activity now also touches
+    user-chat.<pid> in the session marker dir (core.foreground, the same
+    idiom as the governor's input-alive reader) and the reader falls back to
+    the youngest live FOREIGN marker only when the in-process timestamp was
+    never set.  The tests above run with no marker dir and are unchanged.
+    """
+
+    def setUp(self):
+        import os
+        import tempfile
+        from integrations.agent_engine import dispatch
+        self.dispatch = dispatch
+        self.os = os
+        self.tmp = tempfile.TemporaryDirectory()
+        self.prev_env = os.environ.get('HART_SESSION_MARKER_DIR')
+        os.environ['HART_SESSION_MARKER_DIR'] = self.tmp.name
+        dispatch._last_user_chat_at = 0
+        dispatch._active_create_sessions = 0
+
+    def tearDown(self):
+        if self.prev_env is None:
+            self.os.environ.pop('HART_SESSION_MARKER_DIR', None)
+        else:
+            self.os.environ['HART_SESSION_MARKER_DIR'] = self.prev_env
+        self.dispatch._last_user_chat_at = 0
+        self.tmp.cleanup()
+
+    def _marker(self, pid):
+        return self.os.path.join(self.tmp.name, f'user-chat.{pid}')
+
+    def test_mark_touches_the_marker_for_this_process(self):
+        self.dispatch.mark_user_chat_activity()
+        self.assertTrue(self.os.path.exists(self._marker(self.os.getpid())))
+
+    # The two-process proof (a child serves the chat, this process is the
+    # daemon) lives in test_foreground_yield.py beside its foreground twin,
+    # which owns the child-process plumbing.  These pin the reader's rules.
+
+    def test_foreign_marker_is_read_and_a_dead_writer_still_counts(self):
+        """A marker from a pid that no longer exists (a backend restart after
+        the chat) still says the person chatted: the writer need not be alive,
+        unlike a foreground marker, because the fact is about the person."""
+        import subprocess
+        import sys
+        p = subprocess.Popen([sys.executable, '-c', 'pass'])
+        p.wait(timeout=60)
+        open(self._marker(p.pid), 'a').close()
+        self.assertTrue(self.dispatch.is_user_recently_active())
+        self.assertTrue(self.dispatch.should_yield_to_user())
+        self.assertEqual(self.dispatch.get_last_yield_reason(), 'user_active')
+
+    def test_stale_marker_reads_inactive(self):
+        """Older than the 10 minute window: the other process's chat is
+        over, exactly as its own timestamp would have said."""
+        import time
+        p = self._marker(self.os.getppid())
+        open(p, 'a').close()
+        stale = time.time() - (self.dispatch._USER_CHAT_COOLDOWN + 5)
+        self.os.utime(p, (stale, stale))
+        self.assertFalse(self.dispatch.is_user_recently_active())
+        self.os.utime(p, None)
+        self.assertTrue(self.dispatch.is_user_recently_active())
+
+    def test_own_marker_is_not_evidence(self):
+        """A marker this process wrote is this process's own state, which
+        the caller has just said is nothing: the reader ignores it, so a
+        reset in-process timestamp means what it says."""
+        self.dispatch.mark_user_chat_activity()
+        self.dispatch._last_user_chat_at = 0
+        self.assertFalse(self.dispatch.is_user_recently_active())
+
+    def test_marker_consulted_only_when_the_timestamp_says_nothing(self):
+        """An in-process timestamp, even a stale one, is the answer: this
+        process is the writer and its own memory wins over a file."""
+        import time
+        p = self._marker(self.os.getppid())
+        open(p, 'a').close()  # a fresh foreign chat
+        self.dispatch._last_user_chat_at = time.time() - (
+            self.dispatch._USER_CHAT_COOLDOWN + 5)
+        self.assertFalse(self.dispatch.is_user_recently_active())
+
+    def test_create_in_flight_still_wins_without_any_file_read(self):
+        self.dispatch.mark_create_start()
+        try:
+            with patch('core.foreground.marker_age_s',
+                       side_effect=AssertionError('marker read')):
+                self.assertTrue(self.dispatch.is_user_recently_active())
+        finally:
+            self.dispatch.mark_create_end()
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -394,9 +394,35 @@ def _note_yield_reason(reason) -> None:
 def mark_user_chat_activity():
     """Call on every GENUINE user /chat request (including user-initiated
     autonomous CREATE).  MUST NOT be called for the agent_daemon's own
-    background dispatches — see is_genuine_user_request()."""
+    background dispatches (see is_genuine_user_request()).
+
+    Also touches the cross-process ``user-chat`` marker (core.foreground),
+    because hart-agent-daemon runs in its own process where this module's
+    ``_last_user_chat_at`` is the daemon's own, never-stamped copy; the
+    marker is how that process learns the person chatted.  Best-effort, so
+    a marker dir that is missing or not writable never affects the turn."""
     global _last_user_chat_at
     _last_user_chat_at = _time.time()
+    try:
+        from core.foreground import touch_marker, USER_CHAT_MARKER
+        touch_marker(USER_CHAT_MARKER)
+    except Exception:
+        pass
+
+
+def _user_chat_marker_recent() -> bool:
+    """Another process on this machine recorded a genuine user chat within
+    the cooldown window (core.foreground.marker_age_s: the youngest foreign
+    marker; a stale one or this process's own reads as no).  The writer need
+    not be alive: the chat is a fact about the person, and a backend restart
+    does not send them away.  Fail-open False, like the gate's other
+    best-effort reads."""
+    try:
+        from core.foreground import marker_age_s, USER_CHAT_MARKER
+        return marker_age_s(USER_CHAT_MARKER, _USER_CHAT_COOLDOWN,
+                            require_live=False) is not None
+    except Exception:
+        return False
 
 
 def is_genuine_user_request(request_id) -> bool:
@@ -491,10 +517,17 @@ def mark_create_end():
 
 
 def is_user_recently_active() -> bool:
-    """True if user chatted recently OR a CREATE pipeline is running."""
+    """True if user chatted recently OR a CREATE pipeline is running.
+
+    The in-process timestamp is the answer whenever it has ever been set
+    (this process served the chat and is the marker's writer).  Only when it
+    says nothing, which in the agent daemon's own process is always, does
+    the cross-process ``user-chat`` marker answer instead."""
     if _active_create_sessions > 0:
         return True
-    return (_time.time() - _last_user_chat_at) < _USER_CHAT_COOLDOWN
+    if _last_user_chat_at > 0.0:
+        return (_time.time() - _last_user_chat_at) < _USER_CHAT_COOLDOWN
+    return _user_chat_marker_recent()
 
 
 def is_transient_deferral() -> bool:

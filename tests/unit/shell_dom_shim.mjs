@@ -44,7 +44,9 @@ export function makeEl(tag, state) {
       }
     },
     _syncClass() { el._attrs.class = Array.from(el.classList._s).join(' '); },
-    get innerHTML() { return this._innerHTML; },
+    // A string set wins; otherwise mirror textContent so the shell's esc()
+    // idiom (set textContent, read innerHTML) yields the text, not ''.
+    get innerHTML() { return this._innerHTML || this.textContent || ''; },
     set innerHTML(v) { this._innerHTML = String(v); this._kids = []; },
     get children() { return this._kids; },
     get firstChild() { return this._kids[0] || null; },

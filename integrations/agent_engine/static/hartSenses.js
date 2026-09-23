@@ -3,15 +3,21 @@
  *
  * A floating "eye" button: tap to SHUT the AI's senses (mic/camera/screen) and
  * tap to wake. It drives the backend gate (/api/shell/ai-sensing) which refuses
- * mic ingestion and stops the vision service, then POLLS the LIVE status so the
- * proof cannot be faked. When senses are cut, the orb "closes its eyes"
- * (darkens). The AI has no path to flip this — only this human button does.
- * Plain classic script.
+ * mic ingestion and stops the vision service, then paints the LIVE status the
+ * OS pushes over the shell's SSE stream (window.HartShellState 'senses') so the
+ * proof cannot be faked; the GET of the same route is the 30 s fallback for a
+ * stream that is down (poll diet, 2026-09-23). When senses are cut, the orb
+ * "closes its eyes" (darkens). The AI has no path to flip this — only this
+ * human button does. Plain classic script.
  */
 (function () {
   'use strict';
   var API = '/api/shell/ai-sensing';
   var cut = false, timer = null;
+  var FALLBACK_POLL_MS = 30000;   // only while the push stream is down
+  function bus() { return window.HartShellState || null; }
+  function sseUp() { var b = bus(); return !!(b && b.sseUp()); }
+  function isHost() { var b = bus(); return b ? b.isHost() : true; }
 
   function ts(ms) { return window.HartTimeoutSignal ? window.HartTimeoutSignal(ms) : null; }
 
@@ -50,7 +56,7 @@
     box.appendChild(row('Screen', !!d.screen, ''));
     var foot = document.createElement('div');
     foot.className = 'hsp-foot';
-    foot.textContent = 'Live OS state, polled - the AI cannot override this.';
+    foot.textContent = 'Live OS state - the AI cannot override this.';
     box.appendChild(foot);
   }
 
@@ -219,8 +225,12 @@
       e.preventDefault();
       setProofOpen(!proofOpen());
     });
-    refresh();
-    timer = setInterval(refresh, 4000);                  // keep the proof live
+    var b = bus();
+    if (b) b.on('senses', apply);                        // the OS pushes the live proof
+    if (isHost()) {                                      // an iframed shell never polls
+      if (!(b && b.last('senses'))) refresh();           // first paint before the snapshot lands
+      timer = setInterval(function () { if (!sseUp()) refresh(); }, FALLBACK_POLL_MS);
+    }
     initDrag();                                          // floating-draggable widget (#104)
   }
 
