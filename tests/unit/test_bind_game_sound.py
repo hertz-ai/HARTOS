@@ -1152,3 +1152,16 @@ def test_a_reset_on_the_way_to_the_composer_is_still_waited_for():
         out = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
     assert out['status'] == 'composing', out
 
+
+def test_a_timed_out_submit_reads_as_composing_to_the_route_too():
+    """hartos-3a F8: a submit whose reply timed out left only submitted_at,
+    which the matcher called a MISS -- so the node's route queued a second
+    AceStep job for bgm while the agent's first was still queued."""
+    from core.game_sound_memo import SUBMIT_COOLDOWN_S, game_state_match
+    fresh = {'eng-01': {'sounds': {'bgm': {'submitted_at': time.time()}}}}
+    _rec, matched, _key = game_state_match(fresh, 'eng-01', 'bgm')
+    assert matched == 'composing', matched
+    old = {'eng-01': {'sounds': {'bgm': {'submitted_at': time.time() - SUBMIT_COOLDOWN_S - 1}}}}
+    _rec, matched, _key = game_state_match(old, 'eng-01', 'bgm')
+    assert matched == 'miss', 'a stale submit must not block composing for good'
+

@@ -989,10 +989,9 @@ from core.game_sound_memo import (  # noqa: E402
 
 
 #: How long a timed-out submit is assumed to still be queued server-side
-#: before this client will submit the same state again.  AceStep's own
-#: /v1/stats reported avg_job_seconds 907 on a shared GPU; the value is a
-#: floor on duplicates, not a promise about completion.
-SUBMIT_COOLDOWN_S = 600
+#: before this client will submit the same state again -- owned by the memo
+#: module, which answers "composing" with it for the node's route as well.
+from core.game_sound_memo import SUBMIT_COOLDOWN_S  # noqa: E402,F401
 
 #: A task older than this is taken as lost, not slow.  AceStep keeps its job
 #: store in memory, so a restart forgets every id, and it answers a forgotten

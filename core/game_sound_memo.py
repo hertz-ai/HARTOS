@@ -65,6 +65,21 @@ assert set(GAME_STATE_DURATIONS) == set(GAME_STATES), (
     'every state needs a length: ' + str(set(GAME_STATES) ^ set(GAME_STATE_DURATIONS)))
 
 
+#: How long after a submit whose reply timed out this key still counts as
+#: composing.  AceStep's own /v1/stats reported avg_job_seconds 907 on a
+#: shared GPU; the value is a floor on duplicates, not a promise about
+#: completion.  Owned here, beside the matcher that answers "composing",
+#: so the agent's tool and the node's route agree (hartos-3a F8).
+SUBMIT_COOLDOWN_S = 600
+
+
+def _submit_in_flight(record):
+    """A submit whose reply timed out, recent enough to still be queued."""
+    submitted = record.get('submitted_at')
+    return bool(submitted) and not record.get('url') and (
+        time.time() - float(submitted) < SUBMIT_COOLDOWN_S)
+
+
 def game_state_key(state, level=None, variant=None):
     """The memo key for a game's state (spec §3).
 
@@ -121,7 +136,10 @@ def game_state_match(games, game_id, state, level=None, user_id=None,
     # so a second request joins it instead of starting another
     for sounds in (mine, agent_sounds):
         record = sounds.get(level_key) or {}
-        if record.get('task_id'):
+        # A task id, OR a submit whose reply timed out and may be queued:
+        # the route used to see the second as a miss and queue a duplicate
+        # job for bgm, the very thing the cooldown exists to stop (F8).
+        if record.get('task_id') or _submit_in_flight(record):
             return record, 'composing', level_key
     return {}, 'miss', level_key
 
