@@ -58,7 +58,9 @@ use std::time::Duration;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::drm::compositor::{DrmCompositor, FrameError, FrameFlags, RenderFrameError};
+use smithay::backend::drm::compositor::{
+    DrmCompositor, FrameError, FrameFlags, PrimaryPlaneElement, RenderFrameError,
+};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, DrmSurface};
 // PART 3 of the GPU lever — the GLES2 GPU renderer + the EGL platform display it is
@@ -131,6 +133,10 @@ static FIRST_SCANOUT: AtomicBool = AtomicBool::new(false);
 /// marker the WebView host owns today. Same split as above: the pure decision, the path
 /// and the write live in main.rs; this owns only the latch.
 static NATIVE_SHELL_READY: AtomicBool = AtomicBool::new(false);
+
+/// One-shot latch for the render-sync journal line (see the `needs_sync` handling in
+/// `present_surfaces`): whether this box's flips carry a fence or the loop has to wait.
+static SYNC_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Color formats DrmCompositor will try for the primary plane framebuffer. The pixman
 /// software floor + virtually all KMS drivers support Argb8888/Xrgb8888 — the never-
@@ -1697,10 +1703,40 @@ where
             // the Copy `is_empty` bool immediately so no borrow of `surface.compositor` spans
             // the sibling-field writes (`awaiting_vblank`/`flip_queued_at`) below. The Err
             // (`RenderFrameError`) is owned, so it survives the reduction for classification.
+            //
+            // Before reducing it, honour queue_frame's documented contract: "it is your
+            // responsibility to synchronize rendering if the RenderFrameResult returns true
+            // on needs_sync". That is true when the plane cannot take an IN_FENCE_FD or the
+            // renderer cannot export a native fence, and then a page flip can scan out a
+            // buffer the GPU is still writing: the elements drawn last inside a damage rect
+            // (the shell surface, over the bloom and the orb) are exactly the ones that may
+            // not be there yet, for one frame, in the region that just changed. Our loop
+            // never waited. On the Samsung box this is a no-op: i915 is atomic with
+            // IN_FENCE_FD and eglinfo lists EGL_ANDROID_native_fence_sync, so needs_sync is
+            // false and the fence rides the commit (read 2026-09-23). Logged once so any
+            // other box states which case it is in, with the flash symptom in mind.
             let render_outcome = surface
                 .compositor
                 .render_frame::<_, _>(renderer, elements, clear, SOFTWARE_FLOOR_FRAME_FLAGS)
-                .map(|result| result.is_empty);
+                .map(|result| {
+                    let needs_sync = result.needs_sync();
+                    if !SYNC_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        info!(
+                            needs_sync,
+                            "HART-comp DRM: first rendered frame; needs_sync=true means the \
+                             flip cannot carry a fence and the loop waits for the GPU before \
+                             queueing, needs_sync=false means the fence rides the commit"
+                        );
+                    }
+                    if needs_sync {
+                        if let PrimaryPlaneElement::Swapchain(element) = &result.primary_element {
+                            // Interrupted only by a signal; the frame is still the frame, so
+                            // queue it and let the next one wait properly.
+                            let _ = element.sync.wait();
+                        }
+                    }
+                    result.is_empty
+                });
             match render_outcome {
                 Ok(true) => {
                     // Nothing changed — no flip to schedule, no vblank to await.
