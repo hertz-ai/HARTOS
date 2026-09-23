@@ -668,7 +668,8 @@ class ResourceGovernor:
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
-    def start(self, defer_memory_limit: bool = False) -> None:
+    def start(self, defer_memory_limit: bool = False,
+              monitor_only: bool = False) -> None:
         """Start the governor background monitor and proactive stream.
 
         Args:
@@ -679,6 +680,24 @@ class ResourceGovernor:
                 from terminating the process during the boot-time memory
                 peak (autogen + flaml + llmlingua + transformers + 96
                 expert agents all imported before webview.start).
+            monitor_only: Run ONLY the monitor loop, so get_mode() is live
+                in this process: no enforcer, no proactive stream.  For a
+                process that is not the backend but reads the governor,
+                which on HART OS is hart-agent-daemon.service: its
+                _idle_only_blocked and starvation override call
+                get_mode(), and without a monitor that was the
+                constructor's MODE_ACTIVE for the life of the process
+                (found 2026-09-23 on the Samsung box).  The enforcer is
+                skipped on purpose, not for economy: it is per process
+                (nice, affinity, a cgroup or Job Object on THIS process),
+                and its _unrestrict_llm_affinity pins llama-server to
+                every core by port lookup, which from a second process
+                would undo the taskset pin hart-llm.nix applies (measured
+                2026-09-23: llama-server on cpus 2,3,6,7, the pin holding).
+                The proactive stream is skipped because it dispatches hive
+                tasks and benchmarks, and the backend's own governor already
+                runs the one copy of it.  With the enforcer never armed,
+                _transition_to's update_caps call is a no-op here.
         """
         with self._lock:
             if self._running:
@@ -689,19 +708,20 @@ class ResourceGovernor:
             self._stats['uptime_start'] = time.time()
 
         # Apply hard OS-level resource caps at startup
-        try:
-            enforcer = get_enforcer()
-            if defer_memory_limit:
-                # Priority + CPU only — memory cap deferred to avoid
-                # SIGKILL on boot-time spike (see app.py comment block).
-                enforcer._set_process_priority()
-                enforcer._enforce_cpu(0.75, max(1, int((os.cpu_count() or 4) * 0.75)), os.cpu_count() or 4)
-                enforcer._enforced = True  # mark so update_caps doesn't re-enforce
-                logger.info("ResourceEnforcer: priority + CPU applied (memory deferred)")
-            else:
-                enforcer.enforce(cpu_fraction=0.75, ram_fraction=0.75, gpu_fraction=0.75)
-        except Exception as e:
-            logger.warning("ResourceEnforcer failed at startup: %s", e)
+        if not monitor_only:
+            try:
+                enforcer = get_enforcer()
+                if defer_memory_limit:
+                    # Priority + CPU only; the memory cap is deferred to avoid
+                    # SIGKILL on boot-time spike (see app.py comment block).
+                    enforcer._set_process_priority()
+                    enforcer._enforce_cpu(0.75, max(1, int((os.cpu_count() or 4) * 0.75)), os.cpu_count() or 4)
+                    enforcer._enforced = True  # mark so update_caps doesn't re-enforce
+                    logger.info("ResourceEnforcer: priority + CPU applied (memory deferred)")
+                else:
+                    enforcer.enforce(cpu_fraction=0.75, ram_fraction=0.75, gpu_fraction=0.75)
+            except Exception as e:
+                logger.warning("ResourceEnforcer failed at startup: %s", e)
 
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop,
@@ -709,6 +729,12 @@ class ResourceGovernor:
             daemon=True,
         )
         self._monitor_thread.start()
+
+        if monitor_only:
+            logger.info("ResourceGovernor started, monitor only "
+                        "(idle threshold=%.0fs; no enforcer, no proactive stream)",
+                        self._idle_threshold_seconds)
+            return
 
         self._proactive_thread = threading.Thread(
             target=self._proactive_action_stream,

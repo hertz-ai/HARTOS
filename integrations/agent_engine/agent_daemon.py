@@ -649,7 +649,24 @@ class AgentDaemon:
         worker thread ever exits this returns and systemd's Restart=on-failure
         relaunches the unit. Without this method the unit crashed on boot with
         AttributeError: 'AgentDaemon' object has no attribute 'run_forever'.
+
+        The governor's monitor runs in THIS process too, monitor only.  This
+        unit is its own process, and only the backend
+        (hart_intelligence_entry.py) ever started a governor, so every
+        get_mode() here, in _idle_only_blocked and in the starvation
+        override, read the constructor's MODE_ACTIVE for as long as the
+        process lived (found 2026-09-23 on the Samsung box).  Monitor only:
+        the enforcer and the proactive stream stay in the backend, see
+        ResourceGovernor.start.  Best-effort, so a governor fault can never
+        keep the goal engine from starting; the reads then fail closed to
+        "not idle" exactly as they did before.
         """
+        try:
+            from core.resource_governor import get_governor
+            get_governor().start(monitor_only=True)
+        except Exception as e:
+            logger.warning("Agent daemon: governor monitor did not start "
+                           "(idle reads stay closed): %s", e)
         self.start()
         if self._thread is not None:
             self._thread.join()

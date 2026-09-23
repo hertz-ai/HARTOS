@@ -232,3 +232,93 @@ def test_no_override_before_the_starvation_window(starved_daemon, governor_mode)
     assert opened['n'] == 0, (
         "a gate that has only just started blocking is honoured as is; the "
         "override is for STARVATION, and idle alone does not shorten the window")
+
+
+# ── The mode the override reads is LIVE in the daemon process ──────────────
+#
+# hart-agent-daemon.service is its own process and only the backend ever
+# started a governor, so the mode above was the constructor's MODE_ACTIVE for
+# the life of the daemon (found 2026-09-23).  run_forever, the unit's one entry
+# point, now starts the governor monitor only (no enforcer, no proactive
+# stream; see ResourceGovernor.start), so the override reads real idle.
+
+def _wait_for(pred, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return pred()
+
+
+@pytest.fixture
+def live_governor(monkeypatch):
+    """A fresh governor installed as the process singleton, driven by one
+    controllable OS idle probe, every other per-tick read pinned calm
+    (the same harness as tests/unit/test_governor_monitor_only.py)."""
+    import core.resource_governor as rg
+    monkeypatch.setattr(rg, '_MONITOR_INTERVAL_SECONDS', 0.05)
+    monkeypatch.setattr(rg, 'get_enforcer', lambda: MagicMock())
+    import security.node_watchdog as _nw
+    monkeypatch.setattr(_nw, 'get_watchdog', lambda: None)
+    gov = rg.ResourceGovernor(idle_threshold_seconds=120)
+    probe = {'idle_ms': 0.0}
+    monkeypatch.setattr(gov, '_get_os_idle_ms', lambda: probe['idle_ms'])
+    monkeypatch.setattr(gov, '_refresh_cpu_attribution', lambda: None)
+    monkeypatch.setattr(gov, '_get_memory_pressure', lambda: 0.1)
+    monkeypatch.setattr(gov, '_get_battery_status', lambda: (1.0, False))
+    monkeypatch.setattr(gov, '_check_gpu_available', lambda: False)
+    monkeypatch.setattr(rg, '_governor', gov)
+    yield gov, probe
+    gov.stop()
+
+
+def test_run_forever_starts_the_governor_monitor_once(live_governor, monkeypatch):
+    from integrations.agent_engine.agent_daemon import AgentDaemon
+    gov, probe = live_governor
+    d = AgentDaemon()
+    # The worker is not under test: leave _thread None so run_forever returns
+    # instead of joining forever.
+    monkeypatch.setattr(d, 'start', lambda: None)
+    d.run_forever()
+    assert gov._running and gov._monitor_thread is not None
+    assert gov._monitor_thread.is_alive()
+    assert gov._proactive_thread is None, (
+        "the daemon must start the governor MONITOR ONLY; the proactive "
+        "stream and the enforcer stay in the backend")
+    first = gov._monitor_thread
+    d.run_forever()                                # a supervisor re-entry
+    assert gov._monitor_thread is first, "one monitor per process, ever"
+
+
+def test_run_forever_survives_a_governor_that_will_not_start(monkeypatch):
+    """Best-effort: the goal engine must start even if the governor faults;
+    the idle reads then fail closed to 'not idle' as before."""
+    from integrations.agent_engine.agent_daemon import AgentDaemon
+    d = AgentDaemon()
+    monkeypatch.setattr(d, 'start', lambda: None)
+    with patch('core.resource_governor.get_governor',
+               side_effect=RuntimeError('governor down')):
+        d.run_forever()                            # must not raise
+
+
+def test_override_follows_the_live_mode_in_the_daemon_process(
+        starved_daemon, live_governor):
+    """End to end in one process: the probe says idle, the override fires;
+    the probe says a click just happened, the override yields."""
+    from core.resource_governor import MODE_ACTIVE, MODE_IDLE
+    daemon, opened = starved_daemon
+    gov, probe = live_governor
+    probe['idle_ms'] = 10 * 60 * 1000
+    gov.start(monitor_only=True)
+    assert _wait_for(lambda: gov.get_mode() == MODE_IDLE)
+    daemon._tick()
+    assert opened['n'] == 1, "idle per the live governor: the forced tick runs"
+
+    probe['idle_ms'] = 0.0
+    assert _wait_for(lambda: gov.get_mode() == MODE_ACTIVE)
+    daemon._last_tick_completed_at = time.monotonic() - (daemon._starvation_s + 60)
+    daemon._tick()
+    assert opened['n'] == 1, (
+        "a click reached the compositor: the override must yield, whatever "
+        "the yield gate's own reason is")
