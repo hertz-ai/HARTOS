@@ -1194,7 +1194,11 @@ def check_media_status(
         return json.dumps({'status': 'error',
                            'error': f'HTTP {resp.status_code}'})
     except Exception as e:
-        return json.dumps({'status': 'error', 'error': str(e)})
+        # Never reached the composer (reset, refused, timed out): only THIS
+        # kind may read as "still waking".  A failure the composer itself
+        # reports is a failure, whatever its text says (hartos-3a F3).
+        return json.dumps({'status': 'error', 'error': str(e),
+                           'unreachable': True})
 
 
 # ═══════════════════════════════════════════════════════════════

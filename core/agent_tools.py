@@ -994,6 +994,12 @@ from core.game_sound_memo import (  # noqa: E402
 #: floor on duplicates, not a promise about completion.
 SUBMIT_COOLDOWN_S = 600
 
+#: A task older than this is taken as lost, not slow.  AceStep keeps its job
+#: store in memory, so a restart forgets every id, and it answers a forgotten
+#: id exactly as it answers a queued one (hartos-3a F2).  The slowest job
+#: MEASURED on a shared GPU averaged 907 s; twice that is past any real job.
+TASK_STALE_S = 1800
+
 
 def _pending_submit(games, game_id, state, level=None, user_id=None):
     """When this state's last submit went out with no id learned, else None.
@@ -1452,6 +1458,28 @@ def build_core_tool_closures(ctx):
                 'rejected_at': rejected.get('rejected_at'),
             })
         task_id = bound.get('task_id')
+
+        def _forget_task(reason):
+            """Drop a task the composer will never finish, keep the rest.
+
+            hartos-3a F2: nothing ever cleared a dead task_id, so after a
+            composer restart this state answered "composing" for good, and
+            after a failure it answered "failed" for good; it could never be
+            composed again.  The rejection history and variant stay.
+            """
+            kept = {k: v for k, v in game_state_record(
+                        games, slot, which, level, mine).items()
+                    if k not in ('task_id', 'task_since', 'submitted_at')}
+            kept['lost_task'] = {'task_id': task_id, 'reason': reason,
+                                 'at': time.time()}
+            _remember(kept)
+
+        # A record from before task_since existed has no age to judge; it is
+        # polled as before rather than composed a second time.
+        if (task_id and bound.get('task_since')
+                and time.time() - float(bound['task_since']) > TASK_STALE_S):
+            _forget_task('no answer within TASK_STALE_S')
+            task_id = None
         try:
             if not task_id:
                 # A submit whose RESPONSE timed out may still have been
@@ -1534,7 +1562,8 @@ def build_core_tool_closures(ctx):
                                 f"with the same game_id and state.")
                     return f"The composer refused this game's music: {why}"
                 task_id = started.get('task_id')
-                _remember({'task_id': task_id, 'mood': mood, 'prompt': prompt,
+                _remember({'task_id': task_id, 'task_since': time.time(),
+                           'mood': mood, 'prompt': prompt,
                            'state': which, 'level': level or None,
                            'variant': variant,
                            'previous_takes': previous_takes,
@@ -1562,7 +1591,7 @@ def build_core_tool_closures(ctx):
                                        'state': which, 'music': record})
                 if state in MEDIA_FAILED_STATUSES:
                     why = str(progress.get('error', 'unknown reason'))
-                    if _reads_as_still_waking(why):
+                    if progress.get('unreachable') and _reads_as_still_waking(why):
                         # The POLL can be reset by a busy server just as the
                         # submit can (MEASURED 2026-09-22: attempts 9-10 of a
                         # live bind reported "failed" on ConnectionResetError
@@ -1572,7 +1601,11 @@ def build_core_tool_closures(ctx):
                         continue
                     if _no_composer_here(progress):
                         return _ask_for_a_composer(why)
-                    return f"The composer failed on this game: {why}"
+                    # the task is over: the next call composes this state again
+                    # (hartos-3a F2)
+                    _forget_task(why)
+                    return (f"The composer failed on this game: {why}. Call "
+                            f"bind_game_sound again to compose it afresh.")
             return json.dumps({
                 'status': 'composing',
                 'game_id': slot,

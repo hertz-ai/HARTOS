@@ -8,6 +8,7 @@ save_data_in_memory keeps, and the composing is the media capability the
 agent already holds.
 """
 import json
+import time
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +34,15 @@ def _media(started, progress=None):
     module.classify_error = classify_error
     module.ABSENT, module.UNREACHABLE = ABSENT, UNREACHABLE
     module.REFUSED, module.UNKNOWN = REFUSED, UNKNOWN
+    # the real reader too: a MagicMock is truthy for every input, so a
+    # stand-in here read EVERY failure as "still waking" (hartos-3a F3)
+    from integrations.service_tools.media_agent import _reads_as_still_waking
+    module._reads_as_still_waking = _reads_as_still_waking
+    # and the real vocabulary: `'error' in MagicMock()` is False, so with a
+    # stand-in every failed poll looked like "still composing" and the
+    # failure branch never ran in any test
+    from integrations.service_tools.media_agent import MEDIA_FAILED_STATUSES
+    module.MEDIA_FAILED_STATUSES = MEDIA_FAILED_STATUSES
     return module
 
 
@@ -866,7 +876,9 @@ def test_a_reset_while_polling_keeps_polling_instead_of_failing():
     media = _media({'status': 'pending', 'task_id': 'acestep_abc'})
     # first poll: a reset; second poll: finished
     media.check_media_status.side_effect = [
-        json.dumps({'status': 'error',
+        # the shape check_media_status gives a reset: it never reached the
+        # composer, so it is marked unreachable (hartos-3a F3)
+        json.dumps({'status': 'error', 'unreachable': True,
                     'error': "('Connection aborted.', ConnectionResetError("
                              "10054, 'An existing connection was forcibly "
                              "closed by the remote host'))"}),
@@ -1081,3 +1093,62 @@ def test_the_action_prefix_is_matched_without_case_but_the_state_is_not():
     assert parse_game_sound_action('GAME_SOUND:eng-01:starEarned') == ('eng-01', 'starEarned')
     assert parse_game_sound_action('game_sound:eng-01') == ('eng-01', 'bgm')
     assert parse_game_sound_action('camera:on') is None
+
+
+def test_a_failed_task_is_composed_again():
+    """hartos-3a F2: a failed task stayed in the memo, so every later call
+    re-polled it and said "failed" for good; the state could never be
+    composed again."""
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct': {'task_id': 'acestep_dead', 'task_since': time.time()}}}}}}
+    failed = _media({'status': 'pending', 'task_id': 'acestep_new'},
+                    {'status': 'error', 'error': 'CUDA out of memory'})
+    with _agent(agent_data, failed) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        first = tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+        assert 'failed' in first and 'CUDA out of memory' in first, first
+        record = agent_data[4242]['games']['eng-01']['sounds']['correct']
+        assert 'task_id' not in record, f'the dead task is still pinned: {record!r}'
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+    assert failed.generate_media.called, 'the state was never composed again'
+
+
+def test_a_task_older_than_any_real_job_is_taken_as_lost():
+    """After a composer restart AceStep answers a forgotten id as queued."""
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct': {'task_id': 'acestep_old',
+                    'task_since': time.time() - agent_tools.TASK_STALE_S - 1}}}}}}
+    media = _media({'status': 'completed', 'results': [{'url': '/api/voice/audio/x.wav'}]})
+    with _agent(agent_data, media) as tools:
+        out = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+    assert out['status'] == 'bound', out
+    assert media.generate_media.called
+
+
+def test_a_server_failure_that_mentions_a_timeout_is_still_a_failure():
+    """hartos-3a F3: AceStep failing a model fetch reports "Read timed out";
+    that text read as "still waking" and the failure became "composing"."""
+    agent_data = {}
+    media = _media({'status': 'pending', 'task_id': 'acestep_t'},
+                   {'status': 'error',
+                    'error': "HTTPSConnectionPool(host='huggingface.co'): Read timed out."})
+    import integrations.service_tools.media_agent as real
+    media._reads_as_still_waking = real._reads_as_still_waking
+    with _agent(agent_data, media) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        out = tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+    assert 'failed' in out, out
+
+
+def test_a_reset_on_the_way_to_the_composer_is_still_waited_for():
+    agent_data = {}
+    media = _media({'status': 'pending', 'task_id': 'acestep_r'},
+                   {'status': 'error', 'unreachable': True,
+                    'error': "('Connection aborted.', ConnectionResetError(10054))"})
+    import integrations.service_tools.media_agent as real
+    media._reads_as_still_waking = real._reads_as_still_waking
+    with _agent(agent_data, media) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        out = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+    assert out['status'] == 'composing', out
+
