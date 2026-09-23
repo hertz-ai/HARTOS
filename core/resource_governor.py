@@ -999,7 +999,39 @@ class ResourceGovernor:
         return None
 
     def _get_idle_ms_linux(self) -> Optional[float]:
-        """Linux: try xprintidle, then /proc/interrupts delta estimation."""
+        """Linux: xprintidle on X11, then the compositor's input-alive marker.
+
+        xprintidle answers only under X11.  HART OS runs Wayland (hart-comp,
+        sway, cage), where the binary is absent or exits non-zero, so this
+        returned None on every HART OS box and _detect_user_idle fell back to
+        the report_user_activity() timestamp, which only a foreground chat
+        request touches.  A person clicking around the desktop was therefore
+        "away" to the governor, and the agent daemon's starvation override
+        drove CPU inference at the desk.  Measured 2026-09-22 on the Samsung
+        box: press p50 122 ms against a 25 ms budget, clock 1.3 GHz of 3.4,
+        package 94 C, llama-server at 207 percent once a minute; with the
+        daemons paused for 120 s the clock came back to 3.19 GHz and press
+        p50 to 12 ms.
+
+        The marker is the compositor's own input beacon: comp_core.rs
+        note_input_alive writes /run/hart/session/input-alive and the
+        session supervisor reads the same path, so this adds no transport.
+        Its mtime is the last moment the compositor saw a pointer or keyboard
+        event once that write becomes a rate limited heartbeat (S2 of the
+        native OS program); until then it is written once per boot, so an old
+        marker reads as idle, which errs toward letting agents work rather
+        than toward starving them.  The mtime is a wall clock stamp, so it is
+        compared against time.time(); a marker from the future (a clock step)
+        clamps to 0 ms, which reads as active.
+
+        No marker at all (a non HART OS Linux, a dev box) returns None so the
+        timestamp fallback stays the answer there.  HART_INPUT_ALIVE_MARKER
+        overrides the path for tests and for a supervisor that relocates the
+        session run dir.
+
+        There is no /proc/interrupts estimator.  The previous docstring
+        promised one that was never written.
+        """
         # Try xprintidle first (X11 desktops)
         try:
             import subprocess
@@ -1010,7 +1042,14 @@ class ResourceGovernor:
                 return float(result.stdout.strip())
         except Exception:
             pass
-        return None
+        # Wayland: the compositor's input-alive marker (see the docstring).
+        marker = os.environ.get('HART_INPUT_ALIVE_MARKER',
+                                '/run/hart/session/input-alive')
+        try:
+            mtime = os.stat(marker).st_mtime
+        except OSError:
+            return None
+        return max(0.0, (time.time() - mtime) * 1000.0)
 
     def _get_idle_ms_macos(self) -> Optional[float]:
         """macOS: ioreg HIDIdleTime (nanoseconds -> milliseconds)."""
