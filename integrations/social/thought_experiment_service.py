@@ -730,9 +730,17 @@ class ThoughtExperimentService:
 
     @staticmethod
     def get_active_experiments(db: Session, status: str = None,
-                                limit: int = 50) -> List[Dict]:
-        """List experiments filtered by status."""
-        from .models import ThoughtExperiment
+                                limit: int = 50,
+                                with_votes_only: bool = False) -> List[Dict]:
+        """List experiments filtered by status, newest first.
+
+        with_votes_only: only experiments with at least one vote.  This is
+        the question auto-evolve's VOTE gate asks -- a zero-vote experiment
+        can never pass it -- and without it the newest-`limit` window hid
+        every voted row once unvoted rows piled up (measured on a live
+        node: the three human-voted experiments sat at rank ~693 of 807).
+        """
+        from .models import ThoughtExperiment, ExperimentVote
 
         query = db.query(ThoughtExperiment)
         if status:
@@ -740,6 +748,11 @@ class ThoughtExperimentService:
         else:
             query = query.filter(
                 ThoughtExperiment.status != 'archived')
+        if with_votes_only:
+            query = query.filter(
+                db.query(ExperimentVote.id).filter(
+                    ExperimentVote.experiment_id == ThoughtExperiment.id,
+                ).exists())
 
         experiments = query.order_by(
             desc(ThoughtExperiment.created_at)

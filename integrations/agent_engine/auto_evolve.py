@@ -395,8 +395,15 @@ class AutoEvolveOrchestrator:
             with db_session(commit=False) as db:
                 all_experiments = []
                 for status in statuses:
+                    # Only experiments that HAVE votes: a zero-vote row can
+                    # never pass _rank_by_votes (score 0, super-majority 0).
+                    # The newest-50 window used to hide every voted row once
+                    # unvoted ones piled up -- measured on a live node, the
+                    # human-voted experiments sat at rank ~693 of 807 and
+                    # every cycle ended none_approved.  This changes what is
+                    # looked at, never what is approved: the gate is intact.
                     exps = ThoughtExperimentService.get_active_experiments(
-                        db, status=status, limit=50)
+                        db, status=status, limit=200, with_votes_only=True)
                     # One evaluation goal already contains the experiment's
                     # type-aware iteration loop.  Re-dispatching an evaluating
                     # row that has recorded an evaluation creates duplicate
