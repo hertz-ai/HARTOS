@@ -440,17 +440,19 @@ in
       # same as any agent. hart-session.slice at 200 against hart-agents.slice
       # at 40 gives the session 200 of 240 whenever the two contend.
       #
-      # What this does NOT change, so nobody reads more into it: hart-llm and
-      # hart-agent-daemon run in system.slice (measured the same day: Slice=
-      # system.slice, CPUWeight 50 and 80), so this ratio never binds against
-      # llama-server. Inference versus the session is arbitrated at the root
-      # (system.slice, hart.slice and user.slice all at the default 100) and
-      # by the taskset pin in hart-llm.nix. Moving hart-llm under
-      # hart-agents.slice is one Slice= line there and a steward decision,
-      # because the owner's own chat runs on that same llama-server. The
-      # compositor runs in the greetd session scope under user.slice with no
-      # weight at all; the session slice exists so it has somewhere to go when
-      # its unit gains a Slice=.
+      # Who the ratio binds. When first measured (2026-09-23) hart-llm and
+      # hart-agent-daemon ran in system.slice (CPUWeight 50 and 80), so the
+      # ratio never touched llama-server: inference versus the session was
+      # arbitrated at the root, where system.slice, hart.slice and user.slice
+      # all sit at the default 100. The coordinator decided the same day that
+      # both move under hart-agents.slice (one Slice= line in hart-llm.nix and
+      # hart-agent.nix): the owner's priority is the desk staying snappy; a
+      # foreground chat still gets the model, only at a lower CPU share while
+      # the shell is busy, and llama's own threads are already pinned away
+      # from CPU 0 by hart-llm.nix's taskset. The compositor runs in the
+      # greetd session scope under user.slice with no weight at all; the
+      # session slice exists so it has somewhere to go when its unit gains a
+      # Slice=.
       systemd.slices.hart-agents = {
         description = "HART OS Agent Workloads";
         sliceConfig = {

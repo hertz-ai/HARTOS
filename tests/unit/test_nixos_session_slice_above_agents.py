@@ -73,11 +73,24 @@ def test_shell_server_runs_in_the_session_slice():
         "80 of 380 shares with the agents under contention (measured 2026-09-23)")
 
 
-def test_llm_weight_is_documented_as_out_of_this_ratio():
-    """hart-llm runs in system.slice (measured 2026-09-23), so the session vs
-    agents ratio never binds against llama-server.  The kernel module must say
-    so next to the weights, or the next reader assumes inference was demoted."""
+def test_goal_engine_runs_in_the_agent_slice():
+    """hart-agent-daemon is the process whose forced ticks drive llama-server.
+    Measured 2026-09-23 it sat in system.slice, outside the ratio the kernel
+    module defines; the coordinator moved it under the agent slice with
+    hart-llm (whose placement tests/unit/test_nixos_hart_llm_gpu.py pins)."""
+    agent = _read('hart-agent.nix')
+    code = "\n".join(line.split('#')[0] for line in agent.splitlines())
+    assert 'Slice = "hart-agents.slice";' in code, (
+        "hart-agent-daemon must run in hart-agents.slice so the session-over-"
+        "agents ratio binds against the goal engine, not only against the "
+        "units that happened to be in the slice already")
+
+
+def test_kernel_comment_records_where_inference_and_the_engine_live():
+    """The WHY beside the weights names hart-llm and hart-agent-daemon and
+    the day they moved under the agent slice, or the next reader has to
+    rediscover on the box which units the ratio actually binds."""
     kernel = _read('hart-kernel.nix')
-    assert 'system.slice' in kernel and 'hart-llm' in kernel, (
-        "the WHY comment beside the slice weights must record that hart-llm "
-        "is in system.slice and therefore outside this ratio")
+    for name in ('hart-llm', 'hart-agent-daemon', '2026-09-23'):
+        assert name in kernel, (
+            f"the slice comment in hart-kernel.nix must mention {name!r}")
