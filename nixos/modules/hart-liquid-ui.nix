@@ -907,7 +907,15 @@ in
           # separate cage glass-shell client (fixed via giTypelibPath above).
 
           # Resource limits — scale by variant
-          Slice = "hart-agents.slice";
+          # hart-session.slice, not hart-agents.slice. This unit serves every
+          # click's HTTP round trip, and until 2026-09-23 it shared the agent
+          # slice at CPUWeight 80 of 380 shares, so under contention the shell
+          # was just another agent. hart-kernel.nix defines the session slice
+          # at 200 against the agents' 40 and carries the measured numbers
+          # (press p50 122 ms against a 25 ms budget with the daemons running,
+          # 12 ms with them paused). The CPUWeight below is this unit's share
+          # INSIDE the session slice, moot while it is the only member.
+          Slice = "hart-session.slice";
           MemoryMax = if cfg.variant == "edge" then "128M"
                       else if cfg.variant == "desktop" then "512M"
                       else "1G";
