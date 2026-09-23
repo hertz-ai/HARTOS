@@ -240,6 +240,16 @@ in
           cfg.dataDir
           cfg.logDir
           "${cfg.dataDir}/agent_data"
+          # The session marker dir (0770 hart:hart tmpfs, declared by
+          # hart-session-supervisor.nix). This unit serves /chat, and
+          # core.foreground holds foreground-active.<pid> there while a turn
+          # is in flight and dispatch touches user-chat.<pid> on every genuine
+          # chat, which is how hart-agent-daemon (its own process) learns a
+          # person is being served. Under ProtectSystem=strict the whole FS is
+          # read-only but for this list, so without this line the marker write
+          # fails (logged once at WARNING) and the daemon runs inference
+          # through the person's turns.
+          "/run/hart/session"
         ];
         PrivateTmp = true;
         ProtectClock = true;

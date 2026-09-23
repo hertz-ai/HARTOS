@@ -58,6 +58,16 @@ in
           cfg.dataDir
           cfg.logDir
           "${cfg.dataDir}/agent_data"
+          # The session marker dir (0770 hart:hart tmpfs, declared by
+          # hart-session-supervisor.nix). This unit READS the markers the
+          # chat-serving units hold there (core.foreground.marker_age_s is
+          # what lets its yield gate and starvation override see a person
+          # being served in another process), which strict allows anyway.
+          # It is listed here so that the in-process /chat app this unit
+          # also imports (dispatch._native_chat) shares ONE writable dir
+          # with the backend rather than a per-unit exception: a genuine
+          # user turn served through it lands where every reader looks.
+          "/run/hart/session"
         ];
         PrivateTmp = true;
         ProtectClock = true;

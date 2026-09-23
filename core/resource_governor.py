@@ -1052,8 +1052,11 @@ class ResourceGovernor:
 
         No marker at all (a non HART OS Linux, a dev box) returns None so the
         timestamp fallback stays the answer there.  HART_INPUT_ALIVE_MARKER
-        overrides the path for tests and for a supervisor that relocates the
-        session run dir.
+        overrides the full path for tests; otherwise the marker sits in the
+        ONE session marker dir core.foreground.session_marker_dir resolves
+        (HART_SESSION_MARKER_DIR, else /run/hart/session), the same dir the
+        foreground-active and user-chat markers live in, so a supervisor
+        that relocates the run dir moves all three readers with one setting.
 
         There is no /proc/interrupts estimator.  The previous docstring
         promised one that was never written.
@@ -1069,8 +1072,18 @@ class ResourceGovernor:
         except Exception:
             pass
         # Wayland: the compositor's input-alive marker (see the docstring).
-        marker = os.environ.get('HART_INPUT_ALIVE_MARKER',
-                                '/run/hart/session/input-alive')
+        marker = os.environ.get('HART_INPUT_ALIVE_MARKER', '').strip()
+        if not marker:
+            marker_dir = None
+            try:
+                from core.foreground import session_marker_dir
+                marker_dir = session_marker_dir()
+            except Exception:
+                pass
+            # The literal, not a join: on a Windows dev box os.path.join would
+            # put a backslash into a Linux path the tests pin verbatim.
+            marker = (os.path.join(marker_dir, 'input-alive') if marker_dir
+                      else '/run/hart/session/input-alive')
         try:
             mtime = os.stat(marker).st_mtime
         except OSError:

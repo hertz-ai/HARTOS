@@ -129,6 +129,29 @@ def test_default_marker_path_is_the_compositor_contract(no_xprintidle, monkeypat
     assert result is None or result >= 0.0
 
 
+def test_marker_follows_the_one_session_marker_dir(no_xprintidle, tmp_path,
+                                                    monkeypatch):
+    """With no full-path override, the marker sits in the dir
+    core.foreground.session_marker_dir resolves: the same dir the
+    foreground-active and user-chat markers live in, so HART_SESSION_MARKER_DIR
+    relocates all three readers at once (a supervisor that moves the run dir,
+    a test).  The full-path override still wins over it."""
+    monkeypatch.delenv('HART_INPUT_ALIVE_MARKER', raising=False)
+    monkeypatch.setenv('HART_SESSION_MARKER_DIR', str(tmp_path))
+    gov = _gov()
+    assert gov._get_idle_ms_linux() is None, "no marker in that dir yet"
+    (tmp_path / 'input-alive').write_bytes(b'1\n')
+    idle_ms = gov._get_idle_ms_linux()
+    assert idle_ms is not None and idle_ms < IDLE_S * 1000
+    elsewhere = tmp_path / 'elsewhere'
+    elsewhere.write_bytes(b'1\n')
+    stale = time.time() - (IDLE_S + 30)
+    os.utime(elsewhere, (stale, stale))
+    monkeypatch.setenv('HART_INPUT_ALIVE_MARKER', str(elsewhere))
+    assert gov._get_idle_ms_linux() >= IDLE_S * 1000, (
+        "the full-path override keeps precedence over the shared dir")
+
+
 @pytest.mark.parametrize('platform,branch', [
     ('win32', '_get_idle_ms_windows'),
     ('darwin', '_get_idle_ms_macos'),
