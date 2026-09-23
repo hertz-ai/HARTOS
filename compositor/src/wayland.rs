@@ -259,6 +259,13 @@ pub struct State {
     pub ws_switch_at: Option<std::time::Instant>,
     /// M6 killswitch — the constitutional screen cut (black surface + input/capture gate).
     pub capture_blocked: bool,
+    /// zwlr_screencopy `copy` requests awaiting the next presented frame. The DRM render
+    /// tick (udev.rs `present_surfaces`) drains it against the scanout slot the
+    /// DrmCompositor just rendered, the same read-back the winit backend runs on its window
+    /// framebuffer (`screencopy::service_pending_frames`). Until this field existed the DRM
+    /// backend registered no screencopy global at all, and `grim` on the box said so
+    /// (VERIFICATION row 23).
+    pub pending_screencopy: Vec<crate::screencopy::PendingScreencopy>,
     /// NATIVE SHELL M3: render the native scene (top bar + hero + rows + taskbar) this
     /// session. Set from the HART_NATIVE_SHELL env at State construction (default OFF,
     /// so the WebView shell is unchanged). No nix option until M6 flips the default.
@@ -459,6 +466,17 @@ impl CompState for State {
     fn set_capture_blocked_flag(&mut self, on: bool) {
         self.capture_blocked = on;
     }
+    /// The DRM twin of the winit override: the shared flag flip PLUS failing every
+    /// screencopy frame already queued, so a capture requested a tick before the cut never
+    /// reads a frame painted before the black surface (IPC_PROTOCOL 4.11 point 3). The
+    /// `screen.kill` verb reaches this through the trait, so the queue drain is live.
+    fn set_capture_blocked(&mut self, on: bool) -> bool {
+        let blocked = comp_core::set_capture_blocked_shared(self, on);
+        if on {
+            crate::screencopy::fail_pending(self);
+        }
+        blocked
+    }
     fn black_buffer_mut(&mut self) -> &mut smithay::backend::renderer::element::solid::SolidColorBuffer {
         &mut self.black_buffer
     }
@@ -506,6 +524,18 @@ impl CompState for State {
     }
     fn ipc_state_mut(&mut self) -> &mut crate::ipc::IpcState {
         &mut self.ipc
+    }
+}
+
+/// The DRM backend's half of the screencopy contract: the queue, and the nudge that makes
+/// the frame-budget scheduler paint the tick after a `copy` arrives, so `grim` is served
+/// on the next frame instead of after the 200 ms idle heartbeat.
+impl crate::screencopy::ScreencopyState for State {
+    fn pending_screencopy_mut(&mut self) -> &mut Vec<crate::screencopy::PendingScreencopy> {
+        &mut self.pending_screencopy
+    }
+    fn note_capture_requested(&mut self) {
+        self.repaint.mark_damaged();
     }
 }
 

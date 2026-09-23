@@ -55,7 +55,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
-use smithay::backend::allocator::dmabuf::Dmabuf;
+// `AsDmabuf` exports the DrmCompositor's just-rendered swapchain slot (a GBM buffer) as
+// the dmabuf the renderer binds for the screencopy read-back in `present_surfaces`.
+use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::compositor::{
@@ -73,7 +75,7 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::renderer::element::RenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::pixman::PixmanRenderer;
-use smithay::backend::renderer::{Bind, Color32F, ImportDma, Renderer, Texture};
+use smithay::backend::renderer::{Bind, Color32F, ExportMem, ImportDma, Renderer, Texture};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{primary_gpu, UdevBackend, UdevEvent};
@@ -94,6 +96,7 @@ use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice}
 use smithay::reexports::drm::Device as BasicDevice;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
+use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Size, Transform};
 // `Window::wl_surface()` is provided by the `WaylandFocus` trait on this rev (not an
@@ -452,6 +455,17 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     let _output_global = output.create_global::<State>(&dh);
+    // zwlr_screencopy_v1 on the DRM backend (VERIFICATION row 23): the SAME global the
+    // winit backend registers, at the same version, served by the same protocol bodies
+    // (screencopy.rs is generic over the State). `grim` on the box binds this; the copy is
+    // gated by `capture_blocked` in `queue_copy` and serviced in `present_surfaces` from
+    // the scanout slot the DrmCompositor rendered. The per-client bind filter defaults to
+    // "allow all": the socket-owner boundary (IPC_PROTOCOL 6.5) already constrains who
+    // connects, and the killswitch gates the actual copy.
+    let _screencopy_global = dh.create_global::<State, ZwlrScreencopyManagerV1, _>(
+        crate::screencopy::SCREENCOPY_VERSION,
+        (),
+    );
     let boot_mode = WlMode { size: (1920, 1080).into(), refresh: 60_000 };
     output.change_current_state(Some(boot_mode), Some(Transform::Normal), None, Some((0, 0).into()));
     output.set_preferred(boot_mode);
@@ -514,6 +528,8 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         cursor_hotspot: cur_hotspot,
         ws_switch_at: None,
         capture_blocked: false,
+        // Screencopy queue empty; capture allowed (the same two the winit State starts with).
+        pending_screencopy: Vec::new(),
         // NATIVE SHELL M3: opt in per session via the env, default OFF (no regression).
         // The VALUE is parsed, not merely the variable's presence: `HART_NATIVE_SHELL=0`
         // used to turn the native shell ON, which is the wrong answer to the most likely
@@ -1640,6 +1656,15 @@ fn present_surfaces<R>(
     elements: &[HartRenderElement<R>],
     clear: Color32F,
     now: std::time::Instant,
+    // zwlr_screencopy frames waiting for a presented frame (VERIFICATION row 23). Taken
+    // out of the State by `render_all` because this fn holds the device table, not the
+    // State. Serviced against the FIRST CRTC that renders this tick, from the scanout slot
+    // the DrmCompositor rendered into: the buffer the display will show, damage tracking
+    // and all, which is what makes a capture evidence about a flash rather than a second
+    // composite of the same elements. `size` is the output's physical mode, the region the
+    // queued frames were clamped against when they were requested.
+    pending_screencopy: &mut Vec<crate::screencopy::PendingScreencopy>,
+    size: Size<i32, smithay::utils::Physical>,
     // Diagnostic context for the silent-freeze beacon ONLY (never a render input).
     // These are the two collections the frame-callback loop in run_udev walks, so
     // they answer the question the first beacon could not: is the client starving
@@ -1651,7 +1676,7 @@ fn present_surfaces<R>(
     layer_count: usize,
 ) -> PresentOutcome
 where
-    R: Renderer + Bind<Dmabuf>,
+    R: Renderer + Bind<Dmabuf> + ExportMem,
     R::TextureId: Texture + Clone + Send + 'static,
     HartRenderElement<R>: RenderElement<R>,
 {
@@ -1740,6 +1765,46 @@ where
                             // Interrupted only by a signal; the frame is still the frame, so
                             // queue it and let the next one wait properly.
                             let _ = element.sync.wait();
+                        }
+                    }
+                    // SCREENCOPY on the DRM backend (VERIFICATION row 23). Read the slot the
+                    // DrmCompositor just rendered, whether or not this tick changed it: an
+                    // unchanged frame is still the frame on the display. The slot is a GBM
+                    // buffer; exporting it as a dmabuf and binding that is the read path both
+                    // renderers already have (`Bind<Dmabuf>` is how they scan out at all).
+                    // With `SOFTWARE_FLOOR_FRAME_FLAGS` empty no element is ever assigned to
+                    // a plane, so the `Element` arm (direct scanout of a client buffer, which
+                    // has no compositor-side slot to read) is unreachable in practice and
+                    // fails the frames rather than pretending.
+                    if !pending_screencopy.is_empty() {
+                        match &result.primary_element {
+                            PrimaryPlaneElement::Swapchain(element) => {
+                                // The GPU must have finished writing before a readback.
+                                let _ = element.sync.wait();
+                                match element.buffer().export() {
+                                    Ok(mut dmabuf) => match renderer.bind(&mut dmabuf) {
+                                        Ok(fb) => crate::screencopy::service_pending_frames(
+                                            pending_screencopy,
+                                            renderer,
+                                            &fb,
+                                            size,
+                                            element.transform,
+                                        ),
+                                        Err(err) => {
+                                            warn!(?err, ?crtc, "screencopy: could not bind the scanout slot for read-back; failing the queued frames");
+                                            crate::screencopy::fail_pending_frames(pending_screencopy);
+                                        }
+                                    },
+                                    Err(err) => {
+                                        warn!(?err, ?crtc, "screencopy: could not export the scanout slot as a dmabuf; failing the queued frames");
+                                        crate::screencopy::fail_pending_frames(pending_screencopy);
+                                    }
+                                }
+                            }
+                            PrimaryPlaneElement::Element(_) => {
+                                warn!(?crtc, "screencopy: the primary plane scanned out a client buffer directly, nothing compositor-side to read; failing the queued frames");
+                                crate::screencopy::fail_pending_frames(pending_screencopy);
+                            }
                         }
                     }
                     result.is_empty
@@ -1970,7 +2035,10 @@ fn render_all(
     if let Some(renderer) = gles.as_mut() {
         let elements: Vec<HartRenderElement<GlesRenderer>> =
             comp_core::build_frame_elements(state, renderer, size);
-        outcome = present_surfaces(devices, renderer, &elements, clear, now, space_count, layer_count);
+        outcome = present_surfaces(
+            devices, renderer, &elements, clear, now,
+            &mut state.pending_screencopy, size, space_count, layer_count,
+        );
     } else {
         // ── Pixman software-floor path (the never-fail renderer of record) ── The renderer
         // lives ON `state`, but `build_frame_elements` needs BOTH `&mut state` (reads the
@@ -1992,7 +2060,10 @@ fn render_all(
         // is ignored below (a pixman RenderFrame fault is a transient retried next tick;
         // there is no GL context to lose on the CPU path). Its deferral is not ignored:
         // the pixman floor has the same one-flip-in-flight gate.
-        outcome = present_surfaces(devices, &mut renderer, &elements, clear, now, space_count, layer_count);
+        outcome = present_surfaces(
+            devices, &mut renderer, &elements, clear, now,
+            &mut state.pending_screencopy, size, space_count, layer_count,
+        );
         outcome.renderer_fault = false;
         // Restore the real renderer (keeping the ORIGINAL instance avoids re-allocating its
         // internal caches every tick).

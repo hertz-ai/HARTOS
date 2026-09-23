@@ -190,11 +190,12 @@ mod ipc;
 
 // ── Milestone 6 (headline): zwlr_screencopy_v1 served against HART-comp's OWN
 // output framebuffer, so `grim` captures HART-comp DIRECTLY (not the sway host
-// re-composite). Gated behind the SAME `winit` feature as the live compositor whose
-// framebuffer it reads back. Off on the default dev-box build. See src/screencopy.rs
-// (the cursor / animations / screen kill-switch all land in winit.rs and are PROVEN
-// through this capture path — see the module header for the ordering rationale).
-#[cfg(feature = "winit")]
+// re-composite). Generic over both backend States since 2026-09-24: the winit path
+// reads its bound window framebuffer, the DRM path reads the scanout slot it just
+// rendered (VERIFICATION row 23). Off on the default dev-box build. See
+// src/screencopy.rs (the cursor / animations / screen kill-switch are PROVEN through
+// this capture path — see the module header for the ordering rationale).
+#[cfg(any(feature = "winit", feature = "smithay"))]
 mod screencopy;
 
 // NOTE: these `use smithay::...` imports are the SHAPE the real compositor needs.
