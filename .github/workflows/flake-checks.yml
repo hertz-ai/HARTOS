@@ -45,6 +45,16 @@ on:
   workflow_call:
   # Manual full run (e.g. to validate a tricky branch before opening a PR).
   workflow_dispatch:
+    inputs:
+      nixos_tests_regardless:
+        description: >-
+          Run the nixosTests shards even if the Python shards are red. The
+          shards are sequenced after Python to save four runner-hours on a
+          dead gate, but Python has been red on every run since 2026-08-14,
+          so the VM fleet has not executed once in six weeks and has no
+          verdict at all. Dispatch with this on to get one.
+        type: boolean
+        default: false
   # NIGHTLY ON MAIN — because nothing else gates main (2026-08-03).
   #
   # This workflow runs on pull_request, workflow_call (from release.yml) and
@@ -661,6 +671,25 @@ jobs:
     # green path pays ~8 min of added latency; every red-python push saves
     # the VM fleet entirely.
     needs: unit-tests
+    # THE SEQUENCING HAD A COST NOBODY MEASURED (2026-09-24). `needs` skips
+    # this job whenever a Python shard is red, and a Python shard has been red
+    # on every nightly, PR and release run since the sequencing landed on
+    # 2026-08-14: the last time any nixosTests shard EXECUTED was the manual
+    # dispatch of 2026-08-10 (run 31377165213: shard 1 green, shards 0/2/3
+    # red). Every VM test fix since then, and the OTA and session-supervisor
+    # tests added since, has run on no runner. A gate that is skipped for six
+    # weeks is the same as no gate, and it is exactly why VERIFICATION.md row
+    # 9 has no passing run to cite.
+    #
+    # The saving is real and stays the default. The override is a dispatch
+    # input, so a human can ask for the fleet's verdict on purpose and pay
+    # the four runner-hours knowingly. `always()` is required, because without
+    # it a failed `needs` skips the job before `if` is evaluated.
+    if: >-
+      always() && (
+        needs.unit-tests.result == 'success' ||
+        (github.event_name == 'workflow_dispatch' && inputs.nixos_tests_regardless)
+      )
     # Each shard runs ~1/4 of the checks (+ the shared closure build once). 5h
     # budget leaves wide headroom under the 6h cap even on a cold cache.
     timeout-minutes: 300
