@@ -34,21 +34,45 @@ jobs:
       - name: Install Bandit
         run: pip install bandit[toml]
 
-      - name: Run Bandit SAST scan
+      # UNTIL 2026-09-24 EVERY STEP IN THIS FILE ENDED IN `|| true`, so the
+      # workflow had been green on every run while carrying 36 HIGH-severity
+      # findings, 543 known vulnerabilities across 48 pinned packages, and
+      # whatever flake8 had to say. A scan that cannot fail is a badge, not a
+      # gate (NATIVE_OS_PROGRAM.md 3.9: "security scan able to fail on a
+      # CVE'd pin").
+      #
+      # THIS STEP BLOCKS on any HIGH-severity finding that is NOT in the
+      # committed baseline. The baseline (.github/security-scan/
+      # bandit-baseline.json) holds the 36 findings that were already in the
+      # tree, taken from this workflow's own report on run 35899264704, so the
+      # first blocking run is green on the same code the last advisory run
+      # saw, and the NEXT `subprocess(shell=True)` or `tarfile.extractall`
+      # someone adds turns it red. Bandit's -b matches a baseline entry by
+      # text, severity, CWE, confidence, file and test id, not line number,
+      # so edits around a known finding do not trip it; a second instance of
+      # the same finding text in the same file WOULD be masked by the first,
+      # which is the trade for line-number stability. Remove an entry when
+      # its code is fixed. Never add one to make a run green without reading
+      # the finding.
+      - name: Bandit HIGH severity (blocking; new findings against the baseline)
         run: |
           bandit -r . \
             -x ./venv310,./venv,./autogen-0.2.37,./.pycharm_plugin,./tests,./build,./dist \
             -c pyproject.toml \
-            -f json -o bandit-report.json \
-            --severity-level medium \
-            || true
+            --severity-level high \
+            -b .github/security-scan/bandit-baseline.json
 
-      - name: Display Bandit results
+      # MEDIUM stays advisory: 189 findings on the same run, most of them
+      # B108/B310/B311-class noise a baseline would only freeze. The report is
+      # uploaded so the number is visible per run, and `|| true` is honest
+      # here because nothing reads it as a verdict.
+      - name: Bandit MEDIUM report (advisory)
         if: always()
         run: |
           bandit -r . \
             -x ./venv310,./venv,./autogen-0.2.37,./.pycharm_plugin,./tests,./build,./dist \
             -c pyproject.toml \
+            -f json -o bandit-report.json \
             --severity-level medium \
             || true
 
@@ -74,26 +98,54 @@ jobs:
       - name: Install pip-audit
         run: pip install pip-audit
 
-      - name: Run pip-audit
+      # BLOCKING on any vulnerability that is not in the committed allowlist.
+      #
+      # docs/KNOWN_ISSUES.md #1 names seven CVE'd pins and holds them for
+      # langchain compatibility. pip-audit's own report on run 35899264704
+      # finds 48 vulnerable packages in the resolved set (317 distinct ids),
+      # and none open against pydantic 2.9.2, so the seven were never the
+      # whole picture. The allowlist (.github/security-scan/
+      # pip-audit-ignore.txt) lists every id that was open on that run, per
+      # pin, each tagged with whether KNOWN_ISSUES.md covers it. It is a
+      # RATCHET: a newly published advisory against any pin fails this job
+      # the day it appears, and a bump that leaves an old id open fails too,
+      # which is how a pin gets un-listed. The list is read here rather than
+      # pasted into this file so that a reviewer sees the ids beside their
+      # reasons.
+      - name: pip-audit (blocking; ids outside the allowlist fail)
         run: |
+          set -eo pipefail
+          IGNORE=()
+          while IFS= read -r line; do
+            id="${line%%#*}"; id="${id//[[:space:]]/}"
+            [ -n "$id" ] && IGNORE+=( --ignore-vuln "$id" )
+          done < .github/security-scan/pip-audit-ignore.txt
+          echo "allowlisting $(( ${#IGNORE[@]} / 2 )) vulnerability ids from .github/security-scan/pip-audit-ignore.txt"
           pip-audit \
             --requirement requirements.txt \
             --desc \
             --output pip-audit-report.json \
             --format json \
-            || true
+            "${IGNORE[@]}"
 
-      - name: Display pip-audit results
+      # The full, un-allowlisted picture, for the record: uploaded below and
+      # printed here so the count of tolerated ids is visible on every run.
+      - name: pip-audit full report (advisory, nothing ignored)
         if: always()
         run: |
-          pip-audit --requirement requirements.txt --desc || true
+          pip-audit --requirement requirements.txt --desc \
+            --output pip-audit-full-report.json --format json || true
+          pip-audit --requirement requirements.txt || true
 
       - name: Upload pip-audit report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pip-audit-report
-          path: pip-audit-report.json
+          path: |
+            pip-audit-report.json
+            pip-audit-full-report.json
+          if-no-files-found: ignore
 
   lint:
     name: Linting (flake8)
@@ -110,7 +162,9 @@ jobs:
       - name: Install flake8
         run: pip install flake8
 
-      - name: Run flake8
+      # Advisory by decision, not by accident: flake8 over 320k lines is a
+      # style count, and the two blocking jobs above are the security gate.
+      - name: Run flake8 (advisory)
         run: |
           flake8 . \
             --max-line-length=100 \

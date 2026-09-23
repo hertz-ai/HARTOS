@@ -1,0 +1,430 @@
+# pip-audit allowlist for security-scan.yml (2026-09-24).
+#
+# One vulnerability id per line; text after '#' is ignored. security-scan.yml
+# passes every id here as --ignore-vuln, so pip-audit FAILS the job on any
+# vulnerability against requirements.txt that is not listed. This is a
+# ratchet, not an approval: every id below was already open on main when the
+# scan was made able to fail (run 35899264704, 7cedda5), and the reason each
+# pin is still held is the one docs/KNOWN_ISSUES.md #1 gives (upgrading risks
+# the langchain compatibility that has not been integration-tested).
+#
+# KNOWN_ISSUES.md names seven pins. pip-audit finds 48 vulnerable packages in
+# the resolved set (transitive pins included) and 0 open ids against
+# pydantic 2.9.2, so that document is out of date in both directions; the
+# truth is this file. Remove a package's block when its pin moves; a bump
+# that leaves an id open fails the job, which is the point.
+#
+# Regenerate from a report: python -c "import json;d=json.load(open('pip-audit-report.json'));[print(v['id'],'#',x['name']+'=='+x['version']) for x in d['dependencies'] for v in x.get('vulns',[])]"
+
+# aiohttp==3.9.5: 34 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-1097  # aiohttp==3.9.5 fixed in 3.13.3
+PYSEC-2026-1099  # aiohttp==3.9.5 fixed in 3.13.3
+PYSEC-2026-1100  # aiohttp==3.9.5 fixed in 3.13.3
+PYSEC-2026-1101  # aiohttp==3.9.5 fixed in 3.13.3
+PYSEC-2026-1103  # aiohttp==3.9.5 fixed in 3.10.11
+PYSEC-2026-1104  # aiohttp==3.9.5 fixed in 3.12.14
+PYSEC-2026-1105  # aiohttp==3.9.5 fixed in 3.13.3
+PYSEC-2026-1106  # aiohttp==3.9.5 fixed in 3.13.3
+PYSEC-2026-1107  # aiohttp==3.9.5 fixed in 3.13.3
+PYSEC-2026-1109  # aiohttp==3.9.5 fixed in 3.13.3
+PYSEC-2026-2094  # aiohttp==3.9.5 fixed in 3.13.4
+PYSEC-2026-2095  # aiohttp==3.9.5 fixed in 3.13.4
+PYSEC-2026-2096  # aiohttp==3.9.5 fixed in 3.13.4
+PYSEC-2026-2097  # aiohttp==3.9.5 fixed in 3.13.4
+PYSEC-2026-2098  # aiohttp==3.9.5 fixed in 3.13.4
+PYSEC-2026-2099  # aiohttp==3.9.5 fixed in 3.13.4
+PYSEC-2026-2100  # aiohttp==3.9.5 fixed in 3.13.4
+PYSEC-2026-2101  # aiohttp==3.9.5 fixed in 3.13.4
+PYSEC-2026-2102  # aiohttp==3.9.5 fixed in 3.13.4
+PYSEC-2026-2103  # aiohttp==3.9.5 fixed in 3.13.4
+PYSEC-2026-2104  # aiohttp==3.9.5 fixed in 3.14.0
+PYSEC-2026-2105  # aiohttp==3.9.5 fixed in 3.14.0
+PYSEC-2026-2106  # aiohttp==3.9.5 fixed in 3.14.0
+PYSEC-2026-2107  # aiohttp==3.9.5 fixed in 3.14.1
+PYSEC-2026-2108  # aiohttp==3.9.5 fixed in 3.14.1
+PYSEC-2026-2109  # aiohttp==3.9.5 fixed in 3.14.1
+PYSEC-2026-2110  # aiohttp==3.9.5 fixed in 3.14.1
+PYSEC-2026-2111  # aiohttp==3.9.5 fixed in 3.14.1
+PYSEC-2026-2112  # aiohttp==3.9.5 fixed in 3.14.1
+PYSEC-2026-2113  # aiohttp==3.9.5 fixed in 3.14.1
+PYSEC-2026-237  # aiohttp==3.9.5 fixed in 3.14.1
+PYSEC-2026-3545  # aiohttp==3.9.5 fixed in 3.14.3
+PYSEC-2026-3546  # aiohttp==3.9.5 fixed in 3.14.2
+PYSEC-2026-3547  # aiohttp==3.9.5 fixed in 3.14.2
+
+# anyio==4.8.0: 2 ids; inherited pin, not in KNOWN_ISSUES.md
+CVE-2026-63374  # anyio==4.8.0 fixed in 4.14.2
+CVE-2026-64847  # anyio==4.8.0 fixed in 4.14.2
+
+# autobahn==23.1.2: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+CVE-2026-77528  # autobahn==23.1.2 fixed in 26.7.1
+
+# certifi==2023.5.7: 2 ids; KNOWN_ISSUES.md #1 (CVSS 9.8)
+PYSEC-2023-135  # certifi==2023.5.7 fixed in 2023.7.22
+PYSEC-2024-230  # certifi==2023.5.7 fixed in 2024.7.4
+
+# click==8.1.8: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-2132  # click==8.1.8 fixed in 8.3.3
+
+# cryptography==43.0.0: 7 ids; inherited pin, not in KNOWN_ISSUES.md
+GHSA-537c-gmf6-5ccf  # cryptography==43.0.0 fixed in 48.0.1
+GHSA-h4gh-qq45-vh27  # cryptography==43.0.0 fixed in 43.0.1
+PYSEC-2026-1284  # cryptography==43.0.0 fixed in 44.0.1
+PYSEC-2026-2141  # cryptography==43.0.0 fixed in 46.0.5
+PYSEC-2026-35  # cryptography==43.0.0 fixed in 46.0.6
+PYSEC-2026-3553  # cryptography==43.0.0 fixed in 49.0.0
+PYSEC-2026-3554  # cryptography==43.0.0 fixed in 49.0.0
+
+# diskcache==5.6.3: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-2447  # diskcache==5.6.3
+
+# duckdb==0.8.1: 2 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2024-203  # duckdb==0.8.1 fixed in 1.1.0
+PYSEC-2024-25  # duckdb==0.8.1 fixed in 0.9.3.dev6
+
+# filelock==3.12.2: 2 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-1374  # filelock==3.12.2 fixed in 3.20.3
+PYSEC-2026-1375  # filelock==3.12.2 fixed in 3.20.1
+
+# flask==2.3.2: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-2151  # flask==2.3.2 fixed in 3.1.3
+
+# gitpython==3.1.44: 28 ids; inherited pin, not in KNOWN_ISSUES.md
+CVE-2026-73624  # gitpython==3.1.44 fixed in 3.1.54
+PYSEC-2026-2160  # gitpython==3.1.44 fixed in 3.1.47
+PYSEC-2026-2161  # gitpython==3.1.44 fixed in 3.1.47
+PYSEC-2026-2162  # gitpython==3.1.44 fixed in 3.1.48
+PYSEC-2026-2163  # gitpython==3.1.44 fixed in 3.1.49
+PYSEC-2026-3783  # gitpython==3.1.44 fixed in 3.1.58
+PYSEC-2026-3784  # gitpython==3.1.44 fixed in 3.1.58
+PYSEC-2026-3785  # gitpython==3.1.44 fixed in 3.1.59
+PYSEC-2026-3786  # gitpython==3.1.44 fixed in 3.1.59
+PYSEC-2026-3787  # gitpython==3.1.44 fixed in 3.1.59
+PYSEC-2026-3788  # gitpython==3.1.44 fixed in 3.1.59
+PYSEC-2026-3836  # gitpython==3.1.44 fixed in 3.1.51
+PYSEC-2026-3837  # gitpython==3.1.44 fixed in 3.1.59
+PYSEC-2026-3838  # gitpython==3.1.44 fixed in 3.1.58
+PYSEC-2026-3839  # gitpython==3.1.44 fixed in 3.1.51
+PYSEC-2026-3840  # gitpython==3.1.44 fixed in 3.1.58
+PYSEC-2026-3841  # gitpython==3.1.44 fixed in 3.1.58
+PYSEC-2026-3843  # gitpython==3.1.44 fixed in 3.1.58
+PYSEC-2026-3948  # gitpython==3.1.44 fixed in 3.1.57
+PYSEC-2026-3949  # gitpython==3.1.44 fixed in 3.1.57
+PYSEC-2026-3950  # gitpython==3.1.44 fixed in 3.1.56
+PYSEC-2026-3951  # gitpython==3.1.44 fixed in 3.1.55
+PYSEC-2026-3952  # gitpython==3.1.44 fixed in 3.1.54
+PYSEC-2026-3953  # gitpython==3.1.44 fixed in 3.1.54
+PYSEC-2026-3980  # gitpython==3.1.44 fixed in 3.1.50
+PYSEC-2026-3981  # gitpython==3.1.44 fixed in 3.1.53
+PYSEC-2026-3982  # gitpython==3.1.44 fixed in 3.1.60
+PYSEC-2026-3984  # gitpython==3.1.44 fixed in 3.1.60
+
+# google-cloud-aiplatform==1.130.0: 2 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-2499  # google-cloud-aiplatform==1.130.0 fixed in 1.131.0
+PYSEC-2026-2500  # google-cloud-aiplatform==1.130.0 fixed in 1.133.0
+
+# h2==4.1.0: 2 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-1435  # h2==4.1.0 fixed in 4.3.0
+PYSEC-2026-3628  # h2==4.1.0 fixed in 4.4.1
+
+# hnswlib==0.7.0: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-1450  # hnswlib==0.7.0 fixed in 0.8.0
+
+# httplib2==0.22.0: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-3444  # httplib2==0.22.0 fixed in 0.32.0
+
+# idna==3.4: 2 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2024-60  # idna==3.4 fixed in 3.7
+PYSEC-2026-215  # idna==3.4 fixed in 3.15
+
+# jinja2==3.1.2: 5 ids; KNOWN_ISSUES.md #1 (XSS)
+PYSEC-2026-1471  # jinja2==3.1.2 fixed in 3.1.6
+PYSEC-2026-1472  # jinja2==3.1.2 fixed in 3.1.5
+PYSEC-2026-1473  # jinja2==3.1.2 fixed in 3.1.3
+PYSEC-2026-1474  # jinja2==3.1.2 fixed in 3.1.4
+PYSEC-2026-1475  # jinja2==3.1.2 fixed in 3.1.5
+
+# langchain-anthropic==1.0.0: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-2556  # langchain-anthropic==1.0.0 fixed in 1.4.6
+
+# langchain-classic==1.0.1: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-2560  # langchain-classic==1.0.1 fixed in 1.0.7
+
+# langchain-core==1.2.15: 3 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-2193  # langchain-core==1.2.15 fixed in 1.2.22
+PYSEC-2026-2563  # langchain-core==1.2.15 fixed in 0.3.84, 1.2.28
+PYSEC-2026-2564  # langchain-core==1.2.15 fixed in 0.3.85, 1.3.3
+
+# langchain-text-splitters==1.1.1: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-77  # langchain-text-splitters==1.1.1 fixed in 1.1.2
+
+# langsmith==0.3.45: 4 ids; inherited pin, not in KNOWN_ISSUES.md
+CVE-2026-59152  # langsmith==0.3.45 fixed in 0.8.18
+PYSEC-2026-2555  # langsmith==0.3.45 fixed in 0.8.0
+PYSEC-2026-2582  # langsmith==0.3.45 fixed in 0.8.0
+PYSEC-2026-2583  # langsmith==0.3.45 fixed in 0.7.31
+
+# marshmallow==3.19.0: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-1605  # marshmallow==3.19.0 fixed in 3.26.2, 4.1.2
+
+# nltk==3.8.1: 42 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2024-167  # nltk==3.8.1 fixed in 3.9
+PYSEC-2026-2085  # nltk==3.8.1 fixed in 3.9.4
+PYSEC-2026-2235  # nltk==3.8.1 fixed in 3.9.4
+PYSEC-2026-2236  # nltk==3.8.1 fixed in 3.9.4
+PYSEC-2026-2237  # nltk==3.8.1 fixed in 3.9.4
+PYSEC-2026-3582  # nltk==3.8.1 fixed in 3.10.0
+PYSEC-2026-3583  # nltk==3.8.1 fixed in 3.10.0
+PYSEC-2026-3584  # nltk==3.8.1 fixed in 3.10.0
+PYSEC-2026-3657  # nltk==3.8.1 fixed in 3.9.3
+PYSEC-2026-3722  # nltk==3.8.1 fixed in 3.10.0
+PYSEC-2026-3723  # nltk==3.8.1 fixed in 3.10.0
+PYSEC-2026-3724  # nltk==3.8.1 fixed in 3.9.4
+PYSEC-2026-3728  # nltk==3.8.1 fixed in 3.10.0
+PYSEC-2026-3729  # nltk==3.8.1 fixed in 3.9.3
+PYSEC-2026-3730  # nltk==3.8.1 fixed in 3.10.0
+PYSEC-2026-3731  # nltk==3.8.1 fixed in 3.10.0
+PYSEC-2026-3732  # nltk==3.8.1 fixed in 3.9.4
+PYSEC-2026-3733  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3734  # nltk==3.8.1 fixed in 3.10.0
+PYSEC-2026-3735  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3736  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3737  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3738  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3739  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3740  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3741  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3748  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3749  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3750  # nltk==3.8.1 fixed in 3.10.0
+PYSEC-2026-3751  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3752  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3868  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3869  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3870  # nltk==3.8.1 fixed in 3.10.1
+PYSEC-2026-3871  # nltk==3.8.1 fixed in 3.10.3
+PYSEC-2026-3954  # nltk==3.8.1 fixed in 3.10.0
+PYSEC-2026-3955  # nltk==3.8.1
+PYSEC-2026-597  # nltk==3.8.1 fixed in 3.10.0
+PYSEC-2026-96  # nltk==3.8.1 fixed in 3.9.3
+PYSEC-2026-97  # nltk==3.8.1 fixed in 3.9.3
+PYSEC-2026-98  # nltk==3.8.1 fixed in 3.9.3
+PYSEC-2026-99  # nltk==3.8.1 fixed in 3.9.3
+
+# numexpr==2.8.4: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2023-163  # numexpr==2.8.4 fixed in 2.8.5
+
+# opencv-python==4.8.0.76: 2 ids; inherited pin, not in KNOWN_ISSUES.md
+GHSA-qr4w-53vh-m672  # opencv-python==4.8.0.76 fixed in 4.8.1.78
+PYSEC-2023-183  # opencv-python==4.8.0.76 fixed in 4.8.1.78
+
+# orjson==3.10.1: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-107  # orjson==3.10.1 fixed in 3.11.5, 3.11.6
+
+# paramiko==3.5.1: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-2858  # paramiko==3.5.1
+
+# pillow==9.5.0: 19 ids; KNOWN_ISSUES.md #1 (3 CVEs then; 36 ids now)
+PYSEC-2023-175  # pillow==9.5.0 fixed in 10.0.1
+PYSEC-2023-227  # pillow==9.5.0 fixed in 10.0.0
+PYSEC-2026-165  # pillow==9.5.0 fixed in 12.2.0
+PYSEC-2026-1793  # pillow==9.5.0 fixed in 10.3.0
+PYSEC-2026-1794  # pillow==9.5.0 fixed in 10.0.1
+PYSEC-2026-2253  # pillow==9.5.0 fixed in 12.3.0
+PYSEC-2026-2254  # pillow==9.5.0 fixed in 12.3.0
+PYSEC-2026-2255  # pillow==9.5.0 fixed in 12.3.0
+PYSEC-2026-2256  # pillow==9.5.0 fixed in 12.3.0
+PYSEC-2026-2257  # pillow==9.5.0 fixed in 12.3.0
+PYSEC-2026-2874  # pillow==9.5.0 fixed in 12.2.0
+PYSEC-2026-3451  # pillow==9.5.0 fixed in 12.3.0
+PYSEC-2026-3453  # pillow==9.5.0 fixed in 12.3.0
+PYSEC-2026-3454  # pillow==9.5.0 fixed in 12.3.0
+PYSEC-2026-3493  # pillow==9.5.0 fixed in 12.3.0
+PYSEC-2026-3494  # pillow==9.5.0 fixed in 12.3.0
+PYSEC-2026-3495  # pillow==9.5.0 fixed in 12.3.0
+PYSEC-2026-3496  # pillow==9.5.0 fixed in 12.3.0
+PYSEC-2026-457  # pillow==9.5.0 fixed in 10.2.0
+
+# protobuf==4.23.3: 2 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-1805  # protobuf==4.23.3 fixed in 5.29.6, 6.33.5
+PYSEC-2026-1806  # protobuf==4.23.3 fixed in 4.25.8, 5.29.5, 6.31.1
+
+# pyarrow==14.0.1: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2024-161  # pyarrow==14.0.1 fixed in 17.0.0
+
+# pyasn1==0.5.0: 4 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-2263  # pyasn1==0.5.0 fixed in 0.6.3
+PYSEC-2026-3455  # pyasn1==0.5.0 fixed in 0.6.4
+PYSEC-2026-3456  # pyasn1==0.5.0 fixed in 0.6.4
+PYSEC-2026-3457  # pyasn1==0.5.0 fixed in 0.6.4
+
+# pyjwt==2.7.0: 5 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2025-183  # pyjwt==2.7.0
+PYSEC-2026-120  # pyjwt==2.7.0 fixed in 2.12.0
+PYSEC-2026-175  # pyjwt==2.7.0 fixed in 2.13.0
+PYSEC-2026-177  # pyjwt==2.7.0 fixed in 2.13.0
+PYSEC-2026-179  # pyjwt==2.7.0 fixed in 2.13.0
+
+# pypdf==3.17.1: 41 ids; inherited pin, not in KNOWN_ISSUES.md
+CVE-2026-57204  # pypdf==3.17.1 fixed in 6.13.3
+PYSEC-2026-1827  # pypdf==3.17.1 fixed in 6.6.2
+PYSEC-2026-1828  # pypdf==3.17.1 fixed in 6.6.0
+PYSEC-2026-1829  # pypdf==3.17.1 fixed in 6.6.0
+PYSEC-2026-1830  # pypdf==3.17.1 fixed in 6.0.0
+PYSEC-2026-1831  # pypdf==3.17.1 fixed in 6.1.3
+PYSEC-2026-1832  # pypdf==3.17.1 fixed in 6.4.0
+PYSEC-2026-1833  # pypdf==3.17.1 fixed in 6.1.3
+PYSEC-2026-3004  # pypdf==3.17.1 fixed in 6.12.0
+PYSEC-2026-3005  # pypdf==3.17.1 fixed in 6.7.2
+PYSEC-2026-3006  # pypdf==3.17.1 fixed in 6.10.0
+PYSEC-2026-3007  # pypdf==3.17.1 fixed in 6.10.2
+PYSEC-2026-3009  # pypdf==3.17.1 fixed in 6.13.0
+PYSEC-2026-3010  # pypdf==3.17.1 fixed in 6.12.2
+PYSEC-2026-3011  # pypdf==3.17.1 fixed in 6.10.2
+PYSEC-2026-3012  # pypdf==3.17.1 fixed in 6.9.2
+PYSEC-2026-3013  # pypdf==3.17.1 fixed in 6.7.1
+PYSEC-2026-3014  # pypdf==3.17.1 fixed in 6.7.5
+PYSEC-2026-3015  # pypdf==3.17.1 fixed in 6.7.1
+PYSEC-2026-3016  # pypdf==3.17.1 fixed in 6.12.0
+PYSEC-2026-3017  # pypdf==3.17.1 fixed in 6.7.4
+PYSEC-2026-3018  # pypdf==3.17.1 fixed in 6.13.1
+PYSEC-2026-3019  # pypdf==3.17.1 fixed in 6.8.0
+PYSEC-2026-3020  # pypdf==3.17.1 fixed in 6.12.2
+PYSEC-2026-3021  # pypdf==3.17.1 fixed in 6.10.1
+PYSEC-2026-3022  # pypdf==3.17.1 fixed in 6.13.0
+PYSEC-2026-3023  # pypdf==3.17.1 fixed in 6.9.1
+PYSEC-2026-3024  # pypdf==3.17.1 fixed in 6.7.1
+PYSEC-2026-3025  # pypdf==3.17.1 fixed in 6.12.1
+PYSEC-2026-3026  # pypdf==3.17.1 fixed in 6.10.2
+PYSEC-2026-3027  # pypdf==3.17.1 fixed in 6.7.3
+PYSEC-2026-3610  # pypdf==3.17.1 fixed in 6.14.0
+PYSEC-2026-3611  # pypdf==3.17.1 fixed in 6.14.0
+PYSEC-2026-3612  # pypdf==3.17.1 fixed in 6.14.1
+PYSEC-2026-3613  # pypdf==3.17.1 fixed in 6.14.2
+PYSEC-2026-3655  # pypdf==3.17.1 fixed in 6.15.0
+PYSEC-2026-3656  # pypdf==3.17.1 fixed in 6.15.0
+PYSEC-2026-3910  # pypdf==3.17.1 fixed in 6.16.1
+PYSEC-2026-3911  # pypdf==3.17.1 fixed in 6.16.1
+PYSEC-2026-3912  # pypdf==3.17.1 fixed in 6.15.0
+PYSEC-2026-3913  # pypdf==3.17.1 fixed in 6.16.0
+
+# python-dotenv==1.0.0: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-2270  # python-dotenv==1.0.0 fixed in 1.2.2
+
+# python-multipart==0.0.6: 9 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2024-38  # python-multipart==0.0.6 fixed in 0.0.7
+PYSEC-2026-1850  # python-multipart==0.0.6 fixed in 0.0.7
+PYSEC-2026-1851  # python-multipart==0.0.6 fixed in 0.0.18
+PYSEC-2026-1852  # python-multipart==0.0.6 fixed in 0.0.22
+PYSEC-2026-3036  # python-multipart==0.0.6 fixed in 0.0.30
+PYSEC-2026-3037  # python-multipart==0.0.6 fixed in 0.0.30
+PYSEC-2026-3038  # python-multipart==0.0.6 fixed in 0.0.26
+PYSEC-2026-3039  # python-multipart==0.0.6 fixed in 0.0.27
+PYSEC-2026-3040  # python-multipart==0.0.6 fixed in 0.0.31
+
+# requests==2.32.5: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-2275  # requests==2.32.5 fixed in 2.33.0
+
+# scikit-learn==1.3.2: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2024-110  # scikit-learn==1.3.2 fixed in 1.5.0
+
+# sentencepiece==0.1.99: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-1909  # sentencepiece==0.1.99 fixed in 0.2.1
+
+# soupsieve==2.5: 4 ids; inherited pin, not in KNOWN_ISSUES.md
+CVE-2026-85999  # soupsieve==2.5 fixed in 2.9.0
+CVE-2026-86000  # soupsieve==2.5 fixed in 2.9.0
+PYSEC-2026-3071  # soupsieve==2.5 fixed in 2.8.4
+PYSEC-2026-3072  # soupsieve==2.5 fixed in 2.8.4
+
+# starlette==0.41.3: 7 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-161  # starlette==0.41.3 fixed in 1.0.1
+PYSEC-2026-1941  # starlette==0.41.3 fixed in 0.47.2
+PYSEC-2026-1942  # starlette==0.41.3 fixed in 0.49.1
+PYSEC-2026-2280  # starlette==0.41.3 fixed in 1.1.0
+PYSEC-2026-2281  # starlette==0.41.3 fixed in 1.1.0
+PYSEC-2026-248  # starlette==0.41.3 fixed in 1.3.0
+PYSEC-2026-249  # starlette==0.41.3 fixed in 1.3.1
+
+# torch==2.4.1: 20 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2024-259  # torch==2.4.1 fixed in 2.5.0
+PYSEC-2025-189  # torch==2.4.1
+PYSEC-2025-190  # torch==2.4.1
+PYSEC-2025-191  # torch==2.4.1 fixed in 2.7.1rc1
+PYSEC-2025-192  # torch==2.4.1
+PYSEC-2025-193  # torch==2.4.1 fixed in 2.9.1
+PYSEC-2025-194  # torch==2.4.1 fixed in 2.13.0
+PYSEC-2025-195  # torch==2.4.1 fixed in 2.10.0
+PYSEC-2025-198  # torch==2.4.1 fixed in 2.7.0
+PYSEC-2025-203  # torch==2.4.1 fixed in 2.9.0
+PYSEC-2025-204  # torch==2.4.1 fixed in 2.9.0
+PYSEC-2025-205  # torch==2.4.1 fixed in 2.7.1
+PYSEC-2025-206  # torch==2.4.1 fixed in 2.9.0
+PYSEC-2025-207  # torch==2.4.1 fixed in 2.7.1
+PYSEC-2025-208  # torch==2.4.1 fixed in 2.7.1
+PYSEC-2025-209  # torch==2.4.1 fixed in 2.7.1
+PYSEC-2025-41  # torch==2.4.1 fixed in 2.6.0
+PYSEC-2026-139  # torch==2.4.1
+PYSEC-2026-1970  # torch==2.4.1 fixed in 2.8.0
+PYSEC-2026-2286  # torch==2.4.1 fixed in 2.10.0
+
+# tqdm==4.65.0: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-1976  # tqdm==4.65.0 fixed in 4.66.3
+
+# transformers==4.33.3: 29 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2023-300  # transformers==4.33.3 fixed in 4.36.0
+PYSEC-2023-301  # transformers==4.33.3 fixed in 4.36.0
+PYSEC-2024-227  # transformers==4.33.3 fixed in 4.48.0
+PYSEC-2024-228  # transformers==4.33.3 fixed in 4.48.0
+PYSEC-2024-229  # transformers==4.33.3 fixed in 4.48.0
+PYSEC-2025-211  # transformers==4.33.3
+PYSEC-2025-212  # transformers==4.33.3
+PYSEC-2025-213  # transformers==4.33.3
+PYSEC-2025-214  # transformers==4.33.3
+PYSEC-2025-215  # transformers==4.33.3
+PYSEC-2025-216  # transformers==4.33.3
+PYSEC-2025-217  # transformers==4.33.3
+PYSEC-2025-218  # transformers==4.33.3
+PYSEC-2025-40  # transformers==4.33.3 fixed in 4.49.0, 4.50.0
+PYSEC-2026-1977  # transformers==4.33.3 fixed in 4.52.1
+PYSEC-2026-1978  # transformers==4.33.3 fixed in 4.38.0
+PYSEC-2026-1980  # transformers==4.33.3 fixed in 4.53.0
+PYSEC-2026-1981  # transformers==4.33.3 fixed in 4.53.0
+PYSEC-2026-1982  # transformers==4.33.3 fixed in 4.48.0
+PYSEC-2026-1983  # transformers==4.33.3 fixed in 4.53.0
+PYSEC-2026-1984  # transformers==4.33.3 fixed in 4.50.0
+PYSEC-2026-1985  # transformers==4.33.3 fixed in 4.51.0
+PYSEC-2026-1986  # transformers==4.33.3 fixed in 4.52.1
+PYSEC-2026-1987  # transformers==4.33.3 fixed in 4.51.0
+PYSEC-2026-1988  # transformers==4.33.3 fixed in 4.53.0
+PYSEC-2026-2288  # transformers==4.33.3 fixed in 5.0.0, 5.0.0rc3
+PYSEC-2026-2289  # transformers==4.33.3 fixed in 5.3.0
+PYSEC-2026-2290  # transformers==4.33.3 fixed in 5.5.0
+PYSEC-2026-3929  # transformers==4.33.3 fixed in 5.10.0
+
+# urllib3==1.26.16: 8 ids; KNOWN_ISSUES.md #1
+PYSEC-2023-192  # urllib3==1.26.16 fixed in 1.26.17, 2.0.6
+PYSEC-2023-212  # urllib3==1.26.16 fixed in 1.26.18, 2.0.7
+PYSEC-2026-141  # urllib3==1.26.16 fixed in 2.7.0
+PYSEC-2026-1994  # urllib3==1.26.16 fixed in 2.6.0
+PYSEC-2026-1995  # urllib3==1.26.16 fixed in 1.26.19, 2.2.2
+PYSEC-2026-1996  # urllib3==1.26.16 fixed in 2.6.3
+PYSEC-2026-1998  # urllib3==1.26.16 fixed in 2.6.0
+PYSEC-2026-1999  # urllib3==1.26.16 fixed in 2.5.0
+
+# waitress==2.1.2: 2 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2024-210  # waitress==2.1.2 fixed in 3.0.1
+PYSEC-2024-211  # waitress==2.1.2 fixed in 3.0.1
+
+# werkzeug==2.3.6: 8 ids; KNOWN_ISSUES.md #1 (RCE 7.5)
+PYSEC-2023-221  # werkzeug==2.3.6 fixed in 2.3.8, 3.0.1
+PYSEC-2026-1860  # werkzeug==2.3.6 fixed in 3.0.6
+PYSEC-2026-2043  # werkzeug==2.3.6 fixed in 3.0.3
+PYSEC-2026-2044  # werkzeug==2.3.6 fixed in 3.1.5
+PYSEC-2026-2045  # werkzeug==2.3.6 fixed in 3.0.6
+PYSEC-2026-2046  # werkzeug==2.3.6 fixed in 3.1.4
+PYSEC-2026-2320  # werkzeug==2.3.6 fixed in 3.1.6
+PYSEC-2026-3417  # werkzeug==2.3.6 fixed in 3.0.6
+
+# zipp==3.15.0: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-2074  # zipp==3.15.0 fixed in 3.19.1
