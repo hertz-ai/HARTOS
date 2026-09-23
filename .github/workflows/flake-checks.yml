@@ -520,7 +520,7 @@ jobs:
     name: Compositor smoke E2E (hart-comp nested in weston headless)
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    continue-on-error: true
+    continue-on-error: false  # blocking since 2026-09-24: passed on its first three runs (35911822681, 35911836772, 35912938984)
     steps:
       - uses: actions/checkout@v4
 
