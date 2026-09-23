@@ -466,3 +466,30 @@ def test_start_tool_keeps_the_runtime_reason():
         out = ma._start_tool('acestep')
         assert ma._ensure_tool_running('acestep') is False
     assert 'free=4.9GB' in out['error'], out
+
+
+def test_only_audio_is_kept_where_the_audio_route_serves(tmp_path, monkeypatch):
+    import integrations.service_tools.media_agent as ma
+    monkeypatch.setattr(ma, 'composer_output_dir', lambda: tmp_path / 'out')
+    secret = tmp_path / 'notes.txt'
+    secret.write_text('not audio')
+    assert ma._keep_composition(str(secret)) is None
+    assert not (tmp_path / 'out' / 'notes.txt').exists()
+
+
+def test_a_reused_temp_name_never_replaces_a_kept_take(tmp_path, monkeypatch):
+    """A memo names its file for good; new bytes under an old name get a new name."""
+    import integrations.service_tools.media_agent as ma
+    out = tmp_path / 'out'
+    monkeypatch.setattr(ma, 'composer_output_dir', lambda: out)
+    src = tmp_path / 'tmp' / 'take.wav'
+    src.parent.mkdir()
+    src.write_bytes(b'RIFF-first')
+    first = ma._keep_composition(str(src))
+    src.write_bytes(b'RIFF-second-take')
+    second = ma._keep_composition(str(src))
+    assert first[0] == '/api/voice/audio/take.wav'
+    assert second[0] == '/api/voice/audio/take-1.wav', second
+    assert (out / 'take.wav').read_bytes() == b'RIFF-first'
+    # the same bytes again reuse the name they already have
+    assert ma._keep_composition(str(src))[0] == '/api/voice/audio/take-1.wav'

@@ -132,6 +132,10 @@ def composer_output_dir():
     return model_storage.get_tool_dir('acestep') / 'output'
 
 
+#: What _keep_composition will put where /api/voice/audio serves from.
+_KEPT_AUDIO_EXTENSIONS = ('.wav', '.mp3', '.flac', '.ogg')
+
+
 def _keep_composition(file_value):
     """(node url, local path) for a finished AceStep file, or None.
 
@@ -140,6 +144,7 @@ def _keep_composition(file_value):
     bytes are on this machine; they are copied out of the temp dir so a
     replay next week still has them.
     """
+    import filecmp
     import os
     import shutil
     import urllib.parse
@@ -150,9 +155,19 @@ def _keep_composition(file_value):
     if not src or not os.path.isfile(src):
         logger.warning("_keep_composition: %r is not a file on this node", file_value)
         return None
+    stem, ext = os.path.splitext(os.path.basename(src))
+    if ext.lower() not in _KEPT_AUDIO_EXTENSIONS:
+        # the kept dir is served by /api/voice/audio: only audio goes in
+        logger.warning("_keep_composition: %r is not audio; not kept", src)
+        return None
     out = composer_output_dir()
     out.mkdir(parents=True, exist_ok=True)
-    dest = out / os.path.basename(src)
+    # A memo names its file for good, so a name already kept is never
+    # overwritten or reused for different bytes: if AceStep reuses a temp
+    # name, the new take gets a new one (hartos-3a review of 6759fbfa6).
+    dest, n = out / f'{stem}{ext}', 1
+    while dest.exists() and not filecmp.cmp(src, dest, shallow=False):
+        dest, n = out / f'{stem}-{n}{ext}', n + 1
     if not dest.exists():
         shutil.copy2(src, dest)
     return f'/api/voice/audio/{dest.name}', str(dest)
