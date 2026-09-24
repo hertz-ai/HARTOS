@@ -642,6 +642,20 @@ class ThoughtExperimentService:
         votes = db.query(ExperimentVote).filter_by(
             experiment_id=experiment_id).all()
 
+        # Who each vote REALLY belongs to: a registered user, and an agent
+        # is its owner.  An unregistered voter_id is a string anyone can
+        # pass, so it keeps its weight but is no identity.
+        from .models import User
+        from .voting_rules import quorum_met
+        voter_ids = {v.voter_id for v in votes}
+        identity_of = {
+            u.id: (u.owner_id or u.id)
+            for u in (db.query(User).filter(User.id.in_(voter_ids)).all()
+                      if voter_ids else [])
+        }
+        voters = set()
+        supporters = set()
+
         total_for = 0.0
         total_against = 0.0
         weighted_sum = 0.0
@@ -668,6 +682,12 @@ class ThoughtExperimentService:
             elif v.vote_value < 0:
                 total_against += weight
 
+            identity = identity_of.get(v.voter_id)
+            if identity is not None and weight > 0 and v.vote_value != 0:
+                voters.add(identity)
+                if v.vote_value > 0:
+                    supporters.add(identity)
+
             if v.suggestion:
                 suggestions.append({
                     'voter_id': v.voter_id,
@@ -677,6 +697,7 @@ class ThoughtExperimentService:
 
         weighted_score = weighted_sum / total_weight if total_weight > 0 else 0.0
         threshold = context_rules['approval_threshold'] if context_rules else 0.5
+        quorate = quorum_met(len(voters), len(supporters))
 
         return {
             'experiment_id': experiment_id,
@@ -690,8 +711,12 @@ class ThoughtExperimentService:
             'suggestions': suggestions,
             'decision_context': decision_context,
             'approval_threshold': threshold,
+            'distinct_voters': len(voters),
+            'distinct_supporters': len(supporters),
+            'quorum_met': quorate,
             'decision_recommendation': (
-                'approve' if weighted_score > threshold
+                'no_quorum' if not quorate
+                else 'approve' if weighted_score > threshold
                 else 'reject' if weighted_score < -threshold
                 else 'inconclusive'
             ),

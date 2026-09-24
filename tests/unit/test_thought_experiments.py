@@ -361,8 +361,18 @@ class TestExperimentTally:
             db, user.id, 'Recommend Exp', 'Recommend hypothesis')
         ThoughtExperimentService.advance_status(
             db, exp['id'], target_status='voting')
+        # One voter is no quorum (voting_rules.MIN_DISTINCT_VOTERS): this
+        # test used to assert a lone vote recommends 'approve', which is
+        # the one-identity approval the owner's principle rules out.
         ThoughtExperimentService.cast_vote(db, exp['id'], user.id, 2)
+        tally = ThoughtExperimentService.tally_votes(db, exp['id'])
+        assert tally['decision_recommendation'] == 'no_quorum'
 
+        for _ in range(2):
+            voter = User(username=f'rec_{uuid.uuid4().hex[:8]}', user_type='human')
+            db.add(voter)
+            db.flush()
+            ThoughtExperimentService.cast_vote(db, exp['id'], voter.id, 2)
         tally = ThoughtExperimentService.tally_votes(db, exp['id'])
         assert tally['decision_recommendation'] == 'approve'
 

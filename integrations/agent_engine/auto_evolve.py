@@ -481,15 +481,23 @@ class AutoEvolveOrchestrator:
                     exp['_approval_score'] = score
                     exp['_super_majority'] = round(super_ratio, 4)
                     exp['_tally'] = tally
+                    # Quorum of DISTINCT identities (voting_rules): no single
+                    # identity approves alone, however unanimous its vote.
+                    # A tally that does not answer it fails closed.
+                    quorate = tally.get('quorum_met') is True
                     if (score >= min_score
-                            and super_ratio >= AUTO_EVOLVE_SUPERMAJORITY_RATIO):
+                            and super_ratio >= AUTO_EVOLVE_SUPERMAJORITY_RATIO
+                            and quorate):
                         scored.append(exp)
                     else:
                         logger.debug(
                             f"[{session.session_id}] Rejected {exp.get('id')}: "
                             f"score={score} super_ratio={super_ratio:.3f} "
+                            f"quorum_met={quorate} "
+                            f"distinct_voters={tally.get('distinct_voters')} "
                             f"(need score>={min_score} and "
-                            f"ratio>={AUTO_EVOLVE_SUPERMAJORITY_RATIO:.3f})"
+                            f"ratio>={AUTO_EVOLVE_SUPERMAJORITY_RATIO:.3f} "
+                            f"and quorum)"
                         )
         except Exception as e:
             # Fail CLOSED.  This gate is the constitutional supermajority: an
