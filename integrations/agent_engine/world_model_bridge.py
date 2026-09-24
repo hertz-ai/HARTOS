@@ -666,28 +666,10 @@ class WorldModelBridge:
         """
         if not text or os.environ.get('HEVOLVE_CHAT_LEARNING', '1') == '0':
             return
-        # Only a person's own turn is "a person's words".  Measured 2026-09-24
-        # (Master 11.426 E2): on an idle desktop all 47 learned 'reality'
-        # events were prompts the agent daemon wrote as agent user
-        # analysis.local.sage (user_type 'agent'), learned at reality 1.0.
-        # A daemon turn is refused even under a human id; so is an account
-        # whose user_type is 'agent' or 'system' (live values: human, guest,
-        # agent, system).
-        try:
-            from integrations.agent_engine.dispatch import (
-                is_current_request_autonomous)
-            if is_current_request_autonomous():
-                return
-        except Exception:  # noqa: BLE001 -- unknown provenance is not a person
-            return
         try:
             from integrations.social.consent_service import ConsentService
-            from integrations.social.models import User, db_session
+            from integrations.social.models import db_session
             with db_session(commit=False) as db:
-                speaker = db.query(User).filter_by(id=str(user_id)).first()
-                if speaker is not None and speaker.user_type in ('agent',
-                                                                 'system'):
-                    return
                 if not ConsentService.check_consent(db, user_id, 'data_access',
                                                     scope='*'):
                     return
