@@ -962,6 +962,16 @@ class LlamaCppManager:
         if extra_args:
             cmd.extend(extra_args)
 
+        # Multi-token prediction, switched on by the MODEL (its MTP head)
+        # and only for a binary that accepts it: model_catalog.mtp_spec_args,
+        # the same call every spawn makes.  Placement-independent -- it
+        # applies to a full, partial or CPU offload alike.
+        try:
+            from .model_catalog import mtp_spec_args
+            cmd.extend(mtp_spec_args(str(model_path), str(binary)))
+        except Exception as e:
+            logger.info("MTP probe skipped (%s); launching without it", e)
+
         logger.info(f"Starting llama-server: {' '.join(cmd)}")
 
         # Platform-specific subprocess options

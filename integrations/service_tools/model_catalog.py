@@ -503,6 +503,83 @@ def moe_offload_args(gguf_path: str, free_vram_gb: float) -> List[str]:
     return ['--cpu-moe']
 
 
+#: Draft depth for multi-token prediction when nothing overrides it.  The
+#: value the MTP launch block documented (``--spec-draft-n-max 3``); the
+#: live tokens/s + acceptance measurement on a model that fits is what
+#: should tune it.
+_MTP_DRAFT_N_DEFAULT = 3
+
+#: (abspath, mtime_ns, size) -> whether that llama-server accepts draft-mtp.
+#: Keyed on the file's identity so a rebuilt binary is probed again.
+_spec_type_cache: Dict[tuple, bool] = {}
+
+
+def _server_accepts_draft_mtp(server_binary: str) -> bool:
+    """Whether THIS llama-server binary accepts ``--spec-type draft-mtp``.
+
+    Asked of the serving binary, once, because an unknown --spec-type makes
+    llama-server exit at startup: an MTP model on an older build would go
+    from working to dark.  This box carries builds 7909 and 8200 without it
+    beside the serving 10330 (hartos-3a, 2026-09-23).  Anything that cannot
+    answer -- missing binary, probe timeout -- is "no".
+    """
+    try:
+        st = os.stat(server_binary)
+    except (OSError, TypeError):
+        return False
+    key = (os.path.abspath(server_binary), st.st_mtime_ns, st.st_size)
+    if key in _spec_type_cache:
+        return _spec_type_cache[key]
+    from core.subprocess_safe import run_probe
+    res = run_probe([server_binary, '--help'], timeout=20.0)
+    ok = bool(res) and 'draft-mtp' in (
+        (getattr(res, 'stdout', '') or '') + (getattr(res, 'stderr', '') or ''))
+    _spec_type_cache[key] = ok
+    return ok
+
+
+def mtp_spec_args(gguf_path: str, server_binary: str) -> List[str]:
+    """llama.cpp flags turning on multi-token prediction, or [].
+
+    THE one answer to "should this spawn use MTP", beside moe_offload_args
+    and called at the same spawn sites.  Switched on by the MODEL: the GGUF's
+    own nextn_predict_layers (read_gguf_facts()['mtp']), and only on a
+    serving binary that accepts the flag.  It used to be an env opt-in that
+    was set nowhere, so the MTP preset loaded as a plain MoE (owner,
+    2026-09-24: "automatic from model").
+
+    HEVOLVE_LLAMA_MTP_N is an override, not the switch: 0 turns MTP off, N
+    sets the draft depth.  It cannot add MTP to a file without the head.
+
+    Live proof (hartos-3a): with MTP inactive llama-server logs "model has
+    unused tensor blk.N.nextn.* -- ignoring"; active, that line is gone and
+    draft acceptance is reported.
+    """
+    if not read_gguf_facts(gguf_path).get('mtp'):
+        return []
+    depth = _MTP_DRAFT_N_DEFAULT
+    raw = os.environ.get('HEVOLVE_LLAMA_MTP_N')
+    if raw not in (None, ''):
+        try:
+            depth = int(raw)
+        except ValueError:
+            logger.warning("HEVOLVE_LLAMA_MTP_N=%r is not an integer; using "
+                           "the default draft depth %d", raw, depth)
+        if depth <= 0:
+            logger.info("%s carries an MTP head; MTP turned off by "
+                        "HEVOLVE_LLAMA_MTP_N=%s", os.path.basename(gguf_path), raw)
+            return []
+    if not _server_accepts_draft_mtp(server_binary):
+        logger.warning(
+            "%s carries an MTP head but %s does not accept --spec-type "
+            "draft-mtp; starting without MTP rather than failing to start",
+            os.path.basename(gguf_path), server_binary)
+        return []
+    logger.info("%s: MTP on (--spec-type draft-mtp, draft depth %d)",
+                os.path.basename(gguf_path), depth)
+    return ['--spec-type', 'draft-mtp', '--spec-draft-n-max', str(depth)]
+
+
 def model_weight_bytes(file_name: str) -> Optional[int]:
     """Size of a model's weight file in BYTES, or None if unregistered.
 
@@ -1505,7 +1582,10 @@ class ModelCatalog:
             # that also sits in .nunba/llama.cpp.  MIN_BUILD_QWEN35 (9180)
             # already gates the family; the MTP path additionally needs a
             # build carrying draft-mtp, which is NOT expressible in this
-            # row — hence the note rather than a silent assumption.
+            # row.  It is decided at LAUNCH instead: every spawn asks
+            # mtp_spec_args, which reads the head from the file and probes
+            # the serving binary, so this row on an older build starts as a
+            # plain MoE rather than failing to start.
             #
             # Priority 85, NOT the 90 of the row above, and the reason is an
             # invariant rather than a preference: test_llm_seed_priority_is_

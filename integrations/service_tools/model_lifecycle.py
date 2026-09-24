@@ -1859,6 +1859,16 @@ class ModelLifecycleManager:
                 logger.info("MoE placement probe skipped on restart (%s); "
                             "launching with unchanged flags", e)
 
+        # Multi-token prediction: on when the model carries an MTP head and
+        # the binary accepts the flag.  The same call every spawn makes, so
+        # a restart never silently drops what the first launch had.
+        try:
+            from integrations.service_tools.model_catalog import mtp_spec_args
+            cmd.extend(mtp_spec_args(model_path, server_bin))
+        except Exception as e:
+            logger.info("MTP probe skipped on restart (%s); launching "
+                        "without it", e)
+
         log_path = os.path.join(
             os.environ.get('TEMP', '/tmp'), f'llama_{port}.log')
         log_fh = None
