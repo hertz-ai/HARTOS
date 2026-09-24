@@ -612,7 +612,17 @@ in
           # fails. THE authoritative "pixels presented" proof for the GTK4 path —
           # un-fakeable by a half-started host. A screenshot is saved either way.
           paint.screenshot("hart_gtk4_layer_shell_first_frame")
-          paint.wait_for_text("HART", timeout=120)
+          # What text is on a fresh node's FIRST frame changed on 2026-09-23: the
+          # shell's read-only state now arrives over SSE before the first paint
+          # (3c30807), so a node that has not finished onboarding paints the
+          # onboarding language picker straight away instead of the brand hero
+          # for a poll interval first. The claim here is "pixels presented", the
+          # brand was only the text that proved it; the picker's copy proves it
+          # just as hard and is what a fresh VM actually shows. Measured on the
+          # 2026-09-24 nixosTests runs (8c963b1 and babefb0): the OCR read
+          # "What language feels like home?" and this waited 120 s for "HART".
+          # An onboarded node still paints the brand, so both are accepted.
+          paint.wait_for_text("HART|language feels like home", timeout=120)
 
       with subtest("PAINT+MARKER E2E: the GTK4 host TOUCHES /run/hart/session/shell-ready on first paint"):
           # The full paint+marker contract, end-to-end on a live session. OCR above
