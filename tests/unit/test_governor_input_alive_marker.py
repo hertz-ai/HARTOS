@@ -116,16 +116,23 @@ def test_default_marker_path_is_the_compositor_contract(no_xprintidle, monkeypat
     note_input_alive writes and the session supervisor reads; on a box with
     no such file (this test host) that is None, never an exception."""
     monkeypatch.delenv('HART_INPUT_ALIVE_MARKER', raising=False)
-    seen = {}
+    # os.stat is process-wide: a background thread started by an earlier test
+    # module (measured: a prompts/iq_*.json writer after hart_intelligence_entry
+    # is imported) can stat its own file in between.  Record only this
+    # thread's calls.
+    import threading
+    me = threading.get_ident()
+    seen = []
     real_stat = os.stat
 
     def _stat(path, *a, **k):
-        seen['path'] = path
+        if threading.get_ident() == me:
+            seen.append(path)
         return real_stat(path, *a, **k)
 
     monkeypatch.setattr(os, 'stat', _stat)
     result = _gov()._get_idle_ms_linux()
-    assert seen['path'] == '/run/hart/session/input-alive'
+    assert seen and seen[-1] == '/run/hart/session/input-alive'
     assert result is None or result >= 0.0
 
 
