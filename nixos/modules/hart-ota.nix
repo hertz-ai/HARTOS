@@ -88,7 +88,25 @@ let
         echo "[HART OTA] no /etc/hart/src (image system) — source sync skipped"
         exit 0
       fi
-      SRC_PATH="$(nix flake metadata "$FLAKE" --json 2>/dev/null | jq -r '.path // empty')" || SRC_PATH=""
+      # Nix 2.24 rejects `?dir=` on path: URLs ("path URL '...' has unsupported
+      # parameter 'dir'"), while github: refs carry it. A path ref spelled the
+      # way our github refs are (an offline apply from a checkout or a USB
+      # stick, the ota-central test) names the same location as
+      # path:<root>/<dir>, so ask nix with that spelling. Measured 2026-09-24
+      # on the affa34f nixosTests run: "cannot resolve source of
+      # path:/tmp/newrepo?dir=nixos" from exactly this rejection, stderr
+      # hidden; reproduced on the Samsung node with the shipped nix 2.24.14.
+      REF="$FLAKE"
+      case "$REF" in
+        path:*\?dir=*)
+          _p="''${REF#path:}"
+          _d="''${_p#*\?dir=}"
+          _d="''${_d%%&*}"
+          _p="''${_p%%\?*}"
+          REF="path:''${_p%/}/$_d"
+          ;;
+      esac
+      SRC_PATH="$(nix flake metadata "$REF" --json 2>/dev/null | jq -r '.path // empty')" || SRC_PATH=""
       if [ -z "$SRC_PATH" ] || [ ! -e "$SRC_PATH" ]; then
         echo "[HART OTA] cannot resolve source of $FLAKE — /etc/hart/src kept at previous rev"
         exit 0
