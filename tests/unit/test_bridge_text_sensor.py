@@ -60,9 +60,10 @@ def bridge(monkeypatch):
     return wmb, b, posts
 
 
-def _consent(monkeypatch, value):
+def _consent(monkeypatch, value, user_type='human'):
     """Install a fake integrations.social consent surface returning `value`
-    (or raising when value is an exception)."""
+    (or raising when value is an exception).  The users table holds one row
+    of `user_type` for any id (live values: human, guest, agent, system)."""
     cs = types.ModuleType('integrations.social.consent_service')
 
     class ConsentService:
@@ -75,12 +76,33 @@ def _consent(monkeypatch, value):
     cs.ConsentService = ConsentService
     models = types.ModuleType('integrations.social.models')
 
+    class User:
+        pass
+
+    class _Row:
+        pass
+    row = _Row()
+    row.user_type = user_type
+
+    class _Q:
+        def filter_by(self, **kw):
+            return self
+
+        def first(self):
+            return row
+
+    class _Db:
+        def query(self, model):
+            assert model is User
+            return _Q()
+
     class _S:
         def __enter__(self):
-            return object()
+            return _Db()
 
         def __exit__(self, *a):
             return False
+    models.User = User
     models.db_session = lambda commit=False: _S()
     monkeypatch.setitem(sys.modules, 'integrations.social.consent_service', cs)
     monkeypatch.setitem(sys.modules, 'integrations.social.models', models)
@@ -129,6 +151,42 @@ def test_flag_off_and_consent_error_both_fail_closed(bridge, monkeypatch):
     assert posts == [], 'a consent error must mean no ingest'
     assert len(b._experience_queue) == 0
     assert b._stats['total_unverified_skipped'] == 2
+
+
+# ---------------------------------------------------------------------------
+# E2 (Master 11.426, measured 2026-09-24): only a person's own turn is "a
+# person's words".  On an idle desktop every learned 'reality' event (47 of
+# 47) was a prompt the agent daemon wrote as agent user 6c2dc0fc
+# (analysis.local.sage, user_type 'agent'), learned at reality 1.0.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize('user_type', ['agent', 'system'])
+def test_an_agent_or_system_account_is_not_a_person(bridge, monkeypatch, user_type):
+    wmb, b, posts = bridge
+    monkeypatch.delenv('HEVOLVE_CHAT_LEARNING', raising=False)
+    _consent(monkeypatch, True, user_type=user_type)
+    b.record_interaction('6c2dc0fc', 'p5', 'Scan the repo for regressions', 'ok')
+    assert posts == [], f'a {user_type} account\'s prompt was learned as a person\'s words'
+
+
+@pytest.mark.parametrize('user_type', ['human', 'guest'])
+def test_people_still_teach_the_world_model(bridge, monkeypatch, user_type):
+    """Anti-vacuity: the desktop's own UI account is a 'guest' (d68c9dee)."""
+    wmb, b, posts = bridge
+    monkeypatch.delenv('HEVOLVE_CHAT_LEARNING', raising=False)
+    _consent(monkeypatch, True, user_type=user_type)
+    b.record_interaction('d68c9dee', 'p6', 'my dog is called Bruno', 'ok')
+    assert [p[1]['text'] for p in posts] == ['my dog is called Bruno']
+
+
+def test_a_daemon_turn_is_not_a_person_even_under_a_human_id(bridge, monkeypatch):
+    """The daemon can dispatch a goal under its owner's (human) id."""
+    wmb, b, posts = bridge
+    monkeypatch.delenv('HEVOLVE_CHAT_LEARNING', raising=False)
+    _consent(monkeypatch, True, user_type='human')
+    import integrations.agent_engine.dispatch as dispatch
+    monkeypatch.setattr(dispatch, 'is_current_request_autonomous', lambda: True)
+    b.record_interaction('owner1', 'p7', 'Continue goal 42: draft the reel', 'ok')
+    assert posts == []
 
 
 # ---------------------------------------------------------------------------
