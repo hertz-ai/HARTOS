@@ -34,6 +34,7 @@ NO PARALLEL PATHS:
 
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -115,6 +116,142 @@ class AgentAction:
             'steps': [s.to_dict() for s in self.steps],
             'observations': [o.to_dict() for o in self.observations],
         }
+
+
+# ─── Acceptance criteria: ONE evaluator ─────────────────────────────────
+#
+# Owner rule (2026-09-24): every task is broken into checks that can be
+# verified approximately deterministically -- {what, check, expected,
+# tolerance, derivation}.  A criterion is a dict:
+#   kind       'metric' (a number against a threshold), 'test' (a named
+#              check that must be true), 'invariant' (an identity between
+#              two measured values, via value_ref)
+#   target     the measured key
+#   op         one of _CRITERION_OPS ('truthy' for a test)
+#   value      a literal, or value_ref naming another measured key
+#   tolerance  absolute band for '==' / '!=' (default: the legacy
+#              expected_outcome band, 0.05 absolute or 10 % relative)
+#   derivation why this check follows (free text, carried to the chain)
+# Legacy strings ('hive_score >= 0.83', 'all_shards_complete') are parsed
+# into the same shape; anything else is kept and reported 'unevaluable'.
+
+_CRITERION_OPS = ('>=', '<=', '==', '!=', '>', '<')
+_CRITERION_RE = re.compile(
+    r'^\s*([A-Za-z_][\w.]*)\s*(>=|<=|==|!=|>|<)\s*'
+    r'(-?\d+(?:\.\d+)?|[A-Za-z_][\w.]*)\s*$')
+_NAME_RE = re.compile(r'^\s*[A-Za-z_][\w.]*\s*$')
+
+
+def parse_criterion(raw) -> Dict[str, Any]:
+    """A criterion in the one structured shape, from a dict or legacy str."""
+    if isinstance(raw, dict):
+        return dict(raw, kind=raw.get('kind') or 'metric')
+    text = str(raw)
+    m = _CRITERION_RE.match(text)
+    if m:
+        target, op, rhs = m.groups()
+        crit = {'kind': 'metric', 'target': target, 'op': op, 'text': text}
+        try:
+            crit['value'] = float(rhs)
+        except ValueError:
+            crit['value_ref'] = rhs
+        return crit
+    if _NAME_RE.match(text):
+        return {'kind': 'test', 'target': text.strip(), 'op': 'truthy',
+                'text': text}
+    return {'kind': 'unparsed', 'text': text}
+
+
+def _measured(key, outcome, observations):
+    """(value, source) for key: the latest world observation first, then
+    the agent's own outcome.  (None, None) when never measured."""
+    for obs in reversed(observations or []):
+        data = getattr(obs, 'data', None) or {}
+        if isinstance(data, dict) and key in data:
+            return data[key], 'observation'
+    if isinstance(outcome, dict) and key in outcome:
+        return outcome[key], 'outcome'
+    return None, None
+
+
+def _within(actual, expected, tolerance):
+    if tolerance is not None:
+        return abs(actual - expected) <= float(tolerance)
+    # The legacy expected_outcome band: 0.05 absolute catches near-zero
+    # deltas, 10 % relative covers everything else.
+    if abs(actual - expected) <= 0.05:
+        return True
+    return expected != 0 and abs(actual - expected) / abs(expected) <= 0.1
+
+
+def evaluate_criterion(crit, outcome, observations) -> Dict[str, Any]:
+    """{'verdict': 'pass'|'fail'|'unevaluable', ...} for one criterion.
+
+    Never raises.  A target that was never measured is 'unevaluable', which
+    is reported but never counted as a pass.
+    """
+    crit = parse_criterion(crit) if not isinstance(crit, dict) or \
+        'kind' not in crit else crit
+    base = {k: crit.get(k) for k in ('kind', 'target', 'op', 'value',
+                                     'value_ref', 'tolerance', 'derivation',
+                                     'text') if crit.get(k) is not None}
+    target = crit.get('target')
+    if crit.get('kind') == 'unparsed' or not target:
+        return dict(base, verdict='unevaluable', reason='not a checkable criterion')
+    actual, source = _measured(target, outcome, observations)
+    if source is None:
+        return dict(base, verdict='unevaluable', reason='never measured')
+    base.update(actual=actual, source=source)
+    op = crit.get('op')
+    if op == 'truthy':
+        return dict(base, verdict='pass' if bool(actual) else 'fail')
+    if 'value_ref' in crit:
+        expected, ref_src = _measured(crit['value_ref'], outcome, observations)
+        if ref_src is None:
+            return dict(base, verdict='unevaluable', reason='reference never measured')
+    else:
+        expected = crit.get('value')
+    try:
+        if op in ('==', '!='):
+            if isinstance(actual, (int, float)) and isinstance(expected, (int, float)) \
+                    and not isinstance(actual, bool):
+                same = _within(float(actual), float(expected), crit.get('tolerance'))
+            else:
+                same = actual == expected
+            ok = same if op == '==' else not same
+        elif op in ('>=', '<=', '>', '<'):
+            a, e = float(actual), float(expected)
+            ok = {'>=': a >= e, '<=': a <= e, '>': a > e, '<': a < e}[op]
+        else:
+            return dict(base, verdict='unevaluable', reason=f'unknown op {op!r}')
+    except (TypeError, ValueError):
+        return dict(base, verdict='unevaluable', reason='not comparable')
+    return dict(base, verdict='pass' if ok else 'fail', expected=expected)
+
+
+def action_criteria(action) -> List[Dict[str, Any]]:
+    """Every check an action carries, in the one shape: expected_outcome
+    (the degenerate 'metric ==' criterion) followed by acceptance_criteria."""
+    crits = [{'kind': 'metric', 'target': k, 'op': '==', 'value': v,
+              'origin': 'expected_outcome'}
+             for k, v in (action.expected_outcome or {}).items()]
+    crits += [dict(parse_criterion(c), origin='acceptance_criteria')
+              for c in (action.acceptance_criteria or [])]
+    return crits
+
+
+def evaluate_action_criteria(action) -> List[Dict[str, Any]]:
+    """Verdicts for all of an action's checks.  A missing expected_outcome
+    key keeps its legacy meaning (a miss), so it is 'fail', not
+    'unevaluable'; a missing acceptance-criterion target is 'unevaluable'."""
+    verdicts = []
+    for crit in action_criteria(action):
+        v = evaluate_criterion(crit, action.outcome or {}, action.observations)
+        if (crit.get('origin') == 'expected_outcome'
+                and v['verdict'] == 'unevaluable'):
+            v = dict(v, verdict='fail', reason='expected key not in outcome')
+        verdicts.append(dict(v, origin=crit.get('origin')))
+    return verdicts
 
 
 # ─── Orchestrator ───────────────────────────────────────────────────────
@@ -403,6 +540,9 @@ class AgentAttributionOrchestrator:
             'goal_id': action.goal_id,
             'expected_outcome': action.expected_outcome,
             'acceptance_criteria': action.acceptance_criteria,
+            # Every check's verdict, so the learner sees WHICH criterion
+            # passed or failed and which were never measured.
+            'criteria_verdicts': evaluate_action_criteria(action),
             'duration_seconds': round(
                 (action.completed_at or time.time()) - action.started_at, 2),
             'step_count': len(action.steps),
@@ -504,37 +644,18 @@ class AgentAttributionOrchestrator:
         - Otherwise: fraction of expected keys matched within tolerance.
         """
         outcome = action.outcome or {}
-        if not action.expected_outcome:
-            # No expectation set — neutral score, use outcome status
-            if outcome.get('status') == 'error' or outcome.get('error'):
-                return 0.0
-            if outcome.get('status') == 'timeout':
-                return 0.2
-            return 0.5
-
         if outcome.get('status') == 'error' or outcome.get('error'):
             return 0.0
-
-        # Check expected keys
-        matched = 0
-        total = 0
-        for key, expected in action.expected_outcome.items():
-            total += 1
-            actual = outcome.get(key)
-            if actual is None:
-                continue
-            if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
-                # Numeric: within 10% tolerance (relative) OR 0.05 absolute for small values.
-                # The absolute band catches cases like expected=0 + actual=0.03 (delta
-                # metrics), where pure relative tolerance would fail every near-zero case.
-                if abs(actual - expected) <= 0.05:
-                    matched += 1
-                elif expected != 0 and abs(actual - expected) / abs(expected) <= 0.1:
-                    matched += 1
-            elif actual == expected:
-                matched += 1
-
-        return matched / total if total > 0 else 0.5
+        # ONE evaluator for both vocabularies: expected_outcome is the
+        # degenerate 'metric ==' criterion (same tolerance band as before),
+        # acceptance_criteria are parsed into the same shape.  Only checks
+        # that could be evaluated count; none at all keeps the old neutral
+        # reading of the outcome status.
+        decided = [v for v in evaluate_action_criteria(action)
+                   if v['verdict'] in ('pass', 'fail')]
+        if not decided:
+            return 0.2 if outcome.get('status') == 'timeout' else 0.5
+        return sum(v['verdict'] == 'pass' for v in decided) / len(decided)
 
     def _emit_completion_event(self, action: AgentAction) -> None:
         """Emit EventBus event for real-time dashboards."""

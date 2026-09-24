@@ -722,8 +722,16 @@ class HiveBenchmarkProver:
                 action_type=f'benchmark_run:{benchmark_name}',
                 goal_id=config.get('goal_id'),
                 expected_outcome={'score': baseline_target, 'status': 'completed'},
+                # Checks name the keys complete_action reports ('score'),
+                # so they are evaluated, not stored.  The old
+                # 'hive_score >= x' named a key the outcome never carried.
+                # 'all_shards_complete' is not measured by this run yet, so
+                # it is carried and reported 'unevaluable', never a pass.
                 acceptance_criteria=[
-                    f'hive_score >= {baseline_target:.2f}',
+                    {'kind': 'metric', 'target': 'score', 'op': '>=',
+                     'value': baseline_target,
+                     'derivation': 'a run must reach the best score this '
+                                   'benchmark has already shown'},
                     'all_shards_complete',
                 ],
             )
