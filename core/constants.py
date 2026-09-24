@@ -1324,3 +1324,8 @@ TOOL_OBSERVATION_MAX_CHARS: int = 2000
 # graph and through the group chat's write-back is bounded to it by
 # core.token_utils.bound_text, so only rows stored before the cap can be.
 MEMORY_ITEM_MAX_CHARS: int = 16000
+
+# users.user_type values that are not a person. Measured read-only in
+# hevolve_database.db 2026-09-24: human 287, guest 21, agent 285, system 1.
+# Guests are people (the desktop's own UI account is a guest).
+NON_PERSON_USER_TYPES: frozenset = frozenset({'agent', 'system'})
