@@ -119,7 +119,43 @@ let
         # nothing => software, never detecting the good iGPU). `timeout 12` catches
         # a driver that HANGS on context creation (the real-HW pointer-only
         # failure). Capture stdout+stderr; never let it fail the unit (|| true).
-        OUT="$(EGL_PLATFORM=surfaceless timeout 12 ${pkgs.mesa-demos}/bin/eglinfo 2>&1 || true)"
+        # RETRY, bounded (2026-09-24). Measured on the Samsung node, generation 12:
+        # i915 initialised at 01:07:18, this unit started at 01:07:22, and the
+        # single eglinfo call sat for the whole 12 s timeout and reported no
+        # renderer ("renderer: none reported"), so the verdict was `software` for
+        # the entire boot: hart-comp stayed on pixman and the GTK4 shell host on
+        # software GL, and a tray press cost 760-1530 ms to photon with the CPU
+        # at 3.2 GHz and idle. Nine minutes later the identical call answered
+        # "Mesa Intel(R) HD Graphics 4000 (IVB GT2)" in 0.26 s, and in 0.42 s
+        # under a synthetic 4-core load. One early, hung attempt was deciding the
+        # rendering stack for the session. So: try again every 3 s for up to a
+        # minute, stop at the first output that names a renderer, and journal each
+        # attempt with its duration and the tail of what eglinfo said, so the next
+        # `software` verdict explains itself. `-B` prints only the summary lines
+        # the classifier below reads. The classifier itself is unchanged and runs
+        # once, on the last output; tests/unit/test_nixos_gpu_probe.py extracts it
+        # verbatim.
+        OUT=""
+        _attempt=0
+        _deadline=$(( $(date +%s) + 60 ))
+        while :; do
+          _attempt=$((_attempt + 1))
+          _t0=$(date +%s)
+          OUT="$(EGL_PLATFORM=surfaceless timeout 12 ${pkgs.mesa-demos}/bin/eglinfo -B 2>&1 || true)"
+          _took=$(( $(date +%s) - _t0 ))
+          # `case`, not the classifier's `printf | grep` shape: the unit test
+          # locates the classifier by that exact shape and must find ONE.
+          case "$OUT" in
+            *[Rr][Ee][Nn][Dd][Ee][Rr][Ee][Rr]*)
+              echo "[hart-gpu-probe] attempt $_attempt: eglinfo named a renderer after ''${_took}s" >&2
+              break ;;
+          esac
+          echo "[hart-gpu-probe] attempt $_attempt: no renderer line after ''${_took}s (eglinfo tail: $(printf '%s' "$OUT" | tail -n 2 | tr '\n' ' ' | cut -c1-160))" >&2
+          if [ "$(date +%s)" -ge "$_deadline" ]; then
+            break
+          fi
+          sleep 3
+        done
 
         # The renderer line eglinfo reported — captured for the journal so a real-HW
         # boot shows WHICH renderer (Intel iGPU or which software rasterizer) drove
@@ -204,7 +240,8 @@ in
         ExecStart = "${probeScript}";
         # The script bounds eglinfo at 12s itself; this is the outer belt so a
         # pathological hang outside eglinfo still can't wedge the boot.
-        TimeoutStartSec = "30s";
+        # 60 s retry deadline + one 12 s attempt still in flight + slack.
+        TimeoutStartSec = "90s";
       };
     };
   };
