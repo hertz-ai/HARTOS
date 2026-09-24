@@ -92,17 +92,26 @@ class AutoDeployService:
         except Exception as e:
             result['steps']['benchmark'] = {'error': str(e)}
 
-        # 4. Check upgrade safety
+        # 4. Check upgrade safety against the previous benchmarked version.
+        # This used to call is_upgrade_safe(new_version), one of its TWO
+        # required arguments, and then .get() a (bool, str) tuple: the
+        # TypeError fell into the except below, so benchmarks never gated a
+        # merge deploy (hevolveai Master 11.433, gate B). Same signature and
+        # (safe, reason) contract as upgrade_orchestrator._stage_benchmark.
         try:
             from .benchmark_registry import get_benchmark_registry
             registry = get_benchmark_registry()
-            safe = registry.is_upgrade_safe(new_version)
-            result['steps']['upgrade_safe'] = safe
-
-            if not safe.get('safe', True):
-                result['error'] = (
-                    f"Upgrade not safe: {safe.get('regressions', [])}")
-                return result
+            prev_version = registry.previous_version(new_version)
+            if prev_version is None:
+                result['steps']['upgrade_safe'] = {
+                    'safe': True, 'reason': 'no previous benchmark snapshot'}
+            else:
+                safe, reason = registry.is_upgrade_safe(prev_version, new_version)
+                result['steps']['upgrade_safe'] = {
+                    'safe': safe, 'reason': reason, 'baseline': prev_version}
+                if not safe:
+                    result['error'] = f'Upgrade not safe: {reason}'
+                    return result
         except Exception as e:
             result['steps']['upgrade_safe'] = {'error': str(e)}
             # Continue — missing benchmark data should not block deploy

@@ -32,6 +32,14 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger('hevolve.autoresearch')
 
+# The AgentBaselineService flow slot an autoresearch session writes its
+# snapshots to AND the regression gate reads from. One name for both, because
+# they had drifted: the write passed flow_id='autoresearch', which the service's
+# int(flow_id) rejected (logged at DEBUG, no snapshot written), while the gate
+# read flow 0, found nothing, and passed on "no baseline to compare" every time
+# (hevolveai Master 11.433, gate A).
+_BASELINE_FLOW_ID = 0
+
 
 # ── Result Types ─────────────────────────────────────────────
 
@@ -499,7 +507,7 @@ class AutoResearchEngine:
         try:
             prompt_id = session.experiment_id or session.session_id
             result = AgentBaselineService.validate_against_baseline(
-                prompt_id=prompt_id, flow_id=0,
+                prompt_id=prompt_id, flow_id=_BASELINE_FLOW_ID,
             )
         except Exception as e:
             session.baseline_delta_enforced = False
@@ -623,38 +631,53 @@ class AutoResearchEngine:
 
         # AgentBaselineService snapshot is the regression escape-hatch the
         # audit flagged: if we silently skip it, a later benchmark-based
-        # rollback has no anchor to roll back TO.  Make the absence LOUD
-        # and set the session flag so dashboards/tests can read it.
-        try:
-            from integrations.agent_engine.agent_baseline_service import AgentBaselineService
-            AgentBaselineService.capture_snapshot(
-                prompt_id=session.experiment_id or session.session_id,
-                flow_id='autoresearch',
-                trigger='autoresearch_improvement',
-                user_id=session.goal_id or 'system',
-            )
-        except ImportError as e:
-            session.baseline_enforced = False
-            logger.warning(
-                "[%s] AgentBaselineService unavailable (ImportError: %s) — "
-                "iter %d kept WITHOUT baseline snapshot. "
-                "Set session.baseline_enforced=False — regression rollback "
-                "will have no anchor for this iteration.",
-                session.session_id, e, result.iteration,
-            )
-        except Exception as e:
-            session.baseline_enforced = False
-            logger.warning(
-                "[%s] AgentBaselineService.capture_snapshot failed "
-                "(%s: %s) — iter %d kept WITHOUT baseline snapshot.",
-                session.session_id, type(e).__name__, e, result.iteration,
-            )
+        # rollback has no anchor to roll back TO.
+        self.capture_baseline_snapshot(
+            session, 'autoresearch_improvement', result.iteration)
 
         self.emit_progress(session, 'autoresearch.promoted', {
             'iteration': result.iteration,
             'metric_value': result.metric_value,
             'baseline_value': result.baseline_value,
         })
+        return True
+
+    def capture_baseline_snapshot(self, session: AutoResearchSession,
+                                  trigger: str, iteration: int) -> bool:
+        """Write the session's AgentBaselineService snapshot to the SAME flow
+        slot the regression gate reads (_BASELINE_FLOW_ID).
+
+        Called at setup (the pre-evolution state the first promotion is
+        compared against) and after every promotion. capture_snapshot is
+        fire-and-forget: it returns None on failure instead of raising, so the
+        return value decides session.baseline_enforced. Before this, a failed
+        capture left the flag True while no snapshot existed.
+        """
+        try:
+            from integrations.agent_engine.agent_baseline_service import (
+                AgentBaselineService)
+            snap = AgentBaselineService.capture_snapshot(
+                prompt_id=session.experiment_id or session.session_id,
+                flow_id=_BASELINE_FLOW_ID,
+                trigger=trigger,
+                user_id=session.goal_id or 'system',
+            )
+        except Exception as e:  # ImportError included: the service is absent
+            session.baseline_enforced = False
+            logger.warning(
+                "[%s] AgentBaselineService unavailable or raised (%s: %s) - "
+                "iter %d has NO baseline snapshot; set "
+                "session.baseline_enforced=False.",
+                session.session_id, type(e).__name__, e, iteration)
+            return False
+        if snap is None:
+            session.baseline_enforced = False
+            logger.warning(
+                "[%s] baseline snapshot (%s) was NOT written for iter %d - "
+                "the regression gate has no anchor; set "
+                "session.baseline_enforced=False.",
+                session.session_id, trigger, iteration)
+            return False
         return True
 
     # ── History & Reporting ──────────────────────────────────
@@ -943,6 +966,9 @@ def autoresearch_setup(repo_path: str, target_file: str, run_command: str,
     session.baseline_metric = baseline.metric_value
     session.best_metric = baseline.metric_value
     session.results.append(asdict(baseline))
+    # The pre-evolution anchor: without it the FIRST promotion is compared
+    # against nothing and the regression gate passes it unconditionally.
+    engine.capture_baseline_snapshot(session, 'autoresearch_baseline', 0)
     engine.emit_progress(session, 'autoresearch.started')
     engine.emit_progress(session, 'autoresearch.baseline',
                          {'baseline': baseline.metric_value})
