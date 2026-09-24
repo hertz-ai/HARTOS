@@ -141,7 +141,15 @@ let
         while :; do
           _attempt=$((_attempt + 1))
           _t0=$(date +%s)
-          OUT="$(EGL_PLATFORM=surfaceless timeout 12 ${pkgs.mesa-demos}/bin/eglinfo -B 2>&1 || true)"
+          # 20 s per attempt, not 12 (2026-09-24, generation 13 boot): attempt 1
+          # was killed at exactly 12 s and attempt 2 then answered in 2 s, while
+          # the same call answers in 0.26 s once the box is up. No kernel event
+          # sits between them in the journal; what sits there is the backend's
+          # import storm on every core. That is the shape of a cold driver init
+          # that the timeout cut off just short, and the retry only made the
+          # boot pay 12 s + 3 s + 2 s for it. A longer first attempt lets it
+          # finish; the 60 s deadline below still bounds a truly dead GPU.
+          OUT="$(EGL_PLATFORM=surfaceless timeout 20 ${pkgs.mesa-demos}/bin/eglinfo -B 2>&1 || true)"
           _took=$(( $(date +%s) - _t0 ))
           # `case`, not the classifier's `printf | grep` shape: the unit test
           # locates the classifier by that exact shape and must find ONE.
@@ -240,8 +248,14 @@ in
         ExecStart = "${probeScript}";
         # The script bounds eglinfo at 12s itself; this is the outer belt so a
         # pathological hang outside eglinfo still can't wedge the boot.
-        # 60 s retry deadline + one 12 s attempt still in flight + slack.
-        TimeoutStartSec = "90s";
+        # 60 s retry deadline + one 20 s attempt still in flight + slack.
+        TimeoutStartSec = "100s";
+        # The probe runs while hart-backend, hart-nunba and hart-discovery
+        # import their ML stacks on every core; its one eglinfo is on the path
+        # to greetd (Before=), so every second it waits is a second before the
+        # first paint. Let it win the scheduler for the seconds it needs.
+        CPUWeight = 1000;
+        Nice = -5;
       };
     };
   };
