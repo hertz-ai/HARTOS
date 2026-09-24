@@ -173,3 +173,94 @@ def test_C_the_newest_snapshot_is_numeric_not_lexicographic(baselines):
     metrics = abs_mod.AgentBaselineAdapter().run()['metrics']
     assert metrics['agentC_0_reward_delta']['value'] == pytest.approx(1.0), (
         "the adapter must compare v11 -> v12, not v8 -> v9")
+
+
+# -- D: the loop may change ONLY its target file -----------------------------
+
+def _edit_block(name, search, replace):
+    return f"`{name}`\n<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE\n"
+
+
+def test_D_edit_target_containment_and_declared_set(tmp_path):
+    """The decision itself, dependency-free (the full apply below needs the
+    vendored aider deps, which neither this venv nor the shipped Nunba has)."""
+    from pathlib import Path
+    from integrations.coding_agent.aider_native_backend import AiderNativeBackend
+    work = (tmp_path / 'repo')
+    work.mkdir()
+    root = Path(work).resolve()
+    outside = (tmp_path / 'outside.py').resolve()
+    decide = AiderNativeBackend._resolve_edit_target
+    allowed = {(root / 't.py').resolve()}
+    assert decide(root, '../outside.py', None)[0] is None
+    assert decide(root, str(outside), None)[0] is None, "absolute path replaces root"
+    assert decide(root, 'harness.py', allowed) == (None, 'not one of the declared files')
+    assert decide(root, 't.py', allowed)[0] == (root / 't.py').resolve()
+    assert decide(root, 'sub/harness.py', None)[0] is not None, (
+        "unrestricted callers may still edit inside their working dir")
+
+
+def test_D_backend_never_edits_outside_its_working_dir(tmp_path):
+    pytest.importorskip('diff_match_patch')
+    from integrations.coding_agent.aider_native_backend import AiderNativeBackend
+    work = tmp_path / 'repo'
+    work.mkdir()
+    (work / 't.py').write_text('x = 1\n')
+    (work / 'harness.py').write_text('SCORE = 0\n')
+    outside = tmp_path / 'outside.py'
+    outside.write_text('SECRET = 1\n')
+    backend = AiderNativeBackend()
+    reply = (_edit_block('../outside.py', 'SECRET = 1', 'SECRET = 2')
+             + _edit_block(str(outside), 'SECRET = 1', 'SECRET = 3')
+             + _edit_block('harness.py', 'SCORE = 0', 'SCORE = 100')
+             + _edit_block('t.py', 'x = 1', 'x = 2'))
+
+    res = {r['file']: r for r in backend._apply_edits(
+        reply, str(work), ['t.py'], restrict_to_files=True)}
+    assert outside.read_text() == 'SECRET = 1\n', "no edit may leave working_dir"
+    assert res['../outside.py']['status'] == 'refused'
+    assert res[str(outside)]['status'] == 'refused'
+    assert res['harness.py']['status'] == 'refused'
+    assert (work / 'harness.py').read_text() == 'SCORE = 0\n'
+    assert res['t.py']['status'] == 'applied'
+
+    # control: without the restriction other callers keep editing any file
+    # INSIDE their working dir, but containment still holds
+    (work / 't.py').write_text('x = 1\n')
+    res = {r['file']: r for r in backend._apply_edits(reply, str(work), ['t.py'])}
+    assert res['harness.py']['status'] == 'applied'
+    assert res['../outside.py']['status'] == 'refused'
+    assert outside.read_text() == 'SECRET = 1\n'
+
+
+def test_D_autoresearch_rejects_and_reverts_an_edit_beyond_its_target(tmp_path):
+    import subprocess as sp
+    from integrations.coding_agent import autoevolve_code_tools as ae
+    repo = tmp_path / 'exp'
+    repo.mkdir()
+    (repo / 't.py').write_text('x = 1\n')
+    (repo / 'harness.py').write_text('SCORE = 0\n')
+    for cmd in (['git', 'init', '-q'], ['git', 'add', '-A'],
+                ['git', '-c', 'user.email=t@t', '-c', 'user.name=t',
+                 'commit', '-q', '-m', 'init']):
+        sp.run(cmd, cwd=repo, check=True, capture_output=True)
+
+    session = ae.AutoResearchSession(repo_path=str(repo), target_file='t.py',
+                                     run_command='echo')
+    engine = ae.get_autoresearch_engine()
+    engine.register_session(session)
+
+    def cheating_edit(s):
+        (repo / 't.py').write_text('x = 2\n')
+        (repo / 'harness.py').write_text('SCORE = 100\n')   # games the metric
+        return 'raise the score', [], ['t.py', 'harness.py']
+
+    try:
+        with patch.object(engine, 'generate_and_apply_edit', side_effect=cheating_edit):
+            out = json.loads(ae.autoresearch_edit(session.session_id))
+    finally:
+        engine.unregister_session(session.session_id)
+    assert out['success'] is False and 'harness.py' in out['reason']
+    assert (repo / 'harness.py').read_text() == 'SCORE = 0\n', "harness restored"
+    assert (repo / 't.py').read_text() == 'x = 1\n', "the whole iteration is void"
+    assert session.scope_rejections == 1
