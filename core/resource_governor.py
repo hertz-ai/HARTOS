@@ -1209,6 +1209,54 @@ class ResourceGovernor:
         # Windows fallback without psutil: assume moderate usage
         return 0.3
 
+    def _own_process_roots(self) -> list:
+        """This process, every registered managed subprocess, and the
+        llama-server resolved by port -- the roots own_process_pids walks.
+
+        llama-server is NOT spawned by HARTOS (it's a configured endpoint)
+        so it's never register_subprocess'd — but the agent daemon's
+        inference IS HARTOS's own work.  Without counting it as own, its
+        inference CPU reads as a foreign app and trips both the governor
+        backoff AND model_lifecycle pressure → the yield gate flaps and no
+        goal ever completes a tick (2026-05-31 idle-hour: 0 executions).
+        """
+        roots = [os.getpid()]
+        with self._lock:
+            roots.extend(self._managed_subprocesses.values())
+        _llm_pid = self._resolve_llm_server_pid()
+        if _llm_pid and _llm_pid not in roots:
+            roots.append(_llm_pid)
+        return roots
+
+    def own_process_pids(self, include_parent: bool = False) -> set:
+        """The pids of HARTOS's own process tree: this process + its
+        children + every registered managed subprocess + the llama-server
+        resolved by port + their children.  ONE definition, read by the CPU
+        attribution below and by integrations.vlm.safety, which refuses an
+        agent command that would stop any of them (#877).
+
+        ``include_parent`` adds the parent process: when HARTOS runs as a
+        child of Nunba, the parent is the app the user is looking at.
+        Empty set when psutil is unavailable.
+        """
+        psutil = _try_import_psutil()
+        if psutil is None:
+            return set()
+        own_pids = set()
+        for pid in self._own_process_roots():
+            try:
+                proc = psutil.Process(pid)
+                own_pids.add(pid)
+                for child in proc.children(recursive=True):
+                    own_pids.add(child.pid)
+            except Exception:
+                continue
+        if include_parent:
+            parent = os.getppid()
+            if parent and parent > 1:
+                own_pids.add(parent)
+        return own_pids
+
     def _get_own_cpu_usage(self) -> float:
         """Fraction (0..1 of total capacity) consumed by HARTOS's OWN
         process tree: this process + its children + every registered
@@ -1231,44 +1279,17 @@ class ResourceGovernor:
         except Exception:
             ncpu = 1
 
-        own_pids = set()
-        # Main process tree.
-        try:
-            main = self._own_proc_cache.get(os.getpid())
-            if main is None:
-                main = psutil.Process(os.getpid())
-                main.cpu_percent(None)  # prime baseline
-                self._own_proc_cache[os.getpid()] = main
-            own_pids.add(os.getpid())
-            for child in main.children(recursive=True):
-                own_pids.add(child.pid)
-        except Exception:
-            pass
-        # Registered managed-subprocess trees (hevolveai…) PLUS the
-        # llama-server resolved by port.  llama-server is NOT spawned by
-        # HARTOS (it's a configured endpoint) so it's never
-        # register_subprocess'd — but the agent daemon's inference IS
-        # HARTOS's own work.  Without counting it as own, its inference CPU
-        # reads as a foreign app and trips both the governor backoff AND
-        # model_lifecycle pressure → the yield gate flaps and no goal ever
-        # completes a tick (2026-05-31 idle-hour: 0 executions).
-        with self._lock:
-            managed = list(self._managed_subprocesses.values())
-        _llm_pid = self._resolve_llm_server_pid()
-        if _llm_pid and _llm_pid not in managed:
-            managed.append(_llm_pid)
-        for pid in managed:
-            try:
-                proc = self._own_proc_cache.get(pid)
-                if proc is None:
+        # Roots are primed here so they count from this tick; a child first
+        # seen below is primed there and counts from the next tick.
+        for pid in self._own_process_roots():
+            if pid not in self._own_proc_cache:
+                try:
                     proc = psutil.Process(pid)
                     proc.cpu_percent(None)  # prime baseline
                     self._own_proc_cache[pid] = proc
-                own_pids.add(pid)
-                for child in proc.children(recursive=True):
-                    own_pids.add(child.pid)
-            except Exception:
-                self._own_proc_cache.pop(pid, None)
+                except Exception:
+                    continue
+        own_pids = self.own_process_pids()
 
         total_pct = 0.0
         for pid in own_pids:

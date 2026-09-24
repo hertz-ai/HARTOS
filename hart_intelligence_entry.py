@@ -3334,6 +3334,14 @@ def _handle_shell_command_tool(input_text: str) -> str:
                 f"If you really need this, ask the user to run it manually."
             )
 
+    # --- The shared hard-deny policy every computer-use dispatcher calls
+    # (power/reset/erase, and stopping the assistant's own processes, #877).
+    # The LangChain Shell_Command tool reached run_bounded without it.
+    from integrations.vlm.safety import computer_operation_refusal
+    _refusal = computer_operation_refusal({'command': text})
+    if _refusal is not None:
+        return f"Shell_Command refused: {_refusal}"
+
     # --- The owner's permission: the same computer_control consent the VLM
     # loop checks (integrations.vlm.safety.computer_control_block).  After
     # the denylist on purpose, so a destructive command is refused without
