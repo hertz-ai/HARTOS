@@ -17,6 +17,37 @@ from datetime import datetime
 
 logger = logging.getLogger('hevolve_social')
 
+
+_HARTOS_HANDLER_TAG = '_hartos_root_handler'  # same tag hart_intelligence_entry uses
+
+
+def _give_the_journal_a_root_handler(root=None):
+    """The systemd entrypoint's process has NO root log handler unless someone
+    installs one: hart-agent.nix runs `python -c "... AgentDaemon().run_forever()"`,
+    nothing here ever configured logging, so every INFO line this daemon and the
+    governor monitor emit went to Python's lastResort handler, which prints
+    WARNING and above only. Measured on the Samsung node, generations 11 and 12
+    (2026-09-24): `journalctl -u hart-agent-daemon` held ONE line per boot,
+    systemd's "Started", through thirty minutes of ticks, yields and governor
+    transitions; the yield reasons that explain why the box is or is not busy
+    were invisible. The same rule hart_intelligence_entry applies to the backend
+    (babefb0): attach a stdout handler ONLY when root has none, tagged so a host
+    that already configured root (Nunba, pytest) is left exactly as found.
+    Returns the handler it attached, or None.
+    """
+    root = root if root is not None else logging.getLogger()
+    if root.handlers:
+        return None
+    import sys as _sys
+    h = logging.StreamHandler(_sys.stdout)
+    h.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - [%(threadName)s] - %(levelname)s - %(message)s'))
+    setattr(h, _HARTOS_HANDLER_TAG, True)
+    root.addHandler(h)
+    if root.level == logging.NOTSET or root.level > logging.INFO:
+        root.setLevel(logging.INFO)
+    return h
+
 # Lock protecting module-level mutable state accessed from daemon thread + API threads
 _module_lock = threading.Lock()
 
@@ -661,6 +692,7 @@ class AgentDaemon:
         keep the goal engine from starting; the reads then fail closed to
         "not idle" exactly as they did before.
         """
+        _give_the_journal_a_root_handler()
         try:
             from core.resource_governor import get_governor
             get_governor().start(monitor_only=True)
