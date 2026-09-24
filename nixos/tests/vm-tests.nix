@@ -592,8 +592,18 @@ in
                   f"this subtest would pass without testing anything")
               edge.succeed(f"kill -9 {pid}")
 
-              # Bounded: a unit that never comes back is the failure, so an
-              # unbounded wait would hang the run instead of reporting it.
+              # Wait for the RESTART, not merely for "active": right after the
+              # kill the unit still reports active for the few ms systemd needs
+              # to reap the main process, so a plain wait_for_unit returned in
+              # 0.15 s and NRestarts was read as 0 -> 0 while the journal was
+              # still printing "Main process exited, code=killed" (affa34f
+              # nixosTests run, shard 3, 2026-09-24). Bounded either way: a unit
+              # that never comes back is the failure, so an unbounded wait would
+              # hang the run instead of reporting it. 120 s covers RestartSec
+              # plus the backend's own startup.
+              edge.wait_until_succeeds(
+                  f'test "$(systemctl show -p NRestarts --value {unit})" -gt {before}',
+                  timeout=120)
               edge.wait_for_unit(unit, timeout=120)
               after = int(edge.succeed(
                   f"systemctl show -p NRestarts --value {unit}").strip() or 0)
