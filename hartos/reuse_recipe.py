@@ -4430,25 +4430,31 @@ def _reuse_written_answer(group_chat):
 
 
 def _reuse_completion_evidence(user_prompt, action_id, group_chat):
-    """Locate the canonical GroupChat receipt the REUSE gate just proved.
+    """Locate the receipt the REUSE gate just proved.
 
     The fabrication gate remains the one judge of whether every tool named by
     the action produced a real result.  This helper only projects that existing
     judgment into lifecycle_hooks' shared ``{message_index, kind}`` envelope so
     REUSE and CREATE persist and learn from completion through the same path.
+
+    It searches the SAME lists the gate reads (_reuse_evidence_sources): the
+    group log first, then each participant's pairwise buffer.  A buffer receipt
+    carries its address (source/agent/peer) so lifecycle_hooks.resolve_receipt
+    reads it back from that list.  Measured 2026-09-24 on nightly 8a11925: this
+    helper read the group log only, the gate credited results that lived only
+    in a buffer, and 362 actions ended GAVE_UP with 0 committed.
     """
     try:
+        def _dispatch_index(msgs):
+            for idx in range(len(msgs) - 1, -1, -1):
+                if dispatch_action_id((msgs[idx] or {}).get('content')) == action_id:
+                    return idx
+            return None
+
         messages = getattr(group_chat, 'messages', None)
         if not isinstance(messages, list):
             return None
-
-        dispatch_index = None
-        for idx in range(len(messages) - 1, -1, -1):
-            if dispatch_action_id((messages[idx] or {}).get('content')) == action_id:
-                dispatch_index = idx
-                break
-        if dispatch_index is None:
-            return None
+        dispatch_index = _dispatch_index(messages)
 
         task = user_tasks.get(user_prompt)
         action_text = str(task.get_action(int(action_id) - 1) or '').lower() \
@@ -4459,29 +4465,41 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
 
         if referenced:
             wanted = set(referenced)
-            call_fn = _reuse_call_id_to_tool_name([messages])
+            sources = [(src, msgs) for src, msgs
+                       in _reuse_evidence_sources(group_chat, agents)
+                       if isinstance(msgs, list)]
+            call_fn = _reuse_call_id_to_tool_name([msgs for _s, msgs in sources])
             seen = getattr(task, 'evidence_seen_call_ids', set()) if task else set()
             seen = seen if isinstance(seen, (set, frozenset)) else set()
-            for idx in range(len(messages) - 1, dispatch_index, -1):
-                msg = messages[idx]
-                if not isinstance(msg, dict) or msg.get('role') != 'tool':
+            for source, msgs in sources:
+                # Each list is held to its OWN dispatch window: a buffer also
+                # carries earlier actions' turns.
+                start = _dispatch_index(msgs)
+                if start is None:
                     continue
-                responses = msg.get('tool_responses')
-                entries = responses if isinstance(responses, list) and responses else [msg]
-                for result in entries:
-                    if not isinstance(result, dict):
+                for idx in range(len(msgs) - 1, start, -1):
+                    msg = msgs[idx]
+                    if not isinstance(msg, dict) or msg.get('role') != 'tool':
                         continue
-                    call_id = result.get('tool_call_id') or msg.get('tool_call_id')
-                    body = str(result.get('content') or msg.get('content') or '')
-                    if call_id in seen or HISTORICAL_TOOL_PLACEHOLDER in body:
-                        continue
-                    if any(failure in body for failure in TOOL_FAILURE_RESULTS):
-                        continue
-                    name = call_fn.get(call_id) or result.get('name')
-                    if name in wanted:
-                        return {'message_index': idx, 'kind': 'tool_receipt'}
+                    responses = msg.get('tool_responses')
+                    entries = responses if isinstance(responses, list) and responses else [msg]
+                    for result in entries:
+                        if not isinstance(result, dict):
+                            continue
+                        call_id = result.get('tool_call_id') or msg.get('tool_call_id')
+                        body = str(result.get('content') or msg.get('content') or '')
+                        if call_id in seen or HISTORICAL_TOOL_PLACEHOLDER in body:
+                            continue
+                        if any(failure in body for failure in TOOL_FAILURE_RESULTS):
+                            continue
+                        name = call_fn.get(call_id) or result.get('name')
+                        if name in wanted:
+                            return {**(source or {}), 'message_index': idx,
+                                    'kind': 'tool_receipt'}
             return None
 
+        if dispatch_index is None:
+            return None
         answer = _reuse_written_answer(group_chat)
         if not isinstance(answer, dict):
             return None
@@ -5092,18 +5110,31 @@ def _reuse_present_call_ids(msg_lists):
     return out
 
 
+def _reuse_evidence_sources(group_chat, agents):
+    """The message lists the gate treats as evidence, each with its address.
+
+    Yields ``(source, messages)``: ``source`` is None for the group log, or
+    ``{'source': 'buffer', 'agent': <name>, 'peer': <name>}`` for one
+    participant's pairwise buffer -- the address lifecycle_hooks.resolve_receipt
+    reads a receipt back from.  The group log comes first.
+    """
+    yield None, getattr(group_chat, 'messages', None) or []
+    for ag in (agents or []):
+        conv = getattr(ag, '_oai_messages', None)
+        if isinstance(conv, dict):
+            for peer, msgs in conv.items():
+                yield ({'source': 'buffer',
+                        'agent': getattr(ag, 'name', None),
+                        'peer': getattr(peer, 'name', peer)}, msgs)
+
+
 def _reuse_evidence_msg_lists(group_chat, agents):
     """The message lists the gate treats as evidence — ONE definition.
 
     Both the watermark stamp and the gate must look at the same places, or
     the stamp would miss a buffer the gate later credits.
     """
-    lists = [getattr(group_chat, 'messages', None) or []]
-    for ag in (agents or []):
-        conv = getattr(ag, '_oai_messages', None)
-        if isinstance(conv, dict):
-            lists.extend(conv.values())
-    return lists
+    return [msgs for _source, msgs in _reuse_evidence_sources(group_chat, agents)]
 
 
 def _stamp_action_evidence_watermark(user_prompt):

@@ -1415,6 +1415,53 @@ def lifecycle_hook_track_status_verification_request(user_prompt: str, user_task
     return False
 
 
+def resolve_receipt(user_prompt: str, evidence) -> Optional[tuple]:
+    """The ONE rule for reading a completion receipt:
+    ``(messages, index, message, agent)`` or None.
+
+    A receipt lives in one of the lists the REUSE fabrication gate already
+    treats as evidence (reuse_recipe._reuse_evidence_msg_lists):
+
+      * the group log (``{'message_index': i, ...}``; ``agent`` is None), or
+      * one participant's pairwise buffer
+        (``{'source': 'buffer', 'agent': <participant name>,
+        'peer': <counterpart name>, 'message_index': i, ...}``).
+
+    Measured 2026-09-24 on nightly 8a11925: the gate credited tool runs that
+    lived only in a buffer while every reader of the receipt indexed the group
+    log, so 362 actions ended GAVE_UP and 0 committed.  The completion gate,
+    the durable evidence record and the learning promotion all read the
+    receipt through this function, so they cannot disagree about it again.
+    """
+    if not isinstance(evidence, dict):
+        return None
+    index = evidence.get('message_index')
+    if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+        return None
+    group_chat = get_registered_groupchat(user_prompt)
+    if group_chat is None:
+        return None
+    agent = None
+    if evidence.get('source') == 'buffer':
+        agent_name, peer_name = evidence.get('agent'), evidence.get('peer')
+        # Only a participant of THIS group chat can hold the receipt.
+        agent = next((a for a in (getattr(group_chat, 'agents', None) or [])
+                      if getattr(a, 'name', None) == agent_name), None)
+        conv = getattr(agent, '_oai_messages', None) if agent else None
+        if not isinstance(conv, dict):
+            return None
+        messages = next((msgs for peer, msgs in conv.items()
+                         if getattr(peer, 'name', peer) == peer_name), None)
+    else:
+        messages = getattr(group_chat, 'messages', None)
+    if not isinstance(messages, list) or index >= len(messages):
+        return None
+    message = messages[index]
+    if not isinstance(message, dict):
+        return None
+    return messages, index, message, agent
+
+
 def _verifier_completion_has_conversation_evidence(
         user_prompt: str, action_id: int, json_obj: dict) -> bool:
     """Return whether a completion cites a real, earlier GroupChat result.
@@ -1426,27 +1473,27 @@ def _verifier_completion_has_conversation_evidence(
     evidence = json_obj.get('evidence')
     if not isinstance(evidence, dict):
         return False
-    index = evidence.get('message_index')
     kind = evidence.get('kind')
-    if not isinstance(index, int) or isinstance(index, bool):
-        return False
     if kind not in ('tool_receipt', 'user_visible_result'):
         return False
-    group_chat = get_registered_groupchat(user_prompt)
-    messages = getattr(group_chat, 'messages', None)
-    if not isinstance(messages, list) or index < 0 or index >= len(messages):
+    resolved = resolve_receipt(user_prompt, evidence)
+    if resolved is None:
         return False
-    message = messages[index]
-    if not isinstance(message, dict) or not str(message.get('content') or '').strip():
+    messages, index, message, agent = resolved
+    if not str(message.get('content') or '').strip():
         return False
     # Bind the receipt to the action window already used by the stale-verdict
     # guard.  Otherwise a verifier can cite action 1's valid receipt while
-    # completing action 2.  A missing dispatch marker is not evidence.
+    # completing action 2.  A missing dispatch marker is not evidence.  The
+    # window is read in the SAME list that holds the receipt, so a buffer
+    # (which also carries older turns) is held to the same rule as the log.
     if latest_dispatch_before(messages, index + 1) != action_id:
         return False
     if kind == 'tool_receipt':
         return message.get('role') == 'tool'
-    return (message.get('role') == 'assistant'
+    # A written answer is only ever cited from the group log.
+    return (agent is None
+            and message.get('role') == 'assistant'
             and message.get('name') == 'Assistant')
 
 
@@ -1481,9 +1528,13 @@ def _record_verifier_evidence(user_prompt: str, action_id: int,
             action_id)
         return False
     evidence = json_obj['evidence']
-    group_chat = get_registered_groupchat(user_prompt)
-    messages = getattr(group_chat, 'messages', None)
-    receipt = messages[evidence['message_index']]
+    resolved = resolve_receipt(user_prompt, evidence)
+    if resolved is None:
+        logger.error(
+            'Cannot persist verifier evidence: receipt for action_%s is '
+            'not readable', action_id)
+        return False
+    receipt = resolved[2]
     receipt_text = str(receipt.get('content') or '')
     receipt_hash = hashlib.sha256(receipt_text.encode('utf-8')).hexdigest()
     record = {
@@ -1523,6 +1574,10 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
     context = getattr(task, 'context', None)
     if not isinstance(context, dict):
         context = {}
+    resolved = resolve_receipt(user_prompt, json_obj.get('evidence'))
+    # A buffer receipt names the participant that holds it; credit exactly
+    # that participant, never one inferred from the group log.
+    receipt_agent = resolved[3] if resolved else None
     # CREATE and REUSE already declare these two assistant identities when
     # instrumenting their real GroupChat participant.  Award only wrappers
     # that are live for this session; a verifier verdict remains insufficient.
@@ -1535,7 +1590,9 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
         }
         group_chat = get_registered_groupchat(user_prompt)
         credited = record_verified_outcome_for_agents(
-            getattr(group_chat, 'agents', None), True, outcome_context)
+            [receipt_agent] if receipt_agent is not None
+            else getattr(group_chat, 'agents', None),
+            True, outcome_context)
         if not credited:
             # A False here is NOT "the reward was recorded".  It means no live
             # wrapper owned this chat, which happens whenever Agent Lightning
@@ -1560,10 +1617,9 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
     # or worker can bypass the lifecycle by self-attesting success.
     try:
         evidence = json_obj['evidence']
-        group_chat = get_registered_groupchat(user_prompt)
-        messages = getattr(group_chat, 'messages', None)
-        index = evidence.get('message_index')
-        receipt = messages[index]
+        if resolved is None:
+            raise ValueError('receipt not readable')
+        receipt = resolved[2]
         user_id, prompt_id = _extract_ownership_from_prompt(user_prompt)
         from integrations.agent_engine.world_model_bridge import (
             get_world_model_bridge,
@@ -1626,8 +1682,7 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
     if not validate_state_transition(
             user_prompt, action_id, ActionState.COMPLETED):
         return False
-    group_chat = get_registered_groupchat(user_prompt)
-    receipt = group_chat.messages[evidence['message_index']]
+    receipt = resolve_receipt(user_prompt, evidence)[2]
     # The proof must be durable before a completion can release dependents or
     # feed any learning system. A retry deduplicates the same receipt hash.
     if not _record_verifier_evidence(user_prompt, action_id, verdict):
