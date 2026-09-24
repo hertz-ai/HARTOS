@@ -97,13 +97,21 @@ let
       # path:/tmp/newrepo?dir=nixos" from exactly this rejection, stderr
       # hidden; reproduced on the Samsung node with the shipped nix 2.24.14.
       REF="$FLAKE"
+      SRC_ROOT_OVERRIDE=""
       case "$REF" in
         path:*\?dir=*)
           _p="''${REF#path:}"
           _d="''${_p#*\?dir=}"
           _d="''${_d%%&*}"
           _p="''${_p%%\?*}"
-          REF="path:''${_p%/}/$_d"
+          _p="''${_p%/}"
+          REF="path:$_p/$_d"
+          # For a path ref nix copies ONLY the flake dir into the store
+          # (metadata .path = /nix/store/...-source holding nixos/ alone), so
+          # the repo root is the directory the ref named, not anything nix
+          # reports. Measured on the 900b88f nixosTests run: the sync copied
+          # the store copy of nixos/ and /etc/hart/src/REV was gone.
+          SRC_ROOT_OVERRIDE="$_p"
           ;;
       esac
       SRC_PATH="$(nix flake metadata "$REF" --json 2>/dev/null | jq -r '.path // empty')" || SRC_PATH=""
@@ -111,10 +119,16 @@ let
         echo "[HART OTA] cannot resolve source of $FLAKE — /etc/hart/src kept at previous rev"
         exit 0
       fi
-      # Our refs carry ?dir=nixos, so metadata's .path is the nixos/ SUBDIR;
-      # the installed copy is the REPO ROOT (the flake references ../compositor).
+      # The installed copy is the REPO ROOT (the flake references ../compositor).
+      # For our github refs (?dir=nixos) metadata's .path IS the repo root
+      # (nix 2.24: .path = the fetched tree, .locked.dir = "nixos"), so ROOT is
+      # .path as-is. A path ref rewritten above names its root explicitly. The
+      # basename rule stays for a ref whose .path really is the nixos/ subdir
+      # of an on-disk tree.
       ROOT="$SRC_PATH"
-      if [ "$(basename "$SRC_PATH")" = "nixos" ] && [ -e "$(dirname "$SRC_PATH")/nixos/flake.nix" ]; then
+      if [ -n "$SRC_ROOT_OVERRIDE" ] && [ -e "$SRC_ROOT_OVERRIDE/nixos/flake.nix" ]; then
+        ROOT="$SRC_ROOT_OVERRIDE"
+      elif [ "$(basename "$SRC_PATH")" = "nixos" ] && [ -e "$(dirname "$SRC_PATH")/nixos/flake.nix" ]; then
         ROOT="$(dirname "$SRC_PATH")"
       fi
       rm -rf /etc/hart/src.new /etc/hart/src.old

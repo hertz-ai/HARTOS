@@ -651,8 +651,12 @@ in
       with subtest("Kill the GTK4 host -> the cage GTK3 floor is present + still software-GL (crash lands on a painting tier)"):
           # SIGKILL the GTK4 layer-shell host (the crash the floor must survive).
           paint.succeed(
-              "pkill -KILL -f 'hart-glass-shell-gtk4' "
-              "|| pkill -KILL -f 'GlassShellLayer' || true")
+              # The bracket spelling keeps pkill from matching the shell that
+              # runs this very command line (its argv holds the pattern): on the
+              # 900b88f nixosTests run pkill killed that shell first and the step
+              # died with exit 137 before the host was touched.
+              "pkill -KILL -f '[h]art-glass-shell-gtk4' "
+              "|| pkill -KILL -f '[G]lassShellLayer' || true")
           cage_launcher = paint.succeed(
               "find /nix/store -maxdepth 4 -name 'hart-shell-session' -type f "
               "-print -quit; true").strip()
