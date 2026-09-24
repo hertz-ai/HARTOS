@@ -9,6 +9,7 @@ WorldModelBridge for RL-EF learning.
 
 Service Pattern: static methods, db: Session, db.flush() not db.commit().
 """
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -359,6 +360,25 @@ class ThoughtExperimentService:
         experiment.status = 'evaluating'
         db.flush()
 
+        # ONE live evaluation goal per experiment.  A paused goal is not
+        # terminal, so an auto-evolve cycle holding one ages out after 6 h
+        # and the next cycle asks again; this used to create another goal
+        # every time (MEASURED live 2026-09-24: each LiveProbe dispatched at
+        # 20:09Z and 02:24Z, six paused goals for three experiments).  The
+        # live goal is returned instead, so the caller tracks the goal that
+        # already exists.  "Ended" is the same set auto_evolve.reconcile
+        # treats as terminal, so a retry after a failure still creates one.
+        existing = ThoughtExperimentService._live_evaluation_goal(
+            db, experiment_id)
+        if existing is not None:
+            return {
+                'success': True,
+                'goal_id': existing.id,
+                'reused': True,
+                'experiment_type': getattr(
+                    experiment, 'experiment_type', 'traditional') or 'traditional',
+            }
+
         exp_type = getattr(experiment, 'experiment_type', 'traditional') or 'traditional'
         recipe = ThoughtExperimentService._build_iteration_recipe(
             experiment, exp_type, config={})
@@ -409,6 +429,32 @@ class ThoughtExperimentService:
         except Exception as e:
             logger.debug(f"Agent evaluation goal creation failed: {e}")
             return {'success': False, 'reason': str(e)}
+
+    #: Goal statuses after which an evaluation is over -- the same set
+    #: auto_evolve.reconcile treats as terminal.  Anything else ('active',
+    #: 'paused', ...) is still live.
+    _EVALUATION_GOAL_ENDED = frozenset({'completed', 'failed', 'archived'})
+
+    @staticmethod
+    def _live_evaluation_goal(db: Session, experiment_id: str):
+        """The not-yet-ended evaluation goal for this experiment, or None."""
+        from .models import AgentGoal
+        goals = db.query(AgentGoal).filter(
+            AgentGoal.goal_type.in_(
+                ('thought_experiment', 'autoresearch', 'code_evolution')),
+            ~AgentGoal.status.in_(
+                tuple(ThoughtExperimentService._EVALUATION_GOAL_ENDED)),
+        ).all()
+        for g in goals:
+            cfg = g.config_json or {}
+            if isinstance(cfg, str):
+                try:
+                    cfg = json.loads(cfg or '{}')
+                except ValueError:
+                    continue
+            if isinstance(cfg, dict) and cfg.get('experiment_id') == experiment_id:
+                return g
+        return None
 
     @staticmethod
     def _build_iteration_recipe(experiment, exp_type: str, config: dict = None) -> Dict:
