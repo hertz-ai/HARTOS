@@ -4471,31 +4471,51 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
             call_fn = _reuse_call_id_to_tool_name([msgs for _s, msgs in sources])
             seen = getattr(task, 'evidence_seen_call_ids', set()) if task else set()
             seen = seen if isinstance(seen, (set, frozenset)) else set()
+            def _is_named_result(msg):
+                """This tool message carries an unseen, non-failed result of a
+                tool the action names -- the gate's own rule, one copy."""
+                if not isinstance(msg, dict) or msg.get('role') != 'tool':
+                    return False
+                responses = msg.get('tool_responses')
+                for result in (responses if isinstance(responses, list)
+                               and responses else [msg]):
+                    if not isinstance(result, dict):
+                        continue
+                    call_id = result.get('tool_call_id') or msg.get('tool_call_id')
+                    body = str(result.get('content') or msg.get('content') or '')
+                    if call_id in seen or HISTORICAL_TOOL_PLACEHOLDER in body:
+                        continue
+                    if any(failure in body for failure in TOOL_FAILURE_RESULTS):
+                        continue
+                    if (call_fn.get(call_id) or result.get('name')) in wanted:
+                        return True
+                return False
+
+            # What each list held, logged on a miss.  Live 2026-09-24 16:49-
+            # 18:55 (dffb deployed): the gate passed and this found nothing 16
+            # times, and nothing said whether the lists lacked a dispatch
+            # marker or lacked the result.
+            looked = []
             for source, msgs in sources:
                 # Each list is held to its OWN dispatch window: a buffer also
                 # carries earlier actions' turns.
                 start = _dispatch_index(msgs)
+                looked.append((source, msgs, start))
                 if start is None:
                     continue
                 for idx in range(len(msgs) - 1, start, -1):
-                    msg = msgs[idx]
-                    if not isinstance(msg, dict) or msg.get('role') != 'tool':
-                        continue
-                    responses = msg.get('tool_responses')
-                    entries = responses if isinstance(responses, list) and responses else [msg]
-                    for result in entries:
-                        if not isinstance(result, dict):
-                            continue
-                        call_id = result.get('tool_call_id') or msg.get('tool_call_id')
-                        body = str(result.get('content') or msg.get('content') or '')
-                        if call_id in seen or HISTORICAL_TOOL_PLACEHOLDER in body:
-                            continue
-                        if any(failure in body for failure in TOOL_FAILURE_RESULTS):
-                            continue
-                        name = call_fn.get(call_id) or result.get('name')
-                        if name in wanted:
-                            return {**(source or {}), 'message_index': idx,
-                                    'kind': 'tool_receipt'}
+                    if _is_named_result(msgs[idx]):
+                        return {**(source or {}), 'message_index': idx,
+                                'kind': 'tool_receipt'}
+            _ctx_safe_log('warning', (
+                f"[REUSE-VERIFY] receipt search for action {action_id} found "
+                f"none: " + ', '.join(
+                    f"{'group' if src is None else src['agent'] + '->' + str(src['peer'])}"
+                    f"(len={len(msgs)}, "
+                    f"dispatch={'none' if start is None else start}, "
+                    f"unseen_named={sum(1 for m in msgs if _is_named_result(m))})"
+                    for src, msgs, start in looked)
+                + f" for session: {user_prompt}"))
             return None
 
         if dispatch_index is None:

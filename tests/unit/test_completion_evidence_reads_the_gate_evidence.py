@@ -131,6 +131,38 @@ class CompletionEvidenceReadsGateEvidence(unittest.TestCase):
         self.assertIsNone(reuse_recipe._reuse_completion_evidence(_UP, 2, gc))
 
 
+class NoReceiptSaysWhatItSaw(unittest.TestCase):
+    """Live 2026-09-24 16:49-18:55 on nightly 35986387408 (dffb deployed):
+    0 committed, 16 "[REUSE-VERIFY] ... no canonical receipt", while the gate
+    passed.  The finder skips any list with no dispatch marker; the gate does
+    not.  Whether the live buffers carry one was unmeasured, because the miss
+    logged nothing about the lists it read.  This pins that it now does."""
+
+    def setUp(self):
+        self._saved = reuse_recipe.user_tasks.get(_UP)
+        reuse_recipe.user_tasks[_UP] = _FakeTask(_ACTION)
+
+    def tearDown(self):
+        if self._saved is None:
+            reuse_recipe.user_tasks.pop(_UP, None)
+        else:
+            reuse_recipe.user_tasks[_UP] = self._saved
+
+    def test_a_miss_names_each_list_its_dispatch_and_unseen_results(self):
+        helper = _FakeAgent('Helper', [_TOOL], {'Assistant': [_PROPOSAL, _RESULT]})
+        gc = _FakeGroupChat([_DISPATCH, _VERDICT],
+                            [helper, _FakeAgent('Assistant', [])])
+        self.assertEqual(
+            reuse_recipe._reuse_fabricated_tools(_UP, 1, gc, gc.agents), [],
+            "precondition: the gate credits the run in the dispatch-less buffer")
+        with self.assertLogs('reuse_recipe', level='WARNING') as logs:
+            self.assertIsNone(reuse_recipe._reuse_completion_evidence(_UP, 1, gc))
+        line = next(m for m in logs.output if 'receipt search' in m)
+        self.assertIn('group(len=2, dispatch=0, unseen_named=0)', line)
+        self.assertIn('Helper->Assistant(len=2, dispatch=none, unseen_named=1)', line)
+        self.assertIn(f'for session: {_UP}', line)
+
+
 class _FakeLedger:
     def __init__(self):
         self.tasks = {'action_1': type('T', (), {
