@@ -1637,18 +1637,27 @@ try:
         except Exception as fwd_err:
             return jsonify({'error': f'HevolveAI backend unavailable: {fwd_err}'}), 502
 
-        # Meter usage for revenue split
-        usage = result.get('usage', {})
-        total_tokens = usage.get('total_tokens', 0)
+        # Meter usage for the 90/9/1 revenue split. This passed keywords
+        # record_metered_usage does not accept (provider/model/tokens/source);
+        # the TypeError was swallowed below, so SDK usage was NEVER metered
+        # (hevolveai Master 11.435 S2). meter_llm_call owns the contract;
+        # 'hive' is the settled cross-operator source. Two things stay open
+        # for the owner: MeteredAPIUsage has no consumer field (the old
+        # 'sdk:<consumer>' tag had nowhere to go), and a LOCAL model prices at
+        # 0 via spark_per_1k, so SDK use of a local model records no revenue.
+        usage = result.get('usage', {}) or {}
+        total_tokens = usage.get('total_tokens', 0) or 0
         if total_tokens > 0:
             try:
-                from integrations.agent_engine.budget_gate import record_metered_usage
-                consumer = request.headers.get('X-Consumer-Username', 'anonymous')
-                record_metered_usage(
-                    provider='hevolve',
+                from integrations.agent_engine.budget_gate import meter_llm_call
+                tokens_in = usage.get('prompt_tokens', 0) or 0
+                tokens_out = usage.get('completion_tokens',
+                                       max(0, total_tokens - tokens_in)) or 0
+                meter_llm_call(
                     model=data.get('model', 'hevolve'),
-                    tokens=total_tokens,
-                    source=f'sdk:{consumer}'
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
+                    task_source='hive',
                 )
             except Exception:
                 logging.getLogger(__name__).exception("_completions_proxy: swallowed Exception")  # metering failure must not block response
