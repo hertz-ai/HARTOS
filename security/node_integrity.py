@@ -35,10 +35,22 @@ def _resolve_key_dir():
     # outright (#632).  Anchor to the stable user data dir instead, and
     # adopt a legacy CWD-relative keypair once so no node changes identity.
     try:
-        from core.platform_paths import get_data_dir
-        stable = os.path.join(get_data_dir(), 'agent_data')
+        from core.platform_paths import get_identity_data_dir
+        root = get_identity_data_dir()
     except Exception:
         return 'agent_data'  # bare checkout without core: old behaviour
+    # A keypair that already exists in data/ wins over agent_data/. data/ is
+    # where a Nunba process keeps its keys (dirname of its HEVOLVE_DB_PATH), so
+    # a helper process without that env used to resolve agent_data/ and sign as
+    # a DIFFERENT node on the same machine (#140: the owner's desktop held
+    # fee9f14a in data/, the key central knows, and 25cedaa4 in agent_data/).
+    # Only an existing keypair moves the choice; nothing is minted in data/.
+    # channel_encryption's x25519 keys follow the same dir, on purpose.
+    data_dir = os.path.join(root, 'data')
+    if os.path.isfile(os.path.join(data_dir, _PRIVATE_KEY_FILE)) and \
+            os.path.isfile(os.path.join(data_dir, _PUBLIC_KEY_FILE)):
+        return data_dir
+    stable = os.path.join(root, 'agent_data')
     legacy_priv = os.path.join('agent_data', _PRIVATE_KEY_FILE)
     stable_priv = os.path.join(stable, _PRIVATE_KEY_FILE)
     if os.path.isfile(legacy_priv) and not os.path.isfile(stable_priv):
@@ -60,11 +72,19 @@ def _resolve_key_dir():
 
 _KEY_DIR = _resolve_key_dir()
 
-# Canonical resolver for "where does this node's key material live".
-# channel_encryption (X25519 persists alongside Ed25519) and
-# key_delegation (node_certificate.json) import THIS — their own copies
-# had already drifted (key_delegation missed the HEVOLVE_DB_PATH branch).
-resolve_key_dir = _resolve_key_dir
+# Set only by switch_key_dir: this process recovered its identity's key from
+# another local dir (#140 B3 A1), so every key user must follow it there.
+_key_dir_override = None
+
+
+def resolve_key_dir():
+    """Canonical resolver for "where does this node's key material live".
+
+    channel_encryption (X25519 persists alongside Ed25519) and
+    key_delegation (node_certificate.json) import THIS -- their own copies
+    had already drifted (key_delegation missed the HEVOLVE_DB_PATH branch).
+    """
+    return _key_dir_override or _resolve_key_dir()
 _CODE_ROOT = os.environ.get('HEVOLVE_CODE_ROOT', os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
 
@@ -187,6 +207,242 @@ def get_public_key_bytes() -> bytes:
 def get_public_key_hex() -> str:
     """Return hex-encoded public key string for JSON payloads."""
     return get_public_key_bytes().hex()
+
+
+_IDENTITY_FILE = 'node_identity.json'
+
+# How this process got its node_id, for whoever must confirm or question it:
+#   'recorded'           node_identity.json in the key dir, bound to this key
+#   'minted'             no identity existed; a new one was recorded for this key
+#   'legacy_provisional' the old node_id.json, not yet confirmed to belong to
+#                        this key; used in memory, nothing written (#140 B1)
+identity_state = None
+
+
+def _write_identity_once(path, record):
+    """Create path with record unless it already exists; return what is on disk.
+
+    Two processes can boot together (Nunba and a helper) and both mint. The
+    record is written to a temp file and hard-linked into place, which fails if
+    another process got there first; either way the caller uses the file on
+    disk, so both processes end up with ONE id instead of forking it.
+    """
+    import json
+    import uuid as _uuid
+    tmp = f'{path}.{os.getpid()}.{_uuid.uuid4().hex}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(record, fh)
+    try:
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            pass
+        except OSError:
+            # No hard links on this filesystem: atomic replace, then re-read.
+            if not os.path.exists(path):
+                os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    with open(path, 'r', encoding='utf-8') as fh:
+        return json.load(fh)
+
+
+def load_or_create_node_identity(legacy_node_id_path=None) -> str:
+    """This node's id, stored next to the key that proves it.
+
+    The id used to live in <data root>/node_id.json while the key came from
+    resolve_key_dir(), so one machine could hold one id and two keys (the
+    owner's desktop: data/ and agent_data/), and whichever process wrote last
+    paired the id with its key. node_identity.json now lives IN the key dir:
+    two key dirs are two identities, never one id with two keys.
+
+    - Record present and bound to this key: use it.
+    - Record bound to a different key (the key under it was replaced): the old
+      id cannot be proven by this key. Keep the old record as
+      node_identity.superseded.<ts>.json (restoring the old key recovers it)
+      and mint a new id for this key.
+    - No record, but a legacy node_id.json: nothing says which key it belongs
+      to, so it is NOT adopted here. Use it in memory for this boot and write
+      nothing; it is persisted only once a peer confirms it holds THIS key for
+      that id, and a mismatch goes to the owner, never to a silent re-mint.
+    - Nothing at all: mint and record.
+    """
+    import json
+    import uuid as _uuid
+    from datetime import datetime as _dt
+    global identity_state
+
+    pub_hex = get_public_key_hex()
+    key_dir = Path(_KEY_DIR)
+    rec_path = key_dir / _IDENTITY_FILE
+    fresh = {'node_id': str(_uuid.uuid4()), 'public_key_hex': pub_hex,
+             'created_at': _dt.utcnow().isoformat()}
+
+    if rec_path.exists():
+        try:
+            rec = json.loads(rec_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            rec = None
+        if rec and rec.get('node_id') and rec.get('public_key_hex') == pub_hex:
+            identity_state = 'recorded'
+            return rec['node_id']
+        stamp = f"{_dt.utcnow().strftime('%Y%m%dT%H%M%S')}.{os.getpid()}"
+        superseded = key_dir / f'node_identity.superseded.{stamp}.json'
+        try:
+            # Another process on this key may have just replaced it.
+            now = json.loads(rec_path.read_text(encoding='utf-8'))
+            if now.get('node_id') and now.get('public_key_hex') == pub_hex:
+                identity_state = 'recorded'
+                return now['node_id']
+        except (OSError, ValueError):
+            pass
+        logger.warning(
+            'node identity record %s does not match the key in %s '
+            '(record key %s, this key %s); keeping it as %s and taking a new '
+            'identity for this key', rec_path, key_dir,
+            str((rec or {}).get('public_key_hex', 'unreadable'))[:16],
+            pub_hex[:16], superseded.name)
+        try:
+            os.replace(rec_path, superseded)
+        except FileNotFoundError:
+            pass  # another process moved it first; _write_identity_once settles it
+        rec = _write_identity_once(str(rec_path), fresh)
+        identity_state = 'minted'
+        return rec['node_id']
+
+    if legacy_node_id_path and os.path.exists(legacy_node_id_path):
+        try:
+            with open(legacy_node_id_path, 'r', encoding='utf-8') as fh:
+                legacy_id = json.load(fh).get('node_id', '')
+        except (OSError, ValueError):
+            legacy_id = ''
+        if legacy_id:
+            identity_state = 'legacy_provisional'
+            return legacy_id
+
+    rec = _write_identity_once(str(rec_path), fresh)
+    identity_state = 'minted' if rec['node_id'] == fresh['node_id'] else 'recorded'
+    return rec['node_id']
+
+
+def _public_hex_in(key_dir) -> str:
+    """Raw hex of the Ed25519 public key in key_dir, or '' if it has no pair."""
+    pub = os.path.join(key_dir, _PUBLIC_KEY_FILE)
+    if not (os.path.isfile(pub)
+            and os.path.isfile(os.path.join(key_dir, _PRIVATE_KEY_FILE))):
+        return ''
+    try:
+        key = serialization.load_pem_public_key(Path(pub).read_bytes())
+        return key.public_bytes(encoding=serialization.Encoding.Raw,
+                                format=serialization.PublicFormat.Raw).hex()
+    except Exception:
+        return ''
+
+
+def local_key_dir_holding(fingerprint: str):
+    """The local key dir whose public key starts with fingerprint, or None.
+
+    Candidates are every place this machine has kept node keys: the DB_PATH
+    dir, <data root>/data, <data root>/agent_data, and the legacy
+    CWD-relative agent_data (#632).  An explicit HEVOLVE_KEY_DIR is an
+    operator's choice and is never switched away from, so nothing is
+    returned then.
+    """
+    fp = (fingerprint or '').strip().lower()
+    if len(fp) < 16 or os.environ.get('HEVOLVE_KEY_DIR'):
+        return None
+    candidates = []
+    db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+        candidates.append(os.path.dirname(db_path))
+    try:
+        from core.platform_paths import get_identity_data_dir
+        root = get_identity_data_dir()
+        candidates += [os.path.join(root, 'data'), os.path.join(root, 'agent_data')]
+    except Exception:
+        pass
+    candidates.append(os.path.abspath('agent_data'))
+    seen = set()
+    for d in candidates:
+        d = os.path.abspath(d)
+        if d in seen:
+            continue
+        seen.add(d)
+        if _public_hex_in(d).startswith(fp):
+            return d
+    return None
+
+
+def switch_key_dir(key_dir: str) -> None:
+    """Point this process at the keys in key_dir, everywhere at once.
+
+    The ONE owner of the in-process switch (#140 B3 A1): signing
+    (get_or_create_keypair), X25519 (channel_encryption, which resolves through
+    resolve_key_dir) and the node certificate path (key_delegation) all follow,
+    so a node never signs with one key while encrypting with another.  Not
+    persisted: the resolver's data/-first order already picks the right dir at
+    boot, and this only covers a node that booted on the wrong one.
+    """
+    import sys as _sys
+    global _KEY_DIR, _key_dir_override, _private_key, _public_key, identity_state
+    _KEY_DIR = _key_dir_override = str(key_dir)
+    _private_key = _public_key = None
+    identity_state = None
+    ce = _sys.modules.get('security.channel_encryption')
+    if ce is not None:
+        ce.reset_keypair_cache()
+    kd = _sys.modules.get('security.key_delegation')
+    if kd is not None:
+        kd._DEFAULT_CERT_PATH = os.path.join(_KEY_DIR, kd._CERT_FILE)
+
+
+def confirm_node_identity(node_id: str) -> str:
+    """Record a provisional legacy id once a configured seed accepted it.
+
+    A seed accepts a direct announce only when it holds THIS key for the id
+    (or held no key and binds this one), so its "accepted" is the evidence
+    the legacy node_id.json never carried.  First writer wins, as at boot;
+    returns the id now on record.
+    """
+    from datetime import datetime as _dt
+    global identity_state
+    rec = _write_identity_once(
+        str(Path(_KEY_DIR) / _IDENTITY_FILE),
+        {'node_id': node_id, 'public_key_hex': get_public_key_hex(),
+         'created_at': _dt.utcnow().isoformat(), 'confirmed_legacy': True})
+    identity_state = 'recorded'
+    if rec.get('node_id') != node_id:
+        logger.warning('node identity record already names %s; keeping it '
+                       'over the confirmed legacy id %s',
+                       rec.get('node_id', '')[:8], node_id[:8])
+    return rec['node_id']
+
+
+def take_new_node_identity(reason: str) -> str:
+    """Mint and record a new id for this key, keeping any old record aside.
+
+    Called only on an AUTHENTICATED key conflict from a configured seed, after
+    no key on this machine matched the one the seed holds (#140 B3, A2): this
+    key cannot prove the old id, so the node takes a new one.
+    """
+    import uuid as _uuid
+    from datetime import datetime as _dt
+    global identity_state
+    key_dir = Path(_KEY_DIR)
+    rec_path = key_dir / _IDENTITY_FILE
+    if rec_path.exists():
+        stamp = f"{_dt.utcnow().strftime('%Y%m%dT%H%M%S')}.{os.getpid()}"
+        try:
+            os.replace(rec_path, key_dir / f'node_identity.superseded.{stamp}.json')
+        except FileNotFoundError:
+            pass
+    rec = _write_identity_once(str(rec_path), {
+        'node_id': str(_uuid.uuid4()), 'public_key_hex': get_public_key_hex(),
+        'created_at': _dt.utcnow().isoformat()})
+    identity_state = 'minted'
+    logger.warning('node took a new identity %s (%s)', rec['node_id'][:8], reason)
+    return rec['node_id']
 
 
 def sign_message(message: bytes) -> bytes:

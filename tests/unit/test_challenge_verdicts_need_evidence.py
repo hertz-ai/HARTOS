@@ -277,8 +277,14 @@ def _announce(status_before):
     eng = create_engine('sqlite://')
     Base.metadata.create_all(eng)
     db = sessionmaker(bind=eng)()
+    # The row holds the key the announce is signed with: standing that an
+    # announce must neither grant nor remove belongs to a KEYED row. A keyless
+    # row's standing was never bound to any key, and binding its first key
+    # restarts it at 'unverified' (#140 B2, tested in
+    # test_announce_cannot_rewrite_a_proven_identity).
     db.add(PeerNode(node_id='peer-x', url='http://10.9.9.9:5000', name='x',
-                    status='active', integrity_status=status_before, code_hash=OLD))
+                    status='active', integrity_status=status_before, code_hash=OLD,
+                    public_key='cd' * 32))
     db.add(IntegrityChallenge(
         id='c1', challenger_node_id=gossip.node_id, target_node_id='peer-x',
         challenge_type='code_hash_check', challenge_nonce='n', status='inconclusive'))

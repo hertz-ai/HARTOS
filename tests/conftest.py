@@ -449,11 +449,43 @@ def action_flow_scenarios():
 # hard exit happens ONLY in the case that would otherwise hang forever, where
 # the alternative is not "clean shutdown" but "no result at all".
 
+def _real_state_guard():
+    import importlib.util
+    import os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        'real_state_guard.py')
+    spec = importlib.util.spec_from_file_location('real_state_guard', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def pytest_sessionstart(session):
+    """Hash the owner's real node identity and keys; see real_state_guard."""
+    session._real_state_before = _real_state_guard().snapshot()
+
+
 def pytest_sessionfinish(session, exitstatus):
-    """Report any non-daemon thread still alive, then guarantee we exit."""
+    """Fail on a changed real identity; report any non-daemon thread still
+    alive, then guarantee we exit."""
     import os
     import sys
     import threading
+
+    # Before the early return below, which is the normal path.
+    before = getattr(session, '_real_state_before', None)
+    if before is not None:
+        guard = _real_state_guard()
+        touched = guard.changes(before, guard.snapshot())
+        if touched:
+            print('\n' + '=' * 74, file=sys.stderr)
+            print("THIS TEST SESSION CHANGED THE OWNER'S REAL NODE IDENTITY "
+                  f'under {guard.watched_root()}:', file=sys.stderr)
+            for line in touched:
+                print('  ' + line, file=sys.stderr)
+            print('=' * 74, file=sys.stderr)
+            sys.stderr.flush()
+            session.exitstatus = exitstatus = 1
 
     alive = [t for t in threading.enumerate()
              if t is not threading.main_thread()

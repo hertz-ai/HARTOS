@@ -84,37 +84,48 @@ def is_unroutable_peer_url(url):
 logger = logging.getLogger('hevolve_social')
 
 
-def _load_or_create_node_id() -> str:
-    """Persist node_id under platform_paths.get_data_dir() / 'node_id.json'.
+# The reason prefix an announcer reads when a node_id it announces is held
+# under another key (#140 B).  Stable: the sender acts on it (_consume_key_reply).
+KEY_CONFLICT = 'key_conflict'
 
-    Returns existing id on subsequent boots so the central side can
+# A foreign-signed stream can repeat every announce interval; warn once per
+# node_id and keep the rest at debug so the log it informs is not flooded.
+# Bounded: node_ids are chosen by the sender.
+_key_conflicts_warned = set()
+
+
+def _warn_key_conflict_once(node_id):
+    if len(_key_conflicts_warned) > 10000:
+        _key_conflicts_warned.clear()
+    _log = logger.debug if node_id in _key_conflicts_warned else logger.warning
+    _key_conflicts_warned.add(node_id)
+    _log("Key conflict for %s: a direct announce verified under a key other "
+         "than the one held for it; row left unchanged, announcer told",
+         (node_id or '')[:8])
+
+
+def _legacy_node_id_path() -> str:
+    """node_id.json, the legacy home of the id.  Read, never written: the id
+    now lives next to its key (node_integrity.load_or_create_node_identity)."""
+    from core.platform_paths import get_identity_data_dir
+    return os.path.join(get_identity_data_dir(), 'node_id.json')
+
+
+def _load_or_create_node_id() -> str:
+    """This node's persistent id, from security.node_integrity.load_or_create_node_identity.
+
+    Returns the same id on subsequent boots so the central side can
     dedupe joins by node_id.  Falls back to a fresh in-memory uuid if
-    the data dir is unwritable (degraded environments such as
-    cx_Freeze read-only mode).
+    identity storage is unusable (degraded environments such as
+    cx_Freeze read-only mode).  Under pytest the owner's real data root
+    is swapped for a temp dir (see get_identity_data_dir).
     """
-    import json
     try:
-        from core.platform_paths import get_data_dir
-        data_dir = get_data_dir()
-        os.makedirs(data_dir, exist_ok=True)
-        path = os.path.join(data_dir, 'node_id.json')
-        if os.path.exists(path):
-            try:
-                with open(path, 'r', encoding='utf-8') as fh:
-                    payload = json.load(fh)
-                nid = payload.get('node_id', '')
-                if nid:
-                    return nid
-            except Exception:
-                pass  # Corrupt file → regenerate
-        nid = str(uuid.uuid4())
-        try:
-            with open(path, 'w', encoding='utf-8') as fh:
-                json.dump({'node_id': nid, 'created_at': datetime.utcnow().isoformat()}, fh)
-        except Exception:
-            pass  # Best-effort persist; in-memory id is still valid for this boot
-        return nid
-    except Exception:
+        from security.node_integrity import load_or_create_node_identity
+        return load_or_create_node_identity(_legacy_node_id_path())
+    except Exception as e:
+        logger.warning('node identity unavailable (%s); using a temporary id '
+                       'for this boot only', e)
         return str(uuid.uuid4())
 
 
@@ -1003,21 +1014,160 @@ class GossipProtocol:
                 self._heartbeat()
 
     def _announce_to_peer(self, peer_url):
+        if self._blocked_for_key_conflict(peer_url):
+            return False
         try:
+            info = self._self_info()
             resp = pooled_post(
                 f"{peer_url}/api/social/peers/announce",
-                json=self._self_info(),
+                json=info,
                 timeout=5,
             )
             if resp.status_code == 200:
                 self._record_peer_success(peer_url)
                 self._consume_observed_ip_echo(resp)
+                self._consume_key_reply(peer_url, resp, info.get('nonce', ''))
                 return True
             self._record_peer_failure(peer_url)
             return False
         except requests.RequestException:
             self._record_peer_failure(peer_url)
             return False
+
+    # ─── Identity: what a seed's reply may and may not do (#140 B3) ───
+    #
+    # Resolved by the node, never by the owner ("No user would care about
+    # node identity, whatever is the mechanism shd autoresolve", owner
+    # 2026-09-24).  A configured seed's "accepted" confirms a provisional
+    # legacy id.  Its key_conflict names the key it holds for our id:
+    #   A1  a key on this machine matches: switch to it, keep the id.
+    #   A2  none matches and the conflict is AUTHENTICATED: this node's key
+    #       was replaced for real (a reinstall) and cannot prove the old id,
+    #       so it takes a new identity.
+    #   else  never re-identify on it: stay off that seed for a while, retry.
+    # Authenticated = the reply came over verified HTTPS from the seed's own
+    # host (the genesis seeds are https), and, when this node holds a key for
+    # that seed, is also signed by it and bound to this announce's node_id
+    # and nonce.  Only configured seeds count; any other peer's reply is
+    # ignored.
+
+    _KEY_CONFLICT_BACKOFF_S = 1800
+
+    def _is_seed(self, peer_url):
+        return (peer_url or '').strip().rstrip('/') in (self.seed_peers or [])
+
+    def _consume_key_reply(self, peer_url, resp, nonce=''):
+        if not self._is_seed(peer_url):
+            return
+        try:
+            body = resp.json() or {}
+        except Exception:
+            return
+        reason = str(body.get('reason') or '')
+        if reason.startswith(KEY_CONFLICT):
+            self._on_key_conflict(peer_url, resp, body, nonce)
+            return
+        if body.get('accepted') is not True:
+            return
+        try:
+            from security import node_integrity as _ni
+            if _ni.identity_state == 'legacy_provisional':
+                recorded = _ni.confirm_node_identity(self.node_id)
+                logger.info("Seed %s accepted node_id %s under this key; "
+                            "identity recorded", peer_url, recorded[:8])
+        except Exception as e:
+            logger.warning("Could not record the confirmed node identity: %s", e)
+
+    def _seed_key_held(self, seed_node_id):
+        """The key this node stored from the seed's own direct announce, or ''."""
+        if not seed_node_id:
+            return ''
+        try:
+            from .models import get_db, PeerNode
+            db = get_db()
+            try:
+                row = db.query(PeerNode).filter_by(node_id=seed_node_id).first()
+                return (row.public_key or '') if row else ''
+            finally:
+                db.close()
+        except Exception:
+            return ''
+
+    def _reply_is_authentic(self, peer_url, resp, body, nonce):
+        seed = _urlparse((peer_url or '').strip().rstrip('/'))
+        # The FINAL url: a redirect off https, or to another host, loses the
+        # TLS property even though the request went to the seed.
+        final = _urlparse(str(getattr(resp, 'url', '') or ''))
+        https_ok = (seed.scheme == 'https' and final.scheme == 'https'
+                    and (final.hostname or '').lower() == (seed.hostname or '').lower())
+        held = self._seed_key_held(str(body.get('node_id') or ''))
+        if not held:
+            return https_ok
+        reply_to = body.get('reply_to') or {}
+        if body.get('public_key') != held or not nonce:
+            return False
+        if reply_to.get('node_id') != self.node_id or reply_to.get('nonce') != nonce:
+            return False
+        try:
+            from security.node_integrity import verify_json_signature
+            return bool(verify_json_signature(held, body, str(body.get('signature') or '')))
+        except Exception:
+            return False
+
+    def _on_key_conflict(self, peer_url, resp, body, nonce):
+        import re as _re
+        from security import node_integrity as _ni
+        seed = (peer_url or '').strip().rstrip('/')
+        m = _re.search(r'held_key_fp=([0-9a-fA-F]{16,})', str(body.get('reason') or ''))
+        fp = m.group(1).lower() if m else ''
+
+        # A1: the seed holds a key this machine already has.  Safe on any
+        # reply: it can only move this process to a key it owns.
+        key_dir = _ni.local_key_dir_holding(fp) if fp else None
+        if key_dir and os.path.abspath(key_dir) != os.path.abspath(_ni._KEY_DIR):
+            old = self.node_id or ''
+            _ni.switch_key_dir(key_dir)
+            self.node_id = _ni.load_or_create_node_identity(_legacy_node_id_path())
+            self._clear_key_conflict(seed)
+            logger.info("Seed %s holds this node's id under the key in %s; "
+                        "switched to it (id %s -> %s)", seed, key_dir,
+                        old[:8], (self.node_id or '')[:8])
+            return
+
+        # A2: no local key proves the id, and the seed really said so.
+        if self._reply_is_authentic(peer_url, resp, body, nonce):
+            old = self.node_id or ''
+            default_name = self.node_name == f'hevolve-{old[:8]}'
+            self.node_id = _ni.take_new_node_identity(
+                f'seed {seed} holds {old[:8]} under a key this machine does not have')
+            if default_name:
+                self.node_name = f'hevolve-{self.node_id[:8]}'
+            self._clear_key_conflict(seed)
+            return
+
+        # Unauthenticated: never re-identify on it.
+        until = getattr(self, '_key_conflict_until', None)
+        if until is None:
+            until = self._key_conflict_until = {}
+        first = seed not in until
+        until[seed] = time.time() + self._KEY_CONFLICT_BACKOFF_S
+        if first:
+            logger.warning(
+                "Seed %s answered with an unverifiable key conflict for %s; "
+                "keeping this identity and retrying that seed in %d min",
+                seed, (self.node_id or '')[:8], self._KEY_CONFLICT_BACKOFF_S // 60)
+
+    def _clear_key_conflict(self, seed):
+        until = getattr(self, '_key_conflict_until', None)
+        if until:
+            until.pop(seed, None)
+
+    def _blocked_for_key_conflict(self, peer_url):
+        until = getattr(self, '_key_conflict_until', None)
+        if not until:
+            return False
+        t = until.get((peer_url or '').strip().rstrip('/'))
+        return bool(t and time.time() < t)
 
     def _consume_observed_ip_echo(self, resp):
         """Learn our own public IP from a peer's announce response.
@@ -1378,6 +1528,9 @@ class GossipProtocol:
             'agent_count': self._get_count('agent'),
             'post_count': self._get_count('post'),
             'timestamp': int(time.time()),
+            # Echoed in the signed reply (discovery.peer_announce reply_to),
+            # so a recorded reply cannot answer a later announce (#140 B3).
+            'nonce': uuid.uuid4().hex,
             'tier': self.tier,
             'hart_tag': self._hart_tag,
         }
@@ -1990,7 +2143,37 @@ class GossipProtocol:
             certificate_verified = False
             integrity_status = 'unverified'
 
+        # Who may speak for a node (#140 part B).  A challenge answer is
+        # bound to the key STORED for its target (4b0b005eb), so the writer
+        # of that key decides who a node is.  It was "whoever spoke last":
+        # an announce signed by ANY key, or a relayed hint carrying no
+        # signature at all, replaced the stored key and moved the url that
+        # challenges are delivered to, so anyone could take over a node's
+        # audit.  Now a key is taken only from the node's own DIRECT signed
+        # announce, and once stored it holds for that node_id: a new key is
+        # a new identity.  4b0b005eb leaves a proven node's standing
+        # untouched while its address answers with a foreign key, which is
+        # right against framing only because this stops a foreign announce
+        # from moving the address in the first place.
+        speaks_for_itself = bool(signature_valid and not relayed and public_key)
+
         if existing:
+            stored_key = existing.public_key or ''
+            if stored_key and not (speaks_for_itself and public_key == stored_key):
+                # Not provably the node: a foreign key, no signature, or
+                # hearsay.  It changes nothing about the row, not even
+                # liveness.  A DIRECT announce that verifies under a DIFFERENT
+                # key is told so (KEY_CONFLICT), with the fingerprint of the
+                # key held: an impostor learns only a public key, and the real
+                # node can look for that key on its own disk before it gives
+                # up the id (_consume_key_reply).
+                if speaks_for_itself:
+                    if reasons is not None:
+                        reasons.append(
+                            f'{KEY_CONFLICT}: node_id {node_id[:8]} is held '
+                            f'under another key (held_key_fp={stored_key[:16]})')
+                    _warn_key_conflict_once(node_id)
+                return False
             # last_seen is DIRECT evidence of liveness: the node's own announce
             # (this branch with relayed=False) or a successful ping in the
             # health round.  A relayed row is a third party's hearsay and must
@@ -2015,9 +2198,18 @@ class GossipProtocol:
             existing.version = peer_data.get('version', existing.version)
             existing.agent_count = peer_data.get('agent_count', existing.agent_count)
             existing.post_count = peer_data.get('post_count', existing.post_count)
-            # Update integrity fields
-            if public_key:
+            # A keyless row takes its first key only from the node itself
+            # (B2, bounded TOFU).  Whatever the row held was never bound to a
+            # key, so no challenge it passed proved anything (4b0b005eb):
+            # binding a key restarts its standing at 'unverified', and trust
+            # is earned only by challenges answered with THIS key.  The fraud
+            # score and history stay: a rebind never wipes a record (#141).
+            # A squatter can take an id nobody had bound, and moves its url;
+            # harmless, since the row carried no standing, and the real node
+            # hears KEY_CONFLICT and asks its owner.
+            if speaks_for_itself and not stored_key:
                 existing.public_key = public_key
+                existing.integrity_status = 'unverified'
             if peer_data.get('code_hash'):
                 existing.code_hash = peer_data['code_hash']
             if peer_data.get('version'):
@@ -2081,7 +2273,9 @@ class GossipProtocol:
             agent_count=peer_data.get('agent_count', 0),
             post_count=peer_data.get('post_count', 0),
             metadata_json=_new_meta,
-            public_key=public_key or '',
+            # Hearsay never plants a key: a relayer could otherwise fix X's
+            # identity to its own key before X ever speaks.
+            public_key=public_key if speaks_for_itself else '',
             code_hash=peer_data.get('code_hash', ''),
             code_version=peer_data.get('version', ''),
             integrity_status=integrity_status,

@@ -231,6 +231,18 @@ def peer_announce():
     }
     if reasons:
         body['reason'] = reasons[0]
+    # Signed, and bound to the announce it answers (node_id + the nonce the
+    # announcer sent), so a node that holds this node's key can trust a reply
+    # that did not come over verified HTTPS, and a recorded reply cannot be
+    # replayed to another node or a later announce (#140 B3).
+    body['reply_to'] = {'node_id': str(data.get('node_id') or ''),
+                        'nonce': str(data.get('nonce') or '')}
+    try:
+        from security.node_integrity import get_public_key_hex, sign_json_payload
+        body['public_key'] = get_public_key_hex()
+        body['signature'] = sign_json_payload(body)
+    except Exception as e:
+        logger.debug("announce reply left unsigned: %s", e)
     return jsonify(body)
 
 
