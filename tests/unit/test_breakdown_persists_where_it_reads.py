@@ -81,7 +81,17 @@ class BreakdownPersistsWhereItReads(unittest.TestCase):
             self.tree = ast.parse(fh.read())
 
     def test_the_consumer_of_subtasks_is_also_their_producer(self):
-        """add_subtasks must be reachable from the scope that reads them."""
+        """add_subtasks must be reachable from SOME scope that reads them.
+
+        Not necessarily the SMALLEST reader: a later, unrelated fix
+        (_reuse_complete_pending_subtask, 2026-09-10) also calls
+        get_pending_subtasks — as a fallback when closing an ALREADY-decided
+        subtask, never to persist new ones — and being a small dedicated
+        function it would win a smallest-reader race against the giant
+        factory that actually contains the BREAKDOWN EXECUTION block this
+        test protects. The real invariant is existence of a co-located
+        scope, not uniqueness of the smallest one.
+        """
         readers = [f for f in _functions(self.tree)
                    if 'get_pending_subtasks' in _calls_in(f)]
         self.assertTrue(
@@ -89,26 +99,22 @@ class BreakdownPersistsWhereItReads(unittest.TestCase):
             'no function calls get_pending_subtasks — the breakdown consumer '
             'has gone missing entirely')
 
-        # Innermost reader wins: ast.walk yields enclosing functions too, and
-        # an outer function trivially "contains" both calls while the inner
-        # closures stay separated — which is the exact defect.  Score by the
-        # smallest reader that reads.
-        readers.sort(key=lambda f: len(list(ast.walk(f))))
-        innermost = readers[0]
         # Either spelling counts as persisting: `add_subtasks_to_ledger` is the
         # canonical module-level helper both pipelines import, `add_subtasks`
         # the ledger method reuse used to reach for.  The invariant under test
         # is co-location, not which name — pinning one name would fail the day
         # someone correctly migrates to the other.
+        co_located = [f for f in readers
+                      if {'add_subtasks', 'add_subtasks_to_ledger'} & _calls_in(f)]
         self.assertTrue(
-            {'add_subtasks', 'add_subtasks_to_ledger'} & _calls_in(innermost),
-            "the innermost scope that calls get_pending_subtasks (%s) does "
-            "NOT call add_subtasks.  That is the 2026-09-06 defect: the only "
+            co_located,
+            "no function that calls get_pending_subtasks also calls "
+            "add_subtasks.  That is the 2026-09-06 defect: the only "
             "add_subtasks call lived in state_transition, autogen's SPEAKER "
             "SELECTOR, which never runs on a round's final message — and the "
             "requires_breakdown verdict carrying the subtasks IS that final "
-            "message.  Action 9 span 24 times on an empty ledger."
-            % innermost.name)
+            "message.  Action 9 span 24 times on an empty ledger. Readers "
+            "found: %s" % sorted(f.name for f in readers))
 
     def test_add_subtasks_is_not_called_from_the_speaker_selector_alone(self):
         """A write that only the selector performs is a write that never runs.

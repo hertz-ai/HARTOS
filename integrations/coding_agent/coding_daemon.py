@@ -68,27 +68,41 @@ class CodingAgentDaemon:
         (e.g. during platform-affordability back-off) can't age the
         heartbeat past the 300s frozen threshold. See the helper
         docstring for the 2026-04-11 incident context.
+
+        2026-08-06 fix: get_watchdog() used to be checked ONCE, at the
+        top of this call. coding_daemon.start() can fire before the
+        watchdog singleton exists and this thread gets registered
+        (integrations/social/__init__.py registers it later in boot) --
+        so the very first call, the long HEVOLVE_DAEMON_BOOT_DELAY
+        boot-grace sleep, hit get_watchdog() is None and committed to
+        the ENTIRE sleep (hours, when boot-delay is set high) in the
+        silent fallback below with zero heartbeats. By the time
+        registration happened moments later, the thread already looked
+        stale/never-heartbeated, and the watchdog force-restarted it
+        every ~5 minutes for the rest of the process's life --
+        defeating HEVOLVE_DAEMON_BOOT_DELAY entirely and repeatedly
+        disrupting live channel tests sharing the same local model.
+        Now re-checks get_watchdog() every chunk instead of once, so a
+        watchdog that appears mid-sleep is picked up on the next chunk.
         """
-        try:
-            from security.node_watchdog import get_watchdog
-            wd = get_watchdog()
-            if wd is not None:
-                wd.sleep_with_heartbeat(
-                    'coding_daemon', seconds,
-                    stop_check=lambda: not self._running,
-                )
+        end = time.monotonic() + seconds
+        while self._running:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
                 return
-        except Exception:
-            pass
-        # FALLBACK — must keep the interruptibility the watchdog path
-        # provides via stop_check. A bare time.sleep() does not: it
-        # cannot be woken, so stop() blocked for the WHOLE interval
-        # (join(timeout=10) then expired in full — measured 10.00s and
-        # 10.01s in test_start_stop / test_double_start, the giveaway
-        # constant). That hits any node where get_watchdog() returns
-        # None or raises, i.e. exactly the degraded case. Event.wait()
-        # sleeps the same duration but returns immediately on stop().
-        self._stop_event.wait(seconds)
+            chunk = min(10.0, remaining)
+            try:
+                from security.node_watchdog import get_watchdog
+                wd = get_watchdog()
+                if wd is not None:
+                    wd.heartbeat('coding_daemon')
+            except Exception:
+                pass
+            # Event.wait() returns True if stop() set the event early,
+            # False on a normal chunk timeout -- either way this stays
+            # interruptible, unlike a bare time.sleep().
+            if self._stop_event.wait(chunk):
+                return
 
     def _loop(self):
         # Boot grace period: let user chat have exclusive LLM access

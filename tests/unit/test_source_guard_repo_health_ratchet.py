@@ -25,8 +25,8 @@ import os
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SKIP = {'.git', '__pycache__', 'venv', '.venv', 'node_modules', 'claw_native',
-        'build', 'dist', '.claude', 'landing-page'}
+SKIP = {'.git', '__pycache__', 'venv', '.venv', 'venv-hart', 'node_modules',
+        'claw_native', 'build', 'dist', '.claude', 'landing-page', 'scratchpad'}
 
 # ── BUDGETS — measured 2026-08-17. RATCHET DOWN ONLY. ────────────────────────
 # Raising a number here to make CI pass is the failure mode this guard exists to

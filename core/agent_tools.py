@@ -1236,8 +1236,8 @@ def build_core_tool_closures(ctx):
                         {'memory_type': 'fact', 'source_agent': 'helper',
                          'session_id': user_prompt, 'kv_key': key},
                     ), daemon=True).start()
-                except Exception:
-                    pass
+                except Exception as e:
+                    tool_logger.debug("MemoryGraph mirror failed for key %s: %s", key, e)
 
             try:
                 # The value as stored, not the tool's page of it.
@@ -2486,8 +2486,8 @@ def build_core_tool_closures(ctx):
                                       'session_id': user_prompt,
                                       'source': 'simplemem'},
                         ), daemon=True).start()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        tool_logger.debug("MemoryGraph mirror failed for simplemem save: %s", e)
                 return "Saved to long-term memory."
             except Exception as e:
                 tool_logger.info(f"SimpleMem save error: {e}")

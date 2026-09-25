@@ -111,6 +111,12 @@ class IMessageAdapter(ChannelAdapter):
         self._reconnect_delay = 5
         self._max_reconnect_delay = 300
         self._last_message_guid: Optional[str] = None
+        # Client-side cursor for the polling fallback: /api/v1/message/query
+        # has no confirmed "after this guid" filter, so we page the newest
+        # messages every tick and drop anything at or before the last
+        # dateCreated (ms epoch) we've already processed. Seeded to "now" in
+        # connect() so a fresh connection never replays pre-existing history.
+        self._last_message_ts: int = 0
 
     @property
     def name(self) -> str:
@@ -123,14 +129,16 @@ class IMessageAdapter(ChannelAdapter):
             return False
 
         try:
-            # Create session with auth
-            self._session = aiohttp.ClientSession(
-                headers={"Authorization": self._password}
-            )
+            # BlueBubbles authenticates via a `?password=` query param, not
+            # an Authorization header -- confirmed live against a real
+            # server (v1.9.9): the header form gets a 401 "Missing server
+            # password!" even with the correct password attached.
+            self._session = aiohttp.ClientSession()
 
             # Verify API connection
             async with self._session.get(
-                f"{self._api_url}/api/v1/server/info"
+                f"{self._api_url}/api/v1/server/info",
+                params={"password": self._password},
             ) as response:
                 if response.status != 200:
                     logger.error("BlueBubbles API not available")
@@ -138,6 +146,11 @@ class IMessageAdapter(ChannelAdapter):
 
                 info = await response.json()
                 logger.info(f"Connected to BlueBubbles v{info.get('data', {}).get('server_version', 'unknown')}")
+
+            # Seed the polling cursor to "now" so a fresh connection never
+            # replays pre-existing chat history as if it were new inbound.
+            import time as _time
+            self._last_message_ts = int(_time.time() * 1000)
 
             # Set up Socket.IO for real-time messages
             if HAS_SOCKETIO:
@@ -221,22 +234,36 @@ class IMessageAdapter(ChannelAdapter):
 
         while self._running:
             try:
-                params = {"limit": 50, "sort": "DESC"}
-                if self._last_message_guid:
-                    params["after"] = self._last_message_guid
-
-                async with self._session.get(
-                    f"{self._api_url}/api/v1/message",
-                    params=params,
+                # GET /api/v1/message 404s on current BlueBubbles servers
+                # (confirmed live, v1.9.9) -- message listing is POST
+                # /api/v1/message/query. There is no confirmed "after this
+                # guid" filter on that endpoint, so the newest page is
+                # fetched every tick and self._last_message_ts (a client-side
+                # high-water mark) does the de-dup, same as _last_message_guid
+                # was meant to.
+                async with self._session.post(
+                    f"{self._api_url}/api/v1/message/query",
+                    params={"password": self._password},
+                    json={"limit": 50, "sort": "DESC", "with": ["chats"]},
                 ) as response:
                     if response.status == 200:
                         data = await response.json()
                         messages = data.get("data", [])
 
+                        newest_ts = self._last_message_ts
                         # Process in chronological order
                         for msg_data in reversed(messages):
-                            # Skip sent messages (is_from_me)
-                            if msg_data.get("is_from_me"):
+                            ts = msg_data.get("dateCreated") or 0
+                            if ts <= self._last_message_ts:
+                                continue
+                            newest_ts = max(newest_ts, ts)
+
+                            # Skip sent messages. BlueBubbles' own field is
+                            # camelCase (isFromMe) -- this used to check
+                            # is_from_me, which is never present in a real
+                            # response, so the bot's OWN replies would have
+                            # been picked back up as new inbound messages.
+                            if msg_data.get("isFromMe"):
                                 continue
 
                             message = self._convert_message(msg_data)
@@ -244,7 +271,11 @@ class IMessageAdapter(ChannelAdapter):
                                 await self._dispatch_message(message)
                                 self._last_message_guid = msg_data.get("guid")
 
+                        self._last_message_ts = newest_ts
                         reconnect_delay = self._reconnect_delay
+                    else:
+                        logger.error(
+                            f"iMessage poll failed: HTTP {response.status}")
 
                 await asyncio.sleep(2)  # Poll interval
 
@@ -276,8 +307,8 @@ class IMessageAdapter(ChannelAdapter):
         if not msg_data.get("text") and not msg_data.get("attachments"):
             return None
 
-        # Skip messages from self
-        if msg_data.get("is_from_me"):
+        # Skip messages from self (BlueBubbles' field is camelCase)
+        if msg_data.get("isFromMe"):
             return None
 
         handle = msg_data.get("handle", {})
@@ -305,8 +336,8 @@ class IMessageAdapter(ChannelAdapter):
                 file_size=att.get("total_bytes"),
             ))
 
-        # Parse timestamp
-        timestamp = msg_data.get("date_created")
+        # Parse timestamp (BlueBubbles' field is camelCase)
+        timestamp = msg_data.get("dateCreated")
         if isinstance(timestamp, (int, float)):
             # BlueBubbles uses milliseconds
             timestamp = datetime.fromtimestamp(timestamp / 1000)
@@ -368,6 +399,7 @@ class IMessageAdapter(ChannelAdapter):
 
             async with self._session.post(
                 f"{self._api_url}/api/v1/message/text",
+                params={"password": self._password},
                 json=payload,
             ) as response:
                 if response.status in (200, 201):

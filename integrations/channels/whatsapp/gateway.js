@@ -458,10 +458,23 @@ app.post('/api/sessions/:id/request-pair-code', async (req, res) => {
       ctx._torndown = true;
       try { ctx.sock && ctx.sock.end && ctx.sock.end(); } catch (_) { /* best-effort */ }
       sessions.delete(accountId);
+      // sock.end() tears down asynchronously — building the next socket
+      // before WhatsApp's servers have actually seen the old one close
+      // reads as two concurrent logins for the same number and rejects
+      // the new one with "Connection Failure" (observed live). Give the
+      // teardown time to actually land first.
+      await new Promise((resolve) => setTimeout(resolve, 2000));
     }
     ctx = {
       sock: null, qr: null, authenticated: false, state: 'connecting',
       wsClients: new Set(), accountId, messages: [],
+      // Missing here crashes the WHOLE process the instant a real
+      // message arrives (messages.upsert's dedup check assumes this
+      // exists unconditionally) — the pairing-code path builds its own
+      // ctx literal separately from ensureSession()'s, which is the only
+      // place this was previously initialized. Confirmed live: took down
+      // the entire gateway on the first real self-chat message.
+      seenMessageIds: new Set(),
     };
     sessions.set(accountId, ctx);
     await connectSocket(ctx);
@@ -469,6 +482,12 @@ app.post('/api/sessions/:id/request-pair-code', async (req, res) => {
     if (typeof ctx.sock.requestPairingCode !== 'function') {
       return res.status(501).json({ error: 'pair-code not supported by this Baileys version' });
     }
+    // requestPairingCode() called right after the socket is constructed
+    // races the noise handshake (observed: "Connection Closed"/428
+    // Precondition Required, since WA's registration node hasn't gone
+    // out yet) — a brief wait for the handshake to actually start fixes
+    // it (confirmed against real WA servers).
+    await new Promise((resolve) => setTimeout(resolve, 3000));
     const code = await ctx.sock.requestPairingCode(phone);
     res.json({ success: true, code });
   } catch (e) {

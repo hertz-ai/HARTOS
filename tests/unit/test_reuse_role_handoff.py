@@ -150,7 +150,11 @@ def test_replay_completes_and_delivers_answer(replay, journey, prompt_id):
     assert run.dispatched == [1, 2]
     assert 'Reader; run the saved work' in run.steers[0]
     assert run.steers[0].count(run.rr._REUSE_ACTION_MESSAGE_PREFIX) == 1
-    assert run.rr.user_tasks[run.key].current_action == 3
+    # 1, not 3 (one past the last action): _advance_reuse_action resets to 1
+    # on completion so the next message from this same persistent identity
+    # replays the recipe instead of hitting "Cannot access recipe for
+    # current action N" (found live 2026-08-31).
+    assert run.rr.user_tasks[run.key].current_action == 1
     assert run.lifecycle.get_registered_groupchat(run.key) is run.gc
     assert run.rr.user_journey[run.key] == 'UseBot'
     assert run.schedule.call_count == (0 if journey == 'cached' else 1)

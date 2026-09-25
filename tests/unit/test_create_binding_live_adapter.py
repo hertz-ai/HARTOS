@@ -82,6 +82,20 @@ def _mock_integration(existing_adapter=None):
     return integration
 
 
+def _fake_adapter(status, token):
+    """An already-registered adapter in a specific health/credential state.
+
+    A bare MagicMock is not enough here: _wire_live_adapter compares
+    get_status() against real ChannelStatus members and config.token
+    against the incoming credential, and a Mock silently matches neither.
+    """
+    from integrations.channels.base import ChannelStatus  # noqa: F401
+    adapter = MagicMock()
+    adapter.get_status.return_value = status
+    adapter.config.token = token
+    return adapter
+
+
 class TestExtractCredential:
     def test_finds_declared_field_at_top_level(self):
         from integrations.social.api_channels import _extract_credential
@@ -193,10 +207,18 @@ class TestWireLiveAdapterHelper:
         run_coro.assert_called_once()
         assert run_coro.call_args.args[1] is integration._loop
 
-    def test_idempotent_when_already_registered(self):
+    def test_idempotent_when_already_registered_and_healthy(self):
+        """A live adapter holding the SAME credential is left alone.
+
+        Narrowed 2026-08-04: this used to assert that ANY registered
+        adapter short-circuited the helper, which is precisely the bug
+        covered by test_rewires_dead_adapter_on_retry below. Healthy AND
+        same-credential is the only case that legitimately no-ops.
+        """
+        from integrations.channels.base import ChannelStatus
         from integrations.social.api_channels import _wire_live_adapter
 
-        already_live = MagicMock()
+        already_live = _fake_adapter(ChannelStatus.CONNECTED, '123:ABC')
         integration = _mock_integration(existing_adapter=already_live)
 
         with patch(
@@ -208,6 +230,105 @@ class TestWireLiveAdapterHelper:
         assert result['success'] is True
         integration.register_channel.assert_not_called()
         run_coro.assert_not_called()
+
+    def test_rewires_dead_adapter_on_retry(self):
+        """A dead adapter must be rebuilt, not treated as already-wired.
+
+        Real failure this covers (reproduced live against Discord on
+        2026-08-04): a first connect attempt fails — mistyped token,
+        revoked bot, or privileged intents not yet enabled in the Discord
+        developer portal — leaving the adapter registered in ERROR.
+        Resubmitting hit the old unconditional "already registered"
+        short-circuit, so NO new connection was ever attempted: the
+        channel stayed dead until someone restarted the server, while the
+        API kept reporting success. The credential is deliberately
+        unchanged here — enabling intents in the portal fixes the
+        connection without changing the token at all.
+        """
+        from integrations.channels.base import ChannelStatus
+        from integrations.social.api_channels import _wire_live_adapter
+
+        dead = _fake_adapter(ChannelStatus.ERROR, '123:ABC')
+        rebuilt = MagicMock()
+        integration = _mock_integration(existing_adapter=dead)
+        integration.registry.get.side_effect = [dead, rebuilt]
+
+        with patch(
+            'integrations.channels.flask_integration.get_channel_integration',
+            return_value=integration,
+        ), patch('asyncio.run_coroutine_threadsafe') as run_coro:
+            result = _wire_live_adapter('telegram', '123:ABC')
+
+        assert result['success'] is True
+        integration.registry.unregister.assert_called_once_with('telegram')
+        integration.register_channel.assert_called_once_with('telegram', token='123:ABC')
+        # stop() on the stale adapter, then start() on its replacement.
+        assert run_coro.call_count == 2
+
+    def test_rewires_when_credential_changed(self):
+        """A healthy adapter still holding a superseded token is replaced."""
+        from integrations.channels.base import ChannelStatus
+        from integrations.social.api_channels import _wire_live_adapter
+
+        stale = _fake_adapter(ChannelStatus.CONNECTED, 'OLD:TOKEN')
+        rebuilt = MagicMock()
+        integration = _mock_integration(existing_adapter=stale)
+        integration.registry.get.side_effect = [stale, rebuilt]
+
+        with patch(
+            'integrations.channels.flask_integration.get_channel_integration',
+            return_value=integration,
+        ), patch('asyncio.run_coroutine_threadsafe'):
+            result = _wire_live_adapter('telegram', 'NEW:TOKEN')
+
+        assert result['success'] is True
+        integration.register_channel.assert_called_once_with('telegram', token='NEW:TOKEN')
+
+    def test_connecting_adapter_is_left_in_flight(self):
+        """An attempt still in progress is not restarted out from under itself."""
+        from integrations.channels.base import ChannelStatus
+        from integrations.social.api_channels import _wire_live_adapter
+
+        in_flight = _fake_adapter(ChannelStatus.CONNECTING, '123:ABC')
+        integration = _mock_integration(existing_adapter=in_flight)
+
+        with patch(
+            'integrations.channels.flask_integration.get_channel_integration',
+            return_value=integration,
+        ), patch('asyncio.run_coroutine_threadsafe'):
+            result = _wire_live_adapter('telegram', '123:ABC')
+
+        assert result['success'] is True
+        integration.register_channel.assert_not_called()
+
+    def test_teardown_failure_does_not_block_replacement(self):
+        """A stale adapter that won't stop cleanly must not wedge the retry.
+
+        An adapter that never finished connecting can raise on stop() —
+        exactly the state a failed first attempt leaves behind — so that
+        must not be allowed to block the reconnect.
+        """
+        from integrations.channels.base import ChannelStatus
+        from integrations.social.api_channels import _wire_live_adapter
+
+        dead = _fake_adapter(ChannelStatus.ERROR, '123:ABC')
+        rebuilt = MagicMock()
+        integration = _mock_integration(existing_adapter=dead)
+        integration.registry.get.side_effect = [dead, rebuilt]
+
+        def _explode(coro, loop):
+            handle = MagicMock()
+            handle.result.side_effect = RuntimeError('adapter never connected')
+            return handle
+
+        with patch(
+            'integrations.channels.flask_integration.get_channel_integration',
+            return_value=integration,
+        ), patch('asyncio.run_coroutine_threadsafe', side_effect=_explode):
+            result = _wire_live_adapter('telegram', '123:ABC')
+
+        assert result['success'] is True
+        integration.register_channel.assert_called_once_with('telegram', token='123:ABC')
 
     def test_no_credential_is_a_graceful_noop(self):
         from integrations.social.api_channels import _wire_live_adapter

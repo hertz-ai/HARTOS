@@ -618,6 +618,25 @@ def _get_stt_dir() -> Path:
     return stt_dir
 
 
+def _sherpa_model_cached(model_name: str) -> bool:
+    """True when this sherpa-onnx model is already downloaded and extracted.
+
+    Same check _download_model uses to skip re-downloading, exposed so
+    select_whisper_model can prefer an already-cached model over the
+    catalog's raw top score. ModelCatalog.select_best only gives
+    "downloaded" a +50 scoring bonus (not a hard requirement, see
+    model_catalog.py select_best), so a large not-yet-downloaded model
+    can outscore a small cached one and trigger a live multi-GB download
+    inside the request's timeout window. Found 2026-09-25.
+    """
+    try:
+        cfg = _SHERPA_MODELS[model_name]
+    except KeyError:
+        return False
+    model_dir = _get_stt_dir() / cfg["dir"]
+    return model_dir.exists() and (model_dir / cfg["files"]["tokens"]).exists()
+
+
 def _download_model(model_name: str) -> Path:
     """Download and extract a sherpa-onnx model if not already present.
 
@@ -952,6 +971,26 @@ def select_whisper_model() -> str:
         if sherpa_key and sherpa_key in _SHERPA_MODELS:
             try:
                 import sherpa_onnx  # noqa: F401
+                if _sherpa_model_cached(sherpa_key):
+                    return sherpa_key
+                # Catalog's top pick isn't downloaded — downloading it now
+                # would take far longer than the request's timeout window
+                # (#677-style: a multi-GB model fetched on-demand crashes
+                # the worker on timeout instead of ever answering). Prefer
+                # whichever sherpa model is already on disk instead of
+                # kicking off a live download. Found 2026-09-25.
+                for fallback_key in ("moonshine-tiny", "whisper-tiny"):
+                    if fallback_key in _SHERPA_MODELS and _sherpa_model_cached(fallback_key):
+                        logger.info(
+                            "select_whisper_model: catalog picked '%s' but it "
+                            "is not downloaded; using cached '%s' instead",
+                            sherpa_key, fallback_key)
+                        return fallback_key
+                logger.info(
+                    "select_whisper_model: catalog picked '%s' but it is not "
+                    "downloaded and no cached sherpa model exists either; "
+                    "proceeding with '%s' (will trigger a download)",
+                    sherpa_key, sherpa_key)
                 return sherpa_key
             except ImportError:
                 logger.debug("select_whisper_model: swallowed ImportError")

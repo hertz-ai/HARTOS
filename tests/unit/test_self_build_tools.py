@@ -6,7 +6,13 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-# Prevent heavy imports
+# Prevent heavy imports. setdefault so an already-real import elsewhere is
+# left alone; track whether THIS call is what installed the stub so it can
+# be removed right after -- left in sys.modules, it silently hands every
+# later-collected file (e.g. test_shell_command_tool.py, which does
+# `from hart_intelligence_entry import _handle_shell_command_tool`) a
+# MagicMock instead of the real module.
+_installed_fake_hie = 'hart_intelligence_entry' not in sys.modules
 sys.modules.setdefault('hart_intelligence_entry', MagicMock())
 
 from integrations.agent_engine.self_build_tools import (
@@ -18,6 +24,9 @@ from integrations.agent_engine.self_build_tools import (
     get_self_build_status_standalone,
     sandbox_test_build_standalone,
 )
+
+if _installed_fake_hie:
+    sys.modules.pop('hart_intelligence_entry', None)
 
 
 class TestPackageNameValidation(unittest.TestCase):
