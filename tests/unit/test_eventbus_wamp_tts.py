@@ -162,6 +162,56 @@ class TestEventBusWAMPBridge(unittest.TestCase):
             bus._wamp_loop.close()
             bus._wamp_loop = None
 
+    def test_connect_wamp_subscribes_with_details_arg(self):
+        """Regression: the WAMP prefix subscription MUST pass
+        details_arg='details'.
+
+        Without it autobahn never injects the EventDetails, so
+        _on_wamp_event's ``details`` is always None and every inbound
+        event hits ``if not wamp_topic: return`` — silently dropping all
+        remote hive events.  This pins the subscribe options so that
+        details=None silent-drop class cannot quietly reappear.
+        """
+        from core.platform.events import EventBus
+        from autobahn.wamp.types import SubscribeOptions
+        from unittest.mock import AsyncMock
+        import asyncio
+
+        bus = EventBus()
+        captured = {}
+        fake_component = MagicMock()
+        # Capture the handler registered via @component.on_join
+        fake_component.on_join.side_effect = (
+            lambda fn: captured.setdefault('on_join', fn) or fn
+        )
+        fake_component.on_leave.side_effect = lambda fn: fn
+
+        # Component(...) -> fake_component; don't start the background thread.
+        with patch('autobahn.asyncio.component.Component',
+                   return_value=fake_component), \
+                patch('threading.Thread'):
+            bus.connect_wamp('ws://fake:8088/ws', 'realm1')
+
+        self.assertIn('on_join', captured,
+                      "connect_wamp must register an on_join handler")
+
+        # Drive on_join with a mock session and inspect the subscribe call —
+        # this is the exact call the receive path depends on.
+        session = MagicMock()
+        session.subscribe = AsyncMock()
+        asyncio.run(captured['on_join'](session, MagicMock()))
+
+        session.subscribe.assert_awaited_once()
+        opts = session.subscribe.call_args.kwargs.get('options')
+        self.assertIsInstance(
+            opts, SubscribeOptions,
+            "subscribe must be called with a SubscribeOptions instance")
+        self.assertEqual(
+            opts.details_arg, 'details',
+            "prefix subscription must request details_arg='details', else "
+            "autobahn drops every inbound event (details=None)")
+        self.assertEqual(opts.match, 'prefix')
+
 
 # ═══════════════════════════════════════════════════════════════
 # emit_event() module helper
