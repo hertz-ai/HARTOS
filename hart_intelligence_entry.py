@@ -427,7 +427,16 @@ def hevolve_verify_boot():
         _boot_logger.warning(msg)
         return
 
-    current_code_hash = compute_code_hash()
+    # force_walk: the boot check must hash the bytes it is about to run, never
+    # a cache.  compute_code_hash's mtime cache lives in agent_data/, which the
+    # deploy bind-mounts into EVERY container, so the cache one image writes is
+    # read by the next.  Measured 2026-09-22 15:56Z on central: a cancelled
+    # deploy's script kept running and booted its image at 15:37Z, writing the
+    # cache; the next image's checkout carried an earlier mtime (15:32Z, its
+    # git reset), so this line returned the PREVIOUS image's hash, called the
+    # new image tampered ("CODE_HASH mismatch"), and the deploy rolled back
+    # into a crash loop.  A forced walk is a pure read: one directory walk.
+    current_code_hash = compute_code_hash(force_walk=True)
     if d.get("code_hash") != current_code_hash:
         msg = "[HevolveIntegrity] CODE_HASH mismatch"
         if mode == "hard":
@@ -919,17 +928,52 @@ stream_handler.setFormatter(formatter)
 # handlers owned by anyone else.
 _HARTOS_HANDLER_TAG = '_hartos_root_handler'
 
-_root = logging.getLogger()
-for _existing in list(_root.handlers):
-    if getattr(_existing, _HARTOS_HANDLER_TAG, False):
-        _root.removeHandler(_existing)
-_root.setLevel(logging.INFO)
 
-if _is_bundled:
-    setattr(handler, _HARTOS_HANDLER_TAG, True)
-    setattr(stream_handler, _HARTOS_HANDLER_TAG, True)
-    _root.addHandler(handler)
-    _root.addHandler(stream_handler)
+def _install_root_handlers(root, bundled, file_handler, console_handler):
+    """Attach this module's handlers to the ROOT logger, without stealing anyone's.
+
+    Three launch shapes, three answers:
+      * bundled (cx_Freeze): root gets file + console, so every module logger
+        lands in langchain.log and the console;
+      * a host that already configured root (Nunba's gui_app.log/server.log,
+        pytest's capture): root is left exactly as found, per the 2026-08-03
+        incident above;
+      * a bare root with NO handler at all: root gets the console handler.
+
+    The third case is the OS and Docker launch (`python hart_intelligence_entry.py`
+    under systemd). Before 2026-09-24 it got nothing, so every INFO line the
+    root logger saw during main() went to Python's lastResort handler, which
+    prints WARNING and above only. Measured on the hart-ota-central nixos test
+    (2026-09-23 run, shard 0): "STARTUP VALIDATION WARNINGS" reached the journal
+    as bare text, and "[Guardrail] hash verified", "Platform bootstrapped" and
+    "Local subscribers bootstrapped: ... ota-push" never appeared at all, until a
+    background thread's import called logging.basicConfig() some two seconds
+    after Waitress bound and INFO started flowing in basicConfig's format. The
+    OTA test waited 240 s for a line the process had already dropped, and the
+    boot narrative that hart-backend.nix exempts from the journald rate limit
+    was never being written in the first place.
+
+    Attaching only when root is empty is the same rule basicConfig() follows, so
+    a later basicConfig() call becomes the no-op it was always meant to be and
+    the journal keeps ONE format (the RequestID/threadName one) end to end.
+    """
+    for existing in list(root.handlers):
+        if getattr(existing, _HARTOS_HANDLER_TAG, False):
+            root.removeHandler(existing)
+    root.setLevel(logging.INFO)
+
+    if bundled:
+        setattr(file_handler, _HARTOS_HANDLER_TAG, True)
+        setattr(console_handler, _HARTOS_HANDLER_TAG, True)
+        root.addHandler(file_handler)
+        root.addHandler(console_handler)
+    elif not root.handlers:
+        setattr(console_handler, _HARTOS_HANDLER_TAG, True)
+        root.addHandler(console_handler)
+
+
+_root = logging.getLogger()
+_install_root_handlers(_root, _is_bundled, handler, stream_handler)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
@@ -1621,18 +1665,27 @@ try:
         except Exception as fwd_err:
             return jsonify({'error': f'HevolveAI backend unavailable: {fwd_err}'}), 502
 
-        # Meter usage for revenue split
-        usage = result.get('usage', {})
-        total_tokens = usage.get('total_tokens', 0)
+        # Meter usage for the 90/9/1 revenue split. This passed keywords
+        # record_metered_usage does not accept (provider/model/tokens/source);
+        # the TypeError was swallowed below, so SDK usage was NEVER metered
+        # (hevolveai Master 11.435 S2). meter_llm_call owns the contract;
+        # 'hive' is the settled cross-operator source. Two things stay open
+        # for the owner: MeteredAPIUsage has no consumer field (the old
+        # 'sdk:<consumer>' tag had nowhere to go), and a LOCAL model prices at
+        # 0 via spark_per_1k, so SDK use of a local model records no revenue.
+        usage = result.get('usage', {}) or {}
+        total_tokens = usage.get('total_tokens', 0) or 0
         if total_tokens > 0:
             try:
-                from integrations.agent_engine.budget_gate import record_metered_usage
-                consumer = request.headers.get('X-Consumer-Username', 'anonymous')
-                record_metered_usage(
-                    provider='hevolve',
+                from integrations.agent_engine.budget_gate import meter_llm_call
+                tokens_in = usage.get('prompt_tokens', 0) or 0
+                tokens_out = usage.get('completion_tokens',
+                                       max(0, total_tokens - tokens_in)) or 0
+                meter_llm_call(
                     model=data.get('model', 'hevolve'),
-                    tokens=total_tokens,
-                    source=f'sdk:{consumer}'
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
+                    task_source='hive',
                 )
             except Exception:
                 logging.getLogger(__name__).exception("_completions_proxy: swallowed Exception")  # metering failure must not block response
@@ -3317,6 +3370,14 @@ def _handle_shell_command_tool(input_text: str) -> str:
                 f"pattern ('{pat}') and is blocked by the built-in safety list. "
                 f"If you really need this, ask the user to run it manually."
             )
+
+    # --- The shared hard-deny policy every computer-use dispatcher calls
+    # (power/reset/erase, and stopping the assistant's own processes, #877).
+    # The LangChain Shell_Command tool reached run_bounded without it.
+    from integrations.vlm.safety import computer_operation_refusal
+    _refusal = computer_operation_refusal({'command': text})
+    if _refusal is not None:
+        return f"Shell_Command refused: {_refusal}"
 
     # --- The owner's permission: the same computer_control consent the VLM
     # loop checks (integrations.vlm.safety.computer_control_block).  After
@@ -8668,6 +8729,27 @@ def _vision_keyword_override(prompt: str) -> bool:
         return False
 
 
+def _draft_delegates(result: dict) -> bool:
+    """The draft's own envelope says a bigger model must take this turn.
+
+    ONE reader for that field: escalation_reasons.draft_delegates, in the
+    module that already names delegate='local'/'hive' the baseline
+    escalation (CLASSIFIER_DELEGATE).  is_casual has NO vote here.  The
+    two fields are emitted independently and can contradict, and when
+    they did, the casual verdict won.  MEASURED 2026-09-22 08:52:39
+    (speculation c77082b0-af7): delegate='local' AND is_casual=true on
+    "great open a notepad and type hi in it" -> the branch below was
+    skipped -> the draft's "I've opened a notepad for you and typed 'hi'
+    inside" shipped as the final answer and was spoken by TTS.  No tool
+    ran; Computer_Action was in the is_first set that turn would have
+    loaded.  Believing is_casual ships a tool-less model's description of
+    work as if the work had happened; believing delegate costs one slower
+    turn.  See tests/unit/test_draft_delegate_is_not_vetoed_by_casual.py.
+    """
+    from integrations.agent_engine.escalation_reasons import draft_delegates
+    return draft_delegates(result.get('delegate'))
+
+
 def _chat_reply(user_id, request_id, response_text: str, **payload):
     """Return a /chat JSON response AND fire TTS synthesis in the background.
 
@@ -10092,8 +10174,7 @@ def chat():
                     # Fall through — do NOT return the draft standby
                     # reply; the tool-based path below will run and the
                     # VLM tool will produce a grounded answer.
-                elif (result.get('delegate') in ('local', 'hive')
-                      and not result.get('is_casual')
+                elif (_draft_delegates(result)
                       and not _create_intent_actionable):
                     # Draft self-assessed: this is a non-casual TASK
                     # that needs more capability than the 0.8B has
@@ -10127,7 +10208,7 @@ def chat():
                     app.logger.info(
                         f"draft classifier: delegate="
                         f"{result.get('delegate')!r} "
-                        f"is_casual=False, is_create_agent=False — routing to "
+                        f"is_casual={result.get('is_casual')!r} (no veto), is_create_agent=False — routing to "
                         f"the langchain chat (get_ans), NOT autogen CREATE. "
                         f"get_ans carries FULL_HISTORY (date-recall via "
                         f"parsing_string -> get_time_based_history SimpleMem) "
@@ -11210,7 +11291,10 @@ def agent_approval():
     try:
         data = request.get_json(silent=True) or {}
         agent_id = data.get('agent_id', '')
-        action = str(data.get('action', '')).strip().lower()
+        # kept as sent as well: a game sound's state is camelCase and its
+        # memo key exact (hartos-3a F5)
+        action_raw = str(data.get('action', '')).strip()
+        action = action_raw.lower()
         decision = str(data.get('decision', '')).strip().lower()
         if decision not in ('approve', 'approved', 'allow', 'yes', 'deny', 'denied', 'no'):
             return jsonify({'status': 'error', 'reason': 'invalid decision'}), 400
@@ -11245,9 +11329,8 @@ def agent_approval():
             # {'type':'consent', 'decision':'denied'} on the VISION topic
             # for a piece of music -- wrong noun, wrong topic -- while the
             # memo kept serving the take they had just refused.
-            parts = str(action).split(':')
-            sound_game = parts[1] if len(parts) > 1 else ''
-            sound_state = parts[2] if len(parts) > 2 else 'bgm'
+            from core.game_sound_memo import parse_game_sound_action
+            sound_game, sound_state = parse_game_sound_action(action_raw)
             reason = str(data.get('reason') or data.get('note') or '').strip()
             try:
                 from core.game_sound_memo import record_verdict
@@ -11305,9 +11388,8 @@ def agent_approval():
         # from here and from the agent's own tool, so there is one
         # implementation rather than two.
         if str(action or '').startswith('game_sound:'):
-            parts = str(action).split(':')
-            sound_game = parts[1] if len(parts) > 1 else ''
-            sound_state = parts[2] if len(parts) > 2 else 'bgm'
+            from core.game_sound_memo import parse_game_sound_action
+            sound_game, sound_state = parse_game_sound_action(action_raw)
             try:
                 from core.game_sound_memo import record_verdict
                 from hartos.helper import (
@@ -12783,6 +12865,13 @@ def voice_audio(filename):
         _os.path.expanduser('~/.hevolve/models/f5_tts/output'),
         _os.environ.get('TTS_TEMP_DIR', '/tmp/tts'),
     ]
+    # A game's composed sounds (media_agent keeps them there; hartos-3a F1).
+    try:
+        from integrations.service_tools.media_agent import composer_output_dir
+        search_dirs.append(str(composer_output_dir()))
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            'voice_audio: composer output dir unavailable: %s', e)
     for d in search_dirs:
         fpath = _os.path.join(d, safe_name)
         if _os.path.isfile(fpath):
@@ -13657,8 +13746,23 @@ def _serve_app(app, host: str, port: int) -> None:
         log.warning(
             f"Hypercorn unavailable ({exc}) — falling back to Waitress")
 
-    log.info(f"Starting Waitress (WSGI) on {host}:{port} (threads=50)")
-    serve(app, host=host, port=port, threads=50)
+    # The variant thread budget applies HERE too. hart-backend.nix exports
+    # HEVOLVE_WORKER_THREADS as each variant's budget and says that export is what
+    # keeps ExecStart safe against TasksMax; hart-app ships no hypercorn, so every
+    # OS node takes this path, and a hard-coded 50 (plus the import threads) is
+    # more than edge's TasksMax=64. Measured in CI 2026-09-24 (nixosTests
+    # hart-peer-discovery): the edge backend died five times with "can't start
+    # new thread" and "fork rejected by pids controller", then hit its start
+    # limit. Unset (dev box, the Nunba bundle) keeps the old 50, unchanged.
+    raw_budget = os.environ.get('HEVOLVE_WORKER_THREADS')
+    try:
+        waitress_threads = int(raw_budget) if raw_budget else 50
+    except ValueError:
+        waitress_threads = 50
+    if waitress_threads < 1:
+        waitress_threads = 1
+    log.info(f"Starting Waitress (WSGI) on {host}:{port} (threads={waitress_threads})")
+    serve(app, host=host, port=port, threads=waitress_threads)
 
 
 if __name__ == '__main__':

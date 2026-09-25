@@ -80,6 +80,66 @@ _DESTRUCTIVE_REQUEST_RE = re.compile(
 )
 
 
+# Stopping a process: every verb that ends one, in any shell.  Matched on the
+# de-obfuscated text (_deobfuscate), never compiled from the command itself.
+_KILL_VERB_RE = re.compile(
+    r'(?:taskkill|stop-process|\bspps\b|\bp?kill(?:all)?\b|'
+    r'\.(?:kill|terminate)\s*\(|stop-service|\bsc(?:\.exe)?\s+stop\b|'
+    r'\bnet\s+stop\b|systemctl\s+(?:stop|kill)\b|'
+    r'\bwmic\b[^\n]*\b(?:delete|terminate)\b)')
+# The target arrives from elsewhere (a pipe, a variable, xargs), so the
+# command text does not say which process it stops.
+_UNRESOLVED_TARGET_RE = re.compile(
+    r'\|\s*(?:stop-process|spps|xargs)\b|\$')
+_NUMBER_RE = re.compile(r'\b\d+\b')
+# cmd caret escapes, PowerShell backtick escapes, and %VAR% expansions hide a
+# verb from a plain search ("task^kill", "Stop`-Process", "%comspec% /c ...").
+_OBFUSCATION_RE = re.compile(r'[\^`]|%[^%\s]*%')
+
+
+def _own_process_identity():
+    """(pids, names) of the assistant's own processes.  Raises when they
+    cannot be read; the caller then refuses any kill."""
+    import psutil
+    from core.resource_governor import get_governor
+    pids = get_governor().own_process_pids(include_parent=True)
+    names = set()
+    for pid in pids:
+        try:
+            name = psutil.Process(pid).name().casefold()
+        except Exception:  # noqa: BLE001 -- exited mid-walk (M1)
+            continue
+        names.add(name[:-4] if name.endswith('.exe') else name)
+    return pids, names
+
+
+def _deobfuscate(text: str) -> str:
+    return _OBFUSCATION_RE.sub('', text)
+
+
+def _own_process_kill(text: str) -> Optional[str]:
+    """Refusal when ``text`` stops one of the assistant's own processes, or
+    stops a process it does not name (#877: an agent ran
+    ``Get-Process | Where-Object {$_.Name -like '*Nunba*'} | Stop-Process``
+    and Nunba exited under its owner)."""
+    text = _deobfuscate(text)
+    if not _KILL_VERB_RE.search(text):
+        return None
+    try:
+        pids, names = _own_process_identity()
+    except Exception as e:  # noqa: BLE001 -- unknown "own" is a no
+        return ('own_process_kill: the assistant\'s own processes could not '
+                f'be identified ({e}), so no process may be stopped')
+    if any(int(n) in pids for n in _NUMBER_RE.findall(text)):
+        return 'own_process_kill: the command stops one of the assistant\'s own processes'
+    if any(name and name in text for name in names):
+        return 'own_process_kill: the command stops one of the assistant\'s own processes'
+    if _UNRESOLVED_TARGET_RE.search(text):
+        return ('own_process_kill: the command stops processes it does not '
+                'name, so it could stop the assistant itself')
+    return None
+
+
 def destructive_computer_operation(value) -> Optional[str]:
     """Return a refusal reason for a power/reset/erase operation.
 
@@ -92,14 +152,17 @@ def destructive_computer_operation(value) -> Optional[str]:
         parts = (value.get(key) for key in
                  ('command', 'text', 'value', 'path', 'reasoning', 'Reasoning'))
         text = '\n'.join(str(part) for part in parts if part)
+        # What would actually run; the model's reasoning is prose about it.
+        runs = '\n'.join(str(value.get(key)) for key in
+                         ('command', 'text', 'value') if value.get(key))
     else:
-        text = '' if value is None else str(value)
+        text = runs = '' if value is None else str(value)
     text = unicodedata.normalize('NFKC', text).casefold()
     if _DESTRUCTIVE_COMMAND_RE.search(text):
         return 'destructive_computer_operation: power, reset, erase, or format commands are never agent-executable'
     if _DESTRUCTIVE_REQUEST_RE.search(text):
         return 'destructive_computer_operation: power, reset, erase, or format requests require a human to act directly'
-    return None
+    return _own_process_kill(unicodedata.normalize('NFKC', runs).casefold())
 
 
 def computer_operation_refusal(value) -> Optional[str]:

@@ -98,3 +98,29 @@ def coerce(value: Union[None, str, EscalationReason]) -> Optional[EscalationReas
         return EscalationReason(str(value))
     except ValueError:
         return None
+
+
+def draft_delegates(delegate: Union[None, str, EscalationReason]) -> bool:
+    """True when the draft's own envelope hands this turn to a bigger model.
+
+    ``CLASSIFIER_DELEGATE`` above calls ``delegate='local'`` / ``'hive'``
+    the *baseline* escalation: the model itself decided it cannot finish.
+    This is the one predicate for reading that field, so the /chat handler
+    and the dispatcher's telemetry agree on what it means.
+
+    It is deliberately NOT gated on ``is_casual``.  The draft emits both
+    fields independently and they can contradict.  MEASURED 2026-09-22
+    08:52:39 (speculation c77082b0-af7, prompt "great open a notepad and
+    type hi in it"): the envelope said ``delegate='local'`` AND
+    ``is_casual=true``, the handler's branch required ``not is_casual``,
+    so the turn never reached get_ans -- and the draft's in-band reply,
+    "I've opened a notepad for you and typed 'hi' inside", shipped as the
+    final answer and was spoken by TTS.  No tool ran.  Computer_Action and
+    Shell_Command were in the very tool set that session would have
+    loaded.  When the two fields disagree, believing ``is_casual`` ships a
+    tool-less model's description of work as if the work had happened;
+    believing ``delegate`` costs one slower turn.  The asymmetry decides
+    it.  Of the six draft envelopes surviving in the logs that day, this
+    was the only ``delegate='local'``, and it is the one that fabricated.
+    """
+    return str(delegate or '').strip().lower() in ('local', 'hive')

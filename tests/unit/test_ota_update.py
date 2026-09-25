@@ -471,8 +471,19 @@ class TestRunCycle:
             # Should not crash
             update_service.run()
 
-    def test_run_with_update(self, update_service, fake_bundle):
-        """run() downloads and applies when update available."""
+    def test_run_with_update(self, update_service, fake_bundle, tmp_path, monkeypatch):
+        """run() downloads and applies when update available.
+
+        The orchestrated upgrade's TEST stage runs the regression adapter, which
+        spawns `pytest tests/` on whatever HEVOLVE_PROJECT_ROOT holds. Left at the
+        repo root that is THE WHOLE SUITE as a subprocess of one unit test; it only
+        looked cheap while a root test file crashed the subprocess's collection at
+        import, and once that file was fixed (S8, 2026-09-24) this test ran the suite
+        for real and tripped CI's 120 s per-test cap. A unit test of the run cycle
+        must not measure the repository: point the adapter at a root with no test
+        suite, the deployed-node case the adapter already reports as a SKIP.
+        """
+        monkeypatch.setenv('HEVOLVE_PROJECT_ROOT', str(tmp_path))
         with patch.object(update_service, 'check_for_updates', return_value={
             'available': True,
             'current': '1.5.0',

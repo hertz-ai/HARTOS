@@ -4942,25 +4942,31 @@ def _reuse_written_answer(group_chat):
 
 
 def _reuse_completion_evidence(user_prompt, action_id, group_chat):
-    """Locate the canonical GroupChat receipt the REUSE gate just proved.
+    """Locate the receipt the REUSE gate just proved.
 
     The fabrication gate remains the one judge of whether every tool named by
     the action produced a real result.  This helper only projects that existing
     judgment into lifecycle_hooks' shared ``{message_index, kind}`` envelope so
     REUSE and CREATE persist and learn from completion through the same path.
+
+    It searches the SAME lists the gate reads (_reuse_evidence_sources): the
+    group log first, then each participant's pairwise buffer.  A buffer receipt
+    carries its address (source/agent/peer) so lifecycle_hooks.resolve_receipt
+    reads it back from that list.  Measured 2026-09-24 on nightly 8a11925: this
+    helper read the group log only, the gate credited results that lived only
+    in a buffer, and 362 actions ended GAVE_UP with 0 committed.
     """
     try:
+        def _dispatch_index(msgs):
+            for idx in range(len(msgs) - 1, -1, -1):
+                if dispatch_action_id((msgs[idx] or {}).get('content')) == action_id:
+                    return idx
+            return None
+
         messages = getattr(group_chat, 'messages', None)
         if not isinstance(messages, list):
             return None
-
-        dispatch_index = None
-        for idx in range(len(messages) - 1, -1, -1):
-            if dispatch_action_id((messages[idx] or {}).get('content')) == action_id:
-                dispatch_index = idx
-                break
-        if dispatch_index is None:
-            return None
+        dispatch_index = _dispatch_index(messages)
 
         task = user_tasks.get(user_prompt)
         action_text = str(task.get_action(int(action_id) - 1) or '').lower() \
@@ -4971,16 +4977,20 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
 
         if referenced:
             wanted = set(referenced)
-            call_fn = _reuse_call_id_to_tool_name([messages])
+            sources = [(src, msgs) for src, msgs
+                       in _reuse_evidence_sources(group_chat, agents)
+                       if isinstance(msgs, list)]
+            call_fn = _reuse_call_id_to_tool_name([msgs for _s, msgs in sources])
             seen = getattr(task, 'evidence_seen_call_ids', set()) if task else set()
             seen = seen if isinstance(seen, (set, frozenset)) else set()
-            for idx in range(len(messages) - 1, dispatch_index, -1):
-                msg = messages[idx]
+            def _is_named_result(msg):
+                """This tool message carries an unseen, non-failed result of a
+                tool the action names -- the gate's own rule, one copy."""
                 if not isinstance(msg, dict) or msg.get('role') != 'tool':
-                    continue
+                    return False
                 responses = msg.get('tool_responses')
-                entries = responses if isinstance(responses, list) and responses else [msg]
-                for result in entries:
+                for result in (responses if isinstance(responses, list)
+                               and responses else [msg]):
                     if not isinstance(result, dict):
                         continue
                     call_id = result.get('tool_call_id') or msg.get('tool_call_id')
@@ -4989,11 +4999,39 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                         continue
                     if any(failure in body for failure in TOOL_FAILURE_RESULTS):
                         continue
-                    name = call_fn.get(call_id) or result.get('name')
-                    if name in wanted:
-                        return {'message_index': idx, 'kind': 'tool_receipt'}
+                    if (call_fn.get(call_id) or result.get('name')) in wanted:
+                        return True
+                return False
+
+            # What each list held, logged on a miss.  Live 2026-09-24 16:49-
+            # 18:55 (dffb deployed): the gate passed and this found nothing 16
+            # times, and nothing said whether the lists lacked a dispatch
+            # marker or lacked the result.
+            looked = []
+            for source, msgs in sources:
+                # Each list is held to its OWN dispatch window: a buffer also
+                # carries earlier actions' turns.
+                start = _dispatch_index(msgs)
+                looked.append((source, msgs, start))
+                if start is None:
+                    continue
+                for idx in range(len(msgs) - 1, start, -1):
+                    if _is_named_result(msgs[idx]):
+                        return {**(source or {}), 'message_index': idx,
+                                'kind': 'tool_receipt'}
+            _ctx_safe_log('warning', (
+                f"[REUSE-VERIFY] receipt search for action {action_id} found "
+                f"none: " + ', '.join(
+                    f"{'group' if src is None else src['agent'] + '->' + str(src['peer'])}"
+                    f"(len={len(msgs)}, "
+                    f"dispatch={'none' if start is None else start}, "
+                    f"unseen_named={sum(1 for m in msgs if _is_named_result(m))})"
+                    for src, msgs, start in looked)
+                + f" for session: {user_prompt}"))
             return None
 
+        if dispatch_index is None:
+            return None
         answer = _reuse_written_answer(group_chat)
         if not isinstance(answer, dict):
             return None
@@ -5604,18 +5642,31 @@ def _reuse_present_call_ids(msg_lists):
     return out
 
 
+def _reuse_evidence_sources(group_chat, agents):
+    """The message lists the gate treats as evidence, each with its address.
+
+    Yields ``(source, messages)``: ``source`` is None for the group log, or
+    ``{'source': 'buffer', 'agent': <name>, 'peer': <name>}`` for one
+    participant's pairwise buffer -- the address lifecycle_hooks.resolve_receipt
+    reads a receipt back from.  The group log comes first.
+    """
+    yield None, getattr(group_chat, 'messages', None) or []
+    for ag in (agents or []):
+        conv = getattr(ag, '_oai_messages', None)
+        if isinstance(conv, dict):
+            for peer, msgs in conv.items():
+                yield ({'source': 'buffer',
+                        'agent': getattr(ag, 'name', None),
+                        'peer': getattr(peer, 'name', peer)}, msgs)
+
+
 def _reuse_evidence_msg_lists(group_chat, agents):
     """The message lists the gate treats as evidence — ONE definition.
 
     Both the watermark stamp and the gate must look at the same places, or
     the stamp would miss a buffer the gate later credits.
     """
-    lists = [getattr(group_chat, 'messages', None) or []]
-    for ag in (agents or []):
-        conv = getattr(ag, '_oai_messages', None)
-        if isinstance(conv, dict):
-            lists.extend(conv.values())
-    return lists
+    return [msgs for _source, msgs in _reuse_evidence_sources(group_chat, agents)]
 
 
 def _stamp_action_evidence_watermark(user_prompt):
@@ -6063,16 +6114,19 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # with the advance path: see _narrow_assistant_to_current_action.
                 _narrow_assistant_to_current_action(user_prompt)
 
-                # ONE call, not the six lines that used to sit here.  They ran
-                # exactly once per entry into this function while the walk
-                # advances many actions in the loop below, so actions 2..N were
-                # dispatched with action 1's tools -- see the helper's docstring
-                # for the two-line live measurement.  The second caller is
-                # _advance_or_steer, the one door every advance goes through.
-                _attach_named_tools_for_action(user_prompt)
-
                 # (b) TAGS — unchanged fallback for capability families the
                 # recipe never mentions but the conversation drifted into.
+                #
+                # ORDER: this now runs BEFORE the named attach, and that is
+                # load-bearing rather than cosmetic.  The named attach is the
+                # one door that reconciles the session's tool schema with the
+                # live n_ctx (fit_schema_to_ctx, at its tail), so anything
+                # attached AFTER it would be offered unbounded for this turn's
+                # dispatch — which is the whole defect being fixed here.  The
+                # two attaches are order-independent in outcome: both are
+                # idempotent against the same _hart_attached_tools ledger, one
+                # selects by exact name and the other by capability tag, so the
+                # union is the same either way.
                 _new = [t for t in detect_goal_tags(message or '')
                         if t not in _unlocked]
                 if _new:
@@ -6087,6 +6141,16 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     _unlocked.update(_new)
                     current_app.logger.info(
                         f"Tier-1 turn attach: +{_new} -> {_n} tools")
+
+                # ONE call, not the six lines that used to sit here.  They ran
+                # exactly once per entry into this function while the walk
+                # advances many actions in the loop below, so actions 2..N were
+                # dispatched with action 1's tools -- see the helper's docstring
+                # for the two-line live measurement.  The second caller is
+                # _advance_or_steer, the one door every advance goes through.
+                # It is also where the set is bounded to the live n_ctx, so it
+                # goes LAST of the three.
+                _attach_named_tools_for_action(user_prompt)
         except Exception as _e:
             # WARNING, not debug -- same class as d6495f499.  This handler
             # wraps the narrow, the named attach and the tag attach, so a
@@ -7785,6 +7849,7 @@ def _attach_named_tools_for_action(user_prompt):
 
         from integrations.service_tools import service_tool_registry
         _named = _reuse_action_tool_names(user_prompt, _aid)
+        _nn = 0
         if _named:
             from core.agent_tools import attach_for_names
             _nn = attach_for_names(_named, helper, assistant,
@@ -7809,37 +7874,65 @@ def _attach_named_tools_for_action(user_prompt):
             _ctx_safe_log('info',
                           f"Tier-1 named attach: action {_aid} names {_named} "
                           f"-> {_nn} tools for session: {user_prompt}")
-            return _nn
-        # INFO, not debug.  gui_app.log captured ZERO "- DEBUG -" lines
-        # across the whole 2026-09-11 drive (0 of 45,599), so at debug this
-        # branch never reaches production and a resolved-nothing round stays
-        # indistinguishable from one that never ran -- the exact gap the
-        # both-outcomes logging was added to close.  Measured rid
-        # d62-232532: "Tier-1 prompt narrow" fired for actions 1,2,3,4 and
-        # "Tier-1 named attach" for action 1 only, with nothing saying why.
+        else:
+            # INFO, not debug.  gui_app.log captured ZERO "- DEBUG -" lines
+            # across the whole 2026-09-11 drive (0 of 45,599), so at debug this
+            # branch never reaches production and a resolved-nothing round stays
+            # indistinguishable from one that never ran -- the exact gap the
+            # both-outcomes logging was added to close.  Measured rid
+            # d62-232532: "Tier-1 prompt narrow" fired for actions 1,2,3,4 and
+            # "Tier-1 named attach" for action 1 only, with nothing saying why.
+            #
+            # The COUNT is what separates []'s causes, which is why it is in the
+            # line: 0 = no recipe stored for this session (the helper's `except`
+            # swallowed a KeyError), n < _aid = the id is past the end of the
+            # stored list, n >= _aid = the action genuinely names no tool.
+            # Offline against the real recipe the helper returns non-empty for
+            # every one of actions 1,2,3,4,9, so live [] is the STORE, not the
+            # helper -- five hypotheses were eliminated for want of this one
+            # number (#828).
+            # ...and the SESSION KEY, because the count alone is not attributable
+            # on a live box.  Measured 2026-09-11 on the first drive that carried
+            # this line: five occurrences all read "holds 1 action(s)" while the
+            # agent under test (88719487304) has NINE actions in both its flow
+            # recipes on disk -- and the surrounding log showed a rival driver
+            # plus daemon traffic in the same window.  444 of 880 stored agents
+            # are single-action stubs (#758), so "holds 1" is the NORMAL reading
+            # for a stub and says nothing about this agent.
+            _store = (recipes.get(user_prompt) or {}).get('actions') or []
+            _ctx_safe_log('info',
+                          f"Tier-1 named attach: action {_aid} names no tool "
+                          f"(recipes store holds {len(_store)} action(s)) "
+                          f"for session: {user_prompt}")
+
+        # ── and RECONCILE the set with the server before it is offered ─────
+        # The attach above only ever GROWS the schema, and until now nothing
+        # downstream shrank it: measured 2026-09-22 on this box, ALL 60 HTTP
+        # 400s in llm_outbound.jsonl + its .old rotation are autogen.reuse
+        # Helper-seat bodies of 50-65 tools (6,067-7,712 schema tokens) against
+        # an n_ctx of 4,096, while all 972 passing reuse calls are the
+        # Assistant seat carrying the bounded 23 of MAIN_LEG_CORE_TOOLS.
         #
-        # The COUNT is what separates []'s causes, which is why it is in the
-        # line: 0 = no recipe stored for this session (the helper's `except`
-        # swallowed a KeyError), n < _aid = the id is past the end of the
-        # stored list, n >= _aid = the action genuinely names no tool.
-        # Offline against the real recipe the helper returns non-empty for
-        # every one of actions 1,2,3,4,9, so live [] is the STORE, not the
-        # helper -- five hypotheses were eliminated for want of this one
-        # number (#828).
-        # ...and the SESSION KEY, because the count alone is not attributable
-        # on a live box.  Measured 2026-09-11 on the first drive that carried
-        # this line: five occurrences all read "holds 1 action(s)" while the
-        # agent under test (88719487304) has NINE actions in both its flow
-        # recipes on disk -- and the surrounding log showed a rival driver
-        # plus daemon traffic in the same window.  444 of 880 stored agents
-        # are single-action stubs (#758), so "holds 1" is the NORMAL reading
-        # for a stub and says nothing about this agent.
-        _store = (recipes.get(user_prompt) or {}).get('actions') or []
-        _ctx_safe_log('info',
-                      f"Tier-1 named attach: action {_aid} names no tool "
-                      f"(recipes store holds {len(_store)} action(s)) "
-                      f"for session: {user_prompt}")
-        return 0
+        # The count is not the rule -- the SAME 50-74-tool helper bodies
+        # returned 200 from 04:59 to 08:04 and 400 afterwards, with no code
+        # change between: llama_server_8080.log records the restart at 08:04
+        # with n_ctx_slot = 4096.  The tool set is fixed at construction and
+        # the context moved under it, so the reconciliation has to read the
+        # live server, which fit_schema_to_ctx does.
+        #
+        # HERE, at the end of the one per-turn attach door, for exactly the
+        # reason this function exists: it is the only place both walk loops and
+        # all six advance sites pass through, so one call covers every
+        # dispatch.  Deferral, not exclusion -- the callables stay in the
+        # executors' _function_map and request_tools re-arms anything the agent
+        # asks for (see core.agent_tools.defer_helper_schema).  The action's
+        # own named tools are protected, so the authoritative selector above is
+        # never undone by the budget below it.
+        from core.agent_tools import fit_schema_to_ctx
+        _protect = set(_named or ()) | {'send_message_to_user'}
+        fit_schema_to_ctx(helper, protect=_protect)
+        fit_schema_to_ctx(assistant, protect=_protect)
+        return _nn
     except Exception as err:
         # WARNING, not debug -- same class as d6495f499.  A failure here
         # means the action is about to be dispatched without the tools its

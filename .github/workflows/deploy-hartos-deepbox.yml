@@ -52,6 +52,30 @@ jobs:
           script: |
             set -e
             cd ${{ secrets.DEPLOY_REPO_PATH }}
+            # One deploy at a time ON THE BOX. cancel-in-progress above cancels
+            # the GitHub run, not this shell: appleboy/ssh-action leaves the
+            # remote bash running. On 2026-09-22 a cancelled run's script and
+            # the next run's script ran interleaved on one machine: two
+            # --no-cache builds at once, and the older script booted its image
+            # AFTER the newer checkout, which poisoned the code-hash cache in
+            # the shared agent_data mount and took central down for 41 min
+            # (#133). The lock is taken here, before the checkout, on an fd
+            # that deepbox_deploy.sh inherits, so it covers the reset, the
+            # build, the run and the rollback branch. A second run waits and
+            # says who it waits for; every run deploys origin/main's tip at the
+            # moment it starts, so a run that waited never deploys stale code.
+            # The wait is bounded below the job's 120m command_timeout so the
+            # log names the cause instead of a silent kill.
+            DEPLOY_LOCK=/tmp/deepbox_deploy.lock
+            exec 9>"$DEPLOY_LOCK"
+            if ! flock -n 9; then
+              _holder="$(cat "$DEPLOY_LOCK.holder" 2>/dev/null || echo unknown)"
+              echo "deploy.lock held by $_holder; waiting since $(date -u +%H:%M:%SZ)"
+              _t0=$SECONDS
+              flock -w 6600 9 || { echo "::error::deploy.lock still held by $_holder after $((SECONDS - _t0))s; giving up"; exit 1; }
+              echo "deploy.lock acquired after $((SECONDS - _t0))s (was held by $_holder)"
+            fi
+            echo "run ${{ github.run_id }} sha ${{ github.sha }} since $(date -u +%H:%M:%SZ)" > "$DEPLOY_LOCK.holder"
             # sudo, and not a bare rm: release_manifest.json is written by
             # `sudo docker cp` in deepbox_deploy.sh, so it lands ROOT-owned,
             # and it is also a bind-mount source for the container. If the
@@ -71,7 +95,17 @@ jobs:
             # "version": "3abea78b" -- the deploy was pinned by its own
             # leftover artifact. Four separate fixes were pushed and none
             # reached production.
-            sudo rm -rf release_manifest.json
+            #
+            # Only a DIRECTORY is removed. The file is the running container's
+            # bind-mounted manifest: a container under enforcement=hard that
+            # restarts with the file gone dies with "release_manifest.json
+            # missing", every 12 seconds, until a deploy writes one. Measured
+            # 2026-09-22 15:56Z: this line removed the file, the new image
+            # failed its boot check, the rollback restarted the old image
+            # without a manifest, and central was down for the rest of the
+            # hour. deepbox_deploy.sh overwrites the file with the new
+            # image's manifest at the moment it is ready.
+            if [ -d release_manifest.json ]; then sudo rm -rf release_manifest.json; fi
             git fetch origin --prune
             git checkout main
             git reset --hard origin/main

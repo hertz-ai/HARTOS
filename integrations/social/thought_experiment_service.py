@@ -9,6 +9,7 @@ WorldModelBridge for RL-EF learning.
 
 Service Pattern: static methods, db: Session, db.flush() not db.commit().
 """
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -359,6 +360,25 @@ class ThoughtExperimentService:
         experiment.status = 'evaluating'
         db.flush()
 
+        # ONE live evaluation goal per experiment.  A paused goal is not
+        # terminal, so an auto-evolve cycle holding one ages out after 6 h
+        # and the next cycle asks again; this used to create another goal
+        # every time (MEASURED live 2026-09-24: each LiveProbe dispatched at
+        # 20:09Z and 02:24Z, six paused goals for three experiments).  The
+        # live goal is returned instead, so the caller tracks the goal that
+        # already exists.  "Ended" is the same set auto_evolve.reconcile
+        # treats as terminal, so a retry after a failure still creates one.
+        existing = ThoughtExperimentService._live_evaluation_goal(
+            db, experiment_id)
+        if existing is not None:
+            return {
+                'success': True,
+                'goal_id': existing.id,
+                'reused': True,
+                'experiment_type': getattr(
+                    experiment, 'experiment_type', 'traditional') or 'traditional',
+            }
+
         exp_type = getattr(experiment, 'experiment_type', 'traditional') or 'traditional'
         recipe = ThoughtExperimentService._build_iteration_recipe(
             experiment, exp_type, config={})
@@ -409,6 +429,32 @@ class ThoughtExperimentService:
         except Exception as e:
             logger.debug(f"Agent evaluation goal creation failed: {e}")
             return {'success': False, 'reason': str(e)}
+
+    #: Goal statuses after which an evaluation is over -- the same set
+    #: auto_evolve.reconcile treats as terminal.  Anything else ('active',
+    #: 'paused', ...) is still live.
+    _EVALUATION_GOAL_ENDED = frozenset({'completed', 'failed', 'archived'})
+
+    @staticmethod
+    def _live_evaluation_goal(db: Session, experiment_id: str):
+        """The not-yet-ended evaluation goal for this experiment, or None."""
+        from .models import AgentGoal
+        goals = db.query(AgentGoal).filter(
+            AgentGoal.goal_type.in_(
+                ('thought_experiment', 'autoresearch', 'code_evolution')),
+            ~AgentGoal.status.in_(
+                tuple(ThoughtExperimentService._EVALUATION_GOAL_ENDED)),
+        ).all()
+        for g in goals:
+            cfg = g.config_json or {}
+            if isinstance(cfg, str):
+                try:
+                    cfg = json.loads(cfg or '{}')
+                except ValueError:
+                    continue
+            if isinstance(cfg, dict) and cfg.get('experiment_id') == experiment_id:
+                return g
+        return None
 
     @staticmethod
     def _build_iteration_recipe(experiment, exp_type: str, config: dict = None) -> Dict:
@@ -596,6 +642,20 @@ class ThoughtExperimentService:
         votes = db.query(ExperimentVote).filter_by(
             experiment_id=experiment_id).all()
 
+        # Who each vote REALLY belongs to: a registered user, and an agent
+        # is its owner.  An unregistered voter_id is a string anyone can
+        # pass, so it keeps its weight but is no identity.
+        from .models import User
+        from .voting_rules import quorum_met
+        voter_ids = {v.voter_id for v in votes}
+        identity_of = {
+            u.id: (u.owner_id or u.id)
+            for u in (db.query(User).filter(User.id.in_(voter_ids)).all()
+                      if voter_ids else [])
+        }
+        voters = set()
+        supporters = set()
+
         total_for = 0.0
         total_against = 0.0
         weighted_sum = 0.0
@@ -622,6 +682,12 @@ class ThoughtExperimentService:
             elif v.vote_value < 0:
                 total_against += weight
 
+            identity = identity_of.get(v.voter_id)
+            if identity is not None and weight > 0 and v.vote_value != 0:
+                voters.add(identity)
+                if v.vote_value > 0:
+                    supporters.add(identity)
+
             if v.suggestion:
                 suggestions.append({
                     'voter_id': v.voter_id,
@@ -631,6 +697,7 @@ class ThoughtExperimentService:
 
         weighted_score = weighted_sum / total_weight if total_weight > 0 else 0.0
         threshold = context_rules['approval_threshold'] if context_rules else 0.5
+        quorate = quorum_met(len(voters), len(supporters))
 
         return {
             'experiment_id': experiment_id,
@@ -644,8 +711,12 @@ class ThoughtExperimentService:
             'suggestions': suggestions,
             'decision_context': decision_context,
             'approval_threshold': threshold,
+            'distinct_voters': len(voters),
+            'distinct_supporters': len(supporters),
+            'quorum_met': quorate,
             'decision_recommendation': (
-                'approve' if weighted_score > threshold
+                'no_quorum' if not quorate
+                else 'approve' if weighted_score > threshold
                 else 'reject' if weighted_score < -threshold
                 else 'inconclusive'
             ),
@@ -730,9 +801,17 @@ class ThoughtExperimentService:
 
     @staticmethod
     def get_active_experiments(db: Session, status: str = None,
-                                limit: int = 50) -> List[Dict]:
-        """List experiments filtered by status."""
-        from .models import ThoughtExperiment
+                                limit: int = 50,
+                                with_votes_only: bool = False) -> List[Dict]:
+        """List experiments filtered by status, newest first.
+
+        with_votes_only: only experiments with at least one vote.  This is
+        the question auto-evolve's VOTE gate asks -- a zero-vote experiment
+        can never pass it -- and without it the newest-`limit` window hid
+        every voted row once unvoted rows piled up (measured on a live
+        node: the three human-voted experiments sat at rank ~693 of 807).
+        """
+        from .models import ThoughtExperiment, ExperimentVote
 
         query = db.query(ThoughtExperiment)
         if status:
@@ -740,6 +819,11 @@ class ThoughtExperimentService:
         else:
             query = query.filter(
                 ThoughtExperiment.status != 'archived')
+        if with_votes_only:
+            query = query.filter(
+                db.query(ExperimentVote.id).filter(
+                    ExperimentVote.experiment_id == ThoughtExperiment.id,
+                ).exists())
 
         experiments = query.order_by(
             desc(ThoughtExperiment.created_at)

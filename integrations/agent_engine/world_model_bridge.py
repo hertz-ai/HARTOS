@@ -37,6 +37,35 @@ from core.http_pool import pooled_get, pooled_post
 logger = logging.getLogger('hevolve_social')
 
 
+def _utterance_source(user_type) -> str:
+    """WHO spoke a chat utterance, as its stream_source tag.
+
+    'chat' is a person (human/guest) on a user request; 'agent_chat' is an
+    agent/system account or a daemon dispatch under any id; 'unknown' is a
+    speaker with no users row, or a turn with no request id to tell who
+    asked.  A tag only: the owner ruled (2026-09-24) that every turn is kept
+    and its reality VALUE comes from hevolveai's reality discriminator, which
+    reads this tag as an input.  Measured cause: all 47 live 'reality' events
+    on 09-24 were prompts the agent daemon wrote as agent user
+    analysis.local.sage, and every one was tagged 'chat'.
+
+    The request id is read through the one resolver (thread-local, then the
+    contextvar that survives the autogen worker boundary), and classified by
+    the one discriminator, dispatch.is_genuine_user_request.
+    """
+    from core.constants import NON_PERSON_USER_TYPES
+    from core.llm_outbound_logger import _get_request_id
+    from integrations.agent_engine.dispatch import is_genuine_user_request
+    request_id = _get_request_id()
+    if user_type in NON_PERSON_USER_TYPES:
+        return 'agent_chat'
+    if request_id and not is_genuine_user_request(request_id):
+        return 'agent_chat'
+    if user_type is None or not request_id:
+        return 'unknown'
+    return 'chat'
+
+
 class WorldModelBridge:
     """Bridge between LLM-langchain orchestration and HevolveAI embodied AI.
 
@@ -668,11 +697,13 @@ class WorldModelBridge:
             return
         try:
             from integrations.social.consent_service import ConsentService
-            from integrations.social.models import db_session
+            from integrations.social.models import User, db_session
             with db_session(commit=False) as db:
                 if not ConsentService.check_consent(db, user_id, 'data_access',
                                                     scope='*'):
                     return
+                speaker = db.query(User).filter_by(id=str(user_id)).first()
+                user_type = getattr(speaker, 'user_type', None)
         except Exception as e:
             logger.debug("[WorldModelBridge] chat-learning consent check failed "
                          "(user=%s): %s", user_id, e)
@@ -680,7 +711,8 @@ class WorldModelBridge:
         reading = {
             'sensor_id': f'chat_{user_id}',
             'sensor_type': 'text',
-            'data': {'text': text, 'stream_source': 'chat'},
+            'data': {'text': text,
+                     'stream_source': _utterance_source(user_type)},
         }
         try:
             self._flush_executor.submit(self.ingest_sensor_batch, [reading])

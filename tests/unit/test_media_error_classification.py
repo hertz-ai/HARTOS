@@ -315,3 +315,208 @@ def test_a_result_url_means_done_whatever_the_status_says():
     inner = _unwrap_envelope(live)
     assert inner.get('status') == 1, 'the numeric status is what arrives'
     assert inner.get('audio_url'), 'and the artifact is there alongside it'
+
+
+# ── the finished item, as AceStep actually shapes it (MEASURED 2026-09-22) ──
+
+def _poll_acestep(item):
+    """Run check_media_status against one live-shaped /query_result item."""
+    import json as _j
+    from unittest.mock import MagicMock, patch
+    import integrations.service_tools.media_agent as ma
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {'data': [item], 'code': 200, 'error': None}
+    with patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'),             patch('core.http_pool.pooled_post', return_value=resp):
+        return _j.loads(ma.check_media_status('acestep_abc'))
+
+
+def test_a_finished_task_yields_its_file_from_the_nested_result(tmp_path, monkeypatch):
+    """Two WAVs were saved at 10:34:30 and forty polls said composing.
+
+    The path is not a flat url key. It is inside a JSON STRING under
+    'result', at [0]['file'], beside a numeric status (1 = succeeded) --
+    and that `file` is AceStep's OWN url, `/v1/audio?path=<temp file>`
+    (MEASURED 2026-09-22), which only its sidecar can serve.
+    """
+    import json as _j
+    import urllib.parse
+    import integrations.service_tools.media_agent as ma
+    temp = tmp_path / 'acestep_tmp' / '6ac56af6.wav'
+    temp.parent.mkdir()
+    temp.write_bytes(b'RIFF\x00\x00\x00\x00WAVE')
+    kept_dir = tmp_path / 'acestep' / 'output'
+    monkeypatch.setattr(ma, 'composer_output_dir', lambda: kept_dir)
+    file_value = '/v1/audio?path=' + urllib.parse.quote(str(temp))
+    item = {'task_id': 'abc', 'status': 1, 'progress_text': 'done',
+            'result': _j.dumps([{'file': file_value, 'wave': '',
+                                 'status': 1, 'metas': {'duration': 5}}])}
+    out = _poll_acestep(item)
+    assert out['status'] == 'completed', out
+    assert out['results'][0]['url'] == '/api/voice/audio/6ac56af6.wav', out
+    kept = kept_dir / '6ac56af6.wav'
+    assert out['results'][0]['path'] == str(kept)
+    assert kept.read_bytes()[:4] == b'RIFF', 'the composition was not kept'
+
+
+def test_a_composition_whose_file_is_gone_is_not_reported_done(tmp_path, monkeypatch):
+    """hartos-3a F1: a url nothing can fetch must not reach the memo."""
+    import json as _j
+    import integrations.service_tools.media_agent as ma
+    monkeypatch.setattr(ma, 'composer_output_dir', lambda: tmp_path / 'out')
+    item = {'task_id': 'abc', 'status': 1, 'progress_text': 'done',
+            'result': _j.dumps([{'file': '/v1/audio?path=C%3A%5Cgone%5Cx.wav',
+                                 'status': 1}])}
+    out = _poll_acestep(item)
+    assert out['status'] == 'error', out
+    assert 'results' not in out or not out['results'], out
+
+
+def test_the_music_path_starts_its_composer_exactly_once():
+    """2475ff19e applied its auto-start block twice; one copy hid the other."""
+    from unittest.mock import MagicMock, patch
+    import integrations.service_tools.media_agent as ma
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {'data': {'task_id': 't1', 'status': 'queued'}, 'code': 200}
+    with patch.object(ma, '_start_tool', return_value={'running': True}) as start, \
+            patch.object(ma, '_node_has_any', return_value=True), patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'), \
+            patch('core.http_pool.pooled_post', return_value=resp):
+        ma._generate_audio_music('a chime', '', 2, '')
+    assert start.call_count == 1, start.call_count
+
+
+def test_a_failed_task_surfaces_the_nested_error():
+    import json as _j
+    item = {'task_id': 'abc', 'status': 2, 'progress_text': '',
+            'result': _j.dumps([{'file': '', 'status': 2,
+                                 'error': 'CUDA out of memory', 'stage': 'diffusion'}])}
+    out = _poll_acestep(item)
+    assert out['status'] == 'error'
+    assert 'CUDA out of memory' in out['error']
+
+
+def test_the_submit_names_the_duration_field_acestep_reads():
+    """'duration' was silently ignored; every cue came back at 60s."""
+    from unittest.mock import MagicMock, patch
+    import integrations.service_tools.media_agent as ma
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {'data': {'task_id': 't1', 'status': 'queued'}, 'code': 200}
+    with patch.object(ma, '_start_tool', return_value={'running': True}), patch.object(ma, '_node_has_any', return_value=True), patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'),             patch('core.http_pool.pooled_post', return_value=resp) as post:
+        ma._generate_audio_music('a chime', '', 5, '')
+    payload = post.call_args.kwargs['json']
+    assert payload['audio_duration'] == 5
+    assert 'duration' not in payload
+
+
+def test_the_music_path_starts_its_composer_before_dialing_it():
+    """TTS and video start their sidecar first; music dialed straight away.
+
+    So an installed composer that was not up answered "not running" to
+    every game, for ever -- run 8, 2026-09-22.  The proof runs had been
+    starting it by hand, which is why seven of them never noticed.
+    """
+    from unittest.mock import MagicMock, patch
+    import integrations.service_tools.media_agent as ma
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {'data': {'task_id': 't1', 'status': 'queued'}, 'code': 200}
+    with patch.object(ma, '_start_tool', return_value={'running': True}) as start, \
+            patch.object(ma, '_node_has_any', return_value=True), patch.object(ma, '_get_tool_base_url', return_value='http://127.0.0.1:1'), \
+            patch('core.http_pool.pooled_post', return_value=resp):
+        ma._generate_audio_music('a chime', '', 2, '')
+    assert start.call_args.args == ('acestep',)
+
+
+def test_a_composer_the_runtime_will_not_start_is_unreachable_not_absent():
+    """MEASURED 2026-09-22: "Refusing to start acestep: won't fit (free=4.9GB)"
+    with a llama-server on the card.  Installed, so never an install offer;
+    and the runtime's reason travels with the answer instead of dying in a
+    bare False."""
+    from unittest.mock import patch
+    import integrations.service_tools.media_agent as ma
+    refused = {'error': 'Insufficient VRAM for acestep (free=4.9GB); try cpu_only',
+               'oom': True}
+    with patch.object(ma, '_start_tool', return_value=refused), \
+            patch.object(ma, '_node_has_any', return_value=True), \
+            patch.object(ma, '_get_tool_base_url') as dial:
+        out = ma._generate_audio_music('a chime', '', 2, '')
+    assert not dial.called, 'dialed a composer the runtime had just refused to start'
+    assert classify_error(out) == UNREACHABLE, out
+    assert 'free=4.9GB' in out['error'], out
+
+
+def test_a_composer_that_is_not_on_this_node_is_absent():
+    from unittest.mock import patch
+    import integrations.service_tools.media_agent as ma
+    with patch.object(ma, '_start_tool',
+                      return_value={'running': False, 'error': 'no such tool'}), \
+            patch.object(ma, '_node_has_any', return_value=False):
+        out = ma._generate_audio_music('a chime', '', 2, '')
+    assert classify_error(out) == ABSENT, out
+
+
+def test_start_tool_keeps_the_runtime_reason():
+    """_ensure_tool_running folded 'Insufficient VRAM' into a bare False."""
+    from unittest.mock import MagicMock, patch
+    import integrations.service_tools.media_agent as ma
+    rt = MagicMock()
+    rt.get_tool_status.return_value = {'running': False}
+    rt.setup_tool.return_value = {
+        'error': 'Insufficient VRAM for acestep (free=4.9GB); try cpu_only', 'oom': True}
+    fake = MagicMock(runtime_tool_manager=rt)
+    with patch.dict(sys.modules, {'integrations.service_tools.runtime_manager': fake}):
+        out = ma._start_tool('acestep')
+        assert ma._ensure_tool_running('acestep') is False
+    assert 'free=4.9GB' in out['error'], out
+
+
+def test_only_audio_is_kept_where_the_audio_route_serves(tmp_path, monkeypatch):
+    import integrations.service_tools.media_agent as ma
+    monkeypatch.setattr(ma, 'composer_output_dir', lambda: tmp_path / 'out')
+    secret = tmp_path / 'notes.txt'
+    secret.write_text('not audio')
+    assert ma._keep_composition(str(secret)) is None
+    assert not (tmp_path / 'out' / 'notes.txt').exists()
+
+
+def test_a_reused_temp_name_never_replaces_a_kept_take(tmp_path, monkeypatch):
+    """A memo names its file for good; new bytes under an old name get a new name."""
+    import integrations.service_tools.media_agent as ma
+    out = tmp_path / 'out'
+    monkeypatch.setattr(ma, 'composer_output_dir', lambda: out)
+    src = tmp_path / 'tmp' / 'take.wav'
+    src.parent.mkdir()
+    src.write_bytes(b'RIFF-first')
+    first = ma._keep_composition(str(src))
+    src.write_bytes(b'RIFF-second-take')
+    second = ma._keep_composition(str(src))
+    assert first[0] == '/api/voice/audio/take.wav'
+    assert second[0] == '/api/voice/audio/take-1.wav', second
+    assert (out / 'take.wav').read_bytes() == b'RIFF-first'
+    # the same bytes again reuse the name they already have
+    assert ma._keep_composition(str(src))[0] == '/api/voice/audio/take-1.wav'
+
+
+def test_listed_is_not_installed():
+    """hartos-3a F4: the catalog lists every engine; only a downloaded one is here."""
+    from unittest.mock import MagicMock, patch
+    import integrations.service_tools.media_agent as ma
+    listed = MagicMock(downloaded=False)
+    here = MagicMock(downloaded=True)
+    cat = MagicMock()
+    cat.list_by_type.return_value = [listed]
+    with patch('integrations.service_tools.model_catalog.get_catalog', return_value=cat):
+        assert ma._node_has_any('audio_gen') is False
+        cat.list_by_type.return_value = [listed, here]
+        assert ma._node_has_any('audio_gen') is True
+
+
+def test_nothing_downloaded_asks_instead_of_downloading():
+    """Owner 2026-09-23: ask once, then set up. The music path must not
+    start (and so download) a composer that is not on the disk; its answer
+    is ABSENT, which is what brings up the consent card."""
+    from unittest.mock import patch
+    import integrations.service_tools.media_agent as ma
+    with patch.object(ma, '_node_has_any', return_value=False),             patch.object(ma, '_start_tool') as start:
+        out = ma._generate_audio_music('a chime', '', 2, '')
+    assert not start.called, 'a download was started without consent'
+    assert classify_error(out) == ABSENT, out
+

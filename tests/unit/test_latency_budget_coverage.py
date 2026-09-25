@@ -255,6 +255,36 @@ def test_the_instrument_can_measure_every_kind_it_claims_to(budgets):
             "drop the exemption" % kind)
 
 
+def _rust_const_us(src, name):
+    m = re.search(r"pub const %s: u64 = ([\d_]+);" % name, src)
+    assert m, "latency.rs no longer declares %s" % name
+    return int(m.group(1).replace("_", ""))
+
+
+def test_the_frame_time_instrument_carries_the_nfr_the_file_declares(budgets):
+    """The frame-time NFR (16.6 ms budget, p99 under 12 ms) had no instrument at all
+    until the hart-frame journal line; it now has one, and its two thresholds are
+    consts in latency.rs because the budget file lives outside the crate. The
+    mirror must read what this file says, or a PASS is a verdict against a number
+    nobody agreed to. Both are read from their owning file, never restated here."""
+    frame = budgets.get("_frame")
+    assert frame, "latency_budgets.json no longer declares the _frame NFR"
+    src = open(LATENCY_SRC, encoding="utf-8").read()
+    assert _rust_const_us(src, "FRAME_BUDGET_US") == round(frame["budget_ms"] * 1000), (
+        "latency.rs budgets a frame at %sus, the file says %sms"
+        % (_rust_const_us(src, "FRAME_BUDGET_US"), frame["budget_ms"]))
+    assert _rust_const_us(src, "FRAME_P99_TARGET_US") == round(frame["p99_ms"] * 1000), (
+        "latency.rs targets p99 at %sus, the file says %sms"
+        % (_rust_const_us(src, "FRAME_P99_TARGET_US"), frame["p99_ms"]))
+    # The NFR's own shape: the p99 target sits inside the budget, and the budget is
+    # one 60 Hz refresh. A "tightening" that inverted them would pass every frame.
+    assert frame["p99_ms"] < frame["budget_ms"] <= 16.7
+    # And the journal line prints exactly those two numbers, so a reader of the
+    # journal sees the same bound the file declares.
+    line = re.search(r'"hart-frame [^"]*budget=\{[^}]*\}ms target=\{[^}]*\}ms', src)
+    assert line, "the hart-frame journal line no longer prints its budget and target"
+
+
 def test_the_measured_kinds_carry_the_budget_the_file_declares(budgets):
     """latency.rs mirrors the _defaults as consts because the budget file lives
     outside the crate and crane's source filter would drop it. A mirror that

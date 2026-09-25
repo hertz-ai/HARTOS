@@ -238,22 +238,38 @@ docker build --no-cache \
   -t langchain_gpt:"$DEPLOY_COMMIT_SHORT" \
   .
 
-echo "=== Generate signed release manifest ==="
-sudo docker run --name langchain_tmp -d \
-  --env-file .env \
-  -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${DEPLOY_MASTER_KEY_PATH})" \
-  langchain_gpt:"$DEPLOY_COMMIT_SHORT" sleep 3600
+# Sign a manifest for IMAGE claiming VERSION and GIT_SHA, computed INSIDE that
+# image so the hash covers exactly the bytes that image will run, and put it at
+# ./release_manifest.json.  Used for the new image, and used AGAIN for the
+# rollback image: under HEVOLVE_ENFORCEMENT_MODE=hard a container cannot boot
+# without a manifest that matches ITS code, and the rollback used to start the
+# old image with none (the workflow had removed the file), which is a crash
+# loop, i.e. an outage.  Measured 2026-09-22 15:56Z on central: the 5fe8f8901
+# image failed its boot check, "rolled back to langchain_gpt:7eb0810f", and
+# that container died every 12 seconds on "release_manifest.json missing".
+# The hash is a forced walk: the mtime cache in agent_data is not mounted here,
+# and the boot check now walks too (hart_intelligence_entry.hevolve_verify_boot),
+# so both sides hash the same bytes the same way.
+write_signed_manifest() {
+  local image="$1" version="$2" git_sha="$3"
+  docker rm -f langchain_tmp 2>/dev/null || true
+  # Each step returns on failure: called from an `if`, set -e is suspended
+  # inside this function, and the rollback must KNOW it has no manifest.
+  sudo docker run --name langchain_tmp -d \
+    --env-file .env \
+    -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${DEPLOY_MASTER_KEY_PATH})" \
+    "$image" sleep 3600 || return 1
 
-docker exec langchain_tmp sh -lc '
+  docker exec langchain_tmp sh -lc '
 cd /app
 export MASTER_PRIVATE_KEY_HEX="$HEVOLVE_MASTER_PRIVATE_KEY"
 python scripts/sign_release.py \
-  --version "'"$DEPLOY_COMMIT_SHORT"'" \
-  --git-sha "'"$DEPLOY_COMMIT"'" \
+  --version "'"$version"'" \
+  --git-sha "'"$git_sha"'" \
   --code-hash "$(python - <<PY
 import sys; sys.path.insert(0,".")
 from security.node_integrity import compute_code_hash
-print(compute_code_hash())
+print(compute_code_hash(force_walk=True))
 PY
 )" \
   --manifest-hash "$(python - <<PY
@@ -264,10 +280,15 @@ print(hashlib.sha256(json.dumps(m, sort_keys=True).encode()).hexdigest())
 PY
 )" \
   --output /tmp/release_manifest.json
-'
+' || { docker rm -f langchain_tmp; return 1; }
 
-sudo docker cp langchain_tmp:/tmp/release_manifest.json ./release_manifest.json
-docker rm -f langchain_tmp
+  sudo docker cp langchain_tmp:/tmp/release_manifest.json ./release_manifest.json \
+    || { docker rm -f langchain_tmp; return 1; }
+  docker rm -f langchain_tmp
+}
+
+echo "=== Generate signed release manifest ==="
+write_signed_manifest langchain_gpt:"$DEPLOY_COMMIT_SHORT" "$DEPLOY_COMMIT_SHORT" "$DEPLOY_COMMIT"
 
 echo "=== Validate release manifest on Deepbox ==="
 # A DIRECTORY here is the specific failure that froze this deploy for hours on
@@ -337,9 +358,26 @@ echo "=== Run central container ==="
 # is the last moment :6777 goes away, and the new container is
 # started immediately after, so the outage window is a container
 # restart rather than a full image build.
-ROLLBACK_IMAGE="$(docker inspect langchain --format '{{.Config.Image}}' 2>/dev/null || true)"
+# The running container's image BY ID, not by the tag it was started from.
+# The pre-build prune above deletes every langchain_gpt tag but :latest, so
+# .Config.Image (e.g. langchain_gpt:7eb0810f) stops resolving the moment the
+# NEXT deploy begins, which is exactly when a rollback would need it: on
+# 2026-09-22 the box held only langchain_gpt:latest while the container still
+# named its dead tag.  The ID survives as long as the container does, and it
+# is read here while the container still exists.
+ROLLBACK_IMAGE="$(docker inspect langchain --format '{{.Image}}' 2>/dev/null || true)"
 [ -z "$ROLLBACK_IMAGE" ] && ROLLBACK_IMAGE="langchain_gpt:latest"
-echo "rollback target: $ROLLBACK_IMAGE"
+# The commit and tag that image was built from, read from the container's
+# environment while it still exists (docker run sets both below).  A rollback
+# re-signs a manifest for that image and needs the sha and version it should
+# claim.  A container started by an older deploy carries neither: fall back
+# to the tag it was started from, and to :latest.
+_old_env="$(docker inspect langchain --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)"
+ROLLBACK_SHA="$(printf '%s\n' "$_old_env" | sed -n 's/^HARTOS_GIT_SHA=//p' | head -1)"
+ROLLBACK_VERSION="$(printf '%s\n' "$_old_env" | sed -n 's/^HARTOS_IMAGE_TAG=//p' | head -1)"
+[ -z "$ROLLBACK_VERSION" ] && ROLLBACK_VERSION="$(docker inspect langchain --format '{{.Config.Image}}' 2>/dev/null | sed 's/^langchain_gpt://' || true)"
+[ -z "$ROLLBACK_VERSION" ] && ROLLBACK_VERSION="latest"
+echo "rollback target: $ROLLBACK_IMAGE (tag $ROLLBACK_VERSION, sha ${ROLLBACK_SHA:-unknown})"
 docker rm -f langchain 2>/dev/null || true
 
 # Routable self-URL; a bridge NIC leaks otherwise (172.17.0.4, 2026-08-24).
@@ -506,14 +544,26 @@ if [ -z "$STATUS_JSON" ]; then
   # Kong routes /api/social/* here, so an empty box is a site-wide
   # signup outage; a slightly stale HARTOS is strictly better.
   docker rm -f langchain 2>/dev/null || true
+  # The manifest on disk describes the image that just FAILED; the rollback
+  # image needs one that matches its own code or, under enforcement=hard, it
+  # cannot boot either (the 2026-09-22 outage).  Sign one inside that image.
+  ROLLBACK_MANIFEST_MOUNT=""
+  if write_signed_manifest "$ROLLBACK_IMAGE" "$ROLLBACK_VERSION" "${ROLLBACK_SHA:-$ROLLBACK_VERSION}"; then
+    ROLLBACK_MANIFEST_MOUNT="-v $(pwd)/release_manifest.json:/app/release_manifest.json:ro"
+  else
+    echo "::warning::could not sign a manifest for $ROLLBACK_IMAGE; it boots only if enforcement is not hard"
+  fi
   if sudo docker run -d --name langchain --restart unless-stopped \
        -p 6777:6777 \
        --env-file .env \
        --env-file oauth.env \
        $ADV_ARGS \
        -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${DEPLOY_MASTER_KEY_PATH})" \
+       -e HARTOS_GIT_SHA="${ROLLBACK_SHA:-$ROLLBACK_VERSION}" \
+       -e HARTOS_IMAGE_TAG="$ROLLBACK_VERSION" \
        -e WHATSAPP_API_URL="http://172.17.0.1:3000" \
        -v "$(pwd)/config.json:/app/config.json:ro" \
+       $ROLLBACK_MANIFEST_MOUNT \
        -v ${DEPLOY_LOGS_PATH}:/app/logs \
        -v ${DEPLOY_IMAGES_PATH}:/app/output_images \
        -v "$AD":/app/agent_data \

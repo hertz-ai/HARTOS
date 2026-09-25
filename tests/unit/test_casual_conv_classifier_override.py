@@ -28,7 +28,7 @@ def test_no_classifier_override_of_casual_conv():
     """The /chat handler must not overwrite the route's casual_conv with
     the classifier verdict — session shape is decided by prompt_id."""
     m = re.search(
-        r'is_casual=False, is_create_agent=False — routing to "\n(.*?)\n\s+else:',
+        r'is_create_agent=False — routing to "\n(.*?)\n\s+else:',
         _SRC, re.DOTALL)
     assert m, 'non-casual fall-through branch not found'
     region = m.group(1)

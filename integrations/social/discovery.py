@@ -23,7 +23,7 @@ discovery_bp = Blueprint('social_discovery', __name__)
 
 # ─── Gossip Rate Limiter ───
 _ANNOUNCE_RATE = {}   # ip -> list of timestamps
-_RATE_LIMIT = 10      # max announcements per window per IP
+_RATE_LIMIT = 10      # max announcements per window per CLIENT IP (_observed_ip)
 _RATE_WINDOW = 60     # window in seconds
 
 
@@ -197,7 +197,7 @@ def _observed_ip() -> str:
 @discovery_bp.route('/api/social/peers/announce', methods=['POST'])
 def peer_announce():
     """Receive a peer announcement. Merge into local peer list."""
-    if not _check_announce_rate(request.remote_addr):
+    if not _check_announce_rate(_observed_ip()):
         return jsonify({'success': False, 'error': 'Rate limited'}), 429
     from .peer_discovery import gossip
     data = request.get_json(force=True, silent=True) or {}
@@ -231,6 +231,18 @@ def peer_announce():
     }
     if reasons:
         body['reason'] = reasons[0]
+    # Signed, and bound to the announce it answers (node_id + the nonce the
+    # announcer sent), so a node that holds this node's key can trust a reply
+    # that did not come over verified HTTPS, and a recorded reply cannot be
+    # replayed to another node or a later announce (#140 B3).
+    body['reply_to'] = {'node_id': str(data.get('node_id') or ''),
+                        'nonce': str(data.get('nonce') or '')}
+    try:
+        from security.node_integrity import get_public_key_hex, sign_json_payload
+        body['public_key'] = get_public_key_hex()
+        body['signature'] = sign_json_payload(body)
+    except Exception as e:
+        logger.debug("announce reply left unsigned: %s", e)
     return jsonify(body)
 
 
@@ -257,7 +269,7 @@ def peer_list():
 @discovery_bp.route('/api/social/peers/exchange', methods=['POST'])
 def peer_exchange():
     """Gossip exchange: receive their peers, return ours."""
-    if not _check_announce_rate(request.remote_addr):
+    if not _check_announce_rate(_observed_ip()):
         return jsonify({'success': False, 'error': 'Rate limited'}), 429
     from .peer_discovery import gossip
     data = request.get_json(force=True, silent=True) or {}
@@ -448,11 +460,17 @@ def peer_broadcast():
                                   (pulls full packet from the sender's
                                   /v1/ralt/skills/export/<task_id> and
                                   installs it locally via import_skill)
+      * 'recipe_available'      → peer_reuse.on_recipe_available_advert
+                                  (caches the pointer so the daemon can
+                                  pull directly)
+      * 'model_available'       → model_mesh.on_model_available_advert
+                                  (caches the OFFER; registers nothing
+                                  and fetches no weights)
 
     Unknown types are acknowledged but not dispatched, so new gossip
     payload types can be added without wire-breaking older peers.
     """
-    ip = request.remote_addr or '0.0.0.0'
+    ip = _observed_ip() or '0.0.0.0'  # the client, not the Kong gateway
     if not _check_announce_rate(ip):
         return jsonify({'success': False, 'reason': 'rate_limited'}), 429
 
@@ -487,6 +505,25 @@ def peer_broadcast():
             logger.debug(f"peer_broadcast recipe advert dispatch failed: {e}")
             return jsonify({'success': False, 'reason': str(e)}), 500
 
+    elif msg_type == 'model_available':
+        # MODEL capability mesh: an admitted peer installed a model and
+        # advertised it (model_mesh.announce_model_available). Cache the
+        # OFFER so the Model Management page can show what the hive has
+        # that this node does not. Nothing is registered and no weights
+        # are fetched — select_best() does not filter on `downloaded`,
+        # so a catalog row would be a live selection candidate scored
+        # with numbers a peer chose. Trust + echo-skip live in
+        # on_model_available_advert.
+        try:
+            from integrations.service_tools.model_mesh import (
+                on_model_available_advert)
+            result = on_model_available_advert(msg)
+            status = 200 if result.get('success') else 202
+            return jsonify(result), status
+        except Exception as e:
+            logger.debug(f"peer_broadcast model advert dispatch failed: {e}")
+            return jsonify({'success': False, 'reason': str(e)}), 500
+
     # Forward-compatible: ack unknown types without error so older
     # peers don't see 5xx from newer payloads, but mark dispatched=False
     # so the sender knows nothing happened.
@@ -504,7 +541,7 @@ def peer_embedding_delta():
     Phase 1 gradient sync: peers submit embedding deltas via gossip.
     Deltas are validated and fed to FederatedAggregator's embedding channel.
     """
-    ip = request.remote_addr or '0.0.0.0'
+    ip = _observed_ip() or '0.0.0.0'  # the client, not the Kong gateway
     if not _check_announce_rate(ip):
         return jsonify({'success': False, 'reason': 'rate_limited'}), 429
 

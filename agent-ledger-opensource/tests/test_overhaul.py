@@ -309,10 +309,19 @@ class TestGraphStateMachine:
                 f"Graph allows IN_PROGRESS->{target} but Task rejects it"
 
     def test_terminal_states_have_no_transitions(self):
-        for status in [TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.TERMINATED,
+        for status in [TaskStatus.CANCELLED, TaskStatus.TERMINATED,
                        TaskStatus.SKIPPED, TaskStatus.NOT_APPLICABLE, TaskStatus.ROLLED_BACK]:
             assert TaskStateMachine.TRANSITIONS[status] == [], \
                 f"Terminal state {status} should have no transitions"
+
+    def test_failed_only_recovers_forward(self):
+        """FAILED is terminal EXCEPT for forward recovery to a success
+        terminal, which the Task has always allowed (a stale FAILED from the
+        zombie reaper must follow genuine success). The graph's old copied
+        table said [] here and disagreed with the ledger it describes; it is
+        now derived from the one table. FAILED never re-enters active work."""
+        assert TaskStateMachine.TRANSITIONS[TaskStatus.FAILED] == [
+            TaskStatus.COMPLETED, TaskStatus.TERMINATED]
 
     def test_completed_only_to_rolled_back(self):
         allowed = TaskStateMachine.TRANSITIONS[TaskStatus.COMPLETED]

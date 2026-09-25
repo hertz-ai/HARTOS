@@ -55,10 +55,14 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
-use smithay::backend::allocator::dmabuf::Dmabuf;
+// `AsDmabuf` exports the DrmCompositor's just-rendered swapchain slot (a GBM buffer) as
+// the dmabuf the renderer binds for the screencopy read-back in `present_surfaces`.
+use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::drm::compositor::{DrmCompositor, FrameError, FrameFlags, RenderFrameError};
+use smithay::backend::drm::compositor::{
+    DrmCompositor, FrameError, FrameFlags, PrimaryPlaneElement, RenderFrameError,
+};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, DrmSurface};
 // PART 3 of the GPU lever — the GLES2 GPU renderer + the EGL platform display it is
@@ -71,7 +75,7 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::renderer::element::RenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::pixman::PixmanRenderer;
-use smithay::backend::renderer::{Bind, Color32F, ImportDma, Renderer, Texture};
+use smithay::backend::renderer::{Bind, Color32F, ExportMem, ImportDma, Renderer, Texture};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{primary_gpu, UdevBackend, UdevEvent};
@@ -92,6 +96,7 @@ use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice}
 use smithay::reexports::drm::Device as BasicDevice;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
+use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Size, Transform};
 // `Window::wl_surface()` is provided by the `WaylandFocus` trait on this rev (not an
@@ -131,6 +136,10 @@ static FIRST_SCANOUT: AtomicBool = AtomicBool::new(false);
 /// marker the WebView host owns today. Same split as above: the pure decision, the path
 /// and the write live in main.rs; this owns only the latch.
 static NATIVE_SHELL_READY: AtomicBool = AtomicBool::new(false);
+
+/// One-shot latch for the render-sync journal line (see the `needs_sync` handling in
+/// `present_surfaces`): whether this box's flips carry a fence or the loop has to wait.
+static SYNC_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Color formats DrmCompositor will try for the primary plane framebuffer. The pixman
 /// software floor + virtually all KMS drivers support Argb8888/Xrgb8888 — the never-
@@ -446,6 +455,17 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     let _output_global = output.create_global::<State>(&dh);
+    // zwlr_screencopy_v1 on the DRM backend (VERIFICATION row 23): the SAME global the
+    // winit backend registers, at the same version, served by the same protocol bodies
+    // (screencopy.rs is generic over the State). `grim` on the box binds this; the copy is
+    // gated by `capture_blocked` in `queue_copy` and serviced in `present_surfaces` from
+    // the scanout slot the DrmCompositor rendered. The per-client bind filter defaults to
+    // "allow all": the socket-owner boundary (IPC_PROTOCOL 6.5) already constrains who
+    // connects, and the killswitch gates the actual copy.
+    let _screencopy_global = dh.create_global::<State, ZwlrScreencopyManagerV1, _>(
+        crate::screencopy::SCREENCOPY_VERSION,
+        (),
+    );
     let boot_mode = WlMode { size: (1920, 1080).into(), refresh: 60_000 };
     output.change_current_state(Some(boot_mode), Some(Transform::Normal), None, Some((0, 0).into()));
     output.set_preferred(boot_mode);
@@ -508,6 +528,8 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         cursor_hotspot: cur_hotspot,
         ws_switch_at: None,
         capture_blocked: false,
+        // Screencopy queue empty; capture allowed (the same two the winit State starts with).
+        pending_screencopy: Vec::new(),
         // NATIVE SHELL M3: opt in per session via the env, default OFF (no regression).
         // The VALUE is parsed, not merely the variable's presence: `HART_NATIVE_SHELL=0`
         // used to turn the native shell ON, which is the wrong answer to the most likely
@@ -989,6 +1011,10 @@ fn device_added(
         let wl_mode = WlMode::from(mode);
         output.set_preferred(wl_mode);
         output.change_current_state(Some(wl_mode), Some(Transform::Normal), None, Some((0, 0).into()));
+        // The refresh period is what "this flip missed its vblank" is measured against
+        // in the frame-time instrument; tell it the mode actually set rather than
+        // letting it assume 60 Hz.
+        crate::latency::on_output_refresh_mhz(wl_mode.refresh.max(0) as u64);
         // Swap the State's output to the real one (Stage A drives a single display).
         state.space.unmap_output(&state.output);
         state.space.map_output(&output, (0, 0));
@@ -1230,9 +1256,21 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
                 // photon side of every input bound to the frame it completes.
                 // Summaries surface once per 10s window; the journal line is
                 // the harness §3 contract, greppable as `hart-latency`.
-                let (summaries, drops) = crate::latency::on_frame_presented();
+                let (summaries, drops, frames) = crate::latency::on_frame_presented();
                 for s in summaries {
                     info!("{}", s.journal_line());
+                }
+                // The frame-time summary for the same 10 s window: the compositor's
+                // own p50/p99/max against the 16.6 ms budget, the count over it, and
+                // the flips that missed their vblank. A FAIL is a `warn!` for the
+                // same reason the drop record is: a window that broke the frame
+                // budget should not read like one that kept it.
+                if let Some(f) = frames {
+                    if f.pass {
+                        info!("{}", f.journal_line());
+                    } else {
+                        warn!("{}", f.journal_line());
+                    }
                 }
                 // Rare by construction: the instrument only refuses samples when
                 // vblanks stop being reaped or frames stop being queued, which are
@@ -1514,6 +1552,13 @@ fn claim_names(next: u8) -> String {
     if next & crate::comp_core::NATIVE_CHROME_HOME != 0 {
         names.push("home");
     }
+    // The bars, per band: the names liquid_ui_service.read_native_chrome accepts.
+    if next & crate::comp_core::NATIVE_CHROME_TOPBAR != 0 {
+        names.push("topbar");
+    }
+    if next & crate::comp_core::NATIVE_CHROME_TASKBAR != 0 {
+        names.push("taskbar");
+    }
     names.join(",")
 }
 
@@ -1579,6 +1624,22 @@ fn gles_should_demote(is_render_frame_variant: bool) -> bool {
     is_render_frame_variant
 }
 
+/// What one tick's presentation attempt tells the scheduler.
+///
+/// Two independent facts, because they drive two different reactions in `render_all`:
+/// a renderer fault demotes GLES to the pixman floor; a deferral keeps the frame-budget
+/// scheduler dirty so the damage this tick was built for is presented on the tick after
+/// the vblank instead of waiting for the idle heartbeat.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PresentOutcome {
+    /// A `RenderFrameError::RenderFrame` was seen: the renderer itself faulted.
+    renderer_fault: bool,
+    /// At least one CRTC could not take this tick's frame because its previous flip was
+    /// still in flight (the F1 gate held, the vblank was not lost). The frame was built
+    /// and NOT queued, so nothing this tick was built for has reached a swapchain.
+    deferred: bool,
+}
+
 /// Present the built element list to every active DRM surface that is NOT mid-flip:
 /// `render_frame` (composite into the primary swapchain buffer) → `queue_frame` (page-flip)
 /// → gate on vblank (F1, #166; the `frame_submitted` half is driven by `reap_completed_
@@ -1586,14 +1647,24 @@ fn gles_should_demote(is_render_frame_variant: bool) -> bool {
 /// PixmanRenderer software floor OR the GlesRenderer GPU path — it never names a concrete
 /// renderer, so there is no parallel present path. EVERY render/flip error degrades (log +
 /// skip + retry next tick) and KEEPS THE COMPOSITOR ALIVE — never a `panic!`/`.unwrap()`
-/// death (F2/F3, #186). Returns `true` if a RENDERER fault (`RenderFrameError::RenderFrame`)
-/// was seen, so the caller can demote a GLES renderer to the pixman floor (degrade-not-die).
+/// death (F2/F3, #186). Reports a RENDERER fault (`RenderFrameError::RenderFrame`) so the
+/// caller can demote a GLES renderer to the pixman floor (degrade-not-die), and whether any
+/// CRTC DEFERRED the frame behind an in-flight flip, so the caller keeps the damage pending.
 fn present_surfaces<R>(
     devices: &mut HashMap<DrmNode, DeviceData>,
     renderer: &mut R,
     elements: &[HartRenderElement<R>],
     clear: Color32F,
     now: std::time::Instant,
+    // zwlr_screencopy frames waiting for a presented frame (VERIFICATION row 23). Taken
+    // out of the State by `render_all` because this fn holds the device table, not the
+    // State. Serviced against the FIRST CRTC that renders this tick, from the scanout slot
+    // the DrmCompositor rendered into: the buffer the display will show, damage tracking
+    // and all, which is what makes a capture evidence about a flash rather than a second
+    // composite of the same elements. `size` is the output's physical mode, the region the
+    // queued frames were clamped against when they were requested.
+    pending_screencopy: &mut Vec<crate::screencopy::PendingScreencopy>,
+    size: Size<i32, smithay::utils::Physical>,
     // Diagnostic context for the silent-freeze beacon ONLY (never a render input).
     // These are the two collections the frame-callback loop in run_udev walks, so
     // they answer the question the first beacon could not: is the client starving
@@ -1603,13 +1674,13 @@ fn present_surfaces<R>(
     // wlr-layer surface is not in the map we send callbacks to.
     space_count: usize,
     layer_count: usize,
-) -> bool
+) -> PresentOutcome
 where
-    R: Renderer + Bind<Dmabuf>,
+    R: Renderer + Bind<Dmabuf> + ExportMem,
     R::TextureId: Texture + Clone + Send + 'static,
     HartRenderElement<R>: RenderElement<R>,
 {
-    let mut renderer_fault = false;
+    let mut outcome = PresentOutcome::default();
     for device in devices.values_mut() {
         // Self-healing DRM master retry (THE fresh-boot recovery, fix (a)): the construction-time
         // drmSetMaster inside DrmDevice::new may have lost the boot-VT master race ("Unable to
@@ -1643,6 +1714,14 @@ where
                     .map(|t| now.duration_since(t) >= VBLANK_STALL_TIMEOUT)
                     .unwrap_or(true);
                 if !stalled {
+                    // The frame this tick built is NOT going to this CRTC. Say so, or the
+                    // scheduler records the tick as painted, clears its dirty latch, and
+                    // the damage waits out the 200 ms idle heartbeat: the 220 ms tail
+                    // measured on the box 2026-09-11 (VERIFICATION.md). The 16 ms
+                    // dispatch tick and the 16.7 ms refresh drift past each other, so
+                    // roughly every other tick lands here, and the last input of every
+                    // gesture did too.
+                    outcome.deferred = true;
                     continue;
                 }
                 // Clearing our gate alone ORPHANS smithay's pending_frame here, and from
@@ -1656,10 +1735,80 @@ where
             // the Copy `is_empty` bool immediately so no borrow of `surface.compositor` spans
             // the sibling-field writes (`awaiting_vblank`/`flip_queued_at`) below. The Err
             // (`RenderFrameError`) is owned, so it survives the reduction for classification.
+            //
+            // Before reducing it, honour queue_frame's documented contract: "it is your
+            // responsibility to synchronize rendering if the RenderFrameResult returns true
+            // on needs_sync". That is true when the plane cannot take an IN_FENCE_FD or the
+            // renderer cannot export a native fence, and then a page flip can scan out a
+            // buffer the GPU is still writing: the elements drawn last inside a damage rect
+            // (the shell surface, over the bloom and the orb) are exactly the ones that may
+            // not be there yet, for one frame, in the region that just changed. Our loop
+            // never waited. On the Samsung box this is a no-op: i915 is atomic with
+            // IN_FENCE_FD and eglinfo lists EGL_ANDROID_native_fence_sync, so needs_sync is
+            // false and the fence rides the commit (read 2026-09-23). Logged once so any
+            // other box states which case it is in, with the flash symptom in mind.
             let render_outcome = surface
                 .compositor
                 .render_frame::<_, _>(renderer, elements, clear, SOFTWARE_FLOOR_FRAME_FLAGS)
-                .map(|result| result.is_empty);
+                .map(|result| {
+                    let needs_sync = result.needs_sync();
+                    if !SYNC_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        info!(
+                            needs_sync,
+                            "HART-comp DRM: first rendered frame; needs_sync=true means the \
+                             flip cannot carry a fence and the loop waits for the GPU before \
+                             queueing, needs_sync=false means the fence rides the commit"
+                        );
+                    }
+                    if needs_sync {
+                        if let PrimaryPlaneElement::Swapchain(element) = &result.primary_element {
+                            // Interrupted only by a signal; the frame is still the frame, so
+                            // queue it and let the next one wait properly.
+                            let _ = element.sync.wait();
+                        }
+                    }
+                    // SCREENCOPY on the DRM backend (VERIFICATION row 23). Read the slot the
+                    // DrmCompositor just rendered, whether or not this tick changed it: an
+                    // unchanged frame is still the frame on the display. The slot is a GBM
+                    // buffer; exporting it as a dmabuf and binding that is the read path both
+                    // renderers already have (`Bind<Dmabuf>` is how they scan out at all).
+                    // With `SOFTWARE_FLOOR_FRAME_FLAGS` empty no element is ever assigned to
+                    // a plane, so the `Element` arm (direct scanout of a client buffer, which
+                    // has no compositor-side slot to read) is unreachable in practice and
+                    // fails the frames rather than pretending.
+                    if !pending_screencopy.is_empty() {
+                        match &result.primary_element {
+                            PrimaryPlaneElement::Swapchain(element) => {
+                                // The GPU must have finished writing before a readback.
+                                let _ = element.sync.wait();
+                                match element.buffer().export() {
+                                    Ok(mut dmabuf) => match renderer.bind(&mut dmabuf) {
+                                        Ok(fb) => crate::screencopy::service_pending_frames(
+                                            pending_screencopy,
+                                            renderer,
+                                            &fb,
+                                            size,
+                                            element.transform,
+                                        ),
+                                        Err(err) => {
+                                            warn!(?err, ?crtc, "screencopy: could not bind the scanout slot for read-back; failing the queued frames");
+                                            crate::screencopy::fail_pending_frames(pending_screencopy);
+                                        }
+                                    },
+                                    Err(err) => {
+                                        warn!(?err, ?crtc, "screencopy: could not export the scanout slot as a dmabuf; failing the queued frames");
+                                        crate::screencopy::fail_pending_frames(pending_screencopy);
+                                    }
+                                }
+                            }
+                            PrimaryPlaneElement::Element(_) => {
+                                warn!(?crtc, "screencopy: the primary plane scanned out a client buffer directly, nothing compositor-side to read; failing the queued frames");
+                                crate::screencopy::fail_pending_frames(pending_screencopy);
+                            }
+                        }
+                    }
+                    result.is_empty
+                });
             match render_outcome {
                 Ok(true) => {
                     // Nothing changed — no flip to schedule, no vblank to await.
@@ -1742,8 +1891,15 @@ where
                         // even though presentation is proven only at the
                         // vblank: the batch rides FIFO and is measured against
                         // the flip that actually completes (harness M0).
+                        //
+                        // And the frame TIME: `now` was read at the top of
+                        // render_all, before build_frame_elements, so this is
+                        // build + composite + the queue ioctl, the compositor's
+                        // own cost per frame, which is what the 16.6 ms budget
+                        // bounds. The flip's own wait is measured separately, at
+                        // the vblank, as the dropped-frame count.
                         note_render_pass(false);
-                        crate::latency::on_frame_queued();
+                        crate::latency::on_frame_queued(now.elapsed().as_micros() as u64);
                         // `last_flip_at` and `publish_native_chrome()` USED TO BE HERE
                         // and have moved to `reap_completed_vblanks`, because this Ok
                         // does NOT mean the frame reached the screen. smithay's
@@ -1787,7 +1943,7 @@ where
                     // case #1006 describes, and the one worth counting.
                     note_render_pass(false);
                     if gles_should_demote(matches!(err, RenderFrameError::RenderFrame(_))) {
-                        renderer_fault = true;
+                        outcome.renderer_fault = true;
                         warn!(?err, ?crtc, "HART-comp DRM: render_frame RENDERER fault (RenderFrame) — degrading; caller may demote to the pixman floor");
                     } else {
                         warn!(?err, ?crtc, "HART-comp DRM: render_frame failed (PrepareFrame transient) — degrading, retry next frame");
@@ -1796,7 +1952,7 @@ where
             }
         }
     }
-    renderer_fault
+    outcome
 }
 
 /// Render every active DRM surface this tick: build the FULL z-order element list (the
@@ -1875,11 +2031,14 @@ fn render_all(
         map.layers().count()
     };
 
-    let mut demote_gles = false;
+    let mut outcome = PresentOutcome::default();
     if let Some(renderer) = gles.as_mut() {
         let elements: Vec<HartRenderElement<GlesRenderer>> =
             comp_core::build_frame_elements(state, renderer, size);
-        demote_gles = present_surfaces(devices, renderer, &elements, clear, now, space_count, layer_count);
+        outcome = present_surfaces(
+            devices, renderer, &elements, clear, now,
+            &mut state.pending_screencopy, size, space_count, layer_count,
+        );
     } else {
         // ── Pixman software-floor path (the never-fail renderer of record) ── The renderer
         // lives ON `state`, but `build_frame_elements` needs BOTH `&mut state` (reads the
@@ -1897,20 +2056,28 @@ fn render_all(
         };
         let elements: Vec<HartRenderElement<PixmanRenderer>> =
             comp_core::build_frame_elements(state, &mut renderer, size);
-        // The pixman floor has NO lower renderer to demote to, so its renderer-fault return
-        // is ignored (a pixman RenderFrame fault is a transient retried next tick — there is
-        // no GL context to lose on the CPU path).
-        let _ = present_surfaces(devices, &mut renderer, &elements, clear, now, space_count, layer_count);
+        // The pixman floor has NO lower renderer to demote to, so its renderer-fault flag
+        // is ignored below (a pixman RenderFrame fault is a transient retried next tick;
+        // there is no GL context to lose on the CPU path). Its deferral is not ignored:
+        // the pixman floor has the same one-flip-in-flight gate.
+        outcome = present_surfaces(
+            devices, &mut renderer, &elements, clear, now,
+            &mut state.pending_screencopy, size, space_count, layer_count,
+        );
+        outcome.renderer_fault = false;
         // Restore the real renderer (keeping the ORIGINAL instance avoids re-allocating its
         // internal caches every tick).
         state.renderer = renderer;
     }
+    let demote_gles = outcome.renderer_fault;
 
     // #137 — this tick composited: record the paint so the idle heartbeat is measured from
     // now, and clear the dirty latch (so the NEXT static tick can be skipped) UNLESS an effect
     // is still animating, in which case dirty is re-armed to keep the fade playing frame-by-
-    // frame. This is the single place the frame-budget scheduler is told "a frame went out".
-    state.repaint.note_painted(now, effects_animating);
+    // frame, OR the frame was deferred behind an in-flight flip, in which case the damage has
+    // not been presented and must survive to the tick after the vblank. This is the single
+    // place the frame-budget scheduler is told what happened to the frame.
+    state.repaint.note_painted(now, effects_animating, outcome.deferred);
 
     // ── GLES → pixman demotion (degrade-not-die) ── A renderer fault was seen on the GPU
     // path: drop the GLES renderer so EVERY subsequent tick paints via the pixman renderer
@@ -2434,6 +2601,15 @@ mod tests {
             "bloom,orb"
         );
         assert_eq!(claim_names(0), "");
+        // The bands, each its own name, in a fixed order after the older three.
+        use crate::comp_core::{NATIVE_CHROME_HOME, NATIVE_CHROME_TASKBAR, NATIVE_CHROME_TOPBAR};
+        assert_eq!(claim_names(NATIVE_CHROME_TOPBAR), "topbar");
+        assert_eq!(claim_names(NATIVE_CHROME_TASKBAR), "taskbar");
+        assert_eq!(
+            claim_names(NATIVE_CHROME_BLOOM | NATIVE_CHROME_ORB | NATIVE_CHROME_HOME
+                        | NATIVE_CHROME_TOPBAR | NATIVE_CHROME_TASKBAR),
+            "bloom,orb,home,topbar,taskbar"
+        );
     }
 
     #[test]

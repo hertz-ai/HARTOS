@@ -399,6 +399,22 @@ fn dispatch_request<S: CompState>(
             Response::ok(id, json!({ "composed": true }))
         }
 
+        // ── shell.chrome(clock, tray, notifications, agents, tasks, start, toast, menu):
+        //    the bar content the home feed does not carry (IPC_PROTOCOL.md 4.13). Same
+        //    producer as the WebView bar, same socket as shell.compose. Stored on the
+        //    retained scene cache, which is the one place the layout reads and the one
+        //    the IPC already reaches through `native_scene_caches`, so no new accessor
+        //    lands on the backend-agnostic trait. ──
+        "shell.chrome" | "ShellChrome" => {
+            let chrome = crate::scene::decode_shell_chrome(args);
+            let cov = shell_chrome_apply(state, chrome);
+            Response::ok(id, json!({
+                "composed": true,
+                "top_bar": cov.top_bar,
+                "taskbar": cov.taskbar,
+            }))
+        }
+
         // â”€â”€ Â§4.2 window.focus(handle) â€” keyboard focus + raise â”€â”€
         "window.focus" | "FocusWindow" => match arg_handle(args) {
             Some(h) => {
@@ -562,6 +578,44 @@ fn dispatch_request<S: CompState>(
 
         other => Response::err(id, "unsupported", format!("unknown method: {other}")),
     }
+}
+
+/// Store a decoded `shell.chrome` payload on the scene cache and answer the claim rule.
+///
+/// Its own function so the verb's decisions beyond storage have a home. The scene cache
+/// is reached through `native_scene_caches`, the accessor the lowering already uses,
+/// which is what keeps this datum off the backend-agnostic trait.
+///
+/// The one other decision: whether a toast or a menu has just APPEARED. That edge is
+/// what their `animate-start` budget rows measure (the shell asks for the surface, the
+/// compositor's next frame shows it), and it is noted through the same hook the
+/// workspace fade uses, which re-kinds the input still pending, if any. A toast an agent
+/// pushed with nobody at the keyboard has no pending input and is correctly not
+/// attributed; a menu whose right-click is still pending when this lands is.
+fn shell_chrome_apply<S: CompState>(
+    state: &mut S,
+    chrome: crate::scene::ShellChrome,
+) -> crate::scene::ChromeCoverage {
+    let (_, _, _, _, cache) = state.native_scene_caches();
+    let (toast_appeared, menu_appeared) = appeared(cache.chrome(), &chrome);
+    let cov = cache.set_chrome(chrome);
+    if toast_appeared {
+        crate::latency::on_animation_started(crate::latency::Surface::Toast);
+    }
+    if menu_appeared {
+        crate::latency::on_animation_started(crate::latency::Surface::ContextMenu);
+    }
+    cov
+}
+
+/// PURE: did a toast, and did a menu, appear between `before` and `after`? A surface
+/// that was already on screen with the same content is not an appearance, so a pump
+/// re-sending an unchanged toast cannot manufacture an animation sample.
+fn appeared(before: &crate::scene::ShellChrome, after: &crate::scene::ShellChrome) -> (bool, bool) {
+    (
+        after.toast.is_some() && after.toast != before.toast,
+        after.menu.is_some() && after.menu != before.menu,
+    )
 }
 
 /// PURE: did a flag flip actually happen? The rule is the whole honesty of
@@ -900,6 +954,29 @@ mod tests {
         // is the same bug, found on hardware 2026-09-10.
         assert!(!flip_took(true, false), "asked on, still off → refused, not ok");
         assert!(!flip_took(false, true), "asked off, still on → refused, not ok");
+    }
+
+    // ── shell.chrome's appearance edge (§4.13) ──
+
+    #[test]
+    fn a_toast_or_menu_counts_as_appearing_once_and_only_when_it_changes() {
+        use crate::scene::{ContextMenu, Severity, ShellChrome, Toast};
+        let none = ShellChrome::default();
+        let mut with_toast = ShellChrome::default();
+        with_toast.toast = Some(Toast {
+            title: "Bluetooth".into(),
+            message: "Not available".into(),
+            severity: Severity::Warning,
+        });
+        assert_eq!(appeared(&none, &with_toast), (true, false), "a new toast appears");
+        assert_eq!(appeared(&with_toast, &with_toast), (false, false), "re-sent unchanged: no edge");
+        assert_eq!(appeared(&with_toast, &none), (false, false), "going away is not appearing");
+        let mut with_menu = with_toast.clone();
+        with_menu.menu = Some(ContextMenu { x: 1.0, y: 2.0, items: vec![] });
+        assert_eq!(appeared(&with_toast, &with_menu), (false, true), "the menu appears, the toast is unchanged");
+        let mut moved = with_menu.clone();
+        moved.menu.as_mut().unwrap().x = 9.0;
+        assert_eq!(appeared(&with_menu, &moved), (false, true), "a menu at a new point is a new menu");
     }
 
     // ── response envelope (IPC_PROTOCOL.md §3) ──

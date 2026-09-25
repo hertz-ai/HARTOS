@@ -16,6 +16,7 @@ This is purely metadata + state tracking.
 import json
 import logging
 import os
+import struct
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -117,6 +118,493 @@ def backend_requires_torch(backend) -> bool:
     return (backend or 'torch') not in TORCHLESS_BACKENDS
 
 
+# ── How big is a model? ONE table, ONE unit ──────────────────────
+#
+# Keyed by GGUF file name because that is the identity both repos already
+# share: HARTOS's LLM ladder below and Nunba's MODEL_PRESETS name the same
+# artifacts, and until 2026-09-22 each kept its own column of sizes. The
+# literals were byte-identical (550, 1100, 1340, 2910, 6113, 18022, 22733,
+# 22630, 22938) and four months apart in age: Nunba's since its first commit
+# (96661414e, 2026-03-16), HARTOS's since 80c703b6c (2026-07-27). Two tables
+# of the same numbers always drift; this is the surviving one.
+#
+# WHY HERE and not in Nunba, which wrote them first: the import direction
+# decides. Nunba imports HARTOS (models/catalog.py imports this module at
+# module scope); HARTOS imports nothing from Nunba (MEASURED: zero hits for
+# `ModelPreset` in this tree). A shared table can only live at the end both
+# sides can reach.
+#
+# THE UNIT IS BYTES, and for good reason. The field this replaces was named
+# `size_mb` and its meaning changed row to row. MEASURED 2026-09-22 against
+# every .gguf on the author's box:
+#
+#   file                                    literal   bytes          MiB      MB(dec)
+#   Qwen3.5-4B-UD-Q4_K_XL.gguf                2910   2,912,109,728   2777.2   2912.1
+#   Qwen3.5-2B-UD-Q4_K_XL.gguf                1340   1,339,752,704   1277.7   1339.8
+#   Qwen3.5-0.8B-UD-Q4_K_XL.gguf               550     558,772,480    532.9    558.8
+#   Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf      1500   1,129,709,248   1077.4   1129.7
+#
+# The 4B and 2B rows are the decimal-MB reading (copied from HuggingFace's
+# file listing, which is decimal). The 1500 row matches NEITHER — 39% over
+# MiB, 33% over decimal — it was simply wrong. And the large rows were typed
+# the other way, carrying their author's own arithmetic in the comment:
+# `6113,  # 5.97 GB` is 6113/1024, i.e. MiB. One field, three vocabularies,
+# no single divisor correct for all of them.
+#
+# Bytes is the only reading that cannot be misread, so bytes is what is
+# stored. Every row states its PROVENANCE, because the distinction between
+# a measurement and an estimate is exactly what got lost before:
+#
+#   'measured …'  the file was stat'd; the number is that file's size.
+#   'estimate …'  NOT CHECKED — no file on the box that produced this table.
+#                 The literal is preserved and the unit it was typed in is
+#                 named, so the guess is never mistaken for a fact.
+_MIB = 1024 ** 2
+
+MODEL_WEIGHT_BYTES = {
+    # ── MEASURED 2026-09-22 — files present, stat'd, byte-exact ──
+    'Qwen3.5-4B-UD-Q4_K_XL.gguf':
+        (2_912_109_728, 'measured 2026-09-22 (~/.trueflow/models)'),
+    'Qwen3.5-2B-UD-Q4_K_XL.gguf':
+        (1_339_752_704, 'measured 2026-09-22 (~/.trueflow/models)'),
+    'Qwen3.5-0.8B-UD-Q4_K_XL.gguf':
+        (558_772_480, 'measured 2026-09-22 (~/.nunba/models)'),
+    'Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf':
+        (1_129_709_248, 'measured 2026-09-22 (~/.trueflow/models); the 1500 '
+                        'literal it replaces matched neither MB nor MiB'),
+
+    # ── NOT CHECKED — no file on this box. Literals preserved, each
+    # converted from the unit its author used. Do not promote any of
+    # these to "measured" without stat'ing the actual download.
+    'Qwen3-2B-Instruct-Q4_K_M.gguf':
+        (1100 * _MIB, 'estimate: literal 1100, unit undeclared by its author '
+                      '- read as MiB, the over-stating reading'),
+    'Qwen3.5-9B-UD-Q4_K_XL.gguf':
+        (6113 * _MIB, 'estimate: literal 6113 MiB (author comment "# 5.97 GB" '
+                      '= 6113/1024)'),
+    'Qwen3.5-27B-UD-Q4_K_XL.gguf':
+        (18022 * _MIB, 'estimate: literal 18022 MiB (author comment '
+                       '"# 17.6 GB" = 18022/1024)'),
+    'Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf':
+        (22733 * _MIB, 'estimate: literal 22733 MiB (author comment '
+                       '"# 22.2 GB" = 22733/1024)'),
+    'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf':
+        (22630 * _MIB, 'estimate: literal 22630, unit undeclared - read as '
+                       'MiB, matching the sibling 35B rows it was typed with'),
+    'Tiel-Coder-35B-A3B-UD-Q4_K_XL.gguf':
+        (22938 * _MIB, 'estimate: literal 22938, unit undeclared - read as '
+                       'MiB, matching the sibling 35B rows it was typed with'),
+    # The ONLY measured row in this table.  Every other entry above is an
+    # estimate inherited from a literal whose unit had to be inferred; this
+    # one is the exact Content-Length the file downloaded at, confirmed
+    # against os.path.getsize after the fetch (2026-09-22).  Recorded in
+    # bytes rather than N * _MIB precisely so the rounding cannot creep back.
+    'Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf':
+        (22749880160, 'MEASURED: HF Content-Length and on-disk size both '
+                      '22749880160 bytes exactly (2026-09-22)'),
+}
+
+
+#: GGUF metadata value types, by the enum the format defines.  Only the
+#: fixed-width ones need a struct code; strings and arrays are read by shape.
+_GIB = 1024 ** 3
+
+#: VRAM headroom over a MoE's non-expert weights, covering KV cache and
+#: compute buffers. Same 1.35 the dense path uses, and measured comfortably
+#: above the real ratio: Tiel-Coder-35B-A3B took 2.87 GiB for 2.53 GiB of
+#: non-expert weights at ctx 4096, i.e. 1.135.
+_MOE_VRAM_OVERHEAD = 1.35
+
+_GGUF_SCALAR = {0: '<B', 1: '<b', 2: '<H', 3: '<h', 4: '<I', 5: '<i',
+                6: '<f', 7: '<?', 10: '<Q', 11: '<q', 12: '<d'}
+
+
+def read_gguf_facts(path: str) -> dict:
+    """Architecture facts read FROM the file, never typed by a human.
+
+    Everything this returns is stated in the GGUF's own metadata header, so
+    it cannot drift from the artifact the way a hand-written table does.
+    That matters here: the sizes in MODEL_WEIGHT_BYTES above are estimates
+    inherited from literals whose unit had to be guessed, and one of them is
+    1.58 GB wrong -- which inverts the size ordering of two real models and,
+    through the priority ladder, changes which one a machine is offered.
+
+    The two facts that drive behaviour and were previously tracked NOWHERE:
+
+    ``moe`` / ``experts_used`` / ``experts_total``
+        Generation throughput with weights resident is bounded by memory
+        bandwidth times ACTIVE parameters per token. A 35B mixture-of-experts
+        using 8 of 256 experts touches a small fraction of what a dense 27B
+        touches per token, so it is materially FASTER despite being the
+        larger file. speed_score currently says the opposite.
+
+    ``mtp``
+        Whether the weights carry a multi-token-prediction head. Only a model
+        that has one benefits from ``--spec-type draft-mtp``; passing the
+        flag for a plain GGUF is accepted and buys nothing.
+
+    Returns {} for anything unreadable -- an absent file, a truncated header,
+    a non-GGUF. Callers treat {} as "not known", never as "not MoE".
+    """
+    facts: dict = {}
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as f:
+            magic, _ver, _n_tensor, n_kv = struct.unpack('<4sIQQ', f.read(24))
+            if magic != b'GGUF':
+                return {}
+
+            def _u(fmt):
+                return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+
+            def _s():
+                return f.read(_u('<Q')).decode('utf-8', 'replace')
+
+            def _v(t):
+                if t == 8:
+                    return _s()
+                if t == 9:                       # array: elem type, count
+                    et, n = _u('<I'), _u('<Q')
+                    return [_v(et) for _ in range(n)]
+                return _u(_GGUF_SCALAR[t])
+
+            kv = {}
+            for _ in range(n_kv):
+                key = _s()
+                kv[key] = _v(_u('<I'))
+
+            # The tensor table follows the metadata. Read it ONLY for a
+            # mixture of experts, where the expert/non-expert split is the
+            # number that decides placement -- for a dense model every byte
+            # has to be resident anyway, so the split says nothing.
+            spans = None
+            if any(k.endswith('.expert_count') for k in kv):
+                offsets = []
+                for _ in range(_n_tensor):
+                    t_name = _s()
+                    for _ in range(_u('<I')):    # dims
+                        _u('<Q')
+                    _u('<I')                     # ggml type
+                    offsets.append((t_name, _u('<Q')))
+                align = kv.get('general.alignment') or 32
+                data_start = (f.tell() + align - 1) // align * align
+                spans = (offsets, size - data_start)
+    except (OSError, struct.error, KeyError, UnicodeDecodeError) as e:
+        logger.warning("read_gguf_facts(%s): unreadable (%s); returning no "
+                       "facts rather than guessing", path, e)
+        return {}
+
+    arch = kv.get('general.architecture')
+    if arch:
+        facts['architecture'] = arch
+    facts['weight_bytes'] = size
+
+    # Keys are namespaced by architecture (qwen35moe.expert_count), so find
+    # them by suffix rather than assuming the prefix.
+    def _by_suffix(suffix):
+        for k, v in kv.items():
+            if k.endswith('.' + suffix):
+                return v
+        return None
+
+    # How many transformer blocks the file holds -- the unit ``--n-gpu-layers
+    # N`` counts in.  A partial offload that has to pick N used to assume
+    # "~40 layers" for every model it met (llamacpp_manager.get_optimal_params
+    # carried ``int(ratio * 40)``); the file states the real number, so that
+    # guess is now only the fallback for a file this reader could not parse.
+    blocks = _by_suffix('block_count')
+    if blocks is not None:
+        try:
+            facts['block_count'] = int(blocks)
+        except (TypeError, ValueError):
+            logger.warning("read_gguf_facts(%s): block_count %r is not an "
+                           "integer; leaving it unknown", path, blocks)
+
+    used, total = _by_suffix('expert_used_count'), _by_suffix('expert_count')
+    if total:
+        facts['moe'] = True
+        facts['experts_total'] = total
+        if used:
+            facts['experts_used'] = used
+            # The number that actually predicts throughput. Stored exact --
+            # both operands came out of the file, so rounding here would be
+            # re-introducing the hand-typed approximation this replaces.
+            facts['expert_fraction'] = used / total
+        # What actually has to sit in VRAM. llama.cpp's --cpu-moe keeps the
+        # expert tensors (the '_exps' ones) in system RAM and leaves
+        # attention, embeddings and norms on the GPU, so a MoE's VRAM cost
+        # is the NON-expert bytes plus KV cache -- not the file size. For
+        # Tiel-Coder-35B-A3B that is 2.53 GiB of a 21.19 GiB file: sizing it
+        # at weights * 1.35 overstates the requirement by about 11x and is
+        # why a machine that can run this model is told it cannot.
+        #
+        # Sizes come from consecutive tensor OFFSETS rather than a GGML
+        # quant-type table: the file states its own layout, so this cannot
+        # drift from upstream type definitions. Inter-tensor padding counts
+        # into the preceding tensor, which errs high -- the safe direction
+        # for a fit decision.
+        if spans:
+            offsets, data_bytes = spans
+            ordered = sorted(offsets, key=lambda t: t[1])
+            expert = 0
+            for i, (t_name, off) in enumerate(ordered):
+                nxt = ordered[i + 1][1] if i + 1 < len(ordered) else data_bytes
+                if '_exps' in t_name:
+                    expert += nxt - off
+            facts['expert_bytes'] = expert
+            facts['non_expert_bytes'] = data_bytes - expert
+    elif arch:
+        facts['moe'] = False
+
+    nextn = _by_suffix('nextn_predict_layers')
+    if nextn is not None:
+        facts['mtp'] = bool(nextn)
+        facts['mtp_layers'] = nextn
+    elif arch:
+        facts['mtp'] = False
+    return facts
+
+
+def llama_gguf_compute_requirements(size_gb: float) -> tuple:
+    """(vram_gb, ram_gb) a llama.cpp GGUF of this size needs, fully resident.
+
+    THIS FUNCTION DID NOT EXIST. Nunba's main.py imported it twice --
+    `_gguf_install_files` (the quant picker) and the hub-install handler --
+    and `git log -S` finds no definition anywhere in either repo's history.
+    The import sits unconditionally in the picker, before any fit check, and
+    the caller catches only ValueError, so the ImportError propagated: every
+    GGUF install through the Model Management page raised before it could
+    choose a quant. Proven by calling the picker with a real manifest.
+
+    Defined here because the same two numbers were already being computed
+    from bare literals in _populate_llm_models (weights * 1.35, weights *
+    2.0). One function now owns "a GGUF of size N needs this much", and
+    _MOE_VRAM_OVERHEAD is the same 1.35.
+
+    Fully resident is the DENSE answer, and it is the right default: a dense
+    model touches every parameter on every token, so anything not on the GPU
+    costs a PCIe round trip per token. A mixture of experts is the exception
+    and is handled where the placement is chosen, not here -- see
+    moe_offload_args and ModelEntry.matches_compute.
+    """
+    return (round(size_gb * _MOE_VRAM_OVERHEAD, 1), round(size_gb * 2.0, 1))
+
+
+def gguf_fits_gpu(free_vram_gb: float, free_ram_gb: float, *,
+                  gpu_available: bool, moe: bool = False,
+                  vram_need_gb: Optional[float] = None,
+                  ram_need_gb: Optional[float] = None,
+                  whole_need_gb: Optional[float] = None) -> bool:
+    """Can this machine run this GGUF with attention resident on the GPU?
+
+    ONE rule, asked at TWO knowledge levels. It used to be two hand-written
+    rules in two repos, and they disagreed: for Tiel-Coder-35B-A3B at 4.7 GB
+    free VRAM and 21.4 GB free RAM the install path answered no while the
+    selector answered yes -- the install path refusing to fetch the model
+    the selector would pick.
+
+    SPLIT KNOWN (``vram_need_gb`` given). The model is downloaded and
+    read_gguf_facts has measured it, so the row states what actually goes
+    where: attention in VRAM, experts in system RAM under --cpu-moe. Both
+    pools must hold for a mixture of experts. A dense model has no split
+    and tests VRAM alone -- it touches every parameter on every token, so
+    moving any of it to RAM costs a PCIe round trip per token.
+
+    SPLIT UNKNOWN (``whole_need_gb`` given). Pre-download, only the file
+    size is knowable, so a MoE is judged on the COMBINED budget -- the
+    "fits" figure a GGUF publisher quotes. This is deliberately more
+    conservative than the measured rule (it demands 28.6 GB where the truth
+    is 3.4 + 18.6) and that asymmetry is kept, not smoothed away: you
+    cannot know the split before you have the file, and over-demanding
+    picks a smaller quant rather than a model that will not run.
+
+    Returns only whether the GPU arm holds. Callers own their own
+    fallbacks -- matches_compute continues down its mode ladder, the
+    installer falls back to its RAM-only arm.
+    """
+    if not gpu_available:
+        return False
+    if vram_need_gb is not None:
+        if free_vram_gb < vram_need_gb:
+            return False
+        if moe and ram_need_gb is not None and free_ram_gb < ram_need_gb:
+            return False
+        return True
+    if whole_need_gb is None:
+        return False
+    if free_vram_gb >= whole_need_gb:
+        return True
+    return bool(moe) and (free_vram_gb + free_ram_gb) >= whole_need_gb
+
+
+#: Transformer-block count assumed for a PARTIAL offload of a file whose
+#: header ``read_gguf_facts`` could not read.  The real count is
+#: ``read_gguf_facts()['block_count']``; this is reached only for a file the
+#: reader returned {} on.  It is the guess llamacpp_manager applied to EVERY
+#: model as ``int(ratio * 40)  # assume ~40 layers``, kept so an unreadable
+#: file still launches the way it did before, and named so nothing re-types it.
+LAYER_COUNT_FALLBACK = 40
+
+
+def gguf_partial_offload_layers(free_vram_gb: float, size_gb: float,
+                                block_count: Optional[int] = None) -> int:
+    """How many blocks of a model that does NOT fit whole go on the GPU.
+
+    The second half of the placement question ``gguf_fits_gpu`` answers the
+    first half of, and it lives beside it for the same reason: every piece of
+    "how much of this model goes on the GPU" arithmetic has one home, so a
+    source guard can keep it there.  Only called after ``gguf_fits_gpu`` said
+    no.  At least one block, so a spawn that got this far still uses the card.
+    """
+    n_layers = block_count or LAYER_COUNT_FALLBACK
+    if not size_gb or size_gb <= 0:
+        return 1
+    return max(1, int(free_vram_gb / size_gb * n_layers))
+
+
+def moe_offload_args(gguf_path: str, free_vram_gb: float) -> List[str]:
+    """llama.cpp flags placing a MoE's experts in system RAM, or [].
+
+    THE one answer to "should this model's experts go to CPU". Three places
+    decide how to place a model -- the main server spawn, the caption/draft
+    spawn, and model_lifecycle's restart -- and each already carries its own
+    copy of `-ngl 99`. A fourth independent answer here is how those got out
+    of step; they call this instead.
+
+    Only a mixture of experts qualifies. A dense model touches every
+    parameter on every token, so moving any of it off the GPU costs a PCIe
+    round trip per token and the user experience collapses. A MoE activates
+    8 of 256 experts and keeps attention resident, so the trade is sound.
+
+    Returns [] when the whole model already fits in VRAM: at that point
+    keeping the experts on the GPU is strictly faster, and --cpu-moe would
+    be giving away performance for nothing.
+
+    Answers from the artifact -- the caller has the path, and the file
+    states whether it is a MoE -- so this cannot disagree with the catalog
+    row that admitted the model, which was sized from the same read.
+    """
+    facts = read_gguf_facts(gguf_path)
+    if not facts.get('moe'):
+        return []
+    whole_model_gb = facts.get('weight_bytes', 0) / _GIB * _MOE_VRAM_OVERHEAD
+    if free_vram_gb >= whole_model_gb:
+        logger.info(
+            "%s: MoE fits VRAM whole (%.1f GB free >= %.1f GB); keeping "
+            "experts on the GPU", os.path.basename(gguf_path),
+            free_vram_gb, whole_model_gb)
+        return []
+    logger.info(
+        "%s: MoE experts to system RAM (--cpu-moe); %.2f GiB of experts "
+        "off the GPU, %.2f GiB of attention stays",
+        os.path.basename(gguf_path),
+        facts.get('expert_bytes', 0) / _GIB,
+        facts.get('non_expert_bytes', 0) / _GIB)
+    return ['--cpu-moe']
+
+
+#: Draft depth for multi-token prediction when nothing overrides it.  The
+#: value the MTP launch block documented (``--spec-draft-n-max 3``); the
+#: live tokens/s + acceptance measurement on a model that fits is what
+#: should tune it.
+_MTP_DRAFT_N_DEFAULT = 3
+
+#: (abspath, mtime_ns, size) -> whether that llama-server accepts draft-mtp.
+#: Keyed on the file's identity so a rebuilt binary is probed again.
+_spec_type_cache: Dict[tuple, bool] = {}
+
+
+def _server_accepts_draft_mtp(server_binary: str) -> bool:
+    """Whether THIS llama-server binary accepts ``--spec-type draft-mtp``.
+
+    Asked of the serving binary, once, because an unknown --spec-type makes
+    llama-server exit at startup: an MTP model on an older build would go
+    from working to dark.  This box carries builds 7909 and 8200 without it
+    beside the serving 10330 (hartos-3a, 2026-09-23).  Anything that cannot
+    answer -- missing binary, probe timeout -- is "no".
+    """
+    try:
+        st = os.stat(server_binary)
+    except (OSError, TypeError):
+        return False
+    key = (os.path.abspath(server_binary), st.st_mtime_ns, st.st_size)
+    if key in _spec_type_cache:
+        return _spec_type_cache[key]
+    from core.subprocess_safe import run_probe
+    res = run_probe([server_binary, '--help'], timeout=20.0)
+    ok = bool(res) and 'draft-mtp' in (
+        (getattr(res, 'stdout', '') or '') + (getattr(res, 'stderr', '') or ''))
+    _spec_type_cache[key] = ok
+    return ok
+
+
+def mtp_spec_args(gguf_path: str, server_binary: str) -> List[str]:
+    """llama.cpp flags turning on multi-token prediction, or [].
+
+    THE one answer to "should this spawn use MTP", beside moe_offload_args
+    and called at the same spawn sites.  Switched on by the MODEL: the GGUF's
+    own nextn_predict_layers (read_gguf_facts()['mtp']), and only on a
+    serving binary that accepts the flag.  It used to be an env opt-in that
+    was set nowhere, so the MTP preset loaded as a plain MoE (owner,
+    2026-09-24: "automatic from model").
+
+    HEVOLVE_LLAMA_MTP_N is an override, not the switch: 0 turns MTP off, N
+    sets the draft depth.  It cannot add MTP to a file without the head.
+
+    Live proof (hartos-3a): with MTP inactive llama-server logs "model has
+    unused tensor blk.N.nextn.* -- ignoring"; active, that line is gone and
+    draft acceptance is reported.
+    """
+    if not read_gguf_facts(gguf_path).get('mtp'):
+        return []
+    depth = _MTP_DRAFT_N_DEFAULT
+    raw = os.environ.get('HEVOLVE_LLAMA_MTP_N')
+    if raw not in (None, ''):
+        try:
+            depth = int(raw)
+        except ValueError:
+            logger.warning("HEVOLVE_LLAMA_MTP_N=%r is not an integer; using "
+                           "the default draft depth %d", raw, depth)
+        if depth <= 0:
+            logger.info("%s carries an MTP head; MTP turned off by "
+                        "HEVOLVE_LLAMA_MTP_N=%s", os.path.basename(gguf_path), raw)
+            return []
+    if not _server_accepts_draft_mtp(server_binary):
+        logger.warning(
+            "%s carries an MTP head but %s does not accept --spec-type "
+            "draft-mtp; starting without MTP rather than failing to start",
+            os.path.basename(gguf_path), server_binary)
+        return []
+    logger.info("%s: MTP on (--spec-type draft-mtp, draft depth %d)",
+                os.path.basename(gguf_path), depth)
+    return ['--spec-type', 'draft-mtp', '--spec-draft-n-max', str(depth)]
+
+
+def model_weight_bytes(file_name: str) -> Optional[int]:
+    """Size of a model's weight file in BYTES, or None if unregistered.
+
+    The single reader of MODEL_WEIGHT_BYTES. Returns bytes because bytes is
+    the one unit that needs no divisor and can carry no ambiguity; callers
+    that want GiB or MiB divide once, at the point of comparison, against a
+    figure whose unit they can state.
+
+    None (not 0) for an unknown file: a missing size must be visible to the
+    caller, because 0 silently "fits" every budget check in the codebase.
+    """
+    row = MODEL_WEIGHT_BYTES.get(file_name)
+    return row[0] if row else None
+
+
+def model_weight_provenance(file_name: str) -> Optional[str]:
+    """Where a registered weight size came from — 'measured …' or 'estimate …'.
+
+    Kept beside the number rather than in a comment so a caller (or a test)
+    can tell a stat'd fact from a preserved guess at runtime.
+    """
+    row = MODEL_WEIGHT_BYTES.get(file_name)
+    return row[1] if row else None
+
+
 # Download sources
 SOURCES = {
     'huggingface': 'HuggingFace Hub',
@@ -144,6 +632,16 @@ class ModelEntry:
     repo_id: str = ''                    # HuggingFace repo, Ollama model name, pip package
     files: Dict[str, str] = field(default_factory=dict)
     download_url: str = ''               # For custom_url source
+    # Where the weights actually landed. The loader that fetched them sets
+    # it; everything that needs to READ the artifact goes through here.
+    #
+    # This field is not new in intent, only in existence. LlamaInstaller
+    # .get_model_path already documents "1. Canonical ModelCatalog entry by
+    # display name -- if HARTOS has the model registered as installed with a
+    # local_path, use that", and that branch has never run: ModelEntry had
+    # no local_path, so the lookup fell through to a filename walk across
+    # ~/.nunba, ~/.trueflow, ~/.ollama and the HF cache on every call.
+    local_path: str = ''
 
     # ── Compute Requirements ──────────────────────────────────────
     vram_gb: float = 0.0                 # GPU VRAM needed (0 = CPU-capable)
@@ -257,7 +755,20 @@ class ModelEntry:
 
         Returns: 'gpu', 'cpu', 'cpu_offload', or 'impossible'
         """
-        if gpu_available and budget_vram_gb >= self.vram_gb:
+        # The GPU arm is gguf_fits_gpu's to answer -- the same function the
+        # installer asks, so selection and install cannot drift apart. This
+        # row is downloaded, so it passes the MEASURED split: vram_gb is the
+        # non-expert weights, ram_gb the experts that --cpu-moe puts in
+        # system RAM. Both must hold for a MoE, because the experts are
+        # mmapped and a shortfall does not fail the load, it silently
+        # destroys throughput (measured: 0.95 tok/s with 18.64 GiB of
+        # experts against ~6.5 GiB free). A dense model never sets the moe
+        # capability and still tests VRAM alone.
+        if gguf_fits_gpu(budget_vram_gb, budget_ram_gb,
+                         gpu_available=gpu_available,
+                         moe=bool((self.capabilities or {}).get('moe')),
+                         vram_need_gb=self.vram_gb,
+                         ram_need_gb=self.ram_gb):
             return 'gpu'
         if self.supports_cpu_offload and gpu_available and budget_vram_gb >= self.vram_gb * 0.5:
             return 'cpu_offload'
@@ -521,10 +1032,241 @@ class ModelCatalog:
 
     # ── State updates ─────────────────────────────────────────────
 
-    def mark_downloaded(self, model_id: str, downloaded: bool = True) -> None:
+    def mark_downloaded(self, model_id: str, downloaded: bool = True,
+                        local_path: Optional[str] = None) -> None:
+        """Mark a row downloaded, and — when we know where the file landed —
+        record what the file SAYS about itself.
+
+        ``local_path`` is optional and defaults to the old behaviour
+        exactly, so every existing caller is unchanged. It is persisted on
+        the row, which is what makes LlamaInstaller.get_model_path's
+        documented "canonical catalog lookup first" branch able to run at
+        all — it reads entry.local_path, a field that until now did not
+        exist, so that lookup always fell through to a filename walk across
+        ~/.nunba, ~/.trueflow, ~/.ollama and the HF cache.
+
+        A caller that does not pass one falls back to whatever the row
+        already holds, so the loader that fetched the weights can record
+        the path itself and every later call benefits without threading it
+        through. The row then gains architecture facts read FROM the
+        artifact rather than typed into a table: moe / experts_used /
+        experts_total / mtp and the expert split.
+
+        Engine-agnostic by construction: read_gguf_facts returns {} for
+        anything that is not a GGUF, so a torch, onnx or sidecar model
+        records its path and learns nothing further, which is exactly
+        right. No per-backend code.
+
+        For a DENSE model it only ADDS capability keys and never touches
+        vram_gb, ram_gb, disk_gb, priority or the scores, so no dense
+        selection can move because of this call.
+
+        For a MIXTURE OF EXPERTS it also corrects vram_gb and ram_gb,
+        because the inherited figures describe a placement that nobody
+        would ever use. ``vram_gb = weights * 1.35`` assumes every weight
+        sits in VRAM, and for a MoE that is the one thing you would not do:
+        the experts belong in system RAM (--cpu-moe) while attention stays
+        on the GPU. For Tiel-Coder-35B-A3B the inherited row claimed 28.6 GB
+        of VRAM against a measured 2.87 GiB -- about 11x, and the reason a
+        machine that can run the model is told it cannot.
+
+        The constants are taken from that measurement, not invented:
+        loading it with ``-ngl 99 --cpu-moe`` moved GPU use from 3321 to
+        6256 MiB, i.e. 2.87 GiB for 2.53 GiB of non-expert weights plus KV
+        cache at ctx 4096 -- a ratio of 1.135. _MOE_VRAM_OVERHEAD keeps the
+        1.35 the dense path already uses, which is comfortably above that
+        and leaves room for a larger context. ram_gb becomes the expert
+        bytes at 1.0: they are mmapped rather than copied, so what matters
+        is that they can stay RESIDENT, and the same run proved what
+        happens when they cannot -- 0.95 tokens/sec.
+        """
         entry = self._entries.get(model_id)
-        if entry:
-            entry.downloaded = downloaded
+        if not entry:
+            return
+        persisted_before = entry.to_dict()
+        try:
+            self._apply_download(entry, downloaded, local_path)
+        finally:
+            # local_path, the facts and the MoE sizing are persisted fields;
+            # `downloaded` is runtime state (to_dict drops it).  Save only on
+            # a real change: boot calls this with a bare id per model, and
+            # rewriting the whole catalog each time for nothing is waste.
+            if entry.to_dict() != persisted_before:
+                self._dirty = True
+                self._save()
+
+    @staticmethod
+    def _apply_download(entry: 'ModelEntry', downloaded: bool,
+                        local_path: Optional[str]) -> None:
+        """mark_downloaded's in-memory half (it owns persistence)."""
+        model_id = entry.id
+        entry.downloaded = downloaded
+        if local_path:
+            entry.local_path = str(local_path)
+        path = local_path or entry.local_path
+        if downloaded and path:
+            facts = read_gguf_facts(path)
+            if facts:
+                entry.capabilities = {**(entry.capabilities or {}), **facts}
+                logger.info(
+                    "%s: read from the file -- arch=%s moe=%s experts=%s/%s "
+                    "mtp=%s bytes=%s", model_id, facts.get('architecture'),
+                    facts.get('moe'), facts.get('experts_used'),
+                    facts.get('experts_total'), facts.get('mtp'),
+                    facts.get('weight_bytes'))
+                # Gated on EXPERT bytes, not non-expert: a MoE whose tensor
+                # table could not be read reports expert_bytes == 0 and a
+                # non_expert_bytes of whatever trailed the header, which
+                # would rewrite vram_gb to ~0 and make the model look free.
+                # No measured split means no correction.
+                if facts.get('moe') and facts.get('expert_bytes'):
+                    was = (entry.vram_gb, entry.ram_gb)
+                    entry.vram_gb = round(
+                        facts['non_expert_bytes'] / _GIB
+                        * _MOE_VRAM_OVERHEAD, 1)
+                    entry.ram_gb = round(facts['expert_bytes'] / _GIB, 1)
+                    logger.info(
+                        "%s: MoE placement -- vram %.1f -> %.1f GB (non-expert "
+                        "weights only), ram %.1f -> %.1f GB (experts, which "
+                        "must stay resident)", model_id, was[0], entry.vram_gb,
+                        was[1], entry.ram_gb)
+
+    def get_by_weight_file(self, weight_file: str) -> Optional['ModelEntry']:
+        """The entry whose ``files['model']`` is this weight file, or None.
+
+        A KEY, not a fifth heuristic. Four places already match a preset to
+        an entry and they use three different rules -- name-only, name-or-
+        file, and name-or-substring-of-id (see #112) -- so a caller holding
+        only a path would otherwise have to pick one and add a fourth. A
+        weight file is unambiguous where a display name is not: the name can
+        drift, be re-cased or be edited by the admin UI, while the file is
+        what the loader actually opens.
+
+        Matches on the BASENAME, because callers hold a full path (the
+        spawn) or a bare name (the catalog row), and the row stores the
+        bare name.
+
+        Returns None when two rows claim the same file. The catalog has
+        known self-duplicate pairs (#107), and "I do not know which" is the
+        honest answer -- guessing would attach a measurement to the wrong
+        model, which is worse than having none.
+        """
+        name = os.path.basename(str(weight_file or '').strip())
+        if not name:
+            return None
+        hits = [e for e in self._entries.values()
+                if (e.files or {}).get('model') == name]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            logger.info(
+                "get_by_weight_file(%r): %d rows claim this file (%s); "
+                "answering 'unknown' rather than picking one", name,
+                len(hits), ', '.join(e.id for e in hits))
+        return None
+
+    def record_residency(self, model_id: str, vram_gb: Optional[float] = None,
+                         ram_gb: Optional[float] = None,
+                         weight_file: Optional[str] = None) -> bool:
+        """Record what THIS model actually took when we brought it up.
+
+        The reclaim figure has to come from what we started, not from the
+        driver and not from a slot. Measured: `nvidia-smi
+        --query-compute-apps=pid,used_memory` returns [N/A] on Windows
+        WDDM, so per-process VRAM is not obtainable from hardware at all.
+        And vram_manager's ledger is keyed by TOOL -- VRAM_BUDGETS holds
+        "acestep"/"wan2gp"/..., record_actual_usage takes the GPUWorker's
+        name -- so every model loading into the `llm` slot overwrites one
+        entry. That makes can_fit('llm') unable to tell "can the 4B fit"
+        from "can the 35B fit", and leaves the reclaim figure describing
+        whichever model happened to load last.
+
+        This record is keyed by MODEL and lives on the model's own row, so
+        it sits beside the PREDICTED facts read_gguf_facts took from the
+        file. Predicted and observed, one place, per model.
+
+        ``weight_file`` is recorded and checked on read because one
+        catalog row can be re-pointed at a different quant, and a Q4 and a
+        Q8 of the same repo have wildly different footprints. A record
+        that describes a quant the row no longer uses is worse than no
+        record.
+
+        Callers obtain the numbers by DELTA around the spawn -- free
+        memory before, free memory once the server answers -- which is how
+        the 2.87 GiB figure for Tiel-Coder was measured. Nothing else can
+        supply it on this platform.
+
+        Returns True when something was recorded.
+        """
+        entry = self._entries.get(model_id)
+        if entry is None:
+            logger.info("record_residency: %r is not in the catalog",
+                        model_id)
+            return False
+        if vram_gb is None and ram_gb is None:
+            return False
+
+        rec = dict(entry.capabilities.get('residency') or {})
+        # A negative or absurd delta means something else moved during the
+        # measurement window. Drop it rather than poison the record: the
+        # next load measures again, while a bad number would be persisted
+        # and planned against.
+        for key, val in (('vram_gb', vram_gb), ('ram_gb', ram_gb)):
+            if val is None:
+                continue
+            try:
+                gb = float(val)
+            except (TypeError, ValueError):
+                continue
+            if gb <= 0 or gb > 512:
+                logger.info("record_residency: %s %s=%r out of range; "
+                            "ignored", model_id, key, val)
+                continue
+            rec[key] = round(gb, 2)
+        if not rec:
+            return False
+
+        rec['weight_file'] = (weight_file
+                              or (entry.files or {}).get('model') or '')
+        rec['at'] = time.time()
+        entry.capabilities = {**(entry.capabilities or {}),
+                              'residency': rec}
+        self._dirty = True
+        # The next swap plans from this without re-measuring, which it can
+        # only do if the record outlives the process (#110: it never reached
+        # the disk on its own).
+        self._save()
+        logger.info("%s: residency recorded -- vram %s GB, ram %s GB (%s)",
+                    model_id, rec.get('vram_gb'), rec.get('ram_gb'),
+                    rec['weight_file'] or 'no weight file')
+        return True
+
+    def residency(self, model_id: str) -> Optional[dict]:
+        """What this model took last time we brought it up, or None.
+
+        None means "not known" and callers fall back to the catalog
+        estimate -- never to zero. A model whose footprint is unknown is
+        not a model that is free.
+
+        Returns None when the row now points at a DIFFERENT weight file
+        than the record was taken against: the row was re-pointed at
+        another quant and the old number describes weights that are no
+        longer there.
+        """
+        entry = self._entries.get(model_id)
+        if entry is None:
+            return None
+        rec = (entry.capabilities or {}).get('residency')
+        if not rec:
+            return None
+        current = (entry.files or {}).get('model') or ''
+        recorded = rec.get('weight_file') or ''
+        if current and recorded and current != recorded:
+            logger.info(
+                "%s: residency record is for %r but the row now uses %r; "
+                "treating as unknown", model_id, recorded, current)
+            return None
+        return dict(rec)
 
     def mark_loaded(self, model_id: str, device: str = 'gpu') -> None:
         entry = self._entries.get(model_id)
@@ -786,40 +1528,86 @@ class ModelCatalog:
         # plus ~35% for KV cache and context, CPU needs roughly double the
         # weights to stay comfortable. Extending: add a row.
         MIN_BUILD_QWEN35 = 8148          # llama.cpp b8148+ required by Qwen3.5
-        # (id, name, repo, gguf, mmproj|None, size_mb, tier, prio, quality,
+        # (id, name, repo, gguf, mmproj|None, tier, prio, quality,
         #  speed, purposes, min_build)
+        #
+        # No size column. Weight sizes live in MODEL_WEIGHT_BYTES at the top of
+        # this module, keyed by the gguf name already in each row — this table
+        # used to restate them, and Nunba's MODEL_PRESETS restated them again.
         _llms = [
             ('llm-qwen3.5-0.8b', 'Qwen3.5 0.8B VL', 'unsloth/Qwen3.5-0.8B-GGUF',
              'Qwen3.5-0.8B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-0.8B-F16.gguf',
-             550, 'lite', 30, 0.45, 0.95, ['draft'], MIN_BUILD_QWEN35),
+             'lite', 30, 0.45, 0.95, ['draft'], MIN_BUILD_QWEN35),
             ('llm-qwen3-2b-text', 'Qwen3 2B (text only)',
              'unsloth/Qwen3-2B-Instruct-GGUF', 'Qwen3-2B-Instruct-Q4_K_M.gguf',
-             None, 1100, 'lite', 35, 0.50, 0.88, ['main'], None),
+             None, 'lite', 35, 0.50, 0.88, ['main'], None),
             ('llm-qwen3.5-2b', 'Qwen3.5 2B VL', 'unsloth/Qwen3.5-2B-GGUF',
              'Qwen3.5-2B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-2B-F16.gguf',
-             1340, 'lite', 45, 0.55, 0.85, ['main'], MIN_BUILD_QWEN35),
+             'lite', 45, 0.55, 0.85, ['main'], MIN_BUILD_QWEN35),
             ('llm-qwen3.5-4b', 'Qwen3.5 4B VL', 'unsloth/Qwen3.5-4B-GGUF',
              'Qwen3.5-4B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-4B-F16.gguf',
-             2910, 'standard', 60, 0.60, 0.70, ['main'], MIN_BUILD_QWEN35),
+             'standard', 60, 0.60, 0.70, ['main'], MIN_BUILD_QWEN35),
             ('llm-qwen3.5-9b', 'Qwen3.5 9B VL', 'unsloth/Qwen3.5-9B-GGUF',
              'Qwen3.5-9B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-9B-F16.gguf',
-             6113, 'standard', 70, 0.72, 0.50, ['main'], MIN_BUILD_QWEN35),
+             'standard', 70, 0.72, 0.50, ['main'], MIN_BUILD_QWEN35),
             ('llm-qwen3.5-27b', 'Qwen3.5 27B VL', 'unsloth/Qwen3.5-27B-GGUF',
              'Qwen3.5-27B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-27B-F16.gguf',
-             18022, 'full', 80, 0.85, 0.30, ['main'], MIN_BUILD_QWEN35),
+             'full', 80, 0.85, 0.30, ['main'], MIN_BUILD_QWEN35),
             ('llm-qwen3.5-35b-a3b', 'Qwen3.5 35B-A3B MoE',
              'unsloth/Qwen3.5-35B-A3B-GGUF', 'Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf',
              'mmproj-Qwen3.5-35B-A3B-F16.gguf',
-             22733, 'full', 85, 0.88, 0.35, ['main'], MIN_BUILD_QWEN35),
+             'full', 85, 0.88, 0.35, ['main'], MIN_BUILD_QWEN35),
             ('llm-qwen3.6-35b-a3b', 'Qwen3.6 35B-A3B MoE',
              'unsloth/Qwen3.6-35B-A3B-GGUF', 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf',
              'mmproj-Qwen3.6-35B-A3B-F16.gguf',
-             22630, 'full', 85, 0.91, 0.36, ['main'], MIN_BUILD_QWEN35),
+             'full', 85, 0.91, 0.36, ['main'], MIN_BUILD_QWEN35),
             ('llm-tiel-coder-35b-a3b', 'Tiel-Coder 35B-A3B MoE',
              'peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF',
              'Tiel-Coder-35B-A3B-UD-Q4_K_XL.gguf',
              'mmproj-Tiel-Coder-35B-A3B-BF16.gguf',
-             22938, 'full', 90, 0.92, 0.34, ['main'], MIN_BUILD_QWEN35),
+             'full', 90, 0.92, 0.34, ['main'], MIN_BUILD_QWEN35),
+            # Same model, built with the multi-token-prediction head.  It is
+            # a SEPARATE upstream repo (…-GGUF-MTP) with its own file names,
+            # not a quant variant of the row above, so it needs its own row.
+            #
+            # VERIFIED ON DISK 2026-09-22, not inferred from the repo name:
+            # the file carries blk.40.nextn.{eh_proj,enorm,hnorm,
+            # shared_head_norm}.weight — the MTP head — among its 753
+            # tensors. That block is the entire difference and the entire
+            # reason to prefer it.
+            #
+            # It is only worth selecting where the SERVING build can use it:
+            # llama.cpp exposes it as `--spec-type draft-mtp`, present in
+            # build 10330 on this machine and absent from the 7909 binary
+            # that also sits in .nunba/llama.cpp.  MIN_BUILD_QWEN35 (9180)
+            # already gates the family; the MTP path additionally needs a
+            # build carrying draft-mtp, which is NOT expressible in this
+            # row.  It is decided at LAUNCH instead: every spawn asks
+            # mtp_spec_args, which reads the head from the file and probes
+            # the serving binary, so this row on an older build starts as a
+            # plain MoE rather than failing to start.
+            #
+            # Priority 85, NOT the 90 of the row above, and the reason is an
+            # invariant rather than a preference: test_llm_seed_priority_is_
+            # monotonic_with_size requires priority to be non-decreasing when
+            # the seeds are sorted by vram_gb/ram_gb, so that a small model
+            # can never outrank a large one a big box could have run. This
+            # row's MEASURED 21.19 GB puts it BELOW both 35B Qwens (85), so
+            # anything above 85 here breaks the ladder.
+            #
+            # Which surfaces a real defect in the row above, left alone here
+            # deliberately: its 22938 MiB is an ESTIMATE, and the file is
+            # actually 22360478080 bytes = 20.82 GB — overstated by 1.58 GB.
+            # Corrected, that row would sort BELOW the Qwens too and its own
+            # priority 90 would break this same invariant. Its compliance
+            # today rests on a wrong number. Re-ranking the ladder is a
+            # bigger change than adding a row, so it is reported, not
+            # smuggled in beside this.
+            ('llm-tiel-coder-35b-a3b-mtp', 'Tiel-Coder 35B-A3B MoE (MTP)',
+             'peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP',
+             'Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf',
+             'mmproj-Tiel-Coder-35B-A3B-MTP-BF16.gguf',
+             'full', 85, 0.92, 0.34, ['main'], MIN_BUILD_QWEN35),
         ]
         # Rows seeded by an EARLIER version of this method that are now known to
         # be unloadable: google/gemma-*-it are transformers repos with no GGUF,
@@ -831,9 +1619,21 @@ class ModelCatalog:
                 logger.info("Removed unloadable seeded LLM row %s (no GGUF in repo)", _bad)
 
         added = 0
-        for (mid, name, repo, gguf, mmproj, size_mb, tier, prio,
+        for (mid, name, repo, gguf, mmproj, tier, prio,
              quality, speed, purposes, min_build) in _llms:
-            weights_gb = round(size_mb / 1024.0, 2)
+            # ONE lookup, in bytes, then ONE division at the point of use.
+            # A row whose gguf is absent from MODEL_WEIGHT_BYTES is a bug in
+            # this file, not a runtime condition: skip it loudly rather than
+            # seed a 0 GB entry that "fits" every compute budget there is.
+            weight_bytes = model_weight_bytes(gguf)
+            if not weight_bytes:
+                logger.error(
+                    "LLM row %s names %s, which has no entry in "
+                    "MODEL_WEIGHT_BYTES - skipping rather than registering it "
+                    "with a zero size that would pass every budget check",
+                    mid, gguf)
+                continue
+            weights_gb = round(weight_bytes / (1024 ** 3), 2)
             files = {'model': gguf}
             if mmproj:
                 # Local name is model-specific; source name is what the repo
@@ -843,20 +1643,34 @@ class ModelCatalog:
                     'mmproj-BF16.gguf' if mmproj.endswith('-BF16.gguf')
                     else 'mmproj-F16.gguf'
                 )
+            _vram_gb, _ram_gb = llama_gguf_compute_requirements(weights_gb)
             _definition = dict(
                 name=name, model_type=ModelType.LLM,
                 source='huggingface', repo_id=repo, files=files,
-                vram_gb=round(weights_gb * 1.35, 1),
-                ram_gb=round(weights_gb * 2.0, 1),
+                vram_gb=_vram_gb,
+                ram_gb=_ram_gb,
                 disk_gb=weights_gb,
                 min_capability_tier=tier,
-                backend='llama_cpp',
+                # 'llama.cpp' — the spelling in BACKENDS, in
+                # TORCHLESS_BACKENDS and in ModelEntry._DOWNLOADED_BACKENDS.
+                # This row said 'llama_cpp', which is in none of them, so
+                # these entries were the only LLM rows in the catalogue that
+                # (a) named a backend the registry does not define,
+                # (b) answered TRUE to backend_requires_torch — the precise
+                #     mis-provisioning TORCHLESS_BACKENDS exists to stop —
+                # and (c) skipped validate()'s files['model'] requirement,
+                # which is what makes an undownloadable row refusable.
+                backend='llama.cpp',
                 supports_gpu=True, supports_cpu=True,
                 supports_cpu_offload=True, cpu_offload_method='restart_cpu',
                 min_build=min_build,
+                # weight_bytes, not size_mb: disk_gb is rounded to 2 decimals
+                # for display, so anything reconstructing a size from it loses
+                # ~5 MiB. Carrying the exact count makes the
+                # entry -> preset -> entry round trip lossless.
                 capabilities={'chat': True, 'vision': bool(mmproj),
                               'quant': 'Q4_K_M' if mmproj is None else 'UD-Q4_K_XL',
-                              'size_mb': size_mb},
+                              'weight_bytes': weight_bytes},
                 quality_score=quality, speed_score=speed, priority=prio,
                 purposes=list(purposes),
                 tags=['local', 'chat', 'qwen'] + (['vision'] if mmproj else []),
@@ -869,6 +1683,17 @@ class ModelCatalog:
                 # written and makes the catalog uncorrectable. User-owned flags
                 # (enabled / pinned / auto_load) and runtime state (downloaded /
                 # loaded) are NOT in _definition, so they survive untouched.
+                #
+                # Nor does what this machine MEASURED: the residency record
+                # lives in capabilities, which the seed replaces whole, so
+                # every boot erased it (#110, measured). It is carried
+                # forward; residency() already refuses a record taken
+                # against a different weight file, so a re-pointed seed
+                # cannot put a stale number into use.
+                kept = (self._entries[mid].capabilities or {}).get('residency')
+                if kept:
+                    _definition['capabilities'] = {
+                        **_definition['capabilities'], 'residency': kept}
                 self.override(mid, persist=False, **_definition)
                 continue
             self.register(ModelEntry(id=mid, **_definition), persist=False)

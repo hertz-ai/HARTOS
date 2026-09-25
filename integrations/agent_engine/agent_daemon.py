@@ -17,6 +17,37 @@ from datetime import datetime
 
 logger = logging.getLogger('hevolve_social')
 
+
+_HARTOS_HANDLER_TAG = '_hartos_root_handler'  # same tag hart_intelligence_entry uses
+
+
+def _give_the_journal_a_root_handler(root=None):
+    """The systemd entrypoint's process has NO root log handler unless someone
+    installs one: hart-agent.nix runs `python -c "... AgentDaemon().run_forever()"`,
+    nothing here ever configured logging, so every INFO line this daemon and the
+    governor monitor emit went to Python's lastResort handler, which prints
+    WARNING and above only. Measured on the Samsung node, generations 11 and 12
+    (2026-09-24): `journalctl -u hart-agent-daemon` held ONE line per boot,
+    systemd's "Started", through thirty minutes of ticks, yields and governor
+    transitions; the yield reasons that explain why the box is or is not busy
+    were invisible. The same rule hart_intelligence_entry applies to the backend
+    (babefb0): attach a stdout handler ONLY when root has none, tagged so a host
+    that already configured root (Nunba, pytest) is left exactly as found.
+    Returns the handler it attached, or None.
+    """
+    root = root if root is not None else logging.getLogger()
+    if root.handlers:
+        return None
+    import sys as _sys
+    h = logging.StreamHandler(_sys.stdout)
+    h.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - [%(threadName)s] - %(levelname)s - %(message)s'))
+    setattr(h, _HARTOS_HANDLER_TAG, True)
+    root.addHandler(h)
+    if root.level == logging.NOTSET or root.level > logging.INFO:
+        root.setLevel(logging.INFO)
+    return h
+
 # Lock protecting module-level mutable state accessed from daemon thread + API threads
 _module_lock = threading.Lock()
 
@@ -649,7 +680,25 @@ class AgentDaemon:
         worker thread ever exits this returns and systemd's Restart=on-failure
         relaunches the unit. Without this method the unit crashed on boot with
         AttributeError: 'AgentDaemon' object has no attribute 'run_forever'.
+
+        The governor's monitor runs in THIS process too, monitor only.  This
+        unit is its own process, and only the backend
+        (hart_intelligence_entry.py) ever started a governor, so every
+        get_mode() here, in _idle_only_blocked and in the starvation
+        override, read the constructor's MODE_ACTIVE for as long as the
+        process lived (found 2026-09-23 on the Samsung box).  Monitor only:
+        the enforcer and the proactive stream stay in the backend, see
+        ResourceGovernor.start.  Best-effort, so a governor fault can never
+        keep the goal engine from starting; the reads then fail closed to
+        "not idle" exactly as they did before.
         """
+        _give_the_journal_a_root_handler()
+        try:
+            from core.resource_governor import get_governor
+            get_governor().start(monitor_only=True)
+        except Exception as e:
+            logger.warning("Agent daemon: governor monitor did not start "
+                           "(idle reads stay closed): %s", e)
         self.start()
         if self._thread is not None:
             self._thread.join()
@@ -1427,6 +1476,26 @@ class AgentDaemon:
                     return
             except Exception:
                 pass
+            # A person at the desk is neither a foreground request nor
+            # "recently active" (that means chatted), so neither check above
+            # sees them.  The ResourceGovernor is the ONE idle detector (its
+            # Linux backend reads the compositor's input-alive marker), and a
+            # forced tick is idle-only work by definition, so it goes through
+            # the SAME reader every idle_only goal goes through:
+            # _idle_only_blocked, get_mode() != MODE_IDLE, fail closed when
+            # the governor cannot be consulted.  Measured 2026-09-22 on the
+            # Samsung box: this override force-ticked every 120 s on
+            # 'model_pressure' and put llama-server at 207 percent CPU once a
+            # minute while the owner was clicking around the desktop; press
+            # p50 122 ms against a 25 ms budget, clock 1.3 GHz of 3.4,
+            # package 94 C.  With the daemons paused for 120 s: 3.19 GHz,
+            # 84 C, press p50 12 ms.  That headroom belongs to the person.
+            if _idle_only_blocked({'idle_only': True}):
+                logger.debug(
+                    "Agent daemon: governor says the machine is not idle, "
+                    "yielding on '%s' (starvation override suppressed)",
+                    _yreason)
+                return
             _override_active = True
             logger.warning(
                 "Agent daemon: STARVATION OVERRIDE — yield gate has blocked "

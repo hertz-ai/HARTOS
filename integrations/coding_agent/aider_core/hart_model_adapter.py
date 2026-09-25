@@ -123,19 +123,23 @@ def send_completion(
 
         result_text = response.choices[0].message.content
 
-        # Record metered usage if budget gate available
+        # Record metered usage. This called record_metered_usage with keywords
+        # it does not accept; the TypeError escaped `except ImportError` into
+        # the outer handler below, which returned None, so EVERY completion
+        # was lost and every native coding edit failed (hevolveai Master 11.435
+        # S1). meter_llm_call owns the contract and never raises; the extra
+        # guard keeps a missing budget module from costing the completion too.
         try:
-            from integrations.agent_engine.budget_gate import record_metered_usage
+            from integrations.agent_engine.budget_gate import meter_llm_call
             usage = response.usage
-            record_metered_usage(
-                user_id=user_id or 'coding_agent',
+            meter_llm_call(
                 model=model,
-                prompt_tokens=usage.prompt_tokens if usage else 0,
-                completion_tokens=usage.completion_tokens if usage else 0,
-                source='aider_native',
+                tokens_in=usage.prompt_tokens if usage else 0,
+                tokens_out=usage.completion_tokens if usage else 0,
+                task_source='own',
             )
-        except ImportError:
-            pass
+        except Exception as e:
+            logger.warning(f"Metering skipped (completion kept): {e}")
 
         return result_text
 

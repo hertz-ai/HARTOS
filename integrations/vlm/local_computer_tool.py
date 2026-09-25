@@ -64,7 +64,12 @@ SUPPORTED_ACTIONS = {
     'cursor_position', 'hover', 'list_folders_and_files',
     'Open_file_and_copy_paste', 'open_file_gui', 'write_file',
     'read_file_and_understand', 'wait', 'hotkey', 'shell',
+    'scroll_up', 'scroll_down',
 }
+
+#: Wheel notches per scroll when the model gives no amount: about a third
+#: of a typical page, so the next screenshot still overlaps the last one.
+SCROLL_DEFAULT_CLICKS = 5
 
 
 def take_screenshot(tier: str) -> str:
@@ -737,6 +742,22 @@ def _execute_inprocess(action: dict) -> dict:
                     keys = [k.strip() for k in str(text).split('+')]
                 pyautogui.hotkey(*keys)
             return {'output': f'Hotkey: {text}'}
+
+        elif act in ('scroll_up', 'scroll_down'):
+            # The loop offers both to the model; without this branch every
+            # scroll failed as "Unknown action" and nothing below the fold
+            # of a page could be reached.  `value` may carry a notch count.
+            try:
+                clicks = abs(int(str(text).strip())) if text else SCROLL_DEFAULT_CLICKS
+            except ValueError:
+                clicks = SCROLL_DEFAULT_CLICKS
+            if act == 'scroll_down':
+                clicks = -clicks
+            if coord:
+                pyautogui.scroll(clicks, x=coord[0], y=coord[1])
+            else:
+                pyautogui.scroll(clicks)
+            return {'output': f'Scrolled {act[7:]} {abs(clicks)} notches'}
 
         elif act == 'left_click_drag':
             start = action.get('startCoordinate', coord)

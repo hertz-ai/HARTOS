@@ -621,6 +621,14 @@ let
     # harmless. We inherit + re-export it so the glass-host child sees it.
     export HART_SHELL_READY_FLAG="''${HART_SHELL_READY_FLAG:-/run/hart/session/shell-ready}"
 
+    # Card photo layer for the NATIVE scene (S4, 2026-09-24): hart-comp rasterises the
+    # shell's bundled SVG card art at compose time, and WHERE that art lives is a
+    # deployment fact the compositor must be handed, not guess (the OS and the Nunba
+    # bundle keep the static dir in different places). This is the same directory
+    # liquid-ui serves as /shell/static, from the one app package. Absent, every card
+    # keeps its brand gradient and no photo lowers: correct, only photo-less.
+    export HART_SHELL_STATIC_DIR="''${HART_SHELL_STATIC_DIR:-${cfg.package}/integrations/agent_engine/static}"
+
     # ── ORPHAN-BRICK GUARD (FMEA #3, boot-hardening) ──────────────────────────
     # hart-comp and the glass shell run in the BACKGROUND (below) while this
     # wrapper blocks in `wait`. The session-supervisor launches this wrapper as

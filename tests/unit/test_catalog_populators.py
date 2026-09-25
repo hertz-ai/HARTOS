@@ -589,9 +589,11 @@ class TestPopulateFromSubsystems:
     application-registered populators):
         TTS      : derived from the live ENGINE_REGISTRY (see
                    live_tts_count — a hardcoded count here went stale)
-        LLM      :  9  (qwen3.5 ladder 0.8b/2b/4b/9b/27b/35b-a3b,
-                        qwen3.6-35b-a3b, Tiel-Coder-35b-a3b, and qwen3-2b-text;
-                        _populate_llm_models is the
+        LLM      : 10  (qwen3.5 ladder 0.8b/2b/4b/9b/27b/35b-a3b,
+                        qwen3.6-35b-a3b, Tiel-Coder-35b-a3b, the MTP build of
+                        that same Tiel (separate upstream repo, own file
+                        names, carries the blk.40.nextn head), and
+                        qwen3-2b-text; _populate_llm_models is the
                         documented single source of truth for the ladder)
         STT      : 11  (5 faster-whisper + 6 sherpa-onnx)
         VLM      :  5  (qwen3vl, qwen08b caption, minicpm-v2, mobilevlm, clip)
@@ -606,7 +608,7 @@ class TestPopulateFromSubsystems:
     subsystems landing unacknowledged, task #16).
     """
 
-    EXPECTED_LLM_COUNT = 9
+    EXPECTED_LLM_COUNT = 10  # +1: llm-tiel-coder-35b-a3b-mtp (2026-09-22)
     EXPECTED_STT_COUNT = 11
     EXPECTED_VLM_COUNT = 5  # +1 for qwen08b caption model
     EXPECTED_EMBODIED_COUNT = 3  # Qwen-RobotSuite foundation models

@@ -592,8 +592,18 @@ in
                   f"this subtest would pass without testing anything")
               edge.succeed(f"kill -9 {pid}")
 
-              # Bounded: a unit that never comes back is the failure, so an
-              # unbounded wait would hang the run instead of reporting it.
+              # Wait for the RESTART, not merely for "active": right after the
+              # kill the unit still reports active for the few ms systemd needs
+              # to reap the main process, so a plain wait_for_unit returned in
+              # 0.15 s and NRestarts was read as 0 -> 0 while the journal was
+              # still printing "Main process exited, code=killed" (affa34f
+              # nixosTests run, shard 3, 2026-09-24). Bounded either way: a unit
+              # that never comes back is the failure, so an unbounded wait would
+              # hang the run instead of reporting it. 120 s covers RestartSec
+              # plus the backend's own startup.
+              edge.wait_until_succeeds(
+                  f'test "$(systemctl show -p NRestarts --value {unit})" -gt {before}',
+                  timeout=120)
               edge.wait_for_unit(unit, timeout=120)
               after = int(edge.succeed(
                   f"systemctl show -p NRestarts --value {unit}").strip() or 0)
@@ -722,9 +732,44 @@ in
               print(f"── [{tag}] $ {cmd[:120]}")
               print(m.execute(cmd)[1])
 
+      # Port wait that gives up the moment systemd has: wait_for_open_port alone
+      # burns its whole bound on a unit that will never bind. Measured on the
+      # first fleet run in six weeks (run 35911836772, shard 1): the SERVER bound
+      # :6777 in 43.8 s, then this test spent 300 s on the EDGE, whose backend
+      # had died five times by t=153 s ("RuntimeError: can't start new thread",
+      # kernel: "fork rejected by pids controller in hart-backend.service") and
+      # been marked failed by the start limit at t=153 s. The 300 s bound was
+      # never the problem and stays: 44 s is the measured bind on a 1-core
+      # nested-KVM node, and the unit's own ceiling is TimeoutStartSec=600.
+      #
+      # The cause is a product defect, named here so the red reads correctly:
+      # hart-app's python env ships no hypercorn (nixos/packages/nunba.nix:83,
+      # deliberate), so every OS node takes hart_intelligence_entry._serve_app's
+      # Waitress fallback, and that fallback hard-codes threads=50 instead of
+      # reading HEVOLVE_WORKER_THREADS, the variant budget hart-backend.nix
+      # exports precisely so edge (TasksMax=64) survives. ~14 threads of import
+      # plus 50 handler threads exceeds 64; the pids controller refuses the
+      # fork; the edge variant cannot boot its backend at all.
+      def _wait_port_or_unit_failure(node, label, unit, port, bound):
+          import time
+          deadline = time.monotonic() + bound
+          while time.monotonic() < deadline:
+              # The same probe the driver's wait_for_open_port uses (nc is in
+              # NixOS's required system packages, so it is on every node).
+              rc, _ = node.execute(f"nc -z localhost {port}")
+              if rc == 0:
+                  return
+              _, state = node.execute(f"systemctl is-failed {unit} 2>/dev/null || true")
+              if state.strip() == "failed":
+                  raise Exception(
+                      f"{label}: {unit} FAILED before :{port} opened (crash loop "
+                      f"or start limit); the backend dump below names the cause")
+              time.sleep(2)
+          raise Exception(f"{label}: :{port} still closed after {bound}s")
+
       try:
-          server.wait_for_open_port(6777, timeout=300)
-          edge.wait_for_open_port(6777, timeout=300)
+          _wait_port_or_unit_failure(server, "server", "hart-backend.service", 6777, 300)
+          _wait_port_or_unit_failure(edge, "edge", "hart-backend.service", 6777, 300)
       except Exception:
           _dump_backend_state(server, "server")
           _dump_backend_state(edge, "edge")

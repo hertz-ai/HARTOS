@@ -182,10 +182,58 @@ pub const NATIVE_CHROME_ORB: u8 = 1 << 1;
 /// that a `unsafe_code = "deny"` crate cannot format. So the compositor takes the half it
 /// can draw correctly and the shell keeps the half it alone knows.
 ///
-/// There is deliberately no TOPBAR or TASKBAR bit yet. The native bars draw, but the
-/// native taskbar is an empty strip, so claiming it would take the user's window and panel
-/// switching away. A bit nothing can honestly claim is worse than no bit.
+/// The bars have their own bits now (below), each claimed only when its band is FULLY
+/// composed by `shell.chrome` and pixels landed in it; the rule is `leaf_claim`.
 pub const NATIVE_CHROME_HOME: u8 = 1 << 2;
+/// The TOP BAR band and the TASKBAR band, claimed per band and never partially.
+///
+/// A claimed band makes the shell stop painting its own, so the claim must mean "the
+/// native bar carries everything the shell's did": the clock, the tray, the badge and
+/// the agent cluster for the top bar; the chip list for the taskbar. Those come over
+/// `shell.chrome`, and `scene::ShellChrome::coverage` says which bands the payload
+/// composes fully. That answer gates the bit; the pixels in the band earn it. A bar drawn
+/// from a partial payload (a strip with tabs but no clock, a taskbar with no chip list)
+/// therefore claims nothing, which is the same rule the home bit follows for the same
+/// reason: over-claiming costs an empty desktop the paint watchdog cannot see.
+pub const NATIVE_CHROME_TOPBAR: u8 = 1 << 3;
+pub const NATIVE_CHROME_TASKBAR: u8 = 1 << 4;
+
+/// Whether a lowered leaf lies WHOLLY inside the top bar band.
+pub fn in_top_band(rect: crate::scene::Rect, top_h: f32) -> bool {
+    rect.h > 0.0 && rect.w > 0.0 && rect.y >= 0.0 && rect.y + rect.h <= top_h
+}
+
+/// Whether a lowered leaf lies WHOLLY inside the taskbar band.
+pub fn in_taskbar_band(rect: crate::scene::Rect, taskbar_y: f32) -> bool {
+    rect.h > 0.0 && rect.w > 0.0 && rect.y >= taskbar_y
+}
+
+/// Every NATIVE_CHROME_* bit one lowered leaf earns. PURE, so the whole claim rule is
+/// testable without a renderer: the home bit is geometric (see `in_home_band`); the two
+/// bar bits are geometric AND gated on the band being fully composed, because pixels in
+/// a strip are not evidence that the strip carries what the shell's does. On an output
+/// too short for the two strips to be distinct bands nothing bar-shaped is claimed at
+/// all, since a leaf could then sit in both.
+pub fn leaf_claim(
+    rect: crate::scene::Rect,
+    top_h: f32,
+    taskbar_y: f32,
+    cov: crate::scene::ChromeCoverage,
+) -> u8 {
+    let mut mask = 0;
+    if in_home_band(rect, top_h, taskbar_y) {
+        mask |= NATIVE_CHROME_HOME;
+    }
+    if taskbar_y > top_h {
+        if cov.top_bar && in_top_band(rect, top_h) {
+            mask |= NATIVE_CHROME_TOPBAR;
+        }
+        if cov.taskbar && in_taskbar_band(rect, taskbar_y) {
+            mask |= NATIVE_CHROME_TASKBAR;
+        }
+    }
+    mask
+}
 
 /// Whether a lowered leaf lies WHOLLY inside the home band. PURE, so the rule is testable
 /// without a renderer.
@@ -294,35 +342,179 @@ impl MapAnim {
 /// than in a static, mirroring how `black_buffer` is already owned.
 #[derive(Default)]
 pub struct BloomCache {
-    /// Resolved ONCE, not per frame. `bloom::theme_palette` reads a JSON file off
-    /// disk; doing that at 60Hz would be a syscall storm behind a static image.
-    palette: Option<crate::bloom::BloomPalette>,
     key: Option<(i32, i32, crate::bloom::BloomPalette)>,
     buffer: Option<MemoryRenderBuffer>,
+    /// The FROSTED twin of `buffer` (see `frosted_crop`): the same field, blurred and
+    /// saturated the way the shell's `.glass` backdrop-filter would have, composed once
+    /// per (size, palette, look) as bytes, then handed out as per-region crops. Same
+    /// compose-once contract as the field itself.
+    frosted_key: Option<(i32, i32, crate::bloom::BloomPalette, GlassLook)>,
+    frosted_rgba: Vec<u8>,
+    /// One buffer per region that currently sits on the frosted field, keyed by its
+    /// rect. A crop rather than the full buffer with a `src` window because a render
+    /// element's damage id IS its buffer's id: two crops of one buffer would share an id,
+    /// and the damage tracker would then see one element that moves every frame. Each
+    /// crop keeps its own id and its own commit, so a still window costs the tracker
+    /// nothing and a moved one costs one memcpy plus one texture upload, never a compose.
+    /// Stamped with the frame it was last used on; crops nothing has drawn for a while
+    /// are dropped at the next insert.
+    crops: std::collections::HashMap<(i32, i32, i32, i32), (MemoryRenderBuffer, u64)>,
+    frame: u64,
+}
+
+/// The two glass numbers the compositor CONSUMES, read from the same theme file
+/// theme_service.py emits them from: `shell.blur_radius` (`--hart-blur`) and
+/// `shell.saturation` (`--hart-saturation`). hartGlass.js, the one look definition
+/// (checklist GL3), names theme_service as the source of every glass number; this reads
+/// that source, not a copy of it.
+///
+/// Deliberately NOT here: `shell.glass_rgb` and `shell.panel_opacity`, the tint. The
+/// split checklist GL3 arrived at is that the look is the client's CSS and the one
+/// irreducibly platform question is "can this OS put the desktop behind my window so the
+/// page's blur has something to blur". On HART OS the compositor answers it by putting
+/// the FROSTED desktop behind a translucent client region; the client paints its own
+/// `--hart-glass-bg` over it, exactly as the shell's `.taskbar.glass` already does. So
+/// the tint never exists twice, and a theme that moves it moves it in one place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GlassLook {
+    /// `--hart-blur` in px. 0 means no blur (the frosted field IS the field).
+    pub blur_px: u16,
+    /// `--hart-saturation` in percent. 100 means untouched.
+    pub saturation_pct: u16,
+}
+
+impl Default for GlassLook {
+    /// theme_service.py's own fallbacks (`shell.get("blur_radius", 20)`,
+    /// `shell.get("saturation", 180)`), so a theme that omits them is pixel-identical to
+    /// the browser's rendering of the same omission.
+    fn default() -> Self {
+        GlassLook { blur_px: 20, saturation_pct: 180 }
+    }
+}
+
+impl GlassLook {
+    /// From the active theme file, each key None-tolerant and clamped: these cross a
+    /// process boundary as a file, and a blur of a million pixels would be a compose that
+    /// never finishes on the frame path.
+    pub fn from_file(file: &crate::bloom::SettingsFile) -> GlassLook {
+        let d = GlassLook::default();
+        GlassLook {
+            blur_px: file
+                .num("blur_radius")
+                .map(|b| b.clamp(0.0, 128.0).round() as u16)
+                .unwrap_or(d.blur_px),
+            saturation_pct: file
+                .num("saturation")
+                .map(|s| s.clamp(0.0, 400.0).round() as u16)
+                .unwrap_or(d.saturation_pct),
+        }
+    }
+
+    /// The downsample factor the blur becomes. A box blur of radius r is well approximated
+    /// by averaging over r-wide cells and interpolating between them, and the field is
+    /// smooth enough that the difference is invisible; what matters is that this costs
+    /// one compose, not a kernel pass per frame (bloom.rs's own contract).
+    fn downsample(&self) -> usize {
+        (self.blur_px as usize / 2).max(1)
+    }
+}
+
+/// The frosted field: `bloom::compose` at 1/`downsample` resolution (the blur), sampled
+/// back up bilinearly, with CSS `saturate()` applied per pixel. Rows of opaque Argb8888,
+/// the layout `MemoryRenderBuffer::from_slice` expects, the same as the field itself.
+///
+/// Why the blur is a downsample rather than a kernel: the field is resolution
+/// independent (`bloom::compose` places its blobs as fractions of the size), so composing
+/// it small IS averaging it, for free, and bilinear upsampling of a 1/10 field is a
+/// 10 px wide tent filter, which on a field with no edges reads as the 20 px Gaussian the
+/// shell asks for. A `look` of blur 0 and saturation 100 is the identity, which the
+/// proof below pins so nobody can mistake this for a tint.
+pub fn frosted_field_rgba(
+    width: i32,
+    height: i32,
+    pal: &crate::bloom::BloomPalette,
+    look: GlassLook,
+) -> Vec<u8> {
+    let w = width.max(1) as usize;
+    let h = height.max(1) as usize;
+    let s = look.downsample();
+    if s == 1 && look.saturation_pct == 100 {
+        return crate::bloom::compose(width, height, pal);
+    }
+    let lw = w.div_ceil(s).max(1);
+    let lh = h.div_ceil(s).max(1);
+    let low = crate::bloom::compose(lw as i32, lh as i32, pal);
+    let sat = look.saturation_pct as f32 / 100.0;
+    let mut out = vec![0u8; w * h * 4];
+    // Sample the low-res field at the centre of each output pixel, mapped into low-res
+    // pixel centres, clamped at the edges so the border never reads outside.
+    let at = |x: usize, y: usize| -> [f32; 3] {
+        let i = (y * lw + x) * 4;
+        [low[i] as f32, low[i + 1] as f32, low[i + 2] as f32]
+    };
+    for y in 0..h {
+        let fy = ((y as f32 + 0.5) / s as f32 - 0.5).clamp(0.0, (lh - 1) as f32);
+        let y0 = fy.floor() as usize;
+        let y1 = (y0 + 1).min(lh - 1);
+        let ty = fy - y0 as f32;
+        let row = y * w * 4;
+        for x in 0..w {
+            let fx = ((x as f32 + 0.5) / s as f32 - 0.5).clamp(0.0, (lw - 1) as f32);
+            let x0 = fx.floor() as usize;
+            let x1 = (x0 + 1).min(lw - 1);
+            let tx = fx - x0 as f32;
+            let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+            let mut px = [0f32; 3];
+            for ch in 0..3 {
+                let top = a[ch] + (b[ch] - a[ch]) * tx;
+                let bot = c[ch] + (d[ch] - c[ch]) * tx;
+                px[ch] = top + (bot - top) * ty;
+            }
+            // CSS saturate(): Rec. 709 luma held, chroma scaled about it. Bytes are
+            // B,G,R here (Argb8888 little-endian), so the luma weights follow that order.
+            let luma = 0.0722 * px[0] + 0.7152 * px[1] + 0.2126 * px[2];
+            let i = row + x * 4;
+            for ch in 0..3 {
+                out[i + ch] = (luma + (px[ch] - luma) * sat).round().clamp(0.0, 255.0) as u8;
+            }
+            out[i + 3] = 255;
+        }
+    }
+    out
 }
 
 impl BloomCache {
-    // KNOWN GAP, deliberately not papered over with an unused method: the
-    // palette is resolved once and never re-read, so a theme change at runtime
-    // ("switch theme" through the agent) will not restyle this backdrop until
-    // the compositor restarts. An `invalidate()` was written here and removed
-    // again because nothing calls it, and a dead pub method is worse than an
-    // absent one: it warns on every build and reads as though the wiring exists.
-    // Whoever lands the theme-change signal adds it back with a caller.
-
     /// The backdrop for this size, composing only on a genuine miss.
     ///
     /// Returns `None` for a degenerate output size (a disconnected or
     /// not-yet-moded connector reports 0x0). The caller simply paints no
     /// backdrop then and the clear colour still covers the frame, so a bad mode
     /// can never panic the render loop.
-    pub fn get(&mut self, w: i32, h: i32) -> Option<&MemoryRenderBuffer> {
+    ///
+    /// `base` is the theme's own field, handed in by the caller from the theme watch
+    /// (`theme_now().bloom`), which is what closed the gap this cache used to document:
+    /// the palette was resolved once and never re-read, so a theme change restyled
+    /// nothing until a restart. Now a changed theme file yields a changed `base`, the
+    /// key misses once, and the field recomposes once.
+    ///
+    /// `mood` is the composed home's resolved palette, folded over the theme's own
+    /// hues (`BloomPalette::with_mood`). It is part of the key, so a new mood
+    /// recomposes the field exactly once and the same mood never recomposes it; a
+    /// home without one paints the theme's field, which is the aura default today.
+    pub fn get(
+        &mut self,
+        w: i32,
+        h: i32,
+        base: crate::bloom::BloomPalette,
+        mood: Option<&crate::scene::MoodPalette>,
+    ) -> Option<&MemoryRenderBuffer> {
         if w <= 0 || h <= 0 {
             return None;
         }
-        // `BloomPalette` is `Copy`, so this reads the cached value and does NOT
-        // hold the borrow across the compose below.
-        let pal = *self.palette.get_or_insert_with(crate::bloom::theme_palette);
+        let pal = match mood {
+            Some(m) => base.with_mood(m),
+            None => base,
+        };
         if self.key != Some((w, h, pal)) {
             let started = Instant::now();
             let rgba = crate::bloom::compose(w, h, &pal);
@@ -343,6 +535,90 @@ impl BloomCache {
             );
         }
         self.buffer.as_ref()
+    }
+
+    /// Start a frame for the crop pool: crops untouched for `CROP_TTL_FRAMES` are
+    /// evicted at the next insert. Called once per lowering, like `RectCache::begin_frame`.
+    pub fn begin_frame(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+    }
+
+    /// The crop of the frosted field under `rect` (output pixels, already clipped to the
+    /// output), composing the full frosted field only on a genuine miss of
+    /// (size, palette, look) and copying the crop only on a miss of the rect. A still
+    /// desktop does neither; a window that moves pays a memcpy; a theme that changes its
+    /// blur, its saturation or its palette pays one compose and one memcpy per region.
+    pub fn frosted_crop(
+        &mut self,
+        w: i32,
+        h: i32,
+        base: crate::bloom::BloomPalette,
+        mood: Option<&crate::scene::MoodPalette>,
+        look: GlassLook,
+        rect: Rectangle<i32, Physical>,
+    ) -> Option<&MemoryRenderBuffer> {
+        if w <= 0 || h <= 0 || rect.size.w <= 0 || rect.size.h <= 0 {
+            return None;
+        }
+        let pal = match mood {
+            Some(m) => base.with_mood(m),
+            None => base,
+        };
+        if self.frosted_key != Some((w, h, pal, look)) {
+            let started = Instant::now();
+            self.frosted_rgba = frosted_field_rgba(w, h, &pal, look);
+            self.frosted_key = Some((w, h, pal, look));
+            // Every crop was cut from the old field: none of them is right any more.
+            self.crops.clear();
+            info!(
+                width = w,
+                height = h,
+                blur_px = look.blur_px,
+                saturation_pct = look.saturation_pct,
+                took_ms = started.elapsed().as_millis() as u64,
+                "glass.composed (the frosted desktop under translucent regions; cached until the mode, theme or look changes)"
+            );
+        }
+        let key = (rect.loc.x, rect.loc.y, rect.size.w, rect.size.h);
+        let frame = self.frame;
+        if !self.crops.contains_key(&key) {
+            const CROP_TTL_FRAMES: u64 = 120;
+            self.crops
+                .retain(|_, (_, used)| frame.wrapping_sub(*used) <= CROP_TTL_FRAMES);
+            let (x0, y0, cw, ch) = (
+                rect.loc.x.clamp(0, w) as usize,
+                rect.loc.y.clamp(0, h) as usize,
+                rect.size.w.min(w - rect.loc.x.clamp(0, w)) as usize,
+                rect.size.h.min(h - rect.loc.y.clamp(0, h)) as usize,
+            );
+            if cw == 0 || ch == 0 {
+                return None;
+            }
+            let stride = w as usize * 4;
+            let mut rgba = vec![0u8; cw * ch * 4];
+            for row in 0..ch {
+                let s = (y0 + row) * stride + x0 * 4;
+                let d = row * cw * 4;
+                rgba[d..d + cw * 4].copy_from_slice(&self.frosted_rgba[s..s + cw * 4]);
+            }
+            let buffer = MemoryRenderBuffer::from_slice(
+                &rgba,
+                Fourcc::Argb8888,
+                (cw as i32, ch as i32),
+                1,
+                Transform::Normal,
+                None,
+            );
+            self.crops.insert(key, (buffer, frame));
+        }
+        let (buffer, used) = self.crops.get_mut(&key)?;
+        *used = frame;
+        Some(&*buffer)
+    }
+
+    /// How many crops are pooled right now (test hook for the compose-once proof).
+    pub fn crops_pooled(&self) -> usize {
+        self.crops.len()
     }
 }
 
@@ -475,13 +751,7 @@ fn rounded_rect_rgba(
             // Pixel centre relative to the rect centre.
             let px = x as f32 + 0.5 - hw;
             let py = y as f32 + 0.5 - hh;
-            // Rounded-box SDF (<=0 inside): distance to the shape's edge.
-            let qx = px.abs() - (hw - r);
-            let qy = py.abs() - (hh - r);
-            let dist =
-                (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
-            // ~1px anti-aliased coverage across the edge.
-            let cov = (0.5 - dist).clamp(0.0, 1.0);
+            let cov = rounded_coverage(px, py, hw, hh, r);
             if cov <= 0.0 {
                 continue;
             }
@@ -516,6 +786,20 @@ fn rounded_rect_rgba(
         }
     }
     rgba
+}
+
+/// The ~1px anti-aliased coverage of a rounded box at a pixel centre `(px, py)` relative
+/// to the box's centre, for a box of half-extents `(hw, hh)` and corner radius `r`.
+///
+/// A rounded-box signed-distance field (<= 0 inside), the ONE corner rule the tiles use.
+/// Factored out of `rounded_rect_rgba` when the card art gained a photo: the photo is
+/// clipped to the same corner as the tile beneath it, and a second SDF for the same
+/// shape is how two surfaces of one card get two different corners.
+fn rounded_coverage(px: f32, py: f32, hw: f32, hh: f32, r: f32) -> f32 {
+    let qx = px.abs() - (hw - r);
+    let qy = py.abs() - (hh - r);
+    let dist = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
+    (0.5 - dist).clamp(0.0, 1.0)
 }
 
 /// Rasterize a DROP SHADOW: the rounded box, blurred, into a premultiplied buffer.
@@ -594,6 +878,165 @@ pub struct RectCache {
     /// proof: a rounded rect is a per-pixel SDF rasterize, so recomposing one per frame
     /// would be far more expensive than the solid pool it sits beside.
     rounded_composes: u64,
+    /// CARD ART: a bundled SVG rasterised once per (source, size, radius), the photo
+    /// layer `.hh-card-art img` fades in over the gradient. Same compose-once contract
+    /// as the tiles, same cache, a separate map because the key is a path.
+    ///
+    /// A MISS is cached too (`None`): a source that does not resolve, does not read or
+    /// does not parse is remembered so the frame path never touches the disk twice for
+    /// it. Without that a card naming a file that is not there would stat it at 60Hz.
+    ///
+    /// BOUNDED, unlike the tile map, and for the reason the text cache is: the key
+    /// comes from the FEED. An agent-written home can name a fresh source on every
+    /// compose, and a map keyed on what the agent writes grows with what the agent
+    /// writes. See `MAX_CACHED_ART`.
+    art: std::collections::HashMap<(String, u32, u32, u32), Option<MemoryRenderBuffer>>,
+    /// How many SVGs were ever rasterised (test hook for the compose-once proof).
+    art_composes: u64,
+    /// The font database the SVG `<text>` runs shape against, loaded from the system
+    /// ONCE, on the first art compose, and never on the frame path after that. 39 of
+    /// the 51 bundled assets carry their app's initial as text; without a database
+    /// they still decode, as a letterless tile.
+    art_fonts: Option<std::sync::Arc<resvg::usvg::fontdb::Database>>,
+    /// Where a card's served photo path lives on disk. Public so a test can point it
+    /// at a temp dir; the frame path never changes it.
+    pub art_roots: ArtRoots,
+}
+
+/// The most art buffers held at once. A desktop shows at most three rows of about
+/// seven cards, so this is several desktops' worth; past it the map is dropped
+/// wholesale and the live set recomposes once, exactly as the text cache does.
+const MAX_CACHED_ART: usize = 64;
+
+/// Where the two served photo prefixes the sanitizer allows resolve on disk.
+///
+/// `_home_sanitize_card` lets a card's `image` name exactly two prefixes:
+/// `/shell/static/app_art/...` (the shell's own static dir) and `/shell/agent-art/<slug>`
+/// (`HART_AGENT_ART_DIR`, default `/var/lib/hart/agent-art`, then the bundled
+/// `app_art/agents`). The browser fetches those over HTTP; the compositor has no HTTP
+/// and wants none, so it reads the same files by path, and the root of the static dir
+/// is a DEPLOYMENT FACT handed in as `HART_SHELL_STATIC_DIR` (the parity program's own
+/// phrase for it). Unset, no photo is lowered and every card is its gradient, which is
+/// a correct card rather than a hole.
+///
+/// Only `.svg` is decoded: every bundled asset is one, and the raster decoders were
+/// left out of the build on purpose. A central drop of `auto-research.png` shows in
+/// the browser and not natively, which is stated here rather than discovered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtRoots {
+    pub static_dir: Option<std::path::PathBuf>,
+    pub agent_art_dir: Option<std::path::PathBuf>,
+}
+
+impl Default for ArtRoots {
+    /// From the environment, exactly as the shell resolves its own two roots.
+    fn default() -> Self {
+        let dir = |var: &str| std::env::var_os(var).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+        ArtRoots {
+            static_dir: dir("HART_SHELL_STATIC_DIR"),
+            agent_art_dir: dir("HART_AGENT_ART_DIR")
+                .or_else(|| Some(std::path::PathBuf::from("/var/lib/hart/agent-art"))),
+        }
+    }
+}
+
+impl ArtRoots {
+    /// The file a served photo path names, or None when the path is outside the two
+    /// prefixes, could leave its root, or is not an SVG.
+    ///
+    /// PURE (no disk): the sanitizer already constrains the prefix, but `image` is a
+    /// string the LLM wrote and the only thing between it and `read` is this, so `..`
+    /// and absolute segments are refused here regardless of what upstream allowed.
+    pub fn resolve(&self, source: &str) -> Option<std::path::PathBuf> {
+        fn safe_rel(rel: &str) -> bool {
+            !rel.is_empty()
+                && rel.ends_with(".svg")
+                && rel
+                    .split('/')
+                    .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains('\\'))
+        }
+        if let Some(rel) = source.strip_prefix("/shell/static/") {
+            if !safe_rel(rel) {
+                return None;
+            }
+            return self.static_dir.as_ref().map(|d| d.join(rel));
+        }
+        if let Some(slug) = source.strip_prefix("/shell/agent-art/") {
+            // The route's own contract: `[a-z0-9-]` only, extension resolved server side.
+            if slug.is_empty() || !slug.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+                return None;
+            }
+            let file = format!("{slug}.svg");
+            let drop = self.agent_art_dir.as_ref().map(|d| d.join(&file));
+            let bundled = self.static_dir.as_ref().map(|d| d.join("app_art").join("agents").join(&file));
+            // First found wins, the same order the route searches. Existence is the one
+            // disk touch here, and it happens once per source because the miss is cached.
+            return drop
+                .filter(|p| p.is_file())
+                .or(bundled);
+        }
+        None
+    }
+}
+
+/// Rasterise an SVG into a premultiplied [B,G,R,A] buffer of `w` x `h`, COVERING the box
+/// (`object-fit: cover`, the shell's `.hh-card-art img`: scaled to fill, centred, the
+/// overflow cropped) and clipped to the tile's corner radius.
+///
+/// `None` when the data is not an SVG usvg accepts, or has no size. The text runs shape
+/// against `fonts`; an empty database renders them as nothing rather than failing.
+fn svg_rgba(
+    data: &[u8],
+    w: u32,
+    h: u32,
+    radius: f32,
+    fonts: &std::sync::Arc<resvg::usvg::fontdb::Database>,
+) -> Option<Vec<u8>> {
+    use resvg::tiny_skia;
+    use resvg::usvg;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut opt = usvg::Options::default();
+    opt.fontdb = fonts.clone();
+    let tree = usvg::Tree::from_data(data, &opt).ok()?;
+    let size = tree.size();
+    let (sw, sh) = (size.width(), size.height());
+    if !(sw > 0.0 && sh > 0.0) {
+        return None;
+    }
+    let scale = (w as f32 / sw).max(h as f32 / sh);
+    let tx = (w as f32 - sw * scale) * 0.5;
+    let ty = (h as f32 - sh * scale) * 0.5;
+    let mut pixmap = tiny_skia::Pixmap::new(w, h)?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, tx, ty),
+        &mut pixmap.as_mut(),
+    );
+    // tiny-skia hands back PREMULTIPLIED RGBA8; the buffer wants premultiplied BGRA
+    // (Argb8888 little-endian), so this is a channel swap plus the corner coverage,
+    // which scales every channel alike because the data is already premultiplied.
+    let hw = w as f32 / 2.0;
+    let hh = h as f32 / 2.0;
+    let r = radius.clamp(0.0, hw.min(hh));
+    let src = pixmap.data();
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            let cov = rounded_coverage(x as f32 + 0.5 - hw, y as f32 + 0.5 - hh, hw, hh, r);
+            if cov <= 0.0 {
+                continue;
+            }
+            let k = |v: u8| (v as f32 * cov) as u8;
+            out[i] = k(src[i + 2]);
+            out[i + 1] = k(src[i + 1]);
+            out[i + 2] = k(src[i]);
+            out[i + 3] = k(src[i + 3]);
+        }
+    }
+    Some(out)
 }
 
 impl RectCache {
@@ -790,6 +1233,89 @@ impl RectCache {
     /// compose-once proof).
     pub fn rounded_composes(&self) -> u64 {
         self.rounded_composes
+    }
+
+    /// The photo for a card's art tile: `source` (the served path the feed carries)
+    /// rasterised at `w` x `h` under the tile's corner, composed on first use and
+    /// cached, miss included, forever after. `None` when the source is outside the
+    /// roots, unreadable, not an SVG, or degenerate; the card is then its gradient.
+    pub fn art(&mut self, source: &str, w: i32, h: i32, radius: f32) -> Option<&MemoryRenderBuffer> {
+        if w < 1 || h < 1 || source.is_empty() {
+            return None;
+        }
+        let key = (source.to_string(), w as u32, h as u32, radius.to_bits());
+        if !self.art.contains_key(&key) {
+            if self.art.len() >= MAX_CACHED_ART {
+                self.art.clear();
+            }
+            let composed = self.compose_art(source, w as u32, h as u32, radius);
+            self.art.insert(key.clone(), composed);
+        }
+        self.art.get(&key).and_then(Option::as_ref)
+    }
+
+    /// Resolve, read, decode. The only disk touches on the art path, and each source
+    /// takes them once because the result, either way, goes into the map.
+    fn compose_art(&mut self, source: &str, w: u32, h: u32, radius: f32) -> Option<MemoryRenderBuffer> {
+        let path = match self.art_roots.resolve(source) {
+            Some(p) => p,
+            None => {
+                debug!(source, "card art: source is outside the served roots, or no root is set");
+                return None;
+            }
+        };
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(err) => {
+                warn!(?err, ?path, "card art: unreadable, the card keeps its gradient");
+                return None;
+            }
+        };
+        let fonts = self.art_fonts.get_or_insert_with(|| {
+            let started = Instant::now();
+            let mut db = resvg::usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            info!(
+                faces = db.len(),
+                took_ms = started.elapsed().as_millis() as u64,
+                "card art: font database loaded once for the SVG text runs"
+            );
+            std::sync::Arc::new(db)
+        });
+        let started = Instant::now();
+        let rgba = match svg_rgba(&data, w, h, radius, fonts) {
+            Some(px) => px,
+            None => {
+                warn!(?path, "card art: not an SVG the rasteriser accepts, the card keeps its gradient");
+                return None;
+            }
+        };
+        self.art_composes += 1;
+        debug!(
+            ?path,
+            w,
+            h,
+            took_ms = started.elapsed().as_millis() as u64,
+            "card art: composed once (cached until the size or the feed changes)"
+        );
+        Some(MemoryRenderBuffer::from_slice(
+            &rgba,
+            Fourcc::Argb8888,
+            (w as i32, h as i32),
+            1,
+            Transform::Normal,
+            None,
+        ))
+    }
+
+    /// Total SVGs ever rasterised (test hook for the compose-once proof).
+    pub fn art_composes(&self) -> u64 {
+        self.art_composes
+    }
+
+    /// How many art entries are held, misses included (test hook for the bound).
+    pub fn cached_art(&self) -> usize {
+        self.art.len()
     }
 }
 
@@ -1555,23 +2081,32 @@ pub fn process_input_event<S: CompState, B: InputBackend>(state: &mut S, event: 
     }
 }
 
-/// One-shot input-liveness beacon (#134/#128). On the FIRST real pointer/keyboard event,
-/// log a journal line and best-effort touch `/run/hart/session/input-alive` — the marker
-/// the out-of-process session supervisor / HARTLOG can later read to tell a
-/// painted-but-input-starved boot (HEALTHY paint, dead seat) apart from a working desktop,
-/// and drop a tier next time. The flag is a single relaxed atomic: the marker write fires
-/// exactly once and every later event is one atomic load. The file write is best-effort
-/// (a missing `/run/hart/session` dir on the dev box, or a read-only FS, just leaves the
-/// journal line as the signal); it never blocks and never aborts the compositor.
+/// Input-liveness beacon (#134/#128), and the heartbeat the governor reads.
+///
+/// On the FIRST real pointer/keyboard event, log a journal line and best-effort write the
+/// input-alive marker, the file the out-of-process session supervisor reads by EXISTENCE
+/// to tell a painted-but-input-starved boot (HEALTHY paint, dead seat) apart from a
+/// working desktop. From then on, while input keeps flowing, the marker is touched again
+/// at most once per `INPUT_ALIVE_HEARTBEAT`, so its mtime says when a person last touched
+/// the box. The decision (once-only line, unconditional first write, paced touches) is the
+/// pure `InputAliveBeacon` in main.rs, tested there; the path honours
+/// `HART_INPUT_ALIVE_FLAG` like the sibling markers. Every event inside the heartbeat costs
+/// one atomic load and a subtraction. The write is best-effort (a missing
+/// `/run/hart/session` on the dev box, a read-only FS) and never blocks the input path.
 fn note_input_alive() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static INPUT_SEEN: AtomicBool = AtomicBool::new(false);
-    if INPUT_SEEN.swap(true, Ordering::Relaxed) {
-        return;
+    static BEACON: crate::InputAliveBeacon = crate::InputAliveBeacon::new();
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let now = BASE.get_or_init(Instant::now).elapsed();
+    match BEACON.note(now) {
+        crate::InputAliveWrite::Skip => return,
+        crate::InputAliveWrite::First => {
+            info!("hart-comp: first seat input delivered — libinput/Seat path is LIVE (#134 liveness beacon)");
+        }
+        crate::InputAliveWrite::Touch => {}
     }
-    info!("hart-comp: first seat input delivered — libinput/Seat path is LIVE (#134 liveness beacon)");
-    if let Err(err) = std::fs::write("/run/hart/session/input-alive", b"1\n") {
-        debug!(?err, "note_input_alive: could not write the input-alive marker (the journal line above is the primary signal)");
+    let path = crate::input_alive_marker_path();
+    if !crate::write_scanout_marker(&path) {
+        debug!(marker = %path, "note_input_alive: could not write the input-alive marker (the journal line is the primary signal)");
     }
 }
 
@@ -2768,6 +3303,72 @@ where
     painted
 }
 
+/// Put the FROSTED desktop under `rect` (checklist GL2 on HART OS: the compositor is
+/// the platform's own GPU compositor, so the blur-behind a translucent surface needs is
+/// ours to draw). One crop of the compose-once frosted field, blended per frame by the
+/// renderer at `alpha`; the client paints its own tint over it (see `GlassLook` for why
+/// the tint is not here). `elements` is TOP→bottom, so the caller pushes this right
+/// AFTER the surface it sits under. Clipped to the output; returns whether it was pushed.
+///
+/// What this rung IS and IS NOT, stated so nobody reads a claim into it: the blur is of
+/// the compositor's own desktop field, composed once. It is not a per-frame blur of the
+/// live pixels beneath the region (other windows, the WebView's cards); those show the
+/// frosted field in their place while a translucent window covers them. The per-frame
+/// rung is a render-to-texture pass over the elements below the region and belongs to
+/// the GLES path alone; this one is what both renderers can afford on every frame
+/// (checklist GF1: keep the richness, drop only the per-frame cost).
+fn push_frosted_backdrop<S, R>(
+    state: &mut S,
+    renderer: &mut R,
+    elements: &mut Vec<HartRenderElement<R>>,
+    rect: Rectangle<i32, Physical>,
+    alpha: f32,
+    output: Size<i32, Physical>,
+) -> bool
+where
+    S: CompState,
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Send + Clone + 'static,
+{
+    let bounds: Rectangle<i32, Physical> = Rectangle::from_size(output);
+    let rect = match rect.intersection(bounds) {
+        Some(r) if r.size.w > 0 && r.size.h > 0 => r,
+        _ => return false,
+    };
+    // The same mood and theme field the bloom below is composed from, so the frosted
+    // field is that field and not a second palette.
+    let mood = state.native_home().and_then(|h| h.palette);
+    let snap = theme_now();
+    let buffer = match state
+        .bloom_mut()
+        .frosted_crop(output.w, output.h, snap.bloom, mood.as_ref(), snap.glass, rect)
+    {
+        Some(b) => b,
+        None => return false,
+    };
+    let origin: Point<f64, Physical> = Point::from((rect.loc.x as f64, rect.loc.y as f64));
+    match MemoryRenderBufferRenderElement::from_buffer(
+        renderer,
+        origin,
+        buffer,
+        Some(alpha),
+        None,
+        None,
+        Kind::Unspecified,
+    ) {
+        Ok(e) => {
+            elements.push(HartRenderElement::Memory(e));
+            true
+        }
+        // Never fatal: a region without its frosting shows the sharp desktop, which is
+        // exactly what it showed before this existed.
+        Err(err) => {
+            warn!(?err, "glass: failed to import the frosted field; the region shows the sharp desktop");
+            false
+        }
+    }
+}
+
 /// Build the FULL frame element list in z-order (TOP→bottom; `draw_render_elements`
 /// paints index 0 first = top-most): killswitch → cursor → Top/Overlay layers →
 /// windows (faded) → Bottom/Background layers.
@@ -3002,49 +3603,182 @@ where
 }
 
 /// Lower a `HomeCompose` to render elements against the concrete caches — the
-/// Does the active THEME ask for the reduced-effects tier? Resolved once, beside the
-/// others, and carrying the same restart-to-change gap.
+/// Everything the theme files decide, read together so the four consumers (the scene's
+/// colours, the backdrop's field, the potato tier, reduced motion) can never disagree
+/// about which version of the files they saw.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThemeSnapshot {
+    pub theme: crate::scene::Theme,
+    pub bloom: crate::bloom::BloomPalette,
+    /// `performance.disable_blur`, half of the shell's `is_potato`; the other half is
+    /// the software floor, which the compositor knows directly. Only `potato.json` sets
+    /// it today. Its sibling `disable_animations` is NOT read, deliberately: nothing in
+    /// the tree reads it either, so honouring it natively would invent a behaviour the
+    /// shell does not have.
+    pub potato: bool,
+    /// `reduced_motion` from the accessibility file, the ledger's third motion switch.
+    pub reduced_motion: bool,
+    /// `shell.blur_radius` + `shell.saturation`: what the compositor frosts the desktop
+    /// with under a translucent client region (see `GlassLook`). Read in the same reload
+    /// as everything above, so a theme change restyles the glass on the same frame.
+    pub glass: GlassLook,
+}
+
+/// How often the theme files are stat'd, at most. One second is the conky Lua's own
+/// cadence for `active_theme.json` ("read by Conky Lua every 5s" in theme_service.py is
+/// the slow end); a theme applied in the customization hub restyles the native desktop
+/// within a second, and a still desktop pays one `stat` a second, never a read.
+const THEME_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The theme, HOT RELOADABLE: what the files say now, re-read when they change.
 ///
-/// `performance.disable_blur` is half of the shell's `is_potato`; the other half is the
-/// software floor, which the compositor knows directly. Only `potato.json` sets it today.
+/// This replaced three `OnceLock`s (the scene's `Theme`, `disable_blur`, `reduced_motion`)
+/// and the once-resolved palette inside `BloomCache`, all of which carried the same
+/// documented gap: resolved once, never re-read, so a theme change at runtime restyled
+/// nothing until the compositor restarted. The customization hub applies a theme by
+/// rewriting `active_theme.json`, and the shell restyles itself on the next render; the
+/// native desktop stayed on the theme it booted with.
 ///
-/// Its sibling `performance.disable_animations` is NOT read here, deliberately: nothing
-/// in the tree reads it either, so it is a dead key rather than a contract, and honouring
-/// it natively would invent a behaviour the shell does not have.
+/// WHY A WATCH ON THE FILES rather than a `shell.theme` verb over the socket: the shell
+/// already tells the compositor nothing about themes, the file IS the channel both
+/// renderers read (Gate 4: one palette source), and a verb would have landed in ipc.rs
+/// while another stream was adding `shell.chrome` there. A watch needs no producer and
+/// notices every writer: the hub, an agent's `update_custom`, a hand edit.
+///
+/// The frame path never reads the disk for this: `poll` stats the files at most once
+/// per `THEME_RECHECK`, compares modification times, and only re-reads on a change.
+/// `Instant` is passed in so the rate limit is testable without waiting.
+pub struct ThemeWatch {
+    /// In priority order; the first that reads is the theme. Every one is stamped, so
+    /// a file APPEARING (the first theme ever applied) is a change too.
+    theme_paths: Vec<std::path::PathBuf>,
+    a11y_path: std::path::PathBuf,
+    snapshot: ThemeSnapshot,
+    stamps: Vec<Option<std::time::SystemTime>>,
+    last_check: Option<Instant>,
+    reloads: u64,
+}
+
+impl ThemeWatch {
+    /// Watch these files, reading them once now.
+    pub fn new(theme_paths: Vec<std::path::PathBuf>, a11y_path: std::path::PathBuf) -> ThemeWatch {
+        let mut w = ThemeWatch {
+            theme_paths,
+            a11y_path,
+            snapshot: ThemeSnapshot {
+                theme: crate::scene::Theme::cosmic_default(),
+                bloom: crate::bloom::BloomPalette::default(),
+                potato: false,
+                reduced_motion: false,
+                glass: GlassLook::default(),
+            },
+            stamps: Vec::new(),
+            last_check: None,
+            reloads: 0,
+        };
+        w.stamps = w.read_stamps();
+        w.reload();
+        w
+    }
+
+    /// The watch the compositor runs: the shell's own theme paths and its a11y file.
+    pub fn from_env() -> ThemeWatch {
+        ThemeWatch::new(
+            crate::bloom::theme_paths(),
+            std::path::PathBuf::from(crate::bloom::A11Y_SETTINGS_PATH),
+        )
+    }
+
+    fn read_stamps(&self) -> Vec<Option<std::time::SystemTime>> {
+        self.theme_paths
+            .iter()
+            .chain(std::iter::once(&self.a11y_path))
+            .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+            .collect()
+    }
+
+    /// Read the files and fold them, the one place all four consumers are derived.
+    fn reload(&mut self) {
+        let file = crate::bloom::SettingsFile::first_of(&self.theme_paths);
+        let a11y = crate::bloom::SettingsFile::load(&self.a11y_path);
+        self.snapshot = ThemeSnapshot {
+            theme: theme_from_files(&file, &a11y),
+            bloom: crate::bloom::palette_from(&file),
+            potato: file.flag("disable_blur").unwrap_or(false),
+            reduced_motion: crate::bloom::reduced_motion_in(&a11y),
+            glass: GlassLook::from_file(&file),
+        };
+        self.reloads += 1;
+    }
+
+    /// Notice a change, at most once per `THEME_RECHECK`. Returns whether the snapshot
+    /// changed, which the caller does not need (the caches key on the values), but a
+    /// test does.
+    pub fn poll(&mut self, now: Instant) -> bool {
+        if let Some(t) = self.last_check {
+            if now.saturating_duration_since(t) < THEME_RECHECK {
+                return false;
+            }
+        }
+        self.last_check = Some(now);
+        let stamps = self.read_stamps();
+        if stamps == self.stamps {
+            return false;
+        }
+        self.stamps = stamps;
+        let before = self.snapshot;
+        self.reload();
+        let changed = self.snapshot != before;
+        if changed {
+            info!(reloads = self.reloads, "theme.reloaded (a theme file changed; the native desktop restyles on this frame)");
+        }
+        changed
+    }
+
+    pub fn snapshot(&self) -> ThemeSnapshot {
+        self.snapshot
+    }
+
+    /// How many times the files were read (test hook: a still desktop reads once).
+    pub fn reloads(&self) -> u64 {
+        self.reloads
+    }
+}
+
+/// The process's one theme watch, polled on every read and rate limited inside.
+///
+/// A `Mutex` rather than a `OnceLock` because the value CHANGES; it is uncontended (the
+/// render loop is one thread) and held for a stat at most, once a second. A poisoned
+/// lock is recovered rather than propagated: this runs in the process that owns
+/// scanout, and a panic elsewhere must not take the theme with it.
+fn theme_now() -> ThemeSnapshot {
+    static WATCH: std::sync::Mutex<Option<ThemeWatch>> = std::sync::Mutex::new(None);
+    let mut guard = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    let watch = guard.get_or_insert_with(ThemeWatch::from_env);
+    watch.poll(Instant::now());
+    watch.snapshot()
+}
+
+/// Does the active THEME ask for the reduced-effects tier? Live, see `ThemeWatch`.
 fn theme_potato() -> bool {
-    static POTATO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *POTATO.get_or_init(|| {
-        crate::bloom::SettingsFile::active()
-            .flag("disable_blur")
-            .unwrap_or(false)
-    })
+    theme_now().potato
 }
 
-/// Has the user declared reduced motion? Resolved ONCE, like the theme beside it, and
-/// carrying the same documented gap: a runtime PUT to /api/shell/accessibility lives in
-/// the shell process's memory and reaches this at the next start.
-///
-/// A `OnceLock` because the frame path must not touch the disk, and the answer is a
-/// declarative setting rather than something that changes under us.
+/// Has the user declared reduced motion? Live, see `ThemeWatch`. A runtime PUT to
+/// /api/shell/accessibility still lives in the shell process's memory until it writes
+/// the file, which is the shell's half of the same gap.
 fn motion_reduced() -> bool {
-    static REDUCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *REDUCED.get_or_init(crate::bloom::reduced_motion)
+    theme_now().reduced_motion
 }
 
-/// The scene's colours, resolved ONCE from the same theme file the backdrop reads.
+/// The scene's colours, from the same theme file the backdrop reads, live.
 ///
-/// A `OnceLock` rather than a per-frame call because resolving it touches the disk, and
-/// the frame path must not. This carries the SAME known gap `BloomCache` documents beside
-/// it: resolved once and never re-read, so a theme change at runtime does not restyle the
-/// native desktop until the compositor restarts. Whoever lands the theme-change signal
-/// invalidates both together, and they are wrong in the same direction meanwhile, which
-/// is the point of them reading one file.
-fn active_theme() -> &'static crate::scene::Theme {
-    static ACTIVE: std::sync::OnceLock<crate::scene::Theme> = std::sync::OnceLock::new();
-    ACTIVE.get_or_init(|| {
-        let file = crate::bloom::SettingsFile::active();
-        theme_from_file(&file)
-    })
+/// By value: `Theme` is `Copy` and small, and a reference into the watch would pin the
+/// lock across a frame. `SceneCache` keys on the value, so a changed theme rebuilds the
+/// tree once; the tile and text caches key on colour, so recoloured surfaces compose
+/// once each; the theme that did not change costs a compare.
+fn active_theme() -> crate::scene::Theme {
+    theme_now().theme
 }
 
 /// The accessibility FONT SCALE applied to a theme metric, exactly as the shell applies
@@ -3167,13 +3901,25 @@ where
     // claim that is missing leaves TWO orbs breathing on top of each other with the
     // WebView still paying the per-frame cost the native orb exists to remove.
     let mut emitted: u8 = 0;
+    // Where this scene's elements begin in the frame list; see the reversal at the end.
+    let first = elements.len();
 
     // RETAINED TREE (zero-per-frame-alloc, step two): the layout is rebuilt only when the
     // size, the composed home, or the theme changes, so a steady desktop reuses the tree
     // it already owns instead of allocating a fresh one every frame. The pointer is NOT a
     // key, so hover costs no rebuild. `scene_cache` is a disjoint field borrow, so holding
     // the tree across the loop does not conflict with the buffer caches below.
-    let theme = *active_theme();
+    // With the composed home's MOOD folded over it. `SceneCache` keys on the theme, so a
+    // new mood rebuilds the tree once, exactly as a new compose does, and the tile and
+    // text caches key on colour, so the recoloured surfaces compose once each.
+    let theme = match home.palette.as_ref() {
+        Some(mood) => active_theme().with_mood(mood),
+        None => active_theme(),
+    };
+    // Which bands the chrome payload composes fully, read BEFORE the tree is borrowed
+    // out of the cache: it gates the bar claims in the walk below, and it is a property
+    // of the payload, not of the pixels.
+    let chrome_cov = scene_cache.chrome_coverage();
     // The rasterizer doubles as the layout's text measure (it already shapes), so the bar
     // can butt one run against another. It is a disjoint borrow from `scene_cache`, and
     // the reborrow ends when `tree_for` returns, leaving it free for the lowering below.
@@ -3212,7 +3958,9 @@ where
     let home_top = theme.top_bar_h;
     let home_bottom = size.h as f32 - crate::scene::TASKBAR_H;
     tree.for_each_leaf(&mut |idx, leaf| {
-        let home_leaf = in_home_band(leaf.rect(), home_top, home_bottom);
+        // Every bit this leaf can earn, home and bars alike, resolved once by the pure
+        // rule; each arm below ORs it in exactly where an element is actually pushed.
+        let leaf_bits = leaf_claim(leaf.rect(), home_top, home_bottom, chrome_cov);
         match leaf {
             crate::scene::SceneNode::Rect { rect, color, radius } => {
                 if rect.w < 1.0 || rect.h < 1.0 {
@@ -3251,7 +3999,7 @@ where
                             Some((rect.w as i32, rect.h as i32).into()),
                             Kind::Unspecified,
                         ) {
-                            Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
+                            Ok(e) => { elements.push(HartRenderElement::Memory(e)); emitted |= leaf_bits; }
                             Err(err) => warn!(?err, "native scene: rounded rect import failed"),
                         }
                     }
@@ -3272,7 +4020,7 @@ where
                         Kind::Unspecified,
                     );
                     elements.push(HartRenderElement::Solid(el));
-                    if home_leaf { emitted |= NATIVE_CHROME_HOME; }
+                    emitted |= leaf_bits;
                 }
             }
             crate::scene::SceneNode::Text {
@@ -3309,7 +4057,7 @@ where
                     Some((rect.w as i32, rect.h as i32).into()),
                     Kind::Unspecified,
                 ) {
-                    Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
+                    Ok(e) => { elements.push(HartRenderElement::Memory(e)); emitted |= leaf_bits; }
                     Err(err) => warn!(?err, "native scene: text run import failed"),
                 }
             }
@@ -3321,11 +4069,11 @@ where
                 to,
                 angle_deg,
                 radius,
-                // The photo is not lowered yet (M3 remainder). The gradient beneath it is
-                // what the shell paints first and never removes, so the card is a card
-                // with or without one; before this, a card the feed gave a picture drew
-                // its picture's ABSENCE, and a ranked card drew nothing whatsoever.
-                photo: _,
+                // The photo, lowered OVER the gradient below. The gradient is what the
+                // shell paints first and never removes, so the card is a card with or
+                // without one; the photo is `.hh-card-art img` fading in on top, which
+                // here is one more cached buffer at the same rect.
+                photo,
             } => {
                 if rect.w < 1.0 || rect.h < 1.0 {
                     return;
@@ -3363,8 +4111,33 @@ where
                         Some((rect.w as i32, rect.h as i32).into()),
                         Kind::Unspecified,
                     ) {
-                        Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
+                        Ok(e) => { elements.push(HartRenderElement::Memory(e)); emitted |= leaf_bits; }
                         Err(err) => warn!(?err, "native scene: card art import failed"),
+                    }
+                }
+                // The photo layer (M3's last remainder). Only a source under the two
+                // served roots decodes; a remote `image_url` is never fetched here and
+                // so lowers to nothing, exactly as the gradient-only card it is. Pushed
+                // AFTER the gradient, so it paints over it and under the scrim the
+                // layout emits next, which is the shell's own stacking.
+                if let Some(source) = photo {
+                    if let Some(buffer) =
+                        rect_cache.art(source, rect.w as i32, rect.h as i32, *radius)
+                    {
+                        let origin: Point<f64, Physical> =
+                            Point::from((rect.x as f64, rect.y as f64));
+                        match MemoryRenderBufferRenderElement::from_buffer(
+                            renderer,
+                            origin,
+                            buffer,
+                            Some(1.0),
+                            None,
+                            Some((rect.w as i32, rect.h as i32).into()),
+                            Kind::Unspecified,
+                        ) {
+                            Ok(e) => { elements.push(HartRenderElement::Memory(e)); emitted |= leaf_bits; }
+                            Err(err) => warn!(?err, "native scene: card photo import failed"),
+                        }
                     }
                 }
             }
@@ -3404,7 +4177,7 @@ where
                         Some(side.into()),
                         Kind::Unspecified,
                     ) {
-                        Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
+                        Ok(e) => { elements.push(HartRenderElement::Memory(e)); emitted |= leaf_bits; }
                         Err(err) => warn!(?err, "native scene: card shadow import failed"),
                     }
                 }
@@ -3439,7 +4212,7 @@ where
                     ) {
                         Ok(e) => {
                             elements.push(HartRenderElement::Memory(e));
-                            if home_leaf { emitted |= NATIVE_CHROME_HOME; }
+                            emitted |= leaf_bits;
                             emitted |= NATIVE_CHROME_ORB;
                         }
                         Err(err) => warn!(?err, "native scene: orb import failed"),
@@ -3450,6 +4223,25 @@ where
             _ => {}
         }
     });
+    // TWO CONVENTIONS MEET HERE, and until 2026-09-24 they met the wrong way round.
+    // The scene walks its leaves in PAINT order, back to front: the bar's fill first,
+    // its text after, a card's shadow, then its tile, its art, its scrim, its title.
+    // The frame list is the OPPOSITE: smithay's `draw_render_elements` and the
+    // DrmCompositor both take index 0 as the TOP-MOST element (each element's opaque
+    // region occludes every element after it, and the draw runs in reverse), which is
+    // why `build_frame_elements` puts the cursor at 0 and the bloom last. Pushing the
+    // leaves in walk order therefore stacked the whole native scene upside down: every
+    // fill above its own text, every card's tile above its art and its title, and the
+    // omnibox pill under the bar it sits on. No headless proof had read a pixel whose
+    // colour depended on the order, and no screenshot exists from the DRM backend, so
+    // it survived every gate; the first photo lowered onto a card is what found it,
+    // painted under the tile it belonged over.
+    //
+    // Reversed IN PLACE, on this frame's own slice, so the fix allocates nothing per
+    // frame and leaves every element identity where it was (damage tracking compares
+    // identities, not positions). The pooled solids are still handed out in walk
+    // order, so the same rect gets the same buffer frame after frame.
+    elements[first..].reverse();
     emitted
 }
 
@@ -3468,6 +4260,8 @@ where
     // are actually pushed (never on a failed import), and published at the end
     // for the backend's flip handler to turn into the shell's verdict file.
     let mut native_mask: u8 = 0;
+    // The frosted-field crop pool ages by frame (see `BloomCache::frosted_crop`).
+    state.bloom_mut().begin_frame();
 
     // ── 0. KILLSWITCH (top): a full-output opaque black solid ABOVE all windows. ──
     if state.capture_blocked() {
@@ -3524,6 +4318,21 @@ where
         let win_elems: Vec<WaylandSurfaceRenderElement<R>> =
             AsRenderElements::<R>::render_elements(window, renderer, phys, Scale::from(1.0), alpha);
         elements.extend(win_elems.into_iter().map(HartRenderElement::Surface));
+
+        // ── 3a. NATIVE GLASS under the toplevel (checklist GL2, Linux). ──
+        // The frosted desktop, cropped to the window's geometry and pushed right after
+        // its surfaces so it sits directly beneath them. An opaque app covers it and
+        // costs nothing but the crop; a translucent one (the shell's panels, a
+        // companion window painting `--hart-glass-bg`) gets the blur-behind its CSS
+        // asks for from the platform compositor, which on HART OS is this one. It
+        // fades with the window so a map-in never pops a slab under a fading surface.
+        // Skipped under the killswitch for the same reason the bloom is.
+        if !state.capture_blocked() {
+            if let Some(geo) = state.space().element_geometry(window) {
+                let rect: Rectangle<i32, Physical> = geo.to_physical_precise_round(1.0);
+                push_frosted_backdrop(state, renderer, &mut elements, rect, alpha, size);
+            }
+        }
     }
 
     // ── 3c. NATIVE SHELL M3 scene: the DESKTOP PLANE, below windows, above the shell. ──
@@ -3590,13 +4399,35 @@ where
     // ── 4. BOTTOM / BACKGROUND layer surfaces — BELOW the toplevels. ──
     // This is the desktop plane: the HART glass shell anchors here, which is what
     // makes it the desktop rather than an app.
-    layers_painted += push_layer_elements(
+    let layers_below = push_layer_elements(
         renderer, &mut elements, &output, ws_alpha, /* above_windows = */ false);
+    layers_painted += layers_below;
     {
         let prev = LAYERS_PAINTED.swap(layers_painted, std::sync::atomic::Ordering::Relaxed);
         if prev != layers_painted {
             info!(layers_painted, "layer.composited (wlr-layer surfaces now in the rendered frame)");
         }
+    }
+
+    // ── 4a. THE TASKBAR BASE: the frosted desktop under the shell's strip. ──
+    // The shell's taskbar is `<div class="taskbar glass">`: `--hart-glass-bg` at
+    // `--hart-panel-opacity` (0.65) over `backdrop-filter: blur() saturate()`. With the
+    // bloom claimed its wallpaper is `transparent`, so the buffer the WebView commits is
+    // 65 percent opaque in its bottom strip on EVERY commit, and what the browser's
+    // backdrop-filter blurs behind it is nothing at all: the other 35 percent was whatever
+    // the compositor had under the strip, the sharp field and, across a dropped frame,
+    // anything else the z-order below held. This puts the frosted field there, opaque,
+    // the exact thing the CSS meant to blur, so the strip composes to tint-over-frosted
+    // field on every frame and nothing beneath this element can ever show through it
+    // (the probe in `glass_tests` drives the orb under the strip and reads it). Only
+    // when a Background/Bottom surface is painted: no shell, no strip to base. Under the
+    // native scene's own opaque taskbar it is covered, and under a shell that paints an
+    // opaque wallpaper it is covered too, so neither pays anything but the crop.
+    if !state.capture_blocked() && layers_below > 0 {
+        let strip_h = crate::scene::TASKBAR_H.round() as i32;
+        let strip: Rectangle<i32, Physical> =
+            Rectangle::new((0, size.h - strip_h).into(), (size.w, strip_h).into());
+        push_frosted_backdrop(state, renderer, &mut elements, strip, 1.0, size);
     }
 
     // ── 3b. NATIVE ORB (NATIVE SHELL M2), above the backdrop, below the shell. ──
@@ -3671,11 +4502,21 @@ where
     // Cheap by construction: `BloomCache::get` is a key comparison on every
     // frame but the first at a given size/theme.
     if !state.capture_blocked() {
+        // The composed home's MOOD recolours the field, whether or not the native
+        // scene is on: the compositor claims the bloom on every tier and the shell
+        // hides its own on that claim, so the native field is the only one on screen
+        // and must follow the mood the shell's would have. `MoodPalette` is `Copy`, so
+        // this ends the shared borrow of `state` before `bloom_mut` takes it mutably.
+        let mood = state.native_home().and_then(|h| h.palette);
+        // The theme's own field, from the same watch the scene's colours come from, so
+        // the backdrop and the desktop restyle on the same frame when the theme file
+        // changes. Not a disk read: the watch stats its files at most once a second.
+        let base = theme_now().bloom;
         // Split the borrow: `bloom_mut` holds `state` mutably, and
         // `MemoryRenderBufferRenderElement::from_buffer` needs the buffer while
         // `renderer` is also borrowed. They are disjoint (`renderer` is a separate
         // parameter, not a `state` field), so this type-checks and stays short.
-        if let Some(buffer) = state.bloom_mut().get(size.w, size.h) {
+        if let Some(buffer) = state.bloom_mut().get(size.w, size.h, base, mood.as_ref()) {
             let origin: Point<f64, Physical> = Point::from((0.0, 0.0));
             match MemoryRenderBufferRenderElement::from_buffer(
                 renderer,
@@ -5224,6 +6065,285 @@ mod tests {
             "from == to must fill flat"
         );
     }
+
+    // ── THEME HOT RELOAD: the watch that replaced the OnceLocks ─────────────────────
+
+    /// A temp dir of its own per test, so parallel tests never share a file.
+    fn theme_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hart_theme_watch_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write `text` and give the file a modification time of `epoch + secs`, so two
+    /// writes inside one tick still carry two different stamps (the watch compares
+    /// stamps, and a filesystem with coarse mtimes would otherwise hide the second).
+    fn write_stamped(path: &std::path::Path, text: &str, secs: u64) {
+        std::fs::write(path, text).unwrap();
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + secs)).unwrap();
+    }
+
+    #[test]
+    fn a_theme_file_edited_on_disk_restyles_the_native_desktop_and_its_backdrop() {
+        // The gap every theme reader documented: resolved once, never re-read, so the
+        // customization hub changed the WebView and the native desktop kept the theme
+        // it booted with. The watch notices the file change and folds the new colours
+        // through the same paths, and the caches keyed on the values recompose once.
+        let dir = theme_dir("edit");
+        let theme = dir.join("active_theme.json");
+        let a11y = dir.join("accessibility.json");
+        write_stamped(&theme, r#"{"colors":{"accent":"00E6C3","background":"04050B"}}"#, 1);
+        let mut watch = ThemeWatch::new(vec![theme.clone()], a11y.clone());
+        let t0 = Instant::now();
+        let before = watch.snapshot();
+        assert_eq!(before.theme.accent, crate::scene::Color::from_hex("#00E6C3").unwrap());
+        assert_eq!(before.bloom.base, [0x04, 0x05, 0x0B]);
+        assert!(!before.reduced_motion && !before.potato);
+        assert_eq!(watch.reloads(), 1, "read once at construction");
+
+        // The scene tree is retained on this theme.
+        let home = crate::scene::HomeCompose::demo();
+        let mut scenes = crate::scene::SceneCache::default();
+        let scroll = crate::scene::RowScroll::default();
+        let _ = scenes.tree_for(1280.0, 800.0, &home, &before.theme, &scroll, &mut crate::scene::MonoMeasure);
+        let _ = scenes.tree_for(1280.0, 800.0, &home, &before.theme, &scroll, &mut crate::scene::MonoMeasure);
+        assert_eq!(scenes.rebuilds(), 1);
+
+        // The user applies sunset in the hub, and declares reduced motion.
+        write_stamped(&theme, r#"{"colors":{"accent":"FF8A4C","background":"160910"},"performance":{"disable_blur":true}}"#, 2);
+        write_stamped(&a11y, r#"{"reduced_motion":true}"#, 3);
+        assert!(watch.poll(t0 + THEME_RECHECK), "a changed stamp is a reload");
+        let after = watch.snapshot();
+        assert_eq!(after.theme.accent, crate::scene::Color::from_hex("#FF8A4C").unwrap(), "the scene's accent moved");
+        assert_eq!(after.bloom.base, [0x16, 0x09, 0x10], "and the backdrop's ground");
+        assert!(after.potato, "the potato tier is live too");
+        assert!(after.reduced_motion, "and the accessibility switch");
+        assert_eq!(watch.reloads(), 2);
+
+        // The retained tree rebuilds ONCE for the new theme, then holds.
+        let _ = scenes.tree_for(1280.0, 800.0, &home, &after.theme, &scroll, &mut crate::scene::MonoMeasure);
+        assert_eq!(scenes.rebuilds(), 2, "a theme change is one rebuild");
+        let _ = scenes.tree_for(1280.0, 800.0, &home, &after.theme, &scroll, &mut crate::scene::MonoMeasure);
+        assert_eq!(scenes.rebuilds(), 2, "and no more");
+        // And the backdrop recomposes once for the new base (BloomCache keys on it).
+        let mut bloom = BloomCache::default();
+        assert!(bloom.get(64, 40, before.bloom, None).is_some());
+        let k1 = bloom.key;
+        assert!(bloom.get(64, 40, after.bloom, None).is_some());
+        assert_ne!(bloom.key, k1, "the field recomposes for the new theme");
+        let k2 = bloom.key;
+        assert!(bloom.get(64, 40, after.bloom, None).is_some());
+        assert_eq!(bloom.key, k2, "once");
+    }
+
+    #[test]
+    fn the_watch_stats_at_most_once_a_second_and_reads_only_on_a_change() {
+        // The frame path must not touch the disk: a stat per frame at 60Hz is the
+        // syscall storm the OnceLocks existed to avoid. So the poll is rate limited on
+        // the clock it is handed, and a stat that finds the same stamps reads nothing.
+        let dir = theme_dir("rate");
+        let theme = dir.join("active_theme.json");
+        write_stamped(&theme, r#"{"colors":{"accent":"00E6C3"}}"#, 1);
+        let mut watch = ThemeWatch::new(vec![theme.clone()], dir.join("a11y.json"));
+        let t0 = Instant::now();
+        assert!(!watch.poll(t0), "nothing changed");
+        write_stamped(&theme, r#"{"colors":{"accent":"FF8A4C"}}"#, 2);
+        assert!(!watch.poll(t0 + std::time::Duration::from_millis(200)), "inside the interval: not even a stat");
+        assert_eq!(watch.reloads(), 1);
+        assert!(watch.poll(t0 + THEME_RECHECK + std::time::Duration::from_millis(1)), "past it: the change is seen");
+        assert_eq!(watch.reloads(), 2);
+        assert_eq!(watch.snapshot().theme.accent, crate::scene::Color::from_hex("#FF8A4C").unwrap());
+        // A still desktop: many polls, no reads.
+        for i in 0..10u64 {
+            assert!(!watch.poll(t0 + THEME_RECHECK * (2 + i as u32)));
+        }
+        assert_eq!(watch.reloads(), 2, "unchanged stamps never re-read the file");
+        // A touch that changes the stamp but not the content is a stat and a read, but
+        // the snapshot is unchanged and the caller is told so.
+        write_stamped(&theme, r#"{"colors":{"accent":"FF8A4C"}}"#, 3);
+        assert!(!watch.poll(t0 + THEME_RECHECK * 20), "same content, no change reported");
+        assert_eq!(watch.reloads(), 3);
+    }
+
+    #[test]
+    fn a_first_applied_theme_takes_over_the_shipped_preset() {
+        // Before the first apply there is no active_theme.json, only the preset the
+        // environment names; the theme service writes the active file on the first
+        // apply. The watch stamps BOTH paths, so the file appearing is a change like
+        // any other, and the active theme wins from then on, exactly as the shell's
+        // own get_active_theme prefers it.
+        let dir = theme_dir("appear");
+        let active = dir.join("active_theme.json");
+        let preset = dir.join("aura.json");
+        write_stamped(&preset, r#"{"colors":{"accent":"00E6C3","background":"04050B"}}"#, 1);
+        let mut watch = ThemeWatch::new(vec![active.clone(), preset.clone()], dir.join("a11y.json"));
+        assert_eq!(watch.snapshot().theme.accent, crate::scene::Color::from_hex("#00E6C3").unwrap(), "the preset seeds");
+        let t0 = Instant::now();
+        write_stamped(&active, r#"{"colors":{"accent":"5B8CFF","background":"0A0E1F"}}"#, 5);
+        assert!(watch.poll(t0 + THEME_RECHECK));
+        assert_eq!(watch.snapshot().theme.accent, crate::scene::Color::from_hex("#5B8CFF").unwrap(), "the applied theme wins");
+        assert_eq!(watch.snapshot().bloom.base, [0x0A, 0x0E, 0x1F]);
+        // And gone again (a reset to defaults): back to the preset, never to a void.
+        std::fs::remove_file(&active).unwrap();
+        assert!(watch.poll(t0 + THEME_RECHECK * 2));
+        assert_eq!(watch.snapshot().theme.accent, crate::scene::Color::from_hex("#00E6C3").unwrap());
+        // No file at all anywhere: the shipped look, byte for byte.
+        let none = ThemeWatch::new(vec![dir.join("nope.json")], dir.join("nope2.json"));
+        assert_eq!(none.snapshot().theme, crate::scene::Theme::cosmic_default());
+        assert_eq!(none.snapshot().bloom, crate::bloom::BloomPalette::default());
+    }
+
+    #[test]
+    fn the_theme_paths_prefer_the_running_theme_over_the_seed() {
+        // bloom::theme_paths is the one list every reader resolves through: the active
+        // file in the data dir first, the environment's preset second. The data dir
+        // follows theme_service.py's own order. Read here without touching the
+        // environment (tests share a process): the default is the module's.
+        let paths = crate::bloom::theme_paths();
+        assert!(paths.len() >= 1);
+        assert!(paths[0].ends_with(crate::bloom::ACTIVE_THEME_FILE), "{:?}", paths[0]);
+        if std::env::var_os("HEVOLVE_DATA_DIR").is_none() && std::env::var_os("HART_DATA_DIR").is_none() {
+            assert_eq!(crate::bloom::data_dir(), std::path::PathBuf::from("/var/lib/hart"), "hart-base.nix's dataDir default");
+        }
+        assert_eq!(crate::bloom::preset_path_in("/t", "aura"), Some(std::path::PathBuf::from("/t/aura.json")));
+        assert_eq!(crate::bloom::preset_path_in("/t", "../x"), None, "an id cannot leave the dir");
+    }
+
+    // ── CARD ART: the bundled SVGs, decoded by the compositor itself ─────────────
+
+    fn no_fonts() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
+        std::sync::Arc::new(resvg::usvg::fontdb::Database::new())
+    }
+
+    #[test]
+    fn every_bundled_card_svg_decodes_to_real_pixels_under_the_tiles_corner() {
+        // "Every bundled asset decodes": all 51, verbatim from the shell's static dir
+        // via the pinned fixture, through the SAME rasteriser the frame path uses, at
+        // the card's own size. Each must cover the tile (a real fraction of opaque
+        // pixels), keep the corner cut (the pixel in the corner is clear), and be
+        // opaque at the centre (the assets are backdrops, not line art). Run with an
+        // EMPTY font database on purpose: the 39 app icons carry a `<text>` initial,
+        // and the tile must still be a tile on a box with no fonts installed.
+        let fonts = no_fonts();
+        let (w, h) = (258u32, 150u32);
+        let assets = crate::wire_fixture::BUNDLED_CARD_ART;
+        assert_eq!(assets.len(), 51, "the program counts 51 bundled assets");
+        for (name, svg) in assets {
+            let px = svg_rgba(svg.as_bytes(), w, h, 16.0, &fonts)
+                .unwrap_or_else(|| panic!("{name} did not decode"));
+            assert_eq!(px.len(), (w * h * 4) as usize);
+            let alpha = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+            let opaque = px.chunks_exact(4).filter(|p| p[3] > 250).count();
+            assert!(
+                opaque > (w * h) as usize * 8 / 10,
+                "{name} covers only {opaque} of {} px; a card photo fills its tile",
+                w * h
+            );
+            assert_eq!(alpha(0, 0), 0, "{name}: the corner must be cut to the radius");
+            assert!(alpha(w / 2, h / 2) > 250, "{name}: opaque at the centre");
+            // Premultiplied: no channel may exceed its alpha, or the import will
+            // composite a colour brighter than the pixel's coverage allows.
+            for p in px.chunks_exact(4) {
+                assert!(p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3], "{name}: not premultiplied");
+            }
+        }
+    }
+
+    #[test]
+    fn the_photo_covers_the_tile_the_way_object_fit_cover_does() {
+        // `.hh-card-art img { object-fit: cover }`: the picture is scaled to FILL the
+        // box and centred, the overflow cropped, never letterboxed. A 480x300 asset on
+        // a 258x150 tile therefore scales by the HEIGHT (150/300 = 0.5 beats 258/480)
+        // and loses 24px of width on each side. Prove it with an SVG that is red on
+        // its left tenth and blue on its right tenth: neither edge colour survives on
+        // the tile, the middle is what remains.
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 480 300' width='480' height='300'>\
+                   <rect width='480' height='300' fill='#00FF00'/>\
+                   <rect width='48' height='300' fill='#FF0000'/>\
+                   <rect x='432' width='48' height='300' fill='#0000FF'/></svg>";
+        let (w, h) = (258u32, 150u32);
+        let px = svg_rgba(svg.as_bytes(), w, h, 0.0, &no_fonts()).expect("decodes");
+        let at = |x: u32, y: u32| -> (u8, u8, u8) {
+            let i = ((y * w + x) * 4) as usize;
+            (px[i + 2], px[i + 1], px[i])
+        };
+        // COVER takes the LARGER ratio: 258/480 = 0.5375 beats 150/300 = 0.5, so the
+        // asset is scaled by width, fills the tile edge to edge (the strips ARE the
+        // edges) and loses 5px of height top and bottom. A letterbox would take the
+        // smaller ratio and leave 9px of nothing either side, which is what a card
+        // photo must never do.
+        assert_eq!(at(0, h / 2), (255, 0, 0), "the left edge is the asset's left edge");
+        assert_eq!(at(w - 1, h / 2), (0, 0, 255), "and the right its right");
+        assert_eq!(at(w / 2, h / 2), (0, 255, 0));
+        assert!(px.chunks_exact(4).all(|p| p[3] == 255), "no letterbox: every pixel covered");
+        // A box the asset is much WIDER than scales by height and crops the sides: on
+        // a 100x300 box the scale is 1.0, the visible slice is the asset's middle, and
+        // neither strip survives. A letterbox would show both strips and empty rows.
+        let tall = svg_rgba(svg.as_bytes(), 100, 300, 0.0, &no_fonts()).expect("decodes");
+        let at2 = |x: u32, y: u32| -> (u8, u8, u8) {
+            let i = ((y * 100 + x) * 4) as usize;
+            (tall[i + 2], tall[i + 1], tall[i])
+        };
+        assert_eq!(at2(0, 150), (0, 255, 0), "the red strip is cropped away");
+        assert_eq!(at2(99, 150), (0, 255, 0), "and the blue one");
+        assert!(tall.chunks_exact(4).all(|p| p[3] == 255), "every row covered");
+    }
+
+    #[test]
+    fn a_photo_path_never_leaves_its_root_and_only_an_svg_is_decoded() {
+        let roots = ArtRoots {
+            static_dir: Some(std::path::PathBuf::from("/srv/static")),
+            agent_art_dir: Some(std::path::PathBuf::from("/var/lib/hart/agent-art")),
+        };
+        let p = |s: &str| roots.resolve(s).map(|p| p.to_string_lossy().replace('\\', "/"));
+        assert_eq!(p("/shell/static/app_art/app-files.svg"), Some("/srv/static/app_art/app-files.svg".into()));
+        assert_eq!(p("/shell/static/app_art/apps/com.brave.Browser.svg"),
+                   Some("/srv/static/app_art/apps/com.brave.Browser.svg".into()));
+        // The feed's string is LLM-written; the sanitizer checks a prefix, this checks
+        // the rest. None of these may name a file.
+        for bad in [
+            "/shell/static/../../etc/shadow.svg",
+            "/shell/static/app_art/../../secrets.svg",
+            "/shell/static//etc/passwd.svg",
+            "/shell/static/app_art/./a.svg",
+            "/shell/static/app_art/a.png",
+            "/shell/static/app_art/a.svg/",
+            "/shell/static/",
+            "/shell/agent-art/Auto Research",
+            "/shell/agent-art/../x",
+            "/shell/agent-art/",
+            "https://example.invalid/a.svg",
+            "/etc/passwd",
+            "",
+        ] {
+            assert_eq!(p(bad), None, "{bad:?} must not resolve");
+        }
+        // An agent slug falls back to the bundled agents dir when the drop has no file.
+        assert_eq!(
+            p("/shell/agent-art/auto-research"),
+            Some("/srv/static/app_art/agents/auto-research.svg".into())
+        );
+        // No static root at all: nothing under it resolves, and a card is its gradient.
+        let none = ArtRoots { static_dir: None, agent_art_dir: None };
+        assert_eq!(none.resolve("/shell/static/app_art/app-files.svg"), None);
+        assert_eq!(none.resolve("/shell/agent-art/auto-research"), None);
+    }
+
+    #[test]
+    fn junk_and_degenerate_sizes_decode_to_nothing_rather_than_panicking() {
+        let fonts = no_fonts();
+        assert!(svg_rgba(b"not svg at all", 10, 10, 0.0, &fonts).is_none());
+        assert!(
+            svg_rgba(b"<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'/>", 10, 10, 0.0, &fonts).is_none(),
+            "a zero-sized document has nothing to cover a tile with"
+        );
+        let ok = b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 2 2' width='2' height='2'><rect width='2' height='2' fill='#fff'/></svg>";
+        assert!(svg_rgba(ok, 0, 10, 0.0, &fonts).is_none());
+        assert!(svg_rgba(ok, 10, 0, 0.0, &fonts).is_none());
+        assert!(svg_rgba(ok, 3, 3, 0.0, &fonts).is_some());
+    }
 }
 
 // NATIVE SHELL PARITY PROGRAM, M3 render proof. Gated on `smithay` because it uses
@@ -5289,6 +6409,102 @@ mod native_render_tests {
             0,
             "a painted desktop must claim the home surface, or the shell draws a second one"
         );
+    }
+
+    /// Lower the demo home with `chrome` at `size` and answer the claim mask.
+    fn claim_with(chrome: crate::scene::ShellChrome, size: Size<i32, Physical>) -> u8 {
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        scenes.set_chrome(chrome);
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        let mask = lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects,
+            &mut scenes, 0.5, None, false, true,
+            &crate::scene::RowScroll::default(), &mut elements,
+        );
+        assert!(!elements.is_empty(), "the bars paint at {size:?}");
+        mask
+    }
+
+    fn full_chrome() -> crate::scene::ShellChrome {
+        crate::scene::decode_shell_chrome(
+            &serde_json::from_str(crate::wire_fixture::SHELL_CHROME_COMPOSED).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_bar_drawn_from_a_partial_payload_is_never_claimed() {
+        // THE RULE THE PARITY PROGRAM STATES: claim whole bands only. A strip with tabs
+        // and a wordmark but no clock is a bar the shell's bar beats, and claiming it
+        // would make the shell stop painting the clock the user still sees. So the
+        // pixels in the band are necessary and not sufficient: the payload must have
+        // composed the band fully. Each datum the top bar needs is dropped in turn.
+        let size: Size<i32, Physical> = (1280, 800).into();
+        for missing in ["clock", "tray", "notifications", "agents"] {
+            let mut v: serde_json::Value =
+                serde_json::from_str(crate::wire_fixture::SHELL_CHROME_COMPOSED).unwrap();
+            v.as_object_mut().unwrap().remove(missing);
+            let mask = claim_with(crate::scene::decode_shell_chrome(&v), size);
+            assert_eq!(
+                mask & NATIVE_CHROME_TOPBAR, 0,
+                "without {missing} the top bar drew and must NOT be claimed"
+            );
+            assert_ne!(
+                mask & NATIVE_CHROME_TASKBAR, 0,
+                "the taskbar's rule is its own: the chip list is present, so it is claimed"
+            );
+        }
+        // And the taskbar's half: no chip list, no taskbar claim, whatever the strip drew.
+        let mut c = full_chrome();
+        c.tasks = None;
+        let mask = claim_with(c, size);
+        assert_eq!(mask & NATIVE_CHROME_TASKBAR, 0, "an unreported chip list is not a taskbar");
+        assert_ne!(mask & NATIVE_CHROME_TOPBAR, 0, "the top bar's rule is unaffected");
+        // With nothing composed at all, the strips draw and neither band is claimed:
+        // today's desktop, byte for byte.
+        let mask = claim_with(crate::scene::ShellChrome::default(), size);
+        assert_eq!(mask & (NATIVE_CHROME_TOPBAR | NATIVE_CHROME_TASKBAR), 0);
+        assert_ne!(mask & NATIVE_CHROME_HOME, 0, "and the home claim is as before");
+    }
+
+    #[test]
+    fn a_fully_composed_bar_is_claimed_on_the_pixels_it_paints() {
+        // The other direction, or the claim would be unreachable and the shell would
+        // paint two bars forever: the real producer's payload composes both bands, and
+        // a lowering that put elements in both must claim both.
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let mask = claim_with(full_chrome(), size);
+        assert_ne!(mask & NATIVE_CHROME_TOPBAR, 0, "a full top bar is claimed");
+        assert_ne!(mask & NATIVE_CHROME_TASKBAR, 0, "a full taskbar is claimed");
+        assert_ne!(mask & NATIVE_CHROME_HOME, 0);
+        // On an output too short for the two strips to be distinct bands, a leaf could
+        // sit in both, so neither bar is claimed however complete the payload.
+        let tiny: Size<i32, Physical> = (3, 3).into();
+        let mask = claim_with(full_chrome(), tiny);
+        assert_eq!(mask & (NATIVE_CHROME_TOPBAR | NATIVE_CHROME_TASKBAR), 0);
+    }
+
+    #[test]
+    fn the_leaf_claim_rule_is_geometric_and_gated() {
+        use crate::scene::{ChromeCoverage, Rect};
+        let both = ChromeCoverage { top_bar: true, taskbar: true };
+        let none = ChromeCoverage::default();
+        let (top_h, taskbar_y) = (40.0, 756.0);
+        // A leaf wholly in each band, with and without the gate.
+        assert_eq!(leaf_claim(Rect::new(0.0, 0.0, 100.0, 40.0), top_h, taskbar_y, both), NATIVE_CHROME_TOPBAR);
+        assert_eq!(leaf_claim(Rect::new(0.0, 0.0, 100.0, 40.0), top_h, taskbar_y, none), 0);
+        assert_eq!(leaf_claim(Rect::new(0.0, 756.0, 100.0, 44.0), top_h, taskbar_y, both), NATIVE_CHROME_TASKBAR);
+        assert_eq!(leaf_claim(Rect::new(0.0, 756.0, 100.0, 44.0), top_h, taskbar_y, none), 0);
+        assert_eq!(leaf_claim(Rect::new(0.0, 100.0, 100.0, 100.0), top_h, taskbar_y, none), NATIVE_CHROME_HOME);
+        // A leaf straddling a boundary claims nothing on either side of it.
+        assert_eq!(leaf_claim(Rect::new(0.0, 30.0, 100.0, 20.0), top_h, taskbar_y, both), 0);
+        assert_eq!(leaf_claim(Rect::new(0.0, 750.0, 100.0, 20.0), top_h, taskbar_y, both), 0);
+        // Degenerate: bands that are not distinct claim no bar at all.
+        assert_eq!(leaf_claim(Rect::new(0.0, 0.0, 3.0, 3.0), 40.0, -41.0, both) & (NATIVE_CHROME_TOPBAR | NATIVE_CHROME_TASKBAR), 0);
     }
 
     #[test]
@@ -5973,6 +7189,126 @@ mod native_render_tests {
         );
     }
 
+    /// Composite `elements` over a magenta sentinel and hand back the framebuffer bytes
+    /// (Argb8888 little-endian, [B,G,R,A]). The same steps the demo proof below takes,
+    /// extracted so a proof can ask about a REGION rather than the whole frame. Shared
+    /// with `glass_tests` below, which reads pixels the same way.
+    pub(super) fn composite_to_bytes(
+        renderer: &mut PixmanRenderer,
+        size: Size<i32, Physical>,
+        elements: &[HartRenderElement<PixmanRenderer>],
+    ) -> Vec<u8> {
+        use smithay::backend::renderer::utils::draw_render_elements;
+        use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen};
+        let buf_size: Size<i32, BufferCoord> = (size.w, size.h).into();
+        let mut image = renderer
+            .create_buffer(Fourcc::Argb8888, buf_size)
+            .expect("offscreen image");
+        let mut target = renderer.bind(&mut image).expect("bind offscreen");
+        let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
+        {
+            let mut frame = renderer
+                .render(&mut target, size, Transform::Normal)
+                .expect("begin frame");
+            frame
+                .clear(Color32F::new(1.0, 0.0, 1.0, 1.0), &[full])
+                .expect("clear to sentinel");
+            draw_render_elements(&mut frame, 1.0, elements, &[full]).expect("draw scene");
+            let _ = frame.finish().expect("finish frame");
+        }
+        let region: Rectangle<i32, BufferCoord> = Rectangle::from_size(buf_size);
+        let mapping = renderer
+            .copy_framebuffer(&target, region, Fourcc::Argb8888)
+            .expect("copy_framebuffer");
+        renderer.map_texture(&mapping).expect("map_texture").to_vec()
+    }
+
+    /// How many pixels inside `r` differ from the pixel just LEFT of it (the strip's
+    /// own fill), i.e. how many a run painted.
+    fn painted_in(bytes: &[u8], w: usize, r: crate::scene::Rect) -> usize {
+        let x0 = r.x.max(0.0) as usize;
+        let y0 = r.y.max(0.0) as usize;
+        let x1 = (r.x + r.w).min(w as f32) as usize;
+        let y1 = (r.y + r.h) as usize;
+        let reference = {
+            let i = (y0 * w + x0.saturating_sub(2)) * 4;
+            bytes[i..i + 3].to_vec()
+        };
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * w + x) * 4;
+                if bytes[i..i + 3] != reference[..] {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn the_native_bar_paints_the_clock_and_the_tray_it_was_given() {
+        // The headless pixel proof for `shell.chrome`: the layout tests prove the runs
+        // are EMITTED; this proves they reach a framebuffer as pixels that differ from
+        // the strip they sit on. Text, not coverage, is what a bar with a blank clock
+        // slot would fail.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 400).into();
+        let home = crate::scene::HomeCompose::demo();
+        let chrome: crate::scene::ShellChrome = crate::scene::decode_shell_chrome(
+            &serde_json::from_str(crate::wire_fixture::SHELL_CHROME_COMPOSED).unwrap(),
+        );
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let has_face = crate::scene::TextMeasure::has_icon_face(&rasterizer);
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        let cov = scenes.set_chrome(chrome);
+        assert!(cov.top_bar && cov.taskbar, "the fixture composes both bands");
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
+            0.5, None, false, true, &crate::scene::RowScroll::default(), &mut elements,
+        );
+        let bytes = composite_to_bytes(&mut renderer, size, &elements);
+
+        // Every text run in the two strips, by what it says.
+        let tree = scenes.tree().expect("the tree was built by the lowering");
+        let mut runs: Vec<(String, bool, crate::scene::Rect)> = Vec::new();
+        tree.for_each_leaf(&mut |_, leaf| {
+            if let crate::scene::SceneNode::Text { rect, text, icon, .. } = leaf {
+                let in_bar = rect.y < crate::scene::TOP_BAR_H
+                    || rect.y >= size.h as f32 - crate::scene::TASKBAR_H;
+                if in_bar {
+                    runs.push((text.clone(), *icon, *rect));
+                }
+            }
+        });
+        let run = |t: &str| runs.iter().find(|(s, _, _)| s == t).map(|(_, _, r)| *r);
+        let w = size.w as usize;
+        for want in ["02:05 PM", "64%", "Scout", "Files"] {
+            let r = run(want).unwrap_or_else(|| panic!("the bar never laid out {want:?}"));
+            let n = painted_in(&bytes, w, r);
+            assert!(n > 8, "{want:?} laid out at {r:?} but painted only {n} px");
+        }
+        // The glyphs are ligature names in the Material face. Where that face is
+        // loaded they must paint; where it is not, the layout must not have asked for
+        // them at all (a run of the literal word "network_wifi_3_bar" across the tray
+        // is the fresh-ISO failure this rule exists for).
+        let glyphs = ["network_wifi_3_bar", "bluetooth_connected", "volume_down", "battery_4_bar", "folder"];
+        if has_face {
+            for g in glyphs {
+                let r = run(g).unwrap_or_else(|| panic!("the face is loaded but {g:?} was not laid out"));
+                assert!(painted_in(&bytes, w, r) > 4, "{g:?} laid out but painted nothing");
+            }
+        } else {
+            for g in glyphs {
+                assert!(run(g).is_none(), "no icon face, yet {g:?} was laid out as a word");
+            }
+            eprintln!("note: no Material face on this host, so the glyph half of this proof ran as its absence rule");
+        }
+    }
+
     #[test]
     fn demo_scene_composites_visible_pixels_on_pixman() {
         // Color32F / Frame / draw_render_elements are cfg-gated to the winit path in
@@ -6088,6 +7424,710 @@ mod native_render_tests {
         assert!(
             mid > w,
             "the content band painted only {mid} px, so nothing but the bars drew"
+        );
+    }
+
+    /// Composite a lowered home into an offscreen pixman image and hand back the bytes
+    /// (Argb8888 little-endian: B, G, R, A per pixel) beside the retained tree it was
+    /// laid out from, so a test can find a surface by its geometry and read its pixel.
+    fn composite_home(
+        home: &crate::scene::HomeCompose,
+        size: Size<i32, Physical>,
+        rects: &mut RectCache,
+    ) -> (Vec<u8>, crate::scene::SceneNode) {
+        use smithay::backend::renderer::utils::draw_render_elements;
+        use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen};
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let buf_size: Size<i32, BufferCoord> = (size.w, size.h).into();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            home, size, &mut renderer, &mut rasterizer, &mut orb, rects, &mut scenes,
+            0.0, None, false, false, &crate::scene::RowScroll::default(), &mut elements,
+        );
+        let tree = scenes.tree().expect("lowering built the tree").clone();
+        let mut image = renderer
+            .create_buffer(Fourcc::Argb8888, buf_size)
+            .expect("offscreen image");
+        let mut target = renderer.bind(&mut image).expect("bind offscreen");
+        let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
+        {
+            let mut frame = renderer
+                .render(&mut target, size, Transform::Normal)
+                .expect("begin frame");
+            frame
+                .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[full])
+                .expect("clear");
+            draw_render_elements(&mut frame, 1.0, &elements, &[full]).expect("draw scene");
+            let _ = frame.finish().expect("finish frame");
+        }
+        let region: Rectangle<i32, BufferCoord> = Rectangle::from_size(buf_size);
+        let mapping = renderer
+            .copy_framebuffer(&target, region, Fourcc::Argb8888)
+            .expect("copy_framebuffer");
+        let bytes = renderer.map_texture(&mapping).expect("map_texture").to_vec();
+        (bytes, tree)
+    }
+
+    /// The primary CTA's pill: the ONE `Fill` on the desktop shaped as a full-round pill
+    /// wider than it is tall (card art and the chrome strips have other corners). Found
+    /// by SHAPE rather than by colour, because its colour is what the test reads.
+    fn primary_cta_rect(tree: &crate::scene::SceneNode) -> crate::scene::Rect {
+        let mut found = None;
+        tree.for_each_leaf(&mut |_, leaf| {
+            if let crate::scene::SceneNode::Fill { rect, radius, .. } = leaf {
+                if (radius - rect.h * 0.5).abs() < 0.01 && rect.w > rect.h {
+                    found = Some(*rect);
+                }
+            }
+        });
+        found.expect("the demo home draws the lit Resume pill")
+    }
+
+    #[test]
+    fn a_composed_mood_reaches_the_pixels_and_teal_survives_an_aura_mood() {
+        // THE PIXEL PROOF. `mood` was decoded and dropped, so every agent-composed
+        // mood rendered identically. Now the shell sends the id resolved, and this
+        // composites the same home under an Aura mood and a classic one and READS the
+        // framebuffer at the primary CTA, the surface `--hart-accent` paints:
+        //   * under the classic `sunset` the pill goes ORANGE (the accent moved), and
+        //   * under `aurora` it stays TEAL (the Aura rule: the accent is pinned and the
+        //     quad drives only the ambient field, which the bloom test covers).
+        // Sampled near the pill's far end, where the ramp from the fixed bright teal
+        // has all but reached the accent.
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let mut home = crate::scene::HomeCompose::demo();
+        let (plain, tree) = composite_home(&home, size, &mut RectCache::default());
+        let cta = primary_cta_rect(&tree);
+        let px = |bytes: &[u8]| -> (u8, u8, u8) {
+            let x = (cta.x + cta.w - 4.0) as usize;
+            let y = (cta.y + cta.h * 0.5) as usize;
+            let i = (y * size.w as usize + x) * 4;
+            (bytes[i + 2], bytes[i + 1], bytes[i]) // R, G, B
+        };
+        let (r0, g0, b0) = px(&plain);
+        assert!(g0 > b0 && b0 > r0, "no mood: the pill is the brand teal, got {:?}", (r0, g0, b0));
+
+        home.palette = Some(crate::scene::MoodPalette {
+            accent: crate::scene::Color::from_hex("#00E6C3"),
+            secondary: crate::scene::Color::from_hex("#00DDF9"),
+            background: crate::scene::Color::from_hex("#04050B"),
+            ambient: [
+                crate::scene::Color::from_hex("#B182FF"),
+                crate::scene::Color::from_hex("#00DDF9"),
+                crate::scene::Color::from_hex("#FB66B6"),
+                crate::scene::Color::from_hex("#FFB330"),
+            ],
+        });
+        let (aurora, tree_a) = composite_home(&home, size, &mut RectCache::default());
+        assert_eq!(primary_cta_rect(&tree_a), cta, "a mood moves no geometry");
+        let (r1, g1, b1) = px(&aurora);
+        assert!(
+            g1 > b1 && b1 > r1,
+            "under an Aura mood the functional accent must SURVIVE teal, got {:?}",
+            (r1, g1, b1)
+        );
+        assert_eq!((r1, g1, b1), (r0, g0, b0), "aurora's accent IS the brand teal");
+
+        home.palette = Some(crate::scene::MoodPalette {
+            accent: crate::scene::Color::from_hex("#FF8A4C"),
+            secondary: crate::scene::Color::from_hex("#FF2E9A"),
+            background: crate::scene::Color::from_hex("#16090F"),
+            ambient: [
+                crate::scene::Color::from_hex("#FF8A4C"),
+                crate::scene::Color::from_hex("#FF2E9A"),
+                None,
+                None,
+            ],
+        });
+        let (sunset, tree_s) = composite_home(&home, size, &mut RectCache::default());
+        assert_eq!(primary_cta_rect(&tree_s), cta, "a mood moves no geometry");
+        let (r2, g2, b2) = px(&sunset);
+        assert!(
+            r2 > g2 && g2 > b2,
+            "under a classic mood the accent must MOVE, the pill reads orange: {:?}",
+            (r2, g2, b2)
+        );
+        assert!(r2 > r0 + 100, "and it is a different colour from the teal, not a tint");
+    }
+
+    #[test]
+    fn the_backdrop_follows_the_mood_and_recomposes_once_per_mood() {
+        // The bloom half through the CACHE, which is what the frame path actually
+        // calls: a mood is part of the key, so it composes on the first frame carrying
+        // it and never again for the same mood, and a home without one composes the
+        // theme's own field, byte-identical to before moods existed.
+        let mut cache = BloomCache::default();
+        let base = crate::bloom::BloomPalette::default();
+        let (w, h) = (96, 54);
+        assert!(cache.get(w, h, base, None).is_some());
+        let plain_key = cache.key;
+        assert!(cache.get(w, h, base, None).is_some());
+        assert_eq!(cache.key, plain_key, "no mood, no recompose");
+
+        let sunset = crate::scene::MoodPalette {
+            background: crate::scene::Color::from_hex("#16090F"),
+            ambient: [crate::scene::Color::from_hex("#FF8A4C"), None, None, None],
+            ..Default::default()
+        };
+        assert!(cache.get(w, h, base, Some(&sunset)).is_some());
+        let sunset_key = cache.key;
+        assert_ne!(sunset_key, plain_key, "a mood recomposes the field");
+        assert_eq!(
+            sunset_key.map(|k| k.2.base),
+            Some([0x16, 0x09, 0x0F]),
+            "on the mood's own ground"
+        );
+        assert!(cache.get(w, h, base, Some(&sunset)).is_some());
+        assert_eq!(cache.key, sunset_key, "the same mood again does not recompose");
+        assert!(cache.get(w, h, base, None).is_some());
+        assert_eq!(cache.key, plain_key, "and dropping the mood returns to the theme's field");
+        // And a THEME change (a different base from the watch) recomposes once too,
+        // which is the half a restart used to be needed for.
+        let mut moss = base;
+        moss.base = [0x01, 0x02, 0x03];
+        assert!(cache.get(w, h, moss, None).is_some());
+        assert_ne!(cache.key, plain_key, "a changed theme field recomposes");
+        let moss_key = cache.key;
+        assert!(cache.get(w, h, moss, None).is_some());
+        assert_eq!(cache.key, moss_key, "and only once");
+    }
+
+    /// A temp static root holding ONE card SVG at the served path `rel`, so the art
+    /// path can be driven end to end with no environment and no bundled file.
+    fn art_root_with(rel: &str, svg: &str) -> ArtRoots {
+        let dir = std::env::temp_dir().join(format!("hart_art_{}", std::process::id()));
+        let file = dir.join(rel);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, svg).unwrap();
+        ArtRoots { static_dir: Some(dir), agent_art_dir: None }
+    }
+
+    #[test]
+    fn a_cards_photo_reaches_the_pixels_over_its_gradient_and_under_its_scrim() {
+        // THE PIXEL PROOF for the photo layer, the last M3 remainder. A card whose
+        // `image` names a served SVG must composite that SVG over its brand gradient:
+        // the same home with and without the photo differs INSIDE the card's art box
+        // and nowhere else, and the pixel at the box's centre carries the SVG's own
+        // colour, a red no card gradient contains. The scrim still paints over it, so
+        // the sample is taken above the scrim's clear stop, where the title is not.
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let mut home = crate::scene::HomeCompose::demo();
+        let rel = "app_art/proof.svg";
+        home.rows[0].cards[0].photo = Some(format!("/shell/static/{rel}"));
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10' width='10' height='10'>\
+                   <rect width='10' height='10' fill='#FF0000'/></svg>";
+
+        let mut with_art = RectCache::default();
+        with_art.art_roots = art_root_with(rel, svg);
+        let (pictured, tree) = composite_home(&home, size, &mut with_art);
+        assert_eq!(with_art.art_composes(), 1, "the photo composed exactly once");
+
+        let mut no_root = RectCache::default();
+        no_root.art_roots = ArtRoots { static_dir: None, agent_art_dir: None };
+        let (bare, _) = composite_home(&home, size, &mut no_root);
+        assert_eq!(no_root.art_composes(), 0, "with no root there is nothing to decode");
+
+        // The first card's art box, read from the tree the lowering laid out.
+        let mut art_box = None;
+        tree.for_each_leaf(&mut |_, leaf| {
+            if let crate::scene::SceneNode::Fill { rect, photo: Some(_), .. } = leaf {
+                if art_box.is_none() {
+                    art_box = Some(*rect);
+                }
+            }
+        });
+        let b = art_box.expect("the card carries its photo on its art tile");
+        let px = |bytes: &[u8], x: f32, y: f32| -> (u8, u8, u8) {
+            let i = ((y as usize) * size.w as usize + x as usize) * 4;
+            (bytes[i + 2], bytes[i + 1], bytes[i]) // R, G, B
+        };
+        let (cx, cy) = (b.x + b.w * 0.5, b.y + b.h * 0.2);
+        let (r, g, bl) = px(&pictured, cx, cy);
+        assert!(
+            r > 200 && g < 40 && bl < 40,
+            "the photo's red must reach the card: got {:?} at ({cx},{cy})",
+            (r, g, bl)
+        );
+        let (r0, g0, b0) = px(&bare, cx, cy);
+        assert!(r0 < 200, "without a root the card is its gradient, not red: {:?}", (r0, g0, b0));
+
+        // The corner is CLIPPED to the tile's radius: just inside the box's top-left
+        // corner the photo is absent and the pixel is whatever was behind the card.
+        assert_eq!(px(&pictured, b.x + 1.0, b.y + 1.0), px(&bare, b.x + 1.0, b.y + 1.0),
+                   "the photo must not square off the card's rounded corner");
+        // And nothing OUTSIDE the box moved: the bars, the hero, the other cards.
+        let (w, h) = (size.w as usize, size.h as usize);
+        let mut moved_outside = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                let inside = x as f32 >= b.x && (x as f32) < b.right() && y as f32 >= b.y && (y as f32) < b.bottom();
+                if inside {
+                    continue;
+                }
+                let i = (y * w + x) * 4;
+                if pictured[i..i + 4] != bare[i..i + 4] {
+                    moved_outside += 1;
+                }
+            }
+        }
+        assert_eq!(moved_outside, 0, "a photo changes its own card and nothing else");
+    }
+
+    #[test]
+    fn the_scene_stacks_the_way_it_is_walked_so_the_pill_sits_on_the_bar() {
+        // THE Z-ORDER PROOF, in pixels. The frame list is top-most first (smithay's
+        // convention, the reason the cursor is inserted at 0 and the bloom pushed last)
+        // and the scene walks its leaves bottom-most first, so the lowering has to turn
+        // its slice around. It did not, and every headless proof passed: none had read
+        // a pixel whose colour depended on what was on top. This one does. The omnibox
+        // pill is a translucent white over the bar's opaque fill and is walked AFTER
+        // it, so a pixel inside the pill must be lighter than the bar beside it. With
+        // the slice upside down the fill covers the pill and the two are equal.
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let home = crate::scene::HomeCompose::demo();
+        let (bytes, tree) = composite_home(&home, size, &mut RectCache::default());
+        let theme = crate::scene::Theme::cosmic_default();
+        // The pill: the one rounded Rect in the bar band painted in the omnibox ground.
+        let mut pill = None;
+        tree.for_each_leaf(&mut |_, leaf| {
+            if let crate::scene::SceneNode::Rect { rect, color, radius } = leaf {
+                if *color == theme.omnibox_bg && *radius > 0.0 && rect.y < theme.top_bar_h
+                    && rect.w > 100.0 && pill.is_none()
+                {
+                    pill = Some(*rect);
+                }
+            }
+        });
+        let p = pill.expect("the bar draws its omnibox pill");
+        let lum = |x: f32, y: f32| -> u32 {
+            let i = ((y as usize) * size.w as usize + x as usize) * 4;
+            bytes[i] as u32 + bytes[i + 1] as u32 + bytes[i + 2] as u32
+        };
+        let inside = lum(p.x + p.w * 0.5, p.y + p.h * 0.5);
+        // The bar beside the pill, same row, clear of the tabs: 20px right of the pill.
+        let beside = lum(p.right() + 20.0, p.y + p.h * 0.5);
+        assert!(
+            inside > beside + 20,
+            "the pill must sit ON the bar (inside {inside} vs bar {beside}); equal means \
+             the scene is stacked upside down and the fill covers everything on it"
+        );
+    }
+
+    #[test]
+    fn a_steady_desktop_with_photos_composes_each_once_and_never_retries_a_miss() {
+        let rel = "app_art/once.svg";
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4' width='4' height='4'>\
+                   <rect width='4' height='4' fill='#00FF00'/></svg>";
+        let mut rects = RectCache::default();
+        rects.art_roots = art_root_with(rel, svg);
+        for _ in 0..5 {
+            assert!(rects.art(&format!("/shell/static/{rel}"), 258, 150, 16.0).is_some());
+        }
+        assert_eq!(rects.art_composes(), 1, "five frames, one compose");
+        // A second size is a second buffer, as the tiles are.
+        assert!(rects.art(&format!("/shell/static/{rel}"), 174, 150, 16.0).is_some());
+        assert_eq!(rects.art_composes(), 2);
+        // A source that is not there is remembered as a miss: no compose, and the
+        // entry exists so the frame path never touches the disk for it again.
+        let held = rects.cached_art();
+        for _ in 0..3 {
+            assert!(rects.art("/shell/static/app_art/missing.svg", 258, 150, 16.0).is_none());
+        }
+        assert_eq!(rects.cached_art(), held + 1, "one entry for the miss");
+        assert_eq!(rects.art_composes(), 2, "a miss composes nothing");
+        // Bounded: an agent that names a fresh source per compose cannot grow this
+        // without limit. Past the cap the map is dropped and starts again.
+        for i in 0..(MAX_CACHED_ART * 2) {
+            let _ = rects.art(&format!("/shell/static/app_art/agent-{i}.svg"), 258, 150, 16.0);
+        }
+        assert!(rects.cached_art() <= MAX_CACHED_ART, "the art cache is bounded");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// NATIVE GLASS (checklist GL1/GL2/GL3, NATIVE_OS_PROGRAM 3.3) and the taskbar-strip
+// probe S2 asked for. Pixel proofs on the pixman floor: the SAME renderer the DRM path
+// paints with when there is no GPU, composited headless and READ BACK, because GL1's
+// rule is that a glass claim is proven by screen pixels over a bright backdrop, never
+// by an API return.
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(all(test, feature = "smithay"))]
+mod glass_tests {
+    use super::native_render_tests::composite_to_bytes;
+    use super::*;
+    use smithay::backend::renderer::pixman::PixmanRenderer;
+
+    /// A BRIGHT field, so every proof here runs over a bright backdrop: a light grey base
+    /// with the four ambient hues fully saturated.
+    fn bright() -> crate::bloom::BloomPalette {
+        crate::bloom::BloomPalette {
+            base: [0x90, 0x90, 0x9A],
+            amb: [[0xFF, 0x30, 0x30], [0x30, 0xFF, 0x30], [0x30, 0x30, 0xFF], [0xFF, 0xD0, 0x30]],
+        }
+    }
+
+    fn px(bytes: &[u8], w: usize, x: usize, y: usize) -> [u8; 4] {
+        let i = (y * w + x) * 4;
+        [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]
+    }
+
+    /// A premultiplied Argb8888 buffer of `w`x`h` whose rows at or below `from_y` carry
+    /// `rgba` and whose rows above are fully transparent: the shape of the buffer the
+    /// shell commits when its wallpaper is `transparent` and its strip is `.glass`.
+    fn tinted_strip_rgba(w: usize, h: usize, from_y: usize, rgb: [u8; 3], a: f32) -> Vec<u8> {
+        let mut v = vec![0u8; w * h * 4];
+        for y in from_y..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                v[i] = (rgb[2] as f32 * a).round() as u8;
+                v[i + 1] = (rgb[1] as f32 * a).round() as u8;
+                v[i + 2] = (rgb[0] as f32 * a).round() as u8;
+                v[i + 3] = (255.0 * a).round() as u8;
+            }
+        }
+        v
+    }
+
+    fn memory_element(
+        renderer: &mut PixmanRenderer,
+        buffer: &MemoryRenderBuffer,
+        at: (i32, i32),
+        alpha: f32,
+        size: Option<Size<i32, Logical>>,
+    ) -> HartRenderElement<PixmanRenderer> {
+        let origin: Point<f64, Physical> = Point::from((at.0 as f64, at.1 as f64));
+        HartRenderElement::Memory(
+            MemoryRenderBufferRenderElement::from_buffer(
+                renderer, origin, buffer, Some(alpha), None, size, Kind::Unspecified,
+            )
+            .expect("memory buffer imports on pixman"),
+        )
+    }
+
+    // ── the frosted field itself ──
+
+    #[test]
+    fn the_frosted_field_is_the_field_averaged_and_saturated_never_a_slab_or_a_tint() {
+        let pal = bright();
+        let (w, h) = (320, 200);
+        let field = crate::bloom::compose(w, h, &pal);
+
+        // Identity: no blur and 100 percent saturation is the field itself, byte for
+        // byte. This is what stops anyone mistaking the frosting for a tint.
+        let plain = GlassLook { blur_px: 0, saturation_pct: 100 };
+        assert_eq!(frosted_field_rgba(w, h, &pal, plain), field);
+
+        let look = GlassLook { blur_px: 20, saturation_pct: 180 };
+        let frosted = frosted_field_rgba(w, h, &pal, look);
+        assert_eq!(frosted.len(), field.len());
+        assert!(frosted.chunks(4).all(|p| p[3] == 255), "the frosted field is opaque");
+
+        // Not a slab: it varies across the output like the field it comes from.
+        let distinct: std::collections::HashSet<[u8; 3]> =
+            frosted.chunks(4).map(|p| [p[0], p[1], p[2]]).collect();
+        assert!(distinct.len() > 200, "a frosted field is a field, not a colour: {} colours", distinct.len());
+
+        // Blurred: it is different from the sharp field somewhere real...
+        let max_diff = frosted
+            .chunks(4)
+            .zip(field.chunks(4))
+            .map(|(a, b)| (0..3).map(|c| (a[c] as i32 - b[c] as i32).abs()).max().unwrap())
+            .max()
+            .unwrap();
+        assert!(max_diff > 4, "blur 20 at 180 percent must move pixels, moved at most {max_diff}");
+        // ...and the blur is an AVERAGE of a coarser field, not a recolour: at 100
+        // percent saturation each cell centre reads the coarse compose's own value.
+        let only_blur = GlassLook { blur_px: 20, saturation_pct: 100 };
+        let s = only_blur.downsample();
+        assert_eq!(s, 10, "a 20 px blur averages over 10 px cells");
+        let coarse = crate::bloom::compose((w as usize).div_ceil(s) as i32, (h as usize).div_ceil(s) as i32, &pal);
+        let cw = (w as usize).div_ceil(s);
+        let blurred = frosted_field_rgba(w, h, &pal, only_blur);
+        // No output pixel sits exactly on a cell centre (10 px cells, half-pixel
+        // sampling), so the nearest one is 5 percent of the way to its neighbour: a few
+        // levels on the steepest blob edge, hence the tolerance.
+        for (cx, cy) in [(3usize, 4usize), (12, 9), (25, 15), (0, 0)] {
+            let centre = px(&blurred, w as usize, cx * s + s / 2, cy * s + s / 2);
+            let cell = px(&coarse, cw, cx, cy);
+            for c in 0..3 {
+                assert!(
+                    (centre[c] as i32 - cell[c] as i32).abs() <= 4,
+                    "cell ({cx},{cy}) channel {c}: frosted centre {} vs coarse {}", centre[c], cell[c]
+                );
+            }
+        }
+        // A wider blur flattens the peaks: the widest look has less range than the field.
+        let wide = frosted_field_rgba(w, h, &pal, GlassLook { blur_px: 128, saturation_pct: 100 });
+        let range = |b: &[u8]| {
+            let luma: Vec<i32> = b.chunks(4).map(|p| p[0] as i32 + p[1] as i32 + p[2] as i32).collect();
+            luma.iter().max().unwrap() - luma.iter().min().unwrap()
+        };
+        assert!(range(&wide) < range(&field), "a 128 px blur must flatten the field's peaks");
+
+        // Saturated: chroma rises against the same field blurred at 100 percent.
+        let chroma = |b: &[u8]| -> f64 {
+            b.chunks(4)
+                .map(|p| (p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap()) as f64)
+                .sum::<f64>()
+                / (b.len() / 4) as f64
+        };
+        assert!(
+            chroma(&frosted) > chroma(&blurred) * 1.2,
+            "180 percent saturation must lift chroma: {} vs {}", chroma(&frosted), chroma(&blurred)
+        );
+    }
+
+    #[test]
+    fn the_glass_look_is_read_from_the_keys_theme_service_emits_and_defaults_to_its_fallbacks() {
+        let dir = std::env::temp_dir().join(format!("hart_glass_look_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let themed = dir.join("themed.json");
+        // `shell.blur_radius` and `shell.saturation` are exactly what theme_service.py
+        // turns into --hart-blur and --hart-saturation (test_panel_reservation.py pins
+        // the same reader idiom for the three metrics next to them).
+        std::fs::write(&themed, r#"{"shell":{"blur_radius": 24, "saturation": 140, "border_radius": 12}}"#).unwrap();
+        assert_eq!(
+            GlassLook::from_file(&crate::bloom::SettingsFile::load(&themed)),
+            GlassLook { blur_px: 24, saturation_pct: 140 }
+        );
+        // A theme that says nothing renders like the browser's own omission of the
+        // tokens: theme_service's `shell.get("blur_radius", 20)` / `("saturation", 180)`.
+        let bare = dir.join("bare.json");
+        std::fs::write(&bare, r#"{"colors":{"accent":"00E6C3"}}"#).unwrap();
+        assert_eq!(
+            GlassLook::from_file(&crate::bloom::SettingsFile::load(&bare)),
+            GlassLook { blur_px: 20, saturation_pct: 180 }
+        );
+        assert_eq!(GlassLook::default(), GlassLook { blur_px: 20, saturation_pct: 180 });
+        // A file value is clamped: a blur of a million pixels would be a compose that
+        // never finishes on the frame path.
+        let absurd = dir.join("absurd.json");
+        std::fs::write(&absurd, r#"{"shell":{"blur_radius": 1000000, "saturation": -5}}"#).unwrap();
+        assert_eq!(
+            GlassLook::from_file(&crate::bloom::SettingsFile::load(&absurd)),
+            GlassLook { blur_px: 128, saturation_pct: 0 }
+        );
+        // And it rides the same reload as the palette: a watch on the file sees it.
+        let a11y = dir.join("absent-a11y.json");
+        let watch = ThemeWatch::new(vec![themed.clone()], a11y);
+        assert_eq!(watch.snapshot().glass, GlassLook { blur_px: 24, saturation_pct: 140 });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_frosted_field_composes_once_and_a_still_region_reuses_its_crop() {
+        let mut cache = BloomCache::default();
+        let (w, h) = (200, 120);
+        let look = GlassLook::default();
+        let a: Rectangle<i32, Physical> = Rectangle::new((10, 10).into(), (50, 40).into());
+        let b: Rectangle<i32, Physical> = Rectangle::new((0, 76).into(), (200, 44).into());
+        for _ in 0..5 {
+            cache.begin_frame();
+            assert!(cache.frosted_crop(w, h, bright(), None, look, a).is_some());
+            assert!(cache.frosted_crop(w, h, bright(), None, look, b).is_some());
+        }
+        assert_eq!(cache.crops_pooled(), 2, "two still regions, two crops, five frames");
+        // A changed look recomposes the field and drops every crop cut from the old one.
+        cache.begin_frame();
+        let sharper = GlassLook { blur_px: 4, saturation_pct: 120 };
+        assert!(cache.frosted_crop(w, h, bright(), None, sharper, a).is_some());
+        assert_eq!(cache.crops_pooled(), 1, "the crops of the old field are gone");
+        // A region nothing has drawn for long enough is evicted at the next insert.
+        for _ in 0..200 {
+            cache.begin_frame();
+            assert!(cache.frosted_crop(w, h, bright(), None, sharper, a).is_some());
+        }
+        assert!(cache.frosted_crop(w, h, bright(), None, sharper, b).is_some());
+        assert_eq!(cache.crops_pooled(), 2, "a is live, b is fresh, nothing stale is kept");
+        // Degenerate input never panics and never pools.
+        let none: Rectangle<i32, Physical> = Rectangle::new((0, 0).into(), (0, 10).into());
+        assert!(cache.frosted_crop(w, h, bright(), None, sharper, none).is_none());
+        assert!(cache.frosted_crop(0, 0, bright(), None, sharper, a).is_none());
+    }
+
+    // ── GL1: pixels over a bright backdrop ──
+
+    #[test]
+    fn a_translucent_client_over_the_frosted_field_shows_the_field_through_its_tint() {
+        // The proof rule verbatim: a bright backdrop behind the probe, and the pixels of
+        // the probe read against it. The "client" is a buffer painting the shell's own
+        // tint (`--hart-glass-rgb` 18,19,28 at `--hart-panel-opacity` 0.65, the numbers
+        // theme_service.py emits, liquid_ui_service's `.glass`) with nothing else, so
+        // what is read back is tint over whatever the compositor put beneath it.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (320, 200).into();
+        let (w, h) = (320usize, 200usize);
+        let pal = bright();
+        let look = GlassLook::default();
+        let mut cache = BloomCache::default();
+        cache.begin_frame();
+        let win: Rectangle<i32, Physical> = Rectangle::new((40, 30).into(), (200, 120).into());
+        let frosted = frosted_field_rgba(size.w, size.h, &pal, look);
+        let field = crate::bloom::compose(size.w, size.h, &pal);
+
+        let tint = [18u8, 19, 28];
+        let opacity = 0.65f32;
+        let client = MemoryRenderBuffer::from_slice(
+            &tinted_strip_rgba(200, 120, 0, tint, opacity),
+            Fourcc::Argb8888,
+            (200, 120),
+            1,
+            Transform::Normal,
+            None,
+        );
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        elements.push(memory_element(&mut renderer, &client, (40, 30), 1.0, None));
+        let crop = cache
+            .frosted_crop(size.w, size.h, pal, None, look, win)
+            .expect("the crop under the window")
+            .clone();
+        elements.push(memory_element(&mut renderer, &crop, (40, 30), 1.0, None));
+        let bloom = cache.get(size.w, size.h, pal, None).expect("the field").clone();
+        elements.push(memory_element(&mut renderer, &bloom, (0, 0), 1.0, None));
+        let bytes = composite_to_bytes(&mut renderer, size, &elements);
+
+        // Inside the window: tint over the FROSTED field, within blending rounding.
+        let mut worst = 0i32;
+        for y in 30..150usize {
+            for x in 40..240usize {
+                let got = px(&bytes, w, x, y);
+                let under = px(&frosted, w, x, y);
+                assert_eq!(got[3], 255, "opaque at ({x},{y})");
+                let want = |c: usize| {
+                    // Bytes are B,G,R; the tint is R,G,B.
+                    let t = tint[2 - c] as f32;
+                    (t * opacity + under[c] as f32 * (1.0 - opacity)).round() as i32
+                };
+                for c in 0..3 {
+                    worst = worst.max((got[c] as i32 - want(c)).abs());
+                }
+            }
+        }
+        assert!(worst <= 3, "the window is the shell's tint over the frosted field (worst channel error {worst})");
+        // See-through: two points of the window over different field colours read
+        // differently. A slab would read the same everywhere.
+        let p1 = px(&bytes, w, 60, 50);
+        let p2 = px(&bytes, w, 220, 140);
+        assert_ne!(p1, p2, "the field shows through the tint");
+        // Outside the window: the sharp field, untouched.
+        for (x, y) in [(5usize, 5usize), (300, 190), (20, 100)] {
+            let got = px(&bytes, w, x, y);
+            let raw = px(&field, w, x, y);
+            for c in 0..3 {
+                assert!((got[c] as i32 - raw[c] as i32).abs() <= 1, "outside the window at ({x},{y}) is the field");
+            }
+        }
+        let _ = h;
+    }
+
+    // ── the damage-race probe (S2, COMPOSITOR_PLAN C2) ──
+
+    #[test]
+    fn the_taskbar_strip_stays_opaque_across_dropped_frames_and_the_orb_never_shows_through() {
+        // WHAT THIS SETTLES. The shell's strip is `.taskbar.glass`: 65 percent tint over a
+        // wallpaper that is `transparent` while the bloom is claimed, so the buffer the
+        // WebView commits is 35 percent open in its bottom band on every commit, and the
+        // strip shows whatever the compositor has under it. This composes the frame the
+        // way `build_frame_elements` orders it (shell, base, orb, bloom) across a sequence
+        // where the orb, driven UNDER the strip, breathes and then the shell's element
+        // drops out of a frame, and reads the strip each time.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (480, 270).into();
+        let w = 480usize;
+        let strip_h = crate::scene::TASKBAR_H.round() as i32;
+        let strip_y = (size.h - strip_h) as usize;
+        let pal = bright();
+        let look = GlassLook::default();
+
+        let shell = MemoryRenderBuffer::from_slice(
+            &tinted_strip_rgba(480, 270, strip_y, [18, 19, 28], 0.65),
+            Fourcc::Argb8888,
+            (480, 270),
+            1,
+            Transform::Normal,
+            None,
+        );
+        let orb_side = 160;
+        let orb = MemoryRenderBuffer::from_slice(
+            &crate::orb::compose(orb_side, &crate::orb::OrbPalette::default()),
+            Fourcc::Argb8888,
+            (orb_side, orb_side),
+            1,
+            Transform::Normal,
+            None,
+        );
+        // The orb's top-left, chosen so its lower half sits UNDER the strip.
+        let orb_at = (160, 150);
+        let mut cache = BloomCache::default();
+        let bloom = cache.get(size.w, size.h, pal, None).expect("the field").clone();
+
+        let strip_of = |bytes: &[u8]| bytes[strip_y * w * 4..].to_vec();
+        let frame = |renderer: &mut PixmanRenderer,
+                         cache: &mut BloomCache,
+                         with_shell: bool,
+                         with_base: bool,
+                         orb_alpha: f32,
+                         orb_scale: f32|
+         -> Vec<u8> {
+            cache.begin_frame();
+            let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+            if with_shell {
+                elements.push(memory_element(renderer, &shell, (0, 0), 1.0, None));
+            }
+            if with_base {
+                let strip: Rectangle<i32, Physical> =
+                    Rectangle::new((0, size.h - strip_h).into(), (size.w, strip_h).into());
+                let crop = cache
+                    .frosted_crop(size.w, size.h, pal, None, look, strip)
+                    .expect("the base crop")
+                    .clone();
+                elements.push(memory_element(renderer, &crop, (0, size.h - strip_h), 1.0, None));
+            }
+            let drawn = (orb_side as f32 * orb_scale) as i32;
+            elements.push(memory_element(
+                renderer, &orb, orb_at, orb_alpha, Some((drawn, drawn).into()),
+            ));
+            elements.push(memory_element(renderer, &bloom, (0, 0), 1.0, None));
+            composite_to_bytes(renderer, size, &elements)
+        };
+
+        // The sequence: rest, peak of the breath, and a frame that lost the shell.
+        let rest = frame(&mut renderer, &mut cache, true, true, 0.85, 1.0);
+        let peak = frame(&mut renderer, &mut cache, true, true, 1.0, 1.08);
+        let dropped = frame(&mut renderer, &mut cache, false, true, 1.0, 1.08);
+        let base_only = frame(&mut renderer, &mut cache, false, true, 0.0, 1.0);
+
+        for (name, f) in [("rest", &rest), ("peak", &peak), ("dropped", &dropped)] {
+            assert!(
+                strip_of(f).chunks(4).all(|p| p[3] == 255),
+                "{name}: the strip is opaque in every frame"
+            );
+        }
+        assert_eq!(
+            strip_of(&rest),
+            strip_of(&peak),
+            "the orb breathing under the strip never changes a strip pixel"
+        );
+        assert_eq!(
+            strip_of(&dropped),
+            strip_of(&base_only),
+            "a frame without the shell shows the frosted base, never the orb"
+        );
+        // The orb really was under the strip: above the strip it is visible and moving.
+        let above = |f: &[u8]| f[(strip_y - 20) * w * 4..strip_y * w * 4].to_vec();
+        assert_ne!(above(&rest), above(&peak), "the probe drove the orb through the strip's edge");
+
+        // THE OPPOSING DIRECTION, so the probe is known to see the leak it guards against:
+        // without the base, the shell's 35 percent window lets the orb's breath through.
+        let rest_open = frame(&mut renderer, &mut cache, true, false, 0.85, 1.0);
+        let peak_open = frame(&mut renderer, &mut cache, true, false, 1.0, 1.08);
+        assert_ne!(
+            strip_of(&rest_open),
+            strip_of(&peak_open),
+            "without the base the strip changes with the orb: the leak this base closes"
         );
     }
 }

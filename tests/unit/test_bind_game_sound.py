@@ -8,6 +8,7 @@ save_data_in_memory keeps, and the composing is the media capability the
 agent already holds.
 """
 import json
+import time
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +34,15 @@ def _media(started, progress=None):
     module.classify_error = classify_error
     module.ABSENT, module.UNREACHABLE = ABSENT, UNREACHABLE
     module.REFUSED, module.UNKNOWN = REFUSED, UNKNOWN
+    # the real reader too: a MagicMock is truthy for every input, so a
+    # stand-in here read EVERY failure as "still waking" (hartos-3a F3)
+    from integrations.service_tools.media_agent import _reads_as_still_waking
+    module._reads_as_still_waking = _reads_as_still_waking
+    # and the real vocabulary: `'error' in MagicMock()` is False, so with a
+    # stand-in every failed poll looked like "still composing" and the
+    # failure branch never ran in any test
+    from integrations.service_tools.media_agent import MEDIA_FAILED_STATUSES
+    module.MEDIA_FAILED_STATUSES = MEDIA_FAILED_STATUSES
     return module
 
 
@@ -850,3 +860,308 @@ def test_a_reset_from_a_loading_composer_is_not_a_failure():
     assert not _reads_as_still_waking(
         'No connection could be made because the target machine actively '
         'refused it')
+
+
+def test_a_reset_while_polling_keeps_polling_instead_of_failing():
+    """MEASURED 2026-09-22, attempts 9-10 of a live bind.
+
+    The submit path learned that a reset from a loading composer is not a
+    failure; the POLL path had its own failure branch that never asked.
+    A composition mid-generation was reported "failed" on
+    ConnectionResetError 10054 and then finished anyway.
+    """
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct': {'task_id': 'acestep_abc', 'mood': 'happy',
+                    'prompt': 'p', 'state': 'correct'}}}}}}
+    media = _media({'status': 'pending', 'task_id': 'acestep_abc'})
+    # first poll: a reset; second poll: finished
+    media.check_media_status.side_effect = [
+        # the shape check_media_status gives a reset: it never reached the
+        # composer, so it is marked unreachable (hartos-3a F3)
+        json.dumps({'status': 'error', 'unreachable': True,
+                    'error': "('Connection aborted.', ConnectionResetError("
+                             "10054, 'An existing connection was forcibly "
+                             "closed by the remote host'))"}),
+        json.dumps({'status': 'completed',
+                    'results': [{'url': 'https://node/finished.wav'}]}),
+    ]
+
+    with _agent(agent_data, media) as tools,             patch('time.sleep', lambda *_a, **_k: None):
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+
+    assert answer['status'] == 'bound', 'a reset mid-poll was reported as failure'
+    assert answer['music']['url'] == 'https://node/finished.wav'
+
+
+def test_a_timed_out_submit_is_not_submitted_again_inside_the_cooldown():
+    """MEASURED 2026-09-22: /v1/stats reported FIVE jobs from one caller.
+
+    Two 'warming_up' answers (the submit's reply timed out), then a third
+    submit that got an id -- and every one had been ACCEPTED server-side.
+    The id the client finally held sat "queued" behind its own orphans.
+    /release_task has no idempotency key, so the dedupe lives here.
+    """
+    media = _media({'status': 'warming_up',
+                    'message': 'The composer is starting up. Ask again shortly.'})
+
+    with _agent({}, media) as tools:
+        first = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+        second = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+
+    assert first['status'] == 'composing'
+    assert second['status'] == 'composing'
+    assert 'queue' in second['note'].lower()
+    assert media.generate_media.call_count == 1, (
+        'a timed-out submit was retried and queued a duplicate job')
+
+
+def test_after_the_cooldown_one_more_submit_is_allowed():
+    """The cooldown is a floor on duplicates, not a permanent latch."""
+    import core.agent_tools as at
+    media = _media({'status': 'warming_up', 'message': 'starting up'})
+    agent_data = {}
+
+    with _agent(agent_data, media) as tools:
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+        rec = agent_data[4242]['games']['eng-01']['sounds']['correct']
+        rec['submitted_at'] -= (at.SUBMIT_COOLDOWN_S + 1)
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+
+    assert media.generate_media.call_count == 2
+
+
+def test_a_rejection_survives_a_composer_that_is_still_warming_up():
+    """The cooldown placeholder must not overwrite the take under review.
+
+    04b8bd86e made a timed-out submit remember WHEN it went out, so the next
+    call waits rather than queueing a duplicate -- right, and measured.  But
+    it writes that note as a whole NEW record at the state's key, and every
+    other _remember in the function carries `previous_takes` forward while
+    this one does not.  So a rejected take plus a cold composer -- a node
+    restarted overnight, which is exactly when a composer is warming up --
+    silently erased the rejection: the audio the reviewer asked to go back
+    to, the reason they gave, and the variant counter with it.
+
+    Sibling of test_the_take_before_last_survives_the_next_composition,
+    which pins the same guarantee against a composer that answers at once.
+    """
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/first.mp3', 'variant': 1}}}}}}
+    cold = _media({'status': 'warming_up', 'message': 'starting up'})
+
+    with _agent(agent_data, cold) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too jangly')
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+
+    record = agent_data[4242]['games']['eng-01']['sounds']['bgm']
+    assert record.get('submitted_at'), 'the cooldown note was not written'
+    assert record.get('rejected_url') == 'https://node/first.mp3', (
+        'the take the reviewer turned down is gone, so "go back to it" '
+        f'cannot be honoured: {record!r}')
+    assert record.get('rejected_reason') == 'too jangly', (
+        f'the reason the next composition must answer is gone: {record!r}')
+
+
+def test_the_reason_still_reaches_the_composer_after_it_warms_up():
+    """What the erased rejection costs: the same take, asked for again.
+
+    With the rejection gone the next call computes variant 1 and a prompt
+    with no "not like the last one", so the composer is asked for precisely
+    what the reviewer turned down, and nothing records that they did.
+    """
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/first.mp3', 'variant': 1}}}}}}
+    cold = _media({'status': 'warming_up', 'message': 'starting up'})
+
+    with _agent(agent_data, cold) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too jangly')
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+
+    # the composer warms up; the cooldown has passed
+    import core.agent_tools as at
+    agent_data[4242]['games']['eng-01']['sounds']['bgm']['submitted_at'] -= (
+        at.SUBMIT_COOLDOWN_S + 1)
+    warm = _media({'status': 'completed',
+                   'results': [{'url': 'https://node/second.mp3'}]})
+
+    with _agent(agent_data, warm) as tools:
+        again = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+
+    asked = warm.generate_media.call_args.kwargs['context']
+    assert 'too jangly' in asked, (
+        f'the composer was asked again with no memory of the rejection: {asked!r}')
+    assert again['music']['variant'] == 2, (
+        f"the variant counter reset, so this reads as a first take: {again['music']!r}")
+    assert [t['url'] for t in again['music']['previous_takes']] == [
+        'https://node/first.mp3'], f"the earlier audio vanished: {again['music']!r}"
+
+
+def test_a_cue_is_composed_short_and_a_loop_long():
+    """MEASURED 2026-09-22: every state was composed at 60 seconds.
+
+    Both WAVs from the live run were 60.00s -- for "a bright two-note
+    chime for a correct answer" -- because bind_game_sound asked for 60
+    regardless of state. A cue that outlasts the moment it marks is worse
+    than no cue.
+    """
+    media = _media({'status': 'completed',
+                    'results': [{'url': 'https://node/x.mp3'}]})
+
+    with _agent({}, media) as tools:
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+        correct = media.generate_media.call_args.kwargs['duration']
+        tools['bind_game_sound']('eng-02', 'calm', 'spelling', 'bgm')
+        bgm = media.generate_media.call_args.kwargs['duration']
+
+    assert correct <= 3, f'a correct-answer chime asked for {correct}s'
+    assert bgm >= 20, f'background music asked for only {bgm}s'
+
+
+def test_every_state_has_a_length():
+    """A new state must get a prompt AND a length in the same place."""
+    from core.game_sound_memo import GAME_STATES, GAME_STATE_DURATIONS
+    assert set(GAME_STATE_DURATIONS) == set(GAME_STATES)
+    assert all(0 < v <= 60 for v in GAME_STATE_DURATIONS.values())
+
+
+def test_the_cooldown_holds_on_top_of_a_rejected_take():
+    """The note written over a rejected take is still a submit in flight.
+
+    The merge that keeps the rejection must not cost the cooldown: a second
+    call inside SUBMIT_COOLDOWN_S posts nothing, and the rejected take is
+    still there afterwards.
+    """
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/first.mp3', 'variant': 1}}}}}}
+    cold = _media({'status': 'warming_up', 'message': 'starting up'})
+
+    with _agent(agent_data, cold) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too jangly')
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+        posted = cold.generate_media.call_count
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+
+    assert cold.generate_media.call_count == posted, (
+        'a duplicate went out on top of a rejected take')
+    record = agent_data[4242]['games']['eng-01']['sounds']['bgm']
+    assert record.get('rejected_url') == 'https://node/first.mp3', record
+    assert record.get('variant') == 1, (
+        f'the variant counter moved without a take being made: {record!r}')
+
+
+def test_a_composer_that_cannot_start_is_waited_for_not_called_a_refusal():
+    """Run 8, 2026-09-22: a 3 GB llama-server on the card made the runtime
+    refuse to start the composer, and the tool told the agent the composer
+    REFUSED the game's music.  Installed-but-not-up is a wait, not a no --
+    and nothing was posted, so nothing may be remembered.
+    """
+    agent_data = {}
+    down = _media({'status': 'error',
+                   'error': 'AceStep installed but cannot run right now '
+                            '(Insufficient VRAM for acestep (free=4.9GB); try cpu_only)'})
+
+    with _agent(agent_data, down) as tools:
+        answer = tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+
+    assert 'refused' not in answer.lower(), answer
+    assert 'not running right now' in answer and 'free=4.9GB' in answer, answer
+    assert 'bind_game_sound' in answer, 'the agent was not told how to come back'
+    sounds = ((((agent_data.get(4242) or {}).get('games') or {})
+               .get('eng-01') or {}).get('sounds') or {})
+    assert 'correct' not in sounds, (
+        f'nothing was posted, yet something was remembered: {sounds!r}')
+
+
+def test_a_verdict_lands_on_every_state_the_card_can_name():
+    """hartos-3a F5: 7 of 14 states are camelCase; the endpoint lowercased
+    the action, so 'starEarned' became 'starearned' and the verdict never
+    landed.  The card's action round-trips through the one producer and the
+    one parser with its case intact, and record_verdict applies for EVERY
+    state."""
+    from core.game_sound_memo import (
+        GAME_STATES, game_sound_action, parse_game_sound_action, record_verdict)
+    for state in GAME_STATES:
+        games = {'eng-01': {'sounds': {state: {'url': '/api/voice/audio/x.wav'}}}}
+        game_id, parsed = parse_game_sound_action(game_sound_action('eng-01', state))
+        assert (game_id, parsed) == ('eng-01', state)
+        record, matched, _key = record_verdict(games, game_id, parsed, True)
+        assert record.get('approved_at'), f'the verdict did not land on {state!r}'
+
+
+def test_the_action_prefix_is_matched_without_case_but_the_state_is_not():
+    from core.game_sound_memo import parse_game_sound_action
+    assert parse_game_sound_action('GAME_SOUND:eng-01:starEarned') == ('eng-01', 'starEarned')
+    assert parse_game_sound_action('game_sound:eng-01') == ('eng-01', 'bgm')
+    assert parse_game_sound_action('camera:on') is None
+
+
+def test_a_failed_task_is_composed_again():
+    """hartos-3a F2: a failed task stayed in the memo, so every later call
+    re-polled it and said "failed" for good; the state could never be
+    composed again."""
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct': {'task_id': 'acestep_dead', 'task_since': time.time()}}}}}}
+    failed = _media({'status': 'pending', 'task_id': 'acestep_new'},
+                    {'status': 'error', 'error': 'CUDA out of memory'})
+    with _agent(agent_data, failed) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        first = tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+        assert 'failed' in first and 'CUDA out of memory' in first, first
+        record = agent_data[4242]['games']['eng-01']['sounds']['correct']
+        assert 'task_id' not in record, f'the dead task is still pinned: {record!r}'
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+    assert failed.generate_media.called, 'the state was never composed again'
+
+
+def test_a_task_older_than_any_real_job_is_taken_as_lost():
+    """After a composer restart AceStep answers a forgotten id as queued."""
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {
+        'correct': {'task_id': 'acestep_old',
+                    'task_since': time.time() - agent_tools.TASK_STALE_S - 1}}}}}}
+    media = _media({'status': 'completed', 'results': [{'url': '/api/voice/audio/x.wav'}]})
+    with _agent(agent_data, media) as tools:
+        out = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+    assert out['status'] == 'bound', out
+    assert media.generate_media.called
+
+
+def test_a_server_failure_that_mentions_a_timeout_is_still_a_failure():
+    """hartos-3a F3: AceStep failing a model fetch reports "Read timed out";
+    that text read as "still waking" and the failure became "composing"."""
+    agent_data = {}
+    media = _media({'status': 'pending', 'task_id': 'acestep_t'},
+                   {'status': 'error',
+                    'error': "HTTPSConnectionPool(host='huggingface.co'): Read timed out."})
+    import integrations.service_tools.media_agent as real
+    media._reads_as_still_waking = real._reads_as_still_waking
+    with _agent(agent_data, media) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        out = tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+    assert 'failed' in out, out
+
+
+def test_a_reset_on_the_way_to_the_composer_is_still_waited_for():
+    agent_data = {}
+    media = _media({'status': 'pending', 'task_id': 'acestep_r'},
+                   {'status': 'error', 'unreachable': True,
+                    'error': "('Connection aborted.', ConnectionResetError(10054))"})
+    import integrations.service_tools.media_agent as real
+    media._reads_as_still_waking = real._reads_as_still_waking
+    with _agent(agent_data, media) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        out = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+    assert out['status'] == 'composing', out
+
+
+def test_a_timed_out_submit_reads_as_composing_to_the_route_too():
+    """hartos-3a F8: a submit whose reply timed out left only submitted_at,
+    which the matcher called a MISS -- so the node's route queued a second
+    AceStep job for bgm while the agent's first was still queued."""
+    from core.game_sound_memo import SUBMIT_COOLDOWN_S, game_state_match
+    fresh = {'eng-01': {'sounds': {'bgm': {'submitted_at': time.time()}}}}
+    _rec, matched, _key = game_state_match(fresh, 'eng-01', 'bgm')
+    assert matched == 'composing', matched
+    old = {'eng-01': {'sounds': {'bgm': {'submitted_at': time.time() - SUBMIT_COOLDOWN_S - 1}}}}
+    _rec, matched, _key = game_state_match(old, 'eng-01', 'bgm')
+    assert matched == 'miss', 'a stale submit must not block composing for good'
+

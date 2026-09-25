@@ -524,6 +524,18 @@ in
         # the desktop is idle; the desktop just always wins when it needs it. (Was
         # CPUWeight 150 -- ABOVE the UI -- which would let CPU-fallback inference stall the
         # whole desktop, the very thing the steward flagged.)
+        # Under hart-agents.slice (CPUWeight 40), so that hart-session.slice
+        # (200, holding hart-liquid-ui; both defined in hart-kernel.nix with
+        # the measured numbers) binds against llama-server under contention.
+        # Until 2026-09-23 this unit sat in system.slice, where the session
+        # versus inference share was arbitrated at the root, 100 to 100, and
+        # the CPUWeight 50 below was compared against unrelated system units.
+        # Coordinator decision, same day: the owner's priority is the desk
+        # staying snappy. A foreground chat still gets the model, only at a
+        # lower CPU share while the shell is busy, and llama's own threads are
+        # already pinned away from CPU 0 by the launcher above. CPUWeight 50
+        # stays as this unit's share INSIDE the agent slice.
+        Slice = "hart-agents.slice";
         MemoryMax = "8G";
         # Optional hard ceiling; null by default because the launcher already
         # bounds inference by pinning it to a node-computed subset of cores.

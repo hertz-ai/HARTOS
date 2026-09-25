@@ -37,18 +37,33 @@ import sys
 import tempfile
 from unittest.mock import patch
 
-import pytest
+# The copilot's off-switch is a MARKER FILE in Claude's config dir
+# (claude_code_backend._copilot_switch_path), and since 66386a45e an ON env
+# pin no longer overrides a present marker: a human's revocation wins.  This
+# file used to rely on the pin alone, so on a node where the human HAS revoked
+# the copilot (this desktop, 2026-09-22) every invoke answered category 'off'
+# and 7 of 11 tests here read that as a defect in the outbound record.  Point
+# the config dir at an empty temp dir BEFORE the backend is imported, the
+# same way test_copilot_switch_stops_spawn.py does, so the switch state is a
+# precondition this file controls rather than the machine's.  adcea6fe8
+# repaired that file for the same contract change and stopped one file short.
+os.environ['CLAUDE_CONFIG_DIR'] = tempfile.mkdtemp(prefix='copilot_record_')
 
-import core.llm_outbound_logger as outbound
-import integrations.coding_agent.claude_code_backend as cc
+import pytest  # noqa: E402
+
+import core.llm_outbound_logger as outbound  # noqa: E402
+import integrations.coding_agent.claude_code_backend as cc  # noqa: E402
 from core.circuit_breaker import CircuitState, llm_provider_breaker
 
 
 @pytest.fixture(autouse=True)
 def _desktop(monkeypatch, tmp_path):
-    """The switch on, a resolvable binary, the outbound record in a temp
-    file, the claude-code breaker closed."""
-    monkeypatch.setenv('HARTOS_COPILOT_ENABLED', '1')
+    """The switch on (no marker in the redirected config dir -- the env
+    pin can no longer grant what a marker withdraws, so it is not set), a
+    resolvable binary, the outbound record in a temp file, the claude-code
+    breaker closed."""
+    monkeypatch.delenv('HARTOS_COPILOT_ENABLED', raising=False)
+    cc.set_copilot_enabled(True)
     monkeypatch.delenv('HEVOLVE_LLM_OUTBOUND_BODY', raising=False)
     monkeypatch.setattr(cc, '_resolve_claude_bin', lambda: '/usr/bin/claude')
     log_path = str(tmp_path / 'llm_outbound.jsonl')

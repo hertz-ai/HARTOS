@@ -190,11 +190,12 @@ mod ipc;
 
 // ── Milestone 6 (headline): zwlr_screencopy_v1 served against HART-comp's OWN
 // output framebuffer, so `grim` captures HART-comp DIRECTLY (not the sway host
-// re-composite). Gated behind the SAME `winit` feature as the live compositor whose
-// framebuffer it reads back. Off on the default dev-box build. See src/screencopy.rs
-// (the cursor / animations / screen kill-switch all land in winit.rs and are PROVEN
-// through this capture path — see the module header for the ordering rationale).
-#[cfg(feature = "winit")]
+// re-composite). Generic over both backend States since 2026-09-24: the winit path
+// reads its bound window framebuffer, the DRM path reads the scanout slot it just
+// rendered (VERIFICATION row 23). Off on the default dev-box build. See
+// src/screencopy.rs (the cursor / animations / screen kill-switch are PROVEN through
+// this capture path — see the module header for the ordering rationale).
+#[cfg(any(feature = "winit", feature = "smithay"))]
 mod screencopy;
 
 // NOTE: these `use smithay::...` imports are the SHAPE the real compositor needs.
@@ -540,6 +541,107 @@ fn note_native_shell_ready_once(
     }
 }
 
+// ── input-alive: the seat liveness marker, and now a HEARTBEAT the governor can read ──
+//
+// `comp_core::note_input_alive` writes this on the first real seat event (the #134 beacon
+// the session supervisor's input watchdog reads by EXISTENCE) and, from now on, touches it
+// again while input keeps flowing, at most once per `INPUT_ALIVE_HEARTBEAT`. Its mtime is
+// therefore "when a person last touched this box", to within one heartbeat. That is the
+// one thing the resource governor's Linux idle backend never had: its only source was
+// `xprintidle`, which is X11 and answers nothing on Wayland, so the agent daemon's
+// starvation override read a person at the desk as nobody there and force-ticked
+// inference against them (NATIVE_OS_PROGRAM.md section 1, rows 49 to 51).
+//
+// What does NOT change, because other code relies on it: the journal line fires once; the
+// FIRST event writes immediately, with no rate limit on the edge the watchdog is waiting
+// for; and existence keeps meaning what it always meant. What DOES change beyond the
+// heartbeat: the path honours `HART_INPUT_ALIVE_FLAG` like its two siblings. The
+// supervisor exports that variable, the comment above claimed all three markers shared
+// the "env override, else pinned default" contract, and this one had its path hardcoded.
+
+/// Default path of the input-alive marker. The supervisor (hart-session-supervisor.nix
+/// `inputAliveFlag`) and the boot log (hart-boot-log.nix) read the same path; a Python
+/// guard pins the three spellings together.
+#[allow(dead_code)] // consumed by comp_core::note_input_alive (feature builds) + tests
+const INPUT_ALIVE_MARKER_DEFAULT: &str = "/run/hart/session/input-alive";
+
+/// How often the marker's mtime moves while input flows. Two seconds is the coarsest
+/// grain that still answers the governor's question ("is anyone at the desk right now")
+/// and the finest that keeps a 1000 Hz mouse from turning a tmpfs write into a per-event
+/// cost on the input path. The governor's idle reading is therefore accurate to within
+/// this interval, and a consumer that needs to know that reads this constant.
+#[allow(dead_code)] // consumed by the beacon below + tests
+const INPUT_ALIVE_HEARTBEAT: Duration = Duration::from_secs(2);
+
+/// PURE: resolve where the input-alive marker is written. Same contract as
+/// `scanout_marker_path` and `shell_ready_marker_path`.
+#[allow(dead_code)] // consumed by comp_core::note_input_alive + tests
+fn input_alive_marker_path() -> String {
+    match std::env::var("HART_INPUT_ALIVE_FLAG") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => INPUT_ALIVE_MARKER_DEFAULT.to_string(),
+    }
+}
+
+/// PURE: is the marker due another touch? `last_touch` and `now` are both elapsed since
+/// the same base the beacon's owner holds. Saturating so a clock hiccup skips a touch
+/// rather than panicking on the input path.
+#[allow(dead_code)]
+fn input_alive_touch_due(last_touch: Duration, now: Duration) -> bool {
+    now.saturating_sub(last_touch) >= INPUT_ALIVE_HEARTBEAT
+}
+
+/// What one seat event should do to the marker.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputAliveWrite {
+    /// The first event since boot: journal the liveness line AND write the marker now.
+    First,
+    /// A heartbeat is due: touch the marker, say nothing.
+    Touch,
+    /// Within the heartbeat: do nothing at all (one atomic load and a subtraction).
+    Skip,
+}
+
+/// The once-only latch and the rate limiter, together, so the two decisions cannot drift:
+/// the first write is unconditional and every later one is paced. Lock-free because the
+/// input path is where this runs; the atomics are only ever driven from the calloop
+/// thread, so Relaxed is sufficient and `swap` keeps "first" exactly once even if that
+/// ever changes.
+#[allow(dead_code)] // one instance lives in comp_core::note_input_alive; unit-tested here
+struct InputAliveBeacon {
+    seen: std::sync::atomic::AtomicBool,
+    /// Milliseconds since the owner's base at the last write. Meaningless until `seen`.
+    last_touch_ms: AtomicU64,
+}
+
+#[allow(dead_code)]
+impl InputAliveBeacon {
+    const fn new() -> Self {
+        Self {
+            seen: std::sync::atomic::AtomicBool::new(false),
+            last_touch_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Decide what this event does, and record it if it writes. `now` is elapsed since
+    /// the caller's base; millisecond grain is plenty against a two-second heartbeat.
+    fn note(&self, now: Duration) -> InputAliveWrite {
+        let now_ms = now.as_millis() as u64;
+        if !self.seen.swap(true, Ordering::Relaxed) {
+            self.last_touch_ms.store(now_ms, Ordering::Relaxed);
+            return InputAliveWrite::First;
+        }
+        let last = Duration::from_millis(self.last_touch_ms.load(Ordering::Relaxed));
+        if input_alive_touch_due(last, now) {
+            self.last_touch_ms.store(now_ms, Ordering::Relaxed);
+            InputAliveWrite::Touch
+        } else {
+            InputAliveWrite::Skip
+        }
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // #137 — FRAME-BUDGET repaint scheduler (on-demand rendering; stop the idle 60Hz burn)
 // ════════════════════════════════════════════════════════════════════════════
@@ -635,14 +737,27 @@ impl RepaintScheduler {
         self.wants_paint(effects_animating, since)
     }
 
-    /// Call AFTER a tick actually composited. Records the paint time for the heartbeat
+    /// Call AFTER a tick ran the composite. Records the paint time for the heartbeat
     /// and clears the dirty latch — UNLESS an effect is still animating, which must keep
-    /// painting next tick (so a fade is never frozen mid-way). Keeping `dirty` in lockstep
-    /// with `effects_animating` here is what lets an in-flight crossfade play frame-by-
-    /// frame with no separate scheduling, exactly as the old unconditional loop did.
-    fn note_painted(&mut self, now: Instant, effects_animating: bool) {
+    /// painting next tick (so a fade is never frozen mid-way), OR the frame was DEFERRED.
+    /// Keeping `dirty` in lockstep with `effects_animating` here is what lets an in-flight
+    /// crossfade play frame-by-frame with no separate scheduling, exactly as the old
+    /// unconditional loop did.
+    ///
+    /// `deferred` is the fix for the 220 ms tail measured on hardware 2026-09-11
+    /// (VERIFICATION.md, "The 220ms tail every measurement has carried is the IDLE
+    /// HEARTBEAT"). A CRTC takes one flip at a time (the F1 torn-frame gate), so a tick
+    /// that lands while the previous flip is still in flight builds its frame and then
+    /// queues NOTHING. This method used to clear `dirty` on that tick anyway, as if the
+    /// damage had been presented, and the next tick found a clean scheduler: the input
+    /// that caused the damage then waited for the 200 ms heartbeat, plus one frame, which
+    /// is the 216.7 ms the box measured as its max. Under continuous motion each new
+    /// event re-dirtied the scheduler and hid the loss; the LAST event of every gesture
+    /// paid it in full. With `deferred` the damage survives to the tick after the vblank,
+    /// so the worst case is one refresh interval of waiting, not one heartbeat.
+    fn note_painted(&mut self, now: Instant, effects_animating: bool, deferred: bool) {
         self.last_paint = Some(now);
-        self.dirty = effects_animating;
+        self.dirty = effects_animating || deferred;
     }
 }
 
@@ -1417,6 +1532,89 @@ mod tests {
         std::env::remove_var("HART_SCANOUT_ALIVE_FLAG");
     }
 
+    // ── input-alive: the liveness beacon that is now also a heartbeat ──
+
+    #[test]
+    fn the_first_seat_event_writes_at_once_and_only_the_first_journals() {
+        // The watchdog waits on this edge, so it must not be paced; and the journal line
+        // is once per boot, so only `First` may carry it. Every later event within the
+        // heartbeat is a Skip: one atomic load and a subtraction on the input path.
+        let b = InputAliveBeacon::new();
+        assert_eq!(b.note(Duration::from_millis(5)), InputAliveWrite::First);
+        assert_eq!(b.note(Duration::from_millis(6)), InputAliveWrite::Skip);
+        assert_eq!(b.note(Duration::from_millis(1_999 + 5)), InputAliveWrite::Skip, "just under the heartbeat");
+        assert_eq!(
+            b.note(Duration::from_millis(2_000 + 5)),
+            InputAliveWrite::Touch,
+            "at the heartbeat the mtime moves, and it is a Touch, never a second First"
+        );
+        assert_eq!(b.note(Duration::from_millis(2_000 + 6)), InputAliveWrite::Skip, "paced from the last WRITE");
+        assert_eq!(b.note(Duration::from_millis(4_000 + 5)), InputAliveWrite::Touch);
+    }
+
+    #[test]
+    fn a_thousand_hertz_mouse_touches_the_marker_at_the_heartbeat_not_per_event() {
+        // The rate limit stated as a count, which is what a tmpfs write on the input
+        // path costs: ten seconds of 1 kHz motion is 10,000 events and must be 1 + 5
+        // writes (the first, then one per heartbeat), never 10,000.
+        let b = InputAliveBeacon::new();
+        let mut writes = 0;
+        for ms in 0..10_000u64 {
+            if b.note(Duration::from_millis(ms)) != InputAliveWrite::Skip {
+                writes += 1;
+            }
+        }
+        let expected = 1 + (10_000 - 1) / INPUT_ALIVE_HEARTBEAT.as_millis() as u64;
+        assert_eq!(writes, expected, "one write, then one per heartbeat");
+    }
+
+    #[test]
+    fn a_clock_hiccup_skips_a_touch_instead_of_panicking() {
+        // `now` earlier than the last touch cannot happen on a monotonic clock, but the
+        // input path must never be the place a Duration underflow panics.
+        assert!(!input_alive_touch_due(Duration::from_secs(10), Duration::from_secs(9)));
+        assert!(input_alive_touch_due(Duration::from_secs(1), Duration::from_secs(3)));
+        assert!(!input_alive_touch_due(Duration::from_secs(1), Duration::from_millis(2_999)));
+    }
+
+    #[test]
+    fn the_heartbeat_is_coarse_enough_for_a_mouse_and_fine_enough_for_a_governor() {
+        // Under 100 ms would put a tmpfs write inside a 1 kHz mouse's own cadence;
+        // over 10 s would make the governor's "is anyone here" reading useless against
+        // its own 30 s tick. Pinned so a retune argues with this, not with a memory.
+        assert!(INPUT_ALIVE_HEARTBEAT >= Duration::from_millis(100));
+        assert!(INPUT_ALIVE_HEARTBEAT <= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn the_input_alive_marker_honours_its_env_override_and_writes_where_it_says() {
+        // The ONLY test that touches HART_INPUT_ALIVE_FLAG (same discipline as the
+        // scanout and shell-ready tests), so the process-global set cannot race.
+        std::env::remove_var("HART_INPUT_ALIVE_FLAG");
+        assert_eq!(input_alive_marker_path(), INPUT_ALIVE_MARKER_DEFAULT, "no override => the pinned default");
+        std::env::set_var("HART_INPUT_ALIVE_FLAG", "   ");
+        assert_eq!(input_alive_marker_path(), INPUT_ALIVE_MARKER_DEFAULT, "a blank override is no override");
+
+        let mut marker = std::env::temp_dir();
+        marker.push(format!("hart-input-alive-{}.marker", std::process::id()));
+        let marker_s = marker.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&marker);
+        std::env::set_var("HART_INPUT_ALIVE_FLAG", &marker_s);
+        assert_eq!(input_alive_marker_path(), marker_s, "the env override resolves the path");
+
+        // The write is the same advisory byte the sibling markers use, at the resolved
+        // path, and a Touch writes AGAIN (deleting between proves the second write
+        // happened rather than the first surviving).
+        assert!(write_scanout_marker(&input_alive_marker_path()));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"1\n");
+        let _ = std::fs::remove_file(&marker);
+        assert!(write_scanout_marker(&input_alive_marker_path()));
+        assert!(marker.exists(), "a heartbeat touch re-creates the marker if it went missing");
+
+        let _ = std::fs::remove_file(&marker);
+        std::env::remove_var("HART_INPUT_ALIVE_FLAG");
+    }
+
     // ── #137: the frame-budget repaint scheduler. The pure decision that turns the DRM
     // loop from an unconditional 60Hz burn into on-demand rendering, WITHOUT ever being
     // able to freeze the never-fail floor. The `mark_damaged`/`should_paint`/`note_painted`
@@ -1439,7 +1637,7 @@ mod tests {
         // A clean (already-painted, not-dirtied) scheduler with no animation and the last
         // paint well within the heartbeat MUST skip — this is the whole frame-budget win.
         let mut s = RepaintScheduler::new();
-        s.note_painted(Instant::now(), false); // clears dirty, records the paint
+        s.note_painted(Instant::now(), false, false); // clears dirty, records the paint
         assert!(!s.wants_paint(false, Some(Duration::from_millis(16))), "clean + static + fresh paint → skip");
         assert!(!s.wants_paint(false, Some(IDLE_HEARTBEAT - Duration::from_millis(1))), "just under the heartbeat → still skip");
     }
@@ -1449,7 +1647,7 @@ mod tests {
         // A commit / input / map / kill-switch edge marks dirty → the next tick paints even
         // when the clock says "idle" (last paint 1ms ago). This is interactive latency = 0.
         let mut s = RepaintScheduler::new();
-        s.note_painted(Instant::now(), false);
+        s.note_painted(Instant::now(), false, false);
         assert!(!s.wants_paint(false, Some(Duration::from_millis(1))), "clean → would skip");
         s.mark_damaged();
         assert!(s.wants_paint(false, Some(Duration::from_millis(1))), "a damage edge forces a paint on the very next tick");
@@ -1461,7 +1659,7 @@ mod tests {
         // keeps painting; and `note_painted(animating=true)` re-arms dirty so the NEXT tick also
         // paints (the crossfade is never frozen mid-way).
         let mut s = RepaintScheduler::new();
-        s.note_painted(Instant::now(), true); // painted a fade frame; still animating
+        s.note_painted(Instant::now(), true, false); // painted a fade frame; still animating
         assert!(s.dirty, "note_painted keeps dirty while an effect animates");
         assert!(s.wants_paint(true, Some(Duration::from_millis(1))), "an animating effect paints every tick");
     }
@@ -1472,7 +1670,7 @@ mod tests {
         // animating), once the heartbeat elapses the tick force-repaints — so a missed
         // mark_damaged() is at worst a ≤200ms stutter, never a frozen screen.
         let mut s = RepaintScheduler::new();
-        s.note_painted(Instant::now(), false);
+        s.note_painted(Instant::now(), false, false);
         assert!(!s.wants_paint(false, Some(IDLE_HEARTBEAT - Duration::from_millis(1))), "under heartbeat → skip");
         assert!(s.wants_paint(false, Some(IDLE_HEARTBEAT)), "at the heartbeat → force a repaint (self-heal)");
         assert!(s.wants_paint(false, Some(IDLE_HEARTBEAT + Duration::from_secs(5))), "long past the heartbeat → always paint");
@@ -1485,8 +1683,46 @@ mod tests {
         let mut s = RepaintScheduler::new();
         s.mark_damaged();
         assert!(s.dirty);
-        s.note_painted(Instant::now(), false);
+        s.note_painted(Instant::now(), false, false);
         assert!(!s.dirty, "painting a static frame clears the dirty latch → next static tick is skippable");
+    }
+
+    #[test]
+    fn damage_that_lands_while_a_flip_is_in_flight_paints_on_the_next_tick_not_the_heartbeat() {
+        // THE 220 ms TAIL (VERIFICATION.md 2026-09-11: max 218.4 / 220.0 / 225.5 ms across
+        // three windows, collapsing to 40-66 ms the moment anything animates). Replayed
+        // tick by tick on the pure scheduler, the way the DRM loop actually drives it.
+        let t0 = Instant::now();
+        let ms = |n: u64| Duration::from_millis(n);
+        let mut s = RepaintScheduler::new();
+
+        // Tick 0: a frame is built and queued; its flip is now in flight to the CRTC.
+        s.note_painted(t0, false, false);
+        // An input lands 8 ms later (the last event of a hover gesture).
+        s.mark_damaged();
+        // Tick 1 (16 ms): the scheduler wants to paint, the tick builds the frame, but
+        // the CRTC is still awaiting the vblank of tick 0's flip (16.7 ms > 16 ms), so
+        // present_surfaces queues nothing. That is a DEFERRED tick.
+        assert!(s.wants_paint(false, Some(ms(16))));
+        s.note_painted(t0 + ms(16), false, /* deferred = */ true);
+        // Tick 2 (32 ms): the vblank has been reaped. The damage must still be pending,
+        // so this tick paints and the input binds to a frame ~33 ms after it landed.
+        assert!(
+            s.wants_paint(false, Some(ms(16))),
+            "the deferred damage must paint on the tick after the vblank"
+        );
+        s.note_painted(t0 + ms(32), false, false);
+        assert!(!s.wants_paint(false, Some(ms(16))), "and the desktop goes idle again after it");
+
+        // The old contract, stated so a revert is caught: a deferred tick that clears
+        // dirty leaves the input waiting for the heartbeat. 200 ms plus one 16.7 ms
+        // frame is the 216.7 ms the box measured.
+        let mut old = RepaintScheduler::new();
+        old.note_painted(t0, false, false);
+        old.mark_damaged();
+        old.note_painted(t0 + ms(16), false, false); // deferred, but recorded as painted
+        assert!(!old.wants_paint(false, Some(ms(16))), "this is the gap: nothing paints");
+        assert!(old.wants_paint(false, Some(IDLE_HEARTBEAT)), "until the heartbeat");
     }
 
     #[test]
@@ -1503,6 +1739,15 @@ mod tests {
                     "dirty={dirty} animating={animating}: an elapsed heartbeat must always repaint (never wedge)"
                 );
             }
+        }
+        // And the deferred path cannot wedge the OTHER way: a tick that is deferred
+        // forever (a CRTC whose vblank never comes) keeps dirty set, which only ever
+        // means "paint", and the lost-vblank hatch in udev.rs retires the flip after
+        // VBLANK_STALL_TIMEOUT so the deferral itself is bounded.
+        let mut s = RepaintScheduler::new();
+        for i in 0..100u64 {
+            s.note_painted(Instant::now(), false, true);
+            assert!(s.wants_paint(false, Some(Duration::from_millis(i))), "deferred never means idle");
         }
     }
 

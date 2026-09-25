@@ -165,9 +165,11 @@ def read_gpu_render_mode() -> str:
 _NATIVE_CHROME_FILE = '/run/hart/session/native-chrome'
 
 # What this shell knows how to stand down for. A name the shell does not
-# recognise is IGNORED rather than trusted: a newer compositor claiming
-# `taskbar` must not make an older shell hide a taskbar it still owns.
-_NATIVE_CHROME_KNOWN = frozenset({'bloom', 'orb', 'home'})
+# recognise is IGNORED rather than trusted: a newer compositor claiming a
+# band this shell has no stand-down for must not make it hide something it
+# still owns. `topbar` and `taskbar` are the two bands the compositor claims
+# only when `shell.chrome` composed them fully (IPC_PROTOCOL 4.13).
+_NATIVE_CHROME_KNOWN = frozenset({'bloom', 'orb', 'home', 'topbar', 'taskbar'})
 
 
 def read_native_chrome() -> frozenset:
@@ -244,6 +246,198 @@ def publish_panel_reservation(css_vars: str) -> dict:
         logger.debug('[shell] panel reservation not published (%s); the '
                      'compositor will reserve nothing', exc)
     return reservation
+
+
+# ── The bar CONTENT: shell -> compositor, the sibling of the home feed ─────────
+# publish_panel_reservation above hands the compositor the bars' GEOMETRY. This
+# hands it what the bars SHOW that the home feed never carried: the clock, the tray
+# glyphs, the notification badge, the agent cluster, the taskbar chips (IPC_PROTOCOL
+# 4.13 `shell.chrome`). One producer, this module, because it is already the one
+# that serves every one of these to the WebView bar; the compositor must not grow
+# an HTTP client or a timezone to learn them itself (parity program, obligation 3).
+#
+# compose_shell_chrome is PURE and is the single authority on the wire shape, the
+# way _sanitize_home_payload is for the home: tests/unit/test_native_wire_contract.py
+# runs it and pins the result into compositor/src/wire_fixture.rs, which scene.rs's
+# tests decode and draw. A key it omits tells the compositor "not composed", and the
+# compositor claims a band only when every datum the band needs is present, so
+# nothing here may fill a gap with an empty default: tasks is None until the shell
+# reports its open panels, and the taskbar is not claimed until then.
+
+# hartConnectivity.js's four glyph resolvers, mirrored threshold for threshold. The
+# JS stays the WebView tray's own renderer; this copy exists because the resolver
+# cannot run in this process and the compositor must not learn the thresholds itself
+# (that would be a second table, in Rust). The wire-contract test pins every glyph
+# name and threshold below against the JS source, so the two cannot drift silently.
+_TRAY_WIFI_BARS = ((75, 'wifi'), (50, 'network_wifi_3_bar'),
+                   (25, 'network_wifi_2_bar'), (0, 'network_wifi_1_bar'))
+_TRAY_BATTERY_BARS = ((90, 'battery_full'), (70, 'battery_6_bar'),
+                      (50, 'battery_4_bar'), (30, 'battery_3_bar'),
+                      (15, 'battery_2_bar'), (-1, 'battery_alert'))
+_TRAY_VOLUME_DOWN_BELOW = 40
+
+
+def _tray_wifi_glyph(w) -> str:
+    w = w if isinstance(w, dict) else {}
+    if not w.get('available') or not w.get('enabled'):
+        return 'wifi_off'
+    if not w.get('connected'):
+        return 'wifi_find'
+    sgl = w.get('signal')
+    sgl = sgl if isinstance(sgl, (int, float)) and not isinstance(sgl, bool) else 100
+    for floor, glyph in _TRAY_WIFI_BARS:
+        if sgl >= floor:
+            return glyph
+    return _TRAY_WIFI_BARS[-1][1]
+
+
+def _tray_bluetooth_glyph(b) -> str:
+    b = b if isinstance(b, dict) else {}
+    if not b.get('available') or not b.get('powered'):
+        return 'bluetooth_disabled'
+    if (b.get('connected_count') or 0) > 0:
+        return 'bluetooth_connected'
+    return 'bluetooth'
+
+
+def _tray_battery_glyph(bat) -> str:
+    bat = bat if isinstance(bat, dict) else {}
+    pct = bat.get('percent')
+    if (not bat.get('available') or not isinstance(pct, (int, float))
+            or isinstance(pct, bool)):
+        return 'battery_unknown'
+    if bat.get('state') in ('charging', 'full') or bat.get('plugged_in'):
+        return 'battery_charging_full'
+    for floor, glyph in _TRAY_BATTERY_BARS:
+        if pct > floor:
+            return glyph
+    return _TRAY_BATTERY_BARS[-1][1]
+
+
+def _tray_volume_glyph(v) -> str:
+    v = v if isinstance(v, dict) else {}
+    vol = v.get('volume')
+    if not v.get('available') or not isinstance(vol, (int, float)) or isinstance(vol, bool):
+        return 'volume_up'
+    if v.get('muted') or vol == 0:
+        return 'volume_off'
+    if vol < _TRAY_VOLUME_DOWN_BELOW:
+        return 'volume_down'
+    return 'volume_up'
+
+
+# A Material ligature name, the same rule _home_sanitize_card applies to a card icon
+# and hartContextMenu.js applies before adding the icon-font class.
+_CHROME_LIGATURE_RE = re.compile(r'^[a-z0-9_]+$')
+# refreshAgentStatus: four chips at most, each name clipped to 16 characters.
+CHROME_AGENTS_MAX = 4
+CHROME_AGENT_NAME_MAX = 16
+CHROME_TOAST_SEVERITIES = ('info', 'warning', 'error', 'success')
+
+
+def compose_shell_chrome(now, connectivity, agents, unread, tasks=None,
+                         start_open=False, toast=None, menu=None) -> dict:
+    """The `shell.chrome` payload, from the same inputs the WebView bar reads.
+
+    `now` is a local datetime; `connectivity` the _ConnectivityCache summary;
+    `agents` the dashboard's agent rows (status, name, goal_type); `unread` the
+    notification count or None when the store could not be asked; `tasks` the open
+    panels as {id, title, icon, active} or None when the shell has not reported
+    them; `toast` a {title, message, severity}; `menu` a {x, y, items}.
+
+    Every string is passed through _home_clean_text, so a hostile panel title or
+    agent name can no more reach the native bar than a card title can reach the
+    home. Keys are OMITTED, never emptied, when their input is None: that absence
+    is what stops the compositor claiming a band the shell did not compose.
+    """
+    out = {}
+    if now is not None:
+        # tickClock: toLocaleTimeString({hour:'2-digit',minute:'2-digit'}) and
+        # toLocaleDateString({weekday:'long',month:'long',day:'numeric'}), in the
+        # en-US forms the box renders them; the day carries no leading zero.
+        out['clock'] = {'time': now.strftime('%I:%M %p'),
+                        'date': '%s, %s %d' % (now.strftime('%A'),
+                                               now.strftime('%B'), now.day)}
+    if isinstance(connectivity, dict):
+        bat = connectivity.get('battery') or {}
+        pct = bat.get('percent')
+        has_pct = (bat.get('available') and isinstance(pct, (int, float))
+                   and not isinstance(pct, bool))
+        out['tray'] = {
+            'wifi': _tray_wifi_glyph(connectivity.get('wifi')),
+            'bluetooth': _tray_bluetooth_glyph(connectivity.get('bluetooth')),
+            'volume': _tray_volume_glyph(connectivity.get('volume')),
+            'battery': _tray_battery_glyph(bat),
+            # hc-bat-pct: the percent beside the glyph, blank without a battery.
+            'battery_pct': ('%d%%' % int(pct)) if has_pct else '',
+            # #hc-cluster.hc-dim: the cluster dims when no domain is live.
+            'live': any(bool((connectivity.get(k) or {}).get('available'))
+                        for k in ('wifi', 'bluetooth', 'battery', 'volume')),
+        }
+    if isinstance(unread, int) and not isinstance(unread, bool) and unread >= 0:
+        out['notifications'] = {'unread': unread}
+    if isinstance(agents, list):
+        names = []
+        for a in agents:
+            if not isinstance(a, dict) or a.get('status') != 'running':
+                continue
+            nm = _home_clean_text(a.get('name') or a.get('goal_type') or 'agent',
+                                  CHROME_AGENT_NAME_MAX)
+            if nm:
+                names.append(nm)
+            if len(names) >= CHROME_AGENTS_MAX:
+                break
+        out['agents'] = names
+    if isinstance(tasks, list):
+        chips = []
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+            title = _home_clean_text(t.get('title'), 40)
+            if not title:
+                continue
+            chip = {'id': _home_clean_text(t.get('id'), 60) or title,
+                    'title': title, 'active': bool(t.get('active'))}
+            icon = _home_clean_text(t.get('icon'), 40)
+            if icon and _CHROME_LIGATURE_RE.match(icon):
+                chip['icon'] = icon
+            chips.append(chip)
+        out['tasks'] = chips
+    out['start'] = {'open': bool(start_open)}
+    if isinstance(toast, dict):
+        title = _home_clean_text(toast.get('title'), 60)
+        message = _home_clean_text(toast.get('message'), 200)
+        if title or message:
+            sev = toast.get('severity')
+            out['toast'] = {
+                'title': title, 'message': message,
+                'severity': sev if sev in CHROME_TOAST_SEVERITIES else 'info',
+            }
+    if isinstance(menu, dict):
+        x, y = menu.get('x'), menu.get('y')
+        items = []
+        for it in (menu.get('items') or []):
+            if not isinstance(it, dict):
+                continue
+            if it.get('sep') is True:
+                items.append({'sep': True})
+                continue
+            label = _home_clean_text(it.get('label'), 60)
+            if not label:
+                continue
+            row = {'label': label}
+            icon = _home_clean_text(it.get('icon'), 40)
+            if icon and _CHROME_LIGATURE_RE.match(icon):
+                row['icon'] = icon
+            if it.get('danger') is True:
+                row['danger'] = True
+            if it.get('disabled') is True:
+                row['disabled'] = True
+            items.append(row)
+        if (isinstance(x, (int, float)) and isinstance(y, (int, float))
+                and not isinstance(x, bool) and not isinstance(y, bool) and items):
+            out['menu'] = {'x': int(x), 'y': int(y), 'items': items}
+    return out
 
 
 # /run/hart/session (0770, group-writable) NOT /run/hart (0750, owner-only): the
@@ -350,6 +544,10 @@ class _ConnectivityCache:
         self._wifi = {'networks': [], 'connected': {}}
         self._absent = set()  # tool names that raised FileNotFoundError once
         self._running = False
+        # Change subscribers (subscribe()): called with a COPY of the summary
+        # whenever a refresh produced a different one. This is how the shell's
+        # SSE stream learns of a change without any document polling for it.
+        self._listeners = []
 
     @staticmethod
     def _empty_summary():
@@ -581,8 +779,27 @@ class _ConnectivityCache:
         }
         wifi_list = self._probe_wifi_list()
         with self._lock:
+            changed = summary != self._summary
             self._summary = summary
             self._wifi = wifi_list
+            listeners = list(self._listeners)
+        # Notify OUTSIDE the lock (a subscriber may take its own locks), and
+        # only on a real change: an identical snapshot every 9 s is exactly the
+        # idle churn the push exists to remove. One subscriber's bug must not
+        # stop the others, nor the prober.
+        if changed:
+            for fn in listeners:
+                try:
+                    fn(copy.deepcopy(summary))
+                except Exception:
+                    logger.exception("_ConnectivityCache: subscriber raised")
+
+    def subscribe(self, fn):
+        """Call ``fn(summary_copy)`` after every refresh whose summary differs
+        from the previous one. Idempotent per callable."""
+        with self._lock:
+            if fn not in self._listeners:
+                self._listeners.append(fn)
 
     def summary(self):
         with self._lock:
@@ -609,6 +826,76 @@ class _ConnectivityCache:
             except Exception:
                 logger.exception("_loop: swallowed Exception")
             time.sleep(self.REFRESH_INTERVAL_S)
+
+
+def read_system_metrics() -> dict:
+    """The box's live metrics, ONE implementation for two readers: the
+    /api/shell/system/metrics route (the System panel and the shell's slow
+    fallback poll) and the shell-state sampler that pushes the widget's slice
+    of it over the SSE stream. Never raises: a missing psutil is reported in
+    the payload, a partition that cannot be read is skipped.
+
+    NON-BLOCKING CPU sample (interval=None): return CPU% since the last call
+    instead of sleeping 0.5 s on the caller. This used to be POLLED every 4 s
+    by hartSessionUI from every document; a blocking 0.5 s here pinned a
+    waitress worker for 0.5 s out of every 4 s forever (12.5% of a 1-thread
+    pool), a recurring mid-session micro-freeze. The first call after boot
+    reads 0.0 and every subsequent call is an accurate delta.
+    """
+    metrics = {}
+    try:
+        import psutil
+        metrics['cpu_percent'] = psutil.cpu_percent(interval=None)
+        metrics['cpu_count'] = psutil.cpu_count()
+        mem = psutil.virtual_memory()
+        metrics['ram'] = {
+            'total_gb': round(mem.total / (1024**3), 1),
+            'used_gb': round(mem.used / (1024**3), 1),
+            'percent': mem.percent,
+        }
+        disks = []
+        for part in psutil.disk_partitions():
+            try:
+                usage = psutil.disk_usage(part.mountpoint)
+                disks.append({
+                    'mount': part.mountpoint,
+                    'device': part.device,
+                    'total_gb': round(usage.total / (1024**3), 1),
+                    'used_gb': round(usage.used / (1024**3), 1),
+                    'percent': usage.percent,
+                })
+            except (PermissionError, OSError):
+                logger.warning("read_system_metrics: swallowed PermissionError, OSError", exc_info=True)
+        metrics['disks'] = disks
+        net = psutil.net_io_counters()
+        metrics['network'] = {
+            'bytes_sent': net.bytes_sent,
+            'bytes_recv': net.bytes_recv,
+        }
+        metrics['load_avg'] = list(psutil.getloadavg()) if hasattr(psutil, 'getloadavg') else []
+        metrics['uptime_seconds'] = int(time.time() - psutil.boot_time())
+        # Temperatures if available
+        try:
+            temps = psutil.sensors_temperatures()
+            if temps:
+                metrics['temperatures'] = {
+                    name: [{'label': s.label, 'current': s.current}
+                           for s in sensors[:3]]
+                    for name, sensors in temps.items()
+                }
+        except (AttributeError, Exception):
+            logger.exception("read_system_metrics: swallowed AttributeError, Exception")
+    except ImportError:
+        metrics['error'] = 'psutil not installed'
+    # GPU: ONE shape, shared with /api/shell/gpu (task #25). gpu_status()
+    # distinguishes a CPU-only box from a failed probe (available/present) and
+    # never raises, so the two GPU surfaces cannot drift apart.
+    try:
+        from integrations.agent_engine.shell_system_apis import gpu_status
+        metrics['gpu'] = gpu_status()
+    except Exception:
+        logger.debug("read_system_metrics: gpu_status unavailable", exc_info=True)
+    return metrics
 
 
 # One process-wide prober, lazy-started (idempotently) by the connectivity
@@ -1033,6 +1320,18 @@ class LiquidUIService:
         self._running = False
         self._model_available = False
 
+        # Shell-state push (the poll diet, 2026-09-23). kind -> the last pushed
+        # `shell_state` event, read by the SSE producer's _collect alongside the
+        # agent components and sent whole to a freshly connected stream. The
+        # sampler thread runs only while _shell_state_clients > 0, so a box
+        # with no shell open samples nothing.
+        self._shell_state: Dict[str, dict] = {}
+        self._shell_state_fp: Dict[str, str] = {}
+        self._shell_state_clients = 0
+        self._shell_state_wake = threading.Event()
+        self._shell_state_thread = None
+        self._shell_state_wired = False
+
         # Session state (panel positions restored on login)
         self._data_dir = os.environ.get(
             'HEVOLVE_DATA_DIR', os.environ.get(
@@ -1063,6 +1362,172 @@ class LiquidUIService:
         logger.info(
             "LiquidUIService initialized: port=%d, renderer=%s, "
             "voice=%s, haptic=%s", port, renderer, voice_enabled, haptic_enabled)
+
+    # ─── Shell-state push (the idle poll diet) ────────────────────────
+    # MEASURED on the box 2026-09-22: ~18 GETs per 5 s at idle from four
+    # pollers in every shell document (metrics 4 s, ai-sensing 4 s,
+    # connectivity 8 s, agents 5 s), for state the server already keeps fresh
+    # itself. The server now samples ONCE per box, only while a stream is
+    # open, and pushes `shell_state` events on /api/notifications/stream, the
+    # stream the shell already holds. The modules keep a 30 s fallback poll
+    # that runs only while that stream is down.
+
+    #: Sampling cadence while at least one stream is open. Matches the old
+    #: per-document metrics/senses poll, so nothing the user sees gets slower;
+    #: it is simply one reader per box instead of one per document.
+    SHELL_STATE_SAMPLE_S = 4.0
+
+    def push_shell_state(self, kind: str, payload) -> bool:
+        """Publish one kind of shell state to every open stream.
+
+        Deduplicated: an unchanged payload is not re-pushed, because an
+        identical frame every few seconds is precisely the idle churn this
+        replaces. Stamped with the `_ts` cursor the producer keys on and woken
+        through the same condition agent_ui_update uses. Returns True when a
+        push happened."""
+        try:
+            fp = json.dumps(payload, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            fp = repr(payload)
+        with self._ui_event_cv:
+            if self._shell_state_fp.get(kind) == fp:
+                return False
+            self._shell_state_fp[kind] = fp
+            self._shell_state[kind] = {
+                'type': 'shell_state', 'kind': kind, 'payload': payload,
+                'agent': 'shell', '_ts': time.time(),
+            }
+            self._ui_event_cv.notify_all()
+        return True
+
+    def _shell_state_client_enter(self) -> None:
+        """An SSE stream opened: count it, wire the pushers once, wake the
+        sampler so the first frame after the snapshot is not a full period away."""
+        with self._ui_event_cv:
+            self._shell_state_clients += 1
+        self._start_shell_state_sampler()
+        self._shell_state_wake.set()
+
+    def _shell_state_client_leave(self) -> None:
+        with self._ui_event_cv:
+            self._shell_state_clients = max(0, self._shell_state_clients - 1)
+
+    def _start_shell_state_sampler(self) -> None:
+        """Idempotent. Subscribes to the connectivity prober (the reader that
+        already polls the hardware) and starts the sampler thread for the two
+        readers with no thread of their own (metrics, senses) plus the agents
+        probe. Started by the first stream, never at app build, so a process
+        that never serves a shell spawns nothing."""
+        cache = _connectivity_cache
+        if not self._shell_state_wired:
+            self._shell_state_wired = True
+            subscribe = getattr(cache, 'subscribe', None)
+            if callable(subscribe):
+                import weakref
+                ref = weakref.ref(self)
+
+                def _on_connectivity(summary):
+                    svc = ref()
+                    if svc is not None:
+                        svc.push_shell_state('connectivity', summary)
+                subscribe(_on_connectivity)
+        try:
+            cache.start()
+            self.push_shell_state('connectivity', cache.summary())
+        except Exception:
+            logger.debug("shell-state: connectivity cache unavailable", exc_info=True)
+        if self._shell_state_thread is None or not self._shell_state_thread.is_alive():
+            self._shell_state_thread = threading.Thread(
+                target=self._shell_state_loop, name='hart-shell-state', daemon=True)
+            self._shell_state_thread.start()
+
+    def _shell_state_loop(self) -> None:
+        while True:
+            self._shell_state_wake.wait(timeout=self.SHELL_STATE_SAMPLE_S)
+            self._shell_state_wake.clear()
+            try:
+                self._sample_shell_state()
+            except Exception:
+                logger.debug("shell-state: sample failed", exc_info=True)
+
+    def _sample_shell_state(self) -> List[str]:
+        """One tick: read each kind and push what changed. Returns the kinds
+        pushed. With no stream open it reads NOTHING (no psutil, no backend
+        GET), which is what makes an unattended box idle."""
+        if self._shell_state_clients <= 0:
+            return []
+        pushed = []
+        for kind, reader in (('metrics', self._read_shell_metrics),
+                             ('senses', self._read_shell_senses),
+                             ('agents', lambda: self._reduce_shell_agents(
+                                 self._read_shell_agents()))):
+            try:
+                payload = reader()
+            except Exception:
+                logger.debug("shell-state: %s reader failed", kind, exc_info=True)
+                continue
+            if payload is None:
+                continue
+            if self.push_shell_state(kind, payload):
+                pushed.append(kind)
+        return pushed
+
+    @staticmethod
+    def _read_shell_metrics() -> dict:
+        """read_system_metrics() reduced to the three bars the desktop widget
+        paints (hartSessionUI.js reads cpu_percent, ram.percent, disk_percent),
+        so a push is a few numbers, not the full partition table."""
+        m = read_system_metrics()
+        disks = m.get('disks') or []
+        ram = m.get('ram') or {}
+        return {
+            'cpu_percent': round(float(m.get('cpu_percent') or 0.0), 1),
+            'ram': {'percent': ram.get('percent')},
+            'disk_percent': disks[0].get('percent') if disks else None,
+        }
+
+    @staticmethod
+    def _read_shell_senses() -> dict:
+        from core.ai_sensing import status
+        return status()
+
+    def _read_shell_agents(self):
+        """The backend's dashboard/agents answer, or None when it is not
+        reachable (the bar then keeps its last state, as the old poll did).
+        One localhost GET per box per tick instead of one per document."""
+        from core.http_pool import pooled_get
+        try:
+            resp = pooled_get(
+                f'http://localhost:{self.backend_port}/api/social/dashboard/agents',
+                timeout=3)
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+        except Exception:
+            logger.debug("shell-state: agents probe failed", exc_info=True)
+            return None
+
+    @staticmethod
+    def _reduce_shell_agents(data):
+        """The running agents reduced to what the top bar paints (up to four
+        16-character names plus the count); the same reduction the inline
+        refreshAgentStatus applies to its own fallback GET."""
+        if not data:
+            return None
+        agents = [a for a in (data.get('agents') or []) if a.get('status') == 'running']
+        return {
+            'count': len(agents),
+            'names': [str(a.get('name') or a.get('goal_type') or 'agent')[:CHROME_AGENT_NAME_MAX]
+                      for a in agents[:CHROME_AGENTS_MAX]],
+        }
+
+    @staticmethod
+    def _model_check_interval(available: bool) -> float:
+        """Seconds between model-bus /v1/status probes. 10 s while the bus is
+        not yet up (boot: the UI wants to know soon), 30 s once it is (one
+        localhost GET every 10 s forever was part of the idle HTTP measured on
+        the box, and a bus that is up does not need re-asking that often)."""
+        return 30.0 if available else 10.0
 
     # ─── UI Generation (preserved) ────────────────────────────
 
@@ -1624,6 +2089,15 @@ class LiquidUIService:
         # untouched. The XSS gate + slug sanitize already vetted it upstream.
         if mood:
             component['mood'] = mood
+            # And what the id RESOLVES to, for the consumer that has no palette
+            # table of its own. Derived HERE from the mood, never accepted from a
+            # caller: the HTTP route hands this function a raw body, and a palette
+            # a client could dictate would be a way around the one table. Unknown
+            # ids resolve to nothing, exactly as HartPalette.byId answers null.
+            resolved = _home_resolve_mood(
+                re.sub(r'[^a-z0-9_-]', '', str(mood).strip().lower())[:24])
+            if resolved:
+                component['palette'] = resolved
         accepted = self.agent_ui_update(agent_id, component)
         if accepted:
             # SECOND CONSUMER, SAME PAYLOAD. The native scene reads the identical
@@ -1662,7 +2136,11 @@ class LiquidUIService:
             reply = get_wm_client().shell_compose(
                 hero=component.get('hero'),
                 rows=component.get('rows'),
-                mood=component.get('mood'))
+                mood=component.get('mood'),
+                # The mood's resolved colours ride the same verb. The compositor
+                # keeps no palette table, so without these `mood` was decoded and
+                # dropped and every agent-composed mood rendered identically.
+                palette=component.get('palette'))
         except Exception as e:
             logger.debug("native scene compose skipped: %s", e)
             return False
@@ -1676,7 +2154,143 @@ class LiquidUIService:
             # init on purpose: at init the compositor may not exist yet, and a subscription
             # that failed once would need a retry loop nobody would ever see fail.
             self._ensure_native_input_relay()
+            # And the moment to start feeding it the bar content the home feed does not
+            # carry (`shell.chrome`), for the same reason.
+            self._ensure_native_chrome_pump()
         return ok
+
+    # ── The bar content: the `shell.chrome` producer, beside the home producer ──
+    #
+    # How often the bar is recomposed and, when it changed, re-sent. The WebView bar
+    # polls its three sources at 5 s (agents), 8 s (connectivity) and 1 min (clock);
+    # 5 s is the fastest of them, so the native bar is never staler than the DOM one,
+    # and an unchanged composition is not re-sent at all, so a steady desktop costs
+    # one dict compare per tick and no IPC.
+    _NATIVE_CHROME_PUMP_S = 5.0
+    # `showToast` keeps a toast on screen 5 s (slideInRight .3 s, then the .3 s fade
+    # after a 4.7 s delay), so a notification older than that is not a toast any more.
+    _NATIVE_TOAST_LIFE_S = 5.0
+
+    def _compose_native_chrome(self) -> dict:
+        """Gather the bar's inputs from the SAME sources the WebView bar reads, then
+        compose the wire payload with `compose_shell_chrome`.
+
+        Each source is read exactly the way its DOM consumer reads it: the tray from
+        the connectivity cache the summary route serves; the agent cluster from the
+        dashboard's agent rows through ContextEngine; the badge from the notification
+        store; a toast from the newest accepted A2UI `notification`, which is what
+        `_applyEvent` turns into `showToast`. Two things the bar shows are NOT known
+        here and are therefore left ABSENT rather than faked, which keeps the taskbar
+        unclaimable: the open-panel list lives in the browser's `panels` registry and
+        nothing reports it to the server yet (`tasks`), and so does a context menu
+        (`menu`). When a reporter lands it feeds `_shell_panels` and this composes them.
+        """
+        import datetime as _dt
+        # Idempotent: the prober is normally lazy-started by the first summary poll,
+        # but once the WebView bar stands down nobody polls, and the native tray must
+        # not freeze on the last snapshot the browser happened to ask for.
+        _connectivity_cache.start()
+        summary = _connectivity_cache.summary()
+        agents = None
+        try:
+            agents = self.context_engine._get_agent_context().get('agents')
+        except Exception as e:
+            logger.debug("native chrome: agent context unavailable: %s", e)
+        return compose_shell_chrome(
+            now=_dt.datetime.now(),
+            connectivity=summary,
+            agents=agents if isinstance(agents, list) else [],
+            unread=self._native_chrome_unread(),
+            tasks=getattr(self, '_shell_panels', None),
+            start_open=bool(getattr(self, '_shell_start_open', False)),
+            toast=self._native_chrome_toast(),
+            menu=None,
+        )
+
+    def _native_chrome_unread(self):
+        """The unread count behind the badge, from the same store the notifications
+        route reads. 0 when the DB path is unavailable, which is also what the badge
+        shows today (its DOM toggle is never set), and None only for a store that
+        answered something that is not a count."""
+        if getattr(self, '_native_chrome_unread_off', False):
+            return 0
+        try:
+            from integrations.social.services import NotificationService
+            from integrations.social.models import db_session
+            with db_session() as db:
+                rows = NotificationService.get_for_user(
+                    db, 1, unread_only=True, limit=99)
+                return len(rows) if isinstance(rows, list) else 0
+        except Exception as e:
+            # Once, not every five seconds: the route logs the same fallback per
+            # request and a DB that is down stays down for the session.
+            self._native_chrome_unread_off = True
+            logger.debug("native chrome: notification store unavailable (%s); "
+                         "the badge reads 0", e)
+            return 0
+
+    def _native_chrome_toast(self):
+        """The newest accepted `notification` component still within a toast's life,
+        or None. Read under the same lock agent_ui_update writes under."""
+        newest = None
+        with self._lock:
+            for comps in self._agent_components.values():
+                for c in comps:
+                    if c.get('type') != 'notification':
+                        continue
+                    if newest is None or (c.get('_ts') or 0) > (newest.get('_ts') or 0):
+                        newest = c
+        if newest is None:
+            return None
+        if time.time() - float(newest.get('_ts') or 0) > self._NATIVE_TOAST_LIFE_S:
+            return None
+        return {'title': newest.get('title') or newest.get('_agent_id') or 'Notification',
+                'message': newest.get('message') or '',
+                'severity': newest.get('severity') or 'info'}
+
+    def _push_chrome_to_native_scene(self, chrome: dict) -> dict:
+        """Forward one composed bar payload. Best-effort and silent, exactly like
+        `_push_home_to_native_scene`: the WebView bar is unaffected either way."""
+        try:
+            from integrations.agent_engine.hart_wm_client import get_wm_client
+            reply = get_wm_client().shell_chrome(chrome)
+        except Exception as e:
+            logger.debug("native chrome push skipped: %s", e)
+            return {'ok': False, 'error': str(e)}
+        if not (reply and reply.get('ok')):
+            logger.debug("native chrome not applied: %s", (reply or {}).get('error'))
+        return reply or {'ok': False}
+
+    def _ensure_native_chrome_pump(self) -> bool:
+        """Start the bar producer's pump once; a compositor without the verb stops it
+        again (an older binary), and the next accepted compose re-arms it, which is
+        also what a compositor restart with a newer binary looks like from here."""
+        if getattr(self, '_native_chrome_pump', False):
+            return True
+        self._native_chrome_pump = True
+        threading.Thread(target=self._native_chrome_pump_loop,
+                         name='hart-comp-chrome', daemon=True).start()
+        return True
+
+    def _native_chrome_pump_loop(self) -> None:
+        last = None
+        try:
+            while True:
+                try:
+                    chrome = self._compose_native_chrome()
+                    if chrome != last:
+                        reply = self._push_chrome_to_native_scene(chrome)
+                        if reply.get('ok'):
+                            last = chrome
+                        elif reply.get('error') == 'unsupported':
+                            logger.info("native chrome: this compositor has no "
+                                        "shell.chrome; the WebView bar stays")
+                            return
+                except Exception as e:
+                    logger.debug("native chrome pump: %s", e)
+                time.sleep(self._NATIVE_CHROME_PUMP_S)
+        finally:
+            self._native_chrome_pump = False
 
     def _ensure_native_input_relay(self) -> bool:
         """Listen for `shell.activate` from the compositor, at most one listener.
@@ -1695,7 +2309,8 @@ class LiquidUIService:
             return True
         try:
             from integrations.agent_engine.hart_wm_client import get_wm_client
-            started = get_wm_client().subscribe_events(self._on_compositor_event)
+            started = get_wm_client().subscribe_events(
+                self._on_compositor_event, on_close=self._on_native_input_relay_closed)
         except Exception as e:
             logger.debug("native input relay not started: %s", e)
             return False
@@ -1703,6 +2318,43 @@ class LiquidUIService:
         if started:
             logger.info("native input relay listening for shell.activate")
         return self._native_input_relay
+
+    # Retry delays after the listener closes, in seconds; the last one repeats. Short
+    # first so a compositor restart costs one second of unclickable desktop, capped
+    # so a box with no compositor is not polled hard forever. Tests shrink it.
+    _NATIVE_RELAY_RETRY_S = (1, 2, 4, 8, 16, 30)
+
+    def _on_native_input_relay_closed(self) -> None:
+        """The listener's socket closed; get it back, or the desktop is unclickable.
+
+        Runs on the dying subscriber thread. Before this existed the latch above
+        stayed True after the pump had exited, so nothing ever re-subscribed and the
+        chain a press depends on was dead for the rest of the boot. On the box that
+        happened one minute after EVERY boot: the subscription goes through the root
+        relay, whose per-connection unit was capped at 60 s. The cap is gone from the
+        hart-comp relay, but a compositor restart ends the socket the same way, so
+        the shell re-listens on its own rather than waiting for the next compose.
+        """
+        self._native_input_relay = False
+        if getattr(self, '_native_relay_reconnecting', False):
+            return
+        self._native_relay_reconnecting = True
+
+        def _relisten():
+            delays = self._NATIVE_RELAY_RETRY_S
+            i = 0
+            try:
+                while True:
+                    time.sleep(delays[min(i, len(delays) - 1)])
+                    i += 1
+                    if self._ensure_native_input_relay():
+                        logger.info('native input relay re-established after %d tries', i)
+                        return
+            finally:
+                self._native_relay_reconnecting = False
+
+        threading.Thread(target=_relisten, name='hart-comp-events-relisten',
+                         daemon=True).start()
 
     def _on_compositor_event(self, frame: dict) -> None:
         """One compositor event. Runs on the subscriber thread, so it stays cheap."""
@@ -2148,6 +2800,25 @@ class LiquidUIService:
         native_home_css = ''
         if 'home' in native_chrome:
             native_home_css = '#hart-home{visibility:hidden}'
+        # The BARS, per band, claimed by the compositor only for a frame that carried
+        # a bar composed FULLY from `shell.chrome` (clock, tray, badge and agent
+        # cluster for the top bar; the chip list for the taskbar), so standing down
+        # loses the user nothing that was showing. See IPC_PROTOCOL.md 4.13.
+        #
+        # opacity, NOT visibility, and this is the one place the choice differs from
+        # every neighbour above, on purpose: the native bar routes no presses yet. A
+        # press on it falls through to THIS bar, which must therefore keep its hit
+        # targets at the same geometry (the native layout follows the shell's CSS
+        # literals for exactly that reason). `visibility:hidden` removes an element
+        # from hit testing; `opacity:0` keeps every control clickable while the
+        # browser skips painting a fully transparent layer. When native activations
+        # for the bar controls land, this can become visibility like the others.
+        native_bars_css = ''
+        if 'topbar' in native_chrome:
+            native_bars_css += '.top-bar{opacity:0}'
+        if 'taskbar' in native_chrome:
+            native_bars_css += '.taskbar{opacity:0}'
+        native_home_css += native_bars_css
         # The SAME verdict, handed to script as well as to CSS. The CSS above
         # stops the canvas painting; only this can stop the canvas being DRAWN
         # INTO. See the window.HART_NATIVE_CHROME comment below for the measured
@@ -3047,7 +3718,7 @@ html.a11y-rmotion .hart-hero-orbwrap[data-orb-state="listening"]::after{animatio
 .hart-senses.dragging .hart-senses-grip{cursor:grabbing;opacity:1;color:var(--hart-text);background:rgba(255,255,255,0.06)}
 /* EYE — deterministic 3-state (was only .off red) */
 .hart-senses-btn.is-sensing{background:rgba(var(--lg-vision-rgb),.16);border-color:rgb(var(--lg-vision-rgb));box-shadow:var(--lg-ring-vision)}
-.hart-senses-btn.is-sensing .mi{color:rgb(var(--lg-vision-rgb));animation:lg-pulse 2.4s var(--lg-breathe) infinite}
+.hart-senses-btn.is-sensing .mi{color:rgb(var(--lg-vision-rgb));animation:lg-pulse 2.4s var(--lg-breathe) infinite;animation-play-state:var(--hart-motion-detail,running)}
 .hart-senses-btn.off{background:rgba(var(--lg-blind-rgb),.20);border-color:rgb(var(--lg-blind-rgb))}
 .hart-senses-btn.off .mi{color:rgb(var(--lg-blind-rgb))}
 /* MIC — listening cyan (supersede the legacy red .hart-senses-mic.listening :1343) */
@@ -3073,6 +3744,19 @@ html[data-busy="1"] .hart-hero-chips,html[data-panels="1"] .hart-hero-chips,html
 /* Sensory pod: SAFETY control — dims when idle, NEVER hides; full while sensing/voice */
 .hart-senses{transition:opacity var(--t-reveal) var(--lg-glide)}
 html[data-idle="1"] .hart-senses{opacity:.55}
+/* IDLE MOTION (the shell hot-path diet, 2026-09-24). The same engine stamps
+   data-idle after 6 s without input. The decorative pulses that are NOT the
+   orb's breathing (checklist c2/c8: the orb breathes, default ON; the chrome
+   around it does not) pause while nobody is at the desk, on EVERY rung: the
+   senses eye, the hero live dot, the send-button glow and the skeleton
+   shimmer. Only the play state changes, so each signal keeps its colour and
+   resumes on the first input. webkit-flat already stops them by selector;
+   this is the GPU rung's idle frame clock. test_liquid_ui_idle_motion_gate
+   enumerates every infinite animation the shell serves against this rule. */
+html[data-idle="1"] .hart-senses-btn.is-sensing .mi,
+html[data-idle="1"] .hart-hero-hevolve .dot,
+html[data-idle="1"] .hart-hero-go,
+html[data-idle="1"] .ds-skeleton{animation-play-state:paused}
 html[data-voice="1"] .hart-senses,html[data-blind="1"] .hart-senses{opacity:1}
 /* Pager: hidden only on a pristine, empty desktop; reveals as soon as the virtual-
    desktop feature is USABLE — any window is open OR you've navigated off desktop 1
@@ -3729,6 +4413,12 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script defer src="/shell/static/lottie.min.js"></script>
 <script defer src="/shell/static/hartBootSplash.js"></script>
 <script defer src="/shell/static/hartSession.js"></script>
+<!-- ONE dismissal set for every floating sheet (outside press / Escape / scroll /
+     resize / window blur, the last being what fires when a press lands in an
+     iframe or on another surface). Loaded before every sheet that arms it:
+     the start menu (inline), hartSenses.js, hartConnectivity.js and the
+     dynamically injected hartContextMenu.js. -->
+<script defer src="/shell/static/hartDismiss.js"></script>
 <script defer src="/shell/static/hartOSBridge.js"></script>
 <script defer src="/shell/static/voiceOrbViz.js"></script>
 <script defer src="/shell/static/hartHero.js"></script>
@@ -3938,7 +4628,7 @@ window.miStyle = miStyle;
 const PERF = {{
   potato: {'true' if is_potato else 'false'},
   clockMs: {perf.get('clock_interval_ms', 1000)},
-  agentStatusMs: {perf.get('agent_status_interval_ms', 5000)},
+  agentStatusMs: {perf.get('agent_status_interval_ms', 30000)},
   maxPanels: {perf.get('max_open_panels', 20)},
   destroyMinimized: {'true' if perf.get('destroy_minimized_iframes') else 'false'},
   lazyIframes: {'true' if perf.get('lazy_load_iframes') else 'false'},
@@ -4413,10 +5103,17 @@ function snapPanel(id, side) {{
 window.snapPanel = snapPanel;
 
 // ═══ Clock ═══
+// A minute clock ticking once a second: write the DOM only when the text
+// CHANGES. Re-setting textContent to the same string still replaces the text
+// node and invalidates the top bar, and on the software-paint rung every such
+// invalidation is a repaint; 59 of every 60 were for nothing.
+let _clockLast = '';
 function tickClock() {{
   const now = new Date();
   const t = now.toLocaleTimeString([], {{hour:'2-digit',minute:'2-digit'}});
   const d = now.toLocaleDateString([], {{weekday:'long',month:'long',day:'numeric'}});
+  if(t === _clockLast) return;
+  _clockLast = t;
   const el = document.getElementById('clock');
   if(el) el.textContent = t;
   const lc = document.getElementById('lock-clock');
@@ -4427,21 +5124,66 @@ function tickClock() {{
 setInterval(tickClock, PERF.clockMs);
 try {{ tickClock(); }} catch(e) {{ console.error('[HART] tickClock:', e); }}
 
+// ═══ Shell state bus (server pushes -> shell modules) ═══
+// The idle shell used to poll four read-only endpoints from EVERY document
+// (metrics 4 s, ai-sensing 4 s, connectivity 8 s, agents 5 s: ~18 GETs per 5 s
+// measured on the box 2026-09-22) for state the server keeps fresh itself.
+// The server now pushes each as a `shell_state` event on the one SSE stream
+// below (kind + payload); the stream handler publishes them here and the
+// modules subscribe (hartSessionUI metrics, hartSenses senses, hartConnectivity
+// connectivity, the agent status just below). Each module keeps a SLOW
+// fallback poll (30 s) that runs only while sseUp() is false, and only in the
+// HOST document: an iframed copy of the shell never polls (isHost() is false
+// there; its host already owns the state). ONE bus, defined before the
+// deferred modules run; a late subscriber is replayed the last payload.
+window.HartShellState = (function() {{
+  var last = {{}}, subs = {{}}, up = false;
+  function emit(kind, fn) {{
+    try {{ fn(last[kind]); }} catch(e) {{ console.debug('[HART] shell-state subscriber failed', kind, e); }}
+  }}
+  return {{
+    publish: function(kind, payload) {{
+      last[kind] = payload;
+      (subs[kind] || []).forEach(function(fn) {{ emit(kind, fn); }});
+    }},
+    on: function(kind, fn) {{
+      (subs[kind] = subs[kind] || []).push(fn);
+      if(Object.prototype.hasOwnProperty.call(last, kind)) emit(kind, fn);
+    }},
+    last: function(kind) {{ return last[kind]; }},
+    sseUp: function() {{ return up; }},
+    setSse: function(v) {{ up = !!v; }},
+    isHost: function() {{ try {{ return window.self === window.top; }} catch(e) {{ return true; }} }}
+  }};
+}})();
+
 // ═══ Agent Status (top bar) ═══
+// The fallback GET (the server pushes 'agents' on the stream; this runs while
+// the stream is down). Same reduction the server applies (_reduce_shell_agents):
+// running only, four chips, names clipped at 16. The native chrome producer
+// reads these constants against this function (test_native_wire_contract).
 function refreshAgentStatus() {{
   fetch(BACKEND+'/api/social/dashboard/agents',{{signal:_sig(3000)}})
     .then(r=>r.json()).then(data=>{{
-      const bar = document.getElementById('agent-status');
       const agents = (data.agents||[]).filter(a=>a.status==='running');
-      if(agents.length===0){{bar.innerHTML='<span style="opacity:0.5">No agents running</span>';return;}}
-      bar.innerHTML = agents.slice(0,4).map(a=>
-        '<span class="agent-chip"><span class="dot"></span>'+
-        (a.name||a.goal_type||'agent').substring(0,16)+'</span>'
-      ).join('');
+      paintAgentStatus(agents.map(a=>(a.name||a.goal_type||'agent').substring(0,16)));
     }}).catch(()=>{{}});
 }}
-setInterval(refreshAgentStatus, PERF.agentStatusMs);
-try {{ refreshAgentStatus(); }} catch(e) {{ console.error('[HART] refreshAgentStatus:', e); }}
+function paintAgentStatus(names) {{
+  const bar = document.getElementById('agent-status');
+  if(!bar) return;
+  if(!names || names.length===0){{bar.innerHTML='<span style="opacity:0.5">No agents running</span>';return;}}
+  bar.innerHTML = names.slice(0,4).map(n=>
+    '<span class="agent-chip"><span class="dot"></span>'+n+'</span>'
+  ).join('');
+}}
+HartShellState.on('agents', function(p){{ paintAgentStatus(p && p.names); }});
+if(HartShellState.isHost()) {{
+  setInterval(function(){{ if(!HartShellState.sseUp()) refreshAgentStatus(); }}, PERF.agentStatusMs);
+  if(!HartShellState.last('agents')) {{
+    try {{ refreshAgentStatus(); }} catch(e) {{ console.error('[HART] refreshAgentStatus:', e); }}
+  }}
+}}
 
 // ═══ Start Menu ═══
 function buildStartMenu() {{
@@ -4488,11 +5230,24 @@ function buildStartMenu() {{
 }}
 try {{ buildStartMenu(); }} catch(e) {{ console.error('[HART] buildStartMenu:', e); }}
 
+// The start menu closes through the shell's ONE dismissal set (hartDismiss.js):
+// outside press, Escape, scroll, resize and window blur. The old closer was a
+// bubbling click on this document, so a press on another surface or inside an
+// iframed panel (neither reaches this document) left the menu open on the box
+// (2026-09-22). The start button is inside the set so its click stays ONE toggle.
+let _startDisarm = null;
 function toggleStartMenu() {{
   const m = document.getElementById('start-menu');
   startOpen = !startOpen;
   m.classList.toggle('open', startOpen);
-  if(startOpen) document.getElementById('start-search').focus();
+  if(_startDisarm) {{ const d = _startDisarm; _startDisarm = null; d(); }}
+  if(startOpen) {{
+    document.getElementById('start-search').focus();
+    if(window.HartDismiss) _startDisarm = window.HartDismiss.arm({{
+      els: [m, function(){{ return document.querySelector('.start-btn'); }}],
+      onDismiss: function(){{ if(startOpen) toggleStartMenu(); }}
+    }});
+  }}
 }}
 
 function filterStart(q) {{
@@ -6702,8 +7457,6 @@ document.addEventListener('keydown', e => {{
   // Super+Up — maximize, Super+Down — minimize
   if(e.key==='ArrowUp'&&e.metaKey&&focusedPanel) {{ e.preventDefault(); toggleMax(focusedPanel); }}
   if(e.key==='ArrowDown'&&e.metaKey&&focusedPanel) {{ e.preventDefault(); minimizePanel(focusedPanel); }}
-  // Escape — close start menu
-  if(e.key==='Escape'&&startOpen) toggleStartMenu();
   // F11 — fullscreen focused
   if(e.key==='F11'&&focusedPanel) {{ e.preventDefault(); toggleMax(focusedPanel); }}
 }});
@@ -6745,14 +7498,6 @@ function launchApp(appId) {{
     headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{app_id:appId,subsystem:'linux'}})}}).catch(()=>{{}});
 }}
-
-// ═══ Close start menu on outside click ═══
-document.addEventListener('click', e => {{
-  if(startOpen && !document.getElementById('start-menu').contains(e.target) &&
-     !e.target.closest('.start-btn')) {{
-    toggleStartMenu();
-  }}
-}});
 
 // ═══ Voice I/O (push-to-talk + TTS) ═══
 let mediaRecorder = null;
@@ -6925,9 +7670,11 @@ function speakText(text, source) {{
 // ═══ SSE Live Agent Action Stream ═══
 // Renders ALL agent components as floating overlay fragments in real-time.
 // Notification = toast. Everything else = floating glass panel overlay.
-if(!PERF.potato) {{
+if(!PERF.potato && HartShellState.isHost()) {{
   try {{
     const evtSrc = new EventSource(SHELL+'/api/notifications/stream');
+    // The stream's state gates the modules' fallback polls (HartShellState).
+    evtSrc.onopen = function() {{ HartShellState.setSse(true); }};
     // ── Apply events across FRAMES, never in one synchronous run ──
     // Every branch of _applyEvent below is DOM work (toasts, icon pins, a full
     // home recompose, palette repaint, overlay render). Applying a whole message
@@ -6963,7 +7710,11 @@ if(!PERF.potato) {{
     function _applyEvent(ev) {{
       {{
           const type = ev.type || 'notification';
-          if(type === 'notification') {{
+          if(type === 'shell_state') {{
+            // Pushed read-only state (metrics / senses / connectivity / agents):
+            // published on the bus, painted by whichever module subscribed.
+            HartShellState.publish(ev.kind, ev.payload);
+          }} else if(type === 'notification') {{
             showToast(ev.title||ev.agent||'Notification', ev.message||'', ev.severity||'info');
           }} else if(type === 'app_installed') {{
             // Installed app -> live desktop icon. Reuse hartDesktop's manifest
@@ -6999,6 +7750,7 @@ if(!PERF.potato) {{
       }}
     }}
     evtSrc.onmessage = function(e) {{
+      HartShellState.setSse(true);
       try {{
         const events = JSON.parse(e.data);
         // ENQUEUE, never apply inline. The parse is cheap; the DOM work is not.
@@ -7009,7 +7761,7 @@ if(!PERF.potato) {{
         }}
       }} catch(err) {{}}
     }};
-    evtSrc.onerror = function() {{ /* SSE reconnects automatically */ }};
+    evtSrc.onerror = function() {{ HartShellState.setSse(false); /* SSE reconnects automatically; the fallback polls run meanwhile */ }};
   }} catch(err) {{}}
 }}
 
@@ -7027,7 +7779,14 @@ function _postApproval(agentId, action, decision) {{
 // ═══ Agent Action Floating Overlay Renderer ═══
 var _overlayStack = [];
 // HTML escape — prevents XSS from agent-pushed content
-function _esc(s){{if(!s)return'';var d=document.createElement('div');d.textContent=String(s);return d.innerHTML;}}
+// Escapes for BOTH text and attribute context. textContent->innerHTML neutralises
+// & < > for a text node but leaves quotes alone, and this helper is used inside
+// attribute values throughout (data-item, data-ctype, data-agent-id ...). A value
+// like `x" onmouseover="alert(1)` carries no `<`, so the server-side XSS gate,
+// which anchors its event-handler pattern to a tag, passes it -- and an unescaped
+// quote then closes the attribute and opens a live handler. &quot;/&#39; render
+// identically in text, so escaping them here is safe for every existing caller.
+function _esc(s){{if(!s)return'';var d=document.createElement('div');d.textContent=String(s);return d.innerHTML.replace(/"/g,'&quot;').replace(/'/g,'&#39;');}}
 function _submitA2UIForm(form) {{
   event.preventDefault();
   var action = form.dataset.action || '/api/a2ui';
@@ -7251,13 +8010,16 @@ function renderAgentOverlay(ev) {{
     var ordered = ev.ordered||false;
     var tag = ordered?'ol':'ul';
     html += '<'+tag+' style="margin:0;padding-left:18px;color:var(--hart-text)">';
+    // `items` is a LIST prop, so its entries never went through the string-prop
+    // pre-escape at the top of this function: they arrive raw and must be
+    // escaped at use, in the <li> body as well as the data-item attribute.
     (ev.items||[]).forEach(function(item,i){{
       var text = typeof item === 'string' ? item : (item.label||item.text||item.name||JSON.stringify(item));
       var action = typeof item === 'object' ? item.action : null;
       if(action || ev.interactive) {{
-        html += '<li style="padding:2px 0;cursor:pointer;color:var(--hart-accent)" data-action="'+(action||'/api/a2ui')+'" data-idx="'+i+'" data-item="'+_esc(text)+'" onclick="shellA2UIListSelect(this)">'+(text)+'</li>';
+        html += '<li style="padding:2px 0;cursor:pointer;color:var(--hart-accent)" data-action="'+(action||'/api/a2ui')+'" data-idx="'+i+'" data-item="'+_esc(text)+'" onclick="shellA2UIListSelect(this)">'+_esc(text)+'</li>';
       }} else {{
-        html += '<li style="padding:2px 0">'+(text)+'</li>';
+        html += '<li style="padding:2px 0">'+_esc(text)+'</li>';
       }}
     }});
     html += '</'+tag+'>';
@@ -8668,71 +9430,13 @@ function renderAgentOverlay(ev) {{
         # (the app store). Removed the inline duplicate; the canonical one wins.
 
         # ── Shell APIs: System Metrics ──
+        # The body lives in read_system_metrics() (module level) because the
+        # shell-state sampler reads the SAME function and pushes the widget's
+        # slice of it over SSE; this route is now the 30 s fallback poll and
+        # the System panel's full read.
         @app.route('/api/shell/system/metrics', methods=['GET'])
         def shell_system_metrics():
-            metrics = {}
-            try:
-                import psutil
-                # NON-BLOCKING sample (interval=None): return CPU% since the last
-                # call instead of sleeping 0.5s on the request thread. This route
-                # is POLLED every 4s by hartSessionUI; a blocking 0.5s here pinned
-                # a waitress worker for 0.5s out of every 4s forever (12.5% of a
-                # 1-thread pool) — a recurring mid-session micro-freeze. The 4s
-                # poll cadence is a fine sampling window; the first call after boot
-                # reads 0.0 and every subsequent poll is an accurate delta.
-                metrics['cpu_percent'] = psutil.cpu_percent(interval=None)
-                metrics['cpu_count'] = psutil.cpu_count()
-                mem = psutil.virtual_memory()
-                metrics['ram'] = {
-                    'total_gb': round(mem.total / (1024**3), 1),
-                    'used_gb': round(mem.used / (1024**3), 1),
-                    'percent': mem.percent,
-                }
-                disks = []
-                for part in psutil.disk_partitions():
-                    try:
-                        usage = psutil.disk_usage(part.mountpoint)
-                        disks.append({
-                            'mount': part.mountpoint,
-                            'device': part.device,
-                            'total_gb': round(usage.total / (1024**3), 1),
-                            'used_gb': round(usage.used / (1024**3), 1),
-                            'percent': usage.percent,
-                        })
-                    except (PermissionError, OSError):
-                        logger.warning("shell_system_metrics: swallowed PermissionError, OSError", exc_info=True)
-                metrics['disks'] = disks
-                net = psutil.net_io_counters()
-                metrics['network'] = {
-                    'bytes_sent': net.bytes_sent,
-                    'bytes_recv': net.bytes_recv,
-                }
-                metrics['load_avg'] = list(psutil.getloadavg()) if hasattr(psutil, 'getloadavg') else []
-                metrics['uptime_seconds'] = int(
-                    __import__('time').time() - psutil.boot_time())
-                # Temperatures if available
-                try:
-                    temps = psutil.sensors_temperatures()
-                    if temps:
-                        metrics['temperatures'] = {
-                            name: [{'label': s.label, 'current': s.current}
-                                   for s in sensors[:3]]
-                            for name, sensors in temps.items()
-                        }
-                except (AttributeError, Exception):
-                    logger.exception("shell_system_metrics: swallowed AttributeError, Exception")
-            except ImportError:
-                metrics['error'] = 'psutil not installed'
-            # GPU — ONE shape, shared with /api/shell/gpu (task #25).
-            # This used to call the detector itself and attach metrics['gpu']
-            # only when a name came back, so a CPU-only box and a box whose
-            # probe FAILED were indistinguishable: the key was simply absent in
-            # both cases. gpu_status() distinguishes them (available/present)
-            # and never raises, so no try/except is needed around it and the
-            # two GPU surfaces cannot drift apart.
-            from integrations.agent_engine.shell_system_apis import gpu_status
-            metrics['gpu'] = gpu_status()
-            return jsonify(metrics)
+            return jsonify(read_system_metrics())
 
         @app.route('/api/shell/system/processes', methods=['GET'])
         def shell_system_processes():
@@ -8869,6 +9573,11 @@ function renderAgentOverlay(ev) {{
                             event = dict(c)
                             event['agent'] = agent_id
                             out.append(event)
+                # The pushed shell state (push_shell_state): one entry per kind,
+                # replaced in place, so a burst can never pile up here.
+                for ev in list(self._shell_state.values()):
+                    if ev.get('_ts', 0) > since:
+                        out.append(dict(ev))
                 return out
 
             def generate():
@@ -8882,43 +9591,66 @@ function renderAgentOverlay(ev) {{
                 # whose wake latency we had just fixed upstream. An SSE comment is
                 # the canonical fix: 6 bytes, ignored by every conforming client
                 # (it carries no "event:"/"data:" field, so no handler ever sees it).
-                yield ": ok\n\n"
-                last_check = _time.time()
-                # EVENT-DRIVEN (was a 2s server-side poll that capped the latency of
-                # every A2UI card / notification / desktop compose — the "Liquid UI
-                # is the heart" path). Block on the CV until agent_ui_update pushes a
-                # component (woken instantly); the 15s timeout is a safety net +
-                # SSE keep-alive that self-heals a missed wake. The check-then-wait
-                # is atomic under the CV so a push between them can't be lost. The
-                # producer holds ONLY the CV (never self._lock) -> no deadlock with
-                # the writer's lock order.
-                # THE BOUNDED BATCH (the 2026-08-30 desktop freeze). This loop
-                # used to emit every pending event as ONE array and set the cursor
-                # to now; the browser applied that whole array on its main thread
-                # and the desktop froze for the duration. Federation backfill on a
-                # fresh install produced dozens inside one second — measured on
-                # .69 with every OS-level process idle while the UI was dead.
-                #
-                # collect + decide + advance all happen UNDER THE CV, and only the
-                # yield is outside it. That split is load-bearing in both
-                # directions: a push landing between the release and the cursor
-                # assignment would get a _ts below the new cursor and be skipped
-                # forever (a silent drop), while holding the CV across the socket
-                # write would block every pusher behind a slow client.
-                while True:
-                    with self._ui_event_cv:
-                        events = _collect(last_check)
-                        if not events:
-                            self._ui_event_cv.wait(timeout=15.0)
+                self._shell_state_client_enter()
+                try:
+                    yield ": ok\n\n"
+                    last_check = _time.time()
+                    first = True
+                    # EVENT-DRIVEN (was a 2s server-side poll that capped the latency of
+                    # every A2UI card / notification / desktop compose — the "Liquid UI
+                    # is the heart" path). Block on the CV until agent_ui_update pushes a
+                    # component (woken instantly); the 15s timeout is a safety net +
+                    # SSE keep-alive that self-heals a missed wake. The check-then-wait
+                    # is atomic under the CV so a push between them can't be lost. The
+                    # producer holds ONLY the CV (never self._lock) -> no deadlock with
+                    # the writer's lock order.
+                    # THE BOUNDED BATCH (the 2026-08-30 desktop freeze). This loop
+                    # used to emit every pending event as ONE array and set the cursor
+                    # to now; the browser applied that whole array on its main thread
+                    # and the desktop froze for the duration. Federation backfill on a
+                    # fresh install produced dozens inside one second — measured on
+                    # .69 with every OS-level process idle while the UI was dead.
+                    #
+                    # collect + decide + advance all happen UNDER THE CV, and only the
+                    # yield is outside it. That split is load-bearing in both
+                    # directions: a push landing between the release and the cursor
+                    # assignment would get a _ts below the new cursor and be skipped
+                    # forever (a silent drop), while holding the CV across the socket
+                    # write would block every pusher behind a slow client.
+                    while True:
+                        with self._ui_event_cv:
                             events = _collect(last_check)
-                        batch, last_check = sse_next_batch(
-                            events, last_check, _time.time())
-                    if batch:
-                        yield f"data: {json.dumps(batch)}\n\n"
-                    else:
-                        # SSE comment: keeps the stream warm through proxies,
-                        # ignored by the browser EventSource.
-                        yield ": hb\n\n"
+                            if first:
+                                # THE SNAPSHOT (the poll diet). A client that has
+                                # just connected would otherwise have to poll for
+                                # the state it needs to paint (metrics, senses,
+                                # connectivity, agents), which is the traffic
+                                # this stream exists to remove. The current
+                                # shell-state entries ride the FIRST collect,
+                                # re-stamped at the cursor so the decision below
+                                # neither rewinds the cursor to their real, older
+                                # _ts (which would re-send old agent events) nor
+                                # skips them. Entries already newer than the
+                                # cursor are in `events` and are not doubled.
+                                first = False
+                                events += [dict(ev, _ts=last_check)
+                                           for ev in self._shell_state.values()
+                                           if ev.get('_ts', 0) <= last_check]
+                            if not events:
+                                self._ui_event_cv.wait(timeout=15.0)
+                                events = _collect(last_check)
+                            batch, last_check = sse_next_batch(
+                                events, last_check, _time.time())
+                        if batch:
+                            yield f"data: {json.dumps(batch)}\n\n"
+                        else:
+                            # SSE comment: keeps the stream warm through proxies,
+                            # ignored by the browser EventSource.
+                            yield ": hb\n\n"
+                finally:
+                    # The stream closed (client gone, GeneratorExit): release the
+                    # client so a box with no shell open samples nothing.
+                    self._shell_state_client_leave()
             return Response(
                 generate(), mimetype='text/event-stream',
                 headers={
@@ -9098,7 +9830,7 @@ function renderAgentOverlay(ev) {{
                         resp.json().get('backend_count', 0) > 0)
                 except Exception:
                     self._model_available = False
-                time.sleep(10)
+                time.sleep(self._model_check_interval(self._model_available))
 
         threading.Thread(target=_model_check_loop, daemon=True).start()
 
@@ -9643,7 +10375,88 @@ def _sanitize_home_payload(payload) -> Optional[dict]:
         slug = re.sub(r'[^a-z0-9_-]', '', mood.strip().lower())[:24]
         if slug:
             out['mood'] = slug
+            # The SAME mood, resolved to colours, for the consumer that cannot
+            # resolve it itself. The browser owns HART_PALETTES and paints the id;
+            # the compositor's native scene has no copy of that table (Gate 4: no
+            # second palette table in Rust), so it is handed what the id MEANS
+            # over the same wire. Absent when the id is not one the table knows,
+            # which is exactly the browser's own no-op for an unknown mood.
+            resolved = _home_resolve_mood(slug)
+            if resolved:
+                out['palette'] = resolved
     return out
+
+
+# The palette table the moods resolve against, read ONCE from the file that owns
+# it. hartPersonalize.js declares `PALETTES = window.HART_PALETTES` as "the
+# authoritative client list", and HART_MOOD_PALETTE_IDS above mirrors only its
+# IDS for the LLM prompt. Resolving an id to colours server-side needs the
+# colours too, and a second copy of sixteen hex quads would be the drift the
+# source-shape guard in test_home_producer exists to stop. So the server READS the
+# JS table rather than restating it: one table, one owner, two readers.
+_HOME_MOOD_PALETTES: Optional[Dict[str, Dict[str, str]]] = None
+_HOME_MOOD_PALETTES_JS = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'static', 'hartPersonalize.js')
+_HOME_MOOD_PALETTES_RE = re.compile(
+    r'var PALETTES\s*=\s*window\.HART_PALETTES\s*=\s*\[(.*?)\];', re.S)
+_HOME_MOOD_HEX_RE = re.compile(r'^#[0-9A-Fa-f]{6}$')
+
+
+def _home_mood_palettes() -> Dict[str, Dict[str, str]]:
+    """HART_PALETTES by lowercase id, each entry its `key: 'value'` fields."""
+    global _HOME_MOOD_PALETTES
+    if _HOME_MOOD_PALETTES is None:
+        table: Dict[str, Dict[str, str]] = {}
+        try:
+            with open(_HOME_MOOD_PALETTES_JS, 'r', encoding='utf-8') as f:
+                m = _HOME_MOOD_PALETTES_RE.search(f.read())
+            for entry in re.finditer(r'\{([^{}]*)\}', m.group(1) if m else ''):
+                fields = dict(re.findall(r"(\w+):\s*'([^']*)'", entry.group(1)))
+                pid = (fields.get('id') or '').strip().lower()
+                if pid:
+                    table[pid] = fields
+        except OSError as e:
+            logger.warning("mood palettes unavailable (%s): moods will not "
+                           "resolve for the native scene", e)
+        _HOME_MOOD_PALETTES = table
+    return _HOME_MOOD_PALETTES
+
+
+def _home_resolve_mood(slug: str) -> Optional[dict]:
+    """A mood id resolved to the colours `HartPalette.paint` would set for it.
+
+    The rule is paintPalette's own, not a re-derivation of it: the FUNCTIONAL
+    accent is `p.accent || p.a`, so the six Aura moods (which pin `accent` to
+    teal) keep teal on every functional signifier while their `a..a4` quad drives
+    only the ambient field, and the ten classic palettes set the accent from
+    their lead hue. The keys are the theme file's own (`accent`, `secondary`,
+    `background`, `ambient_1..4`), which is what lets the compositor fold them
+    through the same path a theme file takes rather than a second one.
+
+    Only present, well-formed `#RRGGBB` values are emitted: an absent `a3`/`a4`
+    leaves the theme's own ambient in place on both renderers, and a malformed
+    literal in the table costs one colour rather than the palette.
+    """
+    p = _home_mood_palettes().get(slug)
+    if not p:
+        return None
+
+    def hexv(key: str) -> Optional[str]:
+        v = p.get(key)
+        return v.upper() if isinstance(v, str) and _HOME_MOOD_HEX_RE.match(v) else None
+
+    out: Dict[str, str] = {}
+    accent = hexv('accent') or hexv('a')
+    if accent:
+        out['accent'] = accent
+    if hexv('a2'):
+        out['secondary'] = hexv('a2')
+    if hexv('b'):
+        out['background'] = hexv('b')
+    for i, key in enumerate(('a', 'a2', 'a3', 'a4'), 1):
+        if hexv(key):
+            out['ambient_%d' % i] = hexv(key)
+    return out or None
 
 
 def _home_extract_json_obj(text: str):

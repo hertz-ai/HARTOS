@@ -52,6 +52,37 @@ impl Default for BloomPalette {
     }
 }
 
+impl BloomPalette {
+    /// This palette with a composed MOOD folded in: the shell's resolution of the
+    /// `mood` id, over the theme file's own hues, one slot at a time.
+    ///
+    /// The HTML bloom is `.hart-ambient` reading `--hart-amb-1..4` and the body reading
+    /// `--hart-background`, both of which `paintPalette` rewrites from the mood's quad
+    /// and `b`. This is the same recolour on the native backdrop, and it is what
+    /// "mood reaches the pixels" mostly means: the Aura moods pin the functional accent
+    /// teal and change ONLY this field. A slot the mood is silent on (the classic
+    /// palettes name no a3/a4) keeps the theme's own hue, which is exactly what an
+    /// unset CSS variable does.
+    ///
+    /// The cache key includes the result, so a mood change recomposes the field ONCE
+    /// and a repeated mood does not recompose at all (compose-once NFR).
+    pub fn with_mood(mut self, mood: &crate::scene::MoodPalette) -> BloomPalette {
+        let to_u8 = |c: crate::scene::Color| -> [u8; 3] {
+            let ch = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            [ch(c.r), ch(c.g), ch(c.b)]
+        };
+        if let Some(b) = mood.background {
+            self.base = to_u8(b);
+        }
+        for (slot, hue) in self.amb.iter_mut().zip(mood.ambient.iter()) {
+            if let Some(c) = hue {
+                *slot = to_u8(*c);
+            }
+        }
+        self
+    }
+}
+
 fn hex3(s: &str) -> Option<[u8; 3]> {
     let s = s.trim().trim_start_matches('#');
     if s.len() < 6 {
@@ -99,25 +130,44 @@ impl SettingsFile {
 
     /// Resolve the active theme file from the environment, degrading at every step.
     ///
-    /// `HART_THEME_DIR` / `HART_THEME` follow the convention the conky + liquid-ui
-    /// modules already export, so this reads the same file the HTML shell is handed.
+    /// The FIRST of `theme_paths()` that exists: the theme the user is actually running
+    /// (`active_theme.json`, the preset merged with their overrides, which the HTML
+    /// shell renders from), and only when no theme has ever been applied the shipped
+    /// preset the environment names.
     pub fn active() -> SettingsFile {
+        SettingsFile::first_of(&theme_paths())
+    }
+
+    /// The first of `paths` that reads; none of them is the same absent file `load`
+    /// answers for a missing path, so every caller keeps its shipped default.
+    pub fn first_of(paths: &[std::path::PathBuf]) -> SettingsFile {
+        for p in paths {
+            let f = SettingsFile::load(p);
+            if f.text.is_some() {
+                return f;
+            }
+        }
+        SettingsFile { text: None }
+    }
+
+    /// The preset file the environment names, or nothing when the id is unsafe.
+    ///
+    /// `HART_THEME_DIR` / `HART_THEME` follow the convention the conky + liquid-ui
+    /// modules already export, so this is the same file the HTML shell is SEEDED from.
+    pub fn preset_path() -> Option<std::path::PathBuf> {
         let dir = std::env::var("HART_THEME_DIR").unwrap_or_else(|_| THEME_DIR_DEFAULT.to_string());
         let id = std::env::var("HART_THEME").unwrap_or_else(|_| "aura".to_string());
-        SettingsFile::for_id(&dir, &id)
+        preset_path_in(&dir, &id)
     }
 
     /// The resolution rule with the environment read out of the way, so it is testable
     /// without mutating process-global state (cargo runs tests as threads in one
     /// process, and an env-mutating test would race every other test here).
     pub fn for_id(dir: &str, id: &str) -> SettingsFile {
-        // Reject an id that could escape the theme directory. It reaches us from the
-        // environment, and a path separator would let it name any file on disk; a bad id
-        // falls back to the shipped look rather than reading around.
-        if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
-            return SettingsFile { text: None };
+        match preset_path_in(dir, id) {
+            Some(p) => SettingsFile::load(&p),
+            None => SettingsFile { text: None },
         }
-        SettingsFile::load(&Path::new(dir).join(format!("{}.json", id)))
     }
 
     /// The NUMERIC value of `key`, or None when it is absent or not a number.
@@ -247,27 +297,57 @@ pub fn palette_from(file: &SettingsFile) -> BloomPalette {
 /// renderers read one palette source (Gate 4: no parallel theme table).
 const THEME_DIR_DEFAULT: &str = "/run/current-system/sw/share/hart/conky-themes";
 
+/// `<dir>/<id>.json`, or None for an id that could escape the theme directory. The id
+/// reaches us from the environment, and a path separator would let it name any file on
+/// disk; a bad id falls back to the shipped look rather than reading around.
+pub fn preset_path_in(dir: &str, id: &str) -> Option<std::path::PathBuf> {
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return None;
+    }
+    Some(Path::new(dir).join(format!("{}.json", id)))
+}
+
+/// The file the theme service writes the RUNNING theme to, inside the data dir: the
+/// chosen preset merged with the user's custom overrides (`ThemeService.apply_theme`
+/// and `update_custom` both rewrite it), and what `get_css_variables` renders the HTML
+/// shell from. Before this the compositor read only the preset the environment named,
+/// which is the SEED of that file and never changes: every theme the user picked
+/// after first boot left the native desktop on aura.
+pub const ACTIVE_THEME_FILE: &str = "active_theme.json";
+
+/// The data dir, resolved as theme_service.py resolves it: `HEVOLVE_DATA_DIR`, then
+/// `HART_DATA_DIR`, then the module default hart-base.nix gives every node.
+pub fn data_dir() -> std::path::PathBuf {
+    for var in ["HEVOLVE_DATA_DIR", "HART_DATA_DIR"] {
+        if let Some(v) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+            return std::path::PathBuf::from(v);
+        }
+    }
+    std::path::PathBuf::from("/var/lib/hart")
+}
+
+/// Where the active theme can be, in the order the shell itself would look: the
+/// running theme first, the shipped preset as the seed. Every reader of the theme
+/// resolves through this one list, and the hot-reload watch stamps every entry, so a
+/// theme applied for the first time (the file appearing) is a change like any other.
+pub fn theme_paths() -> Vec<std::path::PathBuf> {
+    let mut v = vec![data_dir().join(ACTIVE_THEME_FILE)];
+    if let Some(p) = SettingsFile::preset_path() {
+        v.push(p);
+    }
+    v
+}
+
 /// Where the shell reads its declarative accessibility state
 /// (shell_os_apis.py seeds `_A11Y_SETTINGS` from this exact path at import).
 pub const A11Y_SETTINGS_PATH: &str = "/etc/hart/accessibility.json";
 
-/// Does the user want motion stood down? Reads the same declarative file the shell does.
-/// FALSE when the file is absent or the key is missing, which is the shipped default and
-/// what `_A11Y_SETTINGS` seeds `reduced_motion` to.
-pub fn reduced_motion() -> bool {
-    SettingsFile::load(Path::new(A11Y_SETTINGS_PATH))
-        .flag("reduced_motion")
-        .unwrap_or(false)
-}
-
-/// Resolve the active palette from the environment, degrading at every step.
-///
-/// `HART_THEME_DIR` / `HART_THEME` follow the convention the conky + liquid-ui
-/// modules already export. Every failure path lands on aura's shipped values
-/// rather than a void, because this is the DESKTOP BACKDROP: an unreadable theme
-/// file must never produce a black screen the user cannot explain.
-pub fn theme_palette() -> BloomPalette {
-    palette_from(&SettingsFile::active())
+/// Does the user want motion stood down? The ONE reader of the key, out of the same
+/// declarative file the shell seeds `_A11Y_SETTINGS` from (loaded by the theme watch in
+/// comp_core, which re-reads it when it changes). FALSE when the file is absent or the
+/// key is missing, which is the shipped default the shell seeds `reduced_motion` to.
+pub fn reduced_motion_in(a11y: &SettingsFile) -> bool {
+    a11y.flag("reduced_motion").unwrap_or(false)
 }
 
 /// The resolution rule itself, with the environment read out of the way. Kept as its own
@@ -613,5 +693,66 @@ mod tests {
         // different texture and the desktop would shimmer.
         let p = BloomPalette::default();
         assert_eq!(compose(80, 60, &p), compose(80, 60, &p));
+    }
+
+    fn mood(hexes: [Option<&str>; 5]) -> crate::scene::MoodPalette {
+        let c = |h: Option<&str>| h.and_then(crate::scene::Color::from_hex);
+        crate::scene::MoodPalette {
+            accent: None,
+            secondary: None,
+            background: c(hexes[0]),
+            ambient: [c(hexes[1]), c(hexes[2]), c(hexes[3]), c(hexes[4])],
+        }
+    }
+
+    #[test]
+    fn a_mood_recolours_the_field_slot_by_slot_and_keeps_the_theme_where_silent() {
+        let base = BloomPalette::default();
+        // Sunset, as _home_resolve_mood emits it: a background, a1 and a2, no a3/a4.
+        let sunset = base.with_mood(&mood([
+            Some("#16090F"), Some("#FF8A4C"), Some("#FF2E9A"), None, None,
+        ]));
+        assert_eq!(sunset.base, [0x16, 0x09, 0x0F], "the ground takes the mood's b");
+        assert_eq!(sunset.amb[0], [0xFF, 0x8A, 0x4C], "amb-1 is the lead hue");
+        assert_eq!(sunset.amb[1], [0xFF, 0x2E, 0x9A]);
+        assert_eq!(sunset.amb[2], base.amb[2], "a silent a3 keeps the theme's hue");
+        assert_eq!(sunset.amb[3], base.amb[3], "and so does a4");
+        // An empty mood is the identity, so `"palette": {}` cannot reset anything.
+        assert_eq!(base.with_mood(&mood([None; 5])), base);
+        // Round trip through the f32 colour and back lands on the same byte.
+        let same = base.with_mood(&mood([Some("#04050B"), Some("#B182FF"), None, None, None]));
+        assert_eq!(same, base, "aura's own hues fold back to aura's own bytes");
+    }
+
+    #[test]
+    fn two_moods_paint_different_pixels_and_an_aura_mood_moves_only_the_ambient() {
+        // THE PIXEL PROOF for the backdrop half of "mood reaches the pixels". Compose
+        // the same output under two moods and read the bytes: the violet lead blob is
+        // violet under aurora and orange under sunset, and the far corner sits on each
+        // mood's own ground. A compose that ignored the mood would return equal buffers.
+        let base = BloomPalette::default();
+        let aurora = base.with_mood(&mood([
+            Some("#04050B"), Some("#B182FF"), Some("#00DDF9"), Some("#FB66B6"), Some("#FFB330"),
+        ]));
+        let sunset = base.with_mood(&mood([
+            Some("#16090F"), Some("#FF8A4C"), Some("#FF2E9A"), None, None,
+        ]));
+        let (w, h) = (160, 90);
+        let a = compose(w, h, &aurora);
+        let s = compose(w, h, &sunset);
+        assert_ne!(a, s, "two moods must not compose the same field");
+        // Bytes are B, G, R, A. The lead blob sits at (0.32, 0.40).
+        let at = |buf: &[u8], x: usize, y: usize| -> (u8, u8, u8) {
+            let i = (y * w as usize + x) * 4;
+            (buf[i + 2], buf[i + 1], buf[i])
+        };
+        let lead = ((0.32 * w as f32) as usize, (0.40 * h as f32) as usize);
+        let (ar, ag, ab) = at(&a, lead.0, lead.1);
+        assert!(ab > ag && ar > ag, "under aurora the lead blob reads VIOLET: {:?}", (ar, ag, ab));
+        let (sr, sg, sb) = at(&s, lead.0, lead.1);
+        assert!(sr > sg && sg > sb, "under sunset it reads ORANGE: {:?}", (sr, sg, sb));
+        // And the aurora field is byte-identical to the shipped default: an Aura mood
+        // whose quad IS aura's changes nothing, which is the "only the ambient" half.
+        assert_eq!(a, compose(w, h, &base));
     }
 }

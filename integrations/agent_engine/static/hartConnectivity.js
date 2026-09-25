@@ -10,8 +10,10 @@
  * none of nmcli / bluetoothctl / wpctl / upower) — an indicator with no data
  * shows a NEUTRAL "unknown" glyph, never an error.
  *
- * DRY: the cluster READS one consolidated endpoint
- * (/api/shell/connectivity/summary, served same-process on SHELL=:6800) and the
+ * DRY: the cluster READS one consolidated snapshot, PUSHED by the server's
+ * connectivity prober over the shell's SSE stream (window.HartShellState
+ * 'connectivity'); /api/shell/connectivity/summary (same-process on
+ * SHELL=:6800) is the 30 s fallback poll for a stream that is down, and the
  * quick-settings ACTIONS reuse the EXISTING per-domain endpoints
  * (/api/shell/network/wifi[/connect], /api/shell/wifi/toggle,
  * /api/shell/bluetooth[/power|/connect], /api/shell/battery,
@@ -108,6 +110,10 @@
   }
 
   var STATE = null, pollTimer = null, mounted = false;
+  var FALLBACK_POLL_MS = 30000;   // only while the push stream is down (poll diet)
+  function bus() { return window.HartShellState || null; }
+  function sseUp() { var b = bus(); return !!(b && b.sseUp()); }
+  function isHost() { var b = bus(); return b ? b.isHost() : true; }
   // In-flight guards: at most ONE summary probe and ONE wifi scan outstanding at
   // a time. Both endpoints shell out to nmcli/bluetoothctl/wpctl server-side and
   // can take several seconds on a software-rendered box; the 8s poller, the
@@ -387,26 +393,31 @@
     p.style.left = 'auto';
   }
 
+  // Dismissal is the shell's ONE shared set (hartDismiss.js): outside press,
+  // Escape, scroll, resize and window blur. Blur is the half this popover was
+  // missing: a press on another surface or inside an iframed panel never
+  // reaches this document, so the old mousedown closer left it open (box,
+  // 2026-09-22). The tray cluster is inside the set so its click is one toggle.
+  var _disarm = null;
   function openPopover() {
     var p = ensurePopover();
     renderPopover();
     p.classList.add('open');
     positionPopover();
     refresh();   // freshen the data the moment it opens
-    setTimeout(function () { document.addEventListener('mousedown', onOutside, true); }, 0);
+    if (_disarm) { _disarm(); _disarm = null; }
+    if (window.HartDismiss) {
+      _disarm = window.HartDismiss.arm({
+        els: [p, function () { return document.getElementById('hc-cluster'); }],
+        onDismiss: closePopover
+      });
+    }
   }
   function closePopover() {
     var p = document.getElementById('hc-popover');
     if (p) p.classList.remove('open');
-    document.removeEventListener('mousedown', onOutside, true);
-  }
-  function onOutside(e) {
-    var p = document.getElementById('hc-popover');
-    var cluster = document.getElementById('hc-cluster');
-    if (!p) return;
-    if (p.contains(e.target)) return;
-    if (cluster && cluster.contains(e.target)) return;
-    closePopover();
+    var d = _disarm; _disarm = null;
+    if (d) d();
   }
   function togglePopover() {
     if (popoverOpen()) closePopover(); else openPopover();
@@ -494,12 +505,14 @@
     });
     mounted = true;
 
-    refresh();
-    pollTimer = setInterval(refresh, 8000);   // keep the indicators live
-    window.addEventListener('resize', function () { if (popoverOpen()) positionPopover(); });
-    document.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape' && popoverOpen()) closePopover();
-    });
+    var b = bus();
+    if (b) b.on('connectivity', function (d) { STATE = d || {}; paint(); });
+    if (isHost()) {                            // an iframed shell never polls
+      if (!(b && b.last('connectivity'))) refresh();   // first paint before the snapshot lands
+      pollTimer = setInterval(function () { if (!sseUp()) refresh(); }, FALLBACK_POLL_MS);
+    }
+    // Escape and resize while open are the shared dismissal set's job (armed in
+    // openPopover); a resize simply closes the sheet, as it does the context menu.
   }
 
   // Expose a tiny handle for other shell code / tests (no behaviour leaks).

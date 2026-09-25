@@ -582,6 +582,12 @@ class ResourceGovernor:
         self._gpu_allowed: bool = False
         self._last_user_activity: float = time.monotonic()
         self._idle_threshold_seconds: float = idle_threshold_seconds
+        # The monitor's last sampled answer to "is a person at the desk",
+        # None until the monitor has sampled once. user_present() reads it;
+        # the yield gate asks. Kept apart from _mode on purpose: MODE_ACTIVE
+        # is also the constructor default and also what external load
+        # produces, so "mode == ACTIVE" cannot mean "someone is here".
+        self._last_user_idle: Optional[bool] = None
 
         # Threading
         self._proactive_thread: Optional[threading.Thread] = None
@@ -668,7 +674,8 @@ class ResourceGovernor:
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
-    def start(self, defer_memory_limit: bool = False) -> None:
+    def start(self, defer_memory_limit: bool = False,
+              monitor_only: bool = False) -> None:
         """Start the governor background monitor and proactive stream.
 
         Args:
@@ -679,6 +686,24 @@ class ResourceGovernor:
                 from terminating the process during the boot-time memory
                 peak (autogen + flaml + llmlingua + transformers + 96
                 expert agents all imported before webview.start).
+            monitor_only: Run ONLY the monitor loop, so get_mode() is live
+                in this process: no enforcer, no proactive stream.  For a
+                process that is not the backend but reads the governor,
+                which on HART OS is hart-agent-daemon.service: its
+                _idle_only_blocked and starvation override call
+                get_mode(), and without a monitor that was the
+                constructor's MODE_ACTIVE for the life of the process
+                (found 2026-09-23 on the Samsung box).  The enforcer is
+                skipped on purpose, not for economy: it is per process
+                (nice, affinity, a cgroup or Job Object on THIS process),
+                and its _unrestrict_llm_affinity pins llama-server to
+                every core by port lookup, which from a second process
+                would undo the taskset pin hart-llm.nix applies (measured
+                2026-09-23: llama-server on cpus 2,3,6,7, the pin holding).
+                The proactive stream is skipped because it dispatches hive
+                tasks and benchmarks, and the backend's own governor already
+                runs the one copy of it.  With the enforcer never armed,
+                _transition_to's update_caps call is a no-op here.
         """
         with self._lock:
             if self._running:
@@ -689,19 +714,20 @@ class ResourceGovernor:
             self._stats['uptime_start'] = time.time()
 
         # Apply hard OS-level resource caps at startup
-        try:
-            enforcer = get_enforcer()
-            if defer_memory_limit:
-                # Priority + CPU only — memory cap deferred to avoid
-                # SIGKILL on boot-time spike (see app.py comment block).
-                enforcer._set_process_priority()
-                enforcer._enforce_cpu(0.75, max(1, int((os.cpu_count() or 4) * 0.75)), os.cpu_count() or 4)
-                enforcer._enforced = True  # mark so update_caps doesn't re-enforce
-                logger.info("ResourceEnforcer: priority + CPU applied (memory deferred)")
-            else:
-                enforcer.enforce(cpu_fraction=0.75, ram_fraction=0.75, gpu_fraction=0.75)
-        except Exception as e:
-            logger.warning("ResourceEnforcer failed at startup: %s", e)
+        if not monitor_only:
+            try:
+                enforcer = get_enforcer()
+                if defer_memory_limit:
+                    # Priority + CPU only; the memory cap is deferred to avoid
+                    # SIGKILL on boot-time spike (see app.py comment block).
+                    enforcer._set_process_priority()
+                    enforcer._enforce_cpu(0.75, max(1, int((os.cpu_count() or 4) * 0.75)), os.cpu_count() or 4)
+                    enforcer._enforced = True  # mark so update_caps doesn't re-enforce
+                    logger.info("ResourceEnforcer: priority + CPU applied (memory deferred)")
+                else:
+                    enforcer.enforce(cpu_fraction=0.75, ram_fraction=0.75, gpu_fraction=0.75)
+            except Exception as e:
+                logger.warning("ResourceEnforcer failed at startup: %s", e)
 
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop,
@@ -709,6 +735,12 @@ class ResourceGovernor:
             daemon=True,
         )
         self._monitor_thread.start()
+
+        if monitor_only:
+            logger.info("ResourceGovernor started, monitor only "
+                        "(idle threshold=%.0fs; no enforcer, no proactive stream)",
+                        self._idle_threshold_seconds)
+            return
 
         self._proactive_thread = threading.Thread(
             target=self._proactive_action_stream,
@@ -759,6 +791,35 @@ class ResourceGovernor:
     def get_mode(self) -> str:
         """Current mode: 'active', 'idle', or 'sleep'."""
         return self._mode
+
+    def user_present(self) -> bool:
+        """True when the LIVE monitor last saw a person at the desk.
+
+        This is the signal the yield gate (dispatch.should_yield_to_user)
+        reads, and it is deliberately not derived from get_throttle() or
+        get_mode():
+
+        * get_throttle() in ACTIVE mode returns ACTIVE_CPU_LIMIT, which is
+          0.50 by default ("at keyboard: usable"), above the gate's 0.3
+          floor. So the gate's 'governor_throttle' reason has NOT fired for
+          a person at the desk since that default was raised; measured on
+          the Samsung box 2026-09-24 on generation 11: this governor logged
+          idle -> active at 22:37:26 and held ACTIVE for seven minutes of
+          continuous input, and the in-process agent daemon kept ticking a
+          278-token llama call every minute through all of it, package at
+          94 C, clock 1.1 GHz, press latency p50 600-1500 ms.
+        * get_mode() == MODE_ACTIVE is also the constructor default and
+          also what foreign CPU load produces, so a governor that was never
+          started would read as "person present" forever and silently
+          stall every daemon (the false-healthy class).
+
+        So: False unless the monitor thread is alive AND its last sample
+        said not idle. A process with no monitor gets the old behaviour.
+        """
+        t = self._monitor_thread
+        if not self._running or t is None or not t.is_alive():
+            return False
+        return self._last_user_idle is False
 
     def get_throttle(self) -> float:
         """Current throttle factor 0.0 (full stop) to 1.0 (unlimited).
@@ -916,6 +977,7 @@ class ResourceGovernor:
                 self._refresh_cpu_attribution()
                 mem = self._get_memory_pressure()
                 user_idle = self._detect_user_idle()
+                self._last_user_idle = user_idle
                 battery_level, on_battery = self._get_battery_status()
                 ext_cpu = self._cached_external_cpu
 
@@ -999,7 +1061,42 @@ class ResourceGovernor:
         return None
 
     def _get_idle_ms_linux(self) -> Optional[float]:
-        """Linux: try xprintidle, then /proc/interrupts delta estimation."""
+        """Linux: xprintidle on X11, then the compositor's input-alive marker.
+
+        xprintidle answers only under X11.  HART OS runs Wayland (hart-comp,
+        sway, cage), where the binary is absent or exits non-zero, so this
+        returned None on every HART OS box and _detect_user_idle fell back to
+        the report_user_activity() timestamp, which only a foreground chat
+        request touches.  A person clicking around the desktop was therefore
+        "away" to the governor, and the agent daemon's starvation override
+        drove CPU inference at the desk.  Measured 2026-09-22 on the Samsung
+        box: press p50 122 ms against a 25 ms budget, clock 1.3 GHz of 3.4,
+        package 94 C, llama-server at 207 percent once a minute; with the
+        daemons paused for 120 s the clock came back to 3.19 GHz and press
+        p50 to 12 ms.
+
+        The marker is the compositor's own input beacon: comp_core.rs
+        note_input_alive writes /run/hart/session/input-alive and the
+        session supervisor reads the same path, so this adds no transport.
+        Its mtime is the last moment the compositor saw a pointer or keyboard
+        event once that write becomes a rate limited heartbeat (S2 of the
+        native OS program); until then it is written once per boot, so an old
+        marker reads as idle, which errs toward letting agents work rather
+        than toward starving them.  The mtime is a wall clock stamp, so it is
+        compared against time.time(); a marker from the future (a clock step)
+        clamps to 0 ms, which reads as active.
+
+        No marker at all (a non HART OS Linux, a dev box) returns None so the
+        timestamp fallback stays the answer there.  HART_INPUT_ALIVE_MARKER
+        overrides the full path for tests; otherwise the marker sits in the
+        ONE session marker dir core.foreground.session_marker_dir resolves
+        (HART_SESSION_MARKER_DIR, else /run/hart/session), the same dir the
+        foreground-active and user-chat markers live in, so a supervisor
+        that relocates the run dir moves all three readers with one setting.
+
+        There is no /proc/interrupts estimator.  The previous docstring
+        promised one that was never written.
+        """
         # Try xprintidle first (X11 desktops)
         try:
             import subprocess
@@ -1010,7 +1107,24 @@ class ResourceGovernor:
                 return float(result.stdout.strip())
         except Exception:
             pass
-        return None
+        # Wayland: the compositor's input-alive marker (see the docstring).
+        marker = os.environ.get('HART_INPUT_ALIVE_MARKER', '').strip()
+        if not marker:
+            marker_dir = None
+            try:
+                from core.foreground import session_marker_dir
+                marker_dir = session_marker_dir()
+            except Exception:
+                pass
+            # The literal, not a join: on a Windows dev box os.path.join would
+            # put a backslash into a Linux path the tests pin verbatim.
+            marker = (os.path.join(marker_dir, 'input-alive') if marker_dir
+                      else '/run/hart/session/input-alive')
+        try:
+            mtime = os.stat(marker).st_mtime
+        except OSError:
+            return None
+        return max(0.0, (time.time() - mtime) * 1000.0)
 
     def _get_idle_ms_macos(self) -> Optional[float]:
         """macOS: ioreg HIDIdleTime (nanoseconds -> milliseconds)."""
@@ -1095,6 +1209,54 @@ class ResourceGovernor:
         # Windows fallback without psutil: assume moderate usage
         return 0.3
 
+    def _own_process_roots(self) -> list:
+        """This process, every registered managed subprocess, and the
+        llama-server resolved by port -- the roots own_process_pids walks.
+
+        llama-server is NOT spawned by HARTOS (it's a configured endpoint)
+        so it's never register_subprocess'd — but the agent daemon's
+        inference IS HARTOS's own work.  Without counting it as own, its
+        inference CPU reads as a foreign app and trips both the governor
+        backoff AND model_lifecycle pressure → the yield gate flaps and no
+        goal ever completes a tick (2026-05-31 idle-hour: 0 executions).
+        """
+        roots = [os.getpid()]
+        with self._lock:
+            roots.extend(self._managed_subprocesses.values())
+        _llm_pid = self._resolve_llm_server_pid()
+        if _llm_pid and _llm_pid not in roots:
+            roots.append(_llm_pid)
+        return roots
+
+    def own_process_pids(self, include_parent: bool = False) -> set:
+        """The pids of HARTOS's own process tree: this process + its
+        children + every registered managed subprocess + the llama-server
+        resolved by port + their children.  ONE definition, read by the CPU
+        attribution below and by integrations.vlm.safety, which refuses an
+        agent command that would stop any of them (#877).
+
+        ``include_parent`` adds the parent process: when HARTOS runs as a
+        child of Nunba, the parent is the app the user is looking at.
+        Empty set when psutil is unavailable.
+        """
+        psutil = _try_import_psutil()
+        if psutil is None:
+            return set()
+        own_pids = set()
+        for pid in self._own_process_roots():
+            try:
+                proc = psutil.Process(pid)
+                own_pids.add(pid)
+                for child in proc.children(recursive=True):
+                    own_pids.add(child.pid)
+            except Exception:
+                continue
+        if include_parent:
+            parent = os.getppid()
+            if parent and parent > 1:
+                own_pids.add(parent)
+        return own_pids
+
     def _get_own_cpu_usage(self) -> float:
         """Fraction (0..1 of total capacity) consumed by HARTOS's OWN
         process tree: this process + its children + every registered
@@ -1117,44 +1279,17 @@ class ResourceGovernor:
         except Exception:
             ncpu = 1
 
-        own_pids = set()
-        # Main process tree.
-        try:
-            main = self._own_proc_cache.get(os.getpid())
-            if main is None:
-                main = psutil.Process(os.getpid())
-                main.cpu_percent(None)  # prime baseline
-                self._own_proc_cache[os.getpid()] = main
-            own_pids.add(os.getpid())
-            for child in main.children(recursive=True):
-                own_pids.add(child.pid)
-        except Exception:
-            pass
-        # Registered managed-subprocess trees (hevolveai…) PLUS the
-        # llama-server resolved by port.  llama-server is NOT spawned by
-        # HARTOS (it's a configured endpoint) so it's never
-        # register_subprocess'd — but the agent daemon's inference IS
-        # HARTOS's own work.  Without counting it as own, its inference CPU
-        # reads as a foreign app and trips both the governor backoff AND
-        # model_lifecycle pressure → the yield gate flaps and no goal ever
-        # completes a tick (2026-05-31 idle-hour: 0 executions).
-        with self._lock:
-            managed = list(self._managed_subprocesses.values())
-        _llm_pid = self._resolve_llm_server_pid()
-        if _llm_pid and _llm_pid not in managed:
-            managed.append(_llm_pid)
-        for pid in managed:
-            try:
-                proc = self._own_proc_cache.get(pid)
-                if proc is None:
+        # Roots are primed here so they count from this tick; a child first
+        # seen below is primed there and counts from the next tick.
+        for pid in self._own_process_roots():
+            if pid not in self._own_proc_cache:
+                try:
                     proc = psutil.Process(pid)
                     proc.cpu_percent(None)  # prime baseline
                     self._own_proc_cache[pid] = proc
-                own_pids.add(pid)
-                for child in proc.children(recursive=True):
-                    own_pids.add(child.pid)
-            except Exception:
-                self._own_proc_cache.pop(pid, None)
+                except Exception:
+                    continue
+        own_pids = self.own_process_pids()
 
         total_pct = 0.0
         for pid in own_pids:
@@ -1418,7 +1553,10 @@ class ResourceGovernor:
     def _calculate_throttle(self) -> float:
         """Combine all signals into a single throttle factor 0.0 - 1.0.
 
-        ACTIVE mode:  0.05 — bare minimum for event processing
+        ACTIVE mode:  ACTIVE_CPU_LIMIT (0.50 by default; HEVOLVE_ACTIVE_CPU_LIMIT)
+                      NOTE this is ABOVE the yield gate's 0.3 floor, so the
+                      gate does not learn "person at the desk" from here;
+                      it asks user_present() for that.
         IDLE + low CPU: 1.0 — full speed
         IDLE + moderate CPU: 0.5
         SLEEP: 0.0 — suspend everything
@@ -1430,7 +1568,7 @@ class ResourceGovernor:
             return 0.0
 
         if mode == MODE_ACTIVE:
-            return ACTIVE_CPU_LIMIT  # 0.05
+            return ACTIVE_CPU_LIMIT  # 0.50 by default, see the docstring
 
         # IDLE mode — scale based on current resource usage.  Use EXTERNAL
         # cpu (total - HARTOS's own tree): scaling on total here would make

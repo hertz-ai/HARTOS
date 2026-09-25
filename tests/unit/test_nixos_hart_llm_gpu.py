@@ -115,6 +115,16 @@ def test_cpu_inference_does_not_starve_the_os():
     assert "CPUWeight = 50" in _CODE, (
         "hart-llm CPUWeight must be BELOW the UI services' default 100 (was 150 = above "
         "it, so CPU inference out-prioritised and stalled the desktop).")
+    # A weight is compared only against siblings in the SAME slice. Measured on
+    # the box 2026-09-23: hart-llm sat in system.slice, so its 50 was never
+    # compared with the shell at all, and the session versus inference share was
+    # decided at the root, 100 to 100. Under hart-agents.slice (40) it is bound
+    # by hart-session.slice (200, holding hart-liquid-ui; hart-kernel.nix), so
+    # the desk wins a contended core. Coordinator decision the same day.
+    assert 'Slice = "hart-agents.slice"' in _CODE, (
+        "hart-llm must run in hart-agents.slice: in system.slice its CPUWeight is "
+        "compared with unrelated units and the session-over-agents ratio in "
+        "hart-kernel.nix never binds against llama-server.")
     # The real bound is core affinity, pinned by the launcher.
     assert "taskset" in _CODE, (
         "the launcher must PIN inference with taskset -- CPUWeight alone does not bound "

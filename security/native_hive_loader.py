@@ -14,8 +14,13 @@ Architecture:
            │   ├─ Installed: pip install hevolveai-0.1.0-cp311-cp311-linux_x86_64.whl
            │   └─ Imported via: import hevolveai (standard Python import)
            │
-           ├─ FALLBACK: Native binary via ctypes (Rust hevolveai_topo)
-           │   ├─ .so (Linux) / .dll (Windows) / .dylib (macOS)
+           ├─ FALLBACK: Native binary via ctypes (_PLATFORM_LIB below)
+           │   ├─ libhevolve_ai.so (Linux) / hevolve_ai.dll (Windows) /
+           │   │   libhevolve_ai.dylib (macOS), found via _SEARCH_PATHS
+           │   ├─ No build step produces it today and no install ships it
+           │   │   (checked 2026-09-23), so in practice this path finds
+           │   │   nothing and load falls through to STUB.  It is NOT the
+           │   │   Rust hevolveai_topo backend, which has never shipped.
            │   ├─ Signed by master key — tampered binaries rejected
            │   └─ Exposed via C ABI + Python ctypes wrapper
            │

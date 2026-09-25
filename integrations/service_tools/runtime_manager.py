@@ -528,7 +528,18 @@ class RuntimeToolManager:
             # the first agent call would have taken a ConnectionRefused on
             # a tool the manager had just reported as running.  Wait for
             # the socket to accept before anyone is told the port.
-            self._wait_for_listen(tool_name, port, proc)
+            listening = self._wait_for_listen(tool_name, port, proc)
+            # A child that EXITED is dead, whatever it announced: never
+            # register, book or report it as running.  This call used to
+            # discard the answer (review finding on 38ddbd82e), so a sidecar
+            # that crashed after PORT= came back {'running': True} with a
+            # dead URL in the registry.  A child still ALIVE after the
+            # timeout keeps the documented behaviour (register anyway,
+            # health check reports it unhealthy): a slow `import torch`
+            # must not get a healthy sidecar reaped.
+            if not listening and proc.poll() is not None:
+                return {'error': f'{tool_name} exited (rc={proc.returncode}) '
+                                 f'before listening on port {port}'}
 
             with self._lock:
                 self._processes[tool_name] = proc

@@ -94,16 +94,21 @@ class HealthRoundBudgetTest(unittest.TestCase):
             elapsed = time.time() - t0
         return pinged['n'], elapsed, pd
 
+    # Pings run 8 to a batch (HEVOLVE_HEALTH_PING_WORKERS) and the budget is
+    # checked between batches, so a cut lands on a batch boundary: 0.2s pings
+    # under a 0.3s budget give exactly two batches, 16 of 40 rows.
+
     def test_round_yields_at_the_budget(self):
-        """40 peers x 0.05s would be 2s; a 0.3s budget must cut it short."""
-        n, elapsed, _ = self._run(n_peers=40, budget=0.3, ping_cost=0.05)
+        """40 peers x 0.2s would be 8s serial, 1s in batches; a 0.3s budget
+        must still cut it short."""
+        n, elapsed, _ = self._run(n_peers=40, budget=0.3, ping_cost=0.2)
         self.assertLess(elapsed, 1.5,
                         'health round ran past its budget and would starve integrity')
         self.assertLess(n, 40, 'every peer was pinged despite the budget')
 
     def test_cursor_advances_so_coverage_rotates(self):
         """A budget cut must not re-check the same prefix forever."""
-        _, _, pd = self._run(n_peers=40, budget=0.3, ping_cost=0.05)
+        _, _, pd = self._run(n_peers=40, budget=0.3, ping_cost=0.2)
         self.assertGreater(getattr(pd, '_health_cursor', 0), 0,
                            'cursor did not advance; the tail is never reached')
 
@@ -111,6 +116,208 @@ class HealthRoundBudgetTest(unittest.TestCase):
         """A node with few peers must still do a full pass."""
         n, elapsed, _ = self._run(n_peers=3, budget=30, ping_cost=0.01)
         self.assertEqual(n, 3)
+
+    def test_a_batch_is_probed_concurrently(self):
+        """Serial probing visited 3-5 rows per 30s window on central (a 3s
+        connect timeout per unroutable private address), so ~1,000 junk rows
+        took hours to age out.  16 peers at 0.25s each is 4s serial; two
+        batches of 8 must finish in well under that, and every peer must still
+        be pinged."""
+        n, elapsed, _ = self._run(n_peers=16, budget=30, ping_cost=0.25)
+        self.assertEqual(n, 16, 'a peer was skipped')
+        self.assertLess(elapsed, 2.0,
+                        'pings ran one after another: %.2fs for 16 x 0.25s' % elapsed)
+
+
+class SelfAliasPurgeTest(unittest.TestCase):
+    """A row whose address answers as THIS node is dropped, not kept alive.
+
+    Measured on central 2026-09-22: 378 non-dead loopback rows
+    (http://localhost:5000 x184, http://localhost:6777 x183), each a distinct
+    node_id that some remote node once advertised as its own localhost.  From
+    inside central's container those addresses are central itself, so every
+    ping succeeded, the age logic re-stamped them 'active' forever, and the
+    integrity round audited and challenged central as a peer of itself (the
+    133 'passed' rows per pass).  is_unroutable_peer_url keeps loopback on
+    purpose (co-located nodes on distinct ports are real), so the address
+    cannot decide; the node_id in the health answer can.
+    """
+
+    class _Resp:
+        def __init__(self, node_id):
+            self.status_code = 200
+            self._node_id = node_id
+
+        def json(self):
+            return {'node_id': self._node_id, 'status': 'ok'}
+
+    def _run(self, rows):
+        """``rows``: (node_id the row claims, url, node_id the health endpoint
+        at that url answers with; None for an older node's answer)."""
+        answers = {url: responder for _, url, responder in rows}
+        pd = GossipProtocol.__new__(GossipProtocol)
+        pd._running = True
+        pd.node_id = 'self'
+        pd.dead_threshold = 900
+        pd.stale_threshold = 300
+        pd._health_cursor = 0
+        pd._peer_backoff = type('B', (), {
+            'prune_expired': lambda s: None,
+            'is_backed_off': lambda s, url: False,
+            'record_success': lambda s, url: None,
+            'record_failure': lambda s, url: None,
+        })()
+        pd._heartbeat = lambda: None
+
+        peers = [_Peer(i) for i in range(len(rows))]
+        for p, (node_id, url, _) in zip(peers, rows):
+            p.node_id = node_id
+            p.url = url
+        deleted = []
+        calls = {'n': 0}
+
+        class _Q:
+            def __init__(self, rows): self._rows = rows
+            def filter(self, *a, **k): return self
+            def all(self): return self._rows
+            def first(self): return None
+
+        class _DB:
+            def query(self, *a, **k):
+                calls['n'] += 1
+                return _Q(peers if calls['n'] == 1 else [])
+            def delete(self, row): deleted.append(row)
+            def commit(self): pass
+            def rollback(self): pass
+            def close(self): pass
+
+        def fake_get(url, **kw):
+            base = url.rsplit('/api/social/peers/health', 1)[0]
+            return self._Resp(answers[base])
+
+        with patch('integrations.social.models.get_db', return_value=_DB()), \
+             patch('integrations.social.peer_discovery.pooled_get', fake_get), \
+             patch('integrations.social.peer_discovery.is_unroutable_peer_url',
+                   return_value=(False, '')):
+            os.environ['HEVOLVE_HEALTH_ROUND_BUDGET_S'] = '30'
+            pd._health_check_round()
+        return peers, deleted
+
+    def test_row_answering_as_self_is_deleted_and_a_real_peer_kept(self):
+        peers, deleted = self._run([
+            ('alias-1', 'http://localhost:5000', 'self'),       # central, seen as a peer
+            ('node-1', 'https://node1.example.net', 'node-1'),  # a real remote node
+        ])
+        self.assertEqual([p.url for p in deleted], ['http://localhost:5000'],
+                         'the self-alias row was not the one deleted')
+        real = [p for p in peers if p.url == 'https://node1.example.net'][0]
+        self.assertEqual(real.status, 'active')
+        self.assertIsNotNone(real.last_seen, 'a real reachable peer must be stamped seen')
+
+    def test_row_whose_address_answers_as_another_node_is_deleted(self):
+        """A reinstall on the same host:port mints a fresh identity; the old
+        rows then answer their pings AS the new node and would stay 'active'
+        forever, holding the host at the per-host cap.  Measured on central
+        2026-09-22: five dead identities of the office desktop, all answering
+        as its live sixth (46329c87), kept the live one refused until the cap
+        stopped counting them."""
+        peers, deleted = self._run([
+            ('old-id-1', 'http://192.168.0.165:5000', 'new-id'),
+            ('new-id', 'http://192.168.0.165:5000', 'new-id'),
+        ])
+        self.assertEqual([p.node_id for p in deleted], ['old-id-1'],
+                         'the zombie row was not the one deleted')
+        live = [p for p in peers if p.node_id == 'new-id'][0]
+        self.assertEqual(live.status, 'active')
+
+    def test_reachable_row_without_a_node_id_is_kept(self):
+        """An older node's health answer may carry no node_id; that is not
+        evidence of a stale row, so the row is treated as reachable."""
+        peers, deleted = self._run([('node-2', 'https://node2.example.net', None)])
+        self.assertEqual(deleted, [])
+        self.assertEqual(peers[0].status, 'active')
+
+
+class DeadRowReprobeTest(unittest.TestCase):
+    """The dead-row re-probe applies the same identity rule as the main loop.
+
+    e7c87ddc0 and 5fe8f8901 added the "answers as another node -> delete"
+    guard at two sites: the main health loop and the re-probe of 'dead' rows.
+    Only the main-loop site had a test; a reviewer mutated the dead-row site
+    to `if False:` and this file stayed green (2026-09-23 review ring). A
+    regression there revives a dead row whose address now belongs to another
+    node, reopening #62 on exactly the path that re-probes dead rows every
+    round.
+    """
+
+    class _Resp:
+        def __init__(self, node_id):
+            self.status_code = 200
+            self._node_id = node_id
+
+        def json(self):
+            return {'node_id': self._node_id, 'status': 'ok'}
+
+    def _run(self, row_node_id, responder):
+        pd = GossipProtocol.__new__(GossipProtocol)
+        pd._running = True
+        pd.node_id = 'self'
+        pd.dead_threshold = 900
+        pd.stale_threshold = 300
+        pd._health_cursor = 0
+        pd._peer_backoff = type('B', (), {
+            'prune_expired': lambda s: None,
+            'is_backed_off': lambda s, url: False,
+            'record_success': lambda s, url: None,
+            'record_failure': lambda s, url: None,
+        })()
+        pd._heartbeat = lambda: None
+
+        dead = _Peer(7)
+        dead.node_id = row_node_id
+        dead.url = 'https://node7.example.net'
+        dead.status = 'dead'
+        deleted = []
+
+        class _Q:
+            def __init__(self, kind): self._kind = kind
+            def filter(self, *a, **k): return self
+            def all(self):
+                # main active/stale query: nothing; dead-id query: our row
+                return [(dead.id,)] if self._kind == 'ids' else []
+            def first(self): return dead
+
+        class _DB:
+            def query(self, what, *a, **k):
+                # db.query(PeerNode.id) selects the dead ids; every other
+                # query is the main loop or the per-id fetch.
+                return _Q('ids' if getattr(what, 'key', None) == 'id' else 'rows')
+            def delete(self, row): deleted.append(row)
+            def commit(self): pass
+            def rollback(self): pass
+            def close(self): pass
+
+        with patch('integrations.social.models.get_db', return_value=_DB()), \
+             patch('integrations.social.peer_discovery.pooled_get',
+                   lambda url, **kw: self._Resp(responder)), \
+             patch('integrations.social.peer_discovery.is_unroutable_peer_url',
+                   return_value=(False, '')):
+            os.environ['HEVOLVE_HEALTH_ROUND_BUDGET_S'] = '30'
+            pd._health_check_round()
+        return dead, deleted
+
+    def test_dead_row_answering_as_another_node_is_deleted_not_revived(self):
+        dead, deleted = self._run('old-identity', 'new-identity')
+        self.assertEqual(deleted, [dead],
+                         'a dead row whose address answers as another node '
+                         'was not deleted')
+        self.assertEqual(dead.status, 'dead', 'it was revived instead')
+
+    def test_dead_row_answering_as_itself_is_revived(self):
+        """Preservation: a dead peer that comes back as itself is revived."""
+        dead, deleted = self._run('peer-7', 'peer-7')
+        self.assertEqual(deleted, [])
+        self.assertEqual(dead.status, 'active')
 
 
 class BudgetWiringTest(unittest.TestCase):

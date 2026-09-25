@@ -455,6 +455,7 @@ class TestVoteRanking(unittest.TestCase):
                 'weighted_score': scores.get(exp_id, 0),
                 'total_for': 8.0,
                 'total_against': 2.0,
+                'quorum_met': True,
             }
 
         with patch('integrations.social.models.get_db') as mock_db:
@@ -538,8 +539,10 @@ class TestVoteGateFailsClosed(unittest.TestCase):
         session = EvolveSession(status='selecting')
 
         tallies = {
-            'yes': {'weighted_score': 0.9, 'total_for': 9, 'total_against': 1},
-            'no': {'weighted_score': 0.9, 'total_for': 1, 'total_against': 9},
+            'yes': {'weighted_score': 0.9, 'total_for': 9, 'total_against': 1,
+                    'quorum_met': True},
+            'no': {'weighted_score': 0.9, 'total_for': 1, 'total_against': 9,
+                   'quorum_met': True},
         }
         db = MagicMock()
         context = MagicMock()

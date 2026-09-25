@@ -45,6 +45,16 @@ on:
   workflow_call:
   # Manual full run (e.g. to validate a tricky branch before opening a PR).
   workflow_dispatch:
+    inputs:
+      nixos_tests_regardless:
+        description: >-
+          Run the nixosTests shards even if the Python shards are red. The
+          shards are sequenced after Python to save four runner-hours on a
+          dead gate, but Python has been red on every run since 2026-08-14,
+          so the VM fleet has not executed once in six weeks and has no
+          verdict at all. Dispatch with this on to get one.
+        type: boolean
+        default: false
   # NIGHTLY ON MAIN — because nothing else gates main (2026-08-03).
   #
   # This workflow runs on pull_request, workflow_call (from release.yml) and
@@ -205,7 +215,24 @@ jobs:
           # patch-time. Tracked non-blocking.
           set -eo pipefail
           # Deterministic file sharding — sorted, then round-robin.
-          mapfile -t ALL < <(find tests/unit tests/functional -name 'test_*.py' | sort)
+          #
+          # THE ROOT OF tests/ IS GATED TOO (2026-09-24). 70 test_*.py files
+          # sat directly under tests/ (the social phases 7 to 9, the mailing
+          # list, the supervisors, the security modules, the goal consent
+          # gate, 963 tests) and this find never looked there, so they ran in
+          # no CI job at all. Running every one of them per file on the dev
+          # box found eight red, all stale in the way an ungated test goes
+          # stale: helpers shadowed, dates hard-coded, a gate the code grew
+          # that the test never learned about. Each is fixed or given a
+          # documented skip in the same change. -maxdepth 1 keeps the root
+          # pass to the root: integration/ and e2e/ stay best-effort below,
+          # and standalone/ is conftest-excluded by design (live-server
+          # proof scripts with module-level sys.exit, run by hand and cited
+          # in VERIFICATION.md). tests/meta (the DRY audit) and tests/probes
+          # (the OS pillar proofs) are gated with the same line for the same
+          # reason: both were green and both were being run by nobody.
+          mapfile -t ALL < <({ find tests -maxdepth 1 -name 'test_*.py'; \
+                               find tests/unit tests/functional tests/meta tests/probes -name 'test_*.py'; } | sort)
           TOTAL=${#ALL[@]}
           echo "discovered $TOTAL test files"
           if [[ "$TOTAL" -eq 0 ]]; then
@@ -456,6 +483,119 @@ jobs:
         working-directory: compositor
         run: cargo test --features winit --all-targets --verbose
 
+  # ─── Compositor: the END TO END smoke, nested in a headless Wayland host ───
+  # compositor/tests/smoke_e2e.rs is the only proof that the SHIPPED binary
+  # boots, binds its sockets, maps a real client, arranges it over the IPC and
+  # serves a screencopy frame. Its header says "the CI job runs it explicitly
+  # with `--features winit -- --ignored`", and until 2026-09-24 no job did:
+  # every workflow compiled it (--all-targets above) and skipped it, so the
+  # moat's end to end proof had never run anywhere but a developer's WSLg.
+  #
+  # The host is weston's headless backend (the header names exactly that), with
+  # the pixman renderer so nothing here needs a GPU; hart-comp itself renders
+  # through mesa's llvmpipe (LIBGL_ALWAYS_SOFTWARE, which main.rs also reads as
+  # the software-render allowance). weston ships the trivial clients the test
+  # and hart-comp's auto-client look for (weston-terminal, weston-simple-shm);
+  # foot and grim come from the same apt line. The apt list below is the winit
+  # step's list plus the RUNTIME halves (EGL, GLES, wayland-egl, the DRI
+  # drivers) that `cargo test` never needed because it never launched the
+  # binary.
+  #
+  # Two things the test's own header does not say and this job must:
+  #   * `--test-threads=1`. Both #[ignore]d tests spawn their own hart-comp,
+  #     and every hart-comp binds the SAME `$XDG_RUNTIME_DIR/hart-comp.sock`.
+  #     Run in parallel they would race for one socket and the second would
+  #     talk to the first's compositor. Serial is the only correct mode.
+  #   * a self-skip is a FAILURE here. Off a Wayland host the tests print
+  #     `SKIP smoke_e2e:` and return Ok, which is the right manners on a bare
+  #     developer box and a lie in a gate: green with nothing proven. The step
+  #     greps the captured output and fails on that marker, so a broken host
+  #     setup reads as red, never as "passed".
+  #
+  # NON-BLOCKING ON ITS FIRST RUNS (continue-on-error). This job has never
+  # executed, so its first verdicts are about the host recipe as much as the
+  # compositor. Flip `continue-on-error` to false once it has passed twice on
+  # main; a red after that is a compositor regression and blocks the release.
+  compositor-smoke-e2e:
+    name: Compositor smoke E2E (hart-comp nested in weston headless)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    continue-on-error: false  # blocking since 2026-09-24: passed on its first three runs (35911822681, 35911836772, 35912938984)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          cargo --version && rustc --version
+
+      - name: System deps (build + runtime) and the headless Wayland host
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev libseat-dev libinput-dev libxkbcommon-dev libwayland-dev \
+            libpixman-1-dev libgbm-dev \
+            libegl1 libgles2 libwayland-egl1 libgl1-mesa-dri libegl-mesa0 \
+            weston foot grim
+          weston --version
+          for c in weston-terminal weston-simple-shm foot grim; do
+            command -v "$c" || echo "::warning::$c not on PATH"
+          done
+
+      - name: Build the winit hart-comp and the smoke test binary
+        working-directory: compositor
+        run: cargo test --features winit --test smoke_e2e --no-run
+
+      - name: Start weston headless and run the smoke E2E
+        working-directory: compositor
+        env:
+          XDG_RUNTIME_DIR: /tmp/hart-xdg
+          WAYLAND_DISPLAY: wayland-ci
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          WLR_RENDERER_ALLOW_SOFTWARE: '1'
+          RUST_LOG: info
+          RUST_BACKTRACE: '1'
+        run: |
+          set -eo pipefail
+          mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+          weston --backend=headless --renderer=pixman --socket="$WAYLAND_DISPLAY" \
+                 --idle-time=0 --width=1280 --height=800 \
+                 --log=/tmp/weston.log &
+          WESTON_PID=$!
+          for i in $(seq 1 50); do
+            [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && break
+            sleep 0.2
+          done
+          if [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+            echo "::error::weston never bound $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+            cat /tmp/weston.log || true
+            exit 1
+          fi
+          echo "weston headless up (pid $WESTON_PID) on $WAYLAND_DISPLAY"
+          set +e
+          cargo test --features winit --test smoke_e2e -- \
+            --ignored --test-threads=1 --nocapture 2>&1 | tee /tmp/smoke_e2e.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          kill "$WESTON_PID" 2>/dev/null || true
+          if grep -q 'SKIP smoke_e2e' /tmp/smoke_e2e.log; then
+            echo "::error::smoke_e2e self-skipped: the host recipe is broken, and a"
+            echo "::error::skip in a gate is not a pass. See the SKIP line above."
+            exit 1
+          fi
+          if ! grep -qE '^test result: ok\. [1-9][0-9]* passed' /tmp/smoke_e2e.log; then
+            echo "::error::smoke_e2e ran zero tests or did not report; rc=$rc"
+            exit 1
+          fi
+          exit "$rc"
+
+      - name: Host log on failure
+        if: failure()
+        run: |
+          echo "## weston headless log"; cat /tmp/weston.log 2>/dev/null || echo "(none)"
+          echo "## sockets in XDG_RUNTIME_DIR"; ls -la /tmp/hart-xdg 2>/dev/null || true
+
   # ─── Compositor: the SMITHAY (DRM) feature set, built + tested in Nix ───────
   compositor-nix:
     name: Compositor nix build (smithay feature + cargo test via doCheck)
@@ -531,6 +671,25 @@ jobs:
     # green path pays ~8 min of added latency; every red-python push saves
     # the VM fleet entirely.
     needs: unit-tests
+    # THE SEQUENCING HAD A COST NOBODY MEASURED (2026-09-24). `needs` skips
+    # this job whenever a Python shard is red, and a Python shard has been red
+    # on every nightly, PR and release run since the sequencing landed on
+    # 2026-08-14: the last time any nixosTests shard EXECUTED was the manual
+    # dispatch of 2026-08-10 (run 31377165213: shard 1 green, shards 0/2/3
+    # red). Every VM test fix since then, and the OTA and session-supervisor
+    # tests added since, has run on no runner. A gate that is skipped for six
+    # weeks is the same as no gate, and it is exactly why VERIFICATION.md row
+    # 9 has no passing run to cite.
+    #
+    # The saving is real and stays the default. The override is a dispatch
+    # input, so a human can ask for the fleet's verdict on purpose and pay
+    # the four runner-hours knowingly. `always()` is required, because without
+    # it a failed `needs` skips the job before `if` is evaluated.
+    if: >-
+      always() && (
+        needs.unit-tests.result == 'success' ||
+        (github.event_name == 'workflow_dispatch' && inputs.nixos_tests_regardless)
+      )
     # Each shard runs ~1/4 of the checks (+ the shared closure build once). 5h
     # budget leaves wide headroom under the 6h cap even on a cold cache.
     timeout-minutes: 300

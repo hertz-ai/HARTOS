@@ -569,3 +569,44 @@ def record_metered_usage(node_id: str, model_id: str, task_source: str,
     except Exception as e:
         logger.debug(f"Metered usage recording failed: {e}")
         return None
+
+
+def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
+                   task_source: str = 'own', goal_id: str = None,
+                   requester_node_id: str = None) -> Optional[str]:
+    """Meter ONE completed LLM call through record_metered_usage.
+
+    Derives the two arguments callers could not supply correctly: this node's
+    node_id, and cost_per_1k in USD from the ONE price source (spark_per_1k,
+    0 for local and free-tier models, divided by HEVOLVE_SPARK_PER_USD, the
+    same rate record_metered_usage converts back with). Both production
+    callers had passed keywords record_metered_usage does not accept
+    (user_id/model/prompt_tokens/... and provider/model/tokens/...), so every
+    call raised TypeError: the coding adapter lost every completion to it and
+    the SDK proxy swallowed it and metered nothing (hevolveai Master 11.435
+    S1/S2). task_source is 'own' | 'hive' | 'idle' (MeteredAPIUsage column);
+    anything but 'own' is settled by the revenue aggregator.
+
+    Never raises: metering must not break the call it meters.
+    """
+    try:
+        node_id = os.environ.get('HEVOLVE_NODE_ID', '')
+        if not node_id:
+            try:
+                from security.node_integrity import get_node_identity
+                node_id = get_node_identity().get('node_id', '')
+            except Exception:
+                node_id = ''
+        if _is_local_model():
+            usd_per_1k = 0.0
+        else:
+            spark_per_usd = float(os.environ.get('HEVOLVE_SPARK_PER_USD', '100') or 100)
+            usd_per_1k = spark_per_1k(_resolve_model_name(model)) / max(spark_per_usd, 1e-9)
+        return record_metered_usage(
+            node_id=node_id or 'local', model_id=model or 'unknown',
+            task_source=task_source, tokens_in=int(tokens_in or 0),
+            tokens_out=int(tokens_out or 0), cost_per_1k=usd_per_1k,
+            goal_id=goal_id, requester_node_id=requester_node_id)
+    except Exception as e:
+        logger.warning(f"LLM metering failed (the call itself is unaffected): {e}")
+        return None

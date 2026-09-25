@@ -346,18 +346,14 @@ class UpgradeOrchestrator:
             # Capture new snapshot
             registry.capture_snapshot(version, git_sha, tier='fast')
 
-            # Find previous version
-            snapshots = sorted(
-                [f for f in os.listdir(BENCHMARK_DIR)
-                 if f.endswith('.json') and f != f'{version}.json'],
-                key=lambda x: os.path.getmtime(
-                    os.path.join(BENCHMARK_DIR, x)),
-                reverse=True)
-
-            if not snapshots:
+            # Find previous version. The registry owns "which snapshot came
+            # before" (previous_version: newest other snapshot by mtime, the
+            # rule this stage used to apply inline), shared with
+            # auto_deploy_service so the two gates cannot drift apart.
+            prev_version = registry.previous_version(version)
+            if prev_version is None:
                 return True, 'no baseline snapshot for comparison'
 
-            prev_version = snapshots[0].replace('.json', '')
             safe, reason = registry.is_upgrade_safe(prev_version, version)
             if not safe:
                 return False, reason

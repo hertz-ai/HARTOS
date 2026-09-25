@@ -778,6 +778,29 @@ def test_a_failed_launch_is_retried_after_the_cooldown():
         'captioning stayed dead after one failed launch (#102)')
 
 
+def test_a_wedged_server_is_stopped_before_another_is_launched():
+    """hartos-3a F7: after the cooldown a retry launched a second
+    llama-server while the first -- alive but never serving -- kept running,
+    and its log handle leaked.  One process at a time."""
+    from unittest.mock import MagicMock
+    from integrations.vision.lightweight_backend import Qwen08BBackend
+
+    backend = Qwen08BBackend(port=59997)
+    backend.is_available = lambda: False
+    wedged = MagicMock(pid=4321)
+    wedged.poll.return_value = None
+    log = MagicMock()
+    backend._server_proc, backend._log_fh = wedged, log
+    backend._launch_attempted = True
+    backend._launch_attempted_at -= (backend.LAUNCH_RETRY_S + 1)
+
+    backend._ensure_running()
+
+    assert wedged.terminate.called or wedged.kill.called, (
+        'relaunched over a process that was still running')
+    assert log.close.called, 'the first log handle leaked'
+
+
 def test_the_cooldown_is_not_a_permanent_latch():
     """A guard on the mechanism itself, since the defect was its permanence."""
     from integrations.vision.lightweight_backend import Qwen08BBackend

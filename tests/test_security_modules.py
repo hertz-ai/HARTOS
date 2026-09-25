@@ -37,8 +37,15 @@ class TestJWTManagerInit:
         with pytest.raises(RuntimeError, match="weak or default"):
             JWTManager(secret_key='secret')
 
-    def test_empty_secret_rejected(self):
+    def test_empty_secret_rejected(self, monkeypatch):
+        """An explicit '' is falsy, so __init__ falls through to the loader
+        (env, vault, then the on-disk social key). On a box that has minted a
+        social key the loader finds one and nothing is rejected, which made
+        this test's verdict depend on the machine. Hold the loader empty so
+        the contract under test, "no secret anywhere is refused", is what
+        runs."""
         from security.jwt_manager import JWTManager
+        monkeypatch.setattr(JWTManager, '_load_secret_key', staticmethod(lambda: ''))
         with pytest.raises(RuntimeError, match="weak or default"):
             JWTManager(secret_key='')
 

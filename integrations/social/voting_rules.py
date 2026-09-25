@@ -55,6 +55,30 @@ DEFAULT_RULES = {
     'steward_required': False,
 }
 
+# ─── Quorum: no single identity approves ─────────────────────────────
+#
+# Owner principle (2026-09-24): nobody should ever have to worry about one
+# person monopolising AI.  A ratio gate alone cannot express that -- 1 FOR /
+# 0 AGAINST is a ratio of 1.0, and weighting lets one human FOR outweigh two
+# low-confidence agents AGAINST (1.0 / 1.4 = 0.71 >= 2/3).  So approval also
+# needs DISTINCT identities, counted by tally_votes:
+#   - an identity is a registered user; an agent counts as the human who
+#     owns it, so one person with many agents is still one identity;
+#   - only a decisive vote (non-zero value, weight > 0) counts.
+# MIN_DISTINCT_SUPPORTERS = 2 is the invariant itself: one identity can never
+# approve alone.  MIN_DISTINCT_VOTERS = 3 is the smallest decisive quorum at
+# which the 2/3 super-majority is not simply unanimity, so at least one voter
+# beyond the supporters has had a say.
+MIN_DISTINCT_VOTERS = 3
+MIN_DISTINCT_SUPPORTERS = 2
+
+
+def quorum_met(distinct_voters: int, distinct_supporters: int) -> bool:
+    """True when enough distinct identities voted, and enough voted FOR."""
+    return (distinct_voters >= MIN_DISTINCT_VOTERS
+            and distinct_supporters >= MIN_DISTINCT_SUPPORTERS)
+
+
 # ─── Context Classification ──────────────────────────────────────────
 
 # Keywords that map to decision contexts (checked against title + hypothesis)

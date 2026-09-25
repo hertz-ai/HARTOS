@@ -312,7 +312,7 @@ class HartWmClient:
     # takes an int ``con_id`` and a command string. The public signature and
     # the returned shape are identical either way, so nothing above this line
     # knows which compositor answered.
-    def subscribe_events(self, on_event) -> bool:
+    def subscribe_events(self, on_event, on_close=None) -> bool:
         """Listen for unsolicited compositor events, calling ``on_event(dict)`` per frame.
 
         The compositor has had an event fan-out (`events.subscribe`, IPC_PROTOCOL §4.10)
@@ -330,6 +330,15 @@ class HartWmClient:
         `on_event` runs ON THIS THREAD, so it must be quick and must not raise. Anything
         it throws is swallowed and logged rather than killing the listener, because losing
         the subscription would silently make the native desktop unclickable again.
+
+        `on_close`, if given, runs once on the same thread after the socket has closed,
+        for whatever reason it closed. That is the hook a caller needs to re-listen,
+        and it exists because of what the box showed on 2026-09-22: the subscription
+        goes THROUGH the root relay (HART_COMP_SOCK), whose per-connection unit is
+        capped at 60 s for one-shot queries, so the listener was killed a minute after
+        every boot and, with nobody told, was never re-established. A compositor
+        restart ends here the same way. The pump does not reconnect on its own; the
+        caller decides, and this is how it finds out.
         """
         if not hasattr(socket, 'AF_UNIX'):
             return False
@@ -390,13 +399,19 @@ class HartWmClient:
                 except OSError:
                     pass
                 logger.info('hart-comp event subscription closed')
+                if on_close is not None:
+                    try:
+                        on_close()
+                    except Exception as e:
+                        logger.debug('on_close raised: %s', e)
 
         t = threading.Thread(target=_pump, name='hart-comp-events', daemon=True)
         t.start()
         self._event_thread = t
         return True
 
-    def shell_compose(self, hero=None, rows=None, mood=None) -> Dict[str, Any]:
+    def shell_compose(self, hero=None, rows=None, mood=None,
+                      palette=None) -> Dict[str, Any]:
         """Hand the composed HOME payload to the compositor's native scene.
 
         The SAME payload the WebView shell consumes, over the compositor's own IPC.
@@ -424,9 +439,37 @@ class HartWmClient:
         # which is what the compositor's decoder expects too.
         if mood:
             args['mood'] = mood
+        # Optional: that id resolved to colours by the shell, which owns the
+        # palette table. The compositor decodes `palette`, not `mood`, into paint:
+        # it has no table to resolve an id against and must not grow one.
+        if isinstance(palette, dict) and palette:
+            args['palette'] = palette
         if not args:
             return {'ok': False, 'error': 'nothing to compose'}
         return self._hc('shell.compose', args)
+
+    def shell_chrome(self, chrome: Dict[str, Any]) -> Dict[str, Any]:
+        """Hand the BAR content to the compositor's native scene (IPC 4.13).
+
+        The sibling of `shell_compose`. That one carries the home the A2UI feed
+        composes; this carries what the bars show that the feed never did: the
+        clock, the tray glyphs, the notification badge, the agent cluster, the
+        taskbar chips, the start-menu state, a toast, a context menu. Same
+        producer as the WebView bar (liquid_ui_service composes both), same
+        socket, same request/response, so there is no second feed.
+
+        `chrome` is the composed dict, passed through verbatim: which keys it
+        carries IS the contract. An absent key tells the compositor the shell did
+        not compose that datum, and the compositor claims a band only when every
+        datum the band needs is present, so this must never fill a gap with an
+        empty default on the producer's behalf.
+
+        Best-effort like every verb here: no compositor, an older one without the
+        verb, or a dead socket answer `ok: False` and the WebView bar carries on.
+        """
+        if not isinstance(chrome, dict) or not chrome:
+            return {'ok': False, 'error': 'nothing to compose'}
+        return self._hc('shell.chrome', chrome)
 
     def focus_window(self, con_id: int) -> Dict[str, Any]:
         if self._backend == 'hart-comp':

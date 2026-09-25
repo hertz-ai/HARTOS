@@ -12,6 +12,7 @@ The master key's SOLE purpose is the kill switch for the distributed intelligenc
 
 import json
 import os
+import threading
 import time
 import uuid
 import logging
@@ -44,16 +45,46 @@ GRACE_PERIOD_EXPIRY = 86400 * 30    # 30 days - accept old tokens during migrati
 class TokenBlocklist:
     """In-memory token blocklist with optional Redis backend."""
 
+    # Bound on the ONE connect attempt.  Unbounded, a refused localhost
+    # connect takes 4.10 s on Windows (measured 2026-09-23), and the bound
+    # applies per address family (::1, then 127.0.0.1): 1.0 s measured as
+    # 2.04 s on first use.  With no REDIS_URL we are only PROBING localhost,
+    # where a running Redis answers in microseconds, so fail fast.  An
+    # operator-set REDIS_URL may be a LAN host: allow it a second.
+    _REDIS_PROBE_TIMEOUT_S = 0.1
+    _REDIS_CONFIGURED_TIMEOUT_S = 1.0
+
     def __init__(self):
         self._memory_blocklist: set = set()
         self._redis = None
-        self._init_redis()
+        # Connect on first USE, not at construction: the singleton below is
+        # built at import, and `security` is imported by every process
+        # (Nunba boot, each GPU worker, every test run).  Pinging an absent
+        # Redis there cost each of them 4 s before doing anything.
+        self._redis_checked = False
+        self._redis_lock = threading.Lock()
+
+    def _redis_client(self):
+        """The Redis client, or None.  Asked once per process; an absent
+        Redis is not retried per call.  The in-memory set stays
+        authoritative for this process either way, as before."""
+        if not self._redis_checked:
+            with self._redis_lock:
+                if not self._redis_checked:
+                    self._init_redis()
+                    self._redis_checked = True
+        return self._redis
 
     def _init_redis(self):
         try:
             import redis
-            redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-            self._redis = redis.from_url(redis_url, decode_responses=True)
+            configured = os.environ.get('REDIS_URL')
+            redis_url = configured or 'redis://localhost:6379/0'
+            self._redis = redis.from_url(
+                redis_url, decode_responses=True,
+                socket_connect_timeout=(self._REDIS_CONFIGURED_TIMEOUT_S
+                                        if configured
+                                        else self._REDIS_PROBE_TIMEOUT_S))
             self._redis.ping()
         except Exception:
             self._redis = None
@@ -61,7 +92,7 @@ class TokenBlocklist:
     def add(self, jti: str, expires_in: int = ACCESS_TOKEN_EXPIRY):
         """Add a token JTI to the blocklist."""
         self._memory_blocklist.add(jti)
-        if self._redis:
+        if self._redis_client():
             try:
                 self._redis.setex(f"jwt_blocklist:{jti}", expires_in, "1")
             except Exception:
@@ -71,7 +102,7 @@ class TokenBlocklist:
         """Check if a token JTI is blocked."""
         if jti in self._memory_blocklist:
             return True
-        if self._redis:
+        if self._redis_client():
             try:
                 return self._redis.exists(f"jwt_blocklist:{jti}") > 0
             except Exception:

@@ -420,6 +420,135 @@ def defer_helper_schema(helper, names):
     return removed
 
 
+def fit_schema_to_ctx(agent, protect=(), room=None):
+    """Defer tool schemas from ``agent`` until they fit the LIVE n_ctx.
+
+    The budget half of :func:`defer_helper_schema`.  That function answers
+    "drop THESE names"; a caller still has to know which names, and every
+    caller so far has answered from a static list.  This answers it from the
+    server: how much room the schema actually has right now, measured, and
+    which tools fit in it.  It does the removal THROUGH ``defer_helper_schema``
+    — one remover, so the deferral contract (execution survives on the
+    executor's ``_function_map``, ``request_tools`` is never dropped,
+    ``update_tool_signature`` keeps the client snapshot in step) holds here
+    without being restated.
+
+    WHY IT EXISTS, measured 2026-09-22 on this box (``llm_outbound.jsonl`` +
+    its ``.old`` rotation, 1,184 records).  Every HTTP 400 is
+    ``source=autogen.reuse`` — 60 of them — and every one is the HELPER seat
+    carrying 50-65 tools, while the 972 passing reuse calls are the ASSISTANT
+    seat carrying exactly the 23 of MAIN_LEG_CORE_TOOLS.  ``register_dual``
+    puts the schema on the helper, so the helper accumulates AP2 payments, A2A
+    delegation, outreach CRM, memory-graph, model-lifecycle, service and skill
+    families that the bounded assistant never sees.
+
+    But the COUNT is not the rule, and this is why the fix has to read the
+    server rather than cap a number.  The same helper bodies returned 200 all
+    morning and 400 from 08:04 onward with no code change between them:
+
+        >=50-tool bodies   04-07h: 200 x50, 500 x2      08-10h: 400 x62
+        llama_server_8080.log, started 08:04:
+            srv load_model: initializing, n_slots = 1, n_ctx_slot = 4096
+
+    The tool set is fixed at agent construction; the context moved under it,
+    and nothing in the selection path was reading it.  The wire layer knew and
+    could only complain — ``wire-trim: the TOOL SCHEMA alone is 6849 tokens
+    against an n_ctx of 4096 (60 tool(s)) ... Prune the tool list for this
+    agent`` — because by then the set has already been chosen.  This is the
+    pruning that log line asks for, at the layer that can do it.
+
+    ``room`` defaults to ``llm_outbound_logger.schema_token_room()``: the live
+    per-slot n_ctx minus the message floor the wire trim reserves.  Imported
+    rather than recomputed so the wire's floor and this ceiling are the same
+    number by construction — the precedent is
+    ``hart_intelligence_entry.py:6052``, which imports ``_trim_to_budget`` from
+    the same module for the same "one budget authority" reason.  Prompt-side
+    only; see that function for why ``max_tokens`` is not subtracted.
+
+    KEEP ORDER, most-load-bearing first, because what survives matters as much
+    as that something does:
+
+      1. ``request_tools`` — the escape that makes deferral recoverable
+         (``defer_helper_schema`` protects it whatever this function decides).
+      2. ``protect`` — the names THIS action's own recipe declares, which
+         ``attach_for_names`` attached precisely because the recipe names them.
+         Pruning them would undo the one authoritative selector.
+      3. ``MAIN_LEG_CORE_TOOLS`` — the set the leg is built around and the
+         only set the passing bodies carry.
+      4. everything else, in the order the agent already holds it (stable, so
+         two turns with the same geometry prune the same way).
+
+    Returns the set of names deferred — empty when the set already fits, when
+    the geometry cannot be read, or when the agent has no schema.  NEVER
+    raises: it runs on the per-turn dispatch path, and a token optimisation may
+    not be the reason a turn dies.
+    """
+    try:
+        block = ((getattr(agent, 'llm_config', None) or {}).get('tools')
+                 if isinstance(getattr(agent, 'llm_config', None), dict)
+                 else None)
+        if not isinstance(block, list) or not block:
+            return set()
+        from core.llm_outbound_logger import _schema_tokens, schema_token_room
+        if room is None:
+            room = schema_token_room()
+        room = int(room)
+
+        keep_first = {'request_tools'} | {str(p) for p in (protect or ()) if p}
+
+        def _rank(item):
+            idx, entry = item
+            name = ((entry.get('function') or {}).get('name')
+                    if isinstance(entry, dict) else None)
+            if name in keep_first:
+                return (0, idx)
+            if name in MAIN_LEG_CORE_TOOLS:
+                return (1, idx)
+            return (2, idx)
+
+        ranked = sorted(enumerate(block), key=_rank)
+        used, kept, drop = 0, [], set()
+        for _idx, entry in ranked:
+            name = ((entry.get('function') or {}).get('name')
+                    if isinstance(entry, dict) else None)
+            cost = _schema_tokens({'tools': [entry]})
+            if used + cost <= room:
+                used += cost
+                kept.append((entry, name))
+                continue
+            if name:
+                drop.add(name)
+        # Per-entry costs are measured one entry at a time, so they miss the
+        # separators of the assembled array and come out ~0.2% OPTIMISTIC (24
+        # kept entries summed to 3072 against a real block of 3078).  A budget
+        # that is optimistic by any margin is the failure mode this function
+        # exists to end, so settle it against the REAL block and pop the
+        # lowest-priority survivors until it is true.  Usually zero iterations.
+        while kept:
+            total = _schema_tokens({'tools': [e for e, _ in kept]})
+            if total <= room:
+                used = total
+                break
+            _, name = kept.pop()
+            if name:
+                drop.add(name)
+        else:
+            used = 0
+        if not drop:
+            return set()
+        removed = defer_helper_schema(agent, drop)
+        if removed:
+            tool_logger.info(
+                "tool schema bounded to the live n_ctx: kept ~%d tok of %d "
+                "available, deferred %d tool(s) -- still executable and "
+                "re-attachable via request_tools: %s",
+                used, room, len(removed), ', '.join(sorted(removed)))
+        return removed
+    except Exception as e:
+        tool_logger.warning(f"tool schema ctx-fit skipped: {e}")
+        return set()
+
+
 def main_leg_core_tools(tools):
     """The subset of ``tools`` the main helper/assistant leg registers.
 
@@ -845,15 +974,42 @@ _DEFAULT_RECEIPT_TEMPLATE = (
 
 
 from core.game_sound_memo import (  # noqa: E402
+    GAME_STATE_DURATIONS,
     GAME_STATES,
     game_state_key,
+    game_sound_action,
     game_state_match,
+    game_state_record,
     game_state_sound,
     record_verdict,
     rejected_take,
     set_game_state_sound,
     set_game_state_sound_at,
 )
+
+
+#: How long a timed-out submit is assumed to still be queued server-side
+#: before this client will submit the same state again -- owned by the memo
+#: module, which answers "composing" with it for the node's route as well.
+from core.game_sound_memo import SUBMIT_COOLDOWN_S  # noqa: E402,F401
+
+#: A task older than this is taken as lost, not slow.  AceStep keeps its job
+#: store in memory, so a restart forgets every id, and it answers a forgotten
+#: id exactly as it answers a queued one (hartos-3a F2).  The slowest job
+#: MEASURED on a shared GPU averaged 907 s; twice that is past any real job.
+TASK_STALE_S = 1800
+
+
+def _pending_submit(games, game_id, state, level=None, user_id=None):
+    """When this state's last submit went out with no id learned, else None.
+
+    A record with 'submitted_at' and neither 'url' nor 'task_id' is a submit
+    whose reply timed out.  The ladder ignores it (nothing to play, nothing to
+    poll), so it is read at its own key."""
+    record = game_state_record(games, game_id, state, level, user_id)
+    if record.get('url') or record.get('task_id'):
+        return None
+    return record.get('submitted_at')
 
 
 def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
@@ -896,7 +1052,7 @@ def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
             shown = bool(service.agent_ui_update(user_id, {
                 'type': 'approval',
                 'agent_id': str(prompt_id),
-                'action': f'game_sound:{game_id}:{state}',
+                'action': game_sound_action(game_id, state),
                 'description': (
                     f"New {state} sound for {game_id}. Have a listen: keep "
                     f"it, or say what is wrong and I will compose another."
@@ -1186,6 +1342,8 @@ def build_core_tool_closures(ctx):
 
         try:
             from integrations.service_tools.media_agent import (
+                MEDIA_FAILED_STATUSES,
+                _reads_as_still_waking,
                 check_media_status,
                 generate_media,
             )
@@ -1194,22 +1352,41 @@ def build_core_tool_closures(ctx):
             return ("This node cannot compose music (the media capability is "
                     "not available here), so the game keeps no sound.")
 
-        def _no_composer_here(result):
-            """How to answer a failure, told apart by the module that wrote it.
+        def _failure_kind(result):
+            """Why a composer call failed, told apart by the module that wrote it.
 
             media_agent.classify_error is the reader that lives next to the
-            returns it reads (hartos-94, HARTOS 11d0aebee), and it makes a
-            distinction a prose match here could not: a node with NOTHING
-            installed should be offered an install, while an AceStep that is
-            merely not running must not be -- offering to install what is
-            already installed is its own defect.
+            returns it reads (hartos-94, HARTOS 11d0aebee), and it makes
+            distinctions a prose match here could not: a node with NOTHING
+            installed should be offered an install; an AceStep that is
+            installed and merely not running -- or will not fit beside
+            whatever holds the GPU -- must be waited for: not offered again
+            (installing what is on the disk is its own defect) and not
+            reported as a refusal.
             """
             try:
-                from integrations.service_tools.media_agent import (
-                    classify_error, ABSENT)
-                return classify_error(result) == ABSENT
+                from integrations.service_tools.media_agent import classify_error
+                return classify_error(result)
+            except Exception:
+                return None
+
+        def _no_composer_here(result):
+            try:
+                from integrations.service_tools.media_agent import ABSENT
             except Exception:
                 return False
+            return _failure_kind(result) == ABSENT
+
+        def _composer_not_up(result):
+            """Run 8, 2026-09-22: a 3 GB llama-server on the card made the
+            runtime refuse to start the composer, and this tool told the
+            agent the composer REFUSED the game's music.  Nothing was posted,
+            so nothing is remembered; the next call simply asks again."""
+            try:
+                from integrations.service_tools.media_agent import UNREACHABLE
+            except Exception:
+                return False
+            return _failure_kind(result) == UNREACHABLE
 
         def _ask_for_a_composer(why):
             """Offer to set a music model up, rather than failing quietly.
@@ -1280,13 +1457,57 @@ def build_core_tool_closures(ctx):
                 'rejected_at': rejected.get('rejected_at'),
             })
         task_id = bound.get('task_id')
+
+        def _forget_task(reason):
+            """Drop a task the composer will never finish, keep the rest.
+
+            hartos-3a F2: nothing ever cleared a dead task_id, so after a
+            composer restart this state answered "composing" for good, and
+            after a failure it answered "failed" for good; it could never be
+            composed again.  The rejection history and variant stay.
+            """
+            kept = {k: v for k, v in game_state_record(
+                        games, slot, which, level, mine).items()
+                    if k not in ('task_id', 'task_since', 'submitted_at')}
+            kept['lost_task'] = {'task_id': task_id, 'reason': reason,
+                                 'at': time.time()}
+            _remember(kept)
+
+        # A record from before task_since existed has no age to judge; it is
+        # polled as before rather than composed a second time.
+        if (task_id and bound.get('task_since')
+                and time.time() - float(bound['task_since']) > TASK_STALE_S):
+            _forget_task('no answer within TASK_STALE_S')
+            task_id = None
         try:
             if not task_id:
+                # A submit whose RESPONSE timed out may still have been
+                # ACCEPTED.  MEASURED 2026-09-22 on a live AceStep: two
+                # 'warming_up' answers, then a third submit that got an id --
+                # and /v1/stats reported FIVE jobs from this one caller
+                # (2 succeeded, 1 running, 2 queued, avg 907s each).  Every
+                # retry had enqueued a real job the client never learned the
+                # id of, and the one id it did hold sat "queued" behind its
+                # own orphans.  /release_task takes no idempotency key, so
+                # the only dedupe is here: after a timed-out submit, do not
+                # submit again for this state until a cooldown has passed.
+                _pending = _pending_submit(games, slot, which, level, mine)
+                if _pending and time.time() - _pending < SUBMIT_COOLDOWN_S:
+                    return json.dumps({
+                        'status': 'composing',
+                        'game_id': slot,
+                        'state': which,
+                        'note': ("A submission for this state may already be "
+                                 "in the composer's queue (the last one was "
+                                 "accepted but its reply timed out); waiting "
+                                 "for it rather than queueing a second."),
+                    })
                 started = json.loads(generate_media(
                     context=prompt,
                     output_modality='audio_music',
                     input_text=prompt,
-                    duration=60,
+                    # per state: a chime is two seconds, a loop is thirty (spec 3).
+                    duration=GAME_STATE_DURATIONS.get(which, 30),
                     style=mood,
                 ))
                 if started.get('status') == 'completed':
@@ -1307,7 +1528,20 @@ def build_core_tool_closures(ctx):
                     # Not a refusal: the composer is getting ready, which on
                     # a first run means downloading its model.  Saying it
                     # refused would be wrong AND would leave the game with
-                    # nothing pending to come back to.
+                    # nothing pending to come back to.  And the POST may have
+                    # been accepted: remember WHEN it went out, so the next
+                    # call waits instead of queueing a duplicate.  Written ON
+                    # TOP of what this key already holds: a take the reviewer
+                    # turned down keeps its rejected_url, its reason and its
+                    # variant, so the next call still answers them.  MEASURED
+                    # 2026-09-22 (hartos-14): replacing the record here erased
+                    # all three -- on a node restarted overnight, which is
+                    # exactly when a rejection is waiting.
+                    _remember({'mood': mood, 'prompt': prompt, 'state': which,
+                               'level': level or None, 'variant': variant,
+                               'composed_at': None, 'approved_at': None,
+                               **game_state_record(games, slot, which, level, mine),
+                               'submitted_at': time.time()})
                     return json.dumps({
                         'status': 'composing',
                         'game_id': slot,
@@ -1320,9 +1554,15 @@ def build_core_tool_closures(ctx):
                     why = str(started.get('error', 'unknown reason'))
                     if _no_composer_here(started):
                         return _ask_for_a_composer(why)
+                    if _composer_not_up(started):
+                        return (f"The composer is installed but not running "
+                                f"right now ({why}). Nothing was started; ask "
+                                f"again in a while by calling bind_game_sound "
+                                f"with the same game_id and state.")
                     return f"The composer refused this game's music: {why}"
                 task_id = started.get('task_id')
-                _remember({'task_id': task_id, 'mood': mood, 'prompt': prompt,
+                _remember({'task_id': task_id, 'task_since': time.time(),
+                           'mood': mood, 'prompt': prompt,
                            'state': which, 'level': level or None,
                            'variant': variant,
                            'previous_takes': previous_takes,
@@ -1348,11 +1588,23 @@ def build_core_tool_closures(ctx):
                                         'approved_at': None}))
                     return json.dumps({'status': 'bound', 'game_id': slot,
                                        'state': which, 'music': record})
-                if state in ('failed', 'error'):
+                if state in MEDIA_FAILED_STATUSES:
                     why = str(progress.get('error', 'unknown reason'))
+                    if progress.get('unreachable') and _reads_as_still_waking(why):
+                        # The POLL can be reset by a busy server just as the
+                        # submit can (MEASURED 2026-09-22: attempts 9-10 of a
+                        # live bind reported "failed" on ConnectionResetError
+                        # 10054 while the composer was mid-generation and went
+                        # on to finish).  Keep polling; the deadline below
+                        # still hands the task back as 'composing'.
+                        continue
                     if _no_composer_here(progress):
                         return _ask_for_a_composer(why)
-                    return f"The composer failed on this game: {why}"
+                    # the task is over: the next call composes this state again
+                    # (hartos-3a F2)
+                    _forget_task(why)
+                    return (f"The composer failed on this game: {why}. Call "
+                            f"bind_game_sound again to compose it afresh.")
             return json.dumps({
                 'status': 'composing',
                 'game_id': slot,

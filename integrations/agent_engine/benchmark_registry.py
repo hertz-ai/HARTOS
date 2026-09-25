@@ -496,6 +496,25 @@ class BenchmarkRegistry:
 
         return snapshot
 
+    def previous_version(self, exclude_version: str) -> Optional[str]:
+        """The most recently written snapshot OTHER than `exclude_version`.
+
+        The comparison partner for `is_upgrade_safe(old, new)`: the newest
+        snapshot by file mtime, which is the rule upgrade_orchestrator's
+        benchmark stage applies inline. None when no other snapshot exists,
+        which callers report as "no baseline" rather than a pass or a fail.
+        """
+        try:
+            names = [f for f in os.listdir(BENCHMARK_DIR)
+                     if f.endswith('.json') and f != f'{exclude_version}.json']
+        except OSError:
+            return None
+        if not names:
+            return None
+        names.sort(key=lambda f: os.path.getmtime(os.path.join(BENCHMARK_DIR, f)),
+                   reverse=True)
+        return names[0][:-len('.json')]
+
     def is_upgrade_safe(self, old_version: str, new_version: str) -> Tuple[bool, str]:
         """ALL fast-tier metrics must be >= old version."""
         old_file = os.path.join(BENCHMARK_DIR, f'{old_version}.json')

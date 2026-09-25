@@ -67,12 +67,43 @@ AUTOGEN_HISTORY_LIMIT: int = 50                  # message-count limit, unchange
 # (they all funnel through httpx) — the only place we can guarantee
 # zero context-overflow 500s across all frameworks.
 #
-# Env overrides:
-#   HEVOLVE_LLAMA_CTX_SIZE  — n_ctx on llama-server (must match the
-#                              --ctx-size cmdline; default tracks
-#                              Nunba/llama/llama_config.py:1527 = 12288)
-#   HEVOLVE_LLAMA_SLOTS     — concurrent slots (n_ctx is partitioned
-#                              across slots; default 1)
+# Env overrides — THE COMPLETE SET.  There are exactly two, they are owned by
+# core.llama_geometry, and that module is the only writer and the only reader:
+#
+#   HEVOLVE_LLAMA_CTX_SIZE  — n_ctx on llama-server.  core.llama_geometry
+#                              .CTX_SIZE_ENV; published by publish_geometry()
+#                              on the line above the --ctx-size it hands the
+#                              process, read by ctx_size_from_env() and by
+#                              _get_budget_per_slot() below.
+#   HEVOLVE_LLAMA_SLOTS     — concurrent slots (n_ctx is partitioned across
+#                              slots under kv_unified).  Same publisher.
+#
+# "Must match the --ctx-size cmdline" was written here as a DECLARATION and
+# nothing enforced it, which is how the fragmentation below survived until
+# 2026-09-22:
+#
+#   * integrations/service_tools/model_lifecycle.py read HEVOLVE_LLM_CTX_SIZE
+#     — one word different, no writer anywhere in either repo — so that spawn
+#     always took its 8192 literal.
+#   * integrations/service_tools/llamacpp_manager.py carried a private ladder
+#     (10240/8192/4096/2048) that could produce a value no other component
+#     could.
+#   * integrations/vision/lightweight_backend.py had the literal 512 twice.
+#
+# Three ladders and two names for one number, while the wire trimmer budgets
+# against exactly one of them.  Now: one table (core.llama_geometry.CTX_TIERS),
+# one cap (LLAMA_CTX_SIZE_DEFAULT, read via ctx_cap()), one name, and
+# tests/unit/test_source_guard_one_ctx_size_authority.py fails the build if a
+# second of any of them appears in either repo.
+#
+# NOT in that set: HART_LLM_CTX_SIZE.  It is the systemd/Nix DEPLOY spelling
+# (deploy/linux/systemd/hart-llm.service expands it in ExecStart;
+# nixos/modules/hart-llm.nix defaults it), pinned to LLAMA_CTX_SIZE_DEFAULT by
+# tests/unit/test_source_guard_llama_ctx_size_agrees.py.  systemd expands it
+# before any Python exists, so no Python reads it — renaming it would instead
+# silently break every deployed /etc/hart/hart.env, which is the failure mode
+# that guard was written for.  The invariant that keeps it from becoming a
+# second LIVE name is "no Python reader", and that is asserted.
 LLAMA_CTX_SIZE_DEFAULT: int = 12288
 LLAMA_SLOTS_DEFAULT: int = 1
 # headroom under the budget.  MUST cover the tokens llama-server ADDS when it
@@ -1293,3 +1324,8 @@ TOOL_OBSERVATION_MAX_CHARS: int = 2000
 # graph and through the group chat's write-back is bounded to it by
 # core.token_utils.bound_text, so only rows stored before the cap can be.
 MEMORY_ITEM_MAX_CHARS: int = 16000
+
+# users.user_type values that are not a person. Measured read-only in
+# hevolve_database.db 2026-09-24: human 287, guest 21, agent 285, system 1.
+# Guests are people (the desktop's own UI account is a guest).
+NON_PERSON_USER_TYPES: frozenset = frozenset({'agent', 'system'})

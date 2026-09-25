@@ -51,26 +51,63 @@ def get_data_dir() -> str:
         _cached_data_dir = hartos_dir
         return _cached_data_dir
 
-    # 3. Detect embedded HARTOS OS (systemd service, no home dir)
-    if _IS_LINUX and os.path.isfile('/etc/hartos-release'):
-        _cached_data_dir = '/var/lib/hartos'
-        return _cached_data_dir
+    # 3 + 4. Embedded HARTOS OS, else the platform default
+    _cached_data_dir = _platform_default_data_dir()
+    return _cached_data_dir
 
-    # 4. Platform defaults
+
+def _platform_default_data_dir() -> str:
+    """The data root a person's own install uses, ignoring overrides and cache."""
+    # Embedded HARTOS OS (systemd service, no home dir)
+    if _IS_LINUX and os.path.isfile('/etc/hartos-release'):
+        return '/var/lib/hartos'
     home = os.path.expanduser('~')
     if _IS_WINDOWS:
-        _cached_data_dir = os.path.join(home, 'Documents', 'Nunba')
-    elif _IS_MACOS:
-        _cached_data_dir = os.path.join(home, 'Library', 'Application Support', 'Nunba')
-    else:
-        # Linux / other Unix
-        xdg = os.environ.get('XDG_DATA_HOME', '').strip()
-        if xdg:
-            _cached_data_dir = os.path.join(xdg, 'nunba')
-        else:
-            _cached_data_dir = os.path.join(home, '.config', 'nunba')
+        return os.path.join(home, 'Documents', 'Nunba')
+    if _IS_MACOS:
+        return os.path.join(home, 'Library', 'Application Support', 'Nunba')
+    # Linux / other Unix
+    xdg = os.environ.get('XDG_DATA_HOME', '').strip()
+    if xdg:
+        return os.path.join(xdg, 'nunba')
+    return os.path.join(home, '.config', 'nunba')
 
-    return _cached_data_dir
+
+_pytest_identity_dir = None
+
+
+def get_identity_data_dir() -> str:
+    """Data root for this node's identity: node_id and key material.
+
+    Same as get_data_dir(), except under pytest when that resolves to the
+    owner's real data root. A test run then gets a per-process temp dir.
+
+    Importing integrations.social.peer_discovery builds a GossipProtocol at
+    module level, which reads and can write node_id.json. On 2026-09-23 an
+    uncommitted identity change ran that code under test and replaced the
+    owner's desktop id (46329c87, the one central had verified) with a fresh
+    one. A test that points the data dir somewhere of its own (monkeypatch,
+    NUNBA_DATA_DIR to a tmp path) is left alone; only the real root is
+    swapped out. Same shape as models.py's DB_PATH guard (828562872).
+
+    Residual: the test is "pytest is imported", so a production process that
+    imported pytest would run on a temp identity. No shipped module does;
+    tests/unit/test_identity_is_hermetic.py fails if one starts to.
+    """
+    global _pytest_identity_dir
+    data_dir = get_data_dir()
+    if 'pytest' not in sys.modules:
+        return data_dir
+    real = os.path.normcase(os.path.abspath(_platform_default_data_dir()))
+    if os.path.normcase(os.path.abspath(data_dir)) != real:
+        return data_dir
+    if _pytest_identity_dir is None:
+        import atexit
+        import shutil
+        import tempfile
+        _pytest_identity_dir = tempfile.mkdtemp(prefix='hartos_test_identity_')
+        atexit.register(shutil.rmtree, _pytest_identity_dir, ignore_errors=True)
+    return _pytest_identity_dir
 
 
 def get_db_dir() -> str:

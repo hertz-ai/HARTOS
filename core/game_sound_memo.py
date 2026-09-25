@@ -38,6 +38,48 @@ GAME_STATES = {
 }
 
 
+#: How long each state's sound should be, in seconds.  MEASURED
+#: 2026-09-22: every state -- including "a bright two-note chime for a
+#: correct answer" -- was composed at 60 seconds, because the tool asked
+#: for 60 regardless of state.  A cue that outlasts the moment it marks is
+#: worse than no cue.  bgm is a loop and may be long; everything that
+#: marks an instant is short.  Kept beside GAME_STATES so a new state gets
+#: a prompt and a length in the same place.
+GAME_STATE_DURATIONS = {
+    'bgm': 30,
+    'intro': 6,
+    'complete': 6,
+    'streak': 3,
+    'countdownEnd': 3,
+    'correct': 2,
+    'wrong': 2,
+    'starEarned': 2,
+    'matchFound': 2,
+    'cardFlip': 1,
+    'dragStart': 1,
+    'dragDrop': 1,
+    'countdownTick': 1,
+    'tap': 1,
+}
+assert set(GAME_STATE_DURATIONS) == set(GAME_STATES), (
+    'every state needs a length: ' + str(set(GAME_STATES) ^ set(GAME_STATE_DURATIONS)))
+
+
+#: How long after a submit whose reply timed out this key still counts as
+#: composing.  AceStep's own /v1/stats reported avg_job_seconds 907 on a
+#: shared GPU; the value is a floor on duplicates, not a promise about
+#: completion.  Owned here, beside the matcher that answers "composing",
+#: so the agent's tool and the node's route agree (hartos-3a F8).
+SUBMIT_COOLDOWN_S = 600
+
+
+def _submit_in_flight(record):
+    """A submit whose reply timed out, recent enough to still be queued."""
+    submitted = record.get('submitted_at')
+    return bool(submitted) and not record.get('url') and (
+        time.time() - float(submitted) < SUBMIT_COOLDOWN_S)
+
+
 def game_state_key(state, level=None, variant=None):
     """The memo key for a game's state (spec §3).
 
@@ -94,7 +136,10 @@ def game_state_match(games, game_id, state, level=None, user_id=None,
     # so a second request joins it instead of starting another
     for sounds in (mine, agent_sounds):
         record = sounds.get(level_key) or {}
-        if record.get('task_id'):
+        # A task id, OR a submit whose reply timed out and may be queued:
+        # the route used to see the second as a miss and queue a duplicate
+        # job for bgm, the very thing the cooldown exists to stop (F8).
+        if record.get('task_id') or _submit_in_flight(record):
             return record, 'composing', level_key
     return {}, 'miss', level_key
 
@@ -150,6 +195,34 @@ def set_game_state_sound(games, game_id, state, record, level=None, user_id=None
     return record
 
 
+#: What a reviewer's card names a game sound by.  agent_tools builds it with
+#: game_sound_action and the approval endpoint reads it with
+#: parse_game_sound_action -- one producer, one reader.
+GAME_SOUND_ACTION = 'game_sound:'
+
+
+def game_sound_action(game_id, state):
+    """The action a reviewer's card carries for this game's state."""
+    return f'{GAME_SOUND_ACTION}{game_id}:{state}'
+
+
+def parse_game_sound_action(action):
+    """(game_id, state) from a card's action, CASE KEPT, or None.
+
+    States are camelCase ('starEarned', 'countdownTick') and memo keys are
+    exact.  The approval endpoint lowercased the action before parsing it,
+    so a verdict on 7 of the 14 states matched nothing and never landed
+    (hartos-3a F5, CONFIRMED).  Only the prefix is compared without case.
+    """
+    text = str(action or '').strip()
+    if not text.lower().startswith(GAME_SOUND_ACTION):
+        return None
+    parts = text.split(':')
+    game_id = parts[1] if len(parts) > 1 else ''
+    state = parts[2] if len(parts) > 2 and parts[2] else 'bgm'
+    return game_id, state
+
+
 def record_verdict(games, game_id, state, approved, reason='',
                    level=None, user_id=None):
     """Mark the memo a reviewer just judged, and say which one it was.
@@ -188,14 +261,28 @@ def record_verdict(games, game_id, state, approved, reason='',
     return record, matched, write_key
 
 
+def game_state_record(games, game_id, state, level=None, user_id=None):
+    """The record at EXACTLY this key, or {} -- no ladder.
+
+    The one reader of the storage shape for every caller that needs the
+    key's own record rather than what the game would play: a take a reviewer
+    turned down (rejected_take), a submit still in flight (agent_tools'
+    _pending_submit), and the note that submit writes, which must land ON
+    TOP of whichever of those is already there.  Before this each of them
+    carried its own copy of the three lines below, and the copy in
+    agent_tools was the fourth reader of a shape this module owns.
+    """
+    slot = (games or {}).get(str(game_id), {})
+    sounds = ((slot.get('mine') or {}).get(str(user_id), {}) if user_id
+              else (slot.get('sounds') or {}))
+    return sounds.get(game_state_key(state, level)) or {}
+
+
 def rejected_take(games, game_id, state, level=None, user_id=None):
     """The take a reviewer turned down for this exact key, if any.
 
     Kept so the next composition can answer the reason they gave, and so a
     reviewer can go back to it (spec §6.1).
     """
-    slot = (games or {}).get(str(game_id), {})
-    sounds = ((slot.get('mine') or {}).get(str(user_id), {}) if user_id
-              else (slot.get('sounds') or {}))
-    record = sounds.get(game_state_key(state, level)) or {}
+    record = game_state_record(games, game_id, state, level, user_id)
     return record if record.get('rejected_at') else {}

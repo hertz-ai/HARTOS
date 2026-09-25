@@ -60,9 +60,14 @@ def bridge(monkeypatch):
     return wmb, b, posts
 
 
-def _consent(monkeypatch, value):
+_NO_ROW = object()
+
+
+def _consent(monkeypatch, value, user_type='human'):
     """Install a fake integrations.social consent surface returning `value`
-    (or raising when value is an exception)."""
+    (or raising when value is an exception).  The users table holds one row
+    of `user_type` for any id, or none when user_type is _NO_ROW (live
+    values: human, guest, agent, system)."""
     cs = types.ModuleType('integrations.social.consent_service')
 
     class ConsentService:
@@ -75,12 +80,35 @@ def _consent(monkeypatch, value):
     cs.ConsentService = ConsentService
     models = types.ModuleType('integrations.social.models')
 
+    class User:
+        pass
+
+    class _Row:
+        pass
+    row = None
+    if user_type is not _NO_ROW:
+        row = _Row()
+        row.user_type = user_type
+
+    class _Q:
+        def filter_by(self, **kw):
+            return self
+
+        def first(self):
+            return row
+
+    class _Db:
+        def query(self, model):
+            assert model is User
+            return _Q()
+
     class _S:
         def __enter__(self):
-            return object()
+            return _Db()
 
         def __exit__(self, *a):
             return False
+    models.User = User
     models.db_session = lambda commit=False: _S()
     monkeypatch.setitem(sys.modules, 'integrations.social.consent_service', cs)
     monkeypatch.setitem(sys.modules, 'integrations.social.models', models)
@@ -129,6 +157,48 @@ def test_flag_off_and_consent_error_both_fail_closed(bridge, monkeypatch):
     assert posts == [], 'a consent error must mean no ingest'
     assert len(b._experience_queue) == 0
     assert b._stats['total_unverified_skipped'] == 2
+
+
+# ---------------------------------------------------------------------------
+# E2 (Master 11.426) + owner ruling 2026-09-24: every consented chat turn is
+# still ingested, and it carries WHO spoke as its stream_source, so the
+# reality discriminator (hevolveai, being designed) can score it. No turn is
+# dropped for its speaker; no numeric reality is assigned here.
+#   'chat'        a person (human/guest) on a user request
+#   'agent_chat'  an agent/system account, or a daemon dispatch under any id
+#   'unknown'     no users row, or no request id to tell who asked
+# Measured cause: all 47 live 'reality' events on 09-24 were prompts the
+# agent daemon wrote as agent user analysis.local.sage, tagged 'chat'.
+# ---------------------------------------------------------------------------
+def _speak(bridge, monkeypatch, user_type, request_id):
+    wmb, b, posts = bridge
+    monkeypatch.delenv('HEVOLVE_CHAT_LEARNING', raising=False)
+    _consent(monkeypatch, True, user_type=user_type)
+    import core.llm_outbound_logger as lol
+    monkeypatch.setattr(lol, '_get_request_id', lambda: request_id)
+    b.record_interaction('u9', 'p9', 'the kettle is on', 'ok')
+    assert len(posts) == 1, 'every consented turn is still ingested'
+    return posts[0][1]['source']
+
+
+@pytest.mark.parametrize('user_type,request_id,expected', [
+    ('human', 'req-1', 'chat'),
+    ('guest', '1727164800123', 'chat'),
+    ('agent', 'req-1', 'agent_chat'),
+    ('system', 'req-1', 'agent_chat'),
+    ('human', 'daemon_goal_42', 'agent_chat'),
+    ('guest', 'daemon_goal_42', 'agent_chat'),
+    (_NO_ROW, 'req-1', 'unknown'),
+    ('human', '', 'unknown'),
+])
+def test_the_speaker_is_tagged_not_dropped(bridge, monkeypatch, user_type,
+                                           request_id, expected):
+    assert _speak(bridge, monkeypatch, user_type, request_id) == expected
+
+
+def test_one_definition_of_a_non_person():
+    from core.constants import NON_PERSON_USER_TYPES
+    assert NON_PERSON_USER_TYPES == frozenset({'agent', 'system'})
 
 
 # ---------------------------------------------------------------------------

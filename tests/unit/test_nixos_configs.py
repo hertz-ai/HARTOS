@@ -476,6 +476,64 @@ class TestSecurityHardening:
         agent = read_nix(os.path.join(MODULES_DIR, "hart-agent.nix"))
         assert 'User = "hart"' in agent
 
+    # Units that hold or read the session markers (core.foreground:
+    # foreground-active.<pid>, user-chat.<pid>) under /run/hart/session.
+    # ProtectSystem=strict mounts the whole FS read-only except ReadWritePaths,
+    # so a unit that writes a marker and does not declare the dir fails the
+    # write (logged once) and hart-agent-daemon, its own process, never learns
+    # a person is being served: found 2026-09-24, both units lacked it.
+    SESSION_MARKER_UNITS = ["hart-backend.nix", "hart-agent.nix"]
+
+    @staticmethod
+    def _read_write_paths(content):
+        m = re.search(r"ReadWritePaths\s*=\s*\[(.*?)\];", content, re.S)
+        assert m, "no ReadWritePaths list"
+        body = "\n".join(line for line in m.group(1).splitlines()
+                         if not line.strip().startswith("#"))
+        return body
+
+    @pytest.mark.parametrize("module", SESSION_MARKER_UNITS)
+    def test_session_marker_unit_declares_the_marker_dir(self, module):
+        content = read_nix(os.path.join(MODULES_DIR, module))
+        assert 'ProtectSystem = "strict"' in content, (
+            f"{module}: the marker dir is declared BECAUSE the unit is strict; "
+            "loosening ProtectSystem is not the way to make it writable")
+        rw = self._read_write_paths(content)
+        assert '"-/run/hart/session"' in rw, (
+            f"{module} writes session markers under ProtectSystem=strict and "
+            "must list /run/hart/session in ReadWritePaths, with the leading "
+            "'-' so systemd ignores it where the dir does not exist")
+        assert '"/run/hart/session"' not in rw, (
+            f"{module}: a plain (non '-') /run/hart/session entry takes the unit "
+            "down on every variant without a session supervisor: measured on "
+            "the 2026-09-24 nixosTests run, hart-server-boot and "
+            "hart-peer-discovery both red with 'Failed to set up mount "
+            "namespacing: /run/hart/session: No such file or directory'")
+
+    def test_backend_creates_the_marker_dir_where_no_supervisor_does(self):
+        """Server and edge have no session supervisor, so nothing created
+        /run/hart/session there and the cross-process chat markers had nowhere
+        to land. The backend module declares the dir, gated so the desktop
+        (where the supervisor already declares the identical line) does not
+        get a duplicate tmpfiles line on every boot."""
+        backend = read_nix(os.path.join(MODULES_DIR, "hart-backend.nix"))
+        m = re.search(
+            r'systemd\.tmpfiles\.rules = lib\.mkIf \(!\(config\.hart\.sessionSupervisor\.enable or false\)\) \[(.*?)\];',
+            backend, re.S)
+        assert m, "hart-backend.nix must declare /run/hart/session for variants without a supervisor"
+        assert '"d /run/hart/session 0770 hart hart -"' in m.group(1), (
+            "the backend's rule must be the SAME 0770 hart:hart line the supervisor uses")
+
+    def test_session_marker_dir_is_the_one_the_supervisor_declares(self):
+        """The dir the units open for writing is the dir the session
+        supervisor creates (0770 hart:hart), and the same dir the governor's
+        input-alive reader and core.foreground.session_marker_dir use: one
+        dir, not a second convention."""
+        sup = read_nix(os.path.join(MODULES_DIR, "hart-session-supervisor.nix"))
+        assert re.search(r'"d /run/hart/session 0770 hart hart -"', sup)
+        from core.foreground import _SESSION_RUN_DIR
+        assert _SESSION_RUN_DIR == "/run/hart/session"
+
     def test_discovery_has_hardening(self):
         discovery = read_nix(os.path.join(MODULES_DIR, "hart-discovery.nix"))
         assert "NoNewPrivileges" in discovery or "ProtectSystem" in discovery

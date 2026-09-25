@@ -259,6 +259,13 @@ pub struct State {
     pub ws_switch_at: Option<std::time::Instant>,
     /// M6 killswitch — the constitutional screen cut (black surface + input/capture gate).
     pub capture_blocked: bool,
+    /// zwlr_screencopy `copy` requests awaiting the next presented frame. The DRM render
+    /// tick (udev.rs `present_surfaces`) drains it against the scanout slot the
+    /// DrmCompositor just rendered, the same read-back the winit backend runs on its window
+    /// framebuffer (`screencopy::service_pending_frames`). Until this field existed the DRM
+    /// backend registered no screencopy global at all, and `grim` on the box said so
+    /// (VERIFICATION row 23).
+    pub pending_screencopy: Vec<crate::screencopy::PendingScreencopy>,
     /// NATIVE SHELL M3: render the native scene (top bar + hero + rows + taskbar) this
     /// session. Set from the HART_NATIVE_SHELL env at State construction (default OFF,
     /// so the WebView shell is unchanged). No nix option until M6 flips the default.
@@ -459,6 +466,17 @@ impl CompState for State {
     fn set_capture_blocked_flag(&mut self, on: bool) {
         self.capture_blocked = on;
     }
+    /// The DRM twin of the winit override: the shared flag flip PLUS failing every
+    /// screencopy frame already queued, so a capture requested a tick before the cut never
+    /// reads a frame painted before the black surface (IPC_PROTOCOL 4.11 point 3). The
+    /// `screen.kill` verb reaches this through the trait, so the queue drain is live.
+    fn set_capture_blocked(&mut self, on: bool) -> bool {
+        let blocked = comp_core::set_capture_blocked_shared(self, on);
+        if on {
+            crate::screencopy::fail_pending(self);
+        }
+        blocked
+    }
     fn black_buffer_mut(&mut self) -> &mut smithay::backend::renderer::element::solid::SolidColorBuffer {
         &mut self.black_buffer
     }
@@ -506,6 +524,18 @@ impl CompState for State {
     }
     fn ipc_state_mut(&mut self) -> &mut crate::ipc::IpcState {
         &mut self.ipc
+    }
+}
+
+/// The DRM backend's half of the screencopy contract: the queue, and the nudge that makes
+/// the frame-budget scheduler paint the tick after a `copy` arrives, so `grim` is served
+/// on the next frame instead of after the 200 ms idle heartbeat.
+impl crate::screencopy::ScreencopyState for State {
+    fn pending_screencopy_mut(&mut self) -> &mut Vec<crate::screencopy::PendingScreencopy> {
+        &mut self.pending_screencopy
+    }
+    fn note_capture_requested(&mut self) {
+        self.repaint.mark_damaged();
     }
 }
 
@@ -943,34 +973,42 @@ impl DndGrabHandler for State {}
 // master: `XdgDecorationHandler` has NO `xdg_decoration_state()` method (the global
 // is a plain `XdgDecorationState` field on `State`, made by
 // `XdgDecorationState::new::<State>(&dh)`; the trait is only the three notifications).
+/// The decoration mode a toplevel gets, given what it asked for. PURE: the whole policy
+/// of the three `XdgDecorationHandler` callbacks, so it is tested without a client.
+/// SSD by default and on an unset preference (the AI-native WM owns chrome + placement
+/// uniformly); a client that DEMANDS client-side drawing is allowed to (a hard refusal
+/// of SSD), and anything else it names is still answered with SSD.
+pub fn decoration_mode_for(requested: Option<DecorationMode>) -> DecorationMode {
+    match requested {
+        Some(DecorationMode::ClientSide) => DecorationMode::ClientSide,
+        _ => DecorationMode::ServerSide,
+    }
+}
+
+/// Apply a decision to the toplevel's pending state and configure it. The one place all
+/// three callbacks write, so none can forget the configure.
+fn set_decoration_mode(toplevel: &ToplevelSurface, mode: DecorationMode) {
+    toplevel.with_pending_state(|state| {
+        state.decoration_mode = Some(mode);
+    });
+    toplevel.send_pending_configure();
+}
+
 impl XdgDecorationHandler for State {
     /// A new toplevel asked about decorations → default it to SSD.
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
-        });
-        toplevel.send_pending_configure();
+        set_decoration_mode(&toplevel, decoration_mode_for(None));
     }
 
     /// The client requested a specific mode. Honor SSD; if it demands CSD we allow
     /// it (a hard refusal of SSD), otherwise we keep SSD (the WM draws the frame).
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
-        let chosen = match mode {
-            DecorationMode::ClientSide => DecorationMode::ClientSide,
-            _ => DecorationMode::ServerSide,
-        };
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(chosen);
-        });
-        toplevel.send_pending_configure();
+        set_decoration_mode(&toplevel, decoration_mode_for(Some(mode)));
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
         // Client unset its preference → fall back to our default (SSD).
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
-        });
-        toplevel.send_pending_configure();
+        set_decoration_mode(&toplevel, decoration_mode_for(None));
     }
 }
 
@@ -1058,6 +1096,27 @@ impl BufferHandler for State {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
 
+/// THE MAP EDGE as a decision: does this commit mint the toplevel's handle? PURE, so
+/// the no-phantom-window rule is pinned without a client. Only the ROOT surface's commit
+/// counts (a subsurface commit is not the toplevel mapping), only ONCE (a handle already
+/// stashed on the window means it mapped), and only when the commit actually attached a
+/// buffer (a configure ack with nothing to show is not a map).
+pub fn mints_on_commit(is_root_commit: bool, already_mapped: bool, has_buffer: bool) -> bool {
+    is_root_commit && !already_mapped && has_buffer
+}
+
+/// The X11 focus-on-association decision (the twin of `mints_on_commit` for the
+/// XWayland path, whose handle was minted early in `map_window_request`). The first root
+/// commit with a buffer on an X11 window takes the keyboard, exactly once.
+pub fn x11_takes_focus_on_commit(
+    is_root_commit: bool,
+    is_x11: bool,
+    has_buffer: bool,
+    already_focused: bool,
+) -> bool {
+    is_root_commit && is_x11 && has_buffer && !already_focused
+}
+
 // ── CompositorHandler — THE map edge lives here (first buffer commit), exactly as
 // the winit backend detects it. An xdg toplevel is "mapped" the first time it commits
 // a buffer; we mint the handle then via `on_real_map` (the SINGLE mint site), so a
@@ -1103,8 +1162,10 @@ impl CompositorHandler for State {
             // THE MAP EDGE (no-phantom-window mint site): root commit + not-yet-mapped +
             // a real buffer → mint once via on_real_map (ToplevelKind::Xdg). Identical to
             // winit.rs's commit map-edge, so a handle proves a real map here too.
+            let is_root_commit = &root == surface;
+            let has_buffer = surface_has_buffer(surface);
             let already_mapped = window.user_data().get::<WindowHandle>().is_some();
-            if &root == surface && !already_mapped && surface_has_buffer(surface) {
+            if mints_on_commit(is_root_commit, already_mapped, has_buffer) {
                 if let Some(toplevel) = window.toplevel() {
                     xdg_toplevel_mapped(self, &toplevel.clone());
                 }
@@ -1115,11 +1176,13 @@ impl CompositorHandler for State {
             // (before its wl_surface existed); the X11↔wl_surface association is ASYNC, so
             // its first commit (this one, with a buffer + a matched window) is where we
             // give it keyboard focus, ONCE (de-duplicated by the `X11Focused` marker).
-            if &root == surface
-                && window.x11_surface().is_some()
-                && surface_has_buffer(surface)
-                && window.user_data().get::<comp_core::X11Focused>().is_none()
-            {
+            let already_focused = window.user_data().get::<comp_core::X11Focused>().is_some();
+            if x11_takes_focus_on_commit(
+                is_root_commit,
+                window.x11_surface().is_some(),
+                has_buffer,
+                already_focused,
+            ) {
                 window.user_data().insert_if_missing(|| comp_core::X11Focused);
                 self.space.raise_element(&window, true);
                 let serial = smithay::utils::SERIAL_COUNTER.next_serial();
@@ -1249,5 +1312,320 @@ fn ensure_initial_configure(state: &mut State, surface: &WlSurface) {
         if !initial_configure_sent {
             layer.layer_surface().send_configure();
         }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// The handler bodies' floor (NATIVE_OS_PROGRAM 3.3 "tests for wayland.rs handler bodies,
+// 0 today"). Two kinds:
+//   • the DECISIONS each handler makes, extracted pure above (`decoration_mode_for`,
+//     `mints_on_commit`, `x11_takes_focus_on_commit`) so the map edge, the decoration
+//     policy and the X11 focus rule are pinned without a client;
+//   • the State ITSELF, built headless: a `Display` and every protocol global construct
+//     without a socket or a seat device, so `on_real_map` / `expire_summons` /
+//     `registry_on_unmap` / the screen-kill override run against the REAL DRM State,
+//     not a stand-in. What still needs a client is anything that takes a `WlSurface`
+//     (`commit`, `handle_for_surface`, layer mapping); that is smoke_e2e's job.
+// Compiled only under `--features smithay` (this file's own cfg), which is what
+// hart-comp.nix's doCheck and the deepbox loop run.
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
+    use smithay::backend::renderer::element::solid::SolidColorBuffer;
+    use smithay::output::{Mode as WlMode, PhysicalProperties, Subpixel};
+    use smithay::reexports::calloop::EventLoop;
+    use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
+    use smithay::reexports::wayland_server::Display;
+    use smithay::utils::Transform;
+
+    use crate::screencopy::{copy_admission, CopyVerdict, ScreencopyState, SCREENCOPY_VERSION};
+    use crate::{PendingSummon, ToplevelKind, WindowRegistry, SUMMON_MAP_TIMEOUT};
+
+    /// The DRM State plus what keeps it alive and what it emitted. Field order is drop
+    /// order: the State (which holds handle clones) goes before the Display and the loop.
+    struct Headless {
+        state: State,
+        events: Rc<RefCell<Vec<(String, String)>>>,
+        _display: Display<State>,
+        _event_loop: EventLoop<'static, State>,
+    }
+
+    /// `run_udev`'s State construction without the seat, the GPU or a socket. Every
+    /// field is set the way run_udev sets it, so a field added there without a value
+    /// here fails to compile rather than silently diverging.
+    fn headless() -> Headless {
+        let event_loop: EventLoop<'static, State> =
+            EventLoop::try_new().expect("calloop event loop");
+        let display: Display<State> = Display::new().expect("a headless wayland Display");
+        let dh = display.handle();
+        let compositor_state = CompositorState::new::<State>(&dh);
+        let xdg_shell_state = XdgShellState::new::<State>(&dh);
+        let shm_state = ShmState::new::<State>(&dh, vec![]);
+        let output_manager_state = OutputManagerState::new_with_xdg_output::<State>(&dh);
+        let layer_shell_state = WlrLayerShellState::new::<State>(&dh);
+        let data_device_state = DataDeviceState::new::<State>(&dh);
+        let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
+        let foreign_toplevel_state = ForeignToplevelListState::new::<State>(&dh);
+        let xwayland_shell_state = XWaylandShellState::new::<State>(&dh);
+        let mut seat_state = SeatState::<State>::new();
+        let mut seat: Seat<State> = seat_state.new_wl_seat(&dh, "hart-seat-test");
+        let keyboard = seat
+            .add_keyboard(Default::default(), 200, 25)
+            .expect("the default xkb keymap compiles headless");
+        let pointer = seat.add_pointer();
+        let renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let output = Output::new(
+            "HART-TEST".to_string(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "HART".into(),
+                model: "TEST".into(),
+                serial_number: "0".into(),
+            },
+        );
+        let _output_global = output.create_global::<State>(&dh);
+        // The DRM screencopy global, exactly as run_udev registers it. Compiling this
+        // line is the proof that the delegate macro stamped the raw dispatch impls onto
+        // THIS State, not only onto winit's.
+        let _screencopy_global =
+            dh.create_global::<State, ZwlrScreencopyManagerV1, _>(SCREENCOPY_VERSION, ());
+        let mode = WlMode { size: (1280, 800).into(), refresh: 60_000 };
+        output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
+        output.set_preferred(mode);
+        let mut space: Space<Window> = Space::default();
+        space.map_output(&output, (0, 0));
+        let (cur_rgba, cur_w, cur_h, cur_hotspot) = comp_core::bake_default_cursor();
+        let cursor_buffer = MemoryRenderBuffer::from_slice(
+            &cur_rgba,
+            Fourcc::Argb8888,
+            (cur_w, cur_h),
+            1,
+            Transform::Normal,
+            None,
+        );
+        let black_buffer = SolidColorBuffer::new((1280, 800), [0.0, 0.0, 0.0, 1.0]);
+        let events: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        let state = State {
+            dh: dh.clone(),
+            loop_handle: event_loop.handle(),
+            windows: WindowRegistry::new(),
+            pending: Vec::new(),
+            compositor_state,
+            xdg_shell_state,
+            xdg_decoration_state,
+            foreign_toplevel_state,
+            seat_state,
+            seat,
+            xwayland_shell_state,
+            shm_state,
+            output_manager_state,
+            layer_shell_state,
+            data_device_state,
+            keyboard,
+            pointer,
+            output: output.clone(),
+            space,
+            renderer,
+            xwm: None,
+            running: true,
+            emit_ipc_event: Box::new(move |kind, rec| {
+                sink.borrow_mut()
+                    .push((kind.to_string(), rec.handle.as_str().to_string()))
+            }),
+            next_window_loc: (32, 32).into(),
+            active_workspace: 0,
+            hidden_windows: Vec::new(),
+            desktop_shown: true,
+            suppressed_keys: Vec::new(),
+            cursor_status: smithay::input::pointer::CursorImageStatus::default_named(),
+            cursor_buffer,
+            cursor_hotspot: cur_hotspot,
+            ws_switch_at: None,
+            capture_blocked: false,
+            pending_screencopy: Vec::new(),
+            native_shell_on: false,
+            row_scroll: crate::scene::RowScroll::default(),
+            motion_hardware: false,
+            native_home: None,
+            text_rasterizer: crate::text_render::TextRasterizer::new(),
+            black_buffer,
+            bloom: Default::default(),
+            orb: Default::default(),
+            rect_cache: Default::default(),
+            scene_cache: Default::default(),
+            pointer_buttons_down: 0,
+            ipc: crate::ipc::IpcState::default(),
+            vblank_completed: std::collections::HashSet::new(),
+            pending_session_activate: None,
+            repaint: crate::RepaintScheduler::new(),
+        };
+        Headless { state, events, _display: display, _event_loop: event_loop }
+    }
+
+    // ── the State itself ──
+
+    #[test]
+    fn the_drm_state_builds_headless_with_capture_open_and_nothing_mapped() {
+        let h = headless();
+        assert!(!h.state.capture_blocked(), "a fresh session has not cut the screen");
+        assert!(h.state.pending_screencopy.is_empty());
+        assert!(h.state.windows.list().is_empty(), "no handle exists before a real map");
+        assert!(
+            h.state.keyboard.current_focus().is_none(),
+            "nothing holds the keyboard until a surface maps"
+        );
+    }
+
+    // ── screen.kill on the DRM State (IPC_PROTOCOL 4.11 point 3) ──
+
+    #[test]
+    fn screen_kill_on_the_drm_state_blocks_and_restores_capture_through_the_trait() {
+        let mut h = headless();
+        // The verb reaches the backend through `CompState::set_capture_blocked`, which
+        // the DRM State now overrides to drain its queue as well as flip the flag.
+        assert!(h.state.set_capture_blocked(true));
+        assert!(h.state.capture_blocked());
+        assert_eq!(
+            copy_admission(h.state.capture_blocked(), false, true),
+            CopyVerdict::Blocked,
+            "a copy arriving while cut is refused"
+        );
+        assert!(
+            h.state.pending_screencopy.is_empty(),
+            "a cut leaves no frame waiting to read a pre-cut paint"
+        );
+        assert!(!h.state.set_capture_blocked(false));
+        assert_eq!(
+            copy_admission(h.state.capture_blocked(), false, true),
+            CopyVerdict::Queue,
+            "the brain's restore edge readmits copies; nothing else does"
+        );
+    }
+
+    #[test]
+    fn a_queued_capture_wakes_the_frame_budget_gate() {
+        let mut h = headless();
+        // Settle the boot dirtiness so the gate would skip a still tick.
+        let now = Instant::now();
+        h.state.repaint.note_painted(now, false, false);
+        assert!(
+            !h.state.repaint.should_paint(now, false),
+            "a still desktop skips the tick right after a paint"
+        );
+        ScreencopyState::note_capture_requested(&mut h.state);
+        assert!(
+            h.state.repaint.should_paint(now, false),
+            "a pending copy is damage: the next tick must paint so grim is served on it, \
+             not after the idle heartbeat"
+        );
+    }
+
+    // ── map: the single mint site, driven through the real State ──
+
+    #[test]
+    fn a_real_map_mints_one_handle_and_emits_window_opened_once() {
+        let mut h = headless();
+        let handle = h
+            .state
+            .on_real_map(Some("btop".into()), Some("btop".into()), ToplevelKind::Xdg);
+        assert_eq!(h.state.windows.list().len(), 1);
+        let rec = h.state.windows.record(&handle).expect("the map recorded the window");
+        assert_eq!(rec.app_id.as_deref(), Some("btop"));
+        assert_eq!(rec.manifest_id, None, "an externally opened window has no manifest");
+        assert_eq!(
+            *h.events.borrow(),
+            vec![("window.opened".to_string(), handle.as_str().to_string())],
+            "exactly one window.opened, carrying the minted handle"
+        );
+    }
+
+    #[test]
+    fn a_pending_summon_resolves_only_on_the_matching_real_map() {
+        let mut h = headless();
+        h.state.pending.push(PendingSummon::new("calc", Some(ToplevelKind::Xdg)));
+        // Another app mapping does not satisfy it and gets no manifest of its own.
+        let other = h.state.on_real_map(Some("btop".into()), None, ToplevelKind::Xdg);
+        assert_eq!(h.state.pending.len(), 1, "an unrelated map leaves the summon waiting");
+        assert_eq!(h.state.windows.record(&other).unwrap().manifest_id, None);
+        // The matching map consumes it and the record carries the manifest.
+        let calc = h.state.on_real_map(Some("calc".into()), None, ToplevelKind::Xdg);
+        assert!(h.state.pending.is_empty(), "the real map resolved the summon");
+        assert_eq!(
+            h.state.windows.record(&calc).unwrap().manifest_id.as_deref(),
+            Some("calc")
+        );
+    }
+
+    #[test]
+    fn a_summon_that_never_maps_times_out_honestly_and_mints_nothing() {
+        let mut h = headless();
+        h.state.pending.push(PendingSummon::new("wine-app", Some(ToplevelKind::XWayland)));
+        assert!(h.state.expire_summons(Instant::now()).is_empty(), "not yet overdue");
+        let late = Instant::now() + SUMMON_MAP_TIMEOUT + Duration::from_secs(1);
+        assert_eq!(h.state.expire_summons(late), vec!["wine-app".to_string()]);
+        assert!(h.state.pending.is_empty());
+        assert!(h.state.windows.list().is_empty(), "a timeout never mints a handle");
+        assert!(h.events.borrow().is_empty(), "and never claims a window opened");
+    }
+
+    // ── unmap ──
+
+    #[test]
+    fn unmap_invalidates_the_handle_exactly_once() {
+        let mut h = headless();
+        let handle = h.state.on_real_map(Some("btop".into()), None, ToplevelKind::Xdg);
+        assert!(h.state.registry_on_unmap(&handle));
+        assert!(h.state.windows.record(&handle).is_none(), "the record is gone");
+        assert!(
+            !h.state.registry_on_unmap(&handle),
+            "a second unmap of the same handle is a no-op, so window.closed cannot repeat"
+        );
+    }
+
+    // ── decoration mode ──
+
+    #[test]
+    fn decoration_mode_is_server_side_unless_the_client_insists_on_drawing() {
+        assert_eq!(decoration_mode_for(None), DecorationMode::ServerSide, "the default");
+        assert_eq!(
+            decoration_mode_for(Some(DecorationMode::ServerSide)),
+            DecorationMode::ServerSide
+        );
+        assert_eq!(
+            decoration_mode_for(Some(DecorationMode::ClientSide)),
+            DecorationMode::ClientSide,
+            "a hard refusal of SSD is honoured rather than fought"
+        );
+    }
+
+    // ── the map edge and the X11 focus rule, as decisions ──
+
+    #[test]
+    fn the_map_edge_is_the_first_root_commit_with_a_buffer_and_never_a_second() {
+        assert!(mints_on_commit(true, false, true));
+        assert!(!mints_on_commit(false, false, true), "a subsurface commit is not the map");
+        assert!(!mints_on_commit(true, true, true), "a mapped window does not mint twice");
+        assert!(!mints_on_commit(true, false, false), "an ack with no buffer is not a map");
+    }
+
+    #[test]
+    fn x11_focus_follows_the_first_buffered_root_commit_exactly_once() {
+        assert!(x11_takes_focus_on_commit(true, true, true, false));
+        assert!(
+            !x11_takes_focus_on_commit(true, false, true, false),
+            "xdg windows take focus at their own map edge"
+        );
+        assert!(!x11_takes_focus_on_commit(true, true, false, false), "no buffer, no focus");
+        assert!(!x11_takes_focus_on_commit(false, true, true, false), "not on a subsurface");
+        assert!(!x11_takes_focus_on_commit(true, true, true, true), "granted once");
     }
 }

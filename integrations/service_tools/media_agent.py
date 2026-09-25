@@ -67,7 +67,13 @@ def _node_has_any(model_type: str) -> bool:
     """
     try:
         from integrations.service_tools.model_catalog import get_catalog
-        return bool(get_catalog().list_by_type(model_type))
+        # DOWNLOADED, not listed: the catalog registers every known engine
+        # (populate_audiogen_catalog lists acestep either way), so "listed"
+        # was True on a node with nothing on its disk -- the agent told the
+        # person the composer was installed and busy, and the "may I set one
+        # up?" card could never be reached (hartos-3a F4, CONFIRMED).
+        return any(getattr(e, 'downloaded', False)
+                   for e in get_catalog().list_by_type(model_type))
     except Exception as e:
         # Never silent: this decides whether a caller offers an install,
         # so "I could not tell" must be visible.  warning, not exception,
@@ -94,18 +100,88 @@ def _degraded_reason(model_type: str, what: str) -> str:
 # Auto-start helpers
 # ═══════════════════════════════════════════════════════════════
 
-def _ensure_tool_running(tool_name: str) -> bool:
-    """Auto-start a tool if it's not running. Returns True if available."""
+def _start_tool(tool_name: str) -> dict:
+    """Start a tool if it is not running, and keep the runtime's reason when
+    it could not.
+
+    The runtime answers a refusal with WHY -- 'Insufficient VRAM for acestep
+    (free=4.9GB); try cpu_only', MEASURED 2026-09-22 with a 3 GB llama-server
+    on the card -- and _ensure_tool_running folded that into a bare False, so
+    a caller could only say "not running".  Same shape as the runtime's own
+    answer: 'running', plus 'error' when it is not.
+    """
     try:
         from integrations.service_tools.runtime_manager import runtime_tool_manager
         status = runtime_tool_manager.get_tool_status(tool_name)
         if status.get('running'):
-            return True
-        result = runtime_tool_manager.setup_tool(tool_name)
-        return result.get('running', False)
+            return {'running': True}
+        result = runtime_tool_manager.setup_tool(tool_name) or {}
+        if not result.get('running') and result.get('error'):
+            # never silent: this is the line an operator greps for
+            logger.warning(f"Auto-start of {tool_name} refused: {result['error']}")
+        return result
     except Exception as e:
         logger.warning(f"Auto-start failed for {tool_name}: {e}")
-        return False
+        return {'running': False, 'error': str(e)}
+
+
+def composer_output_dir():
+    """Where a finished composition is kept on this node.
+
+    AceStep saves into a TEMP dir and serves it only through its own
+    sidecar, on a port assigned at start.  A game's memo must outlive both,
+    so the poll copies the file here, and the node's existing audio route
+    (/api/voice/audio, hart_intelligence_entry) serves it from here.  One
+    answer, asked by both the writer and the route.
+    """
+    from integrations.service_tools.model_storage import model_storage
+    return model_storage.get_tool_dir('acestep') / 'output'
+
+
+#: What _keep_composition will put where /api/voice/audio serves from.
+_KEPT_AUDIO_EXTENSIONS = ('.wav', '.mp3', '.flac', '.ogg')
+
+
+def _keep_composition(file_value):
+    """(node url, local path) for a finished AceStep file, or None.
+
+    AceStep reports the file as `/v1/audio?path=<absolute temp path>`
+    (MEASURED 2026-09-22), sometimes as the bare path.  Either way the
+    bytes are on this machine; they are copied out of the temp dir so a
+    replay next week still has them.
+    """
+    import filecmp
+    import os
+    import shutil
+    import urllib.parse
+    src = str(file_value or '')
+    if 'path=' in src:
+        query = urllib.parse.urlparse(src).query
+        src = (urllib.parse.parse_qs(query).get('path') or [''])[0]
+    if not src or not os.path.isfile(src):
+        logger.warning("_keep_composition: %r is not a file on this node", file_value)
+        return None
+    stem, ext = os.path.splitext(os.path.basename(src))
+    if ext.lower() not in _KEPT_AUDIO_EXTENSIONS:
+        # the kept dir is served by /api/voice/audio: only audio goes in
+        logger.warning("_keep_composition: %r is not audio; not kept", src)
+        return None
+    out = composer_output_dir()
+    out.mkdir(parents=True, exist_ok=True)
+    # A memo names its file for good, so a name already kept is never
+    # overwritten or reused for different bytes: if AceStep reuses a temp
+    # name, the new take gets a new one (hartos-3a review of 6759fbfa6).
+    dest, n = out / f'{stem}{ext}', 1
+    while dest.exists() and not filecmp.cmp(src, dest, shallow=False):
+        dest, n = out / f'{stem}-{n}{ext}', n + 1
+    if not dest.exists():
+        shutil.copy2(src, dest)
+    return f'/api/voice/audio/{dest.name}', str(dest)
+
+
+def _ensure_tool_running(tool_name: str) -> bool:
+    """Auto-start a tool if it's not running. Returns True if available."""
+    return bool(_start_tool(tool_name).get('running', False))
 
 
 def populate_videogen_catalog(catalog) -> int:
@@ -290,6 +366,16 @@ def _select_video_tool() -> str:
 #: composition came back as `1`, matched none of the completed words, and read
 #: as unfinished -- a second way for a real outcome to be unreadable.
 _ACESTEP_STATUS_CODE = {0: 'processing', 1: 'succeeded', 2: 'failed'}
+
+#: Every status check_media_status reports for a job that FAILED and will not
+#: recover -- the one definition every poller tests against. check_media_status
+#: turns an AceStep failure, a "succeeded but saved nothing" and an unknown task
+#: into the house ``'error'``; the video sidecars pass their own ``'failed'``
+#: through. A caller that tested only one of them polled a dead job to its
+#: deadline: Nunba's tts_engine branched on ``== 'failed'`` and spent 120 s on
+#: every failed composition (finding N1, 2026-09-23). Test ``in`` this, never a
+#: literal, so the pollers cannot drift apart again.
+MEDIA_FAILED_STATUSES = frozenset({'failed', 'error'})
 
 
 def _unwrap_envelope(payload, task_id: str = '') -> dict:
@@ -514,6 +600,32 @@ def _generate_audio_music(context: str, input_text: str,
     if style:
         prompt = f"[{style}] {prompt}"
 
+    # The speech and video paths start their sidecar before dialing it.  This
+    # one dialed straight away, so a composer that was installed and merely
+    # not up answered "not running" to every game, for ever (run 8,
+    # 2026-09-22 -- the proof scripts had been starting it by hand).
+    # Nothing downloaded: say so, and start nothing.  _start_tool would
+    # download ~10 GB without asking; the owner's ruling (2026-09-23) is
+    # ask once, then set up -- so this answer is ABSENT, which is what
+    # routes the agent to the consent card (capability_setup).
+    if not _node_has_any('audio_gen'):
+        return {'status': 'error',
+                'error': 'AceStep not available on this node (not downloaded)',
+                'output_modality': 'audio_music'}
+    started = _start_tool('acestep')
+    if not started.get('running'):
+        why = str(started.get('error') or 'auto-start failed')
+        if _node_has_any('audio_gen'):
+            # Installed and will not fit this instant.  Worded so that
+            # classify_error reads UNREACHABLE, never ABSENT: offering to
+            # install what is on the disk is its own defect.
+            return {'status': 'error',
+                    'error': f'AceStep installed but cannot run right now ({why})',
+                    'output_modality': 'audio_music'}
+        return {'status': 'error',
+                'error': f'AceStep not available and auto-start failed ({why})',
+                'output_modality': 'audio_music'}
+
     base_url = _get_tool_base_url('acestep')
     if not base_url:
         # No pinned fallback.  Sidecar ports are assigned at start (this node
@@ -529,7 +641,11 @@ def _generate_audio_music(context: str, input_text: str,
         from core.http_pool import pooled_post
         payload = {
             'prompt': prompt,
-            'duration': duration or 30,
+            # AceStep reads 'audio_duration' (release_task_models.py:48), not
+            # 'duration'.  MEASURED 2026-09-22: sending 'duration' was silently
+            # ignored and every game cue came back at the model's 60s default
+            # -- a minute-long "correct answer" chime.
+            'audio_duration': duration or 30,
             # WAV, not AceStep's default of mp3.  MEASURED 2026-09-22: the
             # composition SUCCEEDS ("Done! Generated 2 audio tensors",
             # normalised to peak 0.89) and then the save fails with
@@ -991,10 +1107,29 @@ def check_media_status(
             status = data.get('status', 'unknown')
             if tool_prefix == 'acestep' and isinstance(status, int):
                 status = _ACESTEP_STATUS_CODE.get(status, 'failed')
+            # AceStep does not put the artifact at the top of the item.  Its
+            # finished item is {"task_id", "status": <int>, "result": "<JSON
+            # STRING of a list>", "progress_text"} and the path lives INSIDE
+            # that string at [0]["file"] (query_result_service.py:
+            # _build_store_result_payload).  MEASURED 2026-09-22: two WAVs
+            # saved at 10:34:30, and forty polls over the next seventeen
+            # minutes all read "composing" because this looked for a flat
+            # url key that does not exist.  The nested item also carries
+            # "error" and "stage" for an unfinished or failed task.
+            nested = {}
+            if isinstance(data.get('result'), str) and data['result'].strip():
+                try:
+                    items = json.loads(data['result'])
+                    if isinstance(items, list) and items and isinstance(items[0], dict):
+                        nested = items[0]
+                except Exception as e:
+                    logger.debug('check_media_status: result not JSON: %s', e)
+            if nested.get('error') and not data.get('error'):
+                data['error'] = nested['error']
             result_url = (data.get('video_url') or data.get('audio_url')
                           or data.get('url') or data.get('output_url')
                           or data.get('audio_path') or data.get('file_path')
-                          or '')
+                          or nested.get('file') or '')
             progress = data.get('progress', data.get('percentage', 0))
 
             out = {
@@ -1002,6 +1137,17 @@ def check_media_status(
                 'status': status,
                 'progress': progress,
             }
+            # A failure must CARRY its reason.  The agent's poll reads
+            # progress['error'] to decide between "offer to install" and
+            # "the composer refused"; a bare status of 'failed' with no
+            # error field reads as "unknown reason" and neither branch
+            # can act on it.  AceStep puts the reason inside the nested
+            # result item (surfaced into data['error'] above).
+            if status == 'failed' or data.get('error'):
+                out['status'] = 'error'
+                out['error'] = str(data.get('error') or
+                                   f'{tool_prefix} reported failure')
+                return json.dumps(out)
             # An ARTIFACT is the completion signal, whatever the status
             # vocabulary says.  MEASURED 2026-09-22: AceStep answered
             # status=1 -- a numeric code, not one of the words this list
@@ -1013,7 +1159,20 @@ def check_media_status(
                 status = 'completed'
             _done_words = ('completed', 'complete', 'done', 'finished',
                            'success', 'succeeded')
-            if status in _done_words and result_url:
+            if status in _done_words and result_url and tool_prefix == 'acestep':
+                # AceStep's own value is a sidecar-relative temp path that
+                # nothing off the sidecar can fetch (hartos-3a F1): keep the
+                # file, report the node's url for it.
+                kept = _keep_composition(result_url)
+                if kept:
+                    out['results'] = [{'type': 'audio', 'url': kept[0],
+                                       'path': kept[1]}]
+                    out['status'] = 'completed'
+                else:
+                    out['status'] = 'error'
+                    out['error'] = ('acestep finished but its file is not on '
+                                    f'this node: {result_url}')
+            elif status in _done_words and result_url:
                 media_type = 'video' if tool_prefix in ('wan2gp', 'ltx2') else 'audio'
                 out['results'] = [{'type': media_type, 'url': result_url}]
                 out['status'] = 'completed'
@@ -1035,7 +1194,11 @@ def check_media_status(
         return json.dumps({'status': 'error',
                            'error': f'HTTP {resp.status_code}'})
     except Exception as e:
-        return json.dumps({'status': 'error', 'error': str(e)})
+        # Never reached the composer (reset, refused, timed out): only THIS
+        # kind may read as "still waking".  A failure the composer itself
+        # reports is a failure, whatever its text says (hartos-3a F3).
+        return json.dumps({'status': 'error', 'error': str(e),
+                           'unreachable': True})
 
 
 # ═══════════════════════════════════════════════════════════════

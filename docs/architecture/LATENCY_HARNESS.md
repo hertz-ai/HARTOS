@@ -157,3 +157,175 @@ rule). Whether an agent UI push should carry a synchronous durable audit write, 
 whether that write can be batched or deferred without weakening the hash chain, is
 a security decision with an owner. This records the cost and where it goes so that
 decision can be made on numbers.
+
+### Re-measured 2026-09-24 (S7), same method
+Same instrument as above: cProfile around `LiquidUIService(a2ui_enabled=True)
+.agent_ui_update('prof', {'type': 'card'})`, ten pushes after three warm-ups, real
+service, real audit log, only `HiveCircuitBreaker.is_halted` pinned False (the
+isolation `test_a2ui_gate_hardening.py` uses). Dev box, Windows, NTFS.
+
+| What | 2026-09-05 | 2026-09-24 |
+|---|---|---|
+| one push, wall | ~440 ms | p50 101.7 ms, mean 100.9, max 111.3 |
+| `immutable_audit_log.log_event` | ~396 ms | 100.2 ms of 100.7 (99 percent) |
+| `sqlite3.Connection.commit` | ~206 ms | 37.0 ms (10 calls) |
+| `sqlite3.Connection.close` | not split out | 41.4 ms (20 calls) |
+| pool `connect` | not split out | 17.1 ms (20 calls) |
+| `_get_last_hash` | not split out | 15.7 ms (10 calls) |
+
+The box got faster (a different disk state; nothing in the code changed) and the
+shape did not: everything is `log_event`. What the split adds is that the durable
+commit is under half of it. `log_event` opens and tears down TWO sessions per event
+(`_get_last_hash` opens its own to read the chain head, then the writer opens a
+second one), and the pool hands out a fresh sqlite connection each time, so the
+connect and close churn (58 ms) costs more than the commit (37 ms). Moving the
+commit off the paint path alone would leave ~60 ms on it.
+
+Append plus fsync of one journal line (the alternative durable write, measured with
+a 50-line loop after 5 warm-ups, 190-byte lines, `O_APPEND` + `os.fsync`):
+
+| Where | p50 | p90 | p99 |
+|---|---|---|---|
+| dev box, NTFS, the repo dir | 72 ms | 157 ms | 233 ms |
+| deepbox `langchain` container, ext4, `/app` | 8.3 ms | 10.5 ms | 21 ms |
+| deepbox `langchain` container, ext4, `/tmp` | 8.3 ms | 10.1 ms | 11.3 ms |
+| Samsung box (the target) | not measured: the box is read-only to streams; the coordinator runs the probe |
+
+So even the cheapest durable write is half a frame on ext4 and several frames on
+this Windows disk. A design that fsyncs before returning cannot meet 16 ms on the
+dev box at all and is marginal on the box; the fsync has to be off the return path
+and the durability has to be enforced somewhere else. That is the design below.
+
+### DESIGN: the audit row off the paint path, durable before the next gate decision
+Status: DESIGN ONLY (no code), the N4 steward decision from NATIVE_OS_PROGRAM.md
+section 6 item 1. Written by S7 so the decision is made on a concrete shape.
+
+**Invariant kept.** Every accepted push has an audit row on the chain, in the order
+the pushes were accepted, and no push is accepted while the previous push's row is
+not yet durable. The gate stays fail-closed: if durability cannot be proven, the
+push is refused, never painted unaudited.
+
+**What moves.** Today, inside `agent_ui_update`: allowlist, halted, rate cap,
+destructive guardrail, XSS, store, wake, `log_event` (sync commit), emit. Target:
+
+1. At the gate's entry, before the allowlist: `audit.wait_durable(seq_of_previous_push,
+   timeout)`. The push is admitted only once the previous accepted push's row is on
+   disk. On timeout or a dead writer it returns False and the push is refused with a
+   WARNING, exactly like the halted refusal. This is the "durable before the NEXT
+   gate decision" rule, and it is a wait that normally costs nothing: by the time a
+   second push arrives the first row's fsync (8 ms on ext4) has long completed.
+2. Store and wake, unchanged and still first.
+3. `log_event(..., durable='journal')`: the SAME function, one new argument whose
+   default (`'sync'`) keeps every existing caller exactly as it is (the borrowed
+   session `db=` contract, the writer-lock retry, the memory fallback). No sibling
+   function, no second log. In journal mode, under the existing `_lock`: take
+   `prev_hash` from an in-memory chain head (initialised once from the DB tail,
+   then maintained here, so `_get_last_hash` and its session are off the path),
+   compute `entry_hash` with the unchanged `_compute_hash`, assign a monotonically
+   increasing `seq`, append the row to a bounded in-memory queue, return
+   `(seq, entry_hash)`. Nothing touches sqlite. Measured cost of this step is the
+   hash and a list append: well under a millisecond.
+4. Return. `agent_ui_update` is now store + wake + hash + enqueue: under 16 ms by
+   two orders of magnitude, and the number becomes a budget line
+   (`core.constants.LATENCY_BUDGETS`, so the no-orphan guard gates it).
+5. A single writer thread drains the queue: appends one JSON line per row
+   (`seq`, the six hashed fields, `prev_hash`, `entry_hash`) to
+   `<data dir>/audit/a2ui-journal.jsonl` opened `O_APPEND`, calls `os.fsync` once
+   per drained batch, and only then marks every `seq` in the batch durable (a
+   condition variable `wait_durable` blocks on). Then it inserts the same rows into
+   `AuditLogEntry` in `seq` order in ONE session per batch and commits. The journal
+   is the durable record; the DB stays the queryable replica that `get_trail` and
+   `verify_chain` read today.
+
+**Ordered.** `seq` is assigned under the lock at append time; the queue is FIFO;
+the writer never reorders; the DB insert is in `seq` order. Two pushes from two
+threads get distinct consecutive `seq` and `prev_hash` links in that order.
+
+**Chain hash preserved.** Same fields, same `_compute_hash`, same `created_at`
+rule (#48: the hashed timestamp is the stored timestamp). One chain head in memory
+under one lock, so journal rows and DB rows are the same chain. `verify_chain`
+reads the DB rows and then the journal lines whose `seq` is past the last
+replicated row, and checks the link across the boundary.
+
+**Fail closed.** Writer thread dead, journal unwritable, fsync raising, queue
+full: `wait_durable` reports not durable, the next push is refused. The journal
+directory missing at startup: `log_event` falls back to `'sync'` mode (today's
+path, slow but audited), NEVER to the memory-only fallback. The in-memory
+fallback remains what it is today for sync callers only.
+
+**Crash between paint and fsync.** The frame was shown; the row is in memory. If
+the process dies before the writer's fsync, that ONE row is lost. It is bounded to
+one because rule 1 refuses the next push until this row is durable, so at any
+instant at most one accepted push is painted and not yet on disk. On restart the
+log reconciles: journal rows missing from the DB are replayed in order; the chain
+head is whichever store is longer. A tail loss of one row is invisible to
+`verify_chain` (the chain simply ends one row earlier), and that is the honest
+cost: the alternative that has zero loss is to fsync BEFORE the wake, which is
+option B below.
+
+**The two options the steward chooses between.**
+
+| | A: pipelined (above) | B: fsync before wake |
+|---|---|---|
+| push return time | store + wake + hash: < 1 ms | one journal fsync: 8 ms p50 on ext4 (box unmeasured), 72 ms on this Windows disk |
+| rows lost on crash | at most one, the last accepted push | zero |
+| ordering, chain, fail-closed | kept | kept |
+| sqlite commit and connection churn on the path | gone (replica async) | gone (replica async) |
+| meets 16 ms | yes, everywhere | on ext4 SSD yes, on this Windows disk no |
+
+Both remove the ~95 ms of sqlite work from the path; they differ only in whether
+the fsync of the LAST row is inside the return. A is the design this document
+recommends for the desktop; B is what the reviewer asks for if one lost row is
+unacceptable. There is no option that keeps zero loss AND a disk-independent
+return time.
+
+**What the security reviewer must sign off.**
+1. The one-row tail-loss window (A) or the fsync-on-path cost (B).
+2. The journal file joins the audit record: location under the data dir, mode
+   0600 hart:hart, append-only, never rotated by this code, carrying the same
+   hashes; `verify_chain` and any auditor tooling must read it, not just the table.
+3. The in-memory chain head. Today `_get_last_hash` re-reads the head from the DB
+   per event, which is what lets TWO processes append to one chain: the agent
+   daemon writes `goal_dispatched` rows from its own process (`dispatch.py`
+   `dispatch_goal`) while the backend writes `a2ui_push`. That is already a race
+   with no cross-process lock (two heads read the same tail and both chain onto
+   it: a fork). A memory head in the backend makes the fork certain rather than
+   occasional. The reviewer decides between one chain per writer process
+   (`chain_id` column, verify per chain) and a cross-process append lock; this
+   design assumes per-writer chains, which also removes the 2026-08-12 writer-lock
+   retry from the hot path.
+4. `os.fsync` semantics: fsync the file after each batch; fsync the directory once
+   after the journal is created; on Windows `os.fsync` is `FlushFileBuffers`.
+5. Redaction (`_redact_sensitive`) unchanged and applied before append; the row
+   content for `a2ui_push` stays type + agent only, no user payload.
+6. The `db=` borrowed-session callers and every non-A2UI `log_event` caller stay
+   on `'sync'` and are byte-for-byte unchanged.
+
+**The exact test that proves it** (`tests/unit/test_a2ui_audit_off_paint_path.py`,
+real `LiquidUIService`, real `ImmutableAuditLog` over a temp journal and the test
+DB, the kill switch pinned as in `test_a2ui_gate_hardening.py`):
+1. Latency and ordering: patch `os.fsync` with a stub that sleeps 50 ms and records
+   its completion time per `seq`. Push 1: assert wall time of `agent_ui_update`
+   < 16 ms and the component is in the store before it returns. Push 2: record the
+   gate's admission time (the first check after `wait_durable`); assert it is
+   later than the recorded fsync completion of push 1's row, and that push 1's
+   line is in the journal with its `entry_hash` before push 2 is stored.
+2. Fail closed: fsync raising for push 1's row makes push 2 return False, store
+   nothing and wake nothing; a writer thread that has exited does the same.
+3. Crash: block the writer before fsync, push once, discard the log object, build
+   a fresh `ImmutableAuditLog` over the same journal and DB; assert the recovered
+   head is the last fsynced row, `verify_chain` is valid, and the un-fsynced push
+   is the only row missing (exactly one).
+4. Chain across stores: 100 pushes under random fsync delays; journal `seq` strictly
+   increasing, `verify_chain` valid over DB plus journal tail, DB tail equals
+   journal tail once the writer drains.
+5. Mutation: removing the `wait_durable` at the gate fails test 1's admission
+   assertion; removing the fsync fails test 3; both are run once with the mutation
+   applied and recorded in the commit that lands the code.
+6. Budget: `agent_ui_update` gains a 16 ms line in `core.constants.LATENCY_BUDGETS`
+   and `tests/unit/test_latency_budgets.py` reads it, so a regression is a red
+   build rather than a profile someone has to run.
+
+**Left for the code round (after the decision).** Which option; the chain
+question in item 3; the Samsung box fsync number (coordinator); the
+`LATENCY_BUDGETS` line lives in `core/constants.py`, not an S7 file.
