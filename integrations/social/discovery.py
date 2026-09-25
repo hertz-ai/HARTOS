@@ -23,7 +23,7 @@ discovery_bp = Blueprint('social_discovery', __name__)
 
 # ─── Gossip Rate Limiter ───
 _ANNOUNCE_RATE = {}   # ip -> list of timestamps
-_RATE_LIMIT = 10      # max announcements per window per IP
+_RATE_LIMIT = 10      # max announcements per window per CLIENT IP (_observed_ip)
 _RATE_WINDOW = 60     # window in seconds
 
 
@@ -197,7 +197,7 @@ def _observed_ip() -> str:
 @discovery_bp.route('/api/social/peers/announce', methods=['POST'])
 def peer_announce():
     """Receive a peer announcement. Merge into local peer list."""
-    if not _check_announce_rate(request.remote_addr):
+    if not _check_announce_rate(_observed_ip()):
         return jsonify({'success': False, 'error': 'Rate limited'}), 429
     from .peer_discovery import gossip
     data = request.get_json(force=True, silent=True) or {}
@@ -269,7 +269,7 @@ def peer_list():
 @discovery_bp.route('/api/social/peers/exchange', methods=['POST'])
 def peer_exchange():
     """Gossip exchange: receive their peers, return ours."""
-    if not _check_announce_rate(request.remote_addr):
+    if not _check_announce_rate(_observed_ip()):
         return jsonify({'success': False, 'error': 'Rate limited'}), 429
     from .peer_discovery import gossip
     data = request.get_json(force=True, silent=True) or {}
@@ -470,7 +470,7 @@ def peer_broadcast():
     Unknown types are acknowledged but not dispatched, so new gossip
     payload types can be added without wire-breaking older peers.
     """
-    ip = request.remote_addr or '0.0.0.0'
+    ip = _observed_ip() or '0.0.0.0'  # the client, not the Kong gateway
     if not _check_announce_rate(ip):
         return jsonify({'success': False, 'reason': 'rate_limited'}), 429
 
@@ -541,7 +541,7 @@ def peer_embedding_delta():
     Phase 1 gradient sync: peers submit embedding deltas via gossip.
     Deltas are validated and fed to FederatedAggregator's embedding channel.
     """
-    ip = request.remote_addr or '0.0.0.0'
+    ip = _observed_ip() or '0.0.0.0'  # the client, not the Kong gateway
     if not _check_announce_rate(ip):
         return jsonify({'success': False, 'reason': 'rate_limited'}), 429
 
