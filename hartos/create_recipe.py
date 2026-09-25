@@ -2095,10 +2095,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # AUTHORS a recipe; it does not execute.  REUSE is untouched: the same
     # window shows it calling 17 distinct non-core tools, so its set is load-
     # bearing and this narrowing deliberately does not touch that leg.
+    #
+    # The prompts ADVERTISE execute_windows_or_android_command; deferring it
+    # left a webmail agent unable to touch the screen (2026-09-25), so the
+    # keep rule lives in core.agent_tools beside the advertised list.
     try:
-        _keep = (set(MAIN_LEG_CORE_TOOLS) | {'request_tools'}
-                 | set(svc_tools or {})
-                 | (_helper_tool_names(helper) - _pre_tier2_tools))
+        from core.agent_tools import create_helper_keep
+        _keep = create_helper_keep(_helper_tool_names(helper),
+                                   _pre_tier2_tools, svc_tools)
         _dropped = defer_helper_schema(
             helper, _helper_tool_names(helper) - _keep)
         if _dropped:
@@ -3003,11 +3007,11 @@ def _install_create_group_writeback(group_chat, user_id, prompt_id, user_prompt,
 
 
 def instantiate_executor_agent():
-    from core.agent_tools import main_leg_tool_menu
+    from core.agent_tools import main_leg_tool_menu, CREATE_ADVERTISED_TOOLS
     # create_scheduled_jobs is NOT registered on this leg -- see the note on
     # MAIN_LEG_CORE_TOOLS.  execute_windows_or_android_command is, via
     # register_dual(helper, assistant, ...) at :1670.
-    _tool_menu = main_leg_tool_menu(('execute_windows_or_android_command',))
+    _tool_menu = main_leg_tool_menu(CREATE_ADVERTISED_TOOLS)
     # Inject cultural wisdom — even code execution should embody care
     _executor_cultural = ""
     try:
@@ -3096,8 +3100,8 @@ def instantiate_status_verifier_agent(user_prompt):
     # advertised set cannot drift from the set this leg registers.  Names only:
     # the verifier is still told not to perform actions, and registering tools
     # on it would change what it does, not what it can name.
-    from core.agent_tools import main_leg_tool_menu
-    _tool_menu = main_leg_tool_menu(('execute_windows_or_android_command',))
+    from core.agent_tools import main_leg_tool_menu, CREATE_ADVERTISED_TOOLS
+    _tool_menu = main_leg_tool_menu(CREATE_ADVERTISED_TOOLS)
     verify = autogen.AssistantAgent(
         name="StatusVerifier",
         llm_config=get_llm_config(),
@@ -3180,11 +3184,11 @@ def instantiate_helper_agent():
 
 
 def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, resonance_profile=None, autonomous=False):
-    from core.agent_tools import main_leg_tool_menu
+    from core.agent_tools import main_leg_tool_menu, CREATE_ADVERTISED_TOOLS
     # create_scheduled_jobs is NOT registered on this leg -- see the note on
     # MAIN_LEG_CORE_TOOLS.  execute_windows_or_android_command is, via
     # register_dual(helper, assistant, ...) at :1670.
-    _tool_menu = main_leg_tool_menu(('execute_windows_or_android_command',))
+    _tool_menu = main_leg_tool_menu(CREATE_ADVERTISED_TOOLS)
     # Build personality injection for the primary user-facing agent
     _personality_block = ""
     if personality:

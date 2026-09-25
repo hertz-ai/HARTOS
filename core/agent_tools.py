@@ -260,6 +260,31 @@ CREATE_LEG_EXTRA_TOOLS = frozenset({
     'validate_json_response',
 })
 
+#: Tools the CREATE prompts tell the model to call BY NAME, beyond the core
+#: set.  The prompt menus (main_leg_tool_menu) and the helper's schema keep
+#: rule (create_helper_keep) both read this one list, so a tool the prompt
+#: names can never be missing from what the model is offered.  Measured
+#: 2026-09-25: the prompts said "for Chrome or any browser, use
+#: execute_windows_or_android_command", the schema bounding deferred it, and a
+#: webmail agent made 57 tool calls, all send_message_to_user, never once
+#: touching the screen.
+CREATE_ADVERTISED_TOOLS = ('execute_windows_or_android_command',)
+
+
+def create_helper_keep(helper_names, pre_tier2_names, svc_tools=()):
+    """The tool names the CREATE helper keeps on its schema.
+
+    Everything else it holds is deferred by defer_helper_schema to bound the
+    schema's token cost.  Kept: the core set, ``request_tools`` (the escape
+    that re-arms a deferral), the tools the CREATE prompts advertise, the
+    service tools, and whatever the Tier-2 goal gate added for THIS goal
+    (``helper_names - pre_tier2_names``).
+    """
+    return (set(MAIN_LEG_CORE_TOOLS) | {'request_tools'}
+            | set(CREATE_ADVERTISED_TOOLS)
+            | set(svc_tools or ())
+            | (set(helper_names) - set(pre_tier2_names)))
+
 
 def _join_tool_menu(names, extra=()):
     """One join for every prose tool menu: sorted, comma-separated, no quotes."""
