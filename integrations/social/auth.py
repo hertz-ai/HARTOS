@@ -429,6 +429,30 @@ def _get_user_from_token(token: str):
     return None, db
 
 
+def user_id_for_token(token):
+    """The user id a bearer token belongs to, or None.
+
+    The public form of _get_user_from_token, for callers that need only the
+    id and are not decorated routes (an SSE stream, a sync endpoint in the
+    desktop app).  Accepts everything require_auth accepts: a local JWT, a
+    hive JWT from this node, and a stored api_token.  The last is how a cloud
+    login works on a desktop: the login sync stores the Kong-issued token as
+    the user's api_token.  Decoding the token as a JWT instead rejects every
+    cloud login (measured 2026-09-25: /agents/sync 401 while /api/social/
+    auth/me answered 200 for the same token).  The DB session is closed here.
+    """
+    if not token:
+        return None
+    user, db = _get_user_from_token(token)
+    try:
+        if user is None or getattr(user, 'is_banned', False):
+            return None
+        return str(user.id)
+    finally:
+        if db is not None:
+            db.close()
+
+
 def require_auth(f):
     """Decorator: requires valid Bearer token. Sets g.user and g.db.
 
