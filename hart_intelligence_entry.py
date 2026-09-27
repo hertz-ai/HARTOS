@@ -1326,6 +1326,18 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"App Marketplace init skipped: {e}")
 
+# McGroce agentic commerce — /api/commerce/session (Tomcat -> HARTOS token
+# exchange), /mandates/<id>, /health.  Also in blueprint_registry for the
+# Nunba path; _try_register skips it there when this one already ran.
+try:
+    from integrations.commerce.commerce_api import commerce_bp
+    app.register_blueprint(commerce_bp)
+    app.logger.info("Commerce API registered at /api/commerce/")
+except ImportError:
+    app.logger.info("Commerce API not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Commerce API init skipped: {e}")
+
 # Resource Governor — start background monitoring (task #260: watchdog-registered)
 try:
     from core.resource_governor import get_governor
@@ -11199,6 +11211,18 @@ def agent_approval():
         if decision not in ('approve', 'approved', 'allow', 'yes', 'deny', 'denied', 'no'):
             return jsonify({'status': 'error', 'reason': 'invalid decision'}), 400
         approved = decision in ('approve', 'approved', 'allow', 'yes')
+        # A McGroce payment (ap2_pay:<payment_id>) or merchant / product
+        # draft (merchant_onboard: / merchant_sku:<draft_id>).  Not a
+        # capability consent, so answered before the consent record below,
+        # and the approver is the caller's VERIFIED JWT identity -- never a
+        # body field: an agent must not be able to pay on its own say-so.
+        # One implementation: integrations/commerce/approvals.py.
+        from integrations.commerce.approvals import (
+            answer_commerce_approval, approver_from_request, is_commerce_action)
+        if is_commerce_action(action):
+            _c_body, _c_code = answer_commerce_approval(
+                action_raw, approved, approver_from_request(request))
+            return jsonify(_c_body), _c_code
         # Record first, on BOTH branches: the row is the answer, and writing
         # it also stops or starts the feed through the one actuator and tells
         # every other surface to drop its copy of the card.  The owner of
