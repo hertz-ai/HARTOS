@@ -351,3 +351,78 @@ class TestMerchant:
         assert json.loads(ct.commerce_create_sku(MUID, 'X', 0, 'D'))['success'] is False
         assert json.loads(ct.commerce_create_sku(
             MUID, 'X', 5, 'D', image_url='http://img/x.png'))['success'] is False
+
+
+class _PhonePeDouble(ap2_protocol.PaymentGatewayConnector):
+    def __init__(self):
+        super().__init__(ap2_protocol.PaymentGateway.PHONEPE)
+        self.capture_calls = 0
+
+    def connect(self):
+        self.connected = True
+        return True
+
+    def create_payment(self, payment_request):
+        return {'success': True, 'transaction_id': 'hartos_txn',
+                'redirect_url': 'https://pay.example/c'}
+
+    def capture_payment(self, payment_id, gateway_transaction_id):
+        self.capture_calls += 1
+        return {'success': True}
+
+
+class TestRedirectGatewayCheckout:
+    """INR goes to PhonePe when it is live: checkout hands back a redirect,
+    and the gateway callback -- not the agent -- places the order."""
+
+    def _approved_on_phonepe(self, env):
+        env['ledger'].gateways[ap2_protocol.PaymentGateway.PHONEPE] = _PhonePeDouble()
+        env['fake'].on('GET', '/cart', body=ORDER)
+        out = json.loads(ct.commerce_prepare_checkout(UID))
+        env['mandates'].approve(out['mandate_id'], UID)
+        return out
+
+    def test_checkout_returns_the_redirect_and_places_nothing(self, env):
+        out = self._approved_on_phonepe(env)
+        res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert res == {'success': True, 'status': 'awaiting_payment',
+                       'redirect_url': 'https://pay.example/c',
+                       'payment_id': out['payment_id']}
+        assert env['ledger'].get_payment(out['payment_id']).status == PaymentStatus.PROCESSING
+        assert pushed(env, 'payment_status')[-1]['status'] == 'processing'
+        assert not env['fake'].called('POST', '/cart/checkout')
+        # a second call cannot charge again
+        again = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert again['success'] is False
+        assert pushed(env, 'payment_status')[-1]['status'] == 'processing'
+
+    def test_callback_completion_places_the_approved_order(self, env):
+        out = self._approved_on_phonepe(env)
+        ct.commerce_checkout(UID, out['mandate_id'])
+        env['ledger'].get_payment(out['payment_id']).update_status(PaymentStatus.COMPLETED)
+        env['fake'].on('POST', '/cart/checkout/payment', body={'id': 1})
+        env['fake'].on('POST', '/cart/checkout',
+                       body={'orderNumber': 'ORD-9', 'status': 'SUBMITTED'})
+        later = time.time() + 3600  # the callback may land after the mandate TTL
+        with patch('integrations.ap2.ap2_mandate.time.time', return_value=later):
+            res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is True and res['order_id'] == 'ORD-9'
+        assert env['mandates'].get(out['mandate_id']).status == 'consumed'
+
+    def test_callback_with_a_changed_cart_holds_the_order(self, env):
+        out = self._approved_on_phonepe(env)
+        ct.commerce_checkout(UID, out['mandate_id'])
+        env['ledger'].get_payment(out['payment_id']).update_status(PaymentStatus.COMPLETED)
+        drifted = json.loads(json.dumps(ORDER))
+        drifted['orderItems'].pop()
+        env['fake'].on('GET', '/cart', body=drifted)
+        res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is False and res['needs_attention'] is True
+        assert not env['fake'].called('POST', '/cart/checkout')
+        assert pushed(env, 'notification')[-1]['title'] == 'Payment received, order on hold'
+
+    def test_not_completed_payment_places_nothing(self, env):
+        out = self._approved_on_phonepe(env)
+        ct.commerce_checkout(UID, out['mandate_id'])
+        res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res == {'success': False, 'error': 'payment is not completed'}

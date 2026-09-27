@@ -1280,6 +1280,36 @@ def phonepe_callback():
 
     # Status check confirmed PAYMENT_SUCCESS — finalize.
     meta = payment_req.metadata or {}
+
+    # Not every AP2 PhonePe payment is a tier upgrade: an agent's
+    # request_payment and a McGroce cart mandate route INR to PhonePe too
+    # (PaymentLedger.select_gateway).  The money is confirmed above, so
+    # such a payment COMPLETES here -- the tier-upgrade metadata check
+    # below would otherwise mark a captured payment FAILED.  A commerce
+    # checkout then places its McGroce order (integrations/commerce).
+    if meta.get('kind') != 'tier_upgrade':
+        payment_req.update_status(PaymentStatus.COMPLETED,
+                                  'PhonePe payment captured via callback')
+        payment_ledger.save_ledger()
+        order = None
+        if meta.get('kind') == 'commerce_checkout':
+            try:
+                from integrations.commerce.commerce_tools import (
+                    complete_redirect_checkout)
+                order = complete_redirect_checkout(payment_req.payment_id)
+            except Exception:
+                logger.exception(
+                    "MANUAL RECONCILIATION NEEDED: PhonePe payment "
+                    f"{payment_req.payment_id} captured but the commerce "
+                    "order step raised")
+        return jsonify({
+            'success': True,
+            'status': 'completed',
+            'payment_request_id': payment_req.payment_id,
+            'kind': meta.get('kind'),
+            'order': order,
+        }), 200
+
     api_key_id = meta.get('api_key_id')
     target_tier = meta.get('target_tier')
 

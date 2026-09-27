@@ -181,6 +181,10 @@ class MandateStore:
 
     def _expire_if_due(self, m: CartMandate, now: float) -> None:
         if m.status in ('pending', 'approved') and now >= m.expires_at:
+            if self._money_in_flight(m.payment_id):
+                # A redirect gateway (PhonePe) is holding or has taken the
+                # money; its callback finishes this mandate, not the clock.
+                return
             m.status = 'expired'
             m.sig = self._sign(m)
             try:
@@ -188,6 +192,15 @@ class MandateStore:
                                            'mandate expired')
             except Exception as e:
                 logger.debug(f'ap2 mandates: cancel on expiry failed: {e}')
+
+    def _money_in_flight(self, payment_id: str) -> bool:
+        from integrations.ap2.ap2_protocol import PaymentStatus
+        try:
+            p = self.ledger.get_payment(payment_id)
+        except Exception:
+            return False
+        return p is not None and p.status in (PaymentStatus.PROCESSING,
+                                              PaymentStatus.COMPLETED)
 
     # ── public API ───────────────────────────────────────────────
     def create_cart_mandate(self, user_id: str, merchant: str,

@@ -416,12 +416,22 @@ def commerce_checkout(
                      'redirect_url': paid.get('redirect_url'),
                      'payment_id': m.payment_id})
     if not paid.get('success'):
-        push_fragment(user_id, {'type': 'payment_status', 'status': 'failed',
-                                'amount': float(m.amount), 'currency': CURRENCY,
-                                'method': method})
+        from integrations.ap2.ap2_protocol import PaymentStatus
+        if payment is not None and payment.status == PaymentStatus.FAILED:
+            push_fragment(user_id, {'type': 'payment_status', 'status': 'failed',
+                                    'amount': float(m.amount), 'currency': CURRENCY,
+                                    'method': method})
         return _fail(f"payment failed: {paid.get('error', 'declined')}",
                      payment_id=m.payment_id)
-    store.consume(mandate_id)
+    return _out(_place_order(client, user_id, m, view, payment))
+
+
+def _place_order(client, user_id, m, view, payment) -> Dict[str, Any]:
+    """After the money is taken: consume the mandate, record the payment on
+    the McGroce cart (referenceNumber = mandate_id) and submit the order.
+    Shared by commerce_checkout and the redirect-gateway callback."""
+    _mandates().consume(m.mandate_id)
+    method = payment.gateway.value if payment and payment.gateway else None
     txn = payment.gateway_transaction_id if payment else None
     push_fragment(user_id, {'type': 'payment_status', 'status': 'completed',
                             'amount': float(m.amount), 'currency': CURRENCY,
@@ -434,17 +444,60 @@ def commerce_checkout(
     if not placed['success']:
         logger.error(f'commerce: paid {m.payment_id} but McGroce did not '
                      f'place the order: {placed["error"]}')
-        return _fail('the payment went through but McGroce did not place the '
-                     f'order ({placed["error"]}); it needs a person to '
-                     'reconcile', payment_id=m.payment_id,
-                     mandate_id=m.mandate_id, needs_attention=True)
+        return {'success': False,
+                'error': ('the payment went through but McGroce did not place '
+                          f'the order ({placed["error"]}); it needs a person to '
+                          'reconcile'),
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
+                'needs_attention': True}
     order = placed['data'] or {}
     order_id = order.get('orderNumber') or order.get('id')
     status = order.get('status') or 'SUBMITTED'
     push_fragment(user_id, _tracking_fragment(order_id, status))
-    return _out({'success': True, 'status': 'ordered', 'order_id': order_id,
-                 'order_status': status, 'payment_id': m.payment_id,
-                 'amount': m.amount, 'currency': m.currency})
+    return {'success': True, 'status': 'ordered', 'order_id': order_id,
+            'order_status': status, 'payment_id': m.payment_id,
+            'amount': m.amount, 'currency': m.currency}
+
+
+def complete_redirect_checkout(payment_id: str) -> Dict[str, Any]:
+    """Place the McGroce order for a redirect-gateway (PhonePe) payment the
+    gateway callback has just confirmed COMPLETED.
+
+    The person approved one exact cart; if the live cart no longer hashes to
+    it, nothing is placed -- the payment is flagged for a person instead of
+    ordering something they did not approve.
+    """
+    import hmac
+    from integrations.ap2.ap2_mandate import MandateError, canonical_cart_hash
+    from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
+    m = _mandates().find_by_payment_id(payment_id)
+    if m is None or m.status != 'approved':
+        return {'success': False, 'error': 'no approved mandate for this payment'}
+    payment = get_payment_ledger().get_payment(payment_id)
+    if payment is None or payment.status != PaymentStatus.COMPLETED:
+        return {'success': False, 'error': 'payment is not completed'}
+    client = _client()
+    res = client.cart_get(m.user_id)
+    if not res['success']:
+        return {'success': False, 'error': res['error'], 'needs_attention': True,
+                'payment_id': payment_id}
+    view = cart_view(res['data'])
+    try:
+        same = hmac.compare_digest(canonical_cart_hash(mandate_cart(view)),
+                                   m.cart_hash)
+    except MandateError:
+        same = False
+    if not same:
+        logger.error(f'commerce: PhonePe payment {payment_id} completed but the '
+                     f'cart changed since approval; order NOT placed')
+        push_fragment(m.user_id, {
+            'type': 'notification', 'severity': 'warning',
+            'title': 'Payment received, order on hold',
+            'message': 'Your cart changed after you approved it, so we have not '
+                       'placed the order. We will sort it out with you.'})
+        return {'success': False, 'error': 'cart changed since approval',
+                'needs_attention': True, 'payment_id': payment_id}
+    return _place_order(client, m.user_id, m, view, payment)
 
 
 def commerce_order_status(
