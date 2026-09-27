@@ -8473,6 +8473,21 @@ function renderAgentOverlay(ev) {{
             decision = data.get('decision', '')  # approve / deny / later
             if decision not in ('approve', 'deny', 'later'):
                 return jsonify({'error': 'Invalid decision, must be approve/deny/later'}), 400
+            # A payment or merchant-onboarding card is DECIDED, not just marked:
+            # the one commerce handler, with the approver taken from the
+            # caller's Bearer token (the same call /api/agent/approval on the
+            # backend makes).  'later' leaves the card pending, as below.
+            if decision != 'later':
+                try:
+                    from integrations.commerce.commerce_api import (
+                        handle_commerce_approval, is_commerce_action)
+                except Exception:   # never costs a non-commerce answer
+                    logger.exception("handle_agent_approval: commerce unavailable")
+                    handle_commerce_approval = is_commerce_action = None
+                if is_commerce_action and is_commerce_action(action):
+                    payload, status = handle_commerce_approval(
+                        action, decision == 'approve', request)
+                    return jsonify(payload), status
             # Resolve matching pending approval in _agent_components
             resolved = False
             if agent_id in self._agent_components:

@@ -2923,6 +2923,12 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             from integrations.agent_engine.news_tools import register_news_tools
             register_news_tools(helper, assistant, user_id, executor=executor)
             current_app.logger.info("News tools loaded (Tier 2) for reuse agent")
+        if 'commerce' in goal_tags:
+            # Commerce parity with create_recipe.py — a McGroce recipe authored
+            # under the 'commerce' tag must replay with its cart/checkout tools.
+            from integrations.commerce.commerce_tools import register_commerce_tools
+            register_commerce_tools(helper, assistant, user_id, executor=executor)
+            current_app.logger.info("Commerce tools loaded (Tier 2) for reuse agent")
     except Exception as e:
         # Same observability promotion as create_recipe.py — a failure
         # here strips the agent of goal-specific tools, agent talks

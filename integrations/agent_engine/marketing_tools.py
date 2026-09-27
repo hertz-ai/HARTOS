@@ -684,6 +684,22 @@ def detect_goal_tags(prompt) -> list:
     if _mentions(lower, media_keywords):
         tags.append('media')
 
+    # McGroce agentic commerce (integrations/commerce).  The mcgroce_shopper /
+    # mcgroce_merchant prompts name McGroce and their tool names, so a seeded
+    # goal always tags; a person asking in their own words is caught by the
+    # grocery/cart phrases.  'grocer' is a deliberate stem (grocery,
+    # groceries).  DELIBERATELY EXCLUDED: bare 'checkout' ("git checkout"
+    # would hand a coding goal a tool that places orders) and bare 'order' /
+    # 'shop' / 'buy' (far too common to gate a money-moving toolset on).
+    commerce_keywords = [
+        'mcgroce', 'grocer', 'shopping list', 'shopping cart', 'add to cart',
+        'add_to_cart', 'view_cart', 'search_products', 'track_order',
+        'merchant onboarding', 'request_merchant_onboarding',
+        'onboard my store', 'list my store',
+    ]
+    if _mentions(lower, commerce_keywords):
+        tags.append('commerce')
+
     return tags
 
 

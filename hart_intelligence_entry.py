@@ -1249,6 +1249,19 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"Commercial API init skipped: {e}")
 
+# McGroce agentic commerce — /api/commerce/* (integrations/commerce/commerce_api).
+#   POST /api/commerce/session  McGroce site -> {token, expiresIn}, X-Commerce-Secret
+#   products / cart / checkout / orders / stream for the Nunba + McGroce embed.
+# Importing the package also registers the mcgroce_order AP2 payment hook.
+try:
+    from integrations.commerce.commerce_api import commerce_bp
+    app.register_blueprint(commerce_bp)
+    app.logger.info("Commerce API registered at /api/commerce/")
+except ImportError:
+    app.logger.info("Commerce API not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Commerce API init skipped: {e}")
+
 # Central OTA control — GET /api/ota/latest (PUBLIC pointer nodes poll on their
 # hart-ota-check timer), POST /api/ota/publish (account-gated, kicks the upgrade
 # pipeline + fans a signed firmware_update fleet command), GET /api/ota/nodes
@@ -11199,6 +11212,23 @@ def agent_approval():
         if decision not in ('approve', 'approved', 'allow', 'yes', 'deny', 'denied', 'no'):
             return jsonify({'status': 'error', 'reason': 'invalid decision'}), 400
         approved = decision in ('approve', 'approved', 'allow', 'yes')
+        # Commerce approvals: ap2_pay:<payment_id> and merchant_onboard:<id>.
+        # Not a capability consent, so they branch BEFORE the consent record
+        # below.  The approver is the identity in the caller's Bearer token
+        # (a HARTOS login or a McGroce commerce session), never a body field;
+        # the handler refuses anyone but the payment's / request's owner.
+        try:
+            from integrations.commerce.commerce_api import (
+                handle_commerce_approval, is_commerce_action)
+        except Exception as _com_exc:   # never costs a consent answer
+            app.logger.warning(f'agent_approval: commerce unavailable: {_com_exc}')
+            handle_commerce_approval = is_commerce_action = None
+        if is_commerce_action and is_commerce_action(action_raw):
+            payload, status = handle_commerce_approval(
+                action_raw, approved, request)
+            app.logger.info(f'agent_approval: agent={agent_id} action={action} '
+                            f'commerce -> {status} {payload.get("status")}')
+            return jsonify(payload), status
         # Record first, on BOTH branches: the row is the answer, and writing
         # it also stops or starts the feed through the one actuator and tells
         # every other surface to drop its copy of the card.  The owner of

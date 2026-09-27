@@ -2238,7 +2238,8 @@ _P2P_PREAMBLE = (
 
 _P2P_TOOLS = (
     "TOOLS (use existing — DO NOT create new endpoints):\n"
-    "- request_payment / authorize_payment / process_payment (AP2 protocol)\n"
+    "- request_payment / authorize_payment / process_payment (AP2 protocol;\n"
+    "  authorize_payment only ASKS the user, who approves on their screen)\n"
     "- web_search (find providers, compare prices, verify businesses)\n"
     "- fetch_news_feeds / get_trending_news (market intelligence)\n"
     "- save_data_in_memory / get_data_from_memory (state persistence)\n"
@@ -2280,7 +2281,8 @@ def _build_p2p_marketplace_prompt(goal_dict, product_dict=None):
         "   and memory lookups. Rank by: proximity, rating, price, freshness.\n"
         "3. NEGOTIATION: Facilitate P2P negotiation via channel messages.\n"
         "   Suggest fair prices based on market data (web_search comparable items).\n"
-        "4. PAYMENT: Use request_payment → authorize_payment → process_payment.\n"
+        "4. PAYMENT: Use request_payment → authorize_payment (asks the user;\n"
+        "   you cannot approve) → process_payment once they have approved.\n"
         "   ALWAYS escrow. Release on buyer confirmation.\n"
         "5. FULFILLMENT: For physical goods, coordinate delivery via\n"
         "   logistics APIs (Dunzo, Porter, local couriers). Compare prices.\n"
@@ -2753,6 +2755,74 @@ register_goal_type('p2p_health', _build_p2p_health_prompt,
                     tool_tags=['web_search'])
 register_goal_type('p2p_logistics', _build_p2p_logistics_prompt,
                     tool_tags=['web_search'])
+
+
+# ─── McGroce agentic commerce (integrations/commerce) ───
+# The prompts name McGroce and the tools, so detect_goal_tags tags the turn
+# 'commerce' and CREATE/REUSE attach register_commerce_tools (Tier 2).
+
+_MCGROCE_PAYMENT_RULE = (
+    "PAYMENT RULE (non-negotiable): you can NEVER approve a payment. checkout\n"
+    "returns approval_required and shows the shopper an approval card; the\n"
+    "shopper decides on their own screen. Tell them it is waiting for them,\n"
+    "then stop. Never call checkout twice for one cart. Prices are in INR.\n"
+)
+
+
+def _build_mcgroce_shopper_prompt(goal_dict: Dict,
+                                  product_dict: Optional[Dict] = None) -> str:
+    """McGroce shopping assistant: find, fill the cart, check out, track."""
+    title = _sanitize_goal_input(goal_dict.get('title', ''))
+    desc = _sanitize_goal_input(goal_dict.get('description', ''))
+    config = _goal_config(goal_dict)
+    store_id = config.get('store_id', '')
+    zipcode = config.get('zipcode', '')
+    return (
+        "YOU ARE A McGROCE GROCERY SHOPPING AGENT.\n\n"
+        f"Goal: {title}\n"
+        f"Description: {desc}\n"
+        f"Preferred store: {store_id or 'ask, or use find_stores'}\n"
+        f"Shopper zipcode: {zipcode or 'unknown'}\n\n"
+        "TOOLS (McGroce commerce):\n"
+        "- find_stores(zipcode | lat, lng): nearby McGroce stores\n"
+        "- search_products(query, store_id): catalogue search, shows product cards\n"
+        "- add_to_cart(product_id, quantity, store_id) / remove_from_cart(product_id)\n"
+        "- view_cart(): show the cart\n"
+        "- checkout(store_id): places the order and asks the shopper to approve\n"
+        "- track_order(order_id): order status\n\n"
+        "WORKFLOW:\n"
+        "1. Understand the list (items, quantities, brands, budget).\n"
+        "2. search_products per item; pick the best match, say why.\n"
+        "3. add_to_cart; view_cart to confirm the total with the shopper.\n"
+        "4. Only when the shopper says to buy: checkout.\n"
+        "5. After they approve, track_order.\n\n"
+        + _MCGROCE_PAYMENT_RULE
+    )
+
+
+def _build_mcgroce_merchant_prompt(goal_dict: Dict,
+                                   product_dict: Optional[Dict] = None) -> str:
+    """McGroce merchant assistant: onboard a store onto McGroce."""
+    title = _sanitize_goal_input(goal_dict.get('title', ''))
+    desc = _sanitize_goal_input(goal_dict.get('description', ''))
+    return (
+        "YOU ARE A McGROCE MERCHANT ONBOARDING AGENT.\n\n"
+        f"Goal: {title}\n"
+        f"Description: {desc}\n\n"
+        "Help a shop owner list their store on McGroce.\n"
+        "1. Collect: store name, street address, phone, zipcode, GSTIN if any.\n"
+        "2. Read the details back and fix anything the merchant corrects.\n"
+        "3. Call request_merchant_onboarding(store_name, address, phone,\n"
+        "   zipcode, gstin). It shows the merchant an approval card; NOTHING\n"
+        "   is sent to McGroce until the merchant approves it themselves.\n"
+        "4. You cannot approve on their behalf. Say it is waiting for them.\n"
+    )
+
+
+register_goal_type('mcgroce_shopper', _build_mcgroce_shopper_prompt,
+                   tool_tags=['commerce'])
+register_goal_type('mcgroce_merchant', _build_mcgroce_merchant_prompt,
+                   tool_tags=['commerce'])
 
 
 # ─── Hive Acceleration Goal Types ───

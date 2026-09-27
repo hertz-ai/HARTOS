@@ -2060,6 +2060,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             from integrations.agent_engine.news_tools import register_news_tools
             register_news_tools(helper, assistant, user_id)
             tool_logger.info("News tools loaded (Tier 2) based on prompt content")
+        if 'commerce' in goal_tags:
+            # McGroce commerce tools (search/cart/checkout/track, merchant
+            # onboarding).  checkout only ASKS the shopper to pay; the
+            # approval arrives at /api/agent/approval with their token.
+            from integrations.commerce.commerce_tools import register_commerce_tools
+            register_commerce_tools(helper, assistant, user_id)
+            tool_logger.info("Commerce tools loaded (Tier 2) based on prompt content")
     except Exception as e:
         # Promoted from debug to warning: a failure here means the agent
         # boots without its goal-specific tools, so it can talk about the

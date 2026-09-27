@@ -846,6 +846,10 @@ def _load_tools():
          'AUTOEVOLVE_CODE_TOOLS', 'autoevolve_code'),
         ('integrations.coding_agent.backend_repair_tools',
          'BACKEND_REPAIR_TOOLS', 'backend_repair'),
+        # McGroce commerce (user_id is an explicit argument here; checkout
+        # still only asks the shopper, it never pays).
+        ('integrations.commerce.commerce_tools',
+         'COMMERCE_TOOLS', 'commerce'),
     ):
         try:
             import importlib
