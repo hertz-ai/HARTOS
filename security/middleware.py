@@ -54,17 +54,30 @@ def _apply_security_headers(app: Flask):
         return response
 
 
+#: Env vars whose comma-separated origins together form the CORS allowlist.
+#: MCGROCE_ORIGINS carries the McGroce storefront origins the Nunba embed is
+#: served from (moved here from Nunba), kept apart so an operator can manage
+#: them without touching the node's own CORS_ORIGINS.
+CORS_ORIGIN_ENV_VARS = ('CORS_ORIGINS', 'MCGROCE_ORIGINS')
+
+
+def cors_allowed_origins() -> set:
+    """The CORS allowlist: the union of every CORS_ORIGIN_ENV_VARS entry."""
+    return set(
+        o.strip()
+        for var in CORS_ORIGIN_ENV_VARS
+        for o in os.environ.get(var, '').split(',')
+        if o.strip()
+    )
+
+
 def _apply_cors(app: Flask):
     """CORS with explicit origin allowlist.
 
-    If CORS_ORIGINS is not set, no origins are allowed (fail-closed).
-    Set CORS_ORIGINS=* for development only.
+    If neither CORS_ORIGINS nor MCGROCE_ORIGINS is set, no origins are
+    allowed (fail-closed).  Set CORS_ORIGINS=* for development only.
     """
-    raw_origins = os.environ.get('CORS_ORIGINS', '')
-    allowed_origins = set(
-        o.strip() for o in raw_origins.split(',')
-        if o.strip()
-    )
+    allowed_origins = cors_allowed_origins()
     if not allowed_origins:
         logger.warning(
             "CORS_ORIGINS not configured - no cross-origin requests allowed. "
