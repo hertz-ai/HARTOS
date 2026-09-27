@@ -199,18 +199,24 @@ def test_autogen_tool_functions():
     print("TEST 6: Autogen Tool Functions")
     print("=" * 80)
 
-    # Get tools for autogen
-    tools = get_ap2_tools_for_autogen("test_agent")
+    # Get tools for autogen.  authorize_payment is only offered to the model
+    # when the node opts in -- a person authorizes by default (the ap2_pay
+    # branch of /api/agent/approval), so the LLM cannot self-authorize.
+    tools = get_ap2_tools_for_autogen("test_agent", allow_llm_authorize=False)
 
-    assert len(tools) == 3  # request, authorize, process
+    assert len(tools) == 2  # request, process
     assert all('function' in tool for tool in tools)
     assert all('name' in tool for tool in tools)
     assert all('description' in tool for tool in tools)
 
     tool_names = [tool['name'] for tool in tools]
     assert 'request_payment' in tool_names
-    assert 'authorize_payment' in tool_names
+    assert 'authorize_payment' not in tool_names
     assert 'process_payment' in tool_names
+
+    opted_in = [t['name'] for t in
+                get_ap2_tools_for_autogen("test_agent", allow_llm_authorize=True)]
+    assert opted_in == ['request_payment', 'authorize_payment', 'process_payment']
 
     print(f"[OK] Autogen tools generated correctly")
     print(f"   Tools: {', '.join(tool_names)}")

@@ -2238,7 +2238,8 @@ _P2P_PREAMBLE = (
 
 _P2P_TOOLS = (
     "TOOLS (use existing — DO NOT create new endpoints):\n"
-    "- request_payment / authorize_payment / process_payment (AP2 protocol)\n"
+    "- request_payment / process_payment (AP2 protocol). A PERSON authorizes\n"
+    "  every payment on the approval card; you cannot authorize one yourself.\n"
     "- web_search (find providers, compare prices, verify businesses)\n"
     "- fetch_news_feeds / get_trending_news (market intelligence)\n"
     "- save_data_in_memory / get_data_from_memory (state persistence)\n"
@@ -2280,7 +2281,8 @@ def _build_p2p_marketplace_prompt(goal_dict, product_dict=None):
         "   and memory lookups. Rank by: proximity, rating, price, freshness.\n"
         "3. NEGOTIATION: Facilitate P2P negotiation via channel messages.\n"
         "   Suggest fair prices based on market data (web_search comparable items).\n"
-        "4. PAYMENT: Use request_payment → authorize_payment → process_payment.\n"
+        "4. PAYMENT: Use request_payment, wait for the buyer to approve it,\n"
+        "   then process_payment.\n"
         "   ALWAYS escrow. Release on buyer confirmation.\n"
         "5. FULFILLMENT: For physical goods, coordinate delivery via\n"
         "   logistics APIs (Dunzo, Porter, local couriers). Compare prices.\n"
