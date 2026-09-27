@@ -1976,7 +1976,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         tool_logger.info("Initializing AP2 (Agent Protocol 2) - Agentic Commerce...")
 
         # Get AP2 payment tools for this agent
-        ap2_tools = get_ap2_tools_for_autogen('assistant')
+        ap2_tools = get_ap2_tools_for_autogen('assistant', user_id=user_id)
 
         # Register payment tools — wrap with @log_tool_execution so payment
         # operations fire UI status emits + structured-error envelopes

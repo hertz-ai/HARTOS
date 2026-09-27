@@ -1706,8 +1706,14 @@ class LiquidUIService:
 
     # ─── Agent UI Protocol (A2UI) — preserved ─────────────────
 
-    def agent_ui_update(self, agent_id: str, component: dict) -> bool:
+    def agent_ui_update(self, agent_id: str, component: dict,
+                        user_id: Optional[str] = None) -> bool:
         """Push a UI component from an agent to all connected frontends.
+
+        ``user_id`` names the user the push belongs to.  Omitted, the owner is
+        inferred (core.event_attribution.owner_user_id), exactly as before; a
+        caller serving many users on one node (the McGroce commerce gateway)
+        passes it so the P3a SSE guard routes the card to THAT user.
 
         Delivery paths (best-effort once accepted):
           1. In-memory store → polled by SSE stream → Nunba LiquidUI (web)
@@ -1837,11 +1843,13 @@ class LiquidUIService:
             # still refused, exactly as before: no leak, no regression.
             # Import is local + guarded so an import problem degrades the
             # user_id to None instead of killing the push entirely.
-            try:
-                from core.event_attribution import owner_user_id
-                _owner = owner_user_id()
-            except Exception:
-                _owner = None
+            _owner = user_id
+            if not _owner:
+                try:
+                    from core.event_attribution import owner_user_id
+                    _owner = owner_user_id()
+                except Exception:
+                    _owner = None
             emit_event('agent.ui.update', {
                 'agent_id': agent_id,
                 'component': component,
@@ -10647,3 +10655,69 @@ def run_home_compose(reason: str = 'idle') -> bool:
     except Exception as e:
         logger.debug("run_home_compose cross-process failed: %s", e)
         return False
+
+
+def push_agent_ui(agent_id: str, component: dict,
+                  user_id: Optional[str] = None) -> bool:
+    """Push one agent UI component to its user, from code that holds no
+    reference to the shell.  The in-process form of agent_ui_update.
+
+    Two legs, each for a surface the other does not reach:
+
+      1. The live LiquidUIService, when this process serves one (the
+         registry entry _register_self writes).  agent_ui_update applies the
+         allowlist, kill switch, rate cap and XSS gate, stores the card for the
+         shell's SSE stream and emits ``agent.ui.update`` (the WAMP topic the
+         Android AgentOverlayBridge subscribes to).
+      2. When ``user_id`` is given, the user's own stream:
+         ``publish_event('chat.social', ..., user_id)``, which MessageBus maps
+         to WAMP ``com.hertzai.hevolve.social.{user_id}`` and to the per-user
+         SSE event ``chat.social``.  A node without a shell (the cloud gateway
+         the McGroce embed talks to) has only this leg, so the same gates run
+         here first: an unknown type, a halted hive or unsafe content is not
+         published.
+
+    Returns True if either leg accepted the push.  Never raises.
+    """
+    if not isinstance(component, dict):
+        return False
+    comp_type = component.get('type', '')
+    svc = None
+    try:
+        from core.platform.registry import get_registry
+        svc = get_registry().get_or_none('LiquidUIService')
+    except Exception:
+        svc = None
+    delivered = False
+    if svc is not None:
+        try:
+            delivered = bool(svc.agent_ui_update(
+                agent_id, dict(component), user_id=user_id))
+        except Exception:
+            logger.exception("push_agent_ui: shell push failed")
+    if not user_id:
+        return delivered
+    if comp_type not in COMPONENT_TYPES or _a2ui_has_xss(component):
+        logger.warning("push_agent_ui: %s from %s not published", comp_type,
+                       agent_id)
+        return delivered
+    try:
+        from security.hive_guardrails import HiveCircuitBreaker
+        if HiveCircuitBreaker.is_halted():
+            return delivered
+    except Exception:
+        logger.exception("push_agent_ui: swallowed Exception")
+    try:
+        from integrations.social.realtime import publish_event
+        card = dict(component)
+        card.setdefault('_ts', time.time())
+        card.setdefault('_agent_id', agent_id)
+        publish_event('chat.social', {
+            'type': 'agent_ui_update',
+            'agent_id': agent_id,
+            'component': card,
+        }, user_id=str(user_id))
+        return True
+    except Exception:
+        logger.exception("push_agent_ui: per-user publish failed")
+        return delivered

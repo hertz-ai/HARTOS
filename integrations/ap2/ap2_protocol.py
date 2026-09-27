@@ -737,17 +737,72 @@ class PaymentLedger:
             self.save_ledger()
             return payment
 
+    def request_approval(self, payment_id: str) -> bool:
+        """Mark a pending payment as waiting on a person (APPROVAL_REQUIRED).
+
+        Idempotent for a payment already waiting.  Only a person's decision
+        (ap2_mandate.decide_payment) moves it on from here.
+        """
+        with self.lock:
+            payment = self.payments.get(payment_id)
+            if payment is None:
+                return False
+            if payment.status == PaymentStatus.APPROVAL_REQUIRED:
+                return True
+            if payment.status != PaymentStatus.PENDING:
+                return False
+            payment.update_status(PaymentStatus.APPROVAL_REQUIRED)
+            self.save_ledger()
+            return True
+
+    def cancel_payment(self, payment_id: str, actor_id: str,
+                       reason: str = '') -> bool:
+        """Cancel a payment that has not been authorized yet."""
+        with self.lock:
+            payment = self.payments.get(payment_id)
+            if payment is None or payment.status not in (
+                    PaymentStatus.PENDING, PaymentStatus.APPROVAL_REQUIRED):
+                return False
+            payment.approval_chain.append({
+                'approver_id': actor_id,
+                'approved_at': datetime.now().isoformat(),
+                'action': 'denied',
+            })
+            payment.update_status(PaymentStatus.CANCELLED, reason or None)
+            self.save_ledger()
+            return True
+
+    def set_metadata(self, payment_id: str, key: str, value: Any) -> bool:
+        """Set one metadata key on a payment and persist it."""
+        with self.lock:
+            payment = self.payments.get(payment_id)
+            if payment is None:
+                return False
+            payment.metadata[key] = value
+            payment.updated_at = datetime.now()
+            self.save_ledger()
+            return True
+
     def authorize_payment(self, payment_id: str, approver_id: str) -> bool:
         """
         Authorize a payment request
 
         Args:
             payment_id: Payment ID to authorize
-            approver_id: ID of the approver (user or agent)
+            approver_id: ID of the approving PERSON.  Never an agent: an
+                empty id, a non-human id (ap2_mandate.NON_HUMAN_APPROVERS) or
+                the requesting agent's own id is refused.  A payment that
+                carries an AP2 mandate (every agent-requested payment) is
+                authorized only with the mandate owner's signed approval
+                (ap2_mandate.verify_approval), which only the approval route
+                can write.
 
         Returns:
             True if authorization successful
         """
+        from integrations.ap2.ap2_mandate import (
+            MANDATE_KEY, NON_HUMAN_APPROVERS, verify_approval)
+        approver_id = str(approver_id or '').strip()
         with self.lock:
             if payment_id not in self.payments:
                 logger.error(f"Payment not found: {payment_id}")
@@ -755,8 +810,21 @@ class PaymentLedger:
 
             payment = self.payments[payment_id]
 
-            if payment.status != PaymentStatus.PENDING:
+            if payment.status not in (PaymentStatus.PENDING,
+                                      PaymentStatus.APPROVAL_REQUIRED):
                 logger.warning(f"Payment {payment_id} not in pending state: {payment.status}")
+                return False
+
+            if (approver_id.lower() in NON_HUMAN_APPROVERS
+                    or approver_id == payment.requester_agent_id):
+                logger.warning(f"Payment {payment_id}: approver {approver_id!r} "
+                               f"is not a person; refused")
+                return False
+
+            if (MANDATE_KEY in payment.metadata
+                    and not verify_approval(payment, approver_id)):
+                logger.warning(f"Payment {payment_id}: no valid mandate approval "
+                               f"by {approver_id!r}; refused")
                 return False
 
             # Add to approval chain
@@ -938,12 +1006,20 @@ class PaymentLedger:
 payment_ledger = PaymentLedger()
 
 
-def create_payment_request_function(agent_name: str) -> Callable:
+def get_payment_ledger() -> PaymentLedger:
+    """The process-wide ledger (hart_cli's pay commands import this name)."""
+    return payment_ledger
+
+
+def create_payment_request_function(agent_name: str,
+                                    user_id: Optional[str] = None) -> Callable:
     """
     Create a payment request function for an agent
 
     Args:
         agent_name: Name of the agent
+        user_id: The person the agent works for.  Stamped as the owner of
+            every payment's AP2 mandate, so only they can approve it.
 
     Returns:
         Function that can be registered with autogen
@@ -971,13 +1047,16 @@ def create_payment_request_function(agent_name: str) -> Callable:
         except ValueError:
             method = PaymentMethod.INTERNAL_CREDITS
 
+        from integrations.ap2.ap2_mandate import MANDATE_KEY, build_mandate
+        mandate = build_mandate(user_id, amount, currency, description)
         payment = payment_ledger.create_payment_request(
             amount=Decimal(str(amount)),
             currency=currency,
             description=description,
             requester_agent_id=agent_name,
             payment_method=method,
-            gateway=PaymentGateway.MOCK
+            gateway=PaymentGateway.MOCK,
+            metadata={MANDATE_KEY: mandate, 'user_id': mandate['user_id']},
         )
 
         return json.dumps({
@@ -985,7 +1064,8 @@ def create_payment_request_function(agent_name: str) -> Callable:
             'amount': str(payment.amount),
             'currency': payment.currency,
             'status': payment.status.value,
-            'message': f'Payment request created. Awaiting authorization.'
+            'message': ('Payment request created. Call authorize_payment to '
+                        'ask the user to approve it.')
         }, indent=2)
 
     return request_payment
@@ -993,36 +1073,33 @@ def create_payment_request_function(agent_name: str) -> Callable:
 
 def create_payment_authorization_function() -> Callable:
     """
-    Create a payment authorization function
+    Create the agent-side ``authorize_payment`` tool.
+
+    The name is kept so saved recipes still resolve, but it can no longer
+    authorize: an agent approving its own payment was the defect.  It asks the
+    payment's owner instead (an ``approval`` card) and returns
+    ``approval_required``.  The person's answer reaches
+    /api/agent/approval, which authorizes with the identity from their token
+    (ap2_mandate.decide_payment).
 
     Returns:
-        Function that can be used to authorize payments
+        Function that can be registered with autogen
     """
-    def authorize_payment(payment_id: str, approver_id: str = "system") -> str:
+    def authorize_payment(payment_id: str, approver_id: str = "") -> str:
         """
-        Authorize a payment request
+        Ask the user to approve a pending payment.  Agents cannot approve.
 
         Args:
-            payment_id: Payment ID to authorize
-            approver_id: ID of the approver
+            payment_id: Payment ID awaiting approval
+            approver_id: Ignored.  Kept so older recipes still call cleanly;
+                the approver is whoever the user's login token says.
 
         Returns:
-            Authorization result
+            JSON with status 'approval_required' on success
         """
-        success = payment_ledger.authorize_payment(payment_id, approver_id)
-
-        if success:
-            return json.dumps({
-                'success': True,
-                'payment_id': payment_id,
-                'message': 'Payment authorized successfully'
-            }, indent=2)
-        else:
-            return json.dumps({
-                'success': False,
-                'payment_id': payment_id,
-                'error': 'Authorization failed'
-            }, indent=2)
+        from integrations.ap2.ap2_mandate import request_human_approval
+        return json.dumps(request_human_approval(payment_ledger, payment_id),
+                          indent=2)
 
     return authorize_payment
 
@@ -1050,31 +1127,35 @@ def create_payment_processing_function() -> Callable:
     return process_payment
 
 
-def get_ap2_tools_for_autogen(agent_name: str) -> List[Dict[str, Any]]:
+def get_ap2_tools_for_autogen(agent_name: str,
+                              user_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Get AP2 payment tools for autogen agent registration
 
     Args:
         agent_name: Name of the agent
+        user_id: The person the agent works for (owner of its payments)
 
     Returns:
         List of tool definitions for autogen
     """
     return [
         {
-            'function': create_payment_request_function(agent_name),
+            'function': create_payment_request_function(agent_name, user_id),
             'name': 'request_payment',
             'description': 'Request a payment transaction for services or resources. Returns payment_id for tracking.'
         },
         {
             'function': create_payment_authorization_function(),
             'name': 'authorize_payment',
-            'description': 'Authorize a pending payment request. Requires payment_id.'
+            'description': ('Ask the user to approve a pending payment (shows them an '
+                            'approval card). Agents cannot approve payments; the result '
+                            'is approval_required until the user answers. Requires payment_id.')
         },
         {
             'function': create_payment_processing_function(),
             'name': 'process_payment',
-            'description': 'Process an authorized payment through the gateway. Requires payment_id.'
+            'description': 'Process a payment the user has already approved. Requires payment_id.'
         }
     ]
 
@@ -1084,7 +1165,7 @@ __all__ = [
     'PaymentStatus', 'PaymentMethod', 'PaymentGateway',
     'PaymentRequest', 'PaymentLedger', 'PaymentGatewayConnector',
     'MockPaymentGateway', 'StripePaymentGateway', 'PhonePePaymentGateway',
-    'payment_ledger',
+    'payment_ledger', 'get_payment_ledger',
     'create_payment_request_function', 'create_payment_authorization_function',
     'create_payment_processing_function', 'get_ap2_tools_for_autogen'
 ]
