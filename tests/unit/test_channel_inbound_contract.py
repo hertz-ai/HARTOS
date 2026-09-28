@@ -133,6 +133,33 @@ def test_chat_contract_reply_reads_either_key():
     assert chat_reply(None, 'fallback') == 'fallback'     # non-dict safe
 
 
+def test_agent_turn_timeout_is_one_budget(monkeypatch):
+    """Every /chat client of the same agent turn reads one budget."""
+    from integrations.channels.chat_contract import (
+        agent_turn_timeout, DEFAULT_AGENT_TURN_TIMEOUT_S)
+    monkeypatch.delenv('HEVOLVE_CHANNEL_AGENT_TIMEOUT', raising=False)
+    assert agent_turn_timeout() == DEFAULT_AGENT_TURN_TIMEOUT_S == 120
+    monkeypatch.setenv('HEVOLVE_CHANNEL_AGENT_TIMEOUT', '300')
+    assert agent_turn_timeout() == 300
+
+
+def test_inbound_channel_post_uses_agent_turn_timeout(monkeypatch):
+    try:
+        fi = _bare_integration()
+    except Exception as e:
+        pytest.skip(f"flask_integration unavailable: {e}")
+    monkeypatch.setenv('HEVOLVE_CHANNEL_AGENT_TIMEOUT', '444')
+    seen = {}
+
+    def fake_post(url, json=None, timeout=None, headers=None, **kwargs):
+        seen['timeout'] = timeout
+        return Mock(status_code=200, json=lambda: {'response': 'ok'})
+
+    with patch('integrations.channels.flask_integration.pooled_post', fake_post):
+        fi._handle_message(_msg())
+    assert seen['timeout'] == 444
+
+
 def test_self_chat_reply_not_returned_to_avoid_double_send():
     """SelfChatHandler.handle() already sends its own reply (private
     reply-in-thread) AND returns that same text. _handle_message must NOT

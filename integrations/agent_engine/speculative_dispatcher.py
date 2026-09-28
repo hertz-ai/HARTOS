@@ -1993,7 +1993,8 @@ class SpeculativeDispatcher:
             # _run_collapsed_expert_path treats the resulting '' exactly
             # like "expert produced nothing" and the standby stays final,
             # with no error surfaced anywhere.
-            _timeout = int(os.environ.get('HEVOLVE_CHANNEL_AGENT_TIMEOUT', '120'))
+            from integrations.channels.chat_contract import agent_turn_timeout
+            _timeout = agent_turn_timeout()
             resp = _req.post(f'{base}/chat', json=payload,
                              headers=_internal_auth_headers(), timeout=_timeout)
             if resp.status_code == 200:
