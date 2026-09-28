@@ -5650,12 +5650,12 @@ def _reuse_complete_pending_subtask(user_prompt, action_id, ledgers=None):
 def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
                       manager, chat_instructor,
                       claimed_action_id=None, advanced_latch=None):
-    """Move the reuse pipeline past `action_id` -- or, when the action only
+    """Move the reuse pipeline past `action_id` — or, when the action only
     CLAIMED completion, steer the agent to actually run its tools.
 
     One rule, one home.  Five call sites used to inline this same block
     (w1-completed / w1 / w1-regex / w2 / w2-regex), each with locals named
-    after the loop they sat in -- _rc_next, _next, _next2, _w2_next,
+    after the loop they sat in — _rc_next, _next, _next2, _w2_next,
     _w2_next2 and their _ok/_steer twins.  A name that says WHERE the code
     is tells a reader nothing about WHAT the value holds, and five copies of
     one rule drift apart: the 2026-09-05 fabricated-completion fix had to be
@@ -5664,14 +5664,14 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
     Args:
         action_id: the action the PIPELINE believes is current.
         claimed_action_id: the action id the LLM asserted, when it named one.
-            Logged when it disagrees with `action_id` -- an agent claiming a
+            Logged when it disagrees with `action_id` — an agent claiming a
             different action than the one assigned is a hallucination signal.
         advanced_latch: the caller's once-per-action set, when it keeps one
             (only get_agent_response does).  A refusal drops the latch so the
             action can be re-verified once the agent really runs the tool.
 
     Returns:
-        True -- the next action's message, or a re-steer, was posted; the
+        True  — the next action's message, or a re-steer, was posted; the
                 caller should keep looping.
         False — no next action and nothing to steer; the caller should end
                 the turn.
@@ -5753,7 +5753,7 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
     _attach_named_tools_for_action(user_prompt)
 
     if not advanced:
-        # A fabrication refusal is NOT "all actions done" -- it wants the
+        # A fabrication refusal is NOT "all actions done" — it wants the
         # tool actually run, so steer instead of ending the turn.
         steer_message = _reuse_fab_steer_message(user_prompt, action_id)
         if not steer_message:
@@ -6650,7 +6650,8 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                             f"{user_prompt} — working '{_next_sub.description[:60]}'")
                         chat_instructor.initiate_chat(
                             recipient=manager,
-                            message=f"Work on subtask: {_next_sub.description}",
+                            message=(_REUSE_SUBTASK_STEER_PREFIX
+                                     + str(_next_sub.description)),
                             clear_history=False, silent=False)
                         continue
                     current_app.logger.info(
