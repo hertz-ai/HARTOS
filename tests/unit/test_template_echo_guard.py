@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from reuse_recipe import _is_template_echo  # noqa: E402
+from hartos.reuse_recipe import _is_template_echo  # noqa: E402
 
 
 # Exactly what the model emitted on 2026-08-12 (scratchpad log line 1695).

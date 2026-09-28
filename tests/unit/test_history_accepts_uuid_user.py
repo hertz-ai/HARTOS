@@ -81,7 +81,9 @@ def _call_with(session_id):
     """
     ns = {
         'time': __import__('time'),
-        'current_app': None,          # every logger call here is try/except'd
+        'current_app': None,
+        # The function logs through helper's module-level logger.
+        '_fallback_logger': __import__('logging').getLogger('hartos.helper'),
         'resolve_recall_window': _Recorder(),
     }
     mod = ast.Module(body=[_fn_node('get_time_based_history')], type_ignores=[])

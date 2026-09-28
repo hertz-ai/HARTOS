@@ -28,9 +28,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 pytest.importorskip('autogen', reason='autogen not installed')
 
-import reuse_recipe
-from reuse_recipe import _giveup_current_reuse_action
-from lifecycle_hooks import ActionState
+from hartos import reuse_recipe
+from hartos.reuse_recipe import _giveup_current_reuse_action
+from hartos.lifecycle_hooks import ActionState
 
 
 class _FakeTask:
@@ -42,7 +42,7 @@ class TestGiveupCurrentReuseAction:
     def test_marks_current_action_gave_up(self, mock_flask_app):
         user_prompt = 'u1_8888'
         with patch.object(reuse_recipe, 'user_tasks', {user_prompt: _FakeTask(3)}), \
-             patch('reuse_recipe.safe_set_state') as mock_set_state:
+             patch('hartos.reuse_recipe.safe_set_state') as mock_set_state:
             _giveup_current_reuse_action(user_prompt, '[REUSE-LOOP-ABORT] bound hit: turn-deadline')
 
         mock_set_state.assert_called_once_with(
@@ -51,7 +51,7 @@ class TestGiveupCurrentReuseAction:
 
     def test_unknown_user_prompt_is_a_safe_noop(self, mock_flask_app):
         with patch.object(reuse_recipe, 'user_tasks', {}), \
-             patch('reuse_recipe.safe_set_state') as mock_set_state:
+             patch('hartos.reuse_recipe.safe_set_state') as mock_set_state:
             _giveup_current_reuse_action('never_seen', 'reason')
 
         mock_set_state.assert_not_called()
@@ -63,7 +63,7 @@ class TestGiveupCurrentReuseAction:
         # that turns that reply into a raw traceback.
         user_prompt = 'u1_8888'
         with patch.object(reuse_recipe, 'user_tasks', {user_prompt: _FakeTask(1)}), \
-             patch('reuse_recipe.safe_set_state', side_effect=RuntimeError('boom')):
+             patch('hartos.reuse_recipe.safe_set_state', side_effect=RuntimeError('boom')):
             _giveup_current_reuse_action(user_prompt, 'reason')  # must not raise
 
     def test_each_giveup_site_calls_the_helper(self, mock_flask_app):
