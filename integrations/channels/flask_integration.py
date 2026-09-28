@@ -243,12 +243,16 @@ class FlaskChannelIntegration:
                 self._response_router.log_user_message(
                     user_id, message.channel, message.content)
 
-                # Route response: WAMP desktop + fan-out to bound channels + log
+                # Route response: WAMP desktop + fan-out to bound channels + log.
+                # NOT the originating chat: returning agent_reply below hands it
+                # to ChannelRegistry._route_to_agent, which is the one sender
+                # for this chat.
                 self._response_router.route_response(
                     user_id=user_id,
                     response_text=agent_reply,
                     channel_context=payload.get('channel_context'),
                     fan_out=True,
+                    reply_to_origin=False,
                 )
 
                 return agent_reply

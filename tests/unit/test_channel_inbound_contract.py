@@ -117,6 +117,37 @@ def test_self_chat_reply_is_not_delivered_twice():
     fi._self_chat.handle.assert_called_once()
 
 
+def test_channel_reply_has_exactly_one_sender_for_the_originating_chat():
+    """_handle_message RETURNS the reply and ChannelRegistry._route_to_agent
+    sends it.  The response router must therefore not also send it to the
+    originating chat -- it did once route_response gained its originating
+    leg, delivering every channel reply twice."""
+    try:
+        fi = _bare_integration()
+        from integrations.channels.response.router import ChannelResponseRouter
+    except Exception as e:
+        pytest.skip(f"flask_integration unavailable: {e}")
+    router = ChannelResponseRouter(registry=Mock())
+    fi._response_router = router
+
+    def fake_post(url, json=None, timeout=None, headers=None, **kwargs):
+        return Mock(status_code=200, json=lambda: {'response': 'pong'})
+
+    with patch('integrations.channels.flask_integration.pooled_post', fake_post), \
+         patch.object(router, 'upsert_binding'), \
+         patch.object(router, 'log_user_message'), \
+         patch.object(router, '_log_conversation'), \
+         patch.object(router, '_async_fan_out') as fan_out, \
+         patch.object(router, '_notify_desktop_wamp'), \
+         patch.object(router, '_send_to_originating') as to_origin:
+        reply = fi._handle_message(_msg())
+
+    assert reply == 'pong', "the registry delivers the returned reply"
+    to_origin.assert_not_called()
+    # Fan-out still excludes the originating chat, as before.
+    assert fan_out.call_args.kwargs['exclude_chat_id'] == 'c1'
+
+
 # ── chat_contract: the single source both inbound paths share ──────────
 
 def test_chat_contract_request_sends_both_keys():
