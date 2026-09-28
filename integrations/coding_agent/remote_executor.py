@@ -263,7 +263,7 @@ class RemoteDesktopExecutor:
                 'error': (
                     'Security pre-check unavailable: dlp_engine could not be '
                     'imported. Refusing to dispatch command. '
-                    'Use --force to override.'
+                    'This operation cannot be dispatched by an agent.'
                 ),
             }
 

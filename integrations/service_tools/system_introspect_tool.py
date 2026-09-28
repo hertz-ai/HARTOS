@@ -230,8 +230,12 @@ def get_tier_thresholds() -> Dict[str, Any]:
 def get_boot_decision() -> Dict[str, Any]:
     """Report why the current draft-gate / speculation state was chosen.
 
-    Reads the last line of `~/Documents/Nunba/logs/draft_decision.jsonl`
-    (written by `LlamaConfig.should_boot_draft` — commit 12c9304).
+    Reads the last line of `<get_log_dir()>/draft_decision.jsonl`
+    (written by Nunba's `LlamaConfig._log_draft_decision` into the same
+    core.platform_paths.get_log_dir()).  A dev run's log dir is `logs-dev`;
+    when this process has written none (HARTOS on its own, asked about the
+    installed app), it reads the one the installed build writes
+    (get_installed_log_dir).  `log_path` in the answer names the file read.
 
     Use when the user asks: "why is speculation off on my 8GB GPU?",
     "why didn't Nunba load the draft model?", "what's the cohort
@@ -239,7 +243,10 @@ def get_boot_decision() -> Dict[str, Any]:
     """
     import json
     from pathlib import Path
-    log_path = Path.home() / 'Documents' / 'Nunba' / 'logs' / 'draft_decision.jsonl'
+    from core.platform_paths import get_installed_log_dir, get_log_dir
+    log_path = Path(get_log_dir()) / 'draft_decision.jsonl'
+    if not log_path.exists():
+        log_path = Path(get_installed_log_dir()) / 'draft_decision.jsonl'
     if not log_path.exists():
         return {
             'available': False,
@@ -264,6 +271,7 @@ def get_boot_decision() -> Dict[str, Any]:
             'vram_free_gb': last.get('vram_free_gb'),
             'active_tts': last.get('active_tts'),
             'ts': last.get('ts'),
+            'log_path': str(log_path),
             'summary': (
                 f"Last boot decision (ts={last.get('ts')}): "
                 f"{last.get('decision')} — reason: {last.get('reason')}.  "
@@ -385,7 +393,8 @@ _DECISION_REGISTRY: Dict[str, Dict[str, str]] = {
         'module': 'hart_intelligence_entry',
         'symbol': '_read_preferred_lang',
         'description': (
-            "Reads ~/Documents/Nunba/data/hart_language.json written by "
+            "Reads <data dir>/data/hart_language.json (core.user_lang; "
+            "~/Documents/Nunba/data on Windows) written by "
             "the frontend language selector.  Falls back to 'en' if "
             "missing.  Passed through to whisper.transcribe(language=) "
             "on STT path so short Tamil utterances aren't misrouted as "

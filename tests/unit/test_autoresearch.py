@@ -680,8 +680,26 @@ class TestBenchmarkIntegration(unittest.TestCase):
             iteration=1, hypothesis='test', metric_name='score',
             metric_value=None, baseline_value=None, improved=False,
             error='crash')
-        # Should not raise even without real BenchmarkTracker
-        engine.record_benchmark(session, result)
+        # A real tracker on a temp DB.  The default one is the user's own
+        # data dir (core.platform_paths.get_agent_data_dir), and a test that
+        # built it wrote a row into the DB the desktop routes coding tasks by.
+        from integrations.coding_agent.benchmark_tracker import BenchmarkTracker
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, 'b.db')
+            tracker = BenchmarkTracker(db_path=db)
+            with patch('integrations.coding_agent.benchmark_tracker.get_benchmark_tracker',
+                       return_value=tracker):
+                engine.record_benchmark(session, result)   # must not raise
+            import sqlite3
+            conn = sqlite3.connect(db)
+            try:
+                rows = conn.execute(
+                    'SELECT task_type, tool_name, success FROM benchmarks').fetchall()
+            finally:
+                conn.close()
+        # The crashed experiment is recorded as a failure, and enforcement held.
+        self.assertEqual(rows, [('autoresearch', 'aider_native_backend', 0)])
+        self.assertTrue(session.benchmark_gain_enforced)
 
 
 if __name__ == '__main__':

@@ -1102,6 +1102,51 @@ class WorldModelBridge:
 
     # ─── Expert corrections (RL-EF) ─────────────────────────────────
 
+    def _count_if_learned(self, result: dict) -> bool:
+        """Count a correction only when HevolveAI reports it LEARNED.
+
+        One reader for both paths: ``result`` is the /v1/corrections reply
+        (HTTP) or the provider's own dict (in-process).  HevolveAI reports two
+        verdicts: 'success' means the correction was CAPTURED, 'learned' means
+        the learning step ran and learned.  Only a literal True counts, and
+        the verdict is written back to result['success'] and
+        result['learned'], so what callers receive matches what was counted.
+
+        Decided in this order:
+        1. 'learned' present (a server or provider that reports it): the
+           verdict is ``result['learned'] is True``.
+        2. else a top-level 'success': the hevolveai 2c4e622 reply, or an
+           in-process provider older than 'learned'.  That flag is the
+           CAPTURED flag (true even when learning was skipped), so it is not
+           a learn and is not counted.
+        3. else 'statistics' (a server older than 2c4e622, whose reply always
+           said "status": "success"): statistics.learned when present, else
+           statistics.success.  statistics.success on those servers is the
+           same captured flag, so this last fallback can still count a
+           captured-but-not-learned correction; it is kept because such a
+           server reports nothing better.
+        Measured cause (log defect M19-B): every HTTP 200 was counted,
+        including all 5 live corrections on 09-22 that failed with "No
+        sensor encoding available".
+        """
+        stats = result.get('statistics')
+        if 'learned' in result:
+            learned = result['learned'] is True
+        elif 'success' in result:
+            learned = False
+        elif isinstance(stats, dict) and 'learned' in stats:
+            learned = stats['learned'] is True
+        elif isinstance(stats, dict):
+            learned = stats.get('success') is True
+        else:
+            learned = False
+        result['success'] = learned
+        result['learned'] = learned
+        if learned:
+            with self._lock:
+                self._stats['total_corrections'] += 1
+        return learned
+
     def submit_correction(self, original_response: str,
                           corrected_response: str,
                           expert_id: str = 'hevolve_user',
@@ -1151,9 +1196,11 @@ class WorldModelBridge:
                     explanation=explanation[:2000] if explanation else None,
                     valid_until=valid_until,
                 )
-                with self._lock:
-                    self._stats['total_corrections'] += 1
-                return result if isinstance(result, dict) else {'success': True}
+                if not isinstance(result, dict):
+                    result = {'success': False,
+                              'reason': 'provider returned no result'}
+                self._count_if_learned(result)
+                return result
             except Exception as e:
                 logger.debug(f"In-process correction failed: {e}")
 
@@ -1190,9 +1237,11 @@ class WorldModelBridge:
             )
             self._cb_record_success()
             if resp.status_code == 200:
-                with self._lock:
-                    self._stats['total_corrections'] += 1
-                return resp.json()
+                body = resp.json()
+                if not isinstance(body, dict):
+                    return {'success': False, 'reason': 'unreadable reply'}
+                self._count_if_learned(body)
+                return body
             return {'success': False, 'reason': f'HTTP {resp.status_code}'}
         except requests.RequestException as e:
             self._cb_record_failure()

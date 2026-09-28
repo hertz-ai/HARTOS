@@ -31,8 +31,10 @@ def shell_auth_ok():
     ``(True, None, None)``; otherwise ``(False, <json>, 403)``.
     """
     from flask import request, jsonify
-    remote = request.remote_addr or ''
-    if remote in LOCAL_ORIGINS:
+    from core.auth_local import _is_local_request
+    # The one local check (core.auth_local): loopback socket peer, never a
+    # forwarded claim; 0.0.0.0 is not loopback.
+    if _is_local_request():
         return True, None, None
     token = request.headers.get('X-Shell-Token', '')
     expected = os.environ.get('HART_SHELL_TOKEN', '')

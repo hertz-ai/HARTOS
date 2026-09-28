@@ -1805,7 +1805,7 @@ class TestWorldModelBridge:
         from integrations.agent_engine.world_model_bridge import WorldModelBridge
         mock_post.return_value = Mock(
             status_code=200,
-            json=lambda: {'success': True, 'domain': 'general',
+            json=lambda: {'success': True, 'learned': True, 'domain': 'general',
                           'expert_id': 'expert1'})
         bridge = WorldModelBridge()
         bridge._http_disabled = False
@@ -2247,57 +2247,103 @@ class TestBootVerificationGuardrailHash:
 
 
 class TestRuntimeMonitorGuardrailCheck:
-    def test_monitor_healthy_when_code_and_guardrails_match(self):
+    """The monitor runs for real against a bounded code root.
+
+    Until 2026-09-26 these tests pointed the monitor at the whole checkout
+    and mocked compute_code_hash / compute_file_manifest, but not the rest
+    of what _check_loop does there: purge_pycache (an rglob that deleted
+    every __pycache__ in the checkout, a local venv included), and two
+    _stat_sweep walks on the main thread.  Beside a node that the origin
+    check used to boot in-process, that blew CI's 120 s budget (shard 5).
+    The constructor's own code_root seam bounds all of it to one tmp tree,
+    so nothing below is mocked except time.sleep.
+    """
+
+    @pytest.fixture
+    def code_root(self, tmp_path):
+        (tmp_path / 'mod.py').write_text('VALUE = 1\n', encoding='utf-8')
+        # A bytecode dir inside the ROOT, so the manifest-mode purge has
+        # something real to remove.
+        (tmp_path / '__pycache__').mkdir()
+        (tmp_path / '__pycache__' / 'mod.cpython-311.pyc').write_bytes(b'x')
+        return tmp_path
+
+    @pytest.fixture(autouse=True)
+    def _restore_bytecode_flag(self):
+        # purge_pycache sets PYTHONDONTWRITEBYTECODE process-wide; put it back.
+        before = os.environ.get('PYTHONDONTWRITEBYTECODE')
+        yield
+        if before is None:
+            os.environ.pop('PYTHONDONTWRITEBYTECODE', None)
+        else:
+            os.environ['PYTHONDONTWRITEBYTECODE'] = before
+
+    @staticmethod
+    def _monitor_clock(sleep):
+        """Replace the clock of the MONITOR MODULE only.  A process-wide
+        patch('time.sleep') also counted every other thread's sleeps (186 in
+        one measured run), so the loop's cycle count was not its own."""
+        import types
+        import security.runtime_monitor as rm
+        return patch.object(rm, 'time',
+                            types.SimpleNamespace(sleep=sleep, time=time.time))
+
+    def test_monitor_healthy_when_code_and_guardrails_match(self, code_root):
         """When code hash matches and guardrail integrity passes (real frozen values),
         monitor stays healthy. verify_guardrail_integrity is frozen and can't be
         mocked - this IS the protection working as designed."""
+        from security.node_integrity import compute_code_hash
         from security.runtime_monitor import RuntimeIntegrityMonitor
         monitor = RuntimeIntegrityMonitor(
-            manifest={'code_hash': 'matching_hash'},
-            check_interval=1)
-        with patch('security.node_integrity.compute_code_hash', return_value='matching_hash'):
-            monitor._running = True
-            monitor._check_interval = 0
-            call_count = [0]
-            def mock_sleep(s):
-                call_count[0] += 1
-                if call_count[0] >= 2:
-                    monitor._running = False
-            with patch('time.sleep', side_effect=mock_sleep):
-                monitor._check_loop()
-            # Both code hash and guardrail integrity pass → healthy
-            assert monitor._tampered is False
+            manifest={'code_hash': compute_code_hash(str(code_root),
+                                                     force_walk=True)},
+            check_interval=1, code_root=str(code_root))
+        monitor._full_every = 1   # every cycle re-hashes the bytes
+        monitor._running = True
+        monitor._check_interval = 0
+        call_count = [0]
+        def mock_sleep(s):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                monitor._running = False
+        with self._monitor_clock(mock_sleep):
+            monitor._check_loop()
+        # Both code hash and guardrail integrity pass → healthy
+        assert call_count[0] == 2, 'one full cycle ran, then the loop stopped'
+        assert monitor._tampered is False
+        assert set(monitor._boot_manifest_snapshot) == {'mod.py'}, \
+            'the walk must stay inside the code root it was given'
+        assert not (code_root / '__pycache__').exists(), \
+            'manifest mode must purge bytecode under its code root'
 
-    def test_monitor_detects_code_tamper(self):
-        """When code hash mismatches, monitor detects tampering."""
+    def test_monitor_detects_code_tamper(self, code_root, caplog):
+        """An edit to a tracked file after boot is detected by the real
+        stat sweep + byte walk, and the response names the file."""
+        import logging
+        from security.node_integrity import compute_code_hash
         from security.runtime_monitor import RuntimeIntegrityMonitor
         monitor = RuntimeIntegrityMonitor(
-            manifest={'code_hash': 'original_hash'},
-            check_interval=1)
-        # 439ff36's tiered check only FULL-verifies every _full_every-th cycle
-        # (12 by default); the cycles between are whole-repo stat sweeps, and
-        # twelve of those on a CI checkout blew the 120s pytest-timeout budget
-        # (shard 5, 2026-08-22). This test's contract is "a hash mismatch is
-        # DETECTED", not the sweep cadence — force the full verify on the
-        # first cycle so detection is exercised in one pass.
-        monitor._full_every = 1
-        # De-flake (shard 5, run 33313552929 Timeout >120s; green on 33310728776
-        # with IDENTICAL code). compute_code_hash is mocked, but the tamper path
-        # runs the REAL whole-repo compute_file_manifest TWICE — once in
-        # _prepare_baseline and again in _on_tamper_detected — and on a loaded CI
-        # checkout that occasionally blows the 120s budget. This test's contract
-        # is "a hash mismatch is DETECTED" (monitor._tampered, set BEFORE the
-        # response runs), not the manifest file-diff the response logs. Mock the
-        # manifest so detection is exercised deterministically without hashing
-        # thousands of files.
-        with patch('security.node_integrity.compute_code_hash', return_value='tampered_hash'), \
-                patch('security.node_integrity.compute_file_manifest',
-                      return_value={'sentinel': 'h'}):
-            monitor._running = True
-            monitor._check_interval = 0
-            with patch('time.sleep', side_effect=lambda s: None):
-                monitor._check_loop()
-            assert monitor._tampered is True
+            manifest={'code_hash': compute_code_hash(str(code_root),
+                                                     force_walk=True)},
+            check_interval=1, code_root=str(code_root))
+        monitor._running = True
+        monitor._check_interval = 0
+        sleeps = [0]
+        def tamper_then_sleep(s):
+            sleeps[0] += 1
+            if sleeps[0] == 1:
+                # After the boot baseline: a different size, so the cheap
+                # stat sweep sees it and escalates to the full verify.
+                (code_root / 'mod.py').write_text(
+                    'VALUE = 2  # edited after boot\n', encoding='utf-8')
+            elif sleeps[0] > 5:
+                monitor._running = False   # never spin if detection regressed
+        with self._monitor_clock(tamper_then_sleep), \
+                caplog.at_level(logging.CRITICAL, logger='hevolve_security'):
+            monitor._check_loop()
+        assert monitor._tampered is True
+        assert sleeps[0] == 1, 'detected on the first cycle after the edit'
+        assert 'TAMPERED FILE: mod.py' in caplog.text
 
     def test_guardrail_integrity_always_passes_when_frozen(self):
         """Since values are structurally frozen, verify_guardrail_integrity()

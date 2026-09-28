@@ -36,6 +36,12 @@ TIER_THRESHOLDS = {
 
 HOSTING_MILESTONES = [10, 50, 100, 500]  # agent_count thresholds
 
+# Compute served, measured in tokens, as GPU time: ~1 GPU-second per 1K tokens
+# (rough heuristic).  One constant for both readers: aggregate_compute_stats
+# credits gpu_hours_served with it, and budget_gate prices compute run on a
+# node the requester does not own with it (spark_per_1k_compute_tokens).
+GPU_SECONDS_PER_1K_TOKENS = 1.0
+
 try:
     from integrations.agent_engine.revenue_aggregator import REVENUE_SPLIT_USERS
     HOSTER_REVENUE_SHARE = REVENUE_SPLIT_USERS  # 0.90 (was 0.70)
@@ -448,8 +454,8 @@ class HostingRewardService:
             usd_absorbed = sum(u.actual_usd_cost or 0 for u in usages)
             total_tokens = sum((u.tokens_in or 0) + (u.tokens_out or 0) for u in usages)
 
-            # Estimate GPU hours: ~1 GPU-second per 1K tokens (rough heuristic)
-            gpu_hours_delta = (total_tokens / 1000.0) / 3600.0
+            gpu_hours_delta = (
+                (total_tokens / 1000.0) * GPU_SECONDS_PER_1K_TOKENS / 3600.0)
 
             # Estimate energy: use ModelRegistry if available, else 170W TDP default
             try:

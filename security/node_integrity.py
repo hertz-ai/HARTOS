@@ -236,7 +236,8 @@ def _write_identity_once(path, record):
         try:
             os.link(tmp, path)
         except FileExistsError:
-            pass
+            logger.debug('node identity %s already recorded by another '
+                         'process; using the one on disk', path)
         except OSError:
             # No hard links on this filesystem: atomic replace, then re-read.
             if not os.path.exists(path):
@@ -296,7 +297,8 @@ def load_or_create_node_identity(legacy_node_id_path=None) -> str:
                 identity_state = 'recorded'
                 return now['node_id']
         except (OSError, ValueError):
-            pass
+            logger.debug('node identity record %s unreadable on re-read',
+                         rec_path, exc_info=True)
         logger.warning(
             'node identity record %s does not match the key in %s '
             '(record key %s, this key %s); keeping it as %s and taking a new '
@@ -306,7 +308,9 @@ def load_or_create_node_identity(legacy_node_id_path=None) -> str:
         try:
             os.replace(rec_path, superseded)
         except FileNotFoundError:
-            pass  # another process moved it first; _write_identity_once settles it
+            # another process moved it first; _write_identity_once settles it
+            logger.debug('identity record %s already moved by another '
+                         'process', rec_path)
         rec = _write_identity_once(str(rec_path), fresh)
         identity_state = 'minted'
         return rec['node_id']
@@ -361,7 +365,9 @@ def local_key_dir_holding(fingerprint: str):
         root = get_identity_data_dir()
         candidates += [os.path.join(root, 'data'), os.path.join(root, 'agent_data')]
     except Exception:
-        pass
+        logger.warning('local_key_dir_holding: identity data dir unavailable; '
+                       'the data/ and agent_data/ key dirs are not searched',
+                       exc_info=True)
     candidates.append(os.path.abspath('agent_data'))
     seen = set()
     for d in candidates:
@@ -436,7 +442,8 @@ def take_new_node_identity(reason: str) -> str:
         try:
             os.replace(rec_path, key_dir / f'node_identity.superseded.{stamp}.json')
         except FileNotFoundError:
-            pass
+            logger.debug('identity record %s already moved by another '
+                         'process', rec_path)
     rec = _write_identity_once(str(rec_path), {
         'node_id': str(_uuid.uuid4()), 'public_key_hex': get_public_key_hex(),
         'created_at': _dt.utcnow().isoformat()})

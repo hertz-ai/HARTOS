@@ -227,6 +227,34 @@ def build_agentic_plan(prompt: str, prompts_dir: str = None) -> Dict:
     }
 
 
+#: How long the Agentic_Router tool waits for a plan before answering
+#: without one.  It is two LLM calls; the chat turn must not wait longer.
+AGENTIC_PLAN_TIMEOUT_S = 15
+
+
+def build_agentic_plan_bounded(prompt: str, prompts_dir: str = None,
+                               timeout_s: float = AGENTIC_PLAN_TIMEOUT_S):
+    """build_agentic_plan, or None if it takes longer than ``timeout_s``.
+
+    Its error, if it raises in time, is raised here.  On core.subprocess_safe.
+    call_bounded: hart_intelligence_entry._handle_agentic_router_tool had a
+    `with ThreadPoolExecutor(max_workers=1)` + result(timeout=15) whose
+    `with` exit joined the stuck worker, so the timeout never released the
+    chat turn (review F7, 2026-09-27; probe vlm_pool.py: 3.02 s on 0.5 s).
+    """
+    from core.subprocess_safe import call_bounded
+    finished, plan, error = call_bounded(
+        lambda: build_agentic_plan(prompt, prompts_dir), timeout_s,
+        name='hart-agentic-plan')
+    if not finished:
+        logger.warning('agentic plan not ready after %ss; answering without it',
+                       timeout_s)
+        return None
+    if error is not None:
+        raise error
+    return plan
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Direct-named dispatch (Phase 7b — mention path)
 # Plan reference: sunny-gliding-eich.md, Part B.4 + Part E.5.

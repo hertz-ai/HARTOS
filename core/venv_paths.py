@@ -26,6 +26,8 @@ Public API
     venv_path(backend)                     -> str
     venv_python(backend)                   -> str
     venv_python_if_exists(backend)         -> Optional[str]
+    venv_creator_python()                  -> Optional[str]
+    venv_mismatch(backend)                 -> Optional[str]
     venv_site_packages(backend)            -> str
     parent_package_roots()                 -> List[str]
     parent_package_root_of(module_name)    -> Optional[str]
@@ -59,9 +61,8 @@ def venv_root() -> str:
     Resolution order (highest priority first):
         1. ``NUNBA_VENV_ROOT_OVERRIDE`` env var (tests / custom deploys).
         2. ``core.platform_paths.get_data_dir() / "data" / "venvs"``
-           (the canonical answer in any normal install).
-        3. OS-aware fallback when ``core.platform_paths`` is unimportable
-           (pure-Nunba lint runs that have not yet activated HARTOS).
+           (the canonical answer; this module is in the same ``core``
+           package, so there is no install where it is missing).
     """
     override = os.environ.get("NUNBA_VENV_ROOT_OVERRIDE", "").strip()
     if override:
@@ -72,19 +73,8 @@ def venv_root() -> str:
     if _VENV_ROOT_CACHE is not None:
         return _VENV_ROOT_CACHE
 
-    try:
-        from core.platform_paths import get_data_dir  # type: ignore
-        base = os.path.join(str(get_data_dir()), "data", "venvs")
-    except Exception:
-        # platform_paths unimportable — replicate its decision tree.
-        home = os.path.expanduser("~")
-        if sys.platform == "win32":
-            base = os.path.join(home, "Documents", "Nunba", "data", "venvs")
-        elif sys.platform == "darwin":
-            base = os.path.join(home, "Library", "Application Support",
-                                "Nunba", "data", "venvs")
-        else:
-            base = os.path.join(home, ".config", "nunba", "data", "venvs")
+    from core.platform_paths import get_data_dir
+    base = os.path.join(str(get_data_dir()), "data", "venvs")
 
     os.makedirs(base, exist_ok=True)
     _VENV_ROOT_CACHE = base
@@ -122,12 +112,82 @@ def venv_python(backend: str) -> str:
     return os.path.join(vpath, "bin", "python")
 
 
-def venv_python_if_exists(backend: Optional[str]) -> Optional[str]:
-    """Return the venv's python.exe path if it exists on disk, else None.
+# ── Which interpreter builds a backend venv, and did it build this one ───────
+#
+# Measured 2026-09-25 on the installed build: neutts_air, melotts and kokoro
+# had venvs made by a source-mode run on miniconda 3.11 (pyvenv.cfg home =
+# miniconda3, version = 3.11.4) in the store the installed 3.12 app shares.
+# The app adopted them because only python.exe's existence was checked,
+# spawned them with its own 3.12 sys.path in PYTHONPATH, and each died before
+# running any Python: "bad magic number in 'encodings'".  A venv made from
+# python-embed runs isolated and ignores PYTHONPATH; a venv made by any other
+# interpreter reads it, so even a same-version one would load python-embed's
+# packages ahead of its own pins.  A venv is therefore used only when the
+# interpreter this process creates venvs with is the one that built it.
 
-    The HARTOS spawn path uses this resolver: ``None`` lets the caller
-    fall through to the bundled python-embed (the right behavior for
-    backends that don't have their own venv yet).
+def venv_creator_python() -> Optional[str]:
+    """Return the interpreter that creates (and whose venvs may run) the
+    backend venvs for this process, or None when there is none.
+
+    On the frozen build ``sys.executable`` is the app binary, not Python;
+    the interpreter is the bundled ``python-embed`` beside it.  Running
+    from source, it is ``sys.executable``.
+    """
+    if getattr(sys, "frozen", False):
+        embed = os.path.join(
+            os.path.dirname(os.path.abspath(sys.executable)), "python-embed")
+        for parts in (("python.exe",), ("bin", "python3"), ("bin", "python")):
+            candidate = os.path.join(embed, *parts)
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+    return sys.executable
+
+
+def _creator_home() -> Optional[str]:
+    """The ``home`` a venv made by ``venv_creator_python()`` records: the
+    directory of that interpreter's base executable (``python -m venv``
+    writes ``dirname(sys._base_executable)``, so a creator that is itself a
+    venv records its base install)."""
+    creator = venv_creator_python()
+    if not creator:
+        return None
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(creator))
+    base = getattr(sys, "_base_executable", None) or sys.executable
+    return os.path.dirname(os.path.abspath(base))
+
+
+def _read_pyvenv_cfg(vpath: str) -> Optional[dict]:
+    """``key = value`` pairs of a venv's pyvenv.cfg, or None if unreadable."""
+    try:
+        with open(os.path.join(vpath, "pyvenv.cfg"), "r",
+                  encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    cfg = {}
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if sep:
+            cfg[key.strip().lower()] = value.strip()
+    return cfg
+
+
+def _same_dir(a: str, b: str) -> bool:
+    def norm(p, resolve):
+        p = os.path.realpath(p) if resolve else os.path.abspath(p)
+        return os.path.normcase(os.path.normpath(p))
+    return norm(a, False) == norm(b, False) or norm(a, True) == norm(b, True)
+
+
+def venv_mismatch(backend: Optional[str]) -> Optional[str]:
+    """Why ``backend``'s venv may not be used by this process, or None.
+
+    None means either there is no venv (nothing to refuse) or the venv was
+    built by ``venv_creator_python()``: its pyvenv.cfg ``home`` is that
+    interpreter's home and its ``version`` has this Python's major.minor
+    (the stdlib bytecode magic changes per minor release).
     """
     if not backend:
         return None
@@ -135,7 +195,56 @@ def venv_python_if_exists(backend: Optional[str]) -> Optional[str]:
         candidate = venv_python(backend)
     except ValueError:
         return None
-    return candidate if os.path.isfile(candidate) else None
+    if not os.path.isfile(candidate):
+        return None
+    vpath = venv_path(backend)
+    want_home = _creator_home()
+    want_version = "%d.%d" % sys.version_info[:2]
+    if not want_home:
+        return (f"venv {backend!r} at {vpath}: this process has no "
+                f"interpreter to run backend venvs with")
+    cfg = _read_pyvenv_cfg(vpath)
+    if not cfg:
+        return (f"venv {backend!r} at {vpath} has no readable pyvenv.cfg, so "
+                f"what built it is unknown; this process runs venvs built "
+                f"from {want_home} (Python {want_version})")
+    home = cfg.get("home", "")
+    version = cfg.get("version") or cfg.get("version_info") or ""
+    got_version = ".".join(version.split(".")[:2])
+    if not home or not _same_dir(home, want_home) or got_version != want_version:
+        return (f"venv {backend!r} at {vpath} was built from {home or '?'} "
+                f"(Python {version or '?'}); this process runs venvs built "
+                f"from {want_home} (Python {want_version})")
+    return None
+
+
+_MISMATCH_LOGGED: set = set()
+
+
+def venv_python_if_exists(backend: Optional[str]) -> Optional[str]:
+    """Return the venv's python.exe path if it exists on disk AND was built
+    by this process's venv interpreter (``venv_mismatch``), else None.
+
+    The HARTOS spawn path uses this resolver: ``None`` lets the caller
+    fall through to the bundled python-embed (the right behavior for
+    backends that don't have their own venv yet, and for a venv another
+    interpreter built, which would die at startup or break its cage).
+    """
+    if not backend:
+        return None
+    try:
+        candidate = venv_python(backend)
+    except ValueError:
+        return None
+    if not os.path.isfile(candidate):
+        return None
+    reason = venv_mismatch(backend)
+    if reason:
+        if reason not in _MISMATCH_LOGGED:
+            _MISMATCH_LOGGED.add(reason)
+            logger.warning("%s; not using it until it is rebuilt", reason)
+        return None
+    return candidate
 
 
 # ── Parent-package visibility inside a backend venv ──────────────────────────
@@ -179,8 +288,9 @@ def venv_site_packages(backend: str) -> str:
             candidate = os.path.join(lib, entry, "site-packages")
             if entry.startswith("python") and os.path.isdir(candidate):
                 return candidate
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.debug("venv %r: %s not listable (%s); naming site-packages "
+                     "after this interpreter", backend, lib, exc)
     return os.path.join(
         lib, f"python{sys.version_info[0]}.{sys.version_info[1]}",
         "site-packages",
@@ -325,8 +435,10 @@ def ensure_parent_packages_visible(backend: Optional[str]) -> Optional[str]:
         with open(pth, "r", encoding=encoding) as fh:
             if fh.read() == content:
                 return pth
-    except (OSError, UnicodeError):
-        pass  # absent, unreadable or stale: rewrite below
+    except (OSError, UnicodeError) as exc:
+        # absent, unreadable or stale: rewrite below
+        logger.debug("venv %r: %s not read (%s); rewriting it", backend,
+                     pth, exc)
 
     tmp = pth + ".tmp"
     try:
@@ -340,8 +452,9 @@ def ensure_parent_packages_visible(backend: Optional[str]) -> Optional[str]:
         )
         try:
             os.remove(tmp)
-        except OSError:
-            pass
+        except OSError as rm_exc:
+            logger.debug("venv %r: temp %s not removed (%s)", backend, tmp,
+                         rm_exc)
         return None
     logger.info("venv %r: %s now lists %s", backend, PARENT_PACKAGES_PTH, roots)
     return pth

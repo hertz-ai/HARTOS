@@ -215,10 +215,14 @@ def test_all_routes_require_auth(client):
         ('POST', '/api/social/encounter/register-pubkey',
             {'pubkey': 'a' * 32}),
         ('GET', '/api/social/encounter/topics', {}),
+        ('GET', '/api/social/encounter/persona', {}),
+        ('PUT', '/api/social/encounter/persona', {'bio': 'x'}),
     ]
     for method, path, body in probes:
         if method == 'GET':
             resp = client.get(path)
+        elif method == 'PUT':
+            resp = client.put(path, json=body)
         else:
             resp = client.post(path, json=body)
         assert resp.status_code == 401, \
@@ -292,6 +296,102 @@ def test_discoverable_toggle_limit(client):
         headers=_as_user(uid),
     )
     assert resp.status_code == 429
+
+
+# ══════════════════════════════════════════════════════════════════════
+# persona card — what an agent may say about its user to a matched
+# person's agent (owner 2026-09-27: agents describe each user to the
+# other so they can recognise each other; match on bio + interests)
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_persona_default_empty(client):
+    resp = client.get('/api/social/encounter/persona', headers=_as_user(30))
+    assert resp.status_code == 200
+    data = resp.get_json()['data']
+    assert data == {'bio': '', 'recognize_me': '', 'vibe_tags': [],
+                    'interests_discoverable': False}
+
+
+def test_persona_saved_and_read_back(client):
+    resp = client.put(
+        '/api/social/encounter/persona',
+        json={'bio': 'Weekend trail runner, learning the sitar.',
+              'recognize_me': 'Tall, red backpack, usually near the chai stall',
+              'vibe_tags': ['trail running', 'sitar'],
+              'interests_discoverable': True},
+        headers=_as_user(30),
+    )
+    assert resp.status_code == 200
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(30)).get_json()['data']
+    assert data['bio'] == 'Weekend trail runner, learning the sitar.'
+    assert data['recognize_me'].startswith('Tall, red backpack')
+    assert data['vibe_tags'] == ['trail running', 'sitar']
+    assert data['interests_discoverable'] is True
+
+
+def test_persona_fields_are_capped(client):
+    client.put(
+        '/api/social/encounter/persona',
+        json={'bio': 'b' * 5000, 'recognize_me': 'r' * 5000,
+              'vibe_tags': [f't{i}' * 30 for i in range(40)]},
+        headers=_as_user(31),
+    )
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(31)).get_json()['data']
+    assert len(data['bio']) == C.ENCOUNTER_PERSONA_BIO_MAX_CHARS
+    assert len(data['recognize_me']) == C.ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS
+    assert len(data['vibe_tags']) == 10
+    assert all(len(t) <= 40 for t in data['vibe_tags'])
+
+
+def test_persona_edit_is_not_a_discoverable_toggle(client):
+    """Editing the card must not spend the 6-per-day broadcast toggles
+    or switch discovery on."""
+    for i in range(C.ENCOUNTER_DISCOVERABLE_MAX_TOGGLES_24H + 2):
+        r = client.put('/api/social/encounter/persona',
+                       json={'bio': f'v{i}'}, headers=_as_user(32))
+        assert r.status_code == 200
+    state = client.get('/api/social/encounter/discoverable',
+                       headers=_as_user(32)).get_json()['data']
+    assert state['enabled'] is False
+    assert state['toggle_count_24h'] == 0
+
+
+def test_discoverable_toggle_keeps_persona_tags(client):
+    """The BLE toggle used to overwrite vibe_tags with [] whenever a
+    body omitted them; with the card as a second writer that would
+    silently wipe the user's interests."""
+    client.put('/api/social/encounter/persona',
+               json={'vibe_tags': ['chess', 'jazz']}, headers=_as_user(33))
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': True, 'age_claim_18': True},
+                headers=_as_user(33))
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(33)).get_json()['data']
+    assert data['vibe_tags'] == ['chess', 'jazz']
+
+
+def test_persona_rejects_non_list_tags(client):
+    r = client.put('/api/social/encounter/persona',
+                   json={'vibe_tags': 'chess'}, headers=_as_user(34))
+    assert r.status_code == 400
+
+
+def test_v59_adds_persona_columns_to_an_existing_table():
+    from sqlalchemy import create_engine, inspect, text
+    from integrations.social.migrations import _v59_persona_card
+
+    engine = create_engine('sqlite:///:memory:')
+    with engine.connect() as conn:
+        conn.execute(text(
+            "CREATE TABLE discoverable_prefs (user_id VARCHAR(64) PRIMARY KEY)"))
+        conn.commit()
+    assert _v59_persona_card(engine) is True
+    cols = {c['name'] for c in inspect(engine).get_columns('discoverable_prefs')}
+    assert {'bio', 'recognize_me', 'interests_discoverable'} <= cols
+    assert _v59_persona_card(engine) is True   # idempotent
 
 
 # ══════════════════════════════════════════════════════════════════════

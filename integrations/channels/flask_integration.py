@@ -405,6 +405,19 @@ class FlaskChannelIntegration:
     # registry.register keys on adapter.name.
     _RESTORE_EXCLUDED = ('whatsapp',)
 
+    @classmethod
+    def env_names(cls) -> frozenset:
+        """Every environment variable a channel reads its token or an extra
+        credential from (_ENV_FALLBACKS and each _CHANNEL_SPECS extra's
+        'env').  hartos.ai_key_vault.reads_from_env asks this, so a channel
+        secret stored for a channel still reaches the adapter's env read."""
+        names = set(cls._ENV_FALLBACKS.values())
+        for spec in cls._CHANNEL_SPECS.values():
+            for extra in spec.get('extra', ()):
+                if extra.get('env'):
+                    names.add(extra['env'])
+        return frozenset(names)
+
     # Declarative specs for channels that need more than the single generic
     # `token`: the token maps to a differently-named factory param
     # (`token_param`) and/or extra credentials must be resolved.  This replaces

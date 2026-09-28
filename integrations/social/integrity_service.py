@@ -256,6 +256,13 @@ class IntegrityService:
             status='pending',
         )
         db.add(challenge)
+        # Stamped when the challenge is ISSUED, whatever comes back: the
+        # answered path returns from evaluate_challenge_response below and
+        # used to leave it NULL, so a peer that passed read as "never
+        # challenged" to the integrity round's new-peer-first ranking.
+        _target = db.query(PeerNode).filter_by(node_id=target_node_id).first()
+        if _target:
+            _target.last_challenge_at = datetime.utcnow()
         # COMMIT, not flush, before the network call.  The INSERT takes
         # SQLite's single write lock and a flush kept it until the caller
         # committed, which for _integrity_round was after EVERY active peer
@@ -265,7 +272,7 @@ class IntegrityService:
         # daemon logged "database is locked" on every tick with no goal
         # update persisted (#71).  Same class as the health-round fix
         # (374f5ab6).  The caller's later commit still covers the after-POST
-        # bookkeeping below (status, fraud score, last_challenge_at).
+        # bookkeeping below (status, fraud score).
         db.commit()
 
         # Send challenge to target node
@@ -296,9 +303,6 @@ class IntegrityService:
             # the health round's job (stale/dead), not the fraud score's.
             challenge.status = 'timeout'
 
-        peer = db.query(PeerNode).filter_by(node_id=target_node_id).first()
-        if peer:
-            peer.last_challenge_at = datetime.utcnow()
         return challenge.to_dict()
 
     @staticmethod

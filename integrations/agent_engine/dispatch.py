@@ -253,23 +253,37 @@ def _in_process_chat(native_fallback=True, model_config=None):
         from routes.hartos_backend_adapter import chat
         return chat
     except ImportError:
-        pass
+        logger.debug('routes.hartos_backend_adapter not importable; trying '
+                     'the flat adapter module')
     try:
         from hartos_backend_adapter import chat
         return chat
     except ImportError:
-        pass
+        logger.debug('No Nunba backend adapter importable; native /chat '
+                     'fallback=%s', native_fallback)
     return _native_chat if native_fallback else None
 
 
 def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
-                        native_fallback=True, model_config=None):
+                        native_fallback=True, model_config=None,
+                        cancel_event=None):
     """The ONE in-process call to this node's own /chat.  Returns
     ``(status, text)`` where status is ``'ok'`` (text is the reply),
     ``'deferred'`` (a human has the LLM, or it is saturated — retry later,
     NOT a failure) or ``'unavailable'`` (no in-process route; the caller may
     fall back to its HTTP tier).  ``model_config`` runs the turn on that
     model; _in_process_chat says which path carries it.
+
+    ``cancel_event`` (a threading.Event): set by whoever stopped waiting for
+    this turn (the A2A task/cancel of a peer that gave up).  Honoured while
+    the turn waits for the LLM permit, right after it is taken, and during
+    the turn: it is bound to the turn's request id in core.llama_scheduler,
+    which refuses the turn's NEXT local LLM call (TurnCancelled), so the
+    turn ends and the permit comes back.  Returns ``('cancelled', None)``.
+    The one call already on the wire finishes: llama-server can abort a
+    request only by its connection closing, and the connection is the
+    SHARED background client (core.foreground's preempt), which would stop
+    every other background call too.
 
     ``native_fallback=False`` says "only use this if the Nunba adapter is
     present".  On native HARTOS (central) the loopback POST already reaches
@@ -349,11 +363,20 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
                     f"deferring local /chat for {daemon_id or prompt_id}")
         return 'deferred', None
 
-    if not _local_llm_semaphore.acquire(timeout=_LOCAL_LLM_WAIT_S):
+    if not _acquire_llm_permit(cancel_event):
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info(f"Local /chat for {daemon_id or prompt_id} cancelled "
+                        f"while waiting for the LLM permit")
+            return 'cancelled', None
         logger.info(f"LLM busy ({_LOCAL_LLM_MAX_CONCURRENT} in flight) for "
                     f"{_LOCAL_LLM_WAIT_S:.0f}s, deferring local /chat for "
                     f"{daemon_id or prompt_id}")
         return 'deferred', None
+    if cancel_event is not None and cancel_event.is_set():
+        _local_llm_semaphore.release()
+        logger.info(f"Local /chat for {daemon_id or prompt_id} cancelled "
+                    f"before its turn; permit given back")
+        return 'cancelled', None
 
     # The permit is held from here, so enter the try IMMEDIATELY: everything
     # below must be inside it, because whatever raises, the finally is the
@@ -361,6 +384,7 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
     # between the acquire and the try, so a raise there leaked the semaphore
     # permanently -- one permit, so the node's background LLM would have been
     # wedged for the life of the process.
+    _bound = None
     try:
         # Signal to the watchdog that this thread is in a legitimate LLM call.
         _notify_watchdog_llm_start()
@@ -368,6 +392,10 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
         # user responses via drain_thinking_traces(), and is what
         # dispatch.is_genuine_user_request reads to classify the turn.
         request_id = daemon_request_id(daemon_id) if daemon_id is not None else None
+        if cancel_event is not None and request_id:
+            from core.llama_scheduler import get_scheduler
+            get_scheduler().bind_cancel(request_id, cancel_event)
+            _bound = request_id
         result = hevolve_chat(
             text=prompt, user_id=user_id, agent_id=prompt_id,
             create_agent=True, casual_conv=False, autonomous=True,
@@ -375,15 +403,29 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
             **({'model_config': model_config} if model_config else {}),
         )
     except Exception as e:
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info(f"Local /chat for {daemon_id or prompt_id} cancelled "
+                        f"mid-turn ({type(e).__name__}); permit given back")
+            return 'cancelled', None
         logger.warning(f"In-process /chat failed for {daemon_id or prompt_id}: {e}")
         return 'unavailable', None
     finally:
+        if _bound:
+            try:
+                from core.llama_scheduler import get_scheduler
+                get_scheduler().unbind_cancel(_bound)
+            except Exception:
+                pass
         _local_llm_semaphore.release()
         try:
             _notify_watchdog_llm_end()
         except Exception:
-            pass
+            logger.debug('watchdog LLM-end notify failed', exc_info=True)
 
+    if cancel_event is not None and cancel_event.is_set():
+        # The turn swallowed the refusal and returned: its answer is for a
+        # caller that has gone.
+        return 'cancelled', None
     result = result or {}
     # The Nunba adapter explicitly stamps an agent-addressed request made
     # during HARTOS warm-up as loading.  That text is an availability notice,
@@ -397,6 +439,21 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
                     daemon_id or prompt_id)
         return 'deferred', None
     return 'ok', (result.get('text') or result.get('response', ''))
+
+
+def _acquire_llm_permit(cancel_event=None) -> bool:
+    """Take the local LLM permit within _LOCAL_LLM_WAIT_S.  With a
+    cancel_event, wait in short slices and stop as soon as it is set."""
+    if cancel_event is None:
+        return _local_llm_semaphore.acquire(timeout=_LOCAL_LLM_WAIT_S)
+    deadline = _time.monotonic() + _LOCAL_LLM_WAIT_S
+    while not cancel_event.is_set():
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return False
+        if _local_llm_semaphore.acquire(timeout=min(0.25, remaining)):
+            return True
+    return False
 
 
 def _note_yield_reason(reason) -> None:
@@ -433,7 +490,7 @@ def mark_user_chat_activity():
         from core.foreground import touch_marker, USER_CHAT_MARKER
         touch_marker(USER_CHAT_MARKER)
     except Exception:
-        pass
+        logger.debug('user-chat marker touch failed', exc_info=True)
 
 
 def _user_chat_marker_recent() -> bool:
@@ -584,7 +641,8 @@ def is_transient_deferral() -> bool:
             if _h and llm_provider_breaker.state(_h) == CircuitState.OPEN:
                 return True
         except Exception:
-            pass
+            logger.debug('provider-breaker check failed in '
+                         'is_transient_deferral', exc_info=True)
         # A goal whose in-flight LLM call was just PREEMPTED for a live user turn
         # (foreground abort / llama_scheduler eviction) is a transient defer too —
         # re-queue it next tick, never count it toward auto-pause.  The user may
@@ -719,7 +777,8 @@ def local_dispatch_provider_breaker_open(model_config=None) -> str:
         if host and llm_provider_breaker.state(host) == CircuitState.OPEN:
             return host
     except Exception:
-        pass
+        logger.debug('provider-breaker check failed; not blocking the '
+                     'dispatch', exc_info=True)
     return ''
 
 
@@ -819,7 +878,7 @@ def should_yield_to_user() -> bool:
         if foreground_active():
             reason = 'foreground_request'
     except Exception:
-        pass
+        logger.debug('yield gate: foreground check failed', exc_info=True)
     # Reason #1 — user recently active (is_user_recently_active stays the
     # single source; we only LABEL which sub-condition fired).
     if reason is None:
@@ -828,7 +887,8 @@ def should_yield_to_user() -> bool:
                 reason = ('create_in_flight' if _active_create_sessions > 0
                           else 'user_active')
         except Exception:
-            pass
+            logger.debug('yield gate: user-activity check failed',
+                         exc_info=True)
     # Reason #2 — LLM throttle collapsed under VRAM/CPU pressure.
     if reason is None:
         try:
@@ -839,7 +899,8 @@ def should_yield_to_user() -> bool:
             if callable(_present) and _present() is True:
                 reason = 'user_present'
         except Exception:
-            pass
+            logger.debug('yield gate: user-presence check failed',
+                         exc_info=True)
     if reason is None:
         try:
             from integrations.service_tools.model_lifecycle import (
@@ -848,7 +909,8 @@ def should_yield_to_user() -> bool:
             if _pressure.get('throttle_factor', 1.0) < 0.1:
                 reason = 'model_pressure'
         except Exception:
-            pass
+            logger.debug('yield gate: model-pressure check failed',
+                         exc_info=True)
     # Reason #3 — generic resource-governor throttle (now driven by
     # EXTERNAL cpu, so our OWN idle-compute work no longer trips this).
     if reason is None:
@@ -858,7 +920,8 @@ def should_yield_to_user() -> bool:
             if _gov is not None and _gov.get_throttle() < _GATE_THROTTLE_FLOOR:
                 reason = 'governor_throttle'
         except Exception:
-            pass
+            logger.debug('yield gate: governor throttle check failed',
+                         exc_info=True)
     _note_yield_reason(reason)
     return reason is not None
 
@@ -873,7 +936,8 @@ try:
     from core.foreground import set_yield_gate as _set_yield_gate
     _set_yield_gate(should_yield_to_user)
 except Exception:
-    pass
+    logger.debug('core.foreground yield-gate registration failed; the core '
+                 'accessor fails open', exc_info=True)
 
 
 def _notify_watchdog_llm_start():
@@ -907,9 +971,9 @@ def _notify_watchdog_llm_start():
                 wd.mark_in_llm_call(source)
                 return
         except Exception:
-            pass
+            logger.debug('watchdog task-source lookup failed', exc_info=True)
     except Exception:
-        pass
+        logger.debug('watchdog LLM-start marker failed', exc_info=True)
 
 
 def _notify_watchdog_llm_end():
@@ -922,7 +986,7 @@ def _notify_watchdog_llm_end():
                 wd.clear_llm_call(name)
                 wd.heartbeat(name)
     except Exception:
-        pass
+        logger.debug('watchdog LLM-end marker clear failed', exc_info=True)
 
 
 def _get_distributed_coordinator():
@@ -976,7 +1040,8 @@ def _decompose_goal(prompt: str, goal_id: str, goal_type: str,
             prompt, goal_id, goal_type, user_id, subtask_defs)
         return tasks
     except Exception:
-        pass
+        logger.debug('ledger decomposition unavailable for goal %s; using a '
+                     'single task', goal_id, exc_info=True)
 
     # capabilities are NOT goal types.  A worker claims a task only when one
     # of the names here is in its own advertised set
@@ -1151,7 +1216,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             logger.warning(f"Dispatch blocked by budget gate for {goal_type} goal {goal_id}: {bg_reason}")
             return None
     except ImportError:
-        pass
+        logger.warning('budget_gate not importable; goal %s dispatched without '
+                       'the budget check', goal_id)
 
     # TOOL ALLOWLIST: resolve model tier and attach to dispatch context.
     # Tier is sent to /chat as body['model_tier']; create_recipe uses it
@@ -1171,7 +1237,9 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                         logger.info(f"Dispatch model tier: {_dispatch_model_tier.value} "
                                     f"for {goal_type} goal {goal_id}")
         except Exception:
-            pass  # Model registry unavailable — no tier restriction
+            # Model registry unavailable — no tier restriction
+            logger.debug('model registry unavailable for goal %s; no tier '
+                         'restriction', goal_id, exc_info=True)
 
     # GUARDRAIL: full pre-dispatch gate (fail-closed: block if guardrails unavailable)
     # Pass the goal dict + user_id so before_dispatch's goal-specific checks
@@ -1207,7 +1275,9 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             action=f'dispatch {goal_type} goal {goal_id}',
             target_id=goal_id)
     except Exception:
-        pass  # Audit is best-effort
+        # Audit is best-effort
+        logger.debug('audit log write failed for goal %s', goal_id,
+                     exc_info=True)
 
     # A turn with a model override runs HERE, never on the hive.  The hive
     # task carries no model config (an override's entry can hold a peer's
@@ -1301,7 +1371,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                                f"this tick")
                 return None
         except Exception:
-            pass
+            logger.debug('provider-breaker check failed for goal %s',
+                         goal_id, exc_info=True)
 
     # Tier 1: the canonical in-process /chat call.  The adapter resolution,
     # the user-priority gate and the local-LLM semaphore all live in
@@ -1381,7 +1452,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                     goal_id=goal_id,
                 )
             except Exception:
-                pass
+                logger.debug('world-model record failed for goal %s',
+                             goal_id, exc_info=True)
 
             return response
         else:
@@ -1401,7 +1473,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                         related_goal_id=goal_id,
                     )
                 except Exception:
-                    pass
+                    logger.warning('goal %s not re-queued after HTTP %s',
+                                   goal_id, resp.status_code, exc_info=True)
     except requests.RequestException as e:
         _cb_record_failure()
         logger.warning(f"Goal dispatch failed for {goal_type} goal {goal_id}: {e}")

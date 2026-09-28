@@ -113,7 +113,7 @@ def session_marker_dir() -> Optional[str]:
             from core.platform_paths import get_data_dir
             return os.path.join(get_data_dir(), 'session')
     except Exception:
-        pass
+        logger.debug('bundled session marker dir unresolved', exc_info=True)
     return None
 
 
@@ -159,8 +159,8 @@ def clear_marker(name: str) -> None:
         return
     try:
         os.remove(p)
-    except OSError:
-        pass
+    except OSError as e:
+        logger.debug('marker %s not removed: %s', p, e)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -174,7 +174,8 @@ def _pid_alive(pid: int) -> bool:
         import psutil
         return bool(psutil.pid_exists(pid))
     except Exception:
-        pass
+        logger.debug('psutil pid probe unavailable; using the OS probe',
+                     exc_info=True)
     if os.name == 'nt':
         try:
             import ctypes
@@ -329,7 +330,9 @@ def _fire_cancellables() -> None:
         try:
             fn()
         except Exception:
-            pass  # best-effort: a failed terminate just means the call runs out
+            # best-effort: a failed terminate just means the call runs out
+            logger.debug('background LLM cancel callable failed',
+                         exc_info=True)
 
 
 def enter_foreground() -> None:
@@ -356,7 +359,8 @@ def enter_foreground() -> None:
             from core.resource_governor import get_governor
             get_governor().report_user_activity()
         except Exception:
-            pass
+            logger.debug('governor user-activity report failed',
+                         exc_info=True)
 
 
 def exit_foreground() -> None:

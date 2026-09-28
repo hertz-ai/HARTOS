@@ -95,7 +95,10 @@ class TestAutonomyIsAlsoAContractField:
         assert out[0]['can_perform_without_user_input'] == 'yes', (
             "the flow author said this action is autonomous; a VLM re-authoring "
             "must not silently make it need a human — that is the 99-round spin")
-        assert out[0]['action'] == 'vlm step 1', "content must still be replaced"
+        assert out[0]['recipe'] == [{'steps': 'click'}], (
+            "content (steps) must still be replaced")
+        assert out[0]['action'] == 'a', (
+            "the action text is the GOAL, a contract field (f8bfbcc04)")
 
     def test_a_genuinely_non_autonomous_flow_action_stays_non_autonomous(self):
         """Preserve the FLOW's value, not a hardcoded 'yes'."""
@@ -135,10 +138,12 @@ class TestReplacementKeepsTheOwner:
             "the 2-of-24 defect" % len(kept))
 
     def test_the_vlm_body_still_wins(self):
-        """Only the OWNER is preserved; the re-authored content must apply."""
+        """Only the contract (owner, goal) is preserved; the re-authored
+        STEPS must apply.  Since f8bfbcc04 the action text is the GOAL and
+        is kept: a re-learning may change how, never what."""
         out = _vlm_merged_actions(_flow(3), [_vlm(2)], 'Executor')
         a2 = next(a for a in out if a['action_id'] == 2)
-        assert a2['action'] == 'vlm step 2'
+        assert a2['action'] == 'step 2'
         assert a2['recipe'] == [{'steps': 'click'}]
         assert a2['persona'] == 'Executor'
 
@@ -185,7 +190,8 @@ class TestNeverRaisesOnTheLoadPath:
     def test_flow_action_without_a_persona_key(self):
         flow = [{'action_id': 1, 'action': 'a'}]
         out = _vlm_merged_actions(flow, [_vlm(1)], 'Executor')
-        assert out[0]['action'] == 'vlm step 1'
+        assert out[0]['recipe'] == [{'steps': 'click'}]
+        assert out[0]['action'] == 'a'
 
     def test_the_input_list_is_not_mutated(self):
         """Three call sites share `recipes[user_prompt]`; in-place edits there

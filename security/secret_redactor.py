@@ -270,11 +270,19 @@ def redact_experience(experience: dict) -> dict:
     redacted = dict(experience)
 
     # ── Layer 1: Secret redaction ──
+    # Every content leaf, not only prompt/response: an attribution_chain
+    # observation or an escalation_reason can carry a key as easily.  Which
+    # leaves are content is the one egress answer (edge_privacy.map_content).
+    from security.edge_privacy import map_content
     total_redactions = 0
-    for field in ('prompt', 'response'):
-        if field in redacted and redacted[field]:
-            redacted[field], n = redact_secrets(str(redacted[field]))
-            total_redactions += n
+
+    def _secrets_out(text):
+        nonlocal total_redactions
+        text, n = redact_secrets(text)
+        total_redactions += n
+        return text
+
+    redacted = map_content(redacted, _secrets_out)
 
     if total_redactions > 0:
         logger.info(

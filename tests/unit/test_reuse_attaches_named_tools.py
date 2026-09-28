@@ -49,7 +49,10 @@ import pytest
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 _REUSE = os.path.join(_ROOT, 'hartos', 'reuse_recipe.py')
-_TOOLS = os.path.join(_ROOT, 'core', 'agent_tools.py')
+# attach_for_names, _attach_tool and register_dual live in core.agent_tool_menu
+# (split out of core/agent_tools.py, which re-exports them); the "same file,
+# same primitives" invariant below is asserted where they are defined.
+_TOOLS = os.path.join(_ROOT, 'core', 'agent_tool_menu.py')
 
 
 def _src(path):
@@ -66,32 +69,58 @@ class TestAttachByNameExists:
             'sibling of attach_for_tags')
 
     def test_it_reuses_the_same_attach_primitives(self):
-        """Same file, same primitives — not a second attachment mechanism."""
+        """Same file, same primitives -- not a second attachment mechanism.
+
+        Since the review of f526c4580 the three attach paths share ONE
+        primitive, _attach_tool, which is what calls register_dual; the
+        assertion follows that one indirection rather than being dropped."""
         tree = ast.parse(_src(_TOOLS))
-        fn = next((n for n in ast.walk(tree)
-                   if isinstance(n, ast.FunctionDef)
-                   and n.name == 'attach_for_names'), None)
-        assert fn is not None, 'attach_for_names not found'
-        called = {c.func.id for c in ast.walk(fn)
-                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
-        attrs = {c.func.attr for c in ast.walk(fn)
-                 if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)}
-        assert 'register_dual' in called, (
-            'must attach through register_dual, the same primitive '
-            'attach_for_tags uses — schema on one agent, execution on the other')
+
+        def _calls(name):
+            fn = next((n for n in ast.walk(tree)
+                       if isinstance(n, ast.FunctionDef) and n.name == name),
+                      None)
+            assert fn is not None, f'{name} not found'
+            names = {c.func.id for c in ast.walk(fn)
+                     if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            attrs = {c.func.attr for c in ast.walk(fn)
+                     if isinstance(c, ast.Call)
+                     and isinstance(c.func, ast.Attribute)}
+            return names, attrs
+
+        called, attrs = _calls('attach_for_names')
+        assert '_attach_tool' in called or 'register_dual' in called
+        if 'register_dual' not in called:
+            assert 'register_dual' in _calls('_attach_tool')[0], (
+                'must attach through register_dual, the same primitive '
+                'attach_for_tags uses -- schema on one agent, execution on '
+                'the other')
         assert 'create_endpoint_function' in attrs, (
             'must build the callable with registry.create_endpoint_function, '
-            'like its sibling — no second construction path')
+            'like its sibling -- no second construction path')
 
     def test_it_is_idempotent_across_turns(self):
-        src = _src(_TOOLS)
-        m = re.search(r'def attach_for_names\(.*?(?=\ndef )', src, re.DOTALL)
-        assert m, 'attach_for_names body not found'
-        body = m.group(0)
-        assert 'attached_names' in body and 'add(' in body, (
-            'must skip names already in attached_names and update the set in '
-            'place, exactly like attach_for_tags — the per-turn hook runs on '
-            'every round')
+        """Behavioural: the per-turn hook runs every round, so a second
+        attach of the same name adds nothing and the ledger records it."""
+        autogen = pytest.importorskip('autogen')
+        from core.agent_tools import attach_for_names
+
+        def save(key: str) -> str:
+            """Save a value."""
+            return key
+        cfg = {'config_list': [{'model': 'x', 'api_key': 'x',
+                                'base_url': 'http://127.0.0.1:1/v1'}]}
+        helper = autogen.AssistantAgent('Helper', llm_config=dict(cfg))
+        executor = autogen.UserProxyAgent('Executor', human_input_mode='NEVER',
+                                          code_execution_config=False)
+        empty = type('R', (), {'_tools': {}})()
+        ledger = set()
+        core = [('save_it', 'save', save)]
+        assert attach_for_names(['save_it'], helper, executor, empty, ledger,
+                                core_tools=core) == 1
+        assert 'save_it' in ledger
+        assert attach_for_names(['save_it'], helper, executor, empty, ledger,
+                                core_tools=core) == 0
 
 
 class TestReuseConsultsTheActionsNamedTools:

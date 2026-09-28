@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -57,6 +57,9 @@ from .schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: One admin-config save at a time (AdminAPI._save_config).
+_SAVE_CONFIG_LOCK = threading.Lock()
 
 # Create the blueprint
 admin_bp = Blueprint("admin", __name__, url_prefix="/api/admin")
@@ -135,10 +138,42 @@ class AdminAPI:
         self._load_config()
 
     def _config_path(self) -> str:
-        """Single source for the admin-config file location."""
-        return os.path.join(
-            os.path.dirname(__file__), "..", "..", "..",
-            "agent_data", "admin_config.json")
+        """Single source for the admin-config file location: the user's
+        agent_data dir.  It used to sit next to the package, which in the
+        installed app is under Program Files."""
+        from core.platform_paths import get_agent_data_dir
+        return os.path.join(get_agent_data_dir(), "admin_config.json")
+
+    @staticmethod
+    def _legacy_config_path() -> str:
+        """Where the config lived before bff95ab44: agent_data/ beside the
+        package (in the installed app, under Program Files)."""
+        return os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                            "agent_data", "admin_config.json")
+
+    def _adopt_legacy_config(self, config_path: str) -> None:
+        """One-time, non-destructive move to the user data dir: when nothing
+        is at ``config_path`` yet and the pre-bff95ab44 file is, copy its
+        content there.  The old file is never changed or deleted (a rollback
+        or another install may still read it), a file already at the new
+        place is never overwritten, and an old file that is not valid JSON
+        is left behind, not copied.  Without this an upgrade dropped every
+        saved channel, workflow and the agent identity."""
+        legacy = os.path.abspath(self._legacy_config_path())
+        try:
+            if (os.path.exists(config_path) or not os.path.isfile(legacy)
+                    or os.path.normcase(legacy)
+                    == os.path.normcase(os.path.abspath(config_path))):
+                return
+            with open(legacy, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            from core.file_cache import atomic_json_write
+            atomic_json_write(config_path, data, indent=2)
+            logger.info("Copied admin configuration from %s to %s",
+                        legacy, config_path)
+        except Exception as e:
+            logger.warning("Admin config at %s not carried over to %s: %s",
+                           legacy, config_path, e)
 
     def _load_config(self) -> None:
         """Restore persisted admin state (channels + workflows + identity) so it
@@ -147,6 +182,7 @@ class AdminAPI:
         were never persisted, so identity + workflows (and channels) were lost on
         every restart."""
         config_path = self._config_path()
+        self._adopt_legacy_config(config_path)
         try:
             if not os.path.exists(config_path):
                 return
@@ -174,27 +210,26 @@ class AdminAPI:
         """Atomically persist admin state (channels + workflows + identity) so it
         survives a restart (#45).  Serializes the LIVE attrs — the previous
         version dumped an always-empty self._config, persisting nothing."""
+        from core.file_cache import atomic_json_write
         config_path = self._config_path()
-        payload = {
-            "channels": self._channels,
-            "workflows": {k: w.to_dict() for k, w in self._workflows.items()},
-            "identity": self._identity.to_dict() if self._identity else None,
-        }
-        try:
-            config_dir = os.path.dirname(config_path)
-            os.makedirs(config_dir, exist_ok=True)
-            # Write to temp file first, then atomic rename to prevent corruption
-            fd, tmp_path = tempfile.mkstemp(dir=config_dir, suffix='.tmp')
+        # Saves run on many threads at once (admin routes, every camera or
+        # screen consent answer).  One at a time, and the state is read
+        # inside the lock, so the last save writes the latest state.  The
+        # shared writer gives each save its own temp file and creates it with
+        # one exclusive open (never mkstemp's 2**31 retries on Windows).
+        with _SAVE_CONFIG_LOCK:
             try:
-                with os.fdopen(fd, 'w') as f:
-                    json.dump(payload, f, indent=2, default=str)
-                os.replace(tmp_path, config_path)  # atomic rename
-            except Exception:
-                os.unlink(tmp_path)
-                raise
-            logger.info("Saved admin configuration to %s", config_path)
-        except Exception as e:
-            logger.warning("Failed to save admin config: %s", e)
+                payload = {
+                    "channels": self._channels,
+                    "workflows": {k: w.to_dict()
+                                  for k, w in self._workflows.items()},
+                    "identity": (self._identity.to_dict()
+                                 if self._identity else None),
+                }
+                atomic_json_write(config_path, payload, indent=2)
+                logger.info("Saved admin configuration to %s", config_path)
+            except Exception as e:
+                logger.warning("Failed to save admin config: %s", e)
 
     def get_uptime(self) -> float:
         """Get system uptime in seconds."""

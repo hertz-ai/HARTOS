@@ -124,7 +124,6 @@ class CodingAgentOrchestrator:
                         model: str, working_dir: str) -> Dict:
         """Execute locally via subprocess."""
         from .tool_router import CodingToolRouter
-        from .benchmark_tracker import get_benchmark_tracker
 
         router = CodingToolRouter()
         backend = router.route(task, task_type, preferred_tool)
@@ -150,9 +149,7 @@ class CodingAgentOrchestrator:
         result = backend.execute(task, context)
         result['task_type'] = task_type
 
-        # Record benchmark
-        tracker = get_benchmark_tracker()
-        tracker.record(
+        self._record_benchmark(
             task_type=task_type,
             tool_name=result.get('tool', backend.name),
             completion_time_s=result.get('execution_time_s', 0),
@@ -210,6 +207,26 @@ class CodingAgentOrchestrator:
             return _TIER_RANK[current] >= _TIER_RANK[min_tier]
         except Exception:
             return True  # If system_requirements unavailable, allow
+
+    @staticmethod
+    def _record_benchmark(**fields) -> None:
+        """Write one benchmark row; a failed write is logged, never raised.
+
+        Every caller has a finished coding result in hand when it records.
+        A raise here used to discard that result: on the installed desktop
+        "attempt to write a readonly database" replaced the output of a
+        completed `claude -p` run, and on the hive paths it re-ran the task
+        locally.  The row is telemetry; the result is what the user asked for.
+        """
+        try:
+            from .benchmark_tracker import get_benchmark_tracker
+            get_benchmark_tracker().record(**fields)
+        except Exception as e:
+            logger.warning(
+                "Benchmark row not recorded for %s/%s (%s: %s); "
+                "the coding result is returned regardless",
+                fields.get('task_type'), fields.get('tool_name'),
+                type(e).__name__, e, exc_info=True)
 
     def _distribute_to_hive(self, task: str, task_type: str,
                              preferred_tool: str, user_id: str,
@@ -390,9 +407,7 @@ class CodingAgentOrchestrator:
             elapsed = time.time() - start
 
             # ── Record benchmark ──
-            from .benchmark_tracker import get_benchmark_tracker
-            tracker = get_benchmark_tracker()
-            tracker.record(
+            self._record_benchmark(
                 task_type=task_type,
                 tool_name='distributed',
                 completion_time_s=elapsed,
@@ -529,10 +544,7 @@ class CodingAgentOrchestrator:
                                 result['success'] = False
                                 result['error'] = 'Unauthorized file modifications'
 
-                        # Record benchmark
-                        from .benchmark_tracker import get_benchmark_tracker
-                        tracker = get_benchmark_tracker()
-                        tracker.record(
+                        self._record_benchmark(
                             task_type=task_type,
                             tool_name=result.get('tool', 'unknown'),
                             completion_time_s=result.get('execution_time_s', 0),

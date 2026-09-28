@@ -173,10 +173,17 @@ def should_start_background_services() -> bool:
 
     Defaults True: a real node is unaffected unless the flag is set
     explicitly falsy, and junk never silently flips it (env_flag semantics).
+    Under pytest (core.platform_paths.under_test) the default is False: a
+    test process that imports the entry point must not join the live hive.
+    Measured 2026-09-26 (task #98): CI pytest shards started gossip and the
+    superadmin report-in this way, and the throwaway nodes they registered
+    (1,967 10.1.x rows on the owner's desktop) were relayed to every node.
+    A test that needs the daemons sets the flag.
     Callers MUST log when they skip — a node that quietly starts nothing has
     to be distinguishable from a healthy one.
     """
-    return env_flag('HEVOLVE_START_BACKGROUND_SERVICES', True)
+    from core.platform_paths import under_test
+    return env_flag('HEVOLVE_START_BACKGROUND_SERVICES', not under_test())
 
 
 # ── Endpoint Resolution ──

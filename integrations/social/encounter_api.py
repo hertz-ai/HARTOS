@@ -27,6 +27,8 @@ Endpoints all mounted at /api/social/encounter/*  (JWT-auth required):
 
   POST /discoverable     enable/disable broadcast + TTL + age gate
   GET  /discoverable     current state + remaining TTL + toggle count
+  GET  /persona          the user's persona card (bio, recognize_me, tags)
+  PUT  /persona          edit the card; not a discoverable toggle
   POST /sighting         phone reports a BLE sighting; returns swipe card
   POST /swipe            like/dislike decision (signed event)
   GET  /matches          list of MUTUAL matches (one-sided never leaks)
@@ -68,6 +70,10 @@ from core.constants import (
     ENCOUNTER_DISCOVERABLE_TTL_SEC,
     ENCOUNTER_DRAFT_MAX_CHARS,
     ENCOUNTER_MATCH_WINDOW_SEC,
+    ENCOUNTER_PERSONA_BIO_MAX_CHARS,
+    ENCOUNTER_PERSONA_MAX_TAGS,
+    ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS,
+    ENCOUNTER_PERSONA_TAG_MAX_CHARS,
     ENCOUNTER_SIGHTING_EXPIRES_SEC,
     ENCOUNTER_TOPIC_ICEBREAKER,
     ENCOUNTER_TOPIC_MATCH,
@@ -116,6 +122,15 @@ def _user_id() -> Optional[str]:
     if uid is None and isinstance(user, dict):
         uid = user.get('id')
     return str(uid) if uid is not None else None
+
+
+def _clean_tags(raw) -> Optional[list[str]]:
+    """The user's interest tags, capped the one way every writer caps them.
+    None when the value is not a list (the caller answers 400)."""
+    if not isinstance(raw, list):
+        return None
+    return [str(t)[:ENCOUNTER_PERSONA_TAG_MAX_CHARS]
+            for t in raw[:ENCOUNTER_PERSONA_MAX_TAGS]]
 
 
 def _new_id(prefix: str) -> str:
@@ -293,10 +308,14 @@ def set_discoverable():
     age_claim = bool(body.get('age_claim_18', False))
     face_visible = bool(body.get('face_visible', False))
     avatar_style = str(body.get('avatar_style', 'studio_ghibli'))[:64]
-    vibe_tags = body.get('vibe_tags', []) or []
-    if not isinstance(vibe_tags, list):
-        return _err('vibe_tags must be a list of strings')
-    vibe_tags = [str(t)[:40] for t in vibe_tags[:10]]
+    # vibe_tags is also written by PUT /encounter/persona, so a toggle that
+    # does not name them leaves the user's tags alone (it used to reset
+    # them to []).
+    vibe_tags = None
+    if 'vibe_tags' in body:
+        vibe_tags = _clean_tags(body.get('vibe_tags') or [])
+        if vibe_tags is None:
+            return _err('vibe_tags must be a list of strings')
 
     now = _now_dt()
     pref = g.db.query(DiscoverablePref).filter_by(user_id=uid).first()
@@ -328,7 +347,8 @@ def set_discoverable():
     pref.age_claim_18 = age_claim
     pref.face_visible = face_visible
     pref.avatar_style = avatar_style
-    pref.vibe_tags = vibe_tags
+    if vibe_tags is not None:
+        pref.vibe_tags = vibe_tags
     pref.toggle_count_24h = (pref.toggle_count_24h or 0) + 1
     pref.last_toggle_at = now
     g.db.commit()
@@ -338,6 +358,69 @@ def set_discoverable():
         'expires_at': pref.expires_at.isoformat() if pref.expires_at else None,
         'remaining_sec': ttl if enable else 0,
     })
+
+
+# ──────────────────────────────────────────────────────────────────────
+# /persona — the user's persona card: what their agent may tell a
+# matched person's agent (bio, "how to recognise me", interest tags) and
+# whether they may be matched on interests at all.  Editing the card is
+# not a discoverable toggle: it spends no toggle and never turns the BLE
+# broadcast on.
+# ──────────────────────────────────────────────────────────────────────
+
+def _persona_dict(pref: Optional[DiscoverablePref]) -> dict[str, Any]:
+    if pref is None:
+        return {'bio': '', 'recognize_me': '', 'vibe_tags': [],
+                'interests_discoverable': False}
+    return {
+        'bio': pref.bio or '',
+        'recognize_me': pref.recognize_me or '',
+        'vibe_tags': pref.vibe_tags or [],
+        'interests_discoverable': bool(pref.interests_discoverable),
+    }
+
+
+@encounter_bp.route('/encounter/persona', methods=['GET'])
+@require_auth
+def get_persona():
+    uid = _user_id()
+    if uid is None:
+        return _err('unauthenticated', 401)
+    pref = g.db.query(DiscoverablePref).filter_by(user_id=uid).first()
+    return _ok(_persona_dict(pref))
+
+
+@encounter_bp.route('/encounter/persona', methods=['PUT'])
+@require_auth
+def set_persona():
+    """Update any of bio, recognize_me, vibe_tags, interests_discoverable.
+    Fields the body does not name are left as they are."""
+    uid = _user_id()
+    if uid is None:
+        return _err('unauthenticated', 401)
+    body = _json()
+    tags = None
+    if 'vibe_tags' in body:
+        tags = _clean_tags(body.get('vibe_tags') or [])
+        if tags is None:
+            return _err('vibe_tags must be a list of strings')
+
+    pref = g.db.query(DiscoverablePref).filter_by(user_id=uid).first()
+    if pref is None:
+        pref = DiscoverablePref(user_id=uid, toggle_window_start=_now_dt(),
+                                toggle_count_24h=0)
+        g.db.add(pref)
+    if 'bio' in body:
+        pref.bio = str(body.get('bio') or '')[:ENCOUNTER_PERSONA_BIO_MAX_CHARS]
+    if 'recognize_me' in body:
+        pref.recognize_me = str(body.get('recognize_me') or '')[
+            :ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS]
+    if tags is not None:
+        pref.vibe_tags = tags
+    if 'interests_discoverable' in body:
+        pref.interests_discoverable = bool(body.get('interests_discoverable'))
+    g.db.commit()
+    return _ok(_persona_dict(pref))
 
 
 # ──────────────────────────────────────────────────────────────────────

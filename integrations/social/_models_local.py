@@ -1063,6 +1063,12 @@ class DiscoverablePref(Base):
     last_toggle_at = Column(DateTime, nullable=True)
     current_pubkey = Column(String(128), nullable=True, index=True)
     pubkey_registered_at = Column(DateTime, nullable=True)
+    # v59 persona card: what the user's agent may tell a matched person's
+    # agent.  interests_discoverable is the user's yes to being matched
+    # on interests beyond friends and nearby.
+    bio = Column(Text, nullable=True)
+    recognize_me = Column(String(280), nullable=True)
+    interests_discoverable = Column(Boolean, default=False, nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
     user = relationship('User', foreign_keys=[user_id])
@@ -1079,6 +1085,9 @@ class DiscoverablePref(Base):
             'vibe_tags': self.vibe_tags or [],
             'toggle_count_24h': self.toggle_count_24h or 0,
             'current_pubkey': self.current_pubkey,
+            'bio': self.bio or '',
+            'recognize_me': self.recognize_me or '',
+            'interests_discoverable': bool(self.interests_discoverable),
         }
 
 
@@ -2925,6 +2934,9 @@ class MeteredAPIUsage(Base):
     # v34 — thought-experiment consumption tracking
     escrow_id = Column(Integer, nullable=True, index=True)
     experiment_post_id = Column(String(64), nullable=True, index=True)
+    # v57 — the person whose task ran on node_id (task_source='hive_compute',
+    # budget_gate.charge_remote_compute).  NULL on every other row.
+    requester_user_id = Column(String(64), nullable=True, index=True)
 
     def to_dict(self):
         return {
@@ -2935,6 +2947,7 @@ class MeteredAPIUsage(Base):
             'task_source': self.task_source,
             'goal_id': self.goal_id,
             'requester_node_id': self.requester_node_id,
+            'requester_user_id': self.requester_user_id,
             'tokens_in': self.tokens_in,
             'tokens_out': self.tokens_out,
             'cost_per_1k_tokens': self.cost_per_1k_tokens,
@@ -3186,6 +3199,10 @@ class UserConsent(Base):
     # phone signed into its first ask.  Self-asserted, a hint beside the
     # key's fingerprint, never identity (v55, #111).
     label = Column(String(100), nullable=True)
+    # When the owner took a "no" back ("Allow asking again",
+    # ConsentService.reopen).  revoked_at keeps the time of the no; the row
+    # is declined only while its revocation is newer than this (v58).
+    reopened_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

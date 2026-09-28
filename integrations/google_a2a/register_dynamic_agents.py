@@ -30,19 +30,19 @@ def create_dynamic_executor_function(agent: TrainedAgent):
     Returns:
         Async executor function compatible with A2A protocol
     """
-    async def executor(message: str, context_id: str) -> Dict[str, Any]:
-        """Execute task for dynamically discovered agent"""
+    async def executor(message: str, context_id: str,
+                       cancel_event=None) -> Dict[str, Any]:
+        """Execute task for dynamically discovered agent.  A failure
+        propagates: handle_message_send turns it into a FAILED task.  Turning
+        it into model text here made every failure a COMPLETED task (review
+        of 3a32d8e4b)."""
         try:
             executor = get_dynamic_executor()
-            result = await executor.execute_agent_task(agent.agent_id, message, context_id)
-            return result
-
+            return await executor.execute_agent_task(
+                agent.agent_id, message, context_id, cancel_event=cancel_event)
         except Exception as e:
             logger.error(f"Dynamic agent {agent.agent_id} execution error: {e}")
-            return {
-                "role": "model",
-                "parts": [{"text": f"Error executing {agent.agent_id}: {str(e)}"}]
-            }
+            raise
 
     # Set function name for debugging
     executor.__name__ = f"{agent.agent_id}_executor"
@@ -100,7 +100,7 @@ def register_all_dynamic_agents():
                 capabilities = {
                     "streaming": False,
                     "async": True,
-                    "autonomous": agent.can_perform_without_user_input == "yes",
+                    "autonomous": agent.is_autonomous,
                     "has_fallback": bool(agent.fallback_action),
                     "recipe_steps": len(agent.recipe)
                 }
@@ -174,7 +174,7 @@ def get_registered_agent_info() -> Dict[str, Any]:
         },
         "by_status": by_status,
         "agent_ids": [a.agent_id for a in agents],
-        "autonomous_agents": [a.agent_id for a in agents if a.can_perform_without_user_input == "yes"],
+        "autonomous_agents": [a.agent_id for a in agents if a.is_autonomous],
         "agents_with_fallback": [a.agent_id for a in agents if a.fallback_action]
     }
 
@@ -215,7 +215,7 @@ def list_available_agents():
         # (it was vestigial from an abandoned 3-part scheme → AttributeError).
         for agent in sorted(by_prompt[prompt_id], key=lambda a: a.flow_id):
             status_icon = "✓" if agent.status == "done" else "○"
-            auto_icon = "⚡" if agent.can_perform_without_user_input == "yes" else "👤"
+            auto_icon = "⚡" if agent.is_autonomous else "👤"
             fallback_icon = "🔄" if agent.fallback_action else "  "
 
             print(f"  {status_icon} {agent.agent_id:15} | "

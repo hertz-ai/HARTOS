@@ -248,14 +248,69 @@ def test_all_public_symbols_listed(tool):
 
 
 def test_boot_decision_handles_missing_log(tool):
-    """If `~/Documents/Nunba/logs/draft_decision.jsonl` doesn't exist,
+    """If `<get_log_dir()>/draft_decision.jsonl` doesn't exist,
     the tool returns available=False with a human-readable reason
     instead of raising."""
     import tempfile
-    from pathlib import Path
-    # Point Home to a temp dir that definitely lacks the log file
+    # Point the log dir at a temp dir that definitely lacks the log file
     with tempfile.TemporaryDirectory() as tmp:
-        with patch.object(Path, 'home', return_value=Path(tmp)):
+        with patch('core.platform_paths.get_log_dir', return_value=tmp), \
+               patch('core.platform_paths.get_installed_log_dir', return_value=tmp):
             result = tool.get_boot_decision()
         assert result['available'] is False
         assert 'not yet written' in result['summary'] or 'empty' in result['summary']
+
+
+def test_boot_decision_reads_the_log_dir_nunba_writes(tool, tmp_path):
+    """Nunba's LlamaConfig._log_draft_decision appends to
+    core.platform_paths.get_log_dir(); the reader must look there."""
+    import json
+    (tmp_path / 'draft_decision.jsonl').write_text(
+        json.dumps({'decision': 'main_only', 'reason': 'vram', 'lang': 'ta'})
+        + '\n', encoding='utf-8')
+    with patch('core.platform_paths.get_log_dir', return_value=str(tmp_path)):
+        result = tool.get_boot_decision()
+    assert result['available'] is True
+    assert result['decision'] == 'main_only'
+
+
+def _decision(d, decision):
+    import json
+    d.mkdir(parents=True, exist_ok=True)
+    (d / 'draft_decision.jsonl').write_text(
+        json.dumps({'decision': decision}) + '\n', encoding='utf-8')
+
+
+def test_a_dev_run_with_no_log_of_its_own_reads_the_installed_one(tool, tmp_path):
+    # get_log_dir is logs-dev in a source run; HARTOS alone never writes this
+    # log, so asking it about the installed app must read logs/.
+    _decision(tmp_path / 'logs', 'draft_enabled')
+    with patch('core.platform_paths.get_log_dir', return_value=str(tmp_path / 'logs-dev')), \
+            patch('core.platform_paths.get_installed_log_dir', return_value=str(tmp_path / 'logs')):
+        result = tool.get_boot_decision()
+    assert result['available'] is True
+    assert result['decision'] == 'draft_enabled'
+    assert result['log_path'] == str(tmp_path / 'logs' / 'draft_decision.jsonl')
+
+
+def test_this_runs_own_log_wins_over_the_installed_one(tool, tmp_path):
+    _decision(tmp_path / 'logs', 'draft_enabled')
+    _decision(tmp_path / 'logs-dev', 'main_only')
+    with patch('core.platform_paths.get_log_dir', return_value=str(tmp_path / 'logs-dev')), \
+            patch('core.platform_paths.get_installed_log_dir', return_value=str(tmp_path / 'logs')):
+        result = tool.get_boot_decision()
+    assert result['decision'] == 'main_only'
+
+
+def test_the_installed_log_dir_is_the_log_dir_without_the_dev_suffix(monkeypatch):
+    import os
+    import sys
+    import core.platform_paths as pp
+    monkeypatch.delenv('NUNBA_LOG_DIR', raising=False)
+    monkeypatch.setattr(pp, '_IS_MACOS', False)
+    # The documented installed path: <data root>/logs.
+    assert pp.get_installed_log_dir() == os.path.join(pp.get_data_dir(), 'logs')
+    monkeypatch.setattr(sys, 'frozen', False, raising=False)
+    assert pp.get_log_dir() == pp.get_installed_log_dir() + '-dev'
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    assert pp.get_log_dir() == pp.get_installed_log_dir()

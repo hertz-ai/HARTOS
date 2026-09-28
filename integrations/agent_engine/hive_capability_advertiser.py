@@ -157,15 +157,21 @@ def _local_peer_id() -> str:
     """Stable identifier for THIS node across announces.
 
     Uses ``HEVOLVE_NODE_ID`` when set to a non-trivial value (matches
-    ``hart_intelligence_entry.py:9844``'s convention).  Falls back to a
-    generated UUID held on the singleton instance — stable for the
-    process lifetime, but not across restarts (operator should set
-    ``HEVOLVE_NODE_ID`` for production deployment).
+    ``hart_intelligence_entry.py:9844``'s convention), else this node's
+    gossip id from its canonical source, ``SyncEngine.canonical_node_id``:
+    the id every PeerNode row is keyed by, so a peer that charges this
+    node's served compute can find its operator.  Nothing sets
+    ``HEVOLVE_NODE_ID`` on a default install, and the per-process UUID the
+    caller substitutes for '' matches no PeerNode row anywhere.
     """
     node_id = (os.environ.get('HEVOLVE_NODE_ID') or '').strip()
     if node_id and node_id.lower() != 'local':
         return node_id
-    return ''  # sentinel — caller substitutes per-instance UUID
+    try:
+        from integrations.social.sync_engine import SyncEngine
+        return SyncEngine.canonical_node_id() or ''
+    except Exception:
+        return ''  # sentinel — caller substitutes per-instance UUID
 
 
 def _local_endpoint() -> str:

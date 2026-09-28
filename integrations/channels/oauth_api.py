@@ -536,7 +536,7 @@ def oauth_callback(channel_type: str):
                             'color': meta.get('color') or '#00e89d',
                             'icon': meta.get('icon') or channel_type,
                             'message': f"✅ {display_name} connected.",
-                        },
+                        }, user_id=str(ctx['user_id']),
                     )
             except Exception as _emit_err:
                 logger.debug(

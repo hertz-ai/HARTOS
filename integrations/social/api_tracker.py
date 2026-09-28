@@ -67,14 +67,8 @@ def _get_agent_conversations(user_id, prompt_id, limit=50):
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph
         session_key = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
-        try:
-            from core.platform_paths import get_memory_graph_dir
-            db_path = get_memory_graph_dir(session_key)
-        except ImportError:
-            db_path = os.path.join(
-                os.path.expanduser("~"), "Documents", "Nunba", "data",
-                "memory_graph", session_key,
-            )
+        from core.platform_paths import get_memory_graph_dir
+        db_path = get_memory_graph_dir(session_key)
         if not os.path.exists(db_path):
             return []
         graph = MemoryGraph(db_path=db_path, user_id=str(user_id))
@@ -878,13 +872,8 @@ def inject_variable(post_id):
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph
         session_key = f"{goal.owner_id}_{goal.prompt_id}" if goal.prompt_id else str(goal.owner_id)
-        try:
-            from core.platform_paths import get_memory_graph_dir
-            db_path = get_memory_graph_dir(session_key)
-        except ImportError:
-            db_path = os.path.join(
-                os.path.expanduser("~"), "Documents", "Nunba", "data",
-                "memory_graph", session_key)
+        from core.platform_paths import get_memory_graph_dir
+        db_path = get_memory_graph_dir(session_key)
         os.makedirs(db_path, exist_ok=True)
         graph = MemoryGraph(db_path=db_path, user_id=str(goal.owner_id))
         memory_id = graph.register(

@@ -45,6 +45,12 @@ import threading
 logger = logging.getLogger(__name__)
 
 _PRI = {'user': 0, 'daemon': 1}
+
+
+class TurnCancelled(RuntimeError):
+    """Raised at admission for a request id whose turn was cancelled
+    (bind_cancel).  Deliberately NOT swallowed by the fail-open paths: the
+    turn's caller stopped waiting, so its next LLM call must not run."""
 _DEFAULT_SLOTS = 2
 
 
@@ -132,6 +138,7 @@ class LlamaScheduler:
         self._inflight: dict = {}     # seq -> _Req  (the VISIBLE registry)
         self._wait: list = []         # heap of (pri, seq, _Req)
         self._seq = itertools.count(1)
+        self._cancel_events: dict = {}  # rid -> threading.Event (bind_cancel)
 
     # ── introspection / visibility ──────────────────────────────────────────
     @property
@@ -153,6 +160,24 @@ class LlamaScheduler:
         if n:
             self.set_slots(n)
             logger.info("llama_scheduler: n_slots auto-detected = %d", n)
+
+    # ── per-turn cancel (review of a4ea04651) ──────────────────────────────
+    # A turn binds a threading.Event to its request id; once it is set, every
+    # later admission of that id raises TurnCancelled, and a call of that id
+    # queued for a slot wakes at once.  Only that turn is affected: the
+    # preempt above closes the SHARED background client and stops everyone.
+    def bind_cancel(self, rid, event) -> None:
+        if rid and event is not None:
+            with self._lock:
+                self._cancel_events[rid] = event
+
+    def unbind_cancel(self, rid) -> None:
+        with self._lock:
+            self._cancel_events.pop(rid, None)
+
+    def _is_cancelled(self, rid) -> bool:
+        ev = self._cancel_events.get(rid) if rid else None
+        return bool(ev is not None and ev.is_set())
 
     def inflight(self):
         """List of ``(rid, kind)`` currently holding a slot — what any new
@@ -214,7 +239,21 @@ class LlamaScheduler:
                             req.rid or '<empty>', victim.rid or '<empty>')
             if req.admitted:
                 return req
-            granted = req.event.wait(timeout)
+            cancel_ev = self._cancel_events.get(rid) if rid else None
+            if cancel_ev is None:
+                granted = req.event.wait(timeout)
+            else:
+                # Wait in slices so a cancel of THIS turn wakes it at once.
+                import time as _t
+                end = None if timeout is None else _t.monotonic() + timeout
+                granted = False
+                while not cancel_ev.is_set():
+                    left = 0.25 if end is None else min(0.25, end - _t.monotonic())
+                    if left <= 0:
+                        break
+                    if req.event.wait(left):
+                        granted = True
+                        break
             if granted and req.admitted:
                 return req
             # timeout: lazy-delete from the heap
@@ -239,8 +278,12 @@ class LlamaScheduler:
     def slot(self, rid, kind='daemon', cancel_fn=None, timeout=None):
         """``with get_scheduler().slot(rid, kind, cancel_fn): resp = call()``.
         Yields the token (``None`` on timeout — caller still proceeds, fail-open).
-        Always releases."""
+        Always releases.  A cancelled turn (bind_cancel) raises TurnCancelled
+        instead of proceeding once its slot wait ends."""
         tok = self.acquire(rid, kind, cancel_fn, timeout)
+        if self._is_cancelled(rid):
+            self.release(tok)
+            raise TurnCancelled(f'turn {rid} was cancelled')
         try:
             yield tok
         finally:

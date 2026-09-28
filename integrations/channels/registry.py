@@ -64,12 +64,8 @@ _MEDIA_MIME = {
 
 
 def _media_allowlist_root() -> str:
-    try:
-        from core.platform_paths import get_data_dir
-        return os.path.realpath(get_data_dir())
-    except ImportError:
-        return os.path.realpath(
-            os.path.expanduser('~/Documents/Nunba/data'))
+    from core.platform_paths import get_data_dir
+    return os.path.realpath(get_data_dir())
 
 
 def extract_media_markers(text):

@@ -10,7 +10,7 @@ import hashlib
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, NamedTuple, Optional
 
 from sqlalchemy.orm import Session
 
@@ -51,7 +51,7 @@ class DashboardService:
         # 4. Trained agents (social users with user_type='agent')
         agents.extend(DashboardService._get_trained_agents(db))
 
-        # 5. Expert agents (static registry)
+        # 5. Expert agents registered for A2A delegation
         agents.extend(DashboardService._get_expert_agents())
 
         # Compute priority, sort descending
@@ -89,55 +89,7 @@ class DashboardService:
         # Regression observed 2026-04-26: Tier-1 KeyError at boot left
         # world_model_bridge un-warmed; every dashboard poll then took
         # 57s, queueing the waitress task list and emptying the admin UI.
-        world_model = {'healthy': False, 'error': 'unavailable'}
-        try:
-            import concurrent.futures as _cf
-            def _collect_world_model():
-                from integrations.agent_engine.world_model_bridge import (
-                    get_world_model_bridge)
-                bridge = get_world_model_bridge()
-                return {
-                    'health': bridge.check_health(),
-                    'stats': bridge.get_learning_stats(),
-                }
-            # CRITICAL: do NOT use `with ThreadPoolExecutor as ex:` here.
-            # The context-manager ``__exit__`` calls ``shutdown(wait=True)``,
-            # which join()s the pool's worker thread.  When ``_fut.result``
-            # times out, the worker is still inside the heavy
-            # ``get_world_model_bridge()`` import and CAN'T finish, so the
-            # ``with`` exit blocks forever — turning the 2s timeout into
-            # an infinite hang and stacking every dashboard poll into a
-            # permanently-stuck Hypercorn worker.  Live thread dump
-            # 2026-04-28 22:08 showed 15 nunba_X workers ALL frozen at
-            # ``ThreadPoolExecutor.__exit__ → shutdown → join``.  Fix:
-            # manual try/finally + ``shutdown(wait=False,
-            # cancel_futures=True)`` so the request returns even when
-            # the worker is permanently wedged on the import lock.
-            _ex = _cf.ThreadPoolExecutor(max_workers=1)
-            try:
-                _fut = _ex.submit(_collect_world_model)
-                try:
-                    _wm = _fut.result(timeout=2.0)
-                    health = _wm['health']
-                    stats = _wm['stats']
-                    world_model = {
-                        'healthy': health.get('healthy', False),
-                        'learning_stats': stats.get('learning', {}),
-                        'hivemind_stats': stats.get('hivemind', {}),
-                        'bridge_stats': stats.get('bridge', {}),
-                    }
-                except _cf.TimeoutError:
-                    # Bridge is cold or unreachable: surface that fact
-                    # in the response without blocking the dashboard.
-                    world_model = {'healthy': False, 'error': 'cold_or_unreachable'}
-            finally:
-                # Don't wait for the (potentially permanently-stuck)
-                # worker thread.  It's a daemon — interpreter shutdown
-                # will reap it.  Cancel any not-yet-started futures so
-                # the pool doesn't pick up new work after we leave.
-                _ex.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
+        world_model = DashboardService._world_model_status()
 
         return {
             'timestamp': now.isoformat(),
@@ -145,6 +97,50 @@ class DashboardService:
             'world_model': world_model,
             'agents': agents,
             'summary': summary,
+        }
+
+    #: How long a dashboard poll waits for the world-model bridge.
+    WORLD_MODEL_TIMEOUT_S = 2.0
+
+    @staticmethod
+    def _world_model_status(timeout_s: Optional[float] = None) -> Dict:
+        """HevolveAI world-model status, never holding the poll past timeout_s.
+
+        ``{'healthy': False, 'error': 'cold_or_unreachable'}`` when the bridge
+        does not answer in time (its first call can take 60 s+ bootstrapping
+        embodied_ai / vision / llama), ``'unavailable'`` when it raised.
+
+        On core.subprocess_safe.call_bounded since 2026-09-27 (review F7).
+        This was a one-worker ThreadPoolExecutor with shutdown(wait=False):
+        right that a `with` block would join the stuck worker (live thread
+        dump 2026-04-28 22:08, 15 nunba_X workers frozen in
+        ThreadPoolExecutor.__exit__), wrong that its worker "is a daemon" --
+        an executor's worker is joined at interpreter exit, so a wedged
+        bridge import held shutdown.  call_bounded's worker is a daemon.
+        """
+        from core.subprocess_safe import call_bounded
+        if timeout_s is None:
+            timeout_s = DashboardService.WORLD_MODEL_TIMEOUT_S
+
+        def _collect():
+            from integrations.agent_engine.world_model_bridge import (
+                get_world_model_bridge)
+            bridge = get_world_model_bridge()
+            return bridge.check_health(), bridge.get_learning_stats()
+
+        finished, value, error = call_bounded(
+            _collect, timeout_s, name='hart-dashboard-world-model')
+        if not finished:
+            return {'healthy': False, 'error': 'cold_or_unreachable'}
+        if error is not None:
+            logger.debug('dashboard: world model status unavailable: %s', error)
+            return {'healthy': False, 'error': 'unavailable'}
+        health, stats = value
+        return {
+            'healthy': health.get('healthy', False),
+            'learning_stats': stats.get('learning', {}),
+            'hivemind_stats': stats.get('hivemind', {}),
+            'bridge_stats': stats.get('bridge', {}),
         }
 
     @staticmethod
@@ -324,27 +320,51 @@ class DashboardService:
 
     @staticmethod
     def _get_expert_agents() -> List[Dict]:
-        """Load from ExpertAgentRegistry if available."""
-        result = []
+        """Expert agents the A2A skill registry can delegate to.
+
+        An expert is listed iff it is in the ExpertAgentRegistry catalog
+        (identity + display name) AND registered in the internal_comm
+        ``skill_registry`` singleton (``register_all_experts``): that
+        registration is what makes it discoverable by
+        ``a2a_context.delegate_task``, so only registered experts are
+        'available'.  Other skill-registry entries (assistant, helper,
+        marketing_<uid>, ...) are not experts and are not listed here.
+
+        ``skill_registry.agents`` maps agent_id -> {skill_name: AgentSkill}.
+        """
         try:
-            from integrations.internal_comm.internal_agent_communication import (
-                AgentSkillRegistry)
-            registry = AgentSkillRegistry.get_instance()
-            for agent_id, agent_info in registry._agents.items():
-                result.append({
-                    'id': f'expert_{agent_id}',
-                    'type': 'expert_agent',
-                    'name': agent_info.get('name', agent_id),
-                    'status': 'available',
-                    'current_task': None,
-                    'skills': list(agent_info.get('skills', {}).keys()),
-                    'last_active': None,
-                    'metrics': {
-                        'accuracy': agent_info.get('accuracy', 0),
-                    },
-                })
-        except Exception:
-            pass
+            from integrations.expert_agents.registry import ExpertAgentRegistry
+            from integrations.internal_comm import internal_agent_communication as _iac
+        except ImportError:
+            logger.warning("expert agents unavailable for the dashboard",
+                           exc_info=True)
+            return []
+
+        catalog = ExpertAgentRegistry().agents
+        registry = _iac.skill_registry
+        # Snapshot under the registry's own lock: register_agent mutates
+        # these dicts from request threads while the dashboard reads.
+        with registry.lock:
+            registered = [(agent_id, list(skills.values()))
+                          for agent_id, skills in registry.agents.items()
+                          if agent_id in catalog]
+
+        result = []
+        for agent_id, skills in registered:
+            accuracy = (sum(s.proficiency for s in skills) / len(skills)
+                        if skills else 0)
+            result.append({
+                'id': f'expert_{agent_id}',
+                'type': 'expert_agent',
+                'name': catalog[agent_id].name,
+                'status': 'available',
+                'current_task': None,
+                'skills': [s.name for s in skills],
+                'last_active': None,
+                'metrics': {
+                    'accuracy': round(accuracy, 3),
+                },
+            })
         return result
 
     # ───────────────────────────────────────────────────────────────
@@ -886,7 +906,8 @@ def get_a2a_graph(root_agent_id: str, depth: int = 2) -> Dict:
 
 
 def steer_agent(db, agent_id: str, verb: str, actor_id: str = 'system',
-                reason: Optional[str] = None) -> Dict:
+                reason: Optional[str] = None, *,
+                caller: 'SteeringCaller') -> Dict:
     """Apply a steering verb to an AgentGoal: pause / resume / cancel.
 
     Uses the existing ``AgentGoal.status`` column (values: active |
@@ -902,31 +923,19 @@ def steer_agent(db, agent_id: str, verb: str, actor_id: str = 'system',
 
     Returns ``{ok: bool, new_status: str, error: str|None}``.
     Never raises; bad input returns ``{ok: False, error: ...}``.
+
+    ``caller`` is required and is judged by may_steer, the one rule for
+    every steering verb; a refusal is ``forbidden: True`` (the route
+    answers 403).
     """
     out = {'ok': False, 'new_status': None, 'error': None}
     if verb not in ('pause', 'resume', 'cancel'):
         out['error'] = f'unknown verb {verb}'
         return out
 
-    try:
-        from .models import AgentGoal
-    except ImportError:
-        out['error'] = 'AgentGoal model unavailable'
-        return out
-
-    goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
-    # CodingGoal fallback — same lookup pattern as get_agent_snapshot.
-    # Without this, Pause/Resume/Cancel buttons on the drawer 404 for
-    # any coding-type card (about half the dashboard).
-    if not goal:
-        try:
-            from .models import CodingGoal
-            goal = db.query(CodingGoal).filter(
-                CodingGoal.id == str(agent_id)).first()
-        except Exception:
-            pass
-    if not goal:
-        out['error'] = 'agent not found'
+    goal, refused = _goal_to_steer(db, agent_id, verb, caller, actor_id)
+    if refused:
+        out.update(refused)
         return out
 
     prev_status = goal.status
@@ -1041,8 +1050,117 @@ def _parse_iso(value) -> Optional[datetime]:
         return None
 
 
+class SteeringCaller(NamedTuple):
+    """Who is asking to steer a goal, as the route established it.
+
+    ``user_id`` None means a caller on this machine with no owner configured
+    (HEVOLVE_OWNER_USER_ID unset).  ``is_local`` is a loopback caller, which
+    is this desktop's owner; a remote caller is whoever its token names.
+    """
+    user_id: Optional[str]
+    is_admin: bool = False
+    is_local: bool = False
+
+
+def may_steer(db, goal, caller: SteeringCaller) -> Optional[str]:
+    """Why ``caller`` may NOT steer ``goal`` (inject, pause, resume, cancel),
+    or None.  THE rule for every steering verb (_goal_to_steer applies it).
+
+    Review of de3f89364 (2026-09-27, CRITICAL): the inject route checked
+    nothing, and /api/social/ is exempt from the API gate, so the desktop
+    owner's typed chat reached a guest's running agent (and any caller on the
+    network could have).  The rule:
+      * the goal's owner (core.event_attribution.goal_owner_user_id, the one
+        owner precedence) steers it;
+      * an admin (integrations.social.auth.holds_central_role) steers any;
+      * a goal with no human owner belongs to the machine, so this machine's
+        own callers steer it (the MCP co-pilot does, steer_goal) and a remote
+        non-admin does not.  That is a goal whose author is a machine label
+        (the flywheel's seeded goals) AND a goal run by an agent or system
+        ACCOUNT no person owns -- this node's daemon identity,
+        hevolve_system_agent.  The owner id is resolved to the person behind
+        it by UserService.person_to_notify (the canonical rule: a person is
+        themself, an agent is its human owner, an ownerless agent/system
+        account is nobody), so an agent a person owns is that person's.
+
+    The CALLER is resolved by the same rule: an agent acting with its own
+    token counts as the person who owns it (the rule the thought-experiment
+    tally and the task-assign route apply), so it may steer its owner's
+    goals (review of c3651a483: an agent got 403 on its owner's goal).
+    """
+    if caller.is_admin:
+        return None
+    from core.event_attribution import goal_owner_user_id
+    from .services import UserService
+    owner = goal_owner_user_id(goal)
+    if owner is not None:
+        owner = UserService.person_to_notify(db, owner)
+    if owner is None:
+        return None if caller.is_local else (
+            'only an admin may steer a goal with no owner from another machine')
+    if caller.user_id:
+        who = UserService.person_to_notify(db, str(caller.user_id))
+        if who is not None and str(who) == str(owner):
+            return None
+    return 'this agent belongs to another user'
+
+
+#: What a refused steer answers, whether the goal is someone else's or does
+#: not exist, so the answer never discloses which ids exist.
+STEER_REFUSED = 'agent not found, or not yours to steer'
+
+
+def _goal_to_steer(db, agent_id: str, verb: str, caller: SteeringCaller,
+                   actor_id: str):
+    """The goal ``caller`` may steer with ``verb``, or why not.
+
+    Returns ``(goal, None)``, or ``(None, {'error': STEER_REFUSED,
+    'forbidden': True})`` for an unknown id or a caller may_steer refuses --
+    the same answer for both, logged and audit-logged as ``<verb>_refused``
+    with the caller's identity and the real reason.  ONE
+    lookup (AgentGoal, then CodingGoal: without the fallback the drawer's
+    buttons 404 on every coding card) and ONE authorization for every
+    steering verb, so no verb can skip either.
+    """
+    from .models import AgentGoal
+    goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
+    if not goal:
+        try:
+            from .models import CodingGoal
+            goal = db.query(CodingGoal).filter(
+                CodingGoal.id == str(agent_id)).first()
+        except Exception:
+            logger.debug('CodingGoal lookup unavailable', exc_info=True)
+    refusal = (may_steer(db, goal, caller) if goal
+               else 'no goal with this id')
+    if not refusal:
+        return goal, None
+    logger.warning('%s refused: caller=%s local=%s agent=%s: %s', verb,
+                   caller.user_id, caller.is_local, agent_id, refusal)
+    try:
+        from security.immutable_audit_log import get_audit_log
+        get_audit_log().log_event(
+            event_type='agent_steered',
+            actor_id=str(actor_id or 'admin-ui'),
+            action=f'{verb}_refused',
+            detail={'agent_id': str(agent_id),
+                    'caller_user_id': caller.user_id,
+                    'caller_is_local': caller.is_local,
+                    'reason': refusal},
+            target_id=str(agent_id),
+        )
+    except Exception:
+        logger.exception('%s_refused audit-log write failed for %s', verb,
+                         agent_id)
+    # ONE answer for "no such goal" and "not yours": a different one told
+    # a stranger which goal ids exist (review of c3651a483).  The real
+    # reason is in the log and the audit line above.
+    return None, {'error': STEER_REFUSED, 'forbidden': True}
+
+
 def inject_instruction(db, agent_id: str, instruction: str,
-                       actor_id: str = 'admin-ui') -> Dict:
+                       actor_id: str = 'admin-ui', *,
+                       caller: SteeringCaller) -> Dict:
     """Append an operator instruction to the live GroupChat.
 
     Reuses the existing ``_groupchat_registry`` (populated by
@@ -1057,38 +1175,19 @@ def inject_instruction(db, agent_id: str, instruction: str,
     Returns ``{ok, message_index, error}``.  ``ok=False`` when the
     GroupChat is not registered (process restarted, TTL expired, or
     /chat never ran for this agent in this process).
+
+    ``caller`` is required: a goal is steered only by someone may_steer
+    admits.  A refusal is ``forbidden: True`` (the route answers 403) and is
+    audit-logged as ``inject_refused`` with the caller's identity.
     """
     out = {'ok': False, 'message_index': None, 'error': None}
     if not (instruction or '').strip():
         out['error'] = 'empty instruction'
         return out
 
-    try:
-        from .models import AgentGoal
-    except ImportError:
-        out['error'] = 'AgentGoal unavailable'
-        return out
-
-    goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
-    if not goal:
-        # CodingGoal fallback (same pattern as get_agent_snapshot /
-        # steer_agent).  Without this the inject CTA on the drawer's
-        # Conversation tab silently 400s for any coding agent.
-        try:
-            from .models import CodingGoal
-            cg = db.query(CodingGoal).filter(
-                CodingGoal.id == str(agent_id)).first()
-            if cg:
-                from types import SimpleNamespace
-                goal = SimpleNamespace(
-                    prompt_id=getattr(cg, 'prompt_id', None),
-                    owner_id=getattr(cg, 'owner_id', None) or getattr(cg, 'created_by', None),
-                    created_by=getattr(cg, 'created_by', None),
-                )
-        except Exception:
-            pass
-    if not goal:
-        out['error'] = 'agent not found'
+    goal, refused = _goal_to_steer(db, agent_id, 'inject', caller, actor_id)
+    if refused:
+        out.update(refused)
         return out
 
     try:
@@ -1168,6 +1267,8 @@ def inject_instruction(db, agent_id: str, instruction: str,
             action='inject',
             detail={'agent_id': str(agent_id),
                     'message_index': out['message_index'],
+                    'caller_user_id': caller.user_id,
+                    'caller_is_local': caller.is_local,
                     'instruction_preview': instruction[:200]},
             target_id=str(agent_id),
         )

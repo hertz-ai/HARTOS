@@ -1419,6 +1419,23 @@ class AgentDaemon:
         t.start()
         self._federation_thread = t
 
+    @staticmethod
+    def _settle_metered_usage(db) -> None:
+        """Credit pending MeteredAPIUsage rows (settle_metered_api_costs) and
+        commit them on their own, so a settlement failure rolls back only
+        itself and never the tick that follows."""
+        try:
+            from .revenue_aggregator import settle_metered_api_costs
+            result = settle_metered_api_costs(db)
+            db.commit()
+            if result.get('settled_count'):
+                logger.info(
+                    "Metered settlement: %d row(s), %d Spark credited",
+                    result['settled_count'], result['total_spark_awarded'])
+        except Exception as e:
+            db.rollback()
+            logger.warning("Metered settlement failed (retried next cycle): %s", e)
+
     def _tick(self):
         """Find active goals, find idle agents, dispatch via /chat.
 
@@ -1521,6 +1538,15 @@ class AgentDaemon:
 
         db = get_db()
         try:
+            # Settlement pays operators for compute they served other people
+            # (budget_gate.charge_remote_compute rows, and metered API cost
+            # recovery).  It ran nowhere but a deploy script, so debits taken
+            # on completed remote work were never credited.  Before the
+            # no-goals stop on purpose: a node with nothing to dispatch still
+            # owes the operators who served it.
+            if self._tick_count % self._remediate_every == 0:
+                self._settle_metered_usage(db)
+
             # DETERMINISTIC STOP: no goals = no action = system is inert
             # Skip CODING_GOAL_TYPES — coding_daemon handles those with
             # idle-agent detection + benchmark sync for backend routing.

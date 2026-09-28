@@ -586,7 +586,7 @@ def desktop_copyfile(ctx, source, destination):
 @click.argument('command_text')
 @click.option('--url', required=True, default=DEFAULT_NUNBA_URL, help='Remote Nunba endpoint URL')
 @click.option('--timeout', default=120, help='Execution timeout in seconds')
-@click.option('--force', is_flag=True, help='Bypass destructive command check')
+@click.option('--force', is_flag=True, help='Accepted for compatibility; does not bypass the safety checks')
 @click.pass_context
 def remote(ctx, command_text, url, timeout, force):
     """Execute a command on a remote machine via Nunba."""
@@ -2331,11 +2331,21 @@ def a2a_discover(ctx, agent_url):
 @click.argument('message')
 @click.pass_context
 def a2a_send(ctx, agent_url, message):
-    """Send a task to a remote A2A agent."""
+    """Send a task to a remote A2A agent (AGENT_URL is <node>/a2a/<agent_id>).
+
+    The request is signed with this node's gossip key, the same way a peer
+    invoke is (discovery.signed_peer_request), so a node that has VERIFIED
+    this one runs its shared agent without any other credential."""
     json_output = ctx.obj['json_output']
     import requests
 
     url = agent_url.rstrip('/')
+    if url.endswith('/jsonrpc'):
+        url = url[:-len('/jsonrpc')]
+    base, sep, agent_id = url.rpartition('/a2a/')
+    if not sep or not base or not agent_id or '/' in agent_id:
+        _error_exit('AGENT_URL must name an agent: <node url>/a2a/<agent_id>',
+                    json_output)
     payload = {
         'jsonrpc': '2.0',
         'method': 'message/send',
@@ -2346,28 +2356,48 @@ def a2a_send(ctx, agent_url, message):
             }
         },
         'id': f'hart-cli-{os.getpid()}',
+        'agent_id': agent_id,
     }
+    try:
+        from integrations.google_a2a.peer_reuse import peer_node_id_for
+        from integrations.social.discovery import signed_peer_request
+        payload = signed_peer_request(
+            payload, audience=peer_node_id_for(base, ask_the_node=True))
+    except Exception as e:
+        click.echo(f'Warning: could not sign the request ({e}); sending it '
+                   f'unsigned, which only a node that trusts this LAN admits',
+                   err=True)
 
     try:
         resp = pooled_post(f'{url}/jsonrpc', json=payload, timeout=120)
         result = resp.json()
-
-        if json_output:
-            click.echo(json.dumps(result, indent=2, default=str))
-        else:
-            r = result.get('result', result)
-            state = r.get('state', '?')
-            click.echo(f"Task state: {state}")
-            artifacts = r.get('artifacts', [])
-            for a in artifacts:
-                for part in a.get('parts', []):
-                    if part.get('type') == 'text':
-                        click.echo(part['text'])
-
     except requests.ConnectionError:
         _error_exit(f'Cannot connect to {agent_url}', json_output)
     except Exception as e:
         _error_exit(str(e), json_output)
+
+    if resp.status_code in (401, 403):
+        why = ((result.get('error') or {}).get('message')
+               if isinstance(result, dict) else '') or 'refused'
+        _error_exit(
+            f'{resp.status_code} from {base}: {why}. A peer runs a shared '
+            f'agent for a node it has VERIFIED (this node answered its '
+            f'integrity challenge), or for a caller its /chat gate admits '
+            f'(an API key or a signed-in user).', json_output)
+    if json_output:
+        click.echo(json.dumps(result, indent=2, default=str))
+        return
+    if result.get('error'):
+        _error_exit(f"JSON-RPC error: {result['error'].get('message')}",
+                    json_output)
+    from integrations.google_a2a.peer_reuse import result_text
+    r = result.get('result') or {}
+    click.echo(f"Task state: {r.get('state', '?')}")
+    text = result_text(r)
+    if text:
+        click.echo(text)
+    if r.get('error'):
+        click.echo(f"Error: {r['error']}")
 
 
 @a2a.command('agents')

@@ -781,3 +781,22 @@ class TestTheWeightFileIsAKeyNotAFifthHeuristic:
         entry = c.get_by_weight_file(r'F:\hevolve\models\tiel-q4.gguf')
         assert c.record_residency(entry.id, vram_gb=2.87, ram_gb=18.64)
         assert c.residency('tiel')['vram_gb'] == 2.87
+
+    def test_the_key_does_not_depend_on_the_host_os(self, monkeypatch):
+        """CI (Linux) went red on the two tests above: posixpath splits only
+        on '/', so a Windows-authored path was never cut to its basename
+        and the lookup answered None. Run the lookup with the module's
+        ``os`` seeing POSIX path rules -- what a Linux node gets -- and both
+        path styles must still resolve to the same row."""
+        import posixpath
+        import types
+        from integrations.service_tools import model_catalog as mc
+        monkeypatch.setattr(mc, 'os', types.SimpleNamespace(path=posixpath))
+        c = self._cat(('a', 'tiel-q4.gguf'))
+        for p in (r'F:\hevolve\models\tiel-q4.gguf',
+                  '/mnt/models/tiel-q4.gguf',
+                  r'\\nas\share\models\tiel-q4.gguf',
+                  'tiel-q4.gguf'):
+            hit = c.get_by_weight_file(p)
+            assert hit is not None and hit.id == 'a', p
+        assert c.get_by_weight_file(r'F:\hevolve\models\other.gguf') is None

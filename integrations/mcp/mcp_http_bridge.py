@@ -148,10 +148,10 @@ def _ensure_mcp_token() -> str:
 
 
 def _is_loopback_request() -> bool:
-    """True if the Flask request originates from 127.0.0.1/::1."""
-    from flask import request as _req
-    _addr = (_req.remote_addr or '').strip()
-    return _addr in ('127.0.0.1', '::1', 'localhost')
+    """True if the Flask request originates from this machine: the one rule,
+    core.auth_local._is_local_request (a forwarded loopback claim is not)."""
+    from core.auth_local import _is_local_request
+    return _is_local_request()
 
 
 # ── Public API for cross-package consumers (Nunba) ──────────────────────
@@ -934,6 +934,18 @@ def _invoke_tool(tool_name, arguments):
     # kwarg.  See `_TOOL_ARG_ALIASES` above for the full mapping.
     arguments = _canonicalize_args(tool_name, arguments)
 
+    # An MCP call is no agent's turn, so the tool runs with no request caller
+    # (hartos.threadlocal prompt_id / user_id).  The /chat handler sets them
+    # and never clears them, so a worker thread reused from a chat still
+    # carried that chat's agent and user: measured 2026-09-27
+    # (scratchpad/tl_probe.py), a tool called here saw prompt_id '8865956'
+    # left by the previous /chat.  A tool that acts for "the calling agent"
+    # (cast_experiment_vote) would have acted as that agent.  Restored after,
+    # so the thread's own request state is unchanged.
+    from hartos.threadlocal import thread_local_data as _tl
+    _caller = (_tl.get_prompt_id(), _tl.get_user_id())
+    _tl.set_prompt_id(None)
+    _tl.set_user_id(None)
     try:
         result = fn(**arguments)
         if isinstance(result, str):
@@ -947,6 +959,9 @@ def _invoke_tool(tool_name, arguments):
     except Exception as e:
         logger.error(f"MCP tool {tool_name} execution error: {e}")
         return {"success": False, "error": str(e)}, 500
+    finally:
+        _tl.set_prompt_id(_caller[0])
+        _tl.set_user_id(_caller[1])
 
 
 @mcp_local_bp.route('/tools/execute', methods=['POST'])

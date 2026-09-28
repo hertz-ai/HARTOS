@@ -16,27 +16,38 @@ import pytest
 from integrations.social import consent_service as cs
 
 
-class _FakeDB:
-    def add(self, _):
-        pass
+@pytest.fixture
+def db():
+    """A real session: the grant's broadcast waits for its commit, which a
+    stand-in object without one could never deliver."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from integrations.social.models import UserConsent
 
-    def flush(self):
-        pass
+    engine = create_engine('sqlite://', poolclass=StaticPool,
+                           connect_args={'check_same_thread': False})
+    UserConsent.__table__.create(engine)
+    session = sessionmaker(bind=engine, expire_on_commit=False)()
+    yield session
+    session.close()
+    engine.dispose()
 
 
-def test_service_grant_audits_emits_and_validates(monkeypatch):
+def test_service_grant_audits_emits_and_validates(monkeypatch, db):
     audits, emits = [], []
     monkeypatch.setattr(cs, '_audit', lambda *a, **k: audits.append((a, k)))
     monkeypatch.setattr(cs, '_emit', lambda topic, data: emits.append(topic))
 
-    row = cs.ConsentService.grant_consent(_FakeDB(), 'user-1', 'data_access', '*')
+    row = cs.ConsentService.grant_consent(db, 'user-1', 'data_access', '*')
+    db.commit()
     assert row.consent_type == 'data_access'
     assert audits, "grant must write an immutable-audit entry"
     assert 'consent.granted' in emits, "grant must emit consent.granted"
 
     # Unknown type is now rejected (the UI inline path used to accept anything).
     with pytest.raises(ValueError):
-        cs.ConsentService.grant_consent(_FakeDB(), 'user-1', 'not_a_real_type', '*')
+        cs.ConsentService.grant_consent(db, 'user-1', 'not_a_real_type', '*')
 
 
 def test_consent_api_grant_delegates_to_service():

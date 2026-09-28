@@ -411,10 +411,18 @@ def execute_action(action: dict, tier: str, *,
         except Exception as e:
             logger.debug(f"verify pre-screenshot skipped: {e}")
 
+    # Credentials cross into the real value only here: the guards and the
+    # audit record above saw the {{secret:NAME}} alias, the keystrokes get
+    # the value, and the result is masked back before the model reads it.
+    from core.tool_logging import credential_vault
+    vault = credential_vault()
+    _run = vault.resolve_aliases(action) if vault is not None else action
     if tier == 'inprocess':
-        result = _execute_inprocess(action)
+        result = _execute_inprocess(_run)
     else:
-        result = _execute_http(action)
+        result = _execute_http(_run)
+    if vault is not None:
+        result = vault.mask_secrets(result)
 
     if _mismatch:
         result['window_mismatch'] = _mismatch
@@ -673,6 +681,34 @@ def _quick_image_diff(b64_a: str, b64_b: str) -> float:
         return 0.0
 
 
+#: Seconds the pasted text stays on the clipboard before the previous
+#: content is put back.  The paste is delivered asynchronously to the
+#: target window, so restoring immediately can paste the old content.
+CLIPBOARD_RESTORE_DELAY_S = 0.15
+
+
+def _type_text(text: str) -> None:
+    """Enter ``text`` into the focused field.
+
+    Pastes through the clipboard when available (reliable for long and
+    non-ASCII text, same as OmniParser), then puts the user's previous
+    clipboard back so a typed credential does not stay readable there.
+    """
+    if pyperclip is None:
+        pyautogui.typewrite(text, interval=0.012)
+        return
+    try:
+        previous = pyperclip.paste()
+    except Exception:
+        previous = ''
+    pyperclip.copy(text)
+    try:
+        pyautogui.hotkey('ctrl', 'v')
+        time.sleep(CLIPBOARD_RESTORE_DELAY_S)
+    finally:
+        pyperclip.copy(previous)
+
+
 def _execute_inprocess(action: dict) -> dict:
     """Execute action via direct pyautogui calls."""
     act = action.get('action', '')
@@ -721,13 +757,10 @@ def _execute_inprocess(action: dict) -> dict:
 
         elif act == 'type':
             if text:
-                # Use clipboard for reliability (same as OmniParser)
-                if pyperclip is not None:
-                    pyperclip.copy(text)
-                    pyautogui.hotkey('ctrl', 'v')
-                else:
-                    pyautogui.typewrite(text, interval=0.012)
-            return {'output': f'Typed: {text[:50]}...'}
+                _type_text(text)
+            # The count, never the text: this result goes back into the
+            # model's context, and what was typed may be a credential.
+            return {'output': f'Typed {len(text or "")} characters'}
 
         elif act == 'key':
             if text:

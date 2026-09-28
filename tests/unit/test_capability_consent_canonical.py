@@ -35,6 +35,7 @@ are not vacuous: each one fails on the pre-migration source.
 import ast
 import os
 import re
+import time
 from pathlib import Path
 
 os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
@@ -44,6 +45,15 @@ import pytest
 from integrations.social.models import Base, db_session, get_engine
 
 _HIE = Path(__file__).resolve().parents[2] / 'hart_intelligence_entry.py'
+
+
+def _until(cond, timeout=10.0):
+    """A feed start or stop runs off the caller's thread
+    (consent_service._FeedAnswers); wait for it, bounded."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end and not cond():
+        time.sleep(0.02)
+    return cond()
 
 
 @pytest.fixture(autouse=True)
@@ -300,11 +310,13 @@ def test_the_feed_actuator_drives_the_one_admin_lifecycle_path(monkeypatch):
                         lambda feed, on, cfg: calls.append((feed, on)))
 
     consent_service._embodied_feed_from_consent('screen_capture', True)
-    assert ('screen', True) in calls
+    # The start runs off the caller's thread (consent_service._FeedAnswers).
+    assert _until(lambda: ('screen', True) in calls), calls
     assert 'saved' in calls, 'the persisted flag was not written — a restart would forget'
 
     calls.clear()
     consent_service._embodied_feed_from_consent('copilot_access', True)
+    time.sleep(0.2)
     assert calls == [], 'a non-feed consent type must not touch the embodied feeds'
 
 
@@ -424,6 +436,11 @@ def test_admin_toggle_applies_the_feed_exactly_once(admin_ctx):
     it as well as the consent path did.
     """
     admin_ctx.toggle('screen', True)
+    # The consent path starts the feed off the request thread
+    # (consent_service._FeedAnswers): wait for it, then make sure no second
+    # apply follows.
+    _until(lambda: admin_ctx.directly_applied)
+    time.sleep(0.2)
     assert admin_ctx.directly_applied == [('screen', True)], (
         'the feed was applied 0 or 2 times, not once: '
         f'{admin_ctx.directly_applied}')

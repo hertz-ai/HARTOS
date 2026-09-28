@@ -382,17 +382,6 @@ COMPUTER_CONTROL_WAIT_SECONDS = 90.0
 COMPUTER_CONTROL_POLL_SECONDS = 3.0
 
 
-def _known_agent(agent_id) -> Optional[str]:
-    """The asking agent's id, or None when no agent is known.
-
-    Callers pass the prompt id they hold: None or '' when there is none, and
-    hart_intelligence_entry._handle_computer_action_tool sends
-    str(prompt_id or 0), so '0' too.  An unknown agent is never guessed.
-    """
-    text = '' if agent_id is None else str(agent_id).strip()
-    return None if text in ('', '0', 'None') else text
-
-
 def _computer_control_answer(owner: str, agent: Optional[str],
                              reason: str) -> Optional[bool]:
     """One look at the owner's answer: True allowed, False said no ("Don't
@@ -440,7 +429,14 @@ def computer_control_block(agent_id, *, sleep=time.sleep) -> Optional[str]:
                        '(HEVOLVE_OWNER_USER_ID is not set)')
         return ('Not run: nobody is signed in on this computer who could '
                 'allow an agent to control it.')
-    agent = _known_agent(agent_id)
+    try:
+        from integrations.social.consent_service import known_agent_id
+    except Exception as e:  # noqa: BLE001 -- a failed check is a no
+        logger.warning('computer control refused: the permission system '
+                       f'could not load: {e}')
+        return ('Not run: the permission to control this computer '
+                f'could not be checked ({e}).')
+    agent = known_agent_id(agent_id)
     reason = (f'Agent {agent} asks to {COMPUTER_CONTROL_COVERS}.' if agent
               else 'An agent that could not be identified asks to '
                    f'{COMPUTER_CONTROL_COVERS}.')

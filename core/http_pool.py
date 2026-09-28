@@ -443,11 +443,18 @@ def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Respons
         _body['user'] = rid                       # carry the rid on the wire
     session = _llama_session_for(kind)
     try:
+        from core.llama_scheduler import TurnCancelled
+    except ImportError:          # a stand-in scheduler: nothing is cancelled
+        class TurnCancelled(Exception):
+            pass
+    try:
         from core.llama_scheduler import get_scheduler
         with get_scheduler().slot(rid, kind,
                                   cancel_fn=close_bg_llm_requests_session,
                                   timeout=_SCHED_ACQUIRE_TIMEOUT_S):
             resp = session.post(url, timeout=timeout, **kwargs)
+    except TurnCancelled:
+        raise   # the turn's caller stopped waiting: never fail open into a call
     except Exception:
         # Scheduler import/error → fail-open: never block the call on the queue.
         resp = session.post(url, timeout=timeout, **kwargs)

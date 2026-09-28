@@ -180,3 +180,57 @@ def publish_chat_stage(stage: str, *, user_id: str, request_id: str = '', text: 
         text=text, user_id=str(user_id), request_id=str(request_id or ''),
         bot_type='Agent', full_schema=False, action=CHAT_ACTION_STATUS,
     )
+
+
+def publish_agent_message(
+    *,
+    text: Any,
+    user_id: str,
+    request_id: str,
+    prompt_id: Any,
+    inp: Any = '',
+) -> bool:
+    """Deliver an agent's message to the user on the local chat topic.
+
+    The one on-device path for send_message_to_user1 in BOTH create_recipe
+    and reuse_recipe.  REUSE had no such path and POSTed every message to
+    the cloud host aws_rasa:9890, which a desktop cannot reach (measured in
+    the Nunba gui_app.log 2026-09-26: WinError 10061, the agent's question
+    never arrived).  The envelope is the one CREATE has published since
+    2026-06-09 and chat-stream subscribers parse (text, request_id,
+    prompt_id, bot_type, options, page_image_url).
+
+    Returns True only when publish_async was resolved and returned without
+    raising; False for empty text or user, an unresolvable publisher, or a
+    raising one.  Callers report that result instead of claiming delivery.
+    """
+    text_str = text if isinstance(text, str) else str(text or '')
+    if not user_id or not text_str:
+        return False
+    payload = {
+        'text': [text_str],
+        'request_id': request_id,
+        'prompt_id': prompt_id,
+        'bot_type': 'Custom GPT',
+        'options': [],
+        'newoptions': [],
+        'page_image_url': '',
+        'analogy_image_url': '',
+        'probe': False,
+        'inp': inp,
+    }
+    try:
+        from core.peer_link.message_bus import chat_topic_for
+        from core.safe_hartos_attr import safe_hartos_attr
+        publish_async = safe_hartos_attr('publish_async')
+        if publish_async is None:
+            logger.warning(
+                "publish_agent_message: HARTOS publish_async unresolvable; "
+                "message for user %s not delivered", user_id)
+            return False
+        publish_async(chat_topic_for(user_id), payload)
+        return True
+    except Exception as e:
+        logger.warning(
+            "publish_agent_message: publish for user %s failed: %s", user_id, e)
+        return False

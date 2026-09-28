@@ -79,6 +79,110 @@ def quorum_met(distinct_voters: int, distinct_supporters: int) -> bool:
             and distinct_supporters >= MIN_DISTINCT_SUPPORTERS)
 
 
+# PRODUCT_MAP §10: at least 2/3 of the DECISIVE (for + against) weight must
+# be FOR.  Abstains are excluded from the denominator.
+SUPERMAJORITY_RATIO = 2.0 / 3.0
+
+
+def is_steward(user) -> bool:
+    """True when a vote by ``user`` (a users row, or None) is the steward's.
+
+    The steward is a registered HUMAN account holding the central role,
+    the one auth.require_central admits (auth.holds_central_role); no other
+    role store.  An agent is never the steward, whoever owns it and
+    whatever its own row says: an agent counts as its owner for the quorum
+    (tally_votes), never as the steward.  A voter id with no users row --
+    the literal 'steward' included -- is no one.  Only a signed-in human
+    may cast this vote: the agent tool casts agent votes only
+    (thought_experiment_tools.cast_experiment_vote)."""
+    if user is None or getattr(user, 'user_type', None) != 'human':
+        return False
+    from .auth import holds_central_role
+    return holds_central_role(user)
+
+
+def approval_verdict(tally: dict) -> dict:
+    """The ONE approval rule for a thought experiment, read from a tally.
+
+    `tally` is ThoughtExperimentService.tally_votes' result.  Approved
+    requires all of:
+      - quorum_met is True: >= MIN_DISTINCT_VOTERS identities, >=
+        MIN_DISTINCT_SUPPORTERS of them FOR, an agent counting as its owner
+        (a tally that does not answer it fails closed);
+      - total_for / (total_for + total_against) >= the threshold, which is
+        max(SUPERMAJORITY_RATIO, the context's approval_threshold): the
+        owner's 2/3 is the floor, and a context may only raise it (0.8 for
+        security_guardrail);
+      - when the context is steward_required, the steward voted FOR
+        (tally['steward_vote'] > 0; tally_votes fills it only from votes
+        whose voter is_steward, the most negative when several did, so a
+        steward's AGAINST is never outvoted by another's FOR).
+    The context is the tally's decision_context, and its rules come from
+    VOTER_RULES here, never from the tally, so a tally cannot carry a
+    weaker threshold.  No decision_context means DEFAULT_RULES, as
+    get_voter_rules gives every unknown context.
+
+    Every caller that turns a vote into action asks this: auto-evolve's
+    ranking, the evaluation-goal writer, and tally_votes'
+    decision_recommendation, so no two of them can disagree.  A caller may
+    ADD a stricter floor (auto-evolve's min_approval_score); none may skip
+    it.  test_one_approval_rule.py fails if a second rule appears.
+
+    Returns {'approved', 'reason', 'quorum_met', 'super_majority',
+    'threshold', 'steward_required', 'steward_approved', 'steward_missing'};
+    reason is one of 'approved', 'no_quorum', 'below_threshold',
+    'steward_required'.  steward_missing is True when the context requires
+    the steward and no steward has answered FOR or AGAINST (an abstain is
+    no answer): decide() asks it, so deciding and approving read the
+    steward from this one rule.
+    """
+    rules = get_voter_rules(tally.get('decision_context'))
+    threshold = max(SUPERMAJORITY_RATIO, rules['approval_threshold'])
+    steward_required = bool(rules['steward_required'])
+    steward_vote = tally.get('steward_vote') or 0
+    steward_approved = steward_vote > 0
+    total_for = tally.get('total_for', 0) or 0
+    total_against = tally.get('total_against', 0) or 0
+    decisive = total_for + total_against
+    ratio = (total_for / decisive) if decisive > 0 else 0.0
+    quorate = tally.get('quorum_met') is True
+    if not quorate:
+        reason = 'no_quorum'
+    elif ratio < threshold:
+        reason = 'below_threshold'
+    elif steward_required and not steward_approved:
+        reason = 'steward_required'
+    else:
+        reason = 'approved'
+    return {
+        'approved': reason == 'approved',
+        'reason': reason,
+        'quorum_met': quorate,
+        'super_majority': round(ratio, 4),
+        'threshold': round(threshold, 4),
+        'steward_required': steward_required,
+        'steward_approved': steward_approved,
+        'steward_missing': steward_required and steward_vote == 0,
+    }
+
+
+def recommendation(tally: dict) -> str:
+    """tally_votes' decision_recommendation, read from approval_verdict so
+    the two cannot disagree: 'approve' exactly when it approves;
+    'no_quorum' and 'steward_required' as it says; otherwise 'reject' when
+    the AGAINST share of the decisive weight reaches the threshold, else
+    'inconclusive'."""
+    verdict = approval_verdict(tally)
+    if verdict['approved']:
+        return 'approve'
+    if verdict['reason'] in ('no_quorum', 'steward_required'):
+        return verdict['reason']
+    decisive = (tally.get('total_for', 0) or 0) + \
+        (tally.get('total_against', 0) or 0)
+    against_share = 1.0 - verdict['super_majority'] if decisive > 0 else 0.0
+    return 'reject' if against_share >= verdict['threshold'] else 'inconclusive'
+
+
 # ─── Context Classification ──────────────────────────────────────────
 
 # Keywords that map to decision contexts (checked against title + hypothesis)

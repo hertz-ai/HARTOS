@@ -162,9 +162,14 @@ def test_the_timeout_contract_is_still_enforced():
         'timed-out command would be reported to the agent as a normal '
         'failed exit instead of a timeout.'
     )
-    consts = [n.value for n in ast.walk(node)
-              if isinstance(n, ast.Constant) and isinstance(n.value, int)]
-    assert 30 in consts, (
-        'the 30s shell budget disappeared from the handler; '
-        f'int constants present: {sorted(set(consts))}'
-    )
+    # The budget is core.constants.SHELL_COMMAND_TIMEOUT_S since 2026-09-27:
+    # the VLM loop gives a shell step exactly that long as grace past its own
+    # budget, so the two must read one number.
+    names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    assert 'SHELL_COMMAND_TIMEOUT_S' in names, (
+        'the shell budget is no longer core.constants.SHELL_COMMAND_TIMEOUT_S '
+        'in the handler; the VLM loop grace would drift from it')
+    from core.constants import SHELL_COMMAND_TIMEOUT_S
+    assert SHELL_COMMAND_TIMEOUT_S == 30, (
+        'the 30s shell budget changed; the agent-facing text and '
+        'Execute_Coding_Task advice assume it')

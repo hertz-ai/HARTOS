@@ -246,6 +246,7 @@ from hartos.lifecycle_hooks import (
     debug_lifecycle_status,
     ActionState,
     get_action_state, safe_set_state, force_state_through_valid_path, is_terminal_state,
+    autonomy_needs_user, action_is_autonomous,
     lifecycle_hook_track_status_verification_request,
     lifecycle_hook_track_fallback_request,
     lifecycle_hook_track_recipe_request,
@@ -340,12 +341,8 @@ try:
     log_dir = os.path.join(get_data_dir(), 'logs')
     os.makedirs(log_dir, exist_ok=True)
 except Exception:
-    try:
-        log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
-        os.makedirs(log_dir, exist_ok=True)
-    except Exception:
-        import tempfile
-        log_dir = tempfile.gettempdir()  # last resort: a log path must never brick boot
+    import tempfile
+    log_dir = tempfile.gettempdir()  # last resort: a log path must never brick boot
 
 # Single log file with rotation (no more timestamped files that accumulate forever)
 log_file = os.path.join(log_dir, "agent_system.log")
@@ -501,7 +498,7 @@ except Exception as e:
     tool_logger.error(f"Failed to register expert agents: {e}")
     expert_agents = {}
 
-from core.config_cache import get_db_url
+from core.config_cache import get_db_url, is_bundled
 database_url = get_db_url() or 'https://mailer.hertzai.com'
 
 
@@ -515,11 +512,13 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
 
     Deployment-mode-aware (2026-06-09):
 
-    - **Bundled** (sys.frozen — Nunba desktop / installer / embedded):
-      Emit directly to the canonical local chat topic
+    - **Bundled** (core.config_cache.is_bundled — Nunba desktop /
+      installer / embedded): core.peer_link.crossbar_publish.
+      publish_agent_message emits to the local chat topic
       com.hertzai.hevolve.chat.{user_id} with the schema chat-stream
       subscribers actually parse (text, request_id, prompt_id, bot_type,
-      options, page_image_url).  No cloud round-trip.  Subscribers
+      options, page_image_url).  No cloud round-trip.  REUSE's
+      send_message_to_user1 uses the same publisher.  Subscribers
       (Web SPA Demopage.js, Android RN AutobahnConnectionManager, Nunba
       Python adapter) render the message; downstream TTS/video happen
       via the local chat fan-out (no need to re-trigger here).
@@ -536,48 +535,28 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
     path — it was an artefact of the cloud server's per-user session
     dict and isn't needed by local subscribers.
 
-    Always fire-and-forget — callers don't read the return value.
+    Returns "Message sent successfully to user with request_id: ..." or
+    "Failed to send message to user with request_id: ...", the same two
+    answers REUSE's copy gives.  The send_message_to_user tool
+    (core.agent_tools) returns it to the model, so the model is told whether
+    its message went out; the other callers here ignore it.
     """
-    import sys as _sys
     user_prompt = f'{user_id}_{prompt_id}'
     try:
         request_id = f'{request_id_list[user_prompt]}-intermediate'
     except (KeyError, NameError):
         request_id = f'{user_prompt}-intermediate'
+    sent = f'Message sent successfully to user with request_id: {request_id}'
+    failed = f'Failed to send message to user with request_id: {request_id}'
 
-    _bundled = bool(getattr(_sys, 'frozen', False))
-
-    if _bundled:
+    if is_bundled():
         # Bundled (Nunba install) — local chat topic, on-device.
-        text = str(response or '')
-        if not text:
-            return
-        chat_payload = {
-            'text': [text],
-            'request_id': request_id,
-            'prompt_id': prompt_id,
-            'bot_type': 'Custom GPT',
-            'options': [],
-            'newoptions': [],
-            'page_image_url': '',
-            'analogy_image_url': '',
-            'probe': False,
-            'inp': inp,
-        }
-        try:
-            # Canonical worker-safe publisher is the module-level publish_async
-            # (create_recipe.py:109, routes via safe_hartos_attr). The previous
-            # `from core.message_bus import publish_async` raised
-            # ModuleNotFoundError every call (no such module) → bundled mode
-            # silently dropped every intermediate chat message.
-            publish_async(f'com.hertzai.hevolve.chat.{user_id}', chat_payload)
-        except Exception as _e:
-            try:
-                current_app.logger.debug(
-                    f'send_message_to_user1: local publish failed ({_e})')
-            except Exception:
-                pass
-        return
+        from core.peer_link.crossbar_publish import publish_agent_message
+        if publish_agent_message(text=response, user_id=user_id,
+                                 request_id=request_id, prompt_id=prompt_id,
+                                 inp=inp):
+            return sent
+        return failed
 
     # Standalone central HARTOS — canonical Kong gateway.
     url = 'https://azurekong.hertzai.com:8443/autogen_response'
@@ -596,6 +575,8 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
                 f'send_message_to_user1: azurekong forward failed ({_e})')
         except Exception:
             pass
+        return failed
+    return sent
 
 
 def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
@@ -656,7 +637,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
             break
         _check_action = time_actions[user_prompt].get_action_byaction_id(action_entry_point)
         current_app.logger.info(f'checking can_perform_without_user_input from {_check_action} ')
-        if _check_action and _check_action.get('can_perform_without_user_input') == 'yes':
+        if _check_action and action_is_autonomous(_check_action.get('can_perform_without_user_input')):
             restart = True
             text = 'You can assume things on your own to complete this task'
             result = chat_instructor.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
@@ -1000,13 +981,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph
         import os
-        try:
-            from core.platform_paths import get_memory_graph_dir
-            graph_db_path = get_memory_graph_dir(user_prompt)
-        except ImportError:
-            graph_db_path = os.path.join(
-                os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
-            )
+        from core.platform_paths import get_memory_graph_dir
+        graph_db_path = get_memory_graph_dir(user_prompt)
         memory_graph = MemoryGraph(db_path=graph_db_path, user_id=str(user_id))
         tool_logger.info(f"MemoryGraph initialized for {user_prompt}")
     except Exception as e:
@@ -1819,20 +1795,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # Never-say-unavailable: always-on discovery that attaches gated-out
         # or newly-needed tools mid-conversation (owner req 2026-08-31).
         _attached_names = set(svc_tools)
-
-        def request_tools(need: str) -> str:
-            from core.agent_tools import discover_and_attach
-            return discover_and_attach(need, helper, assistant,
-                                       service_tool_registry, _attached_names,
-                                       core_tools=getattr(
-                                           assistant, '_hart_core_tools', None))
-        register_dual(helper, assistant, request_tools, 'request_tools',
-                      "Discover and attach additional tools by describing the "
-                      "capability you need, e.g. 'text to speech' or 'crawl a "
-                      "webpage'. Call this FIRST whenever your current tools "
-                      "lack a capability - never tell the user something is "
-                      "unavailable without trying this. If it finds no "
-                      "match, call it once more with different wording.")
+        from core.agent_tools import register_request_tools
+        register_request_tools(helper, assistant, service_tool_registry,
+                               _attached_names)
 
         for tool_name, tool_func in svc_tools.items():
             tool_def = next((d for d in svc_defs if d['name'] == tool_name), None)
@@ -2097,10 +2062,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # AUTHORS a recipe; it does not execute.  REUSE is untouched: the same
     # window shows it calling 17 distinct non-core tools, so its set is load-
     # bearing and this narrowing deliberately does not touch that leg.
+    #
+    # The prompts ADVERTISE execute_windows_or_android_command; deferring it
+    # left a webmail agent unable to touch the screen (2026-09-25), so the
+    # keep rule lives in core.agent_tools beside the advertised list.
     try:
-        _keep = (set(MAIN_LEG_CORE_TOOLS) | {'request_tools'}
-                 | set(svc_tools or {})
-                 | (_helper_tool_names(helper) - _pre_tier2_tools))
+        from core.agent_tools import create_helper_keep
+        _keep = create_helper_keep(_helper_tool_names(helper),
+                                   _pre_tier2_tools, svc_tools)
         _dropped = defer_helper_schema(
             helper, _helper_tool_names(helper) - _keep)
         if _dropped:
@@ -2542,7 +2511,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                         f"(can_perform_without_user_input={_gate_value!r}); "
                                         f"OUTER loop will break and return control to user."
                                     )
-                                elif _gate_value.startswith('no'):
+                                elif autonomy_needs_user(_gate_value):
                                     current_app.logger.info(
                                         f"[USER-INPUT-GATE] NOT flagging action {current_action_id}: "
                                         f"verdict said {_gate_value!r} but the action is already "
@@ -3005,11 +2974,11 @@ def _install_create_group_writeback(group_chat, user_id, prompt_id, user_prompt,
 
 
 def instantiate_executor_agent():
-    from core.agent_tools import main_leg_tool_menu
+    from core.agent_tools import main_leg_tool_menu, CREATE_ADVERTISED_TOOLS
     # create_scheduled_jobs is NOT registered on this leg -- see the note on
     # MAIN_LEG_CORE_TOOLS.  execute_windows_or_android_command is, via
     # register_dual(helper, assistant, ...) at :1670.
-    _tool_menu = main_leg_tool_menu(('execute_windows_or_android_command',))
+    _tool_menu = main_leg_tool_menu(CREATE_ADVERTISED_TOOLS)
     # Inject cultural wisdom — even code execution should embody care
     _executor_cultural = ""
     try:
@@ -3098,8 +3067,8 @@ def instantiate_status_verifier_agent(user_prompt):
     # advertised set cannot drift from the set this leg registers.  Names only:
     # the verifier is still told not to perform actions, and registering tools
     # on it would change what it does, not what it can name.
-    from core.agent_tools import main_leg_tool_menu
-    _tool_menu = main_leg_tool_menu(('execute_windows_or_android_command',))
+    from core.agent_tools import main_leg_tool_menu, CREATE_ADVERTISED_TOOLS
+    _tool_menu = main_leg_tool_menu(CREATE_ADVERTISED_TOOLS)
     verify = autogen.AssistantAgent(
         name="StatusVerifier",
         llm_config=get_llm_config(),
@@ -3182,11 +3151,11 @@ def instantiate_helper_agent():
 
 
 def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, resonance_profile=None, autonomous=False):
-    from core.agent_tools import main_leg_tool_menu
+    from core.agent_tools import main_leg_tool_menu, CREATE_ADVERTISED_TOOLS
     # create_scheduled_jobs is NOT registered on this leg -- see the note on
     # MAIN_LEG_CORE_TOOLS.  execute_windows_or_android_command is, via
     # register_dual(helper, assistant, ...) at :1670.
-    _tool_menu = main_leg_tool_menu(('execute_windows_or_android_command',))
+    _tool_menu = main_leg_tool_menu(CREATE_ADVERTISED_TOOLS)
     # Build personality injection for the primary user-facing agent
     _personality_block = ""
     if personality:
@@ -3580,7 +3549,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
                     return chat_instructor1
 
                 currentaction_id = last_json['action_id']
-                if final_recipe[prompt_id]['actions'][currentaction_id-1]['can_perform_without_user_input'] == 'yes':
+                if action_is_autonomous(final_recipe[prompt_id]['actions'][currentaction_id-1]['can_perform_without_user_input']):
                     return time_agent
         except Exception as e:
             current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
@@ -3843,12 +3812,16 @@ def should_continue_autonomously(user_prompt: str) -> bool:
     next_task = ledger.get_next_executable_task()
 
     if next_task:
-        # Check if task requires user input based on context
-        can_do_without_user = next_task.context.get('can_perform_without_user_input', True)
+        # Does the task need the user?  The ONE rule (core.constants.
+        # autonomy_needs_user): a leading 'no'.  A missing value does not
+        # block, as before.  This read `.get(..., True)` and a truthiness
+        # test, so the string 'no' continued (review of cc1393825).
+        needs_user = autonomy_needs_user(
+            next_task.context.get('can_perform_without_user_input'))
         blocked_reason = next_task.blocked_reason
 
         # Don't continue if task needs user input
-        if blocked_reason == 'input_required' or not can_do_without_user:
+        if blocked_reason == 'input_required' or needs_user:
             current_app.logger.info(f'[Autonomous] Next task requires user input: {next_task.description}')
             return False
 
@@ -4156,7 +4129,7 @@ def _should_block_on_user_input(user_prompt, action_id, gate_value) -> bool:
     re-listed here — a fourth copy of that tuple is the drift this codebase keeps
     paying for.
     """
-    if not (gate_value or '').strip().lower().startswith('no'):
+    if not autonomy_needs_user(gate_value):
         return False
     try:
         if is_terminal_state(get_action_state(user_prompt, action_id)):
@@ -4500,6 +4473,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         _pipeline_timeout = 1800  # 30 minutes — CREATE is the learning phase, needs time
         # Per-run replay ledger for _remedy_replay_exceeded (see its docstring).
         _remedy_attempts = {}
+        # The verdict message [LAST-ACTION] has already settled (see there).
+        _spent_verdict = None
 
         while while_loop_iterations < max_iterations:
             # Hard timeout: don't let pipeline run forever
@@ -4670,6 +4645,15 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     f"[STALE-VERDICT] messages[-2] belongs to action "
                     f"{_stale_owner}; not crediting it to action "
                     f"{current_action_id}, which has not started")
+            elif (_spent_verdict is not None
+                    and len(group_chat.messages) >= 2
+                    and group_chat.messages[-2] is _spent_verdict):
+                # Already settled by [LAST-ACTION]; the branches below route
+                # the finished flow ([AUTO-ADVANCE] -> [FLOW-COMPLETE]).
+                _stale_verdict = True
+                current_app.logger.info(
+                    f"[SPENT-VERDICT] messages[-2] was already settled for "
+                    f"action {current_action_id}; completing the flow")
             if (not _stale_verdict and group_chat.messages
                     and group_chat.messages[-1]['name'] == 'ChatInstructor'
                     and _is_terminate(group_chat.messages[-1]['content'])):
@@ -4680,6 +4664,24 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 hook_result = lifecycle_hook_process_verifier_response(user_prompt, json_obj,
                                                                        user_tasks)  # 4-6. Process verifier response
 
+                if hook_result['action'] == 'gave_up':
+                    # The gate refused this action's completion claims to its
+                    # bound and recorded GAVE_UP (an honest, retryable failure).
+                    # Move on the way [RECIPE-GIVEUP] does; posting nothing,
+                    # because the old verdict + TERMINATE still at the tail are
+                    # then stale for the next action and route it to
+                    # [EXECUTE-PENDING].  Re-reading them here instead would
+                    # spin: the COMPLETION-GATE below `continue`s without
+                    # posting for any action that is not COMPLETED.
+                    current_app.logger.warning(
+                        f"[GAVE-UP] action {current_action_id}: "
+                        f"{hook_result['message']}")
+                    if current_action_id < len(user_tasks[user_prompt].actions):
+                        user_tasks[user_prompt].current_action = current_action_id + 1
+                        user_tasks[user_prompt].recipe = False
+                        user_tasks[user_prompt].fallback = False
+                        continue
+                    break
                 if hook_result['action'] != 'allow':
                     if hook_result['action'] == 'force_fallback':
                         # The lifecycle hook is the sole owner of the verified
@@ -4702,6 +4704,28 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                         _generated_fallback = str(
                             json_obj.get('fallback_action') or '').strip()
+                        _flow_now = get_current_flow(user_prompt)
+                        if (_generated_fallback
+                                and _bank_action_recipe_from_trace(
+                                    user_prompt, prompt_id, _flow_now,
+                                    _verified_action_id, group_chat)):
+                            # The work that ran IS the recipe (#88, #106), as
+                            # in the claim handler below; asking the model to
+                            # describe it is a fallible round-trip.  Close the
+                            # verified action and post nothing: next lap the
+                            # claim handler finds it done with its file on
+                            # disk ([ALREADY DONE] / [LAST-ACTION]) and moves
+                            # on.  This path became live on 2026-09-27: before,
+                            # the TERMINATE after each verdict had already
+                            # closed the action (without a receipt) before
+                            # this hook ran.
+                            user_tasks[user_prompt].fallback = False
+                            user_tasks[user_prompt].recipe = False
+                            force_state_through_valid_path(
+                                user_prompt, _verified_action_id,
+                                ActionState.TERMINATED,
+                                'verified; recipe banked from its trace')
+                            continue
                         if _generated_fallback:
                             # The verifier already supplied the fallback, so
                             # keep the autonomous path and request the recipe
@@ -4848,6 +4872,20 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                             user_tasks[user_prompt].recipe = False
                                             current_app.logger.info(
                                                 f"[LAST-ACTION] action {json_action_id} is last in flow")
+                                            if (get_action_state(user_prompt, json_action_id)
+                                                    == ActionState.TERMINATED):
+                                                # Lifecycle over and recipe on disk: there is
+                                                # no fallback left to ask for.  Falling through
+                                                # hit the COMPLETION-GATE (COMPLETED only), which
+                                                # `continue`d without posting, so this verdict
+                                                # was re-read every lap to max_iterations and
+                                                # no flow recipe was saved (live 2026-09-25,
+                                                # prompts 91790350001 / 7700000611).  Mark it
+                                                # spent: next lap takes [AUTO-ADVANCE] ->
+                                                # [FLOW-COMPLETE], the canonical flow finish.
+                                                user_tasks[user_prompt].fallback = False
+                                                _spent_verdict = group_chat.messages[-2]
+                                                continue
                                     if json_action_id < len(user_tasks[user_prompt].actions) and os.path.exists(_recipe_file):
                                         continue
 
@@ -5271,7 +5309,14 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 # If the current action hasn't been executed yet, start it
                 _ca_pending = user_tasks[user_prompt].current_action
                 _ca_pending_state = get_action_state(user_prompt, _ca_pending)
-                if _ca_pending_state in (ActionState.ASSIGNED, ActionState.PENDING, ActionState.IN_PROGRESS):
+                # STATUS_VERIFICATION_REQUESTED too: an action whose completion
+                # claim the gate refused sits there with no verdict at the
+                # tail, and nothing else re-posts it.  Before 2026-09-27 the
+                # TERMINATE hook closed such an action (without a receipt);
+                # left open, it spun here silently to the stall guard.  Re-
+                # posting it is bounded by the three attempts below.
+                if _ca_pending_state in (ActionState.ASSIGNED, ActionState.PENDING, ActionState.IN_PROGRESS,
+                                         ActionState.STATUS_VERIFICATION_REQUESTED):
                     # Track retries to detect actions stuck needing user input
                     if not hasattr(user_tasks[user_prompt], '_exec_retries'):
                         user_tasks[user_prompt]._exec_retries = {}
@@ -5842,8 +5887,9 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
     action recipe in 3 weeks), so every restart re-walked from Action 1 and
     no flow ever reached the completion charge.
 
-    Trace-derived banking records what really ran — only the executed tool
-    calls, never fabricated steps. An action with NO tool work banks an
+    Trace-derived banking records what really ran — the tool calls that did
+    not fail and the code blocks the Executor ran with exitcode 0, never
+    fabricated steps. An action with NO such work banks an
     explicit no-op marker (the 2026-06-04 "synthesis poisons validator"
     guard). Must only be called IN-RUN: the trace lives in this dispatch's
     group_chat and is gone after a restart. Returns True if banked.
@@ -5854,16 +5900,22 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         # "Execute Action N:" when it wraps a round, so an action's work can
         # sit in an earlier window while its last window holds only a closing
         # reply.
-        starts = []
-        for i, m in enumerate(msgs):
-            c = m.get('content') if isinstance(m, dict) else None
-            # Trailing ':' delimiter is required — dispatch markers are
-            # 'Execute Action N: ...', so without the colon 'Execute Action 2'
-            # also matches 'Execute Action 20:'..'29:' and banks the wrong
-            # action's tool calls for flows with >=10 actions (CREATE routinely
-            # decomposes into 11-23).
-            if isinstance(c, str) and f'Execute Action {action_id}:' in c:
-                starts.append(i)
+        #
+        # A dispatch is what hartos.lifecycle_hooks.dispatch_action_id says it
+        # is -- the one parser, used for every window below.  It reads only a
+        # LEADING marker (colon-delimited, so 2 never matches 20), because
+        # CREATE's own dispatch appends the user's text after its marker and
+        # that text can quote another one: "Execute Action 5: ... ,Latest User
+        # message: Properly Execute Action 2: ...".  The containment test that
+        # stood here opened action 2's window on that message and banked
+        # action 5's post_to_social as action 2's recipe (review, 2026-09-26).
+        from hartos.lifecycle_hooks import dispatch_action_id
+
+        def _dispatched(m):
+            return dispatch_action_id(m.get('content')) if isinstance(m, dict) else None
+
+        starts = [i for i, m in enumerate(msgs)
+                  if _dispatched(m) == int(action_id)]
         if not starts:
             # No dispatch marker: this run never started the action, so the
             # trace holds none of its work.  The IN-RUN rule above, enforced
@@ -5880,20 +5932,56 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
             # The window ENDS at the next dispatch marker, so a later action's
             # tool calls don't bleed into this one (the trace can hold later
             # dispatches when banking runs at/after a flow boundary).
+            # Any dispatch ends it, by the same parser: text that only QUOTES
+            # a marker is not a dispatch and must not cut the action's work.
             end = len(msgs)
             for j in range(start + 1, len(msgs)):
-                cj = msgs[j].get('content') if isinstance(msgs[j], dict) else None
-                if isinstance(cj, str) and 'Execute Action ' in cj:
+                if _dispatched(msgs[j]) is not None:
                     end = j
                     break
+            # Only work that SUCCEEDED is a step (CR3, live 2026-09-25).  Two
+            # kinds of work run in the group chat:
+            #  * a tool call, answered by a tool message whose tool_responses
+            #    carry the call's id.  A reply that core.constants
+            #    .tool_reply_failed reads as a failure means the call did not
+            #    do its work: the executor's "Error: ...", core.tool_logging's
+            #    error envelope, or one of TOOL_FAILURE_RESULTS -- which this
+            #    module's own execute_windows_or_android_command returns when
+            #    it refuses (operator gate, computer-control consent, a VLM
+            #    loop that could not finish).  Banking those made a failed
+            #    save_data_in_memory the recipe, and (review of dd46b4da0) a
+            #    desktop action refused for want of consent a step REUSE
+            #    would replay.  The REUSE fabrication gate reads the same
+            #    predicate, so the two ends cannot disagree about a failure.
+            #  * a code block the Executor ran: the Assistant posts ```lang
+            #    fences and the Executor answers "exitcode: 0 ...".  Reading
+            #    only tool_calls dropped this work, so a code-only action
+            #    banked "no-op" and REUSE had no code to replay.
+            from core.constants import tool_reply_failed
+            from autogen.code_utils import extract_code, UNKNOWN
+            window = [m for m in msgs[start:end] if isinstance(m, dict)]
+            failed_ids = set()
+            for m in window:
+                for r in (m.get('tool_responses') or []):
+                    if (isinstance(r, dict) and r.get('tool_call_id')
+                            and tool_reply_failed(r.get('content'))):
+                        failed_ids.add(r['tool_call_id'])
+            # Window positions of the code messages already banked.  One
+            # authored block can earn several "exitcode: 0" replies: measured
+            # with the real autogen 0.2.37 executor configured as this module
+            # configures its Executor (last_n_messages=2, no docker) and a side-effect counter in the
+            # block, the Executor selected twice in a row ran the ONE block
+            # twice, and the Assistant (which also executes code here) a third
+            # time.  That is the executor re-scanning the same message, not
+            # new work, so the block is one step; banking it per reply made
+            # REUSE replay it, side effects and all, once per re-scan.
+            banked_code = set()
             found = []
-            for m in msgs[start:end]:
-                if not isinstance(m, dict):
-                    continue
+            for k, m in enumerate(window):
                 for tc in (m.get('tool_calls') or []):
                     fn = (tc.get('function') or {}) if isinstance(tc, dict) else {}
                     nm = fn.get('name', '')
-                    if not nm:
+                    if not nm or tc.get('id') in failed_ids:
                         continue
                     found.append({
                         'steps': f"{nm}({str(fn.get('arguments') or '')[:400]})",
@@ -5901,6 +5989,35 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                         'generalized_functions': '',
                         'agent_to_perform_this_action': 'Helper',
                     })
+                c = m.get('content')
+                if not (isinstance(c, str) and c.startswith('exitcode: 0 ')):
+                    continue
+                # The code that ran is the newest earlier message holding a
+                # fenced block -- the one the Executor scanned.  Newest first
+                # (a retry's corrected block, not the failed one), over the
+                # whole window: NOT bounded by the executor's last_n_messages,
+                # because autogen scans the agent's TRANSFORMED view, where
+                # ToolMessageHandler merges consecutive user turns, so "last 2"
+                # can span more group messages than 2 (review of ff929cd08,
+                # probed with the real Executor: a block three group messages
+                # back ran).
+                for j in range(k - 1, -1, -1):
+                    blocks = [(lang, code) for lang, code
+                              in extract_code(window[j].get('content') or '')
+                              if lang != UNKNOWN]
+                    if blocks:
+                        if j in banked_code:
+                            break
+                        banked_code.add(j)
+                        found.append({
+                            'steps': 'run the code in generalized_functions',
+                            'tool_name': '',
+                            'generalized_functions': '\n\n'.join(
+                                f"```{lang}\n{code}\n```"
+                                for lang, code in blocks),
+                            'agent_to_perform_this_action': 'Executor',
+                        })
+                        break
             return found
 
         # Newest window first: a re-dispatch that did the work supersedes the
@@ -5927,6 +6044,26 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         # the flow from action 1.
         if not isinstance(action_obj, dict):
             action_obj = {'action': str(action_obj)}
+        # Bookkeeping is not the work (core.constants.BOOKKEEPING_TOOLS).  A
+        # window whose every step is a note-to-self the action does not name
+        # did nothing a replay should repeat: live 2026-09-27 (CREATE
+        # daemon_255bd83f) two execute_coding_task actions banked as recipes
+        # 28345960934_0_1/_0_2 made of request_tools, get_saved_metadata,
+        # search_long_term_memory and save_data_in_memory writes of
+        # {"status": "completed"}, with no coding run.  Nothing is banked, so
+        # the caller asks for the recipe or gives up instead of REUSE replaying
+        # the notes.  A step with generalized_functions (code that ran) is work.
+        from core.constants import BOOKKEEPING_TOOLS
+        _action_text = str(action_obj.get('action', '')).lower()
+        if steps and all(
+                s['tool_name'] in BOOKKEEPING_TOOLS
+                and s['tool_name'].lower() not in _action_text
+                for s in steps):
+            current_app.logger.warning(
+                f"[TRACE-BANK] action {action_id} ran only bookkeeping tools "
+                f"({', '.join(sorted({s['tool_name'] for s in steps}))}); "
+                f"not banking that as its recipe")
+            return False
         if not steps:
             steps = [{
                 'steps': 'no-op: action completed without tool execution',
@@ -5950,8 +6087,9 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         try:
             from security.secret_redactor import redact_secrets
             for _ri in json_obj['recipe']:
-                if isinstance(_ri.get('steps'), str):
-                    _ri['steps'], _ = redact_secrets(_ri['steps'])
+                for _rk in ('steps', 'generalized_functions'):
+                    if isinstance(_ri.get(_rk), str):
+                        _ri[_rk], _ = redact_secrets(_ri[_rk])
         except ImportError:
             pass
         name = helper_fun.safe_prompt_path(prompt_id, flow, action_id)

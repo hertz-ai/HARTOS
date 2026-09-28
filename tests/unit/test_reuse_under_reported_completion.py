@@ -127,9 +127,16 @@ class TestRequiresBreakdownIsNotAnUnderReport:
         block = m.group(1)
         assert "== 'requires_breakdown'" in block, 'must key on the verdict'
         assert 'get_pending_subtasks(' in block, 'must read the persisted subtasks back'
-        assert 'Work on subtask:' in block, (
-            'must post the same work message create_recipe.py:4518 posts — one '
-            'shape, not a second protocol')
+        # 401bff277 moved the literal into _REUSE_SUBTASK_STEER_PREFIX so
+        # _reuse_is_pipeline_text can recognise the steer; the block posts
+        # the constant, and the constant must still be the text create posts.
+        assert '_REUSE_SUBTASK_STEER_PREFIX' in block, (
+            'must post the shared subtask steer prefix — one shape, not a '
+            'second protocol')
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        assert rr._REUSE_SUBTASK_STEER_PREFIX == 'Work on subtask: ', (
+            'must post the same work message create_recipe.py posts '
+            '(f"Work on subtask: {description}")')
         assert '_advance_or_steer' not in block, (
             'the breakdown path must EXECUTE the decomposition, never advance '
             'past it')

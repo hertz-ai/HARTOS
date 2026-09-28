@@ -208,6 +208,21 @@ def provable_user_id() -> str:
     return os.environ.get('HEVOLVE_USER_ID', '')
 
 
+def owns_same_user_links(user_id: str) -> bool:
+    """Does ``user_id`` own this node's SAME_USER node links?
+
+    A SAME_USER node link was proved over ``provable_user_id()`` -- the far
+    side verified a signature over exactly that value -- so its far end
+    belongs to THIS node's user.  A message naming no user is node-level
+    data, which is that same user's.  A message of any other user (a
+    regional or multi-user node serving someone who does not own it) is a
+    third party's on those links: owner ruling 2026-09-26, egress to a node
+    that is "not their node" is scrubbed.
+    """
+    user_id = str(user_id or '')
+    return not user_id or user_id == provable_user_id()
+
+
 class PeerLink:
     """Persistent WebSocket connection to a single peer.
 
@@ -301,6 +316,20 @@ class PeerLink:
             logger.info(
                 f"Trust UPGRADED for {self.peer_id[:8]}: → {new_trust.value}")
         return True
+
+    def owned_by(self, user_id: str) -> bool:
+        """Is the far end of this link owned by ``user_id``?
+
+        A device is its token's user's; a SAME_USER node is this node's
+        user's (``owns_same_user_links``); a PEER or RELAY node is someone
+        else's, including an own node that could not prove it.
+        """
+        user_id = str(user_id or '')
+        if self.kind == 'device':
+            return bool(user_id) and self.user_id == user_id
+        if self.trust != TrustLevel.SAME_USER:
+            return False
+        return owns_same_user_links(user_id)
 
     @property
     def idle_seconds(self) -> float:

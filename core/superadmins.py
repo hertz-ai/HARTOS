@@ -76,6 +76,31 @@ REPORT_TIMEOUT_READ = 8.0
 REPORT_OUTBOX_RETRY_SEC = 300  # 5 minutes
 
 
+def real_centrals_allowed() -> bool:
+    """May this process talk to the real centrals (ALL_CENTRAL_URLS)?
+
+    False in a test process (core.platform_paths.under_test) and in CI
+    (GITHUB_ACTIONS / CI / NUNBA_CI), unless HEVOLVE_ALLOW_REAL_HIVE is set
+    on purpose.  Measured 2026-09-26 (task #98): CI runs announced and
+    reported throwaway nodes to the genesis centrals, which relayed them to
+    every desktop (1,967 unreachable 10.1.x rows on the owner's).  Every
+    dialler of ALL_CENTRAL_URLS asks this: peer_discovery's seed list,
+    superadmin_report, resolve_reachable_central."""
+    import os
+    from core.config_cache import env_flag
+    if env_flag('HEVOLVE_ALLOW_REAL_HIVE', False):
+        return True
+    try:
+        from core.platform_paths import under_test
+        if under_test():
+            return False
+    except Exception:
+        pass
+    if env_flag('GITHUB_ACTIONS', False) or env_flag('CI', False):
+        return False
+    return os.environ.get('NUNBA_CI', '') != '1'
+
+
 def is_superadmin_email(email: str) -> bool:
     """Case-insensitive membership check."""
     if not email:
@@ -115,6 +140,8 @@ def resolve_reachable_central(force: bool = False) -> str:
     bypasses the cache (tests, admin diagnostics).
     """
     import time
+    if not real_centrals_allowed():
+        return ''
     now = time.monotonic()
     if not force and now < _resolve_cache['expires']:
         return _resolve_cache['url']
@@ -152,5 +179,6 @@ __all__ = [
     'REPORT_TIMEOUT_READ',
     'REPORT_OUTBOX_RETRY_SEC',
     'is_superadmin_email',
+    'real_centrals_allowed',
     'resolve_reachable_central',
 ]

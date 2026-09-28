@@ -88,18 +88,29 @@ class _FakeGroupChat:
 
 
 class TestTerminationHookEscapesStuckAction:
-    """lifecycle_hook_track_termination must terminate a TERMINATE'd action even
-    if it never left ASSIGNED — otherwise the hook returns False, the action
-    stays non-terminal, can_increment blocks, and the pipeline re-runs it forever
-    (the live loop). It must use the force-to-terminal recovery path, not a bare
-    validate that rejects ASSIGNED -> TERMINATED."""
+    """A TERMINATE closes an action; it never certifies one.
 
-    def test_terminate_message_escapes_stuck_assigned(self):
+    This class used to pin the opposite: a TERMINATE walked an ASSIGNED action
+    through COMPLETED to TERMINATED, to escape the 2026-06-13 stall.  That walk
+    is the fabricated completion of live 2026-09-27 (CREATE daemon_255bd83f:
+    two execute_coding_task actions COMPLETED with zero coding runs, "auto-path:
+    hook tracking lifecycle_hook_track_termination").  The stall is now bounded
+    by the verdict gate (GAVE_UP after its bound) and [EXECUTE-PENDING]'s three
+    attempts; see tests/unit/test_completion_needs_real_work.py."""
+
+    def test_terminate_message_leaves_an_unverified_action_open(self):
         up, aid = 'fsm_hook_assigned', 3
         assert get_action_state(up, aid) == S.ASSIGNED  # 4B never drove IN_PROGRESS
         gc = _FakeGroupChat([{'name': 'ChatInstructor', 'content': 'TERMINATE'}])
         ok = lh.lifecycle_hook_track_termination(up, _FakeTasks(aid), gc)
-        assert ok is True
+        assert ok is False
+        assert get_action_state(up, aid) == S.ASSIGNED
+
+    def test_terminate_message_closes_a_verified_action(self):
+        up, aid = 'fsm_hook_verified', 3
+        _walk(up, aid, S.IN_PROGRESS, S.STATUS_VERIFICATION_REQUESTED, S.COMPLETED)
+        gc = _FakeGroupChat([{'name': 'ChatInstructor', 'content': 'TERMINATE'}])
+        assert lh.lifecycle_hook_track_termination(up, _FakeTasks(aid), gc) is True
         assert get_action_state(up, aid) == S.TERMINATED
 
     def test_no_terminate_message_is_noop(self):
@@ -127,6 +138,11 @@ class TestAStaleTerminateIsNotTheCurrentActions:
         assert lh.lifecycle_hook_track_termination(up, _FakeTasks(aid), gc) is False
         assert get_action_state(up, aid) == S.ASSIGNED
 
+    # The next four pin OWNERSHIP: whose TERMINATE is it.  Ownership is
+    # stale_for_unstarted_action's answer, asserted directly; the hook itself
+    # then closes the action only once it is verified (COMPLETED), since a
+    # TERMINATE never certifies one (test_completion_needs_real_work.py).
+
     def test_its_own_terminate_still_terminates_it(self):
         up, aid = 'fsm_own_term', 7
         gc = _FakeGroupChat([
@@ -135,6 +151,8 @@ class TestAStaleTerminateIsNotTheCurrentActions:
             {'name': 'StatusVerifier', 'content': '{"status": "completed", "action_id": 7}'},
             {'name': 'ChatInstructor', 'content': 'TERMINATE'},
         ])
+        assert lh.stale_for_unstarted_action(gc.messages, -1, up, aid) is None
+        _walk(up, aid, S.IN_PROGRESS, S.STATUS_VERIFICATION_REQUESTED, S.COMPLETED)
         assert lh.lifecycle_hook_track_termination(up, _FakeTasks(aid), gc) is True
         assert get_action_state(up, aid) == S.TERMINATED
 
@@ -149,6 +167,8 @@ class TestAStaleTerminateIsNotTheCurrentActions:
             {'name': 'StatusVerifier', 'content': '{"status": "completed", "action_id": 1}'},
             {'name': 'ChatInstructor', 'content': 'TERMINATE'},
         ])
+        assert lh.stale_for_unstarted_action(gc.messages, -1, up, aid) is None
+        _walk(up, aid, S.IN_PROGRESS, S.STATUS_VERIFICATION_REQUESTED, S.COMPLETED)
         assert lh.lifecycle_hook_track_termination(up, _FakeTasks(aid), gc) is True
         assert get_action_state(up, aid) == S.TERMINATED
 
@@ -167,6 +187,8 @@ class TestAStaleTerminateIsNotTheCurrentActions:
             {'name': 'ChatInstructor', 'content': 'TERMINATE'},
         ])
         assert lh.latest_dispatch_before(gc.messages, -1) == 7
+        assert lh.stale_for_unstarted_action(gc.messages, -1, up, aid) is None
+        _walk(up, aid, S.IN_PROGRESS, S.STATUS_VERIFICATION_REQUESTED, S.COMPLETED)
         assert lh.lifecycle_hook_track_termination(up, _FakeTasks(aid), gc) is True
         assert get_action_state(up, aid) == S.TERMINATED
 
@@ -185,6 +207,7 @@ class TestAStaleTerminateIsNotTheCurrentActions:
             {'name': 'ChatInstructor', 'content': 'TERMINATE'},
         ])
         assert lh.stale_for_unstarted_action(gc.messages, -1, up, aid) is None
+        _walk(up, aid, S.STATUS_VERIFICATION_REQUESTED, S.COMPLETED)
         assert lh.lifecycle_hook_track_termination(up, _FakeTasks(aid), gc) is True
         assert get_action_state(up, aid) == S.TERMINATED
 

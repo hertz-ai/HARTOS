@@ -23,6 +23,7 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     TOOL_FAILURE_RESULTS,
     TOOL_OBSERVATION_MAX_CHARS,
     VERDICT_COMPLETION_STATUSES,
+    tool_reply_failed,
 )
 
 from enum import Enum
@@ -349,7 +350,8 @@ from hartos.lifecycle_hooks import (
     sync_action_state_to_ledger, register_ledger_for_session,
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
     clear_action_states, settled_action_id, commit_verified_action_completion,
-    dispatch_action_id,
+    dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
+    action_is_autonomous,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -690,7 +692,7 @@ class Action:
 # Updated subscribe_and_return function
 
 
-from core.config_cache import get_db_url
+from core.config_cache import get_db_url, is_bundled
 database_url = get_db_url() or 'https://mailer.hertzai.com'
 
 
@@ -784,7 +786,25 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     except Exception as e:
         _ctx_safe_log('error', f"Error scheduling tracking reset: {e}")
 
-    # Send the message to the user
+    # On the desktop the user's chat is the local topic; the cloud host below
+    # is unreachable there (Nunba gui_app.log 2026-09-26: WinError 10061,
+    # the agent's question never arrived).  One publisher for CREATE and
+    # REUSE: core.peer_link.crossbar_publish.publish_agent_message.
+    if is_bundled():
+        from core.peer_link.crossbar_publish import publish_agent_message
+        if publish_agent_message(text=response, user_id=user_id,
+                                 request_id=intermediate_request_id,
+                                 prompt_id=prompt_id, inp=inp):
+            _ctx_safe_log(
+                'info',
+                f'Message published locally with request_id: {intermediate_request_id}')
+            return f'Message sent successfully to user with request_id: {original_request_id}'
+        _ctx_safe_log(
+            'error',
+            f'Local publish to user failed for request_id: {intermediate_request_id}')
+        return f'Failed to send message to user with request_id: {original_request_id}'
+
+    # Standalone central HARTOS: forward to the chatbot_pipeline backend.
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
     body = json.dumps({'user_id': user_id, 'message': response, 'inp': inp, 'request_id': intermediate_request_id, 'Agent_status': 'Reuse Mode'})
     headers = {'Content-Type': 'application/json'}
@@ -805,6 +825,54 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
 
     return f'Message sent successfully to user with request_id: {original_request_id}'
 
+
+def _reuse_speaker_says_to_user(user_id, message, prompt_id, inp=''):
+    """Send a group member's mid-round message2userfinal to the user, but
+    only when it IS something the user can read.
+
+    The three speaker selectors (state_transition and the timer and visual
+    groups' state_transition1/2) see every message and used to send any
+    message2userfinal they found.  That included the StatusVerifier's own
+    verdict carrying the key and an unfilled '<your answer here>' template,
+    which on the desktop land in the user's chat (review of 31ea54045).
+    The question "is this for the user?" already has one answer,
+    _reuse_message_is_user_answer; this asks it first.  Returns whether it
+    sent.  Also the one door for the scheduled (time_based_execution) and
+    visual (visual_based_execution) runs' results, which have no /chat
+    reply; ``inp`` is the task they ran."""
+    if not _reuse_message_is_user_answer(message):
+        _ctx_safe_log(
+            'info',
+            f"not sending a message2userfinal from "
+            f"{(message or {}).get('name') or '?'}: not an answer for the user")
+        return False
+    json_obj = retrieve_json((message or {}).get('content') or '')
+    if not isinstance(json_obj, dict) or 'message2userfinal' not in json_obj:
+        return False
+    send_message_to_user1(user_id, json_obj['message2userfinal'], inp, prompt_id)
+    return True
+
+
+def _reuse_answer_off_box(user_id, answer, prompt_id):
+    """The off-box leg for a /chat turn's finished answer, which the caller
+    RETURNS: the return value IS the reply.
+
+    On the desktop the reply is the answer's ONLY delivery.  get_agent_response
+    used to also hand it to send_message_to_user1, which since 57516f078
+    publishes on the local chat topic there, and the web client renders both
+    (Demopage appends every text on com.hertzai.hevolve.chat.{user_id} and
+    appends the HTTP reply as another bubble, each starting TTS): the answer
+    arrived twice.  CREATE never sends its main-loop answer, and REUSE's
+    post-loop extractor never did either; the out-of-band leg is for messages
+    that have no reply to ride on (a mid-turn question from the
+    send_message_to_user tool, timer and visual results, A2A replies).
+
+    Central keeps the off-box leg it has always had for this answer
+    (send_message_to_user1's chatbot_pipeline POST); whether it needs it is
+    tied to that URL, which is left to the owner.
+    """
+    if not is_bundled():
+        send_message_to_user1(user_id, answer, '', prompt_id)
 
 
 def _coerce_instruction_text(value) -> str:
@@ -943,26 +1011,24 @@ def time_based_execution(task_description: str, user_id: int, prompt_id: int, ac
         text = f'This is the time now {current_time}\n you must perform this task {task_description}'
         result = time_user.initiate_chat(manager_1, message=text, speaker_selection={"speaker": "assistant"},
                                          clear_history=False)
-        last_message = group_chat.messages[-1]
-        if last_message['content'] == 'TERMINATE':
-            last_message = group_chat.messages[-2]
-        # sending response to receiver agent
-        if f'message2userfinal'.lower() in last_message['content'].lower():
-            try:
-                json_obj = retrieve_json(last_message['content'])
-                if json_obj and 'message2userfinal' in json_obj:
-                    last_message['content'] = json_obj['message2userfinal']
-                    send_message_to_user1(user_id, last_message['content'], task_description, prompt_id)
-
-            except Exception as e:
-                current_app.logger.error(f"Error extracting JSON: {e}")
-                # Fallback to a basic pattern match if retrieve_json fails
-                pattern = r'@user\s*{[\'"]message2userfinal[\'"]\s*:\s*[\'"](.+?)[\'"]}'
-                match = re.search(pattern, last_message['content'], re.DOTALL)
-                if match:
-                    last_message['content'] = match.group(1)
-                    send_message_to_user1(user_id, last_message['content'], task_description, prompt_id)
-        # At this point, don't process messages with message2userfinal as they were already sent
+        # The tail of the group this run happened in: manager_1's
+        # group_chat_1.  It read group_chat, the MAIN conversation, so a
+        # scheduled task could deliver the main chat's last message as its
+        # own result (review of d8fe536b2, F1b).  Brought up to date first
+        # through the one #725 sync, as the main loop does for its group.
+        _reuse_sync_group_log(group_chat_1, manager_1)
+        if not group_chat_1.messages:
+            return 'done'
+        last_message = group_chat_1.messages[-1]
+        if last_message['content'] == 'TERMINATE' and len(group_chat_1.messages) > 1:
+            last_message = group_chat_1.messages[-2]
+        # Sent only when it is something the user can read: not the
+        # verifier's verdict, not an unfilled template (F1).  The regex
+        # fallback that sat here ran only if retrieve_json raised, which it
+        # does not for a str.
+        if 'message2userfinal' in str(last_message.get('content') or '').lower():
+            _reuse_speaker_says_to_user(user_id, last_message, prompt_id,
+                                        inp=task_description)
         return 'done'
     return 'done'
 
@@ -1040,9 +1106,9 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
                 last_message = chat.messages[-2]
             if 'message2userfinal' in last_message['content'].lower():
                 try:
-                    json_obj = retrieve_json(last_message['content'])
-                    if json_obj and 'message2userfinal' in json_obj:
-                        send_message_to_user1(user_id, json_obj['message2userfinal'], task_description, prompt_id)
+                    # Only what the user can read (review of d8fe536b2, F1).
+                    _reuse_speaker_says_to_user(user_id, last_message, prompt_id,
+                                                inp=task_description)
                 except Exception as e:
                     current_app.logger.error(f"Error processing visual agent response: {e}")
 
@@ -1406,13 +1472,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph
         import os
-        try:
-            from core.platform_paths import get_memory_graph_dir
-            graph_db_path = get_memory_graph_dir(user_prompt)
-        except ImportError:
-            graph_db_path = os.path.join(
-                os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
-            )
+        from core.platform_paths import get_memory_graph_dir
+        graph_db_path = get_memory_graph_dir(user_prompt)
         memory_graph = MemoryGraph(db_path=graph_db_path, user_id=str(user_id))
         current_app.logger.info(f"MemoryGraph initialized for {user_prompt}")
     except Exception as e:
@@ -1591,8 +1652,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     user_tasks[user_prompt].set_ledger(ledger)
 
     # Set first action to IN_PROGRESS so ledger tracks it
-    safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "reuse: first action assigned")
-    safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "reuse: first action starting")
+    _start_reuse_action(user_prompt, 1, "reuse: first action")
 
     individual_recipe = []
     for i in range(1, (len(recipes[user_prompt]['actions']) + 1)):
@@ -2435,8 +2495,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                 # the user it could not.
                 #
                 # APPENDED, never substituted.  The fabrication gate matches
-                # by substring (`any(f in body for f in
-                # TOOL_FAILURE_RESULTS)`), so the constant still reads as a
+                # by substring (core.constants.tool_reply_failed), so the
+                # constant still reads as a
                 # refusal and a failed action still cannot count as
                 # completed.  Verified by
                 # test_the_failure_contract_is_untouched.
@@ -2865,22 +2925,12 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         # same list for can_perform_without_user_input.
         assistant._hart_individual_recipe = individual_recipe
 
-        def request_tools(need: str) -> str:
-            from core.agent_tools import discover_and_attach
-            # _hart_core_tools is the FULL closure list stashed at L2415 —
-            # the same source attach_for_names reads.  Without it the runtime
-            # discovery path can only see the 13 service tools.
-            return discover_and_attach(need, helper, assistant,
-                                       service_tool_registry, _attached_names,
-                                       core_tools=getattr(
-                                           assistant, '_hart_core_tools', None))
-        register_dual(helper, assistant, request_tools, 'request_tools',
-                      "Discover and attach additional tools by describing the "
-                      "capability you need, e.g. 'text to speech' or 'crawl a "
-                      "webpage'. Call this FIRST whenever your current tools "
-                      "lack a capability - never tell the user something is "
-                      "unavailable without trying this. If it finds no "
-                      "match, call it once more with different wording.")
+        # _hart_core_tools (set above) is the FULL closure list, the same
+        # source attach_for_names reads; register_request_tools reads it at
+        # call time.  Without it discovery sees only the 13 service tools.
+        from core.agent_tools import register_request_tools
+        register_request_tools(helper, assistant, service_tool_registry,
+                               _attached_names)
 
         for tool_name, tool_func in svc_tools.items():
             tool_def = next((d for d in svc_defs if d['name'] == tool_name), None)
@@ -3230,7 +3280,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                     _known_aid = user_tasks[user_prompt].current_action
                     _cp_yes = False
                     try:
-                        _cp_yes = individual_recipe[_known_aid - 1]['can_perform_without_user_input'] == 'yes'
+                        _cp_yes = action_is_autonomous(
+                            individual_recipe[_known_aid - 1]['can_perform_without_user_input'])
                     except (IndexError, KeyError):
                         pass
 
@@ -3329,7 +3380,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                     json_obj = retrieve_json(messages[-1]["content"])
                     if json_obj:
                         try:
-                            send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
+                            _reuse_speaker_says_to_user(user_id, messages[-1], prompt_id)
                         except Exception as e:
                             current_app.logger.error(f'Error sending message to user: {e}')
 
@@ -3393,7 +3444,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                 # Use known pipeline state, not LLM's claimed action_id
                 _timer_aid = time_actions[user_prompt].current_action
                 try:
-                    if final_recipe[prompt_id]['actions'][_timer_aid - 1]['can_perform_without_user_input'] == 'yes':
+                    if action_is_autonomous(final_recipe[prompt_id]['actions'][_timer_aid - 1]['can_perform_without_user_input']):
                         return time_agent
                 except (IndexError, KeyError):
                     pass
@@ -3416,7 +3467,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             if json_obj:
                 try:
                     current_app.logger.info('Sending user the message')
-                    send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
+                    _reuse_speaker_says_to_user(user_id, messages[-1], prompt_id)
                 except Exception:
                     pass
                 return verify1 if last_speaker is time_agent else time_agent
@@ -3461,7 +3512,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             if json_obj:
                 try:
                     current_app.logger.info('Sending user the message')
-                    send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
+                    _reuse_speaker_says_to_user(user_id, messages[-1], prompt_id)
                 except Exception:
                     pass
 
@@ -4170,8 +4221,13 @@ def _reuse_is_pipeline_text(content):
     differently:
 
       _build_reuse_action_message   the dispatch alone — actions 2..N
-      _reuse_seed_message           ``f"{message}\\n\\n{dispatch}"`` — the
-                                    opening turn puts the USER'S WORDS first
+      _reuse_seed_message           the opening turn put the USER'S WORDS
+                                    first until 2026-09-25; it is now the
+                                    marker line, the user's words, then the
+                                    steps (lifecycle_hooks.dispatch_action_id
+                                    reads only a leading marker, and the token
+                                    cap keeps a message's head), but a model
+                                    echo can still carry it anywhere
 
     Measured live 2026-09-10 10:05:25 (agent 88094979291): the second shape
     reached the user verbatim, all 904 characters of it —
@@ -4459,11 +4515,12 @@ def _reuse_own_tool_progress(user_prompt, action_id, group_chat, agents):
         def _credit(call_id, content, fallback_name):
             body = str(content or '')
             # Same two exclusions the gate draws: the placeholder is minted
-            # BECAUSE nothing executed, and a tool that ran and reported it
-            # could not do the work has not advanced this action either.
+            # BECAUSE nothing executed, and a tool that failed (raised, was
+            # refused, or reported it could not do the work) has not advanced
+            # this action either.
             if HISTORICAL_TOOL_PLACEHOLDER in body:
                 return
-            if any(f in body for f in TOOL_FAILURE_RESULTS):
+            if tool_reply_failed(body):
                 return
             fn = call_fn.get(call_id) or fallback_name
             if fn in wanted:
@@ -4616,13 +4673,35 @@ def _reuse_action_is_autonomous(user_prompt, action_id):
 
     Reads the same ``can_perform_without_user_input`` field the recipe author
     writes and the prompt at L1296 instructs the model to honour.  Absent or
-    unparseable -> False, so an unknown action is never auto-advanced.
+    unparseable -> False, so an unknown action is never auto-advanced.  The
+    rule is lifecycle_hooks.action_is_autonomous, shared with every reader.
     """
+    return action_is_autonomous(_reuse_action_autonomy(user_prompt, action_id))
+
+
+def _reuse_action_autonomy(user_prompt, action_id):
+    """The action's ``can_perform_without_user_input``, lower-cased; '' when
+    absent or unreadable.  Read from the session's task, for the two
+    questions asked of it: "may the walk advance on its own?" (only on an
+    explicit 'yes') and "did the recipe say this action stops for the user?"
+    (a leading 'no', lifecycle_hooks.autonomy_needs_user; see
+    _reuse_action_declares_user_pause).  The recipe-dict subscripts in the
+    time and timer paths read the same field from the recipe itself."""
     try:
         action = user_tasks[user_prompt].actions[action_id - 1]
-        return str(action.get('can_perform_without_user_input', '')).lower() == 'yes'
+        return str(action.get('can_perform_without_user_input', '')).strip().lower()
     except Exception:
-        return False
+        return ''
+
+
+def _reuse_action_declares_user_pause(user_prompt, action_id):
+    """True only when the recipe explicitly marks the action as needing the
+    user: a leading 'no', usually followed by the reason the CREATE prompt
+    asks for ('no - requires specific dish constraints').  A missing field is NOT a declared pause: reading it as one
+    silenced the incomplete report for every recipe without the field
+    (review of b6ac59c89: 52 of 1062 banked actions, 25 whole recipes,
+    including agent 88094979291 whose four actions all lack it)."""
+    return autonomy_needs_user(_reuse_action_autonomy(user_prompt, action_id))
 
 
 # How far back to look for the StatusVerifier's verdict.  Bounded because
@@ -4997,7 +5076,7 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                     body = str(result.get('content') or msg.get('content') or '')
                     if call_id in seen or HISTORICAL_TOOL_PLACEHOLDER in body:
                         continue
-                    if any(failure in body for failure in TOOL_FAILURE_RESULTS):
+                    if tool_reply_failed(body):
                         continue
                     if (call_fn.get(call_id) or result.get('name')) in wanted:
                         return True
@@ -5130,9 +5209,18 @@ _REUSE_SYNTHESIS_STEER = (
 # deserves.  Asks for the SAME message2userfinal key, so the existing
 # extractor unwraps it unchanged (a different shape would produce an answer
 # nobody reads — #797/D31).
+#
+# THE SLOT CARRIES WHAT IS UNFINISHED, not only unrun tool names.  An action
+# can be unfinished with nothing outstanding for the tool gate: a PROSE action
+# that GAVE UP (measured live 2026-09-24 21:17:52, agent 88094979291 --
+# "Action 1: in_progress -> gave_up", then 74 ms later its promise was
+# recovered as the answer), or a turn that stopped mid-recipe.  The caller
+# fills {unrun} with per-action clauses ("these tools did not run for action
+# 1: X", "action 1 gave up ...", "actions 2 to 4 were not reached"), so every
+# clause keeps the per-action scope the evidence has.
 _REUSE_SYNTHESIS_STEER_INCOMPLETE = (
-    "Do NOT run any tool again and do NOT emit another status object. These "
-    "tools did not run for the action just attempted: {unrun}. Write the "
+    "Do NOT run any tool again and do NOT emit another status object. Not "
+    "every action this request needed was done: {unrun}. Write the "
     "ANSWER "
     "for the user now, in your own words: report what WAS actually done, "
     "using only the real tool results present in this conversation, and say "
@@ -5298,9 +5386,69 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
             user_prompt, _reuse_current_action_id(user_prompt), group_chat)
     except Exception:
         _unrun = ['<unknown>']
-    if _unrun:
+
+    # WHAT THE LIFECYCLE RECORDED decides it too.  The tool predicate above
+    # answers "did this action's NAMED tools run", and returns [] for a prose
+    # action that names none -- so on its own it let a GAVE_UP action, or a
+    # turn that stopped mid-recipe, out through the success doors below.
+    # Measured live 2026-09-24 21:17:52 (agent 88094979291): "Action 1:
+    # in_progress -> gave_up", then 74 ms later "[SYNTHESIS] the action
+    # already wrote the answer -- recovered 175 chars": a promise with no
+    # bullets, actions 2..4 never reached, and nothing said so.
+    #
+    # The pointer is the record: _advance_reuse_action is its only writer and
+    # moves it past the last action only after that action's evidence-backed
+    # TERMINATED; every GAVE_UP there returns BEFORE the pointer moves.  So a
+    # pointer still inside the recipe means the turn is unfinished, and the
+    # lifecycle state says whether that action gave up or just stopped.
+    #
+    # No task for the session means no lifecycle fact to add; the tool
+    # predicate still decides.  get_agent_response subscripts
+    # user_tasks[user_prompt] on every loop pass before reaching this call,
+    # so that case is unreachable from the pipeline.  Unreadable state is
+    # treated as unfinished, the same rule the tool predicate's sentinel
+    # follows.
+    _unfinished = []
+    try:
+        _task = user_tasks.get(user_prompt)
+        if _task is not None:
+            _at = int(_task.current_action)
+            _total = len(_task.actions)
+            if 1 <= _at <= _total:
+                _state = get_action_state(user_prompt, _at)
+                if _state == ActionState.GAVE_UP:
+                    _unfinished.append(
+                        f"action {_at} gave up without a verified result")
+                elif (_state in ACTION_STATES_AWAITING_USER
+                        or _reuse_action_declares_user_pause(user_prompt, _at)):
+                    # A PAUSE FOR THE USER, not a failure.  A REUSE turn may
+                    # end mid-recipe on purpose: the REUSE-NODRIVER break stops
+                    # at an action the recipe marks non-autonomous, and the
+                    # pointer carries over to the user's next /chat turn; the
+                    # waiting states say the same thing explicitly.  That
+                    # turn's tail is the agent's QUESTION to the user, and it
+                    # must reach them.  Measured on 784a8143c (review probe):
+                    # action 1 of 4 non-autonomous, the Assistant asking "Please
+                    # paste the text...", and the incomplete steer replaced the
+                    # question with a failure report.
+                    pass
+                else:
+                    _unfinished.append(f"action {_at} did not finish")
+                if _unfinished and _at < _total:
+                    _unfinished.append(
+                        f"actions {_at + 1} to {_total} were not reached")
+    except Exception:
+        _unfinished = ['the state of the actions could not be read']
+
+    if _unrun or _unfinished:
+        _clauses = []
+        if _unrun:
+            _clauses.append(
+                f"these tools did not run for action "
+                f"{_reuse_current_action_id(user_prompt) or '(unknown)'}: "
+                + ', '.join(str(t) for t in _unrun))
         _steer = _REUSE_SYNTHESIS_STEER_INCOMPLETE.format(
-            unrun=', '.join(str(t) for t in _unrun))
+            unrun='; '.join(_clauses + _unfinished))
     else:
         # EVERY TOOL RAN AND EVERY RESULT WAS EMPTY.  Then the honest answer
         # is fully determined and the model is not needed for it — asking is
@@ -5377,7 +5525,8 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
         _steer = _REUSE_SYNTHESIS_STEER
     _say('info', f"[SYNTHESIS] reply would be raw control JSON — asking for "
                  f"the user-facing answer (session: {user_prompt}, "
-                 f"{_before} msgs, unrun={_unrun or 'none'})")
+                 f"{_before} msgs, unrun={_unrun or 'none'}, "
+                 f"unfinished={_unfinished or 'none'})")
     try:
         chat_instructor.initiate_chat(
             recipient=manager, message=_steer,
@@ -5578,7 +5727,8 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
         return True
 
     next_action_id, advanced = _advance_reuse_action(
-        user_prompt, action_id, reason, prompt_id)
+        user_prompt, action_id, reason, prompt_id,
+        claimed_action_id=claimed_action_id)
 
     # Both branches below post a command into the SAME group chat the
     # assistant is already in, so its cached system prompt must name the
@@ -5803,21 +5953,12 @@ def _reuse_call_id_to_tool_name(msg_lists):
     """call_id -> function name, read off the PROPOSING assistant message.
 
     A tool result's own `name` is the EXECUTING AGENT, never the function, so
-    this join is the only way to say which tool a result belongs to.  Lifted
-    out of _reuse_fabricated_tools for the vacuity stamp; one rule, no second
-    vocabulary.
+    this join is the only way to say which tool a result belongs to.  The rule
+    lives in lifecycle_hooks.tool_call_names, which the completion gate reads
+    too, so the gate and these readers name a receipt's tool the same way.
     """
-    out = {}
-    for _ml in (msg_lists or []):
-        for m in (_ml or []):
-            if not isinstance(m, dict):
-                continue
-            for tc in (m.get('tool_calls') or []):
-                _cid = (tc or {}).get('id')
-                _fn = ((tc or {}).get('function') or {}).get('name')
-                if _cid and _fn:
-                    out[_cid] = _fn
-    return out
+    from hartos.lifecycle_hooks import tool_call_names
+    return tool_call_names(msg_lists)
 
 
 def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
@@ -5925,7 +6066,11 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
             # action advanced 25s later with unrun=[].  Treated like the
             # placeholder above: report UNRUN so _advance_reuse_action
             # re-steers (bounded) instead of silently marking it verified.
-            if any(f in _body for f in TOOL_FAILURE_RESULTS):
+            # core.constants.tool_reply_failed is the ONE rule, shared with
+            # CREATE's trace banker; it also covers a tool that RAISED
+            # (core.tool_logging's envelope) or never ran (the executor's
+            # "Error: ..."), which this gate used to credit as the work.
+            if tool_reply_failed(_body):
                 return
             fn = _call_fn.get(call_id) or fallback_name
             # Only a REGISTERED tool name counts.  An agent name satisfies
@@ -6379,6 +6524,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                             user_prompt, _reuse_current_action,
                             "reuse-w1-completed", prompt_id,
                             manager, chat_instructor,
+                            claimed_action_id=_term_vj.get('action_id'),
                             advanced_latch=_reuse_advanced_actions):
                         break  # finished recipe -> post-loop extractor (#798)
                     continue
@@ -6770,29 +6916,19 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 try:
                     json_obj = retrieve_json(last_message['content'])
                     if json_obj and 'message2userfinal' in json_obj:
-                        send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
                         # RETURN the answer, do not drop it.  This return value IS
                         # the reply: hart_intelligence_entry:10165 assigns it and
                         # hands it to _chat_reply (see the note at :2023, "the
                         # /chat handler checks after chat_agent() returns").
-                        # send_message_to_user1 is a SECOND, off-box leg whose
-                        # URL is pointed at the wrong address (:524).  Measured
-                        # 2026-09-09: it POSTs to aws_rasa.hertzai.com:9890
-                        # (-> 106.51.181.24), which refuses; the service is
-                        # REAL and RUNNING on the LAN box — sathish-linux-deep
-                        # container `chatbot_pipeline` publishes
-                        # 0.0.0.0:8001->9890/tcp, and POST
-                        # http://192.168.0.9:8001/autogen_response answers in
-                        # 35 ms.  9890 is the CONTAINER-INTERNAL port, never
-                        # the published one.  So this leg delivers nothing on
-                        # this deployment, and its failure comes back as a
-                        # string nobody reads.  Address fix tracked in #803;
-                        # it does not change the rule below.
-                        # Returning '' here therefore lost the finished answer
-                        # entirely: Nunba's empty-reply check then rerouted the
-                        # user to the tool-less Tier-2 fallback, which answered
-                        # from training data and contradicted the work this
-                        # agent had just done and saved (#797/D31, #803/D37).
+                        # Returning '' here lost the finished answer entirely:
+                        # Nunba's empty-reply check then rerouted the user to
+                        # the tool-less Tier-2 fallback, which answered from
+                        # training data and contradicted the work this agent
+                        # had just done and saved (#797/D31, #803/D37).  What
+                        # else the answer is sent through, and why the desktop
+                        # gets nothing else: _reuse_answer_off_box.
+                        _reuse_answer_off_box(
+                            user_id, json_obj['message2userfinal'], prompt_id)
                         return json_obj['message2userfinal']
                 except Exception as e:
                     current_app.logger.error(f"Error extracting JSON: {e}")
@@ -6801,9 +6937,9 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 try:
                     json_obj = retrieve_json(last_message['content'])
                     if json_obj and 'message2' in json_obj:
-                        send_message_to_user1(user_id, json_obj['message2'], '', prompt_id)
-                        # Same as the message2userfinal branch above — the
-                        # return value is the reply, the POST is a dead leg.
+                        # Same as the message2userfinal branch above.
+                        _reuse_answer_off_box(
+                            user_id, json_obj['message2'], prompt_id)
                         return json_obj['message2']
                 except Exception as e:
                     current_app.logger.error(f"Error extracting JSON: {e}")
@@ -7116,12 +7252,42 @@ creation_signals = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_creation
 # REUSE ACTION ADVANCEMENT HELPER
 # =============================================================================
 
-def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt_id=None):
+def _start_reuse_action(user_prompt, action_id, reason):
+    """Put the action a REUSE run is about to execute into IN_PROGRESS.
+
+    The ONE place a REUSE action starts: the first action of a cold run
+    (create_agents_for_user), the current action of a warm run (chat_agent),
+    and every next action on advance (_advance_reuse_action).  It walks the
+    FSM's own edges, ASSIGNED -> IN_PROGRESS, through safe_set_state, so the
+    transition guard stays the judge; nothing here skips a state.
+
+    Why the warm run needs it: chat_agent clears the session's ActionStates
+    at every run boundary (lifecycle_hooks.clear_action_states), which leaves
+    the current action at ASSIGNED.  On a cache miss create_agents_for_user
+    then started action 1; on a cache hit nothing did, so the completion
+    boundary's ASSIGNED -> STATUS_VERIFICATION_REQUESTED write was refused
+    ("Invalid transition: Action 1 cannot go from assigned to
+    status_verification_requested") and a warm run could never finish an
+    action (tests/unit/test_reuse_role_handoff.py, the `cached` case).
+
+    Returns True when the action is IN_PROGRESS afterwards.
+    """
+    safe_set_state(user_prompt, action_id, ActionState.ASSIGNED,
+                   f"{reason}: assigned")
+    return safe_set_state(user_prompt, action_id, ActionState.IN_PROGRESS,
+                          f"{reason}: starting")
+
+
+def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt_id=None,
+                          claimed_action_id=None):
     """
     Mark action COMPLETED → TERMINATED, advance to next action, set ASSIGNED → IN_PROGRESS.
     Returns (next_action_id, True) if advanced, or (None, False) if all actions done or state
     error prevented advancing — the caller's fabrication-refusal branch and the shared
     end-of-loop extractor (see _advance_or_steer) don't need the two cases told apart.
+
+    ``claimed_action_id`` is the action_id the verdict names; the completion
+    gate refuses a verdict that names another action.
     """
     # FABRICATION GATE (canonical single point — EVERY advance path calls this):
     # refuse to mark a tool-naming action COMPLETED when its specific tool never
@@ -7286,7 +7452,8 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             return None, False
     ok1 = commit_verified_action_completion(
         user_prompt, current_action_id, evidence,
-        f"{reason}: evidence-backed completion")
+        f"{reason}: evidence-backed completion",
+        claimed_action_id=claimed_action_id)
     ok2 = ok1 and safe_set_state(
         user_prompt, current_action_id, ActionState.TERMINATED,
         f"{reason}: done")
@@ -7343,8 +7510,7 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     f'[REUSE] completed-work spark charge skipped: {_spark_err}')
         return None, False
 
-    safe_set_state(user_prompt, next_id, ActionState.ASSIGNED, f"{reason}: next assigned")
-    safe_set_state(user_prompt, next_id, ActionState.IN_PROGRESS, f"{reason}: starting")
+    _start_reuse_action(user_prompt, next_id, f"{reason}: next")
     return next_id, True
 
 
@@ -7381,9 +7547,28 @@ def _reuse_seed_message(user_prompt, message):
     # signal that cannot show its own failure is not a signal: live on
     # 2026-09-05 the command reached the wire 6x for Trading and 0x for Auto
     # Research on the SAME code path, and the log could not say why.
+    # DISPATCH MARKER FIRST, then the user's words, then the steps (see the
+    # last paragraph below for why the steps go last).  This message is action 1's
+    # dispatch, and lifecycle_hooks.dispatch_action_id -- the one parser every
+    # window reader uses -- honours only a LEADING marker (text after a marker
+    # can quote an earlier one, so a mid-message marker says nothing).  The
+    # first cut put the user's words first; the marker then sat mid-message,
+    # the seed was no dispatch, action 1 had no window, and every receipt
+    # search came back empty: live 2026-09-25, 42 "[REUSE-VERIFY] ... no
+    # canonical receipt" lines across 14 sessions, all action 1, 0 advances.
+    # Same shape as CREATE's [EXECUTE-PENDING] dispatch (marker, then text).
+    # The user's words go BETWEEN the marker line and the steps, not after
+    # the whole dispatch: every reuse context chain runs helper.token_limiter
+    # at AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, and autogen keeps the HEAD of a
+    # message, so text placed after the steps is what the cap cuts.  Measured
+    # on the banked recipes (review of 9adccbcaf): action 1's steps alone run
+    # to 1547 tokens, and dispatch-first cut the user's request off the wire.
+    # The steps are the redundant part (the recipe is also in the system
+    # prompt), so they sit last, where the cap eats them first.
     try:
         current_action_id = user_tasks[user_prompt].current_action
-        seeded = f"{message}\n\n{_build_reuse_action_message(user_prompt, current_action_id)}"
+        seeded = _build_reuse_action_message(
+            user_prompt, current_action_id, user_words=message)
         current_app.logger.info(
             f"[REUSE-SEED] seeded action {current_action_id} "
             f"(+{len(seeded) - len(message)} chars)")
@@ -7395,8 +7580,16 @@ def _reuse_seed_message(user_prompt, message):
         return message
 
 
-def _build_reuse_action_message(user_prompt, action_id):
-    """Build the action execution message for REUSE mode."""
+def _build_reuse_action_message(user_prompt, action_id, user_words=None):
+    """Build the action execution message for REUSE mode.
+
+    ONE format for every dispatch: the marker line first (the only thing
+    ``lifecycle_hooks.dispatch_action_id`` reads), the steps last.
+    ``user_words`` is for the opening turn only (``_reuse_seed_message``): it
+    goes between the two, so the per-message token cap -- which keeps a
+    message's head -- cuts the redundant steps before the user's request.
+    Without it (actions 2..N) the message is byte-identical to before.
+    """
     action_message = user_tasks[user_prompt].get_action(action_id - 1)['action']
     recipe_actions = recipes[user_prompt].get('actions', [])
     if action_id - 1 < len(recipe_actions):
@@ -7415,8 +7608,12 @@ def _build_reuse_action_message(user_prompt, action_id):
     else:
         steps = []
         current_app.logger.warning(f"[REUSE] No recipe for action {action_id} — executing without steps")
-    return (f"{_REUSE_ACTION_MESSAGE_PREFIX}{action_id}:{action_message}"
-            f"\n follow these steps: {steps}")
+    head = f"{_REUSE_ACTION_MESSAGE_PREFIX}{action_id}:{action_message}"
+    if user_words:
+        head = f"{head}\n\n{user_words}"
+    # The separator the wire trim reads: everything before it stays whole.
+    from core.constants import ACTION_STEPS_SEPARATOR
+    return f"{head}{ACTION_STEPS_SEPARATOR}{steps}"
 
 
 # A registry tool name as `attach_for_names` compares it.  MOVED to
@@ -7930,8 +8127,8 @@ def _attach_named_tools_for_action(user_prompt):
         # never undone by the budget below it.
         from core.agent_tools import fit_schema_to_ctx
         _protect = set(_named or ()) | {'send_message_to_user'}
-        fit_schema_to_ctx(helper, protect=_protect)
-        fit_schema_to_ctx(assistant, protect=_protect)
+        fit_schema_to_ctx(helper, protect=_protect, turn_protect=True)
+        fit_schema_to_ctx(assistant, protect=_protect, turn_protect=True)
         return _nn
     except Exception as err:
         # WARNING, not debug -- same class as d6495f499.  A failure here
@@ -8025,6 +8222,17 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         # but only when the previous run went past the end of the recipe.  Both
         # stores, one authority; see its docstring for why that is safe here.
         clear_action_states(user_prompt, user_tasks)
+
+        # The clear above leaves the current action at ASSIGNED.  A cache MISS
+        # starts it inside create_agents_for_user; a cache HIT (warm agents)
+        # never reaches that call, so start it here through the same helper.
+        # Without this the completion boundary's ASSIGNED ->
+        # STATUS_VERIFICATION_REQUESTED write is refused and no warm run can
+        # finish an action.  See _start_reuse_action.
+        if user_prompt in user_agents and user_prompt in user_tasks:
+            _start_reuse_action(user_prompt,
+                                user_tasks[user_prompt].current_action,
+                                "reuse: warm run")
 
         # Get or create agents for this user
         if user_prompt not in user_agents:

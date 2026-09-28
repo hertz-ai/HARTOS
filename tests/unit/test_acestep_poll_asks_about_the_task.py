@@ -44,6 +44,34 @@ def poll():
     return check_media_status
 
 
+def _finished_acestep_file(tmp_path, monkeypatch):
+    """AceStep's real finished artifact, and where the node keeps it.
+
+    AceStep reports its file as ``/v1/audio?path=<temp file>`` (MEASURED
+    2026-09-22), inside a JSON string under 'result'. Since 6759fbfa6
+    (hartos-3a F1) the poll copies that file into composer_output_dir()
+    and reports the node's own url for it; a url that is not a file on
+    this node is an error. So the fixture is a real WAV on disk, and the
+    output dir is redirected to tmp_path (the same seam
+    test_media_error_classification uses) so nothing lands in the real
+    acestep tool dir. The keep logic itself runs unstubbed.
+
+    Returns (result_json_string, expected_results, kept_file_path).
+    """
+    import urllib.parse
+    import integrations.service_tools.media_agent as ma
+    temp = tmp_path / 'acestep_tmp' / 'song.wav'
+    temp.parent.mkdir()
+    temp.write_bytes(b'RIFF\x00\x00\x00\x00WAVE')
+    kept_dir = tmp_path / 'kept'
+    monkeypatch.setattr(ma, 'composer_output_dir', lambda: kept_dir)
+    result = json.dumps([{'file': '/v1/audio?path=' + urllib.parse.quote(str(temp)),
+                          'status': 1}])
+    expected = [{'type': 'audio', 'url': '/api/voice/audio/song.wav',
+                 'path': str(kept_dir / 'song.wav')}]
+    return result, expected, kept_dir / 'song.wav'
+
+
 class TestTheRequestNamesTheTask:
 
     def test_acestep_sends_task_id_list(self, poll):
@@ -73,10 +101,10 @@ class TestTheRequestNamesTheTask:
 
 class TestTheBatchAnswerIsRead:
 
-    def test_a_completed_task_reads_completed(self, poll):
+    def test_a_completed_task_reads_completed(self, poll, tmp_path, monkeypatch):
+        result, expected, kept = _finished_acestep_file(tmp_path, monkeypatch)
         payload = {'code': 200, 'data': [
-            {'task_id': 'abc123', 'status': 'completed',
-             'audio_url': 'http://node/song.wav'},
+            {'task_id': 'abc123', 'status': 'completed', 'result': result},
         ]}
         with patch('integrations.service_tools.media_agent._get_tool_base_url',
                    return_value='http://127.0.0.1:54257'), \
@@ -84,8 +112,8 @@ class TestTheBatchAnswerIsRead:
             out = json.loads(poll(task_id='acestep_abc123'))
 
         assert out['status'] == 'completed', out
-        assert out.get('results') == [
-            {'type': 'audio', 'url': 'http://node/song.wav'}], out
+        assert out.get('results') == expected, out
+        assert kept.read_bytes()[:4] == b'RIFF', 'the composition was not kept'
 
     def test_a_failed_task_reads_failed_not_unknown(self, poll):
         """The case the other session hit: a model that failed to load."""
@@ -161,13 +189,13 @@ class TestTheNumericStatusIsTranslated:
              patch('core.http_pool.pooled_post', return_value=_resp(payload)):
             return _j.loads(check_media_status(task_id='acestep_abc123'))
 
-    def test_one_with_an_artifact_is_completed(self):
+    def test_one_with_an_artifact_is_completed(self, tmp_path, monkeypatch):
+        result, expected, kept = _finished_acestep_file(tmp_path, monkeypatch)
         out = self._poll({'code': 200, 'data': [
-            {'task_id': 'abc123', 'status': 1,
-             'audio_url': 'http://node/song.wav'}]})
+            {'task_id': 'abc123', 'status': 1, 'result': result}]})
         assert out['status'] == 'completed', out
-        assert out['results'] == [{'type': 'audio',
-                                   'url': 'http://node/song.wav'}], out
+        assert out['results'] == expected, out
+        assert kept.read_bytes()[:4] == b'RIFF', 'the composition was not kept'
 
     def test_two_is_a_reported_failure(self):
         """Code 2 must be legible as a failure. It surfaces as the house

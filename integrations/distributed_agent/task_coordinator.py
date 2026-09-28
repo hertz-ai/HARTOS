@@ -843,9 +843,28 @@ class DistributedTaskCoordinator:
                 db = get_db()
                 owns_session = True
 
-            from integrations.social.services import NotificationService
+            from integrations.social.services import (
+                NotificationService, UserService)
+            # MACHINE_GOAL_AUTHORS above are daemon LABELS; a daemon goal run
+            # by the hevolve_system_agent account carries that account's user
+            # id instead, and 3003 notifications went to it unread (measured
+            # 2026-09-25).  The users row decides: a person, an agent's human
+            # owner, or nobody.
+            recipient = UserService.person_to_notify(db, user_id)
+            if recipient is None:
+                if owns_session:
+                    db.close()
+                logger.debug("Goal contribution for %s was requested by %s, "
+                             "an agent/system account with no human owner; "
+                             "no notification", task_id, user_id)
+                return
+            user_id = str(recipient)
             message = f'Your agent contributed to "{objective}": completed "{task_description}"'
-            notif = NotificationService.create(
+            # create() pushes the notification to the person's devices once
+            # its row commits (models.after_commit): here on the commit below,
+            # or on the request's own commit when this runs inside one.  A
+            # second on_notification here pushed every card twice.
+            NotificationService.create(
                 db, user_id, 'goal_contribution',
                 source_user_id=None,
                 target_type='goal',
@@ -856,13 +875,6 @@ class DistributedTaskCoordinator:
             if owns_session:
                 db.commit()
                 db.close()
-
-            # Push real-time notification via WAMP (fires silently if Crossbar unavailable)
-            try:
-                from integrations.social.realtime import on_notification
-                on_notification(user_id, notif.to_dict())
-            except Exception:
-                pass
 
             logger.info(f"Notified user {user_id}: goal contribution for {task_id}")
         except Exception as e:

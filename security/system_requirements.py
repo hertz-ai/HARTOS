@@ -296,6 +296,32 @@ FEATURE_TIER_MAP: Dict[str, Tuple[NodeTierLevel, str]] = {
 # Hardware detection
 # ═══════════════════════════════════════════════════════════════
 
+#: platform.processor() -> platform.uname() -> WMI on Windows, which can hang
+#: 30+ minutes on a cold boot, so it gets this long and no longer.
+_CPU_MODEL_TIMEOUT_S = 5
+
+
+def _detect_cpu_model(timeout_s: float = _CPU_MODEL_TIMEOUT_S) -> str:
+    """platform.processor(), or '' if it does not answer within timeout_s.
+
+    On core.subprocess_safe.call_bounded since 2026-09-27 (review F7).  This
+    was a one-worker ThreadPoolExecutor with shutdown(wait=False): that
+    frees the caller, but an executor's worker is not a daemon thread, so a
+    WMI call wedged for 30 minutes also held interpreter exit for that long.
+    """
+    from core.subprocess_safe import call_bounded
+    finished, model, error = call_bounded(
+        lambda: platform.processor() or '', timeout_s, name='hart-cpu-model')
+    if not finished:
+        logger.warning('CPU model probe (platform.processor) did not answer in '
+                       '%ss; reporting none', timeout_s)
+        return ''
+    if error is not None:
+        logger.debug('CPU model probe failed: %s', error)
+        return ''
+    return model
+
+
 def detect_hardware() -> HardwareProfile:
     """Probe CPU, RAM, disk, GPU, and network.
 
@@ -308,20 +334,7 @@ def detect_hardware() -> HardwareProfile:
 
     # CPU
     hw.cpu_cores = os.cpu_count() or 1
-    # platform.processor() → platform.uname() → WMI on Windows, which can
-    # hang 30+ minutes on cold boot.  Run it with a timeout.
-    hw.cpu_model = ''
-    try:
-        import concurrent.futures as _cf
-        _ex = _cf.ThreadPoolExecutor(max_workers=1)
-        hw.cpu_model = _ex.submit(lambda: platform.processor() or '').result(timeout=5)
-        _ex.shutdown(wait=False)  # Don't block if thread is stuck on WMI
-    except Exception:
-        try:
-            _ex.shutdown(wait=False)
-        except Exception:
-            pass
-        pass
+    hw.cpu_model = _detect_cpu_model()
 
     # RAM
     hw.ram_gb = _detect_ram_gb()
@@ -429,11 +442,8 @@ def _detect_read_only_fs() -> bool:
     try:
         import tempfile
         # Prefer the Nunba data directory (always user-writable)
-        try:
-            from core.platform_paths import get_db_dir
-            user_data = get_db_dir()
-        except ImportError:
-            user_data = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data')
+        from core.platform_paths import get_db_dir
+        user_data = get_db_dir()
         if os.path.isdir(user_data):
             test_dir = user_data
         else:

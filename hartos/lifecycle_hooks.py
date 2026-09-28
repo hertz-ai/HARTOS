@@ -15,6 +15,7 @@ import re
 import threading
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any
+from core.constants import BOOKKEEPING_TOOLS, tool_reply_failed
 from core.session_cache import TTLCache
 
 try:
@@ -349,7 +350,8 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState',
                             'action': 'status_request',
                         })
                     except Exception:
-                        pass
+                        logger.warning('task.sla_breached event for %s not '
+                                       'emitted', task_id, exc_info=True)
 
                 # Release ownership on terminal states.
                 if LedgerTaskStatus.is_terminal_state(ledger_status) and task.is_owned:
@@ -382,7 +384,8 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState',
                 task.__dict__.clear()
                 task.__dict__.update(task_snapshot)
             except Exception:
-                pass
+                logger.warning('in-memory task %s not restored after the '
+                               'failed ledger sync', task_id, exc_info=True)
         logger.error(f"Failed to auto-sync to ledger: {e}", exc_info=True)
         return False
 
@@ -544,6 +547,24 @@ class ActionState(Enum):
     PREVIEW_PENDING = "preview_pending"           # 14. Destructive action awaiting user approval
     PREVIEW_APPROVED = "preview_approved"         # 15. User approved destructive action, proceed
     GAVE_UP = "gave_up"                            # 16. Force-abandoned terminal (stalled/unverified work): an HONEST failure (ledger FAILED), NOT a verified success like TERMINATED. Re-openable (→ASSIGNED/RECIPE_REQUESTED) so a hive peer can retry (#139).
+
+
+#: The states that mean "this action is waiting for the USER", straight from
+#: the enum's own definitions above: PENDING is what mark_action_waiting_for_
+#: user projects (the ledger's input_required block), FALLBACK_REQUESTED is a
+#: fallback asked of the user, PREVIEW_PENDING is a destructive action awaiting
+#: the user's approval.  An action in one of these has paused, not failed; a
+#: reader that needs "is this a pause for the user?" asks this set rather than
+#: spelling its own.
+ACTION_STATES_AWAITING_USER = frozenset({
+    ActionState.PENDING, ActionState.FALLBACK_REQUESTED,
+    ActionState.PREVIEW_PENDING})
+
+
+# The two answers to an action's can_perform_without_user_input live in
+# core.constants (cheap to import: the A2A card reads them without pulling
+# this module's hartos.helper).  Re-exported here for existing callers.
+from core.constants import action_is_autonomous, autonomy_needs_user  # noqa: E402,F401
 
 
 # ── No-progress stall guard for the CREATE loop ───────────────────────────
@@ -970,8 +991,15 @@ def safe_set_state(user_prompt: str, action_id: int, new_state: ActionState,
         return False
 
 
-def force_state_through_valid_path(user_prompt: str, action_id: int, target_state: ActionState, reason: str = ""):
-    """Force state to target through valid transitions"""
+def force_state_through_valid_path(user_prompt: str, action_id: int, target_state: ActionState, reason: str = "",
+                                   through_completed: bool = True):
+    """Force state to target through valid transitions.
+
+    ``through_completed=False`` refuses (returns False, writes nothing) a path
+    that would WRITE COMPLETED on the way.  COMPLETED means "verified with a
+    receipt", and its one legitimate writer is commit_verified_action_completion;
+    a caller that only wants an action closed, not certified, passes False.
+    """
     current_state = get_action_state(user_prompt, action_id)
 
     # Map of how to reach each target state from any current state
@@ -1094,6 +1122,13 @@ def force_state_through_valid_path(user_prompt: str, action_id: int, target_stat
         path = [target_state]
     else:
         logger.error(f"[ERROR] No valid path from {current_state.value} to {target_state.value}")
+        return False
+
+    if not through_completed and ActionState.COMPLETED in path:
+        logger.info(
+            f"[UNVERIFIED] Action {action_id} is {current_state.value}: reaching "
+            f"{target_state.value} would record it COMPLETED without a verified "
+            f"receipt; leaving it open (reason={reason!r})")
         return False
 
     logger.info(f"🔧 Auto-path for Action {action_id}: {current_state.value} → {target_state.value}")
@@ -1274,7 +1309,15 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.IN_PROGRESS: [ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.IN_PROGRESS, ActionState.ERROR, ActionState.PENDING],
         ActionState.STATUS_VERIFICATION_REQUESTED: [ActionState.COMPLETED, ActionState.PENDING, ActionState.ERROR, ActionState.STATUS_VERIFICATION_REQUESTED],
         ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED, ActionState.COMPLETED],  # Allow direct recipe request (autonomous) or termination
-        ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR, ActionState.PENDING],
+        # PENDING -> IN_PROGRESS is the resume edge.  PENDING is a wait (the
+        # user's input via mark_action_waiting_for_user, or a 'pending'
+        # verdict); once it is answered the action runs again.  Without this
+        # edge the ledger resumed (resume_from_user_input: BLOCKED ->
+        # IN_PROGRESS) while create_recipe's [EXECUTE-PENDING] request for
+        # IN_PROGRESS was refused and the action ran reading PENDING --
+        # measured 21:23:20 "cannot go from pending to in_progress" right
+        # after "Latest User message: Yes, proceed".
+        ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR, ActionState.PENDING, ActionState.IN_PROGRESS],
         # FIX: Allow ERROR to reach TERMINATED via FALLBACK_REQUESTED/RECIPE_REQUESTED or directly
         ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING, ActionState.ERROR, ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED],
         ActionState.FALLBACK_REQUESTED: [ActionState.FALLBACK_RECEIVED, ActionState.FALLBACK_REQUESTED],
@@ -1462,6 +1505,70 @@ def resolve_receipt(user_prompt: str, evidence) -> Optional[tuple]:
     return messages, index, message, agent
 
 
+def tool_call_names(msg_lists) -> Dict[str, str]:
+    """call_id -> function name, read off the PROPOSING assistant message.
+
+    A tool result's own ``name`` is the EXECUTING AGENT, never the function,
+    so joining on the proposal's tool_call id is the only way to say which
+    tool a result belongs to (measured 2026-09-06: the REUSE gate logged
+    ``executed=['Assistant']`` reading the result's name).  The one rule, used
+    by the completion gate below and by every REUSE evidence reader
+    (reuse_recipe._reuse_call_id_to_tool_name delegates here).
+    """
+    out = {}
+    for _ml in (msg_lists or []):
+        for m in (_ml or []):
+            if not isinstance(m, dict):
+                continue
+            for tc in (m.get('tool_calls') or []):
+                _cid = (tc or {}).get('id')
+                _fn = ((tc or {}).get('function') or {}).get('name')
+                if _cid and _fn:
+                    out[_cid] = _fn
+    return out
+
+
+def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
+                          message: dict) -> bool:
+    """Whether a role='tool' receipt shows the action's work being done.
+
+    Two things a tool message can carry that are not that work:
+
+      * a FAILED reply (core.constants.tool_reply_failed): the executor's
+        "Error: ...", the tool_logging envelope, or a TOOL_FAILURE_RESULTS
+        refusal -- which is what an 'incomplete' computer-use run returns.
+        The gate used to accept any non-empty tool message, so a refusal
+        cited as the receipt completed the action it refused.
+      * a BOOKKEEPING call (core.constants.BOOKKEEPING_TOOLS) the action does
+        not itself name: live 2026-09-27, CREATE daemon_255bd83f, two
+        execute_coding_task actions completed on save_data_in_memory writes of
+        {"status": "completed"} the model composed, with no coding run.
+
+    An aggregate message (autogen's ``tool_responses``) is a receipt when any
+    one of its results qualifies.  A result whose function cannot be resolved
+    is judged on its content alone: it cannot be shown to be bookkeeping.
+    """
+    names = tool_call_names([messages])
+    ledger = get_registered_ledger(user_prompt)
+    task = (getattr(ledger, 'tasks', None) or {}).get(f'action_{action_id}')
+    action_text = str(getattr(task, 'description', '') or '').lower()
+    responses = message.get('tool_responses')
+    results = responses if isinstance(responses, list) and responses else [message]
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        body = result.get('content')
+        if body is None:
+            body = message.get('content')
+        if not str(body or '').strip() or tool_reply_failed(body):
+            continue
+        name = names.get(result.get('tool_call_id') or message.get('tool_call_id'))
+        if name in BOOKKEEPING_TOOLS and name.lower() not in action_text:
+            continue
+        return True
+    return False
+
+
 def _verifier_completion_has_conversation_evidence(
         user_prompt: str, action_id: int, json_obj: dict) -> bool:
     """Return whether a completion cites a real, earlier GroupChat result.
@@ -1490,7 +1597,9 @@ def _verifier_completion_has_conversation_evidence(
     if latest_dispatch_before(messages, index + 1) != action_id:
         return False
     if kind == 'tool_receipt':
-        return message.get('role') == 'tool'
+        return (message.get('role') == 'tool'
+                and _receipt_is_real_work(user_prompt, action_id, messages,
+                                          message))
     # A written answer is only ever cited from the group log.
     return (agent is None
             and message.get('role') == 'assistant'
@@ -1650,7 +1759,8 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
 
 def commit_verified_action_completion(user_prompt: str, action_id: int,
                                       evidence: dict,
-                                      reason: str = 'verified complete') -> bool:
+                                      reason: str = 'verified complete',
+                                      claimed_action_id=None) -> bool:
     """Commit one evidence-backed successful action through the canonical FSM.
 
     CREATE and REUSE use different non-deterministic conversations, but a
@@ -1659,7 +1769,25 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
     current dispatch window.  Keeping the state write, durable ledger evidence,
     Agent Lightning reward, and world-model promotion together prevents a
     caller from advancing the pointer while silently skipping the flywheel.
+
+    ``claimed_action_id`` is the action_id the verdict itself names, when it
+    names one.  A verdict completes only that action: live 2026-09-27 (REUSE
+    daemon_goal_..._b18bba6f, 17:35:28) a StatusVerifier verdict for action_id
+    2 -- "System health check completed successfully" -- completed action 4.
+    settled_action_id still decides which action a verdict is ABOUT (its
+    recipe, its log line); this decides only whether it may COMPLETE one.  A
+    verdict that names no action_id is not contradicting anything.
     """
+    if claimed_action_id is not None:
+        try:
+            _claimed = int(float(claimed_action_id))
+        except (TypeError, ValueError):
+            _claimed = None
+        if _claimed is not None and _claimed != int(action_id):
+            logger.warning(
+                "Refusing completion of action %s in %s: the verdict names "
+                "action %s", action_id, user_prompt, _claimed)
+            return False
     if get_action_state(user_prompt, action_id) != \
             ActionState.STATUS_VERIFICATION_REQUESTED:
         logger.warning(
@@ -1726,6 +1854,22 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
     status = json_obj['status'].lower()
     current_state = get_action_state(user_prompt, current_action_id)
 
+    # A completed verdict IS the verification, so an action still IN_PROGRESS
+    # when it arrives is moved to STATUS_VERIFICATION_REQUESTED and judged
+    # here.  CREATE routes the Assistant's turn to the verifier without an
+    # "@StatusVerifier" mention (state_transition's after-Assistant branch), so
+    # the state never moved and this hook answered 'allow'; the TERMINATE that
+    # follows every verdict then walked the action through COMPLETED with no
+    # receipt (live 2026-09-27 14:26:19, daemon_255bd83f action 1).
+    if (status in ('completed', 'success')
+            and current_state == ActionState.IN_PROGRESS
+            and safe_set_state(
+                user_prompt, current_action_id,
+                ActionState.STATUS_VERIFICATION_REQUESTED,
+                "hook tracking lifecycle_hook_process_verifier_response: "
+                "verdict arrived")):
+        current_state = ActionState.STATUS_VERIFICATION_REQUESTED
+
     # Must be in STATUS_VERIFICATION_REQUESTED to process verifier response
     if current_state != ActionState.STATUS_VERIFICATION_REQUESTED:
         return {'action': 'allow', 'message': None}
@@ -1733,12 +1877,30 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
     if status in ('completed', 'success'):
         if not commit_verified_action_completion(
                 user_prompt, current_action_id, json_obj.get('evidence'),
-                "hook tracking lifecycle_hook_process_verifier_response"):
+                "hook tracking lifecycle_hook_process_verifier_response",
+                claimed_action_id=json_obj.get('action_id')):
+            # Bounded, on the same per-action counter a 'pending' verdict
+            # uses: an unverifiable claim is not a completion, and repeating
+            # it must not loop.  After the bound the action is recorded
+            # GAVE_UP -- an honest, retryable failure, never COMPLETED.
+            if retry_tracker.increment_pending(user_prompt, current_action_id):
+                retry_tracker.reset_count(user_prompt, current_action_id)
+                force_state_through_valid_path(
+                    user_prompt, current_action_id, ActionState.GAVE_UP,
+                    "completion claimed without a verifiable receipt")
+                return {
+                    'action': 'gave_up',
+                    'message': (
+                        f"Action {current_action_id} could not be verified: "
+                        "no completed verdict for it cited a real result.")
+                }
             return {
                 'action': 'force_completion',
                 'message': (
                     f"Action {current_action_id} is not complete yet: the "
-                    "StatusVerifier must cite an earlier tool receipt or "
+                    f"StatusVerifier must report action_id {current_action_id} "
+                    "and cite an earlier tool receipt that did this action's "
+                    "work (not a note saved to memory, not a failed call) or a "
                     "user-visible result from this conversation.")
             }
         # Automatically request fallback after completion
@@ -1758,9 +1920,8 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
 
         if status == 'pending':  # Still pending (not overridden)
             if validate_state_transition(user_prompt, current_action_id, ActionState.PENDING):
-                needs_user = str(
-                    json_obj.get('can_perform_without_user_input') or ''
-                ).strip().lower().startswith('no')
+                needs_user = autonomy_needs_user(
+                    json_obj.get('can_perform_without_user_input'))
                 if needs_user:
                     mark_action_waiting_for_user(
                         user_prompt, current_action_id,
@@ -1906,7 +2067,10 @@ def lifecycle_hook_track_recipe_completion(user_prompt: str, json_obj: dict, use
 # that text can quote an earlier one ("... ,Latest User message: Properly
 # Execute Action 6: ...", the Failure=True retry text), so a marker later in a
 # message says nothing about which action it posts.  Colon-delimited, so
-# action 2 never matches action 20.
+# action 2 never matches action 20.  Every producer therefore puts its marker
+# FIRST, including reuse_recipe._reuse_seed_message (action 1: dispatch, then
+# the user's words); a seed built user-words-first was invisible here and no
+# REUSE action 1 could commit (2026-09-25).
 _DISPATCH_MARKER = re.compile(
     r'\s*(?:'
     r'(?:\[retry:[^\]]*\]\s*)?(?:Properly\s+)?Execute Action '
@@ -2037,14 +2201,28 @@ def lifecycle_hook_track_termination(user_prompt: str, user_tasks, group_chat) -
                 _owner, current_action_id)
             return False
 
-        # force_state_through_valid_path (not a bare validate): a TERMINATE for an
-        # action still stuck in ASSIGNED/IN_PROGRESS/PENDING (the 4B never drove
-        # the intermediate transitions) walks to TERMINATED via the force-to-
-        # terminal recovery paths instead of being rejected -> looping forever
-        # (the live 2026-06-13 'assigned -> terminated' stall).  Normal
-        # COMPLETED/RECIPE_RECEIVED terminations resolve through the same single
-        # [TERMINATED] step as before, so behaviour is unchanged for them.
-        if force_state_through_valid_path(user_prompt, current_action_id, ActionState.TERMINATED, "hook tracking lifecycle_hook_track_termination"):
+        # A TERMINATE closes an action; it never CERTIFIES one.  ChatInstructor
+        # answers every verdict with TERMINATE (its default_auto_reply), so
+        # this hook -- which runs at the top of each create-loop lap, BEFORE
+        # the verdict pickup -- used to walk an unverified action
+        # (ASSIGNED/IN_PROGRESS/STATUS_VERIFICATION_REQUESTED/PENDING)
+        # through COMPLETED to TERMINATED with no receipt.  That write is the
+        # fabricated "[TARGET] Action 1: status_verification_requested ->
+        # completed (auto-path: hook tracking lifecycle_hook_track_termination)"
+        # of live 2026-09-27 14:26:20 (CREATE daemon_255bd83f): two
+        # execute_coding_task actions COMPLETED with zero coding runs.
+        #
+        # So such an action is left open here, for the verdict pickup and its
+        # canonical gate (commit_verified_action_completion) to complete or
+        # refuse -- bounded there, ending GAVE_UP rather than looping.  The
+        # 2026-06-13 'assigned -> terminated' stall this path once escaped is
+        # bounded by that gate and by [EXECUTE-PENDING]'s three attempts.
+        # Verified (COMPLETED / RECIPE_RECEIVED) and recovery-edge
+        # terminations are unchanged.
+        if force_state_through_valid_path(
+                user_prompt, current_action_id, ActionState.TERMINATED,
+                "hook tracking lifecycle_hook_track_termination",
+                through_completed=False):
             return True
 
     return False

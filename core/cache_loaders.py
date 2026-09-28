@@ -20,12 +20,8 @@ def _resolve_agent_data_dir():
         return os.path.join(os.path.dirname(db_path), 'agent_data')
     # Bundled/frozen mode: use cross-platform data dir (Program Files is read-only)
     if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-        try:
-            from core.platform_paths import get_agent_data_dir
-            return get_agent_data_dir()
-        except ImportError:
-            return os.path.join(
-                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+        from core.platform_paths import get_agent_data_dir
+        return get_agent_data_dir()
     return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'agent_data')
 
 AGENT_DATA_DIR = _resolve_agent_data_dir()
@@ -36,15 +32,8 @@ def _resolve_prompts_dir():
     SAVE dir (helper.PROMPTS_DIR) and the daemon reuse-CHECK, in every mode.  See
     core.platform_paths.get_recipe_prompts_dir (bundled → user data dir; Docker &
     dev → code-relative /app/prompts or <repo>/prompts; no extra env)."""
-    try:
-        from core.platform_paths import get_recipe_prompts_dir
-        return get_recipe_prompts_dir()
-    except Exception:
-        # Conservative fallback mirroring get_recipe_prompts_dir's rule.
-        if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-            return os.path.join(
-                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts')
-        return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts')
+    from core.platform_paths import get_recipe_prompts_dir
+    return get_recipe_prompts_dir()
 
 PROMPTS_DIR = _resolve_prompts_dir()
 
@@ -80,6 +69,41 @@ def load_agent_data(prompt_id):
     except Exception as e:
         logger.debug(f"Failed to load agent_data for {prompt_id}: {e}")
         return None
+
+
+def save_agent_data(prompt_id, data) -> bool:
+    """Write ``data`` as agent_data for ``prompt_id``: the file
+    ``load_agent_data`` above reads, in the format hartos.helper's
+    save_agent_data_to_file writes ({prompt_id, saved_at, data}, encrypted
+    when a key is configured), atomically (temp file, then os.replace).
+
+    For core code that cannot import hartos.helper (core must not depend on
+    the app package): the wire trim's ``elided`` namespace is written here and
+    only here.  Never raises; False when nothing was written."""
+    safe_id = str(prompt_id)
+    if not safe_id.replace('_', '').replace('-', '').isalnum():
+        return False
+    try:
+        from datetime import datetime
+        os.makedirs(AGENT_DATA_DIR, exist_ok=True)
+        file_path = os.path.join(AGENT_DATA_DIR, f"{safe_id}_agent_data.json")
+        record = {'prompt_id': safe_id,
+                  'saved_at': datetime.now().isoformat(),
+                  'data': data}
+        payload = json.dumps(record, ensure_ascii=False).encode('utf-8')
+        try:
+            from security.crypto import encrypt_data
+            payload = encrypt_data(payload)
+        except ImportError:
+            pass
+        tmp = f"{file_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, 'wb') as f:
+            f.write(payload)
+        os.replace(tmp, file_path)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to save agent_data for {prompt_id}: {e}")
+        return False
 
 
 def load_user_ledger(user_prompt):

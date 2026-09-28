@@ -999,7 +999,7 @@ class TestEmbodiedInProcess:
     def test_bridge_correction_in_process(self):
         """Mock send_expert_correction → verify direct call, no HTTP."""
         mock_provider = MagicMock()
-        mock_result = {'success': True, 'correction_id': '123'}
+        mock_result = {'success': True, 'learned': True, 'correction_id': '123'}
         mock_send = MagicMock(return_value=mock_result)
 
         with patch(
@@ -1390,7 +1390,7 @@ class TestFlatModeBehavior:
         bridge._provider = MagicMock()
         bridge._in_process = True
 
-        mock_send = MagicMock(return_value={'success': True})
+        mock_send = MagicMock(return_value={'success': True, 'learned': True})
         with patch.dict('sys.modules', {
             'hevolveai': MagicMock(),
             'hevolveai.embodied_ai': MagicMock(),
@@ -1639,7 +1639,7 @@ class TestCentralModeBehavior:
         with patch('integrations.agent_engine.world_model_bridge.pooled_post') as mock_post:
             mock_resp = MagicMock()
             mock_resp.status_code = 200
-            mock_resp.json.return_value = {'success': True}
+            mock_resp.json.return_value = {'success': True, 'learned': True}
             mock_post.return_value = mock_resp
 
             result = bridge.submit_correction(

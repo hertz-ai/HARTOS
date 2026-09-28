@@ -57,6 +57,10 @@ For new callers: use `run_bounded()` from this module for any
 external-tool probe where the child can block on init.  Do NOT add
 fresh `subprocess.run(..., capture_output=True, text=True, timeout=N)`
 sites — they reintroduce the reader-thread orphan.
+
+For a blocking call INSIDE this process (no child to kill), use
+`call_bounded()`: it frees the caller after the wait and leaves the call
+to finish on a daemon worker.
 """
 from __future__ import annotations
 
@@ -65,6 +69,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from typing import Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -194,6 +199,88 @@ def run_bounded(
         return BoundedResult(
             returncode=-1, stdout="", stderr="", timed_out=True,
         )
+
+
+#: How often a call_bounded wait with a ``cancel`` event looks at it.  Stop
+#: is a person pressing a button, so a tenth of a second is immediate.
+_CANCEL_POLL_S = 0.1
+
+
+def _validated_wait(wait) -> float:
+    """``wait`` as seconds in [0, threading.TIMEOUT_MAX], or raise.
+
+    Checked BEFORE anything starts: a bad wait found after the worker is
+    running leaves a call nobody will ever wait for (review F5, 2026-09-27).
+    Clamped at the top because past threading.TIMEOUT_MAX (~49.7 days on
+    Windows) Event.wait raises OverflowError instead of waiting.
+    """
+    seconds = float(wait)  # TypeError for None, ValueError for text
+    if seconds != seconds:
+        raise ValueError("call_bounded: wait is NaN")
+    return min(max(0.0, seconds), threading.TIMEOUT_MAX)
+
+
+def call_bounded(fn, wait: float, *, name: str = "hart-bounded-call",
+                 cancel: Optional[threading.Event] = None):
+    """Run ``fn()`` on a daemon worker; wait at most ``wait`` seconds for it.
+
+    THE ONE bounded wait for a blocking IN-PROCESS call -- the case
+    ``run_bounded`` cannot reach because there is no child process to kill:
+    ``os.startfile`` (ShellExecute), a D-Bus round trip, a library call that
+    never returns.  Nothing can stop such a call from outside, so this frees
+    the CALLER instead: the worker is left to finish on its own (it is a
+    daemon, so it never holds the process open -- unlike a
+    ThreadPoolExecutor worker, which is joined at interpreter exit).
+
+    Returns ``(finished, value, error)``:
+      * ``(True, value, None)``  -- ``fn`` returned ``value`` within ``wait``;
+      * ``(True, None, exc)``    -- ``fn`` raised ``exc`` within ``wait``.  It
+        is handed back, never swallowed: the caller decides what it means;
+      * ``(False, None, None)``  -- still running after ``wait``, or
+        ``cancel`` was set.  The caller reads ``cancel`` to tell which.
+
+    ``wait`` is validated before ``fn`` starts (TypeError / ValueError).  A
+    ``wait`` of 0 or less waits not at all.  Callers that must not START
+    work once the budget is gone check that before calling (starting a call
+    and then abandoning it is still starting it).  ``cancel`` already set
+    means ``fn`` is not started either.
+
+    Callers: integrations/vlm/local_loop.py (one computer-use action),
+    integrations/agent_engine/os_bridge/logind.py (native D-Bus call),
+    integrations/agent_engine/shell_system_apis.py (_run_async_bounded),
+    integrations/web_crawler.py (_run_async), integrations/agentic_router.py
+    (build_agentic_plan_bounded), integrations/social/dashboard_service.py
+    (world model status), security/system_requirements.py (CPU model).
+    Each carried a copy of this shape until 2026-09-27; two of them did not
+    bound anything.  tests/unit/test_one_bounded_wait.py fails on a new one.
+    """
+    seconds = _validated_wait(wait)
+    if cancel is not None and cancel.is_set():
+        return False, None, None
+    holder = {}
+    done = threading.Event()
+
+    def _worker():
+        try:
+            holder["value"] = fn()
+        except Exception as e:  # handed back to the caller, not swallowed
+            holder["error"] = e
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, name=name, daemon=True).start()
+    if cancel is None:
+        finished = done.wait(seconds)
+    else:
+        deadline = time.monotonic() + seconds
+        while True:
+            left = deadline - time.monotonic()
+            finished = done.wait(min(max(0.0, left), _CANCEL_POLL_S))
+            if finished or cancel.is_set() or left <= 0:
+                break
+    if not finished:
+        return False, None, None
+    return True, holder.get("value"), holder.get("error")
 
 
 # Where a NixOS node keeps the tools a login shell can see. A systemd unit's
@@ -429,5 +516,5 @@ def _safe_kill_and_close(
         pass
 
 
-__all__ = ["BoundedResult", "run_bounded", "run_probe",
+__all__ = ["BoundedResult", "run_bounded", "run_probe", "call_bounded",
            "no_window_kwargs", "hidden_popen_kwargs"]

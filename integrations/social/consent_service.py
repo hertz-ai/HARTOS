@@ -22,10 +22,11 @@ immutable regardless of which entry point a caller chose.
 """
 import logging
 import re
+import threading
 import uuid
 from datetime import datetime
 
-from .models import UserConsent
+from .models import UserConsent, after_commit
 
 _logger = logging.getLogger('hevolve.consent')
 
@@ -131,7 +132,18 @@ CONSENT_TYPES = frozenset({
                          # daemon paces, repair_backend_venv ->
                          # install_backend_full, the same function the
                          # "Set up TTS" UI calls).
+    'credential',        # An agent needs a password, key or token only the
+                         # owner can give (Request_Resource).  The card takes
+                         # the value in a password field; Accept stores it in
+                         # the device vault and grants this row.  The scope
+                         # names the ONE credential ('secret:SITE_PASSWORD'),
+                         # and the agent only ever gets its alias
+                         # {{secret:SITE_PASSWORD}} (hartos.ai_key_vault).
 })
+
+#: A credential ask's scope is this prefix + the credential's name, the same
+#: name its {{secret:NAME}} alias carries.
+CREDENTIAL_SCOPE_PREFIX = 'secret:'
 
 #: The capability an agent asks for, keyed by the ``action`` its ask carries,
 #: mapped to the consent type that records the answer.  ONE map, read by both
@@ -284,6 +296,15 @@ def _emit(topic: str, data: dict, msg_id: str = None):
                  bus, note_sent, msg_id)
 
 
+def _standing_revocation():
+    """SQL filter: a row whose no still stands -- revoked, and not reopened
+    since (ConsentService.reopen keeps revoked_at and records reopened_at)."""
+    from sqlalchemy import or_
+    return (UserConsent.revoked_at.isnot(None)
+            & or_(UserConsent.reopened_at.is_(None),
+                  UserConsent.reopened_at < UserConsent.revoked_at))
+
+
 def _validate_consent_type(consent_type: str):
     if consent_type not in CONSENT_TYPES:
         raise ValueError(
@@ -292,6 +313,20 @@ def _validate_consent_type(consent_type: str):
 
 
 _AGENT_ID_RE = re.compile(r'[A-Za-z0-9_-]+')
+
+
+def known_agent_id(agent_id):
+    """The asking agent's id for a consent row, or None when no agent is
+    known.
+
+    Callers pass the prompt id they hold: None or '' when there is none, and
+    hart_intelligence_entry._handle_computer_action_tool sends
+    str(prompt_id or 0), so '0' too.  An unknown agent is never guessed.
+    The one normaliser every ask uses (computer control, capability asks,
+    credential asks), so they file under the same agent_id.
+    """
+    text = '' if agent_id is None else str(agent_id).strip()
+    return None if text in ('', '0', 'None') else text
 
 
 def _is_a_name(name, aid):
@@ -392,22 +427,121 @@ def _embodied_feed_from_consent(consent_type: str, granted: bool) -> None:
     The persisted flag is written too, so a restart sees the same answer and
     get_embodied_status reports it.  Best effort: the consent row is already
     written, and a switch that cannot be applied is logged here.
+
+    The start or stop itself runs OFF the caller's thread (_FeedAnswers).
+    The caller is an HTTP request (an Allow on a card, the privacy page, the
+    admin toggle), and a feed start that never returns -- VisionService,
+    measured live 2026-09-25 -- held that request open: the card's spinner
+    never ended.  The flag is set here, at once, so the answer is on record
+    whatever the hardware does.
     """
     feed = _CONSENT_FEED.get(consent_type)
     if feed is None:
         return
     try:
         from integrations.channels.admin.api import get_api, _apply_embodied_toggle
-        cfg = get_api()._global_config.embodied_ai
+        api = get_api()
+        cfg = api._global_config.embodied_ai
         setattr(cfg, 'camera_enabled' if feed == 'camera' else 'screen_capture_enabled',
                 bool(granted))
-        get_api()._save_config()
-        _apply_embodied_toggle(feed, bool(granted), cfg)
-        _logger.info("consent %s -> embodied feed %s=%s",
-                     consent_type, feed, bool(granted))
     except Exception as e:
         _logger.warning("embodied feed %s from consent %s failed: %s",
                         feed, consent_type, e)
+        return
+    _FEED_ANSWERS.submit(feed, bool(granted), consent_type,
+                         lambda: _apply_feed_answer(
+                             api, _apply_embodied_toggle, cfg, feed,
+                             bool(granted), consent_type))
+
+
+def _apply_feed_answer(api, apply_toggle, cfg, feed: str, granted: bool,
+                       consent_type: str) -> None:
+    """Persist the flag and start or stop the feed; on the background
+    executor, never the request thread.  Logs, never raises."""
+    try:
+        api._save_config()
+        apply_toggle(feed, granted, cfg)
+        _logger.info("consent %s -> embodied feed %s=%s",
+                     consent_type, feed, granted)
+    except Exception as e:
+        _logger.warning("embodied feed %s from consent %s failed: %s",
+                        feed, consent_type, e)
+
+
+class _FeedAnswers:
+    """The owner's feed answers, applied one at a time, off the caller's
+    thread, on the shared background executor
+    (agent_engine.parallel_dispatch.get_executor).
+
+    One drain job at a time, never one job per answer: a start that hangs
+    then holds ONE executor worker, and answers given meanwhile wait here,
+    not in more workers.  One answer per feed is kept, the latest, moved to
+    the back of the line, so a hung start followed by a revoke ends with the
+    revoke applied once the start returns -- never a stale start after it.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._waiting = {}   # feed -> apply job, in the order answered
+        self._draining = False
+
+    def submit(self, feed, granted, consent_type, job) -> None:
+        with self._lock:
+            self._waiting.pop(feed, None)
+            self._waiting[feed] = job
+            if self._draining:
+                return
+            self._draining = True
+        try:
+            from integrations.agent_engine.parallel_dispatch import get_executor
+            get_executor().submit(self._drain)
+        except Exception:
+            # No executor (interpreter shutting down): apply here, as before.
+            _logger.warning("embodied feed %s=%s from consent %s: background "
+                            "executor unavailable, applying inline",
+                            feed, granted, consent_type, exc_info=True)
+            self._drain()
+
+    def _drain(self) -> None:
+        while True:
+            with self._lock:
+                if not self._waiting:
+                    self._draining = False
+                    return
+                feed = next(iter(self._waiting))
+                job = self._waiting.pop(feed)
+            try:
+                job()
+            except Exception:
+                _logger.warning("embodied feed %s answer failed", feed,
+                                exc_info=True)
+
+
+_FEED_ANSWERS = _FeedAnswers()
+
+
+def _announce_grant(db, user_id: str, consent_type: str, scope: str,
+                    agent_id) -> None:
+    """Queue a grant's effects for after its commit (models.after_commit).
+
+    Run between the flush and the caller's commit they held SQLite's one
+    write lock for as long as they took; measured live 2026-09-25, a
+    screen-capture Allow whose feed start never returned left the database
+    unwritable for about 41 minutes and the grant itself never committed.
+
+    Order matters: every surface hears consent.granted, then the copilot
+    switch is set, then the camera/screen feed starts.  The feed start is
+    the effect that hung live, so it goes last and cannot hold the others
+    back.  One place for both grant branches, so they cannot drift."""
+    data = {
+        'user_id': user_id,
+        'consent_type': consent_type,
+        'scope': scope,
+        'agent_id': agent_id,
+    }
+    after_commit(db, lambda: _emit('consent.granted', data))
+    after_commit(db, lambda: _copilot_switch_from_consent(consent_type, True))
+    after_commit(db, lambda: _embodied_feed_from_consent(consent_type, True))
 
 
 def _named(db, data: dict, agent_id) -> dict:
@@ -425,10 +559,12 @@ class ConsentService:
     @staticmethod
     def request_consent(db, user_id: str, consent_type: str,
                         scope: str = '*', agent_id=None, reason: str = '',
-                        requester_name: str = ''):
+                        requester_name: str = '', reask: bool = False):
         """Create a pending (not yet granted) consent record.
 
         Returns existing record if one already exists for this combination.
+        ``reask`` sends the card again after a grant (a credential the site
+        rejected has to be entered again), but never after a "no".
         ``reason`` rides on the ask, so the card can say what is asked for.
         ``requester_name`` is the person asking when the asker is not an
         agent (a device ask: the phone's owner), shown like agent_name.  It
@@ -484,9 +620,10 @@ class ConsentService:
                 UserConsent.scope == scope,
                 UserConsent.agent_id == agent_id,
                 or_(UserConsent.granted == True,
-                    UserConsent.revoked_at.isnot(None)),
+                    _standing_revocation()),
             ).first()
-            if decided is None:
+            if decided is None or (reask and not ConsentService.declined(
+                    db, user_id, consent_type, scope, agent_id)):
                 _emit('consent.request', ask,
                       msg_id=f'consent.request:{existing.id}')
             return existing
@@ -562,7 +699,8 @@ class ConsentService:
             return None
         if granted:
             if ConsentService.active_grant(db, user_id, consent_type) is None:
-                # grant_consent applies the feed and emits consent.granted.
+                # grant_consent applies the feed and emits consent.granted,
+                # both once the caller commits.
                 ConsentService.grant_consent(db, user_id, consent_type)
             else:
                 # Already allowed, so no second row (the UNIQUE constraint
@@ -570,7 +708,12 @@ class ConsentService:
                 # feed may have been stopped from admin settings while the
                 # grant stood, so re-assert it.  Exclusive with the branch
                 # above, so the feed is never applied twice for one answer.
-                _embodied_feed_from_consent(consent_type, True)
+                # After the commit, as grant_consent's own feed start: the
+                # admin toggle's 'all' answers camera then screen in one
+                # session, so a camera grant flushed just before holds
+                # SQLite's write lock, and a feed started here held it too.
+                after_commit(db, lambda: _embodied_feed_from_consent(
+                    consent_type, True))
         elif ConsentService.revoke_consent(db, user_id, consent_type,
                                            agent_id=agent_id) is None:
             # Nothing on file to revoke -- a client that answers without
@@ -580,6 +723,64 @@ class ConsentService:
             ConsentService.announce_revocation(user_id, consent_type,
                                                agent_id=agent_id)
         return consent_type
+
+    @staticmethod
+    def decline(db, user_id: str, consent_type: str, scope: str = '*',
+                agent_id=None):
+        """Say no to an ask (the consent card's "Don't allow"; consent_api
+        decline_consent).  revoke_consent on the ask's own combination, so a
+        no to one agent leaves other agents' asks open.
+
+        For a 'credential' ask the no also ends the saved value's grants
+        (agent None, which the card's Accept writes): the owner saying no on
+        the card that came back after a rejected login means "stop using
+        what I entered", for every agent, whichever agent asked.  Before,
+        an ask with no agent did that and agent 42's did not, so agent 42
+        was still told the rejected value "is stored".  Returns the ask's
+        row, or None when there is no ask."""
+        row = ConsentService.revoke_consent(db, user_id, consent_type,
+                                            scope, agent_id)
+        if (consent_type == 'credential' and agent_id is not None
+                and ConsentService.active_grant(db, user_id, consent_type,
+                                                scope) is not None):
+            ConsentService.revoke_consent(db, user_id, consent_type, scope)
+        return row
+
+    @staticmethod
+    def reopen(db, user_id: str, consent_type: str, scope: str = '*'):
+        """Take back a "no": every standing revocation for (user, type,
+        scope), for any agent, is marked reopened now, so declined() is
+        False and the next request_consent shows the card.  Returns how many
+        rows.
+
+        The way back for an ask with no on/off card to grant from (a
+        credential: the privacy page's "Allow asking again").  It is not a
+        yes and it rewrites no history: granted, granted_at and revoked_at
+        (when the no was given) stay as they were; reopened_at records the
+        reopen, and a later no (a newer revoked_at) stands again.  Every
+        surface hears consent.reopened, after the commit, as it hears
+        consent.granted and consent.revoked.
+        """
+        _validate_consent_type(consent_type)
+        rows = db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == consent_type,
+            UserConsent.scope == scope,
+            _standing_revocation(),
+        ).all()
+        if not rows:
+            return 0
+        now = datetime.utcnow()
+        for row in rows:
+            row.reopened_at = now
+        db.flush()
+        _audit('consent', actor_id=user_id,
+               action=f'consent.reopened:{consent_type}',
+               detail={'scope': scope, 'rows': len(rows)})
+        data = {'user_id': user_id, 'consent_type': consent_type,
+                'scope': scope, 'agent_id': None}
+        after_commit(db, lambda: _emit('consent.reopened', data))
+        return len(rows)
 
     @staticmethod
     def declined(db, user_id: str, consent_type: str, scope: str = '*',
@@ -601,7 +802,7 @@ class ConsentService:
             UserConsent.consent_type == consent_type,
             UserConsent.scope == scope,
             UserConsent.agent_id == agent_id,
-            UserConsent.revoked_at.isnot(None),
+            _standing_revocation(),
         ).first() is not None
 
     @staticmethod
@@ -700,14 +901,7 @@ class ConsentService:
                    action=f'consent.granted:{consent_type}',
                    detail={'scope': scope, 'agent_id': agent_id,
                            'promoted_pending_ask': True})
-            _emit('consent.granted', {
-                'user_id': user_id,
-                'consent_type': consent_type,
-                'scope': scope,
-                'agent_id': agent_id,
-            })
-            _copilot_switch_from_consent(consent_type, True)
-            _embodied_feed_from_consent(consent_type, True)
+            _announce_grant(db, user_id, consent_type, scope, agent_id)
             return _pending
 
         consent = UserConsent(
@@ -728,14 +922,9 @@ class ConsentService:
         _audit('consent', actor_id=user_id,
                action=f'consent.granted:{consent_type}',
                detail={'scope': scope, 'agent_id': agent_id})
-        _emit('consent.granted', {
-            'user_id': user_id,
-            'consent_type': consent_type,
-            'scope': scope,
-            'agent_id': agent_id,
-        })
-        _copilot_switch_from_consent(consent_type, True)
-        _embodied_feed_from_consent(consent_type, True)
+        # The broadcast and the feed wait for the commit (after_commit): run
+        # here they held SQLite's write lock for as long as they took.
+        _announce_grant(db, user_id, consent_type, scope, agent_id)
 
         # Up-sync the now-public agents (gap #4): agents are almost always
         # created BEFORE the owner grants public_exposure, so the
@@ -829,7 +1018,11 @@ class ConsentService:
         # 3. No record at all → auto-grant + emit one-time notice.
         ConsentService.grant_consent(db, user_id, consent_type,
                                      scope=scope, agent_id=agent_id)
-        _emit('consent.auto_granted', _named(db, {
+        # After the commit, like the grant's own consent.granted (and after
+        # it): a notice of a grant that rolled back would offer to revoke a
+        # consent that does not exist.  The name is looked up now, while the
+        # session can still query.
+        notice = _named(db, {
             'user_id': user_id,
             'consent_type': consent_type,
             'scope': scope,
@@ -839,7 +1032,8 @@ class ConsentService:
                 f"could be served.  Tap to review or revoke in settings."
             ),
             'revoke_action': 'consent.revoke',
-        }, agent_id))
+        }, agent_id)
+        after_commit(db, lambda: _emit('consent.auto_granted', notice))
         return True
 
     @staticmethod

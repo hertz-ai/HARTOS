@@ -56,7 +56,13 @@ FILES = ('hartos/reuse_recipe.py', 'hartos/create_recipe.py')
 # The TERMINATE dispatch condition: reads the last message to decide whether a
 # whole action-advance body runs.  This is the shape that went bang.
 _LAST_MSG_READ = re.compile(r"\.messages\[-1\]\[['\"]name['\"]\]")
-_TRUTHY_GUARD = re.compile(r"\.messages\s+and\b")
+# Either the truthiness idiom, or a length floor that proves at least one
+# message: `len(x.messages) >= N` with N >= 1, or `len(x.messages) > K` with
+# K >= 0 (create_recipe.py's stale-verdict check reads [-2] too, so it uses
+# `>= 2`).  `>= 0` proves nothing and is still flagged.
+_TRUTHY_GUARD = re.compile(
+    r"\.messages\s+and\b"
+    r"|len\([^()]*\.messages\)\s*(?:>=\s*[1-9]\d*|>\s*\d+)\s*and\b")
 
 
 def _unguarded_sites(path):

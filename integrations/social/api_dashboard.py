@@ -15,6 +15,8 @@ import time
 
 from flask import Blueprint, jsonify, request, make_response
 
+from .auth import require_local_or_auth
+
 logger = logging.getLogger('hevolve_social')
 
 dashboard_bp = Blueprint('social_dashboard', __name__)
@@ -498,10 +500,12 @@ def _steer(agent_id, verb):
     Each verb writes one ImmutableAuditLog ``agent_steered`` entry.
     Body schema (optional): ``{reason: <str>}``.
 
-    Auth posture matches the rest of the dashboard blueprint — the
-    /agents list endpoint above is also unauthenticated for parity
-    with the existing operator console.  Phase C5 (owner-or-admin)
-    is gated until the dashboard moves behind @require_auth.
+    Every steering route is @require_local_or_auth and passes the caller
+    to dashboard_service.may_steer (via steer_agent / inject_instruction):
+    401 for a remote caller without a token, 403 for a caller who neither
+    owns the goal nor is an admin.  Until 2026-09-27 these three had no
+    identity or ownership check at all (the same hole as inject, c3651a483).
+    ``actor_id`` is a label, never identity.
     """
     from .dashboard_service import steer_agent
     from .models import get_db
@@ -512,8 +516,10 @@ def _steer(agent_id, verb):
     db = get_db()
     try:
         result = steer_agent(db, agent_id, verb,
-                             actor_id=actor_id, reason=reason)
-        status = 200 if result.get('ok') else 400
+                             actor_id=actor_id, reason=reason,
+                             caller=_steering_caller())
+        status = (200 if result.get('ok')
+                  else 403 if result.get('forbidden') else 400)
         return jsonify({'success': result.get('ok'),
                         'data': result}), status
     except Exception as e:
@@ -527,6 +533,7 @@ def _steer(agent_id, verb):
     '/api/social/dashboard/agents/<agent_id>/pause',
     methods=['POST'],
 )
+@require_local_or_auth
 def steer_pause(agent_id):
     """Pause an agent goal.  Idempotent on already-paused."""
     return _steer(agent_id, 'pause')
@@ -536,6 +543,7 @@ def steer_pause(agent_id):
     '/api/social/dashboard/agents/<agent_id>/resume',
     methods=['POST'],
 )
+@require_local_or_auth
 def steer_resume(agent_id):
     """Resume a paused agent goal.  400 if not paused."""
     return _steer(agent_id, 'resume')
@@ -545,6 +553,7 @@ def steer_resume(agent_id):
     '/api/social/dashboard/agents/<agent_id>/cancel',
     methods=['POST'],
 )
+@require_local_or_auth
 def steer_cancel(agent_id):
     """Cancel (archive) an agent goal.  Terminal — cannot resume."""
     return _steer(agent_id, 'cancel')
@@ -552,15 +561,58 @@ def steer_cancel(agent_id):
 
 # ─── Agent Ops Console (Phase D: operator inject) ────────────────────────
 
+def _steering_caller():
+    """Who is calling, for dashboard_service.may_steer.
+
+    Runs under require_local_or_auth: a remote caller is the user its token
+    names (g.user).  A loopback caller is the user its token names when it
+    sends a valid one, else this desktop's owner, HEVOLVE_OWNER_USER_ID --
+    the identity the camera, screen, computer-use and credential asks all go
+    to.  The token comes first because HEVOLVE_OWNER_USER_ID is set at boot
+    and goes stale when someone signs in afterwards (review of c3651a483: a
+    signed-in desktop user got 403 on their own goal).  Nothing a request
+    body says is identity.
+    """
+    from flask import g
+    from .auth import _get_user_from_token, holds_central_role
+    from .dashboard_service import SteeringCaller
+    user = getattr(g, 'user', None)
+    if user is not None:
+        return SteeringCaller(user_id=str(user.id),
+                              is_admin=holds_central_role(user),
+                              is_local=False)
+    auth = request.headers.get('Authorization', '')
+    if auth.startswith('Bearer ') and auth[7:]:
+        # The same token lookup require_auth uses; an invalid token is
+        # no token, and the local owner below answers.
+        token_user, token_db = _get_user_from_token(auth[7:])
+        try:
+            if token_user is not None and not getattr(token_user, 'is_banned', False):
+                return SteeringCaller(user_id=str(token_user.id),
+                                      is_admin=holds_central_role(token_user),
+                                      is_local=True)
+        finally:
+            if token_db is not None:
+                token_db.close()
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    return SteeringCaller(user_id=owner or None, is_admin=False, is_local=True)
+
+
 @dashboard_bp.route(
     '/api/social/dashboard/agents/<agent_id>/inject',
     methods=['POST'],
 )
+@require_local_or_auth
 def inject_into_groupchat(agent_id):
     """Inject an operator instruction into the agent's live GroupChat.
 
     Body: ``{"instruction": <str>, "actor_id": <str>?}``.  Returns
     ``{ok: bool, message_index: int|null, error: str|null}``.
+
+    Only a caller dashboard_service.may_steer admits (the goal's owner, an
+    admin, or this machine for a goal no human owns): 401 for a remote
+    caller without a token, 403 for anyone else.  ``actor_id`` is a label
+    for the audit line and the GroupChat message name, never identity.
 
     Returns 400 when the GroupChat is not registered (process restart,
     8h TTL eviction, or /chat never ran for this agent in this process).
@@ -577,8 +629,10 @@ def inject_into_groupchat(agent_id):
     db = get_db()
     try:
         result = inject_instruction(db, agent_id, instruction,
-                                    actor_id=actor_id)
-        status = 200 if result.get('ok') else 400
+                                    actor_id=actor_id,
+                                    caller=_steering_caller())
+        status = (200 if result.get('ok')
+                  else 403 if result.get('forbidden') else 400)
         return jsonify({'success': result.get('ok'),
                         'data': result}), status
     except Exception as e:

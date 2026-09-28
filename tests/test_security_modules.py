@@ -401,6 +401,38 @@ class TestSecretsManager:
             with patch.dict(os.environ, env_clean, clear=True):
                 assert sm2.get_secret('API_KEY') == 'sk-test123'
 
+    def test_no_key_and_no_vault_is_not_a_warning(self, tmp_path, caplog):
+        """Env-vars-only with no vault on disk is the default, not a fault:
+        nothing is locked away, so the happy path must stay quiet."""
+        import logging
+        from security.secrets_manager import SecretsManager
+        with patch('security.secrets_manager._VAULT_PATH',
+                   str(tmp_path / 'secrets.enc')), \
+             patch.dict(os.environ, {'HEVOLVE_MASTER_KEY': ''}, clear=False), \
+             caplog.at_level(logging.INFO, logger='hevolve_security'):
+            sm = SecretsManager.get_instance()
+        assert sm._fernet is None
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], \
+            caplog.text
+        assert 'environment variables only' in caplog.text
+
+    def test_no_key_with_a_vault_on_disk_warns(self, tmp_path, caplog):
+        """The real misconfiguration: an encrypted vault this process cannot
+        open.  That must stay a WARNING and name the vault."""
+        import logging
+        from security.secrets_manager import SecretsManager
+        vault = tmp_path / 'secrets.enc'
+        vault.write_bytes(b'not-read-without-a-key')
+        with patch('security.secrets_manager._VAULT_PATH', str(vault)), \
+             patch.dict(os.environ, {'HEVOLVE_MASTER_KEY': ''}, clear=False), \
+             caplog.at_level(logging.INFO, logger='hevolve_security'):
+            sm = SecretsManager.get_instance()
+        assert sm._fernet is None and sm._cache == {}
+        warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warns) == 1, caplog.text
+        assert 'UNAVAILABLE' in warns[0].getMessage()
+        assert str(vault) in warns[0].getMessage()
+
     def test_save_without_master_key_raises(self):
         from security.secrets_manager import SecretsManager
         with patch.dict(os.environ, {'HEVOLVE_MASTER_KEY': ''}, clear=False):

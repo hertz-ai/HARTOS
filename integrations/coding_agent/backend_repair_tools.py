@@ -74,11 +74,8 @@ def _resolve_log_path(backend_name: str) -> Optional[str]:
     Best-effort — returns None if the path cannot be derived (the
     repair still runs; only the diagnostic hint is missing).
     """
-    try:
-        from core.platform_paths import get_log_dir  # type: ignore
-        log_dir = Path(get_log_dir())
-    except Exception:
-        log_dir = Path.home() / 'Documents' / 'Nunba' / 'logs'
+    from core.platform_paths import get_log_dir
+    log_dir = Path(get_log_dir())
     try:
         return str(log_dir / f'venv_{backend_name}.log')
     except Exception:

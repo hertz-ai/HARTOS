@@ -75,15 +75,27 @@ def atomic_json_write(filepath: str, data, indent: int = 2):
     """Write JSON atomically: write to temp file → os.replace() (atomic on POSIX and Windows).
 
     Prevents corrupt JSON from crash/power loss during write.
+
+    The temp file has a unique name, so concurrent writers of the same path
+    never share one, and it is created with ONE exclusive open.  Not
+    tempfile.mkstemp: on Windows mkstemp retries a PermissionError up to
+    2**31 times while os.access calls the directory writable; measured live
+    2026-09-25 (bff95ab44), a consent Allow spun in it for minutes.  A
+    refused directory now fails the write at once.
     """
-    import tempfile
+    import uuid
     filepath = os.path.abspath(filepath)
     dir_path = os.path.dirname(filepath)
     os.makedirs(dir_path, exist_ok=True)
 
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=dir_path, suffix='.tmp')
+    tmp_path = os.path.join(
+        dir_path, f'.{os.path.basename(filepath)}.{uuid.uuid4().hex}.tmp')
+    tmp_fd = os.open(tmp_path,
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | getattr(os, 'O_BINARY', 0)
+                     | getattr(os, 'O_NOINHERIT', 0), 0o600)
     try:
-        with os.fdopen(tmp_fd, 'w') as f:
+        with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=indent, default=str)
             f.flush()
             os.fsync(f.fileno())

@@ -4,7 +4,10 @@ Coding Agent Benchmark Tracker — SQLite-backed performance tracking.
 Records task completion time and success rate per tool, task type, and model.
 Exports compact deltas for hive distributed learning via FederatedAggregator.
 
-DB location: agent_data/coding_benchmarks.db
+DB location: <core.platform_paths.get_agent_data_dir()>/coding_benchmarks.db
+(the user data dir, never the install tree: an installed Nunba cannot write
+under Program Files, and a failed write there cost every coding task its
+result; see tests/unit/test_coding_result_survives_benchmark_write.py).
 """
 import logging
 import os
@@ -15,10 +18,15 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger('hevolve.coding_agent')
 
-_DB_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    'agent_data', 'coding_benchmarks.db'
-)
+_DB_FILENAME = 'coding_benchmarks.db'
+
+
+def _default_db_path() -> str:
+    """The benchmark DB in the canonical agent data dir, created if absent."""
+    from core.platform_paths import get_agent_data_dir
+    agent_dir = get_agent_data_dir()
+    os.makedirs(agent_dir, exist_ok=True)
+    return os.path.join(agent_dir, _DB_FILENAME)
 
 # Minimum samples before a tool is considered "benchmarked" for a task type
 MIN_SAMPLES = 5
@@ -27,8 +35,8 @@ MIN_SAMPLES = 5
 class BenchmarkTracker:
     """SQLite benchmark tracker — thread-safe singleton."""
 
-    def __init__(self, db_path: str = _DB_PATH):
-        self._db_path = db_path
+    def __init__(self, db_path: Optional[str] = None):
+        self._db_path = db_path or _default_db_path()
         self._lock = threading.Lock()
         self._init_db()
 

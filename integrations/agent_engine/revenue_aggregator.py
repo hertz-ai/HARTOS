@@ -265,17 +265,25 @@ def settle_metered_api_costs(db, period_hours: int = 24) -> Dict:
       3. award_spark(db, operator_id, spark, 'api_cost_recovery', usage.id, desc)
       4. Mark settlement_status = 'settled'
 
+    Remote-compute ledger rows (budget_gate.COMPUTE_LEDGER_TASK_SOURCES) are
+    never paid here: each node records its own half of an exchange when it
+    happens (the requester's debit, the server's credit), so nothing about
+    them is pending and no node credits another node's operator.
+
     Returns: {settled_count, total_spark_awarded, total_usd_settled}
     """
     from sqlalchemy import and_
     from integrations.social.models import MeteredAPIUsage
     from integrations.social.resonance_engine import ResonanceService
+    from integrations.agent_engine.budget_gate import COMPUTE_LEDGER_TASK_SOURCES
 
     cutoff = datetime.utcnow() - timedelta(hours=period_hours)
     pending = db.query(MeteredAPIUsage).filter(
         and_(
             MeteredAPIUsage.settlement_status == 'pending',
             MeteredAPIUsage.task_source != 'own',
+            MeteredAPIUsage.task_source.notin_(
+                sorted(COMPUTE_LEDGER_TASK_SOURCES)),
             MeteredAPIUsage.created_at >= cutoff,
         )
     ).all()

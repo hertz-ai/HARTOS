@@ -14,8 +14,14 @@ The boundary we mock:
 
 Security focus (why this file exists): the destructive-command / DLP gate must
 FAIL SAFE.  If a security module cannot be imported, the command must NOT be
-silently forwarded to the remote host — it must be refused (unless the caller
-explicitly passes force=True).
+silently forwarded to the remote host — it must be refused.
+
+``force`` never bypasses the gate.  Since a34e6489f execute() always runs
+_check_security(); ``force`` is kept only for API compatibility.  The shared
+hard-deny policy (integrations.vlm.safety.destructive_computer_operation) runs
+first, then security.action_classifier, then the DLP engine.  Each layer is
+exercised below with a command that only that layer catches, so one layer
+cannot mask another.
 """
 
 import sys
@@ -65,11 +71,27 @@ def _exec(url='http://remote-host:6777'):
 class TestExecuteDestructiveGate:
 
     def test_destructive_command_blocked_not_dispatched(self):
-        """A destructive command is blocked and NEVER POSTed to the remote."""
+        """An erase command is refused by the shared hard-deny policy (the
+        first layer) and NEVER POSTed to the remote."""
         with mock.patch.object(rex, 'pooled_post') as post:
             result = _exec().execute('rm -rf /')
         assert result['success'] is False
-        assert 'Destructive' in result['error']
+        assert 'destructive_computer_operation' in result['error']
+        post.assert_not_called()
+
+    def test_classifier_destructive_command_blocked_not_dispatched(self):
+        """A command the shared policy lets through but the action classifier
+        rates destructive is refused by the classifier layer, not dispatched."""
+        from integrations.vlm.safety import destructive_computer_operation
+        from security.action_classifier import classify_action
+        # Precondition: this command really reaches the classifier layer.
+        assert destructive_computer_operation('DROP TABLE users') is None
+        assert classify_action('DROP TABLE users') == 'destructive'
+        with mock.patch.object(rex, 'pooled_post') as post:
+            result = _exec().execute('DROP TABLE users')
+        assert result['success'] is False
+        assert 'Destructive command detected' in result['error']
+        assert 'cannot be dispatched by an agent' in result['error']
         post.assert_not_called()
 
     def test_safe_command_is_dispatched(self):
@@ -82,20 +104,28 @@ class TestExecuteDestructiveGate:
         assert result['returncode'] == 0
         post.assert_called_once()
 
-    def test_force_bypasses_destructive_gate(self):
-        """force=True is the ONLY bypass: even 'rm -rf /' is dispatched."""
+    @pytest.mark.parametrize('command, expected', [
+        ('rm -rf /', 'destructive_computer_operation'),
+        ('DROP TABLE users', 'Destructive command detected'),
+    ])
+    def test_force_does_not_bypass_destructive_gate(self, command, expected):
+        """force=True is NOT a bypass: both the shared hard-deny layer and the
+        classifier layer still refuse, and nothing reaches the remote."""
         resp = _FakeResp(200, {'returncode': 0, 'output': ''})
         with mock.patch.object(rex, 'pooled_post', return_value=resp) as post:
-            result = _exec().execute('rm -rf /', force=True)
-        post.assert_called_once()
-        assert result['success'] is True
+            result = _exec().execute(command, force=True)
+        assert result['success'] is False
+        assert expected in result['error']
+        post.assert_not_called()
 
-    def test_force_also_bypasses_dlp_gate(self):
-        """force=True skips the DLP/PII scan as well."""
+    def test_force_does_not_bypass_dlp_gate(self):
+        """force=True does not skip the DLP/PII scan either."""
         resp = _FakeResp(200, {'returncode': 0, 'output': ''})
         with mock.patch.object(rex, 'pooled_post', return_value=resp) as post:
-            _exec().execute('echo ssn 123-45-6789', force=True)
-        post.assert_called_once()
+            result = _exec().execute('echo ssn 123-45-6789', force=True)
+        assert result['success'] is False
+        assert 'DLP blocked' in result['error']
+        post.assert_not_called()
 
 
 # ── execute(): DLP gate ───────────────────────────────────────────────────────
@@ -124,12 +154,15 @@ class TestSecurityDegradeFailSafe:
         with mock.patch.dict(sys.modules,
                              {'security.action_classifier': None}):
             with mock.patch.object(rex, 'pooled_post') as post:
-                result = _exec().execute('rm -rf /')
+                # 'ls -la' passes the shared hard-deny policy (which runs
+                # first), so the refusal below can only come from the
+                # classifier's degrade branch, not from the shared layer.
+                result = _exec().execute('ls -la')
         assert result['success'] is False, (
-            "destructive command was dispatched despite the classifier being "
+            "command was dispatched despite the classifier being "
             "unavailable — the gate is fail-OPEN")
         post.assert_not_called()
-        assert 'error' in result and result['error']
+        assert 'action_classifier could not be imported' in result['error']
 
     def test_dlp_import_failure_blocks_dispatch(self):
         # action_classifier works (command classifies as non-destructive),
@@ -142,17 +175,32 @@ class TestSecurityDegradeFailSafe:
             "the gate is fail-OPEN")
         post.assert_not_called()
 
-    def test_degrade_path_still_honors_force(self):
-        """Even with a broken security stack, force=True dispatches."""
+    def test_degrade_path_refuses_even_with_force(self):
+        """With a broken classifier + DLP stack, force=True still refuses.
+        'ls -la' passes the shared policy, so the degrade branch itself is
+        what refuses here."""
         resp = _FakeResp(200, {'returncode': 0, 'output': ''})
         with mock.patch.dict(sys.modules,
                              {'security.action_classifier': None,
                               'security.dlp_engine': None}):
             with mock.patch.object(rex, 'pooled_post',
                                    return_value=resp) as post:
-                result = _exec().execute('rm -rf /', force=True)
-        post.assert_called_once()
-        assert result['success'] is True
+                result = _exec().execute('ls -la', force=True)
+        assert result['success'] is False
+        assert 'Security pre-check unavailable' in result['error']
+        post.assert_not_called()
+
+    def test_shared_policy_import_failure_refuses_even_with_force(self):
+        """The first layer (the shared hard-deny policy) also fails safe: if it
+        cannot be imported, nothing is dispatched, force or not."""
+        resp = _FakeResp(200, {'returncode': 0, 'output': ''})
+        with mock.patch.dict(sys.modules, {'integrations.vlm.safety': None}):
+            with mock.patch.object(rex, 'pooled_post',
+                                   return_value=resp) as post:
+                result = _exec().execute('ls -la', force=True)
+        assert result['success'] is False
+        assert 'Security pre-check unavailable' in result['error']
+        post.assert_not_called()
 
 
 # ── execute(): HTTP / network behaviour ───────────────────────────────────────

@@ -11,6 +11,7 @@ if sys.platform == 'win32':
     import asyncio as _asyncio_boot
     _asyncio_boot.set_event_loop_policy(_asyncio_boot.WindowsSelectorEventLoopPolicy())
 from core.subprocess_safe import run_bounded
+from core.platform_paths import under_test as _under_test
 import io
 
 # Diagnostic escape hatch: `kill -USR1 <pid>` dumps every thread's stack to
@@ -25,7 +26,7 @@ try:
 except Exception:
     pass
 
-if sys.platform == 'win32' and 'pytest' not in sys.modules:
+if sys.platform == 'win32' and not _under_test():
     # Force UTF-8 encoding for stdout/stderr to prevent crashes with non-ASCII characters
     # Skip when running under pytest — pytest wraps stdout/stderr for capture,
     # and replacing them here closes pytest's file handles.
@@ -584,12 +585,8 @@ except Exception:
     # helper uses, so we NEVER fall back to the read-only /nix/store package dir on
     # the embedded OS (the boot crash this guards). get_recipe_prompts_dir handles
     # frozen desktop + embedded HART OS (/nix/store or /etc/hartos-release) + dev.
-    try:
-        from core.platform_paths import get_recipe_prompts_dir
-        PROMPTS_DIR = os.path.abspath(get_recipe_prompts_dir())
-    except Exception:
-        PROMPTS_DIR = os.path.abspath(os.path.join(
-            os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
+    from core.platform_paths import get_recipe_prompts_dir
+    PROMPTS_DIR = os.path.abspath(get_recipe_prompts_dir())
 
 # Ensure prompts directory exists (agent creation writes JSON here)
 os.makedirs(PROMPTS_DIR, exist_ok=True)
@@ -635,13 +632,8 @@ def _get_or_create_graph(user_id, prompt_id=None):
         session_key = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
         with _memory_graph_lock:
             if session_key not in _memory_graphs:
-                try:
-                    from core.platform_paths import get_memory_graph_dir
-                    db_path = get_memory_graph_dir(session_key)
-                except ImportError:
-                    db_path = os.path.join(
-                        os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", session_key
-                    )
+                from core.platform_paths import get_memory_graph_dir
+                db_path = get_memory_graph_dir(session_key)
                 _memory_graphs[session_key] = MemoryGraph(
                     db_path=db_path,
                     user_id=str(user_id),
@@ -848,11 +840,8 @@ logging.setLogRecordFactory(RequestLogRecord)
 _is_bundled = bool(os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False))
 
 if _is_bundled:
-    try:
-        from core.platform_paths import get_log_dir as _get_log_dir_lc
-        _nunba_log_dir = _get_log_dir_lc()
-    except ImportError:
-        _nunba_log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
+    from core.platform_paths import get_log_dir as _get_log_dir_lc
+    _nunba_log_dir = _get_log_dir_lc()
     try:
         os.makedirs(_nunba_log_dir, exist_ok=True)
     except PermissionError:
@@ -980,7 +969,7 @@ app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_h
 # One payload policy for app AND transport: core.serve passes the same
 # constant to Hypercorn's WSGI middleware (whose 64 KB library default
 # otherwise transport-rejects bodies Flask's own cap here would accept).
-from core.constants import MAX_PAYLOAD_BYTES
+from core.constants import MAX_PAYLOAD_BYTES, SHELL_COMMAND_TIMEOUT_S
 app.config['MAX_CONTENT_LENGTH'] = MAX_PAYLOAD_BYTES  # 2MB default, HEVOLVE_MAX_PAYLOAD_BYTES to override
 
 # ── LLM outbound logger ───────────────────────────────────────────────
@@ -1587,7 +1576,7 @@ try:
         Secrets never leave the user's device. This endpoint rejects
         any request that doesn't originate from the local machine.
         """
-        if not is_local_request(request.remote_addr):
+        if not is_local_request():
             return jsonify({'error': 'Credential endpoints are localhost only. '
                             'Secrets never leave your device.'}), 403
         data = request.get_json(silent=True) or {}
@@ -1596,6 +1585,9 @@ try:
         if not key_name or not value:
             return jsonify({'error': 'key_name and value are required'}), 400
         vault = _VaultCls.get_instance()
+        # A name the process holds that this vault did not store (PATH,
+        # HTTPS_PROXY...) is left alone by store_credential and answered as
+        # any other, so this endpoint does not say which variables exist.
         resolved = vault.store_credential(
             key_name=key_name,
             value=value,
@@ -1607,7 +1599,7 @@ try:
     @_json_endpoint
     def _api_credentials_pending():
         """List pending credential requests — LOCALHOST ONLY."""
-        if not is_local_request(request.remote_addr):
+        if not is_local_request():
             return jsonify({'error': 'Credential endpoints are localhost only.'}), 403
         vault = _VaultCls.get_instance()
         return jsonify({'pending': vault.get_pending_requests()})
@@ -1665,6 +1657,13 @@ try:
         except Exception as fwd_err:
             return jsonify({'error': f'HevolveAI backend unavailable: {fwd_err}'}), 502
 
+        # The serving half of a hive expert exchange: a peer's person asked,
+        # this node's operator earns the compute served (owner ruling
+        # 2026-09-26).  No requester header (an SDK client) earns nothing.
+        if resp.status_code == 200:
+            from integrations.agent_engine.budget_gate import credit_served_completion
+            credit_served_completion(request.headers, data, result)
+
         # Meter usage for the 90/9/1 revenue split. This passed keywords
         # record_metered_usage does not accept (provider/model/tokens/source);
         # the TypeError was swallowed below, so SDK usage was NEVER metered
@@ -1697,20 +1696,10 @@ try:
     def _gateway_metering():
         """SDK usage metering stats for billing dashboard."""
         try:
-            from integrations.social.models import db_session, MeteredAPIUsage
-            from sqlalchemy import func
-            with db_session() as session:
-                rows = session.query(
-                    MeteredAPIUsage.provider,
-                    func.sum(MeteredAPIUsage.tokens_used),
-                    func.count(MeteredAPIUsage.id)
-                ).group_by(MeteredAPIUsage.provider).all()
-                return jsonify({
-                    'providers': [
-                        {'provider': r[0], 'total_tokens': int(r[1] or 0), 'calls': r[2]}
-                        for r in rows
-                    ]
-                })
+            from integrations.social.models import db_session
+            from integrations.agent_engine.budget_gate import metered_usage_by_model
+            with db_session(commit=False) as session:
+                return jsonify({'providers': metered_usage_by_model(session)})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
@@ -2527,6 +2516,11 @@ def publish_async(topic, message, timeout=2.0):
             data = json.loads(message)
         except (json.JSONDecodeError, TypeError):
             data = {'raw': message}
+    # The user the PAYLOAD names, read before the bus leg below stamps the
+    # topic suffix into it: the egress rule compares it with the owner of
+    # the Crossbar URI (a payload naming nobody on a declared per-user URI
+    # is that URI's user's).
+    _claimed_user = data.get('user_id', '') if isinstance(data, dict) else ''
 
     # 1. Route through MessageBus (LOCAL + PEERLINK — always works offline)
     try:
@@ -2617,6 +2611,29 @@ def publish_async(topic, message, timeout=2.0):
         return
 
     raw_message = message if isinstance(message, str) else json.dumps(message, default=str)
+
+    # Egress (owner ruling 2026-09-26): a topic that is not the message
+    # user's own reaches other people's subscribers, so it carries the
+    # scrubbed copy, or nothing when the scrub failed.  Asked of the one rule
+    # (security.edge_privacy.crossbar_egress_copy) the MessageBus Crossbar
+    # leg asks; the user's own topic still goes byte-identical.
+    _wire, _wire_is_json = message, not isinstance(message, str)
+    if isinstance(message, str):
+        try:
+            _wire, _wire_is_json = json.loads(message), True
+        except (json.JSONDecodeError, TypeError):
+            pass
+    try:
+        from security.edge_privacy import crossbar_egress_copy
+        _out = crossbar_egress_copy(topic, _wire, _claimed_user)
+    except ImportError as _ep_err:
+        app.logger.warning(f"Egress rule unavailable ({_ep_err}); not "
+                           f"publishing {topic} to Crossbar")
+        return
+    if _out is None:
+        return
+    if _out is not _wire:
+        raw_message = json.dumps(_out, default=str) if _wire_is_json else _out
 
     def _publish():
         import socket
@@ -3137,13 +3154,12 @@ def _request_consent(action: str, label: str, input_text: str) -> str:
     /visual_agent (#66).  Which agent is asking comes from the request's own
     prompt id, not the capability label the tool wrapper passes.
     """
-    from integrations.social.consent_service import (
-        ConsentService, consent_type_for_action)
-    from integrations.social.models import db_session
     # ONE normaliser for "is this a real agent id", shared with the
-    # computer_control ask rather than copied (it already handles the '0'
-    # and 'None' spellings this codebase passes around).
-    from integrations.vlm.safety import _known_agent
+    # computer_control and credential asks rather than copied (it already
+    # handles the '0' and 'None' spellings this codebase passes around).
+    from integrations.social.consent_service import (
+        ConsentService, consent_type_for_action, known_agent_id)
+    from integrations.social.models import db_session
 
     log = logging.getLogger(__name__)
     consent_type = consent_type_for_action(action)
@@ -3159,7 +3175,7 @@ def _request_consent(action: str, label: str, input_text: str) -> str:
         return (f"Not asked: nobody is signed in on this computer who could "
                 f"allow {label.lower()} access.")
 
-    agent = _known_agent(thread_local_data.get_prompt_id())
+    agent = known_agent_id(thread_local_data.get_prompt_id())
     reason = f'{label} access needed: {input_text}'.strip()
     try:
         with db_session(commit=True) as db:
@@ -3442,7 +3458,7 @@ def _handle_shell_command_tool(input_text: str) -> str:
     _run.step(iteration=1, action='shell', phase='executing', caption=_caption)
     _phase, _err = 'completed', ''
     try:
-        proc = run_bounded(argv, timeout=30)
+        proc = run_bounded(argv, timeout=SHELL_COMMAND_TIMEOUT_S)
     except FileNotFoundError as e:
         _phase, _err = 'failed', f'interpreter not found — {e}'
         return f"Shell_Command: interpreter not found — {e}"
@@ -3460,7 +3476,8 @@ def _handle_shell_command_tool(input_text: str) -> str:
     # run_bounded never raises TimeoutExpired — it reports the kill this way.
     if proc.timed_out:
         return (
-            "Shell_Command timed out after 30s. For long-running work use "
+            f"Shell_Command timed out after {SHELL_COMMAND_TIMEOUT_S}s. "
+            "For long-running work use "
             "Execute_Coding_Task instead, which has a longer budget."
         )
 
@@ -3661,15 +3678,18 @@ def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
     spawn via the same callback.
     """
     try:
-        from core.platform.registry import ServiceRegistry
+        from core.platform.registry import get_registry as _platform_registry
         from integrations.channels.registry import get_registry
-        _lui = ServiceRegistry.get('LiquidUIService')
+        _lui = _platform_registry().get_or_none('LiquidUIService')
         if _lui is None:
             return
         adapter = get_registry().get(channel_type)
         if adapter is None or not hasattr(adapter, 'set_qr_callback'):
             return
-        user_id = thread_local_data.get_user_id() or 'system'
+        # The card is FOR this user; None lets agent_ui_update fall back to
+        # the resolved owner rather than route to a user named 'system'.
+        _owner = thread_local_data.get_user_id() or None
+        user_id = _owner or 'system'
         display_name = meta.get('display_name') or channel_type
 
         def _emit_qr(qr: str) -> None:
@@ -3683,7 +3703,7 @@ def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
                         "devices → Link a device → scan this code."
                     ),
                     'qr': qr,
-                })
+                }, user_id=_owner)
             except Exception as e:
                 logger.debug("qr_pair emit failed: %s", e)
 
@@ -3758,7 +3778,10 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
     # probes that load this helper before full HARTOS bootstrap).
     _log = _logging.getLogger(__name__)
 
-    user_id = thread_local_data.get_user_id() or 'system'
+    # _owner is who the cards are FOR (None -> agent_ui_update's resolved
+    # owner); user_id keeps its 'system' placeholder for the gateway session.
+    _owner = thread_local_data.get_user_id() or None
+    user_id = _owner or 'system'
     sid = user_id if str(user_id).startswith('user_') else f"user_{user_id}"
     display_name = meta.get('display_name') or channel_type
     icon = meta.get('icon') or channel_type
@@ -3820,7 +3843,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                         # _start_gateway_qr_pair_push with phone bound in
                         # request body.
                         'action': f'/api/social/channels/{channel_type}/connect-pair-code',
-                    },
+                    }, user_id=_owner,
                 )
         except Exception:
             logging.getLogger(__name__).exception("_start_gateway_qr_pair_push: swallowed Exception")
@@ -3922,7 +3945,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                         f"(60-second window).  I've also pushed it "
                         f"to your phone with auto-copy to clipboard."
                     ),
-                },
+                }, user_id=_owner,
             )
     except Exception as e:
         _log.debug("gateway_qr: chat card emit failed: %s", e)
@@ -4041,7 +4064,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                                     'message': (
                                         f"✅ {display_name} connected."
                                     ),
-                                },
+                                }, user_id=_owner,
                             )
                     except Exception:
                         logging.getLogger(__name__).exception("_poll: swallowed Exception")
@@ -4349,8 +4372,8 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                             user_id=int(thread_local_data.get_user_id() or 0),
                             channel_type=channel_type,
                         )
-                        from core.platform.registry import ServiceRegistry
-                        _lui = ServiceRegistry.get('LiquidUIService')
+                        from core.platform.registry import get_registry
+                        _lui = get_registry().get_or_none('LiquidUIService')
                         if _lui:
                             _lui.agent_ui_update(
                                 thread_local_data.get_user_id() or 'system',
@@ -4380,6 +4403,7 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                                     'external_url': meta.get('external_url'),
                                     'cta_label': f"Connect with {meta.get('display_name') or channel_type}",
                                 },
+                                user_id=thread_local_data.get_user_id() or None,
                             )
                             return (
                                 f"To connect {meta.get('display_name') or channel_type}, "
@@ -4403,8 +4427,8 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                 # via the admin Channels page (which shows ALL fields).
                 visible_fields = [f for f in setup_fields if not f.get('auto')]
                 if visible_fields:
-                    from core.platform.registry import ServiceRegistry
-                    _lui = ServiceRegistry.get('LiquidUIService')
+                    from core.platform.registry import get_registry
+                    _lui = get_registry().get_or_none('LiquidUIService')
                     if _lui:
                         _lui.agent_ui_update(
                             thread_local_data.get_user_id() or 'system',
@@ -4437,6 +4461,7 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                                 'submit_label': 'Connect',
                                 'submit_action': 'register_channel',
                             },
+                            user_id=thread_local_data.get_user_id() or None,
                         )
         except Exception as e:
             logger.debug("Connect_Channel: liquid UI emit skipped: %s", e)
@@ -4559,7 +4584,7 @@ def _handle_invite_friend_tool(input_text: str) -> str:
                         ],
                         'submit_label': 'Copy link',
                         'submit_action': 'copy_invite_url',
-                    },
+                    }, user_id=str(uid),
                 )
         except Exception as e:
             logger.debug("Invite_Friend: liquid UI emit skipped: %s", e)
@@ -4643,8 +4668,8 @@ def _handle_join_external_room_tool(input_text: str) -> str:
         if not allowed:
             # Surface a Liquid UI consent card so the user can grant in one click.
             try:
-                from core.platform.registry import ServiceRegistry
-                _lui = ServiceRegistry.get('LiquidUIService')
+                from core.platform.registry import get_registry
+                _lui = get_registry().get_or_none('LiquidUIService')
                 if _lui:
                     # A NOTIFICATION, not an approval card: the gate already
                     # decided, and this only points the owner at where to
@@ -4675,6 +4700,7 @@ def _handle_join_external_room_tool(input_text: str) -> str:
                                  'target': '/social/settings/privacy'},
                             ],
                         },
+                        user_id=str(uid),
                     )
             except Exception as e:
                 logger.debug("Join_External_Room: consent UI emit skipped: %s", e)
@@ -4793,14 +4819,14 @@ def _handle_agentic_router_tool(input_text):
     sets thread-local flags that the /chat handler checks after get_ans() returns.
     """
     try:
-        import concurrent.futures
-        from integrations.agentic_router import build_agentic_plan
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(build_agentic_plan, input_text, PROMPTS_DIR)
-            try:
-                plan = future.result(timeout=15)
-            except concurrent.futures.TimeoutError:
-                return f"I'll help you with: {input_text}. Let me work on this directly."
+        from integrations.agentic_router import build_agentic_plan_bounded
+        # Bounded in agentic_router, on core.subprocess_safe.call_bounded.
+        # This was `with ThreadPoolExecutor(...) as ex: ex.submit(...)
+        # .result(timeout=15)`, whose `with` exit joins the stuck worker, so
+        # the 15 s never released this turn (review F7, 2026-09-27).
+        plan = build_agentic_plan_bounded(input_text, PROMPTS_DIR)
+        if plan is None:
+            return f"I'll help you with: {input_text}. Let me work on this directly."
 
         thread_local_data.set_agentic_routing(
             task_description=plan['task_description'],
@@ -4832,86 +4858,16 @@ def _handle_agentic_router_tool(input_text):
 
 
 def _handle_request_resource(input_text: str) -> str:
-    """Generic runtime resource request — agent calls this when ANY tool needs
-    a missing credential, API key, config value, or permission.
+    """Request_Resource: the agent needs a credential, API key or token.
 
-    The agent provides a JSON string like:
-      {"resource_type": "api_key", "key_name": "GOOGLE_API_KEY",
-       "label": "Google API Key", "used_by": "Google Search tool",
-       "description": "Required for web search"}
-
-    Handler checks the vault first. If the key exists, returns the value
-    (making it available to the agent without the user re-entering it).
-    If not, returns a structured resource_request that the backend injects
-    into the response JSON so the frontend presents a secure input screen.
+    hartos.ai_key_vault.request_credential does the work, for this tool and
+    for core.agent_tools request_resource alike: the owner is asked on the
+    consent card and the agent gets only the {{secret:NAME}} alias.
     """
-    import json as _json
-    try:
-        req = _json.loads(input_text)
-    except (ValueError, TypeError):
-        # Plain-text fallback: agent just described what it needs
-        req = {
-            'resource_type': 'api_key',
-            'key_name': 'UNKNOWN',
-            'label': input_text[:100],
-            'description': input_text,
-            'used_by': 'Agent tool',
-        }
-
-    key_name = req.get('key_name', 'UNKNOWN')
-    resource_type = req.get('resource_type', 'api_key')
-
-    # Check vault first (tool keys + env vars)
-    import os
-    env_val = os.environ.get(key_name)
-    if env_val:
-        return f"Resource '{key_name}' is already configured and available."
-
-    try:
-        from hartos.ai_key_vault import AIKeyVault
-        vault = AIKeyVault.get_instance()
-        if resource_type == 'channel_secret':
-            val = vault.get_channel_secret(
-                req.get('channel_type', ''), key_name)
-        else:
-            val = vault.get_tool_key(key_name)
-        if val:
-            os.environ[key_name] = val  # Make available for current session
-            return f"Resource '{key_name}' loaded from vault and is now available."
-    except Exception:
-        logging.getLogger(__name__).exception("_handle_request_resource: swallowed Exception")
-
-    # Key not found — return a structured request for the frontend
-    # The backend will detect __SECRET_REQUEST__ and inject it into the response
-    # Track as pending so /api/credentials/pending can list it
-    try:
-        from hartos.ai_key_vault import AIKeyVault
-        AIKeyVault.get_instance().add_pending_request(
-            key_name=key_name,
-            resource_type=resource_type,
-            channel_type=req.get('channel_type', ''),
-            label=req.get('label', key_name),
-            description=req.get('description', ''),
-            used_by=req.get('used_by', 'Agent tool'),
-        )
-    except Exception:
-        logging.getLogger(__name__).exception("_handle_request_resource: swallowed Exception")
-
-    secret_request = _json.dumps({
-        '__SECRET_REQUEST__': True,
-        'type': resource_type,
-        'key_name': key_name,
-        'label': req.get('label', key_name),
-        'description': req.get('description', f'{key_name} is required.'),
-        'used_by': req.get('used_by', 'Agent tool'),
-        'channel_type': req.get('channel_type', ''),
-    })
-    return (
-        f"I need the user to provide '{req.get('label', key_name)}'. "
-        f"This is required for {req.get('used_by', 'a tool')}. "
-        f"{req.get('description', '')} "
-        f"RESOURCE_REQUEST:{secret_request}"
-    )
+    from hartos.ai_key_vault import request_credential
+    from integrations.social.consent_service import known_agent_id
+    return request_credential(
+        input_text, agent_id=known_agent_id(thread_local_data.get_prompt_id()))
 
 
 # Module-level cache for the google-search tool list.  Process-wide
@@ -7199,9 +7155,12 @@ def parse_visual_context(inp: str):
         try:
             from integrations.agent_engine.compute_mesh_service import get_compute_mesh
             mesh = get_compute_mesh()
+            # user_id: the person this peer's compute is charged to
+            # (ComputeMeshService._charged).
             result = mesh.offload_to_best_peer(
                 model_type='vision', prompt=prompt_text,
-                options={'image_path': image_path, 'timeout': 60},
+                options={'image_path': image_path, 'timeout': 60,
+                         'user_id': str(user_id or '')},
             )
             if result and 'error' not in result:
                 return result.get('response', str(result))
@@ -8454,8 +8413,10 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
                 try:
+                    from core.prompt_files import proposed_plan_filename
                     _plan_path = os.path.join(
-                        PROMPTS_DIR, f'{prompt_id}.proposed.r{review_rounds}.json')
+                        PROMPTS_DIR,
+                        proposed_plan_filename(prompt_id, review_rounds))
                     os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
                     with open(_plan_path, 'w') as f:
                         json.dump(parsed, f)
@@ -8526,8 +8487,9 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 # feedback) can refine; surface it to the peer reviewer.
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
+                from core.prompt_files import proposed_plan_filename
                 _plan_path = os.path.join(
-                    PROMPTS_DIR, f'{prompt_id}.proposed.json')
+                    PROMPTS_DIR, proposed_plan_filename(prompt_id))
                 try:
                     os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
                     with open(_plan_path, 'w') as f:
@@ -8693,10 +8655,7 @@ def _tune_resonance_after_chat(user_id, prompt_text, response_text):
 
 _tts_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='tts_async')
 
-# --- Language persistence (DRY: one write path) ---
-_HART_LANG_PATH = os.path.join(
-    os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'hart_language.json')
-
+# --- Language persistence (DRY: one write path, core.user_lang) ---
 
 def _persist_language(lang: str) -> bool:
     """Thin shim for backward compatibility.  Real implementation is in
@@ -9500,7 +9459,8 @@ def chat():
         from integrations.social.rate_limiter import _limiter
         # Rate limit by IP always (prevents user_id rotation bypass).
         # Authenticated user_id added as secondary key for per-user tracking.
-        rate_user = request.remote_addr
+        from core.auth_local import client_key as _client_key
+        rate_user = _client_key()
         if not _limiter.check(str(rate_user), 'chat', max_tokens=30, refill_rate=30 / 60):
             return jsonify({'error': 'Rate limit exceeded (30/min). Please wait.', 'response': None}), 429
     except ImportError:
@@ -9828,6 +9788,13 @@ def chat():
             prompt, _redacted_count = redact_secrets(prompt)
         except ImportError:
             logging.getLogger(__name__).debug("chat: swallowed ImportError")
+    # The prompt as the two gates above left it.  Later branches rewrite
+    # `prompt` for one consumer (gather_info gets the cloud record or the
+    # wrap-up instruction appended) and then restore the turn's text; they
+    # restore THIS, never data['prompt'], which would undo both gates.
+    # Measured in the review of 8c9abe070: the gather path re-read the raw
+    # body, so a user's 'sk-...' reached gather_info's LLM and the mirror.
+    _guarded_prompt = prompt
 
     # BUDGET GATE: estimate and log LLM cost before execution
     if prompt:
@@ -10321,7 +10288,16 @@ def chat():
             with _user_lock:
                 review_agents[_ak] = False
                 _touch_agent_timestamp(_ak)
-            prompt = data.get('prompt', None)
+            prompt = _guarded_prompt
+            # The words the user sent this turn, for _chat_reply's user_prompt:
+            # it records the user side (conversation mirror, SimpleMem, the
+            # MemoryGraph) only when given one, and every gather exit below
+            # left it out, so creation turns were stored as assistant-only
+            # (live GR7).  Taken HERE because `prompt` is rewritten below for
+            # gather_info (cloud name/goal appended on the first turn, the
+            # wrap-up instruction on the last), and neither is what the user
+            # said.  tests/unit/test_gather_turn_mirrors_user_side.py
+            _user_turn_text = prompt
             if prompt_id not in first_promts:
                 first_promts.append(prompt_id)
                 try:
@@ -10527,6 +10503,7 @@ def chat():
                         intent=['FINAL_ANSWER'],
                         req_token_count=0, res_token_count=0, history_request_id=[],
                         Agent_status='Creation Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
                     )
                 else:
                     # Completed (or forced completion after max turns)
@@ -10542,6 +10519,7 @@ def chat():
                             intent=['FINAL_ANSWER'],
                             req_token_count=0, res_token_count=0, history_request_id=[],
                             Agent_status='Creation Mode', prompt_id=prompt_id,
+                            user_prompt=_user_turn_text,
                         )
                     app.logger.info('COMPLETED STATUS')
                     _save_and_enter_review(new_res)
@@ -10552,6 +10530,7 @@ def chat():
                         intent=['FINAL_ANSWER'],
                         req_token_count=0, res_token_count=0, history_request_id=[],
                         Agent_status='Review Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
                     )
 
             except Exception as e:
@@ -10593,6 +10572,7 @@ def chat():
                         intent=['FINAL_ANSWER'],
                         req_token_count=0, res_token_count=0, history_request_id=[],
                         Agent_status='Review Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
                     )
                 _record_lifecycle('Creation Mode', user_id, prompt_id, f'Creation continuing after parse error: {e}')
                 return _chat_reply(
@@ -10600,6 +10580,7 @@ def chat():
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0, history_request_id=[],
                     Agent_status='Creation Mode', prompt_id=prompt_id,
+                    user_prompt=_user_turn_text,
                 )
         # Phase 2: Review Phase (re-snapshot flags under lock after Phase 1 may have mutated)
         with _user_lock:
@@ -10859,7 +10840,9 @@ def chat():
     thread_local_data.set_global_intent(global_intent=req_tool)
     thread_local_data.set_prompt_id(prompt_id)
 
-    prompt = data.get('prompt', None)
+    # The guarded text again: the create branch above may have rewritten
+    # `prompt` for gather_info (see _guarded_prompt).
+    prompt = _guarded_prompt
     if probe:
         prompt = ''
 
@@ -11124,9 +11107,10 @@ def vlm_stop():
     )
 
     if data.get('scope') == 'node':
+        from core.auth_local import client_key as _client_key
         if not _is_local_request():
             app.logger.warning(f'vlm_stop: node-wide stop refused for '
-                               f'{request.remote_addr}: not on this machine')
+                               f'{_client_key()}: not on this machine')
             return jsonify({
                 'error': 'forbidden',
                 'message': 'scope=node is only accepted from this machine.',
@@ -11135,7 +11119,7 @@ def vlm_stop():
                    for uid, pid in list_active_sessions()
                    if request_stop(uid, pid)]
         app.logger.warning(f'vlm_stop: node-wide stop from '
-                           f'{request.remote_addr}: {len(stopped)} loop(s) '
+                           f'{_client_key()}: {len(stopped)} loop(s) '
                            f'{stopped}')
         return jsonify({
             'status': 'stopped' if stopped else 'no_active_session',
@@ -11629,41 +11613,37 @@ def get_prompts():
 
     prompts = []
 
-    # 1. Read from local prompts/*.json files
-    if os.path.isdir(PROMPTS_DIR):
-        for fname in os.listdir(PROMPTS_DIR):
-            if fname.endswith('.json') and '_' not in fname:
-                try:
-                    fpath = os.path.join(PROMPTS_DIR, fname)
-                    with open(fpath, 'r') as f:
-                        data = json.load(f)
-                    pid = fname.replace('.json', '')
-                    creator = str(data.get('creator_user_id', ''))
-                    if creator == str(req_user_id) or not creator:
-                        prompts.append({
-                            'prompt_id': pid,
-                            'name': data.get('name', ''),
-                            'prompt': data.get('goal', ''),
-                            'agent_name': data.get('agent_name', ''),
-                            'is_active': data.get('status', '') == 'completed',
-                            'user_id': creator or req_user_id,
-                            'has_recipe': os.path.exists(
-                                os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
-                            'flow_count': len(data.get('flows', [])),
-                            'source': 'local',
-                            # Media passthrough — /prompts/public already
-                            # exposes image_url; the user-scoped list dropped
-                            # it, so /local agents rendered an empty video
-                            # column (no idle fallback portrait). fillers is
-                            # future-proofing: local agents have none today
-                            # (cloud-agent feature), but if cloud-sync ever
-                            # writes them locally, idle videos light up with
-                            # no further code change.
-                            'image_url': data.get('image_url', ''),
-                            'fillers': data.get('fillers') or [],
-                        })
-                except Exception:
-                    continue
+    # 1. Local agent records (core.prompt_files: agents only, never the plans
+    # the CREATE path stages beside them for review)
+    from core.prompt_files import local_agent_prompts
+    for pid, data in local_agent_prompts(PROMPTS_DIR):
+        try:
+            creator = str(data.get('creator_user_id', ''))
+            if creator == str(req_user_id) or not creator:
+                prompts.append({
+                    'prompt_id': pid,
+                    'name': data.get('name', ''),
+                    'prompt': data.get('goal', ''),
+                    'agent_name': data.get('agent_name', ''),
+                    'is_active': data.get('status', '') == 'completed',
+                    'user_id': creator or req_user_id,
+                    'has_recipe': os.path.exists(
+                        os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
+                    'flow_count': len(data.get('flows', [])),
+                    'source': 'local',
+                    # Media passthrough — /prompts/public already
+                    # exposes image_url; the user-scoped list dropped
+                    # it, so /local agents rendered an empty video
+                    # column (no idle fallback portrait). fillers is
+                    # future-proofing: local agents have none today
+                    # (cloud-agent feature), but if cloud-sync ever
+                    # writes them locally, idle videos light up with
+                    # no further code change.
+                    'image_url': data.get('image_url', ''),
+                    'fillers': data.get('fillers') or [],
+                })
+        except Exception as e:
+            app.logger.debug(f'/prompts: skipped local agent {pid}: {e}')
 
     # 2. Merge in cloud-only agents the user owns on hevolve.ai —
     # the local store doesn't know about agents the user created from
@@ -11686,33 +11666,29 @@ def get_public_prompts():
     Equivalent to the legacy /getprompt_all/ cloud endpoint."""
     prompts = []
 
-    # 1. Read ALL prompts from local files (no user filter)
-    if os.path.isdir(PROMPTS_DIR):
-        for fname in os.listdir(PROMPTS_DIR):
-            if fname.endswith('.json') and '_' not in fname:
-                try:
-                    fpath = os.path.join(PROMPTS_DIR, fname)
-                    with open(fpath, 'r') as f:
-                        data = json.load(f)
-                    pid = fname.replace('.json', '')
-                    prompts.append({
-                        'prompt_id': pid,
-                        'name': data.get('name', ''),
-                        'prompt': data.get('goal', ''),
-                        'agent_name': data.get('agent_name', ''),
-                        'is_active': data.get('status', '') == 'completed',
-                        'is_public': True,
-                        'user_id': data.get('creator_user_id', ''),
-                        'teacher_image_url': data.get('teacher_image_url', ''),
-                        'image_url': data.get('image_url', ''),
-                        'video_text': data.get('video_text', ''),
-                        'has_recipe': os.path.exists(
-                            os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
-                        'flow_count': len(data.get('flows', [])),
-                        'source': 'local',
-                    })
-                except Exception:
-                    continue
+    # 1. ALL local agent records, no user filter (core.prompt_files: agents
+    # only, never the plans the CREATE path stages beside them for review)
+    from core.prompt_files import local_agent_prompts
+    for pid, data in local_agent_prompts(PROMPTS_DIR):
+        try:
+            prompts.append({
+                'prompt_id': pid,
+                'name': data.get('name', ''),
+                'prompt': data.get('goal', ''),
+                'agent_name': data.get('agent_name', ''),
+                'is_active': data.get('status', '') == 'completed',
+                'is_public': True,
+                'user_id': data.get('creator_user_id', ''),
+                'teacher_image_url': data.get('teacher_image_url', ''),
+                'image_url': data.get('image_url', ''),
+                'video_text': data.get('video_text', ''),
+                'has_recipe': os.path.exists(
+                    os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
+                'flow_count': len(data.get('flows', [])),
+                'source': 'local',
+            })
+        except Exception as e:
+            app.logger.debug(f'/prompts/public: skipped local agent {pid}: {e}')
 
     # 2. Merge in cloud-only public agents.  Same central-vs-local-DB_URL
     # rationale as /prompts above — DB_URL is localhost in bundled mode
@@ -13492,11 +13468,8 @@ def _validate_startup():
     if _db_p and _db_p != ':memory:' and os.path.isabs(_db_p):
         db_dir = os.path.join(os.path.dirname(_db_p), 'agent_data')
     elif os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-        try:
-            from core.platform_paths import get_agent_data_dir as _get_ad_dir
-            db_dir = _get_ad_dir()
-        except ImportError:
-            db_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+        from core.platform_paths import get_agent_data_dir as _get_ad_dir
+        db_dir = _get_ad_dir()
     else:
         db_dir = os.path.join(os.path.dirname(__file__), 'agent_data')
     if not os.path.isdir(db_dir):

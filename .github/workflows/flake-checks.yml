@@ -199,6 +199,12 @@ jobs:
           pip install pytest pytest-asyncio pytest-timeout
           pip install grep-ast tree-sitter tree-sitter-language-pack 2>/dev/null || true
           python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True)" 2>/dev/null || true
+          # autogen's MessageTokenLimiter (via helper.TokenLimiter) calls
+          # tiktoken.encoding_for_model, which downloads the cl100k_base BPE
+          # file on first use. test_create_loop_end_to_end.py refuses all
+          # network, so on a fresh runner that download fails every CREATE
+          # turn. Warm the cache here, like the nltk data above.
+          python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
 
       - name: Run unit + functional tests
         env:

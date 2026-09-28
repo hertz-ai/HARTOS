@@ -34,6 +34,7 @@ transform_messages = lazy_module(
 transforms = lazy_module(
     "autogen.agentchat.contrib.capabilities.transforms")
 import json
+import math
 from flask import current_app
 from typing import List, Dict, Tuple, Annotated, Set, FrozenSet, Any
 import pickle
@@ -168,17 +169,8 @@ async def async_main(urls):
 # Recipe SAVE dir — the SINGLE deployment-aware resolver shared with the REUSE
 # read (cache_loaders) and the daemon reuse-CHECK, so a recipe is written, read,
 # and checked in the SAME folder in bundled / Docker / dev (no extra env).
-try:
-    from core.platform_paths import get_recipe_prompts_dir
-    PROMPTS_DIR = os.path.abspath(get_recipe_prompts_dir())
-except Exception:
-    # Fallback mirrors get_recipe_prompts_dir: bundled (read-only install) → user
-    # data dir; Docker & dev → code-relative prompts/.
-    if getattr(sys, 'frozen', False) or os.environ.get('NUNBA_BUNDLED'):
-        PROMPTS_DIR = os.path.abspath(os.path.join(
-            os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
-    else:
-        PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
+from core.platform_paths import get_recipe_prompts_dir
+PROMPTS_DIR = os.path.abspath(get_recipe_prompts_dir())
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 
 
@@ -989,6 +981,239 @@ def retrieve_json(json_message):
         return json_obj
 
 
+# ─── Wire-strict JSON ────────────────────────────────────────────────────
+# Python's json.loads is laxer than llama.cpp's parser (nlohmann): it reads
+# NaN / Infinity / -Infinity, and turns a number too big for a double into
+# inf (json.loads('{"v":620e51403072992921}') == {'v': inf}).  nlohmann
+# refuses all of these ("out_of_range.406 number overflow").  Live 2026-09-25:
+# a banked step's unquoted hex user id passed the TOOL-ARGS-GUARD for that
+# reason and llama.cpp answered 500 on every later request of the chat.
+# The same holds for a lone UTF-16 surrogate escape ("\ud800" with no low
+# half): json.loads keeps it as a character, nlohmann answers 500 "invalid
+# string: surrogate U+D800..U+DBFF must be followed by U+DC00..U+DFFF"
+# (measured on :8080 by the review of bb809af28).  json.loads joins an
+# escaped PAIR into one character, so what this pattern finds after a parse
+# is lone; the lookarounds leave a pair of raw surrogate characters alone.
+_LONE_SURROGATE = re.compile(
+    r'[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]')
+
+
+class WireKeyCollision(ValueError):
+    """Two keys of one object would become the same key once each lone
+    surrogate is replaced by U+FFFD (see _wire_json_loads)."""
+
+
+def _wire_json_loads(text, on_refused):
+    """json.loads where every token a strict parser refuses goes to on_refused:
+    a non-finite number or NaN/Infinity constant as its text, a lone
+    surrogate as its one character."""
+    def number(parse):
+        def hook(token):
+            return parse(token) if math.isfinite(float(token)) else on_refused(token)
+        return hook
+
+    def strings(value):
+        if isinstance(value, str):
+            return _LONE_SURROGATE.sub(lambda m: on_refused(m.group()), value)
+        if isinstance(value, list):
+            return [strings(v) for v in value]
+        if isinstance(value, dict):
+            out = {strings(k): strings(v) for k, v in value.items()}
+            if len(out) < len(value):
+                # Two keys became one: a lone surrogate replaced by U+FFFD
+                # met another key that now reads the same, and the dict kept
+                # only one of the two arguments.  Review of b0fa4989e, probed:
+                # {"\ud800":1,"\udc00":2} came back as one key, U+FFFD,
+                # holding 2.
+                raise WireKeyCollision("keys collide once lone surrogates "
+                                       "are replaced: " + repr(list(value)))
+            return out
+        return value
+
+    return strings(json.loads(text, parse_float=number(float),
+                              parse_int=number(int), parse_constant=on_refused))
+
+
+def _refuse_token(token):
+    raise ValueError(f"not valid for a strict JSON parser: {token!r}")
+
+
+def _keep_refused_token(token):
+    """A refused number or constant keeps its text; a lone surrogate, which
+    has no text a strict parser accepts, becomes U+FFFD."""
+    return '\ufffd' if _LONE_SURROGATE.fullmatch(token) else token
+
+
+def is_wire_json(text):
+    """True when ``text`` parses as JSON and holds none of the tokens that
+    Python's ``json.loads`` accepts but llama.cpp's parser (nlohmann) refuses:
+    NaN / Infinity / -Infinity, a number that overflows a double, a lone
+    UTF-16 surrogate.  It is not a full nlohmann conformance check: it covers
+    the laxities of json.loads that are known to reach the wire."""
+    try:
+        _wire_json_loads(text, _refuse_token)
+        return True
+    except Exception:
+        return False
+
+
+def load_wire_json(text):
+    """Parse ``text``, keeping each token a strict parser refuses as its own
+    string: an unquoted id ``620e51403072992921`` comes back as
+    ``"620e51403072992921"``, never ``inf``; a lone surrogate becomes U+FFFD.
+    Raises like ``json.loads``, and ValueError when that replacement would
+    turn two keys of one object into the same key (one argument would be
+    lost without a trace)."""
+    return _wire_json_loads(text, _keep_refused_token)
+
+
+# A bare number token, and the string delimiters json_repair reads (its
+# constants.STRING_DELIMITERS: " ' and the curly pair), each with its closer.
+_BARE_NUMBER = re.compile(r'-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?')
+_STRING_CLOSER = {'"': '"', "'": "'", '“': '”', '”': '”'}
+# What a bare token is made of: a number with one of these next to it is
+# part of a longer token (a UUID, a word, a path), never a number of its own.
+_TOKEN_CHARS = '_.-+'
+# Where a comment may open: after whitespace or ``{ [ ,`` -- not inside an
+# unquoted value, and not after ':', which the '//' of a URL follows.
+_BEFORE_A_COMMENT = '{[,'
+
+
+_NON_FINITE_WORDS = ('Infinity', '-Infinity', 'NaN')
+
+
+def _invents_a_constant(value, original):
+    """True when ``value`` holds Infinity / NaN (as a number or as the string
+    load_wire_json keeps it as) that ``original`` never contains: repair_json
+    writing Infinity for a number it could not hold.  Such a repair is
+    refused, never sent -- the model did not write that value (review of
+    3ea611862)."""
+    if isinstance(value, dict):
+        return any(_invents_a_constant(k, original)
+                   or _invents_a_constant(v, original) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_invents_a_constant(v, original) for v in value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return True
+    return (isinstance(value, str) and value in _NON_FINITE_WORDS
+            and value not in str(original))
+
+
+def _joins_a_token(ch):
+    """True when ``ch`` next to a number makes it part of a longer token."""
+    return ch.isalnum() or ch in _TOKEN_CHARS
+
+
+def _quote_overflowing_numbers(text):
+    """``text`` with every bare number a double cannot hold put in double
+    quotes, for ``repair_json``: it reads such a number as inf and writes
+    Infinity, so the token the model wrote (an unquoted id like
+    ``620e51403072992921``) would be lost before ``load_wire_json`` sees it.
+    Text inside a string literal or a comment, and finite numbers, are left
+    as they are; a string or comment that never closes swallows the rest,
+    which is then left as it was.
+
+    Only a WHOLE token is quoted: one with no letter, digit or ``_ . - +``
+    on either side (_joins_a_token).  Review of ed31c7c53, probed: reading
+    '-' and '+' as delimiters turned an unquoted UUID ``550e8400-e29b-...``
+    into ``"550e8400"`` and lost the rest.  Review of 3ea611862: a list of
+    allowed neighbours (``, } ] :``) left a number before a quote, ``)`` or
+    ``;`` unquoted, and repair_json then wrote Infinity; and a comment is
+    opened only where one can start (_BEFORE_A_COMMENT), since the ``//``
+    of an unquoted URL is not one."""
+    out, i, closer = [], 0, None
+    while i < len(text):
+        ch = text[i]
+        if closer:
+            if closer in ('*/', '\n'):
+                end = text.find(closer, i)
+                end = len(text) if end < 0 else end + len(closer)
+                out.append(text[i:end])
+                i, closer = end, None
+                continue
+            step = 2 if ch == '\\' else 1
+            out.append(text[i:i + step])
+            if ch == closer:
+                closer = None
+            i += step
+            continue
+        if ch in _STRING_CLOSER:
+            closer = _STRING_CLOSER[ch]
+            out.append(ch)
+            i += 1
+            continue
+        if ((text.startswith('/*', i) or text.startswith('//', i))
+                and (i == 0 or text[i - 1].isspace()
+                     or text[i - 1] in _BEFORE_A_COMMENT)):
+            closer = '*/' if text[i + 1] == '*' else '\n'
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        match = _BARE_NUMBER.match(text, i)
+        if match and not (i and _joins_a_token(text[i - 1])):
+            token, end = match.group(), match.end()
+            if end == len(text) or not _joins_a_token(text[end]):
+                out.append(json.dumps(token)
+                           if not math.isfinite(float(token)) else token)
+                i = end
+                continue
+            # Part of a longer token (a UUID, a word): copy the whole run
+            # so no later position inside it is read as a number.
+            run_end = end
+            while run_end < len(text) and _joins_a_token(text[run_end]):
+                run_end += 1
+            out.append(text[i:run_end])
+            i = run_end
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+# The two keys of a refused call's stand-in arguments (see
+# refused_arguments_json).  A stand-in is never run: tool_argument_error
+# refuses any arguments carrying REFUSED_ARGUMENTS_KEY, including for a tool
+# that takes **kwargs and would otherwise bind any names (review of
+# cd8d9154d, M3: clawhub_adapter, MCP tool_executor).
+REFUSED_ARGUMENTS_KEY = 'refused_arguments'
+REFUSED_BECAUSE_KEY = 'refused_because'
+
+
+def refused_arguments_reason(text):
+    """Why ``text`` cannot be sent as a call's arguments, in one sentence.
+
+    For text the guard could not turn into an object: it is invalid JSON,
+    two of its keys collide, or it parses to something that is not an
+    object (an object would have been kept, so that is the only other
+    case)."""
+    try:
+        load_wire_json(text)
+    except WireKeyCollision:
+        return ('two of its keys differ only in an invalid character and '
+                'would become one key')
+    except Exception:
+        return 'it is not valid JSON'
+    return 'it is not one JSON object of named values'
+
+
+def refused_arguments_json(text):
+    """A strict JSON object standing in for arguments that cannot be sent:
+    the text the model wrote, marked refused, and why.
+
+    The wire needs an object (llama.cpp 500s on anything else), but ``{}``
+    erased what the model sent, so its next turn could neither see nor fix
+    its own call (review of 86e580b99).  A lone surrogate in the text becomes
+    U+FFFD, the one change needed for llama.cpp to accept it."""
+    shown = _LONE_SURROGATE.sub(chr(0xFFFD), text)
+    return json.dumps({
+        REFUSED_ARGUMENTS_KEY: shown,
+        REFUSED_BECAUSE_KEY: ('these arguments were refused and the call was '
+                              'not run: ' + refused_arguments_reason(text)
+                              + '. Call it again with one JSON object of '
+                              'named values.'),
+    })
+
+
 def ensure_tool_call_arguments_json(messages):
     """Coerce every tool_call / function_call ``arguments`` field to a valid
     JSON-object string, in place, and return the same list.
@@ -1010,11 +1235,25 @@ def ensure_tool_call_arguments_json(messages):
     the OpenAI/autogen contract ("arguments is a JSON string") rather than any
     engine-specific error text — so it stays engine-neutral.
 
-    Coercion per malformed call: keep it if ``json.loads`` already succeeds;
-    else ``repair_json`` and keep the repaired text only if it parses to a
-    dict; else fall back to ``"{}"`` — a well-formed empty-args call.  The
-    executor then reports a missing argument and the model re-steers, which is
-    strictly better than a 500 that aborts the entire turn.
+    Coercion per malformed call: keep it if it is already a JSON OBJECT a
+    STRICT parser accepts (``is_wire_json``'s test -- Python's ``json.loads`` alone is not
+    that test: it reads an overflowing number as inf and accepts NaN and a
+    lone surrogate escape, all of which llama.cpp refuses with a 500); else
+    parse it, or its ``repair_json`` repair, with ``load_wire_json``, which
+    keeps each refused number as its own string and turns a lone surrogate
+    into U+FFFD (refusing, rather than merging, two keys that replacement
+    would make one), and keep the result only if it is a dict; else replace
+    it with :func:`refused_arguments_json` -- a well-formed object that keeps
+    what the model wrote, marked refused, with the reason, so its next turn
+    can see and correct its own call (it used to be ``"{}"``, which erased
+    it: review of 86e580b99).  ``None`` arguments, where nothing was written,
+    still become ``"{}"``.
+
+    This guard has no tool signatures, so its repair cannot tell a benign fix
+    (a trailing comma) from json_repair splitting an unquoted value into
+    keys.  The executor can: a call it refused as broken JSON is already
+    marked refused in the conversation (bind_tool_call_arguments, ``call``),
+    and a strict JSON object is kept here as it is.
     """
     if not messages:
         return messages
@@ -1032,9 +1271,13 @@ def ensure_tool_call_arguments_json(messages):
             args = fn.get('arguments')
             if isinstance(args, dict):
                 # Some code paths store the arguments as an object already —
-                # the wire wants a string, so serialize (never a 500 risk).
-                fn['arguments'] = json.dumps(args)
-                continue
+                # the wire wants a string, so serialize.  A float inf / nan in
+                # it serializes as Infinity / NaN, so it is checked below
+                # like any other string.
+                args = json.dumps(args)
+                if is_wire_json(args):
+                    fn['arguments'] = args
+                    continue
             if args is None:
                 fn['arguments'] = '{}'
                 coerced += 1
@@ -1042,19 +1285,32 @@ def ensure_tool_call_arguments_json(messages):
             if not isinstance(args, str):
                 args = str(args)
             try:
-                json.loads(args)
-                continue  # already valid JSON — leave untouched
+                is_object = isinstance(_wire_json_loads(args, _refuse_token),
+                                       dict)
             except Exception:
-                pass
-            fixed = '{}'
-            try:
-                repaired = repair_json(args)
-                obj = (repaired if isinstance(repaired, (dict, list))
-                       else json.loads(repaired))
-                if isinstance(obj, dict):
+                is_object = False
+            if is_object:
+                # Already a strict JSON object: leave untouched.  Strict JSON
+                # that is not an object ('[1,2]', '"hello"') is not arguments:
+                # the llama.cpp template reads arguments only as a mapping,
+                # so a prior call with '[{"url": ...}]' rendered with no
+                # parameters at all (measured on :8080, review of b0fa4989e).
+                continue
+            fixed = None
+            # The original text first; before repair, each overflowing
+            # number is quoted, since repair_json itself would turn it into
+            # Infinity and lose the token.
+            for candidate in (lambda: args, lambda: repair_json(
+                    _quote_overflowing_numbers(args))):
+                try:
+                    obj = load_wire_json(candidate())
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and not _invents_a_constant(obj, args):
                     fixed = json.dumps(obj)
-            except Exception:
-                fixed = '{}'
+                    break
+            if fixed is None:
+                fixed = refused_arguments_json(args)
             fn['arguments'] = fixed
             coerced += 1
     if coerced:
@@ -1150,6 +1406,58 @@ def _context_limiter_classes():
                   f"result and would have dropped the newest message "
                   f"(role={newest.get('role')}, name={newest.get('name')}); kept it")
 
+    def same_message(kept_msg, original):
+        # The history limiter keeps the caller's dicts; the token limiter
+        # keeps deep copies whose content it may have cut from the tail
+        # (autogen's cut keeps the head).  So: the same dict, or the same
+        # speaker and call id with the kept content a head of the original.
+        if kept_msg is original:
+            return True
+        if not isinstance(kept_msg, dict) or not isinstance(original, dict):
+            return False
+        if any(kept_msg.get(k) != original.get(k)
+               for k in ('role', 'name', 'tool_call_id')):
+            return False
+        a, b = kept_msg.get('content'), original.get('content')
+        if isinstance(a, str) and isinstance(b, str):
+            return b.startswith(a[:200])
+        return a == b
+
+    def restore_protected(which, messages, kept, bound=None):
+        # Put back every message of the ONE protected set
+        # (core.llm_outbound_logger.protected_messages, which the wire trim
+        # never drops either) that autogen's window left out.  Live
+        # 2026-09-27, REUSE probe liveprobe_reuse_1: 99 of 113
+        # ToolMessageHandler inputs held no message from User -- the token
+        # limiter keeps the newest ~2500 tokens and the task turn is the
+        # oldest message -- so the user's words reached 4 of 77 LLM calls.
+        # Each goes back in its place (before the first kept message that is
+        # newer), cut by ``bound`` like any other message.
+        from core.llm_outbound_logger import protected_messages
+        if kept is messages:
+            return kept
+        missing = [p for p in protected_messages(messages)
+                   if not any(same_message(k, p) for k in kept)]
+        if not missing:
+            return kept
+        kept = list(kept)
+
+        def original_index(k):
+            return next((i for i in range(len(messages) - 1, -1, -1)
+                         if same_message(k, messages[i])), len(messages))
+
+        for p in sorted(missing, key=lambda m: next(
+                i for i, x in enumerate(messages) if x is m)):
+            p_idx = next(i for i, x in enumerate(messages) if x is p)
+            at = next((j for j, k in enumerate(kept)
+                       if original_index(k) > p_idx), len(kept))
+            kept.insert(at, bound(p) if bound else p)
+            _safe_log('info',
+                      f"[PROTECTED-KEPT] autogen {which} dropped a protected "
+                      f"message (role={p.get('role')}, name={p.get('name')}); "
+                      f"put it back at {at}")
+        return kept
+
     class HistoryLimiter(transforms.MessageHistoryLimiter):
         def apply_transform(self, messages):
             kept = super().apply_transform(messages)
@@ -1160,7 +1468,7 @@ def _context_limiter_classes():
                 # in -- so the message it popped is exactly this one.
                 kept.append(newest)
                 note('MessageHistoryLimiter', newest)
-            return kept
+            return restore_protected('MessageHistoryLimiter', messages, kept)
 
     class TokenLimiter(transforms.MessageTokenLimiter):
         def apply_transform(self, messages):
@@ -1169,17 +1477,51 @@ def _context_limiter_classes():
                 # autogen cuts the newest message first, with nothing yet
                 # counted against the budget: to max_tokens_per_message, or to
                 # max_tokens when that is smaller.  Give it the same cut.
-                newest = dict(messages[-1])
-                util = transforms.transforms_util
-                if (util.is_content_right_type(newest.get('content'))
-                        and util.should_transform_message(
-                            newest, self._filter_dict, self._exclude_filter)):
-                    newest['content'] = self._truncate_str_to_tokens(
-                        newest['content'],
-                        min(self._max_tokens, self._max_tokens_per_message))
+                newest = self._bound_message(messages[-1])
                 kept.append(newest)
                 note('MessageTokenLimiter', newest)
+            kept = restore_protected('MessageTokenLimiter', messages, kept,
+                                     bound=self._bound_message)
             return [self._bound_tool_responses(m) for m in kept]
+
+        def _truncate_tokens(self, text, n_tokens):
+            # autogen keeps a message's first n tokens.  A REUSE dispatch
+            # turn keeps its marker and the user's words whole instead and
+            # loses only steps -- the rule the wire trim applies
+            # (core.llm_outbound_logger.must_keep_head).  Review of
+            # f97b6bed8: words over the 1,000-token per-message cap were cut
+            # here first, the "follow these steps:" boundary with them.
+            from core.llm_outbound_logger import keep_head_cut, must_keep_head
+            from core.constants import WIRE_TRIM_MARKER
+            keep = must_keep_head(text)
+            if not keep:
+                return super()._truncate_tokens(text, n_tokens)
+            util = transforms.transforms_util
+            if util.count_text_tokens(text) <= n_tokens:
+                return text
+            room = (n_tokens - util.count_text_tokens(text[:keep])
+                    - util.count_text_tokens(WIRE_TRIM_MARKER))
+            rest = text[keep:]
+            tail = ''
+            if room > 0 and rest:
+                tail = rest[-max(1, int(len(rest) * room
+                                        / max(1, util.count_text_tokens(rest))
+                                        * 0.9)):]
+            return keep_head_cut(text, keep, len(tail), WIRE_TRIM_MARKER)
+
+        def _bound_message(self, msg):
+            # The per-message cut autogen gives every message it keeps (head
+            # kept), for a message put back by restore_protected.  A copy:
+            # the original is the group chat's own.
+            msg = dict(msg)
+            util = transforms.transforms_util
+            if (util.is_content_right_type(msg.get('content'))
+                    and util.should_transform_message(
+                        msg, self._filter_dict, self._exclude_filter)):
+                msg['content'] = self._truncate_str_to_tokens(
+                    msg['content'],
+                    min(self._max_tokens, self._max_tokens_per_message))
+            return msg
 
         def _bound_tool_responses(self, msg):
             # autogen cuts a message's 'content' and never reads
@@ -3240,12 +3582,17 @@ def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
     """Save a conversation turn to the database via the conversation API.
 
     Canonical implementation — create_recipe.py and reuse_recipe.py delegate here.
+
+    user_id goes out as given: a desktop user's id is a UUID string (the
+    bundled /conversation route stores it as is), and a cloud user's integer
+    id stays an integer.  int(user_id) here failed every Generate_video
+    avatar call for UUID users before anything was sent.
     """
     headers = {'Content-Type': 'application/json'}
     data = {
         "request": 'VIDEO GENERATION FROM GENERATE_VIDEO',
         "response": text.strip(),
-        "user_id": int(user_id),
+        "user_id": user_id,
         "conv_bot_name": 'GPT-4o',
         "topic": f'{prompt_id}',
         "revision": False,
@@ -3396,11 +3743,8 @@ def _resolve_agent_data_dir():
     # Bundled/frozen mode: use writable user directory (Program Files is read-only)
     from core.config_cache import is_bundled as _is_bundled_check
     if _is_bundled_check():
-        try:
-            from core.platform_paths import get_agent_data_dir
-            return get_agent_data_dir()
-        except ImportError:
-            return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+        from core.platform_paths import get_agent_data_dir
+        return get_agent_data_dir()
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'agent_data')
 
 AGENT_DATA_DIR = _resolve_agent_data_dir()
@@ -3409,11 +3753,8 @@ try:
         os.makedirs(AGENT_DATA_DIR, exist_ok=True)
 except PermissionError:
     # Fallback: user home directory (e.g. bundled app in Program Files)
-    try:
-        from core.platform_paths import get_agent_data_dir as _get_agent_fallback
-        AGENT_DATA_DIR = _get_agent_fallback()
-    except ImportError:
-        AGENT_DATA_DIR = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+    from core.platform_paths import get_agent_data_dir as _get_agent_fallback
+    AGENT_DATA_DIR = _get_agent_fallback()
     os.makedirs(AGENT_DATA_DIR, exist_ok=True)
     logging.getLogger(__name__).warning(f"agent_data dir redirected to {AGENT_DATA_DIR} (install dir not writable)")
 
@@ -3697,8 +4038,46 @@ def get_agent_data_info(prompt_id: int) -> Dict[str, Any]:
 # ========================================================================================
 # AUTOGEN JSON HANDLING ENHANCEMENT
 # ========================================================================================
+def tool_call_shape(arguments):
+    """``(args, kwargs)`` a tool is called with for parsed ``arguments``.
+
+    THE one rule for turning parsed tool-call arguments into a call, read by
+    safe_function_call (which makes the call), the async executor (which
+    awaits a coroutine tool with it) and tool_argument_error (which binds it
+    to the signature first), so the checked call is the call that runs:
+
+      * a dict                      -> ``func(**dict)``
+      * a list whose head is a dict -> ``func(**list[0])`` (retrieve_json
+        often wraps the object in a list; the rest of the list is ignored)
+      * any other list              -> ``func(*list)``
+      * anything else               -> ``func(arguments)``
+    """
+    if isinstance(arguments, dict):
+        return (), arguments
+    if isinstance(arguments, list):
+        if arguments and isinstance(arguments[0], dict):
+            return (), arguments[0]
+        return tuple(arguments), {}
+    return (arguments,), {}
+
+
+def remapped_positional_kwargs(func, arguments):
+    """safe_function_call's recovery for a positional list that did not bind:
+    drop ``['truncated']`` sentinels and name the rest after the signature's
+    parameters, in order.  The kwargs, or None when that does not apply."""
+    if not isinstance(arguments, list) or not hasattr(func, '__annotations__'):
+        return None
+    import inspect
+    param_names = list(inspect.signature(func).parameters.keys())
+    clean_args = [arg for arg in arguments if
+                  not (isinstance(arg, list) and len(arg) == 1 and arg[0] == 'truncated')]
+    if len(clean_args) > len(param_names):
+        return None
+    return dict(zip(param_names, clean_args))
+
+
 def safe_function_call(func, arguments):
-    """Fixed version that handles list with dict properly"""
+    """Call a tool with parsed arguments, shaped by :func:`tool_call_shape`."""
     import logging
 
     logger = logging.getLogger("safe_function_call")
@@ -3709,73 +4088,30 @@ def safe_function_call(func, arguments):
     logger.info(f"   Arguments content: {arguments}")
 
     try:
-        # Try original AutoGen approach first
-        if isinstance(arguments, dict):
-            logger.info("   → Using **kwargs approach")
-            result = func(**arguments)
-            logger.info("    Success with **kwargs")
-            return result
-
-        # Handle list case - FIXED LOGIC
-        elif isinstance(arguments, list):
-            logger.info("   → Analyzing list content")
-
-            # Check if first item is a dict (common pattern from retrieve_json)
-            if len(arguments) >= 1 and isinstance(arguments[0], dict):
-                # The first item is the actual arguments dict
-                actual_args = arguments[0]
-                logger.info(f"   → Found dict in list[0]: {actual_args}")
-                logger.info("   → Using **kwargs approach on extracted dict")
-                result = func(**actual_args)
-                logger.info("    Success with **kwargs from list")
-                return result
-            else:
-                # Fallback to treating as positional args
-                logger.info("   → Using *args approach")
-                result = func(*arguments)
-                logger.info("    Success with *args")
-                return result
-
-        # Handle single argument case
-        else:
-            logger.info("   → Using single argument approach")
-            result = func(arguments)
-            logger.info("    Success with single arg")
-            return result
+        args, kwargs = tool_call_shape(arguments)
+        logger.info(f"   → Calling with {len(args)} positional, keywords {list(kwargs)}")
+        result = func(*args, **kwargs)
+        logger.info("    Success")
+        return result
 
     except TypeError as e:
         logger.error(f"    TypeError: {e}")
         logger.error(f"   TypeError traceback:\n{traceback.format_exc()}")
 
-        # Enhanced intelligent mapping for lists
-        if isinstance(arguments, list):
+        # A positional list that did not bind: try the sentinel-free list
+        # named after the signature (a list headed by a dict already WAS a
+        # keyword call, so retrying it would repeat the same TypeError).
+        if isinstance(arguments, list) and not (
+                arguments and isinstance(arguments[0], dict)):
             logger.info("   → Trying enhanced list handling")
 
             try:
-                # If it's a list with a dict, extract the dict
-                if len(arguments) >= 1 and isinstance(arguments[0], dict):
-                    logger.info("   → Extracting dict from list and retrying")
-                    result = func(**arguments[0])
-                    logger.info("    Success with extracted dict")
+                kwargs = remapped_positional_kwargs(func, arguments)
+                if kwargs is not None:
+                    logger.info(f"   → Mapped to kwargs: {kwargs}")
+                    result = func(**kwargs)
+                    logger.info("    Success with intelligent mapping")
                     return result
-
-                # If it's a simple list, try intelligent parameter mapping
-                elif hasattr(func, '__annotations__'):
-                    import inspect
-                    sig = inspect.signature(func)
-                    param_names = list(sig.parameters.keys())
-                    logger.info(f"   → Function expects parameters: {param_names}")
-
-                    # Filter out truncation indicators
-                    clean_args = [arg for arg in arguments if
-                                  not (isinstance(arg, list) and len(arg) == 1 and arg[0] == 'truncated')]
-
-                    if len(clean_args) <= len(param_names):
-                        kwargs = dict(zip(param_names, clean_args))
-                        logger.info(f"   → Mapped to kwargs: {kwargs}")
-                        result = func(**kwargs)
-                        logger.info("    Success with intelligent mapping")
-                        return result
 
             except Exception as mapping_error:
                 logger.error(f"    Enhanced list handling failed: {mapping_error}")
@@ -3789,6 +4125,160 @@ def safe_function_call(func, arguments):
         logger.error(f"    Unexpected error: {e}")
         logger.error(f"   Unexpected error traceback:\n{traceback.format_exc()}")
         raise e
+
+
+def tool_argument_error(func, func_name, arguments, repaired):
+    """Why ``func`` cannot be called with ``arguments``, or None.
+
+    Binds the call the arguments actually become (:func:`tool_call_shape`,
+    the same rule safe_function_call and the async executor call with) to the
+    tool's own signature (``inspect.signature`` follows the ``__wrapped__``
+    chain of autogen's and core.tool_logging's wrappers to the real closure).
+    Until the review of 68377afd2 only a dict was checked, so ``[{...}]`` --
+    run as ``func(**list[0])`` -- reached the tool unchecked.  A positional
+    list is bound as the positional call it becomes; safe_function_call's
+    ``['truncated']`` recovery is not credited, because a live tool is wrapped
+    by core.tool_logging, which answers the first call's TypeError itself, so
+    that recovery never runs for it.  A tool whose signature cannot be read
+    is not checked.
+
+    ``repaired`` says the arguments did not parse as JSON and were recovered by
+    retrieve_json.  json_repair reads an unquoted string value as a run of
+    bare ``key: value`` pairs: live 2026-09-22 08:23:01, ``{"text": Financial
+    Dashboard ... - Consulting: $5,000 ...}`` became ``{"text": "...$10",
+    "Consulting": "5,000", ...}`` and the tool raised "unexpected keyword
+    argument 'Consulting'", which reads as a naming mistake.  So a repaired
+    call that does not bind is reported as broken JSON, with the keys that
+    could be read shown as what was received, not as names to fix.  A
+    repaired call that binds but leaves a required value empty (None, or a
+    blank string json_repair filled in) is refused the same way.
+    """
+    import inspect
+    args, kwargs = tool_call_shape(arguments)
+    if REFUSED_ARGUMENTS_KEY in kwargs:
+        # A refused call's stand-in (refused_arguments_json) is never run,
+        # whatever the tool accepts: a **kwargs tool binds any names, so the
+        # signature check alone let it through (review of cd8d9154d, M3).
+        return (f"Error: {func_name} was not run: these are the stand-in for "
+                f"arguments that were refused earlier "
+                f"({kwargs.get(REFUSED_BECAUSE_KEY, 'refused')}). Call "
+                f"{func_name} again with one JSON object of named values.")
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return None
+    params =[p for p in sig.parameters.values()
+              if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
+    try:
+        bound = sig.bind(*args, **kwargs).arguments
+    except TypeError:
+        bound = None
+    # A value json_repair filled in, not one the model wrote: a cut-off call
+    # '{"text":' repairs to {"text": ""}, which binds, and the tool ran with
+    # nothing (log RCA defect 14, leftover).  So after a repair, a REQUIRED
+    # value that is empty is refused like a missing one.  Strict JSON with
+    # "" is the model's own choice and runs.
+    def blank(value):
+        return value is None or (isinstance(value, str) and not value.strip())
+
+    emptied = ([p.name for p in params
+                if p.default is p.empty and blank(bound.get(p.name))]
+               if repaired and bound is not None else [])
+    if bound is not None and not emptied:
+        return None
+    takes_any = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+    names = {p.name for p in params}
+    expected = ', '.join(p.name + (' (required)' if p.default is p.empty else '')
+                         for p in params) or 'none'
+    if args and bound is None:
+        # Positional values: there are no names to report as unknown.
+        return (f"Error: {func_name} was not run: its arguments were not one "
+                f"JSON object of named values. Expected parameters: "
+                f"{expected}. Call {func_name} again with one JSON object "
+                f"using these names.")
+    arguments = kwargs
+    missing = [p.name for p in params
+               if bound is None and p.default is p.empty
+               and p.name not in arguments]
+    unknown = [] if takes_any else [k for k in arguments if k not in names]
+    if repaired:
+        text = (f"Error: the arguments for {func_name} were not valid JSON, so "
+                f"{func_name} was not run. Every string value must be in "
+                f"double quotes, with any double quote inside it written as "
+                f"\\\" and any line break as \\n. What could be read from "
+                f"them had the keys: {', '.join(map(str, arguments)) or 'none'}.")
+    else:
+        text = f"Error: {func_name} was not run."
+        if unknown:
+            text += f" Unknown argument(s): {', '.join(map(str, unknown))}."
+    if missing:
+        text += f" Missing required argument(s): {', '.join(missing)}."
+    if emptied:
+        text += f" Required argument(s) left empty: {', '.join(emptied)}."
+    return (text + f" Expected parameters: {expected}. Call {func_name} again "
+            f"with one JSON object using these names.")
+
+
+def mark_call_refused(call, input_string):
+    """Write the refused stand-in (refused_arguments_json: what the model
+    wrote, marked refused, and why) into ``call``, the conversation's own
+    record of a tool call whose arguments were not valid JSON and were
+    refused.  A no-op when there is no record to mark."""
+    if isinstance(call, dict):
+        call['arguments'] = refused_arguments_json(
+            input_string if isinstance(input_string, str) else str(input_string))
+
+
+def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
+                             where='', call=None):
+    """Parse a tool call's arguments and check them against the tool.
+
+    Returns ``(arguments, None)`` when the tool may be called with them and
+    ``(None, error_text)`` when it may not.  The one parse-and-bind step for
+    the patched ``execute_function`` and ``a_execute_function``: autogen's
+    strict parse first, retrieve_json only when that fails, then
+    ``tool_argument_error`` on whatever came back, including the ``{}``
+    used when nothing could be recovered.
+
+    ``call`` is the conversation's own record of the call: autogen hands the
+    executor the very function dict of the stored message
+    (generate_tool_calls_reply: ``tool_call.get("function")`` of
+    ``messages[-1]``), and every copy of that message shares it.  When
+    arguments that were not valid JSON are refused, it is marked refused
+    (mark_call_refused).  Log RCA defect 14, leftover: the TOOL-ARGS-GUARD
+    (ensure_tool_call_arguments_json), which has no tool signatures, repaired
+    the same text on its own and wrote json_repair's split dict back into
+    every later request, so the model saw its broken call as a well-formed
+    one next to a reply saying it was not valid JSON.  The guard keeps a
+    strict JSON object as it is, so the stand-in is what the model sees.
+    Refused well-formed JSON (a wrong name) stays as the model wrote it:
+    that is what the reply names.
+    """
+    try:
+        arguments = json.loads(format_json_str(input_string))
+        print(f" ORIGINAL AUTOGEN{where}: Successfully parsed arguments for {func_name}")
+        repaired = False
+    except Exception as e:
+        print(f" ORIGINAL AUTOGEN{where} FAILED: {e} - falling back to enhanced parsing for {func_name}")
+        try:
+            arguments = retrieve_json(input_string)
+            if arguments is None:
+                arguments = {}
+            elif isinstance(arguments, str):
+                arguments = json.loads(arguments)
+        except Exception as fallback_error:
+            print(f" FALLBACK{where} FAILED: {fallback_error}")
+            mark_call_refused(call, input_string)
+            return None, f"Error: {e}\n The argument must be in JSON format."
+        print(f" FALLBACK{where} PARSED: arguments for {func_name}: {arguments}")
+        repaired = True
+    error = tool_argument_error(func, func_name, arguments, repaired)
+    if error is not None:
+        print(f" ARGUMENTS REFUSED{where}: {func_name} not run: {error}")
+        if repaired:
+            mark_call_refused(call, input_string)
+        return None, error
+    return arguments, None
 
 
 def force_apply_autogen_json_fix():
@@ -3814,26 +4304,9 @@ def force_apply_autogen_json_fix():
             # ========== PRESERVE ORIGINAL AUTOGEN LOGIC ==========
             # Extract arguments from a json-like string and put it into a dict.
             input_string = func_call.get("arguments", "{}")
-
-            try:
-                # Try original autogen approach first
-                formatted_string = self._format_json_str(input_string)
-                arguments = json.loads(formatted_string)
-                print(f" ORIGINAL AUTOGEN: Successfully parsed arguments for {func_name}")
-            except (json.JSONDecodeError, Exception) as e:
-                # Only if original fails, fall back to our enhanced parsing
-                print(f" ORIGINAL AUTOGEN FAILED: {e} - falling back to enhanced parsing for {func_name}")
-                try:
-                    arguments = retrieve_json(input_string)
-                    if arguments is None:
-                        arguments = {}
-                    elif isinstance(arguments, str):
-                        arguments = json.loads(arguments)
-                    print(f" FALLBACK SUCCESSFUL: Enhanced parsing worked for {func_name}")
-                except Exception as fallback_error:
-                    print(f" FALLBACK FAILED: {fallback_error}")
-                    arguments = None
-                    content = f"Error: {e}\n The argument must be in JSON format."
+            arguments, content = bind_tool_call_arguments(
+                func, func_name, input_string, self._format_json_str,
+                call=func_call)
 
             # ========== PRESERVE ORIGINAL EXECUTION LOGIC ==========
             if arguments is not None:
@@ -3881,26 +4354,9 @@ def force_apply_autogen_json_fix():
         is_exec_success = False
         if func is not None:
             input_string = func_call.get("arguments", "{}")
-
-            try:
-                # Try original autogen approach first
-                formatted_string = self._format_json_str(input_string)
-                arguments = json.loads(formatted_string)
-                print(f" ORIGINAL AUTOGEN ASYNC: Successfully parsed arguments for {func_name}")
-            except (json.JSONDecodeError, Exception) as e:
-                # Only if original fails, fall back to our enhanced parsing
-                print(f" ORIGINAL AUTOGEN ASYNC FAILED: {e} - falling back to enhanced parsing for {func_name}")
-                try:
-                    arguments = retrieve_json(input_string)
-                    if arguments is None:
-                        arguments = {}
-                    elif isinstance(arguments, str):
-                        arguments = json.loads(arguments)
-                    print(f" FALLBACK ASYNC SUCCESSFUL: Enhanced parsing worked for {func_name}")
-                except Exception as fallback_error:
-                    print(f" FALLBACK ASYNC FAILED: {fallback_error}")
-                    arguments = None
-                    content = f"Error: {e}\n The argument must be in JSON format."
+            arguments, content = bind_tool_call_arguments(
+                func, func_name, input_string, self._format_json_str,
+                where=' ASYNC', call=func_call)
 
             if arguments is not None:
                 iostream.print(f"\n>>>>>>>> EXECUTING ASYNC FUNCTION {func_name}...", flush=True)
@@ -3913,14 +4369,11 @@ def force_apply_autogen_json_fix():
                     print(f"   Arguments content: {arguments}")
                     import inspect
                     if inspect.iscoroutinefunction(func):
-                        if isinstance(arguments, dict):
-                            content = await func(**arguments)  # Original autogen always uses **kwargs
-                        # Handle list case - convert to positional arguments
-                        elif isinstance(arguments, list):
-                            content = await func(*arguments)  # Original autogen always uses **kwargs
-                        # Handle single argument case
-                        else:
-                            content = await func(arguments)  # Original autogen always uses **kwargs
+                        # The call bind_tool_call_arguments checked, not a
+                        # second rule: [{...}] used to be awaited as
+                        # func({...}), the whole object as one positional.
+                        args, kwargs = tool_call_shape(arguments)
+                        content = await func(*args, **kwargs)
                     else:
                         content = safe_function_call(func, arguments)
                     is_exec_success = True

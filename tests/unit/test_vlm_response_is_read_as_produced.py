@@ -320,3 +320,35 @@ class TestTheParseHasOneHome(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestAnUnknownLastStepIsSaidInTheOneLiner(unittest.TestCase):
+    """Review F2 (2026-09-27): an action the loop let go of while it still
+    ran is recorded ok=None ("result unknown").  CREATE returns
+    TOOL_FAILURE_RESULTS[0] + outcome_summary -- NOT the observation text --
+    so unless the one-liner says so, the model deciding whether to retry
+    never hears that the step may already have happened."""
+
+    def setUp(self):
+        from integrations.vlm import response_view as rv
+        self.rv = rv
+
+    def _unknown(self, reason):
+        step = _action(result='open_file_gui still running when the time ran '
+                              'out; result unknown - check its effect before '
+                              'repeating it')
+        step['content']['ok'] = None
+        return _response(step, status='incomplete', exit_reason=reason)
+
+    def test_timeout_and_stop_say_the_last_step_may_have_happened(self):
+        for reason in ('timeout', 'stopped'):
+            msg = self.rv.outcome_summary(self._unknown(reason))
+            self.assertIn('result is unknown', msg, reason)
+            self.assertIn('before repeating', msg, reason)
+
+    def test_a_known_failure_says_nothing_of_the_kind(self):
+        step = _action()
+        step['content']['ok'] = False
+        msg = self.rv.outcome_summary(
+            _response(step, status='incomplete', exit_reason='timeout'))
+        self.assertNotIn('unknown', msg)

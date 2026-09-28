@@ -75,12 +75,8 @@ def _font_cached(size, bold=False):
 
 
 def _receipts_dir() -> str:
-    try:
-        from core.platform_paths import get_data_dir
-        base = os.path.join(get_data_dir(), 'receipts')
-    except ImportError:
-        base = os.path.join(os.path.expanduser('~/Documents/Nunba/data'),
-                            'receipts')
+    from core.platform_paths import get_data_dir
+    base = os.path.join(get_data_dir(), 'receipts')
     os.makedirs(base, exist_ok=True)
     return base
 

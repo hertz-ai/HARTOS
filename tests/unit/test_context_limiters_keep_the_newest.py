@@ -189,28 +189,50 @@ def _pairs():
     )
 
 
+def _heads(msgs):
+    return [(m.get('role'), m.get('name'), str(m.get('content'))[:200])
+            for m in msgs]
+
+
 @pytest.mark.parametrize('seed', range(150))
-def test_identical_to_autogen_except_the_newest_is_kept(seed):
+def test_identical_to_autogen_except_the_newest_and_protected_are_kept(seed):
+    """Autogen's window, plus the newest message, plus any protected message
+    it left out -- and nothing else."""
+    from core.llm_outbound_logger import protected_messages
     msgs = _random_conversation(random.Random(seed))
+    protected = _heads(protected_messages(msgs))
     for ours, theirs in _pairs():
         got = ours.apply_transform(msgs)
         want = theirs.apply_transform(msgs)
         popped = want is not msgs and (not want or want[0].get('role') == 'tool')
-        if not popped:
-            assert got == want
-            continue
-        assert got[:-1] == want
-        assert (got[-1]['role'], got[-1].get('name')) == (
-            msgs[-1]['role'], msgs[-1].get('name'))
+        extra = [m for m in got if m not in want]
+        if popped:
+            assert (got[-1]['role'], got[-1].get('name')) == (
+                msgs[-1]['role'], msgs[-1].get('name'))
+            extra = [m for m in extra if m is not got[-1]]
+        assert [m for m in got if m not in extra] == want + (got[-1:] if popped else [])
+        for m in extra:
+            head = (m.get('role'), m.get('name'), str(m.get('content'))[:200])
+            assert any(head[:2] == p[:2] and p[2].startswith(head[2][:100])
+                       for p in protected), head[:2]
 
 
 @pytest.mark.parametrize('seed', range(150))
 def test_the_token_budget_still_holds(seed):
+    """autogen's window stays within the budget; a protected message put
+    back is bounded to the per-message cap like any other."""
     msgs = _random_conversation(random.Random(seed))
     got = token_limiter(**_TOKENS).apply_transform(msgs)
-    total = sum(transforms_util.count_text_tokens(m['content']) for m in got
-                if transforms_util.is_content_right_type(m.get('content')))
-    assert total <= AUTOGEN_MESSAGE_TOKEN_BUDGET
+    want = ag.MessageTokenLimiter(**_TOKENS).apply_transform(msgs)
+
+    def tokens(m):
+        return (transforms_util.count_text_tokens(m['content'])
+                if transforms_util.is_content_right_type(m.get('content')) else 0)
+
+    extra = [m for m in got if m not in want]
+    assert sum(tokens(m) for m in got if m not in extra) <= AUTOGEN_MESSAGE_TOKEN_BUDGET
+    for m in extra:
+        assert tokens(m) <= AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE
 
 
 # ── 5. one limiter for every builder ─────────────────────────────────────

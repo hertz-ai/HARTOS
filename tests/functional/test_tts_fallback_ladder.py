@@ -107,6 +107,30 @@ needs_an_installed_engine = pytest.mark.skipif(
            'ladder is correctly empty -- see TestBareNodeIsHonest',
 )
 
+def _node_can_serve_clone(lang='en'):
+    """Whether this node can offer a CLONE-capable engine for ``lang`` now.
+
+    A stricter question than ``_node_can_serve``: a runner can serve English
+    with kokoro (voice_clone=False) and have no cloning engine at all.
+    Measured 2026-09-26 on this box: select_engines('Hello', 'en') gave
+    [kokoro], and require_clone=True gave [].  The router's filter itself is
+    covered on every node by TestCloneFilterIsHermetic, so skipping the
+    live-machine check here never leaves the filter unexercised.
+    """
+    from integrations.channels.media.tts_router import TTSRouter
+    return any(
+        c.engine.voice_clone
+        for c in TTSRouter().select_engines(
+            'Hello', language=lang, require_clone=True))
+
+
+needs_a_clone_engine = pytest.mark.skipif(
+    not _node_can_serve_clone('en'),
+    reason='no clone-capable TTS engine on this node can serve English right '
+           'now; the require_clone filter is still driven on every node by '
+           'TestCloneFilterIsHermetic',
+)
+
 needs_espeak = pytest.mark.skipif(
     'espeak' not in _installed_engines_for('en'),
     reason='espeak-ng is not on this box; it is bundled on the shipped OS, '
@@ -158,13 +182,75 @@ class TestTTSRouterSelection:
         candidates = router.select_engines("Hello", language="en", urgency="quality")
         assert len(candidates) >= 1
 
+    @needs_a_clone_engine
     def test_voice_clone_filter(self, router):
         candidates = router.select_engines("Hello", language="en", require_clone=True)
-        # Clone filter returns clone-capable engines + espeak (always appended)
         clone_capable = [c for c in candidates
                          if hasattr(c, 'engine') and hasattr(c.engine, 'voice_clone')
                          and c.engine.voice_clone]
         assert len(clone_capable) >= 1, "Should have at least one clone-capable engine"
+
+
+class TestCloneFilterIsHermetic:
+    """The require_clone filter, driven through the REAL select_engines on
+    every node, whatever is installed on it.
+
+    Only the machine boundary is patched: which engines are installed, the
+    GPU report, whether a model fits, the compute policy and the hive peer
+    lookup.  The ladder, the ENGINE_REGISTRY specs and the filter are the
+    production ones.  This is the companion that makes the live-machine
+    ``needs_a_clone_engine`` skip above safe: that test may skip on a
+    runner with no cloning engine, this one never does.
+
+    espeak is reported absent on purpose.  Whether Step 5 should append it
+    to a require_clone request is a separate open defect (task #63) and
+    this test must not pin either answer.
+    """
+
+    # One clone-capable GPU engine and two non-clone neural engines, all on
+    # the 'en' ladder.
+    CLONE = 'f5_tts'
+    NON_CLONE = ('kokoro', 'melotts')
+
+    @pytest.fixture
+    def machine(self):
+        installed = {self.CLONE, *self.NON_CLONE}
+        mod = 'integrations.channels.media.tts_router'
+        with patch(f'{mod}._is_engine_installed',
+                   side_effect=lambda e: e in installed), \
+                patch(f'{mod}._get_gpu_info',
+                      return_value={'cuda_available': True,
+                                    'vram_total_gb': 24.0,
+                                    'vram_free_gb': 20.0}), \
+                patch(f'{mod}._can_fit_on_gpu', return_value=True), \
+                patch(f'{mod}._get_compute_policy',
+                      return_value={'compute_policy': 'local_only'}), \
+                patch(f'{mod}._find_hive_peer_for_tts', return_value=None):
+            yield
+
+    @staticmethod
+    def _ids(candidates):
+        return [c.engine.engine_id for c in candidates]
+
+    def test_precondition_the_machine_offers_the_non_clone_engines(self, machine):
+        """Anti-vacuity: without require_clone the same machine offers all
+        three, so the filter below has something to remove."""
+        from integrations.channels.media.tts_router import (
+            ENGINE_REGISTRY, LANG_ENGINE_PREFERENCE, TTSRouter,
+        )
+        for eid in (self.CLONE, *self.NON_CLONE):
+            assert eid in LANG_ENGINE_PREFERENCE['en'], eid
+        assert ENGINE_REGISTRY[self.CLONE].voice_clone is True
+        assert not any(ENGINE_REGISTRY[e].voice_clone for e in self.NON_CLONE)
+        ids = self._ids(TTSRouter().select_engines('Hello', language='en'))
+        assert sorted(ids) == sorted([self.CLONE, *self.NON_CLONE]), ids
+
+    def test_require_clone_keeps_the_clone_engine_and_drops_the_rest(self, machine):
+        from integrations.channels.media.tts_router import TTSRouter
+        candidates = TTSRouter().select_engines(
+            'Hello', language='en', require_clone=True)
+        assert self._ids(candidates) == [self.CLONE]
+        assert all(c.engine.voice_clone for c in candidates)
 
 
 @needs_an_installed_engine

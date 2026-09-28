@@ -118,6 +118,21 @@ TOPIC_MAP = {
     'recipe.available': RECIPE_AVAILABLE_TOPIC,
 }
 
+# Per-user Crossbar URIs published by URI rather than through a TOPIC_MAP
+# bus topic.  With TOPIC_MAP's {user_id} templates these are the DECLARED
+# per-user URIs: security.edge_privacy.per_user_uri_owner reads both, and a
+# URI is one user's own (not egress) only if it instantiates one of them.
+# Each is measured at its publisher:
+#   chat.new    -- integrations.social.chat_messages.publish_new
+#                  (core.constants.CHAT_TOPIC_NEW + '.' + user_id)
+#   vision      -- hart_intelligence_entry vision consent event
+#   channel.response -- integrations.channels.response.router
+PER_USER_TOPICS_OUTSIDE_BUS = (
+    'com.hertzai.hevolve.chat.new.{user_id}',
+    'com.hertzai.hevolve.vision.{user_id}',
+    'com.hertzai.hevolve.channel.response.{user_id}',
+)
+
 # Reverse lookup: legacy topic prefix → new topic
 # Sorted by prefix length (longest first) so 'com.hertzai.hevolve.chat'
 # matches before the shorter 'com.hertzai.hevolve' (chat.general).
@@ -126,6 +141,62 @@ for new_topic, legacy_template in TOPIC_MAP.items():
     prefix = legacy_template.split('.{')[0] if '.{' in legacy_template else legacy_template
     _REVERSE_MAP_UNSORTED[prefix] = new_topic
 _REVERSE_MAP = dict(sorted(_REVERSE_MAP_UNSORTED.items(), key=lambda x: -len(x[0])))
+
+
+# ─── Egress scrub at the ownership boundary ───────────────────────────
+#
+# Owner ruling 2026-09-26: the outgoing messages that count as going to
+# third parties are "the ones which actually go to regional nodes ... hive
+# nodes ... that's not their node".  A publish is therefore scrubbed only on
+# a leg that reaches a node or subscriber its user does NOT own.  LOCAL, SSE,
+# the user's own devices and own node get the record raw (local records raw,
+# scrub only egress).  What the scrubbed copy is, and whether a Crossbar URI
+# is the user's own, are answered once, in security.edge_privacy
+# (scrub_for_egress, crossbar_leg_is_users_own); this module only asks.
+
+
+def crossbar_topic_is_per_user(topic: str) -> bool:
+    """Is this bus topic's Crossbar URI template scoped to the message's user?
+
+    Asks the one ownership rule (security.edge_privacy
+    .crossbar_uri_is_per_user) about the TOPIC_MAP template.
+    """
+    from security.edge_privacy import crossbar_uri_is_per_user
+    return crossbar_uri_is_per_user(TOPIC_MAP.get(topic, ''))
+
+
+class _ThirdPartyCopy:
+    """The one copy of a payload that nodes its user does not own may get.
+
+    Computed at most once per publish and only when a leg actually has such
+    a recipient.  ``get()`` returns None when the scrub failed: the caller
+    withholds that leg rather than send what could not be scrubbed.  That
+    refuses nothing the user owns -- LOCAL, SSE, own devices and own node
+    are already served raw -- and only a third party misses the message; a
+    leak cannot be recalled, a missed realtime event is refetched from the
+    record.
+    """
+
+    _FAILED = object()
+
+    def __init__(self, topic: str, data: dict):
+        self._topic = topic
+        self._data = data
+        self._copy = None
+
+    def get(self) -> Optional[dict]:
+        if self._copy is None:
+            try:
+                from security.edge_privacy import scrubbed_or_none
+            except Exception as e:
+                logger.warning(
+                    "Egress rule unavailable for %s (%s); not sending it to "
+                    "nodes its user does not own", self._topic, e)
+                scrubbed = None
+            else:
+                scrubbed = scrubbed_or_none(self._data, self._topic)
+            self._copy = self._FAILED if scrubbed is None else scrubbed
+        return None if self._copy is self._FAILED else self._copy
 
 
 def resolve_legacy_topic(legacy_topic: str):
@@ -208,6 +279,9 @@ class MessageBus:
             'relay_dropped_unverified': 0,
             'relay_loop_blocked': 0,
             'relay_ttl_expired': 0,
+            # Egress to nodes the message's user does not own
+            'egress_scrubbed': 0,
+            'egress_withheld': 0,
         }
 
     def set_http_transport(self, transport_fn: Callable) -> None:
@@ -238,7 +312,12 @@ class MessageBus:
 
         SSE is treated like LOCAL trust-wise (same-machine, loopback
         only, MCP-token gated) so payloads pass through unredacted.
-        Outbound legs (PEERLINK + CROSSBAR) get the DLP scrub.
+        The outbound legs (PEERLINK + CROSSBAR) carry
+        ``security.edge_privacy.scrub_for_egress`` only where a recipient is
+        not owned by the message's user (``PeerLink.owned_by``,
+        ``edge_privacy.crossbar_leg_is_users_own``); the
+        user's own devices and node get the payload raw, and the signed
+        ``fleet.command`` relay is never altered.
 
         SUBTLE — Nunba's adapter does NOT see direct ``bus.publish``
         calls.  Nunba's ``routes/hartos_backend_adapter.py``
@@ -305,18 +384,10 @@ class MessageBus:
         if not skip_sse:
             self._route_sse(topic, data, user_id, msg_id)
 
-        # Redact secrets before outbound transmission (PeerLink + Crossbar)
-        outbound_data = data
-        if not skip_peerlink or not skip_crossbar:
-            try:
-                from security.dlp_engine import redact_pii
-                import json
-                raw = json.dumps(data)
-                redacted = redact_pii(raw)
-                if redacted != raw:
-                    outbound_data = json.loads(redacted)
-            except (ImportError, Exception):
-                pass  # DLP not available — proceed unredacted
+        # Outbound legs send the record raw to what the message's user owns
+        # and the scrubbed copy to what they do not (owner ruling 2026-09-26).
+        owner = str(user_id or (data.get('user_id') if isinstance(data, dict) else '') or '')
+        third_party = _ThirdPartyCopy(topic, data)
 
         # 3. PEERLINK — if connected peers exist.  For the relayed topic, carry
         #    the seeded hop_ttl/origin/relay_path on the outbound envelope so a
@@ -329,11 +400,13 @@ class MessageBus:
                     'origin': envelope.get('origin', ''),
                     'relay_path': envelope.get('relay_path', []),
                 }
-            self._route_peerlink(topic, outbound_data, msg_id, relay_meta)
+            self._route_peerlink(topic, data, msg_id, relay_meta,
+                                 owner_user_id=owner, third_party=third_party)
 
         # 4. CROSSBAR — if internet available (and not skipped)
         if not skip_crossbar:
-            self._route_crossbar(topic, outbound_data, user_id, device_id, msg_id)
+            self._route_crossbar(topic, data, user_id, device_id, msg_id,
+                                 third_party=third_party)
 
         return msg_id
 
@@ -592,7 +665,10 @@ class MessageBus:
         # Direct subscribers
         self._deliver_to_subscribers(topic, data)
 
-        # Also emit to EventBus (for cross-subsystem communication)
+        # Also emit to EventBus (for cross-subsystem communication).  In-process
+        # only: core.platform.events.topic_audience classes 'bus.' as
+        # node-internal, so neither SSE nor the WAMP bridge carries this raw
+        # echo; the publish's own SSE and Crossbar legs above/below do.
         try:
             from core.platform.events import emit_event
             emit_event(f'bus.{topic}', data)
@@ -636,7 +712,9 @@ class MessageBus:
             self._stats['delivered_sse'] += 1
 
     def _route_peerlink(self, topic: str, data: dict, msg_id: str,
-                        relay_meta: dict = None, exclude_peer: str = ''):
+                        relay_meta: dict = None, exclude_peer: str = '',
+                        owner_user_id: str = '',
+                        third_party: Optional[_ThirdPartyCopy] = None):
         """Send to connected peers via PeerLink 'events' channel.
 
         ``relay_meta`` (when set, for the relayed fleet.command topic) adds the
@@ -644,6 +722,13 @@ class MessageBus:
         node can continue the multi-hop chain.  ``exclude_peer`` skips one peer
         (the inbound sender) on a re-broadcast so a command never echoes back
         the link it arrived on.
+
+        ``owner_user_id`` / ``third_party`` (set by publish): when a recipient
+        link is not owned by the message's user -- this node's SAME_USER links
+        while it serves someone else -- that link gets the scrubbed copy, or
+        nothing when the scrub failed; links the user owns get ``data`` raw.
+        The signed relay topic is never split: its data carries a signature
+        and an altered byte makes every hop drop it.
         """
         try:
             from core.peer_link.link_manager import get_link_manager
@@ -671,16 +756,46 @@ class MessageBus:
                 except Exception:
                     trust_filter = None
 
-            sent = mgr.broadcast('events', envelope, trust_filter=trust_filter,
-                                 exclude_peer=exclude_peer)
+            from core.peer_link.link import owns_same_user_links
+            if (topic == RELAY_TOPIC or third_party is None
+                    or owns_same_user_links(owner_user_id)):
+                # Every recipient is the message user's own (or the signed
+                # relay, which is node authority and must stay byte-exact).
+                sent = mgr.broadcast('events', envelope, trust_filter=trust_filter,
+                                     exclude_peer=exclude_peer)
+            else:
+                def _owned(link):
+                    return link.owned_by(owner_user_id)
+
+                sent = mgr.broadcast('events', envelope, trust_filter=trust_filter,
+                                     exclude_peer=exclude_peer, link_filter=_owned)
+                scrubbed = third_party.get()
+                if scrubbed is None:
+                    self._stats['egress_withheld'] += 1
+                else:
+                    n = mgr.broadcast(
+                        'events', dict(envelope, data=scrubbed),
+                        trust_filter=trust_filter, exclude_peer=exclude_peer,
+                        link_filter=lambda link: not _owned(link))
+                    if n > 0:
+                        self._stats['egress_scrubbed'] += 1
+                    sent += n
             if sent > 0:
                 self._stats['delivered_peerlink'] += sent
         except Exception:
             pass  # No PeerLink available — that's fine
 
     def _route_crossbar(self, topic: str, data: dict,
-                        user_id: str, device_id: str, msg_id: str):
-        """Publish to Crossbar for legacy mobile app + central telemetry."""
+                        user_id: str, device_id: str, msg_id: str,
+                        third_party: Optional[_ThirdPartyCopy] = None):
+        """Publish to Crossbar for legacy mobile app + central telemetry.
+
+        A URI that is not the message user's own
+        (``security.edge_privacy.crossbar_leg_is_users_own``, asked about the
+        concrete URI this leg publishes) reaches other people's subscribers,
+        so with ``third_party`` set it carries the scrubbed copy, or is
+        withheld when the scrub failed.  The signed relay topic is exempt.
+        """
         legacy_topic = TOPIC_MAP.get(topic)
         if not legacy_topic:
             return  # No legacy mapping — skip Crossbar
@@ -699,6 +814,25 @@ class MessageBus:
             if not val:
                 return  # Can't route without required variable
             legacy_topic = legacy_topic.replace(f'{{{key}}}', str(val))
+
+        if third_party is not None and topic != RELAY_TOPIC:
+            owner = user_id or (data.get('user_id', '') if isinstance(data, dict) else '')
+            try:
+                from security.edge_privacy import crossbar_leg_is_users_own
+                own = crossbar_leg_is_users_own(legacy_topic, owner)
+            except Exception as e:
+                logger.warning("Egress rule unavailable for %s (%s); treating "
+                               "the Crossbar leg as other people's", topic, e)
+                own = False
+        else:
+            own = True
+        if not own:
+            scrubbed = third_party.get()
+            if scrubbed is None:
+                self._stats['egress_withheld'] += 1
+                return
+            data = scrubbed
+            self._stats['egress_scrubbed'] += 1
 
         # Add msg_id for dedup
         if isinstance(data, dict):

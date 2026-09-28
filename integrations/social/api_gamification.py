@@ -6,6 +6,7 @@ Encounters, Agent Evolution, Ratings, Distribution, Onboarding, Campaigns.
 import logging
 from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify, g
+from core.auth_local import client_key as _client_key
 
 from sqlalchemy.orm import Session as SASession
 from .auth import require_auth, optional_auth, require_admin
@@ -1782,7 +1783,7 @@ def record_ad_impression(ad_id):
         node_id = data.get('node_id')
         region_id = data.get('region_id')
         placement_id = data.get('placement_id')
-        ip_raw = request.remote_addr or ''
+        ip_raw = _client_key()
         ip_hash = hashlib.sha256(ip_raw.encode()).hexdigest()[:16]
         result = AdService.record_impression(
             db, ad_id, user_id, node_id, region_id, placement_id, ip_hash)
@@ -1809,7 +1810,7 @@ def record_ad_click(ad_id):
         data = _get_json()
         user_id = g.user_id
         node_id = data.get('node_id')
-        ip_raw = request.remote_addr or ''
+        ip_raw = _client_key()
         ip_hash = hashlib.sha256(ip_raw.encode()).hexdigest()[:16]
         result = AdService.record_click(db, ad_id, user_id, node_id, ip_hash)
         if not result:

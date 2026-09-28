@@ -45,14 +45,59 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from core.constants import SUPPORTED_LANG_DICT
+from core.platform_paths import get_db_path, legacy_documents_db_path
 
 logger = logging.getLogger(__name__)
 
 
-_HART_LANG_PATH = os.path.join(
-    os.path.expanduser('~'), 'Documents', 'Nunba', 'data',
-    'hart_language.json',
-)
+# <data root>/data/hart_language.json.  On Windows that is the same
+# ~/Documents/Nunba/data file as before; on macOS / Linux it now follows the
+# data root like every other file (it used to be the one file left in
+# ~/Documents/Nunba there; _adopt_legacy_file carries a saved preference
+# over), and under pytest it is a temp file.
+_HART_LANG_PATH = get_db_path('hart_language.json')
+
+# Where the file lived before 8bbe771c4 routed it through the data root
+# (~/Documents/Nunba/data on every OS).  Read once, copied, never changed.
+_LEGACY_LANG_PATH = legacy_documents_db_path('hart_language.json')
+_legacy_checked = False
+_legacy_lock = threading.Lock()
+
+
+def _adopt_legacy_file() -> None:
+    """One-time, non-destructive carry-over of a preference saved at the old
+    place (same pattern as the admin config, 4b1796862): when nothing is at
+    _HART_LANG_PATH and the old file holds a supported language, its content
+    is written to the new path.  The old file is never changed or deleted (a
+    rollback or an older install may still read it); a file already at the
+    new path is never overwritten; an old file that does not parse or names
+    no supported language is left, not copied; a failure is logged, never
+    raised.  Asked once per process: this sits under the /chat hot path.
+    On Windows the two paths are the same file, so it does nothing."""
+    global _legacy_checked
+    with _legacy_lock:
+        if _legacy_checked:
+            return
+        _legacy_checked = True
+        new, old = _HART_LANG_PATH, _LEGACY_LANG_PATH
+        try:
+            if (os.path.exists(new) or not os.path.isfile(old)
+                    or os.path.normcase(os.path.abspath(old))
+                    == os.path.normcase(os.path.abspath(new))):
+                return
+            with open(old, encoding='utf-8') as f:
+                data = json.load(f) or {}
+            lang = data.get('language') if isinstance(data, dict) else None
+            if not lang or lang[:2] not in SUPPORTED_LANG_DICT:
+                logger.warning("hart_language.json at %s names no supported "
+                               "language; not carried over to %s", old, new)
+                return
+            from core.file_cache import atomic_json_write
+            atomic_json_write(new, data, indent=None)
+            logger.info("Copied the language preference from %s to %s", old, new)
+        except Exception as e:
+            logger.warning("Language preference at %s not carried over to %s: %s",
+                           old, new, e)
 
 
 # ── Read-side cache (mtime-invalidated) ─────────────────────────────
@@ -64,11 +109,15 @@ _cache_lock = threading.Lock()
 def _load_from_file() -> Optional[str]:
     """Read `hart_language.json` with mtime caching.  Returns None if
     file missing / unreadable / invalid — callers fall back to env or
-    default."""
+    default.  A missing file first adopts the pre-move one, once."""
     try:
         st = os.stat(_HART_LANG_PATH)
     except OSError:
-        return None
+        _adopt_legacy_file()
+        try:
+            st = os.stat(_HART_LANG_PATH)
+        except OSError:
+            return None
     with _cache_lock:
         if _cache['value'] is not None and _cache['mtime'] == st.st_mtime_ns:
             return _cache['value']

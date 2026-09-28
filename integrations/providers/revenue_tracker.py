@@ -71,11 +71,8 @@ class RevenueTracker:
     """Track revenue vs compute cost for the earning spark metric."""
 
     def __init__(self, tracker_path: Optional[str] = None):
-        try:
-            from core.platform_paths import get_db_dir
-            data_dir = Path(get_db_dir())
-        except ImportError:
-            data_dir = Path.home() / 'Documents' / 'Nunba' / 'data'
+        from core.platform_paths import get_db_dir
+        data_dir = Path(get_db_dir())
         data_dir.mkdir(parents=True, exist_ok=True)
 
         self._path = Path(tracker_path) if tracker_path else data_dir / 'revenue_tracker.json'

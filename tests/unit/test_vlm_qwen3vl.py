@@ -1011,8 +1011,16 @@ class TestVLMAgentContextFeedbackAndTools:
 # VLM Adapter Tests
 # ═══════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.usefixtures('computer_control_granted')
 class TestVLMAdapterTierSelection:
-    """Tier routing: Qwen3VL > OmniParser > lightweight."""
+    """Tier routing: Qwen3VL > OmniParser > lightweight.
+
+    execute_vlm_instruction asks the consent gate before any tier is
+    chosen (8b64cbb58).  These tests are about tier selection, so the
+    owner's permission is declared as a precondition; the refusal itself
+    is pinned by test_agent_engine.py::TestVLMAdapter::
+    test_refuses_when_the_owner_has_not_allowed_computer_control.
+    """
 
     @patch('integrations.vlm.vlm_adapter._HAS_PYAUTOGUI', True)
     @patch('integrations.vlm.local_loop.run_local_agentic_loop')
@@ -1064,6 +1072,7 @@ class TestVLMAdapterTierSelection:
         assert result is None
 
 
+@pytest.mark.usefixtures('computer_control_granted')
 class TestVLMAdapterCircuitBreaker:
     """Circuit breaker opens after 2 consecutive failures."""
 
@@ -1119,6 +1128,7 @@ class TestVLMAdapterCircuitBreaker:
         assert mod._probe_cache['result'] is None
 
 
+@pytest.mark.usefixtures('computer_control_granted')
 class TestVLMAdapterFallbackChain:
     """When primary tier fails, falls back to next tier."""
 

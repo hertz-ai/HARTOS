@@ -290,3 +290,56 @@ class TestThreadIsolation:
 
         assert not errors, f"Thread isolation failures: {errors}"
         assert len(results) == 10
+
+
+# ── Handing request state to a worker (review F6, 2026-09-27) ──────────
+
+def test_a_workers_changes_do_not_leak_back_to_the_caller():
+    """snapshot() is a deep copy: a worker appending to a list it adopted
+    must not change the caller's list."""
+    import threading
+    from hartos.threadlocal import thread_local_data as tld
+    tld.set_recognize_intents()
+    tld.update_recognize_intents('caller')
+    tld.set_channel_context({'channel': 'discord', 'tags': ['a']})
+    snap = tld.snapshot()
+
+    def _worker():
+        tld.adopt(snap)
+        tld.update_recognize_intents('worker')
+        tld.get_channel_context()['tags'].append('worker')
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    t.join(5)
+    assert tld.get_recognize_intents() == ['caller']
+    assert tld.get_channel_context() == {'channel': 'discord', 'tags': ['a']}
+    tld.clear_channel_context()
+
+
+def test_adopt_merges_and_shares_what_it_was_handed():
+    """adopt() sets each key it is given and leaves the worker's other keys
+    alone; it does not copy, so the holder of the snapshot shares those
+    objects with the worker (the VLM loop relies on that to close a run)."""
+    import threading
+    from hartos.threadlocal import thread_local_data as tld
+    seen = {}
+
+    def _worker(snap):
+        tld.set_user_role('regional')
+        tld.adopt(snap)
+        seen['role'] = tld.get_user_role()
+        seen['pid'] = tld.get_prompt_id()
+        seen['run'] = tld.get_activity_run()
+
+    tld.set_prompt_id('p-1')
+    tld.set_activity_run('r-1', user_id='u', prompt_id='p-1')
+    snap = tld.snapshot()
+    snap.pop('user_role', None)
+    t = threading.Thread(target=_worker, args=(snap,))
+    t.start()
+    t.join(5)
+    assert seen['role'] == 'regional'
+    assert seen['pid'] == 'p-1'
+    assert seen['run'] is snap['activity_run']
+    tld.clear_activity_run()

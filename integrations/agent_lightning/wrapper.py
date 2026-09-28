@@ -80,8 +80,8 @@ def _describe_llm_failure(exc) -> str:
         url = getattr(getattr(exc, 'request', None), 'url', None)
         if url:
             parts.append('endpoint=%s' % (url,))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug('LLM failure has no readable request url: %r', e)
     try:
         msg = str(exc)
     except Exception:
@@ -95,8 +95,8 @@ def _describe_llm_failure(exc) -> str:
             # a cause that says something the message does not.
             if ctext and ctext not in msg:
                 parts.append('cause=%s: %s' % (type(cause).__name__, ctext))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug('LLM failure cause unreadable: %r', e)
     return ' | '.join(parts)
 
 

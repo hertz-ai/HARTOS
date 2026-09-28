@@ -173,8 +173,14 @@ class TestTheAuthorIsShownTheTools(unittest.TestCase):
         """
         if _MENU not in self.body:
             self.skipTest('covered by the first test')
+        # The menu's extra is the shared CREATE_ADVERTISED_TOOLS list (the same
+        # list the helper's schema keep rule reads), so check the list names
+        # the tool and the leg passes that list.
+        from core.agent_tools import CREATE_ADVERTISED_TOOLS
+        self.assertIn('execute_windows_or_android_command',
+                      CREATE_ADVERTISED_TOOLS)
         self.assertIn(
-            'execute_windows_or_android_command', self.body,
+            'CREATE_ADVERTISED_TOOLS', self.body,
             'the verifier menu omits execute_windows_or_android_command, '
             'which create_agents DOES register on this leg via register_dual '
             '-- the author would still be unable to name the OS-command tool, '

@@ -965,21 +965,17 @@ def _resolve_python_exe() -> str:
 
     Preference:
       1. $HARTOS_WORKER_PYTHON env var (explicit override)
-      2. python-embed next to the frozen exe (Nunba bundled build)
-      3. sys.executable (dev mode)
+      2. the interpreter that builds backend venvs
+         (``core.venv_paths.venv_creator_python``): python-embed next to
+         the frozen exe, sys.executable from source
+      3. sys.executable (a frozen build with no python-embed)
     """
     override = os.environ.get('HARTOS_WORKER_PYTHON')
     if override and os.path.isfile(override):
         return override
 
-    # Frozen build: python-embed sibling to Nunba.exe
-    if getattr(sys, 'frozen', False):
-        app_dir = os.path.dirname(os.path.abspath(sys.executable))
-        candidate = os.path.join(app_dir, 'python-embed', 'python.exe')
-        if os.path.isfile(candidate):
-            return candidate
-
-    return sys.executable
+    from core.venv_paths import venv_creator_python
+    return venv_creator_python() or sys.executable
 
 
 def _resolve_backend_venv_python(tool_name: Optional[str]) -> Optional[str]:
