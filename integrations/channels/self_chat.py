@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 from typing import Optional, TYPE_CHECKING
 
@@ -140,7 +139,8 @@ class SelfChatHandler:
                 logger.debug("self-chat session.add_message failed", exc_info=True)
 
         # 3. Dispatch to agent API with is_self_chat marker
-        from .chat_contract import chat_request_fields, chat_reply
+        from .chat_contract import (
+            chat_request_fields, chat_reply, agent_turn_timeout)
         payload = {
             "user_id": self.owner_user_id,
             "prompt_id": self.owner_prompt_id,
@@ -168,8 +168,8 @@ class SelfChatHandler:
             # up 1st, 5+ minutes before a slow local multi-agent turn
             # (delegate=local, is_casual=False -> synchronous get_ans, no
             # background-expert delivery leg) could actually finish.
-            _timeout = int(os.environ.get('HEVOLVE_CHANNEL_AGENT_TIMEOUT', '120'))
-            resp = pooled_post(self.agent_api_url, json=payload, timeout=_timeout)
+            resp = pooled_post(self.agent_api_url, json=payload,
+                               timeout=agent_turn_timeout())
         except requests.Timeout:
             # Found live 2026-08-31: this branch returned without ever
             # calling _send_reply_in_thread (unlike every other return

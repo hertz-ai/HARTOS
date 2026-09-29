@@ -159,7 +159,8 @@ class FlaskChannelIntegration:
                     return None
 
             # Prepare request to agent API
-            from .chat_contract import chat_request_fields, chat_reply
+            from .chat_contract import (
+                chat_request_fields, chat_reply, agent_turn_timeout)
             payload = {
                 "user_id": user_id,
                 "prompt_id": prompt_id,
@@ -225,7 +226,7 @@ class FlaskChannelIntegration:
                 # calls (30-45s each on a 4B), blowing past 120s and replying
                 # "Sorry, the request timed out" even though the agent went on
                 # to produce a perfectly good answer.
-                timeout=int(os.environ.get('HEVOLVE_CHANNEL_AGENT_TIMEOUT', '120')),
+                timeout=agent_turn_timeout(),
             )
 
             if response.status_code == 200:
@@ -242,12 +243,16 @@ class FlaskChannelIntegration:
                 self._response_router.log_user_message(
                     user_id, message.channel, message.content)
 
-                # Route response: WAMP desktop + fan-out to bound channels + log
+                # Route response: WAMP desktop + fan-out to bound channels + log.
+                # NOT the originating chat: returning agent_reply below hands it
+                # to ChannelRegistry._route_to_agent, which is the one sender
+                # for this chat.
                 self._response_router.route_response(
                     user_id=user_id,
                     response_text=agent_reply,
                     channel_context=payload.get('channel_context'),
                     fan_out=True,
+                    reply_to_origin=False,
                 )
 
                 return agent_reply

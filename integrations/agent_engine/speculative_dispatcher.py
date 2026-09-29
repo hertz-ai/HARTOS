@@ -1837,15 +1837,6 @@ class SpeculativeDispatcher:
     def _dispatch_expert_langchain(self, model, prompt: str, user_id: str,
                                    prompt_id: str, goal_type: str,
                                    goal_id: Optional[str]) -> str:
-        # TEMP DIAGNOSTIC (2026-08-19) -- capture the call stack of whoever
-        # invokes this, to pin the exact duplicate-turn caller.
-        import os as _os_dbg
-        if _os_dbg.environ.get('HEVOLVE_CHAT_ENTRY_TRACE', '').lower() in ('1', 'true', 'yes'):
-            import traceback as _tb_dbg
-            logger.warning(
-                '[EXPERT-DISPATCH-CALLER] user_id=%r prompt_id=%r model=%r\n%s',
-                user_id, prompt_id, getattr(model, 'model_id', model),
-                ''.join(_tb_dbg.format_stack()[-15:]))
         """Send the expert turn through the right transport for its tier.
 
         - ``model.is_local=True``:  route through the FULL HARTOS /chat
@@ -2002,7 +1993,8 @@ class SpeculativeDispatcher:
             # _run_collapsed_expert_path treats the resulting '' exactly
             # like "expert produced nothing" and the standby stays final,
             # with no error surfaced anywhere.
-            _timeout = int(os.environ.get('HEVOLVE_CHANNEL_AGENT_TIMEOUT', '120'))
+            from integrations.channels.chat_contract import agent_turn_timeout
+            _timeout = agent_turn_timeout()
             resp = _req.post(f'{base}/chat', json=payload,
                              headers=_internal_auth_headers(), timeout=_timeout)
             if resp.status_code == 200:

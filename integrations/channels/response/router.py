@@ -64,6 +64,7 @@ class ChannelResponseRouter:
         channel_context: Optional[Dict[str, Any]] = None,
         agent_id: Optional[str] = None,
         fan_out: bool = True,
+        reply_to_origin: bool = True,
     ):
         """
         Route an agent response to all relevant destinations.
@@ -74,6 +75,11 @@ class ChannelResponseRouter:
             channel_context: Originating channel info (channel, chat_id, sender_id, etc.)
             agent_id: Optional agent ID for conversation logging
             fan_out: Whether to send to other bound channels (not just originating)
+            reply_to_origin: Whether THIS call delivers the reply to the
+                originating chat.  False when the caller's own return value is
+                already delivered there -- FlaskChannelIntegration._handle_message
+                returns the reply to ChannelRegistry._route_to_agent, which sends
+                it; sending it here too delivered every channel reply twice.
         """
         originating_channel = None
         originating_chat_id = None
@@ -100,7 +106,7 @@ class ChannelResponseRouter:
         # desktop app) never got its answer. Found live 2026-08-27:
         # get_ans-routed replies never reached Slack, confirmed via a
         # channel binding, not a Crossbar/desktop client.
-        if originating_channel and originating_chat_id:
+        if reply_to_origin and originating_channel and originating_chat_id:
             self._send_to_originating(
                 channel=originating_channel,
                 chat_id=originating_chat_id,

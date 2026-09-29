@@ -19,7 +19,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 
-from reuse_recipe import (  # noqa: E402
+from hartos.reuse_recipe import (  # noqa: E402
     _begin_turn_deadline,
     _clear_turn_deadline,
     _turn_deadline_exceeded,
