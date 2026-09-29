@@ -781,11 +781,16 @@ class PaymentLedger:
 
         Args:
             payment_id: Payment ID to authorize
-            approver_id: ID of the approver (user or agent)
+            approver_id: ID of the approving PERSON.  Refused when empty, a
+                non-human id (ap2_mandate.NON_HUMAN_APPROVERS, e.g. 'system')
+                or the requesting agent's own id -- an agent can never
+                authorize its own request, whatever calls this.
 
         Returns:
             True if authorization successful
         """
+        from integrations.ap2.ap2_mandate import NON_HUMAN_APPROVERS
+        approver_id = str(approver_id or '').strip()
         with self.lock:
             if payment_id not in self.payments:
                 logger.error(f"Payment not found: {payment_id}")
@@ -796,6 +801,12 @@ class PaymentLedger:
             if payment.status not in (PaymentStatus.PENDING,
                                       PaymentStatus.APPROVAL_REQUIRED):
                 logger.warning(f"Payment {payment_id} not in pending state: {payment.status}")
+                return False
+
+            if (approver_id.lower() in NON_HUMAN_APPROVERS
+                    or approver_id == payment.requester_agent_id):
+                logger.warning(f"Payment {payment_id}: approver {approver_id!r} "
+                               f"is not a person; refused")
                 return False
 
             # Add to approval chain
@@ -1034,12 +1045,16 @@ def get_payment_ledger() -> PaymentLedger:
     return payment_ledger
 
 
-def create_payment_request_function(agent_name: str) -> Callable:
+def create_payment_request_function(agent_name: str,
+                                    user_id: Optional[str] = None) -> Callable:
     """
     Create a payment request function for an agent
 
     Args:
         agent_name: Name of the agent
+        user_id: The person the agent works for.  When given, every payment
+            gets an AP2 mandate owned by them (ap2_mandate), so only they can
+            approve it -- on the approval card, never through a tool.
 
     Returns:
         Function that can be registered with autogen
@@ -1067,6 +1082,30 @@ def create_payment_request_function(agent_name: str) -> Callable:
         except ValueError:
             method = PaymentMethod.INTERNAL_CREDITS
 
+        if user_id:
+            from integrations.ap2.ap2_mandate import (
+                MandateError, get_mandate_store, request_human_approval)
+            store = get_mandate_store()
+            try:
+                m = store.create_cart_mandate(
+                    str(user_id), agent_name,
+                    {'lines': [{'sku_id': 'payment', 'qty': 1,
+                                'unit_price': amount}],
+                     'total': amount, 'currency': currency},
+                    description=description, requester_agent_id=agent_name)
+            except MandateError as e:
+                return json.dumps({'success': False, 'error': str(e)}, indent=2)
+            asked = request_human_approval(m.payment_id, store)
+            return json.dumps({
+                'payment_id': m.payment_id,
+                'amount': m.amount,
+                'currency': m.currency,
+                'status': 'approval_required',
+                'approval_card_shown': asked.get('approval_card_shown'),
+                'message': 'Payment request created. The person must approve '
+                           'it on their screen; approving also completes it.'
+            }, indent=2)
+
         payment = payment_ledger.create_payment_request(
             amount=Decimal(str(amount)),
             currency=currency,
@@ -1087,20 +1126,45 @@ def create_payment_request_function(agent_name: str) -> Callable:
     return request_payment
 
 
-def create_payment_authorization_function() -> Callable:
+def create_payment_authorization_function(ask_only: bool = False) -> Callable:
     """
-    Create a payment authorization function
+    Create the ``authorize_payment`` tool.
+
+    ``ask_only`` (what agents get by default): the tool cannot authorize.  It
+    shows the payment's owner the approval card and returns
+    ``approval_required``; the person's answer reaches /api/agent/approval,
+    which authorizes as the identity in their token
+    (ap2_mandate.decide_payment).  The name is kept so saved recipes that
+    call authorize_payment still resolve.
 
     Returns:
-        Function that can be used to authorize payments
+        Function that can be registered with autogen
     """
-    def authorize_payment(payment_id: str, approver_id: str = "system") -> str:
+    if ask_only:
+        def authorize_payment(payment_id: str, approver_id: str = "") -> str:
+            """
+            Ask the person to approve a pending payment.  Agents cannot approve.
+
+            Args:
+                payment_id: Payment ID awaiting approval
+                approver_id: Ignored -- the approver is whoever the person's
+                    login token says.
+
+            Returns:
+                JSON with status 'approval_required' on success
+            """
+            from integrations.ap2.ap2_mandate import request_human_approval
+            return json.dumps(request_human_approval(payment_id), indent=2)
+
+        return authorize_payment
+
+    def authorize_payment(payment_id: str, approver_id: str = "") -> str:
         """
         Authorize a payment request
 
         Args:
             payment_id: Payment ID to authorize
-            approver_id: ID of the approver
+            approver_id: ID of the approving person (never 'system')
 
         Returns:
             Authorization result
@@ -1147,24 +1211,24 @@ def create_payment_processing_function() -> Callable:
 
 
 def get_ap2_tools_for_autogen(agent_name: str,
+                              user_id: Optional[str] = None,
                               allow_llm_authorize: Optional[bool] = None
                               ) -> List[Dict[str, Any]]:
     """
     Get AP2 payment tools for autogen agent registration
 
-    ``authorize_payment`` is NOT offered to the model by default.  With it the
-    agent could request, authorize and process a payment in three tool calls
-    with ``approver_id="system"`` -- no human anywhere in the loop.
-    Authorization now comes from a person: the approval card answered through
-    ``POST /api/agent/approval`` (the ``ap2_pay:`` branch, which takes the
-    approver from the verified JWT), or ``hart pay authorize`` at a terminal.
-    A node that deliberately wants the old behaviour sets
-    ``AP2_ALLOW_LLM_AUTHORIZE=1`` (or passes ``allow_llm_authorize=True``).
+    The model can never self-authorize by default: ``authorize_payment`` only
+    ASKS the payment's owner (an approval card), and the ledger refuses
+    'system' or the requesting agent as an approver in any case.  A node that
+    deliberately wants a tool that authorizes directly sets
+    ``AP2_ALLOW_LLM_AUTHORIZE=1`` (or passes ``allow_llm_authorize=True``);
+    the caller must then still name a person.
 
     Args:
         agent_name: Name of the agent
-        allow_llm_authorize: Offer authorize_payment to the model.  None
-            reads ``AP2_ALLOW_LLM_AUTHORIZE`` (default False).
+        user_id: The person the agent works for (owner of its payments)
+        allow_llm_authorize: None reads ``AP2_ALLOW_LLM_AUTHORIZE`` (default
+            False).
 
     Returns:
         List of tool definitions for autogen
@@ -1172,25 +1236,29 @@ def get_ap2_tools_for_autogen(agent_name: str,
     if allow_llm_authorize is None:
         from core.config_cache import env_flag
         allow_llm_authorize = env_flag('AP2_ALLOW_LLM_AUTHORIZE', False)
-    tools = [
+    return [
         {
-            'function': create_payment_request_function(agent_name),
+            'function': create_payment_request_function(agent_name, user_id),
             'name': 'request_payment',
-            'description': 'Request a payment transaction for services or resources. Returns payment_id for tracking. A person must approve it before it can be processed.'
+            'description': 'Request a payment transaction for services or resources. The person approves it on their screen. Returns payment_id for tracking.'
         },
-    ]
-    if allow_llm_authorize:
-        tools.append({
-            'function': create_payment_authorization_function(),
+        {
+            'function': create_payment_authorization_function(
+                ask_only=not allow_llm_authorize),
             'name': 'authorize_payment',
-            'description': 'Authorize a pending payment request. Requires payment_id.'
-        })
-    tools.append({
-        'function': create_payment_processing_function(),
-        'name': 'process_payment',
-        'description': 'Process a payment a person has authorized through the gateway. Requires payment_id.'
-    })
-    return tools
+            'description': (
+                'Authorize a pending payment request. Requires payment_id.'
+                if allow_llm_authorize else
+                'Ask the person to approve a pending payment (shows them an '
+                'approval card). Agents cannot approve payments; the result is '
+                'approval_required until the person answers. Requires payment_id.')
+        },
+        {
+            'function': create_payment_processing_function(),
+            'name': 'process_payment',
+            'description': 'Process a payment the person has approved (approving usually completes it already). Requires payment_id.'
+        }
+    ]
 
 
 # Convenience exports

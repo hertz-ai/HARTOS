@@ -16,8 +16,12 @@ WHAT.  A mandate is that agreement, bound to the exact thing being paid for:
                  approval for one cart and then pay for another.
 
 Lifecycle: pending -> approved -> consumed, or pending -> rejected / expired.
-The approver comes from the verified JWT on POST /api/agent/approval
-(``ap2_pay:<payment_id>``), never from a tool argument.
+The approver comes from the verified token on POST /api/agent/approval
+(``ap2_pay:<payment_id>``), never from a tool argument: ``decide_payment`` is
+the ONE place a person's answer is applied.  An approval SETTLES the payment
+right away, through the settler registered for the mandate's ``kind``
+(``register_settler``; McGroce checkout registers its own, which re-checks the
+live cart and places the order), so nobody has to come back and "finish".
 
 This module is the single writer of ``ap2_mandates.json`` under
 core.platform_paths.get_agent_data_dir().  Each record carries an HMAC so a
@@ -41,6 +45,15 @@ from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 MANDATE_STATUSES = ('pending', 'approved', 'rejected', 'expired', 'consumed')
+
+#: Approver ids that never name a person.  PaymentLedger.authorize_payment
+#: refuses them outright (and an agent approving its own request).
+NON_HUMAN_APPROVERS = frozenset({'', 'system', 'assistant', 'agent', 'helper',
+                                 'executor', 'llm'})
+
+APPROVAL_ACTION_PREFIX = 'ap2_pay:'
+AP2_AGENT_ID = 'ap2_payments'
+KIND_GENERIC = 'generic'
 
 # How long a person has to approve a cart, and then to check out with it.
 # A stale approval must not authorize a payment an hour later.
@@ -114,6 +127,8 @@ class CartMandate:
     created_at: float = field(default_factory=time.time)
     expires_at: float = 0.0
     intent: Optional[Dict[str, Any]] = None
+    kind: str = KIND_GENERIC
+    description: str = ''
     sig: str = ''
 
     def signed_fields(self) -> Dict[str, Any]:
@@ -206,8 +221,14 @@ class MandateStore:
     def create_cart_mandate(self, user_id: str, merchant: str,
                             cart: Dict[str, Any], cap=None,
                             ttl_s: Optional[int] = None,
-                            description: str = '') -> CartMandate:
+                            description: str = '',
+                            kind: str = KIND_GENERIC,
+                            requester_agent_id: Optional[str] = None
+                            ) -> CartMandate:
         """Create a pending CartMandate plus its APPROVAL_REQUIRED payment.
+
+        ``requester_agent_id`` is the AGENT asking (the ledger refuses it as
+        an approver); it defaults to ``ap2:<merchant>``, never the owner.
 
         Raises MandateError for an empty or malformed cart, a non-positive
         total, or a total over ``cap``.
@@ -238,10 +259,10 @@ class MandateStore:
         payment = ledger.create_payment_request(
             amount=amount, currency=currency,
             description=description or f'{merchant} order',
-            requester_agent_id=f'user:{user_id}',
+            requester_agent_id=requester_agent_id or f'ap2:{merchant}',
             gateway=ledger.select_gateway(currency),
             require_approval=True,
-            metadata={'kind': 'commerce_checkout', 'mandate_id': mandate_id,
+            metadata={'kind': kind, 'mandate_id': mandate_id,
                       'merchant': merchant, 'user_id': str(user_id),
                       'cart_hash': cart_hash},
         )
@@ -249,7 +270,8 @@ class MandateStore:
             mandate_id=mandate_id, user_id=str(user_id), merchant=merchant,
             cart_hash=cart_hash, amount=str(amount), currency=currency,
             payment_id=payment.payment_id, created_at=now,
-            expires_at=now + ttl, intent=intent)
+            expires_at=now + ttl, intent=intent, kind=kind,
+            description=description or f'{merchant} order')
         m.sig = self._sign(m)
         with self._lock:
             self._mandates[mandate_id] = m
@@ -352,6 +374,138 @@ class MandateStore:
             return True
 
 
+# ── the approval card and the one decision point ─────────────────
+
+def approval_action(payment_id: str) -> str:
+    return f'{APPROVAL_ACTION_PREFIX}{payment_id}'
+
+
+def parse_approval_action(action) -> Optional[str]:
+    """The payment id an ``ap2_pay:<id>`` action names, else None."""
+    action = str(action or '').strip()
+    if not action.lower().startswith(APPROVAL_ACTION_PREFIX):
+        return None
+    return action[len(APPROVAL_ACTION_PREFIX):].strip() or None
+
+
+def push_card(user_id, component: Dict[str, Any]) -> bool:
+    """One Liquid UI fragment to ``user_id`` (best effort, never raises)."""
+    try:
+        from integrations.agent_engine.liquid_ui_service import push_agent_ui
+        return bool(push_agent_ui(AP2_AGENT_ID, component,
+                                  user_id=str(user_id) if user_id else None))
+    except Exception as e:
+        logger.debug(f'ap2: card {component.get("type")} not shown: {e}')
+        return False
+
+
+def approval_card(m: CartMandate, description: Optional[str] = None) -> Dict[str, Any]:
+    return {'type': 'approval', 'agent_id': AP2_AGENT_ID,
+            'action': approval_action(m.payment_id),
+            'description': description or f'Pay {m.amount} {m.currency}: {m.description}',
+            'options': ['Approve', 'Decline'],
+            'amount': m.amount, 'currency': m.currency,
+            'payment_id': m.payment_id}
+
+
+def request_human_approval(payment_id: str, store: Optional[MandateStore] = None
+                           ) -> Dict[str, Any]:
+    """Put a payment's approval card in front of its owner.  What the
+    agent-side ``authorize_payment`` tool does: it can ask, never approve."""
+    store = store or get_mandate_store()
+    m = store.find_by_payment_id(payment_id)
+    if m is None:
+        return {'success': False, 'payment_id': payment_id,
+                'error': 'this payment has no owner to ask; it cannot be '
+                         'approved by an agent'}
+    if m.status != 'pending':
+        return {'success': False, 'payment_id': payment_id,
+                'error': f'mandate is {m.status}'}
+    shown = push_card(m.user_id, approval_card(m))
+    return {'success': True, 'payment_id': payment_id,
+            'status': 'approval_required', 'approval_card_shown': shown,
+            'message': 'Waiting for the person to approve this payment. '
+                       'Agents cannot approve payments; do not retry.'}
+
+
+_settlers: Dict[str, Any] = {}
+_settlers_lock = threading.Lock()
+
+
+def register_settler(kind: str, fn) -> None:
+    """``fn(mandate) -> dict`` settles an APPROVED mandate of ``kind``.
+    Without one, settling is ledger.process_payment."""
+    with _settlers_lock:
+        _settlers[kind] = fn
+
+
+def settle(m: CartMandate, store: Optional[MandateStore] = None) -> Dict[str, Any]:
+    """Take the money for an approved mandate (and whatever its kind does)."""
+    with _settlers_lock:
+        fn = _settlers.get(m.kind)
+    if fn is not None:
+        return fn(m)
+    store = store or get_mandate_store()
+    result = store.ledger.process_payment(m.payment_id)
+    if result.get('success'):
+        store.consume(m.mandate_id)
+    payment = store.ledger.get_payment(m.payment_id)
+    push_card(m.user_id, {
+        'type': 'payment_status',
+        'status': ('completed' if result.get('success') else
+                   'processing' if result.get('status') == 'redirect_required'
+                   else 'failed'),
+        'amount': m.amount, 'currency': m.currency,
+        'method': payment.gateway.value if payment and payment.gateway else None,
+        'transaction_id': result.get('transaction_id'),
+        'redirect_url': result.get('redirect_url')})
+    return result
+
+
+def decide_payment(payment_id: str, approver_id: Optional[str], approved: bool,
+                   store: Optional[MandateStore] = None) -> Tuple[Dict[str, Any], int]:
+    """Apply a person's answer to ``ap2_pay:<payment_id>``.
+
+    ``approver_id`` MUST come from the caller's verified token (the route
+    resolves it), never the request body.  Only the mandate's owner may
+    answer.  Approve -> authorize -> settle; decline -> reject + cancel.
+    Returns ``(payload, http_status)``.
+    """
+    action = approval_action(payment_id)
+    if not approver_id:
+        return {'status': 'error', 'action': action,
+                'reason': 'sign in to answer this request'}, 401
+    store = store or get_mandate_store()
+    m = store.find_by_payment_id(payment_id)
+    if m is None:
+        return {'status': 'error', 'action': action,
+                'reason': 'payment not found'}, 404
+    if m.user_id != str(approver_id):
+        logger.warning(f'ap2_pay: {approver_id} tried to answer '
+                       f'{m.user_id}\'s payment {payment_id}')
+        return {'status': 'error', 'action': action,
+                'reason': 'this payment belongs to someone else'}, 403
+    if not approved:
+        ok, reason = store.reject(m.mandate_id, approver_id)
+        if ok:
+            push_card(m.user_id, {'type': 'payment_status', 'status': 'cancelled',
+                                  'amount': m.amount, 'currency': m.currency})
+        return {'status': 'denied', 'action': action, 'applied': ok,
+                'reason': reason, 'mandate_id': m.mandate_id}, 200
+    ok, reason = store.approve(m.mandate_id, approver_id)
+    if not ok:
+        return {'status': 'error', 'action': action, 'reason': reason,
+                'mandate_id': m.mandate_id}, 409
+    try:
+        result = settle(store.get(m.mandate_id), store)
+    except Exception as e:
+        logger.exception(f'ap2_pay: settling {payment_id} raised')
+        result = {'success': False, 'error': str(e)}
+    return {'status': 'approved', 'action': action, 'applied': True,
+            'mandate_id': m.mandate_id, 'payment_id': payment_id,
+            'result': result}, 200
+
+
 def _load_or_create_key(path: str) -> bytes:
     """Node-local HMAC key for mandate records (0600 where supported)."""
     try:
@@ -395,4 +549,6 @@ def get_mandate_store() -> MandateStore:
 __all__ = [
     'MandateError', 'IntentMandate', 'CartMandate', 'MandateStore',
     'canonical_cart_hash', 'get_mandate_store', 'DEFAULT_MANDATE_TTL_S',
+    'NON_HUMAN_APPROVERS', 'approval_action', 'parse_approval_action',
+    'request_human_approval', 'register_settler', 'settle', 'decide_payment',
 ]

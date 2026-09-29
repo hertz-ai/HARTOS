@@ -172,3 +172,59 @@ class TestVerifyForCheckout:
         assert store.consume(m.mandate_id) is False
         ok, reason = store.verify_for_checkout(m.mandate_id, 'u1', CART)
         assert not ok and 'consumed' in reason
+
+
+class TestDecidePayment:
+    """The ONE place a person's answer is applied (the approval routes call it)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_ui(self):
+        with patch('integrations.agent_engine.liquid_ui_service.push_agent_ui',
+                   return_value=True) as push:
+            self.push = push
+            yield
+
+    def test_owner_approval_settles_a_generic_mandate(self, store):
+        from integrations.ap2.ap2_mandate import decide_payment
+        m = store.create_cart_mandate('u1', 'shop', CART)
+        payload, code = decide_payment(m.payment_id, 'u1', True, store=store)
+        assert code == 200 and payload['result']['success'] is True
+        assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.COMPLETED
+        assert store.get(m.mandate_id).status == 'consumed'
+        assert self.push.call_args.args[1]['type'] == 'payment_status'
+        assert self.push.call_args.kwargs['user_id'] == 'u1'
+
+    @pytest.mark.parametrize('who,code', [(None, 401), ('', 401), ('u2', 403)])
+    def test_only_the_owner_may_answer(self, store, who, code):
+        from integrations.ap2.ap2_mandate import decide_payment
+        m = store.create_cart_mandate('u1', 'shop', CART)
+        assert decide_payment(m.payment_id, who, True, store=store)[1] == code
+        assert store.get(m.mandate_id).status == 'pending'
+
+    def test_decline_cancels(self, store):
+        from integrations.ap2.ap2_mandate import decide_payment
+        m = store.create_cart_mandate('u1', 'shop', CART)
+        payload, code = decide_payment(m.payment_id, 'u1', False, store=store)
+        assert (code, payload['status']) == (200, 'denied')
+        assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.CANCELLED
+
+    def test_unknown_payment(self, store):
+        from integrations.ap2.ap2_mandate import decide_payment
+        assert decide_payment('nope', 'u1', True, store=store)[1] == 404
+
+    def test_a_kind_settles_through_its_registered_settler(self, store):
+        from integrations.ap2 import ap2_mandate
+        seen = []
+        ap2_mandate.register_settler('test_kind', lambda m: seen.append(m.mandate_id) or {'success': True})
+        try:
+            m = store.create_cart_mandate('u1', 'shop', CART, kind='test_kind')
+            payload, _ = ap2_mandate.decide_payment(m.payment_id, 'u1', True, store=store)
+        finally:
+            ap2_mandate._settlers.pop('test_kind', None)
+        assert seen == [m.mandate_id] and payload['result'] == {'success': True}
+        # the settler owns the money step: the ledger only authorized it
+        assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.AUTHORIZED
+
+    def test_the_mandate_requester_is_the_agent_not_the_owner(self, store):
+        m = store.create_cart_mandate('u1', 'shop', CART)
+        assert store.ledger.get_payment(m.payment_id).requester_agent_id == 'ap2:shop'

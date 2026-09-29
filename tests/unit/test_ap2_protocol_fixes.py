@@ -59,7 +59,7 @@ def _ledger(tmp_path):
 def _authorized(ledger, gateway=PaymentGateway.MOCK, currency='INR'):
     p = ledger.create_payment_request(
         amount=Decimal('120.00'), currency=currency, description='t',
-        requester_agent_id='user:1', gateway=gateway)
+        requester_agent_id='agent:shop', gateway=gateway)
     assert ledger.authorize_payment(p.payment_id, 'user:1')
     return p.payment_id
 
@@ -176,7 +176,7 @@ class TestApprovalRequiredAndCancel:
         ledger = _ledger(tmp_path)
         p = ledger.create_payment_request(
             amount=Decimal('5'), currency='INR', description='x',
-            requester_agent_id='user:1', require_approval=True)
+            requester_agent_id='agent:shop', require_approval=True)
         assert p.status == PaymentStatus.APPROVAL_REQUIRED
         assert ledger.process_payment(p.payment_id)['success'] is False
         assert ledger.authorize_payment(p.payment_id, 'user:1') is True
@@ -186,7 +186,7 @@ class TestApprovalRequiredAndCancel:
         ledger = _ledger(tmp_path)
         p = ledger.create_payment_request(
             amount=Decimal('5'), currency='INR', description='x',
-            requester_agent_id='user:1', require_approval=True)
+            requester_agent_id='agent:shop', require_approval=True)
         assert ledger.cancel_payment(p.payment_id, 'user:1', 'denied') is True
         assert ledger.get_payment(p.payment_id).status == PaymentStatus.CANCELLED
         assert ledger.authorize_payment(p.payment_id, 'user:1') is False
@@ -205,15 +205,69 @@ class TestToolsAndCli:
         from integrations.ap2 import get_payment_ledger
         assert get_payment_ledger() is ap2.payment_ledger
 
-    def test_authorize_not_offered_to_the_llm_by_default(self, monkeypatch):
+    def test_default_authorize_tool_only_asks(self, tmp_path, monkeypatch):
+        """The model gets authorize_payment (saved recipes still resolve), but
+        by default it can only show the owner the card -- never authorize."""
         monkeypatch.delenv('AP2_ALLOW_LLM_AUTHORIZE', raising=False)
-        names = [t['name'] for t in ap2.get_ap2_tools_for_autogen('a')]
-        assert names == ['request_payment', 'process_payment']
+        from integrations.ap2.ap2_mandate import MandateStore
+        ledger = _ledger(tmp_path)
+        store = MandateStore(str(tmp_path / 'm.json'), ledger=ledger, key=b'k' * 32)
+        tools = {t['name']: t['function']
+                 for t in ap2.get_ap2_tools_for_autogen('agent', user_id='u1')}
+        assert list(tools) == ['request_payment', 'authorize_payment', 'process_payment']
+        with patch.object(ap2, 'payment_ledger', ledger), \
+                patch('integrations.ap2.ap2_mandate.get_mandate_store', return_value=store), \
+                patch('integrations.agent_engine.liquid_ui_service.push_agent_ui',
+                      return_value=True) as push:
+            req = json.loads(tools['request_payment'](
+                amount=99, currency='INR', description='tea'))
+            assert req['status'] == 'approval_required'
+            pid = req['payment_id']
+            out = json.loads(tools['authorize_payment'](pid, approver_id='u1'))
+        assert out['status'] == 'approval_required'
+        assert ledger.get_payment(pid).status == PaymentStatus.APPROVAL_REQUIRED
+        cards = [c.args[1] for c in push.call_args_list]
+        assert cards[-1]['type'] == 'approval'
+        assert cards[-1]['action'] == f'ap2_pay:{pid}'
+        assert push.call_args.kwargs['user_id'] == 'u1'
 
-    def test_env_flag_opts_in(self, monkeypatch):
+    def test_ask_only_tool_refuses_an_ownerless_payment(self, tmp_path):
+        from integrations.ap2.ap2_mandate import MandateStore
+        ledger = _ledger(tmp_path)
+        store = MandateStore(str(tmp_path / 'm.json'), ledger=ledger, key=b'k' * 32)
+        p = ledger.create_payment_request(
+            amount=Decimal('5'), currency='INR', description='x',
+            requester_agent_id='agent')
+        fn = ap2.create_payment_authorization_function(ask_only=True)
+        with patch('integrations.ap2.ap2_mandate.get_mandate_store', return_value=store):
+            out = json.loads(fn(p.payment_id, approver_id='anyone'))
+        assert out['success'] is False
+        assert ledger.get_payment(p.payment_id).status == PaymentStatus.PENDING
+
+    def test_env_flag_gives_the_direct_tool(self, monkeypatch):
         monkeypatch.setenv('AP2_ALLOW_LLM_AUTHORIZE', '1')
-        names = [t['name'] for t in ap2.get_ap2_tools_for_autogen('a')]
-        assert 'authorize_payment' in names
+        tools = ap2.get_ap2_tools_for_autogen('a')
+        desc = next(t['description'] for t in tools if t['name'] == 'authorize_payment')
+        assert desc.startswith('Authorize a pending payment')
+
+
+class TestLedgerRefusesNonHumanApprovers:
+    @pytest.mark.parametrize('approver', ['system', 'SYSTEM', '', 'assistant', 'llm'])
+    def test_non_human_ids_are_refused(self, tmp_path, approver):
+        ledger = _ledger(tmp_path)
+        p = ledger.create_payment_request(
+            amount=Decimal('5'), currency='INR', description='x',
+            requester_agent_id='agent:shop')
+        assert ledger.authorize_payment(p.payment_id, approver) is False
+        assert ledger.get_payment(p.payment_id).status == PaymentStatus.PENDING
+
+    def test_the_requesting_agent_cannot_approve_itself(self, tmp_path):
+        ledger = _ledger(tmp_path)
+        p = ledger.create_payment_request(
+            amount=Decimal('5'), currency='INR', description='x',
+            requester_agent_id='agent:shop')
+        assert ledger.authorize_payment(p.payment_id, 'agent:shop') is False
+        assert ledger.authorize_payment(p.payment_id, 'user:1') is True
 
     def test_hart_cli_pay_list_no_longer_reports_unavailable(self, tmp_path):
         click = pytest.importorskip('click')

@@ -39,6 +39,7 @@ logger = logging.getLogger('tool_execution')
 
 MERCHANT = 'mcgroce'
 CURRENCY = 'INR'
+CHECKOUT_KIND = 'commerce_checkout'
 _AGENT_ID = 'mcgroce'
 _MAX_CARDS = 3
 _MERCHANT_ROLES = frozenset({'merchant', 'admin', 'vendor'})
@@ -80,14 +81,17 @@ def _fail(error: str, **extra) -> str:
 
 
 def push_fragment(user_id, component: Dict[str, Any]) -> bool:
-    """Show one Liquid UI fragment to ``user_id`` (best effort)."""
+    """Show one Liquid UI fragment to ``user_id`` (best effort).
+
+    Through liquid_ui_service.push_agent_ui: the shell's gated agent_ui_update
+    when this process serves one, AND the user's own stream (WAMP
+    com.hertzai.hevolve.social.<user_id> / per-user SSE) -- the only leg a
+    cloud gateway without a shell has.
+    """
     try:
-        from core.platform.registry import get_registry
-        service = get_registry().get('LiquidUIService')
-        if service is None:
-            return False
+        from integrations.agent_engine.liquid_ui_service import push_agent_ui
         component.setdefault('agent_id', _AGENT_ID)
-        return bool(service.agent_ui_update(str(user_id), component))
+        return bool(push_agent_ui(_AGENT_ID, component, user_id=str(user_id)))
     except Exception as e:
         logger.debug(f'commerce: fragment {component.get("type")} not shown: {e}')
         return False
@@ -364,7 +368,8 @@ def commerce_prepare_checkout(
     try:
         m = _mandates().create_cart_mandate(
             user_id, MERCHANT, mandate_cart(view), cap=cap,
-            description=f"McGroce order, {len(view['items'])} item(s)")
+            description=f"McGroce order, {len(view['items'])} item(s)",
+            kind=CHECKOUT_KIND, requester_agent_id=_AGENT_ID)
     except MandateError as e:
         return _fail(str(e))
     count = sum(i['quantity'] for i in view['items'])
@@ -372,36 +377,60 @@ def commerce_prepare_checkout(
                             'items': _cart_fragment(view)['items'],
                             'total': view['total'], 'currency': CURRENCY,
                             'confirm_action': f'ap2_pay:{m.payment_id}'})
-    shown = push_fragment(user_id, {
-        'type': 'approval', 'action': f'ap2_pay:{m.payment_id}',
-        'description': (f"Pay ₹{view['total']:.2f} to McGroce for {count} "
-                        f"item{'s' if count != 1 else ''}?"),
-        'options': ['Approve', 'Decline'],
-    })
+    from integrations.ap2.ap2_mandate import approval_card
+    card = approval_card(m, description=(
+        f"Pay ₹{view['total']:.2f} to McGroce for {count} "
+        f"item{'s' if count != 1 else ''}?"))
+    card['agent_id'] = _AGENT_ID
+    shown = push_fragment(user_id, card)
     return _out({'success': True, 'status': 'awaiting_approval',
                  'mandate_id': m.mandate_id, 'payment_id': m.payment_id,
                  'amount': m.amount, 'currency': m.currency,
                  'expires_at': m.expires_at, 'approval_card_shown': shown,
-                 'next': 'wait for the shopper to approve, then call '
-                         'commerce_checkout with this mandate_id'})
+                 'next': 'wait for the shopper to approve; approving pays and '
+                         'places the order.  If they say it did not go '
+                         'through, call commerce_checkout with this mandate_id'})
 
 
 def commerce_checkout(
     user_id: str,
     mandate_id: Annotated[str, "mandate_id from commerce_prepare_checkout"],
 ) -> str:
-    """Pay for the approved cart and place the McGroce order."""
+    """Pay for the approved cart and place the McGroce order.
+
+    Approving the card already does this; call it only to retry a checkout
+    that did not complete.  Refuses unless the shopper approved.
+    """
+    m = _mandates().get(mandate_id)
+    if m is None or m.user_id != str(user_id):
+        return _fail('checkout refused: mandate not found')
+    return _out(settle_checkout(m))
+
+
+def settle_checkout(m) -> Dict[str, Any]:
+    """Settle an APPROVED McGroce checkout mandate: re-check the live cart
+    against what the shopper approved, take the money, place the order.
+
+    The ap2 settler for CHECKOUT_KIND -- what an approval runs
+    (ap2_mandate.decide_payment) and what commerce_checkout retries.
+    """
+    user_id = m.user_id
     client = _client()
     res = client.cart_get(user_id)
     if not res['success']:
-        return _fail(res['error'])
+        return {'success': False, 'error': res['error']}
     view = cart_view(res['data'])
     store = _mandates()
-    ok, reason = store.verify_for_checkout(mandate_id, user_id, mandate_cart(view))
+    ok, reason = store.verify_for_checkout(m.mandate_id, user_id, mandate_cart(view))
     if not ok:
-        return _fail(f'checkout refused: {reason}')
-    m = store.get(mandate_id)
-    from integrations.ap2.ap2_protocol import get_payment_ledger
+        if 'cart changed' in reason:
+            push_fragment(user_id, {
+                'type': 'notification', 'severity': 'warning',
+                'title': 'Your cart changed',
+                'message': 'Your cart is different from the one you approved, '
+                           'so nothing was charged. Review it and approve again.'})
+        return {'success': False, 'error': f'checkout refused: {reason}'}
+    from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
     ledger = get_payment_ledger()
     paid = ledger.process_payment(m.payment_id)
     payment = ledger.get_payment(m.payment_id)
@@ -412,18 +441,18 @@ def commerce_checkout(
                                 'method': method,
                                 'transaction_id': paid.get('transaction_id'),
                                 'redirect_url': paid.get('redirect_url')})
-        return _out({'success': True, 'status': 'awaiting_payment',
-                     'redirect_url': paid.get('redirect_url'),
-                     'payment_id': m.payment_id})
+        return {'success': True, 'status': 'awaiting_payment',
+                'redirect_url': paid.get('redirect_url'),
+                'payment_id': m.payment_id}
     if not paid.get('success'):
-        from integrations.ap2.ap2_protocol import PaymentStatus
         if payment is not None and payment.status == PaymentStatus.FAILED:
             push_fragment(user_id, {'type': 'payment_status', 'status': 'failed',
                                     'amount': float(m.amount), 'currency': CURRENCY,
                                     'method': method})
-        return _fail(f"payment failed: {paid.get('error', 'declined')}",
-                     payment_id=m.payment_id)
-    return _out(_place_order(client, user_id, m, view, payment))
+        return {'success': False,
+                'error': f"payment failed: {paid.get('error', 'declined')}",
+                'payment_id': m.payment_id}
+    return _place_order(client, user_id, m, view, payment)
 
 
 def _place_order(client, user_id, m, view, payment) -> Dict[str, Any]:
@@ -691,3 +720,9 @@ def register_commerce_tools(helper, assistant, user_id: str, executor=None):
             executor.register_for_execution(name=name)(bound)
     logger.info(f'Registered {len(_TOOL_SPECS)} commerce tools for user {user_id}')
     return len(_TOOL_SPECS)
+
+
+# An approval answered anywhere in the process settles a McGroce checkout
+# through this module (ap2_mandate.decide_payment -> settle).
+from integrations.ap2.ap2_mandate import register_settler  # noqa: E402
+register_settler(CHECKOUT_KIND, settle_checkout)

@@ -12,6 +12,8 @@
                                     and /api/agent/approval.  The McGroce
                                     service account never reaches a browser.
   GET  /api/commerce/mandates/<id>  the caller's own mandate status (JWT).
+  GET  /api/commerce/stream         where the caller's live cards arrive
+                                    (no new stream: the per-user topic).
   GET  /api/commerce/health         configured? breaker state.
 
 The agentic chat itself is the existing POST /chat -- no second chat route.
@@ -78,6 +80,22 @@ def commerce_mandate(mandate_id):
         'payment_id': m.payment_id, 'amount': m.amount,
         'currency': m.currency, 'merchant': m.merchant,
         'expires_at': m.expires_at, 'approved_at': m.approved_at}})
+
+
+@commerce_bp.route('/api/commerce/stream', methods=['GET'])
+def commerce_stream():
+    """Where the embed listens.  Commerce cards go out through
+    liquid_ui_service.push_agent_ui, which publishes each on the user's own
+    'chat.social' topic -- WAMP com.hertzai.hevolve.social.<user_id>, per-user
+    SSE event chat.social in bundled Nunba -- as type agent_ui_update."""
+    from integrations.commerce.approvals import approver_from_request
+    user_id = approver_from_request(request)
+    if not user_id:
+        return _json_error('sign in first', 401)
+    return jsonify({'user_id': user_id,
+                    'wamp_topic': f'com.hertzai.hevolve.social.{user_id}',
+                    'sse_event': 'chat.social',
+                    'message_type': 'agent_ui_update'})
 
 
 @commerce_bp.route('/api/commerce/health', methods=['GET'])

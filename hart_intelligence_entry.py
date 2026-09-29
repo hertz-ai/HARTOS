@@ -11217,9 +11217,14 @@ def agent_approval():
         # and the approver is the caller's VERIFIED JWT identity -- never a
         # body field: an agent must not be able to pay on its own say-so.
         # One implementation: integrations/commerce/approvals.py.
-        from integrations.commerce.approvals import (
-            answer_commerce_approval, approver_from_request, is_commerce_action)
-        if is_commerce_action(action):
+        try:
+            from integrations.commerce.approvals import (
+                answer_commerce_approval, approver_from_request,
+                is_commerce_action)
+        except Exception as _com_exc:   # never costs a consent answer
+            app.logger.warning(f'agent_approval: commerce unavailable: {_com_exc}')
+            is_commerce_action = None
+        if is_commerce_action and is_commerce_action(action):
             _c_body, _c_code = answer_commerce_approval(
                 action_raw, approved, approver_from_request(request))
             return jsonify(_c_body), _c_code

@@ -682,12 +682,16 @@ def detect_goal_tags(prompt) -> list:
     # docs): 'mcgroce' fires on the grocery seed + p2p_grocery +
     # mcgroce_shopper/merchant only (after the shared _P2P_TOOLS block
     # stopped naming it), 'order status' on p2p_grocery only, the rest 0.
-    # DELIBERATELY NOT bare 'checkout': "git checkout <branch>" would hand
-    # cart tools to a coding agent; the cart-qualified phrases stand in.
+    # 'shopping list' / 'shopping cart' / 'onboard my store' / 'list my
+    # store' catch a person asking in their own words (0 corpus hits).
+    # DELIBERATELY NOT bare 'checkout' ("git checkout <branch>" would hand
+    # cart tools to a coding agent) nor the stem 'grocer', which fired on all
+    # 13 P2P prompts (the shared block says "grocery backend").
     commerce_keywords = [
         'mcgroce', 'add to cart', 'checkout my cart', 'cart checkout',
         'proceed to checkout', 'order status', 'onboard merchant',
         'merchant onboarding', 'new sku', 'grocery order',
+        'shopping list', 'shopping cart', 'onboard my store', 'list my store',
     ]
     if _mentions(lower, commerce_keywords):
         tags.append('commerce')

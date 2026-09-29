@@ -2238,8 +2238,8 @@ _P2P_PREAMBLE = (
 
 _P2P_TOOLS = (
     "TOOLS (use existing — DO NOT create new endpoints):\n"
-    "- request_payment / process_payment (AP2 protocol). A PERSON authorizes\n"
-    "  every payment on the approval card; you cannot authorize one yourself.\n"
+    "- request_payment / authorize_payment / process_payment (AP2 protocol;\n"
+    "  authorize_payment only ASKS the person, who approves on their screen)\n"
     "- web_search (find providers, compare prices, verify businesses)\n"
     "- fetch_news_feeds / get_trending_news (market intelligence)\n"
     "- save_data_in_memory / get_data_from_memory (state persistence)\n"
@@ -2281,8 +2281,8 @@ def _build_p2p_marketplace_prompt(goal_dict, product_dict=None):
         "   and memory lookups. Rank by: proximity, rating, price, freshness.\n"
         "3. NEGOTIATION: Facilitate P2P negotiation via channel messages.\n"
         "   Suggest fair prices based on market data (web_search comparable items).\n"
-        "4. PAYMENT: Use request_payment, wait for the buyer to approve it,\n"
-        "   then process_payment.\n"
+        "4. PAYMENT: Use request_payment → authorize_payment (asks the buyer;\n"
+        "   you cannot approve) → process_payment once they have approved.\n"
         "   ALWAYS escrow. Release on buyer confirmation.\n"
         "5. FULFILLMENT: For physical goods, coordinate delivery via\n"
         "   logistics APIs (Dunzo, Porter, local couriers). Compare prices.\n"
@@ -2424,7 +2424,7 @@ def _build_p2p_grocery_prompt(goal_dict, product_dict=None):
         "6. PAYMENT: Escrow via AP2. Item cost + delivery fee.\n"
         "   Shopper gets item reimbursement + 90% of delivery fee.\n"
         "   McGroce cart: commerce_prepare_checkout shows the buyer an approval\n"
-        "   card; only after the buyer approves, commerce_checkout(mandate_id).\n\n"
+        "   card; the buyer's approval pays and places the order.\n\n"
         + _P2P_PREAMBLE + _P2P_TOOLS +
         "FRESHNESS GUARANTEE:\n"
         "- Produce photos required before delivery\n"
@@ -2792,9 +2792,11 @@ def _build_mcgroce_shopper_prompt(goal_dict, product_dict=None):
         "commerce_cart_update, commerce_cart_remove, commerce_apply_promo,\n"
         "commerce_prepare_checkout, commerce_checkout, commerce_order_status.\n\n"
         "CHECKOUT: call commerce_prepare_checkout (pass cap if the shopper named\n"
-        "a budget).  It shows an Approve card and charges nothing.  Wait until\n"
-        "the shopper approves, then call commerce_checkout with the mandate_id.\n"
-        "If checkout is refused because the cart changed, prepare again.\n\n"
+        "a budget).  It shows an Approve card and charges nothing.  You can\n"
+        "NEVER approve.  When the shopper approves, the payment is taken and the\n"
+        "order placed for them; tell them it is waiting on them, then stop.\n"
+        "Call commerce_checkout(mandate_id) only to retry one that did not go\n"
+        "through.  If the cart changed since approval, prepare again.\n\n"
         + _MCGROCE_COMMON
     )
 

@@ -54,28 +54,28 @@ def _apply_security_headers(app: Flask):
         return response
 
 
-#: Env vars whose comma-separated origins join the ONE CORS allowlist.
-#: MCGROCE_SPA_ORIGINS lists the McGroce site + admin SPA origins, whose
-#: floating agent calls POST /chat, /api/agent/approval and /api/commerce/*
-#: with a Bearer JWT -- kept separate so a McGroce deploy can be turned on
-#: or off without touching the node's own CORS_ORIGINS.
-CORS_ORIGIN_ENV_VARS = ('CORS_ORIGINS', 'MCGROCE_SPA_ORIGINS')
+#: Env vars whose comma-separated origins together form the CORS allowlist.
+#: MCGROCE_ORIGINS carries the McGroce storefront origins the Nunba embed is
+#: served from (moved here from Nunba), kept apart so an operator can manage
+#: them without touching the node's own CORS_ORIGINS.
+CORS_ORIGIN_ENV_VARS = ('CORS_ORIGINS', 'MCGROCE_ORIGINS')
 
 
 def cors_allowed_origins() -> set:
-    """The exact origins allowed cross-origin (empty = none, fail-closed)."""
-    return {o.strip()
-            for var in CORS_ORIGIN_ENV_VARS
-            for o in os.environ.get(var, '').split(',')
-            if o.strip()}
+    """The CORS allowlist: the union of every CORS_ORIGIN_ENV_VARS entry."""
+    return set(
+        o.strip()
+        for var in CORS_ORIGIN_ENV_VARS
+        for o in os.environ.get(var, '').split(',')
+        if o.strip()
+    )
 
 
 def _apply_cors(app: Flask):
     """CORS with explicit origin allowlist.
 
-    The allowlist is the union of CORS_ORIGIN_ENV_VARS (CORS_ORIGINS and
-    MCGROCE_SPA_ORIGINS).  If none is set, no origins are allowed
-    (fail-closed).  Set CORS_ORIGINS=* for development only.
+    If neither CORS_ORIGINS nor MCGROCE_ORIGINS is set, no origins are
+    allowed (fail-closed).  Set CORS_ORIGINS=* for development only.
     """
     allowed_origins = cors_allowed_origins()
     if not allowed_origins:

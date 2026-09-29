@@ -82,23 +82,20 @@ def env(tmp_path):
                             key=b'k' * 32)
     drafts = DraftStore(str(tmp_path / 'drafts.json'))
     fake = FakeMcGroce()
-    ui = MagicMock()
-    ui.agent_ui_update.return_value = True
-    registry = MagicMock()
-    registry.get.return_value = ui
+    ui = MagicMock(return_value=True)   # liquid_ui_service.push_agent_ui
     with patch.object(ct, '_client', return_value=client), \
             patch.object(ct, '_mandates', return_value=mandates), \
             patch.object(ct, '_drafts', return_value=drafts), \
             patch.object(ap2_protocol, 'payment_ledger', ledger), \
             patch('integrations.commerce.bindings.get_bindings', return_value=bindings), \
             patch('core.http_pool.pooled_request', side_effect=fake), \
-            patch('core.platform.registry.get_registry', return_value=registry):
+            patch('integrations.agent_engine.liquid_ui_service.push_agent_ui', ui):
         yield {'fake': fake, 'ui': ui, 'ledger': ledger, 'mandates': mandates,
                'drafts': drafts, 'bindings': bindings}
 
 
 def pushed(env, type_=None):
-    comps = [c.args[1] for c in env['ui'].agent_ui_update.call_args_list]
+    comps = [c.args[1] for c in env['ui'].call_args_list]
     return [c for c in comps if type_ is None or c['type'] == type_]
 
 
@@ -259,7 +256,7 @@ class TestCheckout:
         env['mandates'].approve(out['mandate_id'], UID)
         other = env['bindings'].upsert(5, 'ravi@example.com')['user_id']
         self._assert_refused(env, json.loads(ct.commerce_checkout(other, out['mandate_id'])),
-                             'another user')
+                             'not found')
 
     def test_refuses_when_the_cart_changed_after_approval(self, env):
         out = self._prepare(env)
@@ -299,6 +296,34 @@ class TestCheckout:
         # one-shot: a replay is refused
         again = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
         assert again['success'] is False and 'consumed' in again['error']
+
+    def test_the_shoppers_approval_pays_and_places_the_order(self, env):
+        from integrations.ap2.ap2_mandate import decide_payment
+        out = self._prepare(env)
+        env['fake'].on('POST', '/cart/checkout/payment', body={'id': 1})
+        env['fake'].on('POST', '/cart/checkout',
+                       body={'orderNumber': 'ORD-7', 'status': 'SUBMITTED'})
+        payload, code = decide_payment(out['payment_id'], UID, True,
+                                       store=env['mandates'])
+        assert code == 200 and payload['status'] == 'approved'
+        assert payload['result']['order_id'] == 'ORD-7'
+        assert env['mandates'].get(out['mandate_id']).status == 'consumed'
+        assert env['ledger'].get_payment(out['payment_id']).status == PaymentStatus.COMPLETED
+        # every card went to this shopper's own stream
+        assert {c.kwargs['user_id'] for c in env['ui'].call_args_list} == {UID}
+
+    def test_approval_with_a_changed_cart_charges_nothing(self, env):
+        from integrations.ap2.ap2_mandate import decide_payment
+        out = self._prepare(env)
+        drifted = json.loads(json.dumps(ORDER))
+        drifted['orderItems'][1]['quantity'] = 4
+        env['fake'].on('GET', '/cart', body=drifted)
+        payload, code = decide_payment(out['payment_id'], UID, True,
+                                       store=env['mandates'])
+        assert code == 200 and payload['result']['success'] is False
+        assert env['ledger'].get_payment(out['payment_id']).status == PaymentStatus.AUTHORIZED
+        assert pushed(env, 'notification')[-1]['title'] == 'Your cart changed'
+        assert not env['fake'].called('POST', '/cart/checkout')
 
     def test_paid_but_order_failed_is_flagged_for_a_person(self, env):
         out = self._prepare(env)

@@ -185,7 +185,7 @@ class TestCORS:
 
     def test_mcgroce_spa_origins_join_the_allowlist(self, make_app):
         client, _ = make_app({'CORS_ORIGINS': 'https://hart.ai',
-                              'MCGROCE_SPA_ORIGINS':
+                              'MCGROCE_ORIGINS':
                                   'https://mcgroce.example, https://admin.mcgroce.example'})
         for origin in ('https://hart.ai', 'https://mcgroce.example',
                        'https://admin.mcgroce.example'):
@@ -195,7 +195,7 @@ class TestCORS:
         assert 'Access-Control-Allow-Origin' not in resp.headers
 
     def test_mcgroce_preflight_for_chat_allows_bearer(self, make_app):
-        client, _ = make_app({'MCGROCE_SPA_ORIGINS': 'https://mcgroce.example'})
+        client, _ = make_app({'MCGROCE_ORIGINS': 'https://mcgroce.example'})
         resp = client.open('/chat', method='OPTIONS', headers={
             'Origin': 'https://mcgroce.example',
             'Access-Control-Request-Method': 'POST',
@@ -204,7 +204,7 @@ class TestCORS:
         assert 'Authorization' in resp.headers.get('Access-Control-Allow-Headers', '')
 
     def test_mcgroce_origins_unset_stays_fail_closed(self, make_app):
-        client, _ = make_app({'CORS_ORIGINS': '', 'MCGROCE_SPA_ORIGINS': ''})
+        client, _ = make_app({'CORS_ORIGINS': '', 'MCGROCE_ORIGINS': ''})
         resp = client.get('/status', headers={'Origin': 'https://mcgroce.example'})
         assert 'Access-Control-Allow-Origin' not in resp.headers
 

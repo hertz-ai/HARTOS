@@ -34,19 +34,31 @@ def is_commerce_action(action) -> bool:
 
 
 def approver_from_request(req) -> Optional[str]:
-    """user_id from the request's Bearer JWT, or None (no/invalid token, or
-    a node API key, which names no person)."""
+    """Whose Bearer token this is, or None -- never a body field.
+
+    A HARTOS JWT (what /api/commerce/session issues and /chat accepts) is
+    decoded locally; anything else goes through
+    integrations.social.auth.user_id_for_token (a hive JWT or a stored
+    api_token, e.g. a cloud login on a desktop).  A node API key names no
+    person, so it answers None.
+    """
     auth = req.headers.get('Authorization', '')
     if not auth.startswith('Bearer '):
         return None
+    token = auth[7:].strip()
     try:
         from integrations.social.auth import decode_jwt
-        payload = decode_jwt(auth[7:].strip()) or {}
+        uid = (decode_jwt(token) or {}).get('user_id')
+        if uid:
+            return str(uid)
     except Exception as e:
         logger.debug(f'commerce approval: token not decodable: {e}')
+    try:
+        from integrations.social.auth import user_id_for_token
+        return user_id_for_token(token)
+    except Exception as e:
+        logger.debug(f'commerce approval: token lookup failed: {e}')
         return None
-    uid = payload.get('user_id')
-    return str(uid) if uid else None
 
 
 def answer_commerce_approval(action: str, approved: bool,
@@ -70,30 +82,13 @@ def answer_commerce_approval(action: str, approved: bool,
 
 
 def _answer_payment(action, payment_id, approved, approver_id) -> Reply:
-    from integrations.ap2.ap2_mandate import get_mandate_store
-    store = get_mandate_store()
-    m = store.find_by_payment_id(payment_id)
-    if m is None:
-        return {'status': 'error', 'action': action,
-                'reason': 'payment not found'}, 404
-    if m.user_id != str(approver_id):
-        logger.warning(f'ap2_pay: {approver_id} tried to answer '
-                       f'{m.user_id}\'s payment {payment_id}')
-        return {'status': 'error', 'action': action,
-                'reason': 'this payment belongs to someone else'}, 403
-    if approved:
-        ok, reason = store.approve(m.mandate_id, approver_id)
-        if not ok:
-            return {'status': 'error', 'action': action, 'reason': reason,
-                    'mandate_id': m.mandate_id}, 409
-        _push(approver_id, {'type': 'notification',
-                            'title': 'Payment approved',
-                            'message': f'₹{m.amount} to McGroce. Placing your order…'})
-        return {'status': 'approved', 'action': action, 'applied': True,
-                'mandate_id': m.mandate_id, 'payment_id': payment_id}, 200
-    ok, reason = store.reject(m.mandate_id, approver_id)
-    return {'status': 'denied', 'action': action, 'applied': ok,
-            'reason': reason, 'mandate_id': m.mandate_id}, 200
+    # Importing commerce_tools registers the McGroce checkout settler, so an
+    # approval here pays AND places the order.
+    import integrations.commerce.commerce_tools  # noqa: F401
+    from integrations.ap2.ap2_mandate import decide_payment
+    payload, code = decide_payment(payment_id, approver_id, approved)
+    payload['action'] = action
+    return payload, code
 
 
 def _answer_draft(action, prefix, draft_id, approved, approver_id) -> Reply:

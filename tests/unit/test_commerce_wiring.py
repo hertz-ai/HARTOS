@@ -114,3 +114,89 @@ def test_source_guard_tier2_dispatches_commerce(leg):
     assert len(calls) == 1, f'{leg}: expected one gated register_commerce_tools call'
     args = [a.id for a in calls[0].args if isinstance(a, ast.Name)]
     assert args == ['helper', 'assistant', 'user_id']
+
+
+# ── Delivery: push_agent_ui (ported from the parallel WP-H branch) ──
+
+def test_push_reaches_the_shell_and_the_users_own_stream(monkeypatch):
+    from unittest.mock import MagicMock
+    from integrations.agent_engine import liquid_ui_service as lui
+    shell = MagicMock()
+    shell.agent_ui_update.return_value = True
+    registry = MagicMock()
+    registry.get_or_none.return_value = shell
+    published = []
+    monkeypatch.setattr('core.platform.registry.get_registry', lambda: registry)
+    monkeypatch.setattr('integrations.social.realtime.publish_event',
+                        lambda t, d, user_id='': published.append((t, d, user_id)))
+    card = {'type': 'cart', 'items': [], 'total': 0, 'currency': 'INR'}
+    assert lui.push_agent_ui('mcgroce', card, user_id='mcg-1')
+    assert shell.agent_ui_update.call_args.kwargs['user_id'] == 'mcg-1'
+    topic, data, uid = published[0]
+    assert (topic, uid) == ('chat.social', 'mcg-1')
+    assert data['type'] == 'agent_ui_update' and data['component']['type'] == 'cart'
+
+
+def test_push_without_a_shell_still_gates_the_card(monkeypatch):
+    from unittest.mock import MagicMock
+    from integrations.agent_engine import liquid_ui_service as lui
+    registry = MagicMock()
+    registry.get_or_none.return_value = None
+    published = []
+    monkeypatch.setattr('core.platform.registry.get_registry', lambda: registry)
+    monkeypatch.setattr('integrations.social.realtime.publish_event',
+                        lambda t, d, user_id='': published.append(t))
+    assert not lui.push_agent_ui('a', {'type': 'bogus'}, user_id='u')
+    assert not lui.push_agent_ui(
+        'a', {'type': 'notification', 'message': '<script>x</script>'}, user_id='u')
+    assert published == []
+    assert lui.push_agent_ui('a', {'type': 'notification', 'message': 'hi'}, user_id='u')
+    assert published == ['chat.social']
+
+
+# ── The shell's own /api/agent/approval decides commerce cards ──
+
+@pytest.fixture
+def shell_world(monkeypatch, tmp_path):
+    from integrations.agent_engine.liquid_ui_service import LiquidUIService
+    from integrations.ap2.ap2_mandate import MandateStore
+    from integrations.ap2.ap2_protocol import PaymentLedger
+    monkeypatch.setattr(LiquidUIService, '_register_self', lambda self: None)
+    monkeypatch.setattr('integrations.agent_engine.liquid_ui_service.push_agent_ui',
+                        lambda *a, **k: True)
+    ledger = PaymentLedger(ledger_path=str(tmp_path / 'l.json'))
+    store = MandateStore(str(tmp_path / 'm.json'), ledger=ledger, key=b'k' * 32)
+    monkeypatch.setattr('integrations.ap2.ap2_mandate.get_mandate_store', lambda: store)
+    client = LiquidUIService()._create_flask_app().test_client()
+    cart = {'lines': [{'sku_id': 1, 'qty': 1, 'unit_price': 50}],
+            'total': 50, 'currency': 'INR'}
+    m = store.create_cart_mandate('mcg-1', 'mcgroce', cart)
+    return client, ledger, m
+
+
+def _bearer(uid):
+    from integrations.social.auth import generate_jwt
+    return {'Authorization': 'Bearer ' + generate_jwt(uid, uid, tenant_id='mcgroce')}
+
+
+def test_shell_approval_decides_the_payment_as_the_token_holder(shell_world):
+    from integrations.ap2.ap2_protocol import PaymentStatus
+    client, ledger, m = shell_world
+    body = {'agent_id': 'mcgroce', 'action': f'ap2_pay:{m.payment_id}',
+            'decision': 'approve'}
+    assert client.post('/api/agent/approval', json=body).status_code == 401
+    assert client.post('/api/agent/approval', json=body,
+                       headers=_bearer('mcg-2')).status_code == 403
+    r = client.post('/api/agent/approval', json=body, headers=_bearer('mcg-1'))
+    assert r.status_code == 200 and r.get_json()['status'] == 'approved'
+    assert ledger.get_payment(m.payment_id).status == PaymentStatus.COMPLETED
+
+
+def test_shell_later_leaves_the_payment_waiting(shell_world):
+    from integrations.ap2.ap2_protocol import PaymentStatus
+    client, ledger, m = shell_world
+    r = client.post('/api/agent/approval', json={
+        'agent_id': 'mcgroce', 'action': f'ap2_pay:{m.payment_id}',
+        'decision': 'later'}, headers=_bearer('mcg-1'))
+    assert r.status_code == 200
+    assert ledger.get_payment(m.payment_id).status == PaymentStatus.APPROVAL_REQUIRED

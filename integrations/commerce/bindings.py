@@ -11,6 +11,7 @@ Single writer of ``commerce_bindings.json`` under
 core.platform_paths.get_agent_data_dir().
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -24,22 +25,30 @@ logger = logging.getLogger(__name__)
 TENANT = 'mcgroce'
 _FILENAME = 'commerce_bindings.json'
 _MERCHANT_ROLES = frozenset({'merchant', 'admin', 'vendor'})
-_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+_SAFE_ID = re.compile(r'^[A-Za-z0-9-]{1,64}$')
+
+#: HARTOS identity prefix for a McGroce principal.  A HYPHEN, not an
+#: underscore or colon: the id lands in file names (Windows) and in the
+#: "{user_id}_{prompt_id}" session key, whose FIRST underscore separates the
+#: user from the prompt.
+IDENTITY_PREFIX = 'mcg-'
 
 
 def hartos_user_id(customer_id, role: str = 'customer') -> str:
     """The HARTOS user_id a McGroce principal maps to.
 
-    Namespaced so a McGroce id can never collide with a native HARTOS user,
-    and merchants (admin users) apart from shoppers (customers), whose ids
-    come from different McGroce tables.  Underscores only: the id ends up in
-    file names (agent_data/ledger_{user_id}_{prompt_id}.json) on Windows too.
+    ``mcg-<id>`` for shoppers, ``mcg-m-<id>`` for merchants (admin users),
+    whose ids come from a different McGroce table.  An id that is not already
+    [A-Za-z0-9-] (an email, a dotted username) is hashed, so the result is
+    always file-name and topic safe and stable for the same principal.
     """
-    cid = str(customer_id).strip()
-    if not _ID_RE.match(cid):
-        raise ValueError(f'invalid McGroce id: {customer_id!r}')
-    prefix = 'mcgroce_m_' if str(role).lower() in _MERCHANT_ROLES else 'mcgroce_'
-    return prefix + cid
+    cid = str(customer_id if customer_id is not None else '').strip()
+    if not cid:
+        raise ValueError('a McGroce id is required')
+    if not _SAFE_ID.match(cid):
+        cid = hashlib.sha256(cid.encode('utf-8')).hexdigest()[:32]
+    merchant = str(role).lower() in _MERCHANT_ROLES
+    return f"{IDENTITY_PREFIX}{'m-' if merchant else ''}{cid}"
 
 
 class CommerceBindings:

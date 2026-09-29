@@ -20,7 +20,7 @@ from integrations.social.auth import generate_jwt
 
 CART = {'lines': [{'sku_id': 11, 'qty': 2, 'unit_price': 40}],
         'total': 80, 'currency': 'INR'}
-OWNER, OTHER = 'mcgroce_4242', 'mcgroce_5'
+OWNER, OTHER = 'mcg-4242', 'mcg-5'
 
 
 @pytest.fixture(scope='module')
@@ -46,7 +46,8 @@ def ctx(app, tmp_path):
     with patch('integrations.ap2.ap2_mandate.get_mandate_store', return_value=mandates), \
             patch('integrations.commerce.drafts.get_draft_store', return_value=drafts), \
             patch('integrations.commerce.mcgroce_client.get_client', return_value=mcg), \
-            patch('integrations.commerce.commerce_tools.push_fragment') as push:
+            patch('integrations.agent_engine.liquid_ui_service.push_agent_ui',
+                  return_value=True) as push:
         yield {'client': app.test_client(), 'mandates': mandates,
                'ledger': ledger, 'drafts': drafts, 'mcg': mcg, 'push': push}
 
@@ -62,15 +63,17 @@ def _answer(ctx, action, decision='approve', user=OWNER, body_user=None):
 
 
 class TestAp2Pay:
-    def test_owner_approval_authorizes_with_the_jwt_user(self, ctx):
+    def test_owner_approval_authorizes_as_the_jwt_user_and_settles(self, ctx):
         m = ctx['mandates'].create_cart_mandate(OWNER, 'mcgroce', CART)
         r = _answer(ctx, f'ap2_pay:{m.payment_id}')
         assert r.status_code == 200
         assert r.get_json()['status'] == 'approved'
         p = ctx['ledger'].get_payment(m.payment_id)
-        assert p.status == PaymentStatus.AUTHORIZED
+        assert p.status == PaymentStatus.COMPLETED
         assert p.approval_chain[-1]['approver_id'] == f'user:{OWNER}'
-        assert ctx['mandates'].get(m.mandate_id).status == 'approved'
+        assert ctx['mandates'].get(m.mandate_id).status == 'consumed'
+        shown = [c.args[1]['type'] for c in ctx['push'].call_args_list]
+        assert shown[-1] == 'payment_status'
 
     def test_another_user_gets_403_even_naming_the_owner_in_the_body(self, ctx):
         m = ctx['mandates'].create_cart_mandate(OWNER, 'mcgroce', CART)

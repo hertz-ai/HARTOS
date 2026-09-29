@@ -68,7 +68,7 @@ class TestIdentity:
 
     def test_unbound_user_never_reaches_mcgroce(self, client):
         with patch('core.http_pool.pooled_request') as m:
-            out = client.cart_get('mcgroce_999')
+            out = client.cart_get('mcg-999')
         assert out['success'] is False and 'not linked' in out['error']
         m.assert_not_called()
 
@@ -183,15 +183,18 @@ class TestFailures:
 
 
 class TestBindings:
-    def test_ids_are_namespaced_and_validated(self):
-        assert hartos_user_id(12) == 'mcgroce_12'
-        assert hartos_user_id(12, 'merchant') == 'mcgroce_m_12'
+    def test_ids_are_namespaced_file_safe_and_stable(self):
+        assert hartos_user_id(12) == 'mcg-12'
+        assert hartos_user_id(12, 'merchant') == 'mcg-m-12'
+        hashed = hartos_user_id('a.b@shop.in')
+        assert hashed == hartos_user_id('a.b@shop.in')
+        assert hashed.startswith('mcg-') and not set('@./_') & set(hashed)
         with pytest.raises(ValueError):
-            hartos_user_id('1/../x')
+            hartos_user_id('')
 
     def test_upsert_persists_and_reloads(self, tmp_path):
         path = str(tmp_path / 'b.json')
         CommerceBindings(path).upsert(5, 'a@b.c', 'merchant', store_id=3)
-        row = CommerceBindings(path).get('mcgroce_m_5')
+        row = CommerceBindings(path).get('mcg-m-5')
         assert row['customer_id'] == '5' and row['store_id'] == '3'
         assert row['tenant'] == 'mcgroce'

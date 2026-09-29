@@ -41,19 +41,19 @@ class TestSession:
         r = _session(ctx['client'])
         assert r.status_code == 200
         body = r.get_json()
-        assert body['userId'] == 'mcgroce_4242'
+        assert body['userId'] == 'mcg-4242'
         claims = decode_jwt(body['token'])
-        assert claims['user_id'] == 'mcgroce_4242'
+        assert claims['user_id'] == 'mcg-4242'
         assert claims['tid'] == 'mcgroce'
         assert body['expiresIn'] > 0
-        row = ctx['bindings'].get('mcgroce_4242')
+        row = ctx['bindings'].get('mcg-4242')
         assert row['customer_id'] == '4242' and row['store_id'] == '7'
 
     @pytest.mark.parametrize('secret', ['wrong', '', SECRET + 'x', None])
     def test_bad_secret_is_refused_and_binds_nothing(self, ctx, secret):
         r = _session(ctx['client'], secret=secret)
         assert r.status_code == 403
-        assert ctx['bindings'].get('mcgroce_4242') is None
+        assert ctx['bindings'].get('mcg-4242') is None
 
     def test_unconfigured_secret_is_503(self, ctx, monkeypatch):
         monkeypatch.delenv('COMMERCE_SESSION_SECRET')
@@ -61,27 +61,29 @@ class TestSession:
             r = _session(ctx['client'])
         assert r.status_code == 503
 
-    def test_missing_fields_and_bad_ids(self, ctx):
+    def test_missing_fields_and_unsafe_ids(self, ctx):
         assert _session(ctx['client'], customerId=1).status_code == 400
-        assert _session(ctx['client'], customerId='1/..', username='x').status_code == 400
+        r = _session(ctx['client'], customerId='a.b@shop.in', username='x')
+        assert r.status_code == 200
+        assert '@' not in r.get_json()['userId']
 
     def test_merchant_role_gets_its_own_namespace(self, ctx):
         r = _session(ctx['client'], customerId=9, username='o@shop.in', role='merchant')
-        assert r.get_json()['userId'] == 'mcgroce_m_9'
+        assert r.get_json()['userId'] == 'mcg-m-9'
 
 
 class TestMandateRead:
     def test_owner_reads_their_mandate(self, ctx):
-        m = ctx['mandates'].create_cart_mandate('mcgroce_4242', 'mcgroce', CART)
-        tok = generate_jwt('mcgroce_4242', 'asha', tenant_id='mcgroce')
+        m = ctx['mandates'].create_cart_mandate('mcg-4242', 'mcgroce', CART)
+        tok = generate_jwt('mcg-4242', 'asha', tenant_id='mcgroce')
         r = ctx['client'].get(f'/api/commerce/mandates/{m.mandate_id}',
                               headers={'Authorization': f'Bearer {tok}'})
         assert r.status_code == 200
         assert r.get_json()['mandate']['status'] == 'pending'
 
     def test_someone_elses_mandate_looks_missing(self, ctx):
-        m = ctx['mandates'].create_cart_mandate('mcgroce_4242', 'mcgroce', CART)
-        tok = generate_jwt('mcgroce_5', 'ravi', tenant_id='mcgroce')
+        m = ctx['mandates'].create_cart_mandate('mcg-4242', 'mcgroce', CART)
+        tok = generate_jwt('mcg-5', 'ravi', tenant_id='mcgroce')
         r = ctx['client'].get(f'/api/commerce/mandates/{m.mandate_id}',
                               headers={'Authorization': f'Bearer {tok}'})
         assert r.status_code == 404
@@ -95,3 +97,13 @@ def test_health_reports_configuration(ctx):
     assert r.status_code == 200
     assert set(r.get_json()) == {'status', 'configured', 'admin_configured', 'breaker'}
 
+
+def test_stream_names_the_callers_own_topic(ctx):
+    tok = generate_jwt('mcg-4242', 'asha', tenant_id='mcgroce')
+    r = ctx['client'].get('/api/commerce/stream',
+                          headers={'Authorization': f'Bearer {tok}'})
+    assert r.get_json() == {'user_id': 'mcg-4242',
+                            'wamp_topic': 'com.hertzai.hevolve.social.mcg-4242',
+                            'sse_event': 'chat.social',
+                            'message_type': 'agent_ui_update'}
+    assert ctx['client'].get('/api/commerce/stream').status_code == 401
