@@ -10132,6 +10132,17 @@ def chat():
                     # escalates (Computer_Action/Shell are casual-only, so tasks
                     # route via Create_Agent -> CREATE).
                 else:
+                    # Only now — having decided to serve the draft's reply
+                    # as the final answer — fire the background expert.
+                    # The three branches above this one fall through to
+                    # their OWN synchronous full turn for this same prompt
+                    # instead of returning here; scheduling unconditionally
+                    # at classification time (the old behaviour) ran that
+                    # same turn again in the background for those cases —
+                    # the root cause of the 2026-08 duplicate-turn
+                    # investigation. See
+                    # speculative_dispatcher.schedule_expert_for_draft.
+                    dispatcher.schedule_expert_for_draft(result)
                     return _chat_reply(
                         user_id, request_id, result['response'],
                         Agent_status='Draft-First Mode',
