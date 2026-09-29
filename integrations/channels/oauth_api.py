@@ -554,3 +554,16 @@ def oauth_callback(channel_type: str):
             _close_page_html(channel_type, False, f'Registration error: {e}'),
             mimetype='text/html', status=500,
         )
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+# Built from the catalog: every OAuth-capable channel's app id and secret.
+ENV_SECRETS = tuple(
+    f'HARTOS_OAUTH_{kind}_{channel_type.upper()}'
+    for channel_type, meta in CHANNEL_CATALOG.items()
+    if meta.get('oauth_authorize_url')
+    for kind in ('CLIENT', 'SECRET')
+)

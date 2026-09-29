@@ -232,10 +232,12 @@ def get_boot_decision() -> Dict[str, Any]:
 
     Reads the last line of `<get_log_dir()>/draft_decision.jsonl`
     (written by Nunba's `LlamaConfig._log_draft_decision` into the same
-    core.platform_paths.get_log_dir()).  A dev run's log dir is `logs-dev`;
-    when this process has written none (HARTOS on its own, asked about the
-    installed app), it reads the one the installed build writes
-    (get_installed_log_dir).  `log_path` in the answer names the file read.
+    core.platform_paths.get_log_dir()).  A dev run's log dir is `logs-dev`,
+    the installed build's is `logs` (get_installed_log_dir); both are
+    checked and the one written most recently is read, so a stale dev log
+    never hides a newer installed boot and HARTOS on its own (which writes
+    neither) still answers about the installed app.  `log_path` names the
+    file read; `checked` names every file looked at.
 
     Use when the user asks: "why is speculation off on my 8GB GPU?",
     "why didn't Nunba load the draft model?", "what's the cohort
@@ -244,18 +246,31 @@ def get_boot_decision() -> Dict[str, Any]:
     import json
     from pathlib import Path
     from core.platform_paths import get_installed_log_dir, get_log_dir
-    log_path = Path(get_log_dir()) / 'draft_decision.jsonl'
-    if not log_path.exists():
-        log_path = Path(get_installed_log_dir()) / 'draft_decision.jsonl'
-    if not log_path.exists():
+    checked = []
+    for d in (get_log_dir(), get_installed_log_dir()):
+        p = Path(d) / 'draft_decision.jsonl'
+        if p not in checked:
+            checked.append(p)
+    present = []
+    for p in checked:
+        try:
+            present.append((p.stat().st_mtime, p))
+        except OSError as exc:
+            # Absent is the common case (a dev run has no logs-dev copy);
+            # named in 'checked' below, and here for the other errnos.
+            logger.debug("boot decision log %s not readable: %s", p, exc)
+    if not present:
         return {
             'available': False,
+            'checked': [str(p) for p in checked],
             'summary': (
-                "Draft decision log not yet written — this usually means "
-                "Nunba has not been booted since the cohort-aware gate "
-                "landed (commit 12c9304), or log directory is missing."
+                "Draft decision log not yet written (looked at "
+                + ', '.join(str(p) for p in checked) + ") — this usually "
+                "means Nunba has not been booted since the cohort-aware "
+                "gate landed (commit 12c9304), or log directory is missing."
             ),
         }
+    log_path = max(present, key=lambda t: t[0])[1]
     try:
         with log_path.open(encoding='utf-8') as f:
             lines = [line for line in f if line.strip()]

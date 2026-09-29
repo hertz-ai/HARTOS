@@ -356,7 +356,7 @@ class DynamicAgentExecutor:
         self.discovery.discover_all_agents()
 
     async def execute_agent_task(self, agent_id: str, message: str, context_id: str,
-                                 cancel_event=None) -> Dict[str, Any]:
+                                 cancel_event=None, task_id=None) -> Dict[str, Any]:
         """
         Execute a task for a dynamically discovered agent
 
@@ -364,8 +364,13 @@ class DynamicAgentExecutor:
             agent_id: Agent identifier (e.g., "71_0_1")
             message: Task message
             context_id: A2A context ID
-            cancel_event: the A2A task's cancel (task/cancel); a turn still
-                waiting for the LLM permit gives it back and never starts
+            cancel_event: the A2A task's cancel (task/cancel).  A turn
+                waiting for the LLM permit gives it back and never starts;
+                a turn already running is refused its next LLM call
+                (core.llama_scheduler), ends, and gives the permit back.
+            task_id: the A2A task's id.  The turn's request id is built from
+                it, not from the contextId the peer chooses, so two tasks in
+                one context never share a cancel binding.
 
         Returns:
             A2A response format
@@ -418,11 +423,12 @@ class DynamicAgentExecutor:
                 agent.prompt_id,
                 # A peer's request is not this node's human: it is background
                 # work, and the id says so to dispatch.is_genuine_user_request.
-                daemon_id=f"a2a_{context_id}",
+                daemon_id=f"a2a_{task_id or context_id}",
                 cancel_event=cancel_event))
         if status == 'cancelled':
-            raise RuntimeError(f"agent {agent_id} not run: cancelled by the "
-                               f"caller before its turn started")
+            raise TaskCancelled(
+                f"agent {agent_id}: cancelled by the caller (before or during "
+                f"its turn); the LLM permit was given back")
         if status != 'ok':
             raise RuntimeError(
                 f"agent {agent_id} not run: local /chat {status} "
@@ -436,6 +442,10 @@ class DynamicAgentExecutor:
                 "metadata": {"agent_id": agent_id, "persona": agent.persona},
             }]
         }
+
+
+class TaskCancelled(RuntimeError):
+    """The caller cancelled the task; not a failure of the agent."""
 
 
 # Global instances

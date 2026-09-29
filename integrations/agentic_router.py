@@ -100,24 +100,22 @@ def _build_agent_catalog(prompts_dir: str = None) -> List[Dict]:
     except Exception:
         pass
 
-    if prompts_dir and os.path.isdir(prompts_dir):
+    if prompts_dir:
+        # The one agent reader (core.prompt_files): skipping only '_recipe'
+        # names here offered every staged plan, action and personality file
+        # to the matcher as an agent.
         try:
-            for fname in os.listdir(prompts_dir):
-                if not fname.endswith('.json') or '_recipe' in fname:
-                    continue
-                try:
-                    with open(os.path.join(prompts_dir, fname)) as f:
-                        recipe = json.load(f)
-                    catalog.append({
-                        'id': fname.replace('.json', ''),
-                        'name': recipe.get('name', fname),
-                        'description': recipe.get('goal', ''),
-                        'source': 'recipe',
-                    })
-                except Exception:
-                    continue
+            from core.prompt_files import local_agent_prompts
+            for prompt_id, record in local_agent_prompts(prompts_dir):
+                catalog.append({
+                    'id': prompt_id,
+                    'name': record.get('name', f'{prompt_id}.json'),
+                    'description': record.get('goal', ''),
+                    'source': 'recipe',
+                })
         except Exception:
-            pass
+            logger.debug("agent catalog: prompts dir %s not read", prompts_dir,
+                         exc_info=True)
 
     # Hive recipes — federated index from peer nodes
     try:
@@ -243,9 +241,13 @@ def build_agentic_plan_bounded(prompt: str, prompts_dir: str = None,
     chat turn (review F7, 2026-09-27; probe vlm_pool.py: 3.02 s on 0.5 s).
     """
     from core.subprocess_safe import call_bounded
+    from hartos.threadlocal import thread_local_data
+    # The plan's LLM calls run as the request that asked for them (user,
+    # prompt, request id), also after this turn stops waiting for them.
+    plan_as_caller = thread_local_data.carry(
+        lambda: build_agentic_plan(prompt, prompts_dir))
     finished, plan, error = call_bounded(
-        lambda: build_agentic_plan(prompt, prompts_dir), timeout_s,
-        name='hart-agentic-plan')
+        plan_as_caller, timeout_s, name='hart-agentic-plan')
     if not finished:
         logger.warning('agentic plan not ready after %ss; answering without it',
                        timeout_s)

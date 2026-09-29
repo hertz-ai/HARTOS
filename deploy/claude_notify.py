@@ -98,16 +98,10 @@ def notify(message: str, kind: str = 'orchestrator_message') -> str:
             message=message,
         )
         db.commit()
-        # Best-effort live push.  NotificationService's after_commit
-        # hook already calls integrations.social.realtime.on_notification
-        # — repeat-call here is harmless (it's idempotent on msg_id at
-        # the SSE bus and dedup-guarded on the client per
-        # realtimeService.js _isDuplicate).
-        try:
-            from integrations.social.realtime import on_notification
-            on_notification(user_id, notif.to_dict())
-        except Exception:
-            pass
+        # The live push is create()'s, once this commit lands
+        # (models.after_commit).  A second on_notification here pushed the
+        # card twice: the payload carries no msg_id, so a client has
+        # nothing to dedupe on.
         return str(notif.id)
 
 

@@ -1111,3 +1111,13 @@ def register_channel_tools(helper, executor, ctx=None):
     tools = build_channel_tool_closures(ctx)
     from core.agent_tools import register_core_tools
     register_core_tools(tools, helper, executor)
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+ENV_SECRETS = (
+    'GOOGLE_CALENDAR_TOKEN',
+    'ZOOM_ACCESS_TOKEN',
+)

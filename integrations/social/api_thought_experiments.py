@@ -199,6 +199,8 @@ def vote_experiment(experiment_id):
     """Cast a vote on a thought experiment (auth required).
 
     voter_id is taken from the JWT subject — body-supplied voter_id is ignored.
+    voter_type is the account's (agent or human) — body-supplied voter_type
+    is ignored.
     """
     from .models import get_db
     from .thought_experiment_service import ThoughtExperimentService
@@ -208,6 +210,14 @@ def vote_experiment(experiment_id):
     if not voter_id:
         return jsonify({'success': False, 'error': 'voter_id required'}), 400
 
+    # Agent or human from the signed-in ACCOUNT, never the body: every agent
+    # account holds an api_token (UserService.register_agent), passes
+    # require_auth, and used to claim 'human' here for full weight and past
+    # "agents cannot vote on security_guardrail".
+    user = getattr(g, 'user', None)
+    voter_type = ('agent' if getattr(user, 'user_type', None) == 'agent'
+                  else 'human')
+
     db = get_db()
     try:
         result = ThoughtExperimentService.cast_vote(
@@ -215,7 +225,7 @@ def vote_experiment(experiment_id):
             vote_value=body.get('vote_value', 0),
             reasoning=body.get('reasoning', ''),
             suggestion=body.get('suggestion', ''),
-            voter_type=body.get('voter_type', 'human'),
+            voter_type=voter_type,
             confidence=body.get('confidence', 1.0),
         )
         if result and 'error' not in result:

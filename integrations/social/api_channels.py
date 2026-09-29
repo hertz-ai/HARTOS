@@ -764,3 +764,12 @@ def _generate_qr_data_url(data: str) -> str:
     except Exception as e:
         logger.warning("QR generation failed: %s", e)
         return ''
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+ENV_SECRETS = (
+    'WHATSAPP_API_KEY',
+)

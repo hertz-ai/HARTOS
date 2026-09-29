@@ -113,6 +113,11 @@ class A2ATask:
         # Set by task/cancel.  The executor reads it (when it takes a
         # cancel_event) to give the LLM permit back before its turn starts.
         self.cancel_event = threading.Event()
+        # True from admission until the executor RETURNS.  A cancel ends the
+        # task's verdict at once, but its turn (and thread) may run on: the
+        # in-flight cap and the pruner count this, never the state (review
+        # of f97b6bed8, F1: send+cancel pairs ran 24 threads past a cap of 4).
+        self.executing = False
         self.metadata = {
             "prompt_token_count": 0,
             "candidates_token_count": 0,
@@ -165,12 +170,12 @@ class A2AMessageHandler:
 
     def _prune(self) -> None:
         """Evict finished tasks past _TASK_TTL_S, then the oldest finished
-        ones while the table is over _TASK_MAX.  Running tasks stay."""
-        open_states = (TaskState.SUBMITTED, TaskState.WORKING)
+        ones while the table is over _TASK_MAX.  A task whose execution is
+        still running stays, cancelled or not (_running)."""
         now = datetime.now()
         with self._tasks_lock:
             done = [(t.updated_at, tid) for tid, t in self.tasks.items()
-                    if t.state not in open_states]
+                    if not self._running(t)]
             for updated, tid in done:
                 if (now - updated).total_seconds() > _TASK_TTL_S:
                     self.tasks.pop(tid, None)
@@ -180,15 +185,29 @@ class A2AMessageHandler:
                         break
                     self.tasks.pop(tid, None)
 
-    def _admission_refusal(self, caller) -> Optional[str]:
-        """The ONE bound on running turns: 'busy: ...' when this caller
+    @staticmethod
+    def _running(task) -> bool:
+        """Is this task holding an execution (thread / request worker)?
+        Until its executor returns, whatever its verdict says."""
+        return task.executing or task.state in (TaskState.SUBMITTED,
+                                                TaskState.WORKING)
+
+    def _admission_refusal_locked(self, caller, message_id) -> Optional[str]:
+        """The ONE bound on running turns, decided with _tasks_lock HELD so
+        the check and the insert are one step (concurrent sends cannot both
+        pass the last free place).  'busy: ...' when this caller
         (_OPEN_TASKS_PER_CALLER) or the node (_OPEN_TASKS_MAX) already holds
-        that many unfinished tasks, else None.  Finished tasks are evicted
-        by _prune; running ones only end."""
-        self._prune()
-        open_states = (TaskState.SUBMITTED, TaskState.WORKING)
-        with self._tasks_lock:
-            running = [t for t in self.tasks.values() if t.state in open_states]
+        that many executions, or when this caller already has a RUNNING task
+        under this messageId (review of f5c21ec2a: one id sent 20 times
+        replaced its own task each time, so the cap counted one task and all
+        20 turns shared one cancel binding); else None."""
+        running = [t for t in self.tasks.values() if self._running(t)]
+        same = self.tasks.get(message_id)
+        if same is not None and same.owner == caller and self._running(same):
+            logger.info(f"A2A: {caller!r} resent running messageId "
+                        f"{str(message_id)[:12]}; refused")
+            return (f"busy: task {message_id} of this caller is still "
+                    f"running; use a new messageId")
         mine = sum(1 for t in running if caller is not None and t.owner == caller)
         if caller is not None and mine >= _OPEN_TASKS_PER_CALLER:
             logger.info(f"A2A: {caller!r} holds {mine} unfinished tasks; busy")
@@ -235,20 +254,25 @@ class A2AMessageHandler:
             if part.get("kind", part.get("type")) == "text":
                 message_text += part.get("text", "")
 
-        busy = self._admission_refusal(caller)
-        if busy:
-            return {"error": {"code": -32000, "message": busy}}
-        # Create task, bound to the caller that was admitted for it.
+        # Create task, bound to the caller that was admitted for it.  The
+        # cap check and the insert are one step under the lock.
+        self._prune()
         task = A2ATask(task_id=message_id, message=message, context_id=context_id)
         task.owner = caller
         with self._tasks_lock:
+            busy = self._admission_refusal_locked(caller, message_id)
+            if busy:
+                return {"error": {"code": -32000, "message": busy}}
             existing = self.tasks.get(message_id)
             if existing is not None and existing.owner != caller:
                 # Another caller's messageId: never overwrite its task.
                 message_id = str(uuid.uuid4())
                 task.task_id = message_id
+            # Counted from here: a blocking send holds this request worker
+            # for its whole turn, a non-blocking one its thread.
+            task.executing = True
             self.tasks[message_id] = task
-        self._prune()
+        self._prune()   # the insert may have taken the table past _TASK_MAX
 
         # configuration.blocking (A2A MessageSendParams): false returns the
         # task now and runs it on a thread of its own; the caller polls
@@ -265,10 +289,9 @@ class A2AMessageHandler:
         await self._run(task, message_text)
         return task.to_dict()
 
-    def _takes_cancel_event(self) -> bool:
+    def _executor_takes(self, name) -> bool:
         try:
-            return 'cancel_event' in inspect.signature(
-                self.agent_executor).parameters
+            return name in inspect.signature(self.agent_executor).parameters
         except (TypeError, ValueError):
             return False
 
@@ -282,12 +305,17 @@ class A2AMessageHandler:
                 return
             task.update_state(TaskState.WORKING)
             logger.info(f"Executing A2A task {message_id}: {message_text[:100]}")
-            if self._takes_cancel_event():
-                result = await self.agent_executor(
-                    message_text, task.context_id,
-                    cancel_event=task.cancel_event)
-            else:
-                result = await self.agent_executor(message_text, task.context_id)
+            # The cancel and the task's own id (its turn's request id: the
+            # peer chooses the contextId, so two tasks in one context would
+            # share a cancel binding; review of f97b6bed8, F4) go to an
+            # executor that takes them.
+            extra = {}
+            if self._executor_takes('cancel_event'):
+                extra['cancel_event'] = task.cancel_event
+            if self._executor_takes('task_id'):
+                extra['task_id'] = task.task_id
+            result = await self.agent_executor(
+                message_text, task.context_id, **extra)
             if task.cancel_event.is_set():
                 logger.info(f"A2A task {message_id} finished after its "
                             f"cancel; result dropped")
@@ -299,6 +327,8 @@ class A2AMessageHandler:
                 return
             logger.error(f"A2A task {message_id} failed: {e}")
             task.update_state(TaskState.FAILED, error=str(e))
+        finally:
+            task.executing = False
 
     async def handle_message_get(self, params: Dict[str, Any],
                                  caller: Optional[str] = None) -> Dict[str, Any]:

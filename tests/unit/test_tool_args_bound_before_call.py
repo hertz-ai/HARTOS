@@ -136,15 +136,16 @@ class SplitArgumentsAreNotCalled(_Base):
         self._assert_json_refusal(ok, reply, ('text',))
         self.assertIn('Required argument(s) left empty: text', reply['content'])
 
-    def test_repaired_positional_empty_value_is_named_as_empty(self):
-        # A repaired list binds positionally; its empty first value is
-        # reported as left empty, not as missing (it was given).
-        # (json_repair drops a "" list item outright, so the blank is spaces.)
+    def test_repaired_positional_list_is_not_run(self):
+        # A list is never bound positionally any more: arguments that are
+        # not one JSON object are refused by the executor as by the history
+        # guard (test_tool_args_must_be_an_object.py,
+        # NonObjectArgumentsAreNeverRun).  This list, which used to bind with
+        # an emptied first value, is refused as not an object.
         ok, reply = self.run_sync('send_message_to_user', '["  ", "a",]')
+        self.assertFalse(ok)
         self.assertEqual(self.calls, [])
-        self._assert_json_refusal(ok, reply, ('text',))
-        self.assertIn('Required argument(s) left empty: text', reply['content'])
-        self.assertNotIn('Missing required', reply['content'])
+        self.assertIn('not one JSON object', reply['content'])
 
     def test_repair_may_leave_an_optional_value_empty(self):
         # Only a REQUIRED value must be there; an optional one the repair left

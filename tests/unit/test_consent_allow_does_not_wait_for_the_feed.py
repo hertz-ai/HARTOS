@@ -10,8 +10,9 @@ file: POST /api/social/consent for screen_capture, with the feed start held
 by an Event, had not answered after 5 s -- the card's spinner, which is what
 the owner saw live 2026-09-25, "Something's off on our end" on every Allow.
 
-The feed start now runs off the request thread, on the shared background
-executor, and it still runs: the owner pressed Allow to see the screen.
+The feed start now runs off the request thread, on the feed's own worker
+(admin.api._FEED_WORKER, not the shared pool), and it still runs: the owner
+pressed Allow to see the screen.
 
 Real Flask route, real require_auth (only the token lookup is replaced),
 real file-backed SQLite, real ConsentService.  The only stand-in is the

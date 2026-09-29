@@ -108,6 +108,80 @@ class ThreadLocalData:
         for key, value in (snapshot or {}).items():
             setattr(self._local, key, value)
 
+    def carry(self, fn):
+        """``fn``, wrapped to run on another thread as THIS thread's request.
+
+        The one way to hand work to a worker: snapshot() now, adopt() on the
+        worker before ``fn`` runs.  The wrapper's ``.snapshot`` is the dict
+        the worker adopts (shared, per adopt()), so a caller can still mark
+        state it hands over, as the VLM loop does to close an abandoned
+        action's run.  Callers: integrations.vlm.local_loop (one computer-use
+        action), integrations.agentic_router (the plan's LLM calls, which ran
+        with no user, prompt or request id until 2026-09-27).
+        """
+        snap = self.snapshot()
+
+        def _carried(*args, **kwargs):
+            self.adopt(snap)
+            return fn(*args, **kwargs)
+
+        _carried.snapshot = snap
+        return _carried
+
+    def turn_of(self, prompt_id):
+        """Context manager: run a block as agent ``prompt_id``'s turn, then
+        give the thread back its own agent.
+
+        For a request /chat hands to ANOTHER agent (autonomous routing to an
+        existing agent that matches, hart_intelligence_entry): the thread
+        still carried the request's own prompt_id, so a tool acting for "the
+        calling agent" (cast_experiment_vote) acted as the wrong one.  Only
+        prompt_id is swapped and restored (via adopt()): whatever the turn
+        sets for the handler to read afterwards (ui_actions, creation flags)
+        is kept, and user_id is the same person either way.
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            saved = {'prompt_id': self.get_prompt_id()}
+            self.set_prompt_id(prompt_id)
+            try:
+                yield
+            finally:
+                self.adopt(saved)
+        return _cm()
+
+    def detached(self):
+        """Context manager: run a block with NO request state on this thread,
+        then put this thread's state back exactly as it was.
+
+        For work that is no request's turn but runs on a thread a request
+        used.  The /chat handler sets this state and never clears it, so a
+        reused worker thread still carries the last chat's prompt_id,
+        user_id, request_id, user_role, activity run and model override;
+        measured 2026-09-27, an MCP tool saw them (mcp_http_bridge._invoke_
+        tool is the caller).  Inside the block every getter answers its
+        default.  The saved values are put back by reference, not copied,
+        so an object the thread shares (a run the VLM loop may close) stays
+        the same object.
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            saved = dict(vars(self._local))
+            for key in saved:
+                delattr(self._local, key)
+            try:
+                yield
+            finally:
+                for key in list(vars(self._local)):
+                    delattr(self._local, key)
+                for key, value in saved.items():
+                    setattr(self._local, key, value)
+        return _cm()
+
     # --- Computer-use run context (set by integrations.vlm.local_loop) ---
     # The run a desktop action belongs to, so a tool that executes DURING a
     # run can announce itself as a step of that run instead of inventing its

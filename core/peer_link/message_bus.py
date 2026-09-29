@@ -118,6 +118,14 @@ TOPIC_MAP = {
     'recipe.available': RECIPE_AVAILABLE_TOPIC,
 }
 
+# TOPIC_MAP topics whose {user_id} template covers a whole namespace
+# ('chat.general' -> 'com.hertzai.hevolve.{user_id}' also matches every
+# undeclared com.hertzai.hevolve.<x>).  Such a template never ATTRIBUTES a
+# URI to a user (per_user_uri_owner skips it, so an undeclared URI is
+# shared); only its instance for the user a message names is that user's
+# (security.edge_privacy.crossbar_uri_is_per_user).
+CATCH_ALL_TOPICS = ('chat.general',)
+
 # Per-user Crossbar URIs published by URI rather than through a TOPIC_MAP
 # bus topic.  With TOPIC_MAP's {user_id} templates these are the DECLARED
 # per-user URIs: security.edge_privacy.per_user_uri_owner reads both, and a
@@ -828,6 +836,15 @@ class MessageBus:
             own = True
         if not own:
             scrubbed = third_party.get()
+            # The URI was built from these payload keys; a subscriber looks
+            # the event up by them.  If the scrub altered one (an
+            # unclassified routing key holding an id the DLP patterns match),
+            # the scrubbed copy would route nowhere -- withhold it, loudly.
+            if scrubbed is not None:
+                from security.edge_privacy import routing_keys_intact
+                if not routing_keys_intact(data, scrubbed, placeholders,
+                                           legacy_topic):
+                    scrubbed = None
             if scrubbed is None:
                 self._stats['egress_withheld'] += 1
                 return

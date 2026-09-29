@@ -323,7 +323,9 @@ class ReuseLegReconcilesItsToolsWithTheServer(unittest.TestCase):
         body = _func('get_agent_response', _src())
         self.assertTrue(body, 'get_agent_response not found')
         named = body.find('_attach_named_tools_for_action(')
-        tags = body.find('attach_for_tags(')
+        # The tag attach is core.agent_tool_menu.attach_for_turn, the one
+        # per-turn attach shared with CREATE (review of d99b1aa88).
+        tags = body.find('attach_for_turn(')
         self.assertNotEqual(named, -1, 'named attach call not found')
         self.assertNotEqual(tags, -1, 'tag attach call not found')
         self.assertLess(
@@ -331,6 +333,80 @@ class ReuseLegReconcilesItsToolsWithTheServer(unittest.TestCase):
             'attach_for_tags must run BEFORE the named attach, because the '
             'named attach is where the set is reconciled with the live n_ctx '
             '— anything attached after it is offered unbounded')
+
+
+class CreateTurnAttachIsFittedToo(unittest.TestCase):
+    """Review of a4dc8cf3b, F1.  CREATE's per-turn attach
+    (get_response_group -> _attach_for_create_turn -> attach_for_turn)
+    grew the Helper and went straight to initiate_chat with no fit, and
+    CREATE's Helper is trimmed at build time because it measured 7191
+    schema tokens against n_ctx 8192.  The fit now lives INSIDE
+    attach_for_turn, so both pipelines' turn attach is bounded by the live
+    n_ctx.  Driven through CREATE's own door, lifted from create_recipe.py
+    (it cannot be imported in a bare pytest env)."""
+
+    def setUp(self):
+        self._restore = []
+
+    def tearDown(self):
+        for mod, attr, old in reversed(self._restore):
+            setattr(mod, attr, old)
+
+    def _patch(self, mod, attr, value):
+        self._restore.append((mod, attr, getattr(mod, attr)))
+        setattr(mod, attr, value)
+
+    def test_a_create_turn_that_attaches_is_fitted_to_the_live_ctx(self):
+        import ast
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        try:
+            import autogen
+        except ImportError:
+            self.skipTest('autogen not installed')
+        import integrations.service_tools as st_pkg
+        from integrations.service_tools import registry as reg_mod
+        from integrations.agent_engine.thought_experiment_tools import (
+            ExperimentVoteTool)
+        from core.agent_tool_menu import arm_turn_attach
+        from core.llm_outbound_logger import schema_token_room
+
+        fresh = reg_mod.ServiceToolRegistry(config_file='__none__.json')
+        self._patch(reg_mod, 'service_tool_registry', fresh)
+        self._patch(st_pkg, 'service_tool_registry', fresh)
+        ExperimentVoteTool.register()
+
+        # A CREATE Helper already at the edge of a 4096 slot: 40 fat tools.
+        helper = autogen.ConversableAgent('helper', llm_config={
+            'config_list': [{'model': 'none', 'api_key': 'none',
+                             'base_url': 'http://127.0.0.1:9'}]})
+        assistant = autogen.ConversableAgent('assistant', llm_config=False,
+                                             human_input_mode='NEVER')
+        names = [f'family_tool_{i}' for i in range(40)]
+        helper.llm_config['tools'] = [_entry(n) for n in names]
+        arm_turn_attach(assistant, set(names), [])
+        _pin_ctx(self._restore, 4096)
+        room = schema_token_room()
+        self.assertGreater(_schema_tokens(helper), room,
+                           'the fixture must start over the room')
+
+        src = io.open(os.path.join(_HARTOS, 'hartos', 'create_recipe.py'),
+                      encoding='utf-8').read()
+        fn = next(n for n in ast.parse(src).body
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == '_attach_for_create_turn')
+        ns = {'current_app': SimpleNamespace(logger=MagicMock())}
+        exec(ast.get_source_segment(src, fn), ns)
+        ns['_attach_for_create_turn'](
+            {'helper': helper, 'assistant': assistant},
+            'please vote on the experiment about latency', 'u_1')
+
+        self.assertLessEqual(
+            _schema_tokens(helper), room,
+            'CREATE\'s turn attach offered a schema past the live n_ctx')
+        self.assertIn('cast_experiment_vote', _names(helper),
+                      'the tool this turn asked for must survive the fit')
+        self.assertIn('cast_experiment_vote', assistant._function_map)
 
 
 if __name__ == '__main__':

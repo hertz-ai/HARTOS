@@ -1153,3 +1153,13 @@ class Qwen3VLBackend:
             int(bbox_1000[2] * img_w / 1000),
             int(bbox_1000[3] * img_h / 1000),
         ]
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HEVOLVE_LLM_API_KEY',
+    'HEVOLVE_VLM_API_KEY',
+)

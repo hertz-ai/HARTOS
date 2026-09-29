@@ -416,8 +416,10 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
             try:
                 from core.llama_scheduler import get_scheduler
                 get_scheduler().unbind_cancel(_bound)
-            except Exception:
-                pass
+            except Exception as e:
+                # INFO: a binding left behind refuses every later call of
+                # that request id (review of f5c21ec2a).
+                logger.info(f"unbind_cancel({_bound}) failed: {e}")
         _local_llm_semaphore.release()
         try:
             _notify_watchdog_llm_end()
@@ -1094,9 +1096,17 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
     except Exception as _cerr:
         logger.debug(f"continuous lookup failed for goal {goal_id}: {_cerr}")
 
+    # The context goes to the shared coordinator ledger and to gossip peers:
+    # other people's nodes.  A real user id must not (owner's egress ruling,
+    # 2026-09-26), so the ``user_id`` slot carries an opaque per-goal handle
+    # this node maps back (integrations.distributed_agent.requesters): its own
+    # worker runs the task as the person, and the contribution notification
+    # reaches them.  A remote worker runs under the handle; it has no such
+    # user either way.
+    from integrations.distributed_agent.requesters import requester_handle
     context = {
         'goal_type': goal_type,
-        'user_id': user_id,
+        'user_id': requester_handle(goal_id, user_id),
         'prompt': prompt,
         'source_node': os.environ.get('HEVOLVE_NODE_ID', 'unknown'),
         'task_source': 'hive',

@@ -256,8 +256,16 @@ class LlamaScheduler:
                         break
             if granted and req.admitted:
                 return req
-            # timeout: lazy-delete from the heap
+            # Timeout or cancel.  Decided under the lock, because release()
+            # may have promoted this waiter between its last wait slice and
+            # here: it then HOLDS a slot, and returning None left it held
+            # forever (review of f97b6bed8, repro scratchpad/f97_race.py).
+            # A grant that landed is returned as acquired: the caller
+            # releases it, and slot() releases it at once for a cancelled
+            # turn (its post-acquire TurnCancelled check).
             with self._lock:
+                if req.admitted:
+                    return req
                 req.canceled = True
             return None
         except Exception:

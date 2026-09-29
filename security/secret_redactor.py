@@ -149,12 +149,28 @@ _add('password_plaintext',
 # exact where a length threshold was a proxy.
 _STATUS_WORDS = (r'null|none|nil|na|n/a|on|off|true|false|yes|no|unset|empty'
                  r'|missing|expired|invalid|revoked|pending|unknown')
+#
+# 2026-09-28 (egress review): password / passwd / pwd joined the NAMES -- a
+# 7-character `password=hunter2` escaped password_plaintext's {8,} floor --
+# and the leading \b became "not after a letter or digit", because `_` is a
+# word character and \b let `DB_PASSWORD=...` / `my_token=...` through.
 _add('secret_assignment',
-     r'\b(?:api[_-]?key|apikey|secret|token|auth[_-]?token|access[_-]?key)'
+     r'(?<![A-Za-z0-9])(?:api[_-]?key|apikey|secret|token|auth[_-]?token'
+     r'|access[_-]?key|password|passwd|pwd)'
      r'["\']?\s*[=:]\s*["\']?'
      # not a status word (whole value only — `nonesuch` is still redacted)
      r'(?!(?:' + _STATUS_WORDS + r')["\'\s,;}\)]|(?:' + _STATUS_WORDS + r')$)'
      r'([^\s"\',;}\)]+)')
+
+# `pass=v` / `pass:v` with the value glued on (a space after `pass:` is prose:
+# "you pass: nothing"), and a URL's `?key=` / `&key=` query value (Google
+# and most APIs take the key there; google_api_key only knows the full
+# 39-char shape).
+_add('pass_assignment',
+     r'(?<![A-Za-z0-9])pass[=:]'
+     r'(?!(?:' + _STATUS_WORDS + r')["\'\s,;}\)]|(?:' + _STATUS_WORDS + r')$)'
+     r'([^\s"\',;}\)]+)')
+_add('url_key_param', r'[?&]key=([^&\s#"\']+)')
 
 # ── PEM private keys ──
 _add('pem_private_key',

@@ -130,6 +130,23 @@ class TestDefaultDbPath:
         assert (first / 'coding_benchmarks.db').is_file()
         assert (second / 'coding_benchmarks.db').is_file()
 
+    def test_an_existing_data_dir_and_db_are_reused(self, tmp_path, monkeypatch):
+        # Every boot after the first finds agent_data (and the DB) already
+        # there; building the default tracker must not fail on that, and a
+        # second build (a restart) keeps the rows the first one wrote.
+        import core.platform_paths as pp
+        from integrations.coding_agent.benchmark_tracker import BenchmarkTracker
+        data_dir = tmp_path / 'agent_data'
+        data_dir.mkdir()
+        monkeypatch.setattr(pp, 'get_agent_data_dir', lambda: str(data_dir))
+
+        BenchmarkTracker().record('feature', 'claude_code', 2.0, True)
+        BenchmarkTracker().record('bug_fix', 'aider', 3.0, False)
+
+        assert _rows(data_dir / 'coding_benchmarks.db') == [
+            ('feature', 'claude_code', '', '', 2.0, 1, 0),
+            ('bug_fix', 'aider', '', '', 3.0, 0, 0)]
+
 
 class TestExecuteLocalKeepsResult:
     def test_result_returned_when_benchmark_write_fails(self, tmp_path, caplog, restore_perms):

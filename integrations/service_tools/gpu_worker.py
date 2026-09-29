@@ -74,6 +74,7 @@ Usage:
 import json
 import logging
 import os
+from core.error_advice import FAILED_STEP_PIP_INSTALL, FAILED_STEP_SETUP_OFFER
 from core.subprocess_safe import no_window_kwargs
 import queue
 import subprocess
@@ -516,6 +517,19 @@ class GPUWorker:
             )
             return
 
+        # An engine declared to live in its OWN venv (tts_router
+        # install_target='venv') that ran on any other interpreter has no
+        # usable venv: none was built, or another interpreter built it and
+        # core.venv_paths refused it.  The engine is not installed, and a
+        # --target pip into the shared user site is the place its venv
+        # exists to keep it out of (measured 2026-09-25: f5_tts and TTS,
+        # both rc=1, then an agentic goal each).  Installing an engine is
+        # the owner's call: offer it through capability_setup, whose
+        # consent-gated work runs repair_backend_venv -> install_backend_full.
+        if self._engine_is_outside_its_venv():
+            self._offer_engine_setup(pkg)
+            return
+
         logger.warning(
             f"{self.name}: subprocess missing Python package '{pkg}' — "
             f"dispatching to error_advice + deterministic self-heal"
@@ -600,36 +614,19 @@ class GPUWorker:
                 f"{self.name}: deterministic install of '{pkg}' failed "
                 f"(rc={rc}); dispatching agentic self-heal fallback."
             )
-            try:
-                from core.error_advice import handle_exception
-                synthetic = ModuleNotFoundError(f"No module named '{pkg}'")
-                synthetic.name = pkg  # type: ignore[attr-defined]
-                handle_exception(
-                    synthetic,
-                    category='subprocess.tool_load',
-                    severity='high',
-                    agent_remediation=True,
-                    context={
-                        'worker_name': self.name,
-                        'worker_module': self.module,
-                        'missing_package': pkg,
-                        'remediation_hint': (
-                            f"Deterministic `pip install {pkg}` FAILED. "
-                            f"Do NOT edit source to fix a missing package. "
-                            f"Diagnose the pip failure (network / build "
-                            f"deps / wrong index), then add '{pkg}' to the "
-                            f"freeze pip plan (Nunba "
-                            f"scripts/setup_freeze_nunba.py _tts_deps or "
-                            f"the appropriate _<X>_deps tuple) AND to "
-                            f"tts/package_installer.py legacy fallback "
-                            f"plan so the next build bundles it."
-                        ),
-                    },
-                )
-            except Exception as e:
-                logger.debug(
-                    f"{self.name}: error_advice dispatch skipped: {e}"
-                )
+            self._raise_missing_package_goal(
+                pkg,
+                f"Deterministic `pip install {pkg}` FAILED. "
+                f"Do NOT edit source to fix a missing package. "
+                f"Diagnose the pip failure (network / build "
+                f"deps / wrong index), then add '{pkg}' to the "
+                f"freeze pip plan (Nunba "
+                f"scripts/setup_freeze_nunba.py _tts_deps or "
+                f"the appropriate _<X>_deps tuple) AND to "
+                f"tts/package_installer.py legacy fallback "
+                f"plan so the next build bundles it.",
+                failed_step=FAILED_STEP_PIP_INSTALL,
+            )
 
         threading.Thread(
             target=_install_async, daemon=True,
@@ -670,6 +667,118 @@ class GPUWorker:
             return False
         return (os.path.normcase(os.path.abspath(venv_py))
                 == os.path.normcase(os.path.abspath(self.python_exe)))
+
+    def _engine_is_outside_its_venv(self) -> bool:
+        """True when ``self.name`` is a TTS engine declared to run from its
+        own venv (``tts_router.ENGINE_REGISTRY[...].install_target ==
+        'venv'``) and this worker's interpreter is not that venv."""
+        try:
+            from integrations.channels.media.tts_router import ENGINE_REGISTRY
+            spec = ENGINE_REGISTRY.get(self.name)
+        except Exception as e:
+            logger.debug(f"{self.name}: engine spec lookup skipped: {e}")
+            return False
+        if getattr(spec, 'install_target', None) != 'venv':
+            return False
+        return not self._child_is_backend_venv()
+
+    def _offer_engine_setup(self, pkg: str) -> None:
+        """Say why this worker cannot run, and offer the engine's setup to
+        the owner once per worker (``capability_setup`` dedupes the card
+        across workers and turns)."""
+        if getattr(self, '_engine_setup_offered', False):
+            return
+        self._engine_setup_offered = True
+        logger.error(
+            f"{self.name}: worker ran on {self.python_exe}, not its own "
+            f"venv, and cannot import '{pkg}': the engine is not installed "
+            f"(no venv, or one another interpreter built).  No pip into the "
+            f"shared site; offering its setup to the owner"
+        )
+
+        def _offer():
+            try:
+                from integrations.agent_engine.capability_setup import (
+                    request_capability_setup,
+                )
+                outcome = request_capability_setup(
+                    f'tts:{self.name}',
+                    reason=(
+                        f"The {self.name} voice is not installed on this "
+                        f"computer, so it could not speak. Set it up? It "
+                        f"downloads and installs here; until then replies "
+                        f"use another voice."
+                    ),
+                    category='subprocess.tool_load',
+                    context={'backend': self.name, 'missing_package': pkg},
+                )
+            except Exception as e:
+                self._setup_offer_failed(pkg, f"{type(e).__name__}: {e}")
+                return
+            if outcome == 'unavailable':
+                # request_capability_setup's return for "nobody could be
+                # asked" (no owner, consent unreachable): no card was filed.
+                self._setup_offer_failed(
+                    pkg,
+                    "request_capability_setup returned 'unavailable' (no "
+                    "owner to ask, or consent could not be reached)")
+                return
+            # 'asked' (card filed), 'declined' (the owner said no; a goal
+            # would override that), 'provisioning' (the work is raised).
+            logger.info(f"{self.name}: setup offer: {outcome}")
+
+        threading.Thread(
+            target=_offer, daemon=True, name=f"setup-offer-{self.name}",
+        ).start()
+
+    def _setup_offer_failed(self, pkg: str, cause: str) -> None:
+        """The owner could not be offered the engine's setup.  The once-flag
+        is already set, so this worker never offers again: tell the owner
+        through the goal instead of falling back to another voice in
+        silence."""
+        logger.error(
+            f"{self.name}: setup could not be offered: {cause}; raising the "
+            f"missing-package goal instead")
+        self._raise_missing_package_goal(
+            pkg,
+            f"The {self.name} engine is not installed (its worker ran on "
+            f"{self.python_exe}, not its own venv, and cannot import "
+            f"'{pkg}'), and offering its setup to the owner failed: {cause}. "
+            f"Do NOT pip '{pkg}' into the shared site. Diagnose why "
+            f"capability_setup.request_capability_setup failed so the owner "
+            f"can be asked to set up tts:{self.name}.",
+            failed_step=FAILED_STEP_SETUP_OFFER,
+        )
+
+    def _raise_missing_package_goal(self, pkg: str, hint: str, *,
+                                    failed_step: str) -> None:
+        """Raise the agentic self-heal goal for a package this worker could
+        not import (``core.error_advice``, throttled per failure shape).
+        ``failed_step`` (core.error_advice.FAILED_STEP_*) is what the goal's
+        prompt reads to say which step failed.  The context names no
+        ``backend``, so the prompt takes the missing-dependency route,
+        never ``repair_backend_venv`` (an install without the owner's yes)."""
+        try:
+            from core.error_advice import handle_exception
+            synthetic = ModuleNotFoundError(f"No module named '{pkg}'")
+            synthetic.name = pkg  # type: ignore[attr-defined]
+            handle_exception(
+                synthetic,
+                category='subprocess.tool_load',
+                severity='high',
+                agent_remediation=True,
+                context={
+                    'worker_name': self.name,
+                    'worker_module': self.module,
+                    'missing_package': pkg,
+                    'failed_step': failed_step,
+                    'remediation_hint': hint,
+                },
+            )
+        except Exception as e:
+            logger.error(
+                f"{self.name}: the '{pkg}' self-heal goal could not be "
+                f"raised: {type(e).__name__}: {e}")
 
     def _user_site_packages_dir(self) -> Optional[str]:
         """Return the user-writable site-packages dir for runtime

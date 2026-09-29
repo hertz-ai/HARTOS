@@ -829,6 +829,60 @@ def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
     return n
 
 
+def arm_turn_attach(executor, attached_names, goal_tags):
+    """Give a freshly built agent pair the ledger attach_for_turn reads:
+    the tool names already on the pair and the goal tags already unlocked.
+    ONE writer, called by both builders (create_recipe.create_agents and
+    reuse_recipe's constructor) on the agent their register_dual executes
+    service tools on."""
+    executor._hart_attached_tools = attached_names
+    executor._hart_unlocked_tags = set(goal_tags or ())
+
+
+def attach_for_turn(message, helper, executor, registry):
+    """Tier-1 per-turn attach: the capability families THIS turn's words
+    unlock that the agents do not carry yet.  Returns (new_tags, n_attached).
+
+    ONE implementation for both pipelines' turn entry -- REUSE
+    get_agent_response and CREATE get_response_group -- so a conversation
+    that drifts into a capability its build-time goal never mentioned (an
+    agent asked mid-chat to vote on an experiment) gets that family before
+    the model sees the turn.  CREATE only attached at build time until the
+    review of d99b1aa88.  Reads the ledger arm_turn_attach put on
+    ``executor``; agents built without one are left alone.  Idempotent: a
+    tag already unlocked is skipped and the ledger is updated in place.
+
+    Whatever it attaches is then reconciled with the LIVE n_ctx
+    (fit_schema_to_ctx), here, so neither caller can grow the schema past
+    the server.  CREATE's helper is trimmed at build time because it
+    measured 7191 schema tokens against n_ctx 8192 (create_recipe.py, the
+    defer_helper_schema block); an attach after that with no fit reopened
+    the 400 (review of a4dc8cf3b).  The tools just attached are protected,
+    since this turn asked for them; anything deferred stays executable and
+    re-attachable through request_tools.
+    """
+    unlocked = getattr(executor, '_hart_unlocked_tags', None)
+    attached = getattr(executor, '_hart_attached_tools', None)
+    if unlocked is None or attached is None:
+        return [], 0
+    from integrations.agent_engine.marketing_tools import detect_goal_tags
+    from integrations.agent_engine.goal_manager import get_tool_tags
+    new = [t for t in detect_goal_tags(message or '') if t not in unlocked]
+    if not new:
+        return [], 0
+    cap = set()
+    for t in new:
+        cap.update(get_tool_tags(t))
+    before = set(attached)
+    n = attach_for_tags(cap, helper, executor, registry, attached)
+    unlocked.update(new)
+    if n:
+        just = set(attached) - before
+        fit_schema_to_ctx(helper, protect=just)
+        fit_schema_to_ctx(executor, protect=just)
+    return new, n
+
+
 def attach_for_names(names, helper, executor, registry, attached_names,
                      core_tools=None):
     """Attach the tools a turn NAMES outright — registry AND core closures.

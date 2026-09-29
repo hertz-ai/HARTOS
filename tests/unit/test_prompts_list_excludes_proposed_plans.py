@@ -131,3 +131,135 @@ def test_source_guard_entry_names_plans_only_through_prompt_files():
     assert ".proposed" not in src.replace(
         'core.prompt_files', '').replace('proposed_plan_filename', '')
     assert src.count('proposed_plan_filename(prompt_id') == 2
+
+
+# --- the other two agent listings: the router's catalog and MCP list_agents --
+
+_AGENTS = ['79991757345', 'c38e8b7c-ccbc-4127-a0a4-7604f69f9203']
+
+
+def test_router_catalog_lists_agents_not_plans(prompts_dir, monkeypatch):
+    """agentic_router._build_agent_catalog skipped only '_recipe' names, so
+    every staged plan (and every action/personality file) was offered to the
+    matcher LLM as an agent it could route the user's task to."""
+    import sys
+    from integrations.agentic_router import _build_agent_catalog
+    for other_source in ('integrations.expert_agents.registry',
+                         'integrations.agent_engine.federated_aggregator',
+                         'integrations.google_a2a.dynamic_agent_registry'):
+        monkeypatch.setitem(sys.modules, other_source, None)
+    rows = [r for r in _build_agent_catalog(prompts_dir)
+            if r['source'] == 'recipe']
+    assert sorted(r['id'] for r in rows) == _AGENTS
+    assert next(r for r in rows if r['id'] == '79991757345')['name'] == 'A'
+
+
+def test_mcp_list_agents_lists_agents_not_plans(prompts_dir, monkeypatch):
+    """MCP list_agents globbed every prompts JSON as a 'dynamic' agent:
+    plans, recipes, action and personality files alike."""
+    from integrations.mcp import _tool_impls as tools
+
+    class _NoExperts:
+        agents = {}
+
+    def _no_db():
+        raise RuntimeError('no social DB in this test')
+
+    monkeypatch.setattr(tools, 'get_recipe_prompts_dir', lambda: prompts_dir)
+    monkeypatch.setattr(tools, '_get_registry', lambda: _NoExperts())
+    monkeypatch.setattr(tools, '_get_db', _no_db)
+    out = json.loads(tools.list_agents())
+    assert sorted(d['agent_id'] for d in out['dynamic']) == _AGENTS
+    assert out['dynamic_agents'] == 2
+
+
+# --- source guard: every enumeration of the prompts dir is accounted for ----
+
+#: Shipped code that enumerates the prompts dir WITHOUT local_agent_prompts,
+#: each for a reason that is not "list the agents".  A new enumeration fails
+#: test_source_guard_every_prompts_dir_listing_is_accounted_for until it
+#: either reads through local_agent_prompts or is added here with its reason.
+_NOT_AGENT_LISTINGS = {
+    ('core/prompt_files.py', 'local_agent_prompts'): 'the one agent reader',
+    ('core/flow_recipe_reconcile.py', '_flows_needing_reconcile'):
+        'flow recipe files',
+    ('core/prompts_backup.py', 'snapshot_prompts'): 'backs up every file',
+    ('core/recipe_sync.py', '_files_for_prompt'): "one prompt id's files",
+    ('hartos/create_recipe.py',
+     'create_agents.execute_windows_or_android_command'):
+        "one prompt id's VLM files",
+    ('hartos/reuse_recipe.py',
+     'create_agents_for_user.execute_windows_or_android_command'):
+        "one prompt id's VLM files",
+    ('hartos/helper.py', 'load_vlm_agent_files'): "one prompt id's VLM files",
+    ('hartos/hart_cli.py', 'recipe_list'): '*_recipe.json only',
+    ('hartos/hart_cli.py', 'recipe_show'): '*_recipe.json only',
+    ('hartos/hart_cli.py', 'a2a_agents'): '*_recipe.json only',
+    ('integrations/agent_engine/ip_service.py', 'IPService.measure_moat_depth'):
+        '*_recipe.json only',
+    ('integrations/google_a2a/dynamic_agent_registry.py',
+     'DynamicAgentDiscovery._load_prompt_definitions'):
+        'definitions by int stem; its agents are *_*_recipe.json',
+    ('integrations/mcp/_tool_impls.py', 'list_recipes'):
+        'lists every file by name, by design',
+    # OPEN, not a blessing: counts every non-recipe JSON as a prompt, so
+    # staged plans inflate recipe_adoption.total_prompts.  Reported with the
+    # fix of the two listings above; routed to the owner (review of 77a7191a7).
+    ('integrations/agent_engine/ip_service.py', 'IPService.get_loop_health'):
+        'OPEN: counts plans as prompts',
+}
+
+_ENUMERATORS = {'listdir', 'scandir', 'glob', 'iglob', 'iterdir', 'walk',
+                'rglob'}
+
+
+def _prompts_dir_enumerations():
+    """(file, def path) of every call in shipped code that enumerates a
+    directory named after the prompts dir (PROMPTS_DIR, prompts_dir,
+    get_recipe_prompts_dir(), 'prompts/...').  Enumerates by the question,
+    not by a symbol: a listing that never mentions local_agent_prompts is
+    exactly the one to find.  Blind spot, stated: a prompts dir held in a
+    variable whose name does not say 'prompt'."""
+    import ast
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    shipped = [root / 'hart_intelligence_entry.py']
+    for pkg in ('core', 'hartos', 'integrations', 'security'):
+        shipped += [p for p in (root / pkg).rglob('*.py')
+                    if '__pycache__' not in p.parts]
+    found = set()
+
+    def visit(node, owner, rel):
+        for child in ast.iter_child_nodes(node):
+            here = owner
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.ClassDef)):
+                here = child.name if owner is None else f'{owner}.{child.name}'
+            if isinstance(child, ast.Call):
+                fn = child.func
+                name = (fn.id if isinstance(fn, ast.Name)
+                        else fn.attr if isinstance(fn, ast.Attribute) else None)
+                if name in _ENUMERATORS:
+                    text = ' '.join(ast.unparse(a) for a in child.args)
+                    if isinstance(fn, ast.Attribute):
+                        text += ' ' + ast.unparse(fn.value)
+                    if 'prompt' in text.lower():
+                        found.add((rel, here or '<module>'))
+            visit(child, here, rel)
+
+    for path in shipped:
+        rel = path.relative_to(root).as_posix()
+        visit(ast.parse(path.read_text(encoding='utf-8')), None, rel)
+    return found
+
+
+def test_source_guard_every_prompts_dir_listing_is_accounted_for():
+    found = _prompts_dir_enumerations()
+    unaccounted = found - set(_NOT_AGENT_LISTINGS)
+    assert not unaccounted, (
+        f'{sorted(unaccounted)} enumerate the prompts dir without '
+        'core.prompt_files.local_agent_prompts; an agent listing must read '
+        'through it (or staged plans are listed as agents), anything else '
+        'belongs in _NOT_AGENT_LISTINGS with its reason')
+    stale = set(_NOT_AGENT_LISTINGS) - found
+    assert not stale, f'allow-list entries that no longer enumerate: {sorted(stale)}'

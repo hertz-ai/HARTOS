@@ -169,10 +169,11 @@ def _action_persona(action, role):
     (:1138), /chat 500'd, and the turn fell through to a toolless LLM that
     invented carrier rates for the user.
 
-    Defaulting to `role` is not a new rule: _vlm_merged_actions below is handed
-    `role` as its `flow_persona` (see the call at ~:1127) and assigns exactly
-    that to an appended action that has no owner.  Same question, same answer,
-    ONE derivation.  Defaulting also keeps the action in role_actions, so it
+    Defaulting to `role` answers "who owns an action with no owner" the way
+    the flow itself does: every action of a flow runs as that flow's role.
+    (_vlm_merged_actions no longer appends ownerless actions -- a re-learning
+    whose id names no flow action is dropped as an orphan.)  Defaulting also
+    keeps the action in role_actions, so it
     still RUNS -- making the read merely safe would have traded a loud crash
     for a silent omission.
     """
@@ -183,7 +184,7 @@ def _action_persona(action, role):
     return str(role or '')
 
 
-def _vlm_merged_actions(existing_actions, vlm_actions, flow_persona=None):
+def _vlm_merged_actions(existing_actions, vlm_actions):
     """``existing_actions`` with each VLM re-authoring applied, OWNER kept.
 
     A ``*_vlm_agent.json`` file re-authors the STEPS of an action; it does not
@@ -208,6 +209,10 @@ def _vlm_merged_actions(existing_actions, vlm_actions, flow_persona=None):
     Returns a NEW list — the three call sites all merge into the shared
     ``recipes[user_prompt]`` and one of them re-runs on reload, so mutating
     in place let a second pass compound onto an already-merged list.
+    A file whose id names NO flow action is an orphan and is dropped (logged
+    ``[VLM-ORPHAN]``), never appended: a re-learning refines an action, it
+    never creates one.
+
     Never raises: this runs while the agent is being built.
     """
     try:
@@ -221,7 +226,7 @@ def _vlm_merged_actions(existing_actions, vlm_actions, flow_persona=None):
             continue
         action_id = vlm_action.get('action_id')
         if action_id is None:
-            continue          # unplaceable: no id to match or append against
+            continue          # unplaceable: no id to match against
         merged = dict(vlm_action)
         replaced = False
         for i, action in enumerate(out):
@@ -243,12 +248,23 @@ def _vlm_merged_actions(existing_actions, vlm_actions, flow_persona=None):
                 replaced = True
                 break
         if not replaced:
-            # An appended action has no predecessor to inherit from; the flow's
-            # persona is the only correct owner.  Without one, leave the file's
-            # own value alone rather than invent an owner.
-            if flow_persona:
-                merged['persona'] = flow_persona
-            out.append(merged)
+            # ORPHAN: the file names an action this flow does not have.  A
+            # re-learning refines an action; it never creates one, so it is
+            # dropped, not appended.  MEASURED 2026-09-25 21:55:33, agent
+            # 18088688973 (6-action flow): files _7/_8/_9_vlm_agent.json, other
+            # runs' chores ("Create a new directory called autonomous_research_
+            # data in the C drive") filed past the end of the flow by a
+            # next-free-slot walker, were appended -> "[VLM-MERGE] actions
+            # 6 -> 9", "[REUSE-LEDGER] ... actions=9", and three FileNotFound
+            # lines for the per-action files only CREATE writes.  The research
+            # agent would have replayed three OS-mutating jobs its owner never
+            # authored for it.  Logged so an ignored file is countable.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "[VLM-ORPHAN] ignoring re-learning for action_id=%r: no flow "
+                "action has that id (flow ids %s); action=%r",
+                action_id, [a.get('action_id') for a in out],
+                str(vlm_action.get('action') or '')[:120])
     return out
 try:
     from hartos.helper import PROMPTS_DIR
@@ -569,6 +585,11 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
                 response = str(response)
         else:
             response = str(response)
+    # Text for the user: an elided-text pointer a model copied into its
+    # message never reaches them, on either branch below (owner ruling
+    # 2026-09-27; review of d99b1aa88: the central POST sent it).
+    from core.llm_outbound_logger import strip_elided_pointers
+    response = strip_elided_pointers(response)
 
     message_hash = get_message_hash(response, original_request_id)
     unique_message_key = f"{original_request_id}_{message_hash}"
@@ -1333,7 +1354,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     if vlm_actions:
         _before = len(recipes[user_prompt]['actions'])
         recipes[user_prompt]['actions'] = _vlm_merged_actions(
-            recipes[user_prompt]['actions'], vlm_actions, role)
+            recipes[user_prompt]['actions'], vlm_actions)
         final_recipe[prompt_id] = recipes[user_prompt]
         current_app.logger.info(
             f"[VLM-MERGE] {len(vlm_actions)} override(s); actions "
@@ -2177,8 +2198,9 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                         # Same builder the read site above uses, so writer and reader
                         # agree by construction.  The number in this filename is NOT a
                         # uniquifier: helper.load_vlm_agent_files parses it back as the
-                        # action's identity (parts[2]), and _vlm_merged_actions appends
-                        # any id no existing action carries.  A counter that walked to
+                        # action's identity (parts[2]), and _vlm_merged_actions used to
+                        # append any id no existing action carries (it now drops it as
+                        # an orphan).  A counter that walked to
                         # the next free slot therefore filed each re-learned command as
                         # a NEW action.  Measured on agent 33323830039: a 1-action
                         # recipe grew to 4 actions over two drives, and the 3 appended
@@ -2683,6 +2705,9 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         AceStepTool.register()    # port 8001
         SeoAuditTool.register()   # native in-process (no port)
         GhPrTool.register()       # native in-process (no port)
+        from integrations.agent_engine.thought_experiment_tools import (
+            ExperimentVoteTool)
+        ExperimentVoteTool.register()  # native: the agent's own vote
         service_tool_registry.load_config()  # load any user-added tools from service_tools.json
 
         svc_tools = service_tool_registry.get_all_tool_functions()
@@ -2707,8 +2732,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         # Shared per-conversation state for the per-turn attach hook in
         # get_agent_response — same set object request_tools mutates, so
         # both layers see one attach ledger.
-        assistant._hart_attached_tools = _attached_names
-        assistant._hart_unlocked_tags = set(goal_tags)
+        from core.agent_tool_menu import arm_turn_attach
+        arm_turn_attach(assistant, _attached_names, goal_tags)
         # The FULL core closure list, for the per-turn named attach in
         # get_agent_response — that runs in a different function, so the list
         # built at L2141 is out of scope there and has to ride the agent like
@@ -5709,7 +5734,6 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         try:
             _unlocked = getattr(assistant, '_hart_unlocked_tags', None)
             if _unlocked is not None:
-                from integrations.agent_engine.marketing_tools import detect_goal_tags
                 from integrations.service_tools import service_tool_registry
 
                 # (a) NAMED — the tools this action's own recipe declares.
@@ -5748,18 +5772,11 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # idempotent against the same _hart_attached_tools ledger, one
                 # selects by exact name and the other by capability tag, so the
                 # union is the same either way.
-                _new = [t for t in detect_goal_tags(message or '')
-                        if t not in _unlocked]
+                # The one per-turn attach, shared with CREATE's turn.
+                from core.agent_tool_menu import attach_for_turn
+                _new, _n = attach_for_turn(message, helper, assistant,
+                                           service_tool_registry)
                 if _new:
-                    from core.agent_tools import attach_for_tags
-                    from integrations.agent_engine.goal_manager import get_tool_tags
-                    _cap = set()
-                    for _t in _new:
-                        _cap.update(get_tool_tags(_t))
-                    _n = attach_for_tags(_cap, helper, assistant,
-                                         service_tool_registry,
-                                         assistant._hart_attached_tools)
-                    _unlocked.update(_new)
                     current_app.logger.info(
                         f"Tier-1 turn attach: +{_new} -> {_n} tools")
 

@@ -104,3 +104,77 @@ def test_no_old_config_is_a_no_op(paths):
     legacy, new = paths
     api = AdminAPI()
     assert api._channels == {} and not new.exists() and not legacy.exists()
+
+
+# ── Once means once (review of 4b1796862) ─────────────────────────────────────
+#
+# "Once" was only true while the new file existed: delete it (the way to reset
+# the admin config) and restart, and the old file was copied back -- its
+# channels and their bot tokens with it (the `os.path.exists(config_path)`
+# check was the only guard).  A marker beside the new file now records that
+# the move is done, and nothing is copied again once it exists.
+
+
+def _marker(new):
+    return new.parent / 'admin_config.migrated.json'
+
+
+def test_a_deleted_config_does_not_bring_the_old_credentials_back(paths):
+    from integrations.channels.admin.api import AdminAPI
+
+    legacy, new = paths
+    _write(legacy, json.dumps(SAVED))
+    AdminAPI()
+    assert new.exists() and _marker(new).exists()
+
+    new.unlink()                       # the owner resets the admin config
+    api = AdminAPI()                   # and restarts
+
+    assert api._channels == {}, 'the old channels and bot tokens came back'
+    assert not new.exists()
+    assert json.loads(legacy.read_text(encoding='utf-8')) == SAVED
+
+
+def test_an_install_that_moved_before_the_marker_is_marked_too(paths):
+    """A config already at the new place (copied by 4b1796862, before the
+    marker existed) means the move is done: marked on first sight, so its
+    deletion later does not copy the old file either."""
+    from integrations.channels.admin.api import AdminAPI
+
+    legacy, new = paths
+    _write(legacy, json.dumps(SAVED))
+    _write(new, json.dumps({'channels': {}, 'workflows': {}, 'identity': None}))
+
+    AdminAPI()
+    assert _marker(new).exists()
+    new.unlink()
+    api = AdminAPI()
+
+    assert api._channels == {} and not new.exists()
+
+
+def test_the_marker_says_what_was_carried_and_when(paths):
+    from integrations.channels.admin.api import AdminAPI
+
+    legacy, new = paths
+    _write(legacy, json.dumps(SAVED))
+    AdminAPI()
+
+    record = json.loads(_marker(new).read_text(encoding='utf-8'))
+    assert record['from'] == os.path.abspath(str(legacy))
+    assert record['copied'] is True
+    assert record['at']
+
+
+def test_an_old_config_that_could_not_be_copied_is_tried_again(paths):
+    """An unreadable old file leaves no marker: fixed, it is carried over."""
+    from integrations.channels.admin.api import AdminAPI
+
+    legacy, new = paths
+    _write(legacy, '{not json')
+    AdminAPI()
+    assert not _marker(new).exists()
+
+    _write(legacy, json.dumps(SAVED))
+    api = AdminAPI()
+    assert api._channels == SAVED['channels']

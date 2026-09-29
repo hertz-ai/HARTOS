@@ -140,60 +140,92 @@ class _Executor(unittest.TestCase):
             self.assertIn(n, content)
 
 
-class ListWrappedArgumentsAreBound(_Executor):
-    """``[{...}]`` is checked against the signature as the call it becomes."""
+class NonObjectArgumentsAreNeverRun(_Executor):
+    """Arguments that are not one JSON object -- a list, a list wrapping an
+    object, a string -- are refused by the executor, the same rule the
+    history guard applies.  Before, the executor ran '[1, 2]' positionally
+    and '"hello"' as one argument while the guard rewrote the same call in
+    the history to the refused stand-in, which tells the model the call was
+    not run.  Decision (coordinator, sensible default): tools take named
+    parameters and the schema says the arguments are an object, so both
+    refuse.  Measured before deciding: all 854 tool calls models made in
+    llm_outbound.jsonl + .old carry an object."""
 
-    def test_sync_unknown_name_in_a_wrapped_object_is_refused(self):
+    def assert_not_run(self, ok, reply):
+        self.assertFalse(ok)
+        self.assertEqual(self.calls, [])
+        content = reply['content']
+        self.assertTrue(content.startswith('Error:'), content)
+        self.assertIn('not one JSON object', content)
+        self.assertIn('was not run', content)
+
+    def test_a_positional_list_is_refused(self):
+        for text in ('["hi", "a1"]', '["hi", "a1", "x"]',
+                     '["hi", "a1", ["truncated"]]'):
+            with self.subTest(text=text):
+                self.assert_not_run(*self.run_sync('send_message_to_user', text))
+
+    def test_a_list_wrapping_an_object_is_refused(self):
+        self.assert_not_run(*self.run_sync(
+            'send_message_to_user', '[{"text": "hi", "avatar_id": "a1"}]'))
+        self.assert_not_run(*self.run_async(
+            'text_2_image', '[{"text": "a cat"}]'))
+
+    def test_a_bare_string_is_refused(self):
+        self.assert_not_run(*self.run_sync('send_message_to_user', '"hello"'))
+
+    def test_an_object_still_runs(self):
         ok, reply = self.run_sync('send_message_to_user',
-                                  '[{"text": "hi", "status": "done"}]')
-        self.assert_refused_by_name(ok, reply, 'Unknown argument(s): status')
-
-    def test_sync_missing_required_in_a_wrapped_object_is_refused(self):
-        ok, reply = self.run_sync('send_message_to_user',
-                                  '[{"avatar_id": "a1"}]')
-        self.assert_refused_by_name(ok, reply,
-                                    'Missing required argument(s): text')
-
-    def test_async_unknown_name_in_a_wrapped_object_is_refused(self):
-        ok, reply = self.run_async('text_2_image',
-                                   '[{"text": "a cat", "mood": "calm"}]')
-        self.assert_refused_by_name(ok, reply, 'Unknown argument(s): mood')
-
-    def test_sync_a_wrapped_object_that_binds_runs_as_keywords(self):
-        ok, reply = self.run_sync('send_message_to_user',
-                                  '[{"text": "hi", "avatar_id": "a1"}]')
+                                  '{"text": "hi", "avatar_id": "a1"}')
         self.assertTrue(ok, reply)
         self.assertEqual(self.calls, [('sync', 'hi', 'a1')])
 
-    def test_async_a_wrapped_object_that_binds_runs_as_keywords(self):
-        # Was func({"text": "a cat"}): the whole dict as `text`.
-        ok, reply = self.run_async('text_2_image', '[{"text": "a cat"}]')
-        self.assertTrue(ok, reply)
-        self.assertEqual(self.calls, [('async', 'a cat')])
 
+class ExecutionAndHistoryAgree(unittest.TestCase):
+    """Through a real generate_tool_calls_reply: a non-object call is not
+    run, and the history shows the refused stand-in -- the two now say the
+    same thing."""
 
-class PositionalListsAreBoundToo(_Executor):
-    """A plain list is the positional call safe_function_call makes."""
+    def test_the_call_is_not_run_and_the_history_says_so(self):
+        from flask import Flask
+        from hartos.helper import (REFUSED_ARGUMENTS_KEY, ToolMessageHandler,
+                                   force_apply_autogen_json_fix)
+        orig = (ConversableAgent.execute_function,
+                ConversableAgent.a_execute_function)
+        self.addCleanup(lambda: setattr(ConversableAgent, 'execute_function', orig[0]))
+        self.addCleanup(lambda: setattr(ConversableAgent, 'a_execute_function', orig[1]))
+        self.assertTrue(force_apply_autogen_json_fix())
+        vault = mock.patch('core.tool_logging.credential_vault', return_value=None)
+        vault.start()
+        self.addCleanup(vault.stop)
+        calls = []
 
-    def test_a_positional_list_that_binds_runs(self):
-        ok, reply = self.run_sync('send_message_to_user', '["hi", "a1"]')
-        self.assertTrue(ok, reply)
-        self.assertEqual(self.calls, [('sync', 'hi', 'a1')])
+        @log_tool_execution
+        def get_item(id: str, n: int = 1) -> str:
+            calls.append((id, n))
+            return 'item'
 
-    def test_a_positional_list_that_does_not_bind_is_refused(self):
-        ok, reply = self.run_sync('send_message_to_user', '["hi", "a1", "x"]')
-        self.assert_refused_by_name(ok, reply, 'not one JSON object',
-                                    'text (required)')
-
-    def test_a_truncation_sentinel_list_is_refused_not_run_into_an_error(self):
-        # safe_function_call's ['truncated'] recovery needs the first call's
-        # TypeError, but core.tool_logging's wrapper answers that TypeError
-        # itself, so the tool "ran" and replied with a failure envelope
-        # (measured: "takes from 1 to 2 positional arguments but 3 were
-        # given").  The check refuses it before the call instead.
-        ok, reply = self.run_sync('send_message_to_user',
-                                  '["hi", "a1", ["truncated"]]')
-        self.assert_refused_by_name(ok, reply, 'not one JSON object')
+        for text in ('[1, 2]', '"hello"'):
+            with self.subTest(text=text):
+                calls.clear()
+                a = ConversableAgent('a', llm_config=False, human_input_mode='NEVER')
+                ex = ConversableAgent('ex', llm_config=False, human_input_mode='NEVER')
+                ex.register_function({'get_item': ex._wrap_function(get_item)})
+                a.send({'role': 'assistant', 'content': None,
+                        'tool_calls': [{'id': 'c1', 'type': 'function',
+                                        'function': {'name': 'get_item',
+                                                     'arguments': text}}]},
+                       ex, request_reply=False, silent=True)
+                _, reply = ex.generate_tool_calls_reply(sender=a)
+                content = reply['tool_responses'][0]['content']
+                self.assertEqual(calls, [], content)
+                self.assertIn('not one JSON object', content)
+                history = a._oai_messages[ex]
+                with Flask(__name__).app_context():
+                    out = ToolMessageHandler().validate_messages(list(history))
+                sent = [tc['function']['arguments'] for m in out
+                        for tc in (m.get('tool_calls') or [])][0]
+                self.assertIn(REFUSED_ARGUMENTS_KEY, json.loads(sent))
 
 
 class RefusedStandInNeverRuns(_Executor):

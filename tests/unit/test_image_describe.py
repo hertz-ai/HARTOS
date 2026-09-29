@@ -111,3 +111,69 @@ def test_it_uses_the_canonical_endpoint_and_the_scheduled_transport(img):
     _, post = _call(img, _resp('ok'))
     assert post.call_args.args[0] == LLM_URL + '/chat/completions'
     assert post.call_args.kwargs['timeout'] == LLM_COMPLETION_TIMEOUT
+
+
+def test_upload_cache_reuses_default_and_question_specific_analysis(img, tmp_path, monkeypatch):
+    monkeypatch.setenv('NUNBA_DATA_DIR', str(tmp_path))
+    from core import platform_paths
+    monkeypatch.setattr(platform_paths, '_cached_data_dir', None)
+    with patch.object(vis, '_infer_image', side_effect=['a diagram', 'label says ONE']) as infer:
+        assert vis.describe_image(img, cache=True) == 'a diagram'
+        assert vis.describe_image(img, cache=True) == 'a diagram'
+        assert vis.describe_image(img, 'Read the label', cache=True) == 'label says ONE'
+        assert vis.describe_image(img, 'Read the label', cache=True) == 'label says ONE'
+        assert infer.call_count == 2
+    # Reopening from disk (no process-memory cache) does not send the image.
+    with patch.object(vis, '_infer_image', side_effect=AssertionError('resent')):
+        assert vis.describe_image(img, cache=True) == 'a diagram'
+
+
+def test_modified_upload_invalidates_saved_analysis(img, tmp_path, monkeypatch):
+    monkeypatch.setenv('NUNBA_DATA_DIR', str(tmp_path))
+    from core import platform_paths
+    monkeypatch.setattr(platform_paths, '_cached_data_dir', None)
+    with patch.object(vis, '_infer_image', side_effect=['before', 'after']) as infer:
+        assert vis.describe_image(img, cache=True) == 'before'
+        from pathlib import Path
+        Path(img).write_bytes(b'changed image bytes')
+        assert vis.describe_image(img, cache=True) == 'after'
+        assert infer.call_count == 2
+
+
+@pytest.mark.parametrize('failure', [None, ''])
+def test_upload_cache_does_not_remember_inference_failure(img, tmp_path, monkeypatch, failure):
+    monkeypatch.setenv('NUNBA_DATA_DIR', str(tmp_path))
+    from core import platform_paths
+    monkeypatch.setattr(platform_paths, '_cached_data_dir', None)
+    with patch.object(vis, '_infer_image', side_effect=[failure, 'recovered']) as infer:
+        assert vis.describe_image(img, cache=True) == failure
+        assert vis.describe_image(img, cache=True) == 'recovered'
+        assert infer.call_count == 2
+
+
+def test_live_frames_are_not_cached(img):
+    with patch.object(vis, '_infer_image', side_effect=['frame one', 'frame two']) as infer:
+        assert vis.describe_image(img) == 'frame one'
+        assert vis.describe_image(img) == 'frame two'
+        assert infer.call_count == 2
+
+
+@pytest.mark.parametrize('reference', [
+    '/uploads/../outside.png', '/uploads/%2e%2e/outside.png',
+    '/uploads/%2foutside.png', '/uploads/../uploads-other/outside.png',
+    '/uploads/file.txt', 'https://example.com/photo.png', '/etc/passwords.png',
+])
+def test_saved_image_resolver_rejects_escape_and_non_uploads(tmp_path, reference):
+    with pytest.raises(ValueError):
+        vis.resolve_uploaded_image(reference, tmp_path / 'uploads')
+
+
+def test_saved_image_resolver_accepts_file_and_reports_deleted_file(tmp_path):
+    root = tmp_path / 'uploads'
+    (root / 'images').mkdir(parents=True)
+    image = root / 'images' / 'a.png'
+    image.write_bytes(b'image')
+    assert vis.resolve_uploaded_image('/uploads/images/a.png', root) == image.resolve()
+    image.unlink()
+    with pytest.raises(FileNotFoundError):
+        vis.resolve_uploaded_image('/uploads/images/a.png', root)

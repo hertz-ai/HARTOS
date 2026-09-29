@@ -324,7 +324,9 @@ class TestExperimentTally:
         ThoughtExperimentService.advance_status(
             db, exp['id'], target_status='voting')
 
-        agent = User(username=f'eval_agent_{uuid.uuid4().hex[:8]}', user_type='human')
+        # An AGENT account: the tally reads agent-or-human from the account,
+        # not from the vote's voter_type (test_one_identity_one_vote).
+        agent = User(username=f'eval_agent_{uuid.uuid4().hex[:8]}', user_type='agent')
         db.add(agent)
         db.flush()
 

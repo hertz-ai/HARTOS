@@ -541,6 +541,11 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
     (core.agent_tools) returns it to the model, so the model is told whether
     its message went out; the other callers here ignore it.
     """
+    # Text for the user: an elided-text pointer a model copied into its
+    # message never reaches them, on either branch below (owner ruling
+    # 2026-09-27; review of d99b1aa88: the central POST sent it).
+    from core.llm_outbound_logger import strip_elided_pointers
+    response = strip_elided_pointers(response)
     user_prompt = f'{user_id}_{prompt_id}'
     try:
         request_id = f'{request_id_list[user_prompt]}-intermediate'
@@ -1533,16 +1538,18 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                         if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
                             action_id = user_tasks[user_prompt].current_action
 
-                        # Determine file path
+                        # Determine file path.  The number in this filename is the
+                        # action's IDENTITY, not a uniquifier: load_vlm_agent_files
+                        # parses it back (parts[2]) and the REUSE merge applies the
+                        # file to THAT action.  A walker to the next free slot filed
+                        # each learning under another action's id or past the end
+                        # of the flow -- agent 18088688973's 6-action flow carries
+                        # orphan _7/_8/_9 files of unrelated C:\ chores.  Same
+                        # builder the REUSE writer uses; re-learning an action
+                        # overwrites that action's file.
                         role_number = get_current_flow(user_prompt)
-                        action_id_to_use = action_id
-                        base_path = helper_fun.safe_prompt_path(prompt_id, role_number, ext='')
-
-                        # Find next available action_id
-                        while os.path.exists(f"{base_path}_{action_id_to_use}_vlm_agent.json"):
-                            action_id_to_use += 1
-
-                        vlm_agent_path = f"{base_path}_{action_id_to_use}_vlm_agent.json"
+                        vlm_agent_path = helper_fun.safe_prompt_path(
+                            prompt_id, role_number, action_id, 'vlm_agent')
                         os.makedirs(os.path.dirname(vlm_agent_path), exist_ok=True)
 
                         # Bank what the run DID, not what it was asked.
@@ -1562,7 +1569,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             "action": instructions,
                             "fallback_action": f"Perform a Google search using {os_to_control}",
                             "persona": persona,
-                            "action_id": action_id_to_use,
+                            "action_id": action_id,
                             "recipe": recipe_steps,
                             "can_perform_without_user_input": "no",
                             "scheduled_tasks": [],
@@ -1769,6 +1776,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         AceStepTool.register()    # port 8001
         SeoAuditTool.register()   # native in-process (no port)
         GhPrTool.register()       # native in-process (no port)
+        from integrations.agent_engine.thought_experiment_tools import (
+            ExperimentVoteTool)
+        ExperimentVoteTool.register()  # native: the agent's own vote
         service_tool_registry.load_config()  # load any user-added tools from service_tools.json
 
         svc_tools = service_tool_registry.get_all_tool_functions()
@@ -1793,6 +1803,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # Never-say-unavailable: always-on discovery that attaches gated-out
         # or newly-needed tools mid-conversation (owner req 2026-08-31).
         _attached_names = set(svc_tools)
+        # The ledger the per-turn attach reads (core.agent_tool_menu.
+        # attach_for_turn, from _attach_for_create_turn), on the agent the
+        # register_dual above executes service tools on, as REUSE does.
+        # CREATE used to attach only at build time, from the task.
+        from core.agent_tool_menu import arm_turn_attach
+        arm_turn_attach(assistant, _attached_names, goal_tags)
         from core.agent_tools import register_request_tools
         register_request_tools(helper, assistant, service_tool_registry,
                                _attached_names)
@@ -4316,6 +4332,29 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
     return True
 
 
+def _attach_for_create_turn(agents_object, text, user_prompt):
+    """CREATE's Tier-1 per-turn attach, the one REUSE's turn uses
+    (core.agent_tool_menu.attach_for_turn, which also fits the grown schema
+    to the live n_ctx): a turn that drifts into a capability the build-time
+    task never named (an agent asked to vote on an experiment) gets it
+    before the model sees the turn.  On the pair create_agents registered
+    service tools on: the Helper proposes, the Assistant executes.  Never
+    raises; a failure is logged and the turn runs with the tools it has."""
+    try:
+        from core.agent_tool_menu import attach_for_turn
+        from integrations.service_tools import service_tool_registry
+        _new, _n = attach_for_turn(text, agents_object['helper'],
+                                   agents_object['assistant'],
+                                   service_tool_registry)
+        if _new:
+            current_app.logger.info(
+                f"Tier-1 turn attach: +{_new} -> {_n} tools")
+    except Exception as _e:
+        current_app.logger.warning(
+            f"turn attach skipped: {_e} for session: {user_prompt}",
+            exc_info=True)
+
+
 def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     """
     Handles the response generation process for an agent group.
@@ -4374,6 +4413,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             except Exception:
                 message = ""
                 text = f'Properly Execute Action {user_tasks[user_prompt].current_action}: {message} '
+    _attach_for_create_turn(agents_object, text, user_prompt)
+
     # Initiate or resume chat
     try:
         current_app.logger.info(f"Messages in user_prompt before init: {len(messages.get(user_prompt, []))}")

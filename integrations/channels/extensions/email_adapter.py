@@ -1054,3 +1054,12 @@ def create_email_adapter(
         **kwargs
     )
     return EmailAdapter(config)
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+ENV_SECRETS = (
+    'EMAIL_PASSWORD',
+)

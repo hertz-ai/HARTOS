@@ -537,3 +537,12 @@ class AutoDiscovery:
                 logger.info(
                     f"AutoDiscovery: could not announce back to "
                     f"{node_id[:8]} at {url}: {e}")
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HEVOLVE_REQUIRE_KNOWN_CODE_HASH',
+)

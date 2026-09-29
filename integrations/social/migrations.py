@@ -4,6 +4,9 @@ Version tracking and migration helpers.
 """
 import logging
 from sqlalchemy import text
+
+from core.constants import ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS
+
 from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
@@ -168,7 +171,7 @@ def _rekey_legacy_consent_flag(engine) -> tuple:
 
 _V59_PERSONA_COLUMNS = (
     ('bio', 'TEXT'),
-    ('recognize_me', 'VARCHAR(280)'),
+    ('recognize_me', f'VARCHAR({ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS})'),
     ('interests_discoverable', 'BOOLEAN NOT NULL DEFAULT 0'),
 )
 

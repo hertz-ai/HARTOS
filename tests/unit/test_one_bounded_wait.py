@@ -28,6 +28,11 @@ from unittest.mock import patch
 
 import pytest
 
+#: Allowed overrun past a bound, on a box other sessions load heavily
+#: (measured 2026-09-27: a 0.5 s bound took 2.9 s to release under load).
+#: Every blocker below lasts 10 s, so this still tells bounded from not.
+SLACK_S = 4.0
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # ── the detector ──────────────────────────────────────────────────────────
@@ -190,7 +195,7 @@ def test_web_crawler_async_bridge_is_bounded_inside_a_running_loop():
             web_crawler._run_async(_never(), timeout=0.5)
         return time.monotonic() - t0
 
-    assert asyncio.run(_caller()) < 2.0
+    assert asyncio.run(_caller()) < 0.5 + SLACK_S
 
 
 def test_web_crawler_async_bridge_returns_the_result():
@@ -228,7 +233,7 @@ def test_agentic_plan_is_bounded():
         elapsed = time.monotonic() - t0
     release.set()
     assert plan is None
-    assert elapsed < 1.5
+    assert elapsed < 0.3 + SLACK_S
 
 
 def test_agentic_plan_bounded_returns_the_plan_and_raises_its_error():
@@ -251,7 +256,7 @@ def test_dashboard_world_model_is_bounded():
         elapsed = time.monotonic() - t0
     release.set()
     assert status == {'healthy': False, 'error': 'cold_or_unreachable'}
-    assert elapsed < 1.5
+    assert elapsed < 0.3 + SLACK_S
 
 
 def test_dashboard_world_model_reports_a_live_bridge():
@@ -281,7 +286,7 @@ def test_cpu_model_probe_is_bounded():
         elapsed = time.monotonic() - t0
     release.set()
     assert model == ''
-    assert elapsed < 1.5
+    assert elapsed < 0.3 + SLACK_S
 
 
 def test_cpu_model_probe_returns_the_model():
@@ -289,3 +294,30 @@ def test_cpu_model_probe_returns_the_model():
     with patch.object(system_requirements.platform, 'processor',
                       return_value='Intel64 Family 6'):
         assert system_requirements._detect_cpu_model() == 'Intel64 Family 6'
+
+
+def test_the_agentic_plan_runs_as_the_request_that_asked():
+    """Review of 924b8e9dc (minor): the plan's worker made LLM calls with an
+    empty thread-local -- no user, no prompt, no request id -- and kept
+    doing so after the turn stopped waiting.  It carries the caller's."""
+    from integrations import agentic_router
+    from hartos.threadlocal import thread_local_data as tld
+    seen = {}
+
+    def _plan(*_a, **_k):
+        seen['user'] = tld.get_user_id()
+        seen['prompt'] = tld.get_prompt_id()
+        seen['request'] = tld.get_request_id()
+        return {'steps': []}
+
+    tld.set_user_id('u-plan')
+    tld.set_prompt_id('p-plan')
+    tld.set_request_id('r-plan')
+    try:
+        with patch.object(agentic_router, 'build_agentic_plan', side_effect=_plan):
+            agentic_router.build_agentic_plan_bounded('x', None)
+    finally:
+        tld.set_user_id(None)
+        tld.set_prompt_id(None)
+        tld.set_request_id(None)
+    assert seen == {'user': 'u-plan', 'prompt': 'p-plan', 'request': 'r-plan'}

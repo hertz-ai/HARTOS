@@ -40,23 +40,29 @@ logger = logging.getLogger('hevolve_security')
 # Owner ruling 2026-09-26: egress is a message that goes to OTHER people's
 # nodes; it is scrubbed (and metered) only there.  Local records stay raw.
 # Security must not partition the hive, so the protocol's own values --
-# ids, urls, addresses, versions, keys, signatures, timestamps -- travel
-# byte-identical, and what a person wrote or was told is scrubbed.
+# ids, urls, peer addresses, versions, public keys, signatures, timestamps
+# -- travel byte-identical, and what a person wrote or was told is scrubbed.
 #
 # Which leaves are content is decided structurally, not by a list of
 # content fields: a key this module has never seen ('reply', 'caption', a
 # nested 'body_text', a tuple, publish_async's {'raw': ...} wrapper) is
-# content by default.  Exempt are (a) values under the identifier
-# vocabulary below and (b) values whose SHAPE is a protocol value (a pure
-# number, a dotted version or address, one opaque token that is not itself
-# an email / phone / card number).  Why: the DLP phone pattern matches a
-# 10-digit prompt_id, nonce or byte count, and the ip pattern matches a
-# peer url's host or a build number like 1.4.0.12; rewriting either breaks
-# routing and verification for the recipient -- a partition, not a
-# privacy gain.  Secret-named keys and contact keys are never exempt.
+# content by default.  A value is exempt only when it sits under a
+# protocol key AND has that key's shape: an 'ip' that is an address, a
+# 'commit' that is a hash, a label that is a word, a url that names no
+# person, an id with no whitespace, '@' or secret in it.  Why the
+# exemption: the DLP phone pattern matches a 10-digit prompt_id or nonce
+# and the ip pattern matches a peer url's host or a build number like
+# 1.4.0.12; rewriting either breaks routing and verification for the
+# recipient -- a partition, not a privacy gain.  In content every matched
+# span is redacted where it sits, inside a token or not.  Contact keys
+# (email, phone, and person handles: sender_*, caller_*, wa_*, client_ip)
+# and secret keys (the whole key or its last word: api_key, auth_token,
+# db_password) are never exempt; a value under them that no pattern
+# recognises is withheld whole.  The one explicit exception is the
+# capability advert's auth_token (for peers).
 #
 # One home for every question an egress site asks:
-#   * which leaves are content          -> is_identifier_key / map_content
+#   * which leaves are content          -> _leaf_policy / map_content
 #   * what the scrubbed copy is         -> scrub_text / scrub_for_egress
 #   * which of a person's fields never go public
 #                                       -> PERSON_PRIVATE_FIELDS /
@@ -65,6 +71,7 @@ logger = logging.getLogger('hevolve_security')
 #                                          templates), crossbar_uri_is_per_user
 #   * whether a leg is egress            -> crossbar_leg_is_users_own (policy)
 #   * which topic names a user (ACL fact)-> uri_names_user
+#   * a person handle that must travel   -> pseudonym (salted, per node)
 # Every leg that leaves the node asks here: MessageBus (PeerLink + Crossbar
 # legs), the EventBus WAMP bridge (every topic it carries),
 # hart_intelligence_entry.publish_async, the copilot prompt
@@ -75,28 +82,83 @@ logger = logging.getLogger('hevolve_security')
 _IDENTIFIER_KEYS = frozenset({
     # identity + correlation
     'id', 'uid', 'msg_id', 'issued_by', 'origin', 'relay_path', 'hop_ttl',
-    # routing + addressing
-    'topic', 'topic_name', 'channel', 'url', 'uri', 'href', 'endpoint',
-    'host', 'hostname', 'port', 'address', 'ip', 'lan_ip',
-    'node_tier', 'tier', 'served_by',
-    # protocol discriminators + builds
-    'type', 'event', 'action', 'kind', 'status', 'state', 'role',
-    'cmd_type', 'version', 'build', 'commit', 'lang', 'language',
-    # integrity, keys (public), time
-    'signature', 'sig', 'nonce', 'checksum', 'digest', 'public_key',
-    'pubkey', 'timestamp', 'ts', 'expires', 'epoch',
+    # integrity, public keys, time
+    'signature', 'sig', 'nonce', 'public_key', 'pubkey',
+    'timestamp', 'ts', 'expires', 'epoch',
 })
 _IDENTIFIER_KEY_SUFFIXES = (
-    '_id', '_ids', '_url', '_urls', '_uri', '_type', '_at', '_hash', '_ts',
-    '_version', '_ip', '_address', '_sig', '_signature', '_nonce',
-    '_public', '_public_key', '_pubkey', '_sha256', '_checksum', '_digest',
+    '_id', '_ids', '_at', '_ts', '_sig', '_signature', '_nonce',
+    '_public', '_public_key', '_pubkey',
 )
-# Never exempt, whatever their suffix: a secret is not a protocol value
-# ('api_key', 'auth_token', 'private_key'), and a contact field is a
-# person's ('email', 'phone').
-_SECRET_KEY_WORDS = ('secret', 'password', 'passwd', 'token', 'api_key',
-                     'apikey', 'private', 'credential', 'cookie')
+# Protocol LABELS: a word, never a number or an address ('status' holding a
+# phone number is content).
+_LABEL_KEYS = frozenset({
+    'topic', 'topic_name', 'channel', 'type', 'event', 'action', 'kind',
+    'status', 'state', 'role', 'cmd_type', 'lang', 'language', 'node_tier',
+    'tier', 'served_by',
+})
+_LABEL_KEY_SUFFIXES = ('_type',)
+# Where a node or a resource lives: exempt unless it carries a person's
+# email / phone (a peer url's ip host is protocol).
+_URL_KEYS = frozenset({'url', 'uri', 'href', 'endpoint', 'host', 'hostname',
+                       'port'})
+_URL_KEY_SUFFIXES = ('_url', '_urls', '_uri')
+# Identifier keys whose value must also LOOK like the thing the key names:
+# 'ip' holding an email, 'commit' holding an email, 'version' holding a
+# sentence are content (review of d89d50223 F2).
+_IP_KEYS, _IP_KEY_SUFFIXES = frozenset({'ip', 'lan_ip'}), ('_ip',)
+_VERSION_KEYS, _VERSION_KEY_SUFFIXES = frozenset({'version', 'build'}), ('_version',)
+_COMMIT_KEYS = frozenset({'commit'})
+_DIGEST_KEYS = frozenset({'checksum', 'digest'})
+_DIGEST_KEY_SUFFIXES = ('_hash', '_sha256', '_checksum', '_digest')
+_MEASURE_KEY_SUFFIXES = ('_bytes', '_count', '_size', '_ms', '_mb', '_gb')
+# 'address' / '*_address': a peer's host:port is protocol, anything else
+# (a street, a phone number) is a person's and is withheld like a contact.
+_ADDRESS_KEYS, _ADDRESS_KEY_SUFFIXES = frozenset({'address'}), ('_address',)
+
+_IP_SHAPE = re.compile(
+    r'(?:\d{1,3}(?:\.\d{1,3}){3}|\[?[0-9A-Fa-f]*:[0-9A-Fa-f:]+\]?)(?::\d{1,5})?')
+_HOST_PORT_SHAPE = re.compile(
+    r'(?=[^:]*[A-Za-z])[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)+(?::\d{1,5})?'
+    r'|[A-Za-z0-9][A-Za-z0-9.-]*:\d{1,5}')
+_VERSION_SHAPE = re.compile(r'v?\d+(?:[._+-][0-9A-Za-z]+)*')
+_COMMIT_SHAPE = re.compile(r'[0-9a-fA-F]{7,64}')
+_DIGEST_SHAPE = re.compile(r'(?:[a-z0-9]+:)?[A-Za-z0-9+/=_-]{16,}')
+_NUMBER_SHAPE = re.compile(r'-?\d+(?:\.\d+)?')
+_LABEL_SHAPE = re.compile(r'[A-Za-z][\w.:/-]*')
+
+# A person's handle, whatever id-like suffix its key has (review CRITICAL:
+# hive.signal.* sent sender_id = a Signal / iMessage phone number raw):
+# a key with one of these words as a whole segment is a contact field.
+_PERSON_HANDLE_SEGMENTS = frozenset({
+    'sender', 'caller', 'callee', 'contact', 'recipient', 'wa', 'msisdn'})
+_PERSON_HANDLE_KEYS = frozenset({'from', 'to'})
+# An ip that is a PERSON's (the far end of a user's request), not a node's.
+_PERSON_IP_SEGMENTS = frozenset({'client', 'remote', 'user', 'source',
+                                 'caller', 'sender', 'visitor', 'mobile',
+                                 'phone', 'home', 'device'})
+
+# Never exempt: a secret is not a protocol value ('api_key', 'auth_token',
+# 'db_password', 'private_key'), and a contact field is a person's
+# ('email', 'phone').  A value under either that no pattern recognises is
+# withheld whole, not sent raw.  Secret words match the whole key or its
+# last segment -- 'tokenizer', 'token_type', 'max_tokens', 'secret_name',
+# 'private_mode' are protocol, not secrets.
+_SECRET_KEY_WORDS = ('secret', 'password', 'passwd', 'pwd', 'pass', 'token',
+                     'api_key', 'apikey', 'access_key', 'private_key',
+                     'credential', 'credentials', 'cookie')
 _CONTACT_KEY_WORDS = ('email', 'phone', 'mobile', 'cell', 'ssn')
+# A secret-keyed value that says there is no secret stays readable.
+_SECRET_STATUS_WORDS = frozenset({
+    '', 'none', 'null', 'nil', 'na', 'n/a', 'unset', 'empty', 'missing',
+    'expired', 'invalid', 'revoked', 'pending', 'unknown', 'true', 'false'})
+
+# The ONE secret that is meant for other nodes: the capability advert's
+# auth_token (peers call the advertised endpoint with it).  Exempt only in
+# a dict that also carries the signed origin_attestation -- the advert
+# shape (hive_capability_advertiser._build_payload) -- and nowhere else.
+_GOSSIP_SECRET_KEYS = frozenset({'auth_token'})
+_GOSSIP_MARKER_KEY = 'origin_attestation'
 
 # A person record's fields that never reach anyone else, even scrubbed.
 # Why each: email, phone, phone_number, password_hash, api_token -> PII /
@@ -111,33 +173,143 @@ PERSON_PRIVATE_FIELDS = (
 )
 _PERSON_RECORD_KEYS = frozenset({'author'})
 
-_DOTTED_NUMBER = re.compile(r'\d+(?:\.\d+)+')
-_WHOLE_PLACEHOLDER = re.compile(r'\[[A-Z_]+_REDACTED\]')
+_PLACEHOLDER = re.compile(r'\[[A-Z_]+_REDACTED\]')
+_PERSON_PLACEHOLDER = re.compile(r'\[(?!IP_)[A-Z_]+_REDACTED\]')
+
+# Leaf policies (what a string under a key is)
+_CONTENT, _EXEMPT, _CONTACT, _SECRET = 'content', 'exempt', 'contact', 'secret'
 
 
 def _is_secret_key(key: str) -> bool:
-    return any(w in key for w in _SECRET_KEY_WORDS)
+    if {'password', 'passwd', 'pwd'}.intersection(key.split('_')):
+        return True                              # password_hash, pwd_salt
+    return any(key == w or key.endswith('_' + w) for w in _SECRET_KEY_WORDS)
 
 
 def _is_contact_key(key: str) -> bool:
-    # 'email', 'contact_email', 'phone_number' -- not 'phone_like_count'
+    # 'email', 'contact_email', 'phone_number', 'sender_id', 'wa_id',
+    # 'client_ip' -- not 'phone_like_count' or 'peer_ip'
+    if key in _PERSON_HANDLE_KEYS:
+        return True
+    segments = key.split('_')
+    if _PERSON_HANDLE_SEGMENTS.intersection(segments):
+        return True
+    if segments[-1] == 'ip' and _PERSON_IP_SEGMENTS.intersection(segments):
+        return True
     return any(key == w or key.endswith('_' + w) or key == w + '_number'
                or key == w + '_address' for w in _CONTACT_KEY_WORDS)
 
 
-def is_identifier_key(key: Any) -> bool:
-    """Does the value under ``key`` belong to the protocol, not a person?
+def _names_a_person(value: str) -> bool:
+    """Does ``value`` contain an email / phone / ssn / card (an ip alone is
+    not a person here: it is where a node lives)?"""
+    dlp, redact_secrets = _redactors()
+    return bool(_PERSON_PLACEHOLDER.search(dlp.redact(value))) or bool(
+        redact_secrets(value)[1])
 
-    Strings under such a key (and inside a list/tuple under it) travel
-    byte-identical; a dict under it is walked by its own keys.  A
-    secret-named or contact key never is.
+
+def _exempt_shape(key: str, value: str) -> bool:
+    """Is ``value`` under the protocol key ``key`` shaped like what the key
+    names, so it travels byte-identical?
+
+    A key NAME alone never exempts a value; the value must also match the
+    shape its key names.  Do not "simplify" this into a name allowlist:
+    senders put a phone number under sender_id, an email under 'ip', a
+    sentence under 'status', and each of those went raw to every hive node
+    while only the name was checked (reviews of d89d50223 and the
+    c072913e4 set).  When a real protocol value fails its shape, the
+    failure is loud, not silent: a routing key the scrub altered withholds
+    the leg with a warning (routing_keys_intact).
     """
+    if not value or any(c.isspace() for c in value) or '@' in value:
+        return False
+    if key in _IP_KEYS or key.endswith(_IP_KEY_SUFFIXES):
+        return bool(_IP_SHAPE.fullmatch(value))
+    if key in _VERSION_KEYS or key.endswith(_VERSION_KEY_SUFFIXES):
+        return bool(_VERSION_SHAPE.fullmatch(value))
+    if key in _COMMIT_KEYS:
+        return bool(_COMMIT_SHAPE.fullmatch(value))
+    if key in _DIGEST_KEYS or key.endswith(_DIGEST_KEY_SUFFIXES):
+        return bool(_DIGEST_SHAPE.fullmatch(value)) and not _names_a_person(value)
+    if key.endswith(_MEASURE_KEY_SUFFIXES):
+        return bool(_NUMBER_SHAPE.fullmatch(value))
+    if key in _LABEL_KEYS or key.endswith(_LABEL_KEY_SUFFIXES):
+        return bool(_LABEL_SHAPE.fullmatch(value))
+    if key in _URL_KEYS or key.endswith(_URL_KEY_SUFFIXES):
+        return not _names_a_person(value)
+    if key in _IDENTIFIER_KEYS or key.endswith(_IDENTIFIER_KEY_SUFFIXES):
+        return not _redactors()[1](value)[1]
+    return False
+
+
+def _leaf_policy(key: Any, value: str, gossip: bool) -> str:
+    """What the string ``value`` under ``key`` is, in a dict that is (or is
+    not) the capability advert."""
     if not isinstance(key, str):
+        return _CONTENT
+    lk = key.lower()
+    if _is_contact_key(lk):
+        return _CONTACT
+    if _is_secret_key(lk):
+        if gossip and lk in _GOSSIP_SECRET_KEYS:
+            return _EXEMPT
+        return _SECRET
+    if lk in _ADDRESS_KEYS or lk.endswith(_ADDRESS_KEY_SUFFIXES):
+        return _EXEMPT if (_IP_SHAPE.fullmatch(value)
+                           or _HOST_PORT_SHAPE.fullmatch(value)) else _CONTACT
+    return _EXEMPT if _exempt_shape(lk, value) else _CONTENT
+
+
+def routing_keys_intact(original: Any, scrubbed: Any, keys, where: str) -> bool:
+    """Did the scrub leave every payload key a URI or lookup is built from
+    byte-identical?  If not, the scrubbed copy would route nowhere (the URI
+    says one id, the payload another) and nothing would say so: log a
+    WARNING and return False, so the caller withholds that leg exactly as
+    it does for a failed scrub.  The fix is to classify the key (a protocol
+    key with its shape in _exempt_shape), never to send the raw value."""
+    if not isinstance(original, dict) or not isinstance(scrubbed, dict):
+        return True
+    changed = [k for k in keys
+               if k in original and scrubbed.get(k) != original.get(k)]
+    if changed:
+        logger.warning(
+            "Egress withheld for %s: the scrub altered routing key(s) %s, so "
+            "the scrubbed copy would not reach its subscribers; classify the "
+            "key in security.edge_privacy (a protocol key and its shape)",
+            where, ', '.join(sorted(changed)))
         return False
-    key = key.lower()
-    if _is_secret_key(key) or _is_contact_key(key):
-        return False
-    return key in _IDENTIFIER_KEYS or key.endswith(_IDENTIFIER_KEY_SUFFIXES)
+    return True
+
+
+def pseudonym(value: Any, purpose: str) -> str:
+    """A stable, salted per-node stand-in for a person handle (a sender's
+    phone number, a chat id): the same handle maps to the same reference on
+    this node, and no other node can reverse or correlate it.  The salt is
+    this node's social secret key (core.platform_paths
+    .read_social_secret_key) under a ``purpose`` label, or a per-process
+    random salt when the node has none.  '' stays ''."""
+    import hashlib
+    import hmac
+    value = str(value or '')
+    if not value:
+        return ''
+    global _PSEUDONYM_FALLBACK_SALT
+    try:
+        from core.platform_paths import read_social_secret_key
+        key = read_social_secret_key()
+    except Exception:
+        key = ''
+    if not key:
+        if _PSEUDONYM_FALLBACK_SALT is None:
+            import os as _os
+            _PSEUDONYM_FALLBACK_SALT = _os.urandom(32).hex()
+        key = _PSEUDONYM_FALLBACK_SALT
+    digest = hmac.new(key.encode(), f'{purpose}|{value}'.encode(),
+                      hashlib.sha256).hexdigest()
+    return 'anon_' + digest[:16]
+
+
+_PSEUDONYM_FALLBACK_SALT = None
 
 
 def strip_person_private(record: Any) -> Any:
@@ -162,77 +334,87 @@ def public_payload(payload: Any) -> Any:
 
 
 def map_content(data: Any, fn: Callable[[str], str],
-                contact_fn: Optional[Callable[[str], str]] = None) -> Any:
+                contact_fn: Optional[Callable[[str], str]] = None,
+                secret_fn: Optional[Callable[[str], str]] = None) -> Any:
     """A copy of ``data`` with ``fn`` applied to every content string leaf.
 
-    Content is every string not under an identifier key, at any depth,
-    inside dicts, lists and tuples (a tuple stays a tuple).  A bare string
-    is content.  Numbers, booleans and None are unchanged.  Leaves under a
-    contact key use ``contact_fn`` when given.  ``data`` is never mutated.
+    A string under an identifier key whose value has that key's shape is
+    exempt; every other string is content, at any depth, inside dicts,
+    lists and tuples (a tuple stays a tuple).  A bare string is content.
+    Leaves under a contact / secret key use ``contact_fn`` / ``secret_fn``
+    when given.  Numbers, booleans and None are unchanged.  ``data`` is
+    never mutated.
     """
-    def walk(value, exempt, contact):
+    by_policy = {_CONTENT: fn, _CONTACT: contact_fn or fn,
+                 _SECRET: secret_fn or fn}
+
+    def walk(value, key, gossip):
         if isinstance(value, dict):
-            out = {}
-            for k, v in value.items():
-                lk = k.lower() if isinstance(k, str) else k
-                out[k] = walk(v, is_identifier_key(k),
-                              isinstance(lk, str) and _is_contact_key(lk))
-            return out
+            inner = _GOSSIP_MARKER_KEY in value
+            return {k: walk(v, k, inner) for k, v in value.items()}
         if isinstance(value, list):
-            return [walk(v, exempt, contact) for v in value]
+            return [walk(v, key, gossip) for v in value]
         if isinstance(value, tuple):
-            return tuple(walk(v, exempt, contact) for v in value)
-        if isinstance(value, str) and not exempt:
-            return (contact_fn or fn)(value) if contact else fn(value)
+            return tuple(walk(v, key, gossip) for v in value)
+        if isinstance(value, str):
+            policy = _leaf_policy(key, value, gossip)
+            return value if policy == _EXEMPT else by_policy[policy](value)
         return value
 
-    return walk(data, False, False)
+    return walk(data, None, False)
 
 
-def _is_protocol_value(text: str, redacted: str) -> bool:
-    """Is ``text`` (whose DLP redaction is ``redacted``) a protocol value
-    rather than free text?  A pure number or a dotted version / address
-    is; so is one opaque token (no whitespace, no '@') that the PII
-    patterns match only INSIDE -- a base64 key or a hostname carrying a
-    digit run -- as opposed to a token that IS an email, phone or card."""
-    if text.isdigit() or _DOTTED_NUMBER.fullmatch(text):
-        return True
-    if any(c.isspace() for c in text) or '@' in text:
-        return False
-    return not _WHOLE_PLACEHOLDER.fullmatch(redacted)
+def _redactors():
+    from security.dlp_engine import get_dlp_engine
+    from security.secret_redactor import redact_secrets
+    return get_dlp_engine(), redact_secrets
 
 
 def scrub_text(text: str) -> str:
     """One content string, safe for another person's node: structured
-    secrets (secret_redactor) always, PII patterns (dlp_engine) on free
-    text.  Raises ImportError when a scrubber is not importable."""
-    from security.dlp_engine import get_dlp_engine
-    from security.secret_redactor import redact_secrets
-    text, _ = redact_secrets(text)
-    redacted = get_dlp_engine().redact(text)
-    if redacted == text or _is_protocol_value(text, redacted):
-        return text
-    return redacted
+    secrets (secret_redactor) and PII patterns (dlp_engine) replaced, span
+    by span.  Content has no shape allowance: a phone, email or ip inside
+    one spaceless token (wa.me/14155550199, compact JSON, ip=...;port=) is
+    redacted where it sits (review of the c072913e4 set).  Raises
+    ImportError when a scrubber is not importable.
+    """
+    dlp, redact_secrets = _redactors()
+    return dlp.redact(redact_secrets(text)[0])
 
 
 def scrub_contact(text: str) -> str:
-    """A contact field's value (email, phone): its PII redacted, and when
-    no pattern recognises it, withheld whole -- it is a person's either
-    way."""
-    from security.dlp_engine import get_dlp_engine
-    from security.secret_redactor import redact_secrets
-    text, _ = redact_secrets(text)
-    redacted = get_dlp_engine().redact(text)
-    if redacted != text or not text:
+    """A contact field's value (email, phone, a street address) is a
+    person's whole: it goes as the one placeholder its pattern names when
+    it is exactly one email / phone / ..., and withheld whole otherwise (a
+    street with an email in it keeps no street)."""
+    if not text:
+        return text
+    dlp, redact_secrets = _redactors()
+    redacted = dlp.redact(redact_secrets(text)[0])
+    if _PLACEHOLDER.fullmatch(redacted):
         return redacted
     return '[CONTACT_REDACTED]'
+
+
+def scrub_secret(text: str) -> str:
+    """A secret-keyed value: redacted by the secret patterns, and when none
+    recognises it, withheld whole (an 'AIzaSy...' fragment or an opaque
+    token is still a secret).  A status word ('none', 'expired') stays."""
+    _, redact_secrets = _redactors()
+    redacted, n = redact_secrets(text)
+    if n:
+        return redacted
+    if text.strip().lower() in _SECRET_STATUS_WORDS:
+        return text
+    return '[SECRET_REDACTED]'
 
 
 def scrub_for_egress(data: Any) -> Any:
     """The copy of ``data`` that may go to a node its user does not own:
     person records without their private fields, every content leaf
-    scrubbed.  Raises if a scrubber is unavailable; callers withhold that
-    leg rather than send what could not be scrubbed.
+    scrubbed, contact and secret values withheld when unrecognised.
+    Raises if a scrubber is unavailable; callers withhold that leg rather
+    than send what could not be scrubbed.
     """
     def strip_records(value):
         if isinstance(value, dict):
@@ -245,7 +427,8 @@ def scrub_for_egress(data: Any) -> Any:
             return tuple(strip_records(v) for v in value)
         return value
 
-    return map_content(strip_records(data), scrub_text, scrub_contact)
+    return map_content(strip_records(data), scrub_text, scrub_contact,
+                       scrub_secret)
 
 
 def uri_names_user(uri: str, user_id: Any) -> bool:
@@ -276,6 +459,32 @@ def _per_user_patterns(templates: Tuple[str, ...]):
     return tuple(patterns)
 
 
+def _declared_templates():
+    """(the declared templates except catch-alls, the catch-all templates).
+
+    A catch-all template ('com.hertzai.hevolve.{user_id}') would name every
+    undeclared URI under its namespace a user's, so it never ATTRIBUTES a
+    URI to anyone (review of d89d50223 F7); only its instance for a user
+    the caller names is that user's (crossbar_uri_is_per_user)."""
+    from core.constants import CHAT_TOPICS
+    from core.peer_link.message_bus import (
+        CATCH_ALL_TOPICS, PER_USER_TOPICS_OUTSIDE_BUS, TOPIC_MAP)
+    catch_all = tuple(TOPIC_MAP[t] for t in CATCH_ALL_TOPICS)
+    known = tuple(t for t in (*TOPIC_MAP.values(),
+                              *PER_USER_TOPICS_OUTSIDE_BUS, *CHAT_TOPICS)
+                  if t not in catch_all)
+    return known, catch_all
+
+
+def _is_declared_shared(uri: str) -> bool:
+    """A declared SHARED URI is nobody's, even where a per-user template
+    would also match it ('com.hertzai.hevolve.{user_id}' vs the global
+    'com.hertzai.hevolve.confirmation')."""
+    known, _ = _declared_templates()
+    shared = tuple(t for t in known if not _is_user_template(t))
+    return any(rx.fullmatch(uri) for rx in _per_user_patterns(shared))
+
+
 def per_user_uri_owner(uri: str) -> str:
     """The user whose declared per-user Crossbar URI ``uri`` is, or ''.
 
@@ -286,16 +495,9 @@ def per_user_uri_owner(uri: str) -> str:
     user; a community, a session, a global feed or
     ``com.hartos.event.<topic>`` does not.
     """
-    from core.constants import CHAT_TOPICS
-    from core.peer_link.message_bus import (
-        PER_USER_TOPICS_OUTSIDE_BUS, TOPIC_MAP)
     uri = uri or ''
-    known = (*TOPIC_MAP.values(), *PER_USER_TOPICS_OUTSIDE_BUS, *CHAT_TOPICS)
-    # A declared SHARED URI is nobody's, even where a per-user template
-    # would also match it ('com.hertzai.hevolve.{user_id}' vs the global
-    # 'com.hertzai.hevolve.confirmation').
-    shared = tuple(t for t in known if not _is_user_template(t))
-    if any(rx.fullmatch(uri) for rx in _per_user_patterns(shared)):
+    known, _ = _declared_templates()
+    if _is_declared_shared(uri):
         return ''
     per_user = tuple(t for t in known if _is_user_template(t))
     for rx in _per_user_patterns(per_user):
@@ -321,11 +523,17 @@ def crossbar_uri_is_per_user(uri: str, user_id: Any = '') -> bool:
     uri = uri or ''
     if '{' in uri:
         return _is_user_template(uri)
-    owner = per_user_uri_owner(uri)
-    if not owner:
-        return False
     user_id = str(user_id or '')
-    return not user_id or owner == user_id
+    owner = per_user_uri_owner(uri)
+    if owner:
+        return not user_id or owner == user_id
+    # A catch-all template's own instance for the NAMED user is theirs --
+    # one rule, one answer with crossbar_topic_is_per_user('chat.general').
+    if not user_id or '.' in user_id or '/' in user_id:
+        return False
+    _, catch_all = _declared_templates()
+    return (uri in {t.replace('{user_id}', user_id) for t in catch_all}
+            and not _is_declared_shared(uri))
 
 
 def crossbar_leg_is_users_own(uri: str, user_id: Any = '') -> bool:

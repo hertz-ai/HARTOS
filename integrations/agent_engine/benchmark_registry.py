@@ -48,7 +48,12 @@ class BenchmarkAdapter:
     tier: str = 'fast'  # 'fast' | 'heavy'
 
     def run(self, api_url: str = '', **kwargs) -> Dict:
-        """Run benchmark. Return {metrics: {name: {value, direction, unit}}}."""
+        """Run benchmark. Return {metrics: {name: {value, direction, unit}}}.
+
+        A metric may carry 'gate': False to be reported but never compared by
+        is_upgrade_safe: use it for a value that is not comparable across two
+        snapshots, such as a per-process counter that restarts at 0.
+        """
         raise NotImplementedError
 
     def is_available(self) -> bool:
@@ -95,16 +100,21 @@ class WorldModelAdapter(BenchmarkAdapter):
             from .world_model_bridge import get_world_model_bridge
             bridge = get_world_model_bridge()
             stats = bridge.get_stats()
+            # total_corrections and total_hivemind_queries are the bridge's
+            # in-memory cumulative counters: they restart at 0 with the
+            # process, so comparing two snapshots measures uptime, and a
+            # restart between baseline and candidate read as a regression that
+            # blocked the upgrade. Reported, not gated (gate=False).
             return {'metrics': {
                 'flush_rate': {
                     'value': stats.get('total_flushed', 0) / max(1, stats.get('total_recorded', 1)),
                     'direction': 'higher', 'unit': 'ratio'},
                 'correction_density': {
                     'value': stats.get('total_corrections', 0),
-                    'direction': 'higher', 'unit': 'count'},
+                    'direction': 'higher', 'unit': 'count', 'gate': False},
                 'hivemind_queries': {
                     'value': stats.get('total_hivemind_queries', 0),
-                    'direction': 'higher', 'unit': 'count'},
+                    'direction': 'higher', 'unit': 'count', 'gate': False},
             }}
         except Exception as e:
             return {'metrics': {}, 'error': str(e)}
@@ -513,7 +523,12 @@ class BenchmarkRegistry:
         return names[0][:-len('.json')]
 
     def is_upgrade_safe(self, old_version: str, new_version: str) -> Tuple[bool, str]:
-        """ALL fast-tier metrics must be >= old version."""
+        """ALL fast-tier metrics must be >= old version.
+
+        A metric marked 'gate': False in either snapshot is skipped. Either,
+        because a baseline written before a metric was marked still carries it
+        unmarked, and that old value must not block the upgrade.
+        """
         old_file = os.path.join(BENCHMARK_DIR, f'{old_version}.json')
         new_file = os.path.join(BENCHMARK_DIR, f'{new_version}.json')
 
@@ -537,6 +552,8 @@ class BenchmarkRegistry:
             for metric_name, old_m in old_metrics.items():
                 new_m = new_metrics.get(metric_name)
                 if not new_m or not isinstance(old_m, dict) or not isinstance(new_m, dict):
+                    continue
+                if old_m.get('gate') is False or new_m.get('gate') is False:
                     continue
                 old_val = old_m.get('value', 0)
                 new_val = new_m.get('value', 0)

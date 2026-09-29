@@ -94,8 +94,8 @@ def save_agent_data(prompt_id, data) -> bool:
         try:
             from security.crypto import encrypt_data
             payload = encrypt_data(payload)
-        except ImportError:
-            pass
+        except ImportError as e:
+            logger.debug(f"agent_data saved unencrypted: {e}")
         tmp = f"{file_path}.{os.getpid()}.{threading.get_ident()}.tmp"
         with open(tmp, 'wb') as f:
             f.write(payload)

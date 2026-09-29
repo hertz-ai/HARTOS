@@ -191,22 +191,21 @@ def supervisor_should_run() -> bool:
 def _resolve_python_exe() -> str:
     """Pick the interpreter the child should run under.
 
-    Frozen Nunba: ``<app_dir>/python-embed/python.exe``.  Using
-    ``sys.executable`` directly would launch a new Nunba GUI instance
-    instead of starting Python.  Mirrors the resolution in
-    ``integrations/audio/diarization_service.py``.
-
-    Dev mode (PyCharm): plain ``sys.executable`` is the active venv's
-    python -- exactly what the developer expects.
+    ``core.venv_paths.venv_creator_python``, the one answer every worker
+    spawn uses (gpu_worker, diarization_service): frozen Nunba's bundled
+    python-embed, found beside the resolved app binary; ``sys.executable``
+    from source.  Using ``sys.executable`` on a frozen build would launch
+    a new Nunba GUI instead of Python, so that is only the last resort
+    when no python-embed exists (logged; ``_child_can_import_torch`` then
+    keeps a torch-less child from crash-looping).
     """
-    if getattr(sys, 'frozen', False):
-        app_dir = os.path.dirname(sys.executable)
-        embed_python = os.path.join(app_dir, 'python-embed', 'python.exe')
-        if os.path.isfile(embed_python):
-            return embed_python
-        logger.warning(
-            "hevolveai_supervisor: python-embed/python.exe not found at %s; "
-            "falling back to sys.executable", embed_python)
+    from core.venv_paths import python_embed_dir, venv_creator_python
+    creator = venv_creator_python()
+    if creator:
+        return creator
+    logger.warning(
+        "hevolveai_supervisor: no python interpreter under %s; "
+        "falling back to sys.executable", python_embed_dir())
     return sys.executable
 
 

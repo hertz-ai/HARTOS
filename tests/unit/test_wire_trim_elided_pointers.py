@@ -297,3 +297,50 @@ def test_a_budget_too_small_for_the_explanation_sends_plain_markers(
     out2, _, _ = _trim([sys_m, task, call, result], big, monkeypatch)
     assert _POINTER.search(next(m for m in out2 if m.get('role') == 'tool')
                            ['content'])
+
+
+def test_the_scope_is_the_user_the_entry_point_acts_for():
+    """with_llm_context binds the decorated entry point's user_id (recipe /
+    chat_agent), and the elided store scopes by it -- the same user id the
+    get_data_by_key closure is built with -- also on a worker thread the
+    call hands off to with the context copied, as autogen does."""
+    import contextvars
+    import threading
+
+    @lol.with_llm_context('autogen.test')
+    def entry(user_id, text, prompt_id, file_id, request_id):
+        seen = {}
+        ctx = contextvars.copy_context()
+        t = threading.Thread(
+            target=lambda: seen.update(scope=ctx.run(lol.elision_scope)))
+        t.start()
+        t.join()
+        return lol.elision_scope(), seen['scope']
+
+    here, worker = entry('u42', 'hi', 'p1', None, 'r9')
+    assert here == worker == lol.elision_scope(user_id='u42')
+    assert here != lol.elision_scope(request_id='r9')
+
+
+def test_the_store_is_bounded_by_count_and_by_bytes(store, monkeypatch):
+    """Review of e1a1aa233: the item cap was untested and there was no byte
+    bound.  Past either, the oldest items go."""
+    import os
+    import time as _time
+    from core.cache_loaders import save_agent_data
+    now = _time.time()
+    for n in range(6):
+        save_agent_data('elided_anon_%012x' % n,
+                        {'text': 'x' * 1000, 'at': now})
+        path = store / ('elided_anon_%012x_agent_data.json' % n)
+        os.utime(path, (now - 100 + n, now - 100 + n))
+    monkeypatch.setattr(lol, '_ELIDED_MAX_ITEMS', 4)
+    lol._evict_elided()
+    left = sorted(p.name for p in store.glob('elided_*_agent_data.json'))
+    assert len(left) == 4 and 'elided_anon_%012x_agent_data.json' % 0 not in left
+    size = os.path.getsize(store / left[-1])
+    monkeypatch.setattr(lol, '_ELIDED_MAX_ITEMS', 100)
+    monkeypatch.setattr(lol, '_ELIDED_MAX_BYTES', size * 2)
+    lol._evict_elided()
+    left2 = sorted(p.name for p in store.glob('elided_*_agent_data.json'))
+    assert left2 == left[-2:], left2

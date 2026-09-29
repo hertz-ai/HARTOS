@@ -25,7 +25,26 @@ def hie():
     with pytest.MonkeyPatch.context() as mp:
         if not os.environ.get('HEVOLVE_CACHE_DIR'):
             mp.setenv('HEVOLVE_CACHE_DIR', tempfile.mkdtemp())
-        import hart_intelligence_entry  # noqa: TID251 -- the route under test is on its app
+        # Importing the entry module reaches the network at import time: a
+        # Redis ping to azure_all_vms.hertzai.com:6369 (106.51.181.24) and
+        # init_social's connectivity check to 8.8.8.8:443 (socket spy,
+        # 2026-09-28).  Both boundaries are stubbed for the import only;
+        # the route under test uses neither.
+        with pytest.MonkeyPatch.context() as net:
+            import redis
+            from security import system_requirements
+
+            class _NoRedis:
+                def __init__(self, *a, **k):
+                    pass
+
+                def ping(self):
+                    raise redis.exceptions.ConnectionError('no network in tests')
+
+            net.setattr(redis, 'StrictRedis', _NoRedis)
+            net.setattr(system_requirements, 'check_network_connectivity',
+                        lambda *a, **k: False)
+            import hart_intelligence_entry  # noqa: TID251 -- the route under test is on its app
         yield hart_intelligence_entry
 
 

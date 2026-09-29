@@ -86,16 +86,9 @@ def is_unroutable_peer_url(url):
 logger = logging.getLogger('hevolve_social')
 
 
-def _is_loopback_host(host):
-    """localhost / 127.x / ::1: an address that means "this machine" to
-    whoever reads it."""
-    host = (host or '').strip('[]').lower()
-    if host == 'localhost':
-        return True
-    try:
-        return _ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
+# localhost / 127.x / ::1 (and ::ffff:127.x): an address that means "this
+# machine" to whoever reads it.  The one definition, in core.auth_local.
+from core.auth_local import _is_loopback  # noqa: E402
 
 
 def _is_this_host(ip):
@@ -104,7 +97,7 @@ def _is_this_host(ip):
     ip = (ip or '').strip().strip('[]').lower()
     if not ip:
         return False
-    if _is_loopback_host(ip):
+    if _is_loopback(ip):
         return True
     try:
         from core.port_registry import get_lan_ip
@@ -120,8 +113,9 @@ def address_evidence(url, observed_ip='', relayed=False):
                    from this machine for a loopback url, or the vantage is
                    unknown (no measured source; judged as before);
     'unconfirmed'  a relayed hint, or a direct announce from some other
-                   address: the row is kept, but only the health round's ping
-                   can make it active;
+                   address: the row is kept; unless the node signed that
+                   announce itself (_merge_peer), only the health round's
+                   ping can make it active;
     'refused'      a loopback url relayed by another node or announced from
                    another machine: from here it names this machine, never
                    the subject.
@@ -137,7 +131,7 @@ def address_evidence(url, observed_ip='', relayed=False):
                 or '').lower()
     except Exception:
         pass
-    if _is_loopback_host(host):
+    if _is_loopback(host):
         if relayed:
             return 'refused', ('loopback url in a relayed peer list: it names '
                                'the relayer\'s machine or this one, never the '
@@ -1383,12 +1377,45 @@ class GossipProtocol:
                 except Exception:
                     _tl.node_id = None
                 self._record_peer_success(peer_url)
+                self._record_ping_verdict(peer_url, True)
                 return True
             self._record_peer_failure(peer_url)
+            self._record_ping_verdict(peer_url, False)
             return False
         except requests.RequestException:
             self._record_peer_failure(peer_url)
+            self._record_ping_verdict(peer_url, False)
             return False
+
+    # Bound on remembered verdicts: urls come from peers' announces.
+    _PING_VERDICTS_MAX = 20000
+
+    def _record_ping_verdict(self, peer_url, reachable):
+        """Remember what the last real ping of ``peer_url`` measured.
+
+        Only an attempt that went out counts; a backed-off skip changes
+        nothing.  Read by _ping_unreachable."""
+        verdicts = getattr(self, '_unreachable_urls', None)
+        if verdicts is None:
+            verdicts = self._unreachable_urls = {}
+        key = (peer_url or '').rstrip('/')
+        if reachable:
+            verdicts.pop(key, None)
+            return
+        if len(verdicts) >= self._PING_VERDICTS_MAX:
+            verdicts.clear()
+        verdicts[key] = time.time()
+
+    def _ping_unreachable(self, peer_url) -> bool:
+        """Did the last real ping of ``peer_url`` from this node fail?
+
+        Reachability, not liveness: a NAT'd peer that keeps announcing is
+        alive and stays 'active' (_merge_peer), but a call to its LAN url
+        from here is a timeout.  The integrity round skips such a row
+        instead of spending its budget on it (the 81% timeouts 02da559f7
+        measured); a url never pinged is not presumed unreachable."""
+        verdicts = getattr(self, '_unreachable_urls', None) or {}
+        return (peer_url or '').rstrip('/') in verdicts
 
     # ─── Handlers (called by Flask endpoints) ───
 
@@ -1837,7 +1864,7 @@ class GossipProtocol:
         if not observed_ip:
             return ''
         ip = observed_ip.strip().strip('[]')
-        if ip in ('127.0.0.1', '::1', 'localhost') or ip.startswith('127.'):
+        if _is_loopback(ip):
             return ''
         try:
             from urllib.parse import urlparse
@@ -1994,7 +2021,7 @@ class GossipProtocol:
             from urllib.parse import urlparse
             host = (urlparse(url).hostname or '').lower()
             # (0.0.0.0 never reaches here: is_unroutable_peer_url refused it.)
-            if host and not _is_loopback_host(host) and existing is None:
+            if host and not _is_loopback(host) and existing is None:
                 same_host_count = db.query(PeerNode).filter(
                     PeerNode.url.contains(host),
                     PeerNode.integrity_status != 'banned',
@@ -2242,6 +2269,21 @@ class GossipProtocol:
         # from moving the address in the first place.
         speaks_for_itself = bool(signature_valid and not relayed and public_key)
 
+        # 'active' means ALIVE and admitted, which every fleet path reads
+        # (OTA fan-out, halt/estop, sync, regional assignment, uptime
+        # reward).  A node that signed its own direct announce, through the
+        # guardrail-hash gate above, is exactly that, wherever it announced
+        # from: central sees every announcer as its docker gateway
+        # (172.21.0.1) and can never ping a home desktop's LAN url, so
+        # judging aliveness by the address kept every honest NAT'd peer
+        # 'stale' forever and out of all of those paths (review of
+        # 02da559f7).  Whether this node can DIAL the url is a different
+        # question, asked only where dialling happens: the integrity round
+        # skips a row the health round could not reach (_ping_unreachable).
+        # A relayed hint or an unsigned claim from another address is still
+        # only an address: 'stale' until a ping reaches it.
+        _alive = _evidence == 'confirmed' or speaks_for_itself
+
         if existing:
             stored_key = existing.public_key or ''
             if stored_key and not (speaks_for_itself and public_key == stored_key):
@@ -2334,12 +2376,8 @@ class GossipProtocol:
             if existing.status in ('dead', 'stale'):
                 # Only resurrect if announcement is recent (not stale gossip)
                 if (datetime.utcnow() - existing.last_seen).total_seconds() < 60:
-                    # Alive, but 'active' only when the announce came from
-                    # the address on file (as good as a ping); otherwise
-                    # 'stale', so the health round pings that address before
-                    # anything dials it.
-                    existing.status = ('active' if _evidence == 'confirmed'
-                                       else 'stale')
+                    # Same rule as a new row (_alive, above).
+                    existing.status = 'active' if _alive else 'stale'
             # Direct announces update the observed-address hint; relayed
             # records carry the RELAYER's vantage, not the subject's, so
             # they must not overwrite what a direct announce established.
@@ -2363,10 +2401,9 @@ class GossipProtocol:
             node_id=node_id, url=url,
             name=peer_data.get('name', ''),
             version=peer_data.get('version', ''),
-            # 'active' only on evidence the address reaches this node; the
-            # integrity round challenges 'active' rows only, and the health
-            # round's successful ping promotes a 'stale' one.
-            status='active' if _evidence == 'confirmed' else 'stale',
+            # _alive (above); the health round's successful ping promotes a
+            # 'stale' one.
+            status='active' if _alive else 'stale',
             agent_count=peer_data.get('agent_count', 0),
             post_count=peer_data.get('post_count', 0),
             metadata_json=_new_meta,
@@ -2603,6 +2640,11 @@ class GossipProtocol:
                     _bad_url, _ = is_unroutable_peer_url(peer.url)
                     if _bad_url:
                         continue
+                    # Alive but not reachable from here (a NAT'd peer): no
+                    # dial, the row stays in the fleet.  Rechecked each
+                    # health round.
+                    if self._ping_unreachable(peer.url):
+                        continue
                     self._audit_peer_guardrails(db, peer)
                     self._flush_health_row(db, round_name='Integrity round')
                     self._heartbeat()
@@ -2789,3 +2831,12 @@ def get_auto_discovery() -> AutoDiscovery:
     singleton wired here.
     """
     return auto_discovery
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HEVOLVE_REQUIRE_KNOWN_CODE_HASH',
+)

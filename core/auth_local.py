@@ -373,3 +373,12 @@ def require_local_or_token_csrf_safe(f):
                         'valid HARTOS_API_TOKEN bearer header.'),
         }), 401
     return decorated
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HARTOS_API_TOKEN',
+)

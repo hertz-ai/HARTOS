@@ -239,3 +239,149 @@ def test_source_guard_nunba_has_one_client_address_reader():
     bad = _violations('Nunba', NUNBA)
     assert not bad, ('Nunba reads the client address through HARTOS '
                      'core.auth_local (routes.auth delegates):\n' + '\n'.join(bad))
+
+
+# ── Nunba imports no private HARTOS core name ───────────────────────────
+# Review of Nunba ad9ce346 / 48d562f7: tts/backend_venv.py imported
+# core.venv_paths._reset_cache_for_tests and _validate_backend_name.  A
+# private name is free to change in HARTOS without a caller audit (the rule
+# 492a57aab applied to hart_cli), so a Nunba use of one breaks the installed
+# app silently.  core.venv_paths exports public names; this fails on any
+# `from core[.x] import _name` or `<imported core module>._name` in Nunba
+# (tests excepted: a test may reach into what it tests), and on a Nunba
+# module it cannot parse (a file the guard cannot read is not a clean one).
+#
+# One shape is allowed: the compatibility fallback for an older HARTOS
+# (Nunba runs against whatever HARTOS an install carries).  A private import
+# inside `except ImportError` whose `try` imported a PUBLIC name from the same
+# module under the same local name, e.g.
+#     try:
+#         from core.venv_paths import validate_backend_name as _validate
+#     except ImportError:
+#         from core.venv_paths import _validate_backend_name as _validate
+
+def _is_core(module):
+    return bool(module) and (module == 'core' or module.startswith('core.'))
+
+
+def _compat_fallbacks(tree):
+    """ids of the ImportFrom nodes that are the allowed fallback shape."""
+    ok = set()
+    for t in ast.walk(tree):
+        if not isinstance(t, ast.Try):
+            continue
+        public = {(n.module, a.asname or a.name)
+                  for s in t.body for n in ast.walk(s)
+                  if isinstance(n, ast.ImportFrom) and _is_core(n.module)
+                  for a in n.names if not a.name.startswith('_')}
+        for h in t.handlers:
+            names = [h.type] if not isinstance(h.type, ast.Tuple) else list(h.type.elts)
+            if not any(isinstance(x, ast.Name) and x.id in
+                       ('ImportError', 'ModuleNotFoundError') for x in names):
+                continue
+            for s in h.body:
+                for n in ast.walk(s):
+                    if isinstance(n, ast.ImportFrom) and _is_core(n.module) and all(
+                            (n.module, a.asname or a.name) in public
+                            for a in n.names):
+                        ok.add(id(n))
+    return ok
+
+
+def _private_core_imports(tree):
+    """(lineno, 'module.name') of each private core name Nunba reaches:
+    `from core... import _name` (outside the compat fallback) and
+    `m._name` / `core.x._name` where m is an imported core module."""
+    allowed = _compat_fallbacks(tree)
+    modules = {}   # local dotted name -> core module
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                if _is_core(a.name):
+                    modules[a.asname or a.name] = a.name
+        elif isinstance(n, ast.ImportFrom) and n.module == 'core':
+            for a in n.names:   # from core import venv_paths [as vp]
+                if not a.name.startswith('_'):
+                    modules.setdefault(a.asname or a.name, 'core.' + a.name)
+    out = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and _is_core(n.module) \
+                and id(n) not in allowed:
+            out += [(n.lineno, f'{n.module}.{a.name}')
+                    for a in n.names if a.name.startswith('_')]
+        elif isinstance(n, ast.Attribute) and n.attr.startswith('_') \
+                and not n.attr.startswith('__'):
+            try:
+                base = ast.unparse(n.value)
+            except Exception:
+                continue
+            if base in modules:
+                out.append((n.lineno, f'{modules[base]}.{n.attr}'))
+    return sorted(out)
+
+
+def test_private_import_detector_is_not_vacuous():
+    sample = ast.parse(
+        'from core.venv_paths import _reset_cache_for_tests\n'           # 1
+        'from core.venv_paths import venv_root, _validate_backend_name as v\n'
+        'from core import _x\n'                                          # 3
+        'from core.venv_paths import venv_root\n'
+        'from integrations.x import _y\n'
+        'from corex import _z\n'
+        'import core.venv_paths as vp\n'
+        'vp._VENV_ROOT_CACHE = None\n'                                   # 8
+        'import core.platform_paths\n'
+        'core.platform_paths._cached_data_dir\n'                         # 10
+        'from core import venv_paths\n'
+        'venv_paths._validate_backend_name("x")\n'                       # 12
+        'vp.__file__\n'
+        'try:\n'
+        '    from core.venv_paths import validate_backend_name as _v\n'
+        'except ImportError:\n'
+        '    from core.venv_paths import _validate_backend_name as _v\n'  # allowed
+        'try:\n'
+        '    from core.venv_paths import venv_root\n'
+        'except ImportError:\n'
+        '    from core.venv_paths import _validate_backend_name as _w\n'  # 21: other name
+        'try:\n'
+        '    from core.venv_paths import validate_backend_name as _u\n'
+        'except Exception:\n'
+        '    from core.venv_paths import _validate_backend_name as _u\n')  # 25
+    assert [ln for ln, _ in _private_core_imports(sample)] == [
+        1, 2, 3, 8, 10, 12, 21, 25]
+
+
+def _private_core_violations(root):
+    """(violations, modules parsed) over a repository's tracked modules."""
+    bad, seen = [], 0
+    for path in _py_files(root):
+        rel = os.path.relpath(path, root)
+        try:
+            with open(path, encoding='utf-8') as fh:
+                tree = ast.parse(fh.read())
+        except (SyntaxError, UnicodeDecodeError, ValueError) as exc:
+            bad.append(f'{rel}: not parsed ({type(exc).__name__}: {exc})')
+            continue
+        seen += 1
+        bad += [f'{rel}:{ln} {name}' for ln, name in _private_core_imports(tree)]
+    return bad, seen
+
+
+def test_a_module_the_guard_cannot_parse_fails_it(tmp_path):
+    import subprocess
+    (tmp_path / 'good.py').write_text('x = 1\n', encoding='utf-8')
+    (tmp_path / 'broken.py').write_text('def f(:\n', encoding='utf-8')
+    subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True, timeout=60)
+    subprocess.run(['git', 'add', '-A'], cwd=tmp_path, check=True, timeout=60)
+    bad, seen = _private_core_violations(str(tmp_path))
+    assert seen == 1
+    assert len(bad) == 1 and bad[0].startswith('broken.py: not parsed'), bad
+
+
+@pytest.mark.skipif(not os.path.isdir(NUNBA), reason='Nunba checkout absent')
+def test_source_guard_nunba_imports_no_private_core_name():
+    bad, seen = _private_core_violations(NUNBA)
+    assert seen > 50, seen   # 90 tracked non-test modules on 2026-09-28
+    assert not bad, ('Nunba reaches a private HARTOS core name (make it '
+                     'public in core and keep the old name as an alias), or '
+                     'a module the guard cannot parse:\n' + '\n'.join(bad))

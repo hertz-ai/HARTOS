@@ -420,7 +420,14 @@ class DistributedWorkerLoop:
         nothing was produced (the claim is released for a retry).
         """
         prompt = task.context.get('prompt', task.description)
-        user_id = task.context.get('user_id', self._node_id)
+        # The context carries an opaque requester handle, not a user
+        # (dispatch_goal_distributed).  On the node that minted it, the task
+        # runs as the person; anywhere else as the handle, which is only a
+        # session key and a world-model tag here: there is no such user.
+        from integrations.distributed_agent.requesters import resolve_requester
+        _requester = task.context.get('user_id')
+        user_id = (resolve_requester(_requester) or _requester
+                   or self._node_id)
 
         # GUARDRAIL: pre-dispatch gate
         try:

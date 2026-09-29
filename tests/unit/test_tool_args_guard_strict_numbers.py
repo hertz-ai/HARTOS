@@ -362,3 +362,30 @@ class LoneSurrogates(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class QuoteStyleAndTokenChars(unittest.TestCase):
+    """Review of e1a1aa233 (r0003_sq.py)."""
+
+    def test_a_single_quoted_document_keeps_the_id(self):
+        # The quoting put '"' into a document written with "'", and
+        # json_repair then read "'id':" into the URL's value.
+        out = _out_args(ensure_tool_call_arguments_json(
+            _call("{'u': http://h/x, 'id': 620e51403072992921}")))
+        self.assertEqual(_strict_loads(out).get('id'), '620e51403072992921')
+
+    def test_arithmetic_after_a_number_stays_in_the_token(self):
+        # The whole expression, or -- where json_repair's own number reader
+        # still takes 1e999 and writes Infinity -- a refusal; never the
+        # number with the rest dropped.
+        from hartos.helper import REFUSED_ARGUMENTS_KEY
+        for text, want in (("{'v': 1e999/2}", '1e999/2'),
+                           ("{'v': 1e999*2}", '1e999*2'),
+                           ("{'v': 1e999%}", '1e999%')):
+            with self.subTest(text=text):
+                out = _out_args(ensure_tool_call_arguments_json(_call(text)))
+                parsed = _strict_loads(out)
+                if REFUSED_ARGUMENTS_KEY not in parsed:
+                    self.assertEqual(parsed.get('v'), want, out)
+        out = _out_args(ensure_tool_call_arguments_json(_call("{'v': 1e999/2}")))
+        self.assertEqual(_strict_loads(out).get('v'), '1e999/2', out)

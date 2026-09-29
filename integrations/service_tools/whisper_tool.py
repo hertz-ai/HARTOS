@@ -24,6 +24,7 @@ import logging
 import math
 import os
 import re
+import sys
 import tarfile
 import urllib.request
 import wave
@@ -140,9 +141,18 @@ _sherpa_model_name = None
 _whisper_model = None
 _whisper_model_name = None
 
-# faster-whisper (CTranslate2) — preferred engine
+# faster-whisper (CTranslate2) — preferred engine.  The cache is keyed by the
+# REQUESTED size; device and loaded size say what actually sits behind it
+# (a cuda failure serves the CPU rung under the requested key).
 _faster_whisper_model = None
 _faster_whisper_model_size = None
+_faster_whisper_model_device = None
+_faster_whisper_model_loaded_size = None
+# Why cuda is off for the rest of this process, or None while it is untried
+# or working.  Set by a cuda LOAD that raised and by a cuda DECODE that raised
+# (ctranslate2 resolves cuBLAS lazily, at the first encode, so a model can
+# load on cuda and still be unable to decode there).
+_faster_whisper_cuda_error: Optional[str] = None
 
 # Backoff + circuit-breaker for the model-load retry storm.
 # Symptom #10 (Stage-A, 2026-04-16): frozen_debug.log showed ~2Hz
@@ -297,6 +307,10 @@ def _get_faster_whisper_model(model_size: str = STT_CPU_MODEL_SIZE):
         per second.
     """
     global _faster_whisper_model, _faster_whisper_model_size
+    global _faster_whisper_model_device, _faster_whisper_model_loaded_size
+    global _faster_whisper_cuda_error
+    # A model whose decode raised is dropped by _decode_on_faster_whisper,
+    # so this cache can only hand out a model that has not failed.
     if _faster_whisper_model is not None and _faster_whisper_model_size == model_size:
         return _faster_whisper_model
 
@@ -341,25 +355,33 @@ def _get_faster_whisper_model(model_size: str = STT_CPU_MODEL_SIZE):
     device = "cpu"
     compute_type = "int8"
     _cuda_reason = ""
-    try:
-        import ctranslate2
-        if ctranslate2.get_cuda_device_count() > 0:
-            device = "cuda"
-            _types = set(ctranslate2.get_supported_compute_types('cuda'))
-            compute_type = "float16" if "float16" in _types else (
-                "int8_float16" if "int8_float16" in _types else "float32")
-            logger.info("CTranslate2 CUDA available — loading faster-whisper on GPU")
-        else:
-            _cuda_reason = (
-                "ctranslate2 reports no CUDA device "
-                "(CPU-only ctranslate2 build, or no NVIDIA driver/runtime)"
-            )
-    except ImportError as e:
-        _cuda_reason = f"ctranslate2 not importable ({e})"
-    except Exception as e:
-        # The probes can raise on a broken CUDA runtime; treat as CPU and
-        # surface the reason rather than silently swallowing.
-        _cuda_reason = f"ctranslate2 CUDA probe failed ({e})"
+    loaded_size = model_size
+    if _faster_whisper_cuda_error:
+        # cuda already failed in this process: the CPU rung, at the CPU size,
+        # without asking the probe again (it answers yes -- that is how the
+        # failed model got loaded on cuda in the first place).
+        _cuda_reason = f"cuda failed earlier in this process: {_faster_whisper_cuda_error}"
+        loaded_size = STT_CPU_MODEL_SIZE
+    else:
+        try:
+            import ctranslate2
+            if ctranslate2.get_cuda_device_count() > 0:
+                device = "cuda"
+                _types = set(ctranslate2.get_supported_compute_types('cuda'))
+                compute_type = "float16" if "float16" in _types else (
+                    "int8_float16" if "int8_float16" in _types else "float32")
+                logger.info("CTranslate2 CUDA available — loading faster-whisper on GPU")
+            else:
+                _cuda_reason = (
+                    "ctranslate2 reports no CUDA device "
+                    "(CPU-only ctranslate2 build, or no NVIDIA driver/runtime)"
+                )
+        except ImportError as e:
+            _cuda_reason = f"ctranslate2 not importable ({e})"
+        except Exception as e:
+            # The probes can raise on a broken CUDA runtime; treat as CPU and
+            # surface the reason rather than silently swallowing.
+            _cuda_reason = f"ctranslate2 CUDA probe failed ({e})"
 
     if device == "cpu":
         logger.warning(
@@ -369,28 +391,31 @@ def _get_faster_whisper_model(model_size: str = STT_CPU_MODEL_SIZE):
             _cuda_reason or "reason unknown",
         )
 
-    loaded_size = model_size
-    logger.info(f"Loading faster-whisper model '{model_size}' on {device} ({compute_type})...")
+    logger.info(f"Loading faster-whisper model '{loaded_size}' on {device} ({compute_type})...")
     try:
         _faster_whisper_model = WhisperModel(
-            model_size, device=device, compute_type=compute_type
+            loaded_size, device=device, compute_type=compute_type
         )
     except Exception as e:
         if device != "cuda":
-            reason = f"WhisperModel({model_size}, {device}, {compute_type}) failed: {e}"
+            reason = f"WhisperModel({loaded_size}, {device}, {compute_type}) failed: {e}"
             logger.warning(reason)
             _record_whisper_failure(reason)
             raise
-        # A CUDA load that fails (out of memory, a missing cuBLAS DLL) must
-        # not take STT down: retry the CPU rung.  The cache below is keyed
-        # by the REQUESTED size, so the next request for the same size
-        # reuses this model instead of re-running the failing CUDA load on
-        # every 2 s interim window; the worker's idle restart (5 min) is
-        # when CUDA gets tried again.
+        # A CUDA load that fails (out of memory, a bad CUDA runtime) must
+        # not take STT down: retry the CPU rung, and keep cuda off for the
+        # rest of this process.  The cache below is keyed by the REQUESTED
+        # size, so the next request for the same size reuses this model
+        # instead of re-running the failing CUDA load on every 2 s interim
+        # window; the worker's idle restart (5 min) is when CUDA gets tried
+        # again.  A missing cuBLAS DLL does NOT land here -- ctranslate2
+        # loads cuBLAS at the first encode, so that one surfaces in
+        # _decode_on_faster_whisper.
         logger.warning(
             "faster-whisper '%s' failed to load on cuda (%s) — falling back "
             "to '%s' on CPU (int8) until the STT worker restarts",
             model_size, e, STT_CPU_MODEL_SIZE)
+        _faster_whisper_cuda_error = f"load: {e}"
         device, compute_type, loaded_size = "cpu", "int8", STT_CPU_MODEL_SIZE
         try:
             _faster_whisper_model = WhisperModel(
@@ -402,6 +427,8 @@ def _get_faster_whisper_model(model_size: str = STT_CPU_MODEL_SIZE):
             _record_whisper_failure(reason)
             raise
     _faster_whisper_model_size = model_size
+    _faster_whisper_model_device = device
+    _faster_whisper_model_loaded_size = loaded_size
     logger.info(f"faster-whisper model '{loaded_size}' loaded on {device}")
     _record_whisper_success()
 
@@ -417,6 +444,120 @@ def _get_faster_whisper_model(model_size: str = STT_CPU_MODEL_SIZE):
         logger.exception("_get_faster_whisper_model: swallowed Exception")
 
     return _faster_whisper_model
+
+
+def _drop_faster_whisper_model() -> None:
+    """Forget the cached faster-whisper model, giving back a GPU booking.
+
+    The drop half of the rule that a model whose decode raised is never
+    handed out again.  Only the cache reference goes; ctranslate2 frees the
+    model when the last reference does.
+    """
+    global _faster_whisper_model, _faster_whisper_model_size
+    global _faster_whisper_model_device, _faster_whisper_model_loaded_size
+    device, loaded = _faster_whisper_model_device, _faster_whisper_model_loaded_size
+    _faster_whisper_model = None
+    _faster_whisper_model_size = None
+    _faster_whisper_model_device = None
+    _faster_whisper_model_loaded_size = None
+    if device == 'cuda':
+        try:
+            from .model_orchestrator import get_orchestrator
+            get_orchestrator().notify_unloaded('stt', f'whisper-{loaded}')
+        except Exception:
+            logger.exception("_drop_faster_whisper_model: swallowed Exception")
+
+
+# ctranslate2's wording when it cannot load a CUDA library it needs (cuBLAS is
+# loaded lazily, at the first encode).  The library it names is the one
+# _cuda_library_report asks about.
+_CT2_LIBRARY_LOAD_ERROR_RE = re.compile(r'Library (\S+) is not found or cannot be loaded')
+
+
+def _cuda_library_report(error) -> Optional[str]:
+    """For a cuda error naming a library ctranslate2 could not load, what this
+    process gets when it loads that library itself, and the search path.
+
+    None when the error names no library.  Diagnosis only: on the one box
+    where it was logged (2026-09-25/26), ctranslate2 reported "Library
+    cublas64_12.dll is not found or cannot be loaded" although the installed
+    python-embed hook puts torch/lib first on the worker's PATH and torch/lib
+    held that DLL since 2026-09-01; why it still did not resolve was never
+    measured.  A plain load (``winmode=0``: LoadLibrary, which searches PATH
+    as ctranslate2's own load does) either names the file it resolved to or
+    gives the loader's own error -- either answer narrows the cause.
+
+    Never raises: it runs inside the cuda-failure branch, and a diagnosis
+    must not cost the request its CPU answer.
+    """
+    m = _CT2_LIBRARY_LOAD_ERROR_RE.search(str(error))
+    if not m:
+        return None
+    name = m.group(1)
+    import ctypes
+    search_var = 'PATH' if sys.platform == 'win32' else 'LD_LIBRARY_PATH'
+    try:
+        if sys.platform == 'win32':
+            lib = ctypes.CDLL(name, winmode=0)
+            kernel32 = ctypes.WinDLL('kernel32')
+            kernel32.GetModuleFileNameW.argtypes = (
+                ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32)
+            buf = ctypes.create_unicode_buffer(32768)
+            kernel32.GetModuleFileNameW(lib._handle, buf, len(buf))
+            outcome = f"loads in this process from {buf.value or '?'}"
+        else:
+            ctypes.CDLL(name)
+            outcome = "loads in this process"
+    except OSError as e:
+        outcome = f"does not load in this process either: {e}"
+    except Exception as e:  # noqa: BLE001 -- see "Never raises" above
+        outcome = f"could not be probed ({type(e).__name__}: {e})"
+    return f"{name} {outcome}; {search_var}={os.environ.get(search_var, '')}"
+
+
+def _decode_on_faster_whisper(model_size: str, decode):
+    """Run ``decode(model)`` on the cached faster-whisper model -- the ONE
+    place a faster-whisper decode runs (transcribe and language detection).
+
+    A model whose decode raised is dropped from the cache, so it is never
+    decoded on again.  That matters most on cuda: ctranslate2 loads cuBLAS
+    lazily at the first encode, and after "Library cublas64_12.dll is not
+    found or cannot be loaded" a second encode on that model never returns
+    (measured on the installed python-embed, ctranslate2 4.8.2; live, the STT
+    worker hung until gpu_worker killed it at 180 s, and every streaming
+    window queued behind it came back '').  So a cuda decode failure is a
+    cuda failure like a cuda load failure: cuda goes off for this process and
+    the request is decoded again on the CPU rung, which was measured to work
+    in the same process once the failed model is dropped.
+
+    ``decode`` must consume the segment generator itself -- faster-whisper
+    encodes lazily, so an error can surface while iterating.  Load failures
+    propagate from ``_get_faster_whisper_model`` (which records them); a
+    decode failure that the CPU rung cannot absorb is recorded here and
+    propagates after the drop.
+    """
+    global _faster_whisper_cuda_error
+    # At most two passes: a cuda failure sets _faster_whisper_cuda_error, so
+    # the second load is on CPU, and a CPU failure re-raises.
+    while True:
+        model = _get_faster_whisper_model(model_size)
+        device = _faster_whisper_model_device
+        try:
+            return decode(model)
+        except Exception as e:
+            _drop_faster_whisper_model()
+            if device != 'cuda':
+                logger.warning(f"faster-whisper decode failed on {device}: {e}")
+                _record_whisper_failure(f"decode on {device} failed: {e}")
+                raise
+            _faster_whisper_cuda_error = f"decode: {e}"
+            logger.warning(
+                "faster-whisper decode failed on cuda (%s) — dropping that "
+                "model; STT decodes on CPU (int8) until the STT worker "
+                "restarts", e)
+            report = _cuda_library_report(e)
+            if report:
+                logger.warning("faster-whisper cuda library: %s", report)
 
 
 # ── Anti-hallucination gate: "did a human actually speak, or is this noise?" ──
@@ -556,54 +697,52 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None,
     if _whisper_load_breaker is not None and _whisper_load_breaker.is_open():
         return None
 
-    try:
-        model = _get_faster_whisper_model(model_size or faster_whisper_model_size())
-    except Exception as e:
-        # _get_faster_whisper_model already records the failure +
-        # emits one warning. Don't re-log at 2Hz here.
-        logger.debug(f"faster-whisper unavailable: {e}")
-        return None
+    # Anti-hallucination params (fixes the "1.5% 1.5% 1.5%…" repetition
+    # loop on silence/non-speech, reported 2026-06-12):
+    #   - vad_filter=True → Silero VAD strips non-speech BEFORE decoding,
+    #     so a silent/noise window transcribes to '' instead of a
+    #     hallucinated repeated token. This is the #1 fix.
+    #   - condition_on_previous_text=False → don't feed the model its own
+    #     prior output back; that feedback is what makes whisper get stuck
+    #     repeating a token in an autoregressive loop.
+    # Matters most on the realtime streaming path, where a bounded window
+    # is re-decoded every 2s and frequently contains gaps/silence.
+    kwargs = {
+        "beam_size": 5,
+        "vad_filter": True,
+        "condition_on_previous_text": False,
+    }
+    if language:
+        kwargs["language"] = language
 
-    try:
-        # Anti-hallucination params (fixes the "1.5% 1.5% 1.5%…" repetition
-        # loop on silence/non-speech, reported 2026-06-12):
-        #   - vad_filter=True → Silero VAD strips non-speech BEFORE decoding,
-        #     so a silent/noise window transcribes to '' instead of a
-        #     hallucinated repeated token. This is the #1 fix.
-        #   - condition_on_previous_text=False → don't feed the model its own
-        #     prior output back; that feedback is what makes whisper get stuck
-        #     repeating a token in an autoregressive loop.
-        # Matters most on the realtime streaming path, where a bounded window
-        # is re-decoded every 2s and frequently contains gaps/silence.
-        kwargs = {
-            "beam_size": 5,
-            "vad_filter": True,
-            "condition_on_previous_text": False,
-        }
-        if language:
-            kwargs["language"] = language
+    def _decode(model):
         segments, info = model.transcribe(audio_path, **kwargs)
         # Speech-only join: drop silence/noise hallucinations via the shared
         # no_speech_prob/avg_logprob gate (vad_filter alone still lets a short
-        # noise burst decode to a hallucinated phrase).
-        text = _filter_speech_text(
+        # noise burst decode to a hallucinated phrase).  Consumed HERE: the
+        # encode runs while the segments iterate.
+        return _filter_speech_text(
             (seg.text, getattr(seg, 'no_speech_prob', None),
              getattr(seg, 'avg_logprob', None))
             for seg in segments
-        )
-        _record_whisper_success()
-        return json.dumps({
-            "text": text,
-            # Nothing survived the speech gate → the window was noise/silence.
-            # Report 'unknown', not the language Whisper hallucinated from the
-            # noise (fixes wrong-language replies to non-speech audio).
-            "language": (info.language if (text and info.language) else "unknown"),
-        })
+        ), info
+
+    try:
+        text, info = _decode_on_faster_whisper(
+            model_size or faster_whisper_model_size(), _decode)
     except Exception as e:
-        reason = f"transcribe({audio_path}) failed: {e}"
-        logger.warning(f"faster-whisper transcription failed: {e}")
-        _record_whisper_failure(reason)
+        # A load failure is recorded + warned by _get_faster_whisper_model,
+        # a decode failure by _decode_on_faster_whisper. Don't re-log at 2Hz.
+        logger.debug(f"faster-whisper transcribe({audio_path}) gave nothing: {e}")
         return None
+    _record_whisper_success()
+    return json.dumps({
+        "text": text,
+        # Nothing survived the speech gate → the window was noise/silence.
+        # Report 'unknown', not the language Whisper hallucinated from the
+        # noise (fixes wrong-language replies to non-speech audio).
+        "language": (info.language if (text and info.language) else "unknown"),
+    })
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1254,8 +1393,11 @@ def _detect_language_impl(audio_path: str, model_size: Optional[str] = None) -> 
     # Try faster-whisper first (has built-in language detection)
     try:
         from faster_whisper import WhisperModel  # noqa: F401
-        model = _get_faster_whisper_model(model_size or faster_whisper_model_size())
-        _, info = model.transcribe(audio_path, beam_size=1)
+        # transcribe() runs the language-detection encode before it returns,
+        # so the info is complete without iterating the segments.
+        info = _decode_on_faster_whisper(
+            model_size or faster_whisper_model_size(),
+            lambda model: model.transcribe(audio_path, beam_size=1)[1])
         return json.dumps({
             "language": info.language if info.language else "unknown",
             "probability": round(info.language_probability, 4) if info.language_probability else 0.0,
@@ -1325,10 +1467,7 @@ def unload_whisper():
     #    but defensive in case something called a legacy helper in-process).
     global _sherpa_recognizer, _sherpa_model_name
     global _whisper_model, _whisper_model_name
-    global _faster_whisper_model, _faster_whisper_model_size
-
-    _faster_whisper_model = None
-    _faster_whisper_model_size = None
+    _drop_faster_whisper_model()
     _sherpa_recognizer = None
     _sherpa_model_name = None
     _whisper_model = None

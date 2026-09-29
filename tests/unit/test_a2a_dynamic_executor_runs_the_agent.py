@@ -80,9 +80,11 @@ def test_a_turn_that_ran_completes_with_its_answer(calls):
     assert task['state'] == 'completed', task
     assert task['content']['parts'][0]['text'] == 'The ferry carries 83 cyclists.'
     # The one /chat door, called with the agent's owner and prompt_id, and
-    # marked as background (a peer is not this node's human).
+    # marked as background (a peer is not this node's human).  The turn is
+    # named by its TASK id, not the contextId the peer chooses (review of
+    # f97b6bed8, F4: two tasks in one context shared a cancel binding).
     assert calls == [('summarise the ferry text', 'livetest_owner',
-                      7700000123, 'a2a_livetest_c1')]
+                      7700000123, 'a2a_livetest_m1')]
 
 
 def test_a_deferred_turn_fails_the_task(calls):

@@ -155,3 +155,138 @@ def test_under_pytest_the_old_place_is_not_the_owners_real_one():
     real = os.path.normcase(pp._legacy_documents_root())
     assert not os.path.normcase(pp.legacy_documents_db_path('x.json')).startswith(real)
     assert not os.path.normcase(ul._LEGACY_LANG_PATH).startswith(real)
+
+
+# ── Review of e1a1aa233 (F3) ────────────────────────────────────────────────
+
+def test_an_unusable_old_file_is_asked_about_once_per_process(lang_paths, caplog):
+    # Without the once-per-process flag every /chat re-reads the old file
+    # and warns again.
+    _, old = lang_paths
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text(json.dumps({'language': 'xx'}), encoding='utf-8')
+
+    with caplog.at_level('WARNING', logger='core.user_lang'):
+        for _ in range(3):
+            assert ul.get_preferred_lang() == 'en'
+
+    warned = [r for r in caplog.records if 'not carried over' in r.getMessage()]
+    assert len(warned) == 1, [r.getMessage() for r in warned]
+
+
+def test_the_old_path_is_the_one_platform_paths_names():
+    # Every other test patches _LEGACY_LANG_PATH; this pins the production
+    # wiring, so pointing it at the new path (the feature silently off)
+    # fails.
+    assert ul._LEGACY_LANG_PATH == pp.legacy_documents_db_path('hart_language.json')
+    assert os.path.normcase(ul._LEGACY_LANG_PATH) != os.path.normcase(ul._HART_LANG_PATH)
+
+
+def test_only_user_lang_names_the_file():
+    """A second reader of hart_language.json skips the carry-over and the
+    data root (Nunba's TTS warm-up did, review of 924b8e9dc).  Nunba's
+    tests/test_preferred_lang_fallback.py scans both repos the same way."""
+    import ast
+    from tests.unit.test_identity_is_hermetic import _docstring_ids, _shipped_sources
+    offenders = []
+    for rel in _shipped_sources():
+        if rel == 'core/user_lang.py':
+            continue
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))), rel), encoding='utf-8', errors='replace') as fh:
+            text = fh.read()
+        if 'hart_language.json' not in text:
+            continue
+        tree = ast.parse(text)
+        docs = _docstring_ids(tree)
+        offenders += ['%s:%d' % (rel, n.lineno) for n in ast.walk(tree)
+                      if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                      and id(n) not in docs and 'hart_language.json' in n.value
+                      and not any(c.isspace() for c in n.value)]
+    assert offenders == []
+
+
+
+# ── Once means once (the admin config's marker, 4b1796862's review) ─────────
+#
+# The per-process flag was the only guard: delete hart_language.json (the way
+# to reset the preference) and restart, and the old file was copied back.  A
+# marker beside the new file (core.file_cache.adopt_legacy_json_once) now
+# records that the move is done.
+
+def _restart(monkeypatch):
+    """A new process: the once-per-process flag and the read cache reset."""
+    monkeypatch.setattr(ul, '_legacy_checked', False)
+    monkeypatch.setattr(ul, '_cache', {'value': None, 'mtime': 0})
+
+
+def _marker(new):
+    return new.parent / 'hart_language.migrated.json'
+
+
+def test_a_deleted_preference_does_not_bring_the_old_one_back(lang_paths, monkeypatch):
+    new, old = lang_paths
+    _write(old, {'language': 'ta'})
+    assert ul.get_preferred_lang() == 'ta'
+    assert _marker(new).exists()
+
+    new.unlink()                        # the owner resets the preference
+    _restart(monkeypatch)
+
+    assert ul.get_preferred_lang() == 'en', 'the old preference came back'
+    assert not new.exists()
+    assert json.loads(old.read_text(encoding='utf-8')) == {'language': 'ta'}
+
+
+def test_an_install_that_moved_before_the_marker_is_marked_on_first_read(
+        lang_paths, monkeypatch):
+    """A preference already at the new place (copied before the marker
+    existed) is marked on the first read of a process, so deleting it later
+    does not copy the old one either."""
+    new, old = lang_paths
+    _write(old, {'language': 'ta'})
+    _write(new, {'language': 'hi'})
+
+    assert ul.get_preferred_lang() == 'hi'
+    assert _marker(new).exists()
+    new.unlink()
+    _restart(monkeypatch)
+    assert ul.get_preferred_lang() == 'en'
+    assert not new.exists()
+
+
+def test_an_unusable_old_file_leaves_no_marker_and_moves_once_fixed(
+        lang_paths, monkeypatch):
+    new, old = lang_paths
+    _write(old, {'language': 'xx'})
+    assert ul.get_preferred_lang() == 'en'
+    assert not _marker(new).exists()
+
+    _write(old, {'language': 'ta'})
+    _restart(monkeypatch)
+    assert ul.get_preferred_lang() == 'ta'
+
+
+def test_the_first_read_of_a_process_is_the_only_one_that_looks(lang_paths, monkeypatch):
+    """The /chat hot path: after the first read nothing asks again."""
+    calls = []
+    import core.file_cache as fc
+    real = fc.adopt_legacy_json_once
+    monkeypatch.setattr(fc, 'adopt_legacy_json_once',
+                        lambda *a, **k: calls.append(1) or real(*a, **k))
+    for _ in range(3):
+        ul.get_preferred_lang()
+    assert calls == [1]
+
+
+
+def test_the_settle_step_itself_runs_once_per_process(lang_paths, monkeypatch):
+    """Two threads can both see the flag unset before either sets it; the
+    step checks it again under its lock, so it still runs once."""
+    calls = []
+    import core.file_cache as fc
+    monkeypatch.setattr(fc, 'adopt_legacy_json_once',
+                        lambda *a, **k: calls.append(1) or 'none')
+    ul._adopt_legacy_file()
+    ul._adopt_legacy_file()
+    assert calls == [1]

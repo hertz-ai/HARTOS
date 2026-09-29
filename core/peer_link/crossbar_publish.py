@@ -205,6 +205,10 @@ def publish_agent_message(
     raising one.  Callers report that result instead of claiming delivery.
     """
     text_str = text if isinstance(text, str) else str(text or '')
+    # An elided-text pointer a model copied into its message is never shown
+    # to the user (owner ruling 2026-09-27; core.llm_outbound_logger).
+    from core.llm_outbound_logger import strip_elided_pointers
+    text_str = strip_elided_pointers(text_str)
     if not user_id or not text_str:
         return False
     payload = {

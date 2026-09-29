@@ -248,6 +248,15 @@ def _names_the_field(expr, assigned):
         v in assigned.get(n.id, '') for v in _VOCAB) for n in ast.walk(expr))
 
 
+def _names_the_field_itself(expr, assigned):
+    """Like _names_the_field, but only for the field name (one hop through
+    a local), never the 'autonom' vocabulary of the rule's own names."""
+    if _FIELD in ast.unparse(expr):
+        return True
+    return any(isinstance(n, ast.Name) and _FIELD in assigned.get(n.id, '')
+               for n in ast.walk(expr))
+
+
 def _reads_field_with_get(node):
     """`<x>.get('can_perform_without_user_input', ...)`."""
     return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -289,6 +298,23 @@ def private_autonomy_checks(src, filename='<src>'):
                     k.value for k in node.keywords if k.arg == 'default']
                 if any(_autonomous_default(d) for d in defaults):
                     hits.append((node.lineno, func))
+        # getattr(x, <the field>, <autonomous default>) (review of 924b8e9dc).
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == 'getattr' and len(node.args) >= 3
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == _FIELD
+                and _autonomous_default(node.args[2])):
+            hits.append((node.lineno, func))
+        # `v if v is not None else 'yes'` / `'yes' if v is None else v` on
+        # the field: the autonomous default as a conditional expression
+        # (review of 924b8e9dc).  Matched on the FIELD itself, not the
+        # 'autonom' vocabulary, so a verdict read from the rule
+        # (`'yes' if action_is_autonomous(a) else 'no'`) is left alone.
+        if isinstance(node, ast.IfExp):
+            branches = (node.body, node.orelse)
+            if (any(_autonomous_default(b) for b in branches)
+                    and _names_the_field_itself(node.test, assigned)):
+                hits.append((node.lineno, func))
         # `.get(field) or 'yes'`: the same autonomous default, spelled with
         # `or` (review of d8fe536b2, F2).
         if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
@@ -352,10 +378,18 @@ def test_source_guard_is_autonomous_has_one_rule():
     # review of d8fe536b2, F2
     "def f(a):\n    return a.get('can_perform_without_user_input') or 'yes'\n",
     "def f(a):\n    return a.get('can_perform_without_user_input', default=True)\n",
+    # review of 924b8e9dc: an attribute read with an autonomous default, and
+    # the default spelled as a conditional expression
+    "def f(a):\n    return getattr(a, 'can_perform_without_user_input', 'yes')\n",
+    "def f(a):\n    v = a.get('can_perform_without_user_input')\n"
+    "    return v if v is not None else 'yes'\n",
+    "def f(a):\n    v = a['can_perform_without_user_input']\n"
+    "    return 'yes' if v is None else v\n",
 ], ids=['eq-yes-subscript', 'eq-Yes-get', 'eq-yes-attr', 'in-via-variable',
         'ne-yes-reader', 'get-default-True', 'ne-no', 'startswith-y',
         'startswith-no-via-variable', 'get-default-yes', 'get-or-yes',
-        'get-default-kw-True'])
+        'get-default-kw-True', 'getattr-default-yes', 'ifexp-else-yes',
+        'ifexp-yes-if-none'])
 def test_source_guard_sees_every_shape_of_a_copy(snippet):
     """Anti-vacuity: the guard above can fail, once per shape."""
     hits = private_autonomy_checks(snippet)
@@ -370,7 +404,12 @@ def test_source_guard_sees_every_shape_of_a_copy(snippet):
     "def f(s):\n    return s.startswith('no')\n",
     "def f(d):\n    return (d.get('can_perform_without_user_input') or '').strip()\n",
     "def f(d):\n    return d.get('can_perform_without_user_input', default='no')\n",
+    "def f(a):\n    return getattr(a, 'can_perform_without_user_input', 'no')\n",
+    "def f(a):\n    v = a.get('can_perform_without_user_input')\n"
+    "    return v if v is not None else 'no'\n",
+    "def f(a):\n    return 'yes' if action_is_autonomous(a) else 'no'\n",
 ], ids=['unrelated-yes', 'get-default-no', 'get-no-default', 'unrelated-startswith',
-        'get-or-empty', 'get-default-kw-no'])
+        'get-or-empty', 'get-default-kw-no', 'getattr-default-no',
+        'ifexp-else-no', 'ifexp-unrelated-autonomous'])
 def test_source_guard_leaves_unrelated_code_alone(src):
     assert private_autonomy_checks(src) == []

@@ -351,8 +351,11 @@ class ThoughtExperimentService:
         - research:     uses web search (search → synthesize → score)
 
         GATED HERE, for every caller.  The experiment must be approved by
-        the vote (voting_rules.approval_verdict: distinct-identity quorum AND
-        2/3 super-majority), and its lifecycle must be able to reach
+        the vote -- voting_rules.approval_verdict, the ONE rule: a quorum
+        of distinct identities (>= 3, >= 2 FOR), a FOR share of at least
+        max(2/3, the context's threshold) with one vote per identity (an
+        owner and all their agents are one), and the steward's FOR where
+        the context requires one -- and its lifecycle must be able to reach
         'evaluating' (advance_status: never backwards from decided/archived).
         Measured live 2026-09-25 (AE-7): with the gate only in auto-evolve's
         ranking, one authenticated non-admin POSTed /evaluate on an unvoted
@@ -667,61 +670,77 @@ class ThoughtExperimentService:
 
         # Who each vote REALLY belongs to: a registered user, and an agent
         # is its owner.  An unregistered voter_id is a string anyone can
-        # pass, so it keeps its weight but is no identity.
+        # pass, so it keeps its weight but is no identity for the quorum.
         from .models import User
-        from .voting_rules import is_steward, quorum_met, recommendation
+        from .voting_rules import (
+            is_steward, one_vote_per_identity, quorum_met, recommendation)
         voter_ids = {v.voter_id for v in votes}
-        users = (db.query(User).filter(User.id.in_(voter_ids)).all()
-                 if voter_ids else [])
-        identity_of = {u.id: (u.owner_id or u.id) for u in users}
+        users = {u.id: u for u in
+                 (db.query(User).filter(User.id.in_(voter_ids)).all()
+                  if voter_ids else [])}
         # Whose vote is the steward's: voting_rules.is_steward, never a
         # voter_id string.
-        stewards = {u.id for u in users if is_steward(u)}
-        voters = set()
-        supporters = set()
+        stewards = {uid for uid, u in users.items() if is_steward(u)}
 
-        total_for = 0.0
-        total_against = 0.0
-        weighted_sum = 0.0
-        total_weight = 0.0
         human_votes = 0
         agent_votes = 0
         suggestions = []
         steward_vote = None
+        ballots = []
 
         for v in votes:
             if v.voter_id in stewards:
                 steward_vote = (v.vote_value if steward_vote is None
                                 else min(steward_vote, v.vote_value))
-            if v.voter_type == 'human':
-                human_weight = context_rules['human_weight'] if context_rules else 1.0
-                weight = human_weight
-                human_votes += 1
-            else:
+            user = users.get(v.voter_id)
+            # Agent or human from the ACCOUNT, never the stored voter_type,
+            # which the vote route used to take from the request body.  Only
+            # an unregistered id (in-process callers) falls back to it.
+            is_agent = ((user.user_type == 'agent') if user is not None
+                        else v.voter_type != 'human')
+            if is_agent:
                 agent_weight = context_rules['agent_weight'] if context_rules else 1.0
                 weight = v.confidence * agent_weight
                 agent_votes += 1
-
-            weighted_sum += v.vote_value * weight
-            total_weight += weight
-
-            if v.vote_value > 0:
-                total_for += weight
-            elif v.vote_value < 0:
-                total_against += weight
-
-            identity = identity_of.get(v.voter_id)
-            if identity is not None and weight > 0 and v.vote_value != 0:
-                voters.add(identity)
-                if v.vote_value > 0:
-                    supporters.add(identity)
+            else:
+                weight = context_rules['human_weight'] if context_rules else 1.0
+                human_votes += 1
+            if user is not None:
+                identity, own = (user.owner_id or user.id), not is_agent
+            else:
+                identity, own = ('unregistered', v.voter_id), True
+            ballots.append({'identity': identity, 'own': own,
+                            'value': v.vote_value, 'weight': weight})
 
             if v.suggestion:
                 suggestions.append({
                     'voter_id': v.voter_id,
-                    'voter_type': v.voter_type,
+                    'voter_type': 'agent' if is_agent else 'human',
                     'suggestion': v.suggestion,
                 })
+
+        # ONE vote per identity (voting_rules.one_vote_per_identity): an
+        # owner and all their agents weigh as one in the ratio, as they
+        # already counted as one in the quorum.
+        total_for = 0.0
+        total_against = 0.0
+        weighted_sum = 0.0
+        total_weight = 0.0
+        voters = set()
+        supporters = set()
+        for identity, (value, weight) in one_vote_per_identity(ballots).items():
+            weighted_sum += value * weight
+            total_weight += weight
+            if value > 0:
+                total_for += weight
+            elif value < 0:
+                total_against += weight
+            registered = not (isinstance(identity, tuple)
+                              and identity[0] == 'unregistered')
+            if registered and weight > 0 and value != 0:
+                voters.add(identity)
+                if value > 0:
+                    supporters.add(identity)
 
         weighted_score = weighted_sum / total_weight if total_weight > 0 else 0.0
         quorate = quorum_met(len(voters), len(supporters))

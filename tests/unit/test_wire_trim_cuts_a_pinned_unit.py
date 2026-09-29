@@ -138,3 +138,28 @@ def test_quote_dense_arguments_are_cut_to_fit(monkeypatch):
         assert est_after <= budget, (dense[:10], est_after, budget)
         args = _kept_args(out)
         assert is_wire_json(args) and isinstance(json.loads(args), dict)
+
+
+def test_a_call_whose_arguments_fit_their_share_is_left_as_written(
+        monkeypatch):
+    """The pre-check in _truncate_tool_call_arguments: of two parallel calls,
+    only the one over its share is cut; the other keeps its arguments
+    byte-identical, not wrapped in trimmed_arguments."""
+    sys_m = {'role': 'system', 'content': 'sys ' * 500}
+    task = {'role': 'user', 'name': 'User', 'content': 'task ' * 200}
+    small = json.dumps({'path': 'a.txt'})
+    call = {'role': 'assistant', 'content': None, 'tool_calls': [
+        {'id': 'c0', 'type': 'function', 'function': {
+            'name': 'write', 'arguments': json.dumps({'body': 'x ' * 20000})}},
+        {'id': 'c1', 'type': 'function', 'function': {
+            'name': 'read', 'arguments': small}}]}
+    res = [{'role': 'tool', 'tool_call_id': 'c0', 'content': 'ok'},
+           {'role': 'tool', 'tool_call_id': 'c1', 'content': 'read'}]
+    verdict = {'role': 'user', 'name': 'StatusVerifier',
+               'content': '{"status":"pending"}'}
+    out, est_after, budget = _trim([sys_m, task, call] + res + [verdict],
+                                   monkeypatch)
+    assert est_after <= budget
+    kept = [tc for m in out for tc in (m.get('tool_calls') or [])]
+    assert kept[1]['function']['arguments'] == small
+    assert 'trimmed_arguments' in kept[0]['function']['arguments']

@@ -202,7 +202,8 @@ def test_steer_resume_requires_paused(monkeypatch):
     out = ds.steer_agent(fake_db, 'agent-1', 'resume', caller=_OWNER(ds))
 
     assert out['ok'] is False
-    assert 'paused' in out['error']
+    # Worded as the outcome (review of 275e8e361), not the rule.
+    assert out['error'] == 'This run is already running.'
     assert goal.status == 'active'  # unchanged
     fake_db.commit.assert_not_called()
 
@@ -241,7 +242,7 @@ def test_steer_cancel_blocks_already_archived(monkeypatch):
     out = ds.steer_agent(fake_db, 'agent-1', 'cancel', caller=_OWNER(ds))
 
     assert out['ok'] is False
-    assert 'archived' in out['error']
+    assert out['error'] == 'This run was already cancelled.'
 
 
 def test_steer_unknown_verb_rejected(monkeypatch):

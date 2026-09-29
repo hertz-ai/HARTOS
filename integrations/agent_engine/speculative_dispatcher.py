@@ -2163,6 +2163,10 @@ class SpeculativeDispatcher:
         """
         from core.safe_hartos_attr import safe_hartos_attr
         from core.peer_link.message_bus import chat_topic_for
+        # Text for the user, spoken too: no elided-text pointer (owner
+        # ruling 2026-09-27; review of d99b1aa88).
+        from core.llm_outbound_logger import strip_elided_pointers
+        response = strip_elided_pointers(response)
 
         # 1. Publish text via canonical publish_async (MessageBus → Crossbar)
         try:
