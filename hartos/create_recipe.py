@@ -1770,14 +1770,15 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     try:
         from integrations.service_tools import (
             service_tool_registry, Crawl4AITool, AceStepTool,
-            SeoAuditTool, GhPrTool, TimeTool, CalculatorTool)
+            SeoAuditTool, GhPrTool)
 
         Crawl4AITool.register()   # port 11235
         AceStepTool.register()    # port 8001
         SeoAuditTool.register()   # native in-process (no port)
         GhPrTool.register()       # native in-process (no port)
-        TimeTool.register()       # native in-process (no port)
-        CalculatorTool.register() # native in-process (no port)
+        # TimeTool/CalculatorTool deliberately not registered — dropped in
+        # #126 review: the calculator hangs on adversarial input like
+        # 9**9**9**9. See HARTOS#124 closing comment for the measurements.
         from integrations.agent_engine.thought_experiment_tools import (
             ExperimentVoteTool)
         ExperimentVoteTool.register()  # native: the agent's own vote
