@@ -13,31 +13,47 @@ import integrations.service_tools.whisper_tool as wt
 
 
 @pytest.fixture
-def catalog_picks(monkeypatch):
+def catalog(monkeypatch):
+    """A ranked fake catalog: select_best('stt', exclude=...) returns the best
+    entry not excluded, like the real one.  Ranking: big > mid > small."""
     monkeypatch.setitem(sys.modules, 'sherpa_onnx', types.ModuleType('sherpa_onnx'))
-    big = next(k for k in wt._SHERPA_MODELS if k not in ('moonshine-tiny', 'whisper-tiny'))
-    monkeypatch.setattr(wt, '_catalog_stt_entry', lambda: types.SimpleNamespace(id='stt-test-big'))
-    monkeypatch.setitem(wt._CATALOG_ID_TO_SHERPA, 'stt-test-big', big)
+    keys = list(wt._SHERPA_MODELS)[:3]
+    ranking = ['stt-test-big', 'stt-test-mid', 'stt-test-small']
+    for cid, key in zip(ranking, keys):
+        monkeypatch.setitem(wt._CATALOG_ID_TO_SHERPA, cid, key)
+
+    def select(exclude=None):
+        for cid in ranking:
+            if cid not in (exclude or ()):
+                return types.SimpleNamespace(id=cid)
+        return None
+    monkeypatch.setattr(wt, '_catalog_stt_entry', select)
 
     def cached(*names):
         monkeypatch.setattr(wt, '_sherpa_model_cached', lambda key: key in names)
-    return big, cached
+    return keys, cached
 
 
-def test_cached_catalog_pick_is_used(catalog_picks):
-    big, cached = catalog_picks
-    cached(big, 'moonshine-tiny')
+def test_cached_catalog_pick_is_used(catalog):
+    (big, mid, small), cached = catalog
+    cached(big, small)
     assert wt.select_whisper_model() == big
 
 
-def test_uncached_pick_falls_back_to_a_cached_small_model(catalog_picks):
-    big, cached = catalog_picks
-    cached('moonshine-tiny')
-    assert wt.select_whisper_model() == 'moonshine-tiny'
+def test_uncached_pick_falls_back_to_the_next_cached_in_catalog_order(catalog):
+    (big, mid, small), cached = catalog
+    cached(mid, small)
+    assert wt.select_whisper_model() == mid
 
 
-def test_nothing_cached_keeps_the_catalog_pick(catalog_picks):
-    big, cached = catalog_picks
+def test_fallback_skips_uncached_entries(catalog):
+    (big, mid, small), cached = catalog
+    cached(small)
+    assert wt.select_whisper_model() == small
+
+
+def test_nothing_cached_keeps_the_catalog_pick(catalog):
+    (big, mid, small), cached = catalog
     cached()
     assert wt.select_whisper_model() == big
 

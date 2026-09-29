@@ -954,6 +954,27 @@ def _catalog_stt_entry(exclude=None):
         return None
 
 
+def _best_cached_sherpa_after(first_id: str):
+    """The catalog's next-best sherpa STT model that is already on disk.
+
+    Walks the catalog's own ranking (select_best with a growing exclude list)
+    rather than a hardcoded preference list, so model choice stays owned by
+    the catalog; "on disk" is read from the files (_sherpa_model_cached), not
+    the catalog's downloaded flag, which depends on a loader HARTOS itself
+    does not register.  Returns None when no cached sherpa model fits.
+    """
+    excluded = [first_id]
+    for _ in range(len(_CATALOG_ID_TO_SHERPA)):
+        entry = _catalog_stt_entry(exclude=excluded)
+        if entry is None:
+            return None
+        excluded.append(entry.id)
+        key = _CATALOG_ID_TO_SHERPA.get(entry.id)
+        if key in _SHERPA_MODELS and _sherpa_model_cached(key):
+            return key
+    return None
+
+
 def select_whisper_model() -> str:
     """Select best STT model for this hardware.
 
@@ -979,13 +1000,13 @@ def select_whisper_model() -> str:
                 # the worker on timeout instead of ever answering). Prefer
                 # whichever sherpa model is already on disk instead of
                 # kicking off a live download. Found 2026-09-25.
-                for fallback_key in ("moonshine-tiny", "whisper-tiny"):
-                    if fallback_key in _SHERPA_MODELS and _sherpa_model_cached(fallback_key):
-                        logger.info(
-                            "select_whisper_model: catalog picked '%s' but it "
-                            "is not downloaded; using cached '%s' instead",
-                            sherpa_key, fallback_key)
-                        return fallback_key
+                fallback_key = _best_cached_sherpa_after(entry.id)
+                if fallback_key:
+                    logger.info(
+                        "select_whisper_model: catalog picked '%s' but it "
+                        "is not downloaded; using cached '%s' instead",
+                        sherpa_key, fallback_key)
+                    return fallback_key
                 logger.info(
                     "select_whisper_model: catalog picked '%s' but it is not "
                     "downloaded and no cached sherpa model exists either; "
