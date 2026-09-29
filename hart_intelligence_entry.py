@@ -13500,6 +13500,56 @@ def main():
             "Agent engine init failed — no seeded goal will ever execute on "
             "this node: %s", e, exc_info=True)
 
+    # Channel adapters: same class of gap as the agent engine above.
+    # hartos_bootstrap.py calls FlaskChannelIntegration.start() as part of the
+    # bundled boot sequence, but this standalone launcher never did — so
+    # `_loop` stayed None and every persisted UserChannelBinding sat dead
+    # until an unrelated WhatsApp code path happened to trigger start() on
+    # demand (see _ensure_whatsapp_live_adapter).  In practice that meant
+    # Discord/Telegram/Slack had to be re-bound by hand after every restart,
+    # even though the bindings table exists precisely to survive one.
+    #
+    # start() rehydrates adapters from those bindings and is idempotent, so a
+    # launcher that already started channels (Nunba) is unaffected.
+    try:
+        from integrations.channels.flask_integration import (
+            get_channel_integration, register_status_routes,
+        )
+        _channels = get_channel_integration()
+        # Inbound webhook seam, same omission as above: hartos_bootstrap and
+        # run_debug both call this, standalone never did — so the
+        # /channels/webhook/<channel_type> route did not exist here at all and
+        # EVERY webhook-based channel (google_chat, line, messenger,
+        # instagram, twitter, viber, wechat, zalo) was unreachable inbound,
+        # returning 404 to the provider. Must run before _serve_app.
+        try:
+            _channels.register_webhook_routes(app)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Inbound channel webhook routes not registered — webhook-based "
+                "channels cannot receive messages on this node: %s", e,
+                exc_info=True)
+        # Same class of gap again: hartos_bootstrap/run_debug reach these two
+        # routes via init_channels(app), which standalone never called — so
+        # GET /channels/status and POST /channels/send 404'd here even
+        # though _channels itself is live. register_status_routes wires them
+        # onto the SAME get_channel_integration() singleton rather than
+        # going through init_channels(), which would construct a second,
+        # separate FlaskChannelIntegration and orphan whatever this one
+        # already has running (e.g. a WhatsApp adapter started early by
+        # _ensure_whatsapp_live_adapter).
+        try:
+            register_status_routes(app, _channels)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "/channels/status and /channels/send not registered: %s", e,
+                exc_info=True)
+        _channels.start()
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "Channel adapters not started — persisted channel bindings will "
+            "stay disconnected on this node: %s", e, exc_info=True)
+
     from core.port_registry import get_port
     _serve_app(app, host='0.0.0.0', port=get_port('backend'))
 

@@ -36,6 +36,27 @@ class ChannelResponseRouter:
             self._db_session_factory = get_db
         return self._db_session_factory()
 
+    @staticmethod
+    def _get_send_loop():
+        """Return the running asyncio loop channel adapters are on.
+
+        The loop lives on ``FlaskChannelIntegration`` (its
+        ``_run_async_loop`` background thread) — NOT on
+        ``ChannelRegistry``, which has no ``_loop`` attribute at all.
+        A caller on a worker thread has no loop of its own, so
+        ``asyncio.get_event_loop()`` can't find it either; the
+        integration singleton is the only correct source (same fix
+        applied to speculative_dispatcher's channel delivery leg,
+        2026-08-26/27).
+        """
+        try:
+            from integrations.channels.flask_integration import (
+                get_channel_integration)
+            loop = getattr(get_channel_integration(), '_loop', None)
+            return loop if loop and loop.is_running() else None
+        except Exception:
+            return None
+
     def route_response(
         self,
         user_id,
@@ -43,6 +64,7 @@ class ChannelResponseRouter:
         channel_context: Optional[Dict[str, Any]] = None,
         agent_id: Optional[str] = None,
         fan_out: bool = True,
+        reply_to_origin: bool = True,
     ):
         """
         Route an agent response to all relevant destinations.
@@ -53,6 +75,11 @@ class ChannelResponseRouter:
             channel_context: Originating channel info (channel, chat_id, sender_id, etc.)
             agent_id: Optional agent ID for conversation logging
             fan_out: Whether to send to other bound channels (not just originating)
+            reply_to_origin: Whether THIS call delivers the reply to the
+                originating chat.  False when the caller's own return value is
+                already delivered there -- FlaskChannelIntegration._handle_message
+                returns the reply to ChannelRegistry._route_to_agent, which sends
+                it; sending it here too delivered every channel reply twice.
         """
         originating_channel = None
         originating_chat_id = None
@@ -70,7 +97,23 @@ class ChannelResponseRouter:
             agent_id=agent_id,
         )
 
-        # 2. Fan-out to bound channels (async, fire-and-forget)
+        # 2. Reply to the originating channel. This was documented at
+        # the caller (agentic_router.py's dispatch_to_agent) as already
+        # happening here, but never actually existed — route_response
+        # only ever logged + fanned-out (explicitly EXCLUDING the
+        # originating channel) + WAMP-notified the desktop, so a
+        # channel-native reply (Slack/Discord/etc. message, not the
+        # desktop app) never got its answer. Found live 2026-08-27:
+        # get_ans-routed replies never reached Slack, confirmed via a
+        # channel binding, not a Crossbar/desktop client.
+        if reply_to_origin and originating_channel and originating_chat_id:
+            self.deliver_to_chat(
+                channel=originating_channel,
+                chat_id=originating_chat_id,
+                text=response_text,
+            )
+
+        # 3. Fan-out to bound channels (async, fire-and-forget)
         if fan_out:
             self._async_fan_out(
                 user_id=user_id,
@@ -79,12 +122,48 @@ class ChannelResponseRouter:
                 exclude_chat_id=originating_chat_id,
             )
 
-        # 3. WAMP notification to desktop/web
+        # 4. WAMP notification to desktop/web
         self._notify_desktop_wamp(
             user_id=user_id,
             text=response_text,
             channel_type=originating_channel,
         )
+
+    def deliver_to_chat(self, channel, chat_id, text) -> bool:
+        """Send ``text`` to one channel chat from any thread, fire-and-forget.
+
+        The ONE way non-loop threads (Flask workers, the speculative
+        dispatcher's expert pool) reach an adapter: schedule the send on the
+        channel integration's running loop.  Returns False when channels are
+        not running, so the caller can log that nothing was delivered.
+        """
+        loop = self._get_send_loop()
+        if not loop:
+            logger.info(
+                "Channel reply skipped: channel=%s chat_id=%s "
+                "— no running event loop", channel, chat_id,
+            )
+            return False
+        registry = self._get_registry()
+        asyncio.run_coroutine_threadsafe(
+            self._send_and_log(registry, channel, chat_id, text), loop,
+        )
+        return True
+
+    @staticmethod
+    async def _send_and_log(registry, channel, chat_id, text):
+        try:
+            result = await registry.send_to_channel(channel, chat_id, text)
+            if not result.success:
+                logger.warning(
+                    "Originating-channel reply failed: channel=%s "
+                    "chat_id=%s err=%s", channel, chat_id, result.error,
+                )
+        except Exception as e:
+            logger.warning(
+                "Originating-channel reply error: channel=%s chat_id=%s "
+                "err=%s", channel, chat_id, e,
+            )
 
     def log_user_message(
         self,
@@ -171,7 +250,7 @@ class ChannelResponseRouter:
                 bindings.sort(key=lambda b: (not b.is_preferred, b.channel_type))
 
                 registry = self._get_registry()
-                loop = getattr(registry, '_loop', None) or _get_running_loop()
+                loop = self._get_send_loop()
 
                 for binding in bindings:
                     # Skip the originating channel to avoid double-send
@@ -251,14 +330,6 @@ class ChannelResponseRouter:
                 "Channel response WAMP notify failed: user=%s err=%s",
                 user_id, e,
             )
-
-
-def _get_running_loop():
-    """Try to get a running event loop."""
-    try:
-        return asyncio.get_event_loop()
-    except RuntimeError:
-        return None
 
 
 # Singleton
