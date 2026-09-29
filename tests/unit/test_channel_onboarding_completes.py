@@ -353,6 +353,11 @@ class TestWhatsAppLinksByQR:
                 return (pair_body or {'success': True}), 200
             return next(seq, statuses[-1]), 200
 
+        # The fleet bus is a boundary too: its Crossbar leg imports
+        # hartos.crossbar_server when autobahn is installed (as on CI), and
+        # that import starts reuse_recipe's scheduler thread, which the
+        # inline Thread above would run forever.
+        self.bus = MagicMock()
         with patch('integrations.social.api_channels._proxy_gateway',
                    side_effect=gateway), \
                 patch('threading.Thread', _InlineThread), \
@@ -360,7 +365,9 @@ class TestWhatsAppLinksByQR:
                 patch('integrations.channels.agent_tools.build_channel_tool_closures',
                       return_value=tools), \
                 patch('integrations.social.models.db_session',
-                      side_effect=RuntimeError('no db')):
+                      side_effect=RuntimeError('no db')), \
+                patch('core.peer_link.message_bus.get_message_bus',
+                      return_value=self.bus):
             link('whatsapp', {'display_name': 'WhatsApp'}, phone=phone)
         return posts, registered, ensure_live
 
@@ -388,6 +395,9 @@ class TestWhatsAppLinksByQR:
         assert any('request-pair-code' in u for u in posts)
         assert _cards(lui, 'pair_code')[0]['code'] == 'ABCD1234'
         assert _cards(lui, 'qr_pair') == []
+        # The iOS companion gets the same code over the fleet bus.
+        topic, cmd = self.bus.publish.call_args.args
+        assert topic == 'fleet.command.user' and cmd['code'] == 'ABCD1234'
 
     def test_a_newer_connect_supersedes_the_older_watcher(self, lui, monkeypatch):
         """Two watchers on one session would both announce "connected" (and
