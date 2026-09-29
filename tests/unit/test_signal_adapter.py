@@ -762,7 +762,8 @@ class TestSignalFactory:
         extra.get('owner_phone') or extra.get('phone_number') to recognize
         the account's own number -- without this, every self-chat message
         would convert fine but never actually route as one."""
-        with patch.dict('sys.modules', {'aiohttp': MagicMock()}):
+        from tests.unit.module_swap import swap_modules
+        with swap_modules({'aiohttp': MagicMock()}):
             from integrations.channels.signal_adapter import create_signal_adapter
 
             adapter = create_signal_adapter(phone_number="+1234567890", api_url="http://x:8080")

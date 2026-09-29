@@ -22,7 +22,6 @@ register_channel's generic `token`, which maps it via _CHANNEL_SPECS /
 _credential_kwarg.
 """
 
-import sys
 import types
 from datetime import datetime
 from unittest.mock import Mock, patch
@@ -72,7 +71,8 @@ def _patch_db(rows):
     fake_models = types.ModuleType('integrations.social.models')
     fake_models.get_db = lambda: db
     fake_models.UserChannelBinding = object
-    return patch.dict(sys.modules, {'integrations.social.models': fake_models})
+    from tests.unit.module_swap import swap_modules
+    return swap_modules({'integrations.social.models': fake_models})
 
 
 class TestCredentialResolution:
@@ -322,7 +322,8 @@ class TestRestorePersistedChannels:
         assert out['restored'] == ['telegram']
         assert out['skipped']['discord'] == 'registration failed'
 
-    def test_db_failure_is_swallowed(self):
+    def test_db_failure_does_not_raise_and_says_so(self, caplog):
+        from tests.unit.module_swap import swap_modules
         fi = _integration()
         broken = types.ModuleType('integrations.social.models')
 
@@ -331,12 +332,13 @@ class TestRestorePersistedChannels:
 
         broken.get_db = _boom
         broken.UserChannelBinding = object
-        with patch.dict(
-            sys.modules, {'integrations.social.models': broken},
-        ):
+        with swap_modules({'integrations.social.models': broken}), \
+                caplog.at_level('WARNING'):
             out = fi.restore_persisted_channels()
 
         assert out == {'restored': [], 'skipped': {}}
+        assert any('Channel restore failed' in r.getMessage()
+                   and 'db down' in r.getMessage() for r in caplog.records)
 
     def test_env_flag_disables_restore(self, monkeypatch):
         fi = _integration()
