@@ -556,3 +556,40 @@ def start_watchdog(check_interval: int = None) -> NodeWatchdog:
 def get_watchdog() -> Optional[NodeWatchdog]:
     """Get the current watchdog instance (or None)."""
     return _watchdog
+
+
+def sleep_with_heartbeat(name: str, seconds: float, *,
+                         stop_check: Optional[Callable[[], bool]] = None,
+                         wait: Optional[Callable[[float], bool]] = None,
+                         chunk_seconds: float = 10.0) -> None:
+    """Sleep ``seconds`` in chunks, heartbeating ``name`` before each chunk.
+
+    Module-level twin of :meth:`NodeWatchdog.sleep_with_heartbeat` for daemons
+    that may start BEFORE the watchdog exists.  Callers used to resolve
+    ``get_watchdog()`` once: during early boot it was still None, so the whole
+    sleep (the HEVOLVE_DAEMON_BOOT_DELAY boot grace can be hours) ran with no
+    heartbeats, the thread looked frozen once the watchdog registered it, and
+    it was force-restarted every ~5 minutes for the life of the process.
+    Re-resolving per chunk picks the watchdog up as soon as it appears.
+
+    ``stop_check`` returning True ends the sleep between chunks.  ``wait``
+    replaces ``time.sleep`` for a chunk and ends the sleep when it returns
+    True -- pass ``threading.Event.wait`` so ``stop()`` wakes the caller at
+    once instead of after the current chunk.
+    """
+    end = time.monotonic() + seconds
+    while True:
+        if stop_check is not None and stop_check():
+            return
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return
+        wd = get_watchdog()
+        if wd is not None:
+            wd.heartbeat(name)
+        chunk = min(chunk_seconds, remaining)
+        if wait is not None:
+            if wait(chunk):
+                return
+        else:
+            time.sleep(chunk)
