@@ -2,7 +2,7 @@
 import os
 import sys
 import pytest
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 os.environ['HEVOLVE_DB_PATH'] = ':memory:'
@@ -11,7 +11,7 @@ from integrations.social.models import (
     Base, get_engine, get_db, db_session, init_db,
     User, Community, Post, Comment, Vote, Follow,
     CommunityMembership, AgentSkillBadge, TaskRequest,
-    Notification, Report, RecipeShare,
+    Notification, Report, RecipeShare, ProximityMatch,
 )
 
 
@@ -349,3 +349,59 @@ class TestInitDb:
         assert 'posts' in tables
         assert 'comments' in tables
         assert 'votes' in tables
+
+
+class TestProximityMatchToDict:
+    """Regression coverage: a matched proximity encounter rendered as
+    "User & User" on both clients because to_dict() only ever returned
+    {'user_a': {'id': ...}, 'user_b': {'id': ...}} for status='matched' —
+    no display name field existed at all, so the client's
+    `match.display_name_a || 'User'` always fell through to the fallback."""
+
+    def _make_pair(self, db, name_a='Alice', name_b='Bob'):
+        user_a = User(username='proxa', display_name=name_a, user_type='human')
+        user_b = User(username='proxb', display_name=name_b, user_type='human')
+        db.add_all([user_a, user_b])
+        db.commit()
+        return user_a, user_b
+
+    def test_matched_includes_real_display_names(self, db):
+        user_a, user_b = self._make_pair(db)
+        match = ProximityMatch(
+            user_a_id=user_a.id, user_b_id=user_b.id,
+            lat=1.0, lon=1.0, status='matched',
+            expires_at=datetime.utcnow() + timedelta(hours=4),
+        )
+        db.add(match)
+        db.commit()
+        d = match.to_dict()
+        assert d['display_name_a'] == 'Alice'
+        assert d['display_name_b'] == 'Bob'
+        assert d['user_a'] == {'id': user_a.id}
+        assert d['user_b'] == {'id': user_b.id}
+
+    def test_matched_falls_back_to_username_when_display_name_blank(self, db):
+        user_a, user_b = self._make_pair(db, name_a='', name_b='')
+        match = ProximityMatch(
+            user_a_id=user_a.id, user_b_id=user_b.id,
+            lat=1.0, lon=1.0, status='matched',
+            expires_at=datetime.utcnow() + timedelta(hours=4),
+        )
+        db.add(match)
+        db.commit()
+        d = match.to_dict()
+        assert d['display_name_a'] == 'proxa'
+        assert d['display_name_b'] == 'proxb'
+
+    def test_non_matched_status_has_no_display_names(self, db):
+        user_a, user_b = self._make_pair(db)
+        match = ProximityMatch(
+            user_a_id=user_a.id, user_b_id=user_b.id,
+            lat=1.0, lon=1.0, status='pending',
+            expires_at=datetime.utcnow() + timedelta(hours=4),
+        )
+        db.add(match)
+        db.commit()
+        d = match.to_dict(viewer_id=user_a.id)
+        assert 'display_name_a' not in d
+        assert d['you_revealed'] is False
