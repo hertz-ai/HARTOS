@@ -653,20 +653,12 @@ def _init_channel_adapters(app, cfg: dict) -> None:
         except Exception:
             pass
 
-        # Env-var-driven channels (only if credentials present — heavy
-        # SDK modules are NOT imported speculatively).
-        env_creds = {
-            'telegram': os.environ.get('TELEGRAM_BOT_TOKEN'),
-            'discord':  os.environ.get('DISCORD_BOT_TOKEN'),
-            'whatsapp': os.environ.get('WHATSAPP_ACCESS_TOKEN'),
-            'slack':    os.environ.get('SLACK_BOT_TOKEN'),
-            'signal':   os.environ.get('SIGNAL_SERVICE_URL'),
-        }
-        registered_from_env = 0
-        for ch_type, tok in env_creds.items():
-            if tok and ch_type not in (channels.registry._adapters or {}):
-                if channels.register_channel(ch_type, token=tok):
-                    registered_from_env += 1
+        # Env-var channels are registered by channels.start() below, from
+        # FlaskChannelIntegration._ENV_FALLBACKS -- the one list
+        # register_channel itself reads.  This function used to keep its own
+        # five-entry dict whose names disagreed with it: SIGNAL_SERVICE_URL
+        # was passed as Signal's phone number, and WHATSAPP_ACCESS_TOKEN built
+        # the identity-less WhatsApp adapter _RESTORE_EXCLUDED rules out.
 
         # `web` adapter is in-process, cheap, always register
         if 'web' not in (channels.registry._adapters or {}):
@@ -675,8 +667,7 @@ def _init_channel_adapters(app, cfg: dict) -> None:
         channels.start()
         logger.info(
             f"Channel adapters initialised "
-            f"({activated_from_cfg} from config, "
-            f"{registered_from_env} from env, web)"
+            f"({activated_from_cfg} from config, web; env channels via start())"
         )
     except Exception as e:
         logger.debug(f"Channel adapters skipped: {e}")
