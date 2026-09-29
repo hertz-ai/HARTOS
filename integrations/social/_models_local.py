@@ -1507,8 +1507,11 @@ class ProximityMatch(Base):
         }
         # Only reveal identities when matched
         if self.status == 'matched':
-            d['user_a'] = {'id': self.user_a_id}
-            d['user_b'] = {'id': self.user_b_id}
+            d['user_a'] = self._side(self.user_a, self.user_a_id)
+            d['user_b'] = self._side(self.user_b, self.user_b_id)
+            if viewer_id in (self.user_a_id, self.user_b_id):
+                d['other_user_id'] = (self.user_b_id if viewer_id == self.user_a_id
+                                      else self.user_a_id)
         elif viewer_id:
             is_a = viewer_id == self.user_a_id
             d['you_revealed'] = (is_a and self.a_revealed_at is not None) or \
@@ -1516,6 +1519,13 @@ class ProximityMatch(Base):
             d['other_revealed'] = (not is_a and self.a_revealed_at is not None) or \
                                   (is_a and self.b_revealed_at is not None)
         return d
+
+    @staticmethod
+    def _side(user, user_id):
+        if user is None:
+            return {'id': user_id}
+        return {'id': user.id, 'username': user.username,
+                'display_name': user.display_name, 'avatar_url': user.avatar_url}
 
     def _distance_bucket(self):
         if self.distance_m <= 50:
