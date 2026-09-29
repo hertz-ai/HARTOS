@@ -38,22 +38,15 @@ class ChannelResponseRouter:
 
     @staticmethod
     def _get_send_loop():
-        """Return the running asyncio loop channel adapters are on.
+        """The adapters' running event loop, or None.
 
-        The loop lives on ``FlaskChannelIntegration`` (its
-        ``_run_async_loop`` background thread) — NOT on
-        ``ChannelRegistry``, which has no ``_loop`` attribute at all.
-        A caller on a worker thread has no loop of its own, so
-        ``asyncio.get_event_loop()`` can't find it either; the
-        integration singleton is the only correct source (same fix
-        applied to speculative_dispatcher's channel delivery leg,
-        2026-08-26/27).
+        Owned by FlaskChannelIntegration.running_loop() -- ChannelRegistry has
+        no loop, and a worker thread has none of its own.
         """
         try:
             from integrations.channels.flask_integration import (
                 get_channel_integration)
-            loop = getattr(get_channel_integration(), '_loop', None)
-            return loop if loop and loop.is_running() else None
+            return get_channel_integration().running_loop()
         except Exception:
             return None
 

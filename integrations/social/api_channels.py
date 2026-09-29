@@ -111,7 +111,6 @@ def _wire_live_adapter(channel_type: str, credential) -> dict:
         return {'success': True, 'message': 'no credential to wire (binding-only channel)'}
     try:
         import asyncio as _aio
-        import time as _time
         from integrations.channels.base import ChannelStatus
         from integrations.channels.flask_integration import get_channel_integration
         integration = get_channel_integration()
@@ -120,24 +119,13 @@ def _wire_live_adapter(channel_type: str, credential) -> dict:
         # tearing a stale adapter down needs it (stop() is a coroutine),
         # and so does starting the new one. Hoisted above the registry
         # check for that reason.
-        loop = integration._loop
-        if not (loop and loop.is_running()):
-            # Same gap as WhatsApp's _ensure_whatsapp_live_adapter (see
-            # hart_intelligence_entry.py): entrypoints that skip
-            # hartos_bootstrap's full sequence never call
-            # FlaskChannelIntegration.start(), so _loop stays None and
-            # register_channel() below sits registered-but-never-started
-            # forever — confirmed live 2026-07-28 for Telegram, same as
-            # WhatsApp the night before. start() is idempotent and cheap,
-            # safe to trigger on-demand here.
-            integration.start()
-            for _ in range(50):  # ~5s for the background thread to spin up
-                loop = integration._loop
-                if loop and loop.is_running():
-                    break
-                _time.sleep(0.1)
-            else:
-                return {'success': False, 'error': 'channel event loop failed to start'}
+        # Entry points that skip hartos_bootstrap never call start(), so the
+        # loop may not exist yet (confirmed live 2026-07-28 for Telegram).
+        # The adapter is registered AFTER this, so start_all() has not
+        # started it and the explicit start below is always needed.
+        loop, _started_now = integration.ensure_running()
+        if loop is None:
+            return {'success': False, 'error': 'channel event loop failed to start'}
 
         existing = integration.registry.get(channel_type)
         if existing is not None:

@@ -10,6 +10,7 @@ import logging
 import os
 import json
 import threading
+import time
 from datetime import datetime
 from typing import Optional, Dict, Any
 from functools import wraps
@@ -82,7 +83,7 @@ class FlaskChannelIntegration:
             session_manager=self._session_manager,
             response_router=self._response_router,
             registry=self.registry,
-            get_loop=lambda: self._loop,
+            get_loop=self.running_loop,
         )
 
     def _handle_message(self, message: Message) -> str:
@@ -882,6 +883,54 @@ class FlaskChannelIntegration:
             self._loop.run_until_complete(self.registry.stop_all())
             self._loop.close()
 
+    # ── The adapters' event loop, for callers on other threads ──────────
+    # The loop is owned here (created in _run_async_loop).  ChannelRegistry
+    # has no loop of its own, and a worker thread has none either, so every
+    # caller outside the loop reaches adapters through these three methods.
+
+    def running_loop(self) -> Optional[asyncio.AbstractEventLoop]:
+        """The adapters' event loop if it is running, else None."""
+        loop = self._loop
+        return loop if loop is not None and loop.is_running() else None
+
+    def ensure_running(self, timeout_s: float = 5.0) -> tuple:
+        """Start the adapters' loop if needed; return ``(loop, started_now)``.
+
+        Entry points that skip hartos_bootstrap never call start(), so the
+        loop can be absent when a binding is wired on demand.  start() is
+        idempotent.  ``started_now`` is True when this call triggered start():
+        the loop's first act is registry.start_all(), which starts adapters
+        registered BEFORE this call, so a caller must not start them again.
+        ``loop`` is None if the loop did not come up within ``timeout_s``.
+        """
+        loop = self.running_loop()
+        if loop is not None:
+            return loop, False
+        self.start()
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            loop = self.running_loop()
+            if loop is not None:
+                return loop, True
+            time.sleep(0.1)
+        return None, True
+
+    def send_threadsafe(self, channel: str, chat_id: str, text: str, *,
+                        wait: Optional[float] = None, **kwargs):
+        """Send through the registry from any thread.
+
+        Returns None when the loop is not running.  Otherwise returns the
+        concurrent Future, or -- with ``wait`` seconds -- its SendResult.
+        """
+        loop = self.running_loop()
+        if loop is None:
+            return None
+        future = asyncio.run_coroutine_threadsafe(
+            self.registry.send_to_channel(channel, chat_id, text, **kwargs),
+            loop,
+        )
+        return future.result(timeout=wait) if wait is not None else future
+
     @classmethod
     def _binding_credentials(
         cls, channel_type: str, meta: Dict[str, Any],
@@ -1206,20 +1255,14 @@ def register_status_routes(app, integration: FlaskChannelIntegration) -> None:
         if not all([channel, chat_id, text]):
             return jsonify({"error": "Missing required fields"}), 400
 
-        # Run async send in the event loop
-        if integration._loop:
-            future = asyncio.run_coroutine_threadsafe(
-                integration.registry.send_to_channel(channel, chat_id, text),
-                integration._loop,
-            )
-            result = future.result(timeout=30)
-            return jsonify({
-                "success": result.success,
-                "message_id": result.message_id,
-                "error": result.error,
-            })
-        else:
+        result = integration.send_threadsafe(channel, chat_id, text, wait=30)
+        if result is None:
             return jsonify({"error": "Channels not running"}), 503
+        return jsonify({
+            "success": result.success,
+            "message_id": result.message_id,
+            "error": result.error,
+        })
 
 
 def init_channels(app=None, config: Dict[str, Any] = None) -> FlaskChannelIntegration:

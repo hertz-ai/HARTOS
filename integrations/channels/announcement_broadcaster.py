@@ -38,7 +38,6 @@ doesn't need a separate page.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import threading
 from typing import Any, Dict, List, Optional, Tuple
@@ -345,19 +344,17 @@ def _dispatch_to_target(channel: str, chat_id: str, text: str) -> None:
         logger.debug("channel integration unavailable: %s", exc)
         return
     integration = get_channel_integration()
-    loop = getattr(integration, '_loop', None)
-    if loop is None:
-        logger.debug(
-            "channel integration loop not running yet — skipping "
-            "announcement to %s/%s", channel, chat_id)
-        return
-    coro = integration.registry.send_to_channel(channel, chat_id, text)
     try:
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        future = integration.send_threadsafe(channel, chat_id, text)
     except Exception as exc:
         logger.warning(
             "failed to schedule announcement to %s/%s: %s",
             channel, chat_id, exc)
+        return
+    if future is None:
+        logger.debug(
+            "channel integration loop not running yet — skipping "
+            "announcement to %s/%s", channel, chat_id)
         return
 
     # Attach a callback so we LOG the outcome (success / error) but

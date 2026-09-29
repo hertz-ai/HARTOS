@@ -4173,32 +4173,16 @@ def _ensure_whatsapp_live_adapter(
             )
             integration.registry.register(adapter)
 
-            loop = integration._loop
-            started_integration = False
-            if not (loop and loop.is_running()):
-                # Entrypoints that skip hartos_bootstrap's full sequence (e.g.
-                # the standalone hart_intelligence_entry.py used for local/dev
-                # testing) never call FlaskChannelIntegration.start() at all,
-                # so _loop stays None forever and every adapter sits
-                # registered-but-never-started — messages reach the gateway
-                # but nothing is listening. start() is idempotent (no-ops if
-                # already running) and cheap (an empty registry.start_all()
-                # the first time), so it's safe to trigger on-demand here
-                # rather than requiring the full boot sequence to have run.
-                integration.start()
-                started_integration = True
-                for _ in range(50):  # ~5s for the background thread to spin up
-                    loop = integration._loop
-                    if loop and loop.is_running():
-                        break
-                    time.sleep(0.1)
-                else:
-                    return {
-                        'success': False,
-                        'error': 'channel event loop failed to start '
-                                 '(FlaskChannelIntegration.start() ran but '
-                                 '_loop never became live)',
-                    }
+            # Entry points that skip hartos_bootstrap never call start(), so
+            # the loop may not exist yet; ensure_running() starts it on demand.
+            loop, started_integration = integration.ensure_running()
+            if loop is None:
+                return {
+                    'success': False,
+                    'error': 'channel event loop failed to start '
+                             '(FlaskChannelIntegration.start() ran but '
+                             '_loop never became live)',
+                }
             # A newly started integration invokes registry.start_all(), which
             # starts this adapter exactly once. An already-running loop needs
             # this explicit start because registry.start_all() has completed.

@@ -79,6 +79,12 @@ def _mock_integration(existing_adapter=None):
     integration._loop = MagicMock()
     integration._loop.is_running.return_value = True
     integration.register_channel.return_value = True
+    # The real loop-owner methods, run against this mock's state, so the
+    # tests exercise the production ensure_running()/running_loop().
+    from integrations.channels.flask_integration import FlaskChannelIntegration as _FI
+    integration.running_loop = lambda: _FI.running_loop(integration)
+    integration.ensure_running = (
+        lambda timeout_s=5.0: _FI.ensure_running(integration, timeout_s))
     return integration
 
 
