@@ -252,9 +252,13 @@ class ChannelRegistry:
                         reply_to=message.id,
                         media=media or None,
                     )
-                except TypeError:
+                except TypeError as e:
                     # An adapter predating the media kwarg still gets the
                     # text — never lose the reply over an attachment.
+                    logger.warning(
+                        "%s send_message rejected the media kwarg (%s); "
+                        "resending text only%s", message.channel, e,
+                        f", {len(media)} attachment(s) dropped" if media else "")
                     await adapter.send_message(
                         chat_id=message.chat_id,
                         text=clean_text or response,
@@ -297,7 +301,7 @@ class ChannelRegistry:
                 )
 
         except Exception as e:
-            logger.error(f"Error routing message to agent: {e}")
+            logger.error(f"Error routing message to agent: {e}", exc_info=True)
             # Optionally send error message to user
             try:
                 await adapter.send_message(
@@ -305,8 +309,11 @@ class ChannelRegistry:
                     text="Sorry, I encountered an error processing your message.",
                     reply_to=message.id,
                 )
-            except Exception:
-                pass
+            except Exception as send_err:
+                logger.error(
+                    "Could not even tell %s/%s about that error; the user "
+                    "got no reply at all: %s", message.channel,
+                    message.chat_id, send_err)
 
     async def send_to_channel(
         self,

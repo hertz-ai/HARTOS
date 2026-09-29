@@ -898,9 +898,23 @@ class SpeculativeDispatcher:
         scheduled (the guards in _schedule_expert_background can still
         refuse).  Idempotent: a second call finds nothing pending.
         """
+        spec_id = result.get('speculation_id')
         with self._lock:
-            kwargs = self._pending_experts.pop(result.get('speculation_id'), None)
-        if not kwargs or kwargs.get('expert_model') is None:
+            kwargs = self._pending_experts.pop(spec_id, None)
+        if not kwargs:
+            if result.get('delegate') in ('local', 'hive'):
+                # The draft delegated, so an expert was prepared -- unless it
+                # was evicted (>_PENDING_EXPERT_MAX waiting) or already taken.
+                logger.warning(
+                    "expert not scheduled for %s: no prepared expert (evicted "
+                    "or already scheduled); the draft reply stays final",
+                    spec_id)
+            return False
+        if kwargs.get('expert_model') is None:
+            logger.warning(
+                "expert not scheduled for %s: no expert model available for "
+                "delegate=%s; the draft reply stays final",
+                spec_id, kwargs.get('delegate'))
             return False
         scheduled = self._schedule_expert_background(**kwargs)
         result['expert_pending'] = scheduled
@@ -1330,7 +1344,10 @@ class SpeculativeDispatcher:
         try:
             from hartos.threadlocal import thread_local_data as _tl_cc
             _channel_context = _tl_cc.get_channel_context()
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                "expert %s: channel context unreadable, so a channel user "
+                "will not receive the expert's answer: %s", speculation_id, e)
             _channel_context = None
 
         with self._lock:
@@ -1986,7 +2003,8 @@ class SpeculativeDispatcher:
             logger.warning(
                 "local expert /chat HTTP returned %s", resp.status_code)
         except Exception as e:
-            logger.debug("local expert HTTP dispatch failed: %s", e)
+            logger.warning("local expert HTTP dispatch failed, no expert "
+                           "answer for this turn: %s", e)
         return ''
 
     @staticmethod

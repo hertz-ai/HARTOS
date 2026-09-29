@@ -125,6 +125,7 @@ def _wire_live_adapter(channel_type: str, credential) -> dict:
         # started it and the explicit start below is always needed.
         loop, _started_now = integration.ensure_running()
         if loop is None:
+            # ensure_running() already warned why.
             return {'success': False, 'error': 'channel event loop failed to start'}
 
         existing = integration.registry.get(channel_type)
@@ -158,6 +159,8 @@ def _wire_live_adapter(channel_type: str, credential) -> dict:
 
         adapter = integration.registry.get(channel_type)
         if adapter is None:
+            logger.warning("%s registered but missing from the registry; the "
+                           "binding is saved but not live", channel_type)
             return {'success': False, 'error': 'adapter missing after registration'}
         _aio.run_coroutine_threadsafe(adapter.start(), loop)
         return {'success': True, 'message': f'{channel_type} adapter registration scheduled'}

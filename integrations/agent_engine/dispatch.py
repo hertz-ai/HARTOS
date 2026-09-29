@@ -135,7 +135,9 @@ def _internal_auth_headers(user_id: str = 'system_daemon',
             if jwt:
                 headers['Authorization'] = f'Bearer {jwt}'
     except Exception as e:
-        logger.debug(f"daemon-dispatch auth header mint failed (non-fatal): {e}")
+        # Sent without credentials: fine on flat, a 401 on central/regional.
+        logger.warning("internal /chat auth header mint failed, sending "
+                       "unauthenticated (central/regional will answer 401): %s", e)
     return headers or None
 
 

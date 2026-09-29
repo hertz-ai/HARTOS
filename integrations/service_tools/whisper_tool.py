@@ -1002,19 +1002,22 @@ def select_whisper_model() -> str:
                 # kicking off a live download. Found 2026-09-25.
                 fallback_key = _best_cached_sherpa_after(entry.id)
                 if fallback_key:
-                    logger.info(
+                    logger.warning(
                         "select_whisper_model: catalog picked '%s' but it "
                         "is not downloaded; using cached '%s' instead",
                         sherpa_key, fallback_key)
                     return fallback_key
-                logger.info(
+                logger.warning(
                     "select_whisper_model: catalog picked '%s' but it is not "
                     "downloaded and no cached sherpa model exists either; "
                     "proceeding with '%s' (will trigger a download)",
                     sherpa_key, sherpa_key)
                 return sherpa_key
             except ImportError:
-                logger.debug("select_whisper_model: swallowed ImportError")
+                logger.warning(
+                    "select_whisper_model: catalog picked sherpa model '%s' "
+                    "but sherpa_onnx is not installed; falling back to the "
+                    "catalog's faster-whisper/whisper mapping", sherpa_key)
         # faster-whisper size
         fw_size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(entry.id)
         if fw_size:

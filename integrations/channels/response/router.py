@@ -47,7 +47,9 @@ class ChannelResponseRouter:
             from integrations.channels.flask_integration import (
                 get_channel_integration)
             return get_channel_integration().running_loop()
-        except Exception:
+        except Exception as e:
+            logger.warning("Channel send loop unavailable, channel replies "
+                           "cannot be delivered: %s", e, exc_info=True)
             return None
 
     def route_response(
@@ -132,9 +134,9 @@ class ChannelResponseRouter:
         """
         loop = self._get_send_loop()
         if not loop:
-            logger.info(
-                "Channel reply skipped: channel=%s chat_id=%s "
-                "— no running event loop", channel, chat_id,
+            logger.warning(
+                "Channel reply NOT delivered: channel=%s chat_id=%s "
+                "— the channel event loop is not running", channel, chat_id,
             )
             return False
         registry = self._get_registry()

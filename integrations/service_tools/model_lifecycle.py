@@ -404,8 +404,10 @@ class ModelLifecycleManager:
         """
         try:
             from security.node_watchdog import sleep_with_heartbeat
-        except Exception:
-            logger.exception("_wd_sleep: watchdog module unavailable")
+        except Exception as e:
+            logger.warning("model_lifecycle: heartbeat sleep unavailable, falling "
+                           "back to a plain sleep (no heartbeats, the "
+                           "watchdog may restart this thread): %s", e, exc_info=True)
             time.sleep(seconds)
             return
         sleep_with_heartbeat('model_lifecycle', seconds,

@@ -76,7 +76,10 @@ class CodingAgentDaemon:
         """
         try:
             from security.node_watchdog import sleep_with_heartbeat
-        except Exception:
+        except Exception as e:
+            logger.warning("coding_daemon: heartbeat sleep unavailable, falling "
+                           "back to a plain sleep (no heartbeats, the "
+                           "watchdog may restart this thread): %s", e, exc_info=True)
             self._stop_event.wait(seconds)
             return
         sleep_with_heartbeat('coding_daemon', seconds,

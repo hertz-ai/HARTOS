@@ -214,7 +214,10 @@ class FlaskChannelIntegration:
                     _internal_auth_headers)
                 _auth_headers = _internal_auth_headers(user_id=str(user_id))
             except Exception as _auth_err:  # never block a message on this
-                logger.debug("internal auth header unavailable: %s", _auth_err)
+                logger.warning(
+                    "internal auth header unavailable, calling /chat "
+                    "unauthenticated (central/regional will answer 401): %s",
+                    _auth_err)
                 _auth_headers = None
 
             # Call agent API
@@ -232,7 +235,18 @@ class FlaskChannelIntegration:
 
             if response.status_code == 200:
                 result = response.json()
-                agent_reply = chat_reply(result, "I processed your request.")
+                agent_reply = chat_reply(result)
+                if not agent_reply.strip():
+                    # This used to become "I processed your request." -- a
+                    # success claim for a turn that produced nothing.  ''
+                    # hands the failure to ChannelRegistry._route_to_agent,
+                    # which warns and sends the canonical failure sentence.
+                    logger.warning(
+                        "Agent API returned 200 with no reply text for %s:%s "
+                        "(keys=%s); the user gets the failure sentence",
+                        message.channel, message.sender_id,
+                        sorted(result) if isinstance(result, dict) else type(result).__name__)
+                    return ''
 
                 # Track response in session history
                 if session:
@@ -913,6 +927,9 @@ class FlaskChannelIntegration:
             if loop is not None:
                 return loop, True
             time.sleep(0.1)
+        logger.warning(
+            "Channel event loop did not come up within %.1fs of start(): "
+            "no adapter can send or receive until it does", timeout_s)
         return None, True
 
     def send_threadsafe(self, channel: str, chat_id: str, text: str, *,
@@ -924,6 +941,10 @@ class FlaskChannelIntegration:
         """
         loop = self.running_loop()
         if loop is None:
+            logger.warning(
+                "Channel send to %s/%s NOT delivered: the channel event loop "
+                "is not running (start() never ran or its thread died)",
+                channel, chat_id)
             return None
         future = asyncio.run_coroutine_threadsafe(
             self.registry.send_to_channel(channel, chat_id, text, **kwargs),
@@ -996,7 +1017,9 @@ class FlaskChannelIntegration:
         try:
             from integrations.social.models import get_db, UserChannelBinding
         except ImportError as e:
-            logger.debug(f"Channel restore unavailable (no social models): {e}")
+            logger.warning(
+                "Channel restore skipped: social models not importable, so "
+                "persisted channel bindings stay disconnected: %s", e)
             return summary
 
         try:
@@ -1056,10 +1079,12 @@ class FlaskChannelIntegration:
             finally:
                 try:
                     db.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Channel restore: closing the DB session "
+                                   "failed: %s", e)
         except Exception as e:
-            logger.warning(f"Channel restore failed: {e}")
+            logger.warning("Channel restore failed; persisted channel "
+                           "bindings stay disconnected: %s", e, exc_info=True)
             return summary
 
         if summary['restored']:
@@ -1067,7 +1092,16 @@ class FlaskChannelIntegration:
                 f"Restored {len(summary['restored'])} channel adapter(s) "
                 f"from persisted bindings: {', '.join(summary['restored'])}"
             )
-        else:
+        # A binding whose channel stays offline is a failure the user sees
+        # (the bot is silent there), so say which and why.  'already
+        # registered' and 'dedicated restore path' are handled elsewhere.
+        dead = {ct: why for ct, why in summary['skipped'].items()
+                if why not in ('already registered', 'dedicated restore path')}
+        if dead:
+            logger.warning(
+                "Channel bindings NOT restored, these channels stay offline: %s",
+                ', '.join(f'{ct} ({why})' for ct, why in sorted(dead.items())))
+        elif not summary['restored']:
             logger.info(
                 f"No channel adapters restored from bindings "
                 f"(skipped: {summary['skipped'] or 'none'})"

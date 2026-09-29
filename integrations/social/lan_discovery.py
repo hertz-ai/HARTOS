@@ -460,7 +460,10 @@ class AutoDiscovery:
                 logger.debug(f"AutoDiscovery send error: {e}")
             try:
                 from security.node_watchdog import sleep_with_heartbeat
-            except Exception:
+            except Exception as e:
+                logger.warning("auto_discovery: heartbeat sleep unavailable, falling "
+                               "back to a plain sleep (no heartbeats, the "
+                               "watchdog may restart this thread): %s", e, exc_info=True)
                 time.sleep(self._beacon_interval)
                 continue
             sleep_with_heartbeat('auto_discovery', self._beacon_interval,

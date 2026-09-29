@@ -421,6 +421,14 @@ class SignalAdapter(ChannelAdapter):
             # complete quote can't be built from here; better to deliver
             # the reply unquoted than to drop it. Revisit if/when the
             # author+message text are threaded through to this call.
+            if reply_to and not getattr(self, '_warned_unquoted', False):
+                # Once per adapter: every in-thread reply takes this path.
+                self._warned_unquoted = True
+                logger.warning(
+                    "Signal replies are sent UNQUOTED: a quote needs the "
+                    "original author and text, which send_message does not "
+                    "receive (reply_to=%s). Applies to all later replies.",
+                    reply_to)
 
             # Handle attachments
             if media:

@@ -564,15 +564,31 @@ def sleep_with_heartbeat(name: str, seconds: float, *,
     registered, and it was force-restarted every ~5 minutes for the life of
     the process.
 
+    A heartbeat that raises is logged (once per sleep) and the sleep goes
+    on: a failed beat must not kill the daemon that is sleeping.
+
     ``stop_check`` returning True ends the sleep between chunks.  ``wait``
     replaces ``time.sleep`` for a chunk and ends the sleep when it returns
     True -- pass ``threading.Event.wait`` so ``stop()`` wakes the caller at
     once.
     """
+    failed = []
+
     def _beat() -> None:
         wd = watchdog if watchdog is not None else get_watchdog()
-        if wd is not None:
+        if wd is None:
+            return
+        try:
             wd.heartbeat(name)
+        except Exception as e:
+            # Keep sleeping: dying here would take the calling daemon down.
+            # Warn on the first failure of this sleep, not every chunk.
+            if not failed:
+                logger.warning(
+                    "%s: heartbeat failed, this sleep continues without it "
+                    "and the watchdog may restart the thread: %s",
+                    name, e, exc_info=True)
+            failed.append(e)
 
     _beat()
     if seconds <= 0:

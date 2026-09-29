@@ -639,7 +639,9 @@ def _init_channel_adapters(app, cfg: dict) -> None:
         try:
             channels.register_webhook_routes(app)
         except Exception as _wh_e:
-            logger.debug(f"webhook route registration skipped: {_wh_e}")
+            logger.warning(
+                "Inbound channel webhook routes NOT registered; webhook-based "
+                "channels cannot receive messages on this node: %s", _wh_e)
 
         # Auto-activate channels saved in admin config
         activated_from_cfg = 0
@@ -650,8 +652,9 @@ def _init_channel_adapters(app, cfg: dict) -> None:
                     tok = ch_cfg.get('token') or ch_cfg.get('api_key')
                     if channels.register_channel(ch_type, token=tok):
                         activated_from_cfg += 1
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Admin-config channels NOT activated: %s", e,
+                           exc_info=True)
 
         # Env-var channels are registered by channels.start() below, from
         # FlaskChannelIntegration._ENV_FALLBACKS -- the one list
@@ -670,7 +673,8 @@ def _init_channel_adapters(app, cfg: dict) -> None:
             f"({activated_from_cfg} from config, web; env channels via start())"
         )
     except Exception as e:
-        logger.debug(f"Channel adapters skipped: {e}")
+        logger.warning("Channel adapters NOT started; no channel will send or "
+                       "receive on this node: %s", e, exc_info=True)
 
 
 # ─── Step 9: Agent engine ───────────────────────────────────────────────

@@ -341,7 +341,8 @@ def _dispatch_to_target(channel: str, chat_id: str, text: str) -> None:
         from integrations.channels.flask_integration import (
             get_channel_integration)
     except Exception as exc:
-        logger.debug("channel integration unavailable: %s", exc)
+        logger.warning("announcement to %s/%s NOT sent: channel integration "
+                       "unavailable: %s", channel, chat_id, exc)
         return
     integration = get_channel_integration()
     try:
@@ -352,9 +353,7 @@ def _dispatch_to_target(channel: str, chat_id: str, text: str) -> None:
             channel, chat_id, exc)
         return
     if future is None:
-        logger.debug(
-            "channel integration loop not running yet — skipping "
-            "announcement to %s/%s", channel, chat_id)
+        # send_threadsafe already warned (loop not running) with the target.
         return
 
     # Attach a callback so we LOG the outcome (success / error) but
@@ -822,7 +821,9 @@ def _content_distribution_loop() -> None:
         wd = get_watchdog()
         if wd is not None:
             wd.register(name, CONTENT_PUBLISH_INTERVAL_SEC * 2)
-    except Exception:
+    except Exception as e:
+        logger.warning("content distribution runs without watchdog "
+                       "registration, so a hang would go unnoticed: %s", e)
         wd = None
 
     while True:
@@ -833,7 +834,10 @@ def _content_distribution_loop() -> None:
         try:
             from security.node_watchdog import sleep_with_heartbeat
             sleep_with_heartbeat(name, CONTENT_PUBLISH_INTERVAL_SEC, watchdog=wd)
-        except Exception:
+        except Exception as e:
+            logger.warning("%s: heartbeat sleep unavailable, falling back to "
+                           "a plain sleep (no heartbeats this interval): %s",
+                           name, e)
             time.sleep(CONTENT_PUBLISH_INTERVAL_SEC)
 
 
