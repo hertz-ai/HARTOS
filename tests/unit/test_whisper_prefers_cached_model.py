@@ -30,7 +30,27 @@ def catalog(monkeypatch):
     monkeypatch.setattr(wt, '_catalog_stt_entry', select)
 
     def cached(*names):
-        monkeypatch.setattr(wt, '_sherpa_model_cached', lambda key: key in names)
+        state['cached'] = set(names)
+    state = {'cached': set(), 'downloads': []}
+    monkeypatch.setattr(wt, '_sherpa_model_cached',
+                        lambda key: key in state['cached'])
+
+    # The network fetch is the boundary: record it, and "finish" it by
+    # putting the model on disk.  The thread runs inline so the test sees
+    # it complete.
+    def download(name):
+        state['downloads'].append(name)
+        state['cached'].add(name)
+    monkeypatch.setattr(wt, '_download_model', download)
+
+    class _Inline:
+        def __init__(self, target=None, **_kw):
+            self._target = target
+
+        def start(self):
+            self._target()
+    monkeypatch.setattr(wt.threading, 'Thread', _Inline)
+    cached.state = state
     return keys, cached
 
 
@@ -50,6 +70,26 @@ def test_fallback_skips_uncached_entries(catalog):
     (big, mid, small), cached = catalog
     cached(small)
     assert wt.select_whisper_model() == small
+
+
+def test_a_fallback_fetches_the_pick_so_the_node_is_not_stuck_on_it(catalog):
+    """Serving the cached model must not be permanent: the catalog's pick
+    is fetched in the background (once), and the next selection uses it.
+    Before, nothing downloaded it, since _download_model only ran for the
+    model actually chosen, so a node that once cached a tiny model kept it."""
+    (big, mid, small), cached = catalog
+    cached(small)
+    assert wt.select_whisper_model() == small       # answers now
+    assert cached.state['downloads'] == [big]      # fetches the pick
+    assert wt.select_whisper_model() == big         # and uses it next time
+
+
+def test_a_running_download_is_not_started_twice(catalog, monkeypatch):
+    (big, mid, small), cached = catalog
+    cached(small)
+    monkeypatch.setattr(wt, '_background_downloads', {big})
+    assert wt.select_whisper_model() == small
+    assert cached.state['downloads'] == []
 
 
 def test_nothing_cached_keeps_the_catalog_pick(catalog):

@@ -84,3 +84,58 @@ class TestChannelResponseRouter:
         self.router.route_response('user1', 'hello', None, fan_out=False)
         mock_fan.assert_not_called()
         mock_wamp.assert_called_once()
+
+
+class TestFanOutReachesOnlyConnectedChats:
+    """Fan-out sends a user's notification to the chats THEY connected.
+
+    upsert_binding records every inbound sender (auth_method unset), and an
+    unbound sender resolves to the default user, the owner on a desktop.
+    Fan-out from a worker thread was dead on main (no loop found), so this
+    never fired; once #126 made the send loop reachable, an owner's
+    outreach/journey notification went to every stranger DM and group that
+    ever wrote to the bot (review of #126, measured by the reviewer:
+    SENT [('discord','stranger-dm'), ('telegram','group-42')])."""
+
+    def _binding(self, channel, chat, auth_method=None, preferred=False):
+        from types import SimpleNamespace
+        return SimpleNamespace(channel_type=channel, channel_chat_id=chat,
+                               auth_method=auth_method, is_preferred=preferred)
+
+    def test_auto_recorded_senders_are_skipped(self):
+        import asyncio
+        import threading
+        from integrations.channels.base import SendResult
+        router = ChannelResponseRouter()
+        rows = [
+            self._binding('discord', 'stranger-dm'),                  # auto
+            self._binding('telegram', 'group-42'),                    # auto
+            self._binding('telegram', 'owner-chat', auth_method='api_key'),
+            self._binding('slack', 'owner-dm', preferred=True),
+        ]
+        db = MagicMock()
+        db.query.return_value.filter_by.return_value.all.return_value = rows
+        sent = []
+
+        async def send(channel, chat, text):
+            sent.append((channel, chat))
+            return SendResult(success=True)
+
+        registry = MagicMock()
+        registry.send_to_channel.side_effect = send
+        loop = asyncio.new_event_loop()
+        runner = threading.Thread(target=loop.run_forever, daemon=True)
+        runner.start()
+        try:
+            with patch.object(ChannelResponseRouter, '_get_db', return_value=db), \
+                    patch.object(ChannelResponseRouter, '_get_registry',
+                                 return_value=registry), \
+                    patch.object(ChannelResponseRouter, '_get_send_loop',
+                                 return_value=loop):
+                router._async_fan_out('owner', 'A prospect replied')
+                asyncio.run_coroutine_threadsafe(asyncio.sleep(0.05), loop).result(2)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            runner.join(2)
+            loop.close()
+        assert sorted(sent) == [('slack', 'owner-dm'), ('telegram', 'owner-chat')]
