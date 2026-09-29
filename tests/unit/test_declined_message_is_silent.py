@@ -92,9 +92,11 @@ def test_declined_message_stays_silent():
 
 
 def test_empty_reply_gets_a_fallback_not_silence():
+    from core.agent_tools import is_user_facing_error
     sent = _route('')
     assert len(sent) == 1
-    assert sent[0].strip(), 'the fallback must be a real sentence'
+    # The canonical failure sentence, so hive callers never count it as work.
+    assert is_user_facing_error(sent[0])
 
 
 @pytest.mark.parametrize('blank', ['   ', '\n'])

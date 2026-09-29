@@ -286,10 +286,13 @@ class ChannelRegistry:
                     "so the user is not left with silence",
                     message.channel, message.sender_id,
                 )
+                # The canonical failure sentence (core.constants), which
+                # is_user_facing_error() recognises -- a caller that must tell
+                # a failed turn from real work reads it as a failure.
+                from core.constants import LLM_GENERIC_ERROR_REPLY
                 await adapter.send_message(
                     chat_id=message.chat_id,
-                    text=("I wasn't able to put together a reply for that one. "
-                          "Could you try rephrasing it?"),
+                    text=LLM_GENERIC_ERROR_REPLY,
                     reply_to=message.id,
                 )
 
