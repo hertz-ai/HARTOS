@@ -191,10 +191,16 @@ def create_binding():
     # into metadata_json here so it's actually persisted (previously
     # silently dropped: only channel_sender_id/channel_chat_id/
     # auth_method/metadata were ever read).
+    # Encrypted when the vault has a key (seal_binding_credential); the live
+    # adapter below still gets the credential itself.
     cred_key, credential = _extract_credential(data, meta)
     metadata_payload = dict(data.get('metadata') or {})
     if cred_key and credential:
-        metadata_payload[cred_key] = credential
+        from integrations.channels.flask_integration import (
+            seal_binding_credential,
+        )
+        metadata_payload[cred_key] = seal_binding_credential(channel_type,
+                                                             credential)
 
     # Check for existing binding
     existing = g.db.query(UserChannelBinding).filter_by(

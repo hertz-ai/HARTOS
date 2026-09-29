@@ -1117,9 +1117,7 @@ class FlaskChannelIntegration:
 
                     reason = 'no stored credential'
                     for row in candidates:
-                        meta = row.metadata_json
-                        if not isinstance(meta, dict):
-                            meta = {}
+                        meta = unseal_binding_metadata(ct, row.metadata_json)
                         token, extras = self._binding_credentials(ct, meta)
                         if not token:
                             # A credential-less row is not a configuration:
@@ -1232,6 +1230,49 @@ def get_channel_integration() -> FlaskChannelIntegration:
     if _integration is None:
         _integration = FlaskChannelIntegration()
     return _integration
+
+
+def seal_binding_credential(channel_type: str, value: str) -> str:
+    """The form a channel credential is kept in on its UserChannelBinding:
+    encrypted with the secrets vault's key (SecretsManager.encrypt_value).
+
+    Without HEVOLVE_MASTER_KEY there is no key, and the credential is kept
+    in plain text anyway: it is what brings the channel back after a restart
+    (restore_persisted_channels).  That is said loudly, naming the channel
+    and never the value.  The one sealer for both binding writers (the
+    register_channel tool and POST /api/social/channels/bindings)."""
+    try:
+        from security.secrets_manager import SecretsManager
+        return SecretsManager.get_instance().encrypt_value(value)
+    except (RuntimeError, ImportError) as e:
+        logger.warning(
+            "%s credential stored in PLAIN TEXT in its channel binding (%s). "
+            "Set HEVOLVE_MASTER_KEY and connect the channel again to store it "
+            "encrypted.", channel_type, e)
+        return value
+
+
+def unseal_binding_metadata(channel_type: str, meta) -> Dict[str, Any]:
+    """A copy of a binding's metadata_json with every sealed credential
+    opened (plain-text values, from before sealing or a keyless node, read
+    as they are).  A credential that cannot be opened is left out, with an
+    error: its ciphertext must never reach an adapter as the token."""
+    out: Dict[str, Any] = {}
+    if not isinstance(meta, dict):
+        return out
+    from security.secrets_manager import SEALED_PREFIX, SecretsManager
+    for key, value in meta.items():
+        if isinstance(value, str) and value.startswith(SEALED_PREFIX):
+            try:
+                value = SecretsManager.get_instance().decrypt_value(value)
+            except ValueError as e:
+                logger.error(
+                    "%s: the stored %s cannot be decrypted (%s); the channel "
+                    "stays offline until it is connected again",
+                    channel_type, key, e)
+                continue
+        out[key] = value
+    return out
 
 
 def _kong_stamped(headers) -> bool:

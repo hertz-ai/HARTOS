@@ -300,11 +300,16 @@ def build_channel_tool_closures(ctx):
             # binding: that row is what restore_persisted_channels reads at
             # boot (flask_integration._binding_credentials), and the same
             # place the /bindings form stores it, so a channel connected
-            # from chat or OAuth comes back after a restart.
+            # from chat or OAuth comes back after a restart.  Encrypted when
+            # the vault has a key (seal_binding_credential).
             cred_meta = {}
             if (len(required) == 1 and meta['auth_method'] != 'gateway_qr'
                     and config.get(required[0])):
-                cred_meta = {required[0]: config[required[0]]}
+                from integrations.channels.flask_integration import (
+                    seal_binding_credential,
+                )
+                cred_meta = {required[0]: seal_binding_credential(
+                    channel_type, config[required[0]])}
 
             # Create user binding
             uid = user_id or _get_user_id_from_threadlocal()
