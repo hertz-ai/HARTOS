@@ -147,17 +147,41 @@ def test_whatsapp_link_failure_names_the_user_or_none(lui, monkeypatch, uid,
     WhatsApp links by QR by default now, so with no number there is no
     phone form; a gateway that cannot be reached is the card the user sees,
     and it must be addressed the same way."""
-    import requests
     ns = _load(uid)
     monkeypatch.setenv('HEVOLVE_WHATSAPP_PHONE', '')
-    with patch('requests.post',
-               side_effect=requests.ConnectionError('gateway down')):
+    # The ONE gateway client answers (None, 503) when it cannot connect.
+    with patch('integrations.social.api_channels._proxy_gateway',
+               return_value=(None, 503)):
         ns['_start_gateway_qr_pair_push']('whatsapp',
                                           {'display_name': 'WhatsApp'})
     args, kwargs = lui.agent_ui_update.call_args
     assert args[1]['type'] == 'toast' and args[1]['severity'] == 'error'
     assert 'WhatsApp' in args[1]['text']
     assert kwargs['user_id'] == expected
+
+
+@pytest.mark.parametrize('text,phone', [
+    ('whatsapp', None),
+    ('whatsapp +91 90030 54371', '919003054371'),
+    ('whatsapp 919003054371', '919003054371'),
+    ('whatsapp {"phone": "+91 90030 54371"}', '919003054371'),
+    ('whatsapp 12345', None),            # too short to be a phone number
+])
+def test_connect_whatsapp_uses_a_number_only_when_given(lui, text, phone):
+    """A number in the chat input asks for a pair code (the way in for
+    someone whose only device is the phone); the name alone shows the QR.
+    It used to accept only the JSON form, so '+91 ...' silently meant QR."""
+    ns = _load()
+    link = MagicMock()
+    ns['_start_gateway_qr_pair_push'] = link
+    meta = {'display_name': 'WhatsApp', 'auth_method': 'gateway_qr',
+            'setup_fields': []}
+    with patch('integrations.channels.agent_tools.build_channel_tool_closures',
+               return_value=_closures('WhatsApp registered and enabled!')), \
+            patch('integrations.channels.metadata.get_channel_metadata',
+                  return_value=meta):
+        ns['_handle_connect_channel_tool'](text)
+    assert link.call_args.kwargs == {'phone': phone}
 
 
 def test_no_thread_local_user_passes_none_not_system(lui):

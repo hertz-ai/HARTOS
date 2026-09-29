@@ -49,7 +49,7 @@ def _get_user_id_from_threadlocal():
 
 
 #: How long _report_when_live waits for a freshly started adapter to connect.
-#: Discord allows itself 30s to connect (see api_channels._wire_live_adapter).
+#: Discord allows itself 30s to connect (discord_adapter.connect).
 _LIVE_WAIT_SECONDS = 35
 
 
@@ -61,7 +61,10 @@ def _emit_to_user(owner, payload: dict) -> None:
         logger.warning("channel card not delivered, no LiquidUIService: %s",
                        payload.get('type'))
         return
-    lui.agent_ui_update(owner or 'system', payload, user_id=owner)
+    if lui.agent_ui_update(owner or 'system', payload, user_id=owner) is False:
+        # Refused (rate cap or halt): the user saw nothing, so say so here.
+        logger.warning("channel %s card refused by LiquidUIService for %s",
+                       payload.get('type'), owner)
 
 
 def _report_when_live(channel_type: str, meta: dict, owner,
@@ -93,20 +96,26 @@ def _report_when_live(channel_type: str, meta: dict, owner,
             logger.warning("%s: adapter status unreadable: %s", channel_type, e)
             status = None
         if status == ChannelStatus.CONNECTED:
-            _emit_to_user(owner, {
-                'type': 'channel_connected',
-                'channel': channel_type, 'channel_type': channel_type,
-                'display_name': name,
-                'color': meta.get('color') or '#00e89d',
-                'icon': meta.get('icon') or channel_type,
-                'message': f"✅ {name} connected.",
-            })
+            try:
+                _emit_to_user(owner, {
+                    'type': 'channel_connected',
+                    'channel': channel_type, 'channel_type': channel_type,
+                    'display_name': name,
+                    'color': meta.get('color') or '#00e89d',
+                    'icon': meta.get('icon') or channel_type,
+                    'message': f"✅ {name} connected.",
+                })
+            except Exception as e:
+                logger.warning("%s: connected card not delivered: %s", channel_type, e)
             return True
-        if _time.monotonic() >= deadline:
+        # ERROR is where a failed start ends (ChannelAdapter.start); there is
+        # nothing left to wait for.
+        if status == ChannelStatus.ERROR or _time.monotonic() >= deadline:
             break
         _time.sleep(poll_seconds)
 
-    reason = (f"not connected after {int(wait_seconds)}s (status: "
+    reason = ("its start failed" if status == ChannelStatus.ERROR else
+              f"not connected after {int(wait_seconds)}s (status: "
               f"{getattr(status, 'value', status) or 'no adapter'})")
     logger.warning("register_channel: %s %s", channel_type, reason)
     try:
@@ -280,6 +289,18 @@ def build_channel_tool_closures(ctx):
                 }
             api._save_config()
 
+            from integrations.channels.metadata import required_setup_keys
+            required = required_setup_keys(meta)
+            # A single-credential channel's token is also kept on the user's
+            # binding: that row is what restore_persisted_channels reads at
+            # boot (flask_integration._binding_credentials), and the same
+            # place the /bindings form stores it, so a channel connected
+            # from chat or OAuth comes back after a restart.
+            cred_meta = {}
+            if (len(required) == 1 and meta['auth_method'] != 'gateway_qr'
+                    and config.get(required[0])):
+                cred_meta = {required[0]: config[required[0]]}
+
             # Create user binding
             uid = user_id or _get_user_id_from_threadlocal()
             if uid:
@@ -296,18 +317,22 @@ def build_channel_tool_closures(ctx):
                                 channel_type=channel_type,
                                 channel_sender_id='agent_registered',
                                 auth_method=meta['auth_method'],
+                                metadata_json=cred_meta or None,
                                 is_active=True,
                             ))
                         else:
                             existing.is_active = True
+                            if cred_meta:
+                                existing.metadata_json = {
+                                    **(existing.metadata_json or {}), **cred_meta}
                         db.commit()
                     finally:
                         db.close()
                 except Exception as e:
-                    logger.debug("Binding creation during registration: %s", e)
+                    logger.warning("register_channel: %s binding not saved for "
+                                   "user %s (it will not survive a restart): %s",
+                                   channel_type, uid, e)
 
-            from integrations.channels.metadata import required_setup_keys
-            required = required_setup_keys(meta)
             missing = [k for k in required if not config.get(k)]
             if missing:
                 return (f"{meta['display_name']} registered with partial config. "
@@ -324,18 +349,33 @@ def build_channel_tool_closures(ctx):
                         f"Link it by scanning the QR code with your phone.")
 
             if len(required) != 1:
-                # Live connect hands the adapter ONE credential (the same
-                # shape /api/social/channels/bindings wires).  A channel
-                # that needs several is started from its saved config at
-                # boot; say so rather than implying it is connected.
-                return (f"{name} registered and enabled! Auth: "
-                        f"{meta['auth_method']}. It starts the next time "
-                        f"HARTOS restarts; connecting it live needs more than "
-                        f"one credential, which live connect does not handle yet.")
+                # Live connect hands the adapter ONE credential (the shape
+                # /api/social/channels/bindings wires and boot restore
+                # reads).  A channel that needs several is saved but NOT
+                # running, and nothing starts it later: say so, rather than
+                # promise a restart that would not bring it up.
+                return (f"{name} was saved, but it can't be started from here: "
+                        f"it needs several credentials, and connecting those "
+                        f"live isn't supported yet. Nothing will arrive on "
+                        f"{name} until an operator starts it.")
+
+            # A setting only the operator can supply (Slack's app-level
+            # SLACK_APP_TOKEN, Zalo's ZALO_OA_ID): name it, instead of the
+            # adapter's bare "returned False".
+            from integrations.channels.flask_integration import (
+                FlaskChannelIntegration,
+            )
+            unmet = FlaskChannelIntegration.unmet_required_settings(channel_type)
+            if unmet:
+                logger.warning("register_channel: %s saved but cannot run, "
+                               "server lacks %s", channel_type, unmet)
+                return (f"{name} was saved, but this server can't run it yet: "
+                        f"the operator must set {', '.join(unmet)}. Nothing "
+                        f"will arrive on {name} until then.")
 
             # Go live now: the same wiring the connect form's /bindings
-            # route uses, so "connected" means an adapter is running, not
-            # just a row in the config.
+            # route uses (it rebuilds an adapter that is dead or holds an
+            # older token), so "connected" means an adapter is running.
             from integrations.social.api_channels import (
                 _extract_credential, _wire_live_adapter,
             )

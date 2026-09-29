@@ -3739,7 +3739,12 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
     import threading
     import time
 
-    import requests as _req
+    # The ONE gateway client (api_channels): same base URL resolution as
+    # the /whatsapp/qr route and the X-Api-Key a remote WAHA needs.  Never
+    # raises; an unreachable gateway is (None, 503).
+    from integrations.social.api_channels import (
+        _proxy_gateway, _whatsapp_gateway_base,
+    )
 
     # Self-contained logger so the helper works whether the module's
     # global `logger` is initialised yet or not (helps in standalone
@@ -3785,32 +3790,31 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
         phone or os.environ.get('HEVOLVE_WHATSAPP_PHONE', '') or '')
         if ch.isdigit())
 
-    base = (os.environ.get('WHATSAPP_GATEWAY_URL', '') or 'http://localhost:3000').rstrip('/')
-    try:
-        _req.post(f"{base}/api/sessions/{sid}/start", timeout=5)
-    except Exception as e:
+    base = _whatsapp_gateway_base()
+    started, start_status = _proxy_gateway('POST', f'/api/sessions/{sid}/start')
+    if started is None or start_status >= 400:
         _fail(f"Couldn't reach the {display_name} link service on this "
-              f"computer ({e.__class__.__name__}). It may still be starting; "
-              f"try again in a minute.")
+              f"computer (HTTP {start_status}"
+              f"{': ' + str(started.get('error')) if started and started.get('error') else ''}"
+              f"). It may still be starting; try again in a minute.")
         return
+
+    # One live attempt per session: a newer connect (say, the phone form
+    # after the QR) supersedes this watcher, so two never both announce.
+    _attempts = _start_gateway_qr_pair_push.__dict__.setdefault('attempts', {})
+    attempt = object()
+    _attempts[sid] = attempt
 
     if phone:
         # Baileys needs ~3s for the WA noise handshake before
         # requestPairingCode succeeds — manual probe earlier today (the
         # FA9K4NHK code) verified this timing.
         time.sleep(3)
-        body = {}
-        try:
-            r = _req.post(
-                f"{base}/api/sessions/{sid}/request-pair-code",
-                json={'phone': phone},
-                timeout=10,
-            )
-            body = r.json() if r.ok else {}
-            code = body.get('code')
-        except Exception as e:
-            _fail(f"Couldn't get a {display_name} pairing code: {e}")
-            return
+        body, _st = _proxy_gateway(
+            'POST', f'/api/sessions/{sid}/request-pair-code',
+            json={'phone': phone})
+        body = body or {}
+        code = body.get('code') if _st < 400 else None
         if not code:
             _fail(f"{display_name} didn't return a pairing code "
                   f"({body.get('error') or 'no code'}). Say 'connect "
@@ -3939,12 +3943,14 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
         last_qr = None
         shown = 0
         while time.time() < deadline:
-            body = {}
-            try:
-                rr = _req.get(f"{base}/api/sessions/{sid}/status", timeout=5)
-                body = rr.json() if rr.ok else {}
-            except Exception as e:
-                _log.debug("gateway_qr: status poll failed: %s", e)
+            if _attempts.get(sid) is not attempt:
+                _log.info("gateway_qr: %s watcher for %s superseded by a "
+                          "newer connect", channel_type, sid)
+                return
+            body, _st = _proxy_gateway('GET', f'/api/sessions/{sid}/status')
+            if body is None or _st >= 400:
+                _log.debug("gateway_qr: status poll HTTP %s", _st)
+                body = {}
             if body.get('authenticated'):
                 # Register binding so Hevolve/Nunba see channel as
                 # connected.  Re-uses the SAME register_channel
@@ -4007,11 +4013,17 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
                              f"→ Linked devices → Link a device, and scan "
                              f"this code."),
                     'qr': qr,
-                    # One id per code: the overlay shows a new code as a new
-                    # card and never re-shows one it already has.
+                    # One id per code; the overlay replaces the channel's
+                    # card in place with each newer code.
                     'msg_id': f"qr_pair-{channel_type}-{sid}-{shown}",
+                    # The alternative for someone whose only device is the
+                    # phone: "Link with phone number" posts {phone} here.
+                    'pair_code_action': (
+                        f'/api/social/channels/{channel_type}/connect-pair-code'),
                 })
             time.sleep(2)
+        if _attempts.get(sid) is not attempt:
+            return
         _fail(f"The {display_name} link expired before it was completed. "
               f"Say 'connect {channel_type}' to get a new "
               f"{'code' if phone else 'QR code'}.")
@@ -4445,14 +4457,21 @@ def _handle_connect_channel_tool(input_text: str) -> str:
             from integrations.channels.metadata import get_channel_metadata
             meta = get_channel_metadata(channel_type) or {}
             if meta.get('auth_method') == 'gateway_qr':
-                # "connect whatsapp" scans a QR; a number in the input
-                # ('whatsapp {"phone": "+91..."}') asks for a pair code.
+                # "connect whatsapp" scans a QR; a number in the input asks
+                # for a pair code ("Link with phone number"), for someone
+                # whose only device is the phone.  Accepts the JSON form
+                # ('whatsapp {"phone": "+91..."}') or a bare number
+                # ('whatsapp +91 90030 54371'); fewer than 8 digits is not
+                # a phone number and leaves the QR.
                 try:
                     _cfg = _json.loads(config_json or '{}')
                 except ValueError:
-                    _cfg = {}
-                _phone = (_cfg.get('phone') or _cfg.get('phone_number') or ''
-                          if isinstance(_cfg, dict) else '')
+                    _cfg = config_json
+                if isinstance(_cfg, dict):
+                    _cfg = _cfg.get('phone') or _cfg.get('phone_number') or ''
+                _phone = ''.join(ch for ch in str(_cfg or '') if ch.isdigit())
+                if len(_phone) < 8:
+                    _phone = ''
                 _start_gateway_qr_pair_push(channel_type, meta,
                                             phone=_phone or None)
         except Exception as e:
@@ -5463,8 +5482,11 @@ def get_tools(req_tool, is_first: bool = False):
                     # LLM call. Doubling escapes them to literals. See
                     # langchain.log 2026-04-11 22:46:01 for the crash.
                     "with credentials (e.g. 'telegram {{\"bot_token\":\"123:ABC\"}}'). "
-                    "For WhatsApp specifically, passing just 'whatsapp' starts a QR "
-                    "authentication flow. Do NOT ask the user for credentials first — "
+                    "For WhatsApp specifically, passing just 'whatsapp' shows a QR "
+                    "code to scan; if the user can't scan (WhatsApp is on the same "
+                    "phone) or asks to link with their number, pass 'whatsapp "
+                    "<their phone number>' to send a pairing code instead. "
+                    "Do NOT ask the user for credentials first — "
                     "call this tool with just the channel name and it will tell you "
                     "what's needed."
                 ),

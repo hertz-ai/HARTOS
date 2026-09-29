@@ -656,6 +656,10 @@ class FlaskChannelIntegration:
         call_kwargs = dict(kwargs)
         spec = self._CHANNEL_SPECS.get(channel_type)
         if spec:
+            unmet = self.unmet_required_settings(channel_type, call_kwargs)
+            if unmet:
+                logger.warning(f"{channel_type} requires {', '.join(unmet)} — skipping")
+                return False
             if token:
                 call_kwargs[spec['token_param']] = token
             for p in spec.get('extra', ()):
@@ -663,14 +667,8 @@ class FlaskChannelIntegration:
                 if call_kwargs.get(name):
                     continue  # explicit kwarg wins over env/default
                 val = (os.getenv(p['env']) if p.get('env') else None) or p.get('default')
-                if not val:
-                    if p.get('required'):
-                        env_hint = f" ({p['env']})" if p.get('env') else ''
-                        logger.warning(
-                            f"{channel_type} requires {name}{env_hint} — skipping")
-                        return False
-                    continue
-                call_kwargs[name] = val
+                if val:
+                    call_kwargs[name] = val
 
         try:
             import importlib
@@ -703,6 +701,29 @@ class FlaskChannelIntegration:
         except Exception as e:
             logger.warning(f"{channel_type} adapter registration failed: {e}")
             return False
+
+    @classmethod
+    def unmet_required_settings(cls, channel_type: str,
+                                provided: Dict[str, Any] = None) -> list:
+        """The required extra settings ``channel_type`` cannot run without,
+        named by the env var an operator sets (or the parameter when it has
+        no env var).  Empty when every one is supplied by ``provided``, the
+        environment or its default.
+
+        The one statement of this rule: register_channel refuses on it, and
+        the connect tool uses it to tell a user WHICH setting the server
+        lacks (Slack's SLACK_APP_TOKEN) instead of "returned False".
+        """
+        provided = provided or {}
+        spec = cls._CHANNEL_SPECS.get(channel_type) or {}
+        unmet = []
+        for p in spec.get('extra', ()):
+            if not p.get('required') or provided.get(p['param']):
+                continue
+            if (os.getenv(p['env']) if p.get('env') else None) or p.get('default'):
+                continue
+            unmet.append(p.get('env') or p['param'])
+        return unmet
 
     @staticmethod
     def _credential_kwarg(factory_fn, token: str) -> Dict[str, str]:

@@ -93,13 +93,25 @@ class TestRegisterChannelCompletes:
         wire.assert_not_called()
         watch.assert_not_called()
 
-    def test_slack_needs_only_the_bot_token_and_goes_live(self):
+    def test_slack_needs_only_the_bot_token_and_goes_live(self, monkeypatch):
+        monkeypatch.setenv('SLACK_APP_TOKEN', 'xapp-1')
         with _no_db_no_disk() as (wire, watch):
             out = _register_fn()('slack', '{"bot_token": "xoxb-1"}')
         assert 'registered and enabled' in out
         wire.assert_called_once_with('slack', 'xoxb-1')
         watch.assert_called_once()
         assert watch.call_args.args[0] == 'slack'
+
+    def test_slack_without_the_server_app_token_names_it(self, monkeypatch):
+        """Socket Mode needs the app's xapp- token, an operator setting.
+        The user is told which one, not the adapter's bare "returned False"."""
+        monkeypatch.delenv('SLACK_APP_TOKEN', raising=False)
+        with _no_db_no_disk() as (wire, watch):
+            out = _register_fn()('slack', '{"bot_token": "xoxb-1"}')
+        assert 'registered and enabled' not in out
+        assert 'SLACK_APP_TOKEN' in out
+        wire.assert_not_called()
+        watch.assert_not_called()
 
     def test_a_channel_that_cannot_start_says_so(self):
         with _no_db_no_disk({'success': False,
@@ -109,12 +121,34 @@ class TestRegisterChannelCompletes:
         assert 'could not be started' in out and 'returned False' in out
         watch.assert_not_called()
 
-    def test_multi_credential_channel_is_saved_and_says_when_it_starts(self):
+    def test_multi_credential_channel_says_it_is_not_running(self):
+        """Live connect passes one credential and boot restore reads one, so
+        a channel needing several is saved but not started.  It must not
+        claim success or promise a restart that would not bring it up."""
         with _no_db_no_disk() as (wire, _watch):
             out = _register_fn()('mattermost', json.dumps(
                 {'server_url': 'https://mm.example', 'access_token': 't'}))
-        assert 'registered and enabled' in out and 'restarts' in out
+        assert 'registered and enabled' not in out
+        assert "can't be started" in out and 'restart' not in out
         wire.assert_not_called()
+
+    def test_the_token_is_kept_where_boot_restore_reads_it(self):
+        """restore_persisted_channels reads the binding's metadata_json; a
+        chat or OAuth connect that kept the token only in the admin config
+        (whose boot reader looks at the top level, not ['config']) never came
+        back after a restart."""
+        from integrations.social.models import UserChannelBinding
+        added = []
+        db = MagicMock()
+        db.query.return_value.filter_by.return_value.first.return_value = None
+        db.add.side_effect = added.append
+        with _no_db_no_disk() as (_wire, _watch), \
+                patch('integrations.social.models.get_db', return_value=db):
+            _register_fn()('telegram', '{"bot_token": "123:ABC"}')
+        (row,) = added
+        assert isinstance(row, UserChannelBinding)
+        assert row.metadata_json == {'bot_token': '123:ABC'}
+        db.commit.assert_called_once()
 
     def test_an_empty_token_is_still_missing(self):
         with _no_db_no_disk() as (wire, _watch):
@@ -151,7 +185,8 @@ class TestOAuthCallbackCompletes:
             monkeypatch.setenv(f'HARTOS_OAUTH_CLIENT_{ch}', 'id')
             monkeypatch.setenv(f'HARTOS_OAUTH_SECRET_{ch}', 'secret')
 
-    def test_slack_sign_in_ends_connected(self, lui):
+    def test_slack_sign_in_ends_connected(self, lui, monkeypatch):
+        monkeypatch.setenv('SLACK_APP_TOKEN', 'xapp-1')
         with _no_db_no_disk() as (wire, _watch):
             r = _callback(_oauth_app(), 'slack',
                           {'ok': True, 'bot': {'access_token': 'xoxb-9'}})
@@ -201,9 +236,22 @@ class TestReportWhenLive:
         assert card['channel'] == 'telegram'
         assert lui.agent_ui_update.call_args.kwargs['user_id'] == 'u-1'
 
-    def test_never_connecting_is_a_toast_and_a_fleet_banner(self, lui):
+    def test_a_failed_start_is_reported_without_waiting_out_the_clock(self, lui):
+        import time
         from integrations.channels.agent_tools import _report_when_live
         reg = self._registry([ChannelStatus.ERROR])
+        t0 = time.monotonic()
+        with patch('integrations.channels.registry.get_registry', return_value=reg), \
+                patch('integrations.social.fleet_command.emit_channel_unhealthy'), \
+                patch('integrations.social.models.get_db', return_value=MagicMock()):
+            ok = _report_when_live('telegram', {'display_name': 'Telegram'},
+                                   'u-1', wait_seconds=30, poll_seconds=0.01)
+        assert ok is False and time.monotonic() - t0 < 5
+        assert 'start failed' in _cards(lui, 'toast')[0]['text']
+
+    def test_never_connecting_is_a_toast_and_a_fleet_banner(self, lui):
+        from integrations.channels.agent_tools import _report_when_live
+        reg = self._registry([ChannelStatus.DISCONNECTED])
         fanout = MagicMock()
         with patch('integrations.channels.registry.get_registry', return_value=reg), \
                 patch('integrations.social.fleet_command.emit_channel_unhealthy',
@@ -213,7 +261,7 @@ class TestReportWhenLive:
                                    'u-1', wait_seconds=0.05, poll_seconds=0.01)
         assert ok is False
         (toast,) = _cards(lui, 'toast')
-        assert toast['severity'] == 'error' and 'error' in toast['text']
+        assert toast['severity'] == 'error' and 'disconnected' in toast['text']
         assert _cards(lui, 'channel_connected') == []
         assert fanout.call_args.kwargs['channel_type'] == 'telegram'
 
@@ -286,9 +334,7 @@ class _InlineThread:
 
 
 def _status(**kw):
-    r = MagicMock(ok=True)
-    r.json.return_value = kw
-    return r
+    return kw
 
 
 class TestWhatsAppLinksByQR:
@@ -299,15 +345,16 @@ class TestWhatsAppLinksByQR:
         tools = [('register_channel', 'd',
                   lambda ch, cfg: registered.append((ch, cfg)) or 'ok')]
         posts = []
+        seq = iter(statuses)
 
-        def fake_post(url, **kw):
-            posts.append(url)
-            r = MagicMock(ok=True)
-            r.json.return_value = pair_body or {}
-            return r
+        def gateway(method, path, **kw):
+            if method == 'POST':
+                posts.append(path)
+                return (pair_body or {'success': True}), 200
+            return next(seq, statuses[-1]), 200
 
-        with patch('requests.post', side_effect=fake_post), \
-                patch('requests.get', side_effect=list(statuses)), \
+        with patch('integrations.social.api_channels._proxy_gateway',
+                   side_effect=gateway), \
                 patch('threading.Thread', _InlineThread), \
                 patch('time.sleep'), \
                 patch('integrations.channels.agent_tools.build_channel_tool_closures',
@@ -341,6 +388,31 @@ class TestWhatsAppLinksByQR:
         assert any('request-pair-code' in u for u in posts)
         assert _cards(lui, 'pair_code')[0]['code'] == 'ABCD1234'
         assert _cards(lui, 'qr_pair') == []
+
+    def test_a_newer_connect_supersedes_the_older_watcher(self, lui, monkeypatch):
+        """Two watchers on one session would both announce "connected" (and
+        both time out).  A new attempt retires the running one."""
+        monkeypatch.delenv('HEVOLVE_WHATSAPP_PHONE', raising=False)
+        ensure_live = MagicMock(return_value={'success': True})
+        link = _load_link_helper(ensure_live)
+        state = {'polls': 0}
+
+        def gateway(method, path, **kw):
+            if method == 'POST':
+                return {'success': True}, 200
+            state['polls'] += 1
+            if state['polls'] == 1:
+                # While the first watcher polls, the user connects again.
+                link.__dict__['attempts'][path.split('/')[3]] = object()
+            return {'qr': 'QR-A'}, 200
+
+        with patch('integrations.social.api_channels._proxy_gateway',
+                   side_effect=gateway), \
+                patch('threading.Thread', _InlineThread), patch('time.sleep'):
+            link('whatsapp', {'display_name': 'WhatsApp'})
+        assert state['polls'] == 1          # it stopped at the next check
+        assert _cards(lui, 'toast') == []   # and did not time out loudly
+        ensure_live.assert_not_called()
 
     def test_an_unscanned_code_expires_loudly(self, lui, monkeypatch):
         monkeypatch.delenv('HEVOLVE_WHATSAPP_PHONE', raising=False)
