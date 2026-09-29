@@ -70,4 +70,21 @@ def test_agent_daemon_sleep_heartbeats_a_late_watchdog(monkeypatch):
     daemon = AgentDaemon.__new__(AgentDaemon)
     daemon._running = True
     daemon._wd_sleep(0.01)
-    assert wd.beats == ['agent_daemon']
+    assert wd.beats and set(wd.beats) == {'agent_daemon'}
+
+
+def test_method_and_function_heartbeat_the_same_way():
+    """NodeWatchdog.sleep_with_heartbeat delegates to the module primitive:
+    one beat before the first chunk and one after every chunk."""
+    wd = nw.NodeWatchdog.__new__(nw.NodeWatchdog)
+    beats = []
+    wd.heartbeat = beats.append
+    wd.sleep_with_heartbeat('model_lifecycle', 0.05, chunk_seconds=0.02)
+    assert beats[0] == 'model_lifecycle'
+    assert len(beats) == 1 + 3          # 0.05 s in 0.02 s chunks -> 3 chunks
+
+
+def test_zero_seconds_still_heartbeats_once(monkeypatch):
+    wd = _RecordingWatchdog()
+    nw.sleep_with_heartbeat('lan', 0, watchdog=wd)
+    assert wd.beats == ['lan']

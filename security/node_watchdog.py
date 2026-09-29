@@ -216,22 +216,8 @@ class NodeWatchdog:
             stop_check: Optional callable that returns True to exit
                 the sleep early. Called between chunks.
         """
-        if total_seconds <= 0:
-            self.heartbeat(name)
-            return
-        end = time.monotonic() + total_seconds
-        # Guarantee at least one heartbeat at the start so callers that
-        # were blocked before calling sleep_with_heartbeat reset their age.
-        self.heartbeat(name)
-        while True:
-            if stop_check is not None and stop_check():
-                return
-            remaining = end - time.monotonic()
-            if remaining <= 0:
-                return
-            chunk = min(chunk_seconds, remaining)
-            time.sleep(chunk)
-            self.heartbeat(name)
+        sleep_with_heartbeat(name, total_seconds, chunk_seconds=chunk_seconds,
+                             stop_check=stop_check, watchdog=self)
 
     def start(self) -> None:
         """Start the watchdog background thread. Call LAST after all daemons."""
@@ -558,25 +544,39 @@ def get_watchdog() -> Optional[NodeWatchdog]:
     return _watchdog
 
 
+
 def sleep_with_heartbeat(name: str, seconds: float, *,
                          stop_check: Optional[Callable[[], bool]] = None,
                          wait: Optional[Callable[[float], bool]] = None,
-                         chunk_seconds: float = 10.0) -> None:
-    """Sleep ``seconds`` in chunks, heartbeating ``name`` before each chunk.
+                         chunk_seconds: float = 10.0,
+                         watchdog: Optional['NodeWatchdog'] = None) -> None:
+    """Sleep ``seconds`` in chunks, heartbeating ``name`` throughout.
 
-    Module-level twin of :meth:`NodeWatchdog.sleep_with_heartbeat` for daemons
-    that may start BEFORE the watchdog exists.  Callers used to resolve
-    ``get_watchdog()`` once: during early boot it was still None, so the whole
-    sleep (the HEVOLVE_DAEMON_BOOT_DELAY boot grace can be hours) ran with no
-    heartbeats, the thread looked frozen once the watchdog registered it, and
-    it was force-restarted every ~5 minutes for the life of the process.
-    Re-resolving per chunk picks the watchdog up as soon as it appears.
+    THE sleep primitive for watchdog-registered daemons;
+    :meth:`NodeWatchdog.sleep_with_heartbeat` delegates here.  One heartbeat
+    before the first chunk (resets a caller that was blocked before sleeping)
+    and one after every chunk.
+
+    Without an explicit ``watchdog`` the singleton is re-resolved at every
+    heartbeat.  Daemons can start before the watchdog exists; resolving it
+    once meant the whole first sleep (the HEVOLVE_DAEMON_BOOT_DELAY boot
+    grace can be hours) ran with no heartbeats, the thread looked frozen once
+    registered, and it was force-restarted every ~5 minutes for the life of
+    the process.
 
     ``stop_check`` returning True ends the sleep between chunks.  ``wait``
     replaces ``time.sleep`` for a chunk and ends the sleep when it returns
     True -- pass ``threading.Event.wait`` so ``stop()`` wakes the caller at
-    once instead of after the current chunk.
+    once.
     """
+    def _beat() -> None:
+        wd = watchdog if watchdog is not None else get_watchdog()
+        if wd is not None:
+            wd.heartbeat(name)
+
+    _beat()
+    if seconds <= 0:
+        return
     end = time.monotonic() + seconds
     while True:
         if stop_check is not None and stop_check():
@@ -584,12 +584,10 @@ def sleep_with_heartbeat(name: str, seconds: float, *,
         remaining = end - time.monotonic()
         if remaining <= 0:
             return
-        wd = get_watchdog()
-        if wd is not None:
-            wd.heartbeat(name)
         chunk = min(chunk_seconds, remaining)
         if wait is not None:
             if wait(chunk):
                 return
         else:
             time.sleep(chunk)
+        _beat()

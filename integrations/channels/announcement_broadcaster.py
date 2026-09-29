@@ -831,10 +831,8 @@ def _content_distribution_loop() -> None:
         except Exception:
             logger.exception("content distribution pass failed")
         try:
-            if wd is not None:
-                wd.sleep_with_heartbeat(name, CONTENT_PUBLISH_INTERVAL_SEC)
-            else:
-                time.sleep(CONTENT_PUBLISH_INTERVAL_SEC)
+            from security.node_watchdog import sleep_with_heartbeat
+            sleep_with_heartbeat(name, CONTENT_PUBLISH_INTERVAL_SEC, watchdog=wd)
         except Exception:
             time.sleep(CONTENT_PUBLISH_INTERVAL_SEC)
 
