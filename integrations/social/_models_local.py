@@ -1505,6 +1505,17 @@ class ProximityMatch(Base):
         if self.status == 'matched':
             d['user_a'] = {'id': self.user_a_id}
             d['user_b'] = {'id': self.user_b_id}
+            # Client cards render a display name per side (falls back to
+            # 'User' when absent) — nothing populated it, so every match
+            # rendered as "User & User" regardless of who actually matched.
+            d['display_name_a'] = (
+                (self.user_a.display_name or self.user_a.username)
+                if self.user_a else None
+            )
+            d['display_name_b'] = (
+                (self.user_b.display_name or self.user_b.username)
+                if self.user_b else None
+            )
         elif viewer_id:
             is_a = viewer_id == self.user_a_id
             d['you_revealed'] = (is_a and self.a_revealed_at is not None) or \
