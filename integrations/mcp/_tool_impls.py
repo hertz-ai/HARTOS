@@ -99,23 +99,19 @@ def list_agents(category: Optional[str] = None, query: Optional[str] = None) -> 
             "model_type": a.model_type,
         })
 
-    # Also include dynamically discovered agents (trained recipes)
-    prompts_dir = get_recipe_prompts_dir()
+    # Also include this node's agents from the prompts dir, through the one
+    # agent reader: a glob of every JSON listed staged plans, recipes, action
+    # and personality files as agents too.
+    from core.prompt_files import local_agent_prompts
     dynamic = []
-    if os.path.isdir(prompts_dir):
-        for f in _glob.glob(os.path.join(prompts_dir, '*.json')):
-            try:
-                with open(f) as fh:
-                    data = json.load(fh)
-                dynamic.append({
-                    "agent_id": data.get("prompt_id", Path(f).stem),
-                    "name": data.get("agent_name", Path(f).stem),
-                    "category": "dynamic_recipe",
-                    "description": data.get("description", "Trained agent recipe"),
-                    "model_type": "llm",
-                })
-            except Exception:
-                pass
+    for stem, data in local_agent_prompts(get_recipe_prompts_dir()):
+        dynamic.append({
+            "agent_id": data.get("prompt_id", stem),
+            "name": data.get("agent_name", stem),
+            "category": "dynamic_recipe",
+            "description": data.get("description", "Trained agent recipe"),
+            "model_type": "llm",
+        })
 
     # Trained + hive agents: user_type='agent' rows in the social DB (the
     # same query DashboardService._get_trained_agents runs).  The sync

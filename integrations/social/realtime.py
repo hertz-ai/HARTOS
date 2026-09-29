@@ -97,7 +97,7 @@ def _authorize_topic_for_user_id(topic: str, user_id: str) -> bool:
             return False
         # Unknown tenant shape — refuse.
         return False
-    return topic_open_to(topic, user_id)
+    return topic_open_to(topic, user_id, publish=True)
 
 
 _PUBLISH_COUNTERS = {

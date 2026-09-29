@@ -41,16 +41,20 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+# The REAL modules are patched attribute by attribute, never swapped out of
+# sys.modules.  This file used patch.dict('sys.modules', {...}) for
+# local_computer_tool, and restoring that dict DROPS every module first
+# imported inside it (qwen3vl_backend, activity_stream, ...) while leaving
+# the stale object on its package.  Later, `from integrations.vlm import
+# qwen3vl_backend` returned that stale object, a test patched it, and the
+# loop's own call-time import loaded a fresh one: measured 2026-09-27,
+# test_vlm_loop_feeds_back_action_output then sent real requests to
+# 127.0.0.1:8080, and a test here patched a stale subprocess_safe and passed
+# with the code it guards disabled.
 from integrations.vlm import local_loop  # noqa: E402
-# Imported HERE, before any test runs: _run_loop's patch.dict('sys.modules')
-# drops every module first imported inside it, after which `from
-# integrations.vlm import activity_stream` hands back the stale package
-# attribute while the loop re-imports a fresh copy -- so a test patching
-# activity_stream would patch a module the loop no longer uses.
 from integrations.vlm import activity_stream as act  # noqa: E402
-# Same reason, for the other modules these tests patch or share state with:
-# measured 2026-09-27, the late-finish test patched a stale subprocess_safe
-# and passed with the code it guards disabled.
+from integrations.vlm import local_computer_tool as lct  # noqa: E402
+from integrations.vlm import qwen3vl_backend  # noqa: E402
 from core import subprocess_safe  # noqa: E402
 from hartos.threadlocal import thread_local_data as tld  # noqa: E402
 from integrations.vlm.local_loop import run_local_agentic_loop  # noqa: E402
@@ -92,23 +96,18 @@ def _backend(response, call_api=None):
 
 def _run_loop(execute_action, *, budget=BUDGET_S, call_api=None,
               message_extra=None, response=_OPEN_FILE, max_iterations=5):
-    lct = MagicMock()
-    lct.take_screenshot.return_value = 'base64'
-    lct.execute_action.side_effect = execute_action
-    lct.VLM_IMG_W = 1280
-    lct.VLM_IMG_H = 720
     message = {'instruction_to_vlm_agent': 'Open feedback_collector.py',
                'max_ETA_in_seconds': budget}
     message.update(message_extra or {})
     # resolve_steering_agent_id is a DB lookup; its first import alone costs
     # over a second on a loaded box, which would spend the whole test budget
     # before iteration 1 and leave nothing under test.
-    with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': lct}), \
-            patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
-                  return_value=_backend(response, call_api)), \
-            patch('integrations.vlm.activity_stream.resolve_steering_agent_id',
-                  return_value=''), \
-            patch('integrations.vlm.local_loop.time.sleep'):
+    with patch.object(lct, 'take_screenshot', return_value='base64'), \
+            patch.object(lct, 'execute_action', side_effect=execute_action), \
+            patch.object(qwen3vl_backend, 'get_qwen3vl_backend',
+                         return_value=_backend(response, call_api)), \
+            patch.object(act, 'resolve_steering_agent_id', return_value=''), \
+            patch.object(local_loop.time, 'sleep'):
         t0 = time.monotonic()
         result = run_local_agentic_loop(message, tier='inprocess',
                                         max_iterations=max_iterations)

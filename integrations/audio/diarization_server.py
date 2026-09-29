@@ -275,3 +275,12 @@ if __name__ == "__main__":
     )
 
     asyncio.run(main(args.port, args.device, args.output_dir, hf_token))
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+ENV_SECRETS = (
+    'HEVOLVE_HF_TOKEN',
+)

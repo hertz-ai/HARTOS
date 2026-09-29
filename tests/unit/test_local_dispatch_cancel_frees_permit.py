@@ -280,3 +280,85 @@ def test_a_turn_that_swallows_the_refusal_still_reports_cancelled(chat,
     assert dispatch.local_chat_dispatch('p', 'u', 'pid', daemon_id='a2a_s',
                                         cancel_event=cancel) == ('cancelled', None)
     assert _permit_free()
+
+
+# ── review of f97b6bed8 follow-ups ──────────────────────────────────────
+
+def test_two_tasks_in_one_context_keep_their_own_cancel(monkeypatch):
+    """F4: the binding was keyed by daemon_a2a_<contextId>, which the PEER
+    chooses; two tasks in one context overwrote each other's cancel.  Each
+    task's turn now has its own request id."""
+    import asyncio
+    import types
+    from integrations.google_a2a import dynamic_agent_registry as dar
+    seen = []
+
+    def spy(message, user_id, prompt_id, daemon_id=None, cancel_event=None):
+        seen.append(daemon_id)
+        return 'ok', 'done'
+    monkeypatch.setattr(dispatch, 'local_chat_dispatch', spy)
+    ex = dar.DynamicAgentExecutor.__new__(dar.DynamicAgentExecutor)
+    agent = types.SimpleNamespace(persona='p', prompt_id='42', metadata={})
+    ex.discovery = types.SimpleNamespace(get_agent_by_id=lambda a: agent)
+    for tid in ('task-1', 'task-2'):
+        asyncio.run(ex.execute_agent_task('42_0', 'hi', 'same-ctx',
+                                          cancel_event=threading.Event(),
+                                          task_id=tid))
+    assert len(set(seen)) == 2, seen
+    assert all('same-ctx' not in d for d in seen), seen
+
+
+def test_a_mid_turn_cancel_is_reported_as_what_happened(monkeypatch, caplog):
+    """F2: a turn cancelled mid-flight was reported 'cancelled by the caller
+    before its turn started' and logged at ERROR."""
+    import asyncio
+    import logging
+    import types
+    from integrations.google_a2a import dynamic_agent_registry as dar
+    from integrations.google_a2a import register_dynamic_agents as rda
+    monkeypatch.setattr(dispatch, 'local_chat_dispatch',
+                        lambda *a, **k: ('cancelled', None))
+    agent = dar.TrainedAgent(
+        agent_id='77_0', prompt_id=77, flow_id=0, persona='ops', action='a',
+        recipe=[], status='done', can_perform_without_user_input='yes',
+        fallback_action='', metadata={'user_id': 'u'}, recipe_file='')
+    ex = dar.DynamicAgentExecutor.__new__(dar.DynamicAgentExecutor)
+    ex.discovery = types.SimpleNamespace(get_agent_by_id=lambda a: agent)
+    monkeypatch.setattr(rda, 'get_dynamic_executor', lambda: ex)
+    run = rda.create_dynamic_executor_function(agent)
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(RuntimeError) as err:
+            asyncio.run(run('hi', 'ctx', cancel_event=threading.Event()))
+    assert 'before its turn started' not in str(err.value)
+    assert 'cancelled' in str(err.value)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], \
+        [r.getMessage() for r in caplog.records]
+
+
+def test_the_httpx_path_refuses_a_cancelled_turn(monkeypatch):
+    """The refusal holds on the httpx/openai transport too (autogen and
+    langchain calls), not only pooled_post: the patched Client.send admits
+    through the same scheduler slot."""
+    import httpx
+    from core import llm_outbound_logger as lol
+    from core.llama_scheduler import TurnCancelled, get_scheduler
+    from hartos.threadlocal import thread_local_data
+    lol.install()
+    monkeypatch.setattr(lol, '_is_target_request', lambda url, method: True)
+    sent = []
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda req: sent.append(req) or httpx.Response(200, json={})))
+    monkeypatch.setattr(lol, '_select_send_client', lambda self, req: self)
+    rid = 'daemon_a2a_httpx_probe'
+    cancel = threading.Event()
+    cancel.set()
+    get_scheduler().bind_cancel(rid, cancel)
+    thread_local_data.set_request_id(rid)
+    try:
+        with pytest.raises(TurnCancelled):
+            client.post('http://127.0.0.1:8080/v1/chat/completions',
+                        json={'messages': [{'role': 'user', 'content': 'x'}]})
+    finally:
+        get_scheduler().unbind_cancel(rid)
+        thread_local_data.set_request_id(None)
+    assert sent == []

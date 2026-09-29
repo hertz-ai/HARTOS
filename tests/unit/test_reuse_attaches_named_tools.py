@@ -173,9 +173,15 @@ class TestReuseConsultsTheActionsNamedTools:
             'google_search outright')
         assert 'attach_for_names(' in reach, (
             'and must attach them via the name-keyed primitive')
-        assert 'detect_goal_tags(' in block, (
+        # The tag scan moved into core.agent_tool_menu.attach_for_turn, the
+        # one per-turn attach CREATE's turn now shares (review of d99b1aa88);
+        # follow that indirection as the named attach's is followed above.
+        assert 'attach_for_turn(' in block, (
             'the tag scan stays — it is the fallback for families nothing '
             'names; this fix is ADDITIVE, not a replacement')
+        from core.agent_tool_menu import attach_for_turn
+        import inspect
+        assert 'detect_goal_tags(' in inspect.getsource(attach_for_turn)
 
 
 class TestNamedToolExtraction:

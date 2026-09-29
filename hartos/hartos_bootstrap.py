@@ -846,3 +846,15 @@ def _run_on_bootstrap_complete(cfg: dict) -> None:
         cb()
     except Exception as e:
         logger.warning(f"on_bootstrap_complete callback failed: {e}")
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+ENV_SECRETS = (
+    'DISCORD_BOT_TOKEN',
+    'SLACK_BOT_TOKEN',
+    'TELEGRAM_BOT_TOKEN',
+    'WHATSAPP_ACCESS_TOKEN',
+)

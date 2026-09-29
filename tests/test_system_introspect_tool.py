@@ -293,13 +293,46 @@ def test_a_dev_run_with_no_log_of_its_own_reads_the_installed_one(tool, tmp_path
     assert result['log_path'] == str(tmp_path / 'logs' / 'draft_decision.jsonl')
 
 
-def test_this_runs_own_log_wins_over_the_installed_one(tool, tmp_path):
+def _both_logs(tmp_path, dev_age_s, installed_age_s):
+    import os
+    import time
     _decision(tmp_path / 'logs', 'draft_enabled')
     _decision(tmp_path / 'logs-dev', 'main_only')
-    with patch('core.platform_paths.get_log_dir', return_value=str(tmp_path / 'logs-dev')), \
-            patch('core.platform_paths.get_installed_log_dir', return_value=str(tmp_path / 'logs')):
+    now = time.time()
+    for d, age in (('logs-dev', dev_age_s), ('logs', installed_age_s)):
+        p = tmp_path / d / 'draft_decision.jsonl'
+        os.utime(p, (now - age, now - age))
+    return (patch('core.platform_paths.get_log_dir', return_value=str(tmp_path / 'logs-dev')),
+            patch('core.platform_paths.get_installed_log_dir', return_value=str(tmp_path / 'logs')))
+
+
+def test_the_newer_of_the_two_logs_is_read(tool, tmp_path):
+    own, installed = _both_logs(tmp_path, dev_age_s=10, installed_age_s=3600)
+    with own, installed:
         result = tool.get_boot_decision()
     assert result['decision'] == 'main_only'
+
+
+def test_a_stale_dev_log_never_hides_a_newer_installed_boot(tool, tmp_path):
+    # Review of e1a1aa233 (F4): logs-dev from last week, the installed app
+    # booted an hour ago.
+    own, installed = _both_logs(tmp_path, dev_age_s=7 * 86400, installed_age_s=3600)
+    with own, installed:
+        result = tool.get_boot_decision()
+    assert result['decision'] == 'draft_enabled'
+    assert result['log_path'] == str(tmp_path / 'logs' / 'draft_decision.jsonl')
+
+
+def test_not_available_names_every_file_it_looked_at(tool, tmp_path):
+    dev = tmp_path / 'logs-dev'
+    inst = tmp_path / 'logs'
+    with patch('core.platform_paths.get_log_dir', return_value=str(dev)), \
+            patch('core.platform_paths.get_installed_log_dir', return_value=str(inst)):
+        result = tool.get_boot_decision()
+    assert result['available'] is False
+    names = [str(dev / 'draft_decision.jsonl'), str(inst / 'draft_decision.jsonl')]
+    assert result['checked'] == names
+    assert all(n in result['summary'] for n in names)
 
 
 def test_the_installed_log_dir_is_the_log_dir_without_the_dev_suffix(monkeypatch):

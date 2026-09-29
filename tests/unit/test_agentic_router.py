@@ -183,17 +183,20 @@ class TestFindMatchingAgent:
         from integrations.agentic_router import find_matching_agent
 
         mock_llm = MagicMock()
-        mock_llm.invoke.return_value = MagicMock(content='test_agent_42')
+        mock_llm.invoke.return_value = MagicMock(content='4242')
         mock_get_llm.return_value = mock_llm
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            # An agent record is {prompt_id}.json with no '_' in the name
+            # (core.prompt_files.local_agent_prompts): '_' joins the flow,
+            # action and recipe files, and a prompt id is an int or a UUID.
             recipe = {'name': 'Portfolio Builder', 'goal': 'Build portfolio websites'}
-            with open(os.path.join(tmpdir, 'test_agent_42.json'), 'w') as f:
+            with open(os.path.join(tmpdir, '4242.json'), 'w') as f:
                 json.dump(recipe, f)
 
             result = find_matching_agent('build me a portfolio website', tmpdir)
             assert result is not None
-            assert result['agent_id'] == 'test_agent_42'
+            assert result['agent_id'] == '4242'
             assert result['name'] == 'Portfolio Builder'
             assert result['source'] == 'recipe'
             assert result['score'] == 15  # LLM-selected = high confidence
@@ -414,22 +417,11 @@ class TestShouldAutoCreateAgent:
         assert should_auto_create_agent('do math') is False
 
 
-# ══════════════════════════════════════════════════════════════════
-# 7. Timeout Guard in Handler
-# ══════════════════════════════════════════════════════════════════
 
-class TestTimeoutGuard:
-    """Verify _handle_agentic_router_tool has timeout protection."""
-
-    def test_handler_source_has_timeout(self):
-        """_handle_agentic_router_tool should use concurrent.futures timeout."""
-        # Read the source file directly to avoid inspect failures when
-        # hart_intelligence_entry has already been partially mocked.
-        source_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            'hart_intelligence_entry.py')
-        with open(source_path, 'r', encoding='utf-8') as f:
-            src = f.read()
-        assert 'concurrent.futures' in src
-        assert 'timeout' in src.lower()
-        assert 'TimeoutError' in src
+# 7. Timeout guard: the router's plan is bounded by
+# integrations.agentic_router.build_agentic_plan_bounded (on
+# core.subprocess_safe.call_bounded).  Its behaviour is tested, and a
+# hand-rolled bounded wait is refused, in tests/unit/test_one_bounded_wait.py.
+# The source-grep test that stood here ('concurrent.futures' / 'TimeoutError'
+# in hart_intelligence_entry.py) was removed 2026-09-27: it passed while the
+# 15 s bound never released the turn, and failed once it was fixed.

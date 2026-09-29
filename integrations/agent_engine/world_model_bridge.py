@@ -85,7 +85,11 @@ class WorldModelBridge:
         self._experience_queue: deque = deque(maxlen=10000)
         self._flush_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix='wm_flush')
-        atexit.register(lambda: self._flush_executor.shutdown(wait=False))
+        self._flush_timer = None
+        self._flush_closed = False
+        self._flush_max_wait = max(1.0, float(os.environ.get(
+            'HEVOLVE_WM_FLUSH_MAX_WAIT', '60')))
+        atexit.register(self._shutdown_flush)
         self._flush_batch_size = int(os.environ.get(
             'HEVOLVE_WM_FLUSH_BATCH', '50'))
         # Real-throughput signal for check_health: WHEN experiences last actually
@@ -781,8 +785,56 @@ class WorldModelBridge:
                 while (self._experience_queue and
                        len(batch) < self._flush_batch_size):
                     batch.append(self._experience_queue.popleft())
+            self._schedule_flush_locked()
         if batch:
+            self._submit_training_batch(batch)
+
+    def _submit_training_batch(self, batch):
+        with self._lock:
+            if self._flush_closed:
+                # Shutdown raced a drained batch: retain it locally, do not
+                # submit work to an executor that has already stopped.
+                room = max(0, self._experience_queue.maxlen - len(self._experience_queue))
+                self._experience_queue.extendleft(reversed(batch[:room]))
+                return
             self._flush_executor.submit(self._flush_to_world_model, batch)
+
+    def _schedule_flush_locked(self):
+        # Same bounded queue, executor and replay path. A sparse queue must not
+        # wait forever for 50 samples, nor require a new interaction to retry.
+        if not self._experience_queue or self._flush_closed:
+            if self._flush_timer is not None:
+                self._flush_timer.cancel()
+                self._flush_timer = None
+            return
+        if self._flush_timer is None:
+            timer = threading.Timer(
+                self._flush_max_wait, lambda: self._flush_due(timer))
+            timer.daemon = True
+            self._flush_timer = timer
+            timer.start()
+
+    def _flush_due(self, timer):
+        with self._lock:
+            # A cancelled callback can race a new batch/timer. Only the timer
+            # currently owning this queue may drain it.
+            if self._flush_closed or self._flush_timer is not timer:
+                return
+            self._flush_timer = None
+            batch = []
+            while self._experience_queue and len(batch) < self._flush_batch_size:
+                batch.append(self._experience_queue.popleft())
+            self._schedule_flush_locked()
+        if batch:
+            self._submit_training_batch(batch)
+
+    def _shutdown_flush(self):
+        with self._lock:
+            self._flush_closed = True
+            if self._flush_timer is not None:
+                self._flush_timer.cancel()
+                self._flush_timer = None
+        self._flush_executor.shutdown(wait=False)
 
     @staticmethod
     def _replay_messages(experience: dict) -> list:
@@ -987,7 +1039,7 @@ class WorldModelBridge:
         HTTP mode: POST /v1/chat/completions (OpenAI format).
         """
         if self._in_process and self._provider:
-            for exp in batch:
+            for i, exp in enumerate(batch):
                 try:
                     messages = self._replay_messages(exp)
                     self._provider.create_chat_completion(
@@ -996,11 +1048,13 @@ class WorldModelBridge:
                         temperature=0,
                         max_tokens=1,
                     )
+                    self._flush_failures_logged = 0
                     with self._lock:
                         self._stats['total_flushed'] += 1
                         self._last_flush_at = time.monotonic()
                 except Exception as e:
-                    logger.debug(f"In-process flush error: {e}")
+                    self._flush_failed(batch[i:], e)
+                    return
             return
 
         # HTTP fallback (central standalone or HevolveAI not in-process)
@@ -1085,6 +1139,7 @@ class WorldModelBridge:
             dropped = len(exps) - len(keep)
             if dropped:
                 self._stats['total_dropped'] = self._stats.get('total_dropped', 0) + dropped
+            self._schedule_flush_locked()
         return len(keep)
 
     def _flush_failed(self, remaining: list, err: BaseException) -> None:
@@ -1095,10 +1150,11 @@ class WorldModelBridge:
         self._flush_failures_logged = getattr(self, '_flush_failures_logged', 0) + 1
         if self._flush_failures_logged == 1:
             logger.warning(
-                "[WorldModelBridge] flush to %s/v1/chat/completions failed (%s: %s); "
+                "[WorldModelBridge] replay flush to %s failed (%s: %s); "
                 "%d experience(s) re-queued. Further failures in this run are silent "
                 "until a flush succeeds.",
-                self._api_url, type(err).__name__, str(err)[:160], n)
+                'in-process provider' if self._in_process else self._api_url,
+                type(err).__name__, str(err)[:160], n)
 
     # ─── Expert corrections (RL-EF) ─────────────────────────────────
 

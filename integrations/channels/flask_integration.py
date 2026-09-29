@@ -23,6 +23,15 @@ from .registry import ChannelRegistry, ChannelRegistryConfig, get_registry
 logger = logging.getLogger(__name__)
 
 
+#: The webhook secret names built from a channel's name
+#: ('{CHANNEL}' + suffix), read by the webhook signature gate below.
+_WEBHOOK_SECRET_SUFFIXES = ('_APP_SECRET', '_CHANNEL_SECRET', '_WEBHOOK_SECRET',
+                            '_VERIFY_TOKEN')
+
+#: FlaskChannelIntegration.env_names(), computed once.
+_ENV_NAMES = None
+
+
 class FlaskChannelIntegration:
     """
     Integrates channel adapters with the Flask-based agent API.
@@ -412,16 +421,36 @@ class FlaskChannelIntegration:
 
     @classmethod
     def env_names(cls) -> frozenset:
-        """Every environment variable a channel reads its token or an extra
-        credential from (_ENV_FALLBACKS and each _CHANNEL_SPECS extra's
-        'env').  hartos.ai_key_vault.reads_from_env asks this, so a channel
-        secret stored for a channel still reaches the adapter's env read."""
+        """Every environment variable a channel reads a token or credential
+        from: _ENV_FALLBACKS, each _CHANNEL_SPECS extra's 'env', the webhook
+        secrets this module builds from the channel name
+        (_WEBHOOK_SECRET_SUFFIXES, WEBHOOK_VERIFY_TOKEN), and each adapter
+        module's own ENV_SECRETS.  hartos.ai_key_vault.reads_from_env asks
+        this, so a channel secret the owner stored reaches the adapter's env
+        read.  Computed once; an adapter that cannot be imported is logged
+        and adds nothing."""
+        global _ENV_NAMES
+        if _ENV_NAMES is not None:
+            return _ENV_NAMES
+        import importlib
         names = set(cls._ENV_FALLBACKS.values())
         for spec in cls._CHANNEL_SPECS.values():
             for extra in spec.get('extra', ()):
                 if extra.get('env'):
                     names.add(extra['env'])
-        return frozenset(names)
+        names.add('WEBHOOK_VERIFY_TOKEN')
+        for channel_type, (module_path, _factory) in cls._ADAPTER_FACTORIES.items():
+            up = channel_type.upper()
+            names.update(up + s for s in _WEBHOOK_SECRET_SUFFIXES)
+            try:
+                mod = importlib.import_module(module_path, __package__)
+                names.update(getattr(mod, 'ENV_SECRETS', ()))
+            except Exception:
+                logger.warning("env_names: %s adapter not importable; its "
+                               "declared credentials are not delivered",
+                               channel_type, exc_info=True)
+        _ENV_NAMES = frozenset(names)
+        return _ENV_NAMES
 
     # Declarative specs for channels that need more than the single generic
     # `token`: the token maps to a differently-named factory param

@@ -877,6 +877,7 @@ ELIDED_NAMESPACE = 'elided'
 ELIDED_KEY_PREFIX = 'elided:'
 _ELIDED_POINTER_RE = None  # compiled on first use
 _ELIDED_MAX_ITEMS = 5000        # items kept on disk; the oldest go first
+_ELIDED_MAX_BYTES = 64 * 1024 * 1024  # and bytes kept; the oldest go first
 _ELIDED_TTL_S = 24 * 3600       # a REUSE replay reads it within the day
 _ELIDED_EVICT_EVERY = 50        # writes between eviction sweeps
 _elided_writes = 0
@@ -914,6 +915,30 @@ def parse_elided_pointers(text: str) -> list:
             + r'([0-9a-f]{12}) (\d+) chars of ([a-z ]+)\]')
     return [(m.group(1), int(m.group(2)), m.group(3))
             for m in _ELIDED_POINTER_RE.finditer(str(text or ''))]
+
+
+def strip_elided_pointers(text, marker_line=False):
+    """``text`` with every pointer removed, and the space it leaves closed.
+
+    THE text-for-the-user step: every send of a model's text to a person
+    calls it -- both branches of CREATE's and REUSE's send_message_to_user1,
+    publish_agent_message, the /chat reply (_chat_reply), the hive expert's
+    publish and the channel router (tests/unit/
+    test_elided_pointer_never_reaches_the_user.py guards the list).  A model
+    can copy a pointer from its context into its answer, and a pointer is
+    never an answer (owner ruling, 2026-09-27).  Non-text is returned as it
+    is.
+
+    ``marker_line``: the wire's own use, where each pointer follows
+    WIRE_TRIM_MARKER on a line of its own; the line's newline goes with it,
+    so what is left is exactly the plain marker."""
+    if not isinstance(text, str) or ELIDED_KEY_PREFIX not in text:
+        return text
+    import re as _re
+    pat = _re.compile(r'[ \t]*\[' + _re.escape(ELIDED_KEY_PREFIX)
+                      + r'[0-9a-f]{12} \d+ chars of [a-z ]+\]'
+                      + ('\n?' if marker_line else ''))
+    return pat.sub('', text)
 
 
 def _elided_id(text: str) -> str:
@@ -956,7 +981,8 @@ def _elided_item(scope: str, pointer_id: str) -> str:
 
 def _evict_elided() -> None:
     """Remove elided items older than _ELIDED_TTL_S and, past
-    _ELIDED_MAX_ITEMS, the oldest.  One sweep at a time; never raises."""
+    _ELIDED_MAX_ITEMS items or _ELIDED_MAX_BYTES on disk, the oldest.  One
+    sweep at a time; never raises."""
     if not _elided_evict_lock.acquire(blocking=False):
         return
     try:
@@ -966,18 +992,22 @@ def _evict_elided() -> None:
         for entry in os.scandir(AGENT_DATA_DIR):
             if entry.name.startswith(prefix) and entry.name.endswith(suffix):
                 try:
-                    items.append((entry.stat().st_mtime, entry.path))
-                except OSError:
-                    pass
+                    st = entry.stat()
+                    items.append((st.st_mtime, st.st_size, entry.path))
+                except OSError as e:
+                    logger.debug("wire-trim: elided item unreadable: %s", e)
         items.sort()
         now = time.time()
         excess = max(0, len(items) - _ELIDED_MAX_ITEMS)
-        for n, (mtime, path) in enumerate(items):
-            if n < excess or now - mtime > _ELIDED_TTL_S:
+        total = sum(size for _, size, _ in items)
+        for n, (mtime, size, path) in enumerate(items):
+            if (n < excess or total > _ELIDED_MAX_BYTES
+                    or now - mtime > _ELIDED_TTL_S):
                 try:
                     os.remove(path)
-                except OSError:
-                    pass
+                    total -= size
+                except OSError as e:
+                    logger.debug("wire-trim: elided item not evicted: %s", e)
     except Exception as e:
         logger.debug("wire-trim: elided eviction skipped: %s", e)
     finally:
@@ -1263,14 +1293,14 @@ def _drop_units(messages: list) -> dict:
 def _strip_pointers(msg: dict) -> dict:
     """``msg`` with every pointer removed (the plain WIRE_TRIM_MARKER stays),
     for a body whose elided text could not be saved."""
-    import re as _re
-    pat = _re.compile(r'\[' + _re.escape(ELIDED_KEY_PREFIX)
-                      + r'[0-9a-f]{12} \d+ chars of [a-z ]+\]' + '\n?')
+    # The one pointer format, removed by the one stripper.
+    def sub(text):
+        return strip_elided_pointers(text, marker_line=True)
     out = dict(msg)
     if isinstance(out.get('content'), str):
-        out['content'] = pat.sub('', out['content'])
+        out['content'] = sub(out['content'])
     elif isinstance(out.get('content'), list):
-        out['content'] = [{**p, 'text': pat.sub('', p['text'])}
+        out['content'] = [{**p, 'text': sub(p['text'])}
                           if isinstance(p, dict) and isinstance(p.get('text'), str)
                           else p for p in out['content']]
     if out.get('tool_calls'):
@@ -1282,11 +1312,12 @@ def _strip_pointers(msg: dict) -> dict:
                     obj = json.loads(fn['arguments'])
                     if isinstance(obj, dict) and isinstance(
                             obj.get('trimmed_arguments'), str):
-                        obj['trimmed_arguments'] = pat.sub(
-                            '', obj['trimmed_arguments'])
+                        obj['trimmed_arguments'] = sub(
+                            obj['trimmed_arguments'])
                         tc = {**tc, 'function': {**fn, 'arguments': json.dumps(obj)}}
-                except ValueError:
-                    pass
+                except ValueError as e:
+                    # Arguments that are not JSON carry no pointer to strip.
+                    logger.debug("wire-trim: call arguments not JSON: %s", e)
             calls.append(tc)
         out['tool_calls'] = calls
     return out

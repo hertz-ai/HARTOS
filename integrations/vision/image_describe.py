@@ -39,7 +39,11 @@ so it also covers an external, remote or cloud endpoint.
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import logging
+import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -61,7 +65,77 @@ _MIME = {'jpg': 'jpeg', 'jpeg': 'jpeg', 'png': 'png',
          'gif': 'gif', 'webp': 'webp', 'bmp': 'bmp'}
 
 
-def describe_image(image_path, prompt: Optional[str] = None) -> Optional[str]:
+_UPLOAD_ANALYSIS_LOCK = threading.RLock()
+
+
+def resolve_uploaded_image(image_url, upload_dir=None) -> Path:
+    """Resolve a saved upload, never an arbitrary path or remote URL."""
+    from urllib.parse import unquote, urlsplit
+    if not isinstance(image_url, str):
+        raise ValueError('Image reference must be a local upload URL')
+    url = urlsplit(image_url)
+    if url.scheme or url.netloc or url.query or url.fragment:
+        raise ValueError('Image reference must be a local upload URL')
+    if not url.path.startswith('/uploads/'):
+        raise ValueError('Image reference must start with /uploads/')
+    if upload_dir is None:
+        from core.platform_paths import get_uploads_dir
+        upload_dir = get_uploads_dir()
+    root = Path(upload_dir).resolve()
+    path = (root / unquote(url.path[len('/uploads/'):])).resolve()
+    if not path.is_relative_to(root) or path.suffix.lower().lstrip('.') not in _MIME:
+        raise ValueError('Image reference is outside the upload store or is not an image')
+    if not path.is_file():
+        raise FileNotFoundError('Uploaded image is no longer available locally')
+    return path
+
+
+def describe_image(image_path, prompt: Optional[str] = None, *, cache=False) -> Optional[str]:
+    """Describe once; saved uploads may reuse a durable, question-specific result.
+
+    Camera/screen callers keep uncached behavior. Failed/empty inferences are
+    never cached; changing image bytes invalidates all analyses for that file.
+    """
+    if not cache:
+        return _infer_image(image_path, prompt)
+    try:
+        path = Path(image_path).resolve(strict=True)
+        fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
+        key = hashlib.sha256(json.dumps(
+            [str(path), fingerprint, prompt or DEFAULT_PROMPT],
+            ensure_ascii=False).encode('utf-8')).hexdigest()
+        from core.platform_paths import get_data_dir
+        cache_path = Path(get_data_dir()) / 'image_analysis' / (key + '.json')
+    except Exception:
+        logger.warning('Image analysis cache unavailable; attempting inference', exc_info=True)
+        return _infer_image(image_path, prompt)
+    # Upload and chat retries share one read/infer/write operation. This lock
+    # covers cached attachments only, never the live camera/screen loop.
+    with _UPLOAD_ANALYSIS_LOCK:
+        try:
+            saved = json.loads(cache_path.read_text(encoding='utf-8'))
+            if isinstance(saved.get('description'), str) and saved['description'].strip():
+                logger.debug('Reusing saved uploaded-image analysis')
+                return saved['description']
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.warning('Saved image analysis could not be read', exc_info=True)
+        description = _infer_image(image_path, prompt)
+        if description:
+            try:
+                from core.file_cache import atomic_json_write
+                atomic_json_write(str(cache_path), {
+                    'description': description,
+                    'prompt': prompt or DEFAULT_PROMPT,
+                    'image_sha256': fingerprint,
+                })
+            except Exception:
+                logger.warning('Image was analyzed but its result could not be saved', exc_info=True)
+        return description
+
+
+def _infer_image(image_path, prompt: Optional[str] = None) -> Optional[str]:
     """Send one image file to the local vision model and return its reply.
 
     Returns the stripped reply; '' when the model answered with no content

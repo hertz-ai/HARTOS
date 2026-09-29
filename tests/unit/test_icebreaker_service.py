@@ -66,7 +66,11 @@ def _seed_match(session, *, user_a, user_b, payload=None):
     return m.id
 
 
-def _seed_pref(session, *, user_id, vibe_tags=None, avatar_style='studio_ghibli'):
+def _seed_pref(session, *, user_id, vibe_tags=None, avatar_style='studio_ghibli',
+               interests_discoverable=True):
+    """interests_discoverable defaults to True here: the tests below are
+    about anchoring on tags the peer SHARED; the one that is about tags
+    the peer did not share passes False."""
     from integrations.social.models import DiscoverablePref
     s = DiscoverablePref(
         user_id=str(user_id),
@@ -76,6 +80,7 @@ def _seed_pref(session, *, user_id, vibe_tags=None, avatar_style='studio_ghibli'
         age_claim_18=True,
         avatar_style=avatar_style,
         vibe_tags=vibe_tags or [],
+        interests_discoverable=interests_discoverable,
         toggle_window_start=datetime.utcnow(),
     )
     session.add(s)
@@ -112,6 +117,58 @@ def test_falls_back_to_peer_tag_when_no_overlap(session):
     # Peer's first tag is what the draft anchors on.
     assert out['shared_tag'] == 'indie_film'
     assert 'indie_film' in out['draft']
+
+
+def test_peer_tags_unused_unless_peer_made_interests_discoverable(session):
+    """PRIVACY: a matched peer's tags reach the viewer (in the draft text
+    and in the LLM context) only when the peer said yes to
+    interests_discoverable.  An overlap must not reveal them either."""
+    def run(peer_tags, peer_yes):
+        from integrations.social.models import DiscoverablePref, Encounter
+        session.query(Encounter).delete()
+        session.query(DiscoverablePref).delete()
+        session.commit()
+        mid = _seed_match(session, user_a=1, user_b=2)
+        _seed_pref(session, user_id=1, vibe_tags=['hiking'])
+        _seed_pref(session, user_id=2, vibe_tags=peer_tags,
+                   interests_discoverable=peer_yes)
+        seen = {}
+
+        def cb(ctx):
+            seen.update(ctx)
+            return ''      # also exercise the template path
+
+        return draft_icebreaker(mid, '1', session, llm_callback=cb), seen
+
+    hidden, hidden_ctx = run(['hiking', 'secret_club'], False)
+    none, none_ctx = run([], True)
+    shared, shared_ctx = run(['hiking', 'secret_club'], True)
+
+    assert hidden_ctx['peer_vibe_tags'] == []
+    assert 'secret_club' not in repr((hidden, hidden_ctx))
+    # Hidden tags are indistinguishable from having none: the overlap on
+    # 'hiking' is not revealed by the draft either.
+    assert hidden == none and hidden_ctx == none_ctx
+    # Control: the same tags, shared, do reach the viewer.
+    assert shared_ctx['peer_vibe_tags'] == ['hiking', 'secret_club']
+
+
+def test_viewer_own_tags_used_even_when_viewer_shares_nothing(session):
+    """The share flag gates what OTHERS see.  The viewer's own tags are
+    theirs, so their draft may anchor on them with their flag off."""
+    mid = _seed_match(session, user_a=1, user_b=2)
+    _seed_pref(session, user_id=1, vibe_tags=['sitar'],
+               interests_discoverable=False)
+    _seed_pref(session, user_id=2, vibe_tags=[])
+    seen = {}
+
+    def cb(ctx):
+        seen.update(ctx)
+        return ''
+
+    out = draft_icebreaker(mid, '1', session, llm_callback=cb)
+    assert seen['viewer_vibe_tags'] == ['sitar']
+    assert out['shared_tag'] == 'sitar'
 
 
 def test_neutral_template_when_no_tags(session):

@@ -22,6 +22,26 @@ from hartos.create_recipe import visual_execution, get_frame, get_visual_context
 from hartos.reuse_recipe import visual_based_execution, get_frame as reuse_get_frame
 
 
+
+def _no_frame_store():
+    """FrameStore absent, so get_frame falls through to the Redis path.
+
+    get_frame finds the store through core.safe_hartos_attr, which never
+    imports anything.  These tests used to patch
+    'hart_intelligence_entry.get_vision_service', and patch() IMPORTS its
+    target: the whole entry module ran, and at import time it pinged Redis
+    on azure_all_vms.hertzai.com:6369 (106.51.181.24) and ran
+    init_social -> run_system_check, which connects to 8.8.8.8:443
+    (socket spy, 2026-09-28).  Patch the accessor instead, whether or not
+    the entry module is already loaded.
+    """
+    from core import safe_hartos_attr as sha
+    real = sha.safe_hartos_attr
+    return patch.object(
+        sha, 'safe_hartos_attr',
+        side_effect=lambda name, default=None: (
+            default if name == 'get_frame_store' else real(name, default)))
+
 class TestVLMAgentInterruption:
     """Test VLM agent can be interrupted by user"""
 
@@ -378,7 +398,7 @@ class TestVLMAgentIntegration:
         import pickle
 
         with patch('hartos.helper.redis_client') as mock_redis, \
-             patch('hart_intelligence_entry.get_vision_service', return_value=None):
+             _no_frame_store():
             # Mock serialized frame
             fake_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
             serialized = pickle.dumps(fake_frame)
@@ -391,7 +411,7 @@ class TestVLMAgentIntegration:
     def test_vlm_frame_retrieval_no_frame(self, test_user_id, mock_flask_app):
         """Test frame retrieval when no frame is available"""
         with patch('hartos.helper.redis_client') as mock_redis, \
-             patch('hart_intelligence_entry.get_vision_service', return_value=None):
+             _no_frame_store():
             mock_redis.get.return_value = None
 
             frame = get_frame(str(test_user_id))

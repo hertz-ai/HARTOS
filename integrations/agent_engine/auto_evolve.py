@@ -484,9 +484,11 @@ class AutoEvolveOrchestrator:
                     # The ONE approval rule (voting_rules.approval_verdict):
                     # quorum of DISTINCT identities -- no single identity
                     # approves alone, a tally that does not answer fails
-                    # closed -- AND >= 2/3 of DECISIVE weight FOR.  The
-                    # evaluation-goal writer asks the same rule, so ranking
-                    # and dispatch cannot disagree.
+                    # closed -- AND a FOR share of the decisive weight of at
+                    # least max(2/3, the context's threshold), one vote per
+                    # identity -- AND the steward's FOR where the context
+                    # requires one.  The evaluation-goal writer asks the same
+                    # rule, so ranking and dispatch cannot disagree.
                     verdict = approval_verdict(tally)
                     super_ratio = verdict['super_majority']
                     quorate = verdict['quorum_met']

@@ -934,18 +934,21 @@ def _invoke_tool(tool_name, arguments):
     # kwarg.  See `_TOOL_ARG_ALIASES` above for the full mapping.
     arguments = _canonicalize_args(tool_name, arguments)
 
-    # An MCP call is no agent's turn, so the tool runs with no request caller
-    # (hartos.threadlocal prompt_id / user_id).  The /chat handler sets them
-    # and never clears them, so a worker thread reused from a chat still
-    # carried that chat's agent and user: measured 2026-09-27
-    # (scratchpad/tl_probe.py), a tool called here saw prompt_id '8865956'
-    # left by the previous /chat.  A tool that acts for "the calling agent"
-    # (cast_experiment_vote) would have acted as that agent.  Restored after,
-    # so the thread's own request state is unchanged.
+    # An MCP call is no agent's turn, so the tool runs with NO request state
+    # (hartos.threadlocal.detached).  The /chat handler sets that state and
+    # never clears it, so a worker thread reused from a chat still carried
+    # that chat's prompt_id, user_id, request_id, user_role, activity run and
+    # model override: measured 2026-09-27 (scratchpad/tl_probe.py), a tool
+    # called here saw prompt_id '8865956' left by the previous /chat, and a
+    # tool that acts for "the calling agent" (cast_experiment_vote) would
+    # have acted as that agent.  The thread's state is put back after.
     from hartos.threadlocal import thread_local_data as _tl
-    _caller = (_tl.get_prompt_id(), _tl.get_user_id())
-    _tl.set_prompt_id(None)
-    _tl.set_user_id(None)
+    with _tl.detached():
+        return _run_tool(tool_name, fn, arguments)
+
+
+def _run_tool(tool_name, fn, arguments):
+    """Call one resolved tool and shape its result (for _invoke_tool)."""
     try:
         result = fn(**arguments)
         if isinstance(result, str):
@@ -959,9 +962,6 @@ def _invoke_tool(tool_name, arguments):
     except Exception as e:
         logger.error(f"MCP tool {tool_name} execution error: {e}")
         return {"success": False, "error": str(e)}, 500
-    finally:
-        _tl.set_prompt_id(_caller[0])
-        _tl.set_user_id(_caller[1])
 
 
 @mcp_local_bp.route('/tools/execute', methods=['POST'])
@@ -1090,3 +1090,14 @@ def auto_register_local_mcp():
             logger.info(f"Auto-registered local MCP server at {local_url}")
     except Exception as e:
         logger.debug(f"Auto-register local MCP failed (non-critical): {e}")
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HARTOS_MCP_DISABLE_AUTH',
+    'HARTOS_MCP_TOKEN',
+    'HARTOS_MCP_TOKEN_FILE',
+)

@@ -63,18 +63,40 @@ Votes are weighted based on the decision context (`voting_rules.py`):
 
 - Human votes: `vote_value * human_weight`
 - Agent votes: `vote_value * confidence * agent_weight`
-- Approval threshold varies by context (default 0.5)
-- Steward-required contexts block decision until steward has voted
+- Agent or human comes from the voting **account**, never from the request
+  (an agent account cannot claim a human's weight)
+
+### One identity, one vote
+
+An agent counts as its owner.  Before the ratio, every identity's votes
+collapse into one (`voting_rules.one_vote_per_identity`): the human's own
+vote if they cast one, otherwise the majority of their agents' votes; a
+FOR/AGAINST tie is no vote.  Ten agents of one person are one vote.
+
+### Approval: the one rule
+
+`voting_rules.approval_verdict(tally)` is the only approval rule; auto-evolve,
+the evaluation-goal writer, `decide()` and the tally's recommendation all ask
+it.  Approved needs all of:
+
+- **Quorum**: at least 3 distinct identities voted decisively, at least 2 FOR
+- **Threshold**: FOR share of the decisive weight >= max(2/3, the context's
+  `approval_threshold`); a context can raise the bar (0.8 for
+  `security_guardrail`), never lower it
+- **Steward**: where the context is `steward_required`, a FOR vote from a
+  signed-in human account holding the central (steward) role; an abstain is
+  no answer, and `decide()` waits for a FOR or AGAINST
 
 ### Tally
 
 ```python
-weighted_score = sum(vote_value * weight) / sum(weights)
+weighted_score = sum(vote * weight) / sum(weights)   # one vote per identity
 
-decision_recommendation:
-  score > threshold   → 'approve'
-  score < -threshold  → 'reject'
-  otherwise           → 'inconclusive'
+decision_recommendation = voting_rules.recommendation(tally):
+  approved by approval_verdict            → 'approve'
+  no quorum / steward missing             → 'no_quorum' / 'steward_required'
+  AGAINST share >= the threshold          → 'reject'
+  otherwise                               → 'inconclusive'
 ```
 
 ## Agent Evaluation

@@ -29,12 +29,30 @@ Patterns audited:
    `while (true)` / `while (!success)` retry loops in Demopage.js must
    reference MAX_RETRIES — not have their own hardcoded cap.
 
+6. CANONICAL_OWNERS — one module per consolidated name
+   Each name in the table is DEFINED (def / class / literal assignment) in
+   exactly its owner module; every other module imports it.  A second
+   definition is a parallel path by construction.  When you consolidate
+   something, add its row here in the same commit.
+
+7. The user-facing reply sentences (core.constants *_REPLY)
+   Their text appears in no other source module, so a caller cannot ship a
+   private copy that drifts (or that is_user_facing_error cannot recognise).
+
+8. Thread-stack dumps
+   Canonical: core.diag.dump_all_thread_stacks.  Nothing else walks
+   sys._current_frames(), except the fallbacks listed in
+   _CURRENT_FRAMES_ALLOWED with the reason each one exists.
+
 Run from project root:
     python -m pytest tests/meta/test_dry_audit.py -v
 """
+import ast
 import os
 import re
 import unittest
+
+from tests.unit.test_source_guard_repo_health_ratchet import _walk
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -172,6 +190,128 @@ class DryAuditTests(unittest.TestCase):
             code.count('MAX_RETRIES'), 2,
             'Both local + cloud retry loops must cap at MAX_RETRIES.'
         )
+
+
+#: name -> the ONE module (repo-relative) allowed to define it.
+CANONICAL_OWNERS = {
+    'AUTOGEN_MESSAGE_TOKEN_BUDGET': 'core/constants.py',
+    'INDIC_LANGS': 'core/constants.py',
+    'NON_LATIN_SCRIPT_LANGS': 'core/constants.py',
+    'NON_LATIN_SCRIPT_NAMES': 'core/constants.py',
+    'LLM_LOADING_REPLY': 'core/constants.py',
+    'LLM_GENERIC_ERROR_REPLY': 'core/constants.py',
+    'BUILD_INCOMPLETE_REPLY': 'core/constants.py',
+    'get_preferred_lang': 'core/user_lang.py',
+    'set_preferred_lang': 'core/user_lang.py',
+    'user_facing_error': 'core/agent_tools.py',
+    'is_user_facing_error': 'core/agent_tools.py',
+    'dump_all_thread_stacks': 'core/diag.py',
+    'get_watchdog': 'security/node_watchdog.py',
+    'sleep_with_heartbeat': 'security/node_watchdog.py',
+}
+
+#: module -> why it may walk sys._current_frames() itself.
+_CURRENT_FRAMES_ALLOWED = {
+    'core/diag.py': 'the canonical dumper',
+    'security/node_watchdog.py': 'last-resort fallback when neither '
+                                 'core.diag nor its builtin is importable '
+                                 '(HARTOS standalone), documented at the call',
+}
+
+
+def _source_trees():
+    """({repo-relative posix path: AST} for every non-test source module,
+    [modules that do not parse]).  An unparseable module is reported, never
+    skipped: a guard that quietly ignores a file cannot vouch for it."""
+    trees, unparseable = {}, []
+    for rel, path in _walk():
+        rel = rel.replace(os.sep, '/')
+        if rel.split('/')[0] == 'tests':
+            continue
+        try:
+            trees[rel] = ast.parse(_read(path))
+        except SyntaxError as e:
+            unparseable.append(f'{rel}: {e}')
+    return trees, unparseable
+
+
+def _definitions(tree):
+    """Names this module defines: def / class / assignment of a value (an
+    alias of another name, `X = other.X`, re-exports rather than defines)."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            yield node.name
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if isinstance(node.value, (ast.Name, ast.Attribute)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    yield target.id
+
+
+class SingleOwnerGuards(unittest.TestCase):
+    """SOURCE GUARDS (labelled per feedback_no_grep_tests): a second
+    implementation can appear in any of ~900 modules, so no behavioural test
+    at one call site can catch it.  AST, not text: comments and docstrings
+    never match."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.trees, cls.unparseable = _source_trees()
+
+    def test_source_guard_every_module_was_checked(self):
+        self.assertFalse(
+            self.unparseable,
+            'these modules do not parse, so no guard here checked them:\n  '
+            + '\n  '.join(self.unparseable))
+
+    def test_source_guard_each_canonical_name_has_one_owner(self):
+        where = {name: [] for name in CANONICAL_OWNERS}
+        for rel, tree in self.trees.items():
+            for name in set(_definitions(tree)) & set(where):
+                where[name].append(rel)
+        problems = []
+        for name, owner in sorted(CANONICAL_OWNERS.items()):
+            if owner not in where[name]:
+                problems.append(f'{name}: not defined in its owner {owner} '
+                                f'(moved? update the row)')
+            others = sorted(set(where[name]) - {owner})
+            if others:
+                problems.append(f'{name}: also defined in {others}; import it '
+                                f'from {owner} instead')
+        self.assertFalse(problems, 'parallel definitions:\n  ' + '\n  '.join(problems))
+
+    def test_source_guard_reply_sentences_live_only_in_constants(self):
+        from core import constants
+        replies = {n: v for n, v in vars(constants).items()
+                   if n.endswith('_REPLY') and isinstance(v, str) and len(v) >= 20}
+        self.assertTrue(replies, 'core.constants has no *_REPLY sentences')
+        copies = []
+        for rel, tree in self.trees.items():
+            if rel == 'core/constants.py':
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    for name, text in replies.items():
+                        if text in node.value:
+                            copies.append(f'{rel}:{node.lineno} copies {name}')
+        self.assertFalse(copies, 'import the sentence from core.constants:\n  '
+                                 + '\n  '.join(copies))
+
+    def test_source_guard_one_thread_stack_dumper(self):
+        walkers = sorted({
+            rel for rel, tree in self.trees.items()
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute) and node.attr == '_current_frames'})
+        unexpected = [r for r in walkers if r not in _CURRENT_FRAMES_ALLOWED]
+        stale = [r for r in _CURRENT_FRAMES_ALLOWED if r not in walkers]
+        self.assertFalse(
+            unexpected,
+            f'{unexpected} walk sys._current_frames() themselves; call '
+            f'core.diag.dump_all_thread_stacks instead')
+        self.assertFalse(stale, f'{stale} no longer walk frames: delete the '
+                                f'allowance so the list only shrinks')
 
 
 if __name__ == '__main__':

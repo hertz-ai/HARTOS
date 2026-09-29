@@ -265,19 +265,25 @@ def admitted_peers(limit: int = 8) -> List[Dict[str, str]]:
     One entry per url: several rows can share an address (a node that
     re-keyed, one-shot identities behind one host; 106 such urls on the
     owner's desktop, 2026-09-26), and the node answering there is one node.
-    The row kept is the one _admitted_query ranks first for that url, so a
-    caller that invokes the matched peer signs for that node_id."""
+    The row kept is the one _admitted_query ranks first for that url;
+    ``verified`` says whether this node verified it.  An unverified row is
+    a guess at who answers there, so a caller that signs for the peer asks
+    the node (try_peer_recipe_reuse -> peer_node_id_for).
+
+    Streamed in pages until ``limit`` distinct urls are found: a fixed
+    over-fetch (limit*8 rows) returned fewer peers than ``limit`` whenever
+    more duplicate rows than that ranked first (review of 4cf4411d0)."""
     try:
         from integrations.social.models import db_session
         with db_session(commit=False) as db:
             out, seen = [], set()
-            # Bounded over-fetch so duplicates cannot starve the limit.
-            for r in _admitted_query(db).limit(max(limit, 1) * 8).all():
+            for r in _admitted_query(db).yield_per(max(limit, 1) * 8):
                 key = (r.url or '').rstrip('/')
                 if not key or key in seen:
                     continue
                 seen.add(key)
-                out.append({'node_id': r.node_id, 'url': r.url})
+                out.append({'node_id': r.node_id, 'url': r.url,
+                            'verified': r.integrity_status == 'verified'})
                 if len(out) >= limit:
                     break
             return out
@@ -448,40 +454,44 @@ def peer_node_id_for(peer_url: str, ask_the_node: bool = False) -> str:
     """The node_id of the peer at ``peer_url`` (the audience a signed
     request is bound to), or '' when none is known.
 
-    The peer store first.  With ``ask_the_node`` (hart a2a send, which may
-    name a node this one never gossiped with), then the node's own
-    /api/social/peers/health; a failed ask is logged."""
+    The peer store first: a row this node VERIFIED at that url is the
+    answer.  With ``ask_the_node`` (hart a2a send, which may name a node
+    this one never gossiped with; try_peer_recipe_reuse when the row it
+    matched is unverified), anything short of that is asked of the node's
+    own /api/social/peers/health, and the store's unverified guess is kept
+    only when the ask fails (logged).  Without it, the store's best row."""
     want = (peer_url or '').rstrip('/')
     if not want:
         return ''
-    held = _held_node_id_for(want)
-    if held or not ask_the_node:
+    held, verified = _held_node_id_for(want)
+    if verified or not ask_the_node:
         return held
     try:
-        return (pooled_get(f'{want}/api/social/peers/health',
-                           timeout=_DIRECTORY_TIMEOUT_S).json() or {}
-                ).get('node_id') or ''
+        asked = (pooled_get(f'{want}/api/social/peers/health',
+                            timeout=_DIRECTORY_TIMEOUT_S).json() or {}
+                 ).get('node_id') or ''
     except Exception as e:
         logger.info(f'peer_reuse: could not ask {want} for its node_id: {e}')
-        return ''
+        asked = ''
+    return asked or held
 
 
-def _held_node_id_for(want: str) -> str:
-    # The LAST RESORT: a caller that matched a peer passes its node_id
-    # (try_peer_recipe_reuse).  One lookup by url in SQL, not a scan of the
-    # first 1000 admitted rows.  Several identities can share a url; the
-    # row _admitted_query ranks first (verified, then most recent) is the
-    # one signed for.
+def _held_node_id_for(want: str) -> Tuple[str, bool]:
+    # (node_id, verified) of the row _admitted_query ranks first at the url
+    # (verified, then most recent); ('', False) when none.  One lookup by
+    # url in SQL, not a scan of the first 1000 admitted rows.
     try:
         from integrations.social.models import db_session, PeerNode
         with db_session(commit=False) as db:
             row = (_admitted_query(db)
                    .filter(PeerNode.url.in_([want, want + '/']))
                    .first())
-            return (row.node_id or '') if row else ''
+            if row is None:
+                return '', False
+            return (row.node_id or ''), row.integrity_status == 'verified'
     except Exception as e:
         logger.info(f'peer_reuse: peer store unavailable for {want}: {e}')
-        return ''
+        return '', False
 
 
 def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
@@ -562,8 +572,14 @@ def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
         return task
     task_id = task.get('id')
     interval = _POLL_INTERVAL_S
-    while time.monotonic() + interval < deadline:
-        time.sleep(interval)
+    while True:
+        # The last sleep is cut to what is left, so the budget is spent
+        # before the cancel: the loop used to stop a whole backed-off
+        # interval (up to 2 s) early.
+        left = deadline - time.monotonic()
+        if left <= _POLL_INTERVAL_S / 5:
+            break
+        time.sleep(min(interval, left))
         # Back off: 0.25 s, then up to 2 s, so a 30 s wait is ~20 signed
         # reads, not 120 (review of a4ea04651).
         interval = min(interval * 2, _POLL_INTERVAL_MAX_S)
@@ -1002,11 +1018,16 @@ def try_peer_recipe_reuse(identity: Dict[str, str], local_prompt_id: str,
     if not prompt_text:
         logger.info('peer_reuse: no prompt text for remote invoke')
         return None
-    # Signed for the node this sweep matched, not a guess from the url.
+    # Signed for the node this sweep matched when this node VERIFIED it
+    # there; otherwise the matched row is only the most recent of the
+    # identities seen at that url, and the node itself is asked.
+    audience = (peer.get('node_id') if peer.get('verified')
+                else peer_node_id_for(peer_url, ask_the_node=True)
+                or peer.get('node_id'))
     result = invoke_peer_agent(
         peer_url, agent_id, prompt_text,
         timeout=min(_INVOKE_TIMEOUT_S, remaining),
-        peer_node_id=peer.get('node_id') or None)
+        peer_node_id=audience or None)
     if not result or result.get('state') != 'completed':
         if result:
             logger.info(

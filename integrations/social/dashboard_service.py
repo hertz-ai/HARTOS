@@ -905,6 +905,80 @@ def get_a2a_graph(root_agent_id: str, depth: int = 2) -> Dict:
     }
 
 
+#: A steering verb -> the status it moves a goal to.  PATCH /api/goals/<id>/
+#: status is read through this too (STATUS_VERB), so a status no verb
+#: reaches (e.g. 'completed') cannot be set from outside.
+STEER_TARGET = {'pause': 'paused', 'resume': 'active', 'cancel': 'archived'}
+STATUS_VERB = {status: verb for verb, status in STEER_TARGET.items()}
+
+
+#: The status each verb may move a goal OUT of.  Named positively: pause
+#: leaves only an active goal, resume only a paused one, so a finished goal
+#: (completed / failed / error / archived) is never paused and then resumed
+#: back to life (review of dc32b1146: a denylist that named only 'archived'
+#: let pause-then-resume restart every other terminal status).  Cancel
+#: leaves anything not already archived.
+STEER_FROM = {'pause': frozenset({'active'}),
+              'resume': frozenset({'paused'})}
+
+
+def steer_transition(verb: str, prev_status: Optional[str]):
+    """``(target_status, None)``, or ``(None, why)`` when ``verb`` may not
+    move a goal out of ``prev_status`` (STEER_FROM).  Nothing leaves
+    archived; PATCH /api/goals/<id>/status goes through this too.
+    """
+    target = STEER_TARGET[verb]
+    allowed = STEER_FROM.get(verb)
+    if verb == 'cancel' and prev_status == 'archived':
+        return None, 'This run was already cancelled.'
+    if allowed is not None and prev_status not in allowed:
+        # Worded as the outcome for the person who asked, not the rule.
+        if prev_status == target:
+            return None, {'paused': 'This run is already paused.',
+                          'active': 'This run is already running.'}[target]
+        return None, (f'This run has {"been cancelled" if prev_status == "archived" else "finished"}'
+                      f', so it cannot be {"paused" if verb == "pause" else "resumed"}.')
+    return target, None
+
+
+def steer_response(db, goal_id: str, *, verb: Optional[str] = None,
+                   status: Optional[str] = None, caller: 'SteeringCaller',
+                   actor_id: str, reason: str):
+    """``(body, http_status)`` for a route that steers one goal, by ``verb``
+    or by the ``status`` a verb reaches (STATUS_VERB).  THE route helper, so
+    PATCH /api/goals/<id>/status, PATCH /api/coding/goals/<id> and DELETE
+    /api/goals/<id> write a status only through steer_agent and its one
+    writer, _write_goal_status (review of 275e8e361: the coding PATCH wrote
+    any status, default 'active', and revived completed goals).
+    """
+    if verb is None:
+        if not status:
+            return {'success': False, 'error': 'status is required'}, 400
+        verb = STATUS_VERB.get(status)
+        if verb is None:
+            return {'success': False, 'error': (
+                f'status must be one of {sorted(STATUS_VERB)}')}, 400
+    result = steer_agent(db, goal_id, verb, actor_id=actor_id, reason=reason,
+                         caller=caller)
+    code = 200 if result.get('ok') else 403 if result.get('forbidden') else 400
+    return {'success': bool(result.get('ok')), 'data': result}, code
+
+
+def _write_goal_status(db, goal, status: str) -> None:
+    """Set a steered goal's status.  An AgentGoal goes through
+    GoalManager.update_goal_status, the writer /api/goals always used (it
+    emits goal-changed and runs HiveEthos' ephemeral-agent cleanup on a
+    terminal status); a CodingGoal is set directly, as before."""
+    from .models import AgentGoal
+    if isinstance(goal, AgentGoal):
+        from integrations.agent_engine.goal_manager import GoalManager
+        result = GoalManager.update_goal_status(db, goal.id, status)
+        if not result.get('success'):
+            raise RuntimeError(result.get('error') or 'status write failed')
+    else:
+        goal.status = status
+
+
 def steer_agent(db, agent_id: str, verb: str, actor_id: str = 'system',
                 reason: Optional[str] = None, *,
                 caller: 'SteeringCaller') -> Dict:
@@ -933,23 +1007,19 @@ def steer_agent(db, agent_id: str, verb: str, actor_id: str = 'system',
         out['error'] = f'unknown verb {verb}'
         return out
 
-    goal, refused = _goal_to_steer(db, agent_id, verb, caller, actor_id)
+    goal, refused = goal_to_steer(db, agent_id, verb, caller, actor_id)
     if refused:
         out.update(refused)
         return out
 
     prev_status = goal.status
-    target = {'pause': 'paused', 'resume': 'active', 'cancel': 'archived'}[verb]
-
-    if verb == 'resume' and prev_status != 'paused':
-        out['error'] = f'resume requires paused, got {prev_status}'
-        return out
-    if verb == 'cancel' and prev_status == 'archived':
-        out['error'] = 'already archived'
+    target, illegal = steer_transition(verb, prev_status)
+    if illegal:
+        out['error'] = illegal
         return out
 
     try:
-        goal.status = target
+        _write_goal_status(db, goal, target)
         db.commit()
         out['ok'] = True
         out['new_status'] = target
@@ -1064,7 +1134,7 @@ class SteeringCaller(NamedTuple):
 
 def may_steer(db, goal, caller: SteeringCaller) -> Optional[str]:
     """Why ``caller`` may NOT steer ``goal`` (inject, pause, resume, cancel),
-    or None.  THE rule for every steering verb (_goal_to_steer applies it).
+    or None.  THE rule for every steering verb (goal_to_steer applies it).
 
     Review of de3f89364 (2026-09-27, CRITICAL): the inject route checked
     nothing, and /api/social/ is exempt from the API gate, so the desktop
@@ -1110,33 +1180,98 @@ def may_steer(db, goal, caller: SteeringCaller) -> Optional[str]:
 STEER_REFUSED = 'agent not found, or not yours to steer'
 
 
-def _goal_to_steer(db, agent_id: str, verb: str, caller: SteeringCaller,
-                   actor_id: str):
-    """The goal ``caller`` may steer with ``verb``, or why not.
+_LOOKUP = object()
+
+
+def find_goal(db, goal_id: str):
+    """The AgentGoal, else the CodingGoal, with this id; None when neither.
+    The ONE id -> goal lookup for the steering gate (without the CodingGoal
+    fallback the drawer's buttons 404 on every coding card)."""
+    from .models import AgentGoal
+    goal = db.query(AgentGoal).filter(AgentGoal.id == str(goal_id)).first()
+    if goal:
+        return goal
+    try:
+        from .models import CodingGoal
+        return db.query(CodingGoal).filter(CodingGoal.id == str(goal_id)).first()
+    except Exception:
+        logger.debug('CodingGoal lookup unavailable', exc_info=True)
+        return None
+
+
+def steering_caller() -> SteeringCaller:
+    """Who is calling, for may_steer.  THE one reader of the request's
+    identity for every route that acts on or reads one goal.
+
+    A caller the route's auth decorator already named (g.user: require_auth,
+    or require_local_or_auth for a remote caller) is that user.  Otherwise
+    (a loopback caller under require_local_or_auth) it is the user of a
+    valid, unbanned token when one is sent, else this desktop's owner,
+    HEVOLVE_OWNER_USER_ID -- the identity the camera, screen, computer-use
+    and credential asks all go to.  The token comes first because
+    HEVOLVE_OWNER_USER_ID is set at boot and goes stale when someone signs
+    in afterwards (review of c3651a483: a signed-in desktop user got 403 on
+    their own goal).  ``is_local`` is the loopback test either way, so a
+    goal no person owns stays this machine's (may_steer).  Nothing a request
+    body says is identity.
+    """
+    from flask import g, request
+    from core.auth_local import _is_local_request
+    from .auth import _get_user_from_token, holds_central_role
+    local = _is_local_request()
+    user = getattr(g, 'user', None)
+    if user is not None:
+        return SteeringCaller(user_id=str(user.id),
+                              is_admin=holds_central_role(user),
+                              is_local=local)
+    auth = request.headers.get('Authorization', '')
+    if auth.startswith('Bearer ') and auth[7:]:
+        # The same token lookup require_auth uses; an invalid or banned
+        # token is no token, and the local owner below answers.
+        token_user, token_db = _get_user_from_token(auth[7:])
+        try:
+            if token_user is not None and not getattr(token_user, 'is_banned', False):
+                return SteeringCaller(user_id=str(token_user.id),
+                                      is_admin=holds_central_role(token_user),
+                                      is_local=local)
+        finally:
+            if token_db is not None:
+                token_db.close()
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    return SteeringCaller(user_id=owner or None, is_admin=False, is_local=local)
+
+
+def goal_to_steer(db, agent_id: str, verb: str, caller: SteeringCaller,
+                  actor_id: str, *, goal=_LOOKUP, audit: bool = True):
+    """The goal ``caller`` may steer (or read) with ``verb``, or why not.
+
+    THE gate for every route that acts on or reads one goal: the dashboard's
+    inject / pause / resume / cancel / snapshot / chat / a2a, /api/goals'
+    GET / PATCH status / DELETE, and the tracker's inject / interview /
+    dual-context.  Guarded by tests/unit/test_every_goal_route_asks_may_steer.py,
+    which enumerates those blueprints' goal-scoped rules from the url_map.
 
     Returns ``(goal, None)``, or ``(None, {'error': STEER_REFUSED,
     'forbidden': True})`` for an unknown id or a caller may_steer refuses --
-    the same answer for both, logged and audit-logged as ``<verb>_refused``
-    with the caller's identity and the real reason.  ONE
-    lookup (AgentGoal, then CodingGoal: without the fallback the drawer's
-    buttons 404 on every coding card) and ONE authorization for every
-    steering verb, so no verb can skip either.
+    the same answer for both, logged, and for a write (``audit``) audit-
+    logged as ``<verb>_refused`` with the caller's identity and the real
+    reason.  Reads pass ``audit=False``: the drawer polls every 2 s.
+
+    ``goal``: a row the route already resolved another way (the tracker
+    finds it by post), or None when it found none; by default the id is
+    looked up here (AgentGoal, then CodingGoal: without the fallback the
+    drawer's buttons 404 on every coding card).
     """
-    from .models import AgentGoal
-    goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
-    if not goal:
-        try:
-            from .models import CodingGoal
-            goal = db.query(CodingGoal).filter(
-                CodingGoal.id == str(agent_id)).first()
-        except Exception:
-            logger.debug('CodingGoal lookup unavailable', exc_info=True)
+    if goal is _LOOKUP:
+        goal = find_goal(db, agent_id)
     refusal = (may_steer(db, goal, caller) if goal
                else 'no goal with this id')
     if not refusal:
         return goal, None
     logger.warning('%s refused: caller=%s local=%s agent=%s: %s', verb,
                    caller.user_id, caller.is_local, agent_id, refusal)
+    if not audit:
+        return None, {'error': STEER_REFUSED, 'forbidden': True}
     try:
         from security.immutable_audit_log import get_audit_log
         get_audit_log().log_event(
@@ -1185,7 +1320,7 @@ def inject_instruction(db, agent_id: str, instruction: str,
         out['error'] = 'empty instruction'
         return out
 
-    goal, refused = _goal_to_steer(db, agent_id, 'inject', caller, actor_id)
+    goal, refused = goal_to_steer(db, agent_id, 'inject', caller, actor_id)
     if refused:
         out.update(refused)
         return out

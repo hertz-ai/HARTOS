@@ -32,8 +32,14 @@ partition the hive; 10.1.x and 192.168.x are real LANs, see
 test_peer_url_hygiene):
 
 - a NEW row is 'active' when a direct announce came FROM the address it
-  claims (or the vantage is unknown, as before); otherwise it is 'stale'
-  until the health round's ping reaches it, which makes it 'active';
+  claims (or the vantage is unknown, as before), or when the node SIGNED its
+  own direct announce (alive and admitted wherever it announced from: the
+  review of 02da559f7 measured every NAT'd peer on central kept 'stale' and
+  out of OTA fan-out); a relayed hint or an unsigned claim from elsewhere is
+  'stale' until the health round's ping reaches it;
+- the integrity round does not dial a row whose last health ping failed:
+  reachability is asked where dialling happens, never by dropping the row
+  from the fleet;
 - a loopback URL is refused when relayed, or when the announce came from
   another machine; a co-located node announcing over loopback is admitted;
 - a relayed record never carries the relayer's metadata into the new row.
@@ -172,15 +178,133 @@ def test_a_direct_announce_from_the_address_it_claims_is_active(gossip):
     assert _row(info['node_id']).status == 'active'
 
 
-def test_a_direct_announce_from_elsewhere_is_admitted_stale(gossip):
-    """What central sees for every announcer: the claimed LAN address, from
-    its docker gateway.  Admitted (never refused: the address may be real),
-    but not active until a ping reaches it."""
+def test_a_signed_direct_announce_from_elsewhere_is_active(gossip):
+    """What central sees for EVERY announcer: the claimed LAN address, from
+    its docker gateway (172.21.0.1).  The node spoke for itself with its
+    gossip key through the guardrail-hash gate, so it is alive and admitted:
+    'active'.  Whether this node can DIAL that address is a separate
+    question, answered by the health round's ping and asked only where
+    dialling happens (the integrity round).  This test used to assert
+    'stale', which kept every honest peer behind a home router out of OTA
+    fan-out, regional assignment and full uptime on central, forever
+    (review of 02da559f7)."""
     info = _signed('http://10.1.0.5:6777')
     reasons = []
     assert gossip.handle_announce(info, reasons=reasons,
                                   observed_ip='172.21.0.1') is True, reasons
+    assert _row(info['node_id']).status == 'active'
+
+
+def _unsigned(url, **over):
+    from security.hive_guardrails import get_guardrail_hash
+    info = {'node_id': f'addrtest-{uuid.uuid4().hex[:10]}', 'url': url,
+            'name': 'addrtest', 'version': '1.0.0',
+            'guardrail_hash': get_guardrail_hash(),
+            'timestamp': 1_900_000_000, 'tier': 'flat'}
+    info.update(over)
+    return info
+
+
+def test_an_unsigned_direct_announce_from_elsewhere_stays_stale(
+        gossip, monkeypatch):
+    """No key spoke: the record is a claim about an address nobody has seen
+    reach this node, exactly like a relayed hint.  Admitted under soft
+    enforcement, 'stale' until the health round's ping answers."""
+    import security.master_key as mk
+    monkeypatch.setattr(mk, 'get_enforcement_mode', lambda: 'soft')
+    info = _unsigned('http://10.1.0.6:6777')
+    reasons = []
+    assert gossip.handle_announce(info, reasons=reasons,
+                                  observed_ip='172.21.0.1') is True, reasons
     assert _row(info['node_id']).status == 'stale'
+
+
+def _unreachable(monkeypatch, dialled=None):
+    def net(url, *a, **k):
+        if dialled is not None:
+            dialled.append(url)
+        raise requests.ConnectionError('unreachable (NAT)')
+    monkeypatch.setattr(pd, 'pooled_get', net)
+    monkeypatch.setattr(isvc, 'pooled_post', net)
+    return net
+
+
+def test_a_nat_peer_that_keeps_announcing_stays_in_the_fleet(gossip,
+                                                            monkeypatch):
+    """The reviewer's probe (test_bA_nat_probe): an honest desktop behind a
+    home router announces to central with its LAN url; central sees the
+    docker gateway and cannot ping the LAN url.  At 02da559f7 the row stayed
+    'stale' through the health round and every later announce, and an OTA
+    fan-out to it had no targets.  Fleet commands are DRAINED by the node on
+    its own gossip round, so central never needs to dial it."""
+    info = _signed('http://192.168.1.50:5000')
+    assert gossip.handle_announce(info, observed_ip='172.21.0.1') is True
+    _unreachable(monkeypatch)
+    gossip._health_check_round()
+    assert _row(info['node_id']).status == 'active'
+    for i in range(3):
+        again = _signed('http://192.168.1.50:5000', node_id=info['node_id'],
+                        timestamp=1_900_000_010 + i)
+        gossip.handle_announce(again, observed_ip='172.21.0.1')
+    assert _row(info['node_id']).status == 'active'
+
+    from integrations.social.fleet_command import FleetCommandService
+    from integrations.social.hosting_reward_service import (
+        HostingRewardService)
+    from integrations.social.models import get_db
+    db = get_db()
+    try:
+        cmds = FleetCommandService.push_broadcast(
+            db, 'firmware_update', {'v': 'x'}, node_ids=[info['node_id']])
+        assert [c['target_node_id'] for c in cmds] == [info['node_id']]
+        row = db.query(PeerNode).filter_by(node_id=info['node_id']).one()
+        assert HostingRewardService.compute_uptime_ratio(db, row) == 1.0
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_the_integrity_round_skips_a_row_the_health_round_could_not_reach(
+        gossip, monkeypatch):
+    """Keeps 02da559f7's real gain: a challenge to an address this node
+    cannot reach is a timeout (81% of them on the owner's desktop).  The
+    row stays in the fleet; the integrity round just does not dial it."""
+    info = _signed('http://192.168.1.51:5000')
+    gossip.handle_announce(info, observed_ip='172.21.0.1')
+    dialled = []
+    _unreachable(monkeypatch, dialled)
+    gossip._health_check_round()
+    health_dials = len(dialled)
+    assert any('192.168.1.51' in u for u in dialled[:health_dials])
+    gossip._integrity_round()
+    assert not [u for u in dialled[health_dials:] if '192.168.1.51' in u], \
+        dialled[health_dials:]
+
+
+def test_the_integrity_round_challenges_a_row_once_its_ping_answers(
+        gossip, monkeypatch):
+    """Skipping is reachability, not a verdict: the same row is challenged
+    once the health round reaches it again."""
+    info = _signed('http://192.168.1.52:5000')
+    gossip.handle_announce(info, observed_ip='172.21.0.1')
+    _unreachable(monkeypatch)
+    gossip._health_check_round()
+    gossip._peer_backoff.record_success('http://192.168.1.52:5000')
+
+    dialled = []
+
+    def ping(url, *a, **k):
+        dialled.append(url)
+        if url.startswith('http://192.168.1.52:5000/api/social/peers/health'):
+            return types.SimpleNamespace(
+                status_code=200, json=lambda: {'node_id': info['node_id']})
+        raise requests.ConnectionError('unreachable')
+    monkeypatch.setattr(pd, 'pooled_get', ping)
+    monkeypatch.setattr(isvc, 'pooled_post', ping)
+    gossip._health_check_round()
+    before = len(dialled)
+    gossip._integrity_round()
+    assert [u for u in dialled[before:] if '192.168.1.52' in u], dialled
 
 
 def test_a_direct_announce_with_no_vantage_is_active_as_before(gossip):
@@ -210,20 +334,47 @@ def test_a_colocated_node_on_loopback_is_admitted(gossip, source):
     assert _row(info['node_id']).status == 'active'
 
 
-def test_a_dead_row_revived_from_elsewhere_is_stale_not_active(gossip):
-    info = _signed('http://10.1.0.7:6777')
-    gossip.handle_announce(info, observed_ip='10.1.0.7')
+def _kill(node_id):
     with db_session() as db:
-        r = db.query(PeerNode).filter_by(node_id=info['node_id']).one()
+        r = db.query(PeerNode).filter_by(node_id=node_id).one()
         r.status = 'dead'
         r.last_seen = datetime.utcnow() - timedelta(days=2)
+
+
+def test_a_dead_row_revived_by_its_own_signed_announce_is_active(gossip):
+    """The node itself spoke, from wherever it sits: alive."""
+    info = _signed('http://10.1.0.7:6777')
+    gossip.handle_announce(info, observed_ip='10.1.0.7')
+    _kill(info['node_id'])
     again = _signed('http://10.1.0.7:6777', node_id=info['node_id'])
     gossip.handle_announce(again, observed_ip='172.21.0.1')
-    assert _row(info['node_id']).status == 'stale'
-    again = _signed('http://10.1.0.7:6777', node_id=info['node_id'],
-                    timestamp=1_900_000_001)
-    gossip.handle_announce(again, observed_ip='10.1.0.7')
     assert _row(info['node_id']).status == 'active'
+
+
+def test_a_dead_row_revived_unsigned_from_elsewhere_is_stale(gossip,
+                                                            monkeypatch):
+    import security.master_key as mk
+    monkeypatch.setattr(mk, 'get_enforcement_mode', lambda: 'soft')
+    info = _unsigned('http://10.1.0.8:6777')
+    gossip.handle_announce(info, observed_ip='10.1.0.8')
+    _kill(info['node_id'])
+    again = _unsigned('http://10.1.0.8:6777', node_id=info['node_id'])
+    gossip.handle_announce(again, observed_ip='172.21.0.1')
+    assert _row(info['node_id']).status == 'stale'
+    again = _unsigned('http://10.1.0.8:6777', node_id=info['node_id'],
+                      timestamp=1_900_000_001)
+    gossip.handle_announce(again, observed_ip='10.1.0.8')
+    assert _row(info['node_id']).status == 'active'
+
+
+def test_a_relayed_hint_never_revives_a_dead_row(gossip):
+    """02da559f7's protection: hearsay may not make a row active."""
+    info = _signed('http://10.1.0.9:6777')
+    gossip.handle_announce(info, observed_ip='10.1.0.9')
+    _kill(info['node_id'])
+    gossip._merge_peer_list([_hint('http://10.1.0.9:6777',
+                                   node_id=info['node_id'])])
+    assert _row(info['node_id']).status == 'dead'
 
 
 # ── the LAN beacon carries its measured source ──────────────────────────

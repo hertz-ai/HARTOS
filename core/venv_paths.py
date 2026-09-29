@@ -23,9 +23,12 @@ path is computed in exactly one place.
 Public API
 ----------
     venv_root()                            -> str
+    reset_venv_root_cache()                -> None   (tests)
+    validate_backend_name(backend)         -> None   (raises ValueError)
     venv_path(backend)                     -> str
     venv_python(backend)                   -> str
     venv_python_if_exists(backend)         -> Optional[str]
+    python_embed_dir()                     -> str
     venv_creator_python()                  -> Optional[str]
     venv_mismatch(backend)                 -> Optional[str]
     venv_site_packages(backend)            -> str
@@ -48,11 +51,16 @@ logger = logging.getLogger(__name__)
 _VENV_ROOT_CACHE: Optional[str] = None
 
 
-def _reset_cache_for_tests() -> None:
-    """Reset the cached venv root.  Test hook only — do not call from
-    production code (the cache makes hot-path lookups O(1))."""
+def reset_venv_root_cache() -> None:
+    """Reset the cached venv root.  For tests (Nunba's tts.backend_venv
+    forwards to it) — do not call from production code (the cache makes
+    hot-path lookups O(1))."""
     global _VENV_ROOT_CACHE
     _VENV_ROOT_CACHE = None
+
+
+# The old private name, kept for HARTOS tests that call it.
+_reset_cache_for_tests = reset_venv_root_cache
 
 
 def venv_root() -> str:
@@ -81,7 +89,7 @@ def venv_root() -> str:
     return base
 
 
-def _validate_backend_name(backend: str) -> None:
+def validate_backend_name(backend: str) -> None:
     """Reject unsafe backend names before they touch the filesystem."""
     if not backend or not isinstance(backend, str):
         raise ValueError(f"backend must be a non-empty string, got {backend!r}")
@@ -94,9 +102,13 @@ def _validate_backend_name(backend: str) -> None:
         raise ValueError(f"backend name must not start with a dot: {backend!r}")
 
 
+# The old private name, kept for callers that still use it.
+_validate_backend_name = validate_backend_name
+
+
 def venv_path(backend: str) -> str:
     """Return the directory for a specific backend's venv."""
-    _validate_backend_name(backend)
+    validate_backend_name(backend)
     return os.path.join(venv_root(), backend)
 
 
@@ -125,17 +137,28 @@ def venv_python(backend: str) -> str:
 # packages ahead of its own pins.  A venv is therefore used only when the
 # interpreter this process creates venvs with is the one that built it.
 
+def python_embed_dir() -> str:
+    """The frozen build's bundled ``python-embed`` directory: beside the
+    app binary, with ``sys.executable`` resolved (a launcher symlink points
+    at the binary, and python-embed sits beside the binary, not the link).
+    The one place that computes it; callers that name it in an error use
+    this too."""
+    return os.path.join(
+        os.path.dirname(os.path.realpath(sys.executable)), "python-embed")
+
+
 def venv_creator_python() -> Optional[str]:
     """Return the interpreter that creates (and whose venvs may run) the
     backend venvs for this process, or None when there is none.
 
     On the frozen build ``sys.executable`` is the app binary, not Python;
-    the interpreter is the bundled ``python-embed`` beside it.  Running
-    from source, it is ``sys.executable``.
+    the interpreter is the bundled ``python-embed`` beside it
+    (``python_embed_dir``).  Running from source, it is ``sys.executable``.
+    Every worker spawn asks this (gpu_worker, hevolveai_supervisor,
+    diarization_service), so one answer decides which python runs a worker.
     """
     if getattr(sys, "frozen", False):
-        embed = os.path.join(
-            os.path.dirname(os.path.abspath(sys.executable)), "python-embed")
+        embed = python_embed_dir()
         for parts in (("python.exe",), ("bin", "python3"), ("bin", "python")):
             candidate = os.path.join(embed, *parts)
             if os.path.isfile(candidate):

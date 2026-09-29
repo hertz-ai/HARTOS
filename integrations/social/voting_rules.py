@@ -73,6 +73,48 @@ MIN_DISTINCT_VOTERS = 3
 MIN_DISTINCT_SUPPORTERS = 2
 
 
+def one_vote_per_identity(ballots):
+    """Collapse vote rows into ONE vote per identity (owner ruling: an agent
+    counts as its owner, and no one entity monopolises the hive).
+
+    ``ballots``: iterable of dicts {'identity', 'own', 'value', 'weight'},
+    one per vote row; ``own`` is True for the identity's human voting as
+    themself.  Returns {identity: (value, weight)}:
+      - the human's own vote when they cast one (their agents are advisory);
+      - otherwise the majority side of that identity's votes (FOR vs
+        AGAINST), its value and weight the mean of that side's;
+      - a tie between FOR and AGAINST is no vote: (0, 0.0);
+      - only abstains: an abstain, (0, mean weight).
+    Measured before this (review of 058c01b05): five people 2 FOR / 3
+    AGAINST, one FOR owning ten agents voting FOR, summed per ROW to a
+    0.727 FOR share and an approval.  Per identity it is 0.4.
+    """
+    groups = {}
+    for b in ballots:
+        groups.setdefault(b['identity'], []).append(b)
+
+    def _mean(bs, key):
+        return sum(b[key] for b in bs) / len(bs)
+
+    out = {}
+    for identity, bs in groups.items():
+        own = [b for b in bs if b['own']]
+        if own:
+            side = own
+        else:
+            fors = [b for b in bs if b['value'] > 0]
+            againsts = [b for b in bs if b['value'] < 0]
+            if len(fors) != len(againsts):
+                side = fors if len(fors) > len(againsts) else againsts
+            elif fors:
+                out[identity] = (0, 0.0)   # split identity: no vote
+                continue
+            else:
+                side = bs                  # only abstains
+        out[identity] = (_mean(side, 'value'), _mean(side, 'weight'))
+    return out
+
+
 def quorum_met(distinct_voters: int, distinct_supporters: int) -> bool:
     """True when enough distinct identities voted, and enough voted FOR."""
     return (distinct_voters >= MIN_DISTINCT_VOTERS

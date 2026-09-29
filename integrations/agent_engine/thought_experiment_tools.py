@@ -513,6 +513,91 @@ def get_experiment_research_status(session_id: str = '') -> str:
         return json.dumps({'error': str(e)})
 
 
+# ─── The vote tool on a /chat agent (service-tool registry) ───
+#
+# cast_experiment_vote votes for the agent whose turn is running, so its
+# caller is a /chat agent.  It reaches those agents through the one path
+# every in-process tool uses: a native ServiceToolInfo on
+# service_tool_registry (GhPrTool / SeoAuditTool shape), registered where
+# create_recipe and reuse_recipe register theirs, attached by the Tier-1
+# gate when the turn is about a thought experiment (goal tag
+# 'thought_experiment').  Before this the tool's only caller was the MCP
+# bridge, which runs with no caller, so no agent could vote (review of
+# 924b8e9dc).  No voter_id in the schema: the voter is the caller.
+
+def _native_cast_vote(payload) -> str:
+    """The registry's native_handler: it passes the call's arguments as a
+    JSON string.  Absent optional values arrive as None."""
+    try:
+        params = json.loads(payload) if isinstance(payload, str) else dict(payload or {})
+    except (TypeError, ValueError):
+        return json.dumps({'success': False, 'reason': 'arguments_not_json'})
+    return cast_experiment_vote(
+        str(params.get('experiment_id') or ''),
+        str(params.get('voter_id') or ''),
+        vote_value=params.get('vote_value') or 0,
+        reasoning=params.get('reasoning') or '',
+        suggestion=params.get('suggestion') or '',
+        confidence=(params.get('confidence')
+                    if params.get('confidence') is not None else 0.8))
+
+
+class ExperimentVoteTool:
+    """Service-tool registration shim (mirrors GhPrTool / SeoAuditTool)."""
+
+    NAME = 'cast_experiment_vote'
+
+    @classmethod
+    def create_tool_info(cls):
+        from integrations.service_tools.registry import ServiceToolInfo
+        return ServiceToolInfo(
+            name=cls.NAME,
+            description=('Cast your own vote on a thought experiment. The '
+                         'vote is yours, the agent running this turn, and '
+                         'counts as your owner\'s.'),
+            base_url='native://in-process',
+            endpoints={
+                cls.NAME: {
+                    'path': f'/{cls.NAME}',
+                    'method': 'POST',
+                    'description': (
+                        'Vote on a thought experiment as yourself. '
+                        'experiment_id (required); vote_value -2..2 '
+                        '(2 strongly for, -2 strongly against); optional '
+                        'reasoning, suggestion, confidence 0..1. Returns '
+                        '{success, vote} or {success: false, reason}.'),
+                    'params_schema': {
+                        'experiment_id': {'type': 'string',
+                                          'description': 'the experiment'},
+                        'vote_value': {'type': 'integer',
+                                       'description': '-2..2'},
+                        'reasoning': {'type': 'string',
+                                      'description': 'why'},
+                        'suggestion': {'type': 'string',
+                                       'description': 'an improvement'},
+                        'confidence': {'type': 'number',
+                                       'description': '0..1'},
+                    },
+                    'native_handler': _native_cast_vote,
+                },
+            },
+            health_endpoint=None,  # native: no HTTP service to ping
+            tags=['thought_experiment', 'vote', 'governance'],
+            timeout=30,
+        )
+
+    @classmethod
+    def register(cls) -> bool:
+        """Register on the global service_tool_registry.  Idempotent."""
+        try:
+            from integrations.service_tools import registry as _reg
+            return _reg.service_tool_registry.register_tool(
+                cls.create_tool_info())
+        except Exception as exc:
+            logger.warning('cast_experiment_vote registration skipped: %s', exc)
+            return False
+
+
 # ─── Tool Registration ───
 
 THOUGHT_EXPERIMENT_TOOLS = [

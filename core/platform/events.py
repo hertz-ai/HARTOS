@@ -202,6 +202,27 @@ _ONE_PERSON_TOPIC_PREFIXES: tuple = (
 )
 
 
+# The EVERYONE topics server code publishes with no user (the realtime
+# publish gate, integrations.social.realtime_acl.topic_open_to): measured
+# publish_event callers -- community.feed / community.message
+# (realtime._publish_post_event, on_community_membership), vote scores
+# (on_vote_update), setup_progress (channels/base.py) -- plus the node-infra
+# feeds that gate always took (system., catalog., model.).  Any signed-in
+# user may SUBSCRIBE to every EVERYONE topic; only these may be published
+# without a per-user topic (review of d89d50223 F5: hive./public./
+# federation./app./resource. had become publishable by anyone).
+_SERVER_BROADCAST_PREFIXES: tuple = (
+    'community.', 'social.post.', 'social.comment.', 'social.vote.',
+    'setup_progress', 'setup.', 'system.', 'catalog.', 'model.',
+)
+
+
+def topic_is_server_broadcast(topic: str) -> bool:
+    """An EVERYONE topic that server code publishes with no user."""
+    return (topic_audience(topic) == AUDIENCE_EVERYONE
+            and (topic or '').startswith(_SERVER_BROADCAST_PREFIXES))
+
+
 def topic_audience(topic: str) -> str:
     """Who an event on ``topic`` is for: one of the AUDIENCE_* classes.
 

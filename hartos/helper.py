@@ -1073,35 +1073,246 @@ _BARE_NUMBER = re.compile(r'-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?')
 _STRING_CLOSER = {'"': '"', "'": "'", '“': '”', '”': '”'}
 # What a bare token is made of: a number with one of these next to it is
 # part of a longer token (a UUID, a word, a path), never a number of its own.
-_TOKEN_CHARS = '_.-+'
+# '/ * $ % !' too: 1e999/2 is an expression, not a number followed by text
+# (review of e1a1aa233: the /2 was dropped).
+_TOKEN_CHARS = '_.-+/*$%!'
 # Where a comment may open: after whitespace or ``{ [ ,`` -- not inside an
 # unquoted value, and not after ':', which the '//' of a URL follows.
 _BEFORE_A_COMMENT = '{[,'
 
 
+def parse_tool_arguments(text):
+    """``(value, repaired)`` for a tool call's arguments text: THE one reader,
+    for both the history guard (ensure_tool_call_arguments_json) and the
+    executor (bind_tool_call_arguments).  Raises ValueError when the text
+    cannot be read without inventing a value.
+
+    The text as written first, with load_wire_json (an overflowing number
+    comes back as the token the model wrote, never inf); else its
+    repair_json repair, with each overflowing number quoted first because
+    repair_json itself would write Infinity for it.  A repair that still
+    yields Infinity / NaN the model never wrote is refused.
+
+    Review of c21b5e6e2 / 7d07c0a2d: the executor parsed with plain
+    json.loads and retrieve_json, so ``{"id": 620e51403072992921}`` ran the
+    tool with id=inf while the guard showed the model the id it wrote."""
+    try:
+        return load_wire_json(text), False
+    except ValueError as e:
+        _fallback_logger.debug(f"tool arguments not strict JSON, repairing: {e}")
+    value = load_wire_json(repair_json(_quote_overflowing_numbers(text)))
+    if _invents_a_constant(value, text):
+        raise ValueError('repair would send a value the model never wrote')
+    return value, True
+
+
 _NON_FINITE_WORDS = ('Infinity', '-Infinity', 'NaN')
 
 
+def _written_value_counts(original):
+    """How many times the model wrote each of Infinity, -Infinity, NaN as a
+    WHOLE value in ``original``: a bare token, or the whole of a quoted
+    string.  Read with the one scanner (_scan_segments), so a word inside a
+    longer string ("to Infinity, and beyond", "say 'Infinity' now") or a
+    comment is never a value the model wrote (review of dbfef4360: a regex
+    blind to string boundaries let an invented Infinity through)."""
+    segments = [s for s in _scan_segments(str(original))
+                if not (s[0] == "char" and s[1].isspace())
+                and s[0] != "comment"]
+    counts = {}
+    for k, (kind, piece) in enumerate(segments):
+        if kind == "string":
+            word = (piece[1:-1] if len(piece) > 1 else "").strip()
+        elif kind == "run":
+            # A bare word is a whole value only between value delimiters:
+            # in {"q": Infinity war} it is the start of an unquoted string.
+            before = segments[k - 1] if k else None
+            after = segments[k + 1] if k + 1 < len(segments) else None
+            if before is not None and (before[0] != "char"
+                                       or before[1] not in "{[,:"):
+                continue
+            if after is not None and (after[0] != "char"
+                                      or after[1] not in ",}]"):
+                continue
+            word = piece
+        else:
+            continue
+        if word in _NON_FINITE_WORDS:
+            counts[word] = counts.get(word, 0) + 1
+    return counts
+
+
+class _WrittenEntry:
+    """One ``key: value`` the model wrote in the outermost object (see
+    _outermost_entries)."""
+    __slots__ = ('key', 'quoted', 'doubtful', 'empty')
+
+    def __init__(self, key, quoted, doubtful):
+        self.key, self.quoted, self.doubtful = key, quoted, doubtful
+        self.empty = True
+
+
+# A bare word that is a whole JSON value on its own.
+_WHOLE_VALUE_WORDS = ('true', 'false', 'null')
+
+
+def _written_key(kind, piece):
+    """A key token as the reader names it: a double-quoted key decoded (a
+    lone surrogate as U+FFFD, like load_wire_json; an invalid escape kept
+    as written, like json_repair), another quoted key without its quotes,
+    a bare key as it is."""
+    if kind != "string":
+        return piece
+    try:
+        key = json.loads(piece) if piece[0] == '"' else piece[1:-1]
+    except ValueError:
+        key = piece[1:-1]
+    return _LONE_SURROGATE.sub(chr(0xFFFD), key)
+
+
+def _outermost_entries(original):
+    """What the model wrote in the outermost object of ``original``: THE
+    one reader of it, with the one scanner (_scan_segments), for both rules
+    tool_argument_error applies after a repair.  One _WrittenEntry per key,
+    in order.  A key is a quoted string, word or number where a key starts
+    (right after ``{`` or ``,``) followed by ``:``; a quoted word inside an
+    unquoted value (``{"command": echo the "status": ok}``) is not one
+    (review of 30042a2b6, problem 6), nor a split word (``..., then report
+    status: ok``).
+
+    ``quoted``: the key is in quotes.  ``doubtful``: a bare key after a
+    value that was not one whole value (a quoted string, a number, true /
+    false / null, or one [...] / {...}): the comma before it may be part of
+    that unquoted value, which json_repair cut there (``{"text": Hi there,
+    text: again}`` sent 'again', review of 30042a2b6, problem 1).
+    ``empty``: the model left the value empty: a quoted string of nothing
+    but whitespace, ``null``, or no value (``"a": ,`` or the text ending);
+    review of e9daad6c5."""
+    entries = []
+    depth, key_start, loose = 0, False, False
+    candidate, entry, items = None, None, None
+
+    def close():
+        # The value of ``entry`` ends: was it one whole value, and empty?
+        nonlocal loose, entry, items
+        if entry is not None:
+            whole = len(items) <= 1 and all(
+                kind in ("string", "number", "group")
+                or kind == "run" and piece in _WHOLE_VALUE_WORDS
+                for kind, piece in items)
+            loose = loose or not whole
+            entry.empty = not items or items == [("run", "null")] or (
+                items[0][0] == "string" and len(items) == 1
+                and not items[0][1][1:-1].strip())
+        entry, items = None, None
+
+    for kind, piece in _scan_segments(str(original)):
+        if kind == "char" and piece.isspace() or kind == "comment":
+            continue
+        opens = kind == "char" and piece in "{["
+        shuts = kind == "char" and piece in "}]"
+        if depth == 1:
+            if candidate is not None and kind == "char" and piece == ":":
+                entry = _WrittenEntry(_written_key(*candidate),
+                                      candidate[0] == "string",
+                                      candidate[0] != "string" and loose)
+                entries.append(entry)
+                candidate, items = None, []
+                continue
+            candidate = None
+            if kind == "char" and piece == ",":
+                close()
+                key_start = True
+                continue
+            if shuts:
+                close()
+            elif key_start and kind in ("string", "run", "number"):
+                candidate = (kind, piece)
+            elif items is not None:
+                items.append(("group", piece) if opens else (kind, piece))
+            key_start = False
+        if opens:
+            depth += 1
+            key_start = depth == 1
+        elif shuts:
+            depth -= 1
+    close()
+    return entries
+
+
 def _invents_a_constant(value, original):
-    """True when ``value`` holds Infinity / NaN (as a number or as the string
-    load_wire_json keeps it as) that ``original`` never contains: repair_json
-    writing Infinity for a number it could not hold.  Such a repair is
-    refused, never sent -- the model did not write that value (review of
-    3ea611862)."""
-    if isinstance(value, dict):
-        return any(_invents_a_constant(k, original)
-                   or _invents_a_constant(v, original) for k, v in value.items())
-    if isinstance(value, list):
-        return any(_invents_a_constant(v, original) for v in value)
-    if isinstance(value, float) and not math.isfinite(value):
+    """True when ``value`` carries Infinity / NaN the model never wrote as a
+    value: a float inf/nan (json.loads of an overflowing number -- the model
+    wrote a number, never inf), or more "Infinity" / "NaN" string values than
+    the model wrote as whole values.  Such a repair is refused, never sent.
+
+    Counted per value, not looked up anywhere in the text: review of
+    3a7abe540 -- with "Infinity war" in the query, the Infinity json_repair
+    invented for 1e999e was let through and search('Infinity war',
+    'Infinity') ran and was banked."""
+    counts = {}
+
+    def walk(v):
+        if isinstance(v, dict):
+            return any(walk(k) or walk(x) for k, x in v.items())
+        if isinstance(v, list):
+            return any(walk(x) for x in v)
+        if isinstance(v, float) and not math.isfinite(v):
+            return True
+        if isinstance(v, str) and v in _NON_FINITE_WORDS:
+            counts[v] = counts.get(v, 0) + 1
+        return False
+
+    if walk(value):
         return True
-    return (isinstance(value, str) and value in _NON_FINITE_WORDS
-            and value not in str(original))
+    written = _written_value_counts(original)
+    return any(n > written.get(word, 0) for word, n in counts.items())
 
 
 def _joins_a_token(ch):
     """True when ``ch`` next to a number makes it part of a longer token."""
     return ch.isalnum() or ch in _TOKEN_CHARS
+
+
+def _scan_segments(text):
+    """Split ``text`` into ``(kind, piece)`` the way the tool-argument reader
+    sees it, so the quoting and the counting of written values read ONE
+    tokenisation: "string" (a quoted string, quotes included; one that never
+    closes runs to the end), "comment" (/* */ or // to the line end, opened
+    only where a comment can start: after whitespace or { [ , -- not inside
+    an unquoted value such as a URL), "number" (a whole run that is a bare
+    number), "run" (any other whole run of letters, digits and
+    _TOKEN_CHARS: a word, a UUID, a path, an expression), or "char"."""
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in _STRING_CLOSER:
+            closer, j = _STRING_CLOSER[ch], i + 1
+            while j < n and text[j] != closer:
+                j += 2 if text[j] == "\\" else 1
+            j = min(n, j + 1)
+            yield "string", text[i:j]
+            i = j
+            continue
+        if ((text.startswith("/*", i) or text.startswith("//", i))
+                and (i == 0 or text[i - 1].isspace()
+                     or text[i - 1] in _BEFORE_A_COMMENT)):
+            closer = "*/" if text[i + 1] == "*" else "\n"
+            end = text.find(closer, i + 2)
+            end = n if end < 0 else end + len(closer)
+            yield "comment", text[i:end]
+            i = end
+            continue
+        if _joins_a_token(ch):
+            j = i + 1
+            while j < n and _joins_a_token(text[j]):
+                j += 1
+            run = text[i:j]
+            yield ("number" if _BARE_NUMBER.fullmatch(run) else "run"), run
+            i = j
+            continue
+        yield "char", ch
+        i += 1
 
 
 def _quote_overflowing_numbers(text):
@@ -1121,53 +1332,19 @@ def _quote_overflowing_numbers(text):
     ``;`` unquoted, and repair_json then wrote Infinity; and a comment is
     opened only where one can start (_BEFORE_A_COMMENT), since the ``//``
     of an unquoted URL is not one."""
-    out, i, closer = [], 0, None
-    while i < len(text):
-        ch = text[i]
-        if closer:
-            if closer in ('*/', '\n'):
-                end = text.find(closer, i)
-                end = len(text) if end < 0 else end + len(closer)
-                out.append(text[i:end])
-                i, closer = end, None
-                continue
-            step = 2 if ch == '\\' else 1
-            out.append(text[i:i + step])
-            if ch == closer:
-                closer = None
-            i += step
-            continue
-        if ch in _STRING_CLOSER:
-            closer = _STRING_CLOSER[ch]
-            out.append(ch)
-            i += 1
-            continue
-        if ((text.startswith('/*', i) or text.startswith('//', i))
-                and (i == 0 or text[i - 1].isspace()
-                     or text[i - 1] in _BEFORE_A_COMMENT)):
-            closer = '*/' if text[i + 1] == '*' else '\n'
-            out.append(text[i:i + 2])
-            i += 2
-            continue
-        match = _BARE_NUMBER.match(text, i)
-        if match and not (i and _joins_a_token(text[i - 1])):
-            token, end = match.group(), match.end()
-            if end == len(text) or not _joins_a_token(text[end]):
-                out.append(json.dumps(token)
-                           if not math.isfinite(float(token)) else token)
-                i = end
-                continue
-            # Part of a longer token (a UUID, a word): copy the whole run
-            # so no later position inside it is read as a number.
-            run_end = end
-            while run_end < len(text) and _joins_a_token(text[run_end]):
-                run_end += 1
-            out.append(text[i:run_end])
-            i = run_end
-            continue
-        out.append(ch)
-        i += 1
-    return ''.join(out)
+    # A number is quoted with the quote character the document itself uses
+    # (the one its last string opened with): a '"' put into a document
+    # written with "'" made json_repair read the next key into the value
+    # before it (review of e1a1aa233: {'u': http://h/x, 'id': 620e...} lost
+    # the id).
+    out, quote = [], '"'
+    for kind, piece in _scan_segments(text):
+        if kind == "string":
+            quote = "'" if piece[0] == "'" else '"'
+        elif kind == "number" and not math.isfinite(float(piece)):
+            piece = quote + piece + quote
+        out.append(piece)
+    return "".join(out)
 
 
 # The two keys of a refused call's stand-in arguments (see
@@ -1193,7 +1370,7 @@ def refused_arguments_reason(text):
                 'would become one key')
     except Exception:
         return 'it is not valid JSON'
-    return 'it is not one JSON object of named values'
+    return NOT_AN_OBJECT_REASON
 
 
 def refused_arguments_json(text):
@@ -1208,10 +1385,97 @@ def refused_arguments_json(text):
     return json.dumps({
         REFUSED_ARGUMENTS_KEY: shown,
         REFUSED_BECAUSE_KEY: ('these arguments were refused and the call was '
-                              'not run: ' + refused_arguments_reason(text)
-                              + '. Call it again with one JSON object of '
-                              'named values.'),
+                              'not run: '
+                              + refusal_sentence(refused_arguments_reason(text))),
     })
+
+
+# The reason, and what to do instead, for arguments that are not one JSON
+# object: ONE wording for the history's stand-in (refused_arguments_json)
+# and the executor's reply (tool_argument_error), so the model reads the
+# same refusal in both (review of 1bf298f5b).
+NOT_AN_OBJECT_REASON = 'it is not one JSON object of named values'
+
+
+def refusal_sentence(reason):
+    """``reason`` and the one instruction that follows every refusal."""
+    return reason + '. Call it again with one JSON object of named values.'
+
+
+def call_functions(msg):
+    """The function dicts a message's tool calls carry: each
+    ``tool_calls[].function`` and a legacy ``function_call``, in order.  The
+    dicts themselves, not copies, so a caller may write into them."""
+    if not isinstance(msg, dict):
+        return []
+    fns = [tc['function'] for tc in (msg.get('tool_calls') or [])
+           if isinstance(tc, dict) and isinstance(tc.get('function'), dict)]
+    if isinstance(msg.get('function_call'), dict):
+        fns.append(msg['function_call'])
+    return fns
+
+
+def wire_tool_arguments(args):
+    """``(text, coerced)``: the arguments text the TOOL-ARGS-GUARD sends for
+    one call written with ``args`` (see ensure_tool_call_arguments_json), and
+    whether it had to change what was written to get it.  Pure: the guard
+    writes it, and the executor uses it to find the record a guarded copy
+    came from (stored_call_records)."""
+    if isinstance(args, dict):
+        # Some code paths store the arguments as an object already — the
+        # wire wants a string, so serialize.  A float inf / nan in it
+        # serializes as Infinity / NaN, so it is checked below like any
+        # other string.
+        args = json.dumps(args)
+        if is_wire_json(args):
+            return args, False
+    if args is None or (isinstance(args, str) and not args.strip()):
+        # Nothing written is no arguments: {} -- what the executor runs a
+        # zero-parameter tool with, so history and execution agree (review
+        # of 1bf298f5b: "" became the refused stand-in while the tool ran).
+        return '{}', True
+    if not isinstance(args, str):
+        args = str(args)
+    try:
+        is_object = isinstance(_wire_json_loads(args, _refuse_token), dict)
+    except Exception:
+        is_object = False
+    if is_object:
+        # Already a strict JSON object: leave untouched.  Strict JSON that is
+        # not an object ('[1,2]', '"hello"') is not arguments: the llama.cpp
+        # template reads arguments only as a mapping, so a prior call with
+        # '[{"url": ...}]' rendered with no parameters at all (measured on
+        # :8080, review of b0fa4989e).
+        return args, False
+    try:
+        obj, _ = parse_tool_arguments(args)
+        if isinstance(obj, dict):
+            return json.dumps(obj), True
+    except ValueError as e:
+        _fallback_logger.debug(f"TOOL-ARGS-GUARD: arguments refused: {e}")
+    return refused_arguments_json(args), True
+
+
+class _CallArguments(str):
+    """Wire-compatible arguments retaining this call's source through transforms."""
+    def __new__(cls, wire, as_written, record):
+        obj = super().__new__(cls, wire)
+        obj.as_written = as_written
+        obj.record = record
+        return obj
+
+    def __deepcopy__(self, memo):
+        # TransformMessages copies history, not the identity of its source call.
+        return type(self)(str(self), self.as_written, self.record)
+
+
+def _bind_argument_sources(messages):
+    for msg in messages or ():
+        for fn in call_functions(msg):
+            raw = fn.get('arguments')
+            if isinstance(raw, str) and not isinstance(raw, _CallArguments):
+                fn['arguments'] = _CallArguments(raw, raw, fn)
+    return messages
 
 
 def ensure_tool_call_arguments_json(messages):
@@ -1249,70 +1513,30 @@ def ensure_tool_call_arguments_json(messages):
     it: review of 86e580b99).  ``None`` arguments, where nothing was written,
     still become ``"{}"``.
 
+    The per-call rule is :func:`wire_tool_arguments`.
+
     This guard has no tool signatures, so its repair cannot tell a benign fix
     (a trailing comma) from json_repair splitting an unquoted value into
-    keys.  The executor can: a call it refused as broken JSON is already
-    marked refused in the conversation (bind_tool_call_arguments, ``call``),
-    and a strict JSON object is kept here as it is.
+    keys.  The executor can, and it reads the call as the model wrote it:
+    every production seat runs this guard in its TransformMessages chain
+    BEFORE any reply function, so the executor is handed this guard's
+    repair, not the model's text; it finds the conversation's stored record
+    of the call (stored_call_records) and parses that.  A call it refused
+    as broken JSON is marked refused in that record, and a strict JSON
+    object is kept here as it is.
     """
     if not messages:
         return messages
     coerced = 0
     for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        fns = []
-        for tc in (msg.get('tool_calls') or []):
-            if isinstance(tc, dict) and isinstance(tc.get('function'), dict):
-                fns.append(tc['function'])
-        if isinstance(msg.get('function_call'), dict):
-            fns.append(msg['function_call'])
-        for fn in fns:
+        for fn in call_functions(msg):
             args = fn.get('arguments')
-            if isinstance(args, dict):
-                # Some code paths store the arguments as an object already —
-                # the wire wants a string, so serialize.  A float inf / nan in
-                # it serializes as Infinity / NaN, so it is checked below
-                # like any other string.
-                args = json.dumps(args)
-                if is_wire_json(args):
-                    fn['arguments'] = args
-                    continue
-            if args is None:
-                fn['arguments'] = '{}'
-                coerced += 1
-                continue
-            if not isinstance(args, str):
-                args = str(args)
-            try:
-                is_object = isinstance(_wire_json_loads(args, _refuse_token),
-                                       dict)
-            except Exception:
-                is_object = False
-            if is_object:
-                # Already a strict JSON object: leave untouched.  Strict JSON
-                # that is not an object ('[1,2]', '"hello"') is not arguments:
-                # the llama.cpp template reads arguments only as a mapping,
-                # so a prior call with '[{"url": ...}]' rendered with no
-                # parameters at all (measured on :8080, review of b0fa4989e).
-                continue
-            fixed = None
-            # The original text first; before repair, each overflowing
-            # number is quoted, since repair_json itself would turn it into
-            # Infinity and lose the token.
-            for candidate in (lambda: args, lambda: repair_json(
-                    _quote_overflowing_numbers(args))):
-                try:
-                    obj = load_wire_json(candidate())
-                except Exception:
-                    continue
-                if isinstance(obj, dict) and not _invents_a_constant(obj, args):
-                    fixed = json.dumps(obj)
-                    break
-            if fixed is None:
-                fixed = refused_arguments_json(args)
-            fn['arguments'] = fixed
-            coerced += 1
+            fixed, changed = wire_tool_arguments(args)
+            if isinstance(args, _CallArguments):
+                fn['arguments'] = _CallArguments(fixed, args.as_written, args.record)
+            elif fixed != args:
+                fn['arguments'] = _CallArguments(fixed, args, fn)
+            coerced += changed
     if coerced:
         try:
             current_app.logger.info(
@@ -1472,6 +1696,16 @@ def _context_limiter_classes():
 
     class TokenLimiter(transforms.MessageTokenLimiter):
         def apply_transform(self, messages):
+            # autogen's per-message cut (_truncate_tokens below) is handed
+            # the text alone, never the role.  The texts of user turns --
+            # the only turns that keep their head (must_keep_head) -- are
+            # noted here so the cut can tell them apart.  Review of
+            # e1a1aa233: an assistant or tool message holding the separator
+            # kept its head too (~6,000 tokens against 2,500).
+            self._user_texts = {
+                m['content'] for m in messages
+                if isinstance(m, dict) and m.get('role') == 'user'
+                and isinstance(m.get('content'), str)}
             kept = super().apply_transform(messages)
             if dropped_newest(messages, kept):
                 # autogen cuts the newest message first, with nothing yet
@@ -1493,7 +1727,9 @@ def _context_limiter_classes():
             # here first, the "follow these steps:" boundary with them.
             from core.llm_outbound_logger import keep_head_cut, must_keep_head
             from core.constants import WIRE_TRIM_MARKER
-            keep = must_keep_head(text)
+            role = ('user' if text in getattr(self, '_user_texts', ())
+                    else None)
+            keep = must_keep_head(text, role)
             if not keep:
                 return super()._truncate_tokens(text, n_tokens)
             util = transforms.transforms_util
@@ -4127,7 +4363,124 @@ def safe_function_call(func, arguments):
         raise e
 
 
-def tool_argument_error(func, func_name, arguments, repaired):
+def _is_numeric_annotation(annotation):
+    """True for int / float, also inside Optional / Union / Annotated."""
+    return any(t in (int, float) for t in _annotation_types(annotation))
+
+
+def _annotation_types(annotation):
+    """The plain types an annotation admits: Annotated unwrapped, Optional /
+    Union flattened (None dropped)."""
+    import typing
+    origin = typing.get_origin(annotation)
+    if origin is typing.Annotated:
+        return _annotation_types(typing.get_args(annotation)[0])
+    if origin is typing.Union:
+        return [t for a in typing.get_args(annotation) if a is not type(None)
+                for t in _annotation_types(a)]
+    return [annotation]
+
+
+def _list_element_annotation(annotation):
+    """The element annotation of a List[X] / list[X] parameter, else None."""
+    import typing
+    for t in _annotation_types(annotation):
+        if typing.get_origin(t) is list and typing.get_args(t):
+            return typing.get_args(t)[0]
+    return None
+
+
+def _unholdable_token(value):
+    """True for a string the reader kept for a number no double can hold, or
+    for NaN / Infinity."""
+    if not isinstance(value, str):
+        return False
+    token = value.strip()
+    return token in _NON_FINITE_WORDS or bool(
+        _BARE_NUMBER.fullmatch(token) and not math.isfinite(float(token)))
+
+
+def _exact_int_token(value):
+    """The exact int for a whole-number token a double cannot hold (Python
+    ints are exact), else None."""
+    if isinstance(value, str) and re.fullmatch(r'-?\d+', value.strip()):
+        try:
+            return int(value.strip())
+        except ValueError as e:
+            # Past Python's int-from-text digit limit (4300): not a value the
+            # tool can be given, so it is refused like any unholdable number
+            # (review of 1bf298f5b: uncaught, the turn died).
+            _fallback_logger.debug(f"whole number too long to read: {e}")
+            return None
+    return None
+
+
+def _number_for(value, types):
+    """What a number-typed parameter admitting ``types`` gets for ``value``:
+    ``(True, value)`` to pass it as it is, ``(True, exact_int)`` for an exact
+    whole number an int parameter can hold, ``(False, None)`` to refuse a
+    number no double can hold, or NaN / Infinity.  THE one rule, for a
+    single value and for each element of a list (review of 1bf298f5b:
+    List[int] refused what int took)."""
+    if str in types or not any(t in (int, float) for t in types):
+        return True, value
+    if not _unholdable_token(value):
+        return True, value
+    if int in types:
+        exact = _exact_int_token(value)
+        if exact is not None:
+            return True, exact
+    return False, None
+
+
+def _numbers_out_of_range(params, bound):
+    """Names of number-typed parameters bound to the token of a number no
+    double can hold, or to NaN / Infinity, which the reader keeps as text
+    (_number_for decides each value)."""
+    out = []
+    for p in params:
+        value = bound.get(p.name)
+        element = _list_element_annotation(p.annotation)
+        if isinstance(value, list) and element is not None:
+            types = _annotation_types(element)
+            if not all(_number_for(v, types)[0] for v in value):
+                out.append(p.name)
+            continue
+        if not _number_for(value, _annotation_types(p.annotation))[0]:
+            out.append(p.name)
+    return out
+
+
+def _exact_int_arguments(func, arguments):
+    """``arguments`` with each value _number_for turns into an exact int --
+    a whole number a double could not hold, for an int parameter or an
+    element of a List[int] -- replaced by that int.  Anything else, and
+    arguments that are not a dict, as they are."""
+    import inspect
+    if not isinstance(arguments, dict):
+        return arguments
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return arguments
+    out = dict(arguments)
+    for name, value in arguments.items():
+        p = params.get(name)
+        if p is None:
+            continue
+        element = _list_element_annotation(p.annotation)
+        if isinstance(value, list) and element is not None:
+            types = _annotation_types(element)
+            out[name] = [_number_for(v, types)[1] if _number_for(v, types)[0]
+                         else v for v in value]
+        else:
+            ok, got = _number_for(value, _annotation_types(p.annotation))
+            if ok:
+                out[name] = got
+    return out
+
+
+def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     """Why ``func`` cannot be called with ``arguments``, or None.
 
     Binds the call the arguments actually become (:func:`tool_call_shape`,
@@ -4152,8 +4505,43 @@ def tool_argument_error(func, func_name, arguments, repaired):
     could be read shown as what was received, not as names to fix.  A
     repaired call that binds but leaves a required value empty (None, or a
     blank string json_repair filled in) is refused the same way.
+
+    ``as_written`` is the text the model wrote.  After a repair, a key that
+    the tool does not declare and the model did not write in quotes is
+    refused the same way, whatever the signature.  Such a key is either one
+    the model wrote bare (``cwd: "/tmp"``) or one json_repair split out of
+    an unquoted value (``{"command": deploy the app, then report status:
+    ok}`` -> ``status``); the two cannot be told apart, and a tool that
+    takes **kwargs binds any name, so the split used to run it with the
+    value cut short (review of the defect-14 fix; MCP tool_executor and
+    service_tools endpoint_executor keep a **kwargs signature when a tool
+    has no schema).  For such a tool the refusal asks for every key in
+    double quotes and does not present the declared names as the only ones
+    (review of 30042a2b6: that steered the model into dropping ``cwd``).
+    Strict JSON quotes every key, so it is not scanned.  After a repair, a
+    value left empty that the model did not write empty (``"cwd": /tmp``
+    -> ``""``) is refused like a required one.
+
+    A declared name is no safer (review of 30042a2b6, problem 1): the split
+    can make a key the tool declares, and the dict keeps only the last
+    value, so ``{"command": ls -la, command: rm -rf /tmp/x}`` ran
+    ``rm -rf /tmp/x``.  So after a repair every key must be one the model
+    wrote where a key starts, and a key written twice, or written bare after
+    a value that was not one whole value, is refused.  All of it is read by
+    the one reader, once (_outermost_entries).
     """
     import inspect
+    if not isinstance(arguments, dict):
+        # One JSON object of named values, or not run -- the rule the history
+        # guard (ensure_tool_call_arguments_json) applies to the same call.
+        # The executor used to run '[1, 2]' positionally and '"hello"' as one
+        # argument while the guard rewrote the call in the history to the
+        # refused stand-in ("the call was not run"); the two now agree
+        # (coordinator's default, review of dbfef4360).  Measured before:
+        # all 854 tool calls models made in llm_outbound.jsonl + .old carry
+        # an object.
+        return (f"Error: {func_name} was not run: "
+                + refusal_sentence(NOT_AN_OBJECT_REASON))
     args, kwargs = tool_call_shape(arguments)
     if REFUSED_ARGUMENTS_KEY in kwargs:
         # A refused call's stand-in (refused_arguments_json) is never run,
@@ -4184,7 +4572,49 @@ def tool_argument_error(func, func_name, arguments, repaired):
     emptied = ([p.name for p in params
                 if p.default is p.empty and blank(bound.get(p.name))]
                if repaired and bound is not None else [])
-    if bound is not None and not emptied:
+    # Any value, required or not, that the repair emptied: empty now, but
+    # not left empty by the model (review of 30042a2b6: "cwd": /tmp ran a
+    # **kwargs tool with cwd='').
+    blanks = [k for k, v in kwargs.items() if blank(v) and k not in emptied]
+    # What the model wrote, read once and only after a repair: strict JSON
+    # quotes every key and cannot be split (review of 30042a2b6: a scan per
+    # extra key took 0.42 s on 100 KB).
+    written = (_outermost_entries(as_written)
+               if repaired and as_written is not None else None)
+    emptied_written = ([k for k in blanks
+                        if k not in {e.key for e in written if e.empty}]
+                       if written is not None else [])
+    unholdable = (_numbers_out_of_range(params, bound)
+                  if bound is not None else [])
+    if unholdable:
+        # The reader keeps a number a double cannot hold (or NaN/Infinity
+        # the model wrote) as the token it wrote, a string.  For a parameter
+        # typed as a number that string is not a value the tool can take:
+        # refused, never passed on as text (review of 3a7abe540, item 6).
+        return (f"Error: {func_name} was not run: "
+                f"{', '.join(unholdable)} must be a finite number, and the "
+                f"value given cannot be held as one. Call {func_name} again "
+                f"with a number in range.")
+    # After a repair, every key must be one the model wrote as a key: in
+    # quotes when the tool does not declare it; and none written twice or
+    # bare after an unquoted value, where the dict would keep a value cut
+    # out of the one before (review of 30042a2b6, problem 1).
+    declared = {p.name for p in params}
+    invented, suspect = [], []
+    if written is not None:
+        as_keys = [e.key for e in written]
+        quoted = {e.key for e in written if e.quoted}
+        invented = [k for k in kwargs
+                    if k not in (as_keys if k in declared else quoted)]
+        seen, twice = set(), []
+        for k in as_keys:
+            if k in seen:
+                twice.append(k)
+            seen.add(k)
+        suspect = list(dict.fromkeys(
+            [e.key for e in written if e.doubtful] + twice))
+    if (bound is not None and not emptied and not emptied_written
+            and not invented and not suspect):
         return None
     takes_any = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
     names = {p.name for p in params}
@@ -4215,22 +4645,59 @@ def tool_argument_error(func, func_name, arguments, repaired):
         text += f" Missing required argument(s): {', '.join(missing)}."
     if emptied:
         text += f" Required argument(s) left empty: {', '.join(emptied)}."
+    if emptied_written:
+        text += (f" Value(s) that could not be read and came out empty: "
+                 f"{', '.join(map(str, emptied_written))}.")
+    if suspect:
+        text += (f" Key(s) written twice, or bare after a value not in double "
+                 f"quotes, so they may be part of the value before them: "
+                 f"{', '.join(map(str, suspect))}.")
+    if takes_any:
+        # Any name is accepted: the declared ones are not the only ones, so
+        # they are not offered as the fix -- quoting is (review of 30042a2b6).
+        if invented:
+            text += (f" Key(s) not written as a key in double quotes: "
+                     f"{', '.join(map(str, invented))}.")
+        return (text + f" Declared parameters: {expected}; {func_name} also "
+                f"takes other named values. Call {func_name} again with one "
+                f"JSON object, every key and every string value in double "
+                f"quotes.")
     return (text + f" Expected parameters: {expected}. Call {func_name} again "
             f"with one JSON object using these names.")
 
 
-def mark_call_refused(call, input_string):
+def stored_call_records(agent, func_call):
+    """Recover only this call's source; never infer it from repaired arguments."""
+    handed = func_call.get('arguments', '{}')
+    records = [fn
+               for conversation in (getattr(agent, '_oai_messages', None) or {}).values()
+               for msg in conversation or () for fn in call_functions(msg)]
+    if isinstance(handed, _CallArguments):
+        if any(fn is handed.record for fn in records):
+            return handed.as_written, [handed.record]
+        # A guard called directly on a copy has no source identity. An exact,
+        # unique raw match can mark history, but cannot change what is parsed.
+        matches = [fn for fn in records
+                   if fn.get('name') == func_call.get('name')
+                   and fn.get('arguments') == handed.as_written]
+        return handed.as_written, matches if len(matches) == 1 else []
+    return handed, [fn for fn in records if fn is func_call]
+
+
+def mark_call_refused(records, input_string):
     """Write the refused stand-in (refused_arguments_json: what the model
-    wrote, marked refused, and why) into ``call``, the conversation's own
-    record of a tool call whose arguments were not valid JSON and were
-    refused.  A no-op when there is no record to mark."""
-    if isinstance(call, dict):
-        call['arguments'] = refused_arguments_json(
-            input_string if isinstance(input_string, str) else str(input_string))
+    wrote, marked refused, and why) into each of ``records``, the
+    conversation's own records of a tool call whose arguments were not valid
+    JSON and were refused (stored_call_records).  A no-op when there is no
+    record to mark."""
+    text = input_string if isinstance(input_string, str) else str(input_string)
+    for record in records or ():
+        if isinstance(record, dict):
+            record['arguments'] = refused_arguments_json(text)
 
 
 def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
-                             where='', call=None):
+                             where='', records=()):
     """Parse a tool call's arguments and check them against the tool.
 
     Returns ``(arguments, None)`` when the tool may be called with them and
@@ -4240,12 +4707,14 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
     ``tool_argument_error`` on whatever came back, including the ``{}``
     used when nothing could be recovered.
 
-    ``call`` is the conversation's own record of the call: autogen hands the
-    executor the very function dict of the stored message
-    (generate_tool_calls_reply: ``tool_call.get("function")`` of
-    ``messages[-1]``), and every copy of that message shares it.  When
-    arguments that were not valid JSON are refused, it is marked refused
-    (mark_call_refused).  Log RCA defect 14, leftover: the TOOL-ARGS-GUARD
+    ``input_string`` is the call as the model wrote it and ``records`` the
+    conversation's own records of it (stored_call_records: with the
+    production TransformMessages the executor is handed a guarded deep copy,
+    so neither the handed text nor the handed dict will do).  The seats of
+    a conversation share those function dicts (autogen broadcasts the one
+    message object), so when arguments that were not valid JSON are
+    refused, marking the records (mark_call_refused) marks every seat's
+    history.  Log RCA defect 14, leftover: the TOOL-ARGS-GUARD
     (ensure_tool_call_arguments_json), which has no tool signatures, repaired
     the same text on its own and wrote json_repair's split dict back into
     every later request, so the model saw its broken call as a well-formed
@@ -4254,10 +4723,33 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
     Refused well-formed JSON (a wrong name) stays as the model wrote it:
     that is what the reply names.
     """
+    # ONE reader for tool arguments (parse_tool_arguments), the one the
+    # history guard uses, so the tool gets what the model is shown -- never
+    # json.loads here: it read an overflowing number as inf and ran the tool
+    # with it (review of c21b5e6e2 / 7d07c0a2d).  retrieve_json stays the
+    # last resort for shapes the reader cannot repair (an "@user" prefix,
+    # Python-literal syntax), and what it returns is refused if it carries
+    # Infinity / NaN the model never wrote.
+    if not isinstance(input_string, str):
+        # Arguments handed as an object or None, not text: read by the
+        # history guard's own rule (wire_tool_arguments: a dict serialized,
+        # None as {}), so the executor runs what the history shows.  Before,
+        # _format_json_str raised on them and the call was refused and
+        # marked with the Python repr (review of the defect-14 fix).
+        input_string, _ = wire_tool_arguments(input_string)
     try:
-        arguments = json.loads(format_json_str(input_string))
-        print(f" ORIGINAL AUTOGEN{where}: Successfully parsed arguments for {func_name}")
-        repaired = False
+        # A strict read of autogen's formatted text first; on failure the
+        # reader repairs the RAW text, the text the history guard reads.
+        # format_json_str drops newlines, so repairing ITS output let a '//'
+        # comment swallow the rest of the arguments (review of 3a7abe540:
+        # '{\n "id": "x", // c\n "n": 2\n}' ran as ('x', 2) before, and was
+        # refused there).
+        try:
+            arguments, repaired = load_wire_json(format_json_str(input_string)), False
+        except ValueError:
+            arguments, repaired = parse_tool_arguments(input_string)
+        print(f" ORIGINAL AUTOGEN{where}: parsed arguments for {func_name}"
+              f"{' (repaired)' if repaired else ''}")
     except Exception as e:
         print(f" ORIGINAL AUTOGEN{where} FAILED: {e} - falling back to enhanced parsing for {func_name}")
         try:
@@ -4265,20 +4757,31 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
             if arguments is None:
                 arguments = {}
             elif isinstance(arguments, str):
-                arguments = json.loads(arguments)
+                arguments, _ = parse_tool_arguments(arguments)
         except Exception as fallback_error:
             print(f" FALLBACK{where} FAILED: {fallback_error}")
-            mark_call_refused(call, input_string)
+            mark_call_refused(records, input_string)
             return None, f"Error: {e}\n The argument must be in JSON format."
         print(f" FALLBACK{where} PARSED: arguments for {func_name}: {arguments}")
         repaired = True
-    error = tool_argument_error(func, func_name, arguments, repaired)
+    if _invents_a_constant(arguments, input_string):
+        print(f" ARGUMENTS REFUSED{where}: {func_name} not run: a value the "
+              f"model never wrote (Infinity/NaN)")
+        mark_call_refused(records, input_string)
+        return None, (f"Error: {func_name} was not run: its arguments could "
+                      f"not be read without turning a number into Infinity. "
+                      f"Write a long number or id as a string in double "
+                      f"quotes.")
+    error = tool_argument_error(func, func_name, arguments, repaired,
+                                as_written=input_string)
     if error is not None:
         print(f" ARGUMENTS REFUSED{where}: {func_name} not run: {error}")
         if repaired:
-            mark_call_refused(call, input_string)
+            mark_call_refused(records, input_string)
         return None, error
-    return arguments, None
+    # An int parameter gets an exact whole number a double could not hold
+    # as the int it is, not the token text (review of dbfef4360).
+    return _exact_int_arguments(func, arguments), None
 
 
 def force_apply_autogen_json_fix():
@@ -4303,10 +4806,13 @@ def force_apply_autogen_json_fix():
         if func is not None:
             # ========== PRESERVE ORIGINAL AUTOGEN LOGIC ==========
             # Extract arguments from a json-like string and put it into a dict.
-            input_string = func_call.get("arguments", "{}")
+            # The call as the model wrote it, from the conversation's own
+            # record: the handed func_call is the guard's copy under the
+            # production TransformMessages (stored_call_records).
+            input_string, records = stored_call_records(self, func_call)
             arguments, content = bind_tool_call_arguments(
                 func, func_name, input_string, self._format_json_str,
-                call=func_call)
+                records=records)
 
             # ========== PRESERVE ORIGINAL EXECUTION LOGIC ==========
             if arguments is not None:
@@ -4353,10 +4859,10 @@ def force_apply_autogen_json_fix():
 
         is_exec_success = False
         if func is not None:
-            input_string = func_call.get("arguments", "{}")
+            input_string, records = stored_call_records(self, func_call)
             arguments, content = bind_tool_call_arguments(
                 func, func_name, input_string, self._format_json_str,
-                where=' ASYNC', call=func_call)
+                where=' ASYNC', records=records)
 
             if arguments is not None:
                 iostream.print(f"\n>>>>>>>> EXECUTING ASYNC FUNCTION {func_name}...", flush=True)
@@ -4398,6 +4904,22 @@ def force_apply_autogen_json_fix():
         # Store original methods for verification
         original_execute = getattr(ConversableAgent, 'execute_function', None)
         original_a_execute = getattr(ConversableAgent, 'a_execute_function', None)
+
+        # Bind before existing transforms deepcopy history. Both reply modes
+        # retain the same call identity, without adding another reply runner.
+        if not getattr(ConversableAgent, '_hart_argument_sources_bound', False):
+            sync_process = ConversableAgent.process_all_messages_before_reply
+            async_process = ConversableAgent.a_process_all_messages_before_reply
+
+            def process_with_sources(self, messages):
+                return sync_process(self, _bind_argument_sources(messages))
+
+            async def async_process_with_sources(self, messages):
+                return await async_process(self, _bind_argument_sources(messages))
+
+            ConversableAgent.process_all_messages_before_reply = process_with_sources
+            ConversableAgent.a_process_all_messages_before_reply = async_process_with_sources
+            ConversableAgent._hart_argument_sources_bound = True
 
         # Apply patches
         ConversableAgent.execute_function = enhanced_execute_function

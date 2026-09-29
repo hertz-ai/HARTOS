@@ -90,11 +90,30 @@ class FrameStore:
         self._description_ttl = description_ttl
         self._screen_description_ttl = screen_description_ttl
 
+    # ─── The sense gate ───
+
+    def _open(self, sensor: str, frames: Dict[str, deque]) -> bool:
+        """True when ``sensor`` may be sensed now (core.ai_sensing.allowed:
+        the eye button's cut, or the owner's No to the feed).  When it may
+        not, every frame held for it is dropped too, so nothing taken before
+        the No is described after it.  Every producer (the WS receiver, the
+        screen-capture loop, Nunba's frame routes, the ROS bridge) and every
+        reader goes through this store, whichever VisionService owns it.
+        Caller holds self._lock."""
+        from core.ai_sensing import allowed
+        if allowed(sensor):
+            return True
+        frames.clear()
+        return False
+
     # ─── Camera Channel (default, backward compatible) ───
 
     def put_frame(self, user_id: str, frame_bytes: bytes):
-        """Store a raw camera frame for a user (FIFO bounded)."""
+        """Store a raw camera frame for a user (FIFO bounded); dropped while
+        the camera may not be sensed."""
         with self._lock:
+            if not self._open('camera', self._frames):
+                return
             if user_id not in self._frames:
                 self._frames[user_id] = deque(maxlen=self._max_frames)
             self._frames[user_id].append((time.time(), frame_bytes))
@@ -102,6 +121,8 @@ class FrameStore:
     def get_frame(self, user_id: str) -> Optional[bytes]:
         """Get the latest camera frame for a user, or None."""
         with self._lock:
+            if not self._open('camera', self._frames):
+                return None
             buf = self._frames.get(user_id)
             if buf:
                 return buf[-1][1]
@@ -110,6 +131,8 @@ class FrameStore:
     def get_frame_count(self, user_id: str) -> int:
         """Number of buffered camera frames for a user."""
         with self._lock:
+            if not self._open('camera', self._frames):
+                return 0
             buf = self._frames.get(user_id)
             return len(buf) if buf else 0
 
@@ -139,8 +162,11 @@ class FrameStore:
     # ─── Screen Channel ───
 
     def put_screen_frame(self, user_id: str, frame_bytes: bytes):
-        """Store a raw screen capture frame for a user (FIFO bounded)."""
+        """Store a raw screen capture frame for a user (FIFO bounded);
+        dropped while the screen may not be sensed."""
         with self._lock:
+            if not self._open('screen', self._screen_frames):
+                return
             if user_id not in self._screen_frames:
                 self._screen_frames[user_id] = deque(maxlen=self._max_frames)
             self._screen_frames[user_id].append((time.time(), frame_bytes))
@@ -148,6 +174,8 @@ class FrameStore:
     def get_screen_frame(self, user_id: str) -> Optional[bytes]:
         """Get the latest screen frame for a user, or None."""
         with self._lock:
+            if not self._open('screen', self._screen_frames):
+                return None
             buf = self._screen_frames.get(user_id)
             if buf:
                 return buf[-1][1]

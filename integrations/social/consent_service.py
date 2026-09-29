@@ -22,7 +22,6 @@ immutable regardless of which entry point a caller chose.
 """
 import logging
 import re
-import threading
 import uuid
 from datetime import datetime
 
@@ -428,96 +427,30 @@ def _embodied_feed_from_consent(consent_type: str, granted: bool) -> None:
     get_embodied_status reports it.  Best effort: the consent row is already
     written, and a switch that cannot be applied is logged here.
 
-    The start or stop itself runs OFF the caller's thread (_FeedAnswers).
-    The caller is an HTTP request (an Allow on a card, the privacy page, the
-    admin toggle), and a feed start that never returns -- VisionService,
-    measured live 2026-09-25 -- held that request open: the card's spinner
-    never ended.  The flag is set here, at once, so the answer is on record
-    whatever the hardware does.
+    Here, on the caller's thread: the flag, the capture gate
+    (admin.api.apply_embodied_answer -> core.ai_sensing) and the save, so a
+    No stops capture and is on disk the moment it is given.  Only the
+    VisionService start or stop runs off this thread, on the feed's own
+    worker (admin.api._FEED_WORKER): the caller is an HTTP request (an Allow
+    on a card, the privacy page, the admin toggle), and a feed start that
+    never returns -- measured live 2026-09-25 -- held that request open.
     """
     feed = _CONSENT_FEED.get(consent_type)
     if feed is None:
         return
     try:
-        from integrations.channels.admin.api import get_api, _apply_embodied_toggle
+        from integrations.channels.admin.api import get_api, apply_embodied_answer
         api = get_api()
         cfg = api._global_config.embodied_ai
         setattr(cfg, 'camera_enabled' if feed == 'camera' else 'screen_capture_enabled',
                 bool(granted))
-    except Exception as e:
-        _logger.warning("embodied feed %s from consent %s failed: %s",
-                        feed, consent_type, e)
-        return
-    _FEED_ANSWERS.submit(feed, bool(granted), consent_type,
-                         lambda: _apply_feed_answer(
-                             api, _apply_embodied_toggle, cfg, feed,
-                             bool(granted), consent_type))
-
-
-def _apply_feed_answer(api, apply_toggle, cfg, feed: str, granted: bool,
-                       consent_type: str) -> None:
-    """Persist the flag and start or stop the feed; on the background
-    executor, never the request thread.  Logs, never raises."""
-    try:
+        apply_embodied_answer(feed, bool(granted), cfg)
         api._save_config()
-        apply_toggle(feed, granted, cfg)
         _logger.info("consent %s -> embodied feed %s=%s",
-                     consent_type, feed, granted)
+                     consent_type, feed, bool(granted))
     except Exception as e:
         _logger.warning("embodied feed %s from consent %s failed: %s",
                         feed, consent_type, e)
-
-
-class _FeedAnswers:
-    """The owner's feed answers, applied one at a time, off the caller's
-    thread, on the shared background executor
-    (agent_engine.parallel_dispatch.get_executor).
-
-    One drain job at a time, never one job per answer: a start that hangs
-    then holds ONE executor worker, and answers given meanwhile wait here,
-    not in more workers.  One answer per feed is kept, the latest, moved to
-    the back of the line, so a hung start followed by a revoke ends with the
-    revoke applied once the start returns -- never a stale start after it.
-    """
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._waiting = {}   # feed -> apply job, in the order answered
-        self._draining = False
-
-    def submit(self, feed, granted, consent_type, job) -> None:
-        with self._lock:
-            self._waiting.pop(feed, None)
-            self._waiting[feed] = job
-            if self._draining:
-                return
-            self._draining = True
-        try:
-            from integrations.agent_engine.parallel_dispatch import get_executor
-            get_executor().submit(self._drain)
-        except Exception:
-            # No executor (interpreter shutting down): apply here, as before.
-            _logger.warning("embodied feed %s=%s from consent %s: background "
-                            "executor unavailable, applying inline",
-                            feed, granted, consent_type, exc_info=True)
-            self._drain()
-
-    def _drain(self) -> None:
-        while True:
-            with self._lock:
-                if not self._waiting:
-                    self._draining = False
-                    return
-                feed = next(iter(self._waiting))
-                job = self._waiting.pop(feed)
-            try:
-                job()
-            except Exception:
-                _logger.warning("embodied feed %s answer failed", feed,
-                                exc_info=True)
-
-
-_FEED_ANSWERS = _FeedAnswers()
 
 
 def _announce_grant(db, user_id: str, consent_type: str, scope: str,
@@ -1102,6 +1035,26 @@ class ConsentService:
         })
         _copilot_switch_from_consent(consent_type, False)
         _embodied_feed_from_consent(consent_type, False)
+
+    @staticmethod
+    def feed_said_no(db, consent_type: str) -> bool:
+        """True when the latest answer on file for a camera/screen feed is a
+        No, whoever gave it and for whichever agent or scope.
+
+        The feed is this node's hardware and its capture gate is node-wide:
+        every answer, from any surface, reaches the same gate
+        (_embodied_feed_from_consent) and the last one stands.  A process
+        restoring the gate at startup (vision_service.restore_feed_answers)
+        reads that same last answer here.  An answer is a grant (granted_at)
+        or a No (revoked_at: revoke_consent, the privacy page's revoke, a
+        declined ask); a pending ask is neither.  On a tie the No wins.
+        """
+        _validate_consent_type(consent_type)
+        from sqlalchemy import func
+        last_yes, last_no = db.query(
+            func.max(UserConsent.granted_at), func.max(UserConsent.revoked_at),
+        ).filter(UserConsent.consent_type == consent_type).one()
+        return last_no is not None and (last_yes is None or last_no >= last_yes)
 
     @staticmethod
     def active_grant(db, user_id: str, consent_type: str,

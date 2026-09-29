@@ -50,11 +50,20 @@ SECRET_KEYS = [
     'SOCIAL_DB_KEY',
     'REDIS_URL',
     'DATABASE_URL',
-    # Nunba desktop vault tool keys migrated from config.json
-    # (desktop.ai_key_vault._MIGRATABLE_KEYS), read from the environment.
-    'GOOGLE_OAUTH2_CLIENT_ID',
-    'GOOGLE_OAUTH2_CLIENT_SECRET',
+    'ANTHROPIC_API_KEY',
 ]
+
+# The node's own secrets and connection strings in SECRET_KEYS: its JWT
+# signing key, its database key and where its data lives.  Only the node's
+# own vault (hartos.ai_key_vault.AIKeyVault.preload_env) may put them in the
+# environment; a consent-card or agent-supplied value never sets them, held
+# or not (hartos.ai_key_vault.is_node_secret).
+NODE_SECRET_KEYS = (
+    'SOCIAL_SECRET_KEY',
+    'SOCIAL_DB_KEY',
+    'DATABASE_URL',
+    'REDIS_URL',
+)
 
 
 class SecretsManager:
@@ -238,3 +247,12 @@ if __name__ == '__main__':
         SecretsManager.migrate_from_config()
     else:
         print("Usage: python -m security.secrets_manager migrate")
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HEVOLVE_MASTER_KEY',
+)

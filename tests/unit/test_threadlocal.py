@@ -343,3 +343,19 @@ def test_adopt_merges_and_shares_what_it_was_handed():
     assert seen['pid'] == 'p-1'
     assert seen['run'] is snap['activity_run']
     tld.clear_activity_run()
+
+
+def test_carry_runs_fn_on_another_thread_as_this_one():
+    """carry(fn): the one way to hand a call to a worker with this thread's
+    request state (used by the VLM action worker and the agentic plan)."""
+    import threading
+    from hartos.threadlocal import thread_local_data as tld
+    tld.set_prompt_id('p-carry')
+    carried = tld.carry(lambda x: (tld.get_prompt_id(), x))
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault('r', carried(7)))
+    t.start()
+    t.join(5)
+    assert out['r'] == ('p-carry', 7)
+    assert carried.snapshot['prompt_id'] == 'p-carry'
+    tld.set_prompt_id(None)

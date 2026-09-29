@@ -191,6 +191,58 @@ def test_one_caller_cannot_build_a_quorum_of_people(db, caller):
     assert tally['distinct_voters'] == 0 and tally['quorum_met'] is False
 
 
+def test_an_mcp_tool_sees_none_of_the_last_chats_request_state(db):
+    """Review of 924b8e9dc: clearing only prompt_id / user_id left the rest
+    of the last /chat's request on the thread -- request_id, user_role
+    'central', its activity run, its model override -- for any MCP tool to
+    act on.  The whole request context is set aside for the call and put
+    back after it."""
+    from integrations.mcp import mcp_http_bridge as bridge
+
+    tl = thread_local_data
+    before = tl.snapshot()
+    try:
+        tl.set_request_id('req-of-last-chat')
+        tl.set_user_role('central')
+        tl.set_activity_run('run-1', user_id='u9', prompt_id='p9')
+        tl.set_model_config_override([{'model': 'x'}])
+        tl.set_prompt_id('p9')
+        tl.set_user_id('u9')
+        seen = {}
+
+        def _probe():
+            seen.update(request_id=tl.get_request_id(),
+                        user_role=tl.get_user_role(),
+                        activity_run=tl.get_activity_run(),
+                        override=tl.get_model_config_override(),
+                        prompt_id=tl.get_prompt_id(),
+                        user_id=tl.get_user_id())
+            return '{}'
+
+        bridge._load_tools()
+        bridge._local_tools.append({'name': 'probe_ctx', 'description': '',
+                                    'parameters': {}, 'fn': _probe})
+        try:
+            payload, status = bridge._invoke_tool('probe_ctx', {})
+        finally:
+            bridge._local_tools[:] = [t for t in bridge._local_tools
+                                      if t['name'] != 'probe_ctx']
+        assert status == 200, payload
+        assert seen == {'request_id': None, 'user_role': 'flat',
+                        'activity_run': None, 'override': None,
+                        'prompt_id': None, 'user_id': None}
+        # ...and the thread's own request state is back, unchanged.
+        assert tl.get_request_id() == 'req-of-last-chat'
+        assert tl.get_user_role() == 'central'
+        assert tl.get_activity_run()['run_id'] == 'run-1'
+        assert tl.get_model_config_override() == [{'model': 'x'}]
+        assert (tl.get_prompt_id(), tl.get_user_id()) == ('p9', 'u9')
+    finally:
+        for key in list(vars(tl._local)):
+            delattr(tl._local, key)
+        tl.adopt(before)
+
+
 def test_over_mcp_a_left_over_chat_caller_casts_nothing(db, caller,
                                                         monkeypatch):
     """The real MCP bridge, on a thread a /chat left its agent on: the vote

@@ -194,20 +194,20 @@ def _send_hitl_notification(db, goal, task):
 
     try:
         from integrations.social.services import NotificationService
-        from integrations.social.realtime import on_notification
         owner_id = goal.created_by or goal.owner_id
         if not owner_id:
             return
         desc_preview = (task.description or '')[:100]
-        notif = NotificationService.create(
+        # create() pushes it to the owner's devices once the daemon's session
+        # commits (models.after_commit).  A second on_notification here
+        # pushed it twice, the extra one BEFORE the commit, for a row that
+        # could still roll back.
+        NotificationService.create(
             db, str(owner_id), 'approval_required',
             target_type='thought_experiment',
             target_id=str(task.id),
             message=f'Agent needs your review: {desc_preview}',
         )
-        on_notification(str(owner_id), notif.to_dict() if hasattr(notif, 'to_dict') else {
-            'type': 'approval_required', 'message': f'Agent needs your review: {desc_preview}',
-        })
         logger.info(f"HITL notification sent for goal={goal.id} task={task.id}")
     except Exception as e:
         logger.debug(f"HITL notification failed: {e}")

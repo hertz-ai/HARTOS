@@ -53,11 +53,14 @@ MAX_BARE_SWALLOWS = 1517        # `except ...: pass` (was 1533 -> 1528 -> 1521
 #: Note 4 of the remainder are in hive_guardrails.py, which CLAUDE.md forbids
 #: modifying (circuit breaker / structural immutability) — they need the steward,
 #: not a refactor.
-MAX_SECURITY_SWALLOWS = 61      # was 68 -> 63 -> 62 -> 61.
+MAX_SECURITY_SWALLOWS = 60      # was 68 -> 63 -> 62 -> 61 -> 60.
                                 # 2026-09-27: security/node_integrity.py's five
                                 # identity-race swallows (584cdec55 took the
                                 # count to 67) now log; one more had gone
-                                # elsewhere in the meantime, so 61.
+                                # elsewhere in the meantime, so 61.  Then
+                                # system_requirements' CPU-model probe moved
+                                # onto call_bounded and its bare
+                                # `except: pass` went with it, so 60.
                                 # MERGE NOTE 2026-09-11: two lanes lowered this
                                 # to 62 independently and each recorded a
                                 # different cause, so BOTH are kept -- the number

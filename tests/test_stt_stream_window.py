@@ -246,6 +246,10 @@ class DeviceSelectionFallbackTest(unittest.TestCase):
         self._saved_size = whisper_tool._faster_whisper_model_size
         whisper_tool._faster_whisper_model = None
         whisper_tool._faster_whisper_model_size = None
+        # A cuda failure turns cuda off for the rest of the PROCESS; each
+        # test here is its own fresh process as far as the loader knows.
+        self._saved_cuda_error = whisper_tool._faster_whisper_cuda_error
+        whisper_tool._faster_whisper_cuda_error = None
         # Reset breaker/backoff so they don't short-circuit the load (and put
         # them back after: test_whisper_backoff runs in the same process and
         # needs the module's real breaker).
@@ -257,6 +261,7 @@ class DeviceSelectionFallbackTest(unittest.TestCase):
     def tearDown(self):
         whisper_tool._faster_whisper_model = self._saved_model
         whisper_tool._faster_whisper_model_size = self._saved_size
+        whisper_tool._faster_whisper_cuda_error = self._saved_cuda_error
         whisper_tool._whisper_load_breaker = self._saved_breaker
         whisper_tool._whisper_load_backoff = self._saved_backoff
 

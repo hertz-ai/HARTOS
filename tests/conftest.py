@@ -148,6 +148,19 @@ def reset_state_machine():
         pass
 
 
+@pytest.fixture(autouse=True)
+def reopen_owner_feed_answers():
+    """A real camera/screen revoke in one test closes core.ai_sensing's
+    process-wide gate (the owner's No); the next test starts with no answer
+    on record, as a fresh process does."""
+    yield
+    from core import ai_sensing
+    with ai_sensing._lock:
+        for sensor in ai_sensing._withheld:
+            ai_sensing._withheld[sensor] = False
+        ai_sensing._answered.clear()
+
+
 @pytest.fixture
 def computer_control_granted(monkeypatch):
     """The desktop owner has allowed agents to control this computer.
@@ -161,6 +174,11 @@ def computer_control_granted(monkeypatch):
     from integrations.vlm import safety
     monkeypatch.setattr(safety, 'computer_control_block',
                         lambda agent_id, **_kw: None)
+    # These model tests mock OS actions and assume an idle desktop.
+    # Dedicated takeover tests override the signal with event transitions.
+    from core import resource_governor
+    monkeypatch.setattr(resource_governor, 'get_physical_input_state',
+                        lambda **_kw: (0, None))
 
 
 @pytest.fixture
@@ -555,43 +573,18 @@ def pytest_sessionfinish(session, exitstatus):
 
 # ─── Hiding an import without nuking sys.modules ──────────────────────────
 #
-# The repo-wide idiom for "make this import fail so the fallback path runs" is
-#   with patch.dict('sys.modules', {'some.module': None}): ...
-# and it has a nasty side effect: mock's _unpatch_dict CLEARS sys.modules and
-# restores the snapshot it took on entry, so EVERY module imported inside the
-# block is evicted on exit. One of these blocks around a dispatch call evicts
-# ~3200 modules, torch and numpy among them.
-#
-# For pure-Python modules that is merely wasteful (they re-import). For a
-# package backed by a C extension it is fatal: the extension stays initialised
-# in the process while its Python layer re-executes, so the next `import torch`
-# dies with "function '_has_torch_function' already has a docstring" (or a
-# tensor_numpy.cpp INTERNAL ASSERT, depending on version) in whatever unrelated
-# test happens to touch torch next. That is the whole story behind the
-# test_distributed_bridge torch failures on CI.
-#
-# hidden_modules() does only the thing the tests actually want: hide these
-# names, restore exactly these names, leave the rest of sys.modules alone.
-import contextlib as _contextlib
+# hidden_modules(*names) makes `import <name>` raise ImportError for the
+# block.  It is swap_modules({name: None}) from tests/unit/module_swap.py, the
+# one implementation, whose docstring records why patch.dict('sys.modules')
+# is refused: the torch "_has_torch_function already has a docstring" CI
+# failure, and the stale-module one that sent a mocked loop to 127.0.0.1:8080.
 
 
-@_contextlib.contextmanager
 def hidden_modules(*names):
     """Make ``import <name>`` raise ImportError for the duration of the block.
 
     Restores only the named entries on exit, so modules imported inside the
-    block stay imported. Drop-in replacement for
-    ``patch.dict('sys.modules', {name: None, ...})``.
+    block stay imported.  Delegates to tests.unit.module_swap.swap_modules.
     """
-    sentinel = object()
-    saved = {n: sys.modules.get(n, sentinel) for n in names}
-    for n in names:
-        sys.modules[n] = None
-    try:
-        yield
-    finally:
-        for n, old in saved.items():
-            if old is sentinel:
-                sys.modules.pop(n, None)
-            else:
-                sys.modules[n] = old
+    from tests.unit.module_swap import swap_modules
+    return swap_modules({n: None for n in names})

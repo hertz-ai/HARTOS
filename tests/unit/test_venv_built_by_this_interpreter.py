@@ -140,6 +140,38 @@ class TestFrozenBuild:
         _make_venv("xtts_v2", str(tmp_path / "Python312"), _this_version())
         assert venv_paths.venv_python_if_exists("xtts_v2") is None
 
+    def test_a_symlinked_app_binary_still_finds_python_embed(
+            self, frozen_app, tmp_path, monkeypatch):
+        # Review of 02931fdd4: backend_venv resolved sys.executable with
+        # Path.resolve(); venv_creator_python used abspath, so an app binary
+        # reached through a symlink looked for python-embed beside the LINK.
+        app, embed = frozen_app
+        elsewhere = tmp_path / "launcher"
+        elsewhere.mkdir()
+        link = elsewhere / "Nunba.exe"
+        try:
+            os.symlink(app / "Nunba.exe", link)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"no symlinks here: {exc}")
+        monkeypatch.setattr(sys, "executable", str(link))
+        want = os.path.realpath(embed / "python.exe")
+        assert venv_paths.venv_creator_python() == want
+        assert venv_paths.python_embed_dir() == os.path.realpath(embed)
+
+    @pytest.mark.parametrize("posix_name", ["python3", "python"])
+    def test_a_posix_python_embed_is_found_in_bin(self, tmp_path, monkeypatch,
+                                                  posix_name):
+        # The macOS / Linux bundle lays python-embed out as bin/python3 (or
+        # bin/python), not python.exe.
+        app = tmp_path / "Nunba.app"
+        interp = app / "python-embed" / "bin" / posix_name
+        interp.parent.mkdir(parents=True)
+        interp.write_text("", encoding="utf-8")
+        (app / "Nunba").write_text("", encoding="utf-8")
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "executable", str(app / "Nunba"))
+        assert venv_paths.venv_creator_python() == os.path.realpath(interp)
+
     def test_without_python_embed_there_is_no_creator_and_no_venv(
             self, frozen_app):
         app, embed = frozen_app
@@ -174,6 +206,83 @@ class TestSpawnPath:
         assert gpu_worker._resolve_python_exe() == str(embed / "python.exe")
         os.remove(embed / "python.exe")
         assert gpu_worker._resolve_python_exe() == sys.executable
+
+
+class TestOneAnswerForTheWorkerInterpreter:
+    """Review of 02931fdd4: hevolveai_supervisor and diarization_service each
+    joined dirname(sys.executable)/python-embed/python.exe themselves.  Every
+    worker spawn now asks venv_creator_python, the answer the venv check uses."""
+
+    def _supervisor(self):
+        from integrations.agent_engine import hevolveai_supervisor as sup
+        return sup._resolve_python_exe()
+
+    def _diarization(self, monkeypatch):
+        from integrations.audio import diarization_service as ds
+        seen = []
+
+        class _Proc:
+            stdout = None
+
+        monkeypatch.setattr(ds.subprocess, "Popen",
+                            lambda cmd, **kw: seen.append(cmd) or _Proc())
+        svc = ds.DiarizationService.__new__(ds.DiarizationService)
+        svc._port = 1
+        svc._process = None
+        svc._start_subprocess()
+        return seen[0][0]
+
+    def test_frozen_workers_run_python_embed(self, frozen_app, monkeypatch):
+        app, embed = frozen_app
+        want = venv_paths.venv_creator_python()
+        assert want == os.path.realpath(embed / "python.exe")
+        assert self._supervisor() == want
+        assert self._diarization(monkeypatch) == want
+
+    def test_a_symlinked_frozen_app_is_one_answer_everywhere(
+            self, frozen_app, tmp_path, monkeypatch):
+        app, embed = frozen_app
+        link_dir = tmp_path / "launcher"
+        link_dir.mkdir()
+        try:
+            os.symlink(app / "Nunba.exe", link_dir / "Nunba.exe")
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"no symlinks here: {exc}")
+        monkeypatch.setattr(sys, "executable", str(link_dir / "Nunba.exe"))
+        want = os.path.realpath(embed / "python.exe")
+        assert self._supervisor() == want
+        assert self._diarization(monkeypatch) == want
+
+    def test_source_workers_run_this_interpreter(self, monkeypatch):
+        monkeypatch.setattr(sys, "frozen", False, raising=False)
+        assert self._supervisor() == sys.executable
+        assert self._diarization(monkeypatch) == sys.executable
+
+
+class TestPublicNames:
+    """Nunba's tts.backend_venv imported _reset_cache_for_tests and
+    _validate_backend_name; they are public now, the old names aliases."""
+
+    def test_validate_backend_name(self):
+        venv_paths.validate_backend_name("kokoro")
+        for bad in ("", "../evil", ".hidden", "a b"):
+            with pytest.raises(ValueError):
+                venv_paths.validate_backend_name(bad)
+        assert venv_paths._validate_backend_name is venv_paths.validate_backend_name
+
+    def test_reset_venv_root_cache(self, monkeypatch, tmp_path):
+        first = venv_paths.venv_root()
+        monkeypatch.delenv("NUNBA_VENV_ROOT_OVERRIDE")
+        monkeypatch.setattr("core.platform_paths.get_data_dir",
+                            lambda: str(tmp_path / "a"))
+        cached = venv_paths.venv_root()
+        monkeypatch.setattr("core.platform_paths.get_data_dir",
+                            lambda: str(tmp_path / "b"))
+        assert venv_paths.venv_root() == cached
+        venv_paths.reset_venv_root_cache()
+        assert venv_paths.venv_root() == os.path.join(str(tmp_path / "b"), "data", "venvs")
+        assert first != cached
+        assert venv_paths._reset_cache_for_tests is venv_paths.reset_venv_root_cache
 
 
 class TestRealInterpreter:

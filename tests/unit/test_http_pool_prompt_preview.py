@@ -52,7 +52,9 @@ def test_the_llm_log_line_carries_text_not_base64(caplog):
     session.post.return_value = resp
     scheduler = MagicMock()
     scheduler.slot.return_value = nullcontext()
-    fake_scheduler_module = types.SimpleNamespace(get_scheduler=lambda: scheduler)
+    from core.llama_scheduler import TurnCancelled
+    fake_scheduler_module = types.SimpleNamespace(
+        get_scheduler=lambda: scheduler, TurnCancelled=TurnCancelled)
     body = {'messages': [{'role': 'user', 'content': [_IMAGE_PART, _TEXT_PART]}]}
 
     caplog.set_level(logging.INFO, logger='hevolve_core')
@@ -68,3 +70,37 @@ def test_the_llm_log_line_carries_text_not_base64(caplog):
     assert lines, 'the observability line must still be emitted'
     assert 'read this page' in lines[0]
     assert _B64[:40] not in lines[0] and 'base64' not in lines[0]
+
+
+def test_a_broken_scheduler_fails_open_but_a_cancel_does_not():
+    """pooled_post's two exits from the scheduler: any scheduler error sends
+    the call anyway (a queue must never block a call), a TurnCancelled never
+    does (review of f97b6bed8: with 'TurnCancelled = Exception' every error
+    would have been re-raised and no test noticed)."""
+    import pytest
+    from core.llama_scheduler import TurnCancelled
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {'choices': [{'message': {'content': 'ok'}}]}
+    session = MagicMock()
+    session.post.return_value = resp
+
+    def module_raising(exc):
+        sched = MagicMock()
+        sched.slot.side_effect = exc
+        return types.SimpleNamespace(get_scheduler=lambda: sched,
+                                     TurnCancelled=TurnCancelled)
+    body = {'messages': [{'role': 'user', 'content': 'x'}]}
+    with patch.object(http_pool, '_is_llama_completion_url', return_value=True), \
+         patch.object(http_pool, '_classify_llama_call', return_value=('r', 'daemon')), \
+         patch.object(http_pool, '_llama_session_for', return_value=session):
+        with patch.dict(sys.modules, {'core.llama_scheduler':
+                                      module_raising(RuntimeError('queue bug'))}):
+            assert http_pool.pooled_post(
+                'http://127.0.0.1:8080/v1/chat/completions', json=body) is resp
+        session.post.reset_mock()
+        with patch.dict(sys.modules, {'core.llama_scheduler':
+                                      module_raising(TurnCancelled('gone'))}):
+            with pytest.raises(TurnCancelled):
+                http_pool.pooled_post(
+                    'http://127.0.0.1:8080/v1/chat/completions', json=body)
+        session.post.assert_not_called()

@@ -58,32 +58,15 @@ class CapabilityNotInstalled(RuntimeError):
     """
 
 
-def request_capability_setup(capability: str, *, reason: str, category: str,
-                             context: Optional[dict] = None,
-                             severity: str = 'low') -> str:
-    """Offer to set ``capability`` up, and raise the work once the owner has
-    said yes.
+def ask_owner_for_setup(capability: str, *, reason: str) -> str:
+    """The owner's answer to setting ``capability`` up, asking once if none
+    is on file.  The one consent check for installing a capability, used by
+    the offer below and by the install tool itself (repair_backend_venv), so
+    no caller can install without the owner's yes.
 
-    Args:
-        capability: what is being set up, as ``'<family>:<id>'``
-            (``'tts:f5_tts'``).  It becomes the consent scope, so the grant
-            covers this capability and no other.
-        reason: what the card says.  Written for the person reading it.
-        category: the error_advice category the remediation goal carries;
-            ``repair_backend_venv`` documents the TTS ones it answers to
-            (``tts.probe`` / ``tts.install`` / ``subprocess.tool_load``).
-        context: extra fields for the goal.  ``backend`` is what the TTS
-            repair tool reads.
-        severity: error_advice severity, driving the goal's spark budget.
-            Missing a capability is not an incident; 'low' by default.
-
-    Returns what happened, for the caller's log:
-        ``'provisioning'`` consent is on file and the work was raised (or
-                           was already raised -- error_advice dedupes).
-        ``'asked'``        the card is filed and waiting for an answer.
-        ``'declined'``     the owner said no.  Nothing was asked again.
-        ``'unavailable'``  nobody could be asked, or consent could not be
-                           reached at all.
+    Returns ``'granted'``, ``'asked'`` (the card is filed and waiting),
+    ``'declined'`` (the owner said no; not asked again), or ``'unavailable'``
+    (no owner to ask, a bad capability name, or consent unreachable).
     """
     if not isinstance(capability, str) or not capability.strip():
         logger.warning("capability setup: a capability must be named")
@@ -125,7 +108,40 @@ def request_capability_setup(capability: str, *, reason: str, category: str,
 
     if answer != 'granted':
         logger.info("capability setup for %s: %s", capability, answer)
+    return answer
+
+
+def request_capability_setup(capability: str, *, reason: str, category: str,
+                             context: Optional[dict] = None,
+                             severity: str = 'low') -> str:
+    """Offer to set ``capability`` up, and raise the work once the owner has
+    said yes.
+
+    Args:
+        capability: what is being set up, as ``'<family>:<id>'``
+            (``'tts:f5_tts'``).  It becomes the consent scope, so the grant
+            covers this capability and no other.
+        reason: what the card says.  Written for the person reading it.
+        category: the error_advice category the remediation goal carries;
+            ``repair_backend_venv`` documents the TTS ones it answers to
+            (``tts.probe`` / ``tts.install`` / ``subprocess.tool_load``).
+        context: extra fields for the goal.  ``backend`` is what the TTS
+            repair tool reads.
+        severity: error_advice severity, driving the goal's spark budget.
+            Missing a capability is not an incident; 'low' by default.
+
+    Returns what happened, for the caller's log:
+        ``'provisioning'`` consent is on file and the work was raised (or
+                           was already raised -- error_advice dedupes).
+        ``'asked'``        the card is filed and waiting for an answer.
+        ``'declined'``     the owner said no.  Nothing was asked again.
+        ``'unavailable'``  nobody could be asked, or consent could not be
+                           reached at all.
+    """
+    answer = ask_owner_for_setup(capability, reason=reason)
+    if answer != 'granted':
         return answer
+    capability = capability.strip()
 
     try:
         from core.error_advice import handle_exception

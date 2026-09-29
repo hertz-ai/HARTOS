@@ -52,7 +52,12 @@
     var d = st.disabled || {}, p = st.proof || {};
     box.innerHTML = '';
     box.appendChild(row('Hearing (mic)', !!d.mic, d.mic ? 'transcription refused' : ''));
-    box.appendChild(row('Sight (camera)', !!d.camera, p.camera_service_running === false ? 'service stopped' : ''));
+    // 'unknown': the OS could not reach the vision service to check (a
+    // broken module or a renamed call, logged as an ERROR). Say so; never
+    // imply the camera is off.
+    var cam = p.camera_service_running;
+    box.appendChild(row('Sight (camera)', !!d.camera,
+      cam === false ? 'service stopped' : (cam === 'unknown' ? 'state unknown' : '')));
     box.appendChild(row('Screen', !!d.screen, ''));
     var foot = document.createElement('div');
     foot.className = 'hsp-foot';

@@ -353,6 +353,73 @@ def test_discovery_sweeps_each_url_once(node, invoker, monkeypatch):
             if p['url'] == PEER_URL} == {SERVER_ID}
 
 
+def test_admitted_peers_fills_its_limit_past_duplicate_urls(node, invoker):
+    """The dedup ran on a limit*8 over-fetch, so more than limit*8 rows at
+    one url ranked first (verified, most recent) left the sweep with ONE
+    peer where eight distinct nodes were admitted (review of 4cf4411d0)."""
+    now = datetime.utcnow() + timedelta(minutes=5)
+    with db_session() as db:
+        db.add_all([PeerNode(node_id=f'livetest-dup-{i:03d}',
+                             url='http://dup-host:6777', status='active',
+                             public_key=_other_key(),
+                             integrity_status='verified', last_seen=now)
+                    for i in range(3 * 8 + 1)])
+        db.add_all([PeerNode(node_id=f'livetest-distinct-{i}',
+                             url=f'http://distinct-{i}:6777', status='active',
+                             public_key=_other_key(),
+                             integrity_status='verified',
+                             last_seen=now - timedelta(seconds=1 + i))
+                    for i in range(3)])
+    peers = peer_reuse.admitted_peers(limit=3)
+    urls = [p['url'] for p in peers]
+    assert len(urls) == 3 and len(set(urls)) == 3, urls
+
+
+def test_reuse_asks_the_node_when_the_matched_row_is_unverified(
+        node, invoker, monkeypatch):
+    """Nothing this node verified stands at the url: the row the sweep
+    matched is a guess (the most recent of several unverified identities),
+    and a request signed for it is refused.  The node at that url says who
+    it is (peer_node_id_for(ask_the_node=True)); that is the audience
+    (review of 4cf4411d0)."""
+    _admit(invoker.node_id, invoker.public_key)
+    with db_session() as db:
+        db.query(PeerNode).filter_by(node_id=SERVER_ID).one(
+            ).integrity_status = 'unverified'
+    _stale_identities_at_the_peer_url()
+    ident = {'goal_slug': f'livetest-slug-{uuid.uuid4().hex[:6]}',
+             'goal_title': 'collect metrics', 'goal_type': 'ops'}
+
+    class _Get:
+        def __init__(self, code, body):
+            self.status_code, self._body = code, body
+
+        def json(self):
+            return self._body
+
+    def get(url, timeout=None, **kw):
+        if url == f'{PEER_URL}/a2a/agents':
+            return _Get(200, {'agents': [{
+                'agent_id': AGENT, 'status': 'completed', 'flow_id': 0,
+                'goal_slug': ident['goal_slug']}]})
+        if url == f'{PEER_URL}/api/social/peers/health':
+            return _Get(200, {'node_id': SERVER_ID})
+        if url.endswith('/recipe'):
+            return _Get(403, {'error': 'export_refused'})
+        return _Get(404, {})
+    monkeypatch.setattr(peer_reuse, 'pooled_get', get)
+    monkeypatch.setattr(peer_reuse, '_record_remote_outcome',
+                        lambda *a, **k: None)
+    matched = [p for p in peer_reuse.admitted_peers() if p['url'] == PEER_URL]
+    assert matched and matched[0]['node_id'] != SERVER_ID, matched
+    verdict = peer_reuse.try_peer_recipe_reuse(
+        ident, f'livetest-{uuid.uuid4().hex[:8]}',
+        deadline=time.monotonic() + 30)
+    assert node.bodies[-1].get('audience') == SERVER_ID, node.bodies[-1]
+    assert verdict == 'invoked', node.seen
+    assert node.ran == ['collect metrics']
+
+
 def test_a_banned_row_at_the_url_is_not_the_audience(node, invoker):
     """Same admission filter as admitted_peers: a banned row is skipped."""
     _admit(invoker.node_id, invoker.public_key)
@@ -1023,9 +1090,15 @@ def test_the_poll_backs_off(monkeypatch):
         'message/get': [{'id': 't1', 'state': 'working'}],
         'task/cancel': [{'success': True}]})
     started = time.monotonic()
-    assert peer_reuse.invoke_peer_agent(PEER_URL, AGENT, 'x', timeout=6,
+    assert peer_reuse.invoke_peer_agent(PEER_URL, AGENT, 'x', timeout=6.9,
                                         peer_node_id=SERVER_ID) is None
-    assert time.monotonic() - started >= 5.5
+    # The whole budget is spent before the cancel: the last sleep is cut to
+    # what is left, not skipped (a backed-off 2 s step would stop at ~5.8).
+    elapsed = time.monotonic() - started
+    assert elapsed >= 6.7
+    # ...and not overrun: the cancel goes out at the budget, not a backed-off
+    # step past it (mutant P2: the last sleep not cut to what is left).
+    assert elapsed <= 7.6, elapsed
     assert calls.count('message/get') <= 8, calls
     assert calls[-1] == 'task/cancel' or calls[-2] == 'task/cancel', calls
 

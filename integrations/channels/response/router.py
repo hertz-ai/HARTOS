@@ -81,6 +81,10 @@ class ChannelResponseRouter:
                 returns the reply to ChannelRegistry._route_to_agent, which sends
                 it; sending it here too delivered every channel reply twice.
         """
+        # Text for the user on every channel: no elided-text pointer (owner
+        # ruling 2026-09-27; review of d99b1aa88).
+        from core.llm_outbound_logger import strip_elided_pointers
+        response_text = strip_elided_pointers(response_text)
         originating_channel = None
         originating_chat_id = None
 
@@ -286,6 +290,8 @@ class ChannelResponseRouter:
         Singleton accessor — see core.safe_hartos_attr for why workers
         must not eager-import hart_intelligence.
         """
+        from core.llm_outbound_logger import strip_elided_pointers
+        text = strip_elided_pointers(text)
         try:
             from core.safe_hartos_attr import safe_hartos_attr
             publish_async = safe_hartos_attr('publish_async')

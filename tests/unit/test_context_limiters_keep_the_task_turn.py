@@ -134,3 +134,16 @@ def test_a_turn_without_the_separator_is_cut_as_autogen_cuts_it():
     msgs = [{'role': 'user', 'name': 'User', 'content': long}]
     assert (token_limiter(**_TOKENS).apply_transform(msgs)
             == ag.MessageTokenLimiter(**_TOKENS).apply_transform(msgs))
+
+
+def test_only_a_user_turn_keeps_its_head_in_the_limiter():
+    """Review of e1a1aa233 (r0003_lim.py): autogen's per-message hook has
+    no role, so an assistant or tool message holding the separator kept
+    its head whole too (~6,000 tokens against 2,500)."""
+    from core.constants import ACTION_STEPS_SEPARATOR
+    body = 'word ' * 3000 + ACTION_STEPS_SEPARATOR + 'step ' * 50
+    msgs = [{'role': 'assistant', 'name': 'Assistant', 'content': body},
+            {'role': 'user', 'name': 'StatusVerifier', 'content': 'ok'}]
+    out = token_limiter(**_TOKENS).apply_transform(msgs)
+    want = ag.MessageTokenLimiter(**_TOKENS).apply_transform(msgs)
+    assert out == want

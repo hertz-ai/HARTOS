@@ -152,31 +152,22 @@ class AdminAPI:
                             "agent_data", "admin_config.json")
 
     def _adopt_legacy_config(self, config_path: str) -> None:
-        """One-time, non-destructive move to the user data dir: when nothing
-        is at ``config_path`` yet and the pre-bff95ab44 file is, copy its
-        content there.  The old file is never changed or deleted (a rollback
-        or another install may still read it), a file already at the new
-        place is never overwritten, and an old file that is not valid JSON
-        is left behind, not copied.  Without this an upgrade dropped every
-        saved channel, workflow and the agent identity."""
-        legacy = os.path.abspath(self._legacy_config_path())
-        try:
-            if (os.path.exists(config_path) or not os.path.isfile(legacy)
-                    or os.path.normcase(legacy)
-                    == os.path.normcase(os.path.abspath(config_path))):
-                return
-            with open(legacy, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            from core.file_cache import atomic_json_write
-            atomic_json_write(config_path, data, indent=2)
-            logger.info("Copied admin configuration from %s to %s",
-                        legacy, config_path)
-        except Exception as e:
-            logger.warning("Admin config at %s not carried over to %s: %s",
-                           legacy, config_path, e)
+        """One-time, non-destructive move to the user data dir (the
+        pre-bff95ab44 file to ``config_path``), through the shared
+        core.file_cache.adopt_legacy_json_once: the old file is never changed
+        or deleted, a config already at the new place is never overwritten,
+        an old file that is not JSON is not copied, and once the new place is
+        in use a marker (admin_config.migrated.json) keeps it that way.
+        Without the copy an upgrade dropped every saved channel, workflow and
+        the agent identity; without the marker, deleting the new config and
+        restarting brought the old channels and their bot tokens back."""
+        from core.file_cache import adopt_legacy_json_once
+        adopt_legacy_json_once(config_path, self._legacy_config_path(),
+                               what="Admin configuration", indent=2)
 
     def _load_config(self) -> None:
-        """Restore persisted admin state (channels + workflows + identity) so it
+        """Restore persisted admin state (channels + workflows + identity +
+        the embodied_ai feed answers) so it
         survives a restart (#45).  Previously this loaded into self._config —
         which nothing reads — while the live state lived in separate attrs that
         were never persisted, so identity + workflows (and channels) were lost on
@@ -202,12 +193,21 @@ class AdminAPI:
                 self._identity = IdentityConfigSchema(**_ident) if _ident else None
             except Exception:
                 logger.warning("admin: skipping unloadable identity config")
+            _embodied = data.get("embodied_ai")
+            if _embodied:
+                _known = EmbodiedAIConfigSchema.__dataclass_fields__
+                try:
+                    self._global_config.embodied_ai = EmbodiedAIConfigSchema(
+                        **{k: v for k, v in _embodied.items() if k in _known})
+                except Exception:
+                    logger.warning("admin: skipping unloadable embodied_ai config")
             logger.info("Loaded admin configuration from %s", config_path)
         except Exception as e:
             logger.warning("Failed to load admin config: %s", e)
 
     def _save_config(self) -> None:
-        """Atomically persist admin state (channels + workflows + identity) so it
+        """Atomically persist admin state (channels + workflows + identity +
+        the embodied_ai feed answers) so it
         survives a restart (#45).  Serializes the LIVE attrs — the previous
         version dumped an always-empty self._config, persisting nothing."""
         from core.file_cache import atomic_json_write
@@ -225,6 +225,9 @@ class AdminAPI:
                                   for k, w in self._workflows.items()},
                     "identity": (self._identity.to_dict()
                                  if self._identity else None),
+                    # The owner's camera/screen answers: a No saved here is
+                    # still a No after a restart.
+                    "embodied_ai": self._global_config.embodied_ai.to_dict(),
                 }
                 atomic_json_write(config_path, payload, indent=2)
                 logger.info("Saved admin configuration to %s", config_path)
@@ -2279,7 +2282,7 @@ def toggle_embodied_feed():
     # /api/agent/approval (hart_intelligence_entry), for the identical reason:
     # applying again would be the second path.
     if not _record_feed_consent(feed, enabled):
-        _apply_embodied_toggle(feed, enabled, cfg)
+        apply_embodied_answer(feed, enabled, cfg)
     return {"feed": feed, "enabled": enabled, "config": cfg.to_dict()}
 
 
@@ -2322,11 +2325,92 @@ def _record_feed_consent(feed: str, enabled: bool) -> set:
     return recorded
 
 
+#: The senses each toggle feed answers for in core.ai_sensing.  'audio' is
+#: absent: no consent governs it, and the mic has only the eye button.
+_FEED_SENSES = {'camera': ('camera',), 'screen': ('screen',),
+                'all': ('camera', 'screen')}
+
+
+def apply_embodied_answer(feed: str, enabled: bool, cfg) -> None:
+    """The owner's answer for a feed, applied: the ONE way in, for every
+    surface (a consent answered anywhere -- consent_service
+    ._embodied_feed_from_consent --, this module's toggle when no consent
+    recorded it, /api/agent/approval likewise).
+
+    Two halves, on purpose on two threads:
+      * the capture gate (core.ai_sensing.withhold) is set HERE, on the
+        answering thread, so a No stops the frame store and the screen loop
+        at once, whatever the hardware is doing;
+      * the VisionService start/stop (_apply_embodied_toggle) runs on
+        _FEED_WORKER, its own single worker.  It was on the shared
+        parallel_dispatch pool, which the agent daemon fills with /chat
+        jobs: with the pool full, a No did nothing (measured 3 s, review of
+        8d8ac0a11).
+
+    The caller sets and saves the config flag itself (both callers already
+    had to, for their own reasons).
+    """
+    from core import ai_sensing
+    for sensor in _FEED_SENSES.get(feed, ()):
+        ai_sensing.withhold(sensor, not enabled)
+    _FEED_WORKER.submit(feed, lambda: _apply_embodied_toggle(feed, enabled, cfg))
+
+
+class _FeedWorker:
+    """The VisionService start/stop, one at a time, off the caller's thread,
+    on ONE daemon thread of its own -- never the shared pool.
+
+    One answer per feed is kept, the latest, moved to the back of the line,
+    so a start that hangs and a No given meanwhile end with the No applied
+    once the start returns -- never a stale start after it, never two at
+    once.  A daemon thread, so a start that never returns cannot hold the
+    process open at exit either.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._waiting = {}   # feed -> job, in the order answered
+        self._draining = False
+
+    def submit(self, feed, job) -> None:
+        with self._lock:
+            self._waiting.pop(feed, None)
+            self._waiting[feed] = job
+            if self._draining:
+                return
+            self._draining = True
+        try:
+            threading.Thread(target=self._drain, daemon=True,
+                             name='hart-feed-answers').start()
+        except RuntimeError:
+            # No new threads (interpreter shutting down): apply here.
+            logger.warning("embodied feed %s: feed worker unavailable, "
+                           "applying inline", feed, exc_info=True)
+            self._drain()
+
+    def _drain(self) -> None:
+        while True:
+            with self._lock:
+                if not self._waiting:
+                    self._draining = False
+                    return
+                feed = next(iter(self._waiting))
+                job = self._waiting.pop(feed)
+            try:
+                job()
+            except Exception:
+                logger.warning("embodied feed %s answer failed", feed,
+                               exc_info=True)
+
+
+_FEED_WORKER = _FeedWorker()
+
+
 def _apply_embodied_toggle(feed: str, enabled: bool, cfg) -> None:
     """Start or stop VisionService based on the camera/screen toggle so
-    the flag actually controls hardware, not just a config file. Called
-    from both the /config/embodied/toggle endpoint AND the agentic
-    /api/agent/approval flow so the single start/stop path is shared.
+    the flag actually controls hardware, not just a config file.  Runs only
+    on _FEED_WORKER, reached through apply_embodied_answer, which every
+    answer surface shares.
 
     'camera' and 'screen' both route to VisionService (the service
     handles both channels via the same WebSocket on :5460). 'audio'
@@ -2335,18 +2419,25 @@ def _apply_embodied_toggle(feed: str, enabled: bool, cfg) -> None:
     try:
         if feed in ('camera', 'screen', 'all'):
             from integrations.vision import get_vision_service
-            vs = get_vision_service()
+            from integrations.vision.vision_service import (
+                running_vision_services, stop_running_vision_services)
             want_running = (
                 enabled and
                 (cfg.camera_enabled or cfg.screen_capture_enabled or cfg.enabled)
             )
-            if want_running and not vs.is_running():
+            # Every running VisionService, not just the integrations.vision
+            # singleton: in bundled Nunba the one taking frames is Nunba's
+            # boot instance (main._start_vision_service), so a No that stopped
+            # only the singleton stopped nothing, and a Yes started a second
+            # service beside Nunba's.
+            running = running_vision_services()
+            if want_running and not running:
                 mode = 'full' if cfg.enabled else 'lite'
-                vs.start(mode=mode)
+                get_vision_service().start(mode=mode)
                 logger.info(f"VisionService started (mode={mode}) via {feed} toggle")
-            elif not want_running and vs.is_running():
-                vs.stop()
-                logger.info(f"VisionService stopped via {feed} toggle")
+            elif not want_running and running:
+                n = stop_running_vision_services(f'{feed} toggled off')
+                logger.info(f"VisionService stopped via {feed} toggle ({n})")
     except ImportError:
         logger.debug("VisionService not installed — skipping toggle side effect")
     except Exception as e:

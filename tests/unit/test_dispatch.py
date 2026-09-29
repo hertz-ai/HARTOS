@@ -406,7 +406,10 @@ class TestDispatchGoalDistributed:
         assert call_kw['objective'] == 'prompt'[:200]
         assert len(call_kw['decomposed_tasks']) == 1
         assert call_kw['context']['goal_type'] == 'marketing'
-        assert call_kw['context']['user_id'] == 'u1'
+        # An opaque handle stands for the requester: the context goes to
+        # other people's nodes (tests/unit/test_requester_never_leaves_the_node.py).
+        assert call_kw['context']['user_id'].startswith('req_')
+        assert 'u1' not in repr(call_kw['context'])
         assert call_kw['context']['task_source'] == 'hive'
 
     def test_coordinator_submit_exception_returns_none(self):

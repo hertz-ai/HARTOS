@@ -61,6 +61,7 @@ STEP_PHASES = frozenset({'executing', 'completed', 'blocked', 'failed', 'stopped
 _EXIT_STATUS = {
     'done': 'COMPLETED',
     'stopped': 'USER_STOPPED',
+    'user_active': 'USER_STOPPED',
     'action_error': 'FAILED',
     'timeout': 'FAILED',
     'max_iterations': 'FAILED',
@@ -71,6 +72,7 @@ _EXIT_STATUS = {
 _EXIT_PHASE = {
     'done': 'completed',
     'stopped': 'stopped',
+    'user_active': 'stopped',
 }
 
 
@@ -293,7 +295,10 @@ def _run_is_closed(user_id: str, prompt_id: str, run_id: str) -> bool:
     step 2 s after the run closed -- ribbon up again, the finished task's
     context rewritten to phase=failed, run_done=False fanned out, so the
     companion showed a finished run as live.  Unknown (no ledger, no task,
-    a lookup error) reads as open, so a step is never lost on ignorance.
+    a lookup error, or a task with no status or a status of None) reads as
+    open, so a step is never lost on ignorance.  A task finish_run closed
+    always has a real TaskStatus (it sets one), so a None status is never a
+    closed run.
     """
     try:
         from agent_ledger import TaskStatus
@@ -302,9 +307,9 @@ def _run_is_closed(user_id: str, prompt_id: str, run_id: str) -> bool:
         logger.debug('computer-use: run %s closed-check unavailable', run_id,
                      exc_info=True)
         return False
-    if task is None:
-        return False
-    status = task.status
+    status = getattr(task, 'status', None)
+    if status is None:
+        return False          # no task, or none whose state can be read: open
     return (getattr(status, 'name', '') in _CLOSED_STATUS_NAMES
             or TaskStatus.is_terminal_state(status))
 

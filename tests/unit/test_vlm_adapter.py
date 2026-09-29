@@ -371,14 +371,21 @@ class TestThreadSafety:
 
             def do_call():
                 barrier.wait()
-                with patch('integrations.vlm.local_loop.run_local_agentic_loop', side_effect=RuntimeError("fail")):
-                    adapter_mod.execute_vlm_instruction({"instruction_to_vlm_agent": "test"})
+                adapter_mod.execute_vlm_instruction({"instruction_to_vlm_agent": "test"})
 
-            threads = [threading.Thread(target=do_call) for _ in range(call_count)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
+            # ONE patch, installed before the threads start and removed after
+            # they all finish.  It used to be entered and exited inside each
+            # of the 50 threads at once; mock.patch is not thread-safe, so an
+            # interleaved exit restored another thread's MagicMock as the
+            # "original" (5 of 6 full runs, 2026-09-28) and every later loop
+            # test in the session raised RuntimeError('fail').
+            with patch('integrations.vlm.local_loop.run_local_agentic_loop',
+                       side_effect=RuntimeError("fail")):
+                threads = [threading.Thread(target=do_call) for _ in range(call_count)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
 
             # Not atomic, so we check >= rather than == (GIL helps but not guaranteed)
             assert adapter_mod._tier1_fail_count >= 1

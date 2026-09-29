@@ -20,6 +20,8 @@ from sqlalchemy import (
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import relationship
 
+from core.constants import ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS
+
 # Import from parent models.py — these are already defined before models.py
 # reaches the `from _models_local import ...` line, so partial-module import works.
 from integrations.social.models import Base, _uuid, _sanitize_html
@@ -1066,8 +1068,10 @@ class DiscoverablePref(Base):
     # v59 persona card: what the user's agent may tell a matched person's
     # agent.  interests_discoverable is the user's yes to being matched
     # on interests beyond friends and nearby.
+    # Kept separate from users.bio (owner): shown only to a match, users.bio is public; merging leaks one or overwrites the other.
     bio = Column(Text, nullable=True)
-    recognize_me = Column(String(280), nullable=True)
+    recognize_me = Column(String(ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS),
+                          nullable=True)
     interests_discoverable = Column(Boolean, default=False, nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 

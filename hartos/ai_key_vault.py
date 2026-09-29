@@ -98,6 +98,9 @@ class AIKeyVault:
         # HEVOLVE_MASTER_KEY the value lives only in this process's vault
         # cache, which cannot say which of its names the owner entered.
         self._stored: set = set()
+        # Values another store keeps (Nunba's desktop vault), handed over by
+        # hold_credential: memory only, never persisted, never os.environ.
+        self._held: Dict[str, str] = {}
         # Every credential value this process has known -> its name: each
         # value resolve_aliases handed a tool and each value mask_secrets
         # masked.  Keyed by VALUE and never pruned, so masking never shrinks:
@@ -151,8 +154,10 @@ class AIKeyVault:
     # ── Retrieval ──────────────────────────────────────────────────
 
     def get_tool_key(self, key_name: str) -> str:
-        """Get a tool/API key. Delegates to SecretsManager."""
-        return self._secrets_manager().get_secret(key_name)
+        """Get a tool/API key: SecretsManager (environment, then its vault),
+        then what another store handed over (hold_credential)."""
+        return (self._secrets_manager().get_secret(key_name)
+                or self._held.get(key_name, ''))
 
     def get_channel_secret(self, channel_type: str, key_name: str) -> str:
         """Get a channel-specific secret.
@@ -182,7 +187,9 @@ class AIKeyVault:
             current = os.environ.get(resolved)
             ours = (resolved in self._stored
                     or current == self._secrets_manager()._cache.get(resolved))
-            if current and not ours:
+            # A node secret is refused the same way, held or not: only the
+            # node's own vault preload sets it.
+            if (current and not ours) or is_node_secret(resolved):
                 # Answered as any store is (the resolved name): an error
                 # here told a caller the variable exists (secrets review,
                 # the F1 oracle).  Nothing is written; the log says why.
@@ -231,10 +238,13 @@ class AIKeyVault:
         card stored instead of putting it in os.environ.  In memory only;
         never the environment.  It resolves once the owner's grant names it
         (owner_credential_names)."""
-        if not key_name or not value:
+        if not key_name or not value or is_node_secret(str(key_name)):
             return
         with self._lock:
-            self._secrets_manager()._cache[str(key_name)] = value
+            # Beside the SecretsManager cache, not in it: set_secret writes
+            # the whole cache to secrets.enc, and Nunba's vault already keeps
+            # this value.
+            self._held[str(key_name)] = value
 
     # ── Alias (the only form the model sees) ───────────────────────
 
@@ -418,7 +428,8 @@ class AIKeyVault:
 
         # Load from encrypted vault cache
         for key, value in sm._cache.items():
-            if key not in os.environ and value and reads_from_env(key):
+            if key not in os.environ and value and (
+                    reads_from_env(key) or is_node_secret(key)):
                 os.environ[key] = value
                 loaded += 1
 
@@ -494,22 +505,52 @@ class AIKeyVault:
             return resolved in self._pending
 
 
+#: Modules (not channel adapters) that declare ENV_SECRETS: the credentials
+#: they read from the environment.  Channel adapters are found through
+#: FlaskChannelIntegration._ADAPTER_FACTORIES.  tests/unit/
+#: test_env_secrets_declared.py fails when a module declares ENV_SECRETS and
+#: is not listed here, and when a secret env read is declared nowhere.
+_ENV_SECRET_MODULES = (
+    'hartos.hartos_bootstrap',
+    'integrations.agent_engine.erxes_client',
+    'integrations.agent_engine.private_repo_access',
+    'integrations.ap2.ap2_protocol',
+    'integrations.audio.diarization_server',
+    'integrations.audio.diarization_service',
+    'integrations.channels.agent_tools',
+    'integrations.channels.memory.simplemem_store',
+    'integrations.channels.oauth_api',
+    'integrations.service_tools.gh_pr_tool',
+    'integrations.social.api_channels',
+    'integrations.social.livekit_service',
+    'integrations.social.livekit_supervisor',
+)
+
 def reads_from_env(name) -> bool:
     """True when this process legitimately reads ``name`` from its
-    environment: an API key in security.secrets_manager.SECRET_KEYS, or a
-    channel token/credential (FlaskChannelIntegration.env_names, the
-    adapters' env fallbacks).  Only those vault values are ever put in
-    os.environ; anything else the owner entered stays in the vault."""
-    from security.secrets_manager import SECRET_KEYS
-    if name in SECRET_KEYS:
-        return True
-    try:
-        from integrations.channels.flask_integration import FlaskChannelIntegration
-        return name in FlaskChannelIntegration.env_names()
-    except Exception:
-        logger.warning("channel env names unavailable; %s stays in the vault",
-                       name, exc_info=True)
-        return False
+    environment as a credential an owner may enter: an API key in
+    security.secrets_manager.SECRET_KEYS (not a node secret), or a name some
+    module declares in ENV_SECRETS (channel adapters, gh_pr_tool, ap2,
+    livekit...).  Only those vault values are ever put in os.environ;
+    anything else the owner entered stays in the vault, and a name declared
+    ENV_NOT_FROM_VAULT, or a node secret (is_node_secret), never comes from
+    it.
+
+    Read from hartos.env_secrets_manifest.DELIVERABLE, a literal generated
+    from the declarations (tests/unit/test_env_secrets_declared.py fails
+    when it is stale), so the first call, on Nunba's boot path, imports no
+    adapter.  Collecting by import took about 6 s there."""
+    from hartos.env_secrets_manifest import DELIVERABLE
+    return name in DELIVERABLE
+
+
+def is_node_secret(name) -> bool:
+    """True for the node's own secrets and connection strings
+    (security.secrets_manager.NODE_SECRET_KEYS): only the node's vault
+    preload sets them; the consent card, /api/credentials/submit,
+    /api/vault/store and hold_credential never do, held or not."""
+    from hartos.env_secrets_manifest import NODE_SECRETS
+    return name in NODE_SECRETS
 
 
 # ── Module-level singleton (HARTOS convention) ─────────────────────
@@ -652,9 +693,11 @@ def request_credential(resource_description, agent_id=None) -> str:
             # (PATH, HTTPS_PROXY, NUNBA_CI...) is a setting, not a credential:
             # a card for it would make the grant name it an owner credential
             # and {{secret:NAME}} would resolve to the system value.
-            held = (bool(os.environ.get(name))
-                    and name not in vault._stored
-                    and not any(r.granted_at is not None for r in rows))
+            # A node secret is never asked for either, held or not.
+            held = is_node_secret(name) or (
+                bool(os.environ.get(name))
+                and name not in vault._stored
+                and not any(r.granted_at is not None for r in rows))
             # Asking again is bounded: every value the owner typed is a
             # grant row, so the rows say how often they tried.
             entries = 0 if held else _recent_entries(rows)

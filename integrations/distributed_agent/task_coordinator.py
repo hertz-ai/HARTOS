@@ -822,6 +822,11 @@ class DistributedTaskCoordinator:
             # owner rather than creating a notification for a node id such as
             # ``unknown``.
             user_id = task.context.get("user_id") or parent.context.get("user_id")
+            # The context holds an opaque requester handle; only the node
+            # that minted it knows the person (requesters.resolve_requester).
+            # Another node's handle is nobody here: no notification.
+            from integrations.distributed_agent.requesters import resolve_requester
+            user_id = resolve_requester(user_id)
             if not user_id:
                 logger.debug("No human owner for goal contribution task %s; "
                              "skipping user notification", task_id)

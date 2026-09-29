@@ -189,6 +189,7 @@ def outcome_summary(response):
                               'completion.' % n,
             'action_error': 'Hit errors on 3 consecutive actions after %d '
                             'step(s) and stopped.' % n,
+            'user_active': 'Paused because you resumed using the computer after %d step(s).' % n,
             'stopped': 'Stopped at your request after %d step(s).' % n
                        + unknown,
             'grounding_failed': 'Could not reliably locate the UI element '

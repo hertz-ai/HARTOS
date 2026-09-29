@@ -744,3 +744,12 @@ def purge_pycache(code_root: str = None) -> int:
     except (PermissionError, OSError) as e:
         logger.warning(f"Boot integrity: pycache purge partial - {e}")
     return count
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HEVOLVE_CODE_HASH_PRECOMPUTED',
+)
