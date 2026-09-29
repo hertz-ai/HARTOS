@@ -227,3 +227,20 @@ def test_an_empty_chat_reply_is_not_passed_off_as_success(caplog):
     assert reply == ''
     fi._response_router.route_response.assert_not_called()
     assert any('no reply text' in w and "['agent_id']" in w for w in _warnings(caplog))
+
+
+@pytest.mark.parametrize('raw', ['', 'four', '0'])
+def test_a_bad_worker_count_does_not_break_the_channel_registry_import(raw):
+    """HEVOLVE_CHANNEL_AGENT_WORKERS is read at import; a bare int() made a
+    junk or zero value take every channel adapter down with the module."""
+    import os
+    import subprocess
+    env = dict(os.environ, HEVOLVE_CHANNEL_AGENT_WORKERS=raw)
+    out = subprocess.run(
+        [sys.executable, '-c',
+         'import integrations.channels.registry as r; '
+         'print(r._AGENT_HANDLER_POOL._max_workers)'],
+        env=env, capture_output=True, text=True, timeout=120,
+        cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip().splitlines()[-1] == '4'

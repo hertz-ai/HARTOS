@@ -12,6 +12,7 @@ import os
 import re
 from typing import Dict, Optional, Callable, Any, List
 from dataclasses import dataclass, field
+from core.config_cache import env_int
 from core.port_registry import get_port
 
 from .base import (
@@ -43,7 +44,9 @@ logger = logging.getLogger(__name__)
 # spawn unbounded threads; workers are named so they are identifiable in the
 # SIGUSR1 all-thread dump.
 _AGENT_HANDLER_POOL = concurrent.futures.ThreadPoolExecutor(
-    max_workers=int(os.environ.get('HEVOLVE_CHANNEL_AGENT_WORKERS', '4')),
+    # env_int, not int(): a junk or zero value used to make this module fail
+    # to import, taking every channel adapter down with it.
+    max_workers=env_int('HEVOLVE_CHANNEL_AGENT_WORKERS', 4, minimum=1),
     thread_name_prefix='channel-agent',
 )
 

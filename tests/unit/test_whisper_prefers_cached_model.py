@@ -67,3 +67,30 @@ def test_sherpa_model_cached_reads_the_real_directory(tmp_path, monkeypatch):
     (d / cfg['files']['tokens']).write_text('x')
     assert wt._sherpa_model_cached('moonshine-tiny') is True
     assert wt._sherpa_model_cached('no-such-model') is False
+
+
+def test_a_cached_model_ranked_below_many_other_engines_is_still_found(monkeypatch):
+    """faster-whisper entries share the ranking; a cached sherpa model ranked
+    below more of them than there are sherpa models must still be found."""
+    monkeypatch.setitem(sys.modules, 'sherpa_onnx', types.ModuleType('sherpa_onnx'))
+    big, small = list(wt._SHERPA_MODELS)[:2]
+    monkeypatch.setitem(wt._CATALOG_ID_TO_SHERPA, 'stt-t-big', big)
+    monkeypatch.setitem(wt._CATALOG_ID_TO_SHERPA, 'stt-t-small', small)
+    others = [f'stt-t-fw-{i}' for i in range(len(wt._CATALOG_ID_TO_SHERPA) + 2)]
+    ranking = ['stt-t-big', *others, 'stt-t-small']
+    monkeypatch.setattr(wt, '_catalog_stt_entry', lambda exclude=None: next(
+        (types.SimpleNamespace(id=c) for c in ranking if c not in (exclude or ())),
+        None))
+    monkeypatch.setattr(wt, '_sherpa_model_cached', lambda key: key == small)
+    assert wt.select_whisper_model() == small
+
+
+def test_a_catalog_that_ignores_exclude_stops_instead_of_looping(monkeypatch, caplog):
+    monkeypatch.setitem(sys.modules, 'sherpa_onnx', types.ModuleType('sherpa_onnx'))
+    big = list(wt._SHERPA_MODELS)[0]
+    monkeypatch.setitem(wt._CATALOG_ID_TO_SHERPA, 'stt-t-big', big)
+    monkeypatch.setattr(wt, '_catalog_stt_entry',
+                        lambda exclude=None: types.SimpleNamespace(id='stt-t-big'))
+    monkeypatch.setattr(wt, '_sherpa_model_cached', lambda key: False)
+    assert wt.select_whisper_model() == big   # keeps the catalog pick
+    assert any('although it was excluded' in r.getMessage() for r in caplog.records)

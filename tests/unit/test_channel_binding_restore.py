@@ -227,16 +227,21 @@ class TestRestorePersistedChannels:
         reg.assert_not_called()
         assert out['skipped']['discord'] == 'no stored credential'
 
-    def test_whatsapp_is_left_to_its_dedicated_path(self):
+    def test_whatsapp_is_not_rebuilt_and_says_it_stays_offline(self, caplog):
+        """Its live adapter needs the gateway identity that only the pairing
+        path resolves, so restore must not build one -- and must not call
+        that handled: nothing re-wires WhatsApp at boot."""
         fi = _integration()
         rows = [_binding('whatsapp', {'api_url': 'http://127.0.0.1:3000'})]
         with _patch_db(rows), patch.object(
             fi, 'register_channel', return_value=True,
-        ) as reg:
+        ) as reg, caplog.at_level('WARNING'):
             out = fi.restore_persisted_channels()
 
         reg.assert_not_called()
-        assert out['skipped']['whatsapp'] == 'dedicated restore path'
+        assert out['skipped']['whatsapp'] == 'not restored at boot: re-pair to reconnect'
+        assert any('whatsapp' in r.getMessage() and 'stay offline' in r.getMessage()
+                   for r in caplog.records)
 
     def test_already_registered_channel_is_not_replaced(self):
         fi = _integration()
@@ -261,16 +266,34 @@ class TestRestorePersistedChannels:
         reg.assert_not_called()
         assert out['skipped']['discord'] == 'no stored credential'
 
-    def test_no_token_channel_restores_without_a_credential(self):
+    @pytest.mark.parametrize('channel', ['web', 'imessage', 'openprose'])
+    def test_a_credential_less_row_never_starts_a_no_token_channel(
+            self, channel, caplog):
+        """upsert_binding writes a credential-less row for every inbound
+        message's channel.  Restoring `web` from one would open a listener
+        (0.0.0.0 on a standalone node) nobody enabled; boot config starts
+        these channels, so it is skipped, and it is not a failure."""
         fi = _integration()
-        rows = [_binding('imessage', None)]
+        rows = [_binding(channel, None)]
+        with _patch_db(rows), patch.object(
+            fi, 'register_channel', return_value=True,
+        ) as reg, caplog.at_level('WARNING'):
+            out = fi.restore_persisted_channels()
+
+        reg.assert_not_called()
+        assert out['skipped'][channel] == 'no credential: boot config starts it'
+        assert not [r for r in caplog.records if 'NOT restored' in r.getMessage()]
+
+    def test_a_no_token_channel_with_a_stored_credential_is_restored(self):
+        fi = _integration()
+        rows = [_binding('imessage', {'password': 'x', 'token': 'bb-pass'})]
         with _patch_db(rows), patch.object(
             fi, 'register_channel', return_value=True,
         ) as reg:
             out = fi.restore_persisted_channels()
 
         assert out['restored'] == ['imessage']
-        assert reg.call_args.kwargs['token'] is None
+        assert reg.call_args.kwargs['token'] == 'bb-pass'
 
     def test_unknown_channel_type_is_skipped(self):
         fi = _integration()

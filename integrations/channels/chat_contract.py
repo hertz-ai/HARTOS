@@ -18,11 +18,7 @@ Verified live against the INSTALLED bundled Nunba: a prompt-only payload 400'd
 """
 from __future__ import annotations
 
-import logging
-import os
 from typing import Any, Dict
-
-logger = logging.getLogger(__name__)
 
 #: Default seconds a /chat caller waits for a full agent turn.
 DEFAULT_AGENT_TURN_TIMEOUT_S = 120
@@ -48,16 +44,6 @@ def agent_turn_timeout() -> int:
     self-chat, the speculative dispatcher's local expert re-entry), read at call
     time so HEVOLVE_CHANNEL_AGENT_TIMEOUT applies to all of them alike.
     """
-    raw = os.environ.get('HEVOLVE_CHANNEL_AGENT_TIMEOUT')
-    if raw is None or not raw.strip():
-        return DEFAULT_AGENT_TURN_TIMEOUT_S
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 0
-    if value <= 0:
-        logger.warning(
-            "HEVOLVE_CHANNEL_AGENT_TIMEOUT=%r is not a positive integer; "
-            "using the default %ss", raw, DEFAULT_AGENT_TURN_TIMEOUT_S)
-        return DEFAULT_AGENT_TURN_TIMEOUT_S
-    return value
+    from core.config_cache import env_int
+    return env_int('HEVOLVE_CHANNEL_AGENT_TIMEOUT',
+                   DEFAULT_AGENT_TURN_TIMEOUT_S, minimum=1)

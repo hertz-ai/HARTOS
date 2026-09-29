@@ -30,6 +30,14 @@ from integrations.channels.base import (
 )
 
 
+
+def _route_request(session):
+    """IMessageAdapter._api sends every BlueBubbles call through
+    session.request(method, url, ...); route it to the per-verb mocks
+    (session.get / session.post) these tests configure and assert on."""
+    session.request = MagicMock(side_effect=lambda method, url, **kw:
+                                getattr(session, method.lower())(url, **kw))
+
 class TestIMessageAdapter:
     """Tests for IMessageAdapter."""
 
@@ -45,6 +53,7 @@ class TestIMessageAdapter:
         mock_session.get = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(return_value=mock_response)))
         mock_session.post = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(return_value=mock_response)))
         mock_session.close = AsyncMock()
+        _route_request(mock_session)
 
         with patch.dict('sys.modules', {'aiohttp': MagicMock()}):
             with patch('aiohttp.ClientSession', return_value=mock_session):
@@ -222,7 +231,9 @@ class TestIMessageSending:
 
         session.post = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(return_value=response)))
         session.close = AsyncMock()
+        _route_request(session)
 
+        _route_request(session)
         return session
 
     @pytest.mark.asyncio
@@ -295,6 +306,7 @@ class TestIMessageTapbacks:
         response.status = 200
 
         session.post = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(return_value=response)))
+        _route_request(session)
         return session
 
     @pytest.mark.asyncio
@@ -387,6 +399,7 @@ class TestIMessageTyping:
         response.status = 200
 
         session.post = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(return_value=response)))
+        _route_request(session)
         return session
 
     @pytest.mark.asyncio
@@ -433,6 +446,7 @@ class TestIMessageGroups:
 
         session.post = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(return_value=response)))
         session.get = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(return_value=response)))
+        _route_request(session)
         return session
 
     @pytest.mark.asyncio
@@ -539,6 +553,7 @@ class TestIMessageReadReceipts:
         response.status = 200
 
         session.post = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(return_value=response)))
+        _route_request(session)
         return session
 
     @pytest.mark.asyncio

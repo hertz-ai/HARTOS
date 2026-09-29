@@ -417,13 +417,19 @@ class FlaskChannelIntegration:
         'api_url', 'webhook_url', 'private_key',
     )
 
-    # WhatsApp is deliberately NOT restored generically: it already has a
-    # dedicated rehydration path (_ensure_whatsapp_live_adapter in
-    # hart_intelligence_entry) which additionally resolves the self-chat
-    # identity from the live gateway.  Restoring it here would build a second,
-    # identity-less adapter and silently replace that one, since
-    # registry.register keys on adapter.name.
+    # WhatsApp is deliberately NOT restored generically: its live adapter
+    # needs the self-chat identity from the gateway, which only
+    # _ensure_whatsapp_live_adapter (hart_intelligence_entry) resolves.
+    # Restoring it here would build a second, identity-less adapter and
+    # silently replace that one, since registry.register keys on
+    # adapter.name.  That path runs when a pairing completes, NOT at boot, so
+    # after a restart WhatsApp stays offline until it is re-paired; restore
+    # reports that loudly rather than calling it handled.
     _RESTORE_EXCLUDED = ('whatsapp',)
+
+    # Skip reasons that are not a failure: the channel is up, or will be
+    # started by the boot configuration rather than by a binding.
+    _RESTORE_BENIGN_SKIPS = ('already registered', 'no credential: boot config starts it')
 
     @classmethod
     def env_names(cls) -> frozenset:
@@ -1050,7 +1056,7 @@ class FlaskChannelIntegration:
 
                 for ct, candidates in by_channel.items():
                     if ct in self._RESTORE_EXCLUDED:
-                        summary['skipped'][ct] = 'dedicated restore path'
+                        summary['skipped'][ct] = 'not restored at boot: re-pair to reconnect'
                         continue
                     if ct not in self._ADAPTER_FACTORIES:
                         summary['skipped'][ct] = 'no adapter factory'
@@ -1065,7 +1071,15 @@ class FlaskChannelIntegration:
                         if not isinstance(meta, dict):
                             meta = {}
                         token, extras = self._binding_credentials(ct, meta)
-                        if not token and ct not in self._NO_TOKEN_CHANNELS:
+                        if not token:
+                            # A credential-less row is not a configuration:
+                            # upsert_binding writes one for every inbound
+                            # message's channel.  Restoring a no-token channel
+                            # from it (web) would open a listener -- on
+                            # 0.0.0.0 on a standalone node -- that nobody
+                            # enabled.  Those channels start from boot config.
+                            if ct in self._NO_TOKEN_CHANNELS:
+                                reason = 'no credential: boot config starts it'
                             continue
                         if self.register_channel(ct, token=token, **extras):
                             summary['restored'].append(ct)
@@ -1093,10 +1107,9 @@ class FlaskChannelIntegration:
                 f"from persisted bindings: {', '.join(summary['restored'])}"
             )
         # A binding whose channel stays offline is a failure the user sees
-        # (the bot is silent there), so say which and why.  'already
-        # registered' and 'dedicated restore path' are handled elsewhere.
+        # (the bot is silent there), so say which and why.
         dead = {ct: why for ct, why in summary['skipped'].items()
-                if why not in ('already registered', 'dedicated restore path')}
+                if why not in self._RESTORE_BENIGN_SKIPS}
         if dead:
             logger.warning(
                 "Channel bindings NOT restored, these channels stay offline: %s",

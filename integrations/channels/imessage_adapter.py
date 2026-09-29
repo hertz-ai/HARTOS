@@ -122,6 +122,22 @@ class IMessageAdapter(ChannelAdapter):
     def name(self) -> str:
         return "imessage"
 
+    def _api(self, method: str, path: str, **kwargs):
+        """One BlueBubbles API request, authenticated.
+
+        BlueBubbles authenticates via a ``?password=`` query param, not an
+        Authorization header -- confirmed live against a real server
+        (v1.9.9): the header form gets a 401 "Missing server password!" even
+        with the correct password attached.  Every BlueBubbles call goes
+        through here so none can go out without it; requests to OTHER hosts
+        (an attachment's source URL) must not, and use the session directly.
+        Returns aiohttp's request context manager (``async with`` or await).
+        """
+        params = dict(kwargs.pop("params", None) or {})
+        params["password"] = self._password
+        return self._session.request(
+            method, f"{self._api_url}{path}", params=params, **kwargs)
+
     async def connect(self) -> bool:
         """Connect to BlueBubbles API."""
         if not self._password:
@@ -129,17 +145,12 @@ class IMessageAdapter(ChannelAdapter):
             return False
 
         try:
-            # BlueBubbles authenticates via a `?password=` query param, not
-            # an Authorization header -- confirmed live against a real
-            # server (v1.9.9): the header form gets a 401 "Missing server
-            # password!" even with the correct password attached.
+            # No session-wide auth header: BlueBubbles wants a query param,
+            # which _api() adds to every call.
             self._session = aiohttp.ClientSession()
 
             # Verify API connection
-            async with self._session.get(
-                f"{self._api_url}/api/v1/server/info",
-                params={"password": self._password},
-            ) as response:
+            async with self._api("GET", "/api/v1/server/info") as response:
                 if response.status != 200:
                     logger.error("BlueBubbles API not available")
                     return False
@@ -241,9 +252,8 @@ class IMessageAdapter(ChannelAdapter):
                 # fetched every tick and self._last_message_ts (a client-side
                 # high-water mark) does the de-dup, same as _last_message_guid
                 # was meant to.
-                async with self._session.post(
-                    f"{self._api_url}/api/v1/message/query",
-                    params={"password": self._password},
+                async with self._api(
+                    "POST", "/api/v1/message/query",
                     json={"limit": 50, "sort": "DESC", "with": ["chats"]},
                 ) as response:
                     if response.status == 200:
@@ -397,9 +407,8 @@ class IMessageAdapter(ChannelAdapter):
             if media and len(media) > 0:
                 return await self._send_with_attachments(chat_id, text, media, reply_to)
 
-            async with self._session.post(
-                f"{self._api_url}/api/v1/message/text",
-                params={"password": self._password},
+            async with self._api(
+                "POST", "/api/v1/message/text",
                 json=payload,
             ) as response:
                 if response.status in (200, 201):
@@ -457,8 +466,8 @@ class IMessageAdapter(ChannelAdapter):
                                 content_type=m.mime_type or response.content_type,
                             )
 
-            async with self._session.post(
-                f"{self._api_url}/api/v1/message/attachment",
+            async with self._api(
+                "POST", "/api/v1/message/attachment",
                 data=data,
             ) as response:
                 if response.status in (200, 201):
@@ -493,8 +502,8 @@ class IMessageAdapter(ChannelAdapter):
                 "backwardsCompatMessage": f"[Edited] {text}",
             }
 
-            async with self._session.post(
-                f"{self._api_url}/api/v1/message/{message_id}/edit",
+            async with self._api(
+                "POST", f"/api/v1/message/{message_id}/edit",
                 json=payload,
             ) as response:
                 if response.status in (200, 201):
@@ -518,8 +527,8 @@ class IMessageAdapter(ChannelAdapter):
             return False
 
         try:
-            async with self._session.post(
-                f"{self._api_url}/api/v1/message/{message_id}/unsend"
+            async with self._api(
+                "POST", f"/api/v1/message/{message_id}/unsend"
             ) as response:
                 return response.status in (200, 201, 204)
 
@@ -533,8 +542,8 @@ class IMessageAdapter(ChannelAdapter):
             return
 
         try:
-            await self._session.post(
-                f"{self._api_url}/api/v1/chat/{chat_id}/typing",
+            await self._api(
+                "POST", f"/api/v1/chat/{chat_id}/typing",
                 json={"status": True},
             )
         except Exception as e:
@@ -546,12 +555,12 @@ class IMessageAdapter(ChannelAdapter):
             return
 
         try:
-            await self._session.post(
-                f"{self._api_url}/api/v1/chat/{chat_id}/typing",
+            await self._api(
+                "POST", f"/api/v1/chat/{chat_id}/typing",
                 json={"status": False},
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to stop typing indicator: {e}")
 
     async def get_chat_info(self, chat_id: str) -> Optional[Dict[str, Any]]:
         """Get information about a chat."""
@@ -559,8 +568,8 @@ class IMessageAdapter(ChannelAdapter):
             return None
 
         try:
-            async with self._session.get(
-                f"{self._api_url}/api/v1/chat/{chat_id}"
+            async with self._api(
+                "GET", f"/api/v1/chat/{chat_id}"
             ) as response:
                 if response.status == 200:
                     data = await response.json()
@@ -611,8 +620,8 @@ class IMessageAdapter(ChannelAdapter):
                 "reaction": TAPBACK_MAP[tapback] + (1000 if remove else 0),
             }
 
-            async with self._session.post(
-                f"{self._api_url}/api/v1/message/react",
+            async with self._api(
+                "POST", "/api/v1/message/react",
                 json=payload,
             ) as response:
                 return response.status in (200, 201)
@@ -627,8 +636,8 @@ class IMessageAdapter(ChannelAdapter):
             return False
 
         try:
-            async with self._session.post(
-                f"{self._api_url}/api/v1/chat/{chat_id}/read"
+            async with self._api(
+                "POST", f"/api/v1/chat/{chat_id}/read"
             ) as response:
                 return response.status in (200, 201, 204)
 
@@ -652,8 +661,8 @@ class IMessageAdapter(ChannelAdapter):
             if name:
                 payload["name"] = name
 
-            async with self._session.post(
-                f"{self._api_url}/api/v1/chat/new",
+            async with self._api(
+                "POST", "/api/v1/chat/new",
                 json=payload,
             ) as response:
                 if response.status in (200, 201):
@@ -675,8 +684,8 @@ class IMessageAdapter(ChannelAdapter):
             return False
 
         try:
-            async with self._session.get(
-                f"{self._api_url}/api/v1/attachment/{attachment_id}/download"
+            async with self._api(
+                "GET", f"/api/v1/attachment/{attachment_id}/download"
             ) as response:
                 if response.status == 200:
                     content = await response.read()

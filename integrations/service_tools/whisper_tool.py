@@ -963,16 +963,24 @@ def _best_cached_sherpa_after(first_id: str):
     the catalog's downloaded flag, which depends on a loader HARTOS itself
     does not register.  Returns None when no cached sherpa model fits.
     """
+    # Walk the WHOLE ranking: non-sherpa entries (faster-whisper) are ranked
+    # alongside, so bounding the walk by the sherpa count could stop before
+    # reaching a cached sherpa model.  It ends when the catalog runs out,
+    # since every returned id is excluded from the next query.
     excluded = [first_id]
-    for _ in range(len(_CATALOG_ID_TO_SHERPA)):
+    while True:
         entry = _catalog_stt_entry(exclude=excluded)
         if entry is None:
+            return None
+        if entry.id in excluded:
+            logger.warning(
+                "select_whisper_model: the catalog returned %r although it "
+                "was excluded; stopping the cached-model search", entry.id)
             return None
         excluded.append(entry.id)
         key = _CATALOG_ID_TO_SHERPA.get(entry.id)
         if key in _SHERPA_MODELS and _sherpa_model_cached(key):
             return key
-    return None
 
 
 def select_whisper_model() -> str:
