@@ -3154,7 +3154,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
             if (last_speaker.name == f"user_proxy_{user_id}" or
                     last_speaker.name == "multi_role_agent" or
-                    last_speaker.name == "helper" or
+                    last_speaker.name == "Helper" or
                     last_speaker.name == "Executor" or
                     last_speaker.name == "ChatInstructor"):
                 return assistant
@@ -6255,7 +6255,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     'turn instead of raising IndexError')
                 break
             last_message = group_chat.messages[-1]
-            content_lower = last_message['content'].lower()
+            content_lower = (last_message.get('content') or '').lower()
             # ONE notion of "the user's answer" at this return too (D84, #850).
             # The two branches below hand any tail carrying the answer key to
             # the user on the spot; the post-loop pick asks
@@ -6407,7 +6407,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
             last_message = group_chat.messages[-2]
 
-        content_lower = last_message['content'].lower()
+        content_lower = (last_message.get('content') or '').lower()
 
         if f'message2userfinal'.lower() in content_lower:
             try:
