@@ -3704,34 +3704,55 @@ def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
         logger.debug("Connect_Channel: _wire_qr_pair_emitter failed: %s", e)
 
 
+# A phone or tablet: its browser (Android / iPhone / iPad / iPod / Mobile) or
+# a React Native app's HTTP client (okhttp on Android, CFNetwork on iOS).
+# A desktop browser, Nunba's desktop webview and a server-side python client
+# match none of these.
+_PHONE_USER_AGENT = re.compile(
+    r'\b(?:Android|iPhone|iPad|iPod|Mobile|okhttp|CFNetwork)\b', re.IGNORECASE)
+
+
+def _user_agent_is_phone(user_agent) -> bool:
+    """Does this User-Agent belong to a phone or tablet?  One that is the
+    device a WhatsApp QR would have to be scanned WITH, so showing it a QR
+    leaves nothing to scan it."""
+    return bool(_PHONE_USER_AGENT.search(user_agent or ''))
+
+
 def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
-                                phone: str = None, owner=None) -> None:
-    """Link a gateway_qr channel (WhatsApp) from chat.
+                                phone: str = None, owner=None):
+    """Link a gateway_qr channel (WhatsApp) from chat, by the method that
+    works on the device the user is holding.
 
-    QR first: the user asked an agent to connect WhatsApp, so the chat shows
-    WhatsApp's own linked-device QR (a ``qr_pair`` card, the same card the
-    Nunba overlay renders with qrcode.react) and keeps it fresh: WhatsApp
-    rotates the code every ~20s, so each new code from the gateway's
-    /status is sent as a new card until the phone scans one.
+      * A number is known -- given (the phone form, or 'whatsapp +91...'),
+        HEVOLVE_WHATSAPP_PHONE (operator choice) or the user's profile --
+        the pair code: chat card, consent.* notification that puts the code
+        on the phone's clipboard with an "Open WhatsApp" banner, and the iOS
+        fleet command.  One tap on the phone, on any device.
+      * No number and the request came from a phone or tablet
+        (_user_agent_is_phone): the form asking for the number.  A QR shown
+        on the phone cannot be scanned by that same phone.
+      * No number, on a desktop: WhatsApp's linked-device QR (``qr_pair``
+        cards), refreshed as WhatsApp rotates it (~20s) until it is scanned,
+        with "Link with phone number" on the card as the alternative.
 
-    Pair code only when a number is given: ``phone`` (the phone-form
-    re-entry route, or the chat input) or HEVOLVE_WHATSAPP_PHONE (operator
-    choice).  The gateway serves the two methods on different sockets
+    The gateway serves the two methods on different sockets
     (request-pair-code tears the QR socket down), so one attempt uses one.
-    The pair code is pushed exactly as before: chat card, consent.* mobile
-    notification with the code on the clipboard, and the iOS fleet command.
-
-    Either way one watcher polls /api/sessions/<sid>/status.  When WhatsApp
-    confirms, it registers the binding, wires the live adapter and sends
-    the channel_connected card.  Every failure (gateway down, no code, the
-    window running out) reaches the user as a toast in chat and a warning
-    in the log, never only a debug line.
+    One watcher polls /api/sessions/<sid>/status; when WhatsApp confirms, it
+    registers the binding, wires the live adapter and sends the
+    channel_connected card.  Every failure (gateway down, no code, the
+    window running out, a card or push not delivered) is a warning in the
+    log, and the ones the user must act on are a toast in chat.
 
     Args:
         phone: explicit number for "Link with phone number"; any format,
             digits are kept.
         owner: the user the cards are for, when the caller is a request
             handler without a thread-local user (the re-entry route).
+
+    Returns 'pair_code', 'qr' or 'ask_phone': what the user was shown, for
+    the reply to describe.  None when the link could not start (the user
+    was told why in chat).
     """
     import os
     import json as _json
@@ -3785,10 +3806,41 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
                'channel': channel_type, 'channel_type': channel_type,
                'text': text})
 
+    # The number, in order: given, the operator's, the user's profile.
     # WhatsApp's pair-code endpoint REQUIRES E.164 digits-only.
-    phone = ''.join(ch for ch in (
-        phone or os.environ.get('HEVOLVE_WHATSAPP_PHONE', '') or '')
-        if ch.isdigit())
+    phone = phone or os.environ.get('HEVOLVE_WHATSAPP_PHONE', '') or ''
+    if not phone and _owner:
+        try:
+            from integrations.social.models import db_session, User as _SocialUser
+            with db_session(commit=False) as db:
+                u = db.query(_SocialUser).filter_by(id=str(_owner)).first()
+                phone = (getattr(u, 'phone', '') or '') if u else ''
+        except Exception as e:
+            _log.warning("gateway_qr: profile phone not read for %s (%s); "
+                         "linking without it", _owner, e)
+    phone = ''.join(ch for ch in str(phone) if ch.isdigit())
+
+    if not phone and _user_agent_is_phone(thread_local_data.get_client_user_agent()):
+        # On the phone itself: ask for the number, then send the pair code.
+        # The form posts to the re-entry route, which calls back here with
+        # the number.
+        _emit({
+            'type': 'form',
+            'title': f"Connect {display_name}",
+            'channel': channel_type,
+            'fields': [{
+                'name': 'phone',
+                'label': f'Your {display_name} number, with country code',
+                'placeholder': '+91 ...',
+                'help': ("Used once to get a linking code for this phone. "
+                         "Not stored."),
+                'type': 'tel',
+                'secret': False,
+            }],
+            'submit_label': 'Send me a code',
+            'action': f'/api/social/channels/{channel_type}/connect-pair-code',
+        })
+        return 'ask_phone'
 
     base = _whatsapp_gateway_base()
     started, start_status = _proxy_gateway('POST', f'/api/sessions/{sid}/start')
@@ -3797,13 +3849,19 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
               f"computer (HTTP {start_status}"
               f"{': ' + str(started.get('error')) if started and started.get('error') else ''}"
               f"). It may still be starting; try again in a minute.")
-        return
+        return None
 
     # One live attempt per session: a newer connect (say, the phone form
     # after the QR) supersedes this watcher, so two never both announce.
+    # An attempt removes itself when it ends (_retire), so the map holds
+    # only live attempts.
     _attempts = _start_gateway_qr_pair_push.__dict__.setdefault('attempts', {})
     attempt = object()
     _attempts[sid] = attempt
+
+    def _retire() -> None:
+        if _attempts.get(sid) is attempt:
+            _attempts.pop(sid, None)
 
     if phone:
         # Baileys needs ~3s for the WA noise handshake before
@@ -3816,10 +3874,11 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
         body = body or {}
         code = body.get('code') if _st < 400 else None
         if not code:
+            _retire()
             _fail(f"{display_name} didn't return a pairing code "
                   f"({body.get('error') or 'no code'}). Say 'connect "
                   f"{channel_type}' without a number to scan a QR instead.")
-            return
+            return None
 
         push_payload = {
             'kind': 'channel_pair_code',
@@ -3863,7 +3922,8 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
                 )
                 notif_id = getattr(notif, 'id', None)
         except Exception as e:
-            _log.debug("gateway_qr: mobile push skipped: %s", e)
+            _log.warning("gateway_qr: pair code not pushed to %s's phone "
+                         "(it is still in chat): %s", user_id, e)
 
         # In-chat card via the existing LiquidUI emit pipe.
         try:
@@ -3894,7 +3954,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
                     }, user_id=_owner,
                 )
         except Exception as e:
-            _log.debug("gateway_qr: chat card emit failed: %s", e)
+            _log.warning("gateway_qr: pair-code card not delivered: %s", e)
 
         # ── 2026-05-26 P0-E ──────────────────────────────────────────────
         # Fleet fanout for iOS native (Nunba-Companion-iOS) which
@@ -3931,7 +3991,8 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
                 user_id=str(user_id),
             )
         except Exception as e:
-            _log.debug("gateway_qr: iOS fleet publish skipped: %s", e)
+            _log.warning("gateway_qr: pair code not sent to the iOS "
+                         "companion: %s", e)
 
     def _watch():
         """Show each fresh QR; on pairing, register, go live and confirm.
@@ -3999,6 +4060,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
                     'icon': icon,
                     'message': f"✅ {display_name} connected.",
                 })
+                _retire()
                 return
             qr = body.get('qr')
             if qr and qr != last_qr and not phone:
@@ -4024,6 +4086,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
             time.sleep(2)
         if _attempts.get(sid) is not attempt:
             return
+        _retire()
         _fail(f"The {display_name} link expired before it was completed. "
               f"Say 'connect {channel_type}' to get a new "
               f"{'code' if phone else 'QR code'}.")
@@ -4032,6 +4095,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
         target=_watch, daemon=True,
         name=f'connect_channel_poll_{channel_type}',
     ).start()
+    return 'pair_code' if phone else 'qr'
 
 
 _whatsapp_adapter_lock = threading.Lock()
@@ -4457,12 +4521,11 @@ def _handle_connect_channel_tool(input_text: str) -> str:
             from integrations.channels.metadata import get_channel_metadata
             meta = get_channel_metadata(channel_type) or {}
             if meta.get('auth_method') == 'gateway_qr':
-                # "connect whatsapp" scans a QR; a number in the input asks
-                # for a pair code ("Link with phone number"), for someone
-                # whose only device is the phone.  Accepts the JSON form
-                # ('whatsapp {"phone": "+91..."}') or a bare number
-                # ('whatsapp +91 90030 54371'); fewer than 8 digits is not
-                # a phone number and leaves the QR.
+                # A number in the input asks for a pair code.  Accepts the
+                # JSON form ('whatsapp {"phone": "+91..."}') or a bare number
+                # ('whatsapp +91 90030 54371'); fewer than 8 digits is not a
+                # phone number.  With none, the helper picks by the number on
+                # file and the device (_start_gateway_qr_pair_push).
                 try:
                     _cfg = _json.loads(config_json or '{}')
                 except ValueError:
@@ -4472,10 +4535,29 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                 _phone = ''.join(ch for ch in str(_cfg or '') if ch.isdigit())
                 if len(_phone) < 8:
                     _phone = ''
-                _start_gateway_qr_pair_push(channel_type, meta,
-                                            phone=_phone or None)
+                _how = _start_gateway_qr_pair_push(channel_type, meta,
+                                                   phone=_phone or None)
+                _name = meta.get('display_name') or channel_type
+                result = f"{result} " + {
+                    'pair_code': (
+                        f"I sent a linking code to this chat and to your "
+                        f"phone, where it is already copied: in {_name} open "
+                        f"Linked devices > Link a device > Link with phone "
+                        f"number and paste it."),
+                    'ask_phone': (
+                        f"Enter your {_name} number in the form I sent and "
+                        f"I'll send you a linking code: a QR code can't be "
+                        f"scanned by the phone showing it."),
+                    'qr': (
+                        f"Scan the QR code in this chat from {_name} on your "
+                        f"phone (Linked devices > Link a device). If you "
+                        f"can't scan, use 'Link with phone number' on the "
+                        f"card."),
+                }.get(_how, f"But the {_name} link couldn't start; the "
+                            f"message in chat says why.")
         except Exception as e:
-            logger.debug("Connect_Channel: gateway_qr push skipped: %s", e)
+            logger.warning("Connect_Channel: %s link not started: %s",
+                           channel_type, e)
         return result
     except Exception as e:
         return f"Channel connect error: {str(e)[:200]}"
@@ -9642,6 +9724,10 @@ def chat():
     # each other's (the old `thread_local_data.channel_context = …` put it on the
     # shared singleton instance, not _local — a cross-request leak).
     thread_local_data.set_channel_context(channel_context)
+    # Which device asked (always set, like channel_context): connecting
+    # WhatsApp on the phone itself needs a pair code, not a QR that phone
+    # cannot scan (_start_gateway_qr_pair_push).
+    thread_local_data.set_client_user_agent(request.headers.get('User-Agent', ''))
 
     # USER PRIORITY: mark user activity so daemon dispatch yields the LLM.
     #

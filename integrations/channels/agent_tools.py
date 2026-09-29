@@ -126,13 +126,18 @@ def _report_when_live(channel_type: str, meta: dict, owner,
         })
     except Exception as e:
         logger.warning("%s: connect-failure toast not delivered: %s", channel_type, e)
-    # PR Q: the same banner on the user's OTHER devices.
+    # PR Q: the same banner on the user's OTHER devices.  Devices belong to
+    # a person; with no owner there is no one's devices to reach.
+    if not owner:
+        logger.warning("%s: channel_unhealthy banner not sent, no owner "
+                       "known for this connect", channel_type)
+        return False
     try:
         from integrations.social.fleet_command import emit_channel_unhealthy
         from integrations.social.models import get_db
         db = get_db()
         try:
-            emit_channel_unhealthy(db, user_id=owner or 'system',
+            emit_channel_unhealthy(db, user_id=owner,
                                    channel_type=channel_type, reason=reason)
             db.commit()
         finally:
@@ -345,8 +350,11 @@ def build_channel_tool_closures(ctx):
                 # pairing watcher once the phone confirms.  A generic adapter
                 # built here would lack the gateway identity (see
                 # FlaskChannelIntegration._RESTORE_EXCLUDED).
+                # How to link (pair code, number form or QR) depends on the
+                # device and whether a number is known; the caller that
+                # starts the link says which.
                 return (f"{name} registered and enabled! Auth: gateway_qr. "
-                        f"Link it by scanning the QR code with your phone.")
+                        f"Link it from your phone to finish.")
 
             if len(required) != 1:
                 # Live connect hands the adapter ONE credential (the shape

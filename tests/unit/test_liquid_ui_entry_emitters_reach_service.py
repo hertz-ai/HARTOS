@@ -28,7 +28,10 @@ from core.platform.registry import get_registry, reset_registry
 _ENTRY = os.path.join(os.path.dirname(__file__), '..', '..',
                       'hart_intelligence_entry.py')
 _WANTED = ('_wire_qr_pair_emitter', '_handle_connect_channel_tool',
-           '_handle_join_external_room_tool', '_start_gateway_qr_pair_push')
+           '_handle_join_external_room_tool', '_start_gateway_qr_pair_push',
+           '_user_agent_is_phone')
+# Module-level values the functions read.
+_WANTED_VALUES = ('_PHONE_USER_AGENT',)
 
 
 class _ThreadLocal:
@@ -41,15 +44,22 @@ class _ThreadLocal:
     def get_prompt_id(self):
         return 'p-1'
 
+    def get_client_user_agent(self):
+        return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0'
+
 
 def _load(uid='u-7'):
     src = open(_ENTRY, encoding='utf-8').read()
     tree = ast.parse(src)
+    import re
     defs = [n for n in tree.body
             if isinstance(n, ast.FunctionDef) and n.name in _WANTED]
     assert sorted(d.name for d in defs) == sorted(_WANTED)
-    ns = {'thread_local_data': _ThreadLocal(uid),
+    values = [n for n in tree.body if isinstance(n, ast.Assign) and any(
+        getattr(t, 'id', None) in _WANTED_VALUES for t in n.targets)]
+    ns = {'thread_local_data': _ThreadLocal(uid), 're': re,
           'logger': logging.getLogger('test.entry'), 'logging': logging}
+    defs = values + defs
     exec(compile(ast.Module(body=defs, type_ignores=[]), _ENTRY, 'exec'), ns)
     return ns
 
@@ -144,9 +154,9 @@ def test_whatsapp_link_failure_names_the_user_or_none(lui, monkeypatch, uid,
     """F5: with no thread-local user the card must pass user_id=None so
     agent_ui_update resolves the owner, never route to a user 'system'.
 
-    WhatsApp links by QR by default now, so with no number there is no
-    phone form; a gateway that cannot be reached is the card the user sees,
-    and it must be addressed the same way."""
+    On a desktop with no number WhatsApp links by QR, so there is no phone
+    form; a gateway that cannot be reached is the card the user sees, and it
+    must be addressed the same way."""
     ns = _load(uid)
     monkeypatch.setenv('HEVOLVE_WHATSAPP_PHONE', '')
     # The ONE gateway client answers (None, 503) when it cannot connect.
@@ -182,6 +192,31 @@ def test_connect_whatsapp_uses_a_number_only_when_given(lui, text, phone):
                   return_value=meta):
         ns['_handle_connect_channel_tool'](text)
     assert link.call_args.kwargs == {'phone': phone}
+
+
+@pytest.mark.parametrize('how, says', [
+    ('pair_code', 'linking code'),
+    ('ask_phone', 'Enter your WhatsApp number'),
+    ('qr', 'Scan the QR code'),
+    (None, "couldn't start"),
+])
+def test_the_reply_names_the_way_the_link_was_started(lui, how, says):
+    """The reply tells the user what to do with what they were shown; it
+    used to say "scan the QR" whatever the device, including on the phone
+    that would have to scan it."""
+    ns = _load()
+    ns['_start_gateway_qr_pair_push'] = MagicMock(return_value=how)
+    meta = {'display_name': 'WhatsApp', 'auth_method': 'gateway_qr',
+            'setup_fields': []}
+    with patch('integrations.channels.agent_tools.build_channel_tool_closures',
+               return_value=_closures('WhatsApp registered and enabled! '
+                                      'Link it from your phone to finish.')), \
+            patch('integrations.channels.metadata.get_channel_metadata',
+                  return_value=meta):
+        out = ns['_handle_connect_channel_tool']('whatsapp')
+    assert says in out
+    if how != 'qr':
+        assert 'Scan the QR' not in out
 
 
 def test_no_thread_local_user_passes_none_not_system(lui):
