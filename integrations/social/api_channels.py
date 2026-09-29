@@ -182,8 +182,21 @@ def create_binding():
             "create_binding: %s bound but live adapter not wired: %s",
             channel_type, adapter_result.get('error'),
         )
+    elif credential:
+        # Started, not yet connected: tell the user how it ends (the same
+        # watcher register_channel uses), so a wrong token is a visible toast
+        # instead of a "connected" binding that never receives anything.
+        import threading
+        from integrations.channels.agent_tools import _report_when_live
+        threading.Thread(
+            target=_report_when_live, args=(channel_type, meta, g.user_id),
+            name=f'channel-probe-{channel_type}', daemon=True,
+        ).start()
 
-    return jsonify({'success': True, 'data': binding.to_dict()}), 201
+    # `live` says whether the adapter could be started, so a caller never
+    # reads a saved binding as a working channel.
+    return jsonify({'success': True, 'data': binding.to_dict(),
+                    'live': adapter_result}), 201
 
 
 @channel_user_bp.route('/bindings/<int:binding_id>', methods=['DELETE'])
@@ -565,6 +578,41 @@ def whatsapp_request_pair_code():
     })
 
 
+# ── Chat connect form submit ────────────────────────────────────
+#
+# The Connect_Channel tool's credential form (hart_intelligence_entry
+# _handle_connect_channel_tool) posts here.  It used to name only a
+# `submit_action` that no route handled, so Connect closed the card and the
+# typed token went nowhere.  Every field is handed to register_channel, the
+# same populator the chat tool and the OAuth callback use (unlike /bindings,
+# which keeps a single credential), so multi-field channels keep them all.
+
+@channel_user_bp.route('/<channel_type>/connect', methods=['POST'])
+@require_auth
+def channel_connect_submit(channel_type: str):
+    """Register ``channel_type`` for the current user from the form's fields."""
+    import json as _json
+    from integrations.channels.agent_tools import build_channel_tool_closures
+    data = request.get_json(silent=True) or {}
+    config = {k: v for k, v in data.items()
+              if k != 'channel_type' and isinstance(v, (str, bool, int, float))}
+    tools = build_channel_tool_closures({'user_id': g.user_id, 'prompt_id': None}) or []
+    register_fn = next((t[2] for t in tools
+                        if isinstance(t, tuple) and len(t) >= 3
+                        and t[0] == 'register_channel'), None)
+    if register_fn is None:
+        logger.warning("channel_connect_submit: register_channel unavailable")
+        return jsonify({'success': False,
+                        'error': 'Channel registration is not available on this node.'}), 503
+    result = register_fn(channel_type, _json.dumps(config))
+    ok = isinstance(result, str) and 'registered and enabled' in result
+    if not ok:
+        logger.warning("channel_connect_submit: %s not connected: %s",
+                       channel_type, str(result)[:200])
+        return jsonify({'success': False, 'error': result}), 400
+    return jsonify({'success': True, 'message': result})
+
+
 # ── Conversational onboarding form-submit re-entry ─────────────
 #
 # Closes the loop on _start_gateway_qr_pair_push's phone-collection
@@ -584,7 +632,6 @@ def whatsapp_request_pair_code():
 @require_auth
 def channel_connect_pair_code_submit(channel_type: str):
     """Re-enter gateway_qr pair-code flow with the submitted phone."""
-    import os as _os
     data = request.get_json(silent=True) or {}
     phone_raw = (data.get('phone') or '').strip()
     if not phone_raw:
@@ -596,21 +643,17 @@ def channel_connect_pair_code_submit(channel_type: str):
             'error': 'phone must contain digits (E.164 without +).',
         }), 400
 
-    # Env override is the same knob _start_gateway_qr_pair_push reads
-    # at line 1, so setting it here makes the helper find a value on
-    # re-entry.  Process-wide so subsequent users on the same node
-    # would inherit it — for multi-user nodes the proper fix is a
-    # per-user kv store, but the typical Nunba deploy is single-user
-    # and this matches the existing HEVOLVE_WHATSAPP_PHONE override
-    # discipline.
-    _os.environ['HEVOLVE_WHATSAPP_PHONE'] = phone
-
+    # The number goes to the helper as an argument, for this request's
+    # user.  It used to be written into the process-wide
+    # HEVOLVE_WHATSAPP_PHONE, so every later connect on the node, by any
+    # user, requested a pair code for that same number.
     try:
         from integrations.channels.metadata import get_channel_metadata
         meta = get_channel_metadata(channel_type) or {}
         # Local import to avoid circular at module load.
         from hart_intelligence_entry import _start_gateway_qr_pair_push
-        _start_gateway_qr_pair_push(channel_type, meta)
+        _start_gateway_qr_pair_push(channel_type, meta, phone=phone,
+                                    owner=g.user_id)
         return jsonify({
             'success': True,
             'message': (

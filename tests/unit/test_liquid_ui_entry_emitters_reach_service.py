@@ -115,6 +115,8 @@ def test_connect_channel_credential_form_is_delivered(lui):
     args, kwargs = lui.agent_ui_update.call_args
     assert args[1]['type'] == 'form'
     assert [f['name'] for f in args[1]['fields']] == ['bot_token']
+    # The renderer POSTs to `action`; a form without one dropped the token.
+    assert args[1]['action'] == '/api/social/channels/telegram/connect'
     assert kwargs.get('user_id') == 'u-7'
 
 
@@ -137,18 +139,24 @@ def test_qr_pair_card_is_delivered_when_the_adapter_emits_a_qr(lui):
 
 
 @pytest.mark.parametrize('uid,expected', [('u-7', 'u-7'), (None, None)])
-def test_pair_code_phone_form_names_the_user_or_none(lui, monkeypatch, uid,
-                                                     expected):
+def test_whatsapp_link_failure_names_the_user_or_none(lui, monkeypatch, uid,
+                                                      expected):
     """F5: with no thread-local user the card must pass user_id=None so
-    agent_ui_update resolves the owner, never route to a user 'system'."""
+    agent_ui_update resolves the owner, never route to a user 'system'.
+
+    WhatsApp links by QR by default now, so with no number there is no
+    phone form; a gateway that cannot be reached is the card the user sees,
+    and it must be addressed the same way."""
+    import requests
     ns = _load(uid)
     monkeypatch.setenv('HEVOLVE_WHATSAPP_PHONE', '')
-    with patch('integrations.social.models.db_session',
-               side_effect=RuntimeError('no db')):
+    with patch('requests.post',
+               side_effect=requests.ConnectionError('gateway down')):
         ns['_start_gateway_qr_pair_push']('whatsapp',
                                           {'display_name': 'WhatsApp'})
     args, kwargs = lui.agent_ui_update.call_args
-    assert args[1]['type'] == 'form'
+    assert args[1]['type'] == 'toast' and args[1]['severity'] == 'error'
+    assert 'WhatsApp' in args[1]['text']
     assert kwargs['user_id'] == expected
 
 
