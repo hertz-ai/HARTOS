@@ -207,7 +207,8 @@ def create_binding():
         existing.is_active = True
         existing.channel_chat_id = chat_id or existing.channel_chat_id
         existing.metadata_json = metadata_payload or existing.metadata_json
-        existing.auth_method = data.get('auth_method', existing.auth_method)
+        existing.auth_method = (data.get('auth_method') or existing.auth_method
+                                or meta.get('auth_method'))
         binding = existing
     else:
         binding = UserChannelBinding(
@@ -215,7 +216,10 @@ def create_binding():
             channel_type=channel_type,
             channel_sender_id=sender_id,
             channel_chat_id=chat_id,
-            auth_method=data.get('auth_method'),
+            # An authenticated POST here IS an explicit connect; fan-out
+            # (ChannelResponseRouter._async_fan_out) tells those apart from
+            # auto-recorded senders by auth_method, so never leave it empty.
+            auth_method=data.get('auth_method') or meta.get('auth_method'),
             metadata_json=metadata_payload or None,
             is_active=True,
             is_preferred=False,

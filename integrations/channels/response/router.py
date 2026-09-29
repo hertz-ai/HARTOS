@@ -245,6 +245,23 @@ class ChannelResponseRouter:
                     is_active=True,
                 ).all()
 
+                # Only chats the user connected on purpose.  upsert_binding
+                # records EVERY inbound sender (auth_method unset), and an
+                # unbound sender resolves to the default user -- on a desktop
+                # that is the owner -- so without this a notification meant
+                # for the owner (an outreach reply, a journey step) went to
+                # every stranger's DM and group chat that ever messaged the
+                # bot.  Explicit connects (register_channel, /bindings, pair
+                # verify, the WhatsApp QR) set auth_method; a user's
+                # preferred binding is also their choice.
+                explicit = [b for b in bindings if b.auth_method or b.is_preferred]
+                if len(explicit) < len(bindings):
+                    logger.info(
+                        "Fan-out for user %s: %d auto-recorded chat(s) skipped "
+                        "(never connected by the user)",
+                        user_id, len(bindings) - len(explicit))
+                bindings = explicit
+
                 # Sort: preferred first
                 bindings.sort(key=lambda b: (not b.is_preferred, b.channel_type))
 

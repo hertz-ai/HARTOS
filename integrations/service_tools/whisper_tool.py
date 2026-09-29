@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import tarfile
+import threading
 import urllib.request
 import wave
 from pathlib import Path
@@ -785,7 +786,7 @@ def _download_model(model_name: str) -> Path:
     stt_dir = _get_stt_dir()
     model_dir = stt_dir / cfg["dir"]
 
-    if model_dir.exists() and (model_dir / cfg["files"]["tokens"]).exists():
+    if _sherpa_model_cached(model_name):
         return model_dir
 
     archive_url = f"{_SHERPA_MODEL_BASE}/{cfg['archive']}"
@@ -1093,6 +1094,40 @@ def _catalog_stt_entry(exclude=None):
         return None
 
 
+_background_downloads: set = set()
+
+
+def _download_in_background(model_name: str) -> bool:
+    """Fetch a sherpa model off the request path, one fetch per model.
+
+    select_whisper_model serves a cached model when the catalog's pick is
+    not on disk (a live multi-GB fetch would outlast the request).  Without
+    this, nothing ever downloaded the pick, since _download_model runs only
+    for the model actually chosen, so the node stayed on the smaller cached
+    model for good.  Once this finishes, the next selection finds the pick
+    cached.  A failed fetch is logged and may be retried by a later
+    selection.  Returns whether a download was started.
+    """
+    if model_name in _background_downloads:
+        return False
+    _background_downloads.add(model_name)
+
+    def _run():
+        try:
+            _download_model(model_name)
+            logger.info("STT model '%s' downloaded in the background; the next "
+                        "selection uses it", model_name)
+        except Exception as e:
+            logger.warning("Background download of STT model '%s' failed; a "
+                           "later selection retries it: %s", model_name, e)
+        finally:
+            _background_downloads.discard(model_name)
+
+    threading.Thread(target=_run, name=f'stt-download-{model_name}',
+                     daemon=True).start()
+    return True
+
+
 def _best_cached_sherpa_after(first_id: str):
     """The catalog's next-best sherpa STT model that is already on disk.
 
@@ -1149,10 +1184,13 @@ def select_whisper_model() -> str:
                 # kicking off a live download. Found 2026-09-25.
                 fallback_key = _best_cached_sherpa_after(entry.id)
                 if fallback_key:
+                    started = _download_in_background(sherpa_key)
                     logger.warning(
                         "select_whisper_model: catalog picked '%s' but it "
-                        "is not downloaded; using cached '%s' instead",
-                        sherpa_key, fallback_key)
+                        "is not downloaded; using cached '%s' for now%s",
+                        sherpa_key, fallback_key,
+                        "; downloading the pick in the background" if started
+                        else " (the pick's download is already running)")
                     return fallback_key
                 logger.warning(
                     "select_whisper_model: catalog picked '%s' but it is not "
