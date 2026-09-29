@@ -848,22 +848,21 @@ class AgentDaemon:
         Delegates to the canonical ``NodeWatchdog.sleep_with_heartbeat``
         helper so a 480s exponential-backoff sleep can't silently age
         the heartbeat past the 300s frozen threshold. See the helper's
-        docstring for the full incident context. When the watchdog
-        isn't available (test mode, early boot) this falls back to a
-        plain ``time.sleep`` so behavior is unchanged.
+        docstring for the full incident context.  The module-level
+        helper re-resolves the watchdog every chunk, so a watchdog that
+        appears mid-sleep (this daemon can start before it exists) is
+        heartbeated from its next chunk instead of never.
         """
         try:
-            from security.node_watchdog import get_watchdog
-            wd = get_watchdog()
-            if wd is not None:
-                wd.sleep_with_heartbeat(
-                    'agent_daemon', seconds,
-                    stop_check=lambda: not self._running,
-                )
-                return
-        except Exception:
-            pass
-        time.sleep(seconds)
+            from security.node_watchdog import sleep_with_heartbeat
+        except Exception as e:
+            logger.warning("agent_daemon: heartbeat sleep unavailable, falling "
+                           "back to a plain sleep (no heartbeats, the "
+                           "watchdog may restart this thread): %s", e, exc_info=True)
+            time.sleep(seconds)
+            return
+        sleep_with_heartbeat('agent_daemon', seconds,
+                             stop_check=lambda: not self._running)
 
     def _proactive_hive_tick(self):
         """Proactive hive daemon tick — exploration, self-promotion, and compute optimization.

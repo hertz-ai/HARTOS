@@ -757,6 +757,25 @@ def _get_stt_dir() -> Path:
     return stt_dir
 
 
+def _sherpa_model_cached(model_name: str) -> bool:
+    """True when this sherpa-onnx model is already downloaded and extracted.
+
+    Same check _download_model uses to skip re-downloading, exposed so
+    select_whisper_model can prefer an already-cached model over the
+    catalog's raw top score. ModelCatalog.select_best only gives
+    "downloaded" a +50 scoring bonus (not a hard requirement, see
+    model_catalog.py select_best), so a large not-yet-downloaded model
+    can outscore a small cached one and trigger a live multi-GB download
+    inside the request's timeout window. Found 2026-09-25.
+    """
+    try:
+        cfg = _SHERPA_MODELS[model_name]
+    except KeyError:
+        return False
+    model_dir = _get_stt_dir() / cfg["dir"]
+    return model_dir.exists() and (model_dir / cfg["files"]["tokens"]).exists()
+
+
 def _download_model(model_name: str) -> Path:
     """Download and extract a sherpa-onnx model if not already present.
 
@@ -1074,6 +1093,35 @@ def _catalog_stt_entry(exclude=None):
         return None
 
 
+def _best_cached_sherpa_after(first_id: str):
+    """The catalog's next-best sherpa STT model that is already on disk.
+
+    Walks the catalog's own ranking (select_best with a growing exclude list)
+    rather than a hardcoded preference list, so model choice stays owned by
+    the catalog; "on disk" is read from the files (_sherpa_model_cached), not
+    the catalog's downloaded flag, which depends on a loader HARTOS itself
+    does not register.  Returns None when no cached sherpa model fits.
+    """
+    # Walk the WHOLE ranking: non-sherpa entries (faster-whisper) are ranked
+    # alongside, so bounding the walk by the sherpa count could stop before
+    # reaching a cached sherpa model.  It ends when the catalog runs out,
+    # since every returned id is excluded from the next query.
+    excluded = [first_id]
+    while True:
+        entry = _catalog_stt_entry(exclude=excluded)
+        if entry is None:
+            return None
+        if entry.id in excluded:
+            logger.warning(
+                "select_whisper_model: the catalog returned %r although it "
+                "was excluded; stopping the cached-model search", entry.id)
+            return None
+        excluded.append(entry.id)
+        key = _CATALOG_ID_TO_SHERPA.get(entry.id)
+        if key in _SHERPA_MODELS and _sherpa_model_cached(key):
+            return key
+
+
 def select_whisper_model() -> str:
     """Select best STT model for this hardware.
 
@@ -1091,9 +1139,32 @@ def select_whisper_model() -> str:
         if sherpa_key and sherpa_key in _SHERPA_MODELS:
             try:
                 import sherpa_onnx  # noqa: F401
+                if _sherpa_model_cached(sherpa_key):
+                    return sherpa_key
+                # Catalog's top pick isn't downloaded — downloading it now
+                # would take far longer than the request's timeout window
+                # (#677-style: a multi-GB model fetched on-demand crashes
+                # the worker on timeout instead of ever answering). Prefer
+                # whichever sherpa model is already on disk instead of
+                # kicking off a live download. Found 2026-09-25.
+                fallback_key = _best_cached_sherpa_after(entry.id)
+                if fallback_key:
+                    logger.warning(
+                        "select_whisper_model: catalog picked '%s' but it "
+                        "is not downloaded; using cached '%s' instead",
+                        sherpa_key, fallback_key)
+                    return fallback_key
+                logger.warning(
+                    "select_whisper_model: catalog picked '%s' but it is not "
+                    "downloaded and no cached sherpa model exists either; "
+                    "proceeding with '%s' (will trigger a download)",
+                    sherpa_key, sherpa_key)
                 return sherpa_key
             except ImportError:
-                logger.debug("select_whisper_model: swallowed ImportError")
+                logger.warning(
+                    "select_whisper_model: catalog picked sherpa model '%s' "
+                    "but sherpa_onnx is not installed; falling back to the "
+                    "catalog's faster-whisper/whisper mapping", sherpa_key)
         # faster-whisper size
         fw_size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(entry.id)
         if fw_size:

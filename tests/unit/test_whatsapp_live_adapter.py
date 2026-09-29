@@ -103,6 +103,12 @@ def _mock_integration(existing_adapter=None):
     integration.registry.get.return_value = existing_adapter
     integration._loop = MagicMock()
     integration._loop.is_running.return_value = True
+    # The real loop-owner methods, run against this mock's state, so the
+    # tests exercise the production ensure_running()/running_loop().
+    from integrations.channels.flask_integration import FlaskChannelIntegration as _FI
+    integration.running_loop = lambda: _FI.running_loop(integration)
+    integration.ensure_running = (
+        lambda timeout_s=5.0: _FI.ensure_running(integration, timeout_s))
     return integration
 
 
@@ -133,6 +139,10 @@ class TestEnsureWhatsappLiveAdapter:
         call_kwargs = create_fn.call_args.kwargs
         assert call_kwargs['api_url'] == 'http://127.0.0.1:3000'
         assert call_kwargs['account_id'] == 'user_u1'
+        # phone_number/owner_lid carry the self-chat identity, which is fetched
+        # from the live gateway — their VALUES depend on whether one is
+        # reachable on :3000 (None when the fetch is refused). Assert they are
+        # passed through, not what they happen to resolve to here.
         assert 'phone_number' in call_kwargs
         assert 'owner_lid' in call_kwargs
         integration.registry.register.assert_called_once_with(fake_adapter)

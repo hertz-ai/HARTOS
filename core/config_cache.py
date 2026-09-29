@@ -138,15 +138,29 @@ def env_flag(name: str, default: bool) -> bool:
     return default
 
 
-def env_int(name: str, default: int) -> int:
+def env_int(name: str, default: int, minimum: int = None) -> int:
     """Integer env value; '' and junk fall back to the default instead
     of int('') crashing (the HEVOLVE_VLM_CAPTION_PORT class of bug —
     and the default is typed int, never the '8080'-str-vs-8080-int
-    split the sweep found on HEVOLVE_LLM_PORT)."""
-    try:
-        return int(os.environ.get(name, '').strip() or default)
-    except (ValueError, TypeError):
+    split the sweep found on HEVOLVE_LLM_PORT).
+
+    A value that is set but unusable (junk, or below ``minimum``) falls back
+    LOUDLY: the operator set it for a reason, so say it was not applied.
+    """
+    raw = os.environ.get(name, '').strip()
+    if not raw:
         return default
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        logger.warning("%s=%r is not an integer; using the default %s",
+                       name, raw, default)
+        return default
+    if minimum is not None and value < minimum:
+        logger.warning("%s=%s is below the minimum %s; using the default %s",
+                       name, value, minimum, default)
+        return default
+    return value
 
 
 def should_start_background_services() -> bool:

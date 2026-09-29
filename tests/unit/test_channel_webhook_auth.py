@@ -235,6 +235,70 @@ def _clear_send_env():
         os.environ.pop(k, None)
 
 
+class RegisterStatusRoutesOnExistingIntegration(unittest.TestCase):
+    """standalone main() reaches channels via get_channel_integration()
+    (get-or-create the module singleton), never init_channels() — so
+    GET /channels/status and POST /channels/send, which used to be wired up
+    ONLY inside init_channels()'s closure, 404'd on that boot path even
+    though the integration itself was live (same "standalone launcher never
+    did X" gap as web-channel registration and the webhook routes).
+
+    register_status_routes(app, integration) fixes it by wiring those two
+    routes onto an EXISTING integration instance. The property that matters:
+    it must NOT go through init_channels()'s constructor path, which would
+    build a second, separate FlaskChannelIntegration and silently orphan
+    whatever the passed-in one already had running.
+    """
+
+    def test_status_route_reflects_the_passed_in_integration(self):
+        from flask import Flask
+        from integrations.channels import flask_integration as fi
+
+        app = Flask(__name__)
+        app.config['TESTING'] = True
+
+        integration = fi.FlaskChannelIntegration.__new__(fi.FlaskChannelIntegration)
+        integration.get_status = lambda: {'discord': 'connected'}
+
+        fi.register_status_routes(app, integration)
+        resp = app.test_client().get('/channels/status')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {'discord': 'connected'})
+
+    def test_does_not_touch_the_module_singleton(self):
+        """The whole point: this must be safe to call on an integration a
+        caller already holds (e.g. get_channel_integration()'s return
+        value), without init_channels()'s side effect of overwriting
+        integrations.channels.flask_integration._integration."""
+        from flask import Flask
+        from integrations.channels import flask_integration as fi
+
+        sentinel = object()
+        fi._integration = sentinel
+        try:
+            app = Flask(__name__)
+            other_integration = fi.FlaskChannelIntegration.__new__(
+                fi.FlaskChannelIntegration)
+            other_integration.get_status = lambda: {}
+
+            fi.register_status_routes(app, other_integration)
+
+            self.assertIs(
+                fi._integration, sentinel,
+                "register_status_routes must not replace the module "
+                "singleton — that would orphan whatever it already had "
+                "running, the exact bug this function exists to avoid.")
+        finally:
+            fi._integration = None
+
+    def test_noop_when_app_is_none(self):
+        from integrations.channels import flask_integration as fi
+
+        integration = fi.FlaskChannelIntegration.__new__(fi.FlaskChannelIntegration)
+        fi.register_status_routes(None, integration)  # must not raise
+
+
 class ChannelSendRefusesUnauthenticatedCallers(unittest.TestCase):
     """POST /channels/send is an outbound relay: unauthenticated it lets any
     reachable caller send a message through any registered channel to any

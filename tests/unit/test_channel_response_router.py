@@ -49,6 +49,33 @@ class TestChannelResponseRouter:
         mock_fan.assert_called_once()
         mock_wamp.assert_called_once()
 
+    @patch('integrations.channels.response.router.ChannelResponseRouter.deliver_to_chat')
+    @patch('integrations.channels.response.router.ChannelResponseRouter._notify_desktop_wamp')
+    @patch('integrations.channels.response.router.ChannelResponseRouter._async_fan_out')
+    @patch('integrations.channels.response.router.ChannelResponseRouter._log_conversation')
+    def test_route_response_replies_to_origin_by_default(
+            self, mock_log, mock_fan, mock_wamp, mock_origin):
+        """Callers with no sender of their own (agentic_router) rely on it."""
+        ctx = {'channel': 'slack', 'chat_id': 'C1'}
+        self.router.route_response('user1', 'hello', ctx, fan_out=False)
+        mock_origin.assert_called_once_with(
+            channel='slack', chat_id='C1', text='hello')
+
+    @patch('integrations.channels.response.router.ChannelResponseRouter.deliver_to_chat')
+    @patch('integrations.channels.response.router.ChannelResponseRouter._notify_desktop_wamp')
+    @patch('integrations.channels.response.router.ChannelResponseRouter._async_fan_out')
+    @patch('integrations.channels.response.router.ChannelResponseRouter._log_conversation')
+    def test_route_response_reply_to_origin_false_skips_origin(
+            self, mock_log, mock_fan, mock_wamp, mock_origin):
+        """A caller that delivers the reply itself opts out of the origin leg,
+        but keeps logging, fan-out (origin excluded) and the WAMP notify."""
+        ctx = {'channel': 'slack', 'chat_id': 'C1'}
+        self.router.route_response('user1', 'hello', ctx, reply_to_origin=False)
+        mock_origin.assert_not_called()
+        mock_log.assert_called_once()
+        assert mock_fan.call_args.kwargs['exclude_chat_id'] == 'C1'
+        mock_wamp.assert_called_once()
+
     @patch('integrations.channels.response.router.ChannelResponseRouter._notify_desktop_wamp')
     @patch('integrations.channels.response.router.ChannelResponseRouter._async_fan_out')
     @patch('integrations.channels.response.router.ChannelResponseRouter._log_conversation')

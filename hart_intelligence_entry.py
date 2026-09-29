@@ -4145,32 +4145,16 @@ def _ensure_whatsapp_live_adapter(
             )
             integration.registry.register(adapter)
 
-            loop = integration._loop
-            started_integration = False
-            if not (loop and loop.is_running()):
-                # Entrypoints that skip hartos_bootstrap's full sequence (e.g.
-                # the standalone hart_intelligence_entry.py used for local/dev
-                # testing) never call FlaskChannelIntegration.start() at all,
-                # so _loop stays None forever and every adapter sits
-                # registered-but-never-started — messages reach the gateway
-                # but nothing is listening. start() is idempotent (no-ops if
-                # already running) and cheap (an empty registry.start_all()
-                # the first time), so it's safe to trigger on-demand here
-                # rather than requiring the full boot sequence to have run.
-                integration.start()
-                started_integration = True
-                for _ in range(50):  # ~5s for the background thread to spin up
-                    loop = integration._loop
-                    if loop and loop.is_running():
-                        break
-                    time.sleep(0.1)
-                else:
-                    return {
-                        'success': False,
-                        'error': 'channel event loop failed to start '
-                                 '(FlaskChannelIntegration.start() ran but '
-                                 '_loop never became live)',
-                    }
+            # Entry points that skip hartos_bootstrap never call start(), so
+            # the loop may not exist yet; ensure_running() starts it on demand.
+            loop, started_integration = integration.ensure_running()
+            if loop is None:
+                return {
+                    'success': False,
+                    'error': 'channel event loop failed to start '
+                             '(FlaskChannelIntegration.start() ran but '
+                             '_loop never became live)',
+                }
             # A newly started integration invokes registry.start_all(), which
             # starts this adapter exactly once. An already-running loop needs
             # this explicit start because registry.start_all() has completed.
@@ -10135,6 +10119,17 @@ def chat():
                     # escalates (Computer_Action/Shell are casual-only, so tasks
                     # route via Create_Agent -> CREATE).
                 else:
+                    # Only now — having decided to serve the draft's reply
+                    # as the final answer — fire the background expert.
+                    # The three branches above this one fall through to
+                    # their OWN synchronous full turn for this same prompt
+                    # instead of returning here; scheduling unconditionally
+                    # at classification time (the old behaviour) ran that
+                    # same turn again in the background for those cases —
+                    # the root cause of the 2026-08 duplicate-turn
+                    # investigation. See
+                    # speculative_dispatcher.schedule_expert_for_draft.
+                    dispatcher.schedule_expert_for_draft(result)
                     return _chat_reply(
                         user_id, request_id, result['response'],
                         Agent_status='Draft-First Mode',
@@ -13508,6 +13503,56 @@ def main():
         logging.getLogger(__name__).error(
             "Agent engine init failed — no seeded goal will ever execute on "
             "this node: %s", e, exc_info=True)
+
+    # Channel adapters: same class of gap as the agent engine above.
+    # hartos_bootstrap.py calls FlaskChannelIntegration.start() as part of the
+    # bundled boot sequence, but this standalone launcher never did — so
+    # `_loop` stayed None and every persisted UserChannelBinding sat dead
+    # until an unrelated WhatsApp code path happened to trigger start() on
+    # demand (see _ensure_whatsapp_live_adapter).  In practice that meant
+    # Discord/Telegram/Slack had to be re-bound by hand after every restart,
+    # even though the bindings table exists precisely to survive one.
+    #
+    # start() rehydrates adapters from those bindings and is idempotent, so a
+    # launcher that already started channels (Nunba) is unaffected.
+    try:
+        from integrations.channels.flask_integration import (
+            get_channel_integration, register_status_routes,
+        )
+        _channels = get_channel_integration()
+        # Inbound webhook seam, same omission as above: hartos_bootstrap and
+        # run_debug both call this, standalone never did — so the
+        # /channels/webhook/<channel_type> route did not exist here at all and
+        # EVERY webhook-based channel (google_chat, line, messenger,
+        # instagram, twitter, viber, wechat, zalo) was unreachable inbound,
+        # returning 404 to the provider. Must run before _serve_app.
+        try:
+            _channels.register_webhook_routes(app)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Inbound channel webhook routes not registered — webhook-based "
+                "channels cannot receive messages on this node: %s", e,
+                exc_info=True)
+        # Same class of gap again: hartos_bootstrap/run_debug reach these two
+        # routes via init_channels(app), which standalone never called — so
+        # GET /channels/status and POST /channels/send 404'd here even
+        # though _channels itself is live. register_status_routes wires them
+        # onto the SAME get_channel_integration() singleton rather than
+        # going through init_channels(), which would construct a second,
+        # separate FlaskChannelIntegration and orphan whatever this one
+        # already has running (e.g. a WhatsApp adapter started early by
+        # _ensure_whatsapp_live_adapter).
+        try:
+            register_status_routes(app, _channels)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "/channels/status and /channels/send not registered: %s", e,
+                exc_info=True)
+        _channels.start()
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "Channel adapters not started — persisted channel bindings will "
+            "stay disconnected on this node: %s", e, exc_info=True)
 
     from core.port_registry import get_port
     _serve_app(app, host='0.0.0.0', port=get_port('backend'))
