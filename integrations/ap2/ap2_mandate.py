@@ -75,7 +75,8 @@ def _own_gateway_urls() -> Dict[str, str]:
     try:
         from integrations.channels.oauth_api import _public_base_url
         base = _public_base_url()
-    except Exception:
+    except Exception as e:
+        logger.debug(f'ap2: no public base for gateway urls: {e}')
         return {}
     if not base:
         return {}
