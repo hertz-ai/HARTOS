@@ -148,7 +148,9 @@ def test_a_phone_the_owner_has_not_answered_gets_the_ask_and_pending(desktop, ph
     assert ask['requester_fingerprint'] == device_fingerprint(phone.public_hex)
     # The name is the phone's own claim: the ask says so, in the card's
     # words, and never states it as fact (phase 2 wording control).
-    assert ask['reason'].startswith('A phone calling itself "Sathish"')
+    assert ask['reason'].startswith(
+        'A phone on your network (it says its name is "Sathish")')
+    assert 'Allow it only if the phone is yours' in ask['reason']
     assert "Sathish's phone" not in ask['reason']
     assert phone.public_hex not in ask['reason']
     with db_session() as db:
