@@ -100,6 +100,24 @@ class TestLedgerPath:
         assert ledger.ledger_path == os.path.join(
             str(tmp_path / 'agent_data'), 'payment_ledger.json')
 
+    def test_old_cwd_ledger_is_copied_once_never_deleted(self, tmp_path, monkeypatch):
+        old = PaymentLedger(ledger_path=str(tmp_path / 'cwd' / 'agent_data'
+                                            / 'payment_ledger.json'))
+        p = old.create_payment_request(
+            amount=Decimal('9'), currency='INR', description='before the move',
+            requester_agent_id='user:1')
+        monkeypatch.chdir(tmp_path / 'cwd')
+        new_dir = tmp_path / 'data'
+        with patch('core.platform_paths.get_agent_data_dir',
+                   return_value=str(new_dir)):
+            first = PaymentLedger()
+            assert first.get_payment(p.payment_id) is not None
+            assert os.path.exists(old.ledger_path)          # never deleted
+            # a later write to the new file is not overwritten by the old one
+            first.cancel_payment(p.payment_id, 'user:1')
+            again = PaymentLedger()
+        assert again.get_payment(p.payment_id).status == PaymentStatus.CANCELLED
+
 
 class TestProcessPaymentLocking:
     def test_gateway_call_runs_without_the_ledger_lock(self, tmp_path):

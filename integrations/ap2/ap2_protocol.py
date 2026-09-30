@@ -648,6 +648,18 @@ class PaymentLedger:
         if ledger_path is None:
             from core.platform_paths import get_agent_data_dir
             ledger_path = os.path.join(get_agent_data_dir(), 'payment_ledger.json')
+            # One-time move of the old CWD-relative default: copy (never
+            # delete) so payments recorded before the path moved survive.
+            legacy = os.path.join(os.getcwd(), 'agent_data', 'payment_ledger.json')
+            if (os.path.exists(legacy) and not os.path.exists(ledger_path)
+                    and os.path.abspath(legacy) != os.path.abspath(ledger_path)):
+                try:
+                    import shutil
+                    os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+                    shutil.copy2(legacy, ledger_path)
+                    logger.info(f"Payment ledger migrated from {legacy}")
+                except OSError as e:
+                    logger.error(f"Payment ledger migration failed: {e}")
         self.ledger_path = ledger_path
         self.payments: Dict[str, PaymentRequest] = {}
         self.lock = threading.Lock()
