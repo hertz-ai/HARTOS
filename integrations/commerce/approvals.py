@@ -33,31 +33,8 @@ def is_commerce_action(action) -> bool:
     return str(action or '').strip().lower().startswith(COMMERCE_ACTION_PREFIXES)
 
 
-def _local_owner() -> Optional[str]:
-    """The owner of this node when the current request is from this machine."""
-    try:
-        from core.auth_local import _is_local_request
-        if not _is_local_request():
-            return None
-        import os
-        uid = os.environ.get('HEVOLVE_OWNER_USER_ID')
-        if not uid:
-            from core.event_attribution import owner_user_id
-            uid = owner_user_id()
-        return str(uid) if uid else None
-    except Exception as e:
-        logger.debug(f'commerce approval: local owner not resolved: {e}')
-        return None
-
-
 def approver_from_request(req) -> Optional[str]:
     """Whose Bearer token this is, or None -- never a body field.
-
-    With NO Bearer at all (the shell JS, the landing-page overlay and the
-    phone send none), a request from this machine (loopback socket peer,
-    core.auth_local) is the signed-in owner of this node -- the identity
-    the consent branch of the same route already records the answer under
-    (``_local_owner``).  A remote caller without a token answers None.
 
     A HARTOS JWT (what /api/commerce/session issues and /chat accepts) is
     decoded locally; anything else goes through
@@ -67,7 +44,7 @@ def approver_from_request(req) -> Optional[str]:
     """
     auth = req.headers.get('Authorization', '')
     if not auth.startswith('Bearer '):
-        return _local_owner()
+        return None
     token = auth[7:].strip()
     try:
         from integrations.social.auth import decode_jwt

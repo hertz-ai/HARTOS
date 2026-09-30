@@ -184,22 +184,10 @@ def test_shell_approval_decides_the_payment_as_the_token_holder(shell_world):
     client, ledger, m = shell_world
     body = {'agent_id': 'mcgroce', 'action': f'ap2_pay:{m.payment_id}',
             'decision': 'approve'}
-    assert client.post('/api/agent/approval', json=body,
-                       environ_base={'REMOTE_ADDR': '203.0.113.9'}).status_code == 401
+    assert client.post('/api/agent/approval', json=body).status_code == 401
     assert client.post('/api/agent/approval', json=body,
                        headers=_bearer('mcg-2')).status_code == 403
     r = client.post('/api/agent/approval', json=body, headers=_bearer('mcg-1'))
-    assert r.status_code == 200 and r.get_json()['status'] == 'approved'
-    assert ledger.get_payment(m.payment_id).status == PaymentStatus.COMPLETED
-
-
-def test_shell_local_tokenless_answer_is_the_signed_in_owner(shell_world, monkeypatch):
-    from integrations.ap2.ap2_protocol import PaymentStatus
-    client, ledger, m = shell_world
-    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'mcg-1')
-    r = client.post('/api/agent/approval', json={
-        'agent_id': 'mcgroce', 'action': f'ap2_pay:{m.payment_id}',
-        'decision': 'approve'})
     assert r.status_code == 200 and r.get_json()['status'] == 'approved'
     assert ledger.get_payment(m.payment_id).status == PaymentStatus.COMPLETED
 
