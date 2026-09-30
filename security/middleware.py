@@ -56,7 +56,7 @@ def _apply_security_headers(app: Flask):
 
 #: Env vars whose comma-separated origins together form the CORS allowlist.
 #: MCGROCE_ORIGINS carries the McGroce storefront origins the Nunba embed is
-#: served from (moved here from Nunba), kept apart so an operator can manage
+#: served from, kept apart so an operator can manage
 #: them without touching the node's own CORS_ORIGINS.
 CORS_ORIGIN_ENV_VARS = ('CORS_ORIGINS', 'MCGROCE_ORIGINS')
 

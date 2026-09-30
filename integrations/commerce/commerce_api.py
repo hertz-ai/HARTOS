@@ -106,3 +106,10 @@ def commerce_health():
                     'configured': bool(client.base_url),
                     'admin_configured': bool(client.admin_url and client.admin_key),
                     'breaker': client.breaker.get_stats()['state']})
+
+
+# The credentials this module reads from the environment; a vault value is
+# delivered for these names (hartos.ai_key_vault.reads_from_env).
+ENV_SECRETS = (
+    'COMMERCE_SESSION_SECRET',
+)

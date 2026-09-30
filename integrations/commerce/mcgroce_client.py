@@ -267,3 +267,11 @@ def get_client() -> McGroceClient:
     if _client is None:
         _client = McGroceClient()
     return _client
+
+
+# The credentials this module reads from the environment; a vault value is
+# delivered for these names (hartos.ai_key_vault.reads_from_env).
+ENV_SECRETS = (
+    'MCGROCE_API_PASSWORD',
+    'MCGROCE_ADMIN_API_KEY',
+)
