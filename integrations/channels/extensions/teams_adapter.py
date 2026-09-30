@@ -191,6 +191,12 @@ class TeamsAdapter(ChannelAdapter, RoomCapableAdapter):
         await adapter.start()
     """
 
+    # Bot Framework validates the inbound JWT (Authorization header) inside
+    # process_activity — fail-closed when app credentials are set.  Tell the
+    # generic webhook route to defer its Kong/HMAC gate to that validation
+    # rather than reject Bot Framework's bearer-token auth model.
+    webhook_self_authenticates = True
+
     def __init__(self, config: TeamsConfig):
         if not HAS_TEAMS:
             raise ImportError(
@@ -266,6 +272,29 @@ class TeamsAdapter(ChannelAdapter, RoomCapableAdapter):
             await self._handle_turn(turn_context)
 
         await self._adapter.process_activity(activity, auth_header, turn_callback)
+
+    async def handle_webhook(self, body: str = "", auth_header: str = "") -> dict:
+        """Inbound entrypoint for the generic ``/channels/webhook/teams`` route.
+
+        Teams / Bot Framework POST an Activity as JSON with a JWT in the
+        Authorization header.  The JWT is validated by ``BotFrameworkAdapter``
+        inside :meth:`process_activity` (fail-closed when app credentials are
+        configured) — which is why this adapter sets
+        ``webhook_self_authenticates = True`` so the generic route defers its
+        Kong/HMAC gate to that validation instead of rejecting Bot Framework's
+        auth model.  Returns an empty dict so the route replies 200 with no body
+        (Bot Framework replies are sent out-of-band via the connector).
+        """
+        if not self._adapter:
+            raise ChannelConnectionError("Teams adapter not initialized")
+        try:
+            data = json.loads(body) if isinstance(body, str) else (body or {})
+        except (ValueError, TypeError) as e:
+            logger.warning("Teams webhook: invalid JSON body: %s", e)
+            return {}
+        activity = Activity().deserialize(data)
+        await self.process_activity(activity, auth_header)
+        return {}
 
     async def _handle_turn(self, context: TurnContext) -> None:
         """Handle a turn (incoming activity)."""
