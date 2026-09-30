@@ -358,7 +358,8 @@ class _DrivesTheLinkHelper:
     """Runs the real WhatsApp link helper against a scripted gateway."""
 
     def _run(self, statuses, phone=None, pair_body=None,
-             user_agent=_DESKTOP_UA, profile_phone=None, notify_error=None):
+             user_agent=_DESKTOP_UA, profile_phone=None, notify_error=None,
+             profile_attr='phone'):
         """Drive the real helper.  ``profile_phone`` is the number on the
         user's profile row (None: the profile read fails); ``notify_error``
         makes the phone push raise."""
@@ -389,7 +390,7 @@ class _DrivesTheLinkHelper:
                 patch('integrations.channels.agent_tools.build_channel_tool_closures',
                       return_value=tools), \
                 patch('integrations.social.models.db_session',
-                      side_effect=self._db_session(profile_phone)), \
+                      side_effect=self._db_session(profile_phone, profile_attr)), \
                 patch('integrations.social.services.NotificationService.create',
                       side_effect=notify_error), \
                 patch('core.peer_link.message_bus.get_message_bus',
@@ -399,7 +400,7 @@ class _DrivesTheLinkHelper:
         return posts, registered, ensure_live
 
     @staticmethod
-    def _db_session(profile_phone):
+    def _db_session(profile_phone, profile_attr='phone'):
         """The user store as the helper reads it: a profile row carrying
         ``profile_phone``, or a store that cannot be read."""
         if profile_phone is None:
@@ -409,7 +410,7 @@ class _DrivesTheLinkHelper:
         def session(*_a, **_k):
             db = MagicMock()
             db.query.return_value.filter_by.return_value.first.return_value = (
-                SimpleNamespace(phone=profile_phone))
+                SimpleNamespace(**{profile_attr: profile_phone}))
             yield db
         return session
 
@@ -513,6 +514,17 @@ class TestWhatsAppLinksTheWayThisDeviceCan(_DrivesTheLinkHelper):
             assert any('request-pair-code' in u for u in posts), ua
             assert _cards(lui, 'pair_code')[0]['code'] == 'WXYZ1234', ua
             assert _cards(lui, 'qr_pair') == [] and _cards(lui, 'form') == []
+
+    def test_the_hevolve_database_field_name_is_read_too(self, lui,
+                                                         monkeypatch):
+        # Hevolve_Database's user record calls the field ``phone_number``.
+        monkeypatch.delenv('HEVOLVE_WHATSAPP_PHONE', raising=False)
+        posts, _reg, _live = self._run(
+            [_status(qr='QR-A'), _status(authenticated=True)],
+            profile_phone='+91 90030 54371', profile_attr='phone_number',
+            pair_body={'code': 'WXYZ1234'})
+        assert self.how == 'pair_code'
+        assert any('request-pair-code' in u for u in posts)
 
     def test_on_a_desktop_with_no_number_the_qr_is_shown(self, lui,
                                                          monkeypatch):

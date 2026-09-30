@@ -226,3 +226,21 @@ def test_self_chat_uses_shared_dual_contract():
     assert 'chat_request_fields' in src and 'chat_reply' in src, (
         "self_chat must go through the shared chat_contract, not a private "
         "prompt-only/response-only path")
+
+
+@pytest.mark.parametrize('default_uid,session_uid,expected', [
+    (10077, None, 'telegram:s1'),   # the shared guest id is never one identity
+    (10077, 'u9', 'u9'),            # a paired session keeps its user
+    (7, None, 7),                   # an operator-configured default is kept
+])
+def test_unbound_sender_never_shares_the_guest_identity(
+        default_uid, session_uid, expected):
+    fi = _bare_integration()
+    fi.default_user_id = default_uid
+    fi._session_manager.get_session.return_value.user_id = session_uid
+    fi._resolve_user_id_for_sender = Mock(return_value='resolved')
+    with patch('integrations.channels.flask_integration.pooled_post',
+               lambda *a, **k: Mock(status_code=200,
+                                    json=lambda: {'response': 'ok'})):
+        fi._handle_message(_msg())
+    assert fi._resolve_user_id_for_sender.call_args.kwargs['fallback'] == expected

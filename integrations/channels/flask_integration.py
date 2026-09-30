@@ -144,11 +144,21 @@ class FlaskChannelIntegration:
             # account via Connect_Channel would still hit the chat
             # as user_id=10077 (default) and lose access to their
             # per-user memory / bindings / tool permissions.
+            # The shared guest id must never be one identity for every
+            # stranger: the relay JWT carries this id and /chat trusts the
+            # JWT, so all unbound senders would share one agent session and
+            # one memory.  An operator-configured default is kept.
+            from core.constants import DEFAULT_USER_ID
+            if session and session.user_id:
+                fallback = session.user_id
+            elif self.default_user_id == DEFAULT_USER_ID:
+                fallback = f"{message.channel}:{message.sender_id}"
+            else:
+                fallback = self.default_user_id
             user_id = self._resolve_user_id_for_sender(
                 channel=message.channel,
                 sender_id=message.sender_id,
-                fallback=(session.user_id if session and session.user_id
-                          else self.default_user_id),
+                fallback=fallback,
             )
             # prompt_id priority: session (user override) > per-channel config > global default
             prompt_id = (

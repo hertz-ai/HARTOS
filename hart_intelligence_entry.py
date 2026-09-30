@@ -3838,7 +3838,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
             from integrations.social.models import db_session, User as _SocialUser
             with db_session(commit=False) as db:
                 u = db.query(_SocialUser).filter_by(id=str(_owner)).first()
-                phone = (getattr(u, 'phone', '') or '') if u else ''
+                phone = (getattr(u, 'phone_number', '') or getattr(u, 'phone', '') or '') if u else ''
         except Exception as e:
             _log.warning("gateway_qr: profile phone not read for %s (%s); "
                          "linking without it", _owner, e)
