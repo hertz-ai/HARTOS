@@ -179,15 +179,25 @@ def repair_backend_venv(backend_name: str, wipe_first: bool = False) -> str:
                        f"could not be checked ({type(e).__name__}: {e})")
         consent = 'unavailable'
     if consent != 'granted':
+        # No owner at all (a server) is not "the owner has not answered":
+        # say what the node's operator does instead of waiting for nobody.
+        from integrations.agent_engine.capability_setup import (
+            NO_OWNER_REMEDY, setup_owner,
+        )
+        no_owner = consent == 'unavailable' and setup_owner() is None
+        if no_owner:
+            message = (f"Not installed: tts:{backend_name}. "
+                       f"{NO_OWNER_REMEDY} Do not retry until then.")
+        else:
+            message = (f"Not installed: the owner has not allowed setting "
+                       f"up tts:{backend_name} (consent {consent}). Nothing "
+                       f"was changed; do not retry until the owner answers.")
         return json.dumps({
             'success': False,
             'backend': backend_name,
             'consent': consent,
-            'message': (
-                f"Not installed: the owner has not allowed setting up "
-                f"tts:{backend_name} (consent {consent}). Nothing was "
-                f"changed; do not retry until the owner answers."
-            ),
+            'no_owner': no_owner,
+            'message': message,
             'log_path': log_path,
             'wiped': False,
         })
@@ -254,6 +264,56 @@ def repair_backend_venv(backend_name: str, wipe_first: bool = False) -> str:
     })
 
 
+def next_tts_venv_to_provision() -> str:
+    """Which TTS engine the venv provisioner should set up next.
+
+    The first engine, in ENGINE_REGISTRY order, whose spec installs into its
+    own venv (install_target 'venv'), whose venv is not healthy
+    (tts.backend_venv.is_venv_healthy), and that the owner has not declined
+    (capability_setup.setup_declined, a read that never asks).  Declined
+    engines are skipped and listed: the bootstrap goal used to pick "the
+    first unhealthy engine" in its prose, so an engine the owner said no to
+    was picked on every tick and the others were never asked.
+
+    Returns JSON: ``engine`` (str | None), ``declined`` (engines skipped
+    because the owner said no), ``done`` (True when there is nothing left
+    to offer), and ``error`` when the choice cannot be made here (no
+    ENGINE_REGISTRY, or Nunba's venv layer not importable).
+    """
+    known = _get_known_backends()
+    if not known:
+        return json.dumps({'engine': None, 'declined': [], 'done': False,
+                           'error': 'ENGINE_REGISTRY unavailable in this '
+                                    'process'})
+    try:
+        from tts.backend_venv import is_venv_healthy  # type: ignore
+    except ImportError as e:
+        return json.dumps({
+            'engine': None, 'declined': [], 'done': False,
+            'error': (f'Choosing an engine requires the Nunba bundled '
+                      f'environment (tts.backend_venv importable). '
+                      f'ImportError: {e}'),
+        })
+    from integrations.agent_engine.capability_setup import setup_declined
+    from integrations.channels.media.tts_router import ENGINE_REGISTRY
+    declined = []
+    for engine_id, spec in ENGINE_REGISTRY.items():
+        if getattr(spec, 'install_target', 'main') != 'venv':
+            continue
+        try:
+            if is_venv_healthy(engine_id):
+                continue
+        except Exception as e:
+            logger.warning(f"next_tts_venv_to_provision: health of "
+                           f"{engine_id!r} unreadable ({e}); offering it")
+        if setup_declined(f'tts:{engine_id}'):
+            declined.append(engine_id)
+            continue
+        return json.dumps({'engine': engine_id, 'declined': declined,
+                           'done': False})
+    return json.dumps({'engine': None, 'declined': declined, 'done': True})
+
+
 # Tool registration list — same shape as AUTOEVOLVE_CODE_TOOLS /
 # AUTO_EVOLVE_TOOLS / THOUGHT_EXPERIMENT_TOOLS.  Consumed by
 # mcp_http_bridge._load_tools via the registration tuple list around
@@ -273,5 +333,16 @@ BACKEND_REPAIR_TOOLS = [
             'corruption / version-conflict situations).'
         ),
         'tags': ['coding', 'self_heal', 'tts'],
+    },
+    {
+        'name': 'next_tts_venv_to_provision',
+        'func': next_tts_venv_to_provision,
+        'description': (
+            'Which TTS engine to set up next: the first venv engine that is '
+            'not healthy and that the owner has not declined (declined ones '
+            'are skipped and listed). Returns JSON {engine, declined, done}; '
+            'call repair_backend_venv(backend_name=engine) with it.'
+        ),
+        'tags': ['provision', 'self_heal', 'tts'],
     },
 ]

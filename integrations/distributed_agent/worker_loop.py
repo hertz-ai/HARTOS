@@ -423,10 +423,15 @@ class DistributedWorkerLoop:
         # The context carries an opaque requester handle, not a user
         # (dispatch_goal_distributed).  On the node that minted it, the task
         # runs as the person; anywhere else as the handle, which is only a
-        # session key and a world-model tag here: there is no such user.
-        from integrations.distributed_agent.requesters import resolve_requester
+        # session key and a world-model tag here: there is no such user.  A
+        # raw id this node did not stamp is never run as (review of
+        # e9daad6c5: a peer named a local user and a pulled task ran /chat as
+        # them); the task runs as this node instead.
+        from integrations.distributed_agent.requesters import (
+            is_handle, resolve_requester)
         _requester = task.context.get('user_id')
-        user_id = (resolve_requester(_requester) or _requester
+        user_id = (resolve_requester(_requester, task.context.get('source_node'))
+                   or (_requester if is_handle(_requester) else None)
                    or self._node_id)
 
         # GUARDRAIL: pre-dispatch gate

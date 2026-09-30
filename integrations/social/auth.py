@@ -443,6 +443,19 @@ def user_id_for_token(token):
             db.close()
 
 
+def _sign_in_required(error: str):
+    """require_auth's 401: no token, or one that no longer verifies.
+
+    ``needs_sign_in`` is the structured answer a client keys on; the
+    ``error`` prose is for people and logs and may change.  Nunba's
+    steerOutcome matched the prose and would silently show a raw sentence
+    the day it drifted (hart_intelligence_entry already words its own 401
+    'Invalid or expired token.', with a period).
+    """
+    return jsonify({'success': False, 'error': error,
+                    'needs_sign_in': True}), 401
+
+
 def require_auth(f):
     """Decorator: requires valid Bearer token. Sets g.user and g.db.
 
@@ -466,13 +479,13 @@ def require_auth(f):
         if auth_header.startswith('Bearer '):
             token = auth_header[7:]
         elif os.environ.get('HEVOLVE_TRUST_KONG', '').lower() != 'true':
-            return jsonify({'success': False, 'error': 'Missing or invalid Authorization header'}), 401
+            return _sign_in_required('Missing or invalid Authorization header')
 
         user, db = _get_user_from_token(token)
         if user is None:
             if db:
                 db.close()
-            return jsonify({'success': False, 'error': 'Invalid or expired token'}), 401
+            return _sign_in_required('Invalid or expired token')
 
         g.user = user
         g.user_id = str(user.id)

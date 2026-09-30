@@ -1373,6 +1373,9 @@ def inject_instruction(db, agent_id: str, instruction: str,
     if gc is None:
         out['error'] = ('no live GroupChat registered for this agent '
                         '(not currently executing)')
+        # The structured answer a client keys on ("this run is no longer
+        # taking guidance"); the error prose may change.
+        out['not_steerable'] = True
         return out
 
     try:

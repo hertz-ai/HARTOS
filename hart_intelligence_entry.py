@@ -591,6 +591,17 @@ except Exception as _snap_err:
     logging.getLogger('hevolve_core').debug(
         f'prompts_backup at module-load skipped: {_snap_err}')
 
+# Once, after the snapshot above: move aside the VLM learnings that do not say
+# which action they ran under (a next-free-slot walker filed them under other
+# actions' ids; the loader refuses them either way).  Moved, never deleted;
+# marker-guarded.  See hartos.helper.quarantine_unproven_vlm_learnings_once.
+try:
+    from hartos.helper import quarantine_unproven_vlm_learnings_once as _vlm_q_once
+    _vlm_q_once(PROMPTS_DIR)
+except Exception as _vlm_q_err:
+    logging.getLogger('hevolve_core').warning(
+        f'VLM learning quarantine at module-load skipped: {_vlm_q_err}')
+
 # Google A2A integration (from gpt4.1)
 try:
     from integrations.google_a2a import initialize_a2a_server, get_a2a_server, register_all_agents

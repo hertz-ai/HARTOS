@@ -43,7 +43,11 @@ THE INVARIANT, and it already has a canonical home:
 builds ``{prompt_id}_{role}_{action}_vlm_agent.json`` — exactly the shape
 ``load_vlm_agent_files`` parses, and exactly what the DIRECT-READ site a few
 lines above the writer already calls to find "this action's file".  Writer and
-reader must agree by construction; today only the reader uses the helper.
+reader must agree by construction.  Since the review of 5d6343409 both writers
+call ``helper.bank_vlm_learning`` and every reader goes through
+``helper.load_vlm_agent_files`` / ``helper.read_vlm_learning``, which also
+require the file's ``learned_for`` stamp to name the same action
+(tests/unit/test_vlm_learning_must_prove_its_action.py).
 
     python -m pytest tests/unit/test_vlm_writer_action_identity.py --noconftest -q
 """
@@ -101,45 +105,39 @@ class TestWriterNamesTheActionItBelongsTo:
             f"appends a phantom non-autonomous action to the agent's ledger "
             f"(measured live: agent 33323830039, 1 recipe action -> 4)")
 
-    def test_source_guard_create_has_no_uniquifier_either(self):
-        """The CREATE twin of the same writer (create_recipe.py, inside its
-        execute_windows_or_android_command) kept the walker after REUSE's was
-        removed.  MEASURED: agent 18088688973's 6-action flow has orphan files
-        _7/_8/_9_vlm_agent.json (mtimes 2026-09-09 10:50, 2026-09-17 06:53,
-        2026-09-09 10:57), and a walk from action 1 over existing _1.._6
-        files also filed action 1's run as _2.._6 -- another action's steps.
-        Source guard (create_recipe cannot be imported in a bare env); the
-        behaviour it protects is tested in test_vlm_merge_preserves_persona
-        (TestAReLearningNeverCreatesAnAction)."""
-        cr = os.path.join(os.path.dirname(RR_PATH), 'create_recipe.py')
-        with open(cr, encoding='utf-8') as fh:
-            loops = _vlm_uniquifier_loops(ast.parse(fh.read()))
-        assert not loops, (
-            f"create_recipe.py still walks to the next free vlm_agent slot at "
-            f"line(s) {loops}; the reader takes that number as the action id")
+    def test_source_guard_no_writer_has_a_uniquifier(self):
+        """The CREATE twin of the same writer kept the walker after REUSE's
+        was removed (5d6343409).  MEASURED: agent 18088688973's 6-action flow
+        has orphan files _7/_8/_9_vlm_agent.json (mtimes 2026-09-09 10:50,
+        2026-09-17 06:53, 2026-09-09 10:57).  Both writers now call
+        helper.bank_vlm_learning, so the helper is guarded too.  Source guard
+        for the SHAPE only; the behaviour is driven end to end through
+        CREATE's real tool in test_create_vlm_learning_files_its_action.py
+        (hartos.create_recipe imports fine in the HARTOS venv)."""
+        here = os.path.dirname(RR_PATH)
+        for name in ('create_recipe.py', 'helper.py'):
+            with open(os.path.join(here, name), encoding='utf-8') as fh:
+                loops = _vlm_uniquifier_loops(ast.parse(fh.read()))
+            assert not loops, (
+                f"{name} walks to the next free vlm_agent slot at line(s) "
+                f"{loops}; the reader takes that number as the action id")
 
-    def test_writer_uses_the_canonical_path_helper(self, rr_tree):
-        """Same builder the reader already uses — agreement by construction.
-
-        `safe_prompt_path(prompt_id, role, action, 'vlm_agent')` is what the
-        direct-read site calls to locate THIS action's file.  A writer that
-        concatenates its own string can drift from it; one that calls the same
-        helper cannot.
-        """
-        calls = 0
-        for node in ast.walk(rr_tree):
-            if not isinstance(node, ast.Call):
-                continue
-            fn = node.func
-            name = getattr(fn, 'attr', None) or getattr(fn, 'id', None)
-            if name != 'safe_prompt_path':
-                continue
-            if any(isinstance(a, ast.Constant) and a.value == 'vlm_agent'
-                   for a in node.args):
-                calls += 1
-        assert calls >= 2, (
-            "expected the vlm_agent path to come from safe_prompt_path at BOTH "
-            f"the read site and the write site; found {calls} such call(s)")
+    @pytest.mark.parametrize('action_id', [1, 2, 3, 7, 24, 38])
+    def test_the_writer_and_the_reader_agree_on_the_id(
+            self, action_id, tmp_path, monkeypatch):
+        """Agreement by construction, run rather than read: what the one
+        writer banks for action N, the one reader returns as action N."""
+        import logging
+        import types
+        helper = pytest.importorskip('hartos.helper')
+        monkeypatch.setattr(helper, 'PROMPTS_DIR', str(tmp_path))
+        monkeypatch.setattr(helper, 'current_app', types.SimpleNamespace(
+            logger=logging.getLogger('test_vlm_writer_identity')))
+        path = helper.bank_vlm_learning(
+            '33323830039', 0, action_id, 'run', {'action': 'x', 'recipe': []})
+        assert READER_RULE(os.path.basename(path)) == action_id
+        loaded = helper.load_vlm_agent_files('33323830039', 0)
+        assert [v['action_id'] for v in loaded] == [action_id]
 
 
 class TestTheInvariantItself:

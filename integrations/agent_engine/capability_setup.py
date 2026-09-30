@@ -48,6 +48,52 @@ SETUP_CONSENT_TYPE = 'capability_setup'
 _MAX_CAPABILITY = 100
 
 
+#: What a node with no owner does to get a capability installed.  With
+#: HEVOLVE_OWNER_USER_ID unset (a server, or a desktop before its owner is
+#: known) there is nobody to ask, so nothing is installed on an agent's
+#: request; the person who runs the node names who approves installs.
+NO_OWNER_REMEDY = (
+    "This node has no owner to ask (HEVOLVE_OWNER_USER_ID is not set), so "
+    "nothing is installed on an agent's request. To install it, set "
+    "HEVOLVE_OWNER_USER_ID to the account that approves installs on this "
+    "node and restart; that account is then asked.")
+
+
+def setup_owner() -> Optional[str]:
+    """Whose machine this is: HEVOLVE_OWNER_USER_ID (Nunba exports it at
+    boot), or None.  The disk, the bandwidth and the install are the desktop
+    owner's, exactly as for computer_control (vlm.safety) and the screen
+    capture loop, which read the same variable.  The one reader of it here."""
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    return owner or None
+
+
+def setup_declined(capability: str) -> bool:
+    """True when the owner has said no to setting ``capability`` up and no
+    newer yes covers it.  Reads only: never files a card.  False when there
+    is no owner or the consent store cannot be read (logged), so a caller
+    choosing what to offer next never skips something on a guess."""
+    owner = setup_owner()
+    if not owner or not isinstance(capability, str) or not capability.strip():
+        return False
+    capability = capability.strip()
+    try:
+        from integrations.social.models import db_session
+        from integrations.social.consent_service import ConsentService
+        with db_session() as db:
+            # declined() is asked only after check_consent failed: a newer
+            # grant covers an older no (ConsentService.declined).
+            if ConsentService.check_consent(db, owner, SETUP_CONSENT_TYPE,
+                                            scope=capability):
+                return False
+            return bool(ConsentService.declined(db, owner, SETUP_CONSENT_TYPE,
+                                                scope=capability))
+    except Exception as e:
+        logger.warning("capability setup: could not read whether %s was "
+                       "declined (%s: %s)", capability, type(e).__name__, e)
+        return False
+
+
 class CapabilityNotInstalled(RuntimeError):
     """A capability a task needed is not installed on this node.
 
@@ -77,11 +123,9 @@ def ask_owner_for_setup(capability: str, *, reason: str) -> str:
                        capability[:40])
         return 'unavailable'
 
-    # Whose machine this is.  The disk, the bandwidth and the install are the
-    # desktop owner's, exactly as for computer_control (vlm.safety) and the
-    # screen capture loop, which read the same variable Nunba exports at
-    # boot.  With no owner there is nobody to ask, so nothing is offered.
-    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    # With no owner there is nobody to ask, so nothing is offered
+    # (NO_OWNER_REMEDY says what the node's operator does instead).
+    owner = setup_owner()
     if not owner:
         logger.info(
             "capability setup for %s not offered: this node has no owner to "

@@ -26,12 +26,16 @@ if ROOT not in sys.path:
 pytest.importorskip('autogen', reason='autogen not installed')
 
 
-@pytest.mark.parametrize('modname', ['hartos.reuse_recipe', 'hartos.create_recipe'])
+# reuse_recipe only: create_recipe's copy of execute_python_file had no caller
+# and was deleted (see test_scheduled_job_reports_its_run.py).
+@pytest.mark.parametrize('modname', ['hartos.reuse_recipe'])
 def test_time_agent_url_comes_from_the_local_backend_resolver(modname):
     mod = importlib.import_module(modname)
     with patch.object(mod, 'get_local_backend_url',
                       return_value='http://localhost:5000') as resolver, \
          patch.object(mod, 'pooled_post') as mk_post:
+        # The job reads the route's answer now; model a 200.
+        mk_post.return_value.status_code = 200
         mod.execute_python_file('water the plants', 'user-1', 'pid-1')
     assert resolver.called, f'{modname} must ask get_local_backend_url() for the base'
     assert mk_post.call_args[0][0] == 'http://localhost:5000/time_agent'

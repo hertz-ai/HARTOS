@@ -77,6 +77,19 @@ class ProvisionVenvsSeedContractTests(unittest.TestCase):
             "engine on every tick.",
         )
 
+    def test_description_leaves_the_engine_choice_to_the_tool(self):
+        """The engine is chosen by next_tts_venv_to_provision, which skips
+        engines the owner declined.  'Pick the FIRST unhealthy engine' in
+        prose held the loop on a declined engine forever (review of the
+        repair_backend_venv consent gate).  The goal is prose read by the
+        agent, so the contract is its wording; the choice itself is tested
+        in test_tts_venv_provisioning_order.py."""
+        desc = self.seed.get('description', '')
+        self.assertIn('next_tts_venv_to_provision', desc)
+        self.assertNotIn('Pick the FIRST engine', desc)
+        self.assertIn("consent 'declined'", desc)
+        self.assertIn('no_owner', desc)
+
     def test_description_enforces_one_install_per_dispatch(self):
         """The entire pacing design depends on this — without it the
         agent would loop over every unhealthy engine in one dispatch

@@ -184,6 +184,40 @@ def test_a_consent_that_cannot_be_read_closes_both(gate, saved_consent,
     assert (gate.allowed('camera'), gate.allowed('screen')) == (False, False)
 
 
+def test_a_database_with_no_consent_table_leaves_the_feeds_open(
+        gate, tmp_path, monkeypatch):
+    """No consent table means no answer was ever recorded in this database:
+    a fresh install whose VisionService starts before init_db creates the
+    schema, or a file whose migrations never ran.  That is "no answer on
+    file" (open), not "cannot tell" (closed): closing here shut the camera
+    and screen for the whole first boot, and test_vision_sidecar's frame
+    tests failed on exactly this (main 53ddce893)."""
+    import contextlib
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    import integrations.social.models as models
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'fresh.db'}")
+    factory = sessionmaker(bind=engine)
+
+    @contextlib.contextmanager
+    def _session(commit=True):
+        s = factory()
+        try:
+            yield s
+        finally:
+            s.close()
+
+    monkeypatch.setattr(models, 'db_session', _session)
+    try:
+        vs = _new_service()
+        assert (gate.allowed('camera'), gate.allowed('screen')) == (True, True)
+        vs.store.put_frame(OWNER, b'first-boot')
+        assert vs.store.get_frame(OWNER) == b'first-boot'
+    finally:
+        engine.dispose()
+
+
 def test_an_answer_given_in_this_process_is_not_overwritten(gate, saved_consent):
     """The worker may construct the first VisionService while a No is still
     uncommitted, so the row reads Yes: the No must stand."""

@@ -366,6 +366,18 @@ def test_no_token_from_another_machine_is_refused(client, sf, key):
     gid, pid, _ = _goal(sf, owner_id=_user(sf))
     r = _call(client, key, gid, pid, REMOTE)
     assert r.status_code == 401, (key, r.status_code)
+    # The structured answer a client keys on, whatever the prose says.
+    assert r.get_json().get('needs_sign_in') is True, (key, r.get_json())
+
+
+@pytest.mark.parametrize('key', sorted(ROUTES), ids=lambda k: f'{k[0]} {k[1]}')
+def test_an_expired_token_from_another_machine_says_sign_in(client, sf, key):
+    gid, pid, _ = _goal(sf, owner_id=_user(sf))
+    with patch('integrations.social.auth._get_user_from_token',
+               side_effect=lambda token: (None, None)):
+        r = _call(client, key, gid, pid, REMOTE, TOKEN)
+    assert r.status_code == 401, (key, r.status_code)
+    assert r.get_json().get('needs_sign_in') is True, (key, r.get_json())
 
 
 # ── the specific findings ───────────────────────────────────────────────
@@ -634,3 +646,90 @@ def test_patch_coding_goal_status_goes_through_the_steering_rule(client, sf):
     assert paused.status_code == 200, paused.get_json()
     assert empty.status_code == 400
     assert _status(sf, gid) == 'paused'
+
+
+
+# ── review of d4146f843 ─────────────────────────────────────────────────
+
+AUDIT = ('timeline', 'conversations', 'thinking')
+
+
+@pytest.mark.parametrize('route', AUDIT)
+def test_a_trained_agents_owner_reads_its_history_from_another_machine(
+        client, sf, route):
+    """The dashboard lists a trained agent by its users-row id; its owner
+    reads its history from Hevolve web, which is always another machine.
+    The id no goal claims was treated as the machine's: the owner got 403."""
+    owner = _user(sf)
+    agent = _user(sf, user_type='agent', owner_id=owner)
+    url = f'/api/social/audit/agents/{agent}/{route}'
+    with _as(owner):
+        mine = client.get(url, headers=TOKEN, environ_base=REMOTE)
+    with _as(agent):
+        itself = client.get(url, headers=TOKEN, environ_base=REMOTE)
+    with _as(_user(sf)):
+        theirs = client.get(url, headers=TOKEN, environ_base=REMOTE)
+    assert mine.status_code == 200, mine.get_json()
+    assert itself.status_code == 200, itself.get_json()
+    assert theirs.status_code == 403
+    assert SECRET not in theirs.get_data(as_text=True)
+
+
+@pytest.mark.parametrize('route', AUDIT)
+def test_a_person_reads_their_own_history_by_their_user_id(client, sf, route):
+    me = _user(sf)
+    with _as(me):
+        r = client.get(f'/api/social/audit/agents/{me}/{route}',
+                       headers=TOKEN, environ_base=REMOTE)
+    assert r.status_code == 200, r.get_json()
+
+
+def test_an_ownerless_agent_account_stays_the_machines(client, sf):
+    agent = _user(sf, user_type='agent')
+    with _as(_user(sf)):
+        remote = client.get(f'/api/social/audit/agents/{agent}/timeline',
+                            headers=TOKEN, environ_base=REMOTE)
+        local = client.get(f'/api/social/audit/agents/{agent}/timeline',
+                           headers=TOKEN)
+    assert remote.status_code == 403
+    assert local.status_code == 200, local.get_json()
+
+
+def test_a_run_with_no_live_groupchat_says_so_structurally(client, sf):
+    owner = _user(sf)
+    db = sf()
+    gid = uuid.uuid4().hex
+    db.add(AgentGoal(id=gid, owner_id=owner, goal_type='coding', title='t',
+                     prompt_id='31337', status='active'))
+    db.commit()
+    db.close()
+    with _as(owner):
+        r = client.post(f'/api/social/dashboard/agents/{gid}/inject',
+                        json={'instruction': 'go'}, headers=TOKEN,
+                        environ_base=REMOTE)
+    assert r.status_code == 400
+    assert r.get_json()['data'].get('not_steerable') is True
+
+
+def test_progress_of_a_goal_this_node_stamped_is_its_requesters(app, client, sf):
+    """No submitter record (the goal came through dispatch, or predates the
+    record): the requester its own context names counts when THIS node
+    stamped it -- a handle minted here.  A raw id with no source is a
+    peer's word and names nobody."""
+    me = _user(sf)
+    from integrations.distributed_agent import api as dist_api
+    from integrations.distributed_agent.requesters import requester_handle
+    coord = dist_api._get_coordinator()
+    handle = requester_handle('dist-h', me)
+    contexts = {'dist-h': {'user_id': handle, 'source_node': 'node-x'},
+                'dist-raw': {'user_id': me}}
+    coord.get_goal_progress.side_effect = lambda gid: {
+        'goal_id': gid, 'context': contexts[gid], 'tasks': [SECRET]}
+    with patch('integrations.distributed_agent.requesters.this_node_id',
+               return_value='node-x'), _as(me):
+        mine = client.get('/api/distributed/goals/dist-h/progress',
+                          headers=TOKEN, environ_base=REMOTE)
+        raw = client.get('/api/distributed/goals/dist-raw/progress',
+                         headers=TOKEN, environ_base=REMOTE)
+    assert mine.status_code == 200, mine.get_json()
+    assert raw.status_code == 403

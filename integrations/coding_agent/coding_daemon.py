@@ -226,10 +226,18 @@ class CodingAgentDaemon:
                 if agent_idx >= len(idle_agents):
                     break
                 agent = idle_agents[agent_idx]
-                used_agents.add(agent['user_id'])
                 prompt = GoalManager.build_prompt(goal.to_dict())
                 if prompt is None:
+                    # The builder declined the goal, so nothing is sent and
+                    # the agent stays free for the next goal.  Reserving it
+                    # before this check let a declined goal keep it: the
+                    # autoresearch seed with no run_command, frozen at the
+                    # front of the queue since 2026-03-24, took the first
+                    # idle agent on every tick.  Same rule as agent_daemon
+                    # ("Reserve the agent only now that the goal has cleared
+                    # every gate").
                     continue
+                used_agents.add(agent['user_id'])
 
                 goal.last_dispatched_at = now
                 result = dispatch_to_chat(prompt, str(agent['user_id']), goal.id,

@@ -75,7 +75,8 @@ def restore_feed_answers() -> None:
     id the answer was filed under -- the admin toggle files it under the
     signed-in user, the privacy page under the JWT user, /api/agent/approval
     under HEVOLVE_OWNER_USER_ID -- and no owner has to be configured.  No
-    answer on file leaves the feed open, as before.  If the consent cannot
+    answer on file leaves the feed open, as before; so does a database with
+    no consent table yet (first boot, before init_db).  If the consent cannot
     be read, both feeds close: the last answer may have been No.  An answer
     this process already holds is kept (restore_withheld)."""
     from core import ai_sensing
