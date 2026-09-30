@@ -15,6 +15,8 @@ import time
 import logging
 import re
 
+from core.constants import SHELL_COMMAND_TIMEOUT_S
+
 logger = logging.getLogger('hevolve.vlm.local_loop')
 
 # Max iterations to prevent infinite loops (same safeguard as OmniParser)
@@ -86,6 +88,10 @@ _VLM_ACTION_LIST = (
     "    * open_file_gui: open a file or app in the OS default handler. "
     "Put the target in the 'path' field (e.g. path='notepad' or "
     "path='C:\\\\Users\\\\foo\\\\doc.pdf').\n"
+    "      When a task names a bare file, first use shell to resolve it in "
+    "the task's declared workspace. Open only the resolved path. If it is "
+    "absent there, report that blocker; do not retry the same bare name or "
+    "inspect a different checkout.\n"
     "- File: list_folders_and_files, Open_file_and_copy_paste, write_file, "
     "read_file_and_understand\n"
 )
@@ -216,29 +222,168 @@ def list_active_sessions() -> list:
         return [tuple(k.split(':', 1)) for k in _vlm_stop_flags.keys()]
 
 
-def _notify_desktop_indicator(show: bool) -> None:
-    """Show or hide Nunba's AI-control ribbon (desktop/indicator_window.py).
+def _step_caption(action_json: dict, limit: int = 160) -> str:
+    """One line a person can read: the step's action, then why.
 
-    Nunba shows the ribbon from its /execute route, which only the http tier
-    calls.  The inprocess tier drives pyautogui directly, so a run could type
-    and click with nothing on screen saying the AI was in control: on
-    2026-09-13 the audit log holds 2,660 VLM actions and gui_app.log holds no
-    "Ribbon indicator shown" line.  A show request also re-arms the ribbon's
-    15 s inactivity timer, so the loop sends one before every action.
-
-    Best effort, and only inside Nunba: standalone HARTOS has no ribbon, and
-    a refused localhost connect costs seconds on Windows.
+    The VLM answers with 'Next Action' (e.g. "left_click", "type") and
+    'Reasoning' (its own words, e.g. "Open Settings from the Start menu").
+    The reasoning is what tells the owner what is happening, so it comes
+    first; the bare action name is kept as a tail for steps with no
+    reasoning.
     """
-    try:
-        from core.config_cache import is_bundled, _local_base
-        if not is_bundled():
-            return
-        from core.http_pool import pooled_get
-        pooled_get(f"{_local_base()}/indicator/{'show' if show else 'hide'}",
-                   timeout=2)
-    except Exception as e:
-        logger.debug(f"AI-control ribbon {'show' if show else 'hide'} "
-                     f"skipped: {e}")
+    reasoning = ' '.join(str(action_json.get('Reasoning') or '').split())
+    action = ' '.join(str(action_json.get('Next Action') or '').split())
+    if reasoning and action and action.lower() != 'none':
+        line = f"{reasoning} ({action})"
+    else:
+        line = reasoning or action
+    return line if len(line) <= limit else line[:limit - 1].rstrip() + '…'
+
+
+# ─── Actions still running after the loop gave up on them ───
+# An action abandoned at the time budget keeps running on its worker (an
+# in-process call such as os.startfile cannot be stopped from outside).
+# Review F3 (2026-09-27, probe vlm_probe.py q2): ten runs whose action never
+# returned left ten live 'hart-vlm-action' workers, and nothing stopped the
+# next run firing the same action at the same target while the first still
+# ran.  This counts them per target; a new action on a target with one still
+# running is refused instead of started.
+_abandoned_lock = _threading.Lock()
+_abandoned_by_target: dict = {}          # (action, target) -> still running
+
+
+def _action_target(action_payload: dict) -> tuple:
+    """What an action acts ON: the action name plus its path / command /
+    text / coordinate -- whichever it carries."""
+    act = str(action_payload.get('action') or '')
+    for key in ('path', 'command', 'text', 'coordinate'):
+        value = action_payload.get(key)
+        if value:
+            return act, str(value)
+    return act, ''
+
+
+def abandoned_actions_in_flight() -> int:
+    """How many actions the loop gave up on are still running, all targets."""
+    with _abandoned_lock:
+        return sum(_abandoned_by_target.values())
+
+
+def _action_grace_s(action: str) -> float:
+    """Extra wait past the budget for an action that bounds ITSELF.
+
+    A shell step runs through Shell_Command, which kills it at
+    SHELL_COMMAND_TIMEOUT_S, so waiting that long past the budget costs at
+    most that and returns its REAL result instead of "result unknown"
+    (review F2, 2026-09-27).  Nothing else bounds itself, so gets none.
+    """
+    return float(SHELL_COMMAND_TIMEOUT_S) if action == 'shell' else 0.0
+
+
+#: The status of an action the loop let go of while it still ran: it did not
+#: fail and did not succeed, and nobody can yet say which (review F2).  Every
+#: other action result says 'ok' / 'error' / 'blocked' / 'safety_blocked'.
+ACTION_STATUS_UNKNOWN = 'unknown'
+
+
+def _execute_within_budget(execute_action, action_payload, tier, *,
+                           safety, verify, remaining_s, grace_s=0.0,
+                           cancel=None):
+    """Run one action, but never past the loop's remaining time budget.
+
+    Returns ``(outcome, result)``.  ``result`` is the action's own dict for
+    ``'done'``, ``{'output': '', 'status': ACTION_STATUS_UNKNOWN}`` for
+    ``'abandoned'`` and ``'stopped'``, and None for the rest:
+
+      * ``'done'``        -- it returned in time;
+      * ``'no_budget'``   -- nothing was left, so it was NOT started;
+      * ``'busy'``        -- NOT started: an earlier action on the same target
+                             is still running (see _abandoned_by_target);
+      * ``'abandoned'``   -- still running at the deadline plus ``grace_s``
+                             (the caller computes it once with
+                             _action_grace_s and says the same number to
+                             the model).  The caller is
+                             released; the action finishes on its worker and
+                             its result is unknown -- it may yet succeed;
+      * ``'stopped'``     -- still running when ``cancel`` (the session's
+                             Stop) was set; result unknown likewise;
+      * ``'not_started'`` -- Stop was already set; nothing ran.
+
+    An exception the action raised in time is re-raised, so the iteration's
+    own error handling sees it exactly as before.
+
+    Measured live 2026-09-27 (daemon goal b18bba6f): one open_file_gui --
+    os.startfile on a .py associated with pycharm64.exe -- returned after
+    ~6974 s, because the 1800 s ETA was only checked between iterations.
+
+    The action runs on a worker that adopts this thread's hartos.threadlocal
+    state: the shell tool inside it checks consent against prompt_id and
+    announces itself as a step of the run stamped there.  When the action is
+    abandoned that stamp is marked closed, so its late steps cannot write
+    into the finished run (review F1).
+    """
+    if remaining_s <= 0:
+        return 'no_budget', None
+    target = _action_target(action_payload)
+    with _abandoned_lock:
+        if _abandoned_by_target.get(target):
+            return 'busy', None
+    from core.subprocess_safe import call_bounded
+    from hartos.threadlocal import thread_local_data
+    # The worker runs as this thread's request (hartos.threadlocal.carry);
+    # its snapshot is kept to close the run stamp if the action is abandoned.
+    run_action = thread_local_data.carry(execute_action)
+    context = run_action.snapshot
+    state = {'started': False, 'done': False, 'abandoned': False}
+
+    def _act():
+        with _abandoned_lock:
+            state['started'] = True
+        try:
+            state['result'] = run_action(
+                action_payload, tier, safety=safety, verify=verify)
+            return state['result']
+        except Exception as e:
+            state['error'] = e
+            raise
+        finally:
+            with _abandoned_lock:
+                state['done'] = True
+                if state['abandoned']:
+                    left = _abandoned_by_target.get(target, 0) - 1
+                    if left > 0:
+                        _abandoned_by_target[target] = left
+                    else:
+                        _abandoned_by_target.pop(target, None)
+
+    finished, result, error = call_bounded(
+        _act, remaining_s + grace_s, name='hart-vlm-action', cancel=cancel)
+    if finished:
+        if error is not None:
+            raise error
+        return 'done', result
+    stopped = cancel is not None and cancel.is_set()
+    with _abandoned_lock:
+        if not state['started']:
+            return 'not_started', None
+        late = state['done']
+        if not late:
+            state['abandoned'] = True
+            _abandoned_by_target[target] = _abandoned_by_target.get(target, 0) + 1
+        in_flight = sum(_abandoned_by_target.values())
+    if late:
+        # It finished between the wait giving up and this lock: its result
+        # is known, so report it, and its run stamp stays open (peer review
+        # 2026-09-27 -- this used to be reported abandoned and its stamp
+        # closed).
+        if state.get('error') is not None:
+            raise state['error']
+        return 'done', state.get('result')
+    from integrations.vlm.activity_stream import close_run_stamp
+    close_run_stamp(context.get('activity_run'))
+    logger.warning(f"VLM loop: {in_flight} abandoned action(s) still running")
+    return (('stopped' if stopped else 'abandoned'),
+            {'output': '', 'status': ACTION_STATUS_UNKNOWN})
 
 
 def run_local_agentic_loop(
@@ -264,11 +409,24 @@ def run_local_agentic_loop(
 
     Arguments and return shape: _drive_local_agentic_loop below.
     """
-    from integrations.vlm.safety import computer_control_block
+    from integrations.vlm.safety import (
+        computer_control_block, computer_operation_refusal)
     from hartos.threadlocal import thread_local_data
 
     prompt_id = message.get('prompt_id', '')
     started = time.time()
+    # Direct callers (for example the marketing and coding agents) can enter
+    # here without vlm_adapter, so reject before consent, capture or planning.
+    operation_refusal = computer_operation_refusal(
+        message.get('instruction_to_vlm_agent') or message.get('enhanced_instruction'))
+    if operation_refusal is not None:
+        logger.warning('VLM loop refused before start: %s', operation_refusal)
+        return {
+            "status": "blocked", "exit_reason": "destructive_operation",
+            "extracted_responses": [
+                {"type": "error", "content": operation_refusal, "iteration": 0}],
+            "execution_time_seconds": time.time() - started,
+        }
     refusal = computer_control_block(prompt_id)
     if refusal is not None:
         logger.warning(
@@ -319,6 +477,12 @@ def _drive_local_agentic_loop(
 
     instruction = message.get('instruction_to_vlm_agent', '')
     enhanced = message.get('enhanced_instruction', instruction)
+    workspace_root = str(message.get('workspace_root') or '').strip()
+    if workspace_root:
+        enhanced = (
+            f"{enhanced}\n\nDeclared task workspace: {workspace_root}. "
+            "For a named file, resolve it within this workspace before opening it."
+        )
     user_id = message.get('user_id', '')
     prompt_id = message.get('prompt_id', '')
     max_eta = message.get('max_ETA_in_seconds', 1800)
@@ -381,6 +545,21 @@ def _drive_local_agentic_loop(
 
     extracted_responses = []
     start_time = time.time()
+    # Resolve once: the database goal id is only needed for the existing
+    # GroupChat steering endpoint, while prompt_id remains the run join key.
+    from integrations.vlm.activity_stream import open_run, resolve_steering_agent_id
+    steering_agent_id = resolve_steering_agent_id(str(user_id), str(prompt_id))
+    # Run identity is local to this invocation.  It distinguishes retries of
+    # the same prompt while preserving prompt_id as the cross-surface join key.
+    # open_run also publishes it on this thread, so a tool that executes
+    # INSIDE the run -- the shell tool reaches hart_intelligence_entry on this
+    # same thread -- announces its work as a step of this run instead of
+    # writing the ribbon by itself, which is how the two surfaces drifted.
+    run = open_run(
+        user_id=user_id, prompt_id=prompt_id,
+        agent_id=message.get('agent_id') or message.get('daemon_id') or '',
+        steering_agent_id=steering_agent_id)
+    activity_run_id = run.run_id
     # One taskbar shortcut per run — see the pre-check call site below.
     _taskbar_shortcut_used = False
 
@@ -388,7 +567,16 @@ def _drive_local_agentic_loop(
     # signal it.  Cleanup happens just before the final return below
     # (no try/finally — the existing iteration body wraps every error
     # in its own try/continue so exceptions never escape this scope).
-    _register_session(user_id, prompt_id)
+    # The Event is also handed to each action's bounded wait, so Stop ends
+    # the wait on a stuck action instead of the budget doing it (review F4).
+    _stop_event = _register_session(user_id, prompt_id)
+    _finish_error = ''
+    # A hardware-input baseline for this whole run, unaffected by injected
+    # automation. Background file/command actions remain usable while busy.
+    _input_token = None
+    from core.resource_governor import get_physical_input_state
+    _input_state = get_physical_input_state()
+    _input_token = _input_state[0] if _input_state is not None else None
 
     # Each goal gets its own action budget.  The SessionGuard is one
     # process-wide object; nothing reset it, so its 100-action cap was spent
@@ -397,7 +585,13 @@ def _drive_local_agentic_loop(
     # previous run that never reached its end.
     from integrations.vlm.safety import reset_session_guard
     reset_session_guard()
-    _notify_desktop_indicator(True)
+    # The task itself is the run's first announcement; each step's caption
+    # replaces it below.  This used to poke the ribbon directly, so the
+    # floating companion window -- which reads the computer_use.update topic
+    # -- never heard a run start, only its second step onwards.
+    run.step(iteration=0, action='', phase='executing',
+             caption=_step_caption(
+                 {'Reasoning': f"Starting: {instruction}"} if instruction else {}))
 
     for iteration in range(max_iterations):
         # User-requested stop wins over every other exit condition.
@@ -420,7 +614,10 @@ def _drive_local_agentic_loop(
         logger.info(f"VLM loop iteration {iteration + 1}/{max_iterations}")
 
         try:
-            # 1. Take screenshot
+            # Foreground identity belongs to this screenshot, not to the
+            # later moment inference returns after a person may switch apps.
+            from integrations.vlm.local_computer_tool import foreground_window_handle
+            _captured_foreground = foreground_window_handle()
             screenshot_b64 = take_screenshot(tier)
 
             if use_unified and qwen3vl is not None:
@@ -782,26 +979,135 @@ def _drive_local_agentic_loop(
             # but ON in the loop is the right safe default — solo
             # /visual_agent calls keep their existing behaviour.
             action_payload = _build_action_payload(action_json, parsed)
+            action_payload['_human_input_token'] = _input_token
+            action_payload['_expected_foreground'] = _captured_foreground
+            # Persist the run identity beside the action in the existing VLM
+            # audit JSONL, so a ledger event can retain a redacted evidence
+            # reference without duplicating the action stream in the UI.
+            action_payload['_prompt_id'] = str(prompt_id)
+            action_payload['_agent_id'] = str(message.get('agent_id') or message.get('daemon_id') or '')
+            action_payload['_user_id'] = str(user_id)
+            action_payload['_activity_id'] = f'{activity_run_id}:{iteration + 1}'
             from core.config_cache import env_flag as _env_flag
             _safety_on = _env_flag('HEVOLVE_VLM_LOOP_SAFETY', True)
             _verify_on = _env_flag('HEVOLVE_VLM_LOOP_VERIFY', False)
-            _notify_desktop_indicator(True)
-            result = execute_action(
-                action_payload, tier,
-                safety=_safety_on, verify=_verify_on)
+            from integrations.vlm.activity_stream import record_activity
+            _caption = _step_caption(action_json)
+            record_activity(
+                user_id=user_id, prompt_id=prompt_id, run_id=activity_run_id,
+                iteration=iteration + 1, action=next_action, phase='executing',
+                agent_id=message.get('agent_id') or message.get('daemon_id') or '',
+                steering_agent_id=steering_agent_id,
+                audit_ref={'activity_id': action_payload['_activity_id']},
+                caption=_caption,
+            )
+
+            # Check stop request again immediately before executing on the OS.
+            # If the user clicked "Stop AI control" while screenshotting or VLM inference
+            # was running, abort immediately before touching the mouse or keyboard.
+            if _is_stop_requested(user_id, prompt_id):
+                logger.info(
+                    f"VLM action aborted before execution: Stop requested by user "
+                    f"at iteration {iteration + 1} (user={user_id}, prompt={prompt_id})"
+                )
+                exit_reason = 'stopped'
+                record_activity(
+                    user_id=user_id, prompt_id=prompt_id, run_id=activity_run_id,
+                    iteration=iteration + 1, action=next_action, phase='stopped',
+                    agent_id=message.get('agent_id') or message.get('daemon_id') or '',
+                    steering_agent_id=steering_agent_id,
+                    audit_ref={'activity_id': action_payload['_activity_id']},
+                    error='Stopped by user',
+                )
+                break
+
+            # The ETA bounds the action in flight, not only the gap between
+            # iterations -- see _execute_within_budget.
+            _remaining = max_eta - (time.time() - start_time)
+            # Computed ONCE: the grace waited and the grace named to the
+            # model below are this one value.
+            _grace = _action_grace_s(next_action)
+            _outcome, result = _execute_within_budget(
+                execute_action, action_payload, tier,
+                safety=_safety_on, verify=_verify_on, remaining_s=_remaining,
+                grace_s=_grace, cancel=_stop_event)
+            # Where this iteration ends the run, and why.  An action still
+            # running when the loop lets go of it did not FAIL: nobody knows
+            # what it did, and calling it a failure invites the caller to
+            # repeat a step that may yet complete (review F2).
+            _ends_run = None
+            _why = ''
+            _unknown = (result or {}).get('status') == ACTION_STATUS_UNKNOWN
+            if _outcome == 'abandoned':
+                _why = (f"{next_action} still running when the time ran out "
+                        f"({max_eta}s budget"
+                        + (f" + {_grace:g}s own cap" if _grace else '')
+                        + "); result unknown - check its effect before "
+                        "repeating it")
+                _ends_run = 'timeout'
+            elif _outcome == 'stopped':
+                _why = (f"{next_action} still running when Stop was pressed; "
+                        "result unknown - check its effect before repeating it")
+                _ends_run = 'stopped'
+            elif _outcome == 'no_budget':
+                _why = (f"{next_action} not started: the {max_eta}s budget "
+                        f"was spent before it")
+                _ends_run = 'timeout'
+            elif _outcome == 'not_started':
+                _why = f"{next_action} not started: Stop was pressed"
+                _ends_run = 'stopped'
+            elif _outcome == 'busy':
+                _why = (f"{next_action} not started: an earlier {next_action} "
+                        f"on the same target is still running (abandoned at "
+                        f"its time budget; {abandoned_actions_in_flight()} "
+                        f"abandoned action(s) in flight)")
+            if _outcome != 'done':
+                logger.warning(
+                    f"VLM loop: {_why} (iteration {iteration + 1}, "
+                    f"user={user_id}, prompt={prompt_id})")
+                result = (dict(result, output=_why) if _unknown else
+                          {'output': '', 'status': 'blocked', 'error': _why,
+                           'block_reason': _why})
+            if result.get('status') == 'user_active':
+                _ends_run = 'user_active'
+                _why = result.get('error', 'Paused for user activity')
+
             # A result carrying an error did not happen on the machine: the
             # safety guard refused it (status 'safety_blocked') or the
             # executor failed ({'error': ...}, often with no status).  Both
             # used to count as ok, and the reason went with the empty output.
             _err = result.get('error')
-            action_ok = result.get('status') != 'error' and not _err
+            action_ok = (result.get('status') not in ('error', 'safety_blocked', 'blocked')
+                         and not _err)
             _out = result.get('output', '') or ''
             if _err:
                 _out = (f"{_out}\n" if _out else '') + f"FAILED: {_err}"
-            if action_ok:
+            if _unknown:
+                action_ok = None      # neither done nor failed: unknown
+            elif action_ok:
                 consecutive_action_errors = 0
             else:
                 consecutive_action_errors += 1
+
+            # A step whose result is unknown gets no outcome phase of its
+            # own; the run's close below carries why (finish error).  Stop
+            # keeps the 'stopped' step the pre-execution Stop path records.
+            _phase = ('stopped' if _outcome == 'stopped' else
+                      None if _unknown else
+                      'completed' if action_ok else
+                      ('blocked' if result.get('block_reason') or
+                       result.get('status') == 'safety_blocked' else 'failed'))
+            if _phase is not None:
+                record_activity(
+                    user_id=user_id, prompt_id=prompt_id, run_id=activity_run_id,
+                    iteration=iteration + 1, action=next_action, phase=_phase,
+                    agent_id=message.get('agent_id') or message.get('daemon_id') or '',
+                    steering_agent_id=steering_agent_id,
+                    audit_ref={'activity_id': action_payload['_activity_id']},
+                    error=str(_err or result.get('block_reason')
+                              or (_why if _unknown else '')),
+                    caption=_caption,
+                )
 
             # Surface coordinate + strategy in the response content so
             # observers (benchmark, audit, /visual_agent telemetry,
@@ -823,6 +1129,11 @@ def _drive_local_agentic_loop(
                 },
                 "iteration": iteration + 1,
             })
+
+            if _ends_run:
+                exit_reason = _ends_run
+                _finish_error = _why
+                break
 
             # Bail after 3 consecutive action errors — something is structurally
             # broken (bad coordinates, action type mismatch, subprocess dead)
@@ -859,7 +1170,13 @@ def _drive_local_agentic_loop(
     # Drop this session's stop flag so the registry doesn't grow
     # across runs.  Pairs with _register_session above.
     _unregister_session(user_id, prompt_id)
-    _notify_desktop_indicator(False)
+
+    # ONE terminal write for the run's ledger task, from the same exit_reason
+    # the caller receives, and the same call takes the ribbon down.  Steps
+    # above never change the task's status, so without this the run would sit
+    # IN_PROGRESS forever.
+    run.finish(exit_reason=exit_reason, iteration=len(extracted_responses),
+               error=_finish_error)
 
     # status mirrors exit_reason: only 'done' is a real success. Callers
     # (LangChain router, autogen) can inspect exit_reason to craft an honest
@@ -1083,3 +1400,13 @@ def _build_action_payload(action_json: dict, parsed_screen: dict) -> dict:
             payload[key] = action_json[key]
 
     return payload
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HEVOLVE_LLM_API_KEY',
+    'HEVOLVE_VLM_API_KEY',
+)

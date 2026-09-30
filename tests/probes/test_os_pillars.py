@@ -131,6 +131,11 @@ def _bare_liquid_ui(data_dir=None):
     svc.a2ui_enabled = True
     svc._agent_components = {}
     svc._lock = threading.Lock()             # plain Lock — mirrors production (line 772)
+    # The SSE wake-up: agent_ui_update notifies this Condition so the
+    # /api/notifications/stream producer pushes instantly instead of polling.
+    # Added to __init__ after this probe was written; a bare service without it
+    # dies in agent_ui_update with AttributeError before any governance runs.
+    svc._ui_event_cv = threading.Condition()
     svc._a2ui_buckets = {}                    # per-agent token bucket (_a2ui_rate_ok)
     svc._custom_component_types = {}          # runtime-registered component specs
     svc._data_dir = data_dir or tempfile.mkdtemp(prefix='hart_p1_')

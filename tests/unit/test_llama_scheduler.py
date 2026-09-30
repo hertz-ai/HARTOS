@@ -139,3 +139,70 @@ class TestSlotAutoDetect(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# ── review of f97b6bed8: a grant that lands as a waiter gives up ─────────
+
+def _racing_cancel(s, holder):
+    """An Event that, on the waiter's second check, releases the holder
+    (promoting the waiter) and THEN reports cancelled: the grant and the
+    cancel land in the same instant (repro: scratchpad/f97_race.py)."""
+    import threading
+
+    class Ev(threading.Event):
+        n = 0
+
+        def is_set(self):
+            Ev.n += 1
+            if Ev.n == 3:
+                s.release(holder)
+                self.set()
+                return True
+            return super().is_set() if Ev.n > 3 else False
+    return Ev()
+
+
+def test_a_cancel_racing_a_grant_does_not_leak_the_slot():
+    import core.llama_scheduler as ls
+    s = ls.LlamaScheduler(n_slots=1)
+    holder = s.acquire('other', 'daemon')
+    s.bind_cancel('daemon_a2a_x', _racing_cancel(s, holder))
+    try:
+        with s.slot('daemon_a2a_x', 'daemon', timeout=5):
+            pass
+    except ls.TurnCancelled:
+        pass
+    assert s.stats()['in_flight'] == 0, s.inflight()
+    assert s.acquire('next', 'daemon', timeout=1.0) is not None
+
+
+def test_a_timeout_racing_a_grant_does_not_leak_the_slot(monkeypatch):
+    """The same window for a plain timeout: the waiter's wait returns False
+    just as release() promotes it."""
+    import core.llama_scheduler as ls
+    s = ls.LlamaScheduler(n_slots=1)
+    holder = s.acquire('other', 'daemon')
+    real = ls._Req.__init__
+
+    def init(self, *a, **k):
+        real(self, *a, **k)
+        ev = self.event
+
+        class _Late:
+            def wait(self_inner, timeout=None):
+                s.release(holder)        # promoted during the wait...
+                return False             # ...but the wait reports timeout
+
+            def set(self_inner):
+                ev.set()
+
+            def is_set(self_inner):
+                return ev.is_set()
+        self.event = _Late()
+    monkeypatch.setattr(ls._Req, '__init__', init)
+    tok = s.acquire('late', 'daemon', timeout=0.1)
+    monkeypatch.setattr(ls._Req, '__init__', real)
+    assert tok is not None, 'the grant landed in time: the caller owns it'
+    s.release(tok)
+    assert s.stats()['in_flight'] == 0, s.inflight()
+    assert s.acquire('next', 'daemon', timeout=1.0) is not None

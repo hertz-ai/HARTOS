@@ -71,11 +71,65 @@ class TestComputeConfigEnvOverride(unittest.TestCase):
         policy = get_compute_policy()
         self.assertEqual(policy['compute_policy'], 'local_only')
 
+    # allow_metered_for_hive is a PERMISSION, so its env pin is asymmetric: it
+    # may restrict, never grant. This replaces a test that asserted
+    # HEVOLVE_ALLOW_METERED_HIVE='true' GRANTS it -- that test pinned the defect.
+    # Two things the grant defeated:
+    #   * the DB row is the operator's own answer, and env > DB meant the pin
+    #     spent their metered link after they declined it;
+    #   * /api/.../compute-policy returns 403 for this field on a central node
+    #     (hart_intelligence_entry.py:12897); the env layer sat above that guard.
+    # Same asymmetry as copilot_enabled() (66386a45e).
+
     @patch.dict(os.environ, {'HEVOLVE_ALLOW_METERED_HIVE': 'true'})
-    def test_env_allow_metered_override(self):
+    def test_env_cannot_GRANT_metered_permission(self):
         invalidate_cache()
         policy = get_compute_policy()
-        self.assertTrue(policy['allow_metered_for_hive'])
+        self.assertFalse(
+            policy['allow_metered_for_hive'],
+            'an env pin granted a permission the operator did not give; '
+            'HEVOLVE_ALLOW_METERED_HIVE must only be able to restrict')
+
+    @patch.dict(os.environ, {'HEVOLVE_ALLOW_METERED_HIVE': 'false'})
+    def test_env_CAN_still_restrict_metered_permission(self):
+        """The headless kill-switch direction must keep working."""
+        invalidate_cache()
+        policy = get_compute_policy()
+        self.assertFalse(policy['allow_metered_for_hive'])
+
+    @patch.dict(os.environ, {'HEVOLVE_ALLOW_METERED_HIVE': 'true'})
+    def test_a_granting_pin_does_not_disturb_capacity_keys(self):
+        """Only the permission is asymmetric; capacity pins stay honoured.
+
+        Guards the obvious over-fold: clamping every env override would have
+        broken max_hive_gpu_pct / metered_daily_limit_usd, which are numbers, not
+        answers about what is allowed.
+        """
+        invalidate_cache()
+        with patch.dict(os.environ, {'HEVOLVE_MAX_HIVE_GPU_PCT': '75',
+                                     'HEVOLVE_METERED_DAILY_LIMIT': '5.50'}):
+            invalidate_cache()
+            policy = get_compute_policy()
+        self.assertEqual(policy['max_hive_gpu_pct'], 75)
+        self.assertAlmostEqual(policy['metered_daily_limit_usd'], 5.50)
+        self.assertFalse(policy['allow_metered_for_hive'])
+
+    def test_the_restrict_only_set_names_permissions_not_capacity(self):
+        """A capacity key must never be added to the restrict-only set.
+
+        If someone adds max_hive_gpu_pct here, an operator raising their own GPU
+        share via env silently stops working -- a config value would be treated
+        as if it were a consent answer.
+        """
+        from integrations.agent_engine.compute_config import (
+            _ENV_MAY_ONLY_RESTRICT,
+        )
+        capacity = {'max_hive_gpu_pct', 'offered_gpu_hours_per_day',
+                    'metered_daily_limit_usd', 'min_settlement_spark'}
+        self.assertEqual(
+            _ENV_MAY_ONLY_RESTRICT & capacity, frozenset(),
+            'a capacity number was marked restrict-only; that set is for '
+            'permissions (what the machine may do), not for limits')
 
     @patch.dict(os.environ, {'HEVOLVE_MAX_HIVE_GPU_PCT': '75'})
     def test_env_max_gpu_pct_override(self):

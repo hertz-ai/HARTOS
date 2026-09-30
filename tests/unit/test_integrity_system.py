@@ -356,6 +356,24 @@ class TestFraudAlert:
 # 6. TestChallengeResponse (6 tests)
 # =====================================================================
 
+# The unpatched binding, captured before any fixture swaps it, for the one
+# test in the patched classes that is about the binding itself.
+from integrations.social.integrity_service import IntegrityService as _IS  # noqa: E402
+_REAL_ANSWER_NOT_FROM_TARGET = _IS._answer_not_from_target
+
+
+@pytest.fixture
+def answers_come_from_the_target():
+    """The answers in these classes are the TARGET's own; the tests judge their
+    content. The binding of an answer to its target (#140) is pinned with real
+    keys in test_challenge_answer_is_bound_to_the_target.py."""
+    from integrations.social.integrity_service import IntegrityService
+    with patch.object(IntegrityService, '_answer_not_from_target',
+                      return_value=None):
+        yield
+
+
+@pytest.mark.usefixtures('answers_come_from_the_target')
 class TestChallengeResponse:
     """Challenge-response protocol tests."""
 
@@ -446,12 +464,22 @@ class TestChallengeResponse:
         )
         db.add(ch)
         db.flush()
+        # Undo the class fixture: this test is about the binding itself.
+        # A signature that does not verify against the target's stored key is
+        # evidence that someone else answered, not about the target (#140):
+        # not passed, nothing scored.
         response_data = {'nonce': nonce, 'agent_count': 5, 'public_key': 'bad_key'}
-        with patch('security.node_integrity.verify_json_signature', return_value=False):
+        peer.public_key = 'aa' * 32
+        db.flush()
+        with patch.object(IntegrityService, '_answer_not_from_target',
+                          _REAL_ANSWER_NOT_FROM_TARGET), \
+                patch('security.node_integrity.verify_json_signature', return_value=False):
             result = IntegrityService.evaluate_challenge_response(
                 db, ch.id, response_data, 'fake_sig')
         assert result['passed'] is False
-        assert 'Invalid signature' in result['details']
+        assert result.get('inconclusive') is True
+        assert "not signed by the target's key" in result['details']
+        assert (peer.fraud_score or 0.0) == 0.0
 
 
 # =====================================================================
@@ -774,14 +802,18 @@ class TestCodeHashVerification:
             result = IntegrityService.verify_code_hash(db, peer.node_id)
         assert result['verified'] is True
 
-    def test_hash_mismatch_flagged(self, db):
+    def test_hash_mismatch_is_inconclusive_not_scored(self, db):
+        """An unregistered hash that differs from ours is not evidence: a
+        bundled desktop's hash is per install. Same verdict as the challenge
+        path's code_hash_check (5e83047b5); this test used to assert +fraud."""
         from integrations.social.integrity_service import IntegrityService
         peer = _make_peer(db, code_hash='aaaa' * 16, fraud_score=0.0)
         with patch('security.node_integrity.compute_code_hash', return_value='bbbb' * 16):
             result = IntegrityService.verify_code_hash(db, peer.node_id)
         assert result['verified'] is False
+        assert result.get('inconclusive') is True
         db.refresh(peer)
-        assert peer.fraud_score > 0
+        assert (peer.fraud_score or 0.0) == 0.0
 
     def test_registry_fetch_mocked(self, db):
         from integrations.social.integrity_service import IntegrityService
@@ -869,7 +901,11 @@ class TestGossipSignatureIntegration:
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def test_signed_peer_accepted(self, db):
-        """Peer with valid signature should be accepted and marked verified."""
+        """Peer with a valid signature is accepted, with its key recorded,
+        and is NOT marked verified: a signature proves identity, proof is a
+        challenge answered (tests/unit/test_peer_trust_requires_proof). This
+        test used to assert 'verified' here; that grant undid the challenge
+        evaluator's withheld proof on every announce."""
         from integrations.social.peer_discovery import GossipProtocol
         from security.node_integrity import sign_json_payload, get_public_key_hex
 
@@ -888,11 +924,11 @@ class TestGossipSignatureIntegration:
         is_new = gp._merge_peer(db, peer_data)
         assert is_new is True
 
-        # Check the stored peer has verified status
+        # Accepted and recorded; proof is not granted by an announce.
         from integrations.social.models import PeerNode
         stored = db.query(PeerNode).filter_by(node_id=peer_data['node_id']).first()
         assert stored is not None
-        assert stored.integrity_status == 'verified'
+        assert stored.integrity_status == 'unverified'
         assert stored.public_key == peer_data['public_key']
 
     def test_unsigned_backward_compat(self, db):
@@ -992,6 +1028,7 @@ class TestMigrationV11:
 # updates pass (and advance the baseline); unknown hashes fail exactly as
 # before.
 
+@pytest.mark.usefixtures('answers_come_from_the_target')
 class TestCodeHashCheckVsUpdates:
 
     def _challenge(self, db, peer, nonce='ch_nonce'):
@@ -1016,18 +1053,29 @@ class TestCodeHashCheckVsUpdates:
         assert peer.code_hash == 'new_release_hash', \
             'the baseline must advance or the next challenge re-flags the same release'
 
-    def test_unknown_hash_still_fails(self, db):
+    def test_unknown_hash_off_a_registered_release_is_not_proven(self, db):
+        """A node that WAS on a registered release now reports a hash the
+        registry does not know. Since 5e83047b5/b8b1b14ff that is inconclusive,
+        not a failure: it is also what a fleet rollout looks like until the
+        registry catches up. What must still hold is what this test always
+        protected: the unregistered hash is not accepted as the new reference
+        and the peer is not proven. (The mock used to say "every hash is
+        unknown", so the 'release' baseline was itself unregistered and the
+        case fell into the unknown-to-unknown branch; ring review 2026-09-23.)"""
         from integrations.social.integrity_service import IntegrityService
-        peer = _make_peer(db, code_hash='old_release_hash')
+        peer = _make_peer(db, code_hash='old_release_hash', fraud_score=0.0)
         ch = self._challenge(db, peer)
         with patch('security.release_hash_registry.get_release_hash_registry') as reg:
-            reg.return_value.is_known_release_hash.return_value = False
+            reg.return_value.is_known_release_hash.side_effect = \
+                lambda h: h == 'old_release_hash'
             result = IntegrityService.evaluate_challenge_response(
                 db, ch.id, {'nonce': 'ch_nonce', 'code_hash': 'tampered_hash'}, '')
         assert result['passed'] is False
-        assert 'Code hash changed' in result['details']
+        assert result.get('inconclusive') is True
         assert peer.code_hash == 'old_release_hash', \
-            'a REJECTED hash must not advance the baseline'
+            'an unregistered hash must not become the reference'
+        assert peer.integrity_status != 'verified'
+        assert (peer.fraud_score or 0.0) == 0.0
 
     def test_registry_unavailable_keeps_old_behaviour(self, db):
         from integrations.social.integrity_service import IntegrityService

@@ -164,7 +164,9 @@ class TestDraftFirstDelegateRouting:
     def test_delegate_local_or_hive_branch_in_source(self):
         """The /chat handler must contain a branch that flips
         create_agent=True AND autonomous=True when the draft says
-        delegate in ('local', 'hive') AND is_casual=False AND
+        _draft_delegates(result) -- delegate in ('local', 'hive'); is_casual
+        has NO vote since 2026-09-22 (a draft that hands off is not the
+        answer even when it also calls the turn casual) -- AND
         is_create_agent=False."""
         import re
         from pathlib import Path
@@ -177,8 +179,7 @@ class TestDraftFirstDelegateRouting:
         # regex: locate the elif by signature, then capture up to ~80
         # following indented lines (the branch body).
         match = re.search(
-            r"elif\s*\(\s*result\.get\(\s*['\"]delegate['\"]\s*\)\s*in\s*"
-            r"\(\s*['\"]local['\"]\s*,\s*['\"]hive['\"]\s*\)"
+            r"elif\s*\(\s*_draft_delegates\(\s*result\s*\)"
             r"[^:]*?:\s*\n"
             r"((?:[ \t]+[^\n]*\n){1,80})",
             src,

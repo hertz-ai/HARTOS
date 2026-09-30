@@ -1024,7 +1024,16 @@ class ComputeOptimizer:
                 agent_id='compute_optimizer',
                 action_type='optimization_cycle',
                 expected_outcome={'health_score_delta': 0.05},
-                acceptance_criteria=['health_score > baseline'],
+                # Names the keys complete_action reports, so it is
+                # evaluated: an optimization cycle must not end below where
+                # it started.  The old 'health_score > baseline' named keys
+                # the outcome never carried.
+                acceptance_criteria=[
+                    {'kind': 'invariant', 'target': 'final_health_score',
+                     'op': '>=', 'value_ref': 'baseline_health_score',
+                     'derivation': 'an optimization cycle must not leave '
+                                   'health below its own starting point'},
+                ],
             )
         except Exception:
             pass

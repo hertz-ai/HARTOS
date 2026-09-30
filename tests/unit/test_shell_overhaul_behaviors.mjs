@@ -368,6 +368,23 @@ function makeRealm(opts) {
   applyState({ disabled: { mic: false, camera: false, screen: false },
                proof: { camera_service_running: true } });
   ok(eye.classList.contains('is-sensing'), 'camera service running -> eye lit is-sensing');
+
+  // The proof's camera row: 'unknown' (the OS could not check) is never shown
+  // as "service stopped", and the camera cut does not read as proven.
+  function cameraRowText() {
+    const kids = R.registry['hart-senses-proof'].children || [];
+    const row = kids.find(k => (k.children || []).some(c => c.textContent === 'Sight (camera)'));
+    return row ? row.children.map(c => c.textContent).join(' ') : '';
+  }
+  applyState({ disabled: { mic: false, camera: true, screen: false },
+               proof: { camera_service_running: 'unknown' } });
+  ok(/state unknown/.test(cameraRowText()),
+     "camera proof 'unknown' -> row says 'state unknown'  (got: " + cameraRowText() + ')');
+  ok(!/service stopped/.test(cameraRowText()),
+     "camera proof 'unknown' -> never 'service stopped'");
+  applyState({ disabled: { mic: false, camera: true, screen: false },
+               proof: { camera_service_running: false } });
+  ok(/service stopped/.test(cameraRowText()), 'camera proof false -> service stopped');
 })();
 
 // ════════════════════════════════════════════════════════════════════════════

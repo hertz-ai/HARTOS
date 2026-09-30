@@ -36,17 +36,8 @@ _TRACE_LOCK = threading.Lock()
 
 
 def _resolve_trace_dir() -> str:
-    try:
-        from core.platform_paths import get_agent_data_dir
-        return os.path.join(get_agent_data_dir(), 'reasoning_traces')
-    except Exception:
-        pass
-    if os.name == 'nt':
-        return os.path.join(
-            os.path.expanduser('~'),
-            'Documents', 'Nunba', 'data', 'agent_data', 'reasoning_traces',
-        )
-    return os.path.join('agent_data', 'reasoning_traces')
+    from core.platform_paths import get_agent_data_dir
+    return os.path.join(get_agent_data_dir(), 'reasoning_traces')
 
 
 def _file_for(day: Optional[str] = None) -> str:

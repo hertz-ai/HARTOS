@@ -160,6 +160,9 @@ def report_join(node_info: Dict) -> int:
     failover, so one ack on primary is enough and we don't double-bill
     the central with redundant traffic.
     """
+    from core.superadmins import real_centrals_allowed
+    if not real_centrals_allowed():
+        return 0
     report = build_report(node_info)
     sent = 0
     primary_failures = []
@@ -200,6 +203,9 @@ def drain_outbox() -> int:
 
     Returns count successfully resent (deletes those files).
     """
+    from core.superadmins import real_centrals_allowed
+    if not real_centrals_allowed():
+        return 0
     sent = 0
     for fpath in _outbox_drain():
         try:

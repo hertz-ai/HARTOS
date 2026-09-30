@@ -1057,3 +1057,15 @@ def create_twitter_adapter(
         **kwargs
     )
     return TwitterAdapter(config)
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+ENV_SECRETS = (
+    'TWITTER_ACCESS_TOKEN',
+    'TWITTER_ACCESS_TOKEN_SECRET',
+    'TWITTER_CONSUMER_KEY',
+    'TWITTER_CONSUMER_SECRET',
+)

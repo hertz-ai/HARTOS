@@ -482,6 +482,61 @@ _I18N_VIOLATION_KEYWORDS: Tuple[str, ...] = (
 )
 
 
+def _park_goal_for_no_owner(goal_dict: Dict) -> bool:
+    """Pause a consent-flagged goal on a node with nobody to ask.
+
+    The consent gate can only ASK a human it can name.  On a node with no
+    declared owner there is none, so refusing per tick produced a log line on a
+    node whose logs nobody reads — blocked forever, nobody asked.  Parking it
+    makes that visible: ``list_goals``, the dashboard and the daemon's 'active'
+    filter all already read ``status='paused'`` + ``config.pause_reason``, and
+    the daemon stops re-attempting it.
+
+    Writes through ``GoalManager.update_goal`` / ``update_goal_status`` — the
+    same two writers every other pause path uses, so there is no second writer
+    of either field.  ``dict(...)`` deliberately: ``config_json`` is a
+    MutableDict, and mutating the instance's own dict in place leaves the
+    attribute identical to itself, so SQLAlchemy sees no change and drops the
+    write (the defect recorded at ``_models_local.py:2128``).
+
+    Idempotent and best-effort: an already-paused goal is left alone (so a
+    different pause_reason is never overwritten and the row is not rewritten
+    every tick), a goal with no resolvable id is a no-op, and nothing raises
+    into the gate — failing to park must never turn a refusal into an approval.
+
+    Returns True only when this call paused the goal.
+    """
+    goal_id = goal_dict.get('id') if isinstance(goal_dict, dict) else None
+    if not goal_id:
+        return False
+    try:
+        from integrations.agent_engine.goal_manager import GoalManager
+        from integrations.social.models import AgentGoal, db_session
+        with db_session(commit=True) as db:
+            goal = db.query(AgentGoal).filter_by(id=str(goal_id)).first()
+            if goal is None or goal.status == 'paused':
+                return False
+            cfg = dict(goal.config_json or {})
+            cfg['pause_reason'] = (
+                'Needs consent, but this node has no owner to ask: set '
+                'HEVOLVE_OWNER_USER_ID, or run this goal on a desktop where '
+                'the signed-in user is the owner.')
+            cfg['paused_at'] = datetime.utcnow().isoformat()
+            if not GoalManager.update_goal(
+                    db, str(goal_id), config_json=cfg).get('success'):
+                return False
+            if not GoalManager.update_goal_status(
+                    db, str(goal_id), 'paused').get('success'):
+                return False
+        logger.warning(
+            "Goal %s needs consent and this node has no owner to ask — "
+            "paused with a reason instead of refusing every tick", goal_id)
+        return True
+    except Exception as e:
+        logger.warning("could not park consent-blocked goal %s: %s", goal_id, e)
+        return False
+
+
 def _normalize_for_violation_check(text: str) -> str:
     """Return a string that includes original + transliteration + keyword flags.
 
@@ -1304,6 +1359,18 @@ class GuardrailEnforcer:
             except ImportError:
                 cfg = (goal_dict.get('config')
                        or goal_dict.get('config_json') or {})
+            # ONE spelling: `require_consent`.  goal_seeding used to write both
+            # it and `requires_consent` (#96) while this was the only
+            # enforcement site and read the singular alone, so every
+            # plural-seeded goal dispatched UNGATED.  The interim fix read both
+            # — a second working vocabulary, i.e. exactly the parallel path this
+            # canonicalisation exists to remove.  The plural had ZERO readers
+            # anywhere, so it was a producer typo, not a contract: the three
+            # producers were corrected and migrations v56 renames the key in
+            # already-seeded rows.  Folding toward the singular leaves this
+            # gate's semantics untouched and keeps the blast radius at 3 seed
+            # sites, per the owner's rule that the lower-blast-radius spelling
+            # becomes canonical.
             if cfg.get('require_consent'):
                 if not user_id:
                     # Daemon goals carry no requester, which left every
@@ -1316,6 +1383,25 @@ class GuardrailEnforcer:
                     # fail-closed exactly as before.
                     user_id = os.environ.get('HEVOLVE_OWNER_USER_ID') or None
                 if not user_id:
+                    # NO HUMAN ON THIS NODE TO ASK.  Park the goal with a
+                    # reason instead of refusing silently on every tick.
+                    #
+                    # Owner decision (2026-09-21): a node with no declared
+                    # owner does not run consent-requiring work at all — it
+                    # runs on the desktop, where Nunba's boot exports the
+                    # signed-in user as HEVOLVE_OWNER_USER_ID and the ask
+                    # reaches a real person.  Measured on central the same
+                    # day: 45 accounts, 36 guests + 2 service accounts, no
+                    # human and no admin role, so there is nobody an ask
+                    # could ever be filed against or answered by.
+                    #
+                    # Refusing per tick made that a log line on a node whose
+                    # logs nobody reads, which is the BLOCK-without-ASK dead
+                    # end.  A pause is visible state: list_goals, the
+                    # dashboard and the daemon's 'active' filter all already
+                    # understand status='paused' + config pause_reason, and
+                    # the daemon stops re-attempting it.
+                    _park_goal_for_no_owner(goal_dict)
                     return False, ('consent-flagged goal dispatched without '
                                    'user context'), prompt
                 consent_type = cfg.get('consent_type', 'data_access')

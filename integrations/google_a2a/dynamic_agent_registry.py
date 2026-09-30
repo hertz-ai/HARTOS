@@ -22,6 +22,10 @@ from typing import Dict, List, Any, Optional, Set
 from dataclasses import dataclass
 from pathlib import Path
 
+# core.constants, not hartos.lifecycle_hooks: the latter pulls hartos.helper
+# (autogen + langchain), 7.35 s cold on the first agent-card read.
+from core.constants import action_is_autonomous
+
 logger = logging.getLogger(__name__)
 
 # ── What we have already REPORTED, per prompts directory ────────────────────
@@ -67,6 +71,12 @@ class TrainedAgent:
     recipe_file: str
     flow_name: str = ""
     sub_goal: str = ""
+
+    @property
+    def is_autonomous(self) -> bool:
+        """The recipe's can_perform_without_user_input, read by the ONE
+        rule (core.constants.action_is_autonomous)."""
+        return action_is_autonomous(self.can_perform_without_user_input)
 
 
 class DynamicAgentDiscovery:
@@ -280,7 +290,7 @@ class DynamicAgentDiscovery:
                 "flow_id": agent.flow_id,
                 "flow_name": agent.flow_name,
                 "persona": agent.persona,
-                "autonomous": agent.can_perform_without_user_input == "yes",
+                "autonomous": agent.is_autonomous,
                 "has_fallback": bool(agent.fallback_action),
                 "recipe_steps": len(agent.recipe)
             }
@@ -321,7 +331,7 @@ class DynamicAgentDiscovery:
         description += f"Specialized in: {agent.action}. "
         description += f"Recipe contains {len(agent.recipe)} steps. "
 
-        if agent.can_perform_without_user_input == "yes":
+        if agent.is_autonomous:
             description += "Can operate autonomously. "
 
         if agent.fallback_action:
@@ -345,7 +355,8 @@ class DynamicAgentExecutor:
         self.discovery = DynamicAgentDiscovery()
         self.discovery.discover_all_agents()
 
-    async def execute_agent_task(self, agent_id: str, message: str, context_id: str) -> Dict[str, Any]:
+    async def execute_agent_task(self, agent_id: str, message: str, context_id: str,
+                                 cancel_event=None, task_id=None) -> Dict[str, Any]:
         """
         Execute a task for a dynamically discovered agent
 
@@ -353,6 +364,13 @@ class DynamicAgentExecutor:
             agent_id: Agent identifier (e.g., "71_0_1")
             message: Task message
             context_id: A2A context ID
+            cancel_event: the A2A task's cancel (task/cancel).  A turn
+                waiting for the LLM permit gives it back and never starts;
+                a turn already running is refused its next LLM call
+                (core.llama_scheduler), ends, and gives the permit back.
+            task_id: the A2A task's id.  The turn's request id is built from
+                it, not from the contextId the peer chooses, so two tasks in
+                one context never share a cancel binding.
 
         Returns:
             A2A response format
@@ -360,57 +378,74 @@ class DynamicAgentExecutor:
         agent = self.discovery.get_agent_by_id(agent_id)
 
         if not agent:
-            return {
-                "role": "model",
-                "parts": [{
-                    "text": f"Error: Agent {agent_id} not found. Agent may not be trained yet."
-                }]
-            }
+            raise LookupError(
+                f"Agent {agent_id} not found. Agent may not be trained yet.")
 
-        try:
-            # Import execution functions
-            from hartos.create_recipe import recipe
-            from hartos.reuse_recipe import chat_agent
+        # The ONE in-process call to this node's own /chat
+        # (dispatch.local_chat_dispatch): /chat decides CREATE vs REUSE from
+        # the banked recipes, and the call yields to a human user and holds
+        # the local LLM semaphore.  This used to call chat_agent/recipe
+        # directly with arguments neither accepts (chat_agent(message,
+        # user_id=, prompt_id=), recipe(message=)); both signatures are
+        # (user_id, text, prompt_id, file_id, request_id), so every call
+        # raised TypeError, which was returned as the agent's answer
+        # (review of 3a32d8e4b, traced).
+        #
+        # A failure RAISES, so handle_message_send marks the task FAILED.
+        # Returning error text as a model part made it COMPLETED: peer_reuse
+        # then recorded the error as a successful remote outcome and the
+        # daemon skipped its local CREATE for the goal.
+        from core.constants import DEFAULT_USER_ID
+        from core.agent_tools import is_user_facing_error
+        from integrations.agent_engine.dispatch import local_chat_dispatch
 
-            logger.info(f"Executing task for agent {agent_id} (persona: {agent.persona})")
+        logger.info(f"Executing task for agent {agent_id} (persona: {agent.persona})")
+        # On a thread of its own: this coroutine runs inside run_async's
+        # event loop, and a /chat turn run on that thread breaks every
+        # sync->async bridge under it (get_or_create_event_loop().
+        # run_until_complete in the long-term memory tools, asyncio.run in
+        # google_search's fallback: "This event loop is already running",
+        # measured in the review of 309bcd032).
+        #
+        # run_in_executor, NOT asyncio.to_thread: to_thread copies this
+        # request's context into the worker, so the jsonrpc request's flask
+        # `g` (auth_source, jwt_payload, a phone's device identity) leaked
+        # into the inner /chat and could make the turn run as the caller
+        # instead of the agent's owner (review of 05641511d, probed).
+        # run_in_executor starts the call in a fresh context.
+        import asyncio
+        import functools
+        status, text = await asyncio.get_running_loop().run_in_executor(
+            None, functools.partial(
+                local_chat_dispatch,
+                message,
+                agent.metadata.get("user_id", DEFAULT_USER_ID),
+                agent.prompt_id,
+                # A peer's request is not this node's human: it is background
+                # work, and the id says so to dispatch.is_genuine_user_request.
+                daemon_id=f"a2a_{task_id or context_id}",
+                cancel_event=cancel_event))
+        if status == 'cancelled':
+            raise TaskCancelled(
+                f"agent {agent_id}: cancelled by the caller (before or during "
+                f"its turn); the LLM permit was given back")
+        if status != 'ok':
+            raise RuntimeError(
+                f"agent {agent_id} not run: local /chat {status} "
+                f"(deferred = this node's LLM is busy or a human has it)")
+        if not text or is_user_facing_error(text):
+            raise RuntimeError(f"agent {agent_id} turn failed: {text!r}")
+        return {
+            "role": "model",
+            "parts": [{
+                "text": str(text),
+                "metadata": {"agent_id": agent_id, "persona": agent.persona},
+            }]
+        }
 
-            # Determine execution mode based on agent status
-            from core.constants import DEFAULT_USER_ID
-            if agent.status == "done" or agent.status == "completed":
-                # Use reuse mode (agent has trained recipe)
-                result = chat_agent(
-                    message,
-                    user_id=agent.metadata.get("user_id", DEFAULT_USER_ID),
-                    prompt_id=agent.prompt_id
-                )
-            else:
-                # Use create mode (agent still learning)
-                result = recipe(
-                    user_id=agent.metadata.get("user_id", DEFAULT_USER_ID),
-                    message=message,
-                    prompt_id=agent.prompt_id
-                )
 
-            return {
-                "role": "model",
-                "parts": [{
-                    "text": str(result),
-                    "metadata": {
-                        "agent_id": agent_id,
-                        "persona": agent.persona,
-                        "execution_mode": "reuse" if agent.status == "done" else "create"
-                    }
-                }]
-            }
-
-        except Exception as e:
-            logger.error(f"Agent {agent_id} execution failed: {e}")
-            return {
-                "role": "model",
-                "parts": [{
-                    "text": f"Error executing agent {agent_id}: {str(e)}"
-                }]
-            }
+class TaskCancelled(RuntimeError):
+    """The caller cancelled the task; not a failure of the agent."""
 
 
 # Global instances

@@ -34,43 +34,120 @@ def get_data_dir() -> str:
         1. NUNBA_DATA_DIR env var (explicit override)
         2. HARTOS_DATA_DIR env var (embedded OS / custom deployment)
         3. Platform default
+
+    Under pytest a result that is the owner's real data root is swapped for
+    a per-process temp dir; see _off_the_real_root_under_test.
     """
     global _cached_data_dir
     if _cached_data_dir is not None:
         return _cached_data_dir
 
-    # 1. Explicit override
-    override = os.environ.get('NUNBA_DATA_DIR', '').strip()
-    if override:
-        _cached_data_dir = override
-        return _cached_data_dir
+    # 1. Explicit override, 2. HARTOS OS deployment override,
+    # 3 + 4. embedded HARTOS OS, else the platform default.
+    resolved = (os.environ.get('NUNBA_DATA_DIR', '').strip()
+                or os.environ.get('HARTOS_DATA_DIR', '').strip()
+                or _platform_default_data_dir())
+    guarded = _off_the_real_root_under_test(resolved, _platform_default_data_dir())
+    # A frozen build is never swapped.  Under test, sys.frozen is a patch that
+    # ends with the test: caching its real root would hand it to every later
+    # test in the process, so that answer is not kept.
+    if not (under_test() and _is_frozen()):
+        _cached_data_dir = guarded
+    return guarded
 
-    # 2. HARTOS OS deployment override
-    hartos_dir = os.environ.get('HARTOS_DATA_DIR', '').strip()
-    if hartos_dir:
-        _cached_data_dir = hartos_dir
-        return _cached_data_dir
 
-    # 3. Detect embedded HARTOS OS (systemd service, no home dir)
+def _platform_default_data_dir() -> str:
+    """The data root a person's own install uses, ignoring overrides and cache."""
+    # Embedded HARTOS OS (systemd service, no home dir)
     if _IS_LINUX and os.path.isfile('/etc/hartos-release'):
-        _cached_data_dir = '/var/lib/hartos'
-        return _cached_data_dir
-
-    # 4. Platform defaults
+        return '/var/lib/hartos'
     home = os.path.expanduser('~')
     if _IS_WINDOWS:
-        _cached_data_dir = os.path.join(home, 'Documents', 'Nunba')
-    elif _IS_MACOS:
-        _cached_data_dir = os.path.join(home, 'Library', 'Application Support', 'Nunba')
-    else:
-        # Linux / other Unix
-        xdg = os.environ.get('XDG_DATA_HOME', '').strip()
-        if xdg:
-            _cached_data_dir = os.path.join(xdg, 'nunba')
-        else:
-            _cached_data_dir = os.path.join(home, '.config', 'nunba')
+        return os.path.join(home, 'Documents', 'Nunba')
+    if _IS_MACOS:
+        return os.path.join(home, 'Library', 'Application Support', 'Nunba')
+    # Linux / other Unix
+    xdg = os.environ.get('XDG_DATA_HOME', '').strip()
+    if xdg:
+        return os.path.join(xdg, 'nunba')
+    return os.path.join(home, '.config', 'nunba')
 
-    return _cached_data_dir
+
+_pytest_data_dir = None
+
+
+def under_test() -> bool:
+    """Is this a test process?  The ONE test predicate: the data-root guard
+    below, the background-services default (config_cache.
+    should_start_background_services) and the real-hive guard
+    (superadmins.real_centrals_allowed) all read it.  "pytest is imported";
+    see the residual noted in _off_the_real_root_under_test."""
+    return 'pytest' in sys.modules
+
+
+def _is_frozen() -> bool:
+    """A frozen (installed) build: cx_Freeze sets sys.frozen."""
+    return bool(getattr(sys, 'frozen', False))
+
+
+def _off_the_real_root_under_test(path: str, real: str, label: str = '') -> str:
+    """`path`, or a per-process temp dir when a test would use `real`, one of
+    the owner's real roots (the data root; the macOS log root).  `label`
+    names the temp subdir standing in for a root other than the data root.
+
+    The ONE test guard for everything under the owner's roots: identity, keys,
+    databases, recipes, logs. Every resolver in this module goes through it,
+    so each writer that asks this module for a path is covered, including
+    ones added later; tests/unit/test_identity_is_hermetic.py fails on a
+    shipped module that builds ~/Documents/Nunba itself.
+
+    Importing integrations.social.peer_discovery builds a GossipProtocol at
+    module level, which reads and can write node_id.json. On 2026-09-23 an
+    uncommitted identity change ran that code under test and replaced the
+    owner's desktop id (46329c87, the one central had verified) with a fresh
+    one. On 2026-09-27 a test wrote fake autoresearch rows into the owner's
+    agent_data/coding_benchmarks.db, which get_best_tool learns from and
+    export_learning_delta sends to hive peers; the guard then covered the
+    identity alone.
+
+    A test that points the data dir somewhere of its own (monkeypatch,
+    NUNBA_DATA_DIR to a tmp path) is left alone; only the real root is
+    swapped out. Same shape as models.py's DB_PATH guard (828562872).
+
+    The test is "pytest is imported", and the installed Nunba ships pytest in
+    lib/, so a swap there would put a person's DB, recipes and memories in a
+    dir deleted at exit.  Two limits: a frozen build is NEVER swapped, and
+    every swap logs a WARNING naming both paths, so a mis-fire in a source
+    run is visible rather than silent.  No shipped HARTOS module imports
+    pytest (tests/unit/test_identity_is_hermetic.py fails if one starts to).
+    """
+    global _pytest_data_dir
+    if not under_test() or _is_frozen():
+        return path
+    if os.path.normcase(os.path.abspath(path)) != os.path.normcase(os.path.abspath(real)):
+        return path
+    if _pytest_data_dir is None:
+        import atexit
+        import shutil
+        import tempfile
+        _pytest_data_dir = tempfile.mkdtemp(prefix='hartos_test_data_')
+        atexit.register(shutil.rmtree, _pytest_data_dir, ignore_errors=True)
+    swapped = os.path.join(_pytest_data_dir, label) if label else _pytest_data_dir
+    import logging
+    logging.getLogger('hevolve.platform').warning(
+        "pytest is imported: %s is the owner's real root, using %s instead "
+        '(removed at exit)', path, swapped)
+    return swapped
+
+
+def get_identity_data_dir() -> str:
+    """Data root for this node's identity: node_id and key material.
+
+    The data root itself. The name stays because the identity callers
+    (peer_discovery, node_integrity) and their tests use it; the test guard
+    lives in get_data_dir, once.
+    """
+    return get_data_dir()
 
 
 def get_db_dir() -> str:
@@ -86,6 +163,23 @@ def get_db_path(filename: str = 'hevolve_database.db') -> str:
 def get_agent_data_dir() -> str:
     """Return the agent_data/ subdirectory."""
     return os.path.join(get_db_dir(), 'agent_data')
+
+
+def _legacy_documents_root() -> str:
+    """~/Documents/Nunba on every platform: where a few files lived before
+    they followed the data root (hart_language.json until 2026-09-27).  On
+    Windows it IS the platform default data root; on macOS / Linux it is not."""
+    return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba')
+
+
+def legacy_documents_db_path(filename: str) -> str:
+    """Where ``filename`` lived before it moved to get_db_path(), for a
+    one-time copy by that file's own reader (core.user_lang).  Read-only use:
+    never write or delete here.  Under pytest the owner's real ~/Documents
+    tree is swapped like every other real root."""
+    real = _legacy_documents_root()
+    root = _off_the_real_root_under_test(real, real, 'Documents-Nunba')
+    return os.path.join(root, 'data', filename)
 
 
 def get_uploads_dir() -> str:
@@ -273,19 +367,28 @@ def get_log_dir() -> str:
     override = os.environ.get('NUNBA_LOG_DIR', '').strip()
     if override:
         return override
-
-    if _IS_MACOS:
-        base = os.path.expanduser('~/Library/Logs/Nunba')
-    else:
-        # Windows + Linux both nest under the data dir.
-        base = os.path.join(get_data_dir(), 'logs')
-
+    base = get_installed_log_dir()
     # sys.frozen is set by cx_Freeze in the shipped build and is absent
     # from every source run — the one discriminator that needs no config
     # and cannot drift out of sync with how the app was started.
     if not getattr(sys, 'frozen', False):
         base += '-dev'
     return base
+
+
+def get_installed_log_dir() -> str:
+    """The log directory the INSTALLED (frozen) build writes, whatever this
+    process is.  For a reader in a dev run that reports on the installed
+    app (get_boot_decision falls back to it); writers use get_log_dir().
+    NUNBA_LOG_DIR overrides it as it does get_log_dir."""
+    override = os.environ.get('NUNBA_LOG_DIR', '').strip()
+    if override:
+        return override
+    if _IS_MACOS:
+        real_logs = os.path.expanduser('~/Library/Logs/Nunba')
+        return _off_the_real_root_under_test(real_logs, real_logs, 'Library-Logs')
+    # Windows + Linux both nest under the data dir.
+    return os.path.join(get_data_dir(), 'logs')
 
 
 def get_memory_graph_dir(session_key: str = '') -> str:

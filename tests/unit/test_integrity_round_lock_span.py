@@ -52,7 +52,9 @@ class _LockProbe:
     tries BEGIN IMMEDIATE on a second connection with a short busy timeout
     and records whether the round was holding the write lock at that
     moment.  Then it fails like an unroutable peer does (the timeout path,
-    which is the one that also writes: status='timeout' + fraud score)."""
+    which is the one that also writes: status='timeout' and the peer's
+    last_challenge_at; since 5e83047b5 a timeout scores NO fraud, a timeout
+    being absence of evidence)."""
 
     def __init__(self, path):
         self.path = path
@@ -166,7 +168,38 @@ class CreateChallengeLockSpanTest(_FileDb):
         self.assertEqual(row.status, 'timeout')
         peer = self.db.query(PeerNode).filter_by(node_id='peer-1').one()
         self.assertIsNotNone(peer.last_challenge_at)
-        self.assertGreater(peer.fraud_score, 0.0)
+        # 5e83047b5: a timeout is recorded, never scored.  This line used to
+        # assert fraud_score > 0 (the +5 the timeout path once wrote) and was
+        # missed when that write was removed: a test is a caller of what a
+        # code path writes (review finding, 2026-09-23).
+        self.assertEqual(peer.fraud_score or 0.0, 0.0,
+                         'a timeout scored fraud: %r' % peer.fraud_score)
+
+    def test_post_bounds_the_connect_separately_from_the_read(self):
+        """A single 30s timeout made an unroutable peer cost the full 30s at
+        connect, so inside the integrity round's 30s budget (#71) one such
+        peer ate the whole window: measured on central 2026-09-22, 774 of
+        1,149 'active' rows are private addresses unroutable from the
+        container, and the budgeted round advanced one peer per tick.  A
+        blackholed connect must fail in seconds; a slow peer that DID connect
+        keeps the full read allowance."""
+        self._peer(1)
+        self.db.commit()
+        seen = {}
+
+        def record_then_fail(url, **kw):
+            seen['timeout'] = kw.get('timeout')
+            raise requests.ConnectionError('unroutable peer')
+
+        with patch.object(I, 'pooled_post', record_then_fail):
+            IntegrityService.create_challenge(
+                self.db, 'self', 'peer-1', 'http://10.1.0.1:5000',
+                'agent_count_verify')
+        self.assertIsInstance(seen.get('timeout'), tuple,
+                              'the challenge POST has one timeout for connect and read')
+        connect, read = seen['timeout']
+        self.assertLessEqual(connect, 5)
+        self.assertEqual(read, I.CHALLENGE_TIMEOUT_SECONDS)
 
 
 class IntegrityRoundLockSpanTest(_FileDb):

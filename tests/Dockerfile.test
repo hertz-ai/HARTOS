@@ -35,8 +35,10 @@ RUN pip install --no-cache-dir \
     faker==30.8.2 \
     python-dotenv==1.0.1
 
-# Install autogen if not in requirements
-RUN pip install --no-cache-dir pyautogen || true
+# autogen comes from requirements.txt above (autogen-agentchat==0.2.37, the
+# ONE autogen pin). No second install here: an unpinned `pip install pyautogen`
+# resolves to pyautogen 0.10.0 (PyPI, 2026-09-26), which requires
+# autogen-agentchat>=0.6.4 -- it would upgrade the pin out of the 0.2 API.
 
 # Copy application code
 COPY . .

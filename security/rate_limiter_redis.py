@@ -109,7 +109,8 @@ class RedisRateLimiter:
     def _get_key(self, action: str) -> str:
         """Build composite rate limit key from user_id + IP."""
         user_id = getattr(g, 'user_id', None) if hasattr(g, 'user_id') else None
-        ip = request.remote_addr or 'unknown'
+        from core.auth_local import client_key
+        ip = client_key() or 'unknown'
 
         if user_id:
             return f"rl:{action}:user:{user_id}"

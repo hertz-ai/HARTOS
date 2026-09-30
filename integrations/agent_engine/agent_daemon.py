@@ -17,6 +17,37 @@ from datetime import datetime
 
 logger = logging.getLogger('hevolve_social')
 
+
+_HARTOS_HANDLER_TAG = '_hartos_root_handler'  # same tag hart_intelligence_entry uses
+
+
+def _give_the_journal_a_root_handler(root=None):
+    """The systemd entrypoint's process has NO root log handler unless someone
+    installs one: hart-agent.nix runs `python -c "... AgentDaemon().run_forever()"`,
+    nothing here ever configured logging, so every INFO line this daemon and the
+    governor monitor emit went to Python's lastResort handler, which prints
+    WARNING and above only. Measured on the Samsung node, generations 11 and 12
+    (2026-09-24): `journalctl -u hart-agent-daemon` held ONE line per boot,
+    systemd's "Started", through thirty minutes of ticks, yields and governor
+    transitions; the yield reasons that explain why the box is or is not busy
+    were invisible. The same rule hart_intelligence_entry applies to the backend
+    (babefb0): attach a stdout handler ONLY when root has none, tagged so a host
+    that already configured root (Nunba, pytest) is left exactly as found.
+    Returns the handler it attached, or None.
+    """
+    root = root if root is not None else logging.getLogger()
+    if root.handlers:
+        return None
+    import sys as _sys
+    h = logging.StreamHandler(_sys.stdout)
+    h.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - [%(threadName)s] - %(levelname)s - %(message)s'))
+    setattr(h, _HARTOS_HANDLER_TAG, True)
+    root.addHandler(h)
+    if root.level == logging.NOTSET or root.level > logging.INFO:
+        root.setLevel(logging.INFO)
+    return h
+
 # Lock protecting module-level mutable state accessed from daemon thread + API threads
 _module_lock = threading.Lock()
 
@@ -163,20 +194,20 @@ def _send_hitl_notification(db, goal, task):
 
     try:
         from integrations.social.services import NotificationService
-        from integrations.social.realtime import on_notification
         owner_id = goal.created_by or goal.owner_id
         if not owner_id:
             return
         desc_preview = (task.description or '')[:100]
-        notif = NotificationService.create(
+        # create() pushes it to the owner's devices once the daemon's session
+        # commits (models.after_commit).  A second on_notification here
+        # pushed it twice, the extra one BEFORE the commit, for a row that
+        # could still roll back.
+        NotificationService.create(
             db, str(owner_id), 'approval_required',
             target_type='thought_experiment',
             target_id=str(task.id),
             message=f'Agent needs your review: {desc_preview}',
         )
-        on_notification(str(owner_id), notif.to_dict() if hasattr(notif, 'to_dict') else {
-            'type': 'approval_required', 'message': f'Agent needs your review: {desc_preview}',
-        })
         logger.info(f"HITL notification sent for goal={goal.id} task={task.id}")
     except Exception as e:
         logger.debug(f"HITL notification failed: {e}")
@@ -232,6 +263,56 @@ def _goal_ledger_grounding(goal_id):
 _ESCALATION_KEYS = ('action_id', 'action', 'user_prompt', 'prompt_id', 'flow')
 
 
+def _copilot_consent(db, goal, esc):
+    """The copilot switch, asked for through the consent surface when it is off.
+
+    The expert is the owner's Claude Code subscription.  With the switch on
+    (admin page, or the owner's earlier "Always allow") the backend is
+    registered if a restart never did it, and the turn proceeds: None.  With
+    it off, the owner is asked ONCE through the same card every other consent
+    uses, named by the agent, and the goal is skipped this tick but stays
+    active, so the tick after the grant flips the switch takes the turn:
+    (None, True) with no park.  A standing "Don't allow", or a grant the admin
+    page later overrode, hands the action to a person through escalate_goal
+    exactly as an unavailable expert does — the owner said no, and a goal
+    skipped forever would look active while doing nothing.
+    """
+    from integrations.coding_agent.claude_code_backend import (
+        COPILOT_CONSENT_TYPE, copilot_enabled)
+    from .model_registry import ensure_claude_code_registered
+    if copilot_enabled():
+        ensure_claude_code_registered()
+        return None
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    parked_reason = None
+    if not owner:
+        parked_reason = 'the copilot is switched off and this node has no owner to ask'
+    else:
+        try:
+            from integrations.social.consent_service import ConsentService
+            if ConsentService.check_consent(db, owner, COPILOT_CONSENT_TYPE):
+                parked_reason = 'the copilot is switched off in Admin'
+            elif ConsentService.declined(db, owner, COPILOT_CONSENT_TYPE):
+                parked_reason = 'the owner has not allowed agents to use Claude'
+            else:
+                ConsentService.check_or_request(
+                    db, owner, COPILOT_CONSENT_TYPE,
+                    reason=(f"needs Claude for a step it could not finish: "
+                            f"{str(esc.get('action') or '')[:120]}"),
+                    requester_name=str(goal.title or '')[:100])
+                logger.info(f"Goal {goal.id}: asked the owner to allow the copilot")
+                return None, True
+        except Exception as e:
+            logger.warning(f"Goal {goal.id}: copilot consent check failed, "
+                           f"parking: {e}")
+            parked_reason = 'the copilot consent could not be checked'
+    from .goal_manager import GoalManager
+    GoalManager.escalate_goal(db, goal.id, dict(
+        {k: esc.get(k) for k in _ESCALATION_KEYS},
+        reason=parked_reason, tried=['local']))
+    return None, True
+
+
 def _escalation_model_config(db, goal):
     """``(config_list, parked)`` for a goal whose stuck action is handed to
     the expert (#106d); ``(None, False)`` for every other goal.
@@ -246,7 +327,12 @@ def _escalation_model_config(db, goal):
     if esc.get('next') != 'expert':
         return None, False
     from .model_registry import model_registry
-    backend = model_registry.get_model(esc.get('expert') or '')
+    expert_id = esc.get('expert') or ''
+    if expert_id == 'claude-code':
+        verdict = _copilot_consent(db, goal, esc)
+        if verdict is not None:
+            return verdict
+    backend = model_registry.get_model(expert_id)
     if backend is not None and backend.is_dispatchable():
         return backend.to_config_list(), False
     from .goal_manager import GoalManager
@@ -544,6 +630,12 @@ class AgentDaemon:
         self._home_compose_interval_s = int(os.environ.get(
             'HART_HOME_COMPOSE_INTERVAL_S', '300'))
         self._next_home_compose_at = 0.0
+        # Auto-evolve rides the thought-experiment lifecycle tick below.  A
+        # wall-clock cadence keeps it independent of whether ordinary goals
+        # exist, while 0 remains an operator kill switch.
+        self._auto_evolve_interval_s = max(0, int(os.environ.get(
+            'HEVOLVE_AUTO_EVOLVE_INTERVAL_S', '900')))
+        self._next_auto_evolve_at = 0.0
 
     def start(self):
         with self._lock:
@@ -588,7 +680,25 @@ class AgentDaemon:
         worker thread ever exits this returns and systemd's Restart=on-failure
         relaunches the unit. Without this method the unit crashed on boot with
         AttributeError: 'AgentDaemon' object has no attribute 'run_forever'.
+
+        The governor's monitor runs in THIS process too, monitor only.  This
+        unit is its own process, and only the backend
+        (hart_intelligence_entry.py) ever started a governor, so every
+        get_mode() here, in _idle_only_blocked and in the starvation
+        override, read the constructor's MODE_ACTIVE for as long as the
+        process lived (found 2026-09-23 on the Samsung box).  Monitor only:
+        the enforcer and the proactive stream stay in the backend, see
+        ResourceGovernor.start.  Best-effort, so a governor fault can never
+        keep the goal engine from starting; the reads then fail closed to
+        "not idle" exactly as they did before.
         """
+        _give_the_journal_a_root_handler()
+        try:
+            from core.resource_governor import get_governor
+            get_governor().start(monitor_only=True)
+        except Exception as e:
+            logger.warning("Agent daemon: governor monitor did not start "
+                           "(idle reads stay closed): %s", e)
         self.start()
         if self._thread is not None:
             self._thread.join()
@@ -613,6 +723,32 @@ class AgentDaemon:
                 ThoughtExperimentService.advance_due_experiments(db)
         except Exception as exc:
             logger.debug("Thought-experiment lifecycle tick skipped: %s", exc)
+
+        # Complete the existing GATHER->DISPATCH->AgentGoal loop: first project
+        # canonical goal outcomes back onto its active session, then start a new
+        # bounded cycle only on cadence and only when no cycle is active.
+        try:
+            from .auto_evolve import get_auto_evolve_orchestrator
+            orchestrator = get_auto_evolve_orchestrator()
+            status = orchestrator.reconcile()
+            now = time.monotonic()
+            interval = self._auto_evolve_interval_s
+            if interval <= 0 or now < self._next_auto_evolve_at:
+                return
+            self._next_auto_evolve_at = now + interval
+            if status.get('status') in ('selecting', 'dispatching', 'running'):
+                return
+            result = orchestrator.start(user_id='system')
+            if result.get('success'):
+                logger.info(
+                    "Agent daemon: auto-evolve cycle %s started",
+                    result.get('session_id'))
+            else:
+                logger.debug(
+                    "Agent daemon: auto-evolve cycle not started: %s",
+                    result.get('reason'))
+        except Exception as exc:
+            logger.debug("Auto-evolve daemon tick skipped: %s", exc)
 
     def _try_parallel_dispatch(self, goal, idle_agents, dispatched, max_concurrent):
         """Check if a goal has parallel subtasks and dispatch them concurrently.
@@ -1268,6 +1404,23 @@ class AgentDaemon:
         t.start()
         self._federation_thread = t
 
+    @staticmethod
+    def _settle_metered_usage(db) -> None:
+        """Credit pending MeteredAPIUsage rows (settle_metered_api_costs) and
+        commit them on their own, so a settlement failure rolls back only
+        itself and never the tick that follows."""
+        try:
+            from .revenue_aggregator import settle_metered_api_costs
+            result = settle_metered_api_costs(db)
+            db.commit()
+            if result.get('settled_count'):
+                logger.info(
+                    "Metered settlement: %d row(s), %d Spark credited",
+                    result['settled_count'], result['total_spark_awarded'])
+        except Exception as e:
+            db.rollback()
+            logger.warning("Metered settlement failed (retried next cycle): %s", e)
+
     def _tick(self):
         """Find active goals, find idle agents, dispatch via /chat.
 
@@ -1325,6 +1478,26 @@ class AgentDaemon:
                     return
             except Exception:
                 pass
+            # A person at the desk is neither a foreground request nor
+            # "recently active" (that means chatted), so neither check above
+            # sees them.  The ResourceGovernor is the ONE idle detector (its
+            # Linux backend reads the compositor's input-alive marker), and a
+            # forced tick is idle-only work by definition, so it goes through
+            # the SAME reader every idle_only goal goes through:
+            # _idle_only_blocked, get_mode() != MODE_IDLE, fail closed when
+            # the governor cannot be consulted.  Measured 2026-09-22 on the
+            # Samsung box: this override force-ticked every 120 s on
+            # 'model_pressure' and put llama-server at 207 percent CPU once a
+            # minute while the owner was clicking around the desktop; press
+            # p50 122 ms against a 25 ms budget, clock 1.3 GHz of 3.4,
+            # package 94 C.  With the daemons paused for 120 s: 3.19 GHz,
+            # 84 C, press p50 12 ms.  That headroom belongs to the person.
+            if _idle_only_blocked({'idle_only': True}):
+                logger.debug(
+                    "Agent daemon: governor says the machine is not idle, "
+                    "yielding on '%s' (starvation override suppressed)",
+                    _yreason)
+                return
             _override_active = True
             logger.warning(
                 "Agent daemon: STARVATION OVERRIDE — yield gate has blocked "
@@ -1350,6 +1523,15 @@ class AgentDaemon:
 
         db = get_db()
         try:
+            # Settlement pays operators for compute they served other people
+            # (budget_gate.charge_remote_compute rows, and metered API cost
+            # recovery).  It ran nowhere but a deploy script, so debits taken
+            # on completed remote work were never credited.  Before the
+            # no-goals stop on purpose: a node with nothing to dispatch still
+            # owes the operators who served it.
+            if self._tick_count % self._remediate_every == 0:
+                self._settle_metered_usage(db)
+
             # DETERMINISTIC STOP: no goals = no action = system is inert
             # Skip CODING_GOAL_TYPES — coding_daemon handles those with
             # idle-agent detection + benchmark sync for backend routing.
@@ -1611,8 +1793,17 @@ class AgentDaemon:
                 # GUARDRAIL: full pre-dispatch gate
                 try:
                     from security.hive_guardrails import GuardrailEnforcer
+                    # Pass the goal's OWNER as the requester. The consent gate
+                    # can only ask a human it can name: with no user_id it falls
+                    # back to HEVOLVE_OWNER_USER_ID, which desktop sets from
+                    # guest_identity but central/regional set NOWHERE — so a
+                    # consent-flagged goal there was refused with 'dispatched
+                    # without user context' and NO request filed: blocked with
+                    # nobody ever asked, unrecoverable without an env var. The
+                    # goal already carries owner_id, and dispatch_goal already
+                    # passes it (dispatch.py:1089); this path just dropped it.
                     allowed, reason, prompt = GuardrailEnforcer.before_dispatch(
-                        prompt, goal.to_dict())
+                        prompt, goal.to_dict(), user_id=goal.owner_id)
                     if not allowed:
                         logger.warning(f"Goal {goal.id} blocked by guardrail: {reason}")
                         continue
@@ -1736,8 +1927,17 @@ class AgentDaemon:
                     dispatched += 1
                     self._wd_heartbeat()
 
-                # Track failures for exponential backoff
-                if result is None:
+                # Track failures for exponential backoff.  A reply that SAYS the
+                # action failed — the {"status":"error"} envelope the CREATE
+                # prompt tells the agent to return, or a help pause — is a
+                # failure too, not a success (the same rule the hive worker
+                # applies via HeldForHelp).  Counted as success it cleared the
+                # backoff and, for a continuous goal, re-ran the impossible
+                # action every 5 minutes for five months.
+                from core.agent_tools import is_action_error_reply, is_help_pause
+                _reply_failed = result is not None and (
+                    is_action_error_reply(result) or is_help_pause(result))
+                if result is None or _reply_failed:
                     # dispatch_goal returns None for TRANSIENT defers too (user
                     # actively chatting / Tier-2 breaker open), not just real
                     # failures.  Counting those toward the 5-strike AUTO-PAUSE
@@ -1745,11 +1945,14 @@ class AgentDaemon:
                     # using the machine — the "goals stuck / 0 progress" bug.
                     # Reuse the SAME canonical checks dispatch_goal defers on
                     # (single source — never drifts) and skip without penalty.
-                    try:
-                        from .dispatch import is_transient_deferral
-                        _transient = is_transient_deferral()
-                    except Exception:
-                        _transient = False
+                    # An explicit error reply is never transient: the turn ran.
+                    _transient = False
+                    if result is None:
+                        try:
+                            from .dispatch import is_transient_deferral
+                            _transient = is_transient_deferral()
+                        except Exception:
+                            _transient = False
                     if _transient:
                         logger.debug(
                             f"Goal {goal_key}: transient defer (user active / "
@@ -1757,12 +1960,15 @@ class AgentDaemon:
                         continue
                     # Why the turn failed, when it ran, so a paused goal says
                     # what to fix (a 402 from the hosted LLM, say) instead of
-                    # only counting failures.
-                    try:
-                        from .dispatch import dispatch_failure_reason
-                        _why = dispatch_failure_reason(goal_key)
-                    except Exception:
-                        _why = None
+                    # only counting failures.  An error reply carries its own.
+                    if _reply_failed:
+                        _why = ' '.join(str(result).split())[:200]
+                    else:
+                        try:
+                            from .dispatch import dispatch_failure_reason
+                            _why = dispatch_failure_reason(goal_key)
+                        except Exception:
+                            _why = None
                     with _module_lock:
                         info = _dispatch_backoff.get(goal_key, {'failures': 0})
                         info['failures'] = info.get('failures', 0) + 1

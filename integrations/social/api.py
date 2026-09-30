@@ -6,6 +6,7 @@ Compatible with both Nunba web app and HART React Native CommunityView.
 import os
 import logging
 from flask import Blueprint, request, jsonify, g
+from core.auth_local import client_key as _client_key
 
 from .auth import require_auth, optional_auth, require_admin, require_moderator, revoke_token
 from .rate_limiter import rate_limit, get_limiter
@@ -118,7 +119,7 @@ def register():
                 try:
                     _record_marketing_event(
                         referral_code, 'signup', 'web',
-                        (request.remote_addr or '').encode(),
+                        _client_key().encode(),
                         (request.headers.get('User-Agent') or '')[:200])
                 except Exception:
                     pass
@@ -354,7 +355,7 @@ def guest_register():
             try:
                 _record_marketing_event(
                     referral_code, 'signup', 'web',
-                    (request.remote_addr or '').encode(),
+                    _client_key().encode(),
                     (request.headers.get('User-Agent') or '')[:200])
             except Exception:
                 pass
@@ -2710,7 +2711,7 @@ def track_marketing_event():
         return _err('invalid event', 400)
     row = _record_marketing_event(
         code, event, (data.get('platform') or '').strip()[:32],
-        (request.remote_addr or '').encode(),
+        _client_key().encode(),
         (request.headers.get('User-Agent') or '')[:200])
     return _ok({'tracked': True, 'code': row['code'], 'event': row['event'], 'ts': row['ts']})
 
@@ -2887,20 +2888,27 @@ def review_report(report_id):
 @social_bp.route('/admin/stats', methods=['GET'])
 @require_admin
 def platform_stats():
-    from sqlalchemy import func as sqlfunc
-    total_users = g.db.query(sqlfunc.count(User.id)).scalar()
-    total_agents = g.db.query(sqlfunc.count(User.id)).filter(User.user_type == 'agent').scalar()
-    total_humans = g.db.query(sqlfunc.count(User.id)).filter(User.user_type == 'human').scalar()
-    total_posts = g.db.query(sqlfunc.count(Post.id)).filter(Post.is_deleted == False).scalar()
-    total_comments = g.db.query(sqlfunc.count(Comment.id)).filter(Comment.is_deleted == False).scalar()
-    total_communities = g.db.query(sqlfunc.count(Community.id)).scalar()
-    pending_reports = g.db.query(sqlfunc.count(Report.id)).filter(Report.status == 'pending').scalar()
-    return _ok({
-        'total_users': total_users, 'total_agents': total_agents,
-        'total_humans': total_humans, 'total_posts': total_posts,
-        'total_comments': total_comments, 'total_communities': total_communities,
-        'pending_reports': pending_reports,
-    })
+    """Return dashboard aggregates, or say plainly that they are unavailable.
+
+    A failed aggregate query answers 503 with success=false, never a
+    success envelope full of zeros: the Admin dashboard already tolerates a
+    failed call (it renders the tile empty), and a fabricated zero reads as
+    a real "no users" to the operator.
+    """
+    try:
+        from sqlalchemy import func as sqlfunc
+        return _ok({
+            'total_users': g.db.query(sqlfunc.count(User.id)).scalar(),
+            'total_agents': g.db.query(sqlfunc.count(User.id)).filter(User.user_type == 'agent').scalar(),
+            'total_humans': g.db.query(sqlfunc.count(User.id)).filter(User.user_type == 'human').scalar(),
+            'total_posts': g.db.query(sqlfunc.count(Post.id)).filter(Post.is_deleted == False).scalar(),
+            'total_comments': g.db.query(sqlfunc.count(Comment.id)).filter(Comment.is_deleted == False).scalar(),
+            'total_communities': g.db.query(sqlfunc.count(Community.id)).scalar(),
+            'pending_reports': g.db.query(sqlfunc.count(Report.id)).filter(Report.status == 'pending').scalar(),
+        })
+    except Exception:
+        logging.exception('Admin dashboard statistics are unavailable')
+        return _err('Admin dashboard statistics are unavailable', 503)
 
 
 @social_bp.route('/admin/revenue-analytics', methods=['GET'])

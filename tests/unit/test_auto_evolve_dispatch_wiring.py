@@ -33,6 +33,10 @@ class TestSuperMajorityGate(unittest.TestCase):
             'total_for': for_weight,
             'total_against': against_weight,
             'weighted_score': weighted_score,
+            # These tests isolate the RATIO gate; the distinct-identity
+            # quorum is held met here and tested in
+            # test_no_single_identity_approves.py.
+            'quorum_met': True,
         }
 
     def test_rejects_simple_majority(self):

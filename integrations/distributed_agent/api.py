@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 distributed_agent_bp = Blueprint('distributed_agent', __name__)
 
+
+# Who submitted a goal is kept on THIS node, never in the goal's context
+# (which goes to the shared coordinator and to every peer): see
+# integrations.distributed_agent.requesters, the one home for it.
+
 # Track which backend is active
 _coordinator_backend_type = None
 
@@ -388,7 +393,14 @@ def submit_task_result(task_id):
     if result is None:
         return jsonify({'success': False, 'error': 'result is required'}), 400
 
-    info = coordinator.submit_result(task_id, agent_id, result)
+    # A completion the ledger could not persist is not a completion: the
+    # coordinator releases the worker's claim and raises rather than answer
+    # "completed" for work the durable ledger still shows IN_PROGRESS.  The
+    # worker loop catches that; this route did not.
+    try:
+        info = coordinator.submit_result(task_id, agent_id, result)
+    except RuntimeError as e:
+        return jsonify({'success': False, 'error': str(e)}), 503
     return jsonify({'success': True, **info})
 
 
@@ -428,8 +440,33 @@ def submit_goal():
         return jsonify({'success': False, 'error': 'objective is required'}), 400
     if not tasks:
         return jsonify({'success': False, 'error': 'tasks list is required'}), 400
+    # A user id in the context would go to the shared ledger and to every
+    # peer; the submitter is kept on this node instead (requesters).
+    context = {k: v for k, v in (context or {}).items() if k != 'user_id'}
 
-    goal_id = coordinator.submit_goal(objective, tasks, context)
+    # submit_goal refuses with an exception instead of answering with a goal
+    # that is missing children: HiveDepthExceeded for a hop past the
+    # published topology, RuntimeError when a child id collides with a task
+    # the ledger already holds ("Could not stage ...") or when the ledger
+    # cannot persist the set ("Could not persist ...").  Every other caller
+    # guards the call (dispatch.py's distributed dispatch, announce_tasks
+    # above); this route answered a bare 500.  Same envelope as the rest of
+    # the route: 400 for the client's hop, 409 for the client's id, 503 when
+    # the node cannot write.  (Found in review by hartos-7c, 2026-09-20.)
+    from .task_coordinator import HiveDepthExceeded
+    try:
+        goal_id = coordinator.submit_goal(objective, tasks, context)
+    except HiveDepthExceeded as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except RuntimeError as e:
+        status = 503 if 'persist' in str(e) else 409
+        return jsonify({'success': False, 'error': str(e)}), status
+    try:
+        from .requesters import record_submitter
+        record_submitter(goal_id, str(g.user.id))
+    except Exception:
+        logger.warning('could not record who submitted goal %s', goal_id,
+                       exc_info=True)
 
     # Announce to peers via gossip if we have peers
     try:
@@ -445,12 +482,34 @@ def submit_goal():
 @distributed_agent_bp.route('/api/distributed/goals/<goal_id>/progress', methods=['GET'])
 @require_auth
 def goal_progress(goal_id):
-    """Get distributed progress for a goal."""
+    """Get distributed progress for a goal, to whoever may steer it.
+
+    The goal is the AgentGoal / CodingGoal with this id when there is one
+    (dispatch submits under the goal's own id), else the coordinator's goal,
+    owned by whoever submitted it HERE (requesters.submitter_of).  A goal
+    a peer gossiped names nobody on this node -- any user id in its context
+    is the peer's -- so it is this machine's: local callers read it.
+    Judged by dashboard_service.may_steer; an unknown id and someone else's
+    goal answer the same 403.  Review of dc32b1146: any signed-in user read
+    any goal's tasks.
+    """
+    from types import SimpleNamespace
+    from integrations.social.dashboard_service import (
+        find_goal, goal_to_steer, steering_caller)
     coordinator = _get_coordinator()
     if not coordinator:
         return _no_coordinator()
 
     progress = coordinator.get_goal_progress(goal_id)
+    goal = find_goal(g.db, goal_id)
+    if goal is None and 'error' not in progress:
+        from .requesters import submitter_of
+        goal = SimpleNamespace(owner_id=submitter_of(goal_id),
+                               created_by=None, user_id=None)
+    _, refused = goal_to_steer(g.db, goal_id, 'read', steering_caller(),
+                               str(g.user.id), goal=goal, audit=False)
+    if refused:
+        return jsonify({'success': False, 'data': refused}), 403
     return jsonify({'success': True, **progress})
 
 

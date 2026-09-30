@@ -159,7 +159,7 @@ class TestReuseCompletesSubtasksBeforeTheParent(unittest.TestCase):
 
 
 class TestAdvanceChokepointConsultsSubtasks(unittest.TestCase):
-    """_advance_or_steer is the ONE door all six advance sites go through."""
+    """_advance_or_steer is the ONE door all advance sites go through."""
 
     def _src(self):
         import hartos.reuse_recipe as rr
@@ -180,11 +180,11 @@ class TestAdvanceChokepointConsultsSubtasks(unittest.TestCase):
             'action 4 of agent 88719487304 at 20:23:21')
 
     def test_every_advance_site_still_funnels_through_the_one_door(self):
-        """A 7th advance site added elsewhere would dodge the guard."""
+        """A new advance site added elsewhere would dodge the guard."""
         src = self._src()
         self.assertGreaterEqual(
-            src.count('_advance_or_steer('), 6,
-            'expected the 6 known call sites plus the def; re-point this guard')
+            src.count('_advance_or_steer('), 5,
+            'expected the 4 known call sites plus the def; re-point this guard')
         self.assertEqual(
             src.count('next_action_id, advanced = _advance_reuse_action('), 1,
             'more than one place now moves the action pointer -- the guard at '

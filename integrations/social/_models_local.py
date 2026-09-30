@@ -20,6 +20,8 @@ from sqlalchemy import (
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import relationship
 
+from core.constants import ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS
+
 # Import from parent models.py — these are already defined before models.py
 # reaches the `from _models_local import ...` line, so partial-module import works.
 from integrations.social.models import Base, _uuid, _sanitize_html
@@ -418,9 +420,37 @@ class Notification(Base):
 
     user = relationship('User', back_populates='notifications')
 
+    #: What each kind of notification is CALLED, for a human reading it.
+    #: Clients fall back to the raw type when no title is sent (the web
+    #: bell renders `n.title || n.type`), so without this a person saw
+    #: headlines like 'agent_game_sound_review'.  Every type gets a title
+    #: from one place rather than each surface inventing its own.
+    TITLES = {
+        'agent_game_sound_review': 'A new game sound',
+        'agent_consent_request': 'An agent needs your consent',
+        'follow': 'New follower',
+        'like': 'New like',
+        'comment': 'New comment',
+        'mention': 'You were mentioned',
+        'message': 'New message',
+    }
+
+    def title_for_humans(self):
+        """A readable headline, never a raw slug.
+
+        Falls back to the type with its separators softened -- an unknown
+        type then reads as 'Agent game sound review' rather than
+        'agent_game_sound_review', which is wrong but not ugly.
+        """
+        known = self.TITLES.get(self.type)
+        if known:
+            return known
+        return str(self.type or 'Notification').replace('_', ' ').capitalize()
+
     def to_dict(self):
         return {
             'id': self.id, 'user_id': self.user_id, 'type': self.type,
+            'title': self.title_for_humans(),
             'source_user_id': self.source_user_id,
             'target_type': self.target_type, 'target_id': self.target_id,
             'message': self.message, 'is_read': self.is_read,
@@ -1035,6 +1065,14 @@ class DiscoverablePref(Base):
     last_toggle_at = Column(DateTime, nullable=True)
     current_pubkey = Column(String(128), nullable=True, index=True)
     pubkey_registered_at = Column(DateTime, nullable=True)
+    # v59 persona card: what the user's agent may tell a matched person's
+    # agent.  interests_discoverable is the user's yes to being matched
+    # on interests beyond friends and nearby.
+    # Kept separate from users.bio (owner): shown only to a match, users.bio is public; merging leaks one or overwrites the other.
+    bio = Column(Text, nullable=True)
+    recognize_me = Column(String(ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS),
+                          nullable=True)
+    interests_discoverable = Column(Boolean, default=False, nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
     user = relationship('User', foreign_keys=[user_id])
@@ -1051,6 +1089,9 @@ class DiscoverablePref(Base):
             'vibe_tags': self.vibe_tags or [],
             'toggle_count_24h': self.toggle_count_24h or 0,
             'current_pubkey': self.current_pubkey,
+            'bio': self.bio or '',
+            'recognize_me': self.recognize_me or '',
+            'interests_discoverable': bool(self.interests_discoverable),
         }
 
 
@@ -2897,6 +2938,9 @@ class MeteredAPIUsage(Base):
     # v34 — thought-experiment consumption tracking
     escrow_id = Column(Integer, nullable=True, index=True)
     experiment_post_id = Column(String(64), nullable=True, index=True)
+    # v57 — the person whose task ran on node_id (task_source='hive_compute',
+    # budget_gate.charge_remote_compute).  NULL on every other row.
+    requester_user_id = Column(String(64), nullable=True, index=True)
 
     def to_dict(self):
         return {
@@ -2907,6 +2951,7 @@ class MeteredAPIUsage(Base):
             'task_source': self.task_source,
             'goal_id': self.goal_id,
             'requester_node_id': self.requester_node_id,
+            'requester_user_id': self.requester_user_id,
             'tokens_in': self.tokens_in,
             'tokens_out': self.tokens_out,
             'cost_per_1k_tokens': self.cost_per_1k_tokens,
@@ -3153,6 +3198,15 @@ class UserConsent(Base):
     granted = Column(Boolean, default=False, nullable=False)
     granted_at = Column(DateTime, nullable=True)
     revoked_at = Column(DateTime, nullable=True)
+    # What the owner sees for this row when the scope is not readable: for
+    # a device_access row (scope = the phone's public key) the name the
+    # phone signed into its first ask.  Self-asserted, a hint beside the
+    # key's fingerprint, never identity (v55, #111).
+    label = Column(String(100), nullable=True)
+    # When the owner took a "no" back ("Allow asking again",
+    # ConsentService.reopen).  revoked_at keeps the time of the no; the row
+    # is declined only while its revocation is newer than this (v58).
+    reopened_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -3169,6 +3223,7 @@ class UserConsent(Base):
             'agent_id': self.agent_id,
             'consent_type': self.consent_type,
             'scope': self.scope,
+            'label': self.label,
             'granted': self.granted,
             'granted_at': self.granted_at.isoformat() if self.granted_at else None,
             'revoked_at': self.revoked_at.isoformat() if self.revoked_at else None,

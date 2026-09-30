@@ -139,9 +139,11 @@ def think(request: Optional[Dict] = None, **kwargs) -> dict:
 class RobotIntelligenceAPI:
     """Unified Robot Intelligence API.
 
-    Fires 7 intelligences in parallel via ThreadPoolExecutor, fuses the
-    results into a single action plan, and returns within the timeout
-    budget even if some intelligences are unavailable.
+    Fires 6 intelligences in parallel via ThreadPoolExecutor, then runs
+    SAFETY on the motor trajectory that will execute, fuses the results
+    into a single action plan, and returns within the timeout budget even
+    if some intelligences are unavailable. The plan halts unless safety
+    positively reports safe.
 
     Thread-safe.
     """
@@ -195,14 +197,17 @@ class RobotIntelligenceAPI:
             if robot_id in self._registry:
                 self._registry[robot_id]['last_seen'] = time.time()
 
-        # Dispatch map: intelligence name -> (callable, args)
+        # Dispatch map: intelligence name -> (callable, args). SAFETY is not in
+        # it: safety must judge the plan that will EXECUTE, so it runs after
+        # motor below. It used to be dispatched here with an EMPTY plan, so
+        # the workspace, stairs and speed checks never saw the motor
+        # trajectory the robot then ran (hevolveai Master 11.435 S3).
         dispatches: Dict[str, tuple] = {
             'vision': (self._invoke_vision, (sensors,)),
             'language': (self._invoke_language, (context, history)),
             'motor': (self._invoke_motor, ({}, {}, constraints)),
             'spatial': (self._invoke_spatial, (sensors,)),
             'social': (self._invoke_social, (context, robot_id)),
-            'safety': (self._invoke_safety, ({}, constraints)),
             'hivemind': (self._invoke_hivemind, (context, sensors)),
         }
 
@@ -245,6 +250,25 @@ class RobotIntelligenceAPI:
         # wasn't ready. We accept the parallelism trade-off — motor
         # uses whatever constraints it got.  For robots that need tight
         # coupling, the recipe_adapter pipeline handles sequencing.
+
+        # SAFETY, on the trajectory that will execute (the steps _fuse_results
+        # hands to the robot). Local and cheap (E-stop + position and
+        # constraint checks), so it runs inline; if it fails for any reason
+        # the verdict is UNSAFE, never a missing key that reads as safe.
+        motor_result = results.get('motor', {})
+        motor_steps = ([] if 'error' in motor_result
+                       else motor_result.get('trajectory', []))
+        try:
+            results['safety'] = self._invoke_safety(
+                {'steps': motor_steps}, constraints)
+            used += 1
+        except Exception as exc:
+            logger.error("Safety check failed for robot %s: %s", robot_id, exc,
+                         exc_info=True)
+            results['safety'] = {'safe': False, 'estop': False,
+                                 'warnings': [f'safety check failed: {exc}']}
+            with self._lock:
+                self._stats['total_errors'] += 1
 
         # Fuse
         action_plan = self._fuse_results(results)
@@ -640,8 +664,11 @@ class RobotIntelligenceAPI:
                         )
                         safe = False
         except Exception as exc:
-            logger.debug("Safety monitor unavailable: %s", exc)
+            # An unknown E-stop state is not a safe state: without the
+            # monitor neither the E-stop nor the workspace can be checked.
+            logger.warning("Safety monitor unavailable: %s", exc)
             warnings.append(f'safety_monitor_unavailable: {exc}')
+            safe = False
 
         # Constraint checks
         if constraints:
@@ -725,9 +752,11 @@ class RobotIntelligenceAPI:
             'confidence': 0.0,
         }
 
-        # Safety gate — if unsafe, return halt plan
+        # Safety gate: HALT unless safety positively said safe. A timeout,
+        # an error or a missing verdict used to read as safe through
+        # .get('safe', True) (hevolveai Master 11.435 S3).
         safety = results.get('safety', {})
-        if safety.get('estop') or (not safety.get('safe', True)):
+        if safety.get('estop') or safety.get('safe') is not True:
             plan['primary_action'] = 'halt'
             plan['steps'] = []
             plan['confidence'] = 1.0

@@ -147,10 +147,19 @@ class TestStorage:
         mock_sm.set_secret.assert_called_once_with('MY_KEY', 'my-value')
 
     def test_store_injects_env(self, mock_sm):
+        """A name the process reads from its environment (SECRET_KEYS)."""
+        os.environ.pop('NEWS_API_KEY', None)
+        vault = AIKeyVault.get_instance()
+        vault.store_credential('NEWS_API_KEY', 'test-value')
+        assert os.environ.get('NEWS_API_KEY') == 'test-value'
+        os.environ.pop('NEWS_API_KEY', None)
+
+    def test_store_keeps_any_other_name_out_of_env(self, mock_sm):
+        os.environ.pop('TEST_VAULT_KEY', None)
         vault = AIKeyVault.get_instance()
         vault.store_credential('TEST_VAULT_KEY', 'test-value')
-        assert os.environ.get('TEST_VAULT_KEY') == 'test-value'
-        os.environ.pop('TEST_VAULT_KEY', None)
+        assert 'TEST_VAULT_KEY' not in os.environ
+        assert mock_sm._cache['TEST_VAULT_KEY'] == 'test-value'
 
     def test_store_with_channel_type(self, mock_sm):
         vault = AIKeyVault.get_instance()
@@ -163,10 +172,11 @@ class TestStorage:
     def test_store_fallback_env_only(self, mock_sm):
         """When vault is unavailable, falls back to env-only."""
         mock_sm.set_secret.side_effect = RuntimeError("no master key")
+        os.environ.pop('NEWS_API_KEY', None)
         vault = AIKeyVault.get_instance()
-        vault.store_credential('FALLBACK_KEY', 'val')
-        assert os.environ.get('FALLBACK_KEY') == 'val'
-        os.environ.pop('FALLBACK_KEY', None)
+        vault.store_credential('NEWS_API_KEY', 'val')
+        assert os.environ.get('NEWS_API_KEY') == 'val'
+        os.environ.pop('NEWS_API_KEY', None)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -176,23 +186,35 @@ class TestStorage:
 class TestPreload:
 
     def test_preload_loads_cached_secrets(self, mock_sm):
-        mock_sm._cache = {'PRELOAD_A': 'val_a', 'PRELOAD_B': 'val_b'}
+        for k in ('NEWS_API_KEY', 'SERPAPI_API_KEY'):
+            os.environ.pop(k, None)
+        mock_sm._cache = {'NEWS_API_KEY': 'val_a', 'SERPAPI_API_KEY': 'val_b'}
         vault = AIKeyVault.get_instance()
         count = vault.preload_env()
         assert count == 2
-        assert os.environ.get('PRELOAD_A') == 'val_a'
-        assert os.environ.get('PRELOAD_B') == 'val_b'
+        assert os.environ.get('NEWS_API_KEY') == 'val_a'
+        assert os.environ.get('SERPAPI_API_KEY') == 'val_b'
+        os.environ.pop('NEWS_API_KEY', None)
+        os.environ.pop('SERPAPI_API_KEY', None)
+
+    def test_preload_leaves_a_credential_in_the_vault(self, mock_sm):
+        """Only names the process reads from its environment (SECRET_KEYS)
+        are preloaded; a credential entered for an agent reaches a tool
+        through its alias, never as configuration."""
         os.environ.pop('PRELOAD_A', None)
-        os.environ.pop('PRELOAD_B', None)
+        mock_sm._cache = {'PRELOAD_A': 'val_a'}
+        vault = AIKeyVault.get_instance()
+        assert vault.preload_env() == 0
+        assert 'PRELOAD_A' not in os.environ
 
     def test_preload_skips_existing(self, mock_sm):
-        os.environ['EXISTING_KEY'] = 'original'
-        mock_sm._cache = {'EXISTING_KEY': 'vault_value'}
+        os.environ['NEWS_API_KEY'] = 'original'
+        mock_sm._cache = {'NEWS_API_KEY': 'vault_value'}
         vault = AIKeyVault.get_instance()
         count = vault.preload_env()
         assert count == 0
-        assert os.environ['EXISTING_KEY'] == 'original'
-        os.environ.pop('EXISTING_KEY', None)
+        assert os.environ['NEWS_API_KEY'] == 'original'
+        os.environ.pop('NEWS_API_KEY', None)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -341,30 +363,30 @@ class TestCredentialEndpoints:
 # ═══════════════════════════════════════════════════════════════
 
 class TestLocalhostEnforcement:
+    """is_local_request() is core.auth_local's one local check, read from
+    the current request (review of 291e548df, F3)."""
 
-    def test_localhost_ipv4(self):
-        assert is_local_request('127.0.0.1') is True
+    @pytest.fixture
+    def app(self, monkeypatch):
+        from flask import Flask
+        monkeypatch.delenv('TRUSTED_PROXY', raising=False)
+        monkeypatch.delenv('NUNBA_CI', raising=False)
+        return Flask(__name__)
 
-    def test_localhost_ipv6(self):
-        assert is_local_request('::1') is True
+    @pytest.mark.parametrize('addr, local', [
+        ('127.0.0.1', True), ('::1', True), ('::ffff:127.0.0.1', True),
+        ('0.0.0.0', False),          # bind-any sentinel, never a client
+        ('192.168.1.100', False), ('8.8.8.8', False), ('', False)])
+    def test_the_socket_peer_decides(self, app, addr, local):
+        with app.test_request_context(environ_base={'REMOTE_ADDR': addr}):
+            assert is_local_request() is local
 
-    def test_localhost_name(self):
-        assert is_local_request('localhost') is True
-
-    def test_bind_all(self):
-        assert is_local_request('0.0.0.0') is True
-
-    def test_external_ip_rejected(self):
-        assert is_local_request('192.168.1.100') is False
-
-    def test_public_ip_rejected(self):
-        assert is_local_request('8.8.8.8') is False
-
-    def test_empty_rejected(self):
-        assert is_local_request('') is False
-
-    def test_none_rejected(self):
-        assert is_local_request(None) is False
+    def test_a_forwarded_loopback_claim_is_not_local(self, app, monkeypatch):
+        monkeypatch.setenv('TRUSTED_PROXY', '10.0.0.1')
+        with app.test_request_context(
+                environ_base={'REMOTE_ADDR': '10.0.0.1'},
+                headers={'X-Forwarded-For': '127.0.0.1'}):
+            assert is_local_request() is False
 
 
 class TestEndpointLocalhostGate:
@@ -378,7 +400,7 @@ class TestEndpointLocalhostGate:
 
         @app.route('/api/credentials/submit', methods=['POST'])
         def submit():
-            if not is_local_request(flask_request.remote_addr):
+            if not is_local_request():
                 return jsonify({'error': 'localhost only'}), 403
             data = flask_request.get_json(silent=True) or {}
             key_name = (data.get('key_name') or '').strip()
@@ -391,7 +413,7 @@ class TestEndpointLocalhostGate:
 
         @app.route('/api/credentials/pending', methods=['GET'])
         def pending():
-            if not is_local_request(flask_request.remote_addr):
+            if not is_local_request():
                 return jsonify({'error': 'localhost only'}), 403
             vault = AIKeyVault.get_instance()
             return jsonify({'pending': vault.get_pending_requests()})

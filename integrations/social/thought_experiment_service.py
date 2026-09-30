@@ -9,6 +9,7 @@ WorldModelBridge for RL-EF learning.
 
 Service Pattern: static methods, db: Session, db.flush() not db.commit().
 """
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -348,16 +349,61 @@ class ThoughtExperimentService:
         - traditional:  uses LLM scoring (propose → evaluate → refine)
         - physical_ai:  uses visual context (hypothesis → observe → measure)
         - research:     uses web search (search → synthesize → score)
+
+        GATED HERE, for every caller.  The experiment must be approved by
+        the vote -- voting_rules.approval_verdict, the ONE rule: a quorum
+        of distinct identities (>= 3, >= 2 FOR), a FOR share of at least
+        max(2/3, the context's threshold) with one vote per identity (an
+        owner and all their agents are one), and the steward's FOR where
+        the context requires one -- and its lifecycle must be able to reach
+        'evaluating' (advance_status: never backwards from decided/archived).
+        Measured live 2026-09-25 (AE-7): with the gate only in auto-evolve's
+        ranking, one authenticated non-admin POSTed /evaluate on an unvoted
+        experiment and started an autonomous agent goal alone.  A refusal
+        mutates nothing.
         """
         from .models import ThoughtExperiment
+        from .voting_rules import approval_verdict
 
         experiment = db.query(ThoughtExperiment).filter_by(
             id=experiment_id).first()
         if not experiment:
             return {'success': False, 'reason': 'not_found'}
 
-        experiment.status = 'evaluating'
-        db.flush()
+        tally = ThoughtExperimentService.tally_votes(db, experiment_id)
+        verdict = approval_verdict(tally)
+        if not verdict['approved']:
+            return {'success': False, 'reason': 'not_approved',
+                    'verdict': verdict,
+                    'distinct_voters': tally.get('distinct_voters'),
+                    'distinct_supporters': tally.get('distinct_supporters')}
+
+        # advance_status is the ONE writer of the status column; it refuses
+        # to move backwards, so a decided or archived experiment stays closed.
+        if experiment.status != 'evaluating' and not \
+                ThoughtExperimentService.advance_status(
+                    db, experiment_id, 'evaluating'):
+            return {'success': False, 'reason': 'invalid_status',
+                    'current_status': experiment.status}
+
+        # ONE live evaluation goal per experiment.  A paused goal is not
+        # terminal, so an auto-evolve cycle holding one ages out after 6 h
+        # and the next cycle asks again; this used to create another goal
+        # every time (MEASURED live 2026-09-24: each LiveProbe dispatched at
+        # 20:09Z and 02:24Z, six paused goals for three experiments).  The
+        # live goal is returned instead, so the caller tracks the goal that
+        # already exists.  "Ended" is the same set auto_evolve.reconcile
+        # treats as terminal, so a retry after a failure still creates one.
+        existing = ThoughtExperimentService._live_evaluation_goal(
+            db, experiment_id)
+        if existing is not None:
+            return {
+                'success': True,
+                'goal_id': existing.id,
+                'reused': True,
+                'experiment_type': getattr(
+                    experiment, 'experiment_type', 'traditional') or 'traditional',
+            }
 
         exp_type = getattr(experiment, 'experiment_type', 'traditional') or 'traditional'
         recipe = ThoughtExperimentService._build_iteration_recipe(
@@ -409,6 +455,32 @@ class ThoughtExperimentService:
         except Exception as e:
             logger.debug(f"Agent evaluation goal creation failed: {e}")
             return {'success': False, 'reason': str(e)}
+
+    #: Goal statuses after which an evaluation is over -- the same set
+    #: auto_evolve.reconcile treats as terminal.  Anything else ('active',
+    #: 'paused', ...) is still live.
+    _EVALUATION_GOAL_ENDED = frozenset({'completed', 'failed', 'archived'})
+
+    @staticmethod
+    def _live_evaluation_goal(db: Session, experiment_id: str):
+        """The not-yet-ended evaluation goal for this experiment, or None."""
+        from .models import AgentGoal
+        goals = db.query(AgentGoal).filter(
+            AgentGoal.goal_type.in_(
+                ('thought_experiment', 'autoresearch', 'code_evolution')),
+            ~AgentGoal.status.in_(
+                tuple(ThoughtExperimentService._EVALUATION_GOAL_ENDED)),
+        ).all()
+        for g in goals:
+            cfg = g.config_json or {}
+            if isinstance(cfg, str):
+                try:
+                    cfg = json.loads(cfg or '{}')
+                except ValueError:
+                    continue
+            if isinstance(cfg, dict) and cfg.get('experiment_id') == experiment_id:
+                return g
+        return None
 
     @staticmethod
     def _build_iteration_recipe(experiment, exp_type: str, config: dict = None) -> Dict:
@@ -596,43 +668,84 @@ class ThoughtExperimentService:
         votes = db.query(ExperimentVote).filter_by(
             experiment_id=experiment_id).all()
 
-        total_for = 0.0
-        total_against = 0.0
-        weighted_sum = 0.0
-        total_weight = 0.0
+        # Who each vote REALLY belongs to: a registered user, and an agent
+        # is its owner.  An unregistered voter_id is a string anyone can
+        # pass, so it keeps its weight but is no identity for the quorum.
+        from .models import User
+        from .voting_rules import (
+            is_steward, one_vote_per_identity, quorum_met, recommendation)
+        voter_ids = {v.voter_id for v in votes}
+        users = {u.id: u for u in
+                 (db.query(User).filter(User.id.in_(voter_ids)).all()
+                  if voter_ids else [])}
+        # Whose vote is the steward's: voting_rules.is_steward, never a
+        # voter_id string.
+        stewards = {uid for uid, u in users.items() if is_steward(u)}
+
         human_votes = 0
         agent_votes = 0
         suggestions = []
+        steward_vote = None
+        ballots = []
 
         for v in votes:
-            if v.voter_type == 'human':
-                human_weight = context_rules['human_weight'] if context_rules else 1.0
-                weight = human_weight
-                human_votes += 1
-            else:
+            if v.voter_id in stewards:
+                steward_vote = (v.vote_value if steward_vote is None
+                                else min(steward_vote, v.vote_value))
+            user = users.get(v.voter_id)
+            # Agent or human from the ACCOUNT, never the stored voter_type,
+            # which the vote route used to take from the request body.  Only
+            # an unregistered id (in-process callers) falls back to it.
+            is_agent = ((user.user_type == 'agent') if user is not None
+                        else v.voter_type != 'human')
+            if is_agent:
                 agent_weight = context_rules['agent_weight'] if context_rules else 1.0
                 weight = v.confidence * agent_weight
                 agent_votes += 1
-
-            weighted_sum += v.vote_value * weight
-            total_weight += weight
-
-            if v.vote_value > 0:
-                total_for += weight
-            elif v.vote_value < 0:
-                total_against += weight
+            else:
+                weight = context_rules['human_weight'] if context_rules else 1.0
+                human_votes += 1
+            if user is not None:
+                identity, own = (user.owner_id or user.id), not is_agent
+            else:
+                identity, own = ('unregistered', v.voter_id), True
+            ballots.append({'identity': identity, 'own': own,
+                            'value': v.vote_value, 'weight': weight})
 
             if v.suggestion:
                 suggestions.append({
                     'voter_id': v.voter_id,
-                    'voter_type': v.voter_type,
+                    'voter_type': 'agent' if is_agent else 'human',
                     'suggestion': v.suggestion,
                 })
 
-        weighted_score = weighted_sum / total_weight if total_weight > 0 else 0.0
-        threshold = context_rules['approval_threshold'] if context_rules else 0.5
+        # ONE vote per identity (voting_rules.one_vote_per_identity): an
+        # owner and all their agents weigh as one in the ratio, as they
+        # already counted as one in the quorum.
+        total_for = 0.0
+        total_against = 0.0
+        weighted_sum = 0.0
+        total_weight = 0.0
+        voters = set()
+        supporters = set()
+        for identity, (value, weight) in one_vote_per_identity(ballots).items():
+            weighted_sum += value * weight
+            total_weight += weight
+            if value > 0:
+                total_for += weight
+            elif value < 0:
+                total_against += weight
+            registered = not (isinstance(identity, tuple)
+                              and identity[0] == 'unregistered')
+            if registered and weight > 0 and value != 0:
+                voters.add(identity)
+                if value > 0:
+                    supporters.add(identity)
 
-        return {
+        weighted_score = weighted_sum / total_weight if total_weight > 0 else 0.0
+        quorate = quorum_met(len(voters), len(supporters))
+
+        tally = {
             'experiment_id': experiment_id,
             'total_votes': len(votes),
             'human_votes': human_votes,
@@ -643,13 +756,16 @@ class ThoughtExperimentService:
             'total_weight': round(total_weight, 2),
             'suggestions': suggestions,
             'decision_context': decision_context,
-            'approval_threshold': threshold,
-            'decision_recommendation': (
-                'approve' if weighted_score > threshold
-                else 'reject' if weighted_score < -threshold
-                else 'inconclusive'
-            ),
+            'distinct_voters': len(voters),
+            'distinct_supporters': len(supporters),
+            'quorum_met': quorate,
+            'steward_vote': steward_vote,
         }
+        # From the ONE approval rule (voting_rules.approval_verdict), never
+        # a threshold of its own: this used to say 'approve' on the context
+        # threshold while the goal writer approved on 2/3 alone.
+        tally['decision_recommendation'] = recommendation(tally)
+        return tally
 
     @staticmethod
     def decide(db: Session, experiment_id: str,
@@ -657,35 +773,28 @@ class ThoughtExperimentService:
         """Record final decision for an experiment.
 
         Transitions to 'decided' status. Feeds outcome to WorldModelBridge.
-        Steward-required contexts block decision until steward has voted.
+        Steward-required contexts block decision until the steward has
+        answered FOR or AGAINST (an abstain is no answer).
         """
-        from .models import ThoughtExperiment, ExperimentVote
+        from .models import ThoughtExperiment
+        from .voting_rules import approval_verdict
 
         experiment = db.query(ThoughtExperiment).filter_by(
             id=experiment_id).first()
         if not experiment:
             return None
 
-        # Steward gate: certain contexts require steward vote before decision
-        try:
-            from .voting_rules import get_voter_rules, classify_decision_context
-            exp_dict = experiment.to_dict()
-            context = exp_dict.get('decision_context') or \
-                classify_decision_context(exp_dict)
-            rules = get_voter_rules(context)
-            if rules.get('steward_required'):
-                steward_voted = db.query(ExperimentVote).filter_by(
-                    experiment_id=experiment_id,
-                    voter_id='steward',
-                ).first()
-                if not steward_voted:
-                    return {'error': 'steward_vote_required',
-                            'context': context,
-                            'message': 'Steward must vote before decision on security contexts'}
-        except ImportError:
-            pass
-
+        # Steward gate, from the ONE rule (voting_rules.approval_verdict):
+        # who the steward is and whether they answered come from the tally
+        # (voting_rules.is_steward), never a voter_id string.  A decision may
+        # record either outcome, so a steward AGAINST lets it be decided;
+        # only no answer (or an abstain) waits.
         tally = ThoughtExperimentService.tally_votes(db, experiment_id)
+        if approval_verdict(tally)['steward_missing']:
+            return {'error': 'steward_vote_required',
+                    'context': tally.get('decision_context'),
+                    'message': 'Steward must vote before decision on security contexts'}
+
         experiment.status = 'decided'
         experiment.decision_outcome = decision_text
         experiment.decision_rationale = {
@@ -730,9 +839,17 @@ class ThoughtExperimentService:
 
     @staticmethod
     def get_active_experiments(db: Session, status: str = None,
-                                limit: int = 50) -> List[Dict]:
-        """List experiments filtered by status."""
-        from .models import ThoughtExperiment
+                                limit: int = 50,
+                                with_votes_only: bool = False) -> List[Dict]:
+        """List experiments filtered by status, newest first.
+
+        with_votes_only: only experiments with at least one vote.  This is
+        the question auto-evolve's VOTE gate asks -- a zero-vote experiment
+        can never pass it -- and without it the newest-`limit` window hid
+        every voted row once unvoted rows piled up (measured on a live
+        node: the three human-voted experiments sat at rank ~693 of 807).
+        """
+        from .models import ThoughtExperiment, ExperimentVote
 
         query = db.query(ThoughtExperiment)
         if status:
@@ -740,6 +857,11 @@ class ThoughtExperimentService:
         else:
             query = query.filter(
                 ThoughtExperiment.status != 'archived')
+        if with_votes_only:
+            query = query.filter(
+                db.query(ExperimentVote.id).filter(
+                    ExperimentVote.experiment_id == ThoughtExperiment.id,
+                ).exists())
 
         experiments = query.order_by(
             desc(ThoughtExperiment.created_at)

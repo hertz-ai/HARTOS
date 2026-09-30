@@ -96,8 +96,17 @@ def list_goals():
 @coding_agent_bp.route('/api/coding/goals/<goal_id>', methods=['GET'])
 @require_auth
 def get_goal(goal_id):
+    """One coding goal, to whoever dashboard_service.may_steer admits (its
+    owner, an admin, this machine for a goal no person owns); an unknown id
+    and someone else's goal answer the same 403.  Review of dc32b1146: this
+    served any signed-in user."""
     from .goal_manager import CodingGoalManager
+    from integrations.social.dashboard_service import goal_to_steer, steering_caller
 
+    _, refused = goal_to_steer(g.db, goal_id, 'read', steering_caller(),
+                               str(g.user.id), audit=False)
+    if refused:
+        return jsonify({'success': False, 'data': refused}), 403
     result = CodingGoalManager.get_goal(g.db, goal_id)
     return jsonify(result)
 
@@ -106,11 +115,18 @@ def get_goal(goal_id):
 @require_admin
 @_require_central
 def update_goal(goal_id):
-    from .goal_manager import CodingGoalManager
+    """Set a coding goal's status the way every goal's status is set: by the
+    steering verb that reaches it (dashboard_service.steer_response), so a
+    finished goal is never revived.  It wrote any status, 'active' when the
+    body named none (review of 275e8e361); an empty body is now a 400."""
+    from integrations.social.dashboard_service import steer_response, steering_caller
 
     data = request.get_json() or {}
-    result = CodingGoalManager.update_goal_status(g.db, goal_id, data.get('status', 'active'))
-    return jsonify(result)
+    body, code = steer_response(g.db, goal_id, status=data.get('status'),
+                                caller=steering_caller(),
+                                actor_id=str(g.user.id),
+                                reason='/api/coding/goals status')
+    return jsonify(body), code
 
 
 # ─── Opt-In / Opt-Out (self-service) ───

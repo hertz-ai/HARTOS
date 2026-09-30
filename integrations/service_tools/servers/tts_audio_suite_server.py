@@ -121,36 +121,60 @@ def synthesize():
     if not text:
         return jsonify({'error': 'text is required'}), 400
 
-    model = _load_model()
-    if not model.get('loaded'):
-        return jsonify({'error': f"Model not loaded: {model.get('error', 'unknown')}"}), 503
-
-    try:
-        output_id = str(uuid.uuid4())[:8]
-        output_path = os.path.join(OUTPUT_DIR, f"tts_{output_id}.wav")
-
-        # TODO: Replace with actual TTS-Audio-Suite inference call once repo is cloned
-        return jsonify({
-            'success': True,
-            'audio_url': f"/audio/{output_id}",
-            'text': text,
-            'model': model_name,
-            'language': language,
-            'message': 'TTS-Audio-Suite synthesis placeholder — model integration pending repo clone',
-        })
-    except Exception as e:
-        logger.error(f"Synthesis failed: {e}")
-        return jsonify({'error': str(e)}), 500
+    # This sidecar CANNOT synthesize, and must not pretend otherwise.
+    #
+    # Measured 2026-09-21 against the live sidecar: the previous body
+    # returned 200 {"success": true, "audio_url": "/audio/<id>"} while
+    # writing nothing -- GET /audio/<id> answered 404 and OUTPUT_DIR held
+    # zero files.  media_agent._generate_audio_speech turns a 200 into
+    # {'status': 'completed', ...}, so an agent asking for speech was told
+    # it had speech.  A success flag for work that did not happen is worse
+    # than an error.
+    #
+    # It cannot be implemented here either: diodiogod/TTS-Audio-Suite is a
+    # ComfyUI custom-node pack (pyproject [tool.comfy]; 60
+    # NODE_CLASS_MAPPINGS in nodes.py; requirements.txt: "This custom node
+    # uses install.py"), so the clone exposes no synthesis HTTP API to
+    # proxy.  Its engines -- chatterbox, chatterbox_official_23lang,
+    # cosyvoice, f5_tts, omnivoice -- are ALREADY first-class entries in
+    # integrations/channels/media/tts_router.py::ENGINE_REGISTRY, each with
+    # its own tool module.  Synthesizing here would be a second TTS stack
+    # beside the canonical router, which this codebase treats as a defect.
+    logger.warning(
+        "/synthesize refused: this sidecar has no engine; the canonical "
+        "path is tts_router.get_tts_router().synthesize()"
+    )
+    return jsonify({
+        'error': 'not_implemented',
+        'message': (
+            'tts_audio_suite exposes no synthesis backend. Upstream is a '
+            'ComfyUI node pack with no HTTP API, and its engines are '
+            'already in the canonical TTS registry. Use '
+            'integrations.channels.media.tts_router.get_tts_router()'
+            '.synthesize() instead.'
+        ),
+        'canonical_path': 'integrations.channels.media.tts_router',
+        'text': text,
+        'model': model_name,
+        'language': language,
+    }), 501
 
 
 @app.route('/models', methods=['GET'])
 def list_models():
-    """List available TTS models."""
+    """List available TTS models.
+
+    Empty by construction: this sidecar has no engine (see /synthesize).
+    It previously advertised a 'default' model that could not be invoked,
+    which read to a tool-selecting agent as a usable capability.
+    """
     return jsonify({
-        'models': [
-            {'name': 'default', 'description': 'Default TTS model', 'languages': ['en']},
-        ],
-        'message': 'Model list placeholder — populated after model download',
+        'models': [],
+        'canonical_path': 'integrations.channels.media.tts_router',
+        'message': (
+            'No models served here. TTS engines live in '
+            'tts_router.ENGINE_REGISTRY.'
+        ),
     })
 
 

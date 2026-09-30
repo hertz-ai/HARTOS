@@ -11,8 +11,9 @@ if sys.platform == 'win32':
     import asyncio as _asyncio_boot
     _asyncio_boot.set_event_loop_policy(_asyncio_boot.WindowsSelectorEventLoopPolicy())
 from core.subprocess_safe import run_bounded
+from core.platform_paths import under_test as _under_test
 import io
-if sys.platform == 'win32' and 'pytest' not in sys.modules:
+if sys.platform == 'win32' and not _under_test():
     # Force UTF-8 encoding for stdout/stderr to prevent crashes with non-ASCII characters
     # Skip when running under pytest — pytest wraps stdout/stderr for capture,
     # and replacing them here closes pytest's file handles.
@@ -414,7 +415,16 @@ def hevolve_verify_boot():
         _boot_logger.warning(msg)
         return
 
-    current_code_hash = compute_code_hash()
+    # force_walk: the boot check must hash the bytes it is about to run, never
+    # a cache.  compute_code_hash's mtime cache lives in agent_data/, which the
+    # deploy bind-mounts into EVERY container, so the cache one image writes is
+    # read by the next.  Measured 2026-09-22 15:56Z on central: a cancelled
+    # deploy's script kept running and booted its image at 15:37Z, writing the
+    # cache; the next image's checkout carried an earlier mtime (15:32Z, its
+    # git reset), so this line returned the PREVIOUS image's hash, called the
+    # new image tampered ("CODE_HASH mismatch"), and the deploy rolled back
+    # into a crash loop.  A forced walk is a pure read: one directory walk.
+    current_code_hash = compute_code_hash(force_walk=True)
     if d.get("code_hash") != current_code_hash:
         msg = "[HevolveIntegrity] CODE_HASH mismatch"
         if mode == "hard":
@@ -562,12 +572,8 @@ except Exception:
     # helper uses, so we NEVER fall back to the read-only /nix/store package dir on
     # the embedded OS (the boot crash this guards). get_recipe_prompts_dir handles
     # frozen desktop + embedded HART OS (/nix/store or /etc/hartos-release) + dev.
-    try:
-        from core.platform_paths import get_recipe_prompts_dir
-        PROMPTS_DIR = os.path.abspath(get_recipe_prompts_dir())
-    except Exception:
-        PROMPTS_DIR = os.path.abspath(os.path.join(
-            os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
+    from core.platform_paths import get_recipe_prompts_dir
+    PROMPTS_DIR = os.path.abspath(get_recipe_prompts_dir())
 
 # Ensure prompts directory exists (agent creation writes JSON here)
 os.makedirs(PROMPTS_DIR, exist_ok=True)
@@ -613,13 +619,8 @@ def _get_or_create_graph(user_id, prompt_id=None):
         session_key = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
         with _memory_graph_lock:
             if session_key not in _memory_graphs:
-                try:
-                    from core.platform_paths import get_memory_graph_dir
-                    db_path = get_memory_graph_dir(session_key)
-                except ImportError:
-                    db_path = os.path.join(
-                        os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", session_key
-                    )
+                from core.platform_paths import get_memory_graph_dir
+                db_path = get_memory_graph_dir(session_key)
                 _memory_graphs[session_key] = MemoryGraph(
                     db_path=db_path,
                     user_id=str(user_id),
@@ -826,11 +827,8 @@ logging.setLogRecordFactory(RequestLogRecord)
 _is_bundled = bool(os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False))
 
 if _is_bundled:
-    try:
-        from core.platform_paths import get_log_dir as _get_log_dir_lc
-        _nunba_log_dir = _get_log_dir_lc()
-    except ImportError:
-        _nunba_log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
+    from core.platform_paths import get_log_dir as _get_log_dir_lc
+    _nunba_log_dir = _get_log_dir_lc()
     try:
         os.makedirs(_nunba_log_dir, exist_ok=True)
     except PermissionError:
@@ -906,24 +904,59 @@ stream_handler.setFormatter(formatter)
 # handlers owned by anyone else.
 _HARTOS_HANDLER_TAG = '_hartos_root_handler'
 
-_root = logging.getLogger()
-for _existing in list(_root.handlers):
-    if getattr(_existing, _HARTOS_HANDLER_TAG, False):
-        _root.removeHandler(_existing)
-_root.setLevel(logging.INFO)
 
-if _is_bundled:
-    setattr(handler, _HARTOS_HANDLER_TAG, True)
-    setattr(stream_handler, _HARTOS_HANDLER_TAG, True)
-    _root.addHandler(handler)
-    _root.addHandler(stream_handler)
+def _install_root_handlers(root, bundled, file_handler, console_handler):
+    """Attach this module's handlers to the ROOT logger, without stealing anyone's.
+
+    Three launch shapes, three answers:
+      * bundled (cx_Freeze): root gets file + console, so every module logger
+        lands in langchain.log and the console;
+      * a host that already configured root (Nunba's gui_app.log/server.log,
+        pytest's capture): root is left exactly as found, per the 2026-08-03
+        incident above;
+      * a bare root with NO handler at all: root gets the console handler.
+
+    The third case is the OS and Docker launch (`python hart_intelligence_entry.py`
+    under systemd). Before 2026-09-24 it got nothing, so every INFO line the
+    root logger saw during main() went to Python's lastResort handler, which
+    prints WARNING and above only. Measured on the hart-ota-central nixos test
+    (2026-09-23 run, shard 0): "STARTUP VALIDATION WARNINGS" reached the journal
+    as bare text, and "[Guardrail] hash verified", "Platform bootstrapped" and
+    "Local subscribers bootstrapped: ... ota-push" never appeared at all, until a
+    background thread's import called logging.basicConfig() some two seconds
+    after Waitress bound and INFO started flowing in basicConfig's format. The
+    OTA test waited 240 s for a line the process had already dropped, and the
+    boot narrative that hart-backend.nix exempts from the journald rate limit
+    was never being written in the first place.
+
+    Attaching only when root is empty is the same rule basicConfig() follows, so
+    a later basicConfig() call becomes the no-op it was always meant to be and
+    the journal keeps ONE format (the RequestID/threadName one) end to end.
+    """
+    for existing in list(root.handlers):
+        if getattr(existing, _HARTOS_HANDLER_TAG, False):
+            root.removeHandler(existing)
+    root.setLevel(logging.INFO)
+
+    if bundled:
+        setattr(file_handler, _HARTOS_HANDLER_TAG, True)
+        setattr(console_handler, _HARTOS_HANDLER_TAG, True)
+        root.addHandler(file_handler)
+        root.addHandler(console_handler)
+    elif not root.handlers:
+        setattr(console_handler, _HARTOS_HANDLER_TAG, True)
+        root.addHandler(console_handler)
+
+
+_root = logging.getLogger()
+_install_root_handlers(_root, _is_bundled, handler, stream_handler)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 # One payload policy for app AND transport: core.serve passes the same
 # constant to Hypercorn's WSGI middleware (whose 64 KB library default
 # otherwise transport-rejects bodies Flask's own cap here would accept).
-from core.constants import MAX_PAYLOAD_BYTES
+from core.constants import MAX_PAYLOAD_BYTES, SHELL_COMMAND_TIMEOUT_S
 app.config['MAX_CONTENT_LENGTH'] = MAX_PAYLOAD_BYTES  # 2MB default, HEVOLVE_MAX_PAYLOAD_BYTES to override
 
 # ── LLM outbound logger ───────────────────────────────────────────────
@@ -1515,7 +1548,7 @@ try:
         Secrets never leave the user's device. This endpoint rejects
         any request that doesn't originate from the local machine.
         """
-        if not is_local_request(request.remote_addr):
+        if not is_local_request():
             return jsonify({'error': 'Credential endpoints are localhost only. '
                             'Secrets never leave your device.'}), 403
         data = request.get_json(silent=True) or {}
@@ -1524,6 +1557,9 @@ try:
         if not key_name or not value:
             return jsonify({'error': 'key_name and value are required'}), 400
         vault = _VaultCls.get_instance()
+        # A name the process holds that this vault did not store (PATH,
+        # HTTPS_PROXY...) is left alone by store_credential and answered as
+        # any other, so this endpoint does not say which variables exist.
         resolved = vault.store_credential(
             key_name=key_name,
             value=value,
@@ -1535,7 +1571,7 @@ try:
     @_json_endpoint
     def _api_credentials_pending():
         """List pending credential requests — LOCALHOST ONLY."""
-        if not is_local_request(request.remote_addr):
+        if not is_local_request():
             return jsonify({'error': 'Credential endpoints are localhost only.'}), 403
         vault = _VaultCls.get_instance()
         return jsonify({'pending': vault.get_pending_requests()})
@@ -1593,18 +1629,34 @@ try:
         except Exception as fwd_err:
             return jsonify({'error': f'HevolveAI backend unavailable: {fwd_err}'}), 502
 
-        # Meter usage for revenue split
-        usage = result.get('usage', {})
-        total_tokens = usage.get('total_tokens', 0)
+        # The serving half of a hive expert exchange: a peer's person asked,
+        # this node's operator earns the compute served (owner ruling
+        # 2026-09-26).  No requester header (an SDK client) earns nothing.
+        if resp.status_code == 200:
+            from integrations.agent_engine.budget_gate import credit_served_completion
+            credit_served_completion(request.headers, data, result)
+
+        # Meter usage for the 90/9/1 revenue split. This passed keywords
+        # record_metered_usage does not accept (provider/model/tokens/source);
+        # the TypeError was swallowed below, so SDK usage was NEVER metered
+        # (hevolveai Master 11.435 S2). meter_llm_call owns the contract;
+        # 'hive' is the settled cross-operator source. Two things stay open
+        # for the owner: MeteredAPIUsage has no consumer field (the old
+        # 'sdk:<consumer>' tag had nowhere to go), and a LOCAL model prices at
+        # 0 via spark_per_1k, so SDK use of a local model records no revenue.
+        usage = result.get('usage', {}) or {}
+        total_tokens = usage.get('total_tokens', 0) or 0
         if total_tokens > 0:
             try:
-                from integrations.agent_engine.budget_gate import record_metered_usage
-                consumer = request.headers.get('X-Consumer-Username', 'anonymous')
-                record_metered_usage(
-                    provider='hevolve',
+                from integrations.agent_engine.budget_gate import meter_llm_call
+                tokens_in = usage.get('prompt_tokens', 0) or 0
+                tokens_out = usage.get('completion_tokens',
+                                       max(0, total_tokens - tokens_in)) or 0
+                meter_llm_call(
                     model=data.get('model', 'hevolve'),
-                    tokens=total_tokens,
-                    source=f'sdk:{consumer}'
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
+                    task_source='hive',
                 )
             except Exception:
                 logging.getLogger(__name__).exception("_completions_proxy: swallowed Exception")  # metering failure must not block response
@@ -1616,20 +1668,10 @@ try:
     def _gateway_metering():
         """SDK usage metering stats for billing dashboard."""
         try:
-            from integrations.social.models import db_session, MeteredAPIUsage
-            from sqlalchemy import func
-            with db_session() as session:
-                rows = session.query(
-                    MeteredAPIUsage.provider,
-                    func.sum(MeteredAPIUsage.tokens_used),
-                    func.count(MeteredAPIUsage.id)
-                ).group_by(MeteredAPIUsage.provider).all()
-                return jsonify({
-                    'providers': [
-                        {'provider': r[0], 'total_tokens': int(r[1] or 0), 'calls': r[2]}
-                        for r in rows
-                    ]
-                })
+            from integrations.social.models import db_session
+            from integrations.agent_engine.budget_gate import metered_usage_by_model
+            with db_session(commit=False) as session:
+                return jsonify({'providers': metered_usage_by_model(session)})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
@@ -2352,12 +2394,12 @@ try:
     if _CrossbarPub is not None:
         client = _CrossbarPub(_wamp_url)
     elif _legacy_cb is not None and hasattr(_legacy_cb, 'Client'):
-        client = _legacy_cb.Client(_wamp_url)
+        client = _legacy_cb.Client(_wamp_url, timeout=2.0)
     else:
         # Legacy package may expose Client at .crossbarhttp.Client
         # (broken namespace install).  Probe before giving up.
         _nested = getattr(_legacy_cb, 'crossbarhttp', None) if _legacy_cb else None
-        client = _nested.Client(_wamp_url) if (_nested and hasattr(_nested, 'Client')) else None
+        client = _nested.Client(_wamp_url, timeout=2.0) if (_nested and hasattr(_nested, 'Client')) else None
 except Exception as _cb_err:
     client = None
     try:
@@ -2373,20 +2415,55 @@ crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossb
 atexit.register(lambda: crossbar_executor.shutdown(wait=False))
 
 
+_crossbar_client_lock = threading.Lock()
+
+
 def _http_crossbar_publish(topic: str, payload: str, timeout: float = 2.0):
-    """HTTP Crossbar publish — injected into MessageBus as transport fallback."""
+    """Use the publisher's timeout; never change another socket's defaults.
+
+    An unreachable Crossbar is an ordinary state (an offline node), so a
+    topic's failure is announced once when it starts and once when it ends,
+    not as a traceback per publish.  Tracked per topic (``.failing_topics``,
+    under the client lock the publish already holds): one global flag let two
+    workers both warn, and let one always-failing topic beside healthy ones
+    flip it -- a warning and a "recovered" line per publish.
+    """
     if client is None:
         return
-    import socket
-    try:
-        original_timeout = socket.getdefaulttimeout()
-        socket.setdefaulttimeout(timeout)
-        client.publish(topic, payload)
-    except Exception:
-        logging.getLogger(__name__).exception("_http_crossbar_publish: swallowed Exception")
-    finally:
-        if original_timeout is not None:
-            socket.setdefaulttimeout(original_timeout)
+    error = None
+    # The installed crossbarhttp3 distribution exposes crossbarhttp.Client.
+    # Its timeout and signed-message sequence are mutable client state.
+    # Serialize only this cloud leg; local/SSE/PeerLink fanout stays async.
+    with _crossbar_client_lock:
+        try:
+            if hasattr(client, 'timeout'):
+                previous = client.timeout
+                try:
+                    client.timeout = timeout
+                    client.publish(topic, payload)
+                finally:
+                    client.timeout = previous
+            else:
+                # Preserve alternate SDK compatibility. Its implementation
+                # owns its timeout; process-global socket mutation is unsafe.
+                client.publish(topic, payload)
+        except Exception as e:
+            error = e
+        failing = _http_crossbar_publish.__dict__.setdefault(
+            'failing_topics', set())
+        log = logging.getLogger(__name__)
+        if error is None:
+            if topic in failing:
+                failing.discard(topic)
+                log.info("Crossbar publish recovered for %s", topic)
+        elif topic in failing or len(failing) >= 1000:
+            log.debug("Crossbar publish still failing for %s: %s", topic, error)
+        else:
+            failing.add(topic)
+            log.warning("Crossbar publish failing for %s (cloud copy not "
+                        "sent; local/PeerLink delivery unaffected): %s: %s -- "
+                        "repeats are logged at debug until it recovers",
+                        topic, type(error).__name__, error)
 
 
 # Inject HTTP transport into MessageBus (avoids Layer 2 importing Layer 3)
@@ -2446,6 +2523,11 @@ def publish_async(topic, message, timeout=2.0):
             data = json.loads(message)
         except (json.JSONDecodeError, TypeError):
             data = {'raw': message}
+    # The user the PAYLOAD names, read before the bus leg below stamps the
+    # topic suffix into it: the egress rule compares it with the owner of
+    # the Crossbar URI (a payload naming nobody on a declared per-user URI
+    # is that URI's user's).
+    _claimed_user = data.get('user_id', '') if isinstance(data, dict) else ''
 
     # 1. Route through MessageBus (LOCAL + PEERLINK — always works offline)
     try:
@@ -2537,20 +2619,31 @@ def publish_async(topic, message, timeout=2.0):
 
     raw_message = message if isinstance(message, str) else json.dumps(message, default=str)
 
-    def _publish():
-        import socket
+    # Egress (owner ruling 2026-09-26): a topic that is not the message
+    # user's own reaches other people's subscribers, so it carries the
+    # scrubbed copy, or nothing when the scrub failed.  Asked of the one rule
+    # (security.edge_privacy.crossbar_egress_copy) the MessageBus Crossbar
+    # leg asks; the user's own topic still goes byte-identical.
+    _wire, _wire_is_json = message, not isinstance(message, str)
+    if isinstance(message, str):
         try:
-            original_timeout = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(timeout)
-            client.publish(topic, raw_message)
-            app.logger.debug(f"Published to Crossbar: {topic}")
-        except Exception as e:
-            app.logger.debug(f"Crossbar HTTP publish failed (offline OK): {e}")
-        finally:
-            if original_timeout is not None:
-                socket.setdefaulttimeout(original_timeout)
+            _wire, _wire_is_json = json.loads(message), True
+        except (json.JSONDecodeError, TypeError):
+            pass
+    try:
+        from security.edge_privacy import crossbar_egress_copy
+        _out = crossbar_egress_copy(topic, _wire, _claimed_user)
+    except ImportError as _ep_err:
+        app.logger.warning(f"Egress rule unavailable ({_ep_err}); not "
+                           f"publishing {topic} to Crossbar")
+        return
+    if _out is None:
+        return
+    if _out is not _wire:
+        raw_message = json.dumps(_out, default=str) if _wire_is_json else _out
 
-    crossbar_executor.submit(_publish)
+    crossbar_executor.submit(_http_crossbar_publish, topic, raw_message, timeout)
+
 
 
 def _get_dynamic_capability_prompt() -> str:
@@ -3031,35 +3124,76 @@ def _push_workflow_flowchart(user_id, prompt_id, request_id=None):
         logging.getLogger(__name__).exception("_push_workflow_flowchart: swallowed Exception")
 
 
-def _request_consent(agent_id: str, action: str, label: str, input_text: str) -> str:
-    """Request capability consent from user via approval card (Liquid UI → SSE fallback)."""
-    user_id = thread_local_data.get_user_id()
-    description = f'{label} access needed: {input_text}'
-    # Primary: Liquid UI (reaches Android/web/desktop)
+def _request_consent(action: str, label: str, input_text: str) -> str:
+    """Ask this computer's owner for a capability, through ConsentService.
+
+    Same canonical path as every other ask -- integrations.vlm.safety
+    .computer_control_block, vision_service's capture loop, whisper_tool,
+    social/auth, ai_governance, hive_guardrails -- so the ask is a
+    UserConsent row the owner can see on the privacy page and revoke, it
+    carries an immutable audit entry, and it leaves as `consent.request`,
+    the one payload type every surface renders.
+
+    It used to push a bare `{'type': 'approval'}` component through
+    LiquidUIService with a broadcast_sse_safe fallback and touch no database
+    at all.  That meant: nothing to revoke, nothing on the privacy page, and
+    a payload only AgentOverlay knows -- so the floating companion, which
+    exists precisely for when Nunba is NOT the window in front, dropped every
+    camera and screen ask (#863).  The canonical emit that fixed the sibling
+    asks landed upstream on 2026-08-26 (e991309da); this path never migrated.
+
+    Whose permission: the owner of this desktop (HEVOLVE_OWNER_USER_ID, which
+    Nunba exports at boot), never the caller -- the camera and the screen are
+    this machine's, and a remote user must not be asked to lend them.  Same
+    rule and same fail-closed answer as computer_control_block and
+    /visual_agent (#66).  Which agent is asking comes from the request's own
+    prompt id, not the capability label the tool wrapper passes.
+    """
+    # ONE normaliser for "is this a real agent id", shared with the
+    # computer_control and credential asks rather than copied (it already
+    # handles the '0' and 'None' spellings this codebase passes around).
+    from integrations.social.consent_service import (
+        ConsentService, consent_type_for_action, known_agent_id)
+    from integrations.social.models import db_session
+
+    log = logging.getLogger(__name__)
+    consent_type = consent_type_for_action(action)
+    if consent_type is None:
+        log.error('_request_consent: %r maps to no consent type', action)
+        return (f"Could not request {label.lower()} access — this computer "
+                f"records no permission for '{action}'.")
+
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    if not owner:
+        log.warning('%s consent not asked: no owner identity '
+                    '(HEVOLVE_OWNER_USER_ID is not set)', label)
+        return (f"Not asked: nobody is signed in on this computer who could "
+                f"allow {label.lower()} access.")
+
+    agent = known_agent_id(thread_local_data.get_prompt_id())
+    reason = f'{label} access needed: {input_text}'.strip()
     try:
-        from core.platform.registry import ServiceRegistry
-        svc = ServiceRegistry.get('LiquidUIService')
-        if svc:
-            svc.agent_request_approval(agent_id=agent_id, action=action, description=description)
-            return f"{label} access request sent to user. Waiting for approval."
+        with db_session(commit=True) as db:
+            if ConsentService.check_or_request(db, owner, consent_type,
+                                               agent_id=agent, reason=reason):
+                return f"{label} access is already allowed — go ahead."
+            if ConsentService.declined(db, owner, consent_type, agent_id=agent):
+                return (f"The owner of this computer said no to "
+                        f"{label.lower()} access.")
     except Exception:
-        logging.getLogger(__name__).exception("_request_consent: swallowed Exception")
-    # Fallback: SSE (Nunba desktop WebView2)
-    from core.platform.events import broadcast_sse_safe
-    if broadcast_sse_safe('agent.ui.update', {
-        'type': 'approval', 'agent_id': agent_id,
-        'action': action, 'description': description,
-    }, user_id=str(user_id)):
-        return f"{label} access request sent to user. Waiting for approval."
-    return f"Could not request {label.lower()} access — notification system unavailable."
+        log.exception('_request_consent: %s ask could not be filed', label)
+        return (f"Could not request {label.lower()} access — the permission "
+                f"system is unavailable.")
+    return (f"{label} access request sent to the owner of this computer. "
+            f"Waiting for their answer.")
 
 
 def _request_capability_consent(input_text: str) -> str:
-    return _request_consent('vision', 'enable_camera', 'Camera', input_text)
+    return _request_consent('enable_camera', 'Camera', input_text)
 
 
 def _request_screen_consent(input_text: str) -> str:
-    return _request_consent('computer_use', 'enable_screen', 'Screen', input_text)
+    return _request_consent('enable_screen', 'Screen', input_text)
 
 
 
@@ -3248,6 +3382,14 @@ def _handle_shell_command_tool(input_text: str) -> str:
                 f"If you really need this, ask the user to run it manually."
             )
 
+    # --- The shared hard-deny policy every computer-use dispatcher calls
+    # (power/reset/erase, and stopping the assistant's own processes, #877).
+    # The LangChain Shell_Command tool reached run_bounded without it.
+    from integrations.vlm.safety import computer_operation_refusal
+    _refusal = computer_operation_refusal({'command': text})
+    if _refusal is not None:
+        return f"Shell_Command refused: {_refusal}"
+
     # --- The owner's permission: the same computer_control consent the VLM
     # loop checks (integrations.vlm.safety.computer_control_block).  After
     # the denylist on purpose, so a destructive command is refused without
@@ -3296,17 +3438,41 @@ def _handle_shell_command_tool(input_text: str) -> str:
     # shell=True, so the string is not double-parsed.  no_window_kwargs() is
     # applied INSIDE run_bounded; repeating it here would be a second copy of
     # that decision.
+    # Announce it like any other computer-use step, instead of poking the
+    # ribbon directly.  Two things were wrong with the bare poke: the floating
+    # companion window, which reads the computer_use.update topic, never heard
+    # shell commands at ALL; and its `finally` hide took the ribbon down even
+    # when this ran INSIDE a VLM run that was still driving the machine.
+    # current_run joins that enclosing run when there is one (this tool
+    # reaches here on the loop's own thread) and opens a run of its own when
+    # there is not, so neither case needs a branch here.
+    from integrations.vlm.activity_stream import current_run
+    _caption = f"Shell command: {text[:60]}"
+    _run = current_run(user_id=thread_local_data.get_user_id() or '',
+                       prompt_id=thread_local_data.get_prompt_id() or '')
+    _run.step(iteration=1, action='shell', phase='executing', caption=_caption)
+    _phase, _err = 'completed', ''
     try:
-        proc = run_bounded(argv, timeout=30)
+        proc = run_bounded(argv, timeout=SHELL_COMMAND_TIMEOUT_S)
     except FileNotFoundError as e:
+        _phase, _err = 'failed', f'interpreter not found — {e}'
         return f"Shell_Command: interpreter not found — {e}"
     except Exception as e:
+        _phase, _err = 'failed', f'{type(e).__name__}: {str(e)[:200]}'
         return f"Shell_Command error: {type(e).__name__}: {str(e)[:200]}"
+    finally:
+        _run.step(iteration=1, action='shell', phase=_phase,
+                  caption=_caption, error=_err)
+        # Only closes a run this call opened; inside a VLM run the loop still
+        # owns the ribbon and the ledger task.
+        _run.finish(exit_reason='done' if _phase == 'completed' else 'action_error',
+                    iteration=1, action='shell', error=_err)
 
     # run_bounded never raises TimeoutExpired — it reports the kill this way.
     if proc.timed_out:
         return (
-            "Shell_Command timed out after 30s. For long-running work use "
+            f"Shell_Command timed out after {SHELL_COMMAND_TIMEOUT_S}s. "
+            "For long-running work use "
             "Execute_Coding_Task instead, which has a longer budget."
         )
 
@@ -3357,7 +3523,8 @@ def _handle_computer_action_tool(input_text: str) -> str:
     prompt_id = thread_local_data.get_prompt_id()
     try:
         os.environ.setdefault('HEVOLVE_VLM_UNIFIED', 'true')
-        from integrations.vlm.vlm_adapter import execute_vlm_instruction
+        from integrations.vlm.vlm_adapter import (
+            execute_vlm_instruction, resolve_task_workspace)
         # 180s is the floor for cold-start runs: first VLM forward pass alone
         # can take 8-15s on the 4B model, and a realistic 12-iteration loop
         # needs ~2.5 minutes. HEVOLVE_COMPUTER_ACTION_ETA lets the user raise
@@ -3365,6 +3532,7 @@ def _handle_computer_action_tool(input_text: str) -> str:
         max_eta = int(os.environ.get('HEVOLVE_COMPUTER_ACTION_ETA', '180'))
         message = {
             'instruction_to_vlm_agent': input_text,
+            'workspace_root': resolve_task_workspace(prompt_id=prompt_id),
             'user_id': str(user_id or 'guest'),
             'prompt_id': str(prompt_id or 0),
             'os_to_control': 'windows' if sys.platform == 'win32' else (
@@ -3505,15 +3673,18 @@ def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
     spawn via the same callback.
     """
     try:
-        from core.platform.registry import ServiceRegistry
+        from core.platform.registry import get_registry as _platform_registry
         from integrations.channels.registry import get_registry
-        _lui = ServiceRegistry.get('LiquidUIService')
+        _lui = _platform_registry().get_or_none('LiquidUIService')
         if _lui is None:
             return
         adapter = get_registry().get(channel_type)
         if adapter is None or not hasattr(adapter, 'set_qr_callback'):
             return
-        user_id = thread_local_data.get_user_id() or 'system'
+        # The card is FOR this user; None lets agent_ui_update fall back to
+        # the resolved owner rather than route to a user named 'system'.
+        _owner = thread_local_data.get_user_id() or None
+        user_id = _owner or 'system'
         display_name = meta.get('display_name') or channel_type
 
         def _emit_qr(qr: str) -> None:
@@ -3527,7 +3698,7 @@ def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
                         "devices → Link a device → scan this code."
                     ),
                     'qr': qr,
-                })
+                }, user_id=_owner)
             except Exception as e:
                 logger.debug("qr_pair emit failed: %s", e)
 
@@ -3602,7 +3773,10 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
     # probes that load this helper before full HARTOS bootstrap).
     _log = _logging.getLogger(__name__)
 
-    user_id = thread_local_data.get_user_id() or 'system'
+    # _owner is who the cards are FOR (None -> agent_ui_update's resolved
+    # owner); user_id keeps its 'system' placeholder for the gateway session.
+    _owner = thread_local_data.get_user_id() or None
+    user_id = _owner or 'system'
     sid = user_id if str(user_id).startswith('user_') else f"user_{user_id}"
     display_name = meta.get('display_name') or channel_type
     icon = meta.get('icon') or channel_type
@@ -3664,7 +3838,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                         # _start_gateway_qr_pair_push with phone bound in
                         # request body.
                         'action': f'/api/social/channels/{channel_type}/connect-pair-code',
-                    },
+                    }, user_id=_owner,
                 )
         except Exception:
             logging.getLogger(__name__).exception("_start_gateway_qr_pair_push: swallowed Exception")
@@ -3766,7 +3940,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                         f"(60-second window).  I've also pushed it "
                         f"to your phone with auto-copy to clipboard."
                     ),
-                },
+                }, user_id=_owner,
             )
     except Exception as e:
         _log.debug("gateway_qr: chat card emit failed: %s", e)
@@ -3885,7 +4059,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                                     'message': (
                                         f"✅ {display_name} connected."
                                     ),
-                                },
+                                }, user_id=_owner,
                             )
                     except Exception:
                         logging.getLogger(__name__).exception("_poll: swallowed Exception")
@@ -3897,6 +4071,34 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
         target=_poll, daemon=True,
         name=f'connect_channel_poll_{channel_type}',
     ).start()
+
+
+_whatsapp_adapter_lock = threading.Lock()
+
+
+def _fetch_whatsapp_own_identity(gw_base: str, sid: str) -> dict:
+    """GET the gateway's own-identity for ``sid``.
+
+    Returns ``{'own_jid': ..., 'own_lid': ...}`` (either may be None while
+    the gateway is still linking), or ``{}`` on any failure, logged.  ONE
+    bounded request; the caller decides when to try again.
+    """
+    import json as _json
+    import urllib.request as _urlreq
+    log = logging.getLogger(__name__)
+    try:
+        with _urlreq.urlopen(
+            f"{gw_base.rstrip('/')}/api/sessions/{sid}/status",
+            timeout=5.0,
+        ) as _resp:
+            _status = _json.loads(_resp.read().decode('utf-8', errors='replace'))
+        return {'own_jid': _status.get('own_jid'), 'own_lid': _status.get('own_lid')}
+    except Exception as _status_err:
+        log.warning(
+            "_ensure_whatsapp_live_adapter: could not fetch own identity "
+            "from gateway (self-chat detection is off until a later poll "
+            "fetches it): %s", _status_err)
+        return {}
 
 
 def _ensure_whatsapp_live_adapter(
@@ -3934,41 +4136,105 @@ def _ensure_whatsapp_live_adapter(
         )
         integration = get_channel_integration()
 
-        existing = integration.registry.get('whatsapp')
-        if existing is not None:
-            return {
-                'success': True,
-                'message': f'whatsapp adapter already registered '
-                           f'(account_id={getattr(existing, "_account_id", "?")})',
-            }
-
-        from integrations.channels.whatsapp_adapter import (
-            create_whatsapp_adapter,
-        )
+        # This function is called on every /whatsapp/qr poll (the mobile
+        # app's QRScannerScreen polls every ~3s) plus the chat-based
+        # Connect_Channel path — under concurrent requests, the
+        # check-then-register below was NOT atomic: two threads could
+        # both see "not registered yet" before either finished
+        # registering, each construct + register their OWN adapter with
+        # its OWN WebSocket connection to the gateway. The gateway then
+        # broadcasts every inbound message to ALL connected sockets, so
+        # N racing registrations meant N independent self_chat.handle()
+        # calls (and N separate /chat + LLM calls) for the SAME message —
+        # confirmed live 2026-07-28 as repeated near-duplicate replies
+        # sent to a real WhatsApp self-chat a few seconds apart. The lock
+        # makes the whole check+register sequence atomic so only ONE
+        # adapter (and one WebSocket connection) is ever created per
+        # process, no matter how many requests race here.
         gw_base = base or _os.environ.get(
             'WHATSAPP_GATEWAY_URL',
             f"http://127.0.0.1:"
             f"{_os.environ.get('WHATSAPP_GATEWAY_PORT', '3000')}",
         )
-        adapter = create_whatsapp_adapter(api_url=gw_base, account_id=sid)
-        integration.registry.register(adapter)
+        with _whatsapp_adapter_lock:
+            existing = integration.registry.get('whatsapp')
+            if existing is not None:
+                # A gateway that was still linking when the adapter was
+                # registered gave no identity.  The adapter stays (messages
+                # must flow), and because every later poll lands here, this
+                # is the only place the identity can still be adopted: one
+                # bounded fetch per poll until the adapter carries one.
+                if not existing.has_owner_identity():
+                    identity = _fetch_whatsapp_own_identity(gw_base, sid)
+                    if identity.get('own_jid') or identity.get('own_lid'):
+                        existing.set_owner_identity(
+                            identity.get('own_jid'), identity.get('own_lid'))
+                        log.info(
+                            "whatsapp adapter adopted its owner identity on a "
+                            "later poll (account_id=%s)", sid)
+                return {
+                    'success': True,
+                    'message': f'whatsapp adapter already registered '
+                               f'(account_id={getattr(existing, "_account_id", "?")})',
+                }
 
-        loop = integration._loop
-        if not (loop and loop.is_running()):
+            from integrations.channels.whatsapp_adapter import (
+                create_whatsapp_adapter,
+            )
+            # Fetch the gateway's own-identity lookup so self-chat detection
+            # (SelfChatHandler.is_self_message) has something to match against
+            # — without this, owner_phone/owner_lid are never set and a
+            # self-chat message can never be recognized, regardless of which
+            # JID scheme WhatsApp uses for that account (own_jid for
+            # phone-based accounts, own_lid for LID/privacy-ID accounts).
+            identity = _fetch_whatsapp_own_identity(gw_base, sid)
+
+            adapter = create_whatsapp_adapter(
+                api_url=gw_base, account_id=sid,
+                phone_number=identity.get('own_jid'),
+                owner_lid=identity.get('own_lid'),
+            )
+            integration.registry.register(adapter)
+
+            loop = integration._loop
+            started_integration = False
+            if not (loop and loop.is_running()):
+                # Entrypoints that skip hartos_bootstrap's full sequence (e.g.
+                # the standalone hart_intelligence_entry.py used for local/dev
+                # testing) never call FlaskChannelIntegration.start() at all,
+                # so _loop stays None forever and every adapter sits
+                # registered-but-never-started — messages reach the gateway
+                # but nothing is listening. start() is idempotent (no-ops if
+                # already running) and cheap (an empty registry.start_all()
+                # the first time), so it's safe to trigger on-demand here
+                # rather than requiring the full boot sequence to have run.
+                integration.start()
+                started_integration = True
+                for _ in range(50):  # ~5s for the background thread to spin up
+                    loop = integration._loop
+                    if loop and loop.is_running():
+                        break
+                    time.sleep(0.1)
+                else:
+                    return {
+                        'success': False,
+                        'error': 'channel event loop failed to start '
+                                 '(FlaskChannelIntegration.start() ran but '
+                                 '_loop never became live)',
+                    }
+            # A newly started integration invokes registry.start_all(), which
+            # starts this adapter exactly once. An already-running loop needs
+            # this explicit start because registry.start_all() has completed.
+            if not started_integration:
+                _aio.run_coroutine_threadsafe(adapter.start(), loop)
+            log.info(
+                "whatsapp live adapter registration scheduled "
+                "(account_id=%s, base=%s)", sid, gw_base,
+            )
             return {
-                'success': False,
-                'error': 'channel event loop not running '
-                         '(FlaskChannelIntegration.start() never called)',
+                'success': True,
+                'message': f'whatsapp adapter registration scheduled for {sid}',
             }
-        _aio.run_coroutine_threadsafe(adapter.start(), loop)
-        log.info(
-            "whatsapp live adapter registration scheduled "
-            "(account_id=%s, base=%s)", sid, gw_base,
-        )
-        return {
-            'success': True,
-            'message': f'whatsapp adapter registration scheduled for {sid}',
-        }
     except Exception as e:
         log.warning("_ensure_whatsapp_live_adapter failed: %r", e)
         return {'success': False, 'error': repr(e)[:300]}
@@ -4101,8 +4367,8 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                             user_id=int(thread_local_data.get_user_id() or 0),
                             channel_type=channel_type,
                         )
-                        from core.platform.registry import ServiceRegistry
-                        _lui = ServiceRegistry.get('LiquidUIService')
+                        from core.platform.registry import get_registry
+                        _lui = get_registry().get_or_none('LiquidUIService')
                         if _lui:
                             _lui.agent_ui_update(
                                 thread_local_data.get_user_id() or 'system',
@@ -4132,6 +4398,7 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                                     'external_url': meta.get('external_url'),
                                     'cta_label': f"Connect with {meta.get('display_name') or channel_type}",
                                 },
+                                user_id=thread_local_data.get_user_id() or None,
                             )
                             return (
                                 f"To connect {meta.get('display_name') or channel_type}, "
@@ -4155,8 +4422,8 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                 # via the admin Channels page (which shows ALL fields).
                 visible_fields = [f for f in setup_fields if not f.get('auto')]
                 if visible_fields:
-                    from core.platform.registry import ServiceRegistry
-                    _lui = ServiceRegistry.get('LiquidUIService')
+                    from core.platform.registry import get_registry
+                    _lui = get_registry().get_or_none('LiquidUIService')
                     if _lui:
                         _lui.agent_ui_update(
                             thread_local_data.get_user_id() or 'system',
@@ -4189,6 +4456,7 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                                 'submit_label': 'Connect',
                                 'submit_action': 'register_channel',
                             },
+                            user_id=thread_local_data.get_user_id() or None,
                         )
         except Exception as e:
             logger.debug("Connect_Channel: liquid UI emit skipped: %s", e)
@@ -4311,7 +4579,7 @@ def _handle_invite_friend_tool(input_text: str) -> str:
                         ],
                         'submit_label': 'Copy link',
                         'submit_action': 'copy_invite_url',
-                    },
+                    }, user_id=str(uid),
                 )
         except Exception as e:
             logger.debug("Invite_Friend: liquid UI emit skipped: %s", e)
@@ -4395,22 +4663,39 @@ def _handle_join_external_room_tool(input_text: str) -> str:
         if not allowed:
             # Surface a Liquid UI consent card so the user can grant in one click.
             try:
-                from core.platform.registry import ServiceRegistry
-                _lui = ServiceRegistry.get('LiquidUIService')
+                from core.platform.registry import get_registry
+                _lui = get_registry().get_or_none('LiquidUIService')
                 if _lui:
+                    # A NOTIFICATION, not an approval card: the gate already
+                    # decided, and this only points the owner at where to
+                    # grant.  It was typed 'approval', which renders
+                    # AgentOverlay's ApprovalOverlay -- a card that reads
+                    # `description` (absent here, so a blank body), never
+                    # renders `actions` at all, and offers Approve/Deny
+                    # buttons that POST agent_id=undefined, action=undefined
+                    # to /api/agent/approval.  'notification' is the type
+                    # whose contract is exactly this payload's shape:
+                    # title + message + severity + actions
+                    # (liquid_ui_service COMPONENT_TYPES).
+                    #
+                    # And the action key is `kind`, not `action`: the
+                    # renderer dispatches on kind=='navigate' and falls
+                    # through to an "unhandled action" warning otherwise, so
+                    # the button did nothing even once the type was right.
                     _lui.agent_ui_update(
                         str(uid),
                         {
-                            'type': 'approval',
+                            'type': 'notification',
                             'title': 'Permission needed',
                             'message': reason,
                             'severity': 'info',
                             'actions': [
                                 {'label': 'Open Privacy Settings',
-                                 'action': 'navigate',
+                                 'kind': 'navigate',
                                  'target': '/social/settings/privacy'},
                             ],
                         },
+                        user_id=str(uid),
                     )
             except Exception as e:
                 logger.debug("Join_External_Room: consent UI emit skipped: %s", e)
@@ -4529,14 +4814,14 @@ def _handle_agentic_router_tool(input_text):
     sets thread-local flags that the /chat handler checks after get_ans() returns.
     """
     try:
-        import concurrent.futures
-        from integrations.agentic_router import build_agentic_plan
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(build_agentic_plan, input_text, PROMPTS_DIR)
-            try:
-                plan = future.result(timeout=15)
-            except concurrent.futures.TimeoutError:
-                return f"I'll help you with: {input_text}. Let me work on this directly."
+        from integrations.agentic_router import build_agentic_plan_bounded
+        # Bounded in agentic_router, on core.subprocess_safe.call_bounded.
+        # This was `with ThreadPoolExecutor(...) as ex: ex.submit(...)
+        # .result(timeout=15)`, whose `with` exit joins the stuck worker, so
+        # the 15 s never released this turn (review F7, 2026-09-27).
+        plan = build_agentic_plan_bounded(input_text, PROMPTS_DIR)
+        if plan is None:
+            return f"I'll help you with: {input_text}. Let me work on this directly."
 
         thread_local_data.set_agentic_routing(
             task_description=plan['task_description'],
@@ -4568,86 +4853,16 @@ def _handle_agentic_router_tool(input_text):
 
 
 def _handle_request_resource(input_text: str) -> str:
-    """Generic runtime resource request — agent calls this when ANY tool needs
-    a missing credential, API key, config value, or permission.
+    """Request_Resource: the agent needs a credential, API key or token.
 
-    The agent provides a JSON string like:
-      {"resource_type": "api_key", "key_name": "GOOGLE_API_KEY",
-       "label": "Google API Key", "used_by": "Google Search tool",
-       "description": "Required for web search"}
-
-    Handler checks the vault first. If the key exists, returns the value
-    (making it available to the agent without the user re-entering it).
-    If not, returns a structured resource_request that the backend injects
-    into the response JSON so the frontend presents a secure input screen.
+    hartos.ai_key_vault.request_credential does the work, for this tool and
+    for core.agent_tools request_resource alike: the owner is asked on the
+    consent card and the agent gets only the {{secret:NAME}} alias.
     """
-    import json as _json
-    try:
-        req = _json.loads(input_text)
-    except (ValueError, TypeError):
-        # Plain-text fallback: agent just described what it needs
-        req = {
-            'resource_type': 'api_key',
-            'key_name': 'UNKNOWN',
-            'label': input_text[:100],
-            'description': input_text,
-            'used_by': 'Agent tool',
-        }
-
-    key_name = req.get('key_name', 'UNKNOWN')
-    resource_type = req.get('resource_type', 'api_key')
-
-    # Check vault first (tool keys + env vars)
-    import os
-    env_val = os.environ.get(key_name)
-    if env_val:
-        return f"Resource '{key_name}' is already configured and available."
-
-    try:
-        from hartos.ai_key_vault import AIKeyVault
-        vault = AIKeyVault.get_instance()
-        if resource_type == 'channel_secret':
-            val = vault.get_channel_secret(
-                req.get('channel_type', ''), key_name)
-        else:
-            val = vault.get_tool_key(key_name)
-        if val:
-            os.environ[key_name] = val  # Make available for current session
-            return f"Resource '{key_name}' loaded from vault and is now available."
-    except Exception:
-        logging.getLogger(__name__).exception("_handle_request_resource: swallowed Exception")
-
-    # Key not found — return a structured request for the frontend
-    # The backend will detect __SECRET_REQUEST__ and inject it into the response
-    # Track as pending so /api/credentials/pending can list it
-    try:
-        from hartos.ai_key_vault import AIKeyVault
-        AIKeyVault.get_instance().add_pending_request(
-            key_name=key_name,
-            resource_type=resource_type,
-            channel_type=req.get('channel_type', ''),
-            label=req.get('label', key_name),
-            description=req.get('description', ''),
-            used_by=req.get('used_by', 'Agent tool'),
-        )
-    except Exception:
-        logging.getLogger(__name__).exception("_handle_request_resource: swallowed Exception")
-
-    secret_request = _json.dumps({
-        '__SECRET_REQUEST__': True,
-        'type': resource_type,
-        'key_name': key_name,
-        'label': req.get('label', key_name),
-        'description': req.get('description', f'{key_name} is required.'),
-        'used_by': req.get('used_by', 'Agent tool'),
-        'channel_type': req.get('channel_type', ''),
-    })
-    return (
-        f"I need the user to provide '{req.get('label', key_name)}'. "
-        f"This is required for {req.get('used_by', 'a tool')}. "
-        f"{req.get('description', '')} "
-        f"RESOURCE_REQUEST:{secret_request}"
-    )
+    from hartos.ai_key_vault import request_credential
+    from integrations.social.consent_service import known_agent_id
+    return request_credential(
+        input_text, agent_id=known_agent_id(thread_local_data.get_prompt_id()))
 
 
 # Module-level cache for the google-search tool list.  Process-wide
@@ -6617,6 +6832,19 @@ def parse_image_to_text(inp):
         LlaVA implemetation
     '''
 
+    # Saved attachments use this node's canonical image describer. Remote
+    # URL behavior remains below; a local reference never goes to LLAVA.
+    image_ref, _, question = str(inp).partition(',')
+    image_ref = image_ref.strip()
+    if image_ref.startswith('/uploads/'):
+        from integrations.vision.image_describe import resolve_uploaded_image, describe_image
+        try:
+            path = resolve_uploaded_image(image_ref)
+            answer = describe_image(str(path), question.strip() or None, cache=True)
+            return answer or 'Uploaded image analysis is unavailable; no visual answer was obtained.'
+        except (ValueError, FileNotFoundError) as e:
+            return f'Uploaded image analysis failed: {e}'
+
     try:
         post_dict = {'user_id': '', 'task_type': 'async', 'status': TaskStatus.EXECUTING.value, 'task_name': TaskNames.LLAVA.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
@@ -6935,9 +7163,12 @@ def parse_visual_context(inp: str):
         try:
             from integrations.agent_engine.compute_mesh_service import get_compute_mesh
             mesh = get_compute_mesh()
+            # user_id: the person this peer's compute is charged to
+            # (ComputeMeshService._charged).
             result = mesh.offload_to_best_peer(
                 model_type='vision', prompt=prompt_text,
-                options={'image_path': image_path, 'timeout': 60},
+                options={'image_path': image_path, 'timeout': 60,
+                         'user_id': str(user_id or '')},
             )
             if result and 'error' not in result:
                 return result.get('response', str(result))
@@ -8190,8 +8421,10 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
                 try:
+                    from core.prompt_files import proposed_plan_filename
                     _plan_path = os.path.join(
-                        PROMPTS_DIR, f'{prompt_id}.proposed.r{review_rounds}.json')
+                        PROMPTS_DIR,
+                        proposed_plan_filename(prompt_id, review_rounds))
                     os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
                     with open(_plan_path, 'w') as f:
                         json.dump(parsed, f)
@@ -8262,8 +8495,9 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 # feedback) can refine; surface it to the peer reviewer.
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
+                from core.prompt_files import proposed_plan_filename
                 _plan_path = os.path.join(
-                    PROMPTS_DIR, f'{prompt_id}.proposed.json')
+                    PROMPTS_DIR, proposed_plan_filename(prompt_id))
                 try:
                     os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
                     with open(_plan_path, 'w') as f:
@@ -8429,10 +8663,7 @@ def _tune_resonance_after_chat(user_id, prompt_text, response_text):
 
 _tts_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='tts_async')
 
-# --- Language persistence (DRY: one write path) ---
-_HART_LANG_PATH = os.path.join(
-    os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'hart_language.json')
-
+# --- Language persistence (DRY: one write path, core.user_lang) ---
 
 def _persist_language(lang: str) -> bool:
     """Thin shim for backward compatibility.  Real implementation is in
@@ -8463,6 +8694,27 @@ def _vision_keyword_override(prompt: str) -> bool:
         return prompt_needs_vision(prompt or '')
     except Exception:
         return False
+
+
+def _draft_delegates(result: dict) -> bool:
+    """The draft's own envelope says a bigger model must take this turn.
+
+    ONE reader for that field: escalation_reasons.draft_delegates, in the
+    module that already names delegate='local'/'hive' the baseline
+    escalation (CLASSIFIER_DELEGATE).  is_casual has NO vote here.  The
+    two fields are emitted independently and can contradict, and when
+    they did, the casual verdict won.  MEASURED 2026-09-22 08:52:39
+    (speculation c77082b0-af7): delegate='local' AND is_casual=true on
+    "great open a notepad and type hi in it" -> the branch below was
+    skipped -> the draft's "I've opened a notepad for you and typed 'hi'
+    inside" shipped as the final answer and was spoken by TTS.  No tool
+    ran; Computer_Action was in the is_first set that turn would have
+    loaded.  Believing is_casual ships a tool-less model's description of
+    work as if the work had happened; believing delegate costs one slower
+    turn.  See tests/unit/test_draft_delegate_is_not_vetoed_by_casual.py.
+    """
+    from integrations.agent_engine.escalation_reasons import draft_delegates
+    return draft_delegates(result.get('delegate'))
 
 
 def _chat_reply(user_id, request_id, response_text: str, **payload):
@@ -8509,6 +8761,11 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         payload — semantically identical to the old inline
         ``return jsonify({'response': response_text, **payload})``.
     """
+    # An elided-text pointer a model copied into its answer is never shown
+    # to the user, spoken or stored as the reply (owner ruling 2026-09-27;
+    # core.llm_outbound_logger.strip_elided_pointers).
+    from core.llm_outbound_logger import strip_elided_pointers
+    response_text = strip_elided_pointers(response_text)
     if response_text:
         # media_mode honor: the Nunba adapter has forwarded the user's
         # chosen mode ('audio'|'video'|'text') in the /chat body all
@@ -8675,6 +8932,28 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     return jsonify(payload)
 
 
+def _offer_voice_clone_setup(language):
+    """This turn wanted a recorded voice and spoke in the default one: offer
+    to set a cloning engine up, on the demand of the turn that needed it.
+
+    The offer is the canonical consent card (capability_setup.
+    offer_voice_clone_setup -> ConsentService), and the owner's Allow starts
+    the provisioning goal the agent daemon paces.  Nothing here waits and
+    nothing here can fail the reply: the audio is already on its way in the
+    default voice, and an offer that cannot be made is a debug line.
+    """
+    try:
+        from integrations.agent_engine.capability_setup import (
+            offer_voice_clone_setup,
+        )
+        outcome = offer_voice_clone_setup(language)
+        if outcome in ('asked', 'provisioning'):
+            app.logger.info(
+                f"TTS: no cloning engine here; voice-clone setup {outcome}")
+    except Exception as e:
+        app.logger.debug(f"TTS: voice-clone setup offer skipped: {e}")
+
+
 def _speak_in_voice(text, language, voice):
     """Speak ``text`` in the recorded ``voice``; returns the audio path, or
     None for the default voice.
@@ -8715,11 +8994,13 @@ def _speak_in_voice(text, language, voice):
     if result.error or not result.path or not os.path.isfile(result.path):
         app.logger.info(f"TTS: voiced synthesis gave no audio "
                         f"({result.error or result.path!r}); default voice")
+        _offer_voice_clone_setup(language)
         return None
     spec = ENGINE_REGISTRY.get(result.engine_id)
     if spec is None or not spec.voice_clone:
         app.logger.info(f"TTS: {result.engine_id} cannot clone a voice; "
                         f"default voice")
+        _offer_voice_clone_setup(language)
         return None
     # Served by Nunba's /tts/audio/<basename>: a cloning engine's ToolWorker
     # writes under HEVOLVE_MODEL_DIR (default ~/.hevolve/models)/<tool>/output,
@@ -8901,11 +9182,37 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                 else:
                     audio_url = f'/tts/audio/{audio_filename}'
                 app.logger.info(f"TTS async: publishing audio {audio_url} to pupit.{user_id}")
+                # A phone reads the bundle shape central's lip-sync service
+                # publishes (Android VideoUrl: aud_url + face data); with
+                # aud_url alone it plays the voice over the idle avatar
+                # (HARTOS #111, owner: audio only for now, every later
+                # capability on the same delivery).  Additive beside the
+                # SPA's generated_audio_url.  The url is absolute on the
+                # address this node advertises: a phone gets the bundle over
+                # its device link and has no origin to resolve a path
+                # against, while the SPA keeps the relative url (its own
+                # origin is the loopback the LAN gate trusts).
+                try:
+                    from core.port_registry import get_advertisable_base_url
+                    _phone_audio_url = (audio_url if _ext_url
+                                        else f'{get_advertisable_base_url().rstrip("/")}{audio_url}')
+                except Exception as e:
+                    app.logger.warning(
+                        f"TTS async: no advertisable base url for the phone's "
+                        f"bundle ({e}); sending {audio_url} as is")
+                    _phone_audio_url = audio_url
                 _tts_payload = {
                     'text': [text[:200]],
                     'generated_audio_url': audio_url,
                     'request_id': str(request_id),
                     'action': 'TTS',
+                    'video_link': {
+                        'aud_url': _phone_audio_url,
+                        'request_id': str(request_id),
+                        'action': 'TTS',
+                        'is_cartoon': True,
+                        'priority': 0,
+                    },
                 }
                 publish_async(f'com.hertzai.pupit.{user_id}', json.dumps(_tts_payload))
                 # Also push via SSE directly — publish_async → MessageBus/WAMP doesn't
@@ -9089,6 +9396,13 @@ def chat():
         )
         if _api_key_match:
             g.auth_source = 'api_key'
+        elif getattr(g, 'auth_source', None) == 'device':
+            # A phone the desktop owner allowed (#111): security.middleware
+            # verified its Ed25519-signed token against the key on file and
+            # left the payload in g.jwt_payload.  The HS256 decode below
+            # cannot verify that token (the phone has no local secret), so
+            # the gate's verdict stands.
+            pass
         elif _bearer_token:
             # Try JWT decode (Layer 1 / Layer 2)
             try:
@@ -9119,14 +9433,16 @@ def chat():
                 'requests. Set HEVOLVE_API_KEY env var for production.'
             )
             chat._auth_warned = True
-        g.auth_source = 'none'
+        if getattr(g, 'auth_source', None) != 'device':
+            g.auth_source = 'none'
 
     # Rate limit: 30 req/min per user/IP
     try:
         from integrations.social.rate_limiter import _limiter
         # Rate limit by IP always (prevents user_id rotation bypass).
         # Authenticated user_id added as secondary key for per-user tracking.
-        rate_user = request.remote_addr
+        from core.auth_local import client_key as _client_key
+        rate_user = _client_key()
         if not _limiter.check(str(rate_user), 'chat', max_tokens=30, refill_rate=30 / 60):
             return jsonify({'error': 'Rate limit exceeded (30/min). Please wait.', 'response': None}), 429
     except ImportError:
@@ -9155,7 +9471,17 @@ def chat():
     # Layer 1 (LOCAL): Bearer token signed by this node's HS256 secret
     # Layer 2 (HIVE): Bearer token with Ed25519 node_sig (cross-node)
     # Fallback: body user_id (backward compat for desktop/Nunba mode)
-    if g.auth_source not in ('jwt', 'api_key'):
+    if g.auth_source == 'device':
+        # The user is the one the phone's verified token names; the gate
+        # already refused a body naming anyone else (#51).  Fail closed: a
+        # device verdict without its payload admits nobody, never the
+        # body's or a default user.
+        _device_uid = (getattr(g, 'jwt_payload', None) or {}).get('user_id')
+        if not _device_uid:
+            return jsonify({'error': 'Invalid or expired token.', 'response': None}), 401
+        data['user_id'] = _device_uid
+        g.token_scope = 'hive'
+    elif g.auth_source not in ('jwt', 'api_key'):
         if _bearer_token:
             try:
                 from integrations.social.auth import decode_jwt
@@ -9426,6 +9752,13 @@ def chat():
             prompt, _redacted_count = redact_secrets(prompt)
         except ImportError:
             logging.getLogger(__name__).debug("chat: swallowed ImportError")
+    # The prompt as the two gates above left it.  Later branches rewrite
+    # `prompt` for one consumer (gather_info gets the cloud record or the
+    # wrap-up instruction appended) and then restore the turn's text; they
+    # restore THIS, never data['prompt'], which would undo both gates.
+    # Measured in the review of 8c9abe070: the gather path re-read the raw
+    # body, so a user's 'sk-...' reached gather_info's LLM and the mirror.
+    _guarded_prompt = prompt
 
     # BUDGET GATE: estimate and log LLM cost before execution
     if prompt:
@@ -9772,8 +10105,7 @@ def chat():
                     # Fall through — do NOT return the draft standby
                     # reply; the tool-based path below will run and the
                     # VLM tool will produce a grounded answer.
-                elif (result.get('delegate') in ('local', 'hive')
-                      and not result.get('is_casual')
+                elif (_draft_delegates(result)
                       and not _create_intent_actionable):
                     # Draft self-assessed: this is a non-casual TASK
                     # that needs more capability than the 0.8B has
@@ -9807,7 +10139,7 @@ def chat():
                     app.logger.info(
                         f"draft classifier: delegate="
                         f"{result.get('delegate')!r} "
-                        f"is_casual=False, is_create_agent=False — routing to "
+                        f"is_casual={result.get('is_casual')!r} (no veto), is_create_agent=False — routing to "
                         f"the langchain chat (get_ans), NOT autogen CREATE. "
                         f"get_ans carries FULL_HISTORY (date-recall via "
                         f"parsing_string -> get_time_based_history SimpleMem) "
@@ -9909,7 +10241,16 @@ def chat():
             with _user_lock:
                 review_agents[_ak] = False
                 _touch_agent_timestamp(_ak)
-            prompt = data.get('prompt', None)
+            prompt = _guarded_prompt
+            # The words the user sent this turn, for _chat_reply's user_prompt:
+            # it records the user side (conversation mirror, SimpleMem, the
+            # MemoryGraph) only when given one, and every gather exit below
+            # left it out, so creation turns were stored as assistant-only
+            # (live GR7).  Taken HERE because `prompt` is rewritten below for
+            # gather_info (cloud name/goal appended on the first turn, the
+            # wrap-up instruction on the last), and neither is what the user
+            # said.  tests/unit/test_gather_turn_mirrors_user_side.py
+            _user_turn_text = prompt
             if prompt_id not in first_promts:
                 first_promts.append(prompt_id)
                 try:
@@ -9941,7 +10282,11 @@ def chat():
                             app.logger.info(
                                 f'Matched existing agent {_match["name"]} ({_mid}) '
                                 f'— routing to REUSE instead of CREATE')
-                            return chat_agent(user_id, prompt, _mid, file_id, request_id)
+                            # The matched agent's turn: a tool acting for
+                            # "the calling agent" (its own vote) must see
+                            # _mid, not this request's prompt_id.
+                            with thread_local_data.turn_of(_mid):
+                                return chat_agent(user_id, prompt, _mid, file_id, request_id)
                 except Exception as _me:
                     app.logger.debug(f'Agent matching skipped: {_me}')
 
@@ -10115,6 +10460,7 @@ def chat():
                         intent=['FINAL_ANSWER'],
                         req_token_count=0, res_token_count=0, history_request_id=[],
                         Agent_status='Creation Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
                     )
                 else:
                     # Completed (or forced completion after max turns)
@@ -10130,6 +10476,7 @@ def chat():
                             intent=['FINAL_ANSWER'],
                             req_token_count=0, res_token_count=0, history_request_id=[],
                             Agent_status='Creation Mode', prompt_id=prompt_id,
+                            user_prompt=_user_turn_text,
                         )
                     app.logger.info('COMPLETED STATUS')
                     _save_and_enter_review(new_res)
@@ -10140,6 +10487,7 @@ def chat():
                         intent=['FINAL_ANSWER'],
                         req_token_count=0, res_token_count=0, history_request_id=[],
                         Agent_status='Review Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
                     )
 
             except Exception as e:
@@ -10181,6 +10529,7 @@ def chat():
                         intent=['FINAL_ANSWER'],
                         req_token_count=0, res_token_count=0, history_request_id=[],
                         Agent_status='Review Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
                     )
                 _record_lifecycle('Creation Mode', user_id, prompt_id, f'Creation continuing after parse error: {e}')
                 return _chat_reply(
@@ -10188,6 +10537,7 @@ def chat():
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0, history_request_id=[],
                     Agent_status='Creation Mode', prompt_id=prompt_id,
+                    user_prompt=_user_turn_text,
                 )
         # Phase 2: Review Phase (re-snapshot flags under lock after Phase 1 may have mutated)
         with _user_lock:
@@ -10447,7 +10797,9 @@ def chat():
     thread_local_data.set_global_intent(global_intent=req_tool)
     thread_local_data.set_prompt_id(prompt_id)
 
-    prompt = data.get('prompt', None)
+    # The guarded text again: the create branch above may have rewritten
+    # `prompt` for gather_info (see _guarded_prompt).
+    prompt = _guarded_prompt
     if probe:
         prompt = ''
 
@@ -10700,9 +11052,10 @@ def vlm_stop():
     )
 
     if data.get('scope') == 'node':
+        from core.auth_local import client_key as _client_key
         if not _is_local_request():
             app.logger.warning(f'vlm_stop: node-wide stop refused for '
-                               f'{request.remote_addr}: not on this machine')
+                               f'{_client_key()}: not on this machine')
             return jsonify({
                 'error': 'forbidden',
                 'message': 'scope=node is only accepted from this machine.',
@@ -10711,7 +11064,7 @@ def vlm_stop():
                    for uid, pid in list_active_sessions()
                    if request_stop(uid, pid)]
         app.logger.warning(f'vlm_stop: node-wide stop from '
-                           f'{request.remote_addr}: {len(stopped)} loop(s) '
+                           f'{_client_key()}: {len(stopped)} loop(s) '
                            f'{stopped}')
         return jsonify({
             'status': 'stopped' if stopped else 'no_active_session',
@@ -10852,16 +11205,86 @@ def agent_approval():
 
     Both route through _apply_embodied_toggle in the channels admin API
     so the manual settings toggle and the agentic approval path share
-    ONE start/stop implementation — no parallel lifecycle.
+    ONE start/stop implementation — no parallel lifecycle.  Since the
+    consent migration that path is reached through ConsentService
+    (_embodied_feed_from_consent), which every answer surface shares:
+    this route, the privacy page, and a consent card answered on the
+    desktop, on the floating companion or on a phone.
+
+    The DECISION itself is recorded as a UserConsent row by
+    ConsentService.record_capability_decision.  It used to exist only as a
+    config flag and a log line here, so an approval could not be revoked,
+    never appeared on the privacy page, left no audit entry, and a Deny was
+    re-asked on the very next poll because nothing marked it decided.
     """
     try:
         data = request.get_json(silent=True) or {}
         agent_id = data.get('agent_id', '')
-        action = str(data.get('action', '')).strip().lower()
+        # kept as sent as well: a game sound's state is camelCase and its
+        # memo key exact (hartos-3a F5)
+        action_raw = str(data.get('action', '')).strip()
+        action = action_raw.lower()
         decision = str(data.get('decision', '')).strip().lower()
         if decision not in ('approve', 'approved', 'allow', 'yes', 'deny', 'denied', 'no'):
             return jsonify({'status': 'error', 'reason': 'invalid decision'}), 400
         approved = decision in ('approve', 'approved', 'allow', 'yes')
+        # Record first, on BOTH branches: the row is the answer, and writing
+        # it also stops or starts the feed through the one actuator and tells
+        # every other surface to drop its copy of the card.  The owner of
+        # this desktop owns the camera and the screen, so the row is theirs
+        # — never the caller's user_id (#66).
+        _owner_id = os.environ.get('HEVOLVE_OWNER_USER_ID')
+        _recorded = None
+        if _owner_id:
+            try:
+                from integrations.social.models import db_session
+                from integrations.social.consent_service import ConsentService
+                with db_session(commit=True) as _cdb:
+                    _recorded = ConsentService.record_capability_decision(
+                        _cdb, _owner_id, action, approved,
+                        agent_id=agent_id or None)
+            except Exception as _consent_exc:
+                # A recording failure must not swallow the owner's answer —
+                # but it must be loud, because an unrecorded grant is one
+                # that cannot be revoked.
+                app.logger.error('agent_approval: consent not recorded for '
+                                 'action=%s: %s', action, _consent_exc)
+        else:
+            app.logger.warning('agent_approval: consent not recorded — no '
+                               'owner identity (HEVOLVE_OWNER_USER_ID unset)')
+        if not approved and str(action or '').startswith('game_sound:'):
+            # A reviewer turning down a game's music is not a consent
+            # denial.  Falling through to the branch below published
+            # {'type':'consent', 'decision':'denied'} on the VISION topic
+            # for a piece of music -- wrong noun, wrong topic -- while the
+            # memo kept serving the take they had just refused.
+            from core.game_sound_memo import parse_game_sound_action
+            sound_game, sound_state = parse_game_sound_action(action_raw)
+            reason = str(data.get('reason') or data.get('note') or '').strip()
+            try:
+                from core.game_sound_memo import record_verdict
+                from hartos.helper import (
+                    load_agent_data_from_file, save_agent_data_to_file)
+                _pid = int(agent_id)
+                _data = {}
+                load_agent_data_from_file(_pid, _data)
+                _games = _data.setdefault(_pid, {}).setdefault('games', {})
+                _record, _matched, _key = record_verdict(
+                    _games, sound_game, sound_state, False, reason)
+                if _record:
+                    save_agent_data_to_file(_pid, _data)
+                app.logger.info(
+                    f'agent_approval: agent={agent_id} rejected game sound '
+                    f'{sound_game}/{sound_state} at memo {_key}')
+                return jsonify({'status': 'rejected', 'action': action,
+                                'applied': bool(_record), 'key': _key,
+                                'matched': _matched}), 200
+            except Exception as _gs_exc:
+                app.logger.warning(
+                    f'agent_approval: game sound rejection failed: {_gs_exc}')
+                return jsonify({'status': 'rejected', 'action': action,
+                                'applied': False, 'error': str(_gs_exc)}), 200
+
         if not approved:
             # Stage-C (Symptom #6): publish the deny event on WAMP too
             # so subscribers (VisionService, UI) can tear down cleanly
@@ -10884,6 +11307,49 @@ def agent_approval():
             app.logger.info(f'agent_approval: agent={agent_id} action={action} DENIED')
             return jsonify({'status': 'denied', 'action': action}), 200
 
+        # A reviewer's word on a game's sound.  The card an agent raises
+        # carries action 'game_sound:{game_id}:{state}' (core/agent_tools
+        # .offer_sound_for_review), and until now it fell through to the
+        # no-mapping branch below and returned applied=False -- so a sound
+        # could be approved on screen and approved_at stayed null forever,
+        # leaving REUSE unable to tell an approved sound from an unreviewed
+        # one.  The verdict itself lives in core.game_sound_memo, called
+        # from here and from the agent's own tool, so there is one
+        # implementation rather than two.
+        if str(action or '').startswith('game_sound:'):
+            from core.game_sound_memo import parse_game_sound_action
+            sound_game, sound_state = parse_game_sound_action(action_raw)
+            try:
+                from core.game_sound_memo import record_verdict
+                from hartos.helper import (
+                    load_agent_data_from_file, save_agent_data_to_file)
+                _pid = int(agent_id)
+                _data = {}
+                load_agent_data_from_file(_pid, _data)
+                _games = _data.setdefault(_pid, {}).setdefault('games', {})
+                _record, _matched, _key = record_verdict(
+                    _games, sound_game, sound_state, True)
+                if not _record:
+                    app.logger.info(
+                        f'agent_approval: game sound {sound_game}/{sound_state} '
+                        f'has nothing bound to approve')
+                    return jsonify({'status': 'approved', 'action': action,
+                                    'applied': False,
+                                    'reason': 'nothing bound'}), 200
+                save_agent_data_to_file(_pid, _data)
+                app.logger.info(
+                    f'agent_approval: agent={agent_id} approved game sound '
+                    f'{sound_game}/{sound_state} at memo {_key}')
+                return jsonify({'status': 'approved', 'action': action,
+                                'applied': True, 'key': _key,
+                                'matched': _matched}), 200
+            except Exception as _gs_exc:
+                app.logger.warning(
+                    f'agent_approval: game sound verdict failed: {_gs_exc}')
+                return jsonify({'status': 'approved', 'action': action,
+                                'applied': False,
+                                'error': str(_gs_exc)}), 200
+
         # Map the approval to a feed toggle and reuse the single
         # _apply_embodied_toggle codepath admin settings use.
         feed = None
@@ -10902,20 +11368,30 @@ def agent_approval():
 
         try:
             from integrations.channels.admin.api import (
-                get_api, _apply_embodied_toggle,
+                get_api, apply_embodied_answer,
             )
             api = get_api()
             cfg = api._global_config.embodied_ai
-            # Flip the persisted flag so the next restart sees it and so
-            # get_embodied_status reports the right state.
-            if feed == 'camera':
-                cfg.camera_enabled = True
-            elif feed == 'screen':
-                cfg.screen_capture_enabled = True
-            elif feed == 'audio':
-                cfg.audio_enabled = True
-            api._save_config()
-            _apply_embodied_toggle(feed, True, cfg)
+            if _recorded is None:
+                # Either this capability records no consent ('audio' has no
+                # ask producer, so no consent type) or the write above
+                # failed.  Apply it here so the owner's click still acts,
+                # exactly as it did before the migration.  When _recorded is
+                # set, ConsentService already drove this same actuator from
+                # the grant — applying again here would be the second path.
+                #
+                # Flip the persisted flag so the next restart sees it and so
+                # get_embodied_status reports the right state.
+                if feed == 'camera':
+                    cfg.camera_enabled = True
+                elif feed == 'screen':
+                    cfg.screen_capture_enabled = True
+                elif feed == 'audio':
+                    cfg.audio_enabled = True
+                api._save_config()
+                # The one way in: the capture gate now, the VisionService
+                # start on the feed's own worker, never on this request.
+                apply_embodied_answer(feed, True, cfg)
             # Stage-C (Symptom #6, 2026-04-16) — publish the consent
             # event on Crossbar WAMP so subscribers (VisionService,
             # frontend, mobile) never have to poll or watch a raw WS
@@ -11084,41 +11560,37 @@ def get_prompts():
 
     prompts = []
 
-    # 1. Read from local prompts/*.json files
-    if os.path.isdir(PROMPTS_DIR):
-        for fname in os.listdir(PROMPTS_DIR):
-            if fname.endswith('.json') and '_' not in fname:
-                try:
-                    fpath = os.path.join(PROMPTS_DIR, fname)
-                    with open(fpath, 'r') as f:
-                        data = json.load(f)
-                    pid = fname.replace('.json', '')
-                    creator = str(data.get('creator_user_id', ''))
-                    if creator == str(req_user_id) or not creator:
-                        prompts.append({
-                            'prompt_id': pid,
-                            'name': data.get('name', ''),
-                            'prompt': data.get('goal', ''),
-                            'agent_name': data.get('agent_name', ''),
-                            'is_active': data.get('status', '') == 'completed',
-                            'user_id': creator or req_user_id,
-                            'has_recipe': os.path.exists(
-                                os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
-                            'flow_count': len(data.get('flows', [])),
-                            'source': 'local',
-                            # Media passthrough — /prompts/public already
-                            # exposes image_url; the user-scoped list dropped
-                            # it, so /local agents rendered an empty video
-                            # column (no idle fallback portrait). fillers is
-                            # future-proofing: local agents have none today
-                            # (cloud-agent feature), but if cloud-sync ever
-                            # writes them locally, idle videos light up with
-                            # no further code change.
-                            'image_url': data.get('image_url', ''),
-                            'fillers': data.get('fillers') or [],
-                        })
-                except Exception:
-                    continue
+    # 1. Local agent records (core.prompt_files: agents only, never the plans
+    # the CREATE path stages beside them for review)
+    from core.prompt_files import local_agent_prompts
+    for pid, data in local_agent_prompts(PROMPTS_DIR):
+        try:
+            creator = str(data.get('creator_user_id', ''))
+            if creator == str(req_user_id) or not creator:
+                prompts.append({
+                    'prompt_id': pid,
+                    'name': data.get('name', ''),
+                    'prompt': data.get('goal', ''),
+                    'agent_name': data.get('agent_name', ''),
+                    'is_active': data.get('status', '') == 'completed',
+                    'user_id': creator or req_user_id,
+                    'has_recipe': os.path.exists(
+                        os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
+                    'flow_count': len(data.get('flows', [])),
+                    'source': 'local',
+                    # Media passthrough — /prompts/public already
+                    # exposes image_url; the user-scoped list dropped
+                    # it, so /local agents rendered an empty video
+                    # column (no idle fallback portrait). fillers is
+                    # future-proofing: local agents have none today
+                    # (cloud-agent feature), but if cloud-sync ever
+                    # writes them locally, idle videos light up with
+                    # no further code change.
+                    'image_url': data.get('image_url', ''),
+                    'fillers': data.get('fillers') or [],
+                })
+        except Exception as e:
+            app.logger.debug(f'/prompts: skipped local agent {pid}: {e}')
 
     # 2. Merge in cloud-only agents the user owns on hevolve.ai —
     # the local store doesn't know about agents the user created from
@@ -11141,33 +11613,29 @@ def get_public_prompts():
     Equivalent to the legacy /getprompt_all/ cloud endpoint."""
     prompts = []
 
-    # 1. Read ALL prompts from local files (no user filter)
-    if os.path.isdir(PROMPTS_DIR):
-        for fname in os.listdir(PROMPTS_DIR):
-            if fname.endswith('.json') and '_' not in fname:
-                try:
-                    fpath = os.path.join(PROMPTS_DIR, fname)
-                    with open(fpath, 'r') as f:
-                        data = json.load(f)
-                    pid = fname.replace('.json', '')
-                    prompts.append({
-                        'prompt_id': pid,
-                        'name': data.get('name', ''),
-                        'prompt': data.get('goal', ''),
-                        'agent_name': data.get('agent_name', ''),
-                        'is_active': data.get('status', '') == 'completed',
-                        'is_public': True,
-                        'user_id': data.get('creator_user_id', ''),
-                        'teacher_image_url': data.get('teacher_image_url', ''),
-                        'image_url': data.get('image_url', ''),
-                        'video_text': data.get('video_text', ''),
-                        'has_recipe': os.path.exists(
-                            os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
-                        'flow_count': len(data.get('flows', [])),
-                        'source': 'local',
-                    })
-                except Exception:
-                    continue
+    # 1. ALL local agent records, no user filter (core.prompt_files: agents
+    # only, never the plans the CREATE path stages beside them for review)
+    from core.prompt_files import local_agent_prompts
+    for pid, data in local_agent_prompts(PROMPTS_DIR):
+        try:
+            prompts.append({
+                'prompt_id': pid,
+                'name': data.get('name', ''),
+                'prompt': data.get('goal', ''),
+                'agent_name': data.get('agent_name', ''),
+                'is_active': data.get('status', '') == 'completed',
+                'is_public': True,
+                'user_id': data.get('creator_user_id', ''),
+                'teacher_image_url': data.get('teacher_image_url', ''),
+                'image_url': data.get('image_url', ''),
+                'video_text': data.get('video_text', ''),
+                'has_recipe': os.path.exists(
+                    os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
+                'flow_count': len(data.get('flows', [])),
+                'source': 'local',
+            })
+        except Exception as e:
+            app.logger.debug(f'/prompts/public: skipped local agent {pid}: {e}')
 
     # 2. Merge in cloud-only public agents.  Same central-vs-local-DB_URL
     # rationale as /prompts above — DB_URL is localhost in bundled mode
@@ -12320,6 +12788,13 @@ def voice_audio(filename):
         _os.path.expanduser('~/.hevolve/models/f5_tts/output'),
         _os.environ.get('TTS_TEMP_DIR', '/tmp/tts'),
     ]
+    # A game's composed sounds (media_agent keeps them there; hartos-3a F1).
+    try:
+        from integrations.service_tools.media_agent import composer_output_dir
+        search_dirs.append(str(composer_output_dir()))
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            'voice_audio: composer output dir unavailable: %s', e)
     for d in search_dirs:
         fpath = _os.path.join(d, safe_name)
         if _os.path.isfile(fpath):
@@ -12940,11 +13415,8 @@ def _validate_startup():
     if _db_p and _db_p != ':memory:' and os.path.isabs(_db_p):
         db_dir = os.path.join(os.path.dirname(_db_p), 'agent_data')
     elif os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-        try:
-            from core.platform_paths import get_agent_data_dir as _get_ad_dir
-            db_dir = _get_ad_dir()
-        except ImportError:
-            db_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+        from core.platform_paths import get_agent_data_dir as _get_ad_dir
+        db_dir = _get_ad_dir()
     else:
         db_dir = os.path.join(os.path.dirname(__file__), 'agent_data')
     if not os.path.isdir(db_dir):
@@ -13144,8 +13616,23 @@ def _serve_app(app, host: str, port: int) -> None:
         log.warning(
             f"Hypercorn unavailable ({exc}) — falling back to Waitress")
 
-    log.info(f"Starting Waitress (WSGI) on {host}:{port} (threads=50)")
-    serve(app, host=host, port=port, threads=50)
+    # The variant thread budget applies HERE too. hart-backend.nix exports
+    # HEVOLVE_WORKER_THREADS as each variant's budget and says that export is what
+    # keeps ExecStart safe against TasksMax; hart-app ships no hypercorn, so every
+    # OS node takes this path, and a hard-coded 50 (plus the import threads) is
+    # more than edge's TasksMax=64. Measured in CI 2026-09-24 (nixosTests
+    # hart-peer-discovery): the edge backend died five times with "can't start
+    # new thread" and "fork rejected by pids controller", then hit its start
+    # limit. Unset (dev box, the Nunba bundle) keeps the old 50, unchanged.
+    raw_budget = os.environ.get('HEVOLVE_WORKER_THREADS')
+    try:
+        waitress_threads = int(raw_budget) if raw_budget else 50
+    except ValueError:
+        waitress_threads = 50
+    if waitress_threads < 1:
+        waitress_threads = 1
+    log.info(f"Starting Waitress (WSGI) on {host}:{port} (threads={waitress_threads})")
+    serve(app, host=host, port=port, threads=waitress_threads)
 
 
 if __name__ == '__main__':
@@ -13158,3 +13645,15 @@ if __name__ == '__main__':
     # # Run the WAMP client
     # run([component])
 
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'FLASK_SECRET_KEY',
+    'HEVOLVE_LLM_API_KEY',
+    'HEVOLVE_REQUIRE_AUTH',
+    'SECRET_KEY',
+)

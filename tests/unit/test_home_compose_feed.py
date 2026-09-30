@@ -17,6 +17,7 @@ Run isolated (this box OOMs the full suite):
     python -m pytest tests/unit/test_home_compose_feed.py --noconftest -p no:capture -q
 """
 import json
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -398,3 +399,89 @@ def test_the_browser_half_exists_and_runs_the_same_card_action():
     assert 'cardAction(c)' in body, (
         "activate must run the SAME cardAction a DOM click runs, not a second "
         "implementation of what a card does")
+
+
+# ── The listener comes back when its socket closes ──
+#
+# Live on the box 2026-09-22: the shell subscribed once, the root relay's 60 s
+# per-connection cap killed the socket, the latch stayed True, and a press on a
+# native card had nowhere to go for the rest of the boot. The compositor
+# restarting ends the socket the same way. These pin the recovery.
+
+def _wm_sub(*results):
+    """A patched WM client whose subscribe_events answers `results` in turn and
+    hands back the on_close hook it was given, so a test can pull the plug."""
+    client = MagicMock()
+    hooks = []
+
+    def subscribe(on_event, on_close=None):
+        hooks.append(on_close)
+        return results[min(len(hooks) - 1, len(results) - 1)]
+    client.subscribe_events.side_effect = subscribe
+    getter = MagicMock(return_value=client)
+    return client, hooks, patch(
+        'integrations.agent_engine.hart_wm_client.get_wm_client', getter)
+
+
+def _wait(cond, timeout=3.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return cond()
+
+
+def test_a_closed_subscription_is_re_established(svc):
+    svc._NATIVE_RELAY_RETRY_S = (0.01,)
+    client, hooks, patched = _wm_sub(True, True)
+    with patched:
+        assert svc._ensure_native_input_relay() is True
+        assert svc._native_input_relay is True
+        assert callable(hooks[0]), "the listener must be given a close hook"
+        hooks[0]()          # the relay killed the socket, or the compositor restarted
+        assert _wait(lambda: client.subscribe_events.call_count == 2),             "the shell must re-subscribe on its own after the socket closes"
+        assert _wait(lambda: svc._native_input_relay is True)
+    assert svc._native_relay_reconnecting is False
+
+
+def test_the_re_listen_keeps_trying_until_the_compositor_is_back(svc):
+    """A compositor mid-restart refuses for a while; the shell must not give up
+    after one refusal, and must stop the moment it is back."""
+    svc._NATIVE_RELAY_RETRY_S = (0.01,)
+    client, hooks, patched = _wm_sub(True, False, False, True)
+    with patched:
+        assert svc._ensure_native_input_relay() is True
+        hooks[0]()
+        assert _wait(lambda: client.subscribe_events.call_count == 4)
+        assert _wait(lambda: svc._native_relay_reconnecting is False)
+        assert svc._native_input_relay is True
+        time.sleep(0.05)
+        assert client.subscribe_events.call_count == 4, "it must stop once it is listening"
+
+
+def test_a_second_close_does_not_start_a_second_re_listen_loop(svc):
+    svc._NATIVE_RELAY_RETRY_S = (0.02,)
+    client, hooks, patched = _wm_sub(True, False)
+    with patched:
+        assert svc._ensure_native_input_relay() is True
+        hooks[0]()
+        hooks[0]()
+        loops = [t for t in threading.enumerate()
+                 if t.name == 'hart-comp-events-relisten']
+        assert len(loops) == 1, "one listener, one recovery loop"
+        # Let it succeed so the loop exits and does not outlive the test.
+        client.subscribe_events.side_effect = lambda on_event, on_close=None: True
+        assert _wait(lambda: svc._native_relay_reconnecting is False)
+
+
+def test_a_closed_listener_clears_the_latch_immediately(svc):
+    """Between the close and the re-listen the latch must read False, or a compose
+    arriving in that window would trust a listener that is not there."""
+    svc._NATIVE_RELAY_RETRY_S = (0.5,)
+    client, hooks, patched = _wm_sub(True, True)
+    with patched:
+        assert svc._ensure_native_input_relay() is True
+        hooks[0]()
+        assert svc._native_input_relay is False
+        assert _wait(lambda: svc._native_relay_reconnecting is False, timeout=3)

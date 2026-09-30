@@ -318,7 +318,18 @@ def switch_model(model_name: str, quant: str = 'auto') -> Dict:
                 }
 
             logger.info(f"Swapping to {model_name} ({quant_used})...")
-            lcpp.swap_model(str(gguf_path))
+            # The result decides everything below.  It used to be dropped:
+            # every refusal (not our server, does not fit, never served)
+            # reached the switch_model tool, POST /api/models/switch and
+            # `hart model switch` as status 'ready', and the catalog and
+            # registry were told the new model was loaded on the OLD port.
+            if not lcpp.swap_model(str(gguf_path)):
+                return {
+                    'status': 'error',
+                    'error': (f'could not switch to {model_name}: the running '
+                              'model was kept (see the llamacpp_manager log '
+                              'for why the swap was refused)'),
+                }
 
             # Unmark previous active model in catalog
             if _active_model:
@@ -326,9 +337,10 @@ def switch_model(model_name: str, quant: str = 'auto') -> Dict:
                 if catalog:
                     catalog.mark_unloaded(_active_model.get('catalog_id', ''))
 
-            # Register new model
+            # Register new model on the port it is ACTUALLY serving on -- a
+            # make-before-break swap puts it on a new one.
             catalog_id = _make_catalog_id(model_name, quant_used)
-            port = (_active_model or {}).get('port', _get_default_port())
+            port = lcpp.port
             _register_in_catalog(catalog_id, model_name, quant_used, gguf_path, port)
             _register_in_registry(catalog_id, model_name, port)
 
@@ -831,7 +843,13 @@ def _register_in_catalog(catalog_id: str, model_name: str, quant: str,
     )
 
     catalog.register(entry)
-    catalog.mark_downloaded(catalog_id)
+    # The resolved weight file, which this function has had as a parameter
+    # all along and was discarding. Recording it is what lets the row learn
+    # what the artifact SAYS about itself -- architecture, the MoE expert
+    # split, an MTP head -- instead of only what was typed into it. It also
+    # populates the local_path that LlamaInstaller.get_model_path's
+    # "canonical catalog lookup first" branch reads.
+    catalog.mark_downloaded(catalog_id, local_path=str(gguf_path))
     catalog.mark_loaded(catalog_id, device='gpu')
     logger.info(f"Registered {catalog_id} in model catalog")
 

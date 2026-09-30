@@ -12,11 +12,17 @@ from flask import Flask
 
 
 @pytest.fixture
-def replay(monkeypatch):
+def replay(monkeypatch, tmp_path):
     from autogen import Agent, ConversableAgent, GroupChat, GroupChatManager
     from hartos import reuse_recipe as rr
     from hartos import lifecycle_hooks
     from integrations.agent_engine import budget_gate
+    InMemoryBackend = pytest.importorskip('agent_ledger.backends').InMemoryBackend
+
+    # create_ledger_from_actions scans ./agent_data for a resumable session;
+    # a stale one from an earlier run in the real tree must not be adopted.
+    monkeypatch.chdir(tmp_path)
+    created_keys = []
 
     for name in ('user_agents', 'role_agents', 'user_journey', 'user_tasks',
                  'user_ledgers', 'recipes', 'agent_data', 'llm_call_track',
@@ -102,11 +108,23 @@ def replay(monkeypatch):
                   None, None, None, None, instructor, {})
 
         def create(*args):
+            # Mirrors what the real create_agents_for_user leaves behind: a
+            # fresh Action, one durable ledger task per action registered for
+            # auto-sync (completion is refused without it since a34e6489f,
+            # see lifecycle_hooks._record_verifier_evidence), and action 1
+            # started through the production helper.
             rr.user_tasks[key] = rr.Action(actions)
             rr.recipes[key] = {'actions': actions}
             lifecycle_hooks.clear_action_states(key)
-            rr.safe_set_state(key, 1, rr.ActionState.ASSIGNED, 'test start')
-            rr.safe_set_state(key, 1, rr.ActionState.IN_PROGRESS, 'test start')
+            ledger = rr.create_ledger_from_actions(
+                user_id=user_id, prompt_id=prompt_id, actions=actions,
+                backend=InMemoryBackend(), flow_id=0)
+            assert set(ledger.tasks) >= {'action_1', 'action_2'}
+            rr.user_ledgers[key] = ledger
+            lifecycle_hooks.register_ledger_for_session(key, ledger)
+            rr.user_tasks[key].set_ledger(ledger)
+            created_keys.append(key)
+            assert rr._start_reuse_action(key, 1, 'test start')
             return agents
 
         create_main = Mock(side_effect=create)
@@ -133,6 +151,14 @@ def replay(monkeypatch):
 
     with Flask(__name__).app_context():
         yield build
+
+    # The ledger and group-chat registries are process-global; leaving this
+    # test's entries behind would hand the next test (or file) a ledger it
+    # never built.
+    for key in created_keys:
+        lifecycle_hooks._ledger_registry.pop(key, None)
+        lifecycle_hooks._groupchat_registry.pop(key, None)
+        lifecycle_hooks.clear_action_states(key)
 
 
 @pytest.mark.parametrize('journey,prompt_id', [
@@ -181,3 +207,28 @@ def test_unresolved_role_returns_question_without_starting_replay(replay):
     run.schedule.assert_not_called()
     assert run.rr.user_journey[run.key] == 'Roles'
     assert run.executed == []
+
+
+def test_warm_run_starts_the_current_action_before_replay(replay, monkeypatch):
+    """A cache hit must hand the replay loop a STARTED action.
+
+    chat_agent's run-boundary clear resets every ActionState to ASSIGNED.  A
+    cache miss starts action 1 inside create_agents_for_user; a cache hit
+    never calls it, and the completion boundary then refuses
+    ASSIGNED -> STATUS_VERIFICATION_REQUESTED, so the warm run could never
+    finish an action.  Observed at the replay loop's door, not inferred from
+    the final reply.
+    """
+    run = replay(42, 'cached')
+    rr = run.rr
+    seen = {}
+
+    def door(*args, **kwargs):
+        seen['state'] = rr.get_action_state(run.key, rr.user_tasks[run.key].current_action)
+        seen['action'] = rr.user_tasks[run.key].current_action
+        return 'ok'
+
+    monkeypatch.setattr(rr, 'get_agent_response', door)
+    assert rr.chat_agent(run.user_id, 'again', 42, None, 'request-11') == 'ok'
+    assert seen == {'state': rr.ActionState.IN_PROGRESS, 'action': 1}
+    run.create_main.assert_not_called()

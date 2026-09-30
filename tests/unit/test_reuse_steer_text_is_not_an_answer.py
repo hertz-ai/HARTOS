@@ -229,10 +229,13 @@ class TestTheSeedIsAlsoTheProducersOwnText:
          follow these steps: [{"Extract the user's latest message ... ":
          {'tool_name': '', 'code': "def extract_user_input(): ..."}}]
 
-    `_reuse_seed_message` builds the opening turn as
+    `_reuse_seed_message` built the opening turn (until 2026-09-25) as
     ``f"{message}\n\n{_build_reuse_action_message(...)}"`` — the user's own
-    words FIRST, the dispatch second.  So the producer's text is in the
-    MIDDLE of the message, and the 93fdaac3f refusal, which asks
+    words FIRST, the dispatch second.  (It now leads with the marker line,
+    then the user's words, then the steps; a model ECHO can still carry the
+    producer's text anywhere, which is what LIVE_SEED below still pins.)
+    So the producer's text was in the MIDDLE of the message, and the
+    93fdaac3f refusal, which asks
     ``content.lstrip().startswith(_REUSE_ACTION_MESSAGE_PREFIX)``, does not
     see it: the seed reads as ordinary prose, the synthesis turn is skipped,
     and the extractor returns the dispatch verbatim.

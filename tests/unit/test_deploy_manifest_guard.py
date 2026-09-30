@@ -53,13 +53,58 @@ class WorkflowCleanupTest(unittest.TestCase):
         cmds = [l.strip() for l in _read(_WORKFLOW).splitlines()
                 if l.strip() and not l.strip().startswith('#')]
         rm = next(i for i, l in enumerate(cmds)
-                  if l.endswith('rm -rf release_manifest.json'))
+                  if 'rm -rf release_manifest.json' in l)
         reset = next(i for i, l in enumerate(cmds)
                      if l == 'git reset --hard origin/main')
         self.assertLess(rm, reset)
 
+    def test_cleanup_removes_only_a_directory_wedge(self):
+        """The FILE is the running container's bind-mounted manifest.  Removing
+        it and then failing the deploy left the rollback image with nothing to
+        boot from: 2026-09-22 15:56Z, "release_manifest.json missing" every 12
+        seconds, central down.  Only the root-owned directory Docker creates
+        may be removed."""
+        cmds = [l.strip() for l in _read(_WORKFLOW).splitlines()
+                if l.strip() and not l.strip().startswith('#')]
+        rm = next(l for l in cmds if 'rm -rf release_manifest.json' in l)
+        self.assertTrue(rm.startswith('if [ -d release_manifest.json ]'),
+                        'the manifest file must survive the cleanup: %r' % rm)
+
+
+class BootCheckTest(unittest.TestCase):
+
+    def test_boot_check_hashes_the_bytes_not_a_cache(self):
+        """compute_code_hash's mtime cache lives in agent_data/, which the
+        deploy bind-mounts into every container, so the cache one image writes
+        is read by the next.  2026-09-22 15:56Z: a cancelled deploy's script
+        kept running, booted its image and wrote the cache at 15:37Z; the next
+        image's checkout carried the earlier mtime of its git reset, so the
+        boot check returned the previous image's hash and refused the new one
+        as tampered.  The boot check must walk."""
+        src = _read(os.path.join(_ROOT, 'hart_intelligence_entry.py'))
+        start = src.index('def hevolve_verify_boot')
+        end = src.index('End Boot Integrity Verification', start)
+        body = src[start:end]
+        self.assertIn('compute_code_hash(force_walk=True)', body)
+        self.assertNotIn('compute_code_hash()', body)
+
 
 class ScriptGuardTest(unittest.TestCase):
+
+    def test_rollback_signs_a_manifest_for_the_image_it_restores(self):
+        """A rollback under enforcement=hard needs a manifest that matches the
+        restored image's code; the one on disk describes the image that just
+        failed, and before 2026-09-22 the rollback mounted none at all."""
+        src = _read(_SCRIPT)
+        self.assertIn('write_signed_manifest() {', src)
+        start = src.index('rolling back')
+        end = src.index('rolled back to', start)
+        block = src[start:end]
+        self.assertIn('write_signed_manifest "$ROLLBACK_IMAGE"', block)
+        self.assertIn('$ROLLBACK_MANIFEST_MOUNT', block)
+        # the new image's manifest is produced through the same function,
+        # so the two cannot drift in what they hash or how they sign
+        self.assertIn('write_signed_manifest langchain_gpt:"$DEPLOY_COMMIT_SHORT"', src)
 
     def test_script_rejects_a_directory(self):
         src = _read(_SCRIPT)

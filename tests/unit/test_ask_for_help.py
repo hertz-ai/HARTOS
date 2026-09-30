@@ -52,9 +52,14 @@ def _functions(names):
 def _names(state=IN_PROGRESS, task=None):
     """The create_recipe globals _ask_for_help reads, and a record of the
     state changes it asks for."""
+    # The reply prefixes are the real constants: the hive worker recognises
+    # the reply by them (core.agent_tools.is_help_pause).
+    from core.constants import HELP_EXPERT_REPLY_PREFIX, HELP_PAUSED_REPLY_PREFIX
     states = []
     ledgers = {'7_1': types.SimpleNamespace(tasks={'action_2': task})} if task else {}
     return states, {
+        'HELP_PAUSED_REPLY_PREFIX': HELP_PAUSED_REPLY_PREFIX,
+        'HELP_EXPERT_REPLY_PREFIX': HELP_EXPERT_REPLY_PREFIX,
         'user_ledgers': ledgers,
         'get_action_state': lambda up, aid: state,
         'safe_set_state': (lambda up, aid, s, reason='':

@@ -1104,7 +1104,8 @@ def start_parse(pdf_path, user_id, request_id='') -> dict:
 def _worker(job_id, file_id, pdf_path, user_id, request_id) -> None:
     try:
         _run(file_id, pdf_path, user_id, request_id, job_id=job_id)
-    except BookParseError:
-        pass  # already recorded on the row and the job, and published
+    except BookParseError as e:
+        # already recorded on the row and the job, and published
+        logger.debug(f"book {file_id}: parse failed (recorded): {e}")
     except Exception:
         logger.exception(f"book {file_id}: background parse crashed")

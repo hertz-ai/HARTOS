@@ -569,3 +569,423 @@ def record_metered_usage(node_id: str, model_id: str, task_source: str,
     except Exception as e:
         logger.debug(f"Metered usage recording failed: {e}")
         return None
+
+
+def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
+                   task_source: str = 'own', goal_id: str = None,
+                   requester_node_id: str = None) -> Optional[str]:
+    """Meter ONE completed LLM call through record_metered_usage.
+
+    Derives the two arguments callers could not supply correctly: this node's
+    node_id, and cost_per_1k in USD from the ONE price source (spark_per_1k,
+    0 for local and free-tier models, divided by HEVOLVE_SPARK_PER_USD, the
+    same rate record_metered_usage converts back with). Both production
+    callers had passed keywords record_metered_usage does not accept
+    (user_id/model/prompt_tokens/... and provider/model/tokens/...), so every
+    call raised TypeError: the coding adapter lost every completion to it and
+    the SDK proxy swallowed it and metered nothing (hevolveai Master 11.435
+    S1/S2). task_source is 'own' | 'hive' | 'idle' (MeteredAPIUsage column);
+    anything but 'own' is settled by the revenue aggregator.
+
+    Never raises: metering must not break the call it meters.
+    """
+    try:
+        node_id = _this_node_id()
+        if _is_local_model():
+            usd_per_1k = 0.0
+        else:
+            spark_per_usd = float(os.environ.get('HEVOLVE_SPARK_PER_USD', '100') or 100)
+            usd_per_1k = spark_per_1k(_resolve_model_name(model)) / max(spark_per_usd, 1e-9)
+        return record_metered_usage(
+            node_id=node_id or 'local', model_id=model or 'unknown',
+            task_source=task_source, tokens_in=int(tokens_in or 0),
+            tokens_out=int(tokens_out or 0), cost_per_1k=usd_per_1k,
+            goal_id=goal_id, requester_node_id=requester_node_id)
+    except Exception as e:
+        logger.warning(f"LLM metering failed (the call itself is unaffected): {e}")
+        return None
+
+
+def _this_node_id() -> str:
+    """This node's id in the domain PeerNode rows are keyed by.
+
+    HEVOLVE_NODE_ID when the operator set it (the advertiser's peer_id honours
+    the same override), else the gossip id from its canonical source,
+    SyncEngine.canonical_node_id.  The public-key prefix this used to fall
+    back to is a different domain: no PeerNode row carries it, so a metered
+    row's operator lookup could never succeed.
+    """
+    node_id = (os.environ.get('HEVOLVE_NODE_ID') or '').strip()
+    if node_id and node_id.lower() != 'local':
+        return node_id
+    try:
+        from integrations.social.sync_engine import SyncEngine
+        return SyncEngine.canonical_node_id() or ''
+    except Exception:
+        return ''
+
+
+def metered_usage_by_model(db) -> list:
+    """Calls and tokens per model over every MeteredAPIUsage row.
+
+    /api/gateway/metering read MeteredAPIUsage.provider and .tokens_used,
+    neither of which exists on either definition of the table, so every call
+    answered 500.  A row records the model, not a provider; the key stays
+    'provider' for the response shape the route always had.
+    """
+    from sqlalchemy import func as sa_func
+    from integrations.social.models import MeteredAPIUsage
+    rows = db.query(
+        MeteredAPIUsage.model_id,
+        sa_func.sum(sa_func.coalesce(MeteredAPIUsage.tokens_in, 0)
+                    + sa_func.coalesce(MeteredAPIUsage.tokens_out, 0)),
+        sa_func.count(MeteredAPIUsage.id),
+    ).group_by(MeteredAPIUsage.model_id).all()
+    return [{'provider': r[0], 'total_tokens': int(r[1] or 0), 'calls': int(r[2])}
+            for r in rows]
+
+
+# ── Remote compute: each side records its own half on its own node ───
+#
+# Owner rulings 2026-09-26.  (a) What is metered is work that goes to "hive
+# nodes usage that's not their node", tracked inside HARTOS.  (b) The rate is
+# "proportinal to compute spent and earned": ONE measured quantity per
+# exchange is debited from the requester and credited to the operator of the
+# node that served it (before the 90/9/1 split, which revenue_aggregator
+# owns).  (c) "for local person'a work zero spark earned": the requester's own
+# node, a node proven SAME_USER, or a local model costs 0 and earns 0.
+#
+# No node writes another node's wallet.  The requesting node debits its
+# person when a remote result returns (charge_remote_compute); the serving
+# node credits its operator when it serves someone who is not its operator
+# (credit_served_compute).  Both halves measure the exchange with
+# exchange_tokens from the same request and response, so each side reaches
+# the same number without either one trusting the other's report.
+
+REMOTE_COMPUTE_TASK_SOURCE = 'hive_compute'          # requester's debit rows
+SERVED_COMPUTE_TASK_SOURCE = 'hive_compute_served'   # server's credit rows
+# Ledger rows, complete when written: settlement never pays them.
+COMPUTE_LEDGER_TASK_SOURCES = frozenset({
+    REMOTE_COMPUTE_TASK_SOURCE, SERVED_COMPUTE_TASK_SOURCE})
+
+# Who asked, on a request one node sends another for compute.  Ids travel
+# as-is to nodes the user does not own (19d4c5b02: only content is scrubbed);
+# the serving node needs them to tell its own operator from someone else.
+REQUESTER_USER_HEADER = 'X-Hart-Requester-User'
+REQUESTER_NODE_HEADER = 'X-Hart-Requester-Node'
+
+
+def spark_per_1k_compute_tokens() -> float:
+    """Spark per 1K tokens of compute run on a node the requester does not own.
+
+    Composed from the two conversions HARTOS already has, no new number:
+    tokens to GPU time is hosting_reward_service.GPU_SECONDS_PER_1K_TOKENS
+    (what gpu_hours_served is credited with), and GPU time to Spark is the
+    wallet's own award table, AWARD_TABLE['compute_hour'] (Spark per compute
+    hour lent).  spark_per_1k() is NOT this: it prices a paid API by model
+    family and says 0 for every local family, so a peer's Qwen would be free.
+    """
+    from integrations.social.hosting_reward_service import GPU_SECONDS_PER_1K_TOKENS
+    from integrations.social.resonance_engine import AWARD_TABLE
+    spark_per_hour = float(AWARD_TABLE['compute_hour']['spark'])
+    return GPU_SECONDS_PER_1K_TOKENS / 3600.0 * spark_per_hour
+
+
+def exchange_tokens(prompt, response, usage=None,
+                    max_tokens=None) -> Tuple[int, int]:
+    """(tokens_in, tokens_out) one compute exchange is measured at.
+
+    The prompt is counted locally from its text (core.token_utils, the one
+    counter), and that count caps what the serving side claims for it; the
+    completion is capped at the request's ``max_tokens``.  A ``usage`` block
+    can only lower the measure, never raise it: an inflated prompt_tokens
+    moved a requester from 1000 to 100 Spark for a 1-token exchange.
+    Without a usage block the completion is counted from the response text.
+    Both nodes call this with the same request and response, so both reach
+    the same number.
+    """
+    from core.token_utils import count_tokens_for_text
+    counted_in = count_tokens_for_text(prompt if isinstance(prompt, str) else '')
+    counted_out = count_tokens_for_text(response if isinstance(response, str) else '')
+    cap_out = None
+    try:
+        if max_tokens is not None and int(max_tokens) >= 0:
+            cap_out = int(max_tokens)
+    except (TypeError, ValueError):
+        cap_out = None
+    tin, tout = counted_in, counted_out
+    usage = usage if isinstance(usage, dict) else {}
+    try:
+        claim_in = int(usage.get('prompt_tokens') or 0)
+        claim_out = int(usage.get('completion_tokens') or 0)
+    except (TypeError, ValueError):
+        claim_in = claim_out = 0
+    if claim_in > 0 or claim_out > 0:
+        tin = min(max(0, claim_in), counted_in)
+        tout = max(0, claim_out)
+    if cap_out is not None:
+        tout = min(tout, cap_out)
+    return tin, tout
+
+
+def completion_exchange(request_body, response_body) -> Tuple[int, int]:
+    """exchange_tokens for one OpenAI-style /chat/completions exchange: the
+    prompt is the request's message text, the response the first choice.
+    The hive expert's requester and its server both measure through here."""
+    request_body = request_body if isinstance(request_body, dict) else {}
+    response_body = response_body if isinstance(response_body, dict) else {}
+    prompt = '\n'.join(
+        m.get('content') for m in (request_body.get('messages') or [])
+        if isinstance(m, dict) and isinstance(m.get('content'), str))
+    choices = response_body.get('choices') or []
+    msg = (choices[0] or {}).get('message') or {} if choices else {}
+    content = msg.get('content') if isinstance(msg, dict) else ''
+    return exchange_tokens(prompt, content or '', response_body.get('usage'),
+                           request_body.get('max_tokens'))
+
+
+def _node_is_users(user_id: str, node_id: str, operator_id: str) -> bool:
+    """Is ``node_id``, operated by ``operator_id``, ``user_id``'s own node?
+
+    Its operator is the user, or this node holds a link to it that
+    PeerLink.owned_by proves is the user's (SAME_USER, the rule of 19d4c5b02).
+    No second ownership rule lives here.  The requester asks it of the node
+    that served it; the server asks it of the requesting node.
+    """
+    if operator_id and operator_id == user_id:
+        return True
+    if not node_id:
+        return False
+    try:
+        from core.peer_link.link_manager import get_link_manager
+        link = get_link_manager().get_link(node_id)
+    except Exception:
+        link = None
+    return bool(link is not None and link.owned_by(user_id))
+
+
+def _lock_wallet(db, user_id: str):
+    """The user's wallet row, created if missing and locked for this
+    transaction (SELECT ... FOR UPDATE; SQLite serializes writers anyway), so
+    concurrent exchanges for one person read the carry one at a time."""
+    from integrations.social.models import ResonanceWallet
+    from integrations.social.resonance_engine import ResonanceService
+    ResonanceService.get_or_create_wallet(db, user_id)
+    return db.query(ResonanceWallet).filter_by(
+        user_id=user_id).with_for_update().first()
+
+
+def _accrue(db, task_source: str, requester: str, operator: str,
+            node_id: str, requester_node: str, tin: int, tout: int,
+            model_id: str):
+    """Write one exchange row and return (row, whole Spark now due).
+
+    The exact Spark owed is the pair's running total (requester, operator) on
+    this node minus the whole Spark already moved; its whole part moves now
+    and the fraction waits for the next exchange.  The caller holds the
+    wallet lock that serializes this read.
+    """
+    import math
+    from sqlalchemy import func as sa_func
+    from integrations.social.models import MeteredAPIUsage
+    from integrations.agent_engine.revenue_aggregator import SPARK_PER_USD
+    rate = spark_per_1k_compute_tokens()
+    exact_prior, moved_prior = db.query(
+        sa_func.coalesce(sa_func.sum(
+            (sa_func.coalesce(MeteredAPIUsage.tokens_in, 0)
+             + sa_func.coalesce(MeteredAPIUsage.tokens_out, 0))
+            * MeteredAPIUsage.cost_per_1k_tokens / 1000.0), 0.0),
+        sa_func.coalesce(sa_func.sum(MeteredAPIUsage.estimated_spark_cost), 0),
+    ).filter(
+        MeteredAPIUsage.task_source == task_source,
+        MeteredAPIUsage.requester_user_id == requester,
+        MeteredAPIUsage.operator_id == operator,
+    ).one()
+    owed = (float(exact_prior or 0.0) - float(moved_prior or 0)
+            + (tin + tout) / 1000.0 * rate)
+    amount = max(0, int(math.floor(owed + 1e-9)))
+    row = MeteredAPIUsage(
+        node_id=node_id,
+        operator_id=operator,
+        model_id=(model_id or 'remote')[:100],
+        task_source=task_source,
+        requester_node_id=requester_node or None,
+        requester_user_id=requester,
+        tokens_in=tin,
+        tokens_out=tout,
+        cost_per_1k_tokens=rate,
+        estimated_spark_cost=amount,
+        actual_usd_cost=amount / float(SPARK_PER_USD or 100),
+        settlement_status='carried',
+    )
+    db.add(row)
+    db.flush()
+    return row, amount
+
+
+def _ledger_ready() -> bool:
+    from integrations.social.models import MeteredAPIUsage
+    if hasattr(MeteredAPIUsage, 'requester_user_id'):
+        return True
+    logger.warning(
+        "Remote compute not recorded: MeteredAPIUsage has no requester_user_id "
+        "on this install (hevolve_database needs the column)")
+    return False
+
+
+def charge_remote_compute(user_id, serving_node_id, tokens_in, tokens_out,
+                          source: str, ref_id: str = '',
+                          model_id: str = '') -> int:
+    """The requester's half: debit its person for COMPLETED compute on a node
+    they do not own.  Pass tokens measured by exchange_tokens.  Returns the
+    whole Spark debited (0 when nothing moved).  Never raises.
+
+    - Own node or SAME_USER node, no requester, nothing measured: 0, no row.
+    - Serving node's operator unknown: 0, no row (no one would earn it).
+    - Otherwise one row (task_source 'hive_compute', node_id = the serving
+      node, operator_id = its operator).  'debited' when whole Spark moved,
+      'carried' when only a fraction accrued.
+    - Insufficient Spark: the work already ran and nothing blocks the person
+      (owner: no friction).  spend_spark is all or nothing, so nothing is
+      debited; the row is 'unfunded' and its amount is not billed again.
+    """
+    user_id = str(user_id or '')
+    serving_node_id = str(serving_node_id or '')
+    tin = max(0, int(tokens_in or 0))
+    tout = max(0, int(tokens_out or 0))
+    if not user_id or not serving_node_id or (tin + tout) <= 0:
+        return 0
+    try:
+        from integrations.social.models import db_session, PeerNode
+        from integrations.social.resonance_engine import ResonanceService
+        if not _ledger_ready():
+            return 0
+        with db_session() as db:
+            peer = db.query(PeerNode).filter_by(node_id=serving_node_id).first()
+            operator_id = str(peer.node_operator_id) if (
+                peer is not None and peer.node_operator_id) else ''
+            if _node_is_users(user_id, serving_node_id, operator_id):
+                return 0
+            if not operator_id:
+                logger.info(
+                    "Remote compute on %s not charged: no operator known for "
+                    "that node, so no one would earn it", serving_node_id)
+                return 0
+            _lock_wallet(db, user_id)
+            row, amount = _accrue(
+                db, REMOTE_COMPUTE_TASK_SOURCE, user_id, operator_id,
+                serving_node_id, _this_node_id(), tin, tout, model_id or source)
+            if amount <= 0:
+                return 0
+            ok, balance = ResonanceService.spend_spark(
+                db, user_id, amount, 'hive_compute_spent', row.id,
+                f'Compute on {serving_node_id} ({source} {ref_id})'.strip())
+            if not ok:
+                row.settlement_status = 'unfunded'
+                logger.info(
+                    "Remote compute on %s: %s has %s Spark, %d owed; recorded "
+                    "unfunded", serving_node_id, user_id, balance, amount)
+                return 0
+            row.settlement_status = 'debited'
+            return amount
+    except Exception as e:
+        logger.warning("Remote compute charge failed (the work itself is "
+                       "unaffected): %s", e)
+        return 0
+
+
+def this_node_operator(db) -> str:
+    """Who operates this node: its PeerNode row's operator, else the user
+    this node proves SAME_USER links over (link.provable_user_id)."""
+    from integrations.social.models import PeerNode
+    node_id = _this_node_id()
+    if node_id:
+        row = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if row is not None and row.node_operator_id:
+            return str(row.node_operator_id)
+    try:
+        from core.peer_link.link import provable_user_id
+        return str(provable_user_id() or '')
+    except Exception:
+        return ''
+
+
+def credit_served_compute(requester_user_id, requester_node_id, tokens_in,
+                          tokens_out, source: str, ref_id: str = '',
+                          model_id: str = '') -> int:
+    """The serving node's half: credit its operator for compute it served to
+    someone who is not its operator.  Pass tokens measured by exchange_tokens
+    from the request received and the response sent.  Returns the whole
+    Spark credited.  Never raises.
+
+    - No requester named, nothing measured, operator unknown, or the
+      requester is this node's operator (or proves the requesting node is
+      theirs over a SAME_USER link): 0, no row.
+    - Otherwise one row (task_source 'hive_compute_served', node_id = this
+      node): 'credited' when whole Spark moved, 'carried' otherwise.
+    """
+    requester = str(requester_user_id or '')
+    requester_node = str(requester_node_id or '')
+    tin = max(0, int(tokens_in or 0))
+    tout = max(0, int(tokens_out or 0))
+    if not requester or (tin + tout) <= 0:
+        return 0
+    try:
+        from integrations.social.models import db_session
+        from integrations.social.resonance_engine import ResonanceService
+        if not _ledger_ready():
+            return 0
+        with db_session() as db:
+            operator_id = this_node_operator(db)
+            if not operator_id:
+                logger.info("Served compute not credited: this node has no "
+                            "known operator")
+                return 0
+            # The requester's own node served them: its operator is the
+            # requester, or the requesting node is linked SAME_USER to this
+            # node's user and the requester is that user.
+            if _node_is_users(requester, requester_node, operator_id):
+                return 0
+            _lock_wallet(db, operator_id)
+            row, amount = _accrue(
+                db, SERVED_COMPUTE_TASK_SOURCE, requester, operator_id,
+                _this_node_id(), requester_node, tin, tout, model_id or source)
+            if amount <= 0:
+                return 0
+            ResonanceService.award_spark(
+                db, operator_id, amount, 'hive_compute_earned', row.id,
+                f'Compute served to {requester} ({source} {ref_id})'.strip())
+            row.settlement_status = 'credited'
+            return amount
+    except Exception as e:
+        logger.warning("Served compute credit failed (the work itself is "
+                       "unaffected): %s", e)
+        return 0
+
+
+def credit_served_completion(headers, request_body, response_body) -> int:
+    """The serving half of a hive expert exchange, for the node's
+    /v1/chat/completions route: who asked comes from the requester headers,
+    the measure from completion_exchange, the same one the requester's
+    SpeculativeDispatcher._charge_hive_expert debits with.  A reply with no
+    content did not complete and earns nothing; a call without the headers
+    (an SDK client, not a hive peer) earns nothing here.  Never raises."""
+    try:
+        get = getattr(headers, 'get', None)
+        requester = (get(REQUESTER_USER_HEADER) if get else '') or ''
+        if not requester:
+            return 0
+        body = response_body if isinstance(response_body, dict) else {}
+        choices = body.get('choices') or []
+        msg = ((choices[0] or {}).get('message') or {}) if choices else {}
+        if not (isinstance(msg, dict) and msg.get('content')):
+            return 0
+        tin, tout = completion_exchange(request_body, body)
+        model = (request_body or {}).get('model') if isinstance(
+            request_body, dict) else ''
+        return credit_served_compute(
+            requester, get(REQUESTER_NODE_HEADER) or '', tin, tout,
+            source='hive_expert', model_id=str(model or 'hive_expert'))
+    except Exception as e:
+        logger.warning("Served completion credit skipped: %s", e)
+        return 0

@@ -49,6 +49,14 @@ _THROTTLE_LOCK = threading.Lock()
 _THROTTLE: dict[tuple[str, str], float] = {}
 _THROTTLE_TTL_SEC = 300.0
 
+# context['failed_step'] on a missing-package self_heal goal
+# (category='subprocess.tool_load'): which step failed before the goal was
+# raised.  Written by gpu_worker._raise_missing_package_goal, read by
+# goal_manager._build_self_heal_prompt, which says a pip install was tried
+# only when one was.
+FAILED_STEP_PIP_INSTALL = 'pip_install'
+FAILED_STEP_SETUP_OFFER = 'setup_offer'
+
 
 def _fingerprint(exc: BaseException) -> str:
     """Stable error fingerprint for throttling.  Type + truncated msg.

@@ -424,20 +424,89 @@ class TestCreateRecipeExecution:
 class TestStatusVerifierReview:
     """Tests for the StatusVerifier pattern in create_recipe.py."""
 
-    def test_lifecycle_hook_process_verifier_valid_completion(self):
-        """Verifier accepts valid completion JSON."""
-        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response, safe_set_state, ActionState
+    # A VALID completion is one the StatusVerifier grounds: the CREATE prompt
+    # asks for "evidence": {"message_index", "kind"} citing an earlier result
+    # of this action (create_recipe StatusVerifier system_message), and the
+    # one gate is lifecycle_hooks.commit_verified_action_completion.
+    #
+    # This test used to send {"status": "completed", "result": "Done"} -- no
+    # evidence -- for an IN_PROGRESS action and expect 'allow'.  'allow' was
+    # the hook NOT judging the verdict at all (it only judged actions already
+    # in STATUS_VERIFICATION_REQUESTED); the TERMINATE that follows every
+    # verdict then walked the action through COMPLETED with no receipt, the
+    # fabrication measured live 2026-09-27 (daemon_255bd83f).  Since
+    # cd8d9154d the verdict is judged, so that input now gets
+    # 'force_completion' ("not complete yet: cite a receipt"): the correct
+    # answer for an ungrounded claim, not an override of a valid one.  Both
+    # sides are pinned below, through the real registries.
+
+    _UP = 'pipelineverifiersession'   # no '_': the ledger loader makes nothing on disk
+
+    def _session(self, monkeypatch, tool_content):
+        from types import SimpleNamespace
+        from hartos import lifecycle_hooks as lh
         from hartos.helper import Action
+        gc = SimpleNamespace(agents=[], messages=[
+            {'role': 'user', 'name': 'ChatInstructor',
+             'content': 'Execute Action 1: fetch_weather for Chennai'},
+            {'role': 'assistant', 'name': 'Assistant', 'content': '',
+             'tool_calls': [{'id': 'w1', 'type': 'function', 'function': {
+                 'name': 'fetch_weather', 'arguments': '{"city": "Chennai"}'}}]},
+            {'role': 'tool', 'name': 'Assistant', 'content': tool_content,
+             'tool_responses': [{'tool_call_id': 'w1', 'role': 'tool',
+                                 'content': tool_content}]},
+        ])
+        ledger = SimpleNamespace(
+            tasks={'action_1': SimpleNamespace(
+                context={}, description='fetch_weather for Chennai')},
+            save=lambda: True)
+        lh.register_groupchat_for_session(self._UP, gc)
+        # The gate READS the ledger for the action's text and records the
+        # accepted receipt there; the state-sync registry is left empty
+        # (the legacy path), so the FSM writes are the real ones.
+        monkeypatch.setattr(lh, 'get_registered_ledger', lambda _up: ledger)
+        # The learning sinks (Agent Lightning, world model) are not under test.
+        monkeypatch.setattr(lh, '_promote_verified_outcome', lambda *a, **k: None)
+        lh.action_states.pop(self._UP, None)
+        lh.retry_tracker.reset_count(self._UP, 1)
+        lh.safe_set_state(self._UP, 1, lh.ActionState.ASSIGNED, "init")
+        lh.safe_set_state(self._UP, 1, lh.ActionState.IN_PROGRESS, "start")
+        return lh, {self._UP: Action([{"action_id": 1, "action": "fetch_weather"}])}
 
-        user_prompt = "test_verifier_valid"
-        actions = [{"action_id": 1, "action": "Do thing"}]
-        user_tasks = {user_prompt: Action(actions)}
-        safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
-        safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "start")
+    def _cleanup(self, lh):
+        lh.action_states.pop(self._UP, None)
+        lh.retry_tracker.reset_count(self._UP, 1)
+        lh._groupchat_registry.pop(self._UP, None)
 
-        json_obj = {"status": "completed", "action_id": 1, "result": "Done"}
-        result = lifecycle_hook_process_verifier_response(user_prompt, json_obj, user_tasks)
-        assert result['action'] == 'allow'
+    def test_lifecycle_hook_process_verifier_valid_completion(self, monkeypatch):
+        """A grounded completed verdict completes the action; it is never
+        turned into a 'not complete yet' (force_completion)."""
+        lh, user_tasks = self._session(monkeypatch, '{"temp_c": 31, "sky": "clear"}')
+        try:
+            result = lh.lifecycle_hook_process_verifier_response(
+                self._UP,
+                {"status": "completed", "action_id": 1, "result": "31C, clear",
+                 "evidence": {"message_index": 2, "kind": "tool_receipt"}},
+                user_tasks)
+            assert result['action'] == 'force_fallback', result
+            assert lh.get_action_state(self._UP, 1) == lh.ActionState.COMPLETED
+        finally:
+            self._cleanup(lh)
+
+    def test_lifecycle_hook_process_verifier_ungrounded_completion_is_not_completed(
+            self, monkeypatch):
+        """The old test's input: a completed claim with no evidence.  It is
+        judged and refused (steered to cite a receipt), and never COMPLETED."""
+        lh, user_tasks = self._session(monkeypatch, '{"temp_c": 31, "sky": "clear"}')
+        try:
+            result = lh.lifecycle_hook_process_verifier_response(
+                self._UP, {"status": "completed", "action_id": 1, "result": "Done"},
+                user_tasks)
+            assert result['action'] == 'force_completion', result
+            assert 'is not complete yet' in result['message']
+            assert lh.get_action_state(self._UP, 1) != lh.ActionState.COMPLETED
+        finally:
+            self._cleanup(lh)
 
     def test_lifecycle_hook_process_verifier_passes_none_through(self):
         """Verifier allows None JSON through (defensive design)."""

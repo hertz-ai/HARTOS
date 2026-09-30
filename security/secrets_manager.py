@@ -28,7 +28,14 @@ _VAULT_PATH = os.path.join(os.path.dirname(__file__), '..', 'secrets.enc')
 _SALT_PATH = os.path.join(os.path.dirname(__file__), '..', 'secrets.salt')
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', 'config.json')
 
-# Known secret keys that should be loaded from the vault
+# Known secret keys that should be loaded from the vault: the names this
+# process legitimately reads from its environment.  THE one list of them.
+# A vault value reaches os.environ only for a name here (HARTOS
+# AIKeyVault.store_credential / preload_env, Nunba desktop ai_key_vault
+# export_to_env); any other value the owner entered (a site password asked
+# for on the consent card) stays in the vault and reaches a tool only
+# through its {{secret:NAME}} alias, so a card entry named NUNBA_CI or
+# HTTPS_PROXY can never become configuration.
 SECRET_KEYS = [
     'OPENAI_API_KEY',
     'GROQ_API_KEY',
@@ -43,7 +50,20 @@ SECRET_KEYS = [
     'SOCIAL_DB_KEY',
     'REDIS_URL',
     'DATABASE_URL',
+    'ANTHROPIC_API_KEY',
 ]
+
+# The node's own secrets and connection strings in SECRET_KEYS: its JWT
+# signing key, its database key and where its data lives.  Only the node's
+# own vault (hartos.ai_key_vault.AIKeyVault.preload_env) may put them in the
+# environment; a consent-card or agent-supplied value never sets them, held
+# or not (hartos.ai_key_vault.is_node_secret).
+NODE_SECRET_KEYS = (
+    'SOCIAL_SECRET_KEY',
+    'SOCIAL_DB_KEY',
+    'DATABASE_URL',
+    'REDIS_URL',
+)
 
 
 class SecretsManager:
@@ -82,10 +102,23 @@ class SecretsManager:
         """Initialize Fernet cipher from master key."""
         master_key = os.environ.get('HEVOLVE_MASTER_KEY')
         if not master_key:
-            logger.warning(
-                "HEVOLVE_MASTER_KEY not set. Secrets vault unavailable. "
-                "Falling back to environment variables only."
-            )
+            # A WARNING only when something is actually locked away: an
+            # encrypted vault on disk that this process cannot open.  With
+            # no vault there is nothing to decrypt -- _load_vault returns
+            # before reading anything -- and env-vars-only is the documented
+            # default, so warning there put noise on every fresh node's happy
+            # path (first node-key mint on a CI runner, 2026-09-26) and
+            # buried the one case that matters.
+            if os.path.exists(os.path.abspath(_VAULT_PATH)):
+                logger.warning(
+                    "HEVOLVE_MASTER_KEY not set, but an encrypted secrets "
+                    "vault exists at %s: its secrets are UNAVAILABLE to this "
+                    "process. Falling back to environment variables only.",
+                    os.path.abspath(_VAULT_PATH))
+            else:
+                logger.info(
+                    "HEVOLVE_MASTER_KEY not set and no secrets vault exists; "
+                    "secrets come from environment variables only.")
             return
 
         salt_path = os.path.abspath(_SALT_PATH)
@@ -214,3 +247,12 @@ if __name__ == '__main__':
         SecretsManager.migrate_from_config()
     else:
         print("Usage: python -m security.secrets_manager migrate")
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HEVOLVE_MASTER_KEY',
+)

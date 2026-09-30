@@ -25,6 +25,16 @@ class DataClass:
 
 
 # Channel registry: name -> config
+#: What a DEVICE link (a person's phone, admitted by the desktop owner's
+#: device_access grant, HARTOS #111) may do on a channel: 'in' (the device
+#: may send on it), 'out' (the node may deliver on it), 'both', or absent
+#: (nothing).  A device is not a node: every channel that carries node
+#: authority -- compute, dispatch, gossip, federation, hivemind, ralt,
+#: sensor, messages, learning -- is closed to it unless a maintainer opens it
+#: here, so a new channel starts closed.  link.py drops what a device sends
+#: elsewhere; link_manager.broadcast/collect never deliver elsewhere.
+DEVICE_POLICY_KEY = 'device'
+
 CHANNEL_REGISTRY = {
     'control': {
         'id': 0x00,
@@ -32,6 +42,7 @@ CHANNEL_REGISTRY = {
         'priority': 0,    # Highest priority
         'reliable': True,
         'description': 'Handshake, heartbeat, disconnect, capability updates',
+        DEVICE_POLICY_KEY: 'both',
     },
     'compute': {
         'id': 0x01,
@@ -70,6 +81,7 @@ CHANNEL_REGISTRY = {
     },
     'events': {
         'id': 0x06,
+        DEVICE_POLICY_KEY: 'out',   # the user's own pushes (the spoken reply)
         'data_class': DataClass.OPEN,     # Theme changes, config are public
         'priority': 4,
         'reliable': False,
@@ -124,6 +136,16 @@ CHANNEL_NAMES = CHANNEL_ID_TO_NAME
 def get_channel_config(channel: str) -> dict:
     """Get channel config. Returns empty dict for unknown channels."""
     return CHANNEL_REGISTRY.get(channel, {})
+
+
+def device_may_send(channel: str) -> bool:
+    """May a DEVICE link send on this channel (inbound to the node)?"""
+    return get_channel_config(channel).get(DEVICE_POLICY_KEY) in ('in', 'both')
+
+
+def device_may_receive(channel: str) -> bool:
+    """May the node deliver on this channel to a DEVICE link?"""
+    return get_channel_config(channel).get(DEVICE_POLICY_KEY) in ('out', 'both')
 
 
 def is_private_channel(channel: str) -> bool:

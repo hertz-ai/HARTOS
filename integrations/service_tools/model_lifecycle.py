@@ -1794,7 +1794,40 @@ class ModelLifecycleManager:
 
         # Build command
         gpu_layers = 99 if mode == 'gpu' else 0
-        ctx_size = int(os.environ.get('HEVOLVE_LLM_CTX_SIZE', 8192))
+
+        # Context size: whatever the REAL derivation last published.
+        #
+        # This read used to name a DIFFERENT env var — HEVOLVE_LLM_..., one
+        # word short of the HEVOLVE_LLAMA_... the derivation actually
+        # publishes.  Nothing in either repo has ever written that spelling, so
+        # this branch always took its 8192 literal: a third independent answer
+        # to a question that already had one.  A declared override with no
+        # producer is dead config (memory/feedback_declaration_is_not_a_guard
+        # .md), and the wire trimmer — budgeting against the OTHER name — could
+        # not have agreed with it.  The dead spelling is described rather than
+        # quoted here on purpose: a retired name left verbatim in a comment is
+        # still what the next grep finds, and
+        # tests/unit/test_source_guard_one_ctx_size_authority.py fails on it.
+        #
+        # ctx_size_from_env is the one reader of the one name.  This spawner
+        # deliberately does NOT re-derive from VRAM: it is the fallback for
+        # boxes with no Nunba (Docker, standalone, HART OS), and on the desktop
+        # the adopt-probe above has already returned.  Inheriting the published
+        # number keeps it consistent with whatever is serving; the fallback
+        # when nothing has published is core.llama_geometry.CTX_FALLBACK.
+        #
+        # It does NOT call publish_geometry: the command below passes no
+        # --parallel, so llama.cpp picks its own slot count ("auto" = 4 on the
+        # reference box) and publishing slots=1 beside it would hand the
+        # trimmer a number the server does not use — worse than publishing
+        # nothing, because the env branch of _get_budget_per_slot wins over the
+        # live /props probe.  Staying quiet lets that probe read the truth from
+        # the server this call just started.  There is no stale-env hazard:
+        # this path is reached only when `from llama.llama_config import
+        # LlamaConfig` raised ImportError, i.e. in a process where Nunba never
+        # published either.
+        from core.llama_geometry import ctx_size_from_env
+        ctx_size = ctx_size_from_env()
 
         cmd = [
             server_bin,
@@ -1807,6 +1840,34 @@ class ModelLifecycleManager:
         ]
         if mmproj_path:
             cmd.extend(['--mmproj', mmproj_path])
+
+        # The THIRD spawn path, and it has to place a mixture of experts the
+        # same way the other two do. The catalog admits a 35B on an 8 GB card
+        # because it is sized for --cpu-moe placement; a restart that drops
+        # the flag would try to put all 21 GiB on the card, so the model
+        # would survive selection and die on the recovery that was meant to
+        # save it. Asked of the shared helper, never decided here.
+        if gpu_layers:
+            try:
+                from integrations.service_tools.model_catalog import (
+                    moe_offload_args)
+                from integrations.service_tools.vram_manager import (
+                    vram_manager)
+                cmd.extend(moe_offload_args(
+                    model_path, float(vram_manager.get_free_vram())))
+            except Exception as e:
+                logger.info("MoE placement probe skipped on restart (%s); "
+                            "launching with unchanged flags", e)
+
+        # Multi-token prediction: on when the model carries an MTP head and
+        # the binary accepts the flag.  The same call every spawn makes, so
+        # a restart never silently drops what the first launch had.
+        try:
+            from integrations.service_tools.model_catalog import mtp_spec_args
+            cmd.extend(mtp_spec_args(model_path, server_bin))
+        except Exception as e:
+            logger.info("MTP probe skipped on restart (%s); launching "
+                        "without it", e)
 
         log_path = os.path.join(
             os.environ.get('TEMP', '/tmp'), f'llama_{port}.log')

@@ -213,11 +213,11 @@ AgentBaselineService.list_snapshots(prompt_id, flow_id)
 
 ## Coding Benchmark Tracker
 
-**File:** `integrations/coding_agent/benchmark_tracker.py` (249 lines)
+**File:** `integrations/coding_agent/benchmark_tracker.py`
 
 SQLite-backed performance tracking for coding agent tools, tasks, and models.
 
-**Database:** `agent_data/coding_benchmarks.db`
+**Database:** `<data dir>/data/agent_data/coding_benchmarks.db`, from `core.platform_paths.get_agent_data_dir()` (on Windows `~/Documents/Nunba/data/agent_data/`). The user data dir, never the install tree; under pytest the data root is a per-process temp dir.
 
 ### Tables
 

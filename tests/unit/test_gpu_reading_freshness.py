@@ -40,6 +40,10 @@ class _Manager(unittest.TestCase):
                               'free_gb': 2.98, 'cuda_available': True}
         self.mgr._refresh_ttl = 120.0
         self.mgr._vendor_tools_absent = False
+        # The ledger the memo is checked against; the cached reading was
+        # taken at its current revision (nothing loaded or unloaded since).
+        self.mgr._allocations = vm._AllocationLedger()
+        self.mgr._gpu_info_seq = self.mgr._allocations.changed_seq
         self.probes = []
 
         def _fresh():
@@ -115,6 +119,100 @@ class TestForceBypassesTheTtl(_Manager):
         self.assertIsNone(seen['memo_at_entry'],
                           'the memo was still set when detect_gpu ran, so the '
                           'real probe would have been skipped')
+
+
+class TestALoadOrUnloadInvalidatesTheMemo(_Manager):
+    """The same class of failure from the other side, 2026-09-16 (live app
+    PID 26452): llama-server came up and llama_config booked
+    ``_allocations['llm'] = 2.84`` after its health check passed, but a
+    reading taken BEFORE the load (7.5 GB free) stayed inside the 120 s TTL
+    and was what every non-LLM selector sized itself against.
+
+    A load or unload is the transition; the allocation ledger is the
+    manager's own record of it -- llama_config writes the row directly,
+    notify_loaded/allocate() book tools, both release on unload.  So a
+    memo older than the ledger's last change is re-probed ONCE, and a
+    memo newer than it is kept.  detect_gpu() and refresh_gpu_info()
+    both honour it; the TTL still bounds the steady state.
+    """
+
+    def _book_llm(self):
+        self.mgr._allocations['llm'] = 2.84   # llama_config, health OK
+
+    def test_a_memo_older_than_the_last_allocation_change_is_reprobed(self):
+        self._at(5)                            # fresh by TTL standards
+        self._book_llm()
+        with patch.object(self.mgr, '_probe_gpu', self._fresh):
+            got = self.mgr.detect_gpu()
+        self.assertEqual(len(self.probes), 1,
+                         'the pre-load reading was served after the LLM '
+                         'booked its VRAM')
+        self.assertEqual(got['free_gb'], 7.56)
+
+    def test_the_reprobe_happens_once_not_on_every_read(self):
+        self._at(5)
+        self._book_llm()
+        with patch.object(self.mgr, '_probe_gpu', self._fresh):
+            self.mgr.detect_gpu()
+            self.mgr.detect_gpu()
+            self.mgr.get_free_vram()
+        self.assertEqual(len(self.probes), 1)
+
+    def test_a_memo_newer_than_the_last_change_is_kept(self):
+        self._book_llm()
+        with patch.object(self.mgr, '_probe_gpu', self._fresh):
+            self.mgr.detect_gpu()              # the one re-probe
+            self.probes.clear()
+            self.mgr.detect_gpu()
+            self.mgr.get_free_vram()
+        self.assertEqual(self.probes, [])
+
+    def test_releasing_a_row_invalidates_too(self):
+        self._book_llm()
+        with patch.object(self.mgr, '_probe_gpu', self._fresh):
+            self.mgr.detect_gpu()
+            self.probes.clear()
+            self.mgr._allocations.pop('llm', 0)   # llama_config on stop
+            self.mgr.detect_gpu()
+        self.assertEqual(len(self.probes), 1)
+
+    def test_popping_a_row_that_was_never_booked_changes_nothing(self):
+        self._at(5)
+        self.mgr._allocations.pop('llm', 0)
+        with patch.object(self.mgr, '_probe_gpu', self._fresh):
+            self.mgr.detect_gpu()
+        self.assertEqual(self.probes, [])
+
+    def test_refresh_gpu_info_inside_the_ttl_honours_the_ledger(self):
+        self._at(5)
+        self._book_llm()
+        with patch.object(self.mgr, '_probe_gpu', self._fresh):
+            got = self.mgr.refresh_gpu_info()
+        self.assertEqual(len(self.probes), 1)
+        self.assertEqual(got['free_gb'], 7.56)
+
+    def test_a_change_that_lands_during_the_probe_invalidates_its_result(self):
+        """The revision is read before the probe, so a booking that lands
+        while nvidia-smi runs is newer than the reading it produced."""
+        self._at(5)
+        self.mgr._allocations['tts_f5'] = 1.3  # something to re-probe for
+
+        def _probe_with_booking():
+            self._book_llm()                    # lands mid-probe
+            return self._fresh()
+
+        with patch.object(self.mgr, '_probe_gpu', _probe_with_booking):
+            self.mgr.detect_gpu()
+        with patch.object(self.mgr, '_probe_gpu', self._fresh):
+            self.mgr.detect_gpu()
+        self.assertEqual(len(self.probes), 2)
+
+    def test_the_ledger_is_still_a_plain_mapping_for_its_readers(self):
+        """get_allocations()/get_allocations_display() copy it with dict()."""
+        self._book_llm()
+        self.assertEqual(dict(self.mgr._allocations), {'llm': 2.84})
+        self.assertIn('llm', self.mgr._allocations)
+        self.assertEqual(sum(self.mgr._allocations.values()), 2.84)
 
 
 if __name__ == '__main__':

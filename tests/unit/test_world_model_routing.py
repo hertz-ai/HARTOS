@@ -27,6 +27,14 @@ _mock_hive = MagicMock()
 _mock_hive.get_stats = MagicMock(return_value={'agents': 3})
 
 
+def _verified():
+    return {
+        'verified': True, 'source': 'status_verifier',
+        'outcome': 'success', 'action_id': 'routing-test',
+        'evidence': {'kind': 'tool_receipt', 'message_index': 1},
+    }
+
+
 def _make_bridge(tier='flat', api_url=None, bundled=False,
                  inproc_provider=None, inproc_hive=None):
     """Create a WorldModelBridge with controlled state.
@@ -214,7 +222,7 @@ class TestWorldModelRouting:
             bridge._flush_batch_size = 1  # Force immediate flush
             bridge.record_interaction(
                 user_id='u1', prompt_id='p1',
-                prompt='test', response='ok')
+                prompt='test', response='ok', verification=_verified())
             # Experience should be queued and flushed in-process
             assert bridge._stats['total_recorded'] >= 1
 
@@ -227,7 +235,7 @@ class TestWorldModelRouting:
                 bridge._flush_batch_size = 1
                 bridge.record_interaction(
                     user_id='u1', prompt_id='p1',
-                    prompt='test', response='ok')
+                    prompt='test', response='ok', verification=_verified())
                 # Flush runs in executor — verify experience was queued
                 assert bridge._stats['total_recorded'] >= 1
 
@@ -240,7 +248,7 @@ class TestWorldModelRouting:
                 bridge._flush_batch_size = 1
                 bridge.record_interaction(
                     user_id='u1', prompt_id='p1',
-                    prompt='test', response='ok')
+                    prompt='test', response='ok', verification=_verified())
                 # Experience queued (for gossip distribution)
                 assert bridge._stats['total_recorded'] >= 1
                 # HTTP must NOT be called
@@ -255,7 +263,7 @@ class TestWorldModelRouting:
                 bridge._flush_batch_size = 1
                 bridge.record_interaction(
                     user_id='u1', prompt_id='p1',
-                    prompt='test', response='ok')
+                    prompt='test', response='ok', verification=_verified())
                 assert bridge._stats['total_recorded'] >= 1
                 mock_post.assert_not_called()
 

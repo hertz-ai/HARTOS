@@ -582,6 +582,12 @@ class ResourceGovernor:
         self._gpu_allowed: bool = False
         self._last_user_activity: float = time.monotonic()
         self._idle_threshold_seconds: float = idle_threshold_seconds
+        # The monitor's last sampled answer to "is a person at the desk",
+        # None until the monitor has sampled once. user_present() reads it;
+        # the yield gate asks. Kept apart from _mode on purpose: MODE_ACTIVE
+        # is also the constructor default and also what external load
+        # produces, so "mode == ACTIVE" cannot mean "someone is here".
+        self._last_user_idle: Optional[bool] = None
 
         # Threading
         self._proactive_thread: Optional[threading.Thread] = None
@@ -668,7 +674,8 @@ class ResourceGovernor:
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
-    def start(self, defer_memory_limit: bool = False) -> None:
+    def start(self, defer_memory_limit: bool = False,
+              monitor_only: bool = False) -> None:
         """Start the governor background monitor and proactive stream.
 
         Args:
@@ -679,6 +686,24 @@ class ResourceGovernor:
                 from terminating the process during the boot-time memory
                 peak (autogen + flaml + llmlingua + transformers + 96
                 expert agents all imported before webview.start).
+            monitor_only: Run ONLY the monitor loop, so get_mode() is live
+                in this process: no enforcer, no proactive stream.  For a
+                process that is not the backend but reads the governor,
+                which on HART OS is hart-agent-daemon.service: its
+                _idle_only_blocked and starvation override call
+                get_mode(), and without a monitor that was the
+                constructor's MODE_ACTIVE for the life of the process
+                (found 2026-09-23 on the Samsung box).  The enforcer is
+                skipped on purpose, not for economy: it is per process
+                (nice, affinity, a cgroup or Job Object on THIS process),
+                and its _unrestrict_llm_affinity pins llama-server to
+                every core by port lookup, which from a second process
+                would undo the taskset pin hart-llm.nix applies (measured
+                2026-09-23: llama-server on cpus 2,3,6,7, the pin holding).
+                The proactive stream is skipped because it dispatches hive
+                tasks and benchmarks, and the backend's own governor already
+                runs the one copy of it.  With the enforcer never armed,
+                _transition_to's update_caps call is a no-op here.
         """
         with self._lock:
             if self._running:
@@ -689,19 +714,20 @@ class ResourceGovernor:
             self._stats['uptime_start'] = time.time()
 
         # Apply hard OS-level resource caps at startup
-        try:
-            enforcer = get_enforcer()
-            if defer_memory_limit:
-                # Priority + CPU only — memory cap deferred to avoid
-                # SIGKILL on boot-time spike (see app.py comment block).
-                enforcer._set_process_priority()
-                enforcer._enforce_cpu(0.75, max(1, int((os.cpu_count() or 4) * 0.75)), os.cpu_count() or 4)
-                enforcer._enforced = True  # mark so update_caps doesn't re-enforce
-                logger.info("ResourceEnforcer: priority + CPU applied (memory deferred)")
-            else:
-                enforcer.enforce(cpu_fraction=0.75, ram_fraction=0.75, gpu_fraction=0.75)
-        except Exception as e:
-            logger.warning("ResourceEnforcer failed at startup: %s", e)
+        if not monitor_only:
+            try:
+                enforcer = get_enforcer()
+                if defer_memory_limit:
+                    # Priority + CPU only; the memory cap is deferred to avoid
+                    # SIGKILL on boot-time spike (see app.py comment block).
+                    enforcer._set_process_priority()
+                    enforcer._enforce_cpu(0.75, max(1, int((os.cpu_count() or 4) * 0.75)), os.cpu_count() or 4)
+                    enforcer._enforced = True  # mark so update_caps doesn't re-enforce
+                    logger.info("ResourceEnforcer: priority + CPU applied (memory deferred)")
+                else:
+                    enforcer.enforce(cpu_fraction=0.75, ram_fraction=0.75, gpu_fraction=0.75)
+            except Exception as e:
+                logger.warning("ResourceEnforcer failed at startup: %s", e)
 
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop,
@@ -709,6 +735,12 @@ class ResourceGovernor:
             daemon=True,
         )
         self._monitor_thread.start()
+
+        if monitor_only:
+            logger.info("ResourceGovernor started, monitor only "
+                        "(idle threshold=%.0fs; no enforcer, no proactive stream)",
+                        self._idle_threshold_seconds)
+            return
 
         self._proactive_thread = threading.Thread(
             target=self._proactive_action_stream,
@@ -759,6 +791,35 @@ class ResourceGovernor:
     def get_mode(self) -> str:
         """Current mode: 'active', 'idle', or 'sleep'."""
         return self._mode
+
+    def user_present(self) -> bool:
+        """True when the LIVE monitor last saw a person at the desk.
+
+        This is the signal the yield gate (dispatch.should_yield_to_user)
+        reads, and it is deliberately not derived from get_throttle() or
+        get_mode():
+
+        * get_throttle() in ACTIVE mode returns ACTIVE_CPU_LIMIT, which is
+          0.50 by default ("at keyboard: usable"), above the gate's 0.3
+          floor. So the gate's 'governor_throttle' reason has NOT fired for
+          a person at the desk since that default was raised; measured on
+          the Samsung box 2026-09-24 on generation 11: this governor logged
+          idle -> active at 22:37:26 and held ACTIVE for seven minutes of
+          continuous input, and the in-process agent daemon kept ticking a
+          278-token llama call every minute through all of it, package at
+          94 C, clock 1.1 GHz, press latency p50 600-1500 ms.
+        * get_mode() == MODE_ACTIVE is also the constructor default and
+          also what foreign CPU load produces, so a governor that was never
+          started would read as "person present" forever and silently
+          stall every daemon (the false-healthy class).
+
+        So: False unless the monitor thread is alive AND its last sample
+        said not idle. A process with no monitor gets the old behaviour.
+        """
+        t = self._monitor_thread
+        if not self._running or t is None or not t.is_alive():
+            return False
+        return self._last_user_idle is False
 
     def get_throttle(self) -> float:
         """Current throttle factor 0.0 (full stop) to 1.0 (unlimited).
@@ -916,6 +977,7 @@ class ResourceGovernor:
                 self._refresh_cpu_attribution()
                 mem = self._get_memory_pressure()
                 user_idle = self._detect_user_idle()
+                self._last_user_idle = user_idle
                 battery_level, on_battery = self._get_battery_status()
                 ext_cpu = self._cached_external_cpu
 
@@ -999,7 +1061,42 @@ class ResourceGovernor:
         return None
 
     def _get_idle_ms_linux(self) -> Optional[float]:
-        """Linux: try xprintidle, then /proc/interrupts delta estimation."""
+        """Linux: xprintidle on X11, then the compositor's input-alive marker.
+
+        xprintidle answers only under X11.  HART OS runs Wayland (hart-comp,
+        sway, cage), where the binary is absent or exits non-zero, so this
+        returned None on every HART OS box and _detect_user_idle fell back to
+        the report_user_activity() timestamp, which only a foreground chat
+        request touches.  A person clicking around the desktop was therefore
+        "away" to the governor, and the agent daemon's starvation override
+        drove CPU inference at the desk.  Measured 2026-09-22 on the Samsung
+        box: press p50 122 ms against a 25 ms budget, clock 1.3 GHz of 3.4,
+        package 94 C, llama-server at 207 percent once a minute; with the
+        daemons paused for 120 s the clock came back to 3.19 GHz and press
+        p50 to 12 ms.
+
+        The marker is the compositor's own input beacon: comp_core.rs
+        note_input_alive writes /run/hart/session/input-alive and the
+        session supervisor reads the same path, so this adds no transport.
+        Its mtime is the last moment the compositor saw a pointer or keyboard
+        event once that write becomes a rate limited heartbeat (S2 of the
+        native OS program); until then it is written once per boot, so an old
+        marker reads as idle, which errs toward letting agents work rather
+        than toward starving them.  The mtime is a wall clock stamp, so it is
+        compared against time.time(); a marker from the future (a clock step)
+        clamps to 0 ms, which reads as active.
+
+        No marker at all (a non HART OS Linux, a dev box) returns None so the
+        timestamp fallback stays the answer there.  HART_INPUT_ALIVE_MARKER
+        overrides the full path for tests; otherwise the marker sits in the
+        ONE session marker dir core.foreground.session_marker_dir resolves
+        (HART_SESSION_MARKER_DIR, else /run/hart/session), the same dir the
+        foreground-active and user-chat markers live in, so a supervisor
+        that relocates the run dir moves all three readers with one setting.
+
+        There is no /proc/interrupts estimator.  The previous docstring
+        promised one that was never written.
+        """
         # Try xprintidle first (X11 desktops)
         try:
             import subprocess
@@ -1008,9 +1105,28 @@ class ResourceGovernor:
              **no_window_kwargs())
             if result.returncode == 0:
                 return float(result.stdout.strip())
-        except Exception:
-            pass
-        return None
+        except Exception as e:
+            logger.debug('xprintidle unavailable (%s); trying the input-alive '
+                         'marker', e)
+        # Wayland: the compositor's input-alive marker (see the docstring).
+        marker = os.environ.get('HART_INPUT_ALIVE_MARKER', '').strip()
+        if not marker:
+            marker_dir = None
+            try:
+                from core.foreground import session_marker_dir
+                marker_dir = session_marker_dir()
+            except Exception:
+                logger.debug('session marker dir unresolved; using the '
+                             'default input-alive path', exc_info=True)
+            # The literal, not a join: on a Windows dev box os.path.join would
+            # put a backslash into a Linux path the tests pin verbatim.
+            marker = (os.path.join(marker_dir, 'input-alive') if marker_dir
+                      else '/run/hart/session/input-alive')
+        try:
+            mtime = os.stat(marker).st_mtime
+        except OSError:
+            return None
+        return max(0.0, (time.time() - mtime) * 1000.0)
 
     def _get_idle_ms_macos(self) -> Optional[float]:
         """macOS: ioreg HIDIdleTime (nanoseconds -> milliseconds)."""
@@ -1095,6 +1211,54 @@ class ResourceGovernor:
         # Windows fallback without psutil: assume moderate usage
         return 0.3
 
+    def _own_process_roots(self) -> list:
+        """This process, every registered managed subprocess, and the
+        llama-server resolved by port -- the roots own_process_pids walks.
+
+        llama-server is NOT spawned by HARTOS (it's a configured endpoint)
+        so it's never register_subprocess'd — but the agent daemon's
+        inference IS HARTOS's own work.  Without counting it as own, its
+        inference CPU reads as a foreign app and trips both the governor
+        backoff AND model_lifecycle pressure → the yield gate flaps and no
+        goal ever completes a tick (2026-05-31 idle-hour: 0 executions).
+        """
+        roots = [os.getpid()]
+        with self._lock:
+            roots.extend(self._managed_subprocesses.values())
+        _llm_pid = self._resolve_llm_server_pid()
+        if _llm_pid and _llm_pid not in roots:
+            roots.append(_llm_pid)
+        return roots
+
+    def own_process_pids(self, include_parent: bool = False) -> set:
+        """The pids of HARTOS's own process tree: this process + its
+        children + every registered managed subprocess + the llama-server
+        resolved by port + their children.  ONE definition, read by the CPU
+        attribution below and by integrations.vlm.safety, which refuses an
+        agent command that would stop any of them (#877).
+
+        ``include_parent`` adds the parent process: when HARTOS runs as a
+        child of Nunba, the parent is the app the user is looking at.
+        Empty set when psutil is unavailable.
+        """
+        psutil = _try_import_psutil()
+        if psutil is None:
+            return set()
+        own_pids = set()
+        for pid in self._own_process_roots():
+            try:
+                proc = psutil.Process(pid)
+                own_pids.add(pid)
+                for child in proc.children(recursive=True):
+                    own_pids.add(child.pid)
+            except Exception:
+                continue
+        if include_parent:
+            parent = os.getppid()
+            if parent and parent > 1:
+                own_pids.add(parent)
+        return own_pids
+
     def _get_own_cpu_usage(self) -> float:
         """Fraction (0..1 of total capacity) consumed by HARTOS's OWN
         process tree: this process + its children + every registered
@@ -1117,44 +1281,17 @@ class ResourceGovernor:
         except Exception:
             ncpu = 1
 
-        own_pids = set()
-        # Main process tree.
-        try:
-            main = self._own_proc_cache.get(os.getpid())
-            if main is None:
-                main = psutil.Process(os.getpid())
-                main.cpu_percent(None)  # prime baseline
-                self._own_proc_cache[os.getpid()] = main
-            own_pids.add(os.getpid())
-            for child in main.children(recursive=True):
-                own_pids.add(child.pid)
-        except Exception:
-            pass
-        # Registered managed-subprocess trees (hevolveai…) PLUS the
-        # llama-server resolved by port.  llama-server is NOT spawned by
-        # HARTOS (it's a configured endpoint) so it's never
-        # register_subprocess'd — but the agent daemon's inference IS
-        # HARTOS's own work.  Without counting it as own, its inference CPU
-        # reads as a foreign app and trips both the governor backoff AND
-        # model_lifecycle pressure → the yield gate flaps and no goal ever
-        # completes a tick (2026-05-31 idle-hour: 0 executions).
-        with self._lock:
-            managed = list(self._managed_subprocesses.values())
-        _llm_pid = self._resolve_llm_server_pid()
-        if _llm_pid and _llm_pid not in managed:
-            managed.append(_llm_pid)
-        for pid in managed:
-            try:
-                proc = self._own_proc_cache.get(pid)
-                if proc is None:
+        # Roots are primed here so they count from this tick; a child first
+        # seen below is primed there and counts from the next tick.
+        for pid in self._own_process_roots():
+            if pid not in self._own_proc_cache:
+                try:
                     proc = psutil.Process(pid)
                     proc.cpu_percent(None)  # prime baseline
                     self._own_proc_cache[pid] = proc
-                own_pids.add(pid)
-                for child in proc.children(recursive=True):
-                    own_pids.add(child.pid)
-            except Exception:
-                self._own_proc_cache.pop(pid, None)
+                except Exception:
+                    continue
+        own_pids = self.own_process_pids()
 
         total_pct = 0.0
         for pid in own_pids:
@@ -1303,8 +1440,8 @@ class ResourceGovernor:
                         return fh.read().strip() == '1'
                 except OSError:
                     continue
-        except OSError:
-            pass
+        except OSError as e:
+            logger.debug('power_supply sysfs unreadable: %s', e)
         return None
 
     def _get_battery_status(self) -> tuple:
@@ -1418,7 +1555,10 @@ class ResourceGovernor:
     def _calculate_throttle(self) -> float:
         """Combine all signals into a single throttle factor 0.0 - 1.0.
 
-        ACTIVE mode:  0.05 — bare minimum for event processing
+        ACTIVE mode:  ACTIVE_CPU_LIMIT (0.50 by default; HEVOLVE_ACTIVE_CPU_LIMIT)
+                      NOTE this is ABOVE the yield gate's 0.3 floor, so the
+                      gate does not learn "person at the desk" from here;
+                      it asks user_present() for that.
         IDLE + low CPU: 1.0 — full speed
         IDLE + moderate CPU: 0.5
         SLEEP: 0.0 — suspend everything
@@ -1430,7 +1570,7 @@ class ResourceGovernor:
             return 0.0
 
         if mode == MODE_ACTIVE:
-            return ACTIVE_CPU_LIMIT  # 0.05
+            return ACTIVE_CPU_LIMIT  # 0.50 by default, see the docstring
 
         # IDLE mode — scale based on current resource usage.  Use EXTERNAL
         # cpu (total - HARTOS's own tree): scaling on total here would make
@@ -1708,3 +1848,284 @@ def should_proceed(resource: str = 'cpu_heavy') -> bool:
     if gov is None or not gov._running:
         return True
     return gov.should_allow(resource)
+
+
+class _PhysicalInputMonitor:
+    """Physical input signal for active desktop-control takeover detection.
+
+    GetLastInputInfo includes injected automation. Low-level event flags
+    distinguish it from hardware input. No keys/text/coordinates are stored.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._thread = None
+        self._available = False
+        self._generation = 0
+        self._last_input = None
+
+    def record_activity(self):
+        with self._lock:
+            self._generation += 1
+            self._last_input = time.monotonic()
+
+    def snapshot(self, start=True):
+        with self._lock:
+            if start and self._thread is None:
+                self._thread = threading.Thread(target=self._listen,
+                    name='physical-desktop-input', daemon=True)
+                self._thread.start()
+            thread = self._thread
+        if start and thread is not None:
+            self._ready.wait(1.0)
+        with self._lock:
+            if not self._available or thread is None or not thread.is_alive():
+                return None
+            return self._generation, self._last_input
+
+class _WindowsPhysicalInputMonitor(_PhysicalInputMonitor):
+    def record_event(self, kind, flags, message):
+        injected = 0x10 if kind == 'keyboard' else 0x01
+        presses = (0x100, 0x104) if kind == 'keyboard' else (
+            0x200, 0x201, 0x204, 0x207, 0x20A, 0x20B, 0x20E)
+        if not flags & injected and message in presses:
+            self.record_activity()
+
+    def _listen(self):
+        from ctypes import wintypes
+        hooks = []
+        user32 = None
+        try:
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            hook_proc = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                           ctypes.c_size_t, ctypes.c_ssize_t)
+            class KeyboardInput(ctypes.Structure):
+                _fields_ = [('vkCode', wintypes.DWORD), ('scanCode', wintypes.DWORD),
+                    ('flags', wintypes.DWORD), ('time', wintypes.DWORD),
+                    ('extra', ctypes.c_size_t)]
+            class MouseInput(ctypes.Structure):
+                _fields_ = [('point', wintypes.POINT), ('data', wintypes.DWORD),
+                    ('flags', wintypes.DWORD), ('time', wintypes.DWORD),
+                    ('extra', ctypes.c_size_t)]
+            user32.SetWindowsHookExW.argtypes = [ctypes.c_int, hook_proc,
+                                               wintypes.HINSTANCE, wintypes.DWORD]
+            user32.SetWindowsHookExW.restype = wintypes.HANDLE
+            user32.CallNextHookEx.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                             ctypes.c_size_t, ctypes.c_ssize_t]
+            user32.CallNextHookEx.restype = ctypes.c_ssize_t
+            user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
+            user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),
+                                           wintypes.HWND, wintypes.UINT, wintypes.UINT]
+            user32.GetMessageW.restype = ctypes.c_int
+            kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+            kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+            def callback(kind, structure):
+                def receive(code, message, data):
+                    if code >= 0:
+                        event = ctypes.cast(data, ctypes.POINTER(structure)).contents
+                        self.record_event(kind, event.flags, message)
+                    return user32.CallNextHookEx(None, code, message, data)
+                return hook_proc(receive)
+            # Callbacks must remain referenced throughout the message pump.
+            callbacks = [callback('keyboard', KeyboardInput), callback('mouse', MouseInput)]
+            module = kernel32.GetModuleHandleW(None)
+            for kind, cb in zip((13, 14), callbacks):
+                hook = user32.SetWindowsHookExW(kind, cb, module, 0)
+                if not hook:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                hooks.append(hook)
+            with self._lock:
+                self._available = True
+            self._ready.set()
+            message = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                pass
+        except Exception:
+            logger.warning('Physical desktop input monitoring unavailable', exc_info=True)
+        finally:
+            with self._lock:
+                self._available = False
+            self._ready.set()
+            if user32 is not None:
+                for hook in hooks:
+                    user32.UnhookWindowsHookEx(hook)
+
+class _MacPhysicalInputMonitor(_PhysicalInputMonitor):
+    """Listen through the existing pynput dependency; never suppress input."""
+    def __init__(self):
+        super().__init__()
+        self._modifier_flags = 0
+
+    def record_event(self, event_type, source_pid, flags=None):
+        # Quartz marks posted events with their source process ID. Releasing
+        # Ctrl/Shift after submitting a run is not a new user takeover.
+        if source_pid != 0:
+            return
+        if event_type == 12:  # flagsChanged contains both press and release.
+            if flags is None:
+                return
+            modifiers = int(flags) & 0x9E0000  # Shift, Ctrl, Option, Cmd, Fn.
+            with self._lock:
+                gained = modifiers & ~self._modifier_flags
+                self._modifier_flags = modifiers
+            if gained:
+                self.record_activity()
+        elif event_type in (1, 3, 5, 6, 7, 10, 22, 25, 27):
+            self.record_activity()
+
+    def _listen(self):
+        listeners = []
+        try:
+            from pynput import keyboard, mouse
+            from Quartz import (CGEventGetIntegerValueField, CGEventGetFlags,
+                                kCGEventSourceUnixProcessID)
+
+            def observe(event_type, event):
+                self.record_event(event_type, CGEventGetIntegerValueField(
+                    event, kCGEventSourceUnixProcessID), CGEventGetFlags(event))
+                return event  # Observe only, never swallow the person's input.
+
+            for factory in (keyboard.Listener, mouse.Listener):
+                listener = factory(darwin_intercept=observe, suppress=False)
+                listeners.append(listener)
+                listener.start()
+                listener.wait()
+            with self._lock:
+                self._available = all(
+                    item.is_alive() and item.IS_TRUSTED for item in listeners)
+            self._ready.set()
+            while self._available and all(item.is_alive() for item in listeners):
+                time.sleep(0.1)
+        except Exception:
+            logger.warning('macOS physical input monitoring unavailable', exc_info=True)
+        finally:
+            with self._lock:
+                self._available = False
+            self._ready.set()
+            for listener in listeners:
+                listener.stop()
+
+
+class _LinuxPhysicalInputMonitor(_PhysicalInputMonitor):
+    """Read hardware evdev events on X11 or Wayland, never grab devices.
+
+    Virtual uinput devices are excluded so automation cannot pause itself.
+    Missing read access is unavailable, not evidence that the user is idle.
+    """
+    @staticmethod
+    def _devices():
+        from pathlib import Path
+        devices = []
+        for entry in Path('/sys/class/input').glob('event*'):
+            device = (entry / 'device').resolve()
+            if '/virtual/input/' in device.as_posix():
+                continue
+            try:
+                words = (device / 'capabilities/key').read_text().split()
+                word_bits = ctypes.sizeof(ctypes.c_void_p) * 8
+                keys = sum(int(word, 16) << (index * word_bits)
+                           for index, word in enumerate(reversed(words)))
+                # Keyboard letters, mouse buttons, or touch digitizer.
+                if not any(keys & (1 << bit) for bit in (30, 272, 330)):
+                    continue
+            except (OSError, ValueError):
+                continue
+            devices.append('/dev/input/' + entry.name)
+        return devices
+
+    def record_event(self, event_type, code, value):
+        # EV_KEY press/repeat; EV_REL motion/wheel; EV_ABS pointer/touch.
+        # EV_SYN and key/button releases carry no new takeover.
+        if ((event_type == 1 and value in (1, 2))
+                or (event_type == 2 and value != 0)
+                or (event_type == 3 and (
+                    code in (0, 1, 53, 54)  # ABS / multitouch X and Y.
+                    or (code == 57 and value >= 0)  # New tracking contact.
+                    or (code in (24, 58) and value > 0)))):
+            self.record_activity()
+
+    def _listen(self):
+        import select
+        import struct
+        events = struct.Struct('@llHHi')  # native timeval + type/code/value
+        descriptors = {}
+        try:
+            while True:
+                devices = set(self._devices())
+                for path in list(descriptors):
+                    if path not in devices:
+                        os.close(descriptors.pop(path))
+                        self.record_activity()  # topology changed; recapture
+                denied = False
+                for path in devices - descriptors.keys():
+                    fd = None
+                    try:
+                        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                        # Discard queued events from before this monitor opened.
+                        try:
+                            while os.read(fd, events.size * 64):
+                                pass
+                        except BlockingIOError:
+                            pass
+                        descriptors[path] = fd
+                        self.record_activity()  # includes hot-plug during a run
+                    except OSError:
+                        if fd is not None:
+                            os.close(fd)
+                        denied = True
+                with self._lock:
+                    self._available = bool(descriptors) and not denied
+                self._ready.set()
+                if not descriptors:
+                    time.sleep(0.2)
+                    continue
+                readable, _, _ = select.select(list(descriptors.values()), [], [], 0.2)
+                for fd in readable:
+                    try:
+                        data = os.read(fd, events.size * 64)
+                    except BlockingIOError:
+                        continue
+                    except OSError as e:
+                        # ENODEV: the device was unplugged between select and
+                        # read.  One device going away must not end the
+                        # monitor: nothing restarts this thread, so every GUI
+                        # action would read "monitoring unavailable" until the
+                        # process restarts.  Drop it; the next scan rebuilds.
+                        data = b''
+                        logger.info('Physical input device went away: %s', e)
+                    if not data:
+                        path = next(p for p, d in descriptors.items() if d == fd)
+                        os.close(descriptors.pop(path))
+                        self.record_activity()  # topology changed; recapture
+                        continue
+                    for offset in range(0, len(data) - events.size + 1, events.size):
+                        _, _, event_type, code, value = events.unpack_from(data, offset)
+                        self.record_event(event_type, code, value)
+        except Exception:
+            logger.warning('Linux physical input monitoring unavailable', exc_info=True)
+        finally:
+            with self._lock:
+                self._available = False
+            self._ready.set()
+            for fd in descriptors.values():
+                os.close(fd)
+
+
+_monitor_types = {'win32': _WindowsPhysicalInputMonitor,
+                  'darwin': _MacPhysicalInputMonitor,
+                  'linux': _LinuxPhysicalInputMonitor}
+_monitor_type = _monitor_types.get(sys.platform)
+_physical_input_monitor = _monitor_type() if _monitor_type else None
+
+
+def get_physical_input_state(*, start=True):
+    """Physical-input generation/last activity, or unavailable.
+
+    Lazily started only for active computer control. Daemon idle scheduling
+    retains its own unchanged thresholds and platform detection.
+    """
+    if _physical_input_monitor is None:
+        return None
+    return _physical_input_monitor.snapshot(start=start)

@@ -216,6 +216,11 @@ def dispatch_android_action(action: dict, *,
       ``scroll_down``         → dispatchGesture swipe
       ``open_file_gui "X"``   → Intent.ACTION_VIEW launcher
     """
+    from integrations.vlm.safety import destructive_computer_operation
+    refusal = destructive_computer_operation(action)
+    if refusal:
+        logger.warning('Android computer action refused: %s', refusal)
+        return {'status': 'blocked', 'error': refusal}
     plat = _detect_mobile_platform()
     if plat == 'ios':
         return _ios_unsupported_response({'request': 'dispatch_action'})

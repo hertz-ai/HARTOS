@@ -36,11 +36,8 @@ def _resolve_baseline_dir():
     if db_path and db_path != ':memory:' and os.path.isabs(db_path):
         return os.path.join(os.path.dirname(db_path), 'agent_data', 'baselines')
     if os.environ.get('NUNBA_BUNDLED') or getattr(_sys, 'frozen', False):
-        try:
-            from core.platform_paths import get_agent_data_dir
-            return os.path.join(get_agent_data_dir(), 'baselines')
-        except ImportError:
-            return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'baselines')
+        from core.platform_paths import get_agent_data_dir
+        return os.path.join(get_agent_data_dir(), 'baselines')
     return os.path.join('agent_data', 'baselines')
 
 BASELINE_DIR = _resolve_baseline_dir()
@@ -60,6 +57,12 @@ def _sanitize_id(value: str) -> str:
     if not _SAFE_ID_RE.match(s):
         raise ValueError(f'Invalid identifier: {s!r}')
     return s
+
+
+def _version_sort_key(fname: str) -> int:
+    """Numeric version of a 'vN.json' snapshot filename; -1 for anything else."""
+    m = re.match(r'^v(\d+)\.json$', fname)
+    return int(m.group(1)) if m else -1
 
 
 class AgentBaselineService:
@@ -147,7 +150,12 @@ class AgentBaselineService:
             return snapshot
 
         except Exception as e:
-            logger.debug(f'Baseline capture failed: {e}')
+            # WARNING, not DEBUG: a swallowed capture failure is how the
+            # autoresearch gate stayed inert (it passed flow_id='autoresearch',
+            # int() raised here, and no baseline was ever written; hevolveai
+            # Master 11.433 gate A). Still fire-and-forget: never raises.
+            logger.warning(f'Baseline capture failed for {prompt_id!r} '
+                           f'flow {flow_id!r}: {e}')
             return None
 
     # ── Metric Collectors ────────────────────────────────────────
@@ -195,45 +203,80 @@ class AgentBaselineService:
 
     @staticmethod
     def _collect_lightning_metrics(prompt_id: str, user_prompt: str) -> Dict:
-        """Read Agent Lightning spans and compute aggregate metrics."""
+        """Read the live CREATE/REUSE Agent Lightning traces for this session.
+
+        Only these two agents are currently instrumented at their real
+        GroupChat construction sites.  Keeping a per-agent result makes the
+        coverage explicit and prevents a future daemon/helper name from being
+        counted before it is actually traced.
+        """
         try:
-            from integrations.agent_lightning import is_enabled, LightningStore
+            from integrations.agent_lightning import (
+                is_enabled, LightningStore, recipe_assistant_agent_ids)
             if not is_enabled():
                 return {}
 
-            agent_id = f'create_recipe_assistant_{user_prompt}' \
-                if user_prompt else f'create_recipe_assistant_{prompt_id}'
-            store = LightningStore(agent_id, backend='json')
-            spans = store.list_spans(limit=100, status='success')
-            if not spans:
-                spans = store.list_spans(limit=100)
-            if not spans:
-                return {}
-
             rewards: List[float] = []
+            reward_timeline: List[Tuple[float, int, float]] = []
             error_count = 0
             durations: List[float] = []
+            per_agent: Dict[str, Dict] = {}
+            session_key = user_prompt or prompt_id
+            agent_ids = recipe_assistant_agent_ids(session_key)
 
-            for span in spans:
-                if span.get('status') == 'error':
-                    error_count += 1
-                dur = span.get('duration', 0)
-                if dur:
-                    durations.append(dur)
-                for event in span.get('events', []):
-                    if event.get('type') == 'reward':
-                        r = event.get('data', {}).get('reward', 0)
-                        rewards.append(r)
+            for agent_id in agent_ids:
+                store = LightningStore(agent_id, backend='json')
+                spans = store.list_spans(limit=100)
+                if not spans:
+                    continue
+                agent_rewards: List[float] = []
+                agent_errors = 0
+                for span in spans:
+                    if span.get('status') == 'error':
+                        error_count += 1
+                        agent_errors += 1
+                    dur = span.get('duration', 0)
+                    if dur:
+                        durations.append(dur)
+                    for event in span.get('events', []):
+                        if event.get('type') == 'reward':
+                            r = event.get('data', {}).get('reward', 0)
+                            rewards.append(r)
+                            agent_rewards.append(r)
+                            try:
+                                occurred_at = float(
+                                    event.get('timestamp',
+                                              span.get('start_time', 0)) or 0)
+                            except (TypeError, ValueError):
+                                occurred_at = 0.0
+                            # list_spans is newest-first and each agent owns a
+                            # separate store.  Preserve a stable sequence key
+                            # while merging, then sort once before calculating
+                            # a time trend across CREATE and REUSE.
+                            reward_timeline.append(
+                                (occurred_at, len(reward_timeline), r))
+                per_agent[agent_id] = {
+                    'execution_count': len(spans),
+                    'avg_reward': round(
+                        sum(agent_rewards) / len(agent_rewards), 4)
+                    if agent_rewards else 0.0,
+                    'error_rate': round(agent_errors / max(1, len(spans)), 3),
+                }
 
-            execution_count = len(spans)
+            if not per_agent:
+                return {}
+
+            execution_count = sum(m['execution_count'] for m in per_agent.values())
             avg_reward = sum(rewards) / len(rewards) if rewards else 0.0
 
             # Trend: compare first half vs second half
             trend = 'stable'
-            if len(rewards) >= 10:
-                mid = len(rewards) // 2
-                first_half = sum(rewards[:mid]) / mid
-                second_half = sum(rewards[mid:]) / (len(rewards) - mid)
+            ordered_rewards = [sample[2] for sample in sorted(reward_timeline)]
+            if len(ordered_rewards) >= 10:
+                mid = len(ordered_rewards) // 2
+                first_half = sum(ordered_rewards[:mid]) / mid
+                second_half = (
+                    sum(ordered_rewards[mid:]) / (len(ordered_rewards) - mid))
                 if second_half > first_half * 1.10:
                     trend = 'improving'
                 elif second_half < first_half * 0.90:
@@ -248,6 +291,7 @@ class AgentBaselineService:
                 'avg_duration_ms': round(
                     (sum(durations) / len(durations) * 1000)
                     if durations else 0, 1),
+                'per_agent': per_agent,
             }
         except Exception as e:
             logger.debug(f'Lightning metric collection failed: {e}')
@@ -467,7 +511,10 @@ class AgentBaselineService:
         if not os.path.isdir(agent_dir):
             return []
         results = []
-        for fname in sorted(os.listdir(agent_dir)):
+        # NUMERIC version order: a plain sorted() is a string sort, which puts
+        # v10 before v9, so compute_trend's [-1] read v9 as the latest once a
+        # tenth snapshot existed (hevolveai Master 11.433, gate C).
+        for fname in sorted(os.listdir(agent_dir), key=_version_sort_key):
             m = re.match(r'^v(\d+)\.json$', fname)
             if not m:
                 continue
@@ -655,7 +702,12 @@ class AgentBaselineAdapter(BenchmarkAdapter):
         for agent_dir in baseline_dir.iterdir():
             if not agent_dir.is_dir():
                 continue
-            snapshots = sorted(agent_dir.glob('v*.json'))
+            # Numeric version order (see list_snapshots): [-2]/[-1] must be the
+            # two NEWEST snapshots, which a string sort gets wrong from v10 on.
+            snapshots = sorted(
+                (p for p in agent_dir.glob('v*.json')
+                 if re.match(r'^v(\d+)\.json$', p.name)),
+                key=lambda p: _version_sort_key(p.name))
             if len(snapshots) < 2:
                 continue
             try:

@@ -470,30 +470,51 @@ class TestNetworkConnectivityScenarios:
                 allowed = limiter._check_memory(key, 60, 60)
                 assert allowed is True
 
-    def test_action_state_persistence_during_network_drop(self):
-        """Ledger sync fails → exception caught, no propagation."""
-        # Set up action state
-        action_states['test_prompt'] = {}
-        action_states['test_prompt'][1] = ActionState.ASSIGNED
+    def test_action_state_persistence_during_network_drop(self, tmp_path):
+        """Network drops mid-write → the transition FAILS LOUDLY, nothing ghosts.
 
-        # Mock ledger that fails on sync
-        mock_ledger = MagicMock()
-        mock_ledger.tasks = {'action_1': {}}
-        mock_ledger.update_task_status.side_effect = ConnectionError("Network down")
+        Contract since b597a9779: the durable ledger is the authority. A write
+        that never reached disk raises StateTransitionError and projects no
+        ActionState, and the ledger rolls its in-memory change back -- so
+        memory never claims a state the disk never took. Once the network is
+        back the same transition succeeds in both FSMs.
+        """
+        from agent_ledger import SmartLedger, Task, TaskStatus, TaskType
+        from agent_ledger.backends import JSONBackend
+        from hartos import lifecycle_hooks as lh
 
-        with patch('hartos.lifecycle_hooks._ledger_registry', {'test_prompt': mock_ledger}):
-            with patch('hartos.lifecycle_hooks._get_ledger_task_status') as mock_ts:
-                mock_ts.return_value = MagicMock()
-                # State transition should succeed even if ledger sync fails
-                try:
-                    set_action_state('test_prompt', 1, ActionState.IN_PROGRESS,
+        user_prompt = 'test_prompt_network_drop'
+        ledger = SmartLedger(agent_id='7', session_id=user_prompt,
+                             backend=JSONBackend(storage_dir=str(tmp_path)))
+        ledger.add_task(Task(task_id='action_1', description='do the thing',
+                             task_type=TaskType.INTERMEDIATE))
+        lh.register_ledger_for_session(user_prompt, ledger)
+        try:
+            action_states[user_prompt] = {1: ActionState.ASSIGNED}
+
+            # The drop at the real boundary: the backend's durable write.
+            with patch.object(ledger.backend, 'save',
+                              side_effect=ConnectionError("Network down")):
+                with pytest.raises(lh.StateTransitionError) as caught:
+                    set_action_state(user_prompt, 1, ActionState.IN_PROGRESS,
                                      "test transition")
-                except Exception:
-                    pass  # Ledger sync failure should be caught internally
+            assert 'Ledger persistence failed' in str(caught.value)
 
-                # State should still be updated locally
-                state = action_states.get('test_prompt', {}).get(1)
-                assert state == ActionState.IN_PROGRESS
+            # No ghost state in either FSM: the ActionState was not projected
+            # and the ledger rolled its status + claim back.
+            assert get_action_state(user_prompt, 1) == ActionState.ASSIGNED
+            task = ledger.get_task('action_1')
+            assert task.status == TaskStatus.PENDING
+            assert task.is_owned is False
+
+            # Network back: the same transition now lands in both FSMs.
+            set_action_state(user_prompt, 1, ActionState.IN_PROGRESS,
+                             "retry after recovery")
+            assert get_action_state(user_prompt, 1) == ActionState.IN_PROGRESS
+            assert ledger.get_task('action_1').status == TaskStatus.IN_PROGRESS
+        finally:
+            lh._ledger_registry.pop(user_prompt, None)
+            action_states.pop(user_prompt, None)
 
     def test_action_retry_tracker_max_retries(self):
         """4th retry triggers MAX_PENDING_RETRIES threshold."""

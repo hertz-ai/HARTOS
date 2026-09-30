@@ -43,9 +43,25 @@ _ACTIVATION_HIDDEN = 8
 # ~4 MB, far above any real sequence length.
 _MAX_SHARD_ROWS = 1 << 18
 
+# Completion cap of one /mesh/infer exchange unless the requester names one.
+# Both nodes measure the exchange against the same cap (budget_gate.
+# exchange_tokens), so the requester's debit and the server's credit agree;
+# the value is the Model Bus's own default for a chat (_route_llm).
+MESH_INFER_MAX_TOKENS = 512
+
 # ═══════════════════════════════════════════════════════════════
 # Compute Mesh Service
 # ═══════════════════════════════════════════════════════════════
+
+def _mesh_max_tokens(options) -> int:
+    """The completion cap of one exchange: the requester's max_tokens, else
+    MESH_INFER_MAX_TOKENS.  Both nodes read it from the same options."""
+    try:
+        value = int((options or {}).get('max_tokens') or 0)
+    except (TypeError, ValueError, AttributeError):
+        value = 0
+    return value if value > 0 else MESH_INFER_MAX_TOKENS
+
 
 class MeshPeer:
     """Represents a paired device in the compute mesh."""
@@ -234,11 +250,20 @@ class ComputeMeshService:
             age = int(time.monotonic() - peer.last_seen_mono)
             return {'error': f'Peer {peer_id} is stale (last seen {age}s ago)'}
 
+        # Who asked travels as ids (19d4c5b02: only content is scrubbed), so
+        # the serving node credits its operator only for someone else;
+        # max_tokens travels so both nodes measure against the same cap.
+        from integrations.agent_engine.budget_gate import _this_node_id
+        sent_options = {k: v for k, v in (options or {}).items()
+                        if k != 'user_id'}
+        sent_options['max_tokens'] = _mesh_max_tokens(options)
         payload = {
             'model_type': model_type,
             'prompt': prompt,
-            'options': options or {},
+            'options': sent_options,
             'source_device': self._device_id,
+            'requester_user_id': str((options or {}).get('user_id') or ''),
+            'requester_node_id': _this_node_id(),
         }
 
         # Try PeerLink first (encrypted for cross-user, plain for same-user)
@@ -253,7 +278,7 @@ class ComputeMeshService:
                     result['offloaded_to'] = peer_id
                     result['peer_address'] = peer.address
                     result['transport'] = 'peerlink'
-                    return result
+                    return self._charged(peer_id, prompt, options, result)
         except Exception:
             pass
 
@@ -269,11 +294,40 @@ class ComputeMeshService:
                 result = resp.json()
                 result['offloaded_to'] = peer_id
                 result['peer_address'] = peer.address
-                return result
+                return self._charged(peer_id, prompt, options, result)
             else:
                 return {'error': f'Peer returned status {resp.status_code}'}
         except Exception as e:
             return {'error': f'Offload to {peer_id} failed: {str(e)}'}
+
+    @staticmethod
+    def _charged(peer_id: str, prompt: str, options: Optional[dict],
+                 result: Dict[str, Any]) -> Dict[str, Any]:
+        """Charge ``options['user_id']`` for an offload that COMPLETED on
+        ``peer_id`` and return the result unchanged.
+
+        The peer's /mesh/infer runs every request as an LLM chat on its Model
+        Bus (/v1/chat infers ModelType.LLM whatever model_type says), so the
+        compute it spent is tokens, measured by exchange_tokens from the
+        prompt sent and the response received against the cap sent: the same
+        measure the peer credits its operator with in _route_infer.  A body
+        carrying 'error' did not complete and is not charged.  No user_id, no
+        charge: the requester is unknown.  Never raises."""
+        try:
+            from integrations.agent_engine.budget_gate import (
+                charge_remote_compute, exchange_tokens)
+            user_id = (options or {}).get('user_id') or ''
+            if user_id and 'error' not in result:
+                response = result.get('response')
+                tin, tout = exchange_tokens(
+                    prompt, response if isinstance(response, str) else '',
+                    result.get('usage'), _mesh_max_tokens(options))
+                charge_remote_compute(
+                    user_id, peer_id, tin, tout, source='compute_mesh',
+                    model_id=str(result.get('model') or 'mesh_peer'))
+        except Exception as e:
+            logger.warning("mesh compute charge skipped: %s", e)
+        return result
 
     def offload_to_best_peer(
         self, model_type: str, prompt: str, options: Optional[dict] = None
@@ -740,9 +794,18 @@ class ComputeMeshService:
         try:
             from integrations.social.models import db_session, UserConsent
             with db_session(commit=False) as db:
+                # revoked_at IS NULL is load-bearing, not belt-and-braces:
+                # revoke_consent() sets revoked_at and LEAVES granted=True, so
+                # filtering on granted alone treated a REVOKED compute_contribute
+                # consent as live and kept serving peer compute after the human
+                # withdrew it. Same "active" predicate ConsentService.active_grant
+                # and check_consent use (granted AND NOT revoked); kept as a
+                # device-level query here because any granted row authorises the
+                # device, which check_consent's per-user signature cannot express.
                 return db.query(UserConsent).filter(
                     UserConsent.consent_type == 'compute_contribute',
                     UserConsent.granted == True,
+                    UserConsent.revoked_at.is_(None),
                 ).first() is not None
         except Exception:
             return False
@@ -761,24 +824,49 @@ class ComputeMeshService:
             return self._json_response({'error': 'Invalid JSON'}, 400)
         model_type = data.get('model_type', 'llm')
         prompt = data.get('prompt', '')
+        max_tokens = _mesh_max_tokens(data.get('options'))
 
         # Forward to local Model Bus
         from core.http_pool import pooled_post as _pooled_post
         try:
             resp = _pooled_post(
                 f'http://localhost:{get_port("model_bus")}/v1/chat',
-                json={'prompt': prompt, 'model_type': model_type},
+                json={'prompt': prompt, 'model_type': model_type,
+                      'max_tokens': max_tokens},
                 timeout=120,
             )
             if resp.status_code == 200:
                 result = resp.json()
                 result['served_by'] = self._device_id
+                self._credit_served(data, prompt, max_tokens, result)
                 return self._json_response(result)
             return self._json_response(
                 {'error': f'Local inference failed: {resp.status_code}'}, 502)
         except Exception as e:
             return self._json_response(
                 {'error': f'Local inference error: {str(e)}'}, 502)
+
+    @staticmethod
+    def _credit_served(data: dict, prompt: str, max_tokens: int,
+                       result: Dict[str, Any]) -> None:
+        """The serving half of a mesh exchange: credit this node's operator
+        for a request someone else sent, measured by exchange_tokens exactly
+        as the requester's _charged measures it.  Never raises."""
+        try:
+            if not isinstance(result, dict) or 'error' in result:
+                return
+            from integrations.agent_engine.budget_gate import (
+                credit_served_compute, exchange_tokens)
+            response = result.get('response')
+            tin, tout = exchange_tokens(
+                prompt, response if isinstance(response, str) else '',
+                result.get('usage'), max_tokens)
+            credit_served_compute(
+                data.get('requester_user_id'), data.get('requester_node_id'),
+                tin, tout, source='compute_mesh',
+                model_id=str(result.get('model') or 'mesh'))
+        except Exception as e:
+            logger.warning("mesh served-compute credit skipped: %s", e)
 
     def _route_shard(self, body: bytes):
         """Relay one shard-runtime frame. Fail-closed to HTTP 400 on a bad frame."""

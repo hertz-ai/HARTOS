@@ -32,6 +32,14 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger('hevolve.autoresearch')
 
+# The AgentBaselineService flow slot an autoresearch session writes its
+# snapshots to AND the regression gate reads from. One name for both, because
+# they had drifted: the write passed flow_id='autoresearch', which the service's
+# int(flow_id) rejected (logged at DEBUG, no snapshot written), while the gate
+# read flow 0, found nothing, and passed on "no baseline to compare" every time
+# (hevolveai Master 11.433, gate A).
+_BASELINE_FLOW_ID = 0
+
 
 # ── Result Types ─────────────────────────────────────────────
 
@@ -104,6 +112,7 @@ class AutoResearchSession:
     federation_broadcast_enforced: bool = True  # broadcast_delta ran
     constitutional_rejections: int = 0
     baseline_rejections: int = 0
+    scope_rejections: int = 0   # edits that reached beyond target_file
     last_rejection_reason: str = ''
 
     # Last edit state (for decide step)
@@ -145,6 +154,7 @@ class AutoResearchSession:
             'federation_broadcast_enforced': self.federation_broadcast_enforced,
             'constitutional_rejections': self.constitutional_rejections,
             'baseline_rejections': self.baseline_rejections,
+            'scope_rejections': self.scope_rejections,
             'last_rejection_reason': self.last_rejection_reason,
         }
 
@@ -260,6 +270,11 @@ class AutoResearchEngine:
             context = {
                 'working_dir': session.repo_path,
                 'files': [session.target_file],
+                # The loop may change ONLY target_file. "NEVER modify the
+                # evaluation metric or test harness" above is advice to the
+                # model; this is the enforcement (the backend refuses edits to
+                # undeclared files; autoresearch_edit also checks git status).
+                'restrict_edits_to_files': True,
             }
 
             result = backend.execute(task, context, timeout=120)
@@ -402,6 +417,64 @@ class AutoResearchEngine:
 
     # ── Git State Management ─────────────────────────────────
 
+    @staticmethod
+    def changed_paths(session: AutoResearchSession) -> Optional[set]:
+        """Paths git reports as modified or untracked under repo_path,
+        relative to repo_path with '/' separators, or None if git failed.
+
+        The before/after difference around one edit is what that edit
+        touched; it is how autoresearch_edit enforces that an edit changes
+        ONLY target_file (revert_changes restores target_file alone, so an
+        edit elsewhere, e.g. to the test harness, would otherwise survive a
+        revert and bias every later run)."""
+        try:
+            from integrations.coding_agent.aider_core.run_cmd import run_cmd_subprocess
+            code, out = run_cmd_subprocess(
+                ['git', 'status', '--porcelain', '--untracked-files=all',
+                 '--', '.'],
+                cwd=session.repo_path, timeout=15)
+            code_p, prefix = run_cmd_subprocess(
+                ['git', 'rev-parse', '--show-prefix'],
+                cwd=session.repo_path, timeout=15)
+        except Exception as e:
+            logger.warning(f"[{session.session_id}] git status failed: {e}")
+            return None
+        if code != 0 or code_p != 0:
+            return None
+        prefix = (prefix or '').strip()
+        paths = set()
+        for line in (out or '').splitlines():
+            if len(line) < 4:
+                continue
+            path = line[3:].strip().strip('"')
+            if ' -> ' in path:          # rename: keep the new name
+                path = path.split(' -> ', 1)[1].strip('"')
+            if prefix and path.startswith(prefix):
+                path = path[len(prefix):]
+            paths.add(path.replace('\\', '/'))
+        return paths
+
+    def revert_paths(self, session: AutoResearchSession,
+                     paths: List[str]) -> List[str]:
+        """git checkout each path separately (one unknown pathspec would
+        abort a combined checkout). Returns the paths git could not restore,
+        typically files the edit created, which are reported, never deleted."""
+        failed = []
+        try:
+            from integrations.coding_agent.aider_core.run_cmd import run_cmd_subprocess
+        except Exception as e:
+            logger.warning(f"[{session.session_id}] cannot revert {paths}: {e}")
+            return list(paths)
+        for p in paths:
+            try:
+                code, _ = run_cmd_subprocess(['git', 'checkout', '--', p],
+                                             cwd=session.repo_path, timeout=10)
+            except Exception:
+                code = 1
+            if code != 0:
+                failed.append(p)
+        return failed
+
     def revert_changes(self, session: AutoResearchSession):
         """Revert the working directory to the last good state."""
         try:
@@ -499,7 +572,7 @@ class AutoResearchEngine:
         try:
             prompt_id = session.experiment_id or session.session_id
             result = AgentBaselineService.validate_against_baseline(
-                prompt_id=prompt_id, flow_id=0,
+                prompt_id=prompt_id, flow_id=_BASELINE_FLOW_ID,
             )
         except Exception as e:
             session.baseline_delta_enforced = False
@@ -623,38 +696,53 @@ class AutoResearchEngine:
 
         # AgentBaselineService snapshot is the regression escape-hatch the
         # audit flagged: if we silently skip it, a later benchmark-based
-        # rollback has no anchor to roll back TO.  Make the absence LOUD
-        # and set the session flag so dashboards/tests can read it.
-        try:
-            from integrations.agent_engine.agent_baseline_service import AgentBaselineService
-            AgentBaselineService.capture_snapshot(
-                prompt_id=session.experiment_id or session.session_id,
-                flow_id='autoresearch',
-                trigger='autoresearch_improvement',
-                user_id=session.goal_id or 'system',
-            )
-        except ImportError as e:
-            session.baseline_enforced = False
-            logger.warning(
-                "[%s] AgentBaselineService unavailable (ImportError: %s) — "
-                "iter %d kept WITHOUT baseline snapshot. "
-                "Set session.baseline_enforced=False — regression rollback "
-                "will have no anchor for this iteration.",
-                session.session_id, e, result.iteration,
-            )
-        except Exception as e:
-            session.baseline_enforced = False
-            logger.warning(
-                "[%s] AgentBaselineService.capture_snapshot failed "
-                "(%s: %s) — iter %d kept WITHOUT baseline snapshot.",
-                session.session_id, type(e).__name__, e, result.iteration,
-            )
+        # rollback has no anchor to roll back TO.
+        self.capture_baseline_snapshot(
+            session, 'autoresearch_improvement', result.iteration)
 
         self.emit_progress(session, 'autoresearch.promoted', {
             'iteration': result.iteration,
             'metric_value': result.metric_value,
             'baseline_value': result.baseline_value,
         })
+        return True
+
+    def capture_baseline_snapshot(self, session: AutoResearchSession,
+                                  trigger: str, iteration: int) -> bool:
+        """Write the session's AgentBaselineService snapshot to the SAME flow
+        slot the regression gate reads (_BASELINE_FLOW_ID).
+
+        Called at setup (the pre-evolution state the first promotion is
+        compared against) and after every promotion. capture_snapshot is
+        fire-and-forget: it returns None on failure instead of raising, so the
+        return value decides session.baseline_enforced. Before this, a failed
+        capture left the flag True while no snapshot existed.
+        """
+        try:
+            from integrations.agent_engine.agent_baseline_service import (
+                AgentBaselineService)
+            snap = AgentBaselineService.capture_snapshot(
+                prompt_id=session.experiment_id or session.session_id,
+                flow_id=_BASELINE_FLOW_ID,
+                trigger=trigger,
+                user_id=session.goal_id or 'system',
+            )
+        except Exception as e:  # ImportError included: the service is absent
+            session.baseline_enforced = False
+            logger.warning(
+                "[%s] AgentBaselineService unavailable or raised (%s: %s) - "
+                "iter %d has NO baseline snapshot; set "
+                "session.baseline_enforced=False.",
+                session.session_id, type(e).__name__, e, iteration)
+            return False
+        if snap is None:
+            session.baseline_enforced = False
+            logger.warning(
+                "[%s] baseline snapshot (%s) was NOT written for iter %d - "
+                "the regression gate has no anchor; set "
+                "session.baseline_enforced=False.",
+                session.session_id, trigger, iteration)
+            return False
         return True
 
     # ── History & Reporting ──────────────────────────────────
@@ -943,6 +1031,9 @@ def autoresearch_setup(repo_path: str, target_file: str, run_command: str,
     session.baseline_metric = baseline.metric_value
     session.best_metric = baseline.metric_value
     session.results.append(asdict(baseline))
+    # The pre-evolution anchor: without it the FIRST promotion is compared
+    # against nothing and the regression gate passes it unconditionally.
+    engine.capture_baseline_snapshot(session, 'autoresearch_baseline', 0)
     engine.emit_progress(session, 'autoresearch.started')
     engine.emit_progress(session, 'autoresearch.baseline',
                          {'baseline': baseline.metric_value})
@@ -988,6 +1079,7 @@ def autoresearch_edit(session_id: str) -> str:
             'instruction': 'Budget exhausted. Call autoresearch_finalize to save report.',
         })
 
+    before = engine.changed_paths(session)
     session.current_iteration += 1
     edit_result = engine.generate_and_apply_edit(session)
 
@@ -1000,6 +1092,40 @@ def autoresearch_edit(session_id: str) -> str:
         })
 
     hypothesis, edits, files_changed = edit_result
+
+    # SCOPE GUARD: an edit may change ONLY target_file. revert_changes
+    # restores target_file alone, so an edit to anything else (the test
+    # harness, the metric script) would survive a revert and bias every later
+    # run, which is the self-scoring loophole the paper's feedback-quality
+    # check is about. Both what the backend reports and what git sees count.
+    target = session.target_file.replace('\\', '/')
+    escaped = {p.replace('\\', '/') for p in (files_changed or [])} - {target}
+    after = engine.changed_paths(session)
+    if before is not None and after is not None:
+        escaped |= (after - before) - {target}
+    if escaped:
+        not_restored = engine.revert_paths(session, sorted(escaped))
+        engine.revert_changes(session)          # the iteration is void
+        session.scope_rejections += 1
+        session.last_rejection_reason = f'edit_scope: touched {sorted(escaped)}'
+        logger.warning(
+            "[%s] Iter %d REJECTED: the edit changed files other than %s: %s "
+            "(reverted%s)", session.session_id, session.current_iteration,
+            target, sorted(escaped),
+            f'; NOT restorable by git: {not_restored}' if not_restored else '')
+        engine.emit_progress(session, 'autoresearch.rejected', {
+            'iteration': session.current_iteration,
+            'gate': 'edit_scope',
+            'files': sorted(escaped),
+        })
+        return json.dumps({
+            'success': False,
+            'iteration': session.current_iteration,
+            'reason': (f'edit changed files other than {target}: '
+                       f'{sorted(escaped)}; reverted'),
+            'instruction': ('Only the target file may change. Call '
+                            'autoresearch_edit again for a new hypothesis.'),
+        })
     session._pending_hypothesis = hypothesis
     session._pending_edits = edits
     session._pending_files = files_changed

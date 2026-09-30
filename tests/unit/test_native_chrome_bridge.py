@@ -71,9 +71,10 @@ def test_partial_claims_are_honoured_independently(verdict):
 
 
 def test_unknown_names_are_ignored_not_trusted(verdict):
-    """A NEWER compositor claiming `taskbar` must not make an OLDER shell hide a
-    taskbar it still owns. Forward compatibility has to fail closed."""
-    verdict.write_text("bloom,taskbar,topbar,nonsense")
+    """A NEWER compositor claiming a band this shell has no stand-down for (say
+    `startmenu`) must not make an OLDER shell hide something it still owns.
+    Forward compatibility has to fail closed."""
+    verdict.write_text("bloom,startmenu,lockscreen,nonsense")
     assert L.read_native_chrome() == frozenset({"bloom"})
 
 
@@ -455,29 +456,54 @@ def test_the_home_surface_keeps_its_box():
         "against #hart-home")
 
 
-def test_the_bars_are_deliberately_not_claimed():
-    """The scope that makes this non-regressive, pinned so it is a DECISION and not
-    an oversight.
+def test_the_bars_are_claimed_per_band_and_only_when_fully_drawn(verdict):
+    """The successor of `test_the_bars_are_deliberately_not_claimed`, changed on
+    purpose along with the claim, as that test said it should be.
 
-    The native taskbar draws as an empty strip, and the agent-status cluster and the
-    clock are things the compositor cannot see. Claiming the bars would take the
-    user's window switching, agent status and clock away the moment the scene came
-    on. So the compositor takes the home and the shell keeps the bars.
-
-    When the native bars do carry their content, this test is the thing to change,
-    on purpose, along with the claim.
+    The native bars now carry their content over `shell.chrome` (IPC 4.13): the
+    clock, the tray, the badge, the agent cluster, the taskbar chips. So the
+    compositor may claim a band, but only a band it composed FULLY and painted;
+    that rule is `comp_core::leaf_claim`, gated on `ShellChrome::coverage`, and its
+    partial-band half is pinned in Rust (`a_bar_drawn_from_a_partial_payload_is_never_claimed`).
+    This half pins the shell: it accepts the two names, stands each band down on its
+    own, and keeps the bar's hit targets while it does.
     """
+    verdict.write_text("home,topbar")
+    assert L.read_native_chrome() == frozenset({"home", "topbar"}), (
+        "'topbar' must be an accepted claim name")
+    verdict.write_text("taskbar")
+    assert L.read_native_chrome() == frozenset({"taskbar"})
+
     src = _src()
-    assert "'topbar' in native_chrome" not in src, (
-        "the top bar is claimed but the native bar cannot carry the agent cluster "
-        "or the clock yet")
-    assert "'taskbar' in native_chrome" not in src, (
-        "the taskbar is claimed but the native taskbar is an empty strip")
+    window = _code(_block(src, "native_bars_css = ''", "# The SAME verdict"))
+    assert "'topbar' in native_chrome" in window and ".top-bar{opacity:0}" in window
+    assert "'taskbar' in native_chrome" in window and ".taskbar{opacity:0}" in window
+    # Each band on its own: a claimed top bar must not stand the taskbar down.
+    assert window.index("'topbar' in native_chrome") < window.index(".top-bar{opacity:0}")
+    assert window.index("'taskbar' in native_chrome") < window.index(".taskbar{opacity:0}")
 
     comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
                 encoding="utf-8").read()
-    assert "NATIVE_CHROME_TOPBAR" not in comp
-    assert "NATIVE_CHROME_TASKBAR" not in comp
+    assert "NATIVE_CHROME_TOPBAR" in comp and "NATIVE_CHROME_TASKBAR" in comp
+    assert "pub fn leaf_claim(" in comp, "the per-band claim rule has moved"
+    udev = open(os.path.join(REPO, "compositor", "src", "udev.rs"),
+                encoding="utf-8").read()
+    assert 'names.push("topbar")' in udev and 'names.push("taskbar")' in udev, (
+        "the claim publisher must spell the names the shell accepts")
+
+
+def test_a_claimed_bar_keeps_its_hit_targets():
+    """opacity, NOT visibility or display, and this is deliberate where every
+    neighbour uses visibility: the native bar routes no presses yet, so a press on
+    it falls through to the shell's bar underneath. `visibility:hidden` would remove
+    that bar from hit testing and leave the tabs, the start button, the tray and the
+    chips dead the moment the compositor claimed the band."""
+    src = _src()
+    window = _code(_block(src, "native_bars_css = ''", "# The SAME verdict"))
+    assert "visibility:hidden" not in window, (
+        "the bars must stay hit-testable while the compositor paints them")
+    assert "display:none" not in window
+    assert "pointer-events" not in window, "nothing may turn the bar's input off"
 
 
 def test_onboarding_keeps_its_own_orb_because_the_compositor_cannot_draw_one_there():

@@ -411,7 +411,48 @@ in
         "sch_fq"          # Fair queue scheduling (agent network fairness)
       ];
 
-      # Systemd: create agent cgroup slice
+      # Systemd: the agent cgroup slice, and the session slice above it.
+      #
+      # Both slices are children of hart.slice by name, so their CPUWeights
+      # are compared against EACH OTHER when hart.slice's children contend.
+      # CPUWeight is a relative share, never a cap (the trap documented in
+      # tests/unit/test_nixos_configs.py TestBackgroundAgentBlastRadius):
+      # it costs nothing while the box is idle and only decides who wins a
+      # core that two units both want.
+      #
+      # WHY the session sits above the agents (measured, not felt):
+      #
+      # 2026-09-22, Samsung NP550P5C, generation 10, the owner's own clicks
+      # (docs/architecture/NATIVE_OS_PROGRAM.md section 1): press p50 122 ms
+      # and p99 209 ms against a 25 ms budget, hover p50 22 ms against 16 ms,
+      # CPU at 1.3 to 1.5 GHz of 3.4 with 440 throttle events, package 94 C,
+      # llama-server at about 207 percent CPU. With hart-agent-daemon and
+      # hart-copilot-daemon paused for 120 s: 3.19 GHz, 84 C, load 1.9, and
+      # press p50 12.4 ms. The desktop's whole missing headroom was being
+      # spent by background work.
+      #
+      # 2026-09-23, same box, `systemctl show` and `systemd-cgls`: hart.slice
+      # held exactly one child, hart-agents.slice at CPUWeight 100, and inside
+      # it hart-liquid-ui (80) sat beside hart-model-bus (100), hart-app-bridge
+      # (50), hart-compute-mesh (50) and hart-world-model. hart-liquid-ui is
+      # the shell server: every click's HTTP round trip goes through it, and
+      # under contention it was entitled to 80 of the slice's 380 shares, the
+      # same as any agent. hart-session.slice at 200 against hart-agents.slice
+      # at 40 gives the session 200 of 240 whenever the two contend.
+      #
+      # Who the ratio binds. When first measured (2026-09-23) hart-llm and
+      # hart-agent-daemon ran in system.slice (CPUWeight 50 and 80), so the
+      # ratio never touched llama-server: inference versus the session was
+      # arbitrated at the root, where system.slice, hart.slice and user.slice
+      # all sit at the default 100. The coordinator decided the same day that
+      # both move under hart-agents.slice (one Slice= line in hart-llm.nix and
+      # hart-agent.nix): the owner's priority is the desk staying snappy; a
+      # foreground chat still gets the model, only at a lower CPU share while
+      # the shell is busy, and llama's own threads are already pinned away
+      # from CPU 0 by hart-llm.nix's taskset. The compositor runs in the
+      # greetd session scope under user.slice with no weight at all; the
+      # session slice exists so it has somewhere to go when its unit gains a
+      # Slice=.
       systemd.slices.hart-agents = {
         description = "HART OS Agent Workloads";
         sliceConfig = {
@@ -423,8 +464,22 @@ in
 
           # Global agent slice limits
           MemoryMax = "80%";       # Agents can't starve the OS
-          CPUWeight = 100;         # Fair scheduling between agents
+          CPUWeight = 40;          # Below hart-session.slice (200), see above
           TasksMax = 4096;         # Max concurrent agent threads
+        };
+      };
+
+      systemd.slices.hart-session = {
+        description = "HART OS Session (the shell the person is clicking on)";
+        sliceConfig = {
+          CPUAccounting = true;
+          MemoryAccounting = true;
+          IOAccounting = true;
+          TasksAccounting = true;
+
+          # Above hart-agents.slice (40): the person at the desk wins a
+          # contended core; agents get the rest. See the numbers above.
+          CPUWeight = 200;
         };
       };
 

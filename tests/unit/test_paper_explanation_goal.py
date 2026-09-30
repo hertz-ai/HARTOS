@@ -271,7 +271,9 @@ class TestPaperExplainerSeedGoal:
         assert cfg['topics'] == ['ai', 'bci']
         assert cfg['source'] == 'Nature + arXiv'
         assert cfg['max_per_cycle'] == 1
-        assert cfg['requires_consent'] is True
+        # `require_consent`, the one spelling the gate enforces (#96): this
+        # seed used to say `requires_consent`, which no reader gated on.
+        assert cfg['require_consent'] is True
         assert cfg['idle_only'] is True
 
     def test_armed_and_the_builder_accepts_the_seed_as_shipped(self):

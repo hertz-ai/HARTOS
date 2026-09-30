@@ -149,6 +149,12 @@ _request_id_var: 'contextvars.ContextVar[str]' = contextvars.ContextVar(
     'llm_outbound_request_id', default='')
 
 
+# The user an LLM call acts for, bound by ``with_llm_context`` from the
+# decorated entry point's ``user_id`` argument.  Read by _elision_scope only.
+_user_id_var: 'contextvars.ContextVar[str]' = contextvars.ContextVar(
+    'llm_outbound_user_id', default='')
+
+
 def set_source(name: str) -> 'contextvars.Token':
     """Set the origin label for LLM calls issued from this context.
     Returns a Token; pass to ``reset_source`` to restore the prior
@@ -281,8 +287,22 @@ def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
                         rid = _tl_rid or _request_id_var.get() or ''
                     except Exception:
                         rid = _tl_rid or ''
-            with source_context(source_name), request_id_context(rid):
-                return fn(*args, **kwargs)
+            uid = ''
+            if _sig is not None:
+                try:
+                    uid = str(_sig.bind_partial(*args, **kwargs)
+                              .arguments.get('user_id') or '')
+                except (TypeError, KeyError):
+                    uid = ''
+            # The user the elided-text store scopes a pointer to (see
+            # _elision_scope): the same contextvar hop as the request id.
+            _uid_token = _user_id_var.set(uid) if uid else None
+            try:
+                with source_context(source_name), request_id_context(rid):
+                    return fn(*args, **kwargs)
+            finally:
+                if _uid_token is not None:
+                    _user_id_var.reset(_uid_token)
         return _wrapper
 
     return _deco
@@ -299,14 +319,8 @@ def _get_source() -> str:
 
 
 def _get_log_path() -> str:
-    try:
-        from core.platform_paths import get_log_dir
-        return os.path.join(get_log_dir(), _LOG_FILENAME)
-    except Exception:
-        return os.path.join(
-            os.path.expanduser('~'), 'Documents', 'Nunba', 'logs',
-            _LOG_FILENAME,
-        )
+    from core.platform_paths import get_log_dir
+    return os.path.join(get_log_dir(), _LOG_FILENAME)
 
 
 # PERF-2 (audit): this writer reached ~196MB — unbounded append + buffering=1
@@ -465,7 +479,7 @@ def _send_and_feed(orig_send, client, request, kwargs):
     return response
 
 
-# ─── Hard left-trim to fit n_ctx (zero-tolerance context overflow) ───
+# ─── Hard trim to fit n_ctx (zero-tolerance context overflow) ───
 # Architecture note (2026-05-23): autogen and langchain both build
 # their own OpenAI clients from config; we cannot route them through a
 # caller-side ``llm_client.llm_call`` because their internal call sites
@@ -586,6 +600,44 @@ def _get_budget_per_slot() -> int:
         return LLAMA_CTX_SIZE_DEFAULT // slots
     except Exception:
         return LLAMA_CTX_SIZE_DEFAULT
+
+
+def _min_message_budget(per_slot: int) -> int:
+    """Tokens the MESSAGES must always be left, whatever the schema costs.
+
+    The floor the degrade branch of :func:`_trim_to_budget` already fell back
+    to; named here so the two callers cannot drift.  The second caller is
+    ``core.agent_tools.fit_schema_to_ctx``, which subtracts this from the live
+    n_ctx to learn how much a tool schema may spend — so the wire's floor and
+    the selection path's ceiling are the same number by construction.
+    """
+    return max(512, int(per_slot) // 4)
+
+
+def schema_token_room() -> int:
+    """Tokens a request's tool schema may spend against the LIVE n_ctx.
+
+    ``_get_budget_per_slot()`` minus :func:`_min_message_budget`.  Public
+    because the SELECTION path (core.agent_tools) has to ask it before it
+    offers a tool set; everything about the answer — the live ``/props`` probe,
+    the ``HEVOLVE_LLAMA_CTX_SIZE`` override, the constant backstop — stays here,
+    where the wire already computes it.
+
+    PROMPT-SIDE ONLY, and deliberately so.  ``max_tokens`` and
+    ``WIRE_TRIM_SAFETY_MARGIN_TOKENS`` are NOT subtracted: llama-server's 400
+    is ``n_prompt_tokens >= n_ctx``, and reserving the 2,048-token generation
+    budget as well would put the room at 4096-2048-2816-1024 = -1792 and prune
+    the 23-tool set that measurably works.  Measured 2026-09-22 against both
+    populations at n_ctx 4096 (room 3072):
+
+        23 tools = 2489 tok -> fits    (516 such bodies returned 200)
+        50 tools = 5782 tok -> prune   ( 20 such bodies returned 400)
+        60 tools = 7712 tok -> prune   ( 16 such bodies returned 400)
+
+    Generation overrun is the OTHER failure and the trim still reserves for it.
+    """
+    per_slot = _get_budget_per_slot()
+    return per_slot - _min_message_budget(per_slot)
 
 
 def _schema_tokens(body: dict, model=None) -> int:
@@ -748,25 +800,56 @@ def _compact_tool_schema(body: dict, model=None) -> tuple:
 
 def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
                           content_to_text) -> tuple:
-    """Left-truncate one message's content to ``target_chars``, marker-prefixed.
+    """Cut the MIDDLE of one message's content: keep its head and its tail,
+    ``target_chars`` together, with ``marker`` where the middle was.
+
+    Never the head.  Live 2026-09-27 (installed build, REUSE probe
+    liveprobe_reuse_1): a dispatch turn reads "Perform this action -> Action
+    #1:... <the user's words> follow these steps: [...]", and the head cut
+    this used to make removed the marker and the words and kept the steps
+    (6 of 77 calls); the reply was off-topic.  A tool result's head is where
+    its status and failure text sit, and a system message's head is the
+    persona, so every kind of message keeps both ends.  The head gets the
+    larger half -- and never less than :func:`must_keep_head`: a REUSE
+    dispatch turn keeps its marker and the user's words whole, and only the
+    steps after ``ACTION_STEPS_SEPARATOR`` are elided (review of 111c458b0,
+    probed: a fixed half/half split cut the words to 250 chars).
 
     Returns ``(new_msg, n_cut_chars)`` — ``(msg, 0)`` when it already fits.
-    Multimodal-aware: rebuilds list-shaped content preserving image parts.
-    The ONE truncation implementation; both the last-message step and the
-    anchor step in ``_trim_to_budget`` call it.
+    Multimodal-aware: the text parts are replaced by ONE part holding the cut
+    text (they were joined to measure it; keeping the later ones as well
+    would send their text twice), image parts are kept.
+    The ONE truncation implementation; ``_trim_to_budget`` calls it for both
+    of its cuts: the pass over the messages the drop could not remove, and
+    the system-message last resort.
     """
     text = content_to_text(msg.get('content'))
     if len(text) <= target_chars:
         return msg, 0
     new_msg = dict(msg)
-    new_text = marker + text[-target_chars:]
+    target_chars = max(0, target_chars)
+    tail_chars = target_chars // 2
+    head_chars = target_chars - tail_chars
+    keep = must_keep_head(text, msg.get('role'))
+    if keep > head_chars:
+        # The words stay whole even past target_chars: a request over its
+        # budget is reported by the caller; a request without the user's
+        # words is off-topic (liveprobe_reuse_1).
+        head_chars = keep
+        tail_chars = max(0, target_chars - head_chars)
+    if head_chars + tail_chars >= len(text):
+        return msg, 0  # nothing left to elide without cutting the head
+    if callable(marker):
+        marker = marker(text)  # a pointer to this text (see elided_pointer)
+    new_text = _middle_cut(text, head_chars, tail_chars, marker)
     if isinstance(new_msg.get('content'), list):
         new_parts = []
         replaced = False
         for p in new_msg['content']:
-            if isinstance(p, dict) and p.get('type') == 'text' and not replaced:
-                new_parts.append({**p, 'text': new_text})
-                replaced = True
+            if isinstance(p, dict) and p.get('type') == 'text':
+                if not replaced:
+                    new_parts.append({**p, 'text': new_text})
+                    replaced = True
             else:
                 new_parts.append(p)
         if not replaced:
@@ -774,7 +857,301 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
         new_msg['content'] = new_parts
     else:
         new_msg['content'] = new_text
-    return new_msg, len(text) - target_chars
+    return new_msg, len(text) - len(new_text) + len(marker)
+
+
+# ─── Pointers to what the trim elides ───────────────────────────────────
+# Owner direction (2026-09-27): "tool results shd be saved with pointers and
+# whatever is trimmed needs pointers to memory"; "the pointer design shd be
+# explicitly understood by the LLM ... and a pointer shd not influence the
+# context".  Whatever the trim cuts out of a message, or drops as a tool
+# result, is saved whole in the agent-data store under the ``elided``
+# namespace (core.cache_loaders: the store behind get_data_by_key), and the
+# wire carries ``[elided:<id> <n> chars of <kind>]`` in its place.  The id is
+# the first 12 hex digits of the text's sha256, so the pointer stays well
+# inside the trim's 64-token floor.  ``get_data_by_key(key="elided:<id>")``
+# reads the original back a page at a time.  A pointer is metadata only: no
+# instruction, no summary.  What it is and how to expand it is said once, in
+# the system message of a body that carries one (ELIDED_POINTER_EXPLANATION).
+ELIDED_NAMESPACE = 'elided'
+ELIDED_KEY_PREFIX = 'elided:'
+_ELIDED_POINTER_RE = None  # compiled on first use
+_ELIDED_MAX_ITEMS = 5000        # items kept on disk; the oldest go first
+_ELIDED_MAX_BYTES = 64 * 1024 * 1024  # and bytes kept; the oldest go first
+_ELIDED_TTL_S = 24 * 3600       # a REUSE replay reads it within the day
+_ELIDED_EVICT_EVERY = 50        # writes between eviction sweeps
+_elided_writes = 0
+_elided_evict_lock = threading.Lock()
+_ELIDED_KINDS = {'tool': 'a tool result', 'user': 'a user turn',
+                 'assistant': 'an assistant turn', 'system': 'the system prompt'}
+_ELIDED_LISTED_DROPS = 5        # dropped tool results named in the explanation
+# Pointers are sent only when the budget is at least this many times what
+# the explanation costs (~400 tokens today); below it the explanation
+# would crowd out the very text it points at, so plain markers go instead.
+_ELIDED_MIN_BUDGET_MULTIPLE = 4
+
+ELIDED_POINTER_EXPLANATION = (
+    "\n\nSome messages below were shortened to fit. A mark like "
+    "[elided:ID N chars of KIND] stands where text was removed: the mark is "
+    "not the content and is not a result. Judge only what is shown. If you "
+    "need the removed text and can call tools, call get_data_by_key with "
+    "key=\"elided:ID\"; it returns the text a page at a time, and each page "
+    "names the offset of the next.")
+
+
+def elided_pointer(pointer_id: str, n_chars: int, kind: str) -> str:
+    """The ONE pointer format: ``[elided:<id> <n> chars of <kind>]``."""
+    return f'[{ELIDED_KEY_PREFIX}{pointer_id} {int(n_chars)} chars of {kind}]'
+
+
+def parse_elided_pointers(text: str) -> list:
+    """``[(pointer_id, n_chars, kind), ...]`` for every pointer in ``text`` --
+    the parser of :func:`elided_pointer`'s format, defined beside it."""
+    global _ELIDED_POINTER_RE
+    if _ELIDED_POINTER_RE is None:
+        import re as _re
+        _ELIDED_POINTER_RE = _re.compile(
+            r'\[' + _re.escape(ELIDED_KEY_PREFIX)
+            + r'([0-9a-f]{12}) (\d+) chars of ([a-z ]+)\]')
+    return [(m.group(1), int(m.group(2)), m.group(3))
+            for m in _ELIDED_POINTER_RE.finditer(str(text or ''))]
+
+
+def strip_elided_pointers(text, marker_line=False):
+    """``text`` with every pointer removed, and the space it leaves closed.
+
+    THE text-for-the-user step: every send of a model's text to a person
+    calls it -- both branches of CREATE's and REUSE's send_message_to_user1,
+    publish_agent_message, the /chat reply (_chat_reply), the hive expert's
+    publish and the channel router (tests/unit/
+    test_elided_pointer_never_reaches_the_user.py guards the list).  A model
+    can copy a pointer from its context into its answer, and a pointer is
+    never an answer (owner ruling, 2026-09-27).  Non-text is returned as it
+    is.
+
+    ``marker_line``: the wire's own use, where each pointer follows
+    WIRE_TRIM_MARKER on a line of its own; the line's newline goes with it,
+    so what is left is exactly the plain marker."""
+    if not isinstance(text, str) or ELIDED_KEY_PREFIX not in text:
+        return text
+    import re as _re
+    pat = _re.compile(r'[ \t]*\[' + _re.escape(ELIDED_KEY_PREFIX)
+                      + r'[0-9a-f]{12} \d+ chars of [a-z ]+\]'
+                      + ('\n?' if marker_line else ''))
+    return pat.sub('', text)
+
+
+def _elided_id(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(
+        text.encode('utf-8', 'surrogatepass')).hexdigest()[:12]
+
+
+def elision_scope(user_id=None, request_id=None) -> str:
+    """Whose elided text a pointer may read: a digest of the user the LLM
+    call acted for, else of its request id, else 'anon'.
+
+    A pointer resolves only in the scope that wrote it, so one user's
+    elided text is never readable through another user's get_data_by_key
+    (review of f97b6bed8: the one shared store let anyone with an id read
+    it).  With no argument, the scope of the current LLM call: the user id
+    ``with_llm_context`` bound, else the thread-local one, else the request
+    id."""
+    import hashlib
+    if user_id is None and request_id is None:
+        user_id = _user_id_var.get() or ''
+        if not user_id:
+            try:
+                from hartos.threadlocal import thread_local_data as _tl
+                user_id = _tl.get_user_id() or ''
+            except Exception:
+                user_id = ''
+        request_id = '' if user_id else _get_request_id()
+    if user_id:
+        return 'u' + hashlib.sha256(str(user_id).encode()).hexdigest()[:12]
+    if request_id:
+        return 'r' + hashlib.sha256(str(request_id).encode()).hexdigest()[:12]
+    return 'anon'
+
+
+def _elided_item(scope: str, pointer_id: str) -> str:
+    """The agent-data namespace of ONE elided item: ``elided_<scope>_<id>``."""
+    return f'{ELIDED_NAMESPACE}_{scope}_{pointer_id}'
+
+
+def _evict_elided() -> None:
+    """Remove elided items older than _ELIDED_TTL_S and, past
+    _ELIDED_MAX_ITEMS items or _ELIDED_MAX_BYTES on disk, the oldest.  One
+    sweep at a time; never raises."""
+    if not _elided_evict_lock.acquire(blocking=False):
+        return
+    try:
+        from core.cache_loaders import AGENT_DATA_DIR
+        prefix, suffix = ELIDED_NAMESPACE + '_', '_agent_data.json'
+        items = []
+        for entry in os.scandir(AGENT_DATA_DIR):
+            if entry.name.startswith(prefix) and entry.name.endswith(suffix):
+                try:
+                    st = entry.stat()
+                    items.append((st.st_mtime, st.st_size, entry.path))
+                except OSError as e:
+                    logger.debug("wire-trim: elided item unreadable: %s", e)
+        items.sort()
+        now = time.time()
+        excess = max(0, len(items) - _ELIDED_MAX_ITEMS)
+        total = sum(size for _, size, _ in items)
+        for n, (mtime, size, path) in enumerate(items):
+            if (n < excess or total > _ELIDED_MAX_BYTES
+                    or now - mtime > _ELIDED_TTL_S):
+                try:
+                    os.remove(path)
+                    total -= size
+                except OSError as e:
+                    logger.debug("wire-trim: elided item not evicted: %s", e)
+    except Exception as e:
+        logger.debug("wire-trim: elided eviction skipped: %s", e)
+    finally:
+        _elided_evict_lock.release()
+
+
+def _save_elided(records: dict) -> bool:
+    """Write each record as its own item in the current elision_scope --
+    one small atomic file per item, no shared file rewritten, no global lock
+    on the hot path -- and sweep old items every _ELIDED_EVICT_EVERY writes.
+    Never raises; False when any item could not be written (the caller then
+    sends plain markers, never a pointer to nothing)."""
+    global _elided_writes
+    if not records:
+        return True
+    try:
+        from core.cache_loaders import save_agent_data
+        scope = elision_scope()
+        ok = all(save_agent_data(_elided_item(scope, pid), rec)
+                 for pid, rec in records.items())
+        _elided_writes += len(records)
+        if _elided_writes >= _ELIDED_EVICT_EVERY:
+            _elided_writes = 0
+            _evict_elided()
+        return ok
+    except Exception as e:
+        logger.warning("wire-trim: could not save elided text: %s", e)
+        return False
+
+
+def read_elided(pointer_id: str, scope=None):
+    """The original text a pointer names in ``scope`` (default: the current
+    call's elision_scope), or None when that scope holds no such item."""
+    try:
+        from core.cache_loaders import load_agent_data
+        pid = str(pointer_id).strip()
+        if not pid.isalnum():
+            return None
+        entry = load_agent_data(_elided_item(scope or elision_scope(), pid))
+        return entry.get('text') if isinstance(entry, dict) else None
+    except Exception:
+        return None
+
+
+def _middle_cut(text: str, head_chars: int, tail_chars: int,
+                marker: str) -> str:
+    """``text``'s first ``head_chars`` and last ``tail_chars`` characters with
+    ``marker`` between.  A cut never leaves half of a surrogate pair at
+    either edge: json.dumps would send it as a lone surrogate escape, which
+    llama.cpp refuses with a 500 (review of bb809af28)."""
+    head = text[:head_chars]
+    if head and 0xD800 <= ord(head[-1]) <= 0xDBFF:
+        head = head[:-1]
+    tail = text[-tail_chars:] if tail_chars else ''
+    if tail and 0xDC00 <= ord(tail[0]) <= 0xDFFF:
+        tail = tail[1:]
+    return head + marker + tail
+
+
+def _truncate_tool_call_arguments(msg: dict, room_tokens: int, marker,
+                                  model=None) -> tuple:
+    """Cut the arguments of the tool calls ``msg`` carries so they cost about
+    ``room_tokens`` together AS SENT; ``(new_msg, n_cut_chars)``.
+
+    Arguments stay one strict JSON object -- llama.cpp answers 500 "Failed
+    to parse tool call arguments as JSON" to anything else -- so a cut call's
+    arguments become ``{"trimmed_arguments": <head> marker <tail>}``.  Each
+    call gets an equal share of the room; one under its share is left as it
+    is.  Review of be96f2510: a call with 40k-char arguments kept whole with
+    its protected result sent 20,243 tokens against a 7,424 budget.
+
+    Sized on the ESCAPED result, not the raw text: json.dumps writes a quote
+    or a backslash as two characters and an emoji as a 12-character
+    surrogate escape, so a cut sized on the raw text stayed 10k-19k tokens
+    against 7,424 (review of f97b6bed8).  The cut shrinks until the sent
+    arguments fit, a few rounds at most.  ``marker`` is a string, or a
+    callable given the original arguments (it names the pointer)."""
+    from core.token_utils import count_tokens_for_text
+    calls = msg.get('tool_calls')
+    if not isinstance(calls, list) or not calls:
+        return msg, 0
+    share = max(1, int(room_tokens) // len(calls))
+    new_calls, n_cut = [], 0
+    for tc in calls:
+        fn = tc.get('function') if isinstance(tc, dict) else None
+        args = fn.get('arguments') if isinstance(fn, dict) else None
+        if (not isinstance(args, str)
+                or count_tokens_for_text(json.dumps(args), model) <= share):
+            new_calls.append(tc)
+            continue
+        mark = marker(args) if callable(marker) else marker
+        chars = _chars_for_tokens(args, share, model)
+        for _ in range(8):
+            tail_chars = chars // 2
+            cut = _middle_cut(args, chars - tail_chars, tail_chars, mark)
+            sent = json.dumps({'trimmed_arguments': cut})
+            # As the body is counted and sent: the arguments are a JSON
+            # string INSIDE the tool_calls JSON, so escaped once more.
+            cost = count_tokens_for_text(json.dumps(sent), model)
+            if cost <= share or chars <= 0:
+                break
+            chars = int(chars * share / cost * 0.9)
+        new_calls.append({**tc, 'function': {**fn, 'arguments': sent}})
+        n_cut += len(args) - len(cut) + len(mark)
+    if not n_cut:
+        return msg, 0
+    return {**msg, 'tool_calls': new_calls}, n_cut
+
+
+def _chars_for_tokens(text: str, tokens: int, model=None) -> int:
+    """How many characters of ``text`` hold about ``tokens`` tokens, at the
+    text's OWN chars/token -- dense JSON runs ~2.5, prose ~4, so one fixed
+    ratio either over- or under-cuts.  Falls back to 3.5 for empty text."""
+    from core.token_utils import count_tokens_for_text
+    n = count_tokens_for_text(text, model) if text else 0
+    ratio = (len(text) / n) if n else 3.5
+    # 10% under: a cut's two ends tokenize a little worse than the average
+    # (measured: 2-17 tokens over a 700-token room without it).
+    return int(max(0, tokens) * ratio * 0.9)
+
+
+def must_keep_head(text: str, role='user') -> int:
+    """How many leading characters of ``text`` no cut may take: a REUSE
+    dispatch turn's marker and the user's words, up to and including
+    ``ACTION_STEPS_SEPARATOR``.  0 for any other message.
+
+    The ONE rule for both places that shorten a turn: the wire trim (which
+    passes the message's role) and the seats' token limiter (whose messages
+    are conversation turns only: autogen adds the system prompt after the
+    transforms).  Only a user turn is a dispatch turn: a system prompt that
+    happens to contain the separator is cut like any other (review of
+    f97b6bed8)."""
+    if role != 'user' or not isinstance(text, str):
+        return 0
+    from core.constants import ACTION_STEPS_SEPARATOR
+    at = text.find(ACTION_STEPS_SEPARATOR)
+    return at + len(ACTION_STEPS_SEPARATOR) if at >= 0 else 0
+
+
+def keep_head_cut(text: str, keep: int, tail_chars: int, marker: str) -> str:
+    """``text``'s first ``keep`` characters whole, then ``marker``, then its
+    last ``tail_chars``: the cut both the trim and the limiter make of a
+    dispatch turn (must_keep_head)."""
+    return _middle_cut(text, keep, max(0, tail_chars), marker)
 
 
 def ensure_user_turn(messages: list) -> bool:
@@ -801,23 +1178,176 @@ def ensure_user_turn(messages: list) -> bool:
                 and messages[0].get('role') == 'system') else 0
     messages.insert(idx, {'role': 'user', 'name': 'User',
                           'content': WIRE_USER_SEED_TEXT})
+    # A last-resort guard, not a path: since the seats' limiters put the
+    # task turn back (protected_messages), a body without a user turn means
+    # it was lost upstream.  Loud and counted, so it is seen, not absorbed.
+    global _user_seed_count
+    with _user_seed_lock:
+        _user_seed_count += 1
+        n = _user_seed_count
+    logger.warning(
+        "wire-trim: seeded a user turn (WIRE_USER_SEED_TEXT) into a body with "
+        "none -- the real task turn was lost before the wire (seed #%d this "
+        "process); roles=%s", n,
+        [m.get('role') for m in messages if isinstance(m, dict)][:12])
     return True
 
 
-def _trim_to_budget(body: dict) -> tuple:
+_user_seed_count = 0
+_user_seed_lock = threading.Lock()
+
+
+def user_seed_count() -> int:
+    """How many bodies ensure_user_turn had to seed in this process."""
+    return _user_seed_count
+
+
+def _task_turn(messages: list):
+    """The newest turn of the speaker who opened the conversation's user side.
+
+    ``None`` when the first role='user' message carries no ``name`` -- a body
+    whose speakers cannot be told apart has no task turn separate from the
+    newest user turn.  NEWEST of that speaker, not its first message: a
+    carried-over history can open with an earlier request from the same user,
+    and that one is stale.
+    """
+    opener = next((m for m in messages
+                   if isinstance(m, dict) and m.get('role') == 'user'), None)
+    speaker = opener.get('name') if opener is not None else None
+    if not speaker:
+        return None
+    return next((m for m in reversed(messages)
+                 if isinstance(m, dict) and m.get('role') == 'user'
+                 and m.get('name') == speaker), None)
+
+
+def protected_messages(messages: list) -> list:
+    """The messages no trimming may remove, newest-user first, deduplicated.
+
+    THE one protected set, read by both places that shorten a conversation:
+    the wire trim (``_trim_to_budget``) and the seats' context limiters
+    (``hartos.helper`` history_limiter / token_limiter).  The limiters used
+    to keep only the newest message, and dropped the user's task turn
+    BEFORE the wire saw the body: live 2026-09-27, REUSE probe
+    liveprobe_reuse_1, 99 of 113 ToolMessageHandler inputs held no message
+    from User.  One set means the two can never disagree about what must
+    survive.
+
+      * the newest role='user' message: llama.cpp's Qwen3.5 template raises
+        "No user query found in messages." without one (measured 3x on
+        2026-08-30, source autogen.reuse);
+      * the task turn (:func:`_task_turn`): in an autogen group chat every
+        other agent's message reaches a seat as role='user', so the newest
+        user turn is often the StatusVerifier's verdict and the user's own
+        text is the oldest message (measured 2026-09-25 21:17:36);
+      * the newest role='tool' message: what the current step produced, the
+        thing the Assistant must use and the StatusVerifier must check (owner
+        decision, delegated 2026-09-26).
+    """
+    anchor = next((m for m in reversed(messages)
+                   if isinstance(m, dict) and m.get('role') == 'user'), None)
+    newest_result = next((m for m in reversed(messages)
+                          if isinstance(m, dict) and m.get('role') == 'tool'),
+                         None)
+    out = []
+    for m in (anchor, _task_turn(messages), newest_result):
+        if m is not None and not any(m is o for o in out):
+            out.append(m)
+    return out
+
+
+def _drop_units(messages: list) -> dict:
+    """``id(message) -> the messages the drop must remove along with it``.
+
+    An assistant message that carries ``tool_calls`` and the role='tool'
+    messages answering it are one unit: removing the call and keeping a
+    result leaves an answer to a call the model never sees.  Measured on the
+    live llama-server (b10330, Qwen3.5-4B template, 2026-09-26): such a body
+    is accepted with 200 and renders the result as a bare ``<tool_response>``
+    user turn, no ``<tool_call>`` before it.  A result pairs with the NEAREST
+    earlier message announcing its ``tool_call_id``, since a model may reuse
+    ids across turns.  Only the top-level ``tool_call_id`` is read: autogen's
+    ``tool_responses`` bundle is split into one message per call before the
+    wire (0 of 1,111 logged wire bodies carried it, 2026-09-26).  A message
+    outside any unit is absent from the map and drops alone.
+    """
+    units = {}
+    announcer = {}  # call id -> the nearest earlier message announcing it
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get('role') == 'assistant' and isinstance(m.get('tool_calls'), list):
+            for tc in m['tool_calls']:
+                if isinstance(tc, dict) and isinstance(tc.get('id'), str):
+                    announcer[tc['id']] = m
+        elif (m.get('role') == 'tool'
+              and isinstance(m.get('tool_call_id'), str)):
+            parent = announcer.get(m['tool_call_id'])
+            if parent is not None:
+                unit = units.setdefault(id(parent), [parent])
+                unit.append(m)
+                units[id(m)] = unit
+    return units
+
+
+def _strip_pointers(msg: dict) -> dict:
+    """``msg`` with every pointer removed (the plain WIRE_TRIM_MARKER stays),
+    for a body whose elided text could not be saved."""
+    # The one pointer format, removed by the one stripper.
+    def sub(text):
+        return strip_elided_pointers(text, marker_line=True)
+    out = dict(msg)
+    if isinstance(out.get('content'), str):
+        out['content'] = sub(out['content'])
+    elif isinstance(out.get('content'), list):
+        out['content'] = [{**p, 'text': sub(p['text'])}
+                          if isinstance(p, dict) and isinstance(p.get('text'), str)
+                          else p for p in out['content']]
+    if out.get('tool_calls'):
+        calls = []
+        for tc in out['tool_calls']:
+            fn = tc.get('function') if isinstance(tc, dict) else None
+            if isinstance(fn, dict) and isinstance(fn.get('arguments'), str):
+                try:
+                    obj = json.loads(fn['arguments'])
+                    if isinstance(obj, dict) and isinstance(
+                            obj.get('trimmed_arguments'), str):
+                        obj['trimmed_arguments'] = sub(
+                            obj['trimmed_arguments'])
+                        tc = {**tc, 'function': {**fn, 'arguments': json.dumps(obj)}}
+                except ValueError as e:
+                    # Arguments that are not JSON carry no pointer to strip.
+                    logger.debug("wire-trim: call arguments not JSON: %s", e)
+            calls.append(tc)
+        out['tool_calls'] = calls
+    return out
+
+
+def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
     """Return ``(trimmed_body, n_dropped, n_truncated_chars, est_before,
     est_after, budget)``.
 
-    Trim policy (always-succeeds, idempotent):
-      1. budget = per_slot - max_tokens - safety
+    Trim policy (best-effort, idempotent):
+      1. budget = per_slot - max_tokens - safety - the tool schema's tokens
       2. If under budget → return unchanged.
       3. Left-drop non-system messages (preserve index 0 if role=system)
-         until the remaining set fits.  Always keep at least the system
-         message + the most-recent user/assistant message.
-      4. If even [system, last_message] is over budget, left-truncate
-         the last message's content character-by-character until it
-         fits, prefixed with ``WIRE_TRIM_MARKER`` so the LLM sees the
-         truncation.
+         until the remaining set fits.  Never dropped: the system message,
+         the most-recent message, the newest role='user' message, the
+         task turn (:func:`_task_turn`, the initiator's newest turn) and the
+         newest role='tool' message.  An assistant message carrying tool_calls drops together with the
+         results answering it (:func:`_drop_units`), and is kept with them
+         when one of them is never dropped.
+      4. If still over, cut the middle of the messages step 3 could not drop,
+         one at a time, until the set fits: the most-recent message first
+         when nothing protects it, then the protected ones, largest first.
+         Each is cut only as far as the others at their current size
+         require, never below 64 tokens nor below a dispatch turn's marker
+         and words (:func:`must_keep_head`), with ``WIRE_TRIM_MARKER`` where
+         its middle was so the LLM sees the truncation.
+      5. If STILL over, cut the middle of the system message the same way.
+      A cut keeps each message's head and tail (_truncate_msg_content).
+      A body that is still over after step 5 is sent as is and logged as
+      an error.
 
     Idempotent: calling on an already-trimmed body returns it unchanged.
     Multimodal-aware: rebuilds list-shaped content preserving image
@@ -861,6 +1391,9 @@ def _trim_to_budget(body: dict) -> tuple:
         logger.info(
             "wire-trim: seeded one user turn (body had no role='user' — would "
             "trip llama-server's Qwen3 'No user query found in messages' 500).")
+    # For the one re-run with a reserve (see the end): its own copy of the
+    # list, which the drop and the cut below change in place.
+    _entry_body = dict(body, messages=list(messages))
 
     model = body.get('model') or None
     max_tokens = int(body.get('max_tokens') or body.get('max_completion_tokens') or 2048)
@@ -919,92 +1452,194 @@ def _trim_to_budget(body: dict) -> tuple:
                 "Prune the tool list for this agent; the request will be rejected "
                 "as over-length.",
                 tools_tokens, _get_budget_per_slot(), len(body.get('tools') or []))
-        budget = max(512, _get_budget_per_slot() // 4)
+        budget = _min_message_budget(_get_budget_per_slot())
 
     est_before = count_tokens_for_messages(messages, model)
     if est_before <= budget:
         return body, 0, 0, est_before, est_before, budget
 
+    # What a trim that elides adds -- the pointer explanation in the system
+    # message and the dropped results it names -- is only known once the
+    # trim has run.  So the trim runs aiming at the full budget and, when
+    # those additions then push it over, once more with exactly that much
+    # reserved (``_reserve``; see the end of this function).  A cut's own
+    # pointer is reserved in ``marker_tokens`` below.  The budget RETURNED
+    # is always the full one.
+    _sample_pointer = elided_pointer('0' * 12, 10 ** 6, 'an assistant turn')
+    _pointer_tokens = count_tokens_for_text(_sample_pointer + '\n', model)
+    full_budget = budget
+    budget = max(1, budget - int(_reserve))
+    elided = {}          # pointer_id -> record, saved once at the end
+    dropped_pointers = []
+
+    def _remember(text, kind):
+        pid = _elided_id(text)
+        elided[pid] = {'text': text, 'kind': kind, 'at': time.time(),
+                       'request_id': _get_request_id()}
+        return elided_pointer(pid, len(text), kind)
+
+    def _marker_for(msg):
+        kind = _ELIDED_KINDS.get(msg.get('role'), 'a message')
+        return lambda text: (WIRE_TRIM_MARKER + _remember(text, kind) + '\n')
+
     has_system = bool(messages and isinstance(messages[0], dict)
                       and messages[0].get('role') == 'system')
-    # The newest user message is load-bearing: llama.cpp's Qwen3.5 chat
-    # template raises "No user query found in messages." whenever a
-    # role='tool' message survives with no user message anywhere, and the
-    # server turns that into HTTP 500 (measured 3x on 2026-08-30, source
-    # autogen.reuse — post-trim roles were [system, assistant, assistant,
-    # tool, assistant]).  Left-dropping by position deleted it first,
-    # because the user's task instruction is the OLDEST non-system message.
-    anchor = next((m for m in reversed(messages)
-                   if isinstance(m, dict) and m.get('role') == 'user'), None)
+    # Never dropped: the newest user message, the task turn and the newest
+    # tool result -- protected_messages, the one set the seats' context
+    # limiters keep too.  Each was added after a measured failure; the
+    # reasons live on that function.
+    protected = protected_messages(messages)
+    start = 1 if has_system else 0
     n_dropped = 0
-    floor = 2 if has_system else 1
-    while len(messages) > floor:
-        drop_idx = 1 if has_system else 0
-        if messages[drop_idx] is anchor:
-            if len(messages) <= floor + 1:
-                break  # only system + anchor + newest remain
-            drop_idx += 1
-        messages.pop(drop_idx)
-        n_dropped += 1
+    # A tool call and its results leave together or not at all (see
+    # _drop_units): review of 9ddc8b92d, probed, [system, User task,
+    # assistant tool_calls, StatusVerifier, tool] trimmed to [system, user,
+    # user, tool] -- the result kept, the call it answers dropped.
+    units = _drop_units(messages)
+    must_stay = protected + messages[-1:]
+    while True:
+        # Leftmost message that is not the system prompt, not protected and
+        # not the newest message -- the same "keep system + newest" floor --
+        # taken with the rest of its unit.  A unit holding a message that
+        # must stay (a call whose result is the newest message) stays whole.
+        drop = next((unit for unit in (units.get(id(messages[i]), [messages[i]])
+                                       for i in range(start, len(messages)))
+                     if not any(m is k for m in unit for k in must_stay)),
+                    None)
+        if drop is None:
+            break
+        messages[:] = [m for m in messages if not any(m is d for d in drop)]
+        n_dropped += len(drop)
+        for d in drop:
+            if isinstance(d, dict) and d.get('role') == 'tool':
+                d_text = _content_to_text(d.get('content'))
+                if d_text:
+                    dropped_pointers.append(_remember(d_text, 'a tool result'))
         if count_tokens_for_messages(messages, model) <= budget:
             break
 
-    # (b)+(c) reserves below: the message-frame overhead of the message being
-    # truncated, and the truncation marker we'll prepend.  Previous bug:
-    # didn't subtract (c), so the post-truncation message exceeded budget by
-    # the marker length (~7 tokens) and the wire request still tickled n_ctx.
+    # Each cut below sizes a message against everything else in the set plus
+    # two reserves: the envelope overhead of the message being cut, and the
+    # truncation marker prepended to it.  Previous bug: the marker was not
+    # reserved, so the cut message exceeded budget by the marker length
+    # (~7 tokens) and the wire request still tickled n_ctx.
     _TOKENS_PER_MSG = 4  # OpenAI envelope overhead per message
-    marker_tokens = count_tokens_for_text(WIRE_TRIM_MARKER, model)
+    marker_tokens = (count_tokens_for_text(WIRE_TRIM_MARKER, model)
+                     + _pointer_tokens)
 
     n_truncated_chars = 0
-    if count_tokens_for_messages(messages, model) > budget and messages:
-        overhead_tokens = (count_tokens_for_messages(messages[:-1], model)
-                           + _TOKENS_PER_MSG
-                           + marker_tokens)
-        room_for_last = max(64, budget - overhead_tokens)
-        # Use the same chars/token ratio the fallback uses (3.5).  When
-        # tiktoken is available this is conservative; when it's the
-        # active path, it's exact.  Either way we're cutting from the
-        # left so over-cutting just means a slightly smaller payload.
-        target_chars = int(room_for_last * 3.5)
-        new_last, n_cut = _truncate_msg_content(
-            messages[-1], target_chars, WIRE_TRIM_MARKER, _content_to_text)
-        if n_cut:
-            n_truncated_chars += n_cut
-            messages[-1] = new_last
 
-    # The anchor (newest user message) is drop-protected, so when IT is the
-    # oversized component the step above never touches it: it only truncates
-    # messages[-1], and in the autogen.reuse conversations the anchor sits
-    # mid-list behind assistant/tool replies.  Measured 2026-08-30 19:35-19:46
-    # on the installed build: system+anchor ~5597 tok against budget 3840 —
-    # every trim ended in the STILL-over error below and llama-server rejected
-    # the turn, 95x in 11 minutes.  Same policy, same helper, applied to the
-    # anchor.
-    if (count_tokens_for_messages(messages, model) > budget
-            and anchor is not None and anchor in messages
-            and messages[-1] is not anchor):
-        a_idx = messages.index(anchor)
-        others = messages[:a_idx] + messages[a_idx + 1:]
+    # The drop above never removes a protected message or the newest one (nor
+    # a tool call whose result is the newest; that call is not cut), so
+    # when one of those is the oversized component, cutting its content is
+    # the only way to fit.  The cut once reached only messages[-1], and in the
+    # autogen.reuse conversations the anchor sits mid-list behind
+    # assistant/tool replies.  Measured 2026-08-30 19:35-19:46 on the
+    # installed build: system+anchor ~5597 tok against budget 3840 -- every
+    # trim ended in the STILL-over error below and llama-server rejected the
+    # turn, 95x in 11 minutes.  So the cut covers every message the drop
+    # kept: protecting a message from the drop must never make the trim
+    # unable to fit it.
+    #
+    # LARGEST FIRST.  Each message's room is computed with the others at their
+    # current size, so the order decides who is cut.  Anchor-first (the first
+    # cut) sized the anchor against a still-full task, floored it at 64
+    # tokens, then cut the task anyway and left budget unused: measured in the
+    # StatusVerifier seat (review of bac8f91c4), the Assistant's 2.7k-char
+    # result -- the thing the verifier must check -- went to ~224 chars while
+    # the user's 15k-char input was what needed cutting.  Shrinking the larger
+    # message first means the smaller one is only cut when the larger alone
+    # cannot make room.
+    #
+    # The NEWEST message is in the same pass.  It used to be cut first, in a
+    # separate step sized against the others at full size; in the
+    # StatusVerifier seat the anchor (the Assistant's result) IS the newest
+    # message, so it was floored while the 15k-char task was what needed
+    # cutting (review of 520c95e28, probed: anchor 2822 -> 247 chars, task
+    # cut anyway, est 569 of budget 740).  Deduplicated by identity: the
+    # newest message is often the anchor itself.  Room converts to chars at
+    # the message's own measured chars/token (_chars_for_tokens): a fixed 3.5
+    # over-counted dense text (JSON steps run ~2.5), so the cut left the
+    # message over its room.
+    #
+    # UNPROTECTED BEFORE PROTECTED.  When the newest message is protected by
+    # nothing (an assistant reply), it is cut before any protected message,
+    # whatever the sizes.  Largest-first decides only among the protected.
+    # The newest tool result used to be that unprotected message, and was
+    # floored at 64 tokens ahead of a whole task (review of 9ddc8b92d); it is
+    # protected now, so a 15k task and a 10.5k result share the cut, the
+    # larger first -- which can cut the middle of the task, the price of the result
+    # keeping real content (owner decision above).
+    #
+    # AND THE UNITS THEY PIN.  A protected tool result keeps its whole unit
+    # (_drop_units): the tool_calls message and every sibling result.  Those
+    # can be neither dropped nor, until the review of be96f2510, cut: a call
+    # with 40k-char arguments sent 20,243 tokens and three parallel ~16k
+    # results 8,307, each against a budget of 7,424.  They are unprotected
+    # candidates, so they are cut first, largest first; a call is cut in its
+    # arguments (_truncate_tool_call_arguments), a sibling in its content.
+    pinned = [m for m in messages
+              if any(m is k for u in (units.get(id(s), [s]) for s in must_stay)
+                     for k in u)]
+    candidates = []
+    for m in protected + messages[-1:] + pinned:
+        if not any(m is c for c in candidates):
+            candidates.append(m)
+
+    def _cut_order(m):
+        is_protected = any(m is p for p in protected)
+        return (is_protected, -count_tokens_for_messages([m], model))
+
+    for p in sorted(candidates, key=_cut_order):
+        if count_tokens_for_messages(messages, model) <= budget:
+            break
+        # Always found: the drop skips every candidate (protected or newest).
+        p_idx = next(i for i, m in enumerate(messages) if m is p)
+        others = messages[:p_idx] + messages[p_idx + 1:]
         overhead_tokens = (count_tokens_for_messages(others, model)
                            + _TOKENS_PER_MSG
                            + marker_tokens)
-        room_for_anchor = max(64, budget - overhead_tokens)
-        target_chars = int(room_for_anchor * 3.5)
-        new_anchor, n_cut = _truncate_msg_content(
-            anchor, target_chars, WIRE_TRIM_MARKER, _content_to_text)
+        p_text = _content_to_text(p.get('content'))
+        # A dispatch turn keeps its marker and words whatever its room
+        # (_truncate_msg_content / must_keep_head): sized against a
+        # full-size tool result it went to the 64-token floor and lost them
+        # (review of 111c458b0).  The candidates after it are sized against
+        # what it kept.
+        room_for_p = max(64, budget - overhead_tokens)
+        new_p, n_cut = p, 0
+        if p.get('tool_calls'):
+            # A call is cut in its arguments AND its text, each in proportion
+            # to what it costs (review of f97b6bed8: a call carrying "Writing
+            # the file." was cut in neither, 20,416 tokens against 7,424).
+            args_tokens = count_tokens_for_text(
+                json.dumps(p['tool_calls'], ensure_ascii=False), model)
+            text_tokens = (count_tokens_for_text(p_text, model)
+                           if p_text.strip() else 0)
+            args_room = max(1, room_for_p * args_tokens
+                            // max(1, args_tokens + text_tokens))
+            new_p, n_cut = _truncate_tool_call_arguments(
+                p, args_room,
+                lambda t: (WIRE_TRIM_MARKER
+                           + _remember(t, 'tool call arguments') + '\n'),
+                model)
+            room_for_p = max(64, room_for_p - args_room)
+        if p_text.strip():
+            target_chars = _chars_for_tokens(p_text, room_for_p, model)
+            new_p, n_text = _truncate_msg_content(
+                new_p, target_chars, _marker_for(p), _content_to_text)
+            n_cut += n_text
         if n_cut:
             n_truncated_chars += n_cut
-            messages[a_idx] = new_anchor
+            messages[p_idx] = new_p
 
     # LAST resort: the SYSTEM message itself.  autogen.reuse builds its
     # system prompt as persona boilerplate + the whole serialized recipe —
     # measured 2026-08-30 20:06-20:20 on the installed build: 86 of 100
     # STILL-over failures were this shape (sample: [system 28,154 chars,
     # assistant 247]), each sent doomed and rejected by llama-server.  When
-    # drops + last + anchor have all run and the set is STILL over, the
-    # system message is the only mass left; left-truncating it cuts the
-    # boilerplate head and keeps the actionable recipe tail.  Only reached
+    # the drop and the cut pass have both run and the set is STILL over, the
+    # system message is the only mass left; cutting its middle keeps the
+    # persona head and the actionable recipe tail.  Only reached
     # when the alternative is a guaranteed reject.
     if (count_tokens_for_messages(messages, model) > budget
             and has_system and len(messages) >= 1):
@@ -1012,21 +1647,62 @@ def _trim_to_budget(body: dict) -> tuple:
         overhead_tokens = (count_tokens_for_messages(others, model)
                            + _TOKENS_PER_MSG + marker_tokens)
         room_for_system = max(64, budget - overhead_tokens)
-        target_chars = int(room_for_system * 3.5)
+        target_chars = _chars_for_tokens(
+            _content_to_text(messages[0].get('content')), room_for_system,
+            model)
         new_sys, n_cut = _truncate_msg_content(
-            messages[0], target_chars, WIRE_TRIM_MARKER, _content_to_text)
+            messages[0], target_chars, _marker_for(messages[0]),
+            _content_to_text)
         if n_cut:
             n_truncated_chars += n_cut
             messages[0] = new_sys
 
+    # ─── Pointers: save what was elided, then explain them -- or, when the
+    # store cannot be written, send plain markers (never a pointer to
+    # nothing).  A pointer that ended up cut out of a message is not saved.
+    budget = full_budget
+    sent = '\n'.join(_content_to_text(m.get('content')) + json.dumps(
+        m.get('tool_calls') or '', ensure_ascii=False) for m in messages)
+    listed = dropped_pointers[-_ELIDED_LISTED_DROPS:]
+    live = {pid: rec for pid, rec in elided.items()
+            if pid in sent or any(pid in lp for lp in listed)}
+    _added = count_tokens_for_text(
+        ELIDED_POINTER_EXPLANATION + ' Removed earlier: '
+        + ' '.join(listed) + '.', model) if live else 0
+    if live and _added * _ELIDED_MIN_BUDGET_MULTIPLE > full_budget:
+        # A budget this small cannot spare the explanation for the text it
+        # needs: plain markers, as before pointers existed.
+        live = {}
+    if live and not _reserve:
+        if count_tokens_for_messages(messages, model) + _added > full_budget:
+            return _trim_to_budget(_entry_body, _reserve=_added)
+    if not live and elided:
+        messages[:] = [_strip_pointers(m) for m in messages]
+    elif live and _save_elided(live):
+        explanation = ELIDED_POINTER_EXPLANATION
+        if listed:
+            explanation += (' Removed earlier: ' + ' '.join(listed) + '.')
+        if has_system:
+            head = dict(messages[0])
+            head['content'] = (_content_to_text(head.get('content'))
+                               + explanation)
+            messages[0] = head
+        else:
+            messages.insert(0, {'role': 'system',
+                                'content': explanation.strip()})
+    elif live:
+        messages[:] = [_strip_pointers(m) for m in messages]
+
     # ─── Post-trim acceptance test — the trim is best-effort, so CHECK it ───
-    # Trimming can be structurally unable to reach the budget: it drops and
-    # truncates the LAST message, which cannot shrink the SYSTEM message.  On
-    # 2026-08-29 that produced est 795 against a budget of 351 — over by 2.3x —
-    # and the request was sent anyway because `we truncated something` was
-    # treated as success.  llama-server then rejected it (11,236 > n_ctx 8192).
-    # Say so here: a silent doomed request costs a full round trip and surfaces
-    # to the user as an unexplained failure (see #591 for the caller side).
+    # Trimming can be structurally unable to reach the budget: every message
+    # it cuts keeps at least 64 tokens, and a tool call kept because its
+    # result is the newest message is not cut at all.  On 2026-08-29, when the trim could
+    # not yet cut the system message, that produced est 795 against a budget
+    # of 351 — over by 2.3x — and the request was sent anyway because `we
+    # truncated something` was treated as success.  llama-server then
+    # rejected it (11,236 > n_ctx 8192).  Say so here: a silent doomed
+    # request costs a full round trip and surfaces to the user as an
+    # unexplained failure (see #591 for the caller side).
     _est_after = count_tokens_for_messages(messages, model)
     _wire_total = _est_after + tools_tokens
     _per_slot = _get_budget_per_slot()
@@ -1035,8 +1711,8 @@ def _trim_to_budget(body: dict) -> tuple:
             "[TRIM] trim could not reach budget — request is STILL over and "
             "will very likely be rejected: messages %d tok + schema %d tok = "
             "%d tok against n_ctx %d (budget was %d, %d msg(s) dropped, %d "
-            "char(s) truncated). Trimming cannot shrink the system message; "
-            "the oversized component is %s.",
+            "char(s) truncated). Every message the trim may cut keeps at "
+            "least 64 tokens; the oversized component is %s.",
             _est_after, tools_tokens, _wire_total, _per_slot, budget,
             n_dropped, n_truncated_chars,
             'the tool/function schema' if tools_tokens > _est_after
@@ -1087,7 +1763,7 @@ def _apply_trim_to_request(httpx_module, request, body: dict) -> tuple:
             pass
         if n_dropped or n_truncated:
             logger.warning(
-                "[TRIM] left-trimmed %d msg(s) + %d char(s) — est tokens "
+                "[TRIM] trimmed %d msg(s) + %d char(s) — est tokens "
                 "%d→%d, budget %d (n_ctx/%s slots, max_tokens=%s)",
                 n_dropped, n_truncated, est_before, est_after, budget,
                 os.environ.get('HEVOLVE_LLAMA_SLOTS', '1'),
@@ -1135,6 +1811,62 @@ def _ts() -> str:
 # (the longest observed live was ~380 chars), short enough that one
 # runaway blob cannot eat the file's size budget (PERF-2).
 _RESP_ARG_CAP = 600
+
+# Per-error-string cap.  Long enough for llama-server's whole overflow
+# sentence (~130 chars) and a hosted provider's JSON error object, short
+# enough that an HTML error page cannot eat the file's size budget (PERF-2).
+_RESP_ERROR_CAP = 1200
+
+
+def _response_error(response, status) -> Optional[str]:
+    """What the server SAID on a non-2xx, from an ALREADY-BUFFERED body.
+
+    ``None`` when there is nothing to report — a 2xx, or a body that was never
+    buffered.  Absent stays visibly different from empty, for the reason
+    :func:`_response_tool_calls` keeps that distinction.
+
+    WHY THIS EXISTS (measured 2026-09-22, this box).  Across 1,184 records in
+    ``llm_outbound.jsonl`` + its ``.old`` rotation, 60 carry
+    ``response_status: 400`` and every one of them stores only the status code.
+    The cause — ``request (6249 tokens) exceeds the available context size
+    (4096 tokens)`` — existed only in ``logs/llama_server_8080.log``, so
+    attributing those 400s to the tool schema was a CORRELATION between tool
+    counts (23 passing vs 50-65 failing) rather than a quotation.  This file is
+    the one place that sees every framework's response; recording the refusal
+    here is what makes that inference unnecessary next time.
+
+    Same read discipline as the tool-call extractor: only ``_content``, which
+    httpx sets when a non-streaming ``send`` has already buffered the body.
+    Touching ``.content`` would raise on an unread response and drain the bytes
+    the real caller is waiting for.
+
+    Prefers the provider's own ``error`` object (llama-server, OpenAI and Azure
+    all use it) and falls back to the raw text, so a proxy's HTML 502 is still
+    an answer rather than "unparseable, therefore nothing happened".
+    """
+    try:
+        if isinstance(status, int) and 200 <= status < 300:
+            return None
+        raw = getattr(response, '_content', None)
+        if raw is None:
+            return None
+        text = bytes(raw).decode('utf-8', 'replace').strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            err = data.get('error', data)
+            text = (json.dumps(err, ensure_ascii=False, default=str)
+                    if not isinstance(err, str) else err)
+        if len(text) > _RESP_ERROR_CAP:
+            text = text[:_RESP_ERROR_CAP] + '...[cut]'
+        return text
+    except Exception:
+        # A logging hook may never fail an LLM call.
+        return None
 
 
 def _response_tool_calls(response) -> Optional[list]:
@@ -1201,7 +1933,8 @@ def log_outbound(body: dict, *,
                  response_status: Any = None,
                  latency_ms: Optional[float] = None,
                  source: Optional[str] = None,
-                 response_tools: Optional[list] = None) -> None:
+                 response_tools: Optional[list] = None,
+                 response_error: Optional[str] = None) -> None:
     """Public hook for non-httpx callers (dispatcher's raw
     ``requests.post`` draft path).  Writes one JSONL record; never
     raises.
@@ -1212,7 +1945,11 @@ def log_outbound(body: dict, *,
 
     ``response_tools`` is ``_response_tool_calls``' output; the key is
     omitted entirely when it is ``None`` so "not readable" stays visibly
-    different from "read it, no tool calls" (``[]``)."""
+    different from "read it, no tool calls" (``[]``).
+
+    ``response_error`` is ``_response_error``' output — what the server said
+    when it refused.  Same omit-when-None rule, and never written on a 2xx, so
+    grepping the field finds exactly the failures."""
     try:
         record = {
             'ts': _ts(),
@@ -1224,6 +1961,8 @@ def log_outbound(body: dict, *,
         }
         if response_tools is not None:
             record['response_tool_calls'] = response_tools
+        if response_error is not None:
+            record['response_error'] = response_error
         line = json.dumps(record, default=str, ensure_ascii=False) + '\n'
         with _file_lock:
             fh = _open_log_handle()
@@ -1395,12 +2134,14 @@ def _install_sync_patch(httpx_module) -> None:
                 response = _orig_send(send_client, request, **kwargs)
             # Local llama-server is a provider too (host 127.0.0.1); feed the
             # breaker the real status (#106b b) before logging.
-            _feed_provider_breaker(request.url, getattr(response, 'status_code', None))
+            _status = getattr(response, 'status_code', None)
+            _feed_provider_breaker(request.url, _status)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
-                         response_status=getattr(response, 'status_code', None),
+                         response_status=_status,
                          latency_ms=round(elapsed, 1),
-                         response_tools=_response_tool_calls(response))
+                         response_tools=_response_tool_calls(response),
+                         response_error=_response_error(response, _status))
             return response
         except Exception as e:
             elapsed = (time.time() - start) * 1000
@@ -1439,12 +2180,14 @@ def _install_async_patch(httpx_module) -> None:
         start = time.time()
         try:
             response = await _orig(self, request, **kwargs)
-            _feed_provider_breaker(request.url, getattr(response, 'status_code', None))
+            _status = getattr(response, 'status_code', None)
+            _feed_provider_breaker(request.url, _status)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
-                         response_status=getattr(response, 'status_code', None),
+                         response_status=_status,
                          latency_ms=round(elapsed, 1),
-                         response_tools=_response_tool_calls(response))
+                         response_tools=_response_tool_calls(response),
+                         response_error=_response_error(response, _status))
             return response
         except Exception as e:
             elapsed = (time.time() - start) * 1000
@@ -1541,11 +2284,13 @@ def _install_urllib_patch(urllib_request_module) -> None:
             # HTTPResponse carries no buffered `_content`, so it reports None
             # and the key is omitted; the alternative (read it here) would
             # drain the body the caller has not read yet.
+            _status = getattr(response, 'status', None)
             log_outbound(body or {},
                          source=(_get_source() or 'urllib'),
-                         response_status=getattr(response, 'status', None),
+                         response_status=_status,
                          latency_ms=round(elapsed, 1),
-                         response_tools=_response_tool_calls(response))
+                         response_tools=_response_tool_calls(response),
+                         response_error=_response_error(response, _status))
             return response
         except Exception as e:
             elapsed = (time.time() - start) * 1000

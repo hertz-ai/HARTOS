@@ -201,6 +201,29 @@ def check_port_available(port: int, host: str = '0.0.0.0') -> bool:
         s.close()
 
 
+def find_free_port(host: str = '127.0.0.1') -> int:
+    """Ask the OS for an unused port (bind to 0, read it back, release).
+
+    The RuntimeToolManager sidecar contract ("all sidecar servers use
+    dynamic port allocation (no fixed ports)") needs this on the CHILD
+    side: the server binds :0, prints ``PORT=NNNNN`` on stdout, and
+    ``RuntimeToolManager._read_port_from_stdout`` reads it back.  Ports
+    are this module's concern -- get_port / check_port_available /
+    _is_port_listening already live here -- so the dynamic case belongs
+    here too rather than as another private copy per sidecar.
+
+    NOTE: the port is released before it is returned, so the caller must
+    bind it promptly; this is the same TOCTOU window every OS-assigned
+    port carries.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
 def get_mode_label() -> str:
     """Return 'OS' or 'APP' for display."""
     return 'OS' if is_os_mode() else 'APP'

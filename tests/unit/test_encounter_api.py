@@ -215,10 +215,14 @@ def test_all_routes_require_auth(client):
         ('POST', '/api/social/encounter/register-pubkey',
             {'pubkey': 'a' * 32}),
         ('GET', '/api/social/encounter/topics', {}),
+        ('GET', '/api/social/encounter/persona', {}),
+        ('PUT', '/api/social/encounter/persona', {'bio': 'x'}),
     ]
     for method, path, body in probes:
         if method == 'GET':
             resp = client.get(path)
+        elif method == 'PUT':
+            resp = client.put(path, json=body)
         else:
             resp = client.post(path, json=body)
         assert resp.status_code == 401, \
@@ -295,6 +299,458 @@ def test_discoverable_toggle_limit(client):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# persona card — what an agent may say about its user to a matched
+# person's agent (owner 2026-09-27: agents describe each user to the
+# other so they can recognise each other; match on bio + interests)
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_persona_default_empty(client):
+    resp = client.get('/api/social/encounter/persona', headers=_as_user(30))
+    assert resp.status_code == 200
+    data = resp.get_json()['data']
+    assert data == {'bio': '', 'recognize_me': '', 'vibe_tags': [],
+                    'interests_discoverable': False}
+
+
+def test_persona_saved_and_read_back(client):
+    resp = client.put(
+        '/api/social/encounter/persona',
+        json={'bio': 'Weekend trail runner, learning the sitar.',
+              'recognize_me': 'Tall, red backpack, usually near the chai stall',
+              'vibe_tags': ['trail running', 'sitar'],
+              'interests_discoverable': True},
+        headers=_as_user(30),
+    )
+    assert resp.status_code == 200
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(30)).get_json()['data']
+    assert data['bio'] == 'Weekend trail runner, learning the sitar.'
+    assert data['recognize_me'].startswith('Tall, red backpack')
+    assert data['vibe_tags'] == ['trail running', 'sitar']
+    assert data['interests_discoverable'] is True
+
+
+def test_persona_fields_are_capped(client):
+    client.put(
+        '/api/social/encounter/persona',
+        json={'bio': 'b' * 5000, 'recognize_me': 'r' * 5000,
+              'vibe_tags': [f't{i}' * 30 for i in range(40)]},
+        headers=_as_user(31),
+    )
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(31)).get_json()['data']
+    assert len(data['bio']) == C.ENCOUNTER_PERSONA_BIO_MAX_CHARS
+    assert len(data['recognize_me']) == C.ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS
+    assert len(data['vibe_tags']) == 10
+    assert all(len(t) <= 40 for t in data['vibe_tags'])
+
+
+def test_persona_edit_is_not_a_discoverable_toggle(client):
+    """Editing the card must not spend the 6-per-day broadcast toggles
+    or switch discovery on."""
+    for i in range(C.ENCOUNTER_DISCOVERABLE_MAX_TOGGLES_24H + 2):
+        r = client.put('/api/social/encounter/persona',
+                       json={'bio': f'v{i}'}, headers=_as_user(32))
+        assert r.status_code == 200
+    state = client.get('/api/social/encounter/discoverable',
+                       headers=_as_user(32)).get_json()['data']
+    assert state['enabled'] is False
+    assert state['toggle_count_24h'] == 0
+
+
+def test_discoverable_toggle_keeps_persona_tags(client):
+    """The BLE toggle used to overwrite vibe_tags with [] whenever a
+    body omitted them; with the card as a second writer that would
+    silently wipe the user's interests."""
+    client.put('/api/social/encounter/persona',
+               json={'vibe_tags': ['chess', 'jazz']}, headers=_as_user(33))
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': True, 'age_claim_18': True},
+                headers=_as_user(33))
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(33)).get_json()['data']
+    assert data['vibe_tags'] == ['chess', 'jazz']
+
+
+def test_persona_rejects_non_list_tags(client):
+    r = client.put('/api/social/encounter/persona',
+                   json={'vibe_tags': 'chess'}, headers=_as_user(34))
+    assert r.status_code == 400
+
+
+def _sight(client, viewer, pk):
+    return client.post(
+        '/api/social/encounter/sighting',
+        json={'peer_pubkey': pk, 'rssi_peak': -40, 'dwell_sec': 4},
+        headers=_as_user(viewer))
+
+
+def test_sighting_card_shows_tags_only_with_interests_discoverable(client):
+    """PRIVACY: turning the BLE broadcast on must not hand a stranger the
+    tags on the persona card.  They reach others only while the owner's
+    interests_discoverable is true, and stop again when it goes false."""
+    pk = 'abcd1234' * 4
+    client.put('/api/social/encounter/persona',
+               json={'vibe_tags': ['chess', 'jazz']}, headers=_as_user(40))
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': True, 'age_claim_18': True},
+                headers=_as_user(40))
+    _register_pubkey(client, 40, pk)
+
+    r = _sight(client, 41, pk)
+    assert r.status_code == 200
+    assert r.get_json()['data']['vibe_tags'] == []
+
+    client.put('/api/social/encounter/persona',
+               json={'interests_discoverable': True}, headers=_as_user(40))
+    assert _sight(client, 41, pk).get_json()['data']['vibe_tags'] == \
+        ['chess', 'jazz']
+
+    client.put('/api/social/encounter/persona',
+               json={'interests_discoverable': False}, headers=_as_user(40))
+    assert _sight(client, 41, pk).get_json()['data']['vibe_tags'] == []
+    # The owner still sees their own tags.
+    own = client.get('/api/social/encounter/persona',
+                     headers=_as_user(40)).get_json()['data']
+    assert own['vibe_tags'] == ['chess', 'jazz']
+
+
+@pytest.mark.parametrize('raw,stored', [(True, True), (False, False),
+                                        ('true', True), ('false', False)])
+def test_persona_consent_flag_accepts_booleans_and_exact_strings(
+        client, raw, stored):
+    # Start from the opposite value so a write that did nothing fails.
+    client.put('/api/social/encounter/persona',
+               json={'interests_discoverable': not stored},
+               headers=_as_user(50))
+    r = client.put('/api/social/encounter/persona',
+                   json={'interests_discoverable': raw}, headers=_as_user(50))
+    assert r.status_code == 200
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(50)).get_json()['data']
+    assert data['interests_discoverable'] is stored
+
+
+_NOT_A_FLAG = ['False', 'TRUE', ' true', 'yes', '1', '0', '', 1, 0, None,
+               [], {}, 'on']
+
+
+@pytest.mark.parametrize('raw', _NOT_A_FLAG)
+def test_persona_consent_flag_rejects_anything_else(client, raw):
+    client.put('/api/social/encounter/persona',
+               json={'bio': 'before', 'interests_discoverable': False},
+               headers=_as_user(51))
+    r = client.put('/api/social/encounter/persona',
+                   json={'bio': 'after', 'interests_discoverable': raw},
+                   headers=_as_user(51))
+    assert r.status_code == 400
+    assert 'interests_discoverable' in r.get_json()['error']
+    # A refused body writes nothing, not even its valid fields.
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(51)).get_json()['data']
+    assert data['interests_discoverable'] is False
+    assert data['bio'] == 'before'
+
+
+@pytest.mark.parametrize('key', ['enabled', 'age_claim_18', 'face_visible'])
+@pytest.mark.parametrize('raw', _NOT_A_FLAG)
+def test_discoverable_flags_reject_anything_else(client, key, raw):
+    body = {'enabled': False, 'age_claim_18': True, key: raw}
+    r = client.post('/api/social/encounter/discoverable', json=body,
+                    headers=_as_user(52))
+    assert r.status_code == 400
+    assert key in r.get_json()['error']
+    state = client.get('/api/social/encounter/discoverable',
+                       headers=_as_user(52)).get_json()['data']
+    assert state['toggle_count_24h'] == 0     # a refusal spends no toggle
+
+
+def test_discoverable_string_false_is_false(client):
+    """bool('false') is True: an age claim or face-visible sent as the
+    string 'false' must not be recorded as a yes."""
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'enabled': 'true', 'age_claim_18': 'false'},
+                    headers=_as_user(53))
+    assert r.status_code == 403
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'enabled': 'true', 'age_claim_18': 'true',
+                          'face_visible': 'false'},
+                    headers=_as_user(53))
+    assert r.status_code == 200
+    state = client.get('/api/social/encounter/discoverable',
+                       headers=_as_user(53)).get_json()['data']
+    assert state['enabled'] is True
+    assert state['face_visible'] is False
+    # 'false' for enabled turns the broadcast off, it does not keep it on.
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'enabled': 'false', 'age_claim_18': 'true'},
+                    headers=_as_user(53))
+    assert r.status_code == 200
+    state = client.get('/api/social/encounter/discoverable',
+                       headers=_as_user(53)).get_json()['data']
+    assert state['enabled'] is False
+
+
+def _write_routes():
+    from flask import Flask
+    from integrations.social import encounter_api
+    a = Flask('routes')
+    a.register_blueprint(encounter_api.encounter_bp)
+    return sorted((m, r.rule) for r in a.url_map.iter_rules()
+                  for m in r.methods - {'GET', 'HEAD', 'OPTIONS'})
+
+
+@pytest.mark.parametrize('method,path', _write_routes())
+@pytest.mark.parametrize('body', [['bio'], ['x'], 'bio', 7, True])
+def test_non_object_json_body_is_400_on_every_write_route(
+        client, method, path, body):
+    """A JSON body that is not an object (a list, a string, a number)
+    crashed every write handler with a 500 (body.get on a list); PUT
+    /persona crashed only when the list held a field name.  Every write
+    route answers 400 instead.  Routes come from the url_map, so a new
+    one is covered without editing this test."""
+    r = client.open(path, method=method, json=body, headers=_as_user(60))
+    assert r.status_code == 400, (method, path, r.status_code)
+    assert 'JSON object' in r.get_json()['error']
+
+
+def test_non_object_body_still_needs_auth(client):
+    r = client.put('/api/social/encounter/persona', json=['bio'])
+    assert r.status_code == 401
+
+
+@pytest.mark.parametrize('field', ['bio', 'recognize_me'])
+@pytest.mark.parametrize('raw', [None, 7, 1.5, True, ['a'], {'k': 'v'}])
+def test_persona_text_must_be_a_string(client, field, raw):
+    """Non-string text used to be stored as its str() form ("None",
+    "{'k': 'v'}").  Refuse it with 400 and write nothing."""
+    client.put('/api/social/encounter/persona',
+               json={'bio': 'kept', 'recognize_me': 'kept too'},
+               headers=_as_user(61))
+    r = client.put('/api/social/encounter/persona',
+                   json={field: raw, 'vibe_tags': ['new']},
+                   headers=_as_user(61))
+    assert r.status_code == 400
+    assert field in r.get_json()['error']
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(61)).get_json()['data']
+    assert data['bio'] == 'kept' and data['recognize_me'] == 'kept too'
+    assert data['vibe_tags'] == []
+
+
+def test_persona_text_empty_string_clears(client):
+    client.put('/api/social/encounter/persona', json={'bio': 'x'},
+               headers=_as_user(62))
+    r = client.put('/api/social/encounter/persona', json={'bio': ''},
+                   headers=_as_user(62))
+    assert r.status_code == 200
+    assert r.get_json()['data']['bio'] == ''
+
+
+@pytest.mark.parametrize('route', ['persona', 'discoverable'])
+@pytest.mark.parametrize('tags', [[None], ['ok', 7], [{'a': 1}], [['x']],
+                                  [True], None])
+def test_tags_must_be_a_list_of_strings(client, route, tags):
+    """Non-string tags were stored as "None" / "{'a': 1}".  Both writers
+    of vibe_tags refuse them (and null for the list) with 400."""
+    client.put('/api/social/encounter/persona',
+               json={'vibe_tags': ['chess']}, headers=_as_user(63))
+    if route == 'persona':
+        r = client.put('/api/social/encounter/persona',
+                       json={'vibe_tags': tags}, headers=_as_user(63))
+    else:
+        r = client.post('/api/social/encounter/discoverable',
+                        json={'enabled': False, 'vibe_tags': tags},
+                        headers=_as_user(63))
+    assert r.status_code == 400
+    assert 'vibe_tags' in r.get_json()['error']
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(63)).get_json()['data']
+    assert data['vibe_tags'] == ['chess']
+
+
+def _discoverable(client, uid):
+    return client.get('/api/social/encounter/discoverable',
+                      headers=_as_user(uid)).get_json()['data']
+
+
+def test_toggle_that_omits_enabled_turns_broadcast_off(client):
+    """Consent default: a body that does not say enabled is not a yes."""
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': True, 'age_claim_18': True},
+                headers=_as_user(70))
+    assert _discoverable(client, 70)['enabled'] is True
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'age_claim_18': True}, headers=_as_user(70))
+    assert r.status_code == 200
+    assert _discoverable(client, 70)['enabled'] is False
+
+
+def test_face_visible_is_off_unless_the_user_says_so(client):
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': True, 'age_claim_18': True},
+                headers=_as_user(71))
+    assert _discoverable(client, 71)['face_visible'] is False
+    assert _discoverable(client, 71)['avatar_style'] == 'studio_ghibli'
+
+
+def test_toggle_keeps_stored_face_visible_and_avatar_style(client):
+    """Like vibe_tags: a toggle that does not name face_visible or
+    avatar_style leaves the stored values alone (it reset them)."""
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': True, 'age_claim_18': True,
+                      'face_visible': True, 'avatar_style': 'pixel'},
+                headers=_as_user(72))
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': False}, headers=_as_user(72))
+    state = _discoverable(client, 72)
+    assert state['face_visible'] is True
+    assert state['avatar_style'] == 'pixel'
+    # And naming them still changes them.
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': False, 'face_visible': False,
+                      'avatar_style': 'neon'}, headers=_as_user(72))
+    state = _discoverable(client, 72)
+    assert state['face_visible'] is False
+    assert state['avatar_style'] == 'neon'
+
+
+@pytest.mark.parametrize('raw', [None, 7, ['pixel'], {'a': 1}, True])
+def test_avatar_style_must_be_a_string(client, raw):
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'enabled': False, 'avatar_style': raw},
+                    headers=_as_user(73))
+    assert r.status_code == 400
+    assert 'avatar_style' in r.get_json()['error']
+    assert _discoverable(client, 73)['toggle_count_24h'] == 0
+
+
+@pytest.mark.parametrize('raw', ['abc', '3600', None, True, 1.5, [], {}])
+def test_ttl_must_be_a_whole_number(client, raw):
+    """int('abc') raised a 500."""
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'enabled': True, 'age_claim_18': True,
+                          'ttl_sec': raw}, headers=_as_user(74))
+    assert r.status_code == 400
+    assert 'ttl_sec' in r.get_json()['error']
+    assert _discoverable(client, 74)['enabled'] is False
+
+
+def test_ttl_whole_number_still_accepted(client):
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'enabled': True, 'age_claim_18': True,
+                          'ttl_sec': 600}, headers=_as_user(75))
+    assert r.status_code == 200
+    assert 0 < r.get_json()['data']['remaining_sec'] <= 600
+
+
+@pytest.mark.parametrize('key,raw', [
+    ('rssi_peak', 'abc'), ('rssi_peak', None), ('rssi_peak', 1.5),
+    ('dwell_sec', 'x'), ('dwell_sec', True), ('dwell_sec', []),
+    ('lat', 'north'), ('lat', True), ('lng', {}), ('lng', 'x'),
+])
+def test_sighting_numbers_must_be_numbers(client, key, raw):
+    pk = 'dada' * 8
+    _make_discoverable(client, 76)
+    _register_pubkey(client, 76, pk)
+    body = {'peer_pubkey': pk, 'rssi_peak': -40, 'dwell_sec': 4,
+            'lat': 12.9, 'lng': 77.5, key: raw}
+    r = client.post('/api/social/encounter/sighting', json=body,
+                    headers=_as_user(77))
+    assert r.status_code == 400
+    assert key in r.get_json()['error']
+
+
+@pytest.mark.parametrize('key,raw', [('lat', 'NaN'), ('lng', 'Infinity'),
+                                     ('lat', '-Infinity')])
+def test_sighting_location_must_be_finite(client, key, raw):
+    """Python's JSON parser accepts NaN / Infinity; a map pin at NaN is
+    not a location."""
+    pk = 'dcdc' * 8
+    _make_discoverable(client, 76)
+    _register_pubkey(client, 76, pk)
+    fields = {'lat': '12.9', 'lng': '77.5', key: raw}
+    body = ('{"peer_pubkey": "%s", "rssi_peak": -40, "dwell_sec": 4, '
+            '"lat": %s, "lng": %s}' % (pk, fields['lat'], fields['lng']))
+    r = client.post('/api/social/encounter/sighting', data=body,
+                    content_type='application/json', headers=_as_user(77))
+    assert r.status_code == 400
+    assert key in r.get_json()['error']
+
+
+def test_sighting_numbers_accept_numbers_and_null_location(client):
+    pk = 'dbdb' * 8
+    _make_discoverable(client, 78)
+    _register_pubkey(client, 78, pk)
+    r = client.post('/api/social/encounter/sighting',
+                    json={'peer_pubkey': pk, 'rssi_peak': -40,
+                          'dwell_sec': 4, 'lat': None, 'lng': 77},
+                    headers=_as_user(79))
+    assert r.status_code == 200
+
+
+def test_owner_sees_own_tags_on_discoverable_get(client):
+    """The share flag gates what OTHERS see; the owner's own GET still
+    shows their tags with interests_discoverable off."""
+    client.put('/api/social/encounter/persona',
+               json={'vibe_tags': ['chess'], 'interests_discoverable': False},
+               headers=_as_user(80))
+    assert _discoverable(client, 80)['vibe_tags'] == ['chess']
+
+
+def test_source_guard_recognize_me_limit_is_the_constant():
+    """DRY: the recognize_me column width in the local model and in the
+    v59 DDL is ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS, not a second 280
+    that can drift from the cap encounter_api applies.  (Behaviour cannot
+    tell them apart while the values are equal, so this reads the AST.)"""
+    import ast
+    import inspect as _inspect
+
+    from integrations.social import _models_local, migrations
+
+    limit = C.ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS
+    model_src = _inspect.getsource(_models_local.DiscoverablePref)
+    mig_src = _inspect.getsource(migrations)
+    mig_tree = ast.parse(mig_src)
+    persona_ddl = next(
+        n for n in ast.walk(mig_tree)
+        if isinstance(n, ast.Assign)
+        and any(getattr(t, 'id', None) == '_V59_PERSONA_COLUMNS'
+                for t in n.targets))
+    for label, node in (('model', ast.parse(model_src)),
+                        ('v59 DDL', persona_ddl)):
+        literals = [c.value for c in ast.walk(node)
+                    if isinstance(c, ast.Constant) and c.value == limit]
+        texts = [c.value for c in ast.walk(node)
+                 if isinstance(c, ast.Constant) and isinstance(c.value, str)
+                 and str(limit) in c.value]
+        assert not literals and not texts, \
+            f'{label} writes {limit} inline; use the constant'
+    assert 'ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS' in model_src
+    # And the values the two places produce really are the constant.
+    assert _models_local.DiscoverablePref.__table__.c.recognize_me.type.length \
+        == limit
+    assert dict(migrations._V59_PERSONA_COLUMNS)['recognize_me'] == \
+        f'VARCHAR({limit})'
+
+
+def test_v59_adds_persona_columns_to_an_existing_table():
+    from sqlalchemy import create_engine, inspect, text
+    from integrations.social.migrations import _v59_persona_card
+
+    engine = create_engine('sqlite:///:memory:')
+    with engine.connect() as conn:
+        conn.execute(text(
+            "CREATE TABLE discoverable_prefs (user_id VARCHAR(64) PRIMARY KEY)"))
+        conn.commit()
+    assert _v59_persona_card(engine) is True
+    cols = {c['name'] for c in inspect(engine).get_columns('discoverable_prefs')}
+    assert {'bio', 'recognize_me', 'interests_discoverable'} <= cols
+    assert _v59_persona_card(engine) is True   # idempotent
+
+
+# ══════════════════════════════════════════════════════════════════════
 # sighting → swipe-card
 # ══════════════════════════════════════════════════════════════════════
 
@@ -347,6 +803,8 @@ def test_sighting_rejects_self(client):
 def test_sighting_returns_swipe_card(client):
     pk = 'feedface' * 4
     _make_discoverable(client, 20, tags=['indie_film'])
+    client.put('/api/social/encounter/persona',
+               json={'interests_discoverable': True}, headers=_as_user(20))
     _register_pubkey(client, 20, pk)
     resp = client.post(
         '/api/social/encounter/sighting',
@@ -687,3 +1145,23 @@ def test_icebreaker_draft_missing_match_id_400(client):
         headers=_as_user(1),
     )
     assert r.status_code == 400
+
+
+@pytest.mark.parametrize('ttl', [10**400, -(10**400)])
+def test_discoverable_oversized_integer_is_clamped_not_server_error(client, ttl):
+    response = client.post('/api/social/encounter/discoverable',
+        json={'enabled': True, 'age_claim_18': True, 'ttl_sec': ttl},
+        headers=_as_user(10))
+    assert response.status_code == 200
+
+
+def test_coordinate_integer_overflow_is_a_client_error():
+    from integrations.social.encounter_api import _number
+    value, error = _number({'lat': 10**400}, 'lat', None, whole=False)
+    assert value is None and error
+
+
+def test_large_but_float_representable_integer_retains_existing_validation():
+    from integrations.social.encounter_api import _number
+    raw = 15 * 10**307
+    assert _number({'lat': raw}, 'lat', None, whole=False) == (raw, None)

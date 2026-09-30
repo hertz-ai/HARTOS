@@ -107,6 +107,32 @@ class VoicedReplyGoesThroughTheRouter(unittest.TestCase):
                          'synthesize_text must never receive a voice reference')
         self.assertEqual(self._published_file(seen), 'default_reply.wav')
 
+    # ── the phone's bundle (HARTOS #111) ───────────────────────────────
+
+    def _bundle(self, seen):
+        import json
+        self.assertEqual(len(seen['published']), 1)
+        return json.loads(seen['published'][0])
+
+    def test_the_reply_carries_the_phones_bundle_beside_the_spas_url(self):
+        """A phone plays the bundle shape central's lip-sync service
+        publishes; with aud_url alone it plays the voice over the idle
+        avatar.  Additive: the SPA's generated_audio_url is untouched."""
+        with patch.dict(os.environ, {'HEVOLVE_EXTERNAL_URL': ''}),                 patch('core.port_registry.get_advertisable_base_url',
+                      return_value='http://192.168.0.165:5000'):
+            payload = self._bundle(self._speak(None))
+        self.assertEqual(payload['generated_audio_url'], '/tts/audio/default_reply.wav')
+        self.assertEqual(payload['video_link'], {
+            'aud_url': 'http://192.168.0.165:5000/tts/audio/default_reply.wav',
+            'request_id': 'req-1', 'action': 'TTS', 'is_cartoon': True, 'priority': 0})
+
+    def test_the_phones_url_is_the_external_one_when_configured(self):
+        with patch.dict(os.environ, {'HEVOLVE_EXTERNAL_URL': 'https://node.example/'}):
+            payload = self._bundle(self._speak(None))
+        self.assertEqual(payload['generated_audio_url'],
+                         'https://node.example/tts/audio/default_reply.wav')
+        self.assertEqual(payload['video_link']['aud_url'], payload['generated_audio_url'])
+
     # ── the voice is used ──────────────────────────────────────────────
 
     def test_a_recorded_voice_is_spoken_by_a_cloning_engine(self):

@@ -1083,6 +1083,8 @@ class TestPlatformPaths:
 
     @pytest.mark.skipif(sys.platform != 'win32', reason='Windows-only')
     def test_windows_default_path(self):
-        from core.platform_paths import get_data_dir
-        d = get_data_dir()
+        # The platform default itself: under pytest get_data_dir swaps it for
+        # a temp dir so no test writes the owner's real data root.
+        from core.platform_paths import _platform_default_data_dir
+        d = _platform_default_data_dir()
         assert 'Documents' in d and 'Nunba' in d

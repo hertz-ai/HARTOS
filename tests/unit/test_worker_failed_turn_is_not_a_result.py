@@ -32,11 +32,29 @@ for p in (_ROOT, os.path.join(_ROOT, 'agent-ledger-opensource')):
         sys.path.insert(0, p)
 
 from agent_ledger.core import SmartLedger, TaskStatus  # noqa: E402
+import pytest
 
 
 # --------------------------------------------------------------------------
 # Recognising a failed turn
 # --------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _worker_may_claim(monkeypatch):
+    """Precondition these tests always assumed: the daemon gate is open.
+
+    Since 2026-09-20 the worker asks should_yield_to_user, the provider
+    breaker and the adapter's readiness BEFORE claiming (a claim the
+    dispatcher would defer is three full ledger writes for nothing), so a
+    test that drives _tick on a live box would otherwise inherit that box's
+    pressure readings.  The gate itself is pinned in
+    tests/unit/test_worker_tick_claims_nothing_it_would_defer.py.
+    """
+    from integrations.distributed_agent.worker_loop import DistributedWorkerLoop
+    monkeypatch.setattr(DistributedWorkerLoop, '_dispatch_would_defer',
+                        staticmethod(lambda: None))
+
 
 def test_both_shapes_user_facing_error_produces_are_recognised():
     from core.agent_tools import is_user_facing_error, user_facing_error
@@ -53,6 +71,33 @@ def test_the_canonical_llm_error_replies_are_recognised():
     from core.agent_tools import is_user_facing_error
     assert is_user_facing_error(C.LLM_LOADING_REPLY)
     assert is_user_facing_error(C.LLM_GENERIC_ERROR_REPLY)
+
+
+def test_the_action_error_envelope_is_recognised_wrapped_or_not():
+    """The CREATE prompt tells an agent to answer a failed action with
+    {"status":"error","action":...,"action_id":...,"message":...}.  The daemon
+    counted that reply as a successful dispatch, so a continuous goal whose
+    every run ended in it re-ran every 5 minutes for five months (goal
+    85d091d3, prompt 65708210992, 53,949 copilot sessions).  This is the
+    envelope from one of those sessions, in the shapes a reply carries it."""
+    from core.agent_tools import is_action_error_reply
+    real = ('{"status": "error", "action": "Automatically collect new user '
+            'feedback logs, parse ratings/quality scores, aggregate training '
+            'signals from distributed nodes, and verify privacy compliance '
+            'before model update", "action_id": 1, "message": "Verified at the '
+            '2026-09-15 16:15 timer fire, re-issued stand."}')
+    assert is_action_error_reply(real)
+    assert is_action_error_reply(real + chr(10) + 'assistant: No tool is needed in this slot.')
+    assert is_action_error_reply('Here is the status:' + chr(10) + real)
+    # The other envelopes of the same protocol are outcomes, not failures.
+    assert not is_action_error_reply(real.replace('"error"', '"completed"'))
+    assert not is_action_error_reply(real.replace('"error"', '"pending"'))
+    # Prose that merely mentions an error, and the help pause (its own
+    # recogniser), are not this envelope.
+    assert not is_action_error_reply('There was an error yesterday but it is fixed.')
+    assert not is_action_error_reply('Paused for help: step 1 could not be finished.')
+    assert not is_action_error_reply(None)
+    assert not is_action_error_reply('')
 
 
 def test_a_real_answer_is_not_mistaken_for_a_failure():

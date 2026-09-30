@@ -64,7 +64,12 @@ SUPPORTED_ACTIONS = {
     'cursor_position', 'hover', 'list_folders_and_files',
     'Open_file_and_copy_paste', 'open_file_gui', 'write_file',
     'read_file_and_understand', 'wait', 'hotkey', 'shell',
+    'scroll_up', 'scroll_down',
 }
+
+#: Wheel notches per scroll when the model gives no amount: about a third
+#: of a typical page, so the next screenshot still overlaps the last one.
+SCROLL_DEFAULT_CLICKS = 5
 
 
 def take_screenshot(tier: str) -> str:
@@ -357,12 +362,25 @@ def execute_action(action: dict, tier: str, *,
         'status', 'translated_from', 'translated_to', 'verify_diff',
         'safety_block' (when safety=True and a guard refused).
     """
+    # Mandatory operation policy.  It is intentionally outside ``safety``:
+    # disabling rate/window checks must never make shutdown, reset, erase or
+    # format executable.
+    from integrations.vlm.safety import destructive_computer_operation
+    _operation_block = destructive_computer_operation(action)
+    if _operation_block is not None:
+        return {'output': '', 'status': 'safety_blocked',
+                'error': _operation_block, 'safety_block': _operation_block}
+
     _mismatch = _check_reasoning_mismatch(action)
 
     # Phase 4: per-window translation + occlusion handling.  Mutates
     # action['coordinate'] in place when needed; returns an early
     # status dict when the window can't be acted on safely.
     _window_meta = None
+    block = _input_context_block(action)
+    if block is not None:
+        return block
+
     if window_handle is not None:
         _window_meta, _early = _prepare_window_for_action(
             window_handle, action, if_occluded)
@@ -371,6 +389,8 @@ def execute_action(action: dict, tier: str, *,
                 _emit_audit(action, _early, _window_meta, None,
                             block_reason=_early.get('status'))
             return _early
+        if if_occluded == 'foreground':
+            action['_expected_foreground'] = window_handle
 
     # Phase 6: safety guards run BEFORE any pyautogui call so a refusal
     # never reaches the user's screen.  Order matters — session-level
@@ -397,10 +417,18 @@ def execute_action(action: dict, tier: str, *,
         except Exception as e:
             logger.debug(f"verify pre-screenshot skipped: {e}")
 
+    # Credentials cross into the real value only here: the guards and the
+    # audit record above saw the {{secret:NAME}} alias, the keystrokes get
+    # the value, and the result is masked back before the model reads it.
+    from core.tool_logging import credential_vault
+    vault = credential_vault()
+    _run = vault.resolve_aliases(action) if vault is not None else action
     if tier == 'inprocess':
-        result = _execute_inprocess(action)
+        result = _execute_inprocess(_run)
     else:
-        result = _execute_http(action)
+        result = _execute_http(_run)
+    if vault is not None:
+        result = vault.mask_secrets(result)
 
     if _mismatch:
         result['window_mismatch'] = _mismatch
@@ -659,6 +687,96 @@ def _quick_image_diff(b64_a: str, b64_b: str) -> float:
         return 0.0
 
 
+#: Seconds the pasted text stays on the clipboard before the previous
+#: content is put back.  The paste is delivered asynchronously to the
+#: target window, so restoring immediately can paste the old content.
+CLIPBOARD_RESTORE_DELAY_S = 0.15
+
+
+def _type_text(text: str, action=None) -> None:
+    """Enter ``text`` into the focused field.
+
+    Pastes through the clipboard when available (reliable for long and
+    non-ASCII text, same as OmniParser), then puts the user's previous
+    clipboard back so a typed credential does not stay readable there.
+    """
+    def check():
+        block = _input_context_block(action or {})
+        if block is not None:
+            raise _InputPreempted(block)
+    check()
+    if pyperclip is None:
+        if action and '_human_input_token' in action:
+            for character in text:
+                check()
+                pyautogui.typewrite(character, interval=0.012)
+        else:
+            pyautogui.typewrite(text, interval=0.012)
+        return
+    try:
+        previous = pyperclip.paste()
+    except Exception:
+        previous = ''
+    pyperclip.copy(text)
+    try:
+        check()  # A person may change focus while the clipboard is copied.
+        pyautogui.hotkey('ctrl', 'v')
+        time.sleep(CLIPBOARD_RESTORE_DELAY_S)
+    finally:
+        # Do not overwrite something the person copied while paste settled.
+        try:
+            if pyperclip.paste() == text:
+                pyperclip.copy(previous)
+        except Exception:
+            logger.warning('Could not restore the clipboard after typing', exc_info=True)
+
+
+class _InputPreempted(Exception):
+    def __init__(self, result):
+        self.result = result
+        super().__init__(result['error'])
+
+def foreground_window_handle():
+    """Foreground identity at capture/dispatch; no titles or text."""
+    if sys.platform != 'win32':
+        return None
+    import ctypes
+    api = ctypes.WinDLL('user32', use_last_error=True)
+    api.GetForegroundWindow.restype = ctypes.c_void_p
+    return api.GetForegroundWindow() or None
+
+_NO_GUI_ACTIONS = frozenset({
+    'list_folders_and_files', 'read_file_and_understand', 'write_file',
+    'Open_file_and_copy_paste', 'open_file_gui', 'wait', 'shell',
+})
+
+def _input_context_block(action):
+    # Local-loop-owned context. Background files/commands use no shared input.
+    if '_human_input_token' not in action:
+        return None
+    act = action.get('action', '')
+    if ((act in _NO_GUI_ACTIONS and act != 'open_file_gui')
+            or act in ('screenshot', 'cursor_position')):
+        return None
+    from core.resource_governor import get_physical_input_state
+    state = get_physical_input_state()
+    token = action['_human_input_token']
+    if state is None or token is None:
+        why = 'Desktop input monitoring is unavailable; withholding interactive input.'
+        status = 'blocked'
+    elif state[0] != token:
+        why = ('Paused because you resumed using the mouse or keyboard. '
+               'Inspect the last action before resuming computer control.')
+        status = 'user_active'
+    else:
+        expected = action.get('_expected_foreground')
+        current = foreground_window_handle()
+        if not expected or not current or expected == current:
+            return None
+        why = 'Foreground changed after capture; take a new screenshot before acting.'
+        status = 'context_changed'
+    return {'output': '', 'status': status, 'error': why, 'block_reason': why}
+
 def _execute_inprocess(action: dict) -> dict:
     """Execute action via direct pyautogui calls."""
     act = action.get('action', '')
@@ -670,11 +788,10 @@ def _execute_inprocess(action: dict) -> dict:
         if not isinstance(coord, (list, tuple)) or len(coord) < 2:
             return {'output': '', 'error': f'Invalid coordinate format: {coord}'}
 
-    # File/wait/shell actions don't need pyautogui
-    _NO_GUI_ACTIONS = {
-        'list_folders_and_files', 'read_file_and_understand', 'write_file',
-        'Open_file_and_copy_paste', 'open_file_gui', 'wait', 'shell',
-    }
+    # File/wait/shell actions don't need pyautogui.
+    block = _input_context_block(action)
+    if block is not None:
+        return block
 
     if act not in _NO_GUI_ACTIONS and pyautogui is None:
         return {'output': '', 'error': 'pyautogui not installed'}
@@ -707,13 +824,10 @@ def _execute_inprocess(action: dict) -> dict:
 
         elif act == 'type':
             if text:
-                # Use clipboard for reliability (same as OmniParser)
-                if pyperclip is not None:
-                    pyperclip.copy(text)
-                    pyautogui.hotkey('ctrl', 'v')
-                else:
-                    pyautogui.typewrite(text, interval=0.012)
-            return {'output': f'Typed: {text[:50]}...'}
+                _type_text(text, action)
+            # The count, never the text: this result goes back into the
+            # model's context, and what was typed may be a credential.
+            return {'output': f'Typed {len(text or "")} characters'}
 
         elif act == 'key':
             if text:
@@ -728,6 +842,22 @@ def _execute_inprocess(action: dict) -> dict:
                     keys = [k.strip() for k in str(text).split('+')]
                 pyautogui.hotkey(*keys)
             return {'output': f'Hotkey: {text}'}
+
+        elif act in ('scroll_up', 'scroll_down'):
+            # The loop offers both to the model; without this branch every
+            # scroll failed as "Unknown action" and nothing below the fold
+            # of a page could be reached.  `value` may carry a notch count.
+            try:
+                clicks = abs(int(str(text).strip())) if text else SCROLL_DEFAULT_CLICKS
+            except ValueError:
+                clicks = SCROLL_DEFAULT_CLICKS
+            if act == 'scroll_down':
+                clicks = -clicks
+            if coord:
+                pyautogui.scroll(clicks, x=coord[0], y=coord[1])
+            else:
+                pyautogui.scroll(clicks)
+            return {'output': f'Scrolled {act[7:]} {abs(clicks)} notches'}
 
         elif act == 'left_click_drag':
             start = action.get('startCoordinate', coord)
@@ -880,6 +1010,8 @@ def _execute_inprocess(action: dict) -> dict:
         else:
             return {'output': '', 'error': f'Unknown action: {act}'}
 
+    except _InputPreempted as e:
+        return e.result
     except Exception as e:
         logger.error(f"Action execution error ({act}): {e}")
         return {'output': '', 'error': str(e)}
@@ -888,6 +1020,9 @@ def _execute_inprocess(action: dict) -> dict:
 def _execute_http(action: dict) -> dict:
     """Execute action via HTTP POST to localhost:5001/execute."""
     try:
+        block = _input_context_block(action)
+        if block is not None:
+            return block
         resp = pooled_post(
             'http://localhost:5001/execute',
             json=action,

@@ -31,12 +31,21 @@ SKIP = {'.git', '__pycache__', 'venv', '.venv', 'node_modules', 'claw_native',
 # ── BUDGETS — measured 2026-08-17. RATCHET DOWN ONLY. ────────────────────────
 # Raising a number here to make CI pass is the failure mode this guard exists to
 # prevent: it converts a regression into a silently accepted new normal.
-MAX_BARE_SWALLOWS = 1521        # `except ...: pass` (was 1533 -> 1528 -> 1521;
+MAX_BARE_SWALLOWS = 1517        # `except ...: pass` (was 1533 -> 1528 -> 1521
+                                # -> 1517;
                                 # 2026-08-30: world_model_bridge.py's 24 silent
                                 # swallows converted to logged debug/warning
                                 # excepts — security-control absences now WARN
                                 # (task #6, no-silent-gulping), best-effort paths
                                 # log debug. Net tree count 1545 -> 1521.)
+                                # 2026-09-27: the tree had grown back to 1571
+                                # (September swallows in dispatch, worker_loop,
+                                # foreground, venv_paths, node_integrity, ...);
+                                # 54 converted to logged excepts.  1517 is what
+                                # this walk measures on the dev box, which
+                                # includes 6 swallows in git-ignored root
+                                # scratch files (/_*.py, /_drops_ready/); a clean
+                                # checkout (CI) measures 1511.
 
 #: security/ gets its OWN, TIGHTER budget. A swallow here is worst: a control that
 #: fails without saying so still reports green, so the system cannot tell a working
@@ -44,7 +53,14 @@ MAX_BARE_SWALLOWS = 1521        # `except ...: pass` (was 1533 -> 1528 -> 1521;
 #: Note 4 of the remainder are in hive_guardrails.py, which CLAUDE.md forbids
 #: modifying (circuit breaker / structural immutability) — they need the steward,
 #: not a refactor.
-MAX_SECURITY_SWALLOWS = 62      # was 68 -> 63 -> 62.
+MAX_SECURITY_SWALLOWS = 60      # was 68 -> 63 -> 62 -> 61 -> 60.
+                                # 2026-09-27: security/node_integrity.py's five
+                                # identity-race swallows (584cdec55 took the
+                                # count to 67) now log; one more had gone
+                                # elsewhere in the meantime, so 61.  Then
+                                # system_requirements' CPU-model probe moved
+                                # onto call_bounded and its bare
+                                # `except: pass` went with it, so 60.
                                 # MERGE NOTE 2026-09-11: two lanes lowered this
                                 # to 62 independently and each recorded a
                                 # different cause, so BOTH are kept -- the number
@@ -67,6 +83,10 @@ MAX_GOD_MODULES = 9             # SOURCE files > 3000 lines (tests excluded —
                                 # the first draft said 11 by counting
                                 # test_nixos_configs.py and test_agent_engine.py,
                                 # and this guard's own staleness check caught it)
+                                # 2026-09-27: back to 9 after core/agent_tools.py
+                                # (tool menu/attach -> core/agent_tool_menu.py)
+                                # and integrations/social/peer_discovery.py
+                                # (AutoDiscovery -> lan_discovery.py) were split.
 MAX_DUP_PUBLIC_NAMES = 122      # one public name defined in >1 SOURCE module
 
 #: The core-pipeline helpers that are verbatim-duplicated across the CREATE/REUSE

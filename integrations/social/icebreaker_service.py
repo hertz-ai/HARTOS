@@ -27,7 +27,9 @@ Design contract (project_encounter_icebreaker.md §9):
      the peer's opt-in vibe_tags.  This ensures the encounter
      feature works on offline / cold-boot machines.
   5. No PII surface: the draft text only mentions the peer's
-     OPT-IN public-facing fields (vibe_tags, avatar_style).  Never
+     OPT-IN public-facing fields (vibe_tags only while the peer's
+     interests_discoverable is true, see vibe_tags_others_may_see;
+     avatar_style).  Never
      references the peer's user_id, real name, location, or any
      stored memory_graph entry that wasn't tagged shared.
 
@@ -145,6 +147,18 @@ def _pick_shared_tag(
     return None
 
 
+def vibe_tags_others_may_see(pref: Optional[DiscoverablePref]) -> list[str]:
+    """The tags on a user's persona card that anyone OTHER than that user
+    may see: all of them while the user's interests_discoverable is true,
+    none otherwise.  The one rule every reader that shows a user's tags to
+    someone else goes through (the sighting swipe card, the icebreaker
+    draft and its LLM context).  Turning the BLE broadcast on is not a yes
+    to sharing interests."""
+    if pref is None or not pref.interests_discoverable:
+        return []
+    return list(pref.vibe_tags or [])
+
+
 def _peer_id_for(match: Encounter, viewer_uid: str) -> Optional[str]:
     if match.user_a_id == viewer_uid:
         return match.user_b_id
@@ -237,7 +251,8 @@ def draft_icebreaker(
     viewer_pref = db_session.query(DiscoverablePref).filter_by(
         user_id=viewer_user_id,
     ).first()
-    peer_tags = list(peer_pref.vibe_tags or []) if peer_pref else []
+    peer_tags = vibe_tags_others_may_see(peer_pref)
+    # The viewer's own tags are theirs to see, whatever their flag says.
     viewer_tags = list(viewer_pref.vibe_tags or []) if viewer_pref else []
     shared = _pick_shared_tag(viewer_tags, peer_tags)
 

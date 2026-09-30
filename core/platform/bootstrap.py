@@ -222,6 +222,12 @@ def bootstrap_platform(extensions_dir: Optional[str] = None) -> ServiceRegistry:
 
     registry.start_all()
 
+    # ── Liquid UI (A2UI) owner for this process ───────────────
+    # AFTER start_all on purpose: start_all instantiates every registered
+    # singleton, and this one must stay lazy so a process that never pushes a
+    # card never imports the shell module.
+    _register_liquid_ui(registry)
+
     total = apps.count()
     ext_count = ext_reg.count()
     logger.info("Platform bootstrapped: %d apps, %d extensions", total, ext_count)
@@ -536,6 +542,53 @@ def _register_orchestrator_services(registry: ServiceRegistry) -> None:
         logger.debug("Remote Desktop Orchestrator not available — skipping")
     except Exception as e:
         logger.warning("Remote Desktop Orchestrator startup: %s", e)
+
+
+def _register_liquid_ui(registry: ServiceRegistry) -> None:
+    """Give THIS process its one LiquidUIService, when it is the owner.
+
+    Owner ruling 2026-09-26: "demopage agent compoennt shd be part and parcel
+    of liqui i\\ui". On the desktop, Liquid UI IS the Nunba Demopage's agent
+    component (AgentOverlay over realtimeService). There is no separate shell
+    host there, so the backend process itself must own the service, headless:
+    no Flask app, no routes. Its agent_ui_update emits `agent.ui.update` on
+    the EventBus, which reaches the owning user's SSE stream (and WAMP).
+
+    Before this, the only registration was LiquidUIService._register_self,
+    reached only from _create_flask_app (the :6800 shell). In the backend
+    process every emitter found nothing and the push was dropped.
+
+    One owner per topology:
+      * no separate shell (Nunba desktop, a bare HARTOS backend): registered
+        here, lazily.
+      * HART OS (core.port_registry.is_os_mode, true via /etc/os-release
+        ID=hart-os): the hart-liquid-ui unit is a separate :6800 process and
+        owns the service; its _register_self registers the SERVING instance.
+        The backend registers nothing, so run_home_compose keeps POSTing the
+        live shell. That process runs this bootstrap too (serve_forever ->
+        ensure_platform), which is why the check is os-mode and not "no shell
+        in this process".
+      * anything already registered (a serving shell, a probe stub) is left
+        alone.
+    """
+    from core.port_registry import get_port, is_os_mode
+    if is_os_mode():
+        logger.debug("LiquidUIService: owned by the hart-liquid-ui shell unit "
+                     "on HART OS; not registered in this process")
+        return
+
+    def _make_liquid_ui():
+        from integrations.agent_engine.liquid_ui_service import LiquidUIService
+        return LiquidUIService(backend_port=get_port('backend'),
+                               model_bus_port=get_port('model_bus'))
+
+    try:
+        registry.register('LiquidUIService', _make_liquid_ui, singleton=True)
+    except ValueError:
+        # Already registered (a serving shell, a probe stub): that owner
+        # stands. register() is the one check, so there is no has()-then-
+        # register window for a concurrent registration to fall into.
+        pass
 
 
 def _verify_extension_signatures(extensions_dir: str) -> None:

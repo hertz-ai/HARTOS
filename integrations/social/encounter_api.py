@@ -27,6 +27,8 @@ Endpoints all mounted at /api/social/encounter/*  (JWT-auth required):
 
   POST /discoverable     enable/disable broadcast + TTL + age gate
   GET  /discoverable     current state + remaining TTL + toggle count
+  GET  /persona          the user's persona card (bio, recognize_me, tags)
+  PUT  /persona          edit the card; not a discoverable toggle
   POST /sighting         phone reports a BLE sighting; returns swipe card
   POST /swipe            like/dislike decision (signed event)
   GET  /matches          list of MUTUAL matches (one-sided never leaks)
@@ -51,11 +53,16 @@ Invariants enforced server-side (the blocking privacy gates):
   6. All pubkeys are rotating (scheme rotates every
      ENCOUNTER_PUBKEY_ROTATION_SEC on the phone); server stores only
      the rotating value, never the user's master identity.
+  7. A user's vibe_tags reach anyone else only while their
+     interests_discoverable is true (icebreaker_service.
+     vibe_tags_others_may_see); consent flags are parsed strictly
+     (_flags), so the string 'false' is never a yes.
 """
 from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import secrets
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -68,6 +75,10 @@ from core.constants import (
     ENCOUNTER_DISCOVERABLE_TTL_SEC,
     ENCOUNTER_DRAFT_MAX_CHARS,
     ENCOUNTER_MATCH_WINDOW_SEC,
+    ENCOUNTER_PERSONA_BIO_MAX_CHARS,
+    ENCOUNTER_PERSONA_MAX_TAGS,
+    ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS,
+    ENCOUNTER_PERSONA_TAG_MAX_CHARS,
     ENCOUNTER_SIGHTING_EXPIRES_SEC,
     ENCOUNTER_TOPIC_ICEBREAKER,
     ENCOUNTER_TOPIC_MATCH,
@@ -76,6 +87,7 @@ from core.constants import (
 )
 
 from .auth import require_auth
+from .icebreaker_service import vibe_tags_others_may_see
 from .models import (
     DiscoverablePref,
     Encounter,
@@ -94,8 +106,38 @@ encounter_bp = Blueprint('encounter', __name__, url_prefix='/api/social')
 from .api_common import _ok, _err  # single-sourced envelope helpers (#97)
 
 
+class _BodyNotAnObject(Exception):
+    """The request body is JSON but not an object (a list, a string, a
+    number).  Every handler reads fields with body.get, so it answers 400
+    here instead of crashing with a 500."""
+
+
 def _json() -> dict[str, Any]:
-    return request.get_json(force=True, silent=True) or {}
+    """The request's JSON object; {} for no body or a body that is not
+    JSON.  Raises _BodyNotAnObject (answered 400 by the blueprint) for
+    JSON that is not an object.  Handlers call it after @require_auth, so
+    an unauthenticated caller still gets 401 first."""
+    body = request.get_json(force=True, silent=True)
+    if body is None:
+        return {}
+    if not isinstance(body, dict):
+        raise _BodyNotAnObject()
+    return body
+
+
+@encounter_bp.errorhandler(_BodyNotAnObject)
+def _body_not_an_object(_exc):
+    return _err('request body must be a JSON object')
+
+
+def _text(body: dict, key: str, cap: int):
+    """A free-text field from the body, capped: (value, None), or
+    (None, error) when the value is not a string.  Never str() of
+    whatever arrived (that stored "None" and "{'k': 'v'}")."""
+    raw = body[key]
+    if not isinstance(raw, str):
+        return None, f'{key} must be a string'
+    return raw[:cap], None
 
 
 def _now_dt() -> datetime:
@@ -116,6 +158,76 @@ def _user_id() -> Optional[str]:
     if uid is None and isinstance(user, dict):
         uid = user.get('id')
     return str(uid) if uid is not None else None
+
+
+def _clean_tags(raw) -> Optional[list[str]]:
+    """The user's interest tags, capped the one way every writer caps them.
+    None when the value is not a list of strings (the caller answers 400);
+    a non-string tag is refused, never stored as its str() form."""
+    if not isinstance(raw, list) or not all(isinstance(t, str) for t in raw):
+        return None
+    return [str(t)[:ENCOUNTER_PERSONA_TAG_MAX_CHARS]
+            for t in raw[:ENCOUNTER_PERSONA_MAX_TAGS]]
+
+
+_FLAG_STRINGS = {'true': True, 'false': False}
+
+
+def _flags(body: dict, defaults: dict[str, Optional[bool]]):
+    """Read the named yes/no flags from a request body, strictly.
+
+    A flag is a JSON boolean or exactly the string 'true' / 'false'; a key
+    the body does not name takes its default.  Anything else ('False',
+    'yes', 1, null, ...) is refused, never guessed: these are consent
+    flags, and bool('false') is True.  Returns (values, None) or
+    (None, error message).  The codebase's other parsers
+    (api_compute_earnings._parse_bool, compute_config._parse_bool,
+    video_orchestrator._to_bool, core.platform.config._convert_bool) map
+    unknown input to a value instead of refusing it, so they do not fit.
+    """
+    out = {}
+    for key, default in defaults.items():
+        if key not in body:
+            out[key] = default
+            continue
+        raw = body[key]
+        if isinstance(raw, bool):
+            out[key] = raw
+        elif isinstance(raw, str) and raw in _FLAG_STRINGS:
+            out[key] = _FLAG_STRINGS[raw]
+        else:
+            return None, f'{key} must be true or false'
+    return out, None
+
+
+def _number(body: dict, key: str, default, *, whole: bool = True,
+            nullable: bool = False):
+    """A numeric field from the body: (value, None) or (None, error).
+
+    A key the body does not name takes `default`; null is allowed only
+    when `nullable`.  A JSON bool, a string ('abc' or '3600'), a list or a
+    non-finite number is refused (int('abc') used to answer 500).  With
+    `whole`, only a JSON integer is accepted."""
+    if key not in body:
+        return default, None
+    raw = body[key]
+    if raw is None and nullable:
+        return None, None
+    kinds = (int,) if whole else (int, float)
+    error = (f'{key} must be a whole number' if whole
+             else f'{key} must be a number')
+    if isinstance(raw, bool) or not isinstance(raw, kinds):
+        return None, error
+    # Whole integers (including TTLs subsequently clamped by the caller)
+    # are finite without conversion. Coordinate fields must fit a float.
+    if not whole:
+        try:
+            finite = math.isfinite(raw)
+        except OverflowError:
+            finite = False
+        if not finite:
+            return None, error
+    return raw, None
 
 
 def _new_id(prefix: str) -> str:
@@ -286,17 +398,34 @@ def set_discoverable():
     if uid is None:
         return _err('unauthenticated', 401)
     body = _json()
-    enable = bool(body.get('enabled', False))
-    ttl = int(body.get('ttl_sec', ENCOUNTER_DISCOVERABLE_TTL_SEC))
+    # enabled / age_claim_18 left out are a no (consent is never implied);
+    # face_visible and avatar_style left out keep what is stored, like
+    # vibe_tags below (a toggle used to reset them).
+    flags, bad = _flags(body, {'enabled': False, 'age_claim_18': False,
+                               'face_visible': None})
+    if bad:
+        return _err(bad)
+    enable = flags['enabled']
+    ttl, bad = _number(body, 'ttl_sec', ENCOUNTER_DISCOVERABLE_TTL_SEC)
+    if bad:
+        return _err(bad)
     if ttl <= 0 or ttl > ENCOUNTER_DISCOVERABLE_TTL_SEC:
         ttl = ENCOUNTER_DISCOVERABLE_TTL_SEC
-    age_claim = bool(body.get('age_claim_18', False))
-    face_visible = bool(body.get('face_visible', False))
-    avatar_style = str(body.get('avatar_style', 'studio_ghibli'))[:64]
-    vibe_tags = body.get('vibe_tags', []) or []
-    if not isinstance(vibe_tags, list):
-        return _err('vibe_tags must be a list of strings')
-    vibe_tags = [str(t)[:40] for t in vibe_tags[:10]]
+    age_claim = flags['age_claim_18']
+    face_visible = flags['face_visible']
+    avatar_style = None
+    if 'avatar_style' in body:
+        avatar_style, bad = _text(body, 'avatar_style', 64)
+        if bad:
+            return _err(bad)
+    # vibe_tags is also written by PUT /encounter/persona, so a toggle that
+    # does not name them leaves the user's tags alone (it used to reset
+    # them to []).
+    vibe_tags = None
+    if 'vibe_tags' in body:
+        vibe_tags = _clean_tags(body['vibe_tags'])
+        if vibe_tags is None:
+            return _err('vibe_tags must be a list of strings')
 
     now = _now_dt()
     pref = g.db.query(DiscoverablePref).filter_by(user_id=uid).first()
@@ -326,9 +455,12 @@ def set_discoverable():
     pref.enabled_at = now if enable else pref.enabled_at
     pref.expires_at = (now + timedelta(seconds=ttl)) if enable else None
     pref.age_claim_18 = age_claim
-    pref.face_visible = face_visible
-    pref.avatar_style = avatar_style
-    pref.vibe_tags = vibe_tags
+    if face_visible is not None:
+        pref.face_visible = face_visible
+    if avatar_style is not None:
+        pref.avatar_style = avatar_style
+    if vibe_tags is not None:
+        pref.vibe_tags = vibe_tags
     pref.toggle_count_24h = (pref.toggle_count_24h or 0) + 1
     pref.last_toggle_at = now
     g.db.commit()
@@ -338,6 +470,78 @@ def set_discoverable():
         'expires_at': pref.expires_at.isoformat() if pref.expires_at else None,
         'remaining_sec': ttl if enable else 0,
     })
+
+
+# ──────────────────────────────────────────────────────────────────────
+# /persona — the user's persona card: what their agent may tell a
+# matched person's agent (bio, "how to recognise me", interest tags) and
+# whether they may be matched on interests at all.  Editing the card is
+# not a discoverable toggle: it spends no toggle and never turns the BLE
+# broadcast on.
+# ──────────────────────────────────────────────────────────────────────
+
+def _persona_dict(pref: Optional[DiscoverablePref]) -> dict[str, Any]:
+    if pref is None:
+        return {'bio': '', 'recognize_me': '', 'vibe_tags': [],
+                'interests_discoverable': False}
+    return {
+        'bio': pref.bio or '',
+        'recognize_me': pref.recognize_me or '',
+        'vibe_tags': pref.vibe_tags or [],
+        'interests_discoverable': bool(pref.interests_discoverable),
+    }
+
+
+@encounter_bp.route('/encounter/persona', methods=['GET'])
+@require_auth
+def get_persona():
+    uid = _user_id()
+    if uid is None:
+        return _err('unauthenticated', 401)
+    pref = g.db.query(DiscoverablePref).filter_by(user_id=uid).first()
+    return _ok(_persona_dict(pref))
+
+
+@encounter_bp.route('/encounter/persona', methods=['PUT'])
+@require_auth
+def set_persona():
+    """Update any of bio, recognize_me, vibe_tags, interests_discoverable.
+    Fields the body does not name are left as they are."""
+    uid = _user_id()
+    if uid is None:
+        return _err('unauthenticated', 401)
+    body = _json()
+    tags = None
+    if 'vibe_tags' in body:
+        tags = _clean_tags(body['vibe_tags'])
+        if tags is None:
+            return _err('vibe_tags must be a list of strings')
+    flags, bad = _flags(body, {'interests_discoverable': None})
+    if bad:
+        return _err(bad)
+    texts = {}
+    for key, cap in (('bio', ENCOUNTER_PERSONA_BIO_MAX_CHARS),
+                     ('recognize_me', ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS)):
+        if key in body:
+            texts[key], bad = _text(body, key, cap)
+            if bad:
+                return _err(bad)
+
+    pref = g.db.query(DiscoverablePref).filter_by(user_id=uid).first()
+    if pref is None:
+        pref = DiscoverablePref(user_id=uid, toggle_window_start=_now_dt(),
+                                toggle_count_24h=0)
+        g.db.add(pref)
+    if 'bio' in texts:
+        pref.bio = texts['bio']
+    if 'recognize_me' in texts:
+        pref.recognize_me = texts['recognize_me']
+    if tags is not None:
+        pref.vibe_tags = tags
+    if flags['interests_discoverable'] is not None:
+        pref.interests_discoverable = flags['interests_discoverable']
+    g.db.commit()
+    return _ok(_persona_dict(pref))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -355,10 +559,15 @@ def report_sighting():
         return _err('unauthenticated', 401)
     body = _json()
     peer_pubkey = str(body.get('peer_pubkey', '')).strip().lower()
-    rssi_peak = int(body.get('rssi_peak', 0))
-    dwell_sec = int(body.get('dwell_sec', 0))
-    lat = body.get('lat')
-    lng = body.get('lng')
+    nums = {}
+    for key, default, whole in (('rssi_peak', 0, True), ('dwell_sec', 0, True),
+                                ('lat', None, False), ('lng', None, False)):
+        nums[key], bad = _number(body, key, default, whole=whole,
+                                 nullable=not whole)
+        if bad:
+            return _err(bad)
+    rssi_peak, dwell_sec = nums['rssi_peak'], nums['dwell_sec']
+    lat, lng = nums['lat'], nums['lng']
     if not peer_pubkey or len(peer_pubkey) < 16:
         return _err('peer_pubkey required (hex, >=16 chars)')
 
@@ -402,7 +611,9 @@ def report_sighting():
         'sighting_id': sighting.id,
         'peer_anon_id': peer_pubkey[:12],
         'avatar_style': peer_pref.avatar_style or 'studio_ghibli',
-        'vibe_tags': peer_pref.vibe_tags or [],
+        # A stranger's card: tags only if the peer said yes to sharing
+        # interests.  Being discoverable is not that yes.
+        'vibe_tags': vibe_tags_others_may_see(peer_pref),
         'face_visible': bool(peer_pref.face_visible),
         'expires_at': sighting.expires_at.isoformat(),
     })

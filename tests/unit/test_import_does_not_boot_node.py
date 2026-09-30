@@ -159,7 +159,12 @@ class TestThePredicateItself:
     the production answer so this change cannot alter a real node."""
 
     def test_defaults_to_true_so_production_is_unchanged(self, monkeypatch):
+        """A real node (not a test process) still starts its daemons.  Under
+        pytest the default is off (task #98, test_tests_never_reach_the_real_
+        hive), so the production answer is read with under_test() False."""
+        from core import platform_paths
         from core.config_cache import should_start_background_services
+        monkeypatch.setattr(platform_paths, 'under_test', lambda: False)
         monkeypatch.delenv(FLAG, raising=False)
         assert should_start_background_services() is True
 
@@ -181,9 +186,82 @@ class TestThePredicateItself:
         This matters more here than for most flags — a typo must never be
         the reason a desktop stops gossiping.
         """
+        from core import platform_paths
         from core.config_cache import should_start_background_services
+        monkeypatch.setattr(platform_paths, 'under_test', lambda: False)
         monkeypatch.setenv(FLAG, 'maybe')
         assert should_start_background_services() is True
+
+
+class TestOriginCheckDoesNotBootTheNode:
+    """A security CHECK must not start what it checks.
+
+    MEASURED 2026-09-26 (CI shard 5, tests/unit/test_agent_engine.py):
+    RuntimeIntegrityMonitor._check_loop -> verify_origin ->
+    verify_brand_markers ran ``import hart_intelligence`` only to find a
+    directory.  That executed hart_intelligence_entry, whose module body
+    runs init_social, so the pytest process booted a node: a second
+    integrity monitor hashing the checkout, agent daemons, gossip, and a
+    sync drained to central.  The next test then timed out past 120 s
+    competing with it.  The root is now LOCATED with importlib.util.find_spec.
+    """
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+
+    def test_verify_origin_in_a_fresh_process_imports_no_backend(self):
+        import json
+        import subprocess
+        import sys
+        probe = (
+            'import json, sys\n'
+            'from security.origin_attestation import verify_origin\n'
+            'r = verify_origin()\n'
+            'print(json.dumps({"brand": r["checks"]["brand_markers"],\n'
+            '  "loaded": sorted(m for m in ("hart_intelligence",\n'
+            '                               "hart_intelligence_entry")\n'
+            '                  if m in sys.modules)}))\n')
+        env = dict(os.environ)
+        env['PYTHONPATH'] = os.pathsep.join(
+            p for p in (self.ROOT, env.get('PYTHONPATH', '')) if p)
+        # Belt and braces: should a regression re-import the backend, the
+        # probe must not join the hive while proving it.
+        env[FLAG] = '0'
+        out = subprocess.run(
+            [sys.executable, '-c', probe], cwd=self.ROOT, env=env,
+            capture_output=True, text=True, timeout=300)
+        assert out.returncode == 0, out.stderr[-2000:]
+        result = json.loads(out.stdout.strip().splitlines()[-1])
+        assert result['loaded'] == [], (
+            f'verify_origin imported {result["loaded"]}: an origin check '
+            f'boots the node it is checking')
+        assert result['brand'] is True, 'the brand markers must still verify'
+
+    def test_the_hart_intelligence_root_is_still_a_candidate(self):
+        """Behaviour kept: the directory holding hart_intelligence (the
+        Nunba-bundled layout) is still searched, now found by its spec."""
+        from importlib.machinery import ModuleSpec
+        from unittest.mock import patch
+        from security import origin_attestation as oa
+        elsewhere = os.path.join(os.sep, 'bundle', 'lib_hart')
+        spec = ModuleSpec('hart_intelligence', loader=None,
+                          origin=os.path.join(elsewhere, 'hart_intelligence.py'))
+        spec.has_location = True
+        tried = []
+
+        def _exists(path):
+            tried.append(os.path.dirname(os.path.normpath(path)))
+            return False
+
+        with patch('importlib.util.find_spec', return_value=spec) as fs, \
+                patch.object(oa.os.path, 'exists', side_effect=_exists):
+            ok, msg = oa.verify_brand_markers()
+        fs.assert_called_with('hart_intelligence')
+        assert ok is False and 'Missing required file' in msg
+        first_rel = next(iter(oa.BRAND_MARKER_FILES))
+        expected = os.path.dirname(os.path.normpath(
+            os.path.join(elsewhere, first_rel)))
+        assert expected in tried, tried
 
 
 class TestTheDetectorIsNotVacuous:

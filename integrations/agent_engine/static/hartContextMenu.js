@@ -21,7 +21,11 @@
  *   - GPU-friendly motion only (transform + opacity), respects
  *     prefers-reduced-motion.
  *   - never renders off-screen (flips/clamps near every edge).
- *   - closes on outside pointerdown / Escape / scroll / blur / resize.
+ *   - closes on outside pointerdown / Escape / scroll / blur / resize, through
+ *     the ONE shared dismissal set (window.HartDismiss, hartDismiss.js), which
+ *     this file's private copy of that set was extracted into on 2026-09-23 so
+ *     the Wi-Fi popover, the senses panel and the start menu close the same way
+ *     (blur is what fires when a press lands in an iframe or another surface).
  *   - keyboard navigable: Up/Down move, Enter/Space activate, Escape closes,
  *     Home/End jump, with a roving focus + ARIA menu roles.
  *   - NO em dashes in user-visible text (caller supplies labels).
@@ -197,13 +201,12 @@
   }
 
   // ── Global dismissers (attached only while a menu is open) ──
-  function onDocPointerDown(e) {
-    if (EL && !EL.contains(e.target)) close();
-  }
+  // Outside press / Escape / scroll / resize / blur are the shared set
+  // (HartDismiss); only the menu's OWN keyboard navigation lives here.
+  var disarm = null;
   function onKeyDown(e) {
     if (!EL) return;
     var k = e.key;
-    if (k === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); return; }
     if (k === 'ArrowDown') { e.preventDefault(); setActive(activeIdx() + 1); return; }
     if (k === 'ArrowUp') { e.preventDefault(); setActive(activeIdx() - 1); return; }
     if (k === 'Home') { e.preventDefault(); setActive(0); return; }
@@ -217,24 +220,21 @@
     }
     if (k === 'Tab') { e.preventDefault(); setActive(activeIdx() + (e.shiftKey ? -1 : 1)); return; }
   }
-  function onScrollOrResize() { close(); }
-  function onBlur() { close(); }
 
   function attach() {
-    // pointerdown (capture) so we dismiss before any other click handler runs;
-    // keydown (capture) so Escape wins over the shell's global key shortcuts.
-    document.addEventListener('pointerdown', onDocPointerDown, true);
+    if (window.HartDismiss) {
+      disarm = window.HartDismiss.arm({ els: [function () { return EL; }], onDismiss: close });
+    } else {
+      console.error('hartContextMenu: window.HartDismiss is missing (hartDismiss.js not loaded); the menu will not auto-dismiss');
+    }
+    // keydown (capture) so the roving focus wins over the shell's global key shortcuts.
     document.addEventListener('keydown', onKeyDown, true);
-    window.addEventListener('scroll', onScrollOrResize, true);
-    window.addEventListener('resize', onScrollOrResize, true);
-    window.addEventListener('blur', onBlur);
   }
   function detach() {
-    document.removeEventListener('pointerdown', onDocPointerDown, true);
+    var d = disarm;
+    disarm = null;
+    if (d) d();
     document.removeEventListener('keydown', onKeyDown, true);
-    window.removeEventListener('scroll', onScrollOrResize, true);
-    window.removeEventListener('resize', onScrollOrResize, true);
-    window.removeEventListener('blur', onBlur);
   }
 
   function open(items, x, y) {

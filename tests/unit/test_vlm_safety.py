@@ -20,6 +20,7 @@ from integrations.vlm.safety import (
     is_window_blocked,
     DEFAULT_BLOCKED_PROCESSES, DEFAULT_BLOCKED_TITLE_PATTERNS,
     get_session_guard, get_audit_logger, reset_session_guard,
+    destructive_computer_operation,
 )
 
 
@@ -126,6 +127,25 @@ class TestWindowBlocklist(unittest.TestCase):
         # admins who customize get full control.
         meta2 = {'process_name': 'lsass.exe', 'title': 'x'}
         self.assertIsNone(is_window_blocked(meta2, cfg))
+
+
+class TestDestructiveComputerOperation(unittest.TestCase):
+    def test_blocks_power_reset_requests_in_multiple_languages(self):
+        for request in ('Restart the system', '\u91cd\u542f\u7535\u8111', '\u0930\u0940\u0938\u094d\u091f\u093e\u0930\u094d\u091f \u0915\u0930\u0947\u0902'):
+            self.assertIsNotNone(destructive_computer_operation(request))
+
+    def test_blocks_actual_commands_but_not_ordinary_formatting(self):
+        for command in ('shutdown.exe /s', 'systemctl poweroff', 'mkfs.ext4 /dev/sda'):
+            self.assertIsNotNone(destructive_computer_operation(command))
+        self.assertIsNone(destructive_computer_operation('format a project report'))
+
+    def test_allows_app_lifecycle_and_non_system_sleep_language(self):
+        for request in (
+                'restart the Nunba app',
+                'restart the LiveKit service',
+                'sleep for five seconds before retrying',
+                'open the shutdown documentation'):
+            self.assertIsNone(destructive_computer_operation(request), request)
 
 
 class TestAuditLogger(unittest.TestCase):
@@ -274,6 +294,13 @@ class TestExecuteActionSafetyIntegration(unittest.TestCase):
         mock_exec.return_value = {'output': 'ok'}
         result = execute_action({'action': 'left_click'}, 'inprocess')
         self.assertNotIn('safety_block', result)
+
+    @patch('integrations.vlm.local_computer_tool._execute_inprocess')
+    def test_destructive_command_is_blocked_even_when_optional_safety_is_off(self, mock_exec):
+        from integrations.vlm.local_computer_tool import execute_action
+        result = execute_action({'action': 'shell', 'command': 'shutdown.exe /s'}, 'inprocess')
+        self.assertEqual(result['status'], 'safety_blocked')
+        mock_exec.assert_not_called()
 
     @patch('integrations.vlm.local_computer_tool._execute_inprocess')
     @patch('integrations.vlm.safety.is_window_blocked',

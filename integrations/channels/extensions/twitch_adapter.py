@@ -1039,3 +1039,13 @@ def create_twitch_adapter(
         **kwargs
     )
     return TwitchAdapter(config)
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+ENV_SECRETS = (
+    'TWITCH_ACCESS_TOKEN',
+    'TWITCH_CLIENT_SECRET',
+)

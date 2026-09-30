@@ -246,7 +246,19 @@ NETWORK_PROTECTED_PATHS = ('/chat', '/time_agent', '/visual_agent',
 PROTECTED_PATHS = ADMIN_PATHS + NETWORK_PROTECTED_PATHS
 
 EXEMPT_PREFIXES = ('/status', '/a2a/', '/api/social/', '/.well-known/',
-                   '/prompts/public')
+                   '/prompts/public',
+                   # A phone that found this desktop on the LAN GETs /health
+                   # before adopting the node (PeerLinkDiscovery.isHealthy;
+                   # measured 2026-09-16: 401 here kept every phone on the
+                   # cloud).  On HARTOS's own app it is the liveness probe
+                   # ({'status': 'alive'}); on Nunba's app, the one a desktop
+                   # advertises, it aliases /backend/health: GPU tier, name
+                   # and VRAM figures -- no secret, path or identifier, and
+                   # the class of facts the node already advertises to peers
+                   # in the announce (has_gpu, vram_free_gb).  Reads are
+                   # cached, so a LAN caller runs no GPU probe.  /ready,
+                   # which reports DB and identity checks, stays gated.
+                   '/health')
 
 
 def _apply_api_auth(app: Flask, register: bool = True):
@@ -303,6 +315,10 @@ def _apply_api_auth(app: Flask, register: bool = True):
         if expected_key:
             api_key = request.headers.get('X-API-Key')
             if api_key and _constant_time_compare(api_key, expected_key):
+                # Recorded like 'jwt' below: who the gate verified.  A route
+                # binding state to a caller reads THIS, never the raw header
+                # (review of 436580009: an unchecked X-API-Key was an identity).
+                g.auth_source = 'api_key'
                 return None
             # Fall through to Bearer check so API-key-configured deploys
             # still accept JWTs (useful for admin UI + k8s probes).
@@ -331,6 +347,81 @@ def _apply_api_auth(app: Flask, register: bool = True):
             {'error': 'Authentication required (Bearer token)'},
         ), 401
 
+    def _admit_owner_allowed_device(refused):
+        """A desktop's second network credential: a token the phone signed
+        with its own PeerLink key, admitted when the owner has allowed that
+        key (integrations.social.auth.verify_device_jwt; the grant is the
+        owner's ``device_access`` consent whose scope names the key).
+
+        ``refused`` is the 401 the key/JWT check already produced; it stands
+        for anything that is not a device token.  A device the owner has not
+        answered about gets the ask filed for them (ConsentService.
+        request_consent, delivered like every consent ask, one card per
+        pending row) and a 403 ``consent_pending`` it can retry on; a device
+        the owner said no to gets 403 ``consent_denied`` and no new ask.  An
+        admitted device acts only as the token's user: a JSON body must
+        carry that ``user_id`` and no other (#51), so no route's default
+        user can stand in for it.
+
+        Filing is what an unauthenticated peer can trigger, so it is paced
+        per CLIENT with the gossip announce limiter (discovery.
+        check_client_rate, keyed by core.auth_local.client_address: a LAN
+        host cannot rotate X-Forwarded-For into a fresh budget): past the
+        limit the ask is not filed and the answer is still
+        ``consent_pending``, which an honest phone retries.
+        """
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return refused
+        owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+        if not owner:
+            return refused
+        token = auth_header[7:]
+        try:
+            from integrations.social.auth import (
+                file_device_access_ask, verify_device_jwt)
+            from integrations.social.models import db_session
+            with db_session(commit=True) as db:
+                verdict = verify_device_jwt(db, token, owner)
+                if verdict['status'] == 'pending':
+                    from integrations.social.discovery import check_client_rate
+                    if check_client_rate():
+                        file_device_access_ask(db, owner, verdict['public_key'],
+                                               verdict.get('claims') or {})
+                    else:
+                        from core.auth_local import client_key
+                        logger.warning("device ask from %s not filed: rate limit",
+                                       client_key())
+        except Exception:
+            logger.warning("device credential check failed; refusing",
+                           exc_info=True)
+            return refused
+        status = verdict['status']
+        if status == 'ok':
+            payload = verdict['payload']
+            body = request.get_json(silent=True) if request.is_json else None
+            if isinstance(body, dict):
+                asked_as = body.get('user_id')
+                if asked_as is None or str(asked_as) != str(payload.get('user_id')):
+                    logger.warning("device %s... acting as user %s, token says "
+                                   "%s; refused", verdict['public_key'][:16],
+                                   asked_as, payload.get('user_id'))
+                    return jsonify({'error': 'user_id must be the token\'s user'}), 403
+            g.auth_source = 'device'
+            g.jwt_payload = payload
+            g.device_public_key = verdict['public_key']
+            return None
+        if status == 'pending':
+            return jsonify({'error': 'consent_pending',
+                            'message': "Waiting for this desktop's owner to "
+                                       "allow this phone"}), 403
+        if status == 'denied':
+            return jsonify({'error': 'consent_denied',
+                            'message': "This desktop's owner has not allowed "
+                                       "this phone"}), 403
+        return refused
+
+
     def _expected_api_key() -> str:
         """HEVOLVE_API_KEY, the one credential both branches below accept."""
         try:
@@ -339,8 +430,14 @@ def _apply_api_auth(app: Flask, register: bool = True):
         except Exception:
             return os.environ.get('HEVOLVE_API_KEY', '')
 
-    def check_api_auth():
-        path = request.path
+    def check_api_auth(as_path=None):
+        # ``as_path``: judge THIS request as if it had been sent to that path.
+        # For a route under an exempt prefix that nonetheless does what a
+        # gated path does: A2A message/send runs a /chat turn, so it is
+        # admitted exactly as /chat would be, by this one gate rather than a
+        # copy of it (review of 309bcd032: the exempt /a2a/ prefix let an
+        # unauthenticated caller on another machine run a /chat turn).
+        path = as_path or request.path
         # Bundled desktop.  This machine's own callers (the SPA, the tray,
         # in-process test clients) are trusted, as they always were.  But the
         # socket is Nunba's app on 0.0.0.0, the address the desktop advertises
@@ -353,7 +450,13 @@ def _apply_api_auth(app: Flask, register: bool = True):
             from core.auth_local import _is_local_request
             if _is_local_request() or _is_exempt(path):
                 return
-            return _require_api_key_or_bearer(_expected_api_key())
+            refused = _require_api_key_or_bearer(_expected_api_key())
+            if refused is None:
+                return
+            # A person's phone, signed with the key the owner allowed (#111):
+            # only after the key and the local JWT have not admitted it, so
+            # every caller admitted today is admitted exactly as before.
+            return _admit_owner_allowed_device(refused)
 
         if _is_exempt(path):
             return

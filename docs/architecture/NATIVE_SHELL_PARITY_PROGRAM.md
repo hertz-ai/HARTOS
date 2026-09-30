@@ -1908,3 +1908,67 @@ The reusable part: when an instrument reports nothing, the interesting question
 is not "is it broken" but "which of its preconditions is the system failing to
 meet". Both hypotheses here were about the instrument. Both were wrong. The
 preconditions were.
+
+### HERO_H: the proposal for the steward (2026-09-24, stream S4)
+
+`HERO_H` is still one constant doing two jobs (recorded above, at "HERO_H is left
+open, deliberately"): the home orb's slot AND the vertical budget the hero takes
+before the rows begin. This section is the decision the box needs, written out with
+the numbers, so it can be taken by looking rather than by re-deriving. Nothing in the
+layout changes until it is taken; NATIVE_OS_PROGRAM 6.4 lists it as a steward call.
+
+**What the shell does.** `.hart-hero-orbwrap` is 300px and FLOATS (z 1450), outside
+the home's flow. `.hh-hero` is `flex: 0 0 auto`, so its height is its content's, and
+`.hh-rows` takes the rest. The shell has no number for the hero band at all.
+
+**What the native scene does today.** `HERO_H = 200`: the orb is drawn 200px, floated
+right of the hero copy, and the rows begin at `content.y + 200 + CONTENT_PAD_Y`
+whatever the hero's content came to. Two consequences: the orb is two thirds of the
+shell's, and the hero band is a fixed 200 where the shell's is content-sized.
+
+**The proposal.** Split the constant: `HERO_ORB_D = 300` for the floating orb, sized
+and placed like `.hart-hero-orbwrap` (right of the hero copy, top of the content
+band), and the hero band's height taken from where the hero's own content ends
+(eyebrow, figure, meta strip, calls to action, each already laid out top-down in
+`layout_home`), plus the row gap. The orb stays out of that flow exactly as it does
+in the shell, so it no longer subtracts from the row budget.
+
+**What that changes on screen, measured from the layout's own constants.** The
+hero's content is eyebrow (16 * 1.6 = 25.6), figure (`amount_px * 1.35`), meta strip
+(`HERO_PILL_H` 29.5 plus half a 15px line = 37) and the calls to action (`HERO_BTN_H`
+= 53.4); the rows then start after `ROW_GAP` (18). Today they start at `content.y +
+200 + 12`, that is 264 from the top on every panel.
+
+| Panel | Figure | Hero content | Rows start (today -> proposal) | Rows that fit (today -> proposal) |
+|---|---|---|---|---|
+| 1920x1080 | 88 | 235 | 264 -> 305 | 3 -> 3 (760 and 719 available, 3 rows need 612) |
+| 1600x900 | 88 | 235 | 264 -> 305 | 2 -> 2 (580 and 539 available; 3 rows never fit here) |
+| 1366x768 (figure 58, cards 132) | 58 | 194 | 264 -> 264 | 2 -> 2 (448 available, 2 rows need 366) |
+
+So on a large panel the rows start about 40px lower than today, which is where the
+shell starts them, and on the 768-high laptop panel exactly where they start today.
+No panel in `the_shells_two_breakpoints_still_fit_every_row_on_a_real_panel` loses a
+row under the proposal.
+
+**The orb.** At 300 it overlaps the first row's right end on any panel narrower than
+about 1700px (orb left edge = `content.right() - 300`; the first row's cards run to
+`content.right()`), exactly as the shell's floating orb does over `.hh-rows`. That
+overlap is the visual call: on the shell it is accepted because the orb is
+translucent at its rim and breathes; natively the orb texture is the same M2 compose,
+so the look should match, but nobody has seen it on a panel.
+
+**Options, for the steward to pick one.**
+
+1. Take the proposal: `HERO_ORB_D = 300`, band from content. Parity with the shell,
+   the orb at its designed size, rows start where the shell starts them.
+2. Keep `HERO_H = 200` as is: no overlap, a smaller orb than designed, a fixed band
+   that is 50px short of the shell's on a large panel.
+3. `HERO_H = 300` in place: the orb at size but the band 300 too, which spends 100px
+   of row budget the shell never spends and drops the second row on 768-high panels.
+   Recorded only to say why it is not proposed.
+
+The change for option 1 is confined to `layout_home` (the hero block and the
+`cursor_y` the rows start from) and the constant itself. No cross-language guard pins
+`HERO_H` today (only `HERO_PILL_H` is pinned); option 1 adds one for `HERO_ORB_D`
+against `.hart-hero-orbwrap`'s 300px, a pixel proof that the orb slot is 300, and a
+layout test that the band follows the content on the three panels above.

@@ -18,6 +18,13 @@ It asserts the invariants the incidents broke:
 - no action is skipped, and the flow recipe gets written;
 - no recipe is requested for work that never ran, and no LLM is called.
 
+The scripted verifier cites its receipt (evidence.message_index) and the
+scripted tool is real work, not bookkeeping: since 2026-09-27 a verdict
+without a receipt, or with a note saved to memory as its receipt, completes
+nothing (tests/unit/test_completion_needs_real_work.py).  Before that this
+flow finished only because the TERMINATE after each verdict walked the action
+through COMPLETED with no receipt at all.
+
 It also pins that a verdict settles only the action it answers.  One naming a
 different action_id leaves that action's text alone, and one naming a FUTURE
 action_id completes nothing before that action is posted.  Both were strict
@@ -68,6 +75,8 @@ class _Script:
         self.verdict_ids = dict(verdict_ids or {})
         # actions the verifier holds as needing a person
         self.pending_ids = set()
+        # the tool the helper runs for each step
+        self.tool = 'google_search'
 
     # -- helpers ---------------------------------------------------------
     def _msgs(self):
@@ -115,9 +124,8 @@ class _Script:
         if '@Helper' in _content(self._last()):
             return True, {'content': '', 'tool_calls': [{
                 'id': f'call_step_{n}', 'type': 'function',
-                'function': {'name': 'save_data_in_memory',
-                             'arguments': json.dumps({'key': f'e2e.step{n}',
-                                                      'value': 'ok'})}}]}
+                'function': {'name': self.tool,
+                             'arguments': json.dumps({'query': f'e2e.step{n}'})}}]}
         self.unexpected.append(('Helper', _content(self._last())[:200]))
         return True, 'TERMINATE'
 
@@ -131,9 +139,12 @@ class _Script:
                 'can_perform_without_user_input': 'no'})
         if 'please verify' in c:
             claimed = self.verdict_ids.get(n, n)
+            receipt = max(i for i, m in enumerate(self._msgs())
+                          if isinstance(m, dict) and m.get('role') == 'tool')
             return True, json.dumps({
                 'status': 'completed', 'action': ACTIONS[n - 1],
                 'action_id': claimed, 'message': 'verified',
+                'evidence': {'message_index': receipt, 'kind': 'tool_receipt'},
                 'can_perform_without_user_input': 'yes',
                 'persona_name': 'Researcher', 'fallback_action': 'retry once'})
         if c.strip().endswith('[]'):
@@ -143,8 +154,8 @@ class _Script:
             return True, json.dumps({
                 'status': 'done', 'action': ACTIONS[n - 1], 'action_id': n,
                 'fallback_action': 'retry once', 'persona': 'Researcher',
-                'recipe': [{'steps': f'save step {n}',
-                            'tool_name': 'save_data_in_memory',
+                'recipe': [{'steps': f'search step {n}',
+                            'tool_name': 'google_search',
                             'generalized_functions': ''}],
                 'can_perform_without_user_input': 'yes',
                 'scheduled_tasks': []})
@@ -421,7 +432,7 @@ def test_a_whole_flow_runs_in_order_with_no_phantom_completion(create_env):
         assert data is not None, f'action {n} has no file (a gap)'
         assert data.get('recipe_source') == 'execution_trace', (n, data)
         steps = data.get('recipe') or []
-        assert any(s.get('tool_name') == 'save_data_in_memory'
+        assert any(s.get('tool_name') == 'google_search'
                    and f'e2e.step{n}' in s.get('steps', '') for s in steps), (
             f'action {n} was not banked from its own tool call: {steps!r}')
 
@@ -432,6 +443,38 @@ def test_a_whole_flow_runs_in_order_with_no_phantom_completion(create_env):
     assert not env.llm_calls, env.llm_calls
     assert (env.prompts / f'{PROMPT_ID}_0_recipe.json').exists(), (
         f'the flow recipe was never written; replies {replies!r}')
+
+
+def test_a_finished_last_action_saves_the_flow_recipe_in_one_turn(create_env,
+                                                                    caplog):
+    """The last action's verdict is settled once, then the flow completes.
+
+    Live 2026-09-25 (livetest_create_recipe_verify_01, prompt 91790350001,
+    and livetest_agent_to_agent_verify_r1): the termination hook moved the
+    last action COMPLETED -> TERMINATED before the verdict pickup, whose
+    [ALREADY DONE] -> [LAST-ACTION] path then fell into the COMPLETION-GATE.
+    The gate only accepts COMPLETED, so it `continue`d without posting
+    anything, the same verdict was re-read on the next lap, and the loop ran
+    [LAST-ACTION] -> [COMPLETION-GATE] ~300 times in ~3 s to max_iterations.
+    No flow recipe was written and /chat answered 'Review Mode' after 448 s.
+
+    One turn must finish the flow: the reply is the success string the /chat
+    handler maps to a created agent, the flow recipe is on disk, and the
+    loop never reaches its iteration cap.
+    """
+    env = create_env
+    with caplog.at_level('INFO'):
+        replies = _run(env, turns=1)
+    log = '\n'.join(r.getMessage() for r in caplog.records)
+    assert 'reaching max iterations' not in log, (
+        f'the create loop drained max_iterations; '
+        f'{log.count("[COMPLETION-GATE]")} COMPLETION-GATE laps; '
+        f'replies {replies!r}')
+    assert (env.prompts / f'{PROMPT_ID}_0_recipe.json').exists(), (
+        f'the flow recipe was never written; replies {replies!r}')
+    assert replies == ['Agent Created Successfully'], replies
+    for n in (1, 2, 3):
+        assert env.lh.get_action_state(UP, n).value == 'terminated', n
 
 
 def test_a_mislabelled_verdict_leaves_other_actions_alone(create_env):
@@ -490,3 +533,24 @@ def test_a_stuck_action_is_handed_on_not_completed(create_env, monkeypatch):
     assert not env.script.recipe_requests, env.script.recipe_requests
     done = [s for aid, s, _ in env.events if aid == 2 and s in _DONE_STATES]
     assert not done, f'action 2 was recorded as done: {done}'
+
+
+def test_notes_to_self_complete_nothing(create_env, caplog):
+    """Live 2026-09-27, CREATE daemon_255bd83f: the only tool traffic was
+    save_data_in_memory, the verifier cited it, and both actions went
+    COMPLETED and were banked.  Here every step runs only that note-taking
+    tool: no action may complete, and none may be banked.
+
+    Nor may the refused action stall the loop: it is re-posted (bounded) and
+    then given up or handed to a person, never left for the stall guard to
+    break after 120 silent laps (measured while writing this fix)."""
+    env = create_env
+    env.script.tool = 'save_data_in_memory'
+    with caplog.at_level('INFO'):
+        _run(env, turns=1)
+    log = ' | '.join(r.getMessage() for r in caplog.records)
+    assert '[STALL-GUARD]' not in log, 'a refused action spun to the stall guard'
+    completed = [(aid, s) for aid, s, _ in env.events if s == 'completed']
+    assert not completed, f'an action completed on a note to self: {completed}'
+    banked = [n for n in (1, 2, 3) if _action_file(env, n) is not None]
+    assert not banked, f'notes were banked as the recipe of action(s) {banked}'

@@ -59,8 +59,13 @@ fourth copy of that tuple is exactly the drift this codebase keeps paying for.
     python -m pytest tests/unit/test_user_input_gate_terminal.py -q
 """
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from hartos.create_recipe import _should_block_on_user_input
+from hartos import create_recipe
+from hartos.create_recipe import (
+    _resume_prior_user_input_block, _should_block_on_user_input,
+)
 from hartos.lifecycle_hooks import (
     ActionState, clear_action_states, force_state_through_valid_path,
     get_action_state, safe_set_state,
@@ -138,6 +143,90 @@ class UserInputGateTerminal(unittest.TestCase):
         accident.
         """
         self.assertTrue(_should_block_on_user_input(_UP, 999, 'no'))
+
+    def test_same_round_cannot_answer_the_block_it_just_created(self):
+        task = SimpleNamespace(_needs_user_input_action_id=None)
+        create_recipe.user_tasks[_UP] = task
+        create_recipe.request_id_list[_UP] = 'user-request-1'
+        with patch('hartos.create_recipe.resume_from_user_input') as resume:
+            self.assertFalse(
+                _resume_prior_user_input_block(_UP, 'original request'))
+        resume.assert_not_called()
+
+    def test_daemon_retry_cannot_impersonate_human_unblocker(self):
+        task = SimpleNamespace(
+            _needs_user_input_action_id=3, _needs_help_reason='need choice',
+            _needs_user_input_kind='human_required')
+        create_recipe.user_tasks[_UP] = task
+        create_recipe.request_id_list[_UP] = 'daemon_goal-123'
+        with patch('hartos.create_recipe.resume_from_user_input') as resume:
+            self.assertFalse(
+                _resume_prior_user_input_block(_UP, 'retry original task'))
+        self.assertEqual(task._needs_user_input_action_id, 3)
+        resume.assert_not_called()
+
+    def test_assigned_expert_can_retry_a_recoverable_stall(self):
+        task = SimpleNamespace(
+            _needs_user_input_action_id=3,
+            _needs_help_reason='conversation looped',
+            _needs_user_input_kind='recoverable_stall')
+        create_recipe.user_tasks[_UP] = task
+        create_recipe.request_id_list[_UP] = 'daemon_goal-123'
+        with patch('hartos.create_recipe._is_serving_escalation_expert',
+                   return_value=True), patch(
+                       'hartos.create_recipe.resume_blocked_action',
+                       return_value=True) as resume:
+            self.assertTrue(
+                _resume_prior_user_input_block(_UP, 'retry with expert'))
+        resume.assert_called_once()
+        self.assertIsNone(task._needs_user_input_action_id)
+        self.assertIsNone(task._needs_user_input_kind)
+
+    def test_expert_cannot_clear_a_human_authority_gate(self):
+        task = SimpleNamespace(
+            _needs_user_input_action_id=3,
+            _needs_help_reason='payment approval needed',
+            _needs_user_input_kind='human_required')
+        create_recipe.user_tasks[_UP] = task
+        create_recipe.request_id_list[_UP] = 'daemon_goal-123'
+        with patch('hartos.create_recipe._is_serving_escalation_expert',
+                   return_value=True), patch(
+                       'hartos.create_recipe.resume_blocked_action') as resume:
+            self.assertFalse(
+                _resume_prior_user_input_block(_UP, 'approve it'))
+        self.assertEqual(task._needs_user_input_action_id, 3)
+        resume.assert_not_called()
+
+    def test_genuine_next_turn_resumes_and_records_the_answer(self):
+        task = SimpleNamespace(
+            _needs_user_input_action_id=3, _needs_help_reason='need choice',
+            _needs_user_input_kind='human_required')
+        create_recipe.user_tasks[_UP] = task
+        create_recipe.request_id_list[_UP] = 'user-request-2'
+        with patch('hartos.create_recipe.resume_from_user_input',
+                   return_value=True) as resume:
+            self.assertTrue(
+                _resume_prior_user_input_block(_UP, 'Use account A'))
+        resume.assert_called_once_with(
+            _UP, 3, 'User supplied input for the blocked action',
+            'Use account A')
+        self.assertIsNone(task._needs_user_input_action_id)
+
+    def test_failed_durable_resume_keeps_the_sticky_gate(self):
+        task = SimpleNamespace(
+            _needs_user_input_action_id=3,
+            _needs_help_reason='need choice',
+            _needs_user_input_kind='human_required')
+        create_recipe.user_tasks[_UP] = task
+        create_recipe.request_id_list[_UP] = 'user-request-2'
+        with patch('hartos.create_recipe.resume_from_user_input',
+                   return_value=False) as resume:
+            self.assertFalse(
+                _resume_prior_user_input_block(_UP, 'Use account A'))
+        resume.assert_called_once()
+        self.assertEqual(task._needs_user_input_action_id, 3)
+        self.assertEqual(task._needs_user_input_kind, 'human_required')
+        self.assertEqual(task._needs_help_reason, 'need choice')
 
 
 if __name__ == '__main__':

@@ -38,10 +38,26 @@ def _tool():
     return mod
 
 
+def _install(monkeypatch, fake):
+    """Stand `fake` in for core.ai_sensing (None: the import fails).
+
+    Both places must change: `import core.ai_sensing as x` (what the tool
+    does) resolves the `core` package's attribute BEFORE sys.modules, so once
+    any test in the process has imported the real module, a sys.modules-only
+    fake is bypassed and the real gate answers.
+    """
+    import core
+    monkeypatch.setitem(sys.modules, "core.ai_sensing", fake)
+    if fake is None:
+        monkeypatch.delattr(core, "ai_sensing", raising=False)
+    else:
+        monkeypatch.setattr(core, "ai_sensing", fake, raising=False)
+
+
 def test_fails_closed_when_the_authority_is_unreachable(monkeypatch):
     """No answer is a NO. An unreachable gate must never mean 'go ahead'."""
     mod = _tool()
-    monkeypatch.setitem(sys.modules, "core.ai_sensing", None)  # force import failure
+    _install(monkeypatch, None)  # force import failure
     ok, why = mod.screen_capture_allowed()
     assert ok is False
     assert "consent" in why or "unavailable" in why
@@ -68,7 +84,7 @@ def test_an_older_ai_sensing_still_refuses_but_does_not_claim_a_cut(monkeypatch)
     """
     fake = type(sys)("core.ai_sensing")
     fake.query_authority = lambda sensor: False      # no query_authority_state
-    monkeypatch.setitem(sys.modules, "core.ai_sensing", fake)
+    _install(monkeypatch, fake)
     mod = _tool()
     ok, why = mod.screen_capture_allowed()
     assert ok is False, "fail-closed must survive an older ai_sensing"
@@ -80,7 +96,7 @@ def test_an_older_ai_sensing_still_refuses_but_does_not_claim_a_cut(monkeypatch)
 def test_allows_only_on_a_definitive_yes(monkeypatch):
     fake = type(sys)("core.ai_sensing")
     fake.query_authority = lambda sensor: True
-    monkeypatch.setitem(sys.modules, "core.ai_sensing", fake)
+    _install(monkeypatch, fake)
     mod = _tool()
     ok, _why = mod.screen_capture_allowed()
     assert ok is True
@@ -91,7 +107,7 @@ def test_an_authority_error_is_not_an_allow(monkeypatch):
         raise RuntimeError("socket exploded")
     fake = type(sys)("core.ai_sensing")
     fake.query_authority = _boom
-    monkeypatch.setitem(sys.modules, "core.ai_sensing", fake)
+    _install(monkeypatch, fake)
     mod = _tool()
     ok, why = mod.screen_capture_allowed()
     assert ok is False and "unreachable" in why
@@ -122,7 +138,7 @@ def _authority(monkeypatch, state):
     fake.SENSE_UNREACHABLE = 'unreachable'
     fake.query_authority_state = lambda sensor, *a, **kw: state
     fake.query_authority = lambda sensor, *a, **kw: state == 'allow'
-    monkeypatch.setitem(sys.modules, "core.ai_sensing", fake)
+    _install(monkeypatch, fake)
 
 
 def _record_capture(mod, monkeypatch, seen):

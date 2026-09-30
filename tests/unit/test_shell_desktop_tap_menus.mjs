@@ -169,6 +169,9 @@ vm.createContext(sandbox);
 // hartDesktop init() runs injectCtxMenu (which then skips the <script> inject);
 // and the shared brand-art (glyph + gradient renderers hartDesktop paints with)
 // must be defined before the module runs.
+// The dismissal set the menu arms lives in hartDismiss.js (extracted 2026-09-23);
+// it loads deferred before the menu in the served shell, so mirror that order.
+vm.runInContext(readFileSync(join(STATIC, 'hartDismiss.js'), 'utf8'), sandbox, { filename: 'hartDismiss.js' });
 vm.runInContext(readFileSync(SRC_CTX, 'utf8'), sandbox, { filename: 'hartContextMenu.js' });
 vm.runInContext(readFileSync(SRC_BRAND, 'utf8'), sandbox, { filename: 'hartBrandArt.js' });
 vm.runInContext(readFileSync(SRC_DESK, 'utf8'), sandbox, { filename: 'hartDesktop.js' });

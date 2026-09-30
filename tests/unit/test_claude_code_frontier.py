@@ -8,9 +8,32 @@ Covers the two no-parallel-path guarantees and the resilience contract:
 All `claude -p` calls are stubbed — no subprocess, no network.
 """
 import json
+import os
+import tempfile
 from unittest.mock import patch
 
-import integrations.coding_agent.claude_code_backend as be
+# The owner's off-switch is a marker in Claude's config dir, and since
+# 66386a45e an ON env pin no longer overrides a present marker.  Point the
+# config dir at an empty temp dir BEFORE the backend is imported, as
+# test_copilot_switch_stops_spawn does, so the switch is this file's
+# precondition and not the developer's own setting (on the owner's desktop
+# the marker exists -- revoked 2026-09-16 -- and 3 of these 9 read 'off' as
+# a defect in the tool gating).
+os.environ['CLAUDE_CONFIG_DIR'] = tempfile.mkdtemp(prefix='claude_code_frontier_')
+
+import pytest  # noqa: E402
+
+import integrations.coding_agent.claude_code_backend as be  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _copilot_on(monkeypatch):
+    """invoke_claude refuses when the owner's switch is off.  The switch is
+    the marker in CLAUDE_CONFIG_DIR (redirected above); the env pin can no
+    longer turn it on, so it is cleared and the switch is set directly.  The
+    off behaviour has its own file, test_copilot_switch_stops_spawn."""
+    monkeypatch.delenv('HARTOS_COPILOT_ENABLED', raising=False)
+    be.set_copilot_enabled(True)
 
 
 # ─── the shared invocation primitive ─────────────────────────────────────────
@@ -30,7 +53,17 @@ def test_inference_mode_constrains_tools_and_text_output():
     assert r['ok'] and r['stdout'] == '4'
     cmd = sr.call_args[0][0]
     assert '--output-format' in cmd and 'text' in cmd
-    assert '--allowedTools' in cmd          # no tools in inference mode
+    # --tools "" REMOVES the built-in tools; --allowedTools "" only withheld
+    # pre-approval and the model went on executing Edit/Grep/Read/Bash against
+    # its own memory dir in 199 of 300 measured sessions (2026-09-16).  The
+    # live check is the sandbox probe; this pins the flag from regressing.
+    assert '--allowedTools' not in cmd
+    i = cmd.index('--tools')
+    assert cmd[i + 1] == ''
+    assert '--strict-mcp-config' in cmd     # no MCP callback into HARTOS
+    # The caller's system text REPLACES the harness prompt (memory, CLAUDE.md)
+    # rather than being appended to it: an inference endpoint's whole prompt.
+    assert '--system-prompt' in cmd and '--append-system-prompt' not in cmd
 
 
 def test_agentic_mode_is_a_plain_run_no_tool_gating():
@@ -39,6 +72,7 @@ def test_agentic_mode_is_a_plain_run_no_tool_gating():
     assert r['ok'] and r['returncode'] == 0
     cmd = sr.call_args[0][0]
     assert '--allowedTools' not in cmd       # agentic keeps full tools
+    assert '--tools' not in cmd and '--strict-mcp-config' not in cmd
     assert sr.call_args[1]['cwd'] == '/repo'
 
 

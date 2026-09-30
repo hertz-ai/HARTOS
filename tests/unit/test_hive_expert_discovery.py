@@ -2,10 +2,14 @@
 
 Coverage matrix:
 
-  Trust gate
-    - env-var allowlist: hit, miss, unset, whitespace, empty entries
-    - attestation: ImportError fallback (current production state),
-      future-proof when symbol exists
+  Trust gate (a signed origin attestation, and only that)
+    - a REAL attestation from this node is trusted, end to end
+    - what the advertiser publishes is what the gate accepts
+    - the wrapper instead of the inner dict is refused
+    - missing / empty / tampered attestation denied
+    - the gate passes msg['origin_attestation'] and reads the (ok, reason)
+      tuple rather than truth-testing it
+    - the env allowlist and the key_delegation import are gone from both sides
 
   Announce parsing
     - missing peer_id / endpoint → rejected
@@ -86,7 +90,11 @@ def _announce(peer_id='node-a', endpoint='https://node-a.example.com',
         'peer_id': peer_id,
         'endpoint': endpoint,
         'auth_token': 'token-xyz',
-        'trust_signature': 'sig',
+        # The trust gate is stubbed by _trusted() in the tests that use this
+        # helper, so the attestation's CONTENT is irrelevant here — its presence
+        # keeps the payload the shape the producer really sends.  TestTrustGate
+        # uses real attestations.
+        'origin_attestation': {'origin_fingerprint': 'test-only'},
         'models': models,
     }
     payload.update(extra)
@@ -102,11 +110,45 @@ def _mock_ping(latency_ms=42.0):
     )
 
 
-def _allowlist(*peer_ids):
-    """Set ``HEVOLVE_HIVE_TRUSTED_PEERS`` for the duration of the test."""
-    return patch.dict(
-        os.environ,
-        {'HEVOLVE_HIVE_TRUSTED_PEERS': ','.join(peer_ids)},
+def _code_only(mod):
+    """A module's source with comments AND docstrings stripped.
+
+    A divergence guard that searches raw text fires on the prose explaining the
+    fix: the module docstring described the deleted mechanism, and so does the
+    comment recording why it went. Same technique the consent suite uses for the
+    same reason — ast.unparse drops comments, and docstrings are dropped here.
+    """
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(mod))
+    for node in ast.walk(tree):
+        body = getattr(node, 'body', None)
+        if (isinstance(body, list) and body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(getattr(body[0], 'value', None), ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            node.body = body[1:] or [ast.Pass()]
+    return ast.unparse(tree)
+
+
+def _trusted(*peer_ids):
+    """Make these peers pass the trust gate, for the tests about what happens
+    AFTER it (registration, tiers, latency, revocation).
+
+    Those tests never cared HOW a peer became trusted, which is why this could
+    change from an env allowlist (``HEVOLVE_HIVE_TRUSTED_PEERS``, deleted with
+    that mechanism) to a stub of the gate without touching any of them.  The
+    gate itself is tested in TestTrustGate against the REAL attestation
+    functions — stubbing it there would test nothing.
+
+    ``staticmethod`` matters: the production call is ``self._verify_peer_trust(
+    msg)``, so a bare function would arrive with ``self`` as its first argument.
+    """
+    allowed = set(peer_ids)
+    return patch(
+        'integrations.agent_engine.hive_expert_discovery.'
+        'HiveExpertDiscovery._verify_peer_trust',
+        staticmethod(lambda msg: (msg.get('peer_id') or '') in allowed),
     )
 
 
@@ -116,112 +158,169 @@ def _allowlist(*peer_ids):
 
 
 class TestTrustGate:
+    """The gate is a signed origin attestation, and only that.
 
-    def test_allowlist_hit(self, discovery):
+    What it replaced was three mechanisms for one decision, all three inert:
+      * the import was ``security.key_delegation.verify_peer_attestation``,
+        which that module does not define -> ImportError on EVERY advert;
+      * so it fell to an env allowlist (``HEVOLVE_HIVE_TRUSTED_PEERS``) that is
+        unset in the field -> ``peer_id in set()`` -> no peer EVER trusted, so
+        this whole discovery path was dead;
+      * and the producer sent ``trust_signature: ''``, which no verifier of any
+        kind could have accepted.
+    The old tests here passed while the path was dead, because they set the env
+    var themselves. That is why these use the REAL functions.
+    """
+
+    def test_a_real_attestation_from_this_node_is_trusted(self, discovery):
+        """End to end on the real pair, no mocks: produce -> verify.
+
+        This is the test the old suite could not have: it fails if the producer
+        and the verifier ever disagree again, including on the wrapper-vs-inner
+        dict shape that reads as "not genuine HART OS" on a genuine node.
+        """
+        from security.origin_attestation import get_attestation_for_federation
         from integrations.agent_engine.hive_expert_discovery import (
             HiveExpertDiscovery,
         )
-        with _allowlist('node-a', 'node-b'):
-            assert HiveExpertDiscovery._verify_peer_trust(
-                {'peer_id': 'node-a'}) is True
+        att = (get_attestation_for_federation() or {}).get('attestation')
+        if not att:
+            pytest.skip('this checkout cannot self-attest (origin verification '
+                        'failed) — not a gate defect')
+        assert HiveExpertDiscovery._verify_peer_trust({
+            'peer_id': 'node-a', 'origin_attestation': att}) is True
 
-    def test_allowlist_miss(self, discovery):
+    def test_the_advertiser_publishes_what_the_gate_accepts(self, discovery):
+        """The producer helper and the gate, joined — the contract itself.
+
+        _origin_attestation exists so the unwrap happens in ONE place; this
+        pins that what it publishes is what the consumer accepts.
+        """
+        from integrations.agent_engine.hive_capability_advertiser import (
+            _origin_attestation,
+        )
         from integrations.agent_engine.hive_expert_discovery import (
             HiveExpertDiscovery,
         )
-        with _allowlist('node-a'):
-            assert HiveExpertDiscovery._verify_peer_trust(
-                {'peer_id': 'node-z'}) is False
+        att = _origin_attestation()
+        if att is None:
+            pytest.skip('this checkout cannot self-attest — not a gate defect')
+        assert HiveExpertDiscovery._verify_peer_trust({
+            'peer_id': 'node-a', 'origin_attestation': att}) is True
 
-    def test_unset_env_denies(self, discovery, monkeypatch):
+    def test_a_wrapped_attestation_is_refused(self, discovery):
+        """The caller bug that looks like a rejected peer.
+
+        get_attestation_for_federation returns {'valid', 'attestation'}; passing
+        the WRAPPER fails with "Origin fingerprint mismatch" even from a genuine
+        node. Pinned so nobody re-introduces it while reading the failure as a
+        peer problem.
+        """
+        from security.origin_attestation import get_attestation_for_federation
         from integrations.agent_engine.hive_expert_discovery import (
             HiveExpertDiscovery,
         )
-        monkeypatch.delenv('HEVOLVE_HIVE_TRUSTED_PEERS', raising=False)
+        wrapper = get_attestation_for_federation() or {}
+        if not wrapper.get('attestation'):
+            pytest.skip('this checkout cannot self-attest')
+        assert HiveExpertDiscovery._verify_peer_trust({
+            'peer_id': 'node-a', 'origin_attestation': wrapper}) is False
+
+    def test_no_attestation_denies(self, discovery):
+        """An advert with nothing to verify is refused — the old code trusted
+        such a peer whenever its id happened to be in the env list."""
+        from integrations.agent_engine.hive_expert_discovery import (
+            HiveExpertDiscovery,
+        )
         assert HiveExpertDiscovery._verify_peer_trust(
             {'peer_id': 'node-a'}) is False
+        assert HiveExpertDiscovery._verify_peer_trust(
+            {'peer_id': 'node-a', 'origin_attestation': None}) is False
+        assert HiveExpertDiscovery._verify_peer_trust(
+            {'peer_id': 'node-a', 'origin_attestation': {}}) is False
+
+    def test_a_tampered_attestation_denies(self, discovery):
+        from security.origin_attestation import get_attestation_for_federation
+        from integrations.agent_engine.hive_expert_discovery import (
+            HiveExpertDiscovery,
+        )
+        att = (get_attestation_for_federation() or {}).get('attestation')
+        if not att:
+            pytest.skip('this checkout cannot self-attest')
+        forged = dict(att)
+        forged['node_public_key'] = '00' * 32     # signature no longer matches
+        assert HiveExpertDiscovery._verify_peer_trust({
+            'peer_id': 'node-a', 'origin_attestation': forged}) is False
 
     def test_empty_peer_id_denied(self, discovery):
         from integrations.agent_engine.hive_expert_discovery import (
             HiveExpertDiscovery,
         )
-        with _allowlist('node-a'):
+        from security.origin_attestation import get_attestation_for_federation
+        att = (get_attestation_for_federation() or {}).get('attestation') or {}
+        for pid in ('', None):
             assert HiveExpertDiscovery._verify_peer_trust(
-                {'peer_id': ''}) is False
-            assert HiveExpertDiscovery._verify_peer_trust(
-                {'peer_id': None}) is False
-            assert HiveExpertDiscovery._verify_peer_trust({}) is False
+                {'peer_id': pid, 'origin_attestation': att}) is False
+        assert HiveExpertDiscovery._verify_peer_trust({}) is False
 
-    def test_allowlist_whitespace_tolerated(self, discovery):
+    def test_the_gate_passes_the_inner_dict_and_reads_the_tuple(
+            self, discovery, monkeypatch):
+        """Wiring, deterministically: which value goes in, how the result is
+        read. verify_peer_attestation returns (ok, reason) — a gate that
+        truth-tested the tuple would trust every rejected peer, since a
+        2-tuple is always truthy.
+        """
+        import security.origin_attestation as oa
         from integrations.agent_engine.hive_expert_discovery import (
             HiveExpertDiscovery,
         )
-        with patch.dict(os.environ, {
-            'HEVOLVE_HIVE_TRUSTED_PEERS': '  node-a , node-b ,, ,  ',
-        }):
-            assert HiveExpertDiscovery._verify_peer_trust(
-                {'peer_id': 'node-a'}) is True
-            assert HiveExpertDiscovery._verify_peer_trust(
-                {'peer_id': 'node-b'}) is True
-            # The empty-token entries between commas must NOT match an
-            # empty peer_id
-            assert HiveExpertDiscovery._verify_peer_trust(
-                {'peer_id': ''}) is False
+        seen = []
 
-    def test_attestation_path_when_symbol_lands(
-            self, discovery, monkeypatch):
-        """When ``verify_peer_attestation`` becomes importable, the
-        env-var fallback is bypassed and attestation is the source of
-        truth.  Simulates a future state — proves the ImportError
-        branch will retire cleanly."""
-        import sys as _sys
-        fake_module = MagicMock()
-        fake_module.verify_peer_attestation = MagicMock(return_value=True)
+        monkeypatch.setattr(oa, 'verify_peer_attestation',
+                            lambda att: (seen.append(att), (False, 'nope'))[1])
+        assert HiveExpertDiscovery._verify_peer_trust({
+            'peer_id': 'node-a',
+            'origin_attestation': {'marker': 'inner'},
+        }) is False, 'a (False, reason) tuple was read as trust'
+        assert seen == [{'marker': 'inner'}], (
+            'the gate passed something other than msg["origin_attestation"] — '
+            f'{seen}')
+
+    def test_attestation_exception_denies(self, discovery, monkeypatch):
+        """Never accept by accident."""
+        import security.origin_attestation as oa
         from integrations.agent_engine.hive_expert_discovery import (
             HiveExpertDiscovery,
         )
-        # Inject ``verify_peer_attestation`` into the existing
-        # ``security.key_delegation`` module (it ships, just doesn't
-        # export the symbol yet).
-        kd_module = _sys.modules.get('security.key_delegation')
-        if kd_module is not None:
-            monkeypatch.setattr(
-                kd_module, 'verify_peer_attestation',
-                fake_module.verify_peer_attestation,
-                raising=False,
-            )
-        else:
-            monkeypatch.setitem(_sys.modules,
-                                'security.key_delegation', fake_module)
-        ok = HiveExpertDiscovery._verify_peer_trust(
-            {'peer_id': 'node-a', 'trust_signature': 'sig'})
-        assert ok is True
-        fake_module.verify_peer_attestation.assert_called_once()
-
-    def test_attestation_exception_denies(
-            self, discovery, monkeypatch):
-        """If attestation raises a non-ImportError exception, the gate
-        must DENY (never accept by accident)."""
-        import sys as _sys
-        kd_module = _sys.modules.get('security.key_delegation')
 
         def _boom(*a, **kw):
             raise RuntimeError('attestation backend down')
-        from integrations.agent_engine.hive_expert_discovery import (
-            HiveExpertDiscovery,
+
+        monkeypatch.setattr(oa, 'verify_peer_attestation', _boom)
+        assert HiveExpertDiscovery._verify_peer_trust({
+            'peer_id': 'node-a', 'origin_attestation': {'x': 1}}) is False
+
+    def test_the_env_allowlist_is_gone_from_both_sides(self):
+        """Divergence guard: one mechanism, and no way back to the dead ones.
+
+        An env allowlist is a second grant path that cannot be revoked, audited
+        or attributed; a re-added `key_delegation` import would silently restore
+        the ImportError fallback that made this path inert for its whole life.
+        """
+        from integrations.agent_engine import (
+            hive_capability_advertiser as adv,
+            hive_expert_discovery as disc,
         )
-        if kd_module is not None:
-            monkeypatch.setattr(
-                kd_module, 'verify_peer_attestation', _boom,
-                raising=False,
-            )
-        else:
-            fake = MagicMock()
-            fake.verify_peer_attestation = _boom
-            monkeypatch.setitem(
-                _sys.modules, 'security.key_delegation', fake)
-        assert HiveExpertDiscovery._verify_peer_trust(
-            {'peer_id': 'node-a'}) is False
+        for mod in (adv, disc):
+            src = _code_only(mod)
+            assert 'HEVOLVE_HIVE_TRUSTED_PEERS' not in src, (
+                f'{mod.__name__} still consults the env allowlist')
+            assert 'key_delegation' not in src, (
+                f'{mod.__name__} imports key_delegation again — that module '
+                'does not define verify_peer_attestation, so the gate falls '
+                'back and denies every peer')
+        assert "'trust_signature'" not in _code_only(adv), (
+            'the advertiser still publishes the empty trust_signature field')
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -232,23 +331,23 @@ class TestTrustGate:
 class TestAnnounceParsing:
 
     def test_missing_peer_id(self, discovery):
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             assert discovery.on_peer_announce(
                 _announce(peer_id='')) == 0
 
     def test_missing_endpoint(self, discovery):
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             assert discovery.on_peer_announce(
                 _announce(endpoint='')) == 0
 
     def test_trust_denied(self, discovery):
-        with _allowlist('node-b'), _mock_ping():  # node-b allowed, not node-a
+        with _trusted('node-b'), _mock_ping():  # node-b allowed, not node-a
             assert discovery.on_peer_announce(_announce()) == 0
 
     def test_unreachable_first_probe(self, discovery):
         """Peer fails the reachability probe → no registration; the
         peer's next announce gets another shot."""
-        with _allowlist('node-a'):
+        with _trusted('node-a'):
             with patch(
                 'integrations.agent_engine.hive_expert_discovery.'
                 'HiveExpertDiscovery._ping_latency',
@@ -258,19 +357,19 @@ class TestAnnounceParsing:
         assert len(discovery._registry._models) == 0
 
     def test_models_not_list(self, discovery):
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             assert discovery.on_peer_announce(
                 _announce(models='not-a-list')) == 0
 
     def test_model_not_dict(self, discovery):
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             assert discovery.on_peer_announce(
                 _announce(models=['just a string'])) == 0
 
     def test_non_expert_tier_filtered_out(self, discovery):
         """Only ``tier=expert`` models register.  Mixed payloads keep
         the expert entries and silently drop the others."""
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             count = discovery.on_peer_announce(_announce(models=[
                 {'model_id': 'qwen-27b', 'tier': 'expert',
                  'verified_baseline': 0.8, 'display_name': 'Q'},
@@ -284,7 +383,7 @@ class TestAnnounceParsing:
     def test_below_baseline_floor_filtered(self, discovery):
         """``_MIN_VERIFIED_BASELINE=0.5`` floor — anything advertised
         below random-chance reasoning quality must not register."""
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             count = discovery.on_peer_announce(_announce(models=[
                 {'model_id': 'untrusted', 'tier': 'expert',
                  'verified_baseline': 0.49, 'display_name': 'X'},
@@ -293,7 +392,7 @@ class TestAnnounceParsing:
         assert len(discovery._registry._models) == 0
 
     def test_non_numeric_baseline_silently_dropped(self, discovery):
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             count = discovery.on_peer_announce(_announce(models=[
                 {'model_id': 'broken', 'tier': 'expert',
                  'verified_baseline': 'unparseable', 'display_name': 'X'},
@@ -301,7 +400,7 @@ class TestAnnounceParsing:
         assert count == 0
 
     def test_missing_model_id_filtered(self, discovery):
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             count = discovery.on_peer_announce(_announce(models=[
                 {'tier': 'expert',
                  'verified_baseline': 0.8, 'display_name': 'X'},
@@ -309,7 +408,7 @@ class TestAnnounceParsing:
         assert count == 0
 
     def test_well_formed_payload_registers(self, discovery):
-        with _allowlist('node-a'), _mock_ping(latency_ms=120):
+        with _trusted('node-a'), _mock_ping(latency_ms=120):
             count = discovery.on_peer_announce(_announce())
         assert count == 1
         backend = discovery._registry.get_model('hive-node-a-qwen-27b')
@@ -322,7 +421,7 @@ class TestAnnounceParsing:
             'https://node-a.example.com/v1')
 
     def test_specialty_propagated(self, discovery):
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             discovery.on_peer_announce(_announce(models=[
                 {'model_id': 'coder', 'tier': 'expert',
                  'verified_baseline': 0.9, 'display_name': 'C',
@@ -343,7 +442,7 @@ class TestReannounceDiff:
     def test_overlapping_ids_no_churn(self, discovery):
         """Same peer re-announces the same models → register overwrites
         idempotently, no drop+re-register sequence."""
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             discovery.on_peer_announce(_announce())
             with patch.object(discovery._registry,
                               'unregister') as unreg:
@@ -353,7 +452,7 @@ class TestReannounceDiff:
     def test_subset_drops_missing(self, discovery):
         """Peer reduces its model set → the missing ones get
         unregistered, surviving ones stay."""
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             discovery.on_peer_announce(_announce(models=[
                 {'model_id': 'qwen-27b', 'tier': 'expert',
                  'verified_baseline': 0.8, 'display_name': 'Q'},
@@ -373,7 +472,7 @@ class TestReannounceDiff:
         """Peer announces zero expert models → all its backends drop.
         The peer entry survives in _peer_models with an empty set, so
         a later revoke is still well-formed."""
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             discovery.on_peer_announce(_announce())
             assert 'hive-node-a-qwen-27b' in discovery._registry._models
             discovery.on_peer_announce(_announce(models=[]))
@@ -389,7 +488,7 @@ class TestReannounceDiff:
 class TestRevoke:
 
     def test_revoke_drops_all_peer_backends(self, discovery):
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             discovery.on_peer_announce(_announce())
         # Simulate the revoke event-callback shape (topic, data)
         discovery._on_revoke_event(
@@ -420,7 +519,7 @@ class TestRevoke:
 class TestHealthCheck:
 
     def test_single_failure_does_not_drop(self, discovery):
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             discovery.on_peer_announce(_announce())
         with patch(
             'integrations.agent_engine.hive_expert_discovery.'
@@ -433,7 +532,7 @@ class TestHealthCheck:
 
     def test_drop_after_fail_budget(self, discovery):
         from integrations.agent_engine import hive_expert_discovery as hed
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             discovery.on_peer_announce(_announce())
         with patch(
             'integrations.agent_engine.hive_expert_discovery.'
@@ -446,7 +545,7 @@ class TestHealthCheck:
         assert discovery._peer_models.get('node-a') is None
 
     def test_success_resets_fail_count(self, discovery):
-        with _allowlist('node-a'), _mock_ping():
+        with _trusted('node-a'), _mock_ping():
             discovery.on_peer_announce(_announce())
         # First two pings fail
         with patch(
@@ -466,7 +565,7 @@ class TestHealthCheck:
         """Health-check ping latency feeds ModelRegistry.record_latency
         so the dispatcher's picker reflects live network conditions
         instead of the stale announce-time snapshot."""
-        with _allowlist('node-a'), _mock_ping(latency_ms=100):
+        with _trusted('node-a'), _mock_ping(latency_ms=100):
             discovery.on_peer_announce(_announce())
         # Backend has latency=100 from announce (constructor-set hint).
         backend = discovery._registry.get_model('hive-node-a-qwen-27b')

@@ -30,11 +30,8 @@ def _resolve_benchmark_dir():
     if db_path and db_path != ':memory:' and os.path.isabs(db_path):
         return os.path.join(os.path.dirname(db_path), 'agent_data', 'benchmarks')
     if os.environ.get('NUNBA_BUNDLED') or getattr(_sys, 'frozen', False):
-        try:
-            from core.platform_paths import get_agent_data_dir
-            return os.path.join(get_agent_data_dir(), 'benchmarks')
-        except ImportError:
-            return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'benchmarks')
+        from core.platform_paths import get_agent_data_dir
+        return os.path.join(get_agent_data_dir(), 'benchmarks')
     return os.path.join('agent_data', 'benchmarks')
 
 BENCHMARK_DIR = _resolve_benchmark_dir()
@@ -51,7 +48,12 @@ class BenchmarkAdapter:
     tier: str = 'fast'  # 'fast' | 'heavy'
 
     def run(self, api_url: str = '', **kwargs) -> Dict:
-        """Run benchmark. Return {metrics: {name: {value, direction, unit}}}."""
+        """Run benchmark. Return {metrics: {name: {value, direction, unit}}}.
+
+        A metric may carry 'gate': False to be reported but never compared by
+        is_upgrade_safe: use it for a value that is not comparable across two
+        snapshots, such as a per-process counter that restarts at 0.
+        """
         raise NotImplementedError
 
     def is_available(self) -> bool:
@@ -98,16 +100,21 @@ class WorldModelAdapter(BenchmarkAdapter):
             from .world_model_bridge import get_world_model_bridge
             bridge = get_world_model_bridge()
             stats = bridge.get_stats()
+            # total_corrections and total_hivemind_queries are the bridge's
+            # in-memory cumulative counters: they restart at 0 with the
+            # process, so comparing two snapshots measures uptime, and a
+            # restart between baseline and candidate read as a regression that
+            # blocked the upgrade. Reported, not gated (gate=False).
             return {'metrics': {
                 'flush_rate': {
                     'value': stats.get('total_flushed', 0) / max(1, stats.get('total_recorded', 1)),
                     'direction': 'higher', 'unit': 'ratio'},
                 'correction_density': {
                     'value': stats.get('total_corrections', 0),
-                    'direction': 'higher', 'unit': 'count'},
+                    'direction': 'higher', 'unit': 'count', 'gate': False},
                 'hivemind_queries': {
                     'value': stats.get('total_hivemind_queries', 0),
-                    'direction': 'higher', 'unit': 'count'},
+                    'direction': 'higher', 'unit': 'count', 'gate': False},
             }}
         except Exception as e:
             return {'metrics': {}, 'error': str(e)}
@@ -496,8 +503,32 @@ class BenchmarkRegistry:
 
         return snapshot
 
+    def previous_version(self, exclude_version: str) -> Optional[str]:
+        """The most recently written snapshot OTHER than `exclude_version`.
+
+        The comparison partner for `is_upgrade_safe(old, new)`: the newest
+        snapshot by file mtime, which is the rule upgrade_orchestrator's
+        benchmark stage applies inline. None when no other snapshot exists,
+        which callers report as "no baseline" rather than a pass or a fail.
+        """
+        try:
+            names = [f for f in os.listdir(BENCHMARK_DIR)
+                     if f.endswith('.json') and f != f'{exclude_version}.json']
+        except OSError:
+            return None
+        if not names:
+            return None
+        names.sort(key=lambda f: os.path.getmtime(os.path.join(BENCHMARK_DIR, f)),
+                   reverse=True)
+        return names[0][:-len('.json')]
+
     def is_upgrade_safe(self, old_version: str, new_version: str) -> Tuple[bool, str]:
-        """ALL fast-tier metrics must be >= old version."""
+        """ALL fast-tier metrics must be >= old version.
+
+        A metric marked 'gate': False in either snapshot is skipped. Either,
+        because a baseline written before a metric was marked still carries it
+        unmarked, and that old value must not block the upgrade.
+        """
         old_file = os.path.join(BENCHMARK_DIR, f'{old_version}.json')
         new_file = os.path.join(BENCHMARK_DIR, f'{new_version}.json')
 
@@ -521,6 +552,8 @@ class BenchmarkRegistry:
             for metric_name, old_m in old_metrics.items():
                 new_m = new_metrics.get(metric_name)
                 if not new_m or not isinstance(old_m, dict) or not isinstance(new_m, dict):
+                    continue
+                if old_m.get('gate') is False or new_m.get('gate') is False:
                     continue
                 old_val = old_m.get('value', 0)
                 new_val = new_m.get('value', 0)

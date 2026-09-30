@@ -39,10 +39,142 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 logger = logging.getLogger('hevolve.vlm.safety')
+
+
+# Computer-use may receive prose in any language, but the operating-system
+# operations it can ultimately invoke have a finite, stable vocabulary.  This
+# is deliberately an always-on deny policy: consent to control a computer is
+# never consent to power it off, reset it, or erase it.
+_DESTRUCTIVE_COMMAND_RE = re.compile(
+    r'(?imx)(?:'
+    r'(?:^|[;&|]\s*)(?:cmd(?:\.exe)?\s+/c\s+|powershell(?:\.exe)?\s+[^\n]*?\s+)?'
+    r'(?:shutdown(?:\.exe)?\b|restart-computer\b|stop-computer\b|'
+    r'reboot\b|poweroff\b|halt\b|systemctl\s+(?:reboot|poweroff|halt)\b|'
+    r'init\s+[06]\b|adb\s+reboot\b|diskpart\b|mkfs(?:\.[\w-]+)?\b|'
+    r'format(?:\.com)?\s+(?:[a-z]:|/|disk\b|volume\b)|'
+    r'rm\s+-[^\n]*r[^\n]*f\s+(?:[/~]|[a-z]:[\\/]))|'
+    r'\b(?:factory[\s_-]*reset|reset[\s_-]*this[\s_-]*pc)\b)'
+)
+
+# Early refusal for plain-language requests.  The final command/action gate
+# above is authoritative and language-independent; these terms only avoid
+# handing an obviously destructive request to a GUI planner first.
+_DESTRUCTIVE_REQUEST_RE = re.compile(
+    r'(?ix)(?:'
+    r'\b(?:shutdown|shut[\s-]*down|restart|reboot|power[\s-]*off|'
+    r'hibernate|sleep)\b(?:\s+(?:the|this|my))?\s+'
+    r'(?:computer|pc|machine|device|system|windows|phone|tablet)\b|'
+    r'\b(?:computer|pc|machine|device|system|windows|phone|tablet)\b'
+    r'(?:\s+(?:should|must|can|please|now|to))*\s+'
+    r'(?:shutdown|shut[\s-]*down|restart|reboot|power[\s-]*off|hibernate|sleep)\b|'
+    r'\bfactory[\s-]*reset\b|'
+    r'\u91cd\u542f|\u5173\u673a|\u6062\u590d\u51fa\u5382\u8bbe\u7f6e|'
+    r'\u092a\u0941\u0928\u0930\u094d\u092d\u0942\u0924|\u0930\u0940\u0938\u094d\u091f\u093e\u0930\u094d\u091f|'
+    r'\u092c\u0902\u0926\s*\u0915\u0930|'
+    r'\u0440\u0435\u0436\u0438\u043c\s+\u043f\u0435\u0440\u0435\u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0438)'
+)
+
+
+# Stopping a process: every verb that ends one, in any shell.  Matched on the
+# de-obfuscated text (_deobfuscate), never compiled from the command itself.
+_KILL_VERB_RE = re.compile(
+    r'(?:taskkill|stop-process|\bspps\b|\bp?kill(?:all)?\b|'
+    r'\.(?:kill|terminate)\s*\(|stop-service|\bsc(?:\.exe)?\s+stop\b|'
+    r'\bnet\s+stop\b|systemctl\s+(?:stop|kill)\b|'
+    r'\bwmic\b[^\n]*\b(?:delete|terminate)\b)')
+# The target arrives from elsewhere (a pipe, a variable, xargs), so the
+# command text does not say which process it stops.
+_UNRESOLVED_TARGET_RE = re.compile(
+    r'\|\s*(?:stop-process|spps|xargs)\b|\$')
+_NUMBER_RE = re.compile(r'\b\d+\b')
+# cmd caret escapes, PowerShell backtick escapes, and %VAR% expansions hide a
+# verb from a plain search ("task^kill", "Stop`-Process", "%comspec% /c ...").
+_OBFUSCATION_RE = re.compile(r'[\^`]|%[^%\s]*%')
+
+
+def _own_process_identity():
+    """(pids, names) of the assistant's own processes.  Raises when they
+    cannot be read; the caller then refuses any kill."""
+    import psutil
+    from core.resource_governor import get_governor
+    pids = get_governor().own_process_pids(include_parent=True)
+    names = set()
+    for pid in pids:
+        try:
+            name = psutil.Process(pid).name().casefold()
+        except Exception:  # noqa: BLE001 -- exited mid-walk (M1)
+            continue
+        names.add(name[:-4] if name.endswith('.exe') else name)
+    return pids, names
+
+
+def _deobfuscate(text: str) -> str:
+    return _OBFUSCATION_RE.sub('', text)
+
+
+def _own_process_kill(text: str) -> Optional[str]:
+    """Refusal when ``text`` stops one of the assistant's own processes, or
+    stops a process it does not name (#877: an agent ran
+    ``Get-Process | Where-Object {$_.Name -like '*Nunba*'} | Stop-Process``
+    and Nunba exited under its owner)."""
+    text = _deobfuscate(text)
+    if not _KILL_VERB_RE.search(text):
+        return None
+    try:
+        pids, names = _own_process_identity()
+    except Exception as e:  # noqa: BLE001 -- unknown "own" is a no
+        return ('own_process_kill: the assistant\'s own processes could not '
+                f'be identified ({e}), so no process may be stopped')
+    if any(int(n) in pids for n in _NUMBER_RE.findall(text)):
+        return 'own_process_kill: the command stops one of the assistant\'s own processes'
+    if any(name and name in text for name in names):
+        return 'own_process_kill: the command stops one of the assistant\'s own processes'
+    if _UNRESOLVED_TARGET_RE.search(text):
+        return ('own_process_kill: the command stops processes it does not '
+                'name, so it could stop the assistant itself')
+    return None
+
+
+def destructive_computer_operation(value) -> Optional[str]:
+    """Return a refusal reason for a power/reset/erase operation.
+
+    Accepts either a tool instruction or a concrete action dict.  Every
+    computer-use dispatcher calls this same function before it transfers
+    control, and ``execute_action`` calls it again immediately before the OS
+    action so a remote or VLM-generated action cannot bypass the policy.
+    """
+    if isinstance(value, dict):
+        parts = (value.get(key) for key in
+                 ('command', 'text', 'value', 'path', 'reasoning', 'Reasoning'))
+        text = '\n'.join(str(part) for part in parts if part)
+        # What would actually run; the model's reasoning is prose about it.
+        runs = '\n'.join(str(value.get(key)) for key in
+                         ('command', 'text', 'value') if value.get(key))
+    else:
+        text = runs = '' if value is None else str(value)
+    text = unicodedata.normalize('NFKC', text).casefold()
+    if _DESTRUCTIVE_COMMAND_RE.search(text):
+        return 'destructive_computer_operation: power, reset, erase, or format commands are never agent-executable'
+    if _DESTRUCTIVE_REQUEST_RE.search(text):
+        return 'destructive_computer_operation: power, reset, erase, or format requests require a human to act directly'
+    return _own_process_kill(unicodedata.normalize('NFKC', runs).casefold())
+
+
+def computer_operation_refusal(value) -> Optional[str]:
+    """Shared synchronous hard-deny policy for every execution hand-off.
+
+    Semantic policy review belongs to the existing CREATE/REUSE StatusVerifier
+    conversation, where it can be attributed and attached to the action
+    ledger.  A dispatcher must never make a separate best-effort model call or
+    infer an allow because that review is unavailable.  Its synchronous job is
+    the deterministic final deny check below.
+    """
+    return destructive_computer_operation(value)
 
 
 # ─── Defaults ─────────────────────────────────────────────────────────
@@ -250,17 +382,6 @@ COMPUTER_CONTROL_WAIT_SECONDS = 90.0
 COMPUTER_CONTROL_POLL_SECONDS = 3.0
 
 
-def _known_agent(agent_id) -> Optional[str]:
-    """The asking agent's id, or None when no agent is known.
-
-    Callers pass the prompt id they hold: None or '' when there is none, and
-    hart_intelligence_entry._handle_computer_action_tool sends
-    str(prompt_id or 0), so '0' too.  An unknown agent is never guessed.
-    """
-    text = '' if agent_id is None else str(agent_id).strip()
-    return None if text in ('', '0', 'None') else text
-
-
 def _computer_control_answer(owner: str, agent: Optional[str],
                              reason: str) -> Optional[bool]:
     """One look at the owner's answer: True allowed, False said no ("Don't
@@ -308,7 +429,14 @@ def computer_control_block(agent_id, *, sleep=time.sleep) -> Optional[str]:
                        '(HEVOLVE_OWNER_USER_ID is not set)')
         return ('Not run: nobody is signed in on this computer who could '
                 'allow an agent to control it.')
-    agent = _known_agent(agent_id)
+    try:
+        from integrations.social.consent_service import known_agent_id
+    except Exception as e:  # noqa: BLE001 -- a failed check is a no
+        logger.warning('computer control refused: the permission system '
+                       f'could not load: {e}')
+        return ('Not run: the permission to control this computer '
+                f'could not be checked ({e}).')
+    agent = known_agent_id(agent_id)
     reason = (f'Agent {agent} asks to {COMPUTER_CONTROL_COVERS}.' if agent
               else 'An agent that could not be identified asks to '
                    f'{COMPUTER_CONTROL_COVERS}.')
@@ -475,6 +603,13 @@ class AuditLogger:
             'block_reason': block_reason,
             'verify_diff': result.get('verify_diff'),
             'verify_retried': result.get('verify_retried'),
+            # Correlation fields are set by local_loop before it executes an
+            # action. A durable ledger event can reference this redacted
+            # evidence without treating the audit file as an interaction store.
+            'prompt_id': action.get('_prompt_id'),
+            'agent_id': action.get('_agent_id'),
+            'user_id': action.get('_user_id'),
+            'activity_id': action.get('_activity_id'),
         }
         date = time.strftime('%Y%m%d')
         log_path = os.path.join(self.path, f'vlm_actions_{date}.jsonl')

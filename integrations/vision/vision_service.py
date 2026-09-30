@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -29,6 +30,73 @@ from .minicpm_installer import MiniCPMInstaller
 from .lightweight_backend import get_vision_backend, VisionBackend
 
 logger = logging.getLogger('hevolve_vision')
+
+#: Every VisionService constructed in this process.  Weak: an instance its
+#: owner dropped is not kept alive here.
+_LIVE = weakref.WeakSet()
+_LIVE_LOCK = threading.Lock()
+
+
+def running_vision_services() -> List['VisionService']:
+    """Every VisionService running in this process, whichever of its owners
+    made it (Nunba's boot instance, hart_intelligence_entry's standalone one,
+    the integrations.vision singleton).  Never constructs one."""
+    with _LIVE_LOCK:
+        live = list(_LIVE)
+    return [vs for vs in live if vs.is_running()]
+
+
+def stop_running_vision_services(why: str) -> int:
+    """Stop every running VisionService, whoever owns it; how many stopped.
+    The one stop for every cut: the eye button (core.ai_sensing) and the
+    owner's No (admin._apply_embodied_toggle).  A service that fails to stop
+    is logged and the rest still stop."""
+    stopped = 0
+    for vs in running_vision_services():
+        try:
+            vs.stop()
+            stopped += 1
+        except Exception:
+            logger.warning("VisionService did not stop (%s)", why,
+                           exc_info=True)
+    return stopped
+
+
+def restore_feed_answers() -> None:
+    """Load the saved camera/screen answers into the capture gate
+    (core.ai_sensing), before any frame can reach a store.
+
+    The gate is process memory and started open on every boot, so after a
+    restart camera frames were accepted until the owner answered again.
+    Now the gate starts where the last answer left it, read by the rule the
+    running process applies: every camera/screen answer, from any surface
+    and signed in as anyone, sets the one node-wide gate, and the latest one
+    stands (ConsentService.feed_said_no).  So it does not matter which user
+    id the answer was filed under -- the admin toggle files it under the
+    signed-in user, the privacy page under the JWT user, /api/agent/approval
+    under HEVOLVE_OWNER_USER_ID -- and no owner has to be configured.  No
+    answer on file leaves the feed open, as before.  If the consent cannot
+    be read, both feeds close: the last answer may have been No.  An answer
+    this process already holds is kept (restore_withheld)."""
+    from core import ai_sensing
+    feeds = ('camera', 'screen')
+    try:
+        from integrations.social.models import db_session
+        from integrations.social.consent_service import (
+            ConsentService, consent_type_for_action)
+        answers = {}
+        with db_session(commit=False) as db:
+            for feed in feeds:
+                answers[feed] = ConsentService.feed_said_no(
+                    db, consent_type_for_action(feed))
+    except Exception:
+        logger.warning("Feed answers could not be read: camera and screen "
+                       "stay closed until the owner answers", exc_info=True)
+        answers = {feed: True for feed in feeds}
+    for feed, said_no in answers.items():
+        if ai_sensing.restore_withheld(feed, said_no):
+            logger.info("Feed %s restored from saved consent: %s",
+                        feed, 'No' if said_no else 'open')
 
 
 def run_screen_capture_loop(consent_ok, grab, put, yielding, sleep, stop):
@@ -123,6 +191,11 @@ class VisionService:
         self._last_describe_time: Dict[str, float] = {}  # user_id → timestamp
         self._frames_skipped: int = 0
         self._frames_described: int = 0
+
+        with _LIVE_LOCK:
+            _LIVE.add(self)
+        # Before this service can take a frame: the owner's saved answers.
+        restore_feed_answers()
 
     # ─── Public API ───
 
@@ -246,6 +319,12 @@ class VisionService:
         state = {'capture': None}
 
         def _consent_ok() -> bool:
+            # The owner's No, or the eye button's cut, first: in memory, set
+            # on the answering thread, so no screenshot is taken after it
+            # even before the stored row is read or the service stopped.
+            from core.ai_sensing import allowed
+            if not allowed('screen'):
+                return False
             from integrations.social.models import db_session
             from integrations.social.consent_service import ConsentService
             with db_session(commit=True) as db:

@@ -495,7 +495,15 @@ class TestPhase4NixosTest:
         # OCR proof of pixels presented (un-fakeable), exactly mirroring the cage
         # desktop-boot paint proof but on the GTK4 session.
         assert "enableOCR = true" in src
-        assert 'wait_for_text("HART"' in src
+        # eb6c5bab5 widened the wait to the brand OR the onboarding language
+        # picker a fresh VM paints first; wait_for_text is a regex search, so
+        # assert what it ACCEPTS (the brand is still proof of pixels).
+        import re
+        patterns = re.findall(r'wait_for_text\(\s*"([^"]*)"', src)
+        assert patterns, "no OCR wait_for_text in the paint node"
+        assert any(re.search(p, "HART") for p in patterns), patterns
+        assert any(re.search(p, "What language feels like home?")
+                   for p in patterns), patterns
         # The paint must be of the Model-1 BACKGROUND/zone-0 surface under NEVER.
         assert "HardwareAccelerationPolicy.NEVER" in src
         assert "Layer.BACKGROUND" in src

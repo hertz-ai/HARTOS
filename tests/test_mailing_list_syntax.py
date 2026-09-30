@@ -317,6 +317,14 @@ def test_probe_maps_smtp_codes_correctly():
     assert ml.mailbox_exists("a@gmail.com", smtp=FakeSMTP(451))[0] is None
 
 
+# The day the sends below are dated. recent_bounce_rate windows on the real
+# clock (last 3 days) and calls the bounce log stale unless it was written
+# after the newest send's day has fully elapsed, so a fixed date fell out of
+# the window within days of being written (sent==0, the halt never fired) and
+# "today" would read as stale. Yesterday satisfies both.
+_SEND_DAY = __import__('datetime').date.fromordinal(
+    __import__('datetime').date.today().toordinal() - 1).isoformat()
+
 def test_bounce_breaker_halts_a_bad_list(tmp_path, monkeypatch):
     """MAX_CONSECUTIVE_FAILURES cannot catch this. Hotmail, Yahoo and AOL
     accept every recipient at RCPT and reject asynchronously, so for ~52% of
@@ -324,10 +332,10 @@ def test_bounce_breaker_halts_a_bad_list(tmp_path, monkeypatch):
     moves however dead the addresses are."""
     import integrations.channels.email_campaign as ec
     monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
-    monkeypatch.setattr(ec, "_today", lambda: "2026-07-22")
+    monkeypatch.setattr(ec, "_today", lambda: _SEND_DAY)
     with open(ec._state_path("c", "sent"), "w", encoding="utf-8") as f:
         for i in range(200):
-            f.write("2026-07-22\tu%d@example.com\n" % i)
+            f.write("%s\tu%d@example.com\n" % (_SEND_DAY, i))
     for i in range(60):                       # 30% bounce
         ec.record_bounce("u%d@example.com" % i, "5.1.1", "user unknown")
 
@@ -344,10 +352,10 @@ def test_bounce_breaker_halts_a_bad_list(tmp_path, monkeypatch):
 def test_bounce_breaker_allows_a_healthy_list(tmp_path, monkeypatch):
     import integrations.channels.email_campaign as ec
     monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
-    monkeypatch.setattr(ec, "_today", lambda: "2026-07-22")
+    monkeypatch.setattr(ec, "_today", lambda: _SEND_DAY)
     with open(ec._state_path("h", "sent"), "w", encoding="utf-8") as f:
         for i in range(200):
-            f.write("2026-07-22\tu%d@example.com\n" % i)
+            f.write("%s\tu%d@example.com\n" % (_SEND_DAY, i))
     for i in range(4):                        # 2%, under the 5% ceiling
         ec.record_bounce("u%d@example.com" % i, "5.1.1", "user unknown")
     r = ec.send_campaign(["new%d@example.com" % i for i in range(10)],
@@ -361,10 +369,10 @@ def test_breaker_needs_a_sample_before_it_fires(tmp_path, monkeypatch):
     samples would halt every campaign on its first bad address."""
     import integrations.channels.email_campaign as ec
     monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
-    monkeypatch.setattr(ec, "_today", lambda: "2026-07-22")
+    monkeypatch.setattr(ec, "_today", lambda: _SEND_DAY)
     with open(ec._state_path("t", "sent"), "w", encoding="utf-8") as f:
         for i in range(3):
-            f.write("2026-07-22\tu%d@example.com\n" % i)
+            f.write("%s\tu%d@example.com\n" % (_SEND_DAY, i))
     ec.record_bounce("u0@example.com", "5.1.1", "x")
     r = ec.send_campaign(["new@example.com"], "s", "<p>h</p>", "t",
                          campaign="t", dry_run=True)
@@ -493,8 +501,12 @@ def test_test_account_rule_does_not_take_real_people():
         assert sendable, '%s wrongly rejected as %s' % (addr, reason)
 
 
-def _dsn(status, diagnostic):
-    """Build a minimal RFC 3464 delivery-status notification."""
+def _dsn_with_diagnostic(status, diagnostic):
+    """Build a minimal RFC 3464 delivery-status notification carrying a
+    Diagnostic-Code. Named apart from _dsn above: both used to be called _dsn,
+    the later definition shadowed the earlier one at import, and the two
+    Postfix tests near the top were silently calling this helper with the
+    wrong arguments (TypeError, and a 'soft' bounce classified 'other')."""
     import email as _email
     raw = (
         "From: MAILER-DAEMON@mail.hertzai.com\r\n"
@@ -520,7 +532,7 @@ def test_policy_block_is_not_a_dead_mailbox():
     permanently suppressed 400+ real readers and hidden the actual cause.
     """
     from integrations.channels.bounce_handler import classify_message
-    msg = _dsn('5.7.1', '550-5.7.1 [104.254.246.77] Gmail has detected that '
+    msg = _dsn_with_diagnostic('5.7.1', '550-5.7.1 [104.254.246.77] Gmail has detected that '
                         'this message is likely unsolicited mail')
     kind, addr, code, _reason = classify_message(msg)
     assert kind == 'blocked', 'a policy block must never be suppressed'
@@ -532,7 +544,7 @@ def test_user_unknown_is_still_a_hard_bounce():
     """The other direction: a genuinely dead mailbox must still suppress,
     otherwise this 'fix' would quietly disable bounce handling entirely."""
     from integrations.channels.bounce_handler import classify_message
-    msg = _dsn('5.1.1', "550 5.1.1 The email account that you tried to reach "
+    msg = _dsn_with_diagnostic('5.1.1', "550 5.1.1 The email account that you tried to reach "
                         "does not exist")
     kind, addr, code, _reason = classify_message(msg)
     assert kind == 'hard'
@@ -543,6 +555,6 @@ def test_user_unknown_is_still_a_hard_bounce():
 def test_mailbox_full_is_temporary():
     from integrations.channels.bounce_handler import classify_message
     kind, _addr, code, _r = classify_message(
-        _dsn('5.2.2', '552 5.2.2 The email account is over quota'))
+        _dsn_with_diagnostic('5.2.2', '552 5.2.2 The email account is over quota'))
     assert kind == 'soft', 'a full mailbox is not a reason to drop somebody'
     assert code == '5.2.2'

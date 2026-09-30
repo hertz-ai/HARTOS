@@ -58,6 +58,18 @@ in
           cfg.dataDir
           cfg.logDir
           "${cfg.dataDir}/agent_data"
+          # The session marker dir (0770 hart:hart tmpfs, declared by
+          # hart-session-supervisor.nix). This unit READS the markers the
+          # chat-serving units hold there (core.foreground.marker_age_s is
+          # what lets its yield gate and starvation override see a person
+          # being served in another process), which strict allows anyway.
+          # It is listed here so that the in-process /chat app this unit
+          # also imports (dispatch._native_chat) shares ONE writable dir
+          # with the backend rather than a per-unit exception: a genuine
+          # user turn served through it lands where every reader looks.
+          # "-": ignored when the dir is absent (see hart-backend.nix for the
+          # server/edge boot failure the plain entry caused).
+          "-/run/hart/session"
         ];
         PrivateTmp = true;
         ProtectClock = true;
@@ -72,6 +84,16 @@ in
         RestrictSUIDSGID = true;
 
         # Resource limits — scale by variant
+        # Under hart-agents.slice (CPUWeight 40): this is the goal engine, the
+        # process whose forced ticks drive llama-server, and the agent slice
+        # is where agent work is meant to be arbitrated against the session
+        # (hart-session.slice at 200, holding hart-liquid-ui; both defined in
+        # hart-kernel.nix with the measured numbers). Until 2026-09-23 it sat
+        # in system.slice, outside that ratio. Coordinator decision, same
+        # day, alongside hart-llm's move: the owner's priority is the desk
+        # staying snappy. The slice's MemoryMax 80% and TasksMax 4096 sit
+        # above this unit's own caps below, so nothing tightens.
+        Slice = "hart-agents.slice";
         MemoryMax = if cfg.variant == "edge" then "128M"
                     else if cfg.variant == "desktop" then "512M"
                     else "1G";

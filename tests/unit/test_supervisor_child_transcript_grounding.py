@@ -1,24 +1,21 @@
-"""The hevolveai child is told to ground the spoken WORD, not just the sound.
+"""The hevolveai child grounds the spoken WORD with no environment knob.
 
-WHY: hevolveai's audio-ingest branch encodes the waveform and calls encode_text
-on the transcript only when HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING is set (its
-C265). That call is what stashes the per-token sequence its concept grounder
-names concepts from; without it every concept is named "token_0" and nothing
-consolidates or recalls (hevolveai Master 11.331).
+HISTORY: hevolveai's audio-ingest branch used to call encode_text on the
+transcript only when HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING was set (its C265), and
+this supervisor exported that flag. hevolveai a951136 (C265b) graduated it: the
+child now grounds any delivered transcript unconditionally and reads no such
+variable. The export became a dead knob whose comment promised an operator that
+=0 turns grounding off, which no longer holds (review 2026-09-22, F4).
 
-HARTOS already delivers the transcript (world_model_bridge sets `text` on the
-/v1/sensor/ingest body), and the 153-entry child environment did not carry the
-flag, so the words died at the child's door. This is the env-contract half; the
-consumer half lives in the hevolveai repo.
-
-Behavioural, in the same shape as test_supervisor_child_llm_url.py: call the
-real _build_env with a fake self and assert the env it returns. Covers: the
-default is ON, an operator override is preserved, and the flag rides the same
-dict the child is actually spawned with.
+What this file now pins: the supervisor does NOT hand the child that variable,
+so nobody reintroduces a switch the child ignores. The two cwd tests below are
+unrelated to the flag and unchanged.
 """
 import os
 import sys
+import tempfile
 import types
+from pathlib import Path
 from unittest.mock import patch
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -33,42 +30,30 @@ def _fake_self():
         api_url='http://127.0.0.1:8000', port=8000, pythonpath='')
 
 
-def test_transcript_grounding_defaults_on():
-    """Absent from the parent env -> the child still gets it ON.
-
-    This is the whole point: the flag was absent from production's child
-    environment, so spoken words never reached grounding.
-    """
+def test_the_graduated_grounding_flag_is_not_exported():
+    """The child no longer reads HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING (hevolveai
+    a951136). Exporting it would advertise an off switch that does nothing."""
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop('HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING', None)
         env = _Supervisor._build_env(_fake_self())
-    assert env['HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING'] == '1'
+    assert 'HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING' not in env, (
+        'the supervisor re-exported a flag the child ignores')
 
 
-def test_operator_can_still_turn_it_off():
-    """setdefault, not assignment: an explicit 0 survives.
-
-    Same contract as HEVOLVE_DEVICE, so an operator can disable transcript
-    grounding without editing HARTOS.
-    """
-    with patch.dict(os.environ,
-                    {'HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING': '0'},
-                    clear=False):
-        env = _Supervisor._build_env(_fake_self())
-    assert env['HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING'] == '0'
-
-
-def test_flag_rides_the_env_the_child_is_spawned_with():
-    """The value must be on the dict handed to Popen, not merely computed.
-
-    _build_popen is the single site that assembles the spawn kwargs, so
-    asserting there proves the flag reaches the actual child.
-    """
+def test_installed_child_uses_canonical_writable_data_cwd():
+    """The bundled Python child must not inherit Program Files as its cwd."""
     sup = _Supervisor.__new__(_Supervisor)
-    sup.api_url, sup.port, sup.pythonpath = 'http://127.0.0.1:8000', 8000, ''
     sup.repo_root, sup.repo_python = None, None
-    sup.python_exe = sys.executable
-    with patch.dict(os.environ, {}, clear=False):
-        os.environ.pop('HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING', None)
-        _cmd, kw = _Supervisor._build_popen(sup)
-    assert kw['env']['HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING'] == '1'
+    with tempfile.TemporaryDirectory() as tmp, \
+            patch('core.platform_paths.get_data_dir', return_value=tmp):
+        assert sup._child_working_dir() == str(Path(tmp).resolve())
+
+
+def test_repo_child_keeps_checkout_cwd():
+    """The installed-mode fix must preserve run_server.py repo semantics."""
+    sup = _Supervisor.__new__(_Supervisor)
+    sup.repo_root = Path('C:/work/hevolveai')
+    sup.repo_python = 'C:/Python310/python.exe'
+    with patch('core.platform_paths.get_data_dir') as get_data_dir:
+        assert sup._child_working_dir() == str(sup.repo_root)
+    get_data_dir.assert_not_called()

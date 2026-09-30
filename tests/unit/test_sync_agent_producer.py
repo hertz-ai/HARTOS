@@ -167,6 +167,19 @@ def test_register_agent_fires_up_sync(monkeypatch):
     assert user.user_type == 'agent'
 
 
+def _consent_db():
+    """A real session for grant_consent: the grant queues its broadcast on the
+    session's commit, which only a real Session has."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from integrations.social.models import UserConsent
+    engine = create_engine('sqlite://', poolclass=StaticPool,
+                           connect_args={'check_same_thread': False})
+    UserConsent.__table__.create(engine)
+    return sessionmaker(bind=engine, expire_on_commit=False)()
+
+
 # ── PRODUCER re-sync: grant public_exposure rises the owner's existing agents ─
 def test_grant_public_exposure_resyncs_owned_agents(monkeypatch):
     """create-before-consent ordering: granting public_exposure re-queues
@@ -180,12 +193,6 @@ def test_grant_public_exposure_resyncs_owned_agents(monkeypatch):
     monkeypatch.setattr('integrations.social.consent_service._audit', lambda *a, **k: None)
     monkeypatch.setattr('integrations.social.consent_service._emit', lambda *a, **k: None)
 
-    class _DB:
-        def add(self, obj):
-            pass
-
-        def flush(self):
-            pass
 
     synced = []
     monkeypatch.setattr('integrations.social.services.UserService.get_owned_agents',
@@ -193,7 +200,7 @@ def test_grant_public_exposure_resyncs_owned_agents(monkeypatch):
     monkeypatch.setattr(federation, 'sync_agent_to_parent',
                         lambda db, agent: synced.append(agent.id))
 
-    ConsentService.grant_consent(_DB(), 'owner-1', 'public_exposure')
+    ConsentService.grant_consent(_consent_db(), 'owner-1', 'public_exposure')
     assert synced == ['agent-9', 'agent-10']   # both owned agents re-synced
 
 
@@ -203,16 +210,10 @@ def test_grant_other_consent_does_not_resync(monkeypatch):
     monkeypatch.setattr('integrations.social.consent_service._audit', lambda *a, **k: None)
     monkeypatch.setattr('integrations.social.consent_service._emit', lambda *a, **k: None)
 
-    class _DB:
-        def add(self, obj):
-            pass
-
-        def flush(self):
-            pass
 
     def _must_not_run(db, uid):
         raise AssertionError("get_owned_agents must not be called for non-public consent")
     monkeypatch.setattr('integrations.social.services.UserService.get_owned_agents',
                         staticmethod(_must_not_run))
     # a 'data_access' grant must not touch the agent up-sync path
-    ConsentService.grant_consent(_DB(), 'owner-1', 'data_access')
+    ConsentService.grant_consent(_consent_db(), 'owner-1', 'data_access')

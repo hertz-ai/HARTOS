@@ -439,31 +439,49 @@ class TestResonanceEventEmission(unittest.TestCase):
 class TestLifecycleEventEmission(unittest.TestCase):
     """Test that action state changes emit events."""
 
-    @patch('core.platform.events.emit_event')
-    def test_auto_sync_emits_event(self, mock_emit):
+    # b597a9779: the state change is published AFTER the ledger write is
+    # accepted, never for a write the ledger refused.  The real
+    # agent_ledger.TaskStatus is used; only the ledger and its task are
+    # doubles, so the sync runs its production path end to end.
+
+    def _sync(self, write_accepted):
         from hartos.lifecycle_hooks import _auto_sync_to_ledger, _ledger_registry, ActionState
-
-        # Register a mock ledger
-        mock_ledger = MagicMock()
-        mock_ledger.tasks = {'action_42': MagicMock()}
-        _ledger_registry['test_prompt'] = mock_ledger
-
+        task = MagicMock()
+        task.is_owned = True            # no claim branch
+        task.is_terminal.return_value = False
+        task.is_sla_breached.return_value = False
+        ledger = MagicMock()
+        ledger.tasks = {'action_42': task}
+        ledger.update_task_status.return_value = write_accepted
+        _ledger_registry['test_prompt'] = ledger
         try:
-            with patch('hartos.lifecycle_hooks._get_ledger_task_status') as mock_status:
-                MockStatus = MagicMock()
-                MockStatus.IN_PROGRESS = 'IN_PROGRESS'
-                mock_status.return_value = MockStatus
-                _auto_sync_to_ledger('test_prompt', 42, ActionState.IN_PROGRESS)
-        except Exception:
-            pass  # Ledger sync may fail — we only care about event emission
+            ok = _auto_sync_to_ledger('test_prompt', 42, ActionState.IN_PROGRESS)
         finally:
             _ledger_registry.pop('test_prompt', None)
+        return ok, ledger
 
-        calls = [c for c in mock_emit.call_args_list
-                 if c[0][0] == 'action_state.changed']
-        self.assertGreaterEqual(len(calls), 1)
+    @staticmethod
+    def _state_events(mock_emit):
+        return [c for c in mock_emit.call_args_list
+                if c[0][0] == 'action_state.changed']
+
+    @patch('core.platform.events.emit_event')
+    def test_auto_sync_emits_event(self, mock_emit):
+        ok, ledger = self._sync(write_accepted=True)
+        self.assertIs(ok, True)
+        ledger.update_task_status.assert_called_once()
+        calls = self._state_events(mock_emit)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0][1]['action_id'], 42)
         self.assertEqual(calls[0][0][1]['state'], 'in_progress')
+        self.assertEqual(calls[0][0][1]['prompt'], 'test_prompt')
+
+    @patch('core.platform.events.emit_event')
+    def test_a_rejected_write_emits_nothing(self, mock_emit):
+        ok, ledger = self._sync(write_accepted=False)
+        self.assertIs(ok, False)
+        ledger.update_task_status.assert_called_once()
+        self.assertEqual(self._state_events(mock_emit), [])
 
 
 class TestInferenceEventEmission(unittest.TestCase):

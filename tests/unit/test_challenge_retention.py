@@ -76,6 +76,20 @@ class ChallengeRetentionTest(unittest.TestCase):
         self.assertEqual(r['deleted_timeout'], 3)
         self.assertEqual(self._count('timeout'), 0)
 
+    def test_old_inconclusive_is_deleted(self):
+        """An 'inconclusive' code_hash_check (a hash changed between two
+        unregistered builds, nothing proven either way) is non-forensic
+        telemetry like a timeout, and expires on the same clock."""
+        _mk(self.db, 'inconclusive', age_days=45, n=2)
+        r = IntegrityService.prune_challenge_history(self.db)
+        self.assertEqual(r.get('deleted_inconclusive'), 2)
+        self.assertEqual(self._count('inconclusive'), 0)
+
+    def test_recent_inconclusive_survives(self):
+        _mk(self.db, 'inconclusive', age_days=1, n=2)
+        IntegrityService.prune_challenge_history(self.db)
+        self.assertEqual(self._count('inconclusive'), 2)
+
     # ── what must survive ──────────────────────────────────────────────
     def test_recent_passed_survives(self):
         _mk(self.db, 'passed', age_days=1, n=4)

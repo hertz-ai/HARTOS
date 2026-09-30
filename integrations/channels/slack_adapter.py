@@ -627,3 +627,13 @@ def create_slack_adapter(
         extra={"app_token": app_token, **kwargs},
     )
     return SlackAdapter(config)
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+ENV_SECRETS = (
+    'SLACK_APP_TOKEN',
+    'SLACK_BOT_TOKEN',
+)

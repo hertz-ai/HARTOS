@@ -118,13 +118,17 @@ class TestEngineSelection:
         # GPU-only Hindi engines excluded
         assert 'indic_parler' not in engine_ids
 
-    def test_always_has_espeak_fallback(self, router):
+    def test_espeak_is_the_fallback_where_espeak_exists(self, router):
+        """espeak is bundled on the shipped OS, so it is the last rung
+        there.  It is NOT unconditional: a desktop without the binary was
+        handed it anyway until 2026-09-21 (see
+        tests/unit/test_tts_engine_availability_is_the_engine.py)."""
         with patch('integrations.channels.media.tts_router._get_gpu_info',
                    return_value={'cuda_available': False}), \
              patch('integrations.channels.media.tts_router._get_compute_policy',
                    return_value={'compute_policy': 'local_only'}), \
              patch('integrations.channels.media.tts_router._is_engine_installed',
-                   return_value=False):
+                   side_effect=lambda eid: eid == 'espeak'):
             candidates = router.select_engines("Hello", language='en')
             engine_ids = [c.engine.engine_id for c in candidates]
             assert 'espeak' in engine_ids
@@ -284,6 +288,84 @@ class TestVoiceClone:
             if c.engine.engine_id != 'espeak':  # espeak is always added as fallback
                 assert c.engine.voice_clone is True
 
+    @patch('integrations.channels.media.tts_router._get_gpu_info',
+           return_value={'cuda_available': True, 'free_gb': 3.2})
+    @patch('integrations.channels.media.tts_router._can_fit_on_gpu', return_value=True)
+    @patch('integrations.channels.media.tts_router._get_compute_policy',
+           return_value={'compute_policy': 'local_preferred'})
+    @patch('integrations.channels.media.tts_router._is_engine_installed',
+           return_value=True)
+    def test_english_clone_ladder_offers_f5(self, mock_inst, mock_pol, mock_fit, mock_gpu, router):
+        """F5-TTS clones English at a 2.5 GB budget, the one cloner that fits
+        beside a resident LLM on an 8 GB card, yet the English ladder never
+        listed it: the 2026-09-20 voiced turn tried chatterbox_turbo, then
+        xtts_v2, then fell back to Piper's default voice without F5 ever being
+        a candidate.  The ladder lists it right after xtts_v2; the default
+        ('normal') ranking then weighs quality 0.6 and latency 0.4, and F5's
+        200 ms against xtts_v2's 350 ms at near-equal quality (0.91 vs 0.92)
+        puts F5 ahead of xtts_v2 in the order the voiced turn will try."""
+        candidates = router.select_engines(
+            "Hello", language='en', require_clone=True,
+        )
+        engine_ids = [c.engine.engine_id for c in candidates]
+        assert 'f5_tts' in engine_ids, engine_ids
+        assert engine_ids.index('f5_tts') < engine_ids.index('xtts_v2'), engine_ids
+
+
+# ═══════════════════════════════════════════════════════════════
+# Installed check for venv-quarantined engines
+# ═══════════════════════════════════════════════════════════════
+
+class TestInstalledCheckHonoursTheVenv:
+    """An engine with install_target='venv' runs from its own venv
+    (core.venv_paths, the one resolver the installer and the spawn share).
+    The app-side tool module always imports, so that alone said "installed"
+    for xtts_v2 on 2026-09-20 with no venv on the box: every voiced turn
+    spent 27 s on a worker that died at import.  Measured, not assumed:
+    the installed check now asks the same resolver the spawn will use."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self, monkeypatch):
+        from integrations.channels.media import tts_router
+        monkeypatch.setattr(tts_router, '_engine_available_cache', {})
+
+    def test_venv_engine_without_its_venv_is_not_installed(self, monkeypatch):
+        from integrations.channels.media import tts_router
+        monkeypatch.setattr('core.venv_paths.venv_python_if_exists',
+                            lambda backend: None)
+        assert tts_router.ENGINE_REGISTRY['f5_tts'].install_target == 'venv'
+        assert tts_router._is_engine_installed('f5_tts') is False
+        assert tts_router._is_engine_installed('xtts_v2') is False
+
+    def test_venv_engine_with_its_venv_is_installed(self, monkeypatch, tmp_path):
+        from integrations.channels.media import tts_router
+        seen = []
+
+        def _venv(backend):
+            seen.append(backend)
+            return str(tmp_path / backend / 'python.exe')
+
+        monkeypatch.setattr('core.venv_paths.venv_python_if_exists', _venv)
+        # The venv must also HOLD the engine: a failed install leaves the
+        # directory behind, and the worker then dies at import after the
+        # turn has already waited on its startup.
+        monkeypatch.setattr('core.venv_paths.venv_site_packages',
+                            lambda backend: str(tmp_path / backend / 'site'))
+        monkeypatch.setattr(tts_router, '_package_importable',
+                            lambda package, search_path=None: True)
+        assert tts_router._is_engine_installed('f5_tts') is True
+        assert seen == ['f5_tts'], "the check must ask by the engine id the spawn uses"
+
+    def test_main_target_engine_is_unaffected_by_the_venv_resolver(self, monkeypatch):
+        from integrations.channels.media import tts_router
+        calls = []
+        monkeypatch.setattr('core.venv_paths.venv_python_if_exists',
+                            lambda backend: calls.append(backend))
+        spec = tts_router.ENGINE_REGISTRY['pocket_tts']
+        assert spec.install_target != 'venv'
+        tts_router._is_engine_installed('pocket_tts')
+        assert calls == []
+
 
 # ═══════════════════════════════════════════════════════════════
 # Fallback Chain
@@ -301,8 +383,8 @@ class TestFallbackChain:
     @patch('integrations.channels.media.tts_router._get_compute_policy',
            return_value={'compute_policy': 'local_only'})
     @patch('integrations.channels.media.tts_router._is_engine_installed',
-           return_value=False)
-    def test_all_engines_unavailable_still_has_espeak(self, mock_inst, mock_pol, mock_gpu, router):
+           side_effect=lambda eid: eid == 'espeak')
+    def test_all_neural_engines_unavailable_still_has_espeak(self, mock_inst, mock_pol, mock_gpu, router):
         candidates = router.select_engines("Hello", language='en')
         assert len(candidates) >= 1
         assert candidates[-1].engine.engine_id == 'espeak'

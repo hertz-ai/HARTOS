@@ -162,8 +162,13 @@ class AiderNativeBackend(CodingToolBackend):
                 'error': 'LLM completion failed',
             }
 
-        # Parse edit blocks from response and apply them
-        applied_edits = self._apply_edits(response, working_dir, files)
+        # Parse edit blocks from response and apply them. A caller that
+        # declares the files it may change sets restrict_edits_to_files, and
+        # edits to any other file are then refused (autoresearch uses this so
+        # the loop cannot edit the harness that scores it).
+        applied_edits = self._apply_edits(
+            response, working_dir, files,
+            restrict_to_files=bool(context.get('restrict_edits_to_files')))
 
         output_parts = [response]
         if applied_edits:
@@ -286,18 +291,35 @@ class AiderNativeBackend(CodingToolBackend):
         return '\n'.join(parts)
 
     def _apply_edits(self, response: str, working_dir: str,
-                     files: List[str]) -> List[Dict]:
-        """Parse SEARCH/REPLACE blocks from LLM response and apply them."""
+                     files: List[str],
+                     restrict_to_files: bool = False) -> List[Dict]:
+        """Parse SEARCH/REPLACE blocks from LLM response and apply them.
+
+        CONTAINMENT, always: the file name comes from the LLM's reply, and
+        `Path(working_dir) / name` escapes the working directory for '../x'
+        and is REPLACED outright by an absolute name, so an in-process edit
+        could rewrite any existing file this process can write. Every target
+        is resolved and must lie inside working_dir, or it is refused.
+        With restrict_to_files, a target must also be one of `files`.
+        """
         from .aider_core.coders.search_replace import (
             flexible_search_and_replace, editblock_strategies,
         )
 
         edits = self._parse_edit_blocks(response)
         results = []
+        root = Path(working_dir).resolve()
+        allowed = ({(root / f).resolve() for f in files}
+                   if restrict_to_files else None)
 
         for edit in edits:
             fname = edit['file']
-            fpath = Path(working_dir) / fname
+            fpath, refusal = self._resolve_edit_target(root, fname, allowed)
+            if fpath is None:
+                results.append({'file': fname, 'status': 'refused',
+                                'reason': refusal})
+                logger.warning(f"Refused edit to {fname!r}: {refusal}")
+                continue
 
             if not fpath.exists():
                 results.append({'file': fname, 'status': 'skipped', 'reason': 'file not found'})
@@ -325,6 +347,22 @@ class AiderNativeBackend(CodingToolBackend):
                 results.append({'file': fname, 'status': 'error', 'reason': str(e)})
 
         return results
+
+    @staticmethod
+    def _resolve_edit_target(root: Path, fname: str, allowed) -> tuple:
+        """(resolved path, '') if an LLM-named file may be edited, else
+        (None, reason). The target must resolve inside `root`, and inside
+        `allowed` when a declared set is given (see _apply_edits)."""
+        fpath = (root / fname).resolve()
+        try:
+            inside = os.path.commonpath([str(root), str(fpath)]) == str(root)
+        except ValueError:  # different drive on Windows: outside by definition
+            inside = False
+        if not inside:
+            return None, 'path escapes working_dir'
+        if allowed is not None and fpath not in allowed:
+            return None, 'not one of the declared files'
+        return fpath, ''
 
     @staticmethod
     def _parse_edit_blocks(response: str) -> List[Dict]:

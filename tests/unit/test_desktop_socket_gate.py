@@ -30,10 +30,13 @@ from security.middleware import _apply_api_auth, install_api_gate  # noqa: E402
 
 LAN = {'REMOTE_ADDR': '192.168.0.50'}
 LOOPBACK = {'REMOTE_ADDR': '127.0.0.1'}
-GATED = ['/chat', '/prompts', '/api/nunba/settings', '/api/admin/ping']
+GATED = ['/chat', '/prompts', '/api/nunba/settings', '/api/admin/ping',
+         '/ready']
 PEER = ['/api/social/peers/announce', '/api/social/peers/health',
         '/api/social/federation/inbox', '/status', '/a2a/agents',
-        '/.well-known/agent.json']
+        '/.well-known/agent.json',
+        # the liveness probe a phone sends before adopting the node
+        '/health']
 
 # The steps _run_bootstrap runs inside its setup-lock window, stubbed so the
 # wiring can be driven without a real boot.
