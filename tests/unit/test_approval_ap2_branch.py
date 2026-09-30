@@ -66,14 +66,16 @@ def ctx(app, tmp_path):
                'ledger': ledger, 'drafts': drafts, 'mcg': mcg, 'push': push}
 
 
-def _answer(ctx, action, decision='approve', user=OWNER, body_user=None):
+def _answer(ctx, action, decision='approve', user=OWNER, body_user=None,
+            remote=None):
     headers = {}
     if user:
         headers['Authorization'] = 'Bearer ' + generate_jwt(user, user, tenant_id='mcgroce')
     body = {'agent_id': 'mcgroce', 'action': action, 'decision': decision}
     if body_user:
         body['user_id'] = body_user
-    return ctx['client'].post('/api/agent/approval', json=body, headers=headers)
+    return ctx['client'].post('/api/agent/approval', json=body, headers=headers,
+                              environ_base={'REMOTE_ADDR': remote} if remote else {})
 
 
 class TestAp2Pay:
@@ -98,8 +100,24 @@ class TestAp2Pay:
 
     def test_no_token_is_401(self, ctx):
         m = ctx['mandates'].create_cart_mandate(OWNER, 'mcgroce', CART)
-        r = _answer(ctx, f'ap2_pay:{m.payment_id}', user=None, body_user=OWNER)
+        r = _answer(ctx, f'ap2_pay:{m.payment_id}', user=None, body_user=OWNER,
+                    remote='203.0.113.9')
         assert r.status_code == 401
+        assert ctx['mandates'].get(m.mandate_id).status == 'pending'
+
+    def test_local_tokenless_answer_is_the_signed_in_owner(self, ctx, monkeypatch):
+        # The shell JS / landing-page overlay / phone send no Bearer.
+        monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', OWNER)
+        m = ctx['mandates'].create_cart_mandate(OWNER, 'mcgroce', CART)
+        r = _answer(ctx, f'ap2_pay:{m.payment_id}', user=None)
+        assert r.status_code == 200 and r.get_json()['status'] == 'approved'
+        assert ctx['ledger'].get_payment(m.payment_id).status == PaymentStatus.COMPLETED
+
+    def test_local_tokenless_answer_never_takes_the_body_user(self, ctx, monkeypatch):
+        monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', OTHER)
+        m = ctx['mandates'].create_cart_mandate(OWNER, 'mcgroce', CART)
+        r = _answer(ctx, f'ap2_pay:{m.payment_id}', user=None, body_user=OWNER)
+        assert r.status_code == 403
         assert ctx['mandates'].get(m.mandate_id).status == 'pending'
 
     def test_decline_rejects_and_cancels(self, ctx):
