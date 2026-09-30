@@ -154,7 +154,14 @@ def reopen_owner_feed_answers():
     process-wide gate (the owner's No); the next test starts with no answer
     on record, as a fresh process does."""
     yield
-    from core import ai_sensing
+    # Only if a test loaded the real module -- never import it here.  An
+    # import in teardown binds `core.ai_sensing` on the package, and
+    # `import core.ai_sensing as x` resolves that attribute BEFORE
+    # sys.modules, so every later test's sys.modules fake of it
+    # (tests/unit/test_drm_capture_gate.py) silently got the real gate.
+    ai_sensing = sys.modules.get('core.ai_sensing')
+    if ai_sensing is None or not hasattr(ai_sensing, '_withheld'):
+        return
     with ai_sensing._lock:
         for sensor in ai_sensing._withheld:
             ai_sensing._withheld[sensor] = False

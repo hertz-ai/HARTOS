@@ -2419,14 +2419,23 @@ _crossbar_client_lock = threading.Lock()
 
 
 def _http_crossbar_publish(topic: str, payload: str, timeout: float = 2.0):
-    """Use the publisher's timeout; never change another socket's defaults."""
+    """Use the publisher's timeout; never change another socket's defaults.
+
+    An unreachable Crossbar is an ordinary state (an offline node), so a
+    topic's failure is announced once when it starts and once when it ends,
+    not as a traceback per publish.  Tracked per topic (``.failing_topics``,
+    under the client lock the publish already holds): one global flag let two
+    workers both warn, and let one always-failing topic beside healthy ones
+    flip it -- a warning and a "recovered" line per publish.
+    """
     if client is None:
         return
-    try:
-        # The installed crossbarhttp3 distribution exposes crossbarhttp.Client.
-        # Its timeout and signed-message sequence are mutable client state.
-        # Serialize only this cloud leg; local/SSE/PeerLink fanout stays async.
-        with _crossbar_client_lock:
+    error = None
+    # The installed crossbarhttp3 distribution exposes crossbarhttp.Client.
+    # Its timeout and signed-message sequence are mutable client state.
+    # Serialize only this cloud leg; local/SSE/PeerLink fanout stays async.
+    with _crossbar_client_lock:
+        try:
             if hasattr(client, 'timeout'):
                 previous = client.timeout
                 try:
@@ -2438,8 +2447,23 @@ def _http_crossbar_publish(topic: str, payload: str, timeout: float = 2.0):
                 # Preserve alternate SDK compatibility. Its implementation
                 # owns its timeout; process-global socket mutation is unsafe.
                 client.publish(topic, payload)
-    except Exception:
-        logging.getLogger(__name__).exception("_http_crossbar_publish: swallowed Exception")
+        except Exception as e:
+            error = e
+        failing = _http_crossbar_publish.__dict__.setdefault(
+            'failing_topics', set())
+        log = logging.getLogger(__name__)
+        if error is None:
+            if topic in failing:
+                failing.discard(topic)
+                log.info("Crossbar publish recovered for %s", topic)
+        elif topic in failing or len(failing) >= 1000:
+            log.debug("Crossbar publish still failing for %s: %s", topic, error)
+        else:
+            failing.add(topic)
+            log.warning("Crossbar publish failing for %s (cloud copy not "
+                        "sent; local/PeerLink delivery unaffected): %s: %s -- "
+                        "repeats are logged at debug until it recovers",
+                        topic, type(error).__name__, error)
 
 
 # Inject HTTP transport into MessageBus (avoids Layer 2 importing Layer 3)

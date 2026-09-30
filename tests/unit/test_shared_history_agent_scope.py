@@ -18,8 +18,8 @@ messages of ALL of that user's agents and daemon goals.
 
     python -m pytest tests/unit/test_shared_history_agent_scope.py -q
 """
+import ast
 import importlib
-import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -100,35 +100,56 @@ def test_writeback_stamps_the_agent(sh):
     assert [m['content'] for m in seed] == ['remember BLUEFIN9']
 
 
-_REUSE = (_ROOT / 'hartos' / 'reuse_recipe.py').read_text(encoding='utf-8')
-_CREATE = (_ROOT / 'hartos' / 'create_recipe.py').read_text(encoding='utf-8')
+def test_create_writes_the_buffer_through_the_shared_writer(sh):
+    """create_recipe's ingest hook wrote the buffer inline, unstamped.  It
+    goes through the shared installer (record_autogen_message) so the agent
+    stamp has one home: what the create group says is seeded back to THAT
+    agent, and to no other."""
+    from hartos.create_recipe import _install_create_group_writeback
+    gc = SimpleNamespace(messages=[])
+    assert _install_create_group_writeback(gc, 'u-create', 444,
+                                           'u-create_444') is True
+    gc.messages.append({'role': 'user', 'content': 'remember MARLIN7',
+                        'name': 'User'})
+    time.sleep(0.8)  # the buffer flush is a 150 ms coalesced timer
+    assert [m['content'] for m in sh.seed_autogen_from_shared_history(
+        'u-create', max_messages=8, prompt_id=444)] == ['remember MARLIN7']
+    assert sh.seed_autogen_from_shared_history(
+        'u-create', max_messages=8, prompt_id=555) == []
 
 
-def test_every_seed_call_passes_the_agent():
-    calls = []
-    for name, src in (('reuse_recipe', _REUSE), ('create_recipe', _CREATE)):
-        for args in re.findall(r'seed_autogen_from_shared_history\(([^)]*)\)',
-                               src):
-            calls.append(args)
-            assert 'prompt_id=' in args, (
-                f"{name}: seed without the agent's prompt_id: ({args})")
-    for args in re.findall(r'_seed_messages\(([^)]*)\)', _CREATE):
-        calls.append(args)
-        assert 'prompt_id' in args, (
-            f"create_recipe: _seed_messages without prompt_id: ({args})")
+def _calls(module, func):
+    """Every call to ``func`` in hartos/<module>.py, parsed (not matched as
+    text: a regex over the argument list stops at the first ')' of a
+    nested call and misses a keyword after it)."""
+    tree = ast.parse((_ROOT / 'hartos' / f'{module}.py').read_text(
+        encoding='utf-8'))
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+            and getattr(n.func, 'id', getattr(n.func, 'attr', None)) == func]
+
+
+def _passes_prompt_id(call):
+    return any(k.arg == 'prompt_id' for k in call.keywords) or any(
+        isinstance(a, ast.Name) and a.id == 'prompt_id' for a in call.args)
+
+
+def test_source_guard_every_seed_call_passes_the_agent():
+    """Every seed of an autogen group names the agent, or it is seeded with
+    all of the user's agents (the live echo above).  Across two modules'
+    call sites, so a source guard; the behaviour is tested above."""
+    calls = [(m, c) for m in ('reuse_recipe', 'create_recipe')
+             for c in _calls(m, 'seed_autogen_from_shared_history')]
+    calls += [('create_recipe', c) for c in _calls('create_recipe', '_seed_messages')]
     assert calls, "no seed call found -- the guard would be vacuous"
+    for module, call in calls:
+        assert _passes_prompt_id(call), (
+            f"{module}:{call.lineno}: seed without the agent's prompt_id")
 
 
-def test_every_writeback_call_passes_the_agent():
-    calls = re.findall(r'install_history_writeback\(([^)]*)\)', _REUSE)
+def test_source_guard_every_writeback_call_passes_the_agent():
+    calls = [(m, c) for m in ('reuse_recipe', 'create_recipe')
+             for c in _calls(m, 'install_history_writeback')]
     assert calls, "no write-back call found -- the guard would be vacuous"
-    for args in calls:
-        assert 'prompt_id=' in args, (
-            f"reuse_recipe: write-back without the agent's prompt_id: ({args})")
-
-
-def test_create_writes_the_buffer_through_the_shared_writer():
-    """create_recipe's ingest hook wrote the buffer inline.  It goes through
-    shared_history.record_autogen_message so the stamp has one home."""
-    assert 'hist.add_message(' not in _CREATE
-    assert 'record_autogen_message(' in _CREATE
+    for module, call in calls:
+        assert _passes_prompt_id(call), (
+            f"{module}:{call.lineno}: write-back without the agent's prompt_id")

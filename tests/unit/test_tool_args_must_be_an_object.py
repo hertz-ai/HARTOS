@@ -233,7 +233,10 @@ class RefusedStandInNeverRuns(_Executor):
     def test_a_stand_in_repeated_as_a_call_is_refused_by_name(self):
         # If a model copies the stand-in into a new call, the tool is not run
         # with it, and the reply says why.
-        stand_in = _guarded('[1,2]')
+        # str(): a model's new call is plain text.  _guarded returns the
+        # history's _CallArguments, which remembers the ORIGINAL [1,2], so
+        # passing it back would test the first refusal, not the copy.
+        stand_in = str(_guarded('[1,2]'))
         ok, reply = self.run_sync('send_message_to_user', stand_in)
         self.assertFalse(ok)
         self.assertEqual(self.calls, [])
@@ -255,7 +258,7 @@ class RefusedStandInAndKwargsTools(_Executor):
 
         self.agent.register_function(
             {'lenient': self.agent._wrap_function(lenient)})
-        ok, reply = self.run_sync('lenient', _guarded('[1,2]'))
+        ok, reply = self.run_sync('lenient', str(_guarded('[1,2]')))
         self.assertFalse(ok)
         self.assertEqual(seen, [])
         self.assertIn('refused', reply['content'])

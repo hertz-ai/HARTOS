@@ -26,12 +26,14 @@ from core.tool_logging import log_tool_execution
 from hartos.helper import force_apply_autogen_json_fix
 
 # Unquoted value, the shape of the 2026-09-22 08:23:01 event.
-UNQUOTED = ('{"text": Financial Dashboard Revenue (Monthly): - Trading: '
-            '$10,000\n- Consulting: $5,000\n- Education: $2,500\n- TOTAL: '
-            '$17,500 Net Profit Margin: 28.6%}')
+from tests.unit.json_repair_split import UNQUOTED, old_json_repair_split
 
 
 class _Base(unittest.TestCase):
+
+    # The tests pin the refusal of json_repair's split; replay it unless a
+    # class is about the installed library itself.
+    replay_old_split = True
 
     def setUp(self):
         self._orig = (ConversableAgent.execute_function,
@@ -42,6 +44,13 @@ class _Base(unittest.TestCase):
                            return_value=None)
         vault.start()
         self.addCleanup(vault.stop)
+        # These tests pin the refusal of json_repair's split, which
+        # json-repair >= 0.59.4 no longer makes for UNQUOTED: replay it
+        # (tests/unit/json_repair_split.py).
+        if self.replay_old_split:
+            split = old_json_repair_split()
+            split.__enter__()
+            self.addCleanup(split.__exit__, None, None, None)
 
         self.calls = []
 
@@ -222,6 +231,33 @@ class ValidArgumentsStillRun(_Base):
         self.assertIn('Missing required argument(s): text', reply['content'])
         self.assertNotIn('Unknown', reply['content'])
         self.assertEqual(len(seen), 1)
+
+
+class TheInstalledJsonRepairKeepsTheValueWhole(_Base):
+    """The same logged call through the real json-repair (requirements pin
+    >= 0.59.4): the unquoted value comes back whole, so the message the model
+    wrote is delivered in full instead of refused.  If a json-repair release
+    splits it again, this fails, and the refusal tests above say what the
+    executor then does."""
+
+    replay_old_split = False
+
+    def test_the_repair_keeps_the_whole_message(self):
+        import json
+        from hartos.helper import repair_json
+        self.assertEqual(json.loads(repair_json(UNQUOTED)),
+                         {'text': UNQUOTED[len('{"text": '):-1]})
+
+    def test_the_logged_call_delivers_the_whole_message(self):
+        ok, reply = self.run_sync('send_message_to_user', UNQUOTED)
+        self.assertTrue(ok, reply)
+        self.assertEqual(self.calls, [('sync', UNQUOTED[len('{"text": '):-1],
+                                       '', 'Neutral')])
+
+    def test_the_logged_call_delivers_the_whole_message_async(self):
+        ok, reply = self.run_async('text_2_image', UNQUOTED)
+        self.assertTrue(ok, reply)
+        self.assertEqual(self.calls, [('async', UNQUOTED[len('{"text": '):-1])])
 
 
 class SourceGuardOneParseAndBind(unittest.TestCase):

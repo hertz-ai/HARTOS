@@ -226,6 +226,10 @@ class TestOneAnswerForTheWorkerInterpreter:
 
         monkeypatch.setattr(ds.subprocess, "Popen",
                             lambda cmd, **kw: seen.append(cmd) or _Proc())
+        # frozen_app sets sys.platform='win32'; on a Linux runner the
+        # Windows-only flag the win32 branch reads does not exist.
+        monkeypatch.setattr(ds.subprocess, "CREATE_NO_WINDOW", 0x08000000,
+                            raising=False)
         svc = ds.DiarizationService.__new__(ds.DiarizationService)
         svc._port = 1
         svc._process = None

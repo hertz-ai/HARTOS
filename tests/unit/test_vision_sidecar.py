@@ -13,6 +13,17 @@ from unittest.mock import patch, MagicMock, PropertyMock
 
 # ─── FrameStore Tests ───
 
+
+@pytest.fixture(autouse=True)
+def _no_saved_feed_answers(monkeypatch):
+    """VisionService() loads the saved camera/screen answers (53ddce89).
+    These tests have no consent DB, and an unreadable one closes both feeds
+    by design (fail-closed), so every frame here would be dropped.  They are
+    not about consent: stand in a node with no answer on file, where the
+    feeds stay open.  The fail-closed restore is tested with the gate."""
+    import integrations.vision.vision_service as vs
+    monkeypatch.setattr(vs, 'restore_feed_answers', lambda: None)
+
 class TestFrameStore:
     """Thread-safe in-process frame store."""
 

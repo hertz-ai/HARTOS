@@ -118,11 +118,23 @@ def test_node_stop_with_nothing_running(client):
     assert resp.get_json()['status'] == 'no_active_session'
 
 
-def test_node_stop_is_logged_with_its_count(hie, client, loops, caplog, monkeypatch):
-    # Outside the bundle app.logger keeps its own handlers and does not
-    # propagate (hart_intelligence_entry.py:1019-1023); caplog listens on root.
-    monkeypatch.setattr(hie.app.logger, 'propagate', True)
-    with caplog.at_level(logging.WARNING):
+def test_node_stop_is_logged_with_its_count(hie, client, loops):
+    # Counted with a handler of our own on app.logger, the logger the route
+    # writes to.  caplog counted each line twice under pytest 9.1: it also
+    # attaches its capture handler to app.logger, and the propagate=True this
+    # test set to reach root's handler delivered the same record there again.
+    # The route logs once; this measures exactly that.
+    seen = []
+
+    class _Lines(logging.Handler):
+        def emit(self, record):
+            if 'node-wide' in record.getMessage():
+                seen.append(record.getMessage())
+
+    handler = _Lines(logging.WARNING)
+    hie.app.logger.addHandler(handler)
+    try:
         client.post('/api/vlm/stop', json={'scope': 'node'})
-    lines = [r.getMessage() for r in caplog.records if 'node-wide' in r.getMessage()]
-    assert len(lines) == 1 and '2 loop(s)' in lines[0], lines
+    finally:
+        hie.app.logger.removeHandler(handler)
+    assert len(seen) == 1 and '2 loop(s)' in seen[0], seen

@@ -186,7 +186,8 @@ def test_the_checked_in_baseline_parses_and_names_real_test_files():
     """Every entry must point at a test file that exists, or it can never be
     matched and only hides a real regression under a dead name."""
     known = ratchet.load_baseline(os.path.join(_REPO, 'tests', 'ci_known_failures.txt'))
-    assert known
+    # An empty list is the goal (every test green on main), not a vacuous
+    # check: the reading of each line is test_baseline_lines' job.
     for test_id in known:
         module_path = test_id.split('::')[0]
         if not module_path.endswith('.py'):
