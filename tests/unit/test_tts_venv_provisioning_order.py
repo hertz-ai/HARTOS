@@ -45,10 +45,14 @@ ENGINES = [('a_venv', 'venv'), ('b_venv', 'venv'), ('main_one', 'main'),
 
 @pytest.fixture
 def registry(monkeypatch):
-    tr = types.ModuleType('integrations.channels.media.tts_router')
-    tr.ENGINE_REGISTRY = {e: _Spec(e, t) for e, t in ENGINES}
-    monkeypatch.setitem(sys.modules, 'integrations.channels.media.tts_router', tr)
-    return tr.ENGINE_REGISTRY
+    # Attributes on the real modules, never a sys.modules swap: a swapped-in
+    # module that was not imported yet is deleted on restore, and the next
+    # import rebuilds it (a second UserConsent class broke a later consent
+    # test in the same run).
+    from integrations.channels.media import tts_router as tr
+    fake = {e: _Spec(e, t) for e, t in ENGINES}
+    monkeypatch.setattr(tr, 'ENGINE_REGISTRY', fake)
+    return fake
 
 
 @pytest.fixture
@@ -99,13 +103,12 @@ def consent(monkeypatch):
     def db_session(commit=False):
         yield object()
 
-    svc = types.ModuleType('integrations.social.consent_service')
-    svc.ConsentService = _Consent
-    models = types.ModuleType('integrations.social.models')
-    models.db_session = db_session
-    monkeypatch.setitem(sys.modules, 'integrations.social.consent_service', svc)
-    monkeypatch.setitem(sys.modules, 'integrations.social.models', models)
+    from integrations.social import consent_service as svc, models
+    monkeypatch.setattr(svc, 'ConsentService', _Consent)
+    monkeypatch.setattr(models, 'db_session', db_session)
     monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'owner-1')
+    state['ConsentService'] = _Consent
+    state['models'] = models
     return state
 
 
@@ -197,9 +200,8 @@ def test_a_grant_after_a_no_is_not_a_decline(consent, monkeypatch):
     """ConsentService.declined is to be asked only after check_consent
     failed: a newer grant covers an older no."""
     consent['answers']['tts:x'] = 'yes'
-    monkeypatch.setattr(
-        sys.modules['integrations.social.consent_service'].ConsentService,
-        'declined', staticmethod(lambda *a, **k: True))
+    monkeypatch.setattr(consent['ConsentService'], 'declined',
+                        staticmethod(lambda *a, **k: True))
     assert cs.setup_declined('tts:x') is False
 
 
@@ -214,7 +216,7 @@ def test_setup_declined_is_false_with_no_owner_or_no_store(consent, monkeypatch)
         raise RuntimeError('db down')
         yield
 
-    monkeypatch.setattr(sys.modules['integrations.social.models'], 'db_session', broken)
+    monkeypatch.setattr(consent['models'], 'db_session', broken)
     assert cs.setup_declined('tts:x') is False
 
 
@@ -241,7 +243,7 @@ def test_an_owner_whose_store_is_down_is_not_told_there_is_no_owner(
         raise RuntimeError('db down')
         yield
 
-    monkeypatch.setattr(sys.modules['integrations.social.models'], 'db_session', broken)
+    monkeypatch.setattr(consent['models'], 'db_session', broken)
     got = _repair('a_venv')
     assert got['consent'] == 'unavailable'
     assert got['no_owner'] is False

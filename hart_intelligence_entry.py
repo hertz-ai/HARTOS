@@ -7035,15 +7035,24 @@ def get_frame(user_id):
                     f"Frame for user_id {user_id} from FrameStore")
                 return frame[:, :, ::-1]  # BGR → RGB
 
-    # Desktop screenshot fallback (for computer use mode)
-    try:
-        from PIL import ImageGrab
-        screenshot = ImageGrab.grab()
-        frame = np.array(screenshot)
-        app.logger.info(f"Frame for user_id {user_id} from desktop screenshot ({frame.shape})")
-        return frame  # Already RGB
-    except Exception as _ss_err:
-        app.logger.debug(f"Screenshot fallback failed: {_ss_err}")
+    # Desktop screenshot fallback (for computer use mode), behind the same
+    # gate _handle_screenshot_tool reads (core.ai_sensing.allowed: the eye
+    # button's cut, or the owner's No to the screen).  Ungated, a No to both
+    # feeds emptied the FrameStore and this fallback then handed
+    # Visual_Context_Camera the desktop the owner had just refused (review
+    # of 55a6cde43 / 00fc7a37b, measured).
+    from core.ai_sensing import allowed
+    if allowed('screen'):
+        try:
+            from PIL import ImageGrab
+            screenshot = ImageGrab.grab()
+            frame = np.array(screenshot)
+            app.logger.info(f"Frame for user_id {user_id} from desktop screenshot ({frame.shape})")
+            return frame  # Already RGB
+        except Exception as _ss_err:
+            app.logger.debug(f"Screenshot fallback failed: {_ss_err}")
+    else:
+        app.logger.info(f"No screenshot for user_id {user_id}: the screen sense is off")
 
     # Last resort: Redis (legacy camera path)
     if redis_client is None:
