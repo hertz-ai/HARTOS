@@ -72,4 +72,34 @@ def parse_topic(topic: Optional[str]) -> ParsedTopic:
     )
 
 
-__all__ = ['parse_topic', 'ParsedTopic']
+def topic_open_to(topic: Optional[str], user_id, publish: bool = False) -> bool:
+    """Is a non-tenant ``topic`` one ``user_id`` may publish or subscribe?
+
+    The one answer both gates ask (publish: realtime._authorize_topic_for_
+    user_id; subscribe: tenant_acl.authorize_subscribe), built only from the
+    canonical tables:
+      * everyone's topic -- core.platform.events.topic_audience says
+        AUDIENCE_EVERYONE (community feeds, vote scores, node infra); to
+        PUBLISH one it must also be a server broadcast
+        (events.topic_is_server_broadcast);
+      * a bus topic whose Crossbar URI is per-user (chat.social ->
+        com.hertzai.hevolve.social.{user_id}): MessageBus substitutes the
+        publisher's own id, so only their devices receive it;
+      * a concrete topic that names the user (security.edge_privacy
+        .uri_names_user).
+    A one-person topic is never everyone's.  No user, no per-user answer.
+    """
+    if not topic:
+        return False
+    from core.platform.events import (
+        AUDIENCE_EVERYONE, topic_audience, topic_is_server_broadcast)
+    if topic_audience(topic) == AUDIENCE_EVERYONE:
+        return topic_is_server_broadcast(topic) if publish else True
+    if not user_id:
+        return False
+    from core.peer_link.message_bus import crossbar_topic_is_per_user
+    from security.edge_privacy import uri_names_user
+    return crossbar_topic_is_per_user(topic) or uri_names_user(topic, user_id)
+
+
+__all__ = ['parse_topic', 'ParsedTopic', 'topic_open_to']

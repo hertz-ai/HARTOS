@@ -7,10 +7,15 @@ It also provides functions to sync ActionState with SmartLedger TaskStatus.
 """
 
 from enum import Enum
+import copy
+import hashlib
 import logging
 import os
+import re
 import threading
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any
+from core.constants import BOOKKEEPING_TOOLS, tool_reply_failed
 from core.session_cache import TTLCache
 
 try:
@@ -109,7 +114,8 @@ def _get_node_id():
     return platform.node()
 
 
-def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState'):
+def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState',
+                         result: Any = None):
     """Auto-sync state change to ledger if registered.
 
     Wires v2.0 ledger features using KNOWN stateful variables in scope:
@@ -119,16 +125,26 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
     """
     ledger = _ledger_registry.get(user_prompt)
     if ledger is None:
-        return  # No ledger registered, skip sync
+        return True  # Legacy/direct callers may not own a ledger.
 
+    task = None
+    task_snapshot = None
     try:
         LedgerTaskStatus = _get_ledger_task_status()
         task_id = f"action_{action_id}"
 
         if task_id not in ledger.tasks:
-            return  # Task doesn't exist in ledger
+            return True  # No ledger projection exists for this action.
 
         task = ledger.tasks[task_id]
+        # Direct resume paths predate SmartLedger's atomic status method.
+        # Keep the complete object so a rejected save also rolls back claim,
+        # history, and reason mutations in memory.
+        task_snapshot = copy.deepcopy(task.__dict__)
+
+        def _rollback_task():
+            task.__dict__.clear()
+            task.__dict__.update(copy.deepcopy(task_snapshot))
 
         # Map ActionState to LedgerTaskStatus — complete 1:1 coverage
         STATE_MAP = {
@@ -172,16 +188,31 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
             # the state machine — go through PENDING first)
             if (ledger_status == LedgerTaskStatus.IN_PROGRESS
                     and task.status in (LedgerTaskStatus.PAUSED, LedgerTaskStatus.USER_STOPPED)):
-                task.resume(reason=f"Resumed via ActionState.{state.value}")
+                if not task.resume(
+                        reason=f"Resumed via ActionState.{state.value}"):
+                    _rollback_task()
+                    return False
                 task.blocked_reason = None
-                ledger.save()
+                if ledger.save() is False:
+                    _rollback_task()
+                    return False
             elif (ledger_status == LedgerTaskStatus.IN_PROGRESS
                     and task.status == LedgerTaskStatus.BLOCKED):
                 # BLOCKED -> PENDING -> IN_PROGRESS (validated 2-step path)
-                task.transition_to(LedgerTaskStatus.PENDING, f"Unblocked via ActionState.{state.value}")
-                task.transition_to(LedgerTaskStatus.IN_PROGRESS, f"Resumed via ActionState.{state.value}")
+                if not task.transition_to(
+                        LedgerTaskStatus.PENDING,
+                        f"Unblocked via ActionState.{state.value}"):
+                    _rollback_task()
+                    return False
+                if not task.transition_to(
+                        LedgerTaskStatus.IN_PROGRESS,
+                        f"Resumed via ActionState.{state.value}"):
+                    _rollback_task()
+                    return False
                 task.blocked_reason = None
-                ledger.save()
+                if ledger.save() is False:
+                    _rollback_task()
+                    return False
             elif task.status != ledger_status:
                 # Skip no-op transitions (e.g. IN_PROGRESS → IN_PROGRESS when
                 # multiple ActionStates map to the same LedgerTaskStatus).
@@ -252,7 +283,13 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                                 "(ActionState %s authoritative — recovered work).",
                                 task_id, state.value)
                     if _apply:
-                        ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
+                        if not ledger.update_task_status(
+                                task_id, ledger_status,
+                                result=(result if state == ActionState.COMPLETED
+                                        else None),
+                                reason=f"ActionState: {state.value}"):
+                            _rollback_task()
+                            return False
 
             # === BLOCKED REASON: set specific reason based on ActionState source ===
             if ledger_status == LedgerTaskStatus.BLOCKED:
@@ -261,7 +298,11 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                 elif state == ActionState.FALLBACK_REQUESTED:
                     task.set_blocked_reason('input_required')
                 elif state == ActionState.PENDING:
-                    task.set_blocked_reason('dependency')
+                    # ``block_for_user_input`` runs immediately before the
+                    # state projection.  Do not overwrite its specific human
+                    # dependency with the generic pending reason.
+                    if task.blocked_reason != 'input_required':
+                        task.set_blocked_reason('dependency')
 
             # === FAILURE REASON: the same courtesy for the FAILED terminal ===
             # BLOCKED recorded WHY; FAILED recorded nothing, so a reader could
@@ -280,39 +321,73 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                     # MAX_RETRIES_EXCEEDED would be true.
                     task.set_failure_reason('abandoned')
 
-            # === HEARTBEAT: every state change records liveness ===
-            task.heartbeat()
+            # === BOOKKEEPING: liveness, SLA, ownership ===
+            # These run AFTER the durable write and must never vote on
+            # whether it succeeded.  They used to sit under the same blanket
+            # `except Exception` as the persistence above, so one malformed
+            # value -- a bad started_at reaching _dt.fromisoformat below is
+            # the cheapest example -- made this function return False.  Since
+            # set_action_state now RAISES on a false return, that turned a
+            # stale timestamp into a StateTransitionError that blocked every
+            # transition for the action, including its terminal one: the work
+            # was done and persisted, and the agent still could not say so.
+            # Narrowed so only the transition and the save decide the verdict.
+            try:
+                task.heartbeat()
 
-            # === SLA CHECK: flag breach, post status request, emit notification ===
-            if task.is_sla_breached() and not task.sla_breached:
-                task.mark_sla_breached()
-                task.post_status("SLA breached — requesting status update from agent")
-                logger.warning(f"SLA breached for {task_id}")
-                try:
-                    from core.platform.events import emit_event
-                    emit_event('task.sla_breached', {
-                        'task_id': task_id,
-                        'prompt': user_prompt,
-                        'sla_target_s': task.sla_target_s,
-                        'deadline': task.deadline,
-                        'action': 'status_request',
-                    })
-                except Exception:
-                    pass
+                # SLA: flag breach, post status request, emit notification.
+                if task.is_sla_breached() and not task.sla_breached:
+                    task.mark_sla_breached()
+                    task.post_status("SLA breached — requesting status update from agent")
+                    logger.warning(f"SLA breached for {task_id}")
+                    try:
+                        from core.platform.events import emit_event
+                        emit_event('task.sla_breached', {
+                            'task_id': task_id,
+                            'prompt': user_prompt,
+                            'sla_target_s': task.sla_target_s,
+                            'deadline': task.deadline,
+                            'action': 'status_request',
+                        })
+                    except Exception:
+                        logger.warning('task.sla_breached event for %s not '
+                                       'emitted', task_id, exc_info=True)
 
-            # === RELEASE OWNERSHIP on terminal states ===
-            if LedgerTaskStatus.is_terminal_state(ledger_status) and task.is_owned:
-                # Record time spent using known started_at from scope
-                if task.started_at:
-                    from datetime import datetime as _dt
-                    elapsed = (_dt.now() - _dt.fromisoformat(task.started_at)).total_seconds()
-                    task.record_spend(time_s=elapsed)
-                task.release()
-                logger.info(f"Released ownership of {task_id}")
+                # Release ownership on terminal states.
+                if LedgerTaskStatus.is_terminal_state(ledger_status) and task.is_owned:
+                    # Record time spent using known started_at from scope
+                    if task.started_at:
+                        from datetime import datetime as _dt
+                        try:
+                            elapsed = (_dt.now() - _dt.fromisoformat(
+                                task.started_at)).total_seconds()
+                            task.record_spend(time_s=elapsed)
+                        except (TypeError, ValueError):
+                            # A stale or hand-edited started_at costs the
+                            # spend figure, never the release or the verdict.
+                            logger.warning(
+                                "%s has an unparseable started_at (%r); "
+                                "releasing without a time_s spend record",
+                                task_id, task.started_at)
+                    task.release()
+                    logger.info(f"Released ownership of {task_id}")
+            except Exception as _bookkeeping_err:
+                logger.warning(
+                    "Ledger bookkeeping after a COMMITTED write failed for "
+                    "%s (%s); the state change itself stands",
+                    task_id, _bookkeeping_err, exc_info=True)
 
             logger.info(f"Auto-synced {task_id} -> {ledger_status.value} (ActionState: {state.value})")
     except Exception as e:
+        if task is not None and task_snapshot is not None:
+            try:
+                task.__dict__.clear()
+                task.__dict__.update(task_snapshot)
+            except Exception:
+                logger.warning('in-memory task %s not restored after the '
+                               'failed ledger sync', task_id, exc_info=True)
         logger.error(f"Failed to auto-sync to ledger: {e}", exc_info=True)
+        return False
 
     # Audit log: record state transition
     try:
@@ -340,6 +415,8 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
     except Exception:
         pass
 
+    return True
+
 # Import ledger types for sync function (lazy import to avoid circular deps)
 def _get_ledger_task_status():
     """Lazy import to avoid circular dependencies"""
@@ -347,7 +424,8 @@ def _get_ledger_task_status():
     return LedgerTaskStatus
 
 
-def block_for_user_input(user_prompt: str, action_id: int, reason: str = "Waiting for user input"):
+def block_for_user_input(user_prompt: str, action_id: int,
+                         reason: str = "Waiting for user input") -> bool:
     """Block a task in the ledger when the agent needs user consent/input.
 
     Call this when send_message_to_user is invoked and the action's
@@ -356,36 +434,92 @@ def block_for_user_input(user_prompt: str, action_id: int, reason: str = "Waitin
     """
     ledger = _ledger_registry.get(user_prompt)
     if not ledger:
-        return
+        return False
     LedgerTaskStatus = _get_ledger_task_status()
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id)
     if not task or task.status != LedgerTaskStatus.IN_PROGRESS:
-        return
-    task.block(reason)
+        return False
+    before = copy.deepcopy(task.__dict__)
+    if not task.block(reason):
+        return False
     task.set_blocked_reason('input_required')
-    ledger.save()
+    if ledger.save() is False:
+        task.__dict__.clear()
+        task.__dict__.update(before)
+        logger.error(
+            "Refusing user-input block for %s: ledger persistence failed",
+            task_id)
+        return False
     logger.info(f"Blocked {task_id} for user input: {reason}")
+    return True
 
 
-def resume_from_user_input(user_prompt: str, action_id: int, reason: str = "User responded"):
-    """Resume a task that was blocked waiting for user input.
+def mark_action_waiting_for_user(user_prompt: str, action_id: int, reason: str) -> bool:
+    """Project an existing input dependency into both lifecycle authorities.
 
-    Call this when the user responds to a send_message_to_user request
-    or when PREVIEW_APPROVED is received.
+    The ledger is blocked first while the action is still in progress; then
+    the canonical ActionState projection becomes ``PENDING``.  This preserves
+    the existing ``input_required`` reason instead of creating a second queue
+    or allowing the generic pending projection to relabel it as a dependency.
+    """
+    if not block_for_user_input(user_prompt, action_id, reason):
+        return False
+    return safe_set_state(user_prompt, action_id, ActionState.PENDING, reason)
+
+
+def resume_blocked_action(user_prompt: str, action_id: int,
+                          reason: str = "Block resolved",
+                          evidence: Optional[Dict[str, Any]] = None,
+                          evidence_key: str = 'unblock_evidence') -> bool:
+    """Resume one BLOCKED ledger task through its validated transition.
+
+    User replies and an assigned expert turn are different authorities, but
+    both resolve the same ledger block. Typed evidence is optional; callers
+    must never label an expert response as human input.
     """
     ledger = _ledger_registry.get(user_prompt)
     if not ledger:
-        return
+        return False
     LedgerTaskStatus = _get_ledger_task_status()
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id)
     if not task or task.status != LedgerTaskStatus.BLOCKED:
-        return
-    task.resume(reason)
+        return False
+    before = copy.deepcopy(task.__dict__)
+    if not task.resume(reason):
+        return False
+    evidence_items = None
+    if evidence is not None:
+        context = getattr(task, 'context', None)
+        if isinstance(context, dict):
+            evidence_items = context.setdefault(evidence_key, [])
+            evidence_items.append(evidence)
     task.blocked_reason = None
-    ledger.save()
-    logger.info(f"Resumed {task_id} from user input: {reason}")
+    if ledger.save() is False:
+        task.__dict__.clear()
+        task.__dict__.update(before)
+        logger.error(
+            "Refusing unblock for %s: ledger persistence failed", task_id)
+        return False
+    logger.info(f"Resumed blocked {task_id}: {reason}")
+    return True
+
+
+def resume_from_user_input(user_prompt: str, action_id: int,
+                           reason: str = "User responded",
+                           answer: Optional[str] = None) -> bool:
+    """Resume a blocked task with evidence from a genuine user turn."""
+    evidence = None
+    if answer is not None:
+        evidence = {
+            'action_id': action_id,
+            'answer': str(answer),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        }
+    return resume_blocked_action(
+        user_prompt, action_id, reason, evidence=evidence,
+        evidence_key='user_input_evidence')
 
 # Add new states to ActionState enum:
 class FlowState(Enum):
@@ -413,6 +547,24 @@ class ActionState(Enum):
     PREVIEW_PENDING = "preview_pending"           # 14. Destructive action awaiting user approval
     PREVIEW_APPROVED = "preview_approved"         # 15. User approved destructive action, proceed
     GAVE_UP = "gave_up"                            # 16. Force-abandoned terminal (stalled/unverified work): an HONEST failure (ledger FAILED), NOT a verified success like TERMINATED. Re-openable (→ASSIGNED/RECIPE_REQUESTED) so a hive peer can retry (#139).
+
+
+#: The states that mean "this action is waiting for the USER", straight from
+#: the enum's own definitions above: PENDING is what mark_action_waiting_for_
+#: user projects (the ledger's input_required block), FALLBACK_REQUESTED is a
+#: fallback asked of the user, PREVIEW_PENDING is a destructive action awaiting
+#: the user's approval.  An action in one of these has paused, not failed; a
+#: reader that needs "is this a pause for the user?" asks this set rather than
+#: spelling its own.
+ACTION_STATES_AWAITING_USER = frozenset({
+    ActionState.PENDING, ActionState.FALLBACK_REQUESTED,
+    ActionState.PREVIEW_PENDING})
+
+
+# The two answers to an action's can_perform_without_user_input live in
+# core.constants (cheap to import: the A2A card reads them without pulling
+# this module's hartos.helper).  Re-exported here for existing callers.
+from core.constants import action_is_autonomous, autonomy_needs_user  # noqa: E402,F401
 
 
 # ── No-progress stall guard for the CREATE loop ───────────────────────────
@@ -443,6 +595,23 @@ STALL_GUARD_INPROGRESS_ITERS = 120
 
 _STALL_STATES = (ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_REQUESTED)
 _TERMINAL_STATES = (ActionState.COMPLETED, ActionState.TERMINATED, ActionState.ERROR, ActionState.GAVE_UP)
+
+
+def is_terminal_state(state) -> bool:
+    """Is this action state one the action can never leave?
+
+    The public reader for `_TERMINAL_STATES`, so callers in other modules ask
+    this question instead of re-listing the states.  That tuple is already
+    spelled out inline in `validate_state_transition` (the GAVE_UP guard) and
+    twice more around the give-up paths; every extra copy is a place the set can
+    drift, and drift here means a consumer disagreeing with the state machine
+    about whether an action is finished.
+
+    Added for the CREATE user-input gate (agent 88761328396, 2026-09-07), which
+    kept asking the user about action 5 for 20 minutes after that action reached
+    TERMINATED — see `create_recipe._should_block_on_user_input`.
+    """
+    return state in _TERMINAL_STATES
 
 
 # #139 observability counter — bumped each time the FAILED→COMPLETED recovery
@@ -735,7 +904,8 @@ class StateTransitionError(Exception):
 
 
 # 2. UPDATE your set_action_state function to enforce transitions:
-def set_action_state(user_prompt: str, action_id: int, state: ActionState, reason: str = ""):
+def set_action_state(user_prompt: str, action_id: int, state: ActionState,
+                     reason: str = "", result: Any = None):
     """Set state of an action with validation."""
     current_state = get_action_state(user_prompt, action_id)
 
@@ -748,6 +918,22 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
         raise StateTransitionError(
             f"Invalid transition: Action {action_id} cannot go from {current_state.value} to {state.value}")
 
+    # The durable ledger is the lifecycle authority. Project ActionState only
+    # after that write commits; otherwise callers could receive True while the
+    # task remained unfinished on disk.
+    #
+    # Keep persistence failure explicit for every state, including terminal
+    # ones.  Returning false here would be ignored by direct callers and would
+    # recreate a silent completion.  The current call graph has one public
+    # wrapper (safe_set_state) and one multi-step wrapper
+    # (force_state_through_valid_path); both translate this exception to False.
+    # The only remaining direct call is the idempotent assignment hook.
+    if not _auto_sync_to_ledger(
+            user_prompt, action_id, state, result=result):
+        raise StateTransitionError(
+            f"Ledger persistence failed for Action {action_id} -> "
+            f"{state.value}")
+
     # Perform transition (lock protects check-then-act on shared dict)
     with _state_lock:
         if user_prompt not in action_states:
@@ -755,18 +941,26 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
         action_states[user_prompt][action_id] = state
     logger.info(f"[TARGET] Action {action_id}: {current_state.value} → {state.value} ({reason})")
 
-    # Auto-sync to ledger if registered
-    _auto_sync_to_ledger(user_prompt, action_id, state)
-
     # Advisory consent check — log when data_access consent is missing (never blocks)
     if state == ActionState.IN_PROGRESS:
         try:
             from integrations.social.consent_service import ConsentService
             from integrations.social.models import db_session
             with db_session(commit=False) as db:
-                if not ConsentService.check_consent(db, user_prompt, 'data_access'):
+                # user_prompt is the SESSION KEY f"{user_id}_{prompt_id}";
+                # check_consent's parameter is a USER ID and it matches against
+                # user_consents.user_id, which holds bare uuids written by the
+                # consent UI. Passing the session key made this branch
+                # unsatisfiable -- it logged 415 false "no consent" lines over
+                # Sep 18-19 while a granted data_access row sat in the table --
+                # so resolve the owner with the helper already in this file
+                # (:102) instead of inventing a second parse.
+                _consent_user, _ = _extract_ownership_from_prompt(user_prompt)
+                if not ConsentService.check_consent(db, _consent_user,
+                                                    'data_access'):
                     logger.info(
-                        f"[CONSENT] No data_access consent for user={user_prompt}, "
+                        f"[CONSENT] No data_access consent for "
+                        f"user={_consent_user} (session={user_prompt}), "
                         f"action={action_id} (advisory only)")
         except Exception:
             pass  # Consent check is advisory, never blocks execution
@@ -785,18 +979,27 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
 
 
 # 3. ADD these wrapper functions for safe state updates:
-def safe_set_state(user_prompt: str, action_id: int, new_state: ActionState, reason: str = ""):
+def safe_set_state(user_prompt: str, action_id: int, new_state: ActionState,
+                   reason: str = "", result: Any = None):
     """Safely set state with error handling"""
     try:
-        set_action_state(user_prompt, action_id, new_state, reason)
+        set_action_state(user_prompt, action_id, new_state, reason,
+                         result=result)
         return True
     except StateTransitionError as e:
         logger.error(f"[ERROR] {e}")
         return False
 
 
-def force_state_through_valid_path(user_prompt: str, action_id: int, target_state: ActionState, reason: str = ""):
-    """Force state to target through valid transitions"""
+def force_state_through_valid_path(user_prompt: str, action_id: int, target_state: ActionState, reason: str = "",
+                                   through_completed: bool = True):
+    """Force state to target through valid transitions.
+
+    ``through_completed=False`` refuses (returns False, writes nothing) a path
+    that would WRITE COMPLETED on the way.  COMPLETED means "verified with a
+    receipt", and its one legitimate writer is commit_verified_action_completion;
+    a caller that only wants an action closed, not certified, passes False.
+    """
     current_state = get_action_state(user_prompt, action_id)
 
     # Map of how to reach each target state from any current state
@@ -921,6 +1124,13 @@ def force_state_through_valid_path(user_prompt: str, action_id: int, target_stat
         logger.error(f"[ERROR] No valid path from {current_state.value} to {target_state.value}")
         return False
 
+    if not through_completed and ActionState.COMPLETED in path:
+        logger.info(
+            f"[UNVERIFIED] Action {action_id} is {current_state.value}: reaching "
+            f"{target_state.value} would record it COMPLETED without a verified "
+            f"receipt; leaving it open (reason={reason!r})")
+        return False
+
     logger.info(f"🔧 Auto-path for Action {action_id}: {current_state.value} → {target_state.value}")
     # Execute each step in the path
     for step_state in path:
@@ -942,8 +1152,8 @@ def get_action_state(user_prompt: str, action_id: int) -> ActionState:
         return action_states.get(user_prompt, {}).get(action_id, ActionState.ASSIGNED)
 
 
-def clear_action_states(user_prompt: str) -> int:
-    """Drop one session's action states so a NEW run starts from ASSIGNED.
+def clear_action_states(user_prompt: str, user_tasks=None) -> int:
+    """Drop one session's run state so a NEW run starts from the beginning.
 
     `action_states` is keyed only by user_prompt ("{user_id}_{prompt_id}") — it
     carries no phase dimension and no run id, so CREATE and REUSE for the same
@@ -970,8 +1180,50 @@ def clear_action_states(user_prompt: str) -> int:
     only reader — a caller reaching into the dict itself would be a third
     accessor and a parallel path.
 
+    RUN STATE IS TWO STORES, AND BOTH RESET HERE.  `action_states` (this module)
+    says what PHASE each action is in; the session's `Action.current_action` (an
+    entry in the caller's `user_tasks` cache) says WHICH action is current.
+    Clearing only one is vacuous — [[feedback_mirrored_state_reset]], and
+    measured twice:
+
+      • states without pointer — agent 33323830039, 2026-09-07: a 1-action
+        recipe driven twice in one process kept `current_action = 2`, so the
+        second drive terminated a phantom "Action 2" in 35 ms, ran no tool, and
+        answered with a self-introduction.
+      • pointer without states — the 90210554431 case above: every action still
+        reads TERMINATED and the loop `[AUTO-ADVANCE]`s through the recipe.
+
+    Pass `user_tasks` (the mapping, or the session's own `Action`) and this
+    resets both.  Callers that only hold the states — `reuse_recipe.py:1081`,
+    which rebuilds the `Action` itself on the next line — keep the one-argument
+    form unchanged.
+
+    THE TWO STORES RESET ON DIFFERENT TERMS, because they carry different risk.
+    Dropping `action_states` mid-run is safe: the actions re-read as ASSIGNED and
+    the run continues where its pointer says.  Resetting the POINTER mid-run
+    would truncate the run, so it happens only on the two states that cannot be
+    a live continuation:
+
+      * `current_action > len(actions)` — past the end.
+      * `current_action == len(actions)` AND that action is TERMINAL — parked on
+        a finished final action.  The integer alone is ambiguous here (a run
+        still working on its last action looks identical), so the action's own
+        state is what separates them; agent 88764372848 is the measured case.
+
+    Anything else is a live continuation and is left alone.  That is what makes
+    this function safe to call at ANY run entry point without knowing whether a
+    run is already in flight.
+
+    DELIBERATELY NOT HANDLED: a run abandoned MID-recipe — action 3 of 10, not
+    terminal — followed by a genuinely NEW request, still resumes at 3.  That one
+    is genuinely ambiguous without a run-id from the caller, and this does not
+    invent one.
+
     Returns the number of action entries dropped (0 when there was no session).
     """
+    if user_tasks is not None:
+        _reset_finished_pointer(user_prompt, user_tasks)
+
     with _state_lock:
         dropped = len(action_states.pop(user_prompt, {}) or {})
     if dropped:
@@ -980,6 +1232,63 @@ def clear_action_states(user_prompt: str) -> int:
             "from ASSIGNED instead of inheriting the previous phase's terminals",
             dropped, user_prompt)
     return dropped
+
+
+def _reset_finished_pointer(user_prompt: str, user_tasks) -> bool:
+    """Rewind `current_action` to 1 iff the previous run ran off the end.
+
+    Split out of `clear_action_states` for SRP: that function owns the states,
+    this owns the pointer, and the caller-facing contract stays one call.  The
+    predicate and its safety argument are documented there.
+
+    Accepts the same shapes the sibling `lifecycle_hook_*` functions accept — a
+    mapping of sessions, or the session's `Action` itself — so there is one
+    accessor idiom in this module rather than a second one here.
+    """
+    try:
+        if hasattr(user_tasks, 'get'):
+            task = user_tasks.get(user_prompt)
+        elif hasattr(user_tasks, 'current_action'):
+            task = user_tasks
+        else:
+            return False
+        if task is None:
+            return False
+
+        n = len(getattr(task, 'actions', None) or [])
+        current = getattr(task, 'current_action', 1)
+        # `not n` guards a recipe with zero actions: 1 > 0 would otherwise read
+        # as "past the end" and rewind on every single turn.
+        if not n or not isinstance(current, int) or current < 1:
+            return False
+
+        if current > n:
+            why = f"pointer {current} is past the end of {n} action(s)"
+        elif current == n and is_terminal_state(get_action_state(user_prompt, current)):
+            # A run PARKED on its final action and a run still WORKING on its
+            # final action are the same integer; only the action's own state
+            # separates them.  Measured live 2026-09-07 on agent 88764372848
+            # ("Nunba Guardian", 5 actions): CREATE ended with current_action=5
+            # and action 5 TERMINATED, so the next REUSE drive resumed AT 5 —
+            # `Retrieved current_action_id: 5` x7, then STUCK LOOP DETECTED and
+            # ASSISTANT-STREAK-ESCALATE — and actions 1-4 (read the log, filter
+            # ERROR, pick the newest) never ran.  The agent could not reach its
+            # goal because the work was skipped, not because it failed.
+            why = (f"final action {current}/{n} is "
+                   f"{get_action_state(user_prompt, current).value} — the "
+                   f"previous run ended on it")
+        else:
+            return False
+
+        task.current_action = 1
+    except Exception:
+        # Never raise into the reuse hot path — a failed reset must degrade to
+        # the previous behaviour, not kill the turn.
+        return False
+
+    logger.info("[RUN-BOUNDARY] %s: previous run finished (%s) — reset to "
+                "action 1", user_prompt, why)
+    return True
 
 
 def validate_state_transition(user_prompt: str, action_id: int, new_state: ActionState) -> bool:
@@ -1000,7 +1309,15 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.IN_PROGRESS: [ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.IN_PROGRESS, ActionState.ERROR, ActionState.PENDING],
         ActionState.STATUS_VERIFICATION_REQUESTED: [ActionState.COMPLETED, ActionState.PENDING, ActionState.ERROR, ActionState.STATUS_VERIFICATION_REQUESTED],
         ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED, ActionState.COMPLETED],  # Allow direct recipe request (autonomous) or termination
-        ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR, ActionState.PENDING],
+        # PENDING -> IN_PROGRESS is the resume edge.  PENDING is a wait (the
+        # user's input via mark_action_waiting_for_user, or a 'pending'
+        # verdict); once it is answered the action runs again.  Without this
+        # edge the ledger resumed (resume_from_user_input: BLOCKED ->
+        # IN_PROGRESS) while create_recipe's [EXECUTE-PENDING] request for
+        # IN_PROGRESS was refused and the action ran reading PENDING --
+        # measured 21:23:20 "cannot go from pending to in_progress" right
+        # after "Latest User message: Yes, proceed".
+        ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR, ActionState.PENDING, ActionState.IN_PROGRESS],
         # FIX: Allow ERROR to reach TERMINATED via FALLBACK_REQUESTED/RECIPE_REQUESTED or directly
         ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING, ActionState.ERROR, ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED],
         ActionState.FALLBACK_REQUESTED: [ActionState.FALLBACK_RECEIVED, ActionState.FALLBACK_REQUESTED],
@@ -1141,6 +1458,375 @@ def lifecycle_hook_track_status_verification_request(user_prompt: str, user_task
     return False
 
 
+def resolve_receipt(user_prompt: str, evidence) -> Optional[tuple]:
+    """The ONE rule for reading a completion receipt:
+    ``(messages, index, message, agent)`` or None.
+
+    A receipt lives in one of the lists the REUSE fabrication gate already
+    treats as evidence (reuse_recipe._reuse_evidence_msg_lists):
+
+      * the group log (``{'message_index': i, ...}``; ``agent`` is None), or
+      * one participant's pairwise buffer
+        (``{'source': 'buffer', 'agent': <participant name>,
+        'peer': <counterpart name>, 'message_index': i, ...}``).
+
+    Measured 2026-09-24 on nightly 8a11925: the gate credited tool runs that
+    lived only in a buffer while every reader of the receipt indexed the group
+    log, so 362 actions ended GAVE_UP and 0 committed.  The completion gate,
+    the durable evidence record and the learning promotion all read the
+    receipt through this function, so they cannot disagree about it again.
+    """
+    if not isinstance(evidence, dict):
+        return None
+    index = evidence.get('message_index')
+    if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+        return None
+    group_chat = get_registered_groupchat(user_prompt)
+    if group_chat is None:
+        return None
+    agent = None
+    if evidence.get('source') == 'buffer':
+        agent_name, peer_name = evidence.get('agent'), evidence.get('peer')
+        # Only a participant of THIS group chat can hold the receipt.
+        agent = next((a for a in (getattr(group_chat, 'agents', None) or [])
+                      if getattr(a, 'name', None) == agent_name), None)
+        conv = getattr(agent, '_oai_messages', None) if agent else None
+        if not isinstance(conv, dict):
+            return None
+        messages = next((msgs for peer, msgs in conv.items()
+                         if getattr(peer, 'name', peer) == peer_name), None)
+    else:
+        messages = getattr(group_chat, 'messages', None)
+    if not isinstance(messages, list) or index >= len(messages):
+        return None
+    message = messages[index]
+    if not isinstance(message, dict):
+        return None
+    return messages, index, message, agent
+
+
+def tool_call_names(msg_lists) -> Dict[str, str]:
+    """call_id -> function name, read off the PROPOSING assistant message.
+
+    A tool result's own ``name`` is the EXECUTING AGENT, never the function,
+    so joining on the proposal's tool_call id is the only way to say which
+    tool a result belongs to (measured 2026-09-06: the REUSE gate logged
+    ``executed=['Assistant']`` reading the result's name).  The one rule, used
+    by the completion gate below and by every REUSE evidence reader
+    (reuse_recipe._reuse_call_id_to_tool_name delegates here).
+    """
+    out = {}
+    for _ml in (msg_lists or []):
+        for m in (_ml or []):
+            if not isinstance(m, dict):
+                continue
+            for tc in (m.get('tool_calls') or []):
+                _cid = (tc or {}).get('id')
+                _fn = ((tc or {}).get('function') or {}).get('name')
+                if _cid and _fn:
+                    out[_cid] = _fn
+    return out
+
+
+def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
+                          message: dict) -> bool:
+    """Whether a role='tool' receipt shows the action's work being done.
+
+    Two things a tool message can carry that are not that work:
+
+      * a FAILED reply (core.constants.tool_reply_failed): the executor's
+        "Error: ...", the tool_logging envelope, or a TOOL_FAILURE_RESULTS
+        refusal -- which is what an 'incomplete' computer-use run returns.
+        The gate used to accept any non-empty tool message, so a refusal
+        cited as the receipt completed the action it refused.
+      * a BOOKKEEPING call (core.constants.BOOKKEEPING_TOOLS) the action does
+        not itself name: live 2026-09-27, CREATE daemon_255bd83f, two
+        execute_coding_task actions completed on save_data_in_memory writes of
+        {"status": "completed"} the model composed, with no coding run.
+
+    An aggregate message (autogen's ``tool_responses``) is a receipt when any
+    one of its results qualifies.  A result whose function cannot be resolved
+    is judged on its content alone: it cannot be shown to be bookkeeping.
+    """
+    names = tool_call_names([messages])
+    ledger = get_registered_ledger(user_prompt)
+    task = (getattr(ledger, 'tasks', None) or {}).get(f'action_{action_id}')
+    action_text = str(getattr(task, 'description', '') or '').lower()
+    responses = message.get('tool_responses')
+    results = responses if isinstance(responses, list) and responses else [message]
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        body = result.get('content')
+        if body is None:
+            body = message.get('content')
+        if not str(body or '').strip() or tool_reply_failed(body):
+            continue
+        name = names.get(result.get('tool_call_id') or message.get('tool_call_id'))
+        if name in BOOKKEEPING_TOOLS and name.lower() not in action_text:
+            continue
+        return True
+    return False
+
+
+def _verifier_completion_has_conversation_evidence(
+        user_prompt: str, action_id: int, json_obj: dict) -> bool:
+    """Return whether a completion cites a real, earlier GroupChat result.
+
+    The StatusVerifier JSON alone is never a receipt. The GroupChat registry is
+    already the canonical conversation projection used by the Admin agent
+    drawer, so this creates no second evidence store.
+    """
+    evidence = json_obj.get('evidence')
+    if not isinstance(evidence, dict):
+        return False
+    kind = evidence.get('kind')
+    if kind not in ('tool_receipt', 'user_visible_result'):
+        return False
+    resolved = resolve_receipt(user_prompt, evidence)
+    if resolved is None:
+        return False
+    messages, index, message, agent = resolved
+    if not str(message.get('content') or '').strip():
+        return False
+    # Bind the receipt to the action window already used by the stale-verdict
+    # guard.  Otherwise a verifier can cite action 1's valid receipt while
+    # completing action 2.  A missing dispatch marker is not evidence.  The
+    # window is read in the SAME list that holds the receipt, so a buffer
+    # (which also carries older turns) is held to the same rule as the log.
+    if latest_dispatch_before(messages, index + 1) != action_id:
+        return False
+    if kind == 'tool_receipt':
+        return (message.get('role') == 'tool'
+                and _receipt_is_real_work(user_prompt, action_id, messages,
+                                          message))
+    # A written answer is only ever cited from the group log.
+    return (agent is None
+            and message.get('role') == 'assistant'
+            and message.get('name') == 'Assistant')
+
+
+def _record_verifier_evidence(user_prompt: str, action_id: int,
+                              json_obj: dict) -> bool:
+    """Persist the same receipt the completion gate accepted.
+
+    ``verification_evidence`` is the existing distributed-verification field.
+    Recording the accepted receipt there lets later recipe and learning code use
+    one durable outcome instead of treating an LLM verdict as evidence.
+    """
+    ledger = get_registered_ledger(user_prompt)
+    if ledger is None:
+        # This is the verified-completion boundary, not a generic state helper.
+        # Its only production callers are CREATE and REUSE, and both register
+        # their ledger before execution.  Advancing without that durable
+        # authority would turn an in-memory/model verdict into completion.
+        logger.error(
+            'Cannot persist verifier evidence: no ledger registered for %s',
+            user_prompt)
+        return False
+    task = getattr(ledger, 'tasks', {}).get(f'action_{action_id}')
+    if task is None:
+        logger.error(
+            'Cannot persist verifier evidence: action_%s missing from %s',
+            action_id, user_prompt)
+        return False
+    context = getattr(task, 'context', None)
+    if not isinstance(context, dict):
+        logger.error(
+            'Cannot persist verifier evidence: action_%s has no context',
+            action_id)
+        return False
+    evidence = json_obj['evidence']
+    resolved = resolve_receipt(user_prompt, evidence)
+    if resolved is None:
+        logger.error(
+            'Cannot persist verifier evidence: receipt for action_%s is '
+            'not readable', action_id)
+        return False
+    receipt = resolved[2]
+    receipt_text = str(receipt.get('content') or '')
+    receipt_hash = hashlib.sha256(receipt_text.encode('utf-8')).hexdigest()
+    record = {
+        'agent': 'StatusVerifier',
+        'verdict': True,
+        'action_id': action_id,
+        'evidence': evidence,
+        'receipt_sha256': receipt_hash,
+        'receipt_role': str(receipt.get('role') or ''),
+        'receipt_agent': str(receipt.get('name') or ''),
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+    }
+    records = context.setdefault('verification_evidence', [])
+    already_persisted = any(
+        isinstance(item, dict)
+        and item.get('action_id') == action_id
+        and item.get('receipt_sha256') == receipt_hash
+        for item in records
+    )
+    if not already_persisted:
+        records.append(record)
+        if ledger.save() is False:
+            records.remove(record)
+            logger.error(
+                'Refusing completion: verifier evidence was not persisted '
+                'for action %s in %s', action_id, user_prompt)
+            return False
+    return True
+
+
+def _promote_verified_outcome(user_prompt: str, action_id: int,
+                              json_obj: dict) -> None:
+    """Credit one outcome after evidence and lifecycle completion commit."""
+    ledger = get_registered_ledger(user_prompt)
+    task = (getattr(ledger, 'tasks', {}).get(f'action_{action_id}')
+            if ledger is not None else None)
+    context = getattr(task, 'context', None)
+    if not isinstance(context, dict):
+        context = {}
+    resolved = resolve_receipt(user_prompt, json_obj.get('evidence'))
+    # A buffer receipt names the participant that holds it; credit exactly
+    # that participant, never one inferred from the group log.
+    receipt_agent = resolved[3] if resolved else None
+    # CREATE and REUSE already declare these two assistant identities when
+    # instrumenting their real GroupChat participant.  Award only wrappers
+    # that are live for this session; a verifier verdict remains insufficient.
+    try:
+        from integrations.agent_lightning import record_verified_outcome_for_agents
+        outcome_context = {
+            'user_prompt': user_prompt,
+            'action_id': action_id,
+            'evidence': json_obj['evidence'],
+        }
+        group_chat = get_registered_groupchat(user_prompt)
+        credited = record_verified_outcome_for_agents(
+            [receipt_agent] if receipt_agent is not None
+            else getattr(group_chat, 'agents', None),
+            True, outcome_context)
+        if not credited:
+            # A False here is NOT "the reward was recorded".  It means no live
+            # wrapper owned this chat, which happens whenever Agent Lightning
+            # is off (the code default) or the session's wrapper has gone.
+            # Phase 3 of the recovery plan requires that we say so rather than
+            # let the caller read silence as learning.
+            from integrations.agent_lightning.config import is_enabled
+            if is_enabled():
+                logger.warning(
+                    'Verified outcome for action %s in %s was NOT credited: '
+                    'Agent Lightning is enabled but no instrumented wrapper '
+                    'owns this GroupChat', action_id, user_prompt)
+            else:
+                logger.debug(
+                    'Verified outcome for action %s in %s not credited: '
+                    'Agent Lightning is disabled', action_id, user_prompt)
+    except Exception:
+        logger.exception('Unable to record verified Agent Lightning outcome')
+    # Promote the already-persisted action/result pair through the one world
+    # model bridge only after this exact receipt committed COMPLETED.  The
+    # bridge independently checks the verification envelope, so no dispatcher
+    # or worker can bypass the lifecycle by self-attesting success.
+    try:
+        evidence = json_obj['evidence']
+        if resolved is None:
+            raise ValueError('receipt not readable')
+        receipt = resolved[2]
+        user_id, prompt_id = _extract_ownership_from_prompt(user_prompt)
+        from integrations.agent_engine.world_model_bridge import (
+            get_world_model_bridge,
+        )
+        get_world_model_bridge().record_interaction(
+            user_id=user_id,
+            prompt_id=prompt_id or user_prompt,
+            prompt=str(getattr(task, 'description', '') or
+                       f'Complete action {action_id}'),
+            response=str(receipt.get('content') or ''),
+            model_id=str(receipt.get('name') or 'verified-agent'),
+            goal_id=(context.get('goal_id') or context.get('parent_task_id')),
+            verification={
+                'verified': True,
+                'source': 'status_verifier',
+                'outcome': 'success',
+                'action_id': action_id,
+                'evidence': evidence,
+            },
+            # The raw chat path already owns history and user-sensor writes.
+            # This call promotes that result; it must not duplicate either.
+            persist_conversation=False,
+            ingest_user_utterance=False,
+        )
+    except Exception:
+        logger.exception('Unable to record verified world-model outcome')
+
+
+def commit_verified_action_completion(user_prompt: str, action_id: int,
+                                      evidence: dict,
+                                      reason: str = 'verified complete',
+                                      claimed_action_id=None) -> bool:
+    """Commit one evidence-backed successful action through the canonical FSM.
+
+    CREATE and REUSE use different non-deterministic conversations, but a
+    successful action has one deterministic boundary: it must already be in
+    ``STATUS_VERIFICATION_REQUESTED`` and cite a receipt from that action's
+    current dispatch window.  Keeping the state write, durable ledger evidence,
+    Agent Lightning reward, and world-model promotion together prevents a
+    caller from advancing the pointer while silently skipping the flywheel.
+
+    ``claimed_action_id`` is the action_id the verdict itself names, when it
+    names one.  A verdict completes only that action: live 2026-09-27 (REUSE
+    daemon_goal_..._b18bba6f, 17:35:28) a StatusVerifier verdict for action_id
+    2 -- "System health check completed successfully" -- completed action 4.
+    settled_action_id still decides which action a verdict is ABOUT (its
+    recipe, its log line); this decides only whether it may COMPLETE one.  A
+    verdict that names no action_id is not contradicting anything.
+    """
+    if claimed_action_id is not None:
+        try:
+            _claimed = int(float(claimed_action_id))
+        except (TypeError, ValueError):
+            _claimed = None
+        if _claimed is not None and _claimed != int(action_id):
+            logger.warning(
+                "Refusing completion of action %s in %s: the verdict names "
+                "action %s", action_id, user_prompt, _claimed)
+            return False
+    if get_action_state(user_prompt, action_id) != \
+            ActionState.STATUS_VERIFICATION_REQUESTED:
+        logger.warning(
+            "Refusing verified completion for action %s in %s from state %s",
+            action_id, user_prompt,
+            get_action_state(user_prompt, action_id).value)
+        return False
+
+    verdict = {
+        'status': 'completed',
+        'action_id': action_id,
+        'evidence': evidence,
+    }
+    if not _verifier_completion_has_conversation_evidence(
+            user_prompt, action_id, verdict):
+        logger.warning(
+            "Refusing ungrounded completed verdict for action %s in %s",
+            action_id, user_prompt)
+        return False
+    if not validate_state_transition(
+            user_prompt, action_id, ActionState.COMPLETED):
+        return False
+    receipt = resolve_receipt(user_prompt, evidence)[2]
+    # The proof must be durable before a completion can release dependents or
+    # feed any learning system. A retry deduplicates the same receipt hash.
+    if not _record_verifier_evidence(user_prompt, action_id, verdict):
+        return False
+    if not safe_set_state(
+            user_prompt, action_id, ActionState.COMPLETED, reason,
+            result=str(receipt.get('content') or '')):
+        return False
+
+    # Learning follows both durable evidence and the successful canonical
+    # state write. Never credit a receipt which failed either boundary.
+    _promote_verified_outcome(user_prompt, action_id, verdict)
+    retry_tracker.reset_count(user_prompt, action_id)
+    return True
+
+
 def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, user_tasks) -> dict:
     """4-6. Process verifier response: completed/pending/error"""
     # isinstance before the membership test: helper.retrieve_json returns
@@ -1168,20 +1854,60 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
     status = json_obj['status'].lower()
     current_state = get_action_state(user_prompt, current_action_id)
 
+    # A completed verdict IS the verification, so an action still IN_PROGRESS
+    # when it arrives is moved to STATUS_VERIFICATION_REQUESTED and judged
+    # here.  CREATE routes the Assistant's turn to the verifier without an
+    # "@StatusVerifier" mention (state_transition's after-Assistant branch), so
+    # the state never moved and this hook answered 'allow'; the TERMINATE that
+    # follows every verdict then walked the action through COMPLETED with no
+    # receipt (live 2026-09-27 14:26:19, daemon_255bd83f action 1).
+    if (status in ('completed', 'success')
+            and current_state == ActionState.IN_PROGRESS
+            and safe_set_state(
+                user_prompt, current_action_id,
+                ActionState.STATUS_VERIFICATION_REQUESTED,
+                "hook tracking lifecycle_hook_process_verifier_response: "
+                "verdict arrived")):
+        current_state = ActionState.STATUS_VERIFICATION_REQUESTED
+
     # Must be in STATUS_VERIFICATION_REQUESTED to process verifier response
     if current_state != ActionState.STATUS_VERIFICATION_REQUESTED:
         return {'action': 'allow', 'message': None}
 
-    if status == 'completed':
-        # Reset retry counter on completion
-        retry_tracker.reset_count(user_prompt, current_action_id)
-        if validate_state_transition(user_prompt, current_action_id, ActionState.COMPLETED):
-            safe_set_state(user_prompt, current_action_id, ActionState.COMPLETED,"hook tracking lifecycle_hook_process_verifier_response")
-            # Automatically request fallback after completion
+    if status in ('completed', 'success'):
+        if not commit_verified_action_completion(
+                user_prompt, current_action_id, json_obj.get('evidence'),
+                "hook tracking lifecycle_hook_process_verifier_response",
+                claimed_action_id=json_obj.get('action_id')):
+            # Bounded, on the same per-action counter a 'pending' verdict
+            # uses: an unverifiable claim is not a completion, and repeating
+            # it must not loop.  After the bound the action is recorded
+            # GAVE_UP -- an honest, retryable failure, never COMPLETED.
+            if retry_tracker.increment_pending(user_prompt, current_action_id):
+                retry_tracker.reset_count(user_prompt, current_action_id)
+                force_state_through_valid_path(
+                    user_prompt, current_action_id, ActionState.GAVE_UP,
+                    "completion claimed without a verifiable receipt")
+                return {
+                    'action': 'gave_up',
+                    'message': (
+                        f"Action {current_action_id} could not be verified: "
+                        "no completed verdict for it cited a real result.")
+                }
             return {
-                'action': 'force_fallback',
-                'message': f"Action {current_action_id} fallback: ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversation to StatusVerifier agent"
+                'action': 'force_completion',
+                'message': (
+                    f"Action {current_action_id} is not complete yet: the "
+                    f"StatusVerifier must report action_id {current_action_id} "
+                    "and cite an earlier tool receipt that did this action's "
+                    "work (not a note saved to memory, not a failed call) or a "
+                    "user-visible result from this conversation.")
             }
+        # Automatically request fallback after completion
+        return {
+            'action': 'force_fallback',
+            'message': f"Action {current_action_id} fallback: ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversation to StatusVerifier agent"
+        }
 
     elif status == 'pending':
         # SAFETY NET: Check if pending count exceeded (prevents infinite retry loops)
@@ -1194,10 +1920,21 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
 
         if status == 'pending':  # Still pending (not overridden)
             if validate_state_transition(user_prompt, current_action_id, ActionState.PENDING):
-                safe_set_state(user_prompt, current_action_id, ActionState.PENDING,"hook tracking lifecycle_hook_process_verifier_response")
+                needs_user = autonomy_needs_user(
+                    json_obj.get('can_perform_without_user_input'))
+                if needs_user:
+                    mark_action_waiting_for_user(
+                        user_prompt, current_action_id,
+                        json_obj.get('message') or 'Waiting for user input')
+                else:
+                    safe_set_state(user_prompt, current_action_id, ActionState.PENDING,"hook tracking lifecycle_hook_process_verifier_response")
                 return {
                     'action': 'force_completion',
-                    'message': f"Complete pending steps for action {current_action_id} and ask @StatusVerifier to verify completion"
+                    'message': (
+                        (json_obj.get('message') or f'Action {current_action_id} needs user input')
+                        if needs_user else
+                        f"Complete pending steps for action {current_action_id} and ask @StatusVerifier to verify completion"
+                    )
                 }
 
     if status == 'error':  # Separated to allow fall-through from pending override
@@ -1321,6 +2058,121 @@ def lifecycle_hook_track_recipe_completion(user_prompt: str, json_obj: dict, use
     return {'action': 'allow', 'message': None}
 
 
+# "Execute Action N:" is how CREATE posts an action, while REUSE uses
+# "Perform this action -> Action #N:".  Both are projections of the same
+# lifecycle dispatch and therefore share this parser.  CREATE also emits
+# "Properly Execute Action N:" and retry posts prefixed with "[retry:<tag>]".
+# Only a LEADING marker is a dispatch: the
+# [EXECUTE-PENDING] dispatch appends the user's text after its own marker, and
+# that text can quote an earlier one ("... ,Latest User message: Properly
+# Execute Action 6: ...", the Failure=True retry text), so a marker later in a
+# message says nothing about which action it posts.  Colon-delimited, so
+# action 2 never matches action 20.  Every producer therefore puts its marker
+# FIRST, including reuse_recipe._reuse_seed_message (action 1: dispatch, then
+# the user's words); a seed built user-words-first was invisible here and no
+# REUSE action 1 could commit (2026-09-25).
+_DISPATCH_MARKER = re.compile(
+    r'\s*(?:'
+    r'(?:\[retry:[^\]]*\]\s*)?(?:Properly\s+)?Execute Action '
+    r'|Perform this action -> Action #'
+    r')(?P<action_id>\d+):')
+
+
+def dispatch_action_id(content) -> Optional[int]:
+    """The action a message dispatches, or None when it is not a dispatch."""
+    if not isinstance(content, str):
+        return None
+    m = _DISPATCH_MARKER.match(content)
+    return int(m.group('action_id')) if m else None
+
+
+def latest_dispatch_before(messages, index) -> Optional[int]:
+    """The action id of the latest dispatch posted before ``messages[index]``,
+    or None when none precedes it.
+
+    Seeded messages (``_from_shared``) do not count: an earlier run's marker in
+    the shared history says nothing about which action this run is on.
+    """
+    try:
+        earlier = messages[:index]
+    except Exception:
+        logger.warning("latest_dispatch_before: cannot slice messages at %r",
+                       index, exc_info=True)
+        return None
+    for m in reversed(earlier):
+        if not isinstance(m, dict) or m.get('_from_shared'):
+            continue
+        aid = dispatch_action_id(m.get('content'))
+        if aid is not None:
+            return aid
+    return None
+
+
+def stale_for_unstarted_action(messages, index, user_prompt,
+                               action_id) -> Optional[int]:
+    """The action ``messages[index]`` belongs to, returned only when it is a
+    message left over for an action that has NOT started; otherwise None, and
+    callers keep their old behaviour.
+
+    Both conditions must hold: the current action is still ASSIGNED, and the
+    latest dispatch before the message names another action.  Measured on
+    central 2026-09-13 (#101): after [ADVANCE] N->N+1 the old verdict and
+    TERMINATE stay the last messages, and the termination hook and the create
+    loop's verdict pickup credited them to N+1 before it ran, so every executed
+    action was followed by a phantom completion of the next.  The state
+    condition matters as much as the marker: a started action's own rounds
+    (a recipe request, a fallback request, a claim rejection, a "continue"
+    nudge) carry no dispatch marker of their own, and reading only markers
+    handed them to the previous action (#101 review, 2026-09-14).
+    """
+    try:
+        aid = int(action_id)
+    except (TypeError, ValueError):
+        logger.warning("stale check: action_id %r is not an int; treating the "
+                       "message as the current action's", action_id)
+        return None
+    if get_action_state(user_prompt, aid) != ActionState.ASSIGNED:
+        return None
+    owner = latest_dispatch_before(messages, index)
+    if owner is not None and owner != aid:
+        return owner
+    return None
+
+
+def settled_action_id(claimed_action_id, current_action_id) -> int:
+    """The action a verdict settles: the one the pipeline posted.
+
+    The model's action_id is advisory.  A verdict for the action on the floor
+    that names another id (a mistyped number, a future id, an id copied from
+    an earlier verdict) still answers the posted action, so it settles that
+    one, and the mismatch is logged as a hallucination signal.  This is the
+    one home of the rule: reuse's _advance_or_steer, the create loop's verdict
+    pickup and create's state_transition all call it.  Before it,
+    state_transition trusted the claimed id, so a verdict naming action 3
+    while action 2 ran force-completed action 3 before it was posted, and one
+    naming action 1 rewrote action 1's text (both reproduced by
+    tests/unit/test_create_loop_end_to_end.py).
+
+    A verdict left over for an action that has not started is not this case;
+    stale_for_unstarted_action refuses that one first.
+    """
+    try:
+        current = int(current_action_id)
+    except (TypeError, ValueError):
+        logger.warning("settled_action_id: the posted action %r is not an int; "
+                       "leaving it as it is", current_action_id)
+        return current_action_id
+    try:
+        claimed = int(float(claimed_action_id))
+    except (TypeError, ValueError):
+        return current
+    if claimed != current:
+        logger.warning(
+            "[HALLUCINATION?] LLM claims action_id=%s but pipeline has %s",
+            claimed, current)
+    return current
+
+
 def lifecycle_hook_track_termination(user_prompt: str, user_tasks, group_chat) -> bool:
     """11. Track when action is terminated and passed to chat instructor"""
     if hasattr(user_tasks, 'get'):
@@ -1337,14 +2189,40 @@ def lifecycle_hook_track_termination(user_prompt: str, user_tasks, group_chat) -
     if (group_chat.messages and
         group_chat.messages[-1]['content'] == 'TERMINATE'):
 
-        # force_state_through_valid_path (not a bare validate): a TERMINATE for an
-        # action still stuck in ASSIGNED/IN_PROGRESS/PENDING (the 4B never drove
-        # the intermediate transitions) walks to TERMINATED via the force-to-
-        # terminal recovery paths instead of being rejected -> looping forever
-        # (the live 2026-06-13 'assigned -> terminated' stall).  Normal
-        # COMPLETED/RECIPE_RECEIVED terminations resolve through the same single
-        # [TERMINATED] step as before, so behaviour is unchanged for them.
-        if force_state_through_valid_path(user_prompt, current_action_id, ActionState.TERMINATED, "hook tracking lifecycle_hook_track_termination"):
+        # A TERMINATE left over from the previous action is not this one's
+        # (#101): after an advance it is still the last message, and the new
+        # action has not started yet.
+        _owner = stale_for_unstarted_action(
+            group_chat.messages, -1, user_prompt, current_action_id)
+        if _owner is not None:
+            logger.info(
+                "[STALE-TERMINATE] the last TERMINATE belongs to action %s; "
+                "not terminating action %s, which has not started",
+                _owner, current_action_id)
+            return False
+
+        # A TERMINATE closes an action; it never CERTIFIES one.  ChatInstructor
+        # answers every verdict with TERMINATE (its default_auto_reply), so
+        # this hook -- which runs at the top of each create-loop lap, BEFORE
+        # the verdict pickup -- used to walk an unverified action
+        # (ASSIGNED/IN_PROGRESS/STATUS_VERIFICATION_REQUESTED/PENDING)
+        # through COMPLETED to TERMINATED with no receipt.  That write is the
+        # fabricated "[TARGET] Action 1: status_verification_requested ->
+        # completed (auto-path: hook tracking lifecycle_hook_track_termination)"
+        # of live 2026-09-27 14:26:20 (CREATE daemon_255bd83f): two
+        # execute_coding_task actions COMPLETED with zero coding runs.
+        #
+        # So such an action is left open here, for the verdict pickup and its
+        # canonical gate (commit_verified_action_completion) to complete or
+        # refuse -- bounded there, ending GAVE_UP rather than looping.  The
+        # 2026-06-13 'assigned -> terminated' stall this path once escaped is
+        # bounded by that gate and by [EXECUTE-PENDING]'s three attempts.
+        # Verified (COMPLETED / RECIPE_RECEIVED) and recovery-edge
+        # terminations are unchanged.
+        if force_state_through_valid_path(
+                user_prompt, current_action_id, ActionState.TERMINATED,
+                "hook tracking lifecycle_hook_track_termination",
+                through_completed=False):
             return True
 
     return False

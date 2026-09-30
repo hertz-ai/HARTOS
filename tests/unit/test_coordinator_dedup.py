@@ -82,6 +82,173 @@ class TestSubmitGoalDedup:
         assert len(led.tasks) > n1  # genuinely new goal adds tasks
 
 
+class TestRedispatchHealsGoalTypeDemands:
+    """Re-dispatch must repair a task set written before the
+    goal-type-as-capability fix, not preserve it forever.
+
+    Measured on central 2026-09-13. Three hive goals had task sets created by
+    the old code with capabilities_required=['hive_growth'] /
+    ['hive_training'], names no worker can advertise. The dedup branch
+    returned early on every re-dispatch, so the bad demand outlived the fix
+    and two redeploys (the ledger is file-backed): the goals dispatched every
+    tick into a queue nothing could claim, spark frozen since 09-01.
+    """
+
+    def _stale(self, goal_type, demanded):
+        """A task set exactly as the pre-fix code wrote it."""
+        led = _ledger()
+        coord = _coordinator(led)
+        coord.submit_goal(
+            'obj',
+            [{'task_id': 'g_task_0', 'description': 'd',
+              'capabilities': demanded}],
+            {'goal_type': goal_type}, goal_id='g')
+        return led, coord
+
+    def _redispatch(self, coord, goal_type):
+        return coord.submit_goal('obj', [], {'goal_type': goal_type},
+                                 goal_id='g')
+
+    def test_redispatch_drops_an_unadvertisable_goal_type_demand(self):
+        led, coord = self._stale('hive_growth', ['hive_growth'])
+        assert led.get_task('g_task_0').context[
+            'capabilities_required'] == ['hive_growth']
+        self._redispatch(coord, 'hive_growth')
+        assert led.get_task('g_task_0').context[
+            'capabilities_required'] == [], (
+            "re-dispatch preserved a demand for 'hive_growth', which no "
+            "worker can advertise, so the task stays unclaimable forever")
+
+    def test_the_healed_task_is_claimable_by_an_ordinary_worker(self):
+        """The outcome that matters, end to end through the real matcher."""
+        from core.constants import HIVE_WORKER_BASE_CAPABILITIES
+        worker_caps = list(HIVE_WORKER_BASE_CAPABILITIES)
+        led, coord = self._stale('hive_training', ['hive_training'])
+        coord._lock.try_claim_task.return_value = True
+
+        assert coord.claim_next_task('w', worker_caps) is None, \
+            'precondition: the stale task must be unclaimable before healing'
+
+        self._redispatch(coord, 'hive_training')
+        got = coord.claim_next_task('w', worker_caps)
+        assert got is not None and got.task_id == 'g_task_0', \
+            'after healing, an ordinary worker must be able to claim the task'
+
+    def test_a_real_capability_demand_is_kept(self):
+        """The five words shared by both vocabularies must keep routing."""
+        led, coord = self._stale('marketing', ['marketing'])
+        self._redispatch(coord, 'marketing')
+        assert led.get_task('g_task_0').context[
+            'capabilities_required'] == ['marketing']
+
+    def test_a_deliberate_non_goal_type_demand_is_kept(self):
+        """Robot hardware names sit outside the worker vocabulary on purpose.
+        The heal repairs one bad write; it must not become a general filter
+        that would let a hardware-less node claim a robot task."""
+        led, coord = self._stale('robot', ['locomotion'])
+        self._redispatch(coord, 'robot')
+        assert led.get_task('g_task_0').context[
+            'capabilities_required'] == ['locomotion']
+
+    def test_a_claimed_task_is_left_alone(self):
+        """Rewriting a held task's contract mid-flight is not a repair."""
+        led, coord = self._stale('hive_growth', ['hive_growth'])
+        t = led.get_task('g_task_0')
+        t.context['claimed_by'] = 'worker_x'
+        self._redispatch(coord, 'hive_growth')
+        assert t.context['capabilities_required'] == ['hive_growth']
+
+    def test_nothing_to_heal_costs_no_save(self):
+        """This branch runs every tick for every in-flight goal. A save per
+        re-dispatch re-serializes the whole ledger each time: #145."""
+        led, coord = self._stale('marketing', ['marketing'])
+        before = led.backend.save_calls
+        self._redispatch(coord, 'marketing')
+        assert led.backend.save_calls == before, \
+            're-dispatch with nothing to heal must not write the ledger'
+
+
+class TestContinuousGoalsReopenAfterEachRun:
+    """Owner decision 2026-09-13: a continuous goal's hive task comes back after
+    every finished run.
+
+    submit_goal creates a goal's task set once and dedups every later dispatch,
+    and COMPLETED is terminal in the ledger's state machine, so a continuous
+    goal got exactly one hive run for its whole life. Measured on central the
+    same morning: Guardian Convergence's only task completed with a real result,
+    and from then on the goal dispatched every few minutes into a task set with
+    nothing left to claim.
+    """
+
+    def _finished_run(self, continuous):
+        led = _ledger()
+        coord = _coordinator(led)
+        coord.submit_goal('obj', [{'task_id': 'g_task_0', 'description': 'd'}],
+                          {'continuous': continuous}, goal_id='g')
+        led.update_task_status('g_task_0', TaskStatus.IN_PROGRESS)
+        ctx = led.get_task('g_task_0').context
+        ctx['claimed_by'] = 'worker_a'
+        ctx['claimed_at'] = '2026-09-13T06:00:00'
+        led.complete_task('g_task_0', result='found three GPU owners on HN')
+        assert led.get_task('g_task_0').status == TaskStatus.COMPLETED
+        return led, coord
+
+    def test_a_finished_continuous_run_is_reopened_on_redispatch(self):
+        led, coord = self._finished_run(continuous=True)
+        size_before = len(led.tasks)
+        coord.submit_goal('obj', [], {'continuous': True}, goal_id='g')
+        t = led.get_task('g_task_0')
+        assert t.status == TaskStatus.PENDING
+        assert t.result is None and t.completed_at is None
+        assert 'claimed_by' not in t.context and 'claimed_at' not in t.context
+        assert t.context.get('runs') == 1
+        assert t.context.get('last_result_hash'), "the finished run's hash was lost"
+        assert len(led.tasks) == size_before, (
+            'reopening grew the ledger; one task per run is the unbounded '
+            'growth behind the 9166-task save deadlock')
+        assert t.state_history[-1]['previous_status'] == TaskStatus.COMPLETED.value, (
+            'the reopen is not recorded in the task history')
+
+    def test_the_reopened_task_is_claimable_again(self):
+        led, coord = self._finished_run(continuous=True)
+        coord._lock.try_claim_task.return_value = True
+        coord.submit_goal('obj', [], {'continuous': True}, goal_id='g')
+        got = coord.claim_next_task('worker_b', None)
+        assert got is not None and got.task_id == 'g_task_0'
+
+    def test_a_finished_run_of_a_normal_goal_stays_completed(self):
+        """The safety line. For a non-continuous goal the settle gate reads the
+        ledger right after dispatch; re-opening here would erase the grounding
+        it is about to read, and the goal could never complete."""
+        led, coord = self._finished_run(continuous=False)
+        coord.submit_goal('obj', [], {'continuous': False}, goal_id='g')
+        assert led.get_task('g_task_0').status == TaskStatus.COMPLETED
+
+    def test_a_run_still_in_flight_is_not_touched(self):
+        led = _ledger()
+        coord = _coordinator(led)
+        coord.submit_goal('obj', [{'task_id': 'g_task_0', 'description': 'd'}],
+                          {'continuous': True}, goal_id='g')
+        led.update_task_status('g_task_0', TaskStatus.IN_PROGRESS)
+        before = led.backend.save_calls
+        coord.submit_goal('obj', [], {'continuous': True}, goal_id='g')
+        assert led.get_task('g_task_0').status == TaskStatus.IN_PROGRESS
+        assert led.backend.save_calls == before, \
+            'a re-dispatch with nothing to reopen must not write the ledger (#145)'
+
+    def test_reopen_is_only_legal_from_completed(self):
+        """COMPLETED -> PENDING is the one new transition, and only through
+        reopen_task. A FAILED task stays failed so the fast-fail breaker (#59)
+        still prevents retry storms."""
+        led = _ledger()
+        led.add_task(Task(task_id='p', description='x',
+                          task_type=TaskType.AUTONOMOUS))
+        assert led.reopen_task('p', reason='test') is False        # PENDING
+        led.update_task_status('p', TaskStatus.IN_PROGRESS)
+        led.update_task_status('p', TaskStatus.FAILED)
+        assert led.reopen_task('p', reason='test') is False        # FAILED
+
+
 class TestSaveLockHygiene:
     def test_slow_save_does_not_hold_the_task_lock(self):
         """A slow save() must hold _io_lock (write serialization) but NOT _lock

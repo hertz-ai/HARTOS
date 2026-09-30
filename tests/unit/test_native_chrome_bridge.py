@@ -71,9 +71,10 @@ def test_partial_claims_are_honoured_independently(verdict):
 
 
 def test_unknown_names_are_ignored_not_trusted(verdict):
-    """A NEWER compositor claiming `taskbar` must not make an OLDER shell hide a
-    taskbar it still owns. Forward compatibility has to fail closed."""
-    verdict.write_text("bloom,taskbar,topbar,nonsense")
+    """A NEWER compositor claiming a band this shell has no stand-down for (say
+    `startmenu`) must not make an OLDER shell hide something it still owns.
+    Forward compatibility has to fail closed."""
+    verdict.write_text("bloom,startmenu,lockscreen,nonsense")
     assert L.read_native_chrome() == frozenset({"bloom"})
 
 
@@ -94,13 +95,38 @@ def _src():
         return fh.read()
 
 
+def _block(src, start, end=None):
+    """The source between two markers, rather than a fixed number of characters.
+
+    These guards used to slice `src[i:i + 2000]`, which is a bet on how much PROSE
+    sits between the marker and the code. Two of them lost that bet on 2026-09-10
+    when a real comment was added inside the orb block explaining the duplicate
+    render path, and they went red while the code they check was correct. A guard
+    that fails on a comment is not testing anything.
+    """
+    i = src.index(start)
+    j = src.index(end, i) if end else len(src)
+    return src[i:j]
+
+
+def _code(block):
+    """A block with its whole-line `#` comments dropped.
+
+    The comments here deliberately NAME the thing they rejected ("visibility:hidden
+    rather than display:none on purpose"), so a guard that forbids a string has to
+    read the code and not the prose, or explaining a decision breaks the test that
+    protects it.
+    """
+    return chr(10).join(
+        ln for ln in block.splitlines() if not ln.lstrip().startswith("#"))
+
+
 def test_the_wallpaper_stands_down_for_a_claimed_bloom():
     """The default wallpaper bottoms out in an OPAQUE linear-gradient. That is
     exactly what has hidden the native bloom since M1, so the claim must make it
     transparent or the bridge does nothing."""
     src = _src()
-    i = src.index("native_chrome = read_native_chrome()")
-    window = src[i: i + 1200]
+    window = _block(src, "native_chrome = read_native_chrome()", "native_orb_css = ''")
     assert "'bloom' in native_chrome" in window
     assert "wp_css = 'transparent'" in window, (
         "a claimed bloom must make the shell's wallpaper transparent")
@@ -111,8 +137,7 @@ def test_the_shell_hides_its_own_orb_when_the_compositor_owns_it():
     HTML one breathing on top — and the browser would still pay the per-frame
     cost M2 exists to remove."""
     src = _src()
-    i = src.index("native_chrome = read_native_chrome()")
-    window = src[i: i + 2000]
+    window = _block(src, "native_orb_css = ''", "native_home_css = ''")
     assert "'orb' in native_chrome" in window
     assert "hart-voice-orb" in window, "the HTML orb must be suppressed"
     assert "animation:none" in window, (
@@ -125,10 +150,9 @@ def test_the_orb_keeps_its_hit_target():
     click-to-talk and drag keep working against the same geometry while the
     compositor draws the pixels."""
     src = _src()
-    i = src.index("native_orb_css = ")
-    window = src[i: i + 600]
+    window = _block(src, "native_orb_css = ''", "native_home_css = ''")
     assert "visibility:hidden" in window
-    assert "display:none" not in window, (
+    assert "display:none" not in _code(window), (
         "display:none would remove the orb's hit target and break input, which "
         "is a far bigger change than swapping who paints it")
 
@@ -400,3 +424,127 @@ def test_the_embedded_python_has_no_doubled_single_quote():
         'doubled single quote inside the python -c program: Nix reads it as an '
         'escape in the enclosing indented string and the evaluation gate dies, '
         'skipping every build: %r' % bad[:3])
+
+
+def test_the_shell_hides_its_home_surface_when_the_compositor_claims_it(verdict):
+    """The claim that makes the native scene the RENDERER rather than a second one.
+
+    With `home` claimed the compositor is painting the desktop between the bars, so
+    the shell must stop painting its own or the box draws two full home surfaces and
+    the browser keeps paying to rasterise the one nobody sees, which is the entire
+    cost the native scene exists to remove.
+    """
+    verdict.write_text("home")
+    assert L.read_native_chrome() == frozenset({"home"}), (
+        "'home' must be an accepted claim name, or the shell ignores it")
+    src = _src()
+    window = _block(src, "native_home_css = ''", "# The SAME verdict")
+    assert "'home' in native_chrome" in window
+    assert "#hart-home{visibility:hidden}" in window, (
+        "a claimed home must hide #hart-home, the one element hartHome mounts into")
+
+
+def test_the_home_surface_keeps_its_box():
+    """visibility, not display:none, matching both neighbours: #hart-home keeps its
+    layout box so the desktop does not reflow and geometry read against it stays
+    valid while the compositor owns the pixels."""
+    src = _src()
+    window = _block(src, "native_home_css = ''", "# The SAME verdict")
+    assert "visibility:hidden" in window
+    assert "display:none" not in _code(window), (
+        "display:none would reflow the desktop and invalidate any geometry read "
+        "against #hart-home")
+
+
+def test_the_bars_are_claimed_per_band_and_only_when_fully_drawn(verdict):
+    """The successor of `test_the_bars_are_deliberately_not_claimed`, changed on
+    purpose along with the claim, as that test said it should be.
+
+    The native bars now carry their content over `shell.chrome` (IPC 4.13): the
+    clock, the tray, the badge, the agent cluster, the taskbar chips. So the
+    compositor may claim a band, but only a band it composed FULLY and painted;
+    that rule is `comp_core::leaf_claim`, gated on `ShellChrome::coverage`, and its
+    partial-band half is pinned in Rust (`a_bar_drawn_from_a_partial_payload_is_never_claimed`).
+    This half pins the shell: it accepts the two names, stands each band down on its
+    own, and keeps the bar's hit targets while it does.
+    """
+    verdict.write_text("home,topbar")
+    assert L.read_native_chrome() == frozenset({"home", "topbar"}), (
+        "'topbar' must be an accepted claim name")
+    verdict.write_text("taskbar")
+    assert L.read_native_chrome() == frozenset({"taskbar"})
+
+    src = _src()
+    window = _code(_block(src, "native_bars_css = ''", "# The SAME verdict"))
+    assert "'topbar' in native_chrome" in window and ".top-bar{opacity:0}" in window
+    assert "'taskbar' in native_chrome" in window and ".taskbar{opacity:0}" in window
+    # Each band on its own: a claimed top bar must not stand the taskbar down.
+    assert window.index("'topbar' in native_chrome") < window.index(".top-bar{opacity:0}")
+    assert window.index("'taskbar' in native_chrome") < window.index(".taskbar{opacity:0}")
+
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+    assert "NATIVE_CHROME_TOPBAR" in comp and "NATIVE_CHROME_TASKBAR" in comp
+    assert "pub fn leaf_claim(" in comp, "the per-band claim rule has moved"
+    udev = open(os.path.join(REPO, "compositor", "src", "udev.rs"),
+                encoding="utf-8").read()
+    assert 'names.push("topbar")' in udev and 'names.push("taskbar")' in udev, (
+        "the claim publisher must spell the names the shell accepts")
+
+
+def test_a_claimed_bar_keeps_its_hit_targets():
+    """opacity, NOT visibility or display, and this is deliberate where every
+    neighbour uses visibility: the native bar routes no presses yet, so a press on
+    it falls through to the shell's bar underneath. `visibility:hidden` would remove
+    that bar from hit testing and leave the tabs, the start button, the tray and the
+    chips dead the moment the compositor claimed the band."""
+    src = _src()
+    window = _code(_block(src, "native_bars_css = ''", "# The SAME verdict"))
+    assert "visibility:hidden" not in window, (
+        "the bars must stay hit-testable while the compositor paints them")
+    assert "display:none" not in window
+    assert "pointer-events" not in window, "nothing may turn the bar's input off"
+
+
+def test_onboarding_keeps_its_own_orb_because_the_compositor_cannot_draw_one_there():
+    """The stand-down's premise fails for exactly one surface, and it was applied
+    there anyway.
+
+    Everything else in that list is safe because the bloom claim makes the WALLPAPER
+    transparent, so the compositor's layers show through underneath. `.hart-onboarding`
+    paints its own backdrop at `inset:0; z-index:12000` out of two fully opaque stops,
+    so the transparent wallpaper buys it nothing, and the native orb is drawn BELOW the
+    shell surface, which orb.rs describes as OCCLUDED whenever the shell paints an
+    opaque background.
+
+    So hiding `.hob-orb` did not hand the orb over to the compositor. It left the first
+    screen a new user sees with no orb at all, which is what the owner reported on
+    2026-09-11.
+
+    The positions never matched either: the native orb takes the HOME layout's slot at
+    0.72w/0.46h, while the ceremony centres its own above the name reveal.
+    """
+    src = _src()
+    stand_down = _block(src, "native_orb_css = ''", "native_home_css = ''")
+    css = _code(stand_down)
+    assert 'hob-orb' not in css, (
+        "the onboarding orb is standing down again; the compositor cannot draw an orb "
+        "behind an opaque full-screen ceremony, so this leaves onboarding with none")
+
+    # The surfaces that CAN hand off must still do so, or this guard would pass by
+    # gutting the bridge rather than by scoping it.
+    assert 'hart-hero-orbwrap' in css and 'hart-voice-orb' in css, (
+        "the hero and voice orbs must still stand down for a claimed orb")
+    assert 'hart-orb-orbit' in css, "the orbit rings must still stand down"
+
+    # And the onboarding backdrop is still the opaque thing this argument rests on.
+    onb = _block(src, ".hart-onboarding{", "}")
+    assert 'z-index:12000' in onb and 'background:radial-gradient' in onb, (
+        "the onboarding backdrop changed shape; re-check whether the native orb can "
+        "now be seen behind it before trusting this test's reasoning")
+
+    # The software-floor ANIMATION gate is a different rule and must survive: it drops
+    # the breathing on a box that paints in software while keeping the orb visible.
+    assert 'body.webkit-flat .hart-onboarding .hob-orb,' in src, (
+        "the onboarding orb lost its software-floor animation gate, which is what "
+        "stopped it re-rasterising a 150px double box-shadow forever")

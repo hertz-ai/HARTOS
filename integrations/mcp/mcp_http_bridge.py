@@ -148,10 +148,10 @@ def _ensure_mcp_token() -> str:
 
 
 def _is_loopback_request() -> bool:
-    """True if the Flask request originates from 127.0.0.1/::1."""
-    from flask import request as _req
-    _addr = (_req.remote_addr or '').strip()
-    return _addr in ('127.0.0.1', '::1', 'localhost')
+    """True if the Flask request originates from this machine: the one rule,
+    core.auth_local._is_local_request (a forwarded loopback claim is not)."""
+    from core.auth_local import _is_local_request
+    return _is_local_request()
 
 
 # ── Public API for cross-package consumers (Nunba) ──────────────────────
@@ -251,6 +251,19 @@ def _mcp_auth_gate():
     from flask import request as _req, jsonify as _jsonify
     import os as _os
     global _MCP_AUTH_DISABLED_WARNED
+    # The copilot's off-switch, FIRST — before the open /health endpoint and
+    # before the env auth bypass, so "off" means the whole surface refuses and
+    # no path routes around it.  503, not 403: the node is not refusing this
+    # caller's credential, it is switched off, and a client that reads the
+    # difference can say so instead of telling the owner their token is wrong.
+    from integrations.coding_agent.claude_code_backend import copilot_enabled
+    if not copilot_enabled():
+        return _jsonify({
+            'success': False,
+            'error': 'mcp: the Claude Code copilot is switched off on this '
+                     'node — turn it back on in Admin → Integrations → '
+                     'Claude Code.  Your token is unchanged.',
+        }), 503
     # Health endpoint is open — it returns only a tool count, no data, no mutation.
     if _req.path.endswith('/health'):
         return None
@@ -921,6 +934,21 @@ def _invoke_tool(tool_name, arguments):
     # kwarg.  See `_TOOL_ARG_ALIASES` above for the full mapping.
     arguments = _canonicalize_args(tool_name, arguments)
 
+    # An MCP call is no agent's turn, so the tool runs with NO request state
+    # (hartos.threadlocal.detached).  The /chat handler sets that state and
+    # never clears it, so a worker thread reused from a chat still carried
+    # that chat's prompt_id, user_id, request_id, user_role, activity run and
+    # model override: measured 2026-09-27 (scratchpad/tl_probe.py), a tool
+    # called here saw prompt_id '8865956' left by the previous /chat, and a
+    # tool that acts for "the calling agent" (cast_experiment_vote) would
+    # have acted as that agent.  The thread's state is put back after.
+    from hartos.threadlocal import thread_local_data as _tl
+    with _tl.detached():
+        return _run_tool(tool_name, fn, arguments)
+
+
+def _run_tool(tool_name, fn, arguments):
+    """Call one resolved tool and shape its result (for _invoke_tool)."""
     try:
         result = fn(**arguments)
         if isinstance(result, str):
@@ -1062,3 +1090,14 @@ def auto_register_local_mcp():
             logger.info(f"Auto-registered local MCP server at {local_url}")
     except Exception as e:
         logger.debug(f"Auto-register local MCP failed (non-critical): {e}")
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HARTOS_MCP_DISABLE_AUTH',
+    'HARTOS_MCP_TOKEN',
+    'HARTOS_MCP_TOKEN_FILE',
+)

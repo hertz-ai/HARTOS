@@ -7,6 +7,7 @@ Three guard layers:
 
 Plus integration with execute_action(safety=True).
 """
+import hashlib
 import json
 import os
 import tempfile
@@ -19,6 +20,7 @@ from integrations.vlm.safety import (
     is_window_blocked,
     DEFAULT_BLOCKED_PROCESSES, DEFAULT_BLOCKED_TITLE_PATTERNS,
     get_session_guard, get_audit_logger, reset_session_guard,
+    destructive_computer_operation,
 )
 
 
@@ -127,6 +129,25 @@ class TestWindowBlocklist(unittest.TestCase):
         self.assertIsNone(is_window_blocked(meta2, cfg))
 
 
+class TestDestructiveComputerOperation(unittest.TestCase):
+    def test_blocks_power_reset_requests_in_multiple_languages(self):
+        for request in ('Restart the system', '\u91cd\u542f\u7535\u8111', '\u0930\u0940\u0938\u094d\u091f\u093e\u0930\u094d\u091f \u0915\u0930\u0947\u0902'):
+            self.assertIsNotNone(destructive_computer_operation(request))
+
+    def test_blocks_actual_commands_but_not_ordinary_formatting(self):
+        for command in ('shutdown.exe /s', 'systemctl poweroff', 'mkfs.ext4 /dev/sda'):
+            self.assertIsNotNone(destructive_computer_operation(command))
+        self.assertIsNone(destructive_computer_operation('format a project report'))
+
+    def test_allows_app_lifecycle_and_non_system_sleep_language(self):
+        for request in (
+                'restart the Nunba app',
+                'restart the LiveKit service',
+                'sleep for five seconds before retrying',
+                'open the shutdown documentation'):
+            self.assertIsNone(destructive_computer_operation(request), request)
+
+
 class TestAuditLogger(unittest.TestCase):
     """JSONL append + screenshot hash + window metadata."""
 
@@ -182,6 +203,74 @@ class TestAuditLogger(unittest.TestCase):
             record = json.loads(f.readline())
         self.assertEqual(record['block_reason'], 'process_blocked: lsass.exe')
 
+    def _only_record(self):
+        files = [f for f in os.listdir(self.tmpdir) if f.endswith('.jsonl')]
+        with open(os.path.join(self.tmpdir, files[0])) as f:
+            return json.loads(f.readline())
+
+    # Live 2026-09-14: the loop wrote C:\Users\Public\search_llm_config.py
+    # (write_file, 18:33:41) and ran it (shell, 18:33:45), and neither record
+    # named the file: the command rides in 'command' and the target in 'path',
+    # and the audit kept neither.  0 of that day's 666 records named it.
+    def test_shell_command_is_recorded(self):
+        cmd = r'python C:\Users\Public\search_llm_config.py'
+        self.logger.log({'action': 'shell', 'command': cmd}, {'status': 'error'})
+        self.assertEqual(self._only_record()['command'], cmd)
+
+    def test_written_file_path_is_recorded_not_its_content(self):
+        content = 'print("SECRET-CONTENT")'
+        self.logger.log(
+            {'action': 'write_file', 'path': r'C:\Users\Public\x.py',
+             'content': content},
+            {'output': 'Written'})
+        record = self._only_record()
+        self.assertEqual(record['path'], r'C:\Users\Public\x.py')
+        self.assertNotIn('SECRET-CONTENT', json.dumps(record))
+        self.assertEqual(record['content_sha256'],
+                         hashlib.sha256(content.encode('utf-8')).hexdigest()[:16])
+
+    def test_content_sent_as_value_is_hashed_too(self):
+        """The 18:33:41 record: the model put the script in 'value', the loop
+        carried it as 'text', and the audit stored its first 80 chars raw."""
+        self.logger.log(
+            {'action': 'write_file', 'path': r'C:\Users\Public\x.py',
+             'text': '#!/usr/bin/env python3\nSECRET-CONTENT = 1'},
+            {'output': 'Written'})
+        record = self._only_record()
+        self.assertNotIn('SECRET-CONTENT', json.dumps(record))
+        self.assertTrue(record['content_sha256'])
+
+    def test_a_secret_in_a_command_is_redacted(self):
+        token = 'a' * 40
+        self.logger.log(
+            {'action': 'shell',
+             'command': f'curl -H "Authorization: Bearer {token}" https://x'},
+            {'status': 'ok'})
+        record = self._only_record()
+        self.assertNotIn(token, json.dumps(record))
+        self.assertIn('[REDACTED:', record['command'])
+
+    def test_a_secret_in_typed_text_is_redacted(self):
+        self.logger.log({'action': 'type', 'text': 'password=hunter2secret'},
+                        {'output': 'Typed'})
+        self.assertNotIn('hunter2secret', json.dumps(self._only_record()))
+
+    def test_copy_records_both_paths(self):
+        self.logger.log(
+            {'action': 'Open_file_and_copy_paste',
+             'source_path': 'C:/a.txt', 'destination_path': 'C:/b.txt'},
+            {'output': 'Copied'})
+        record = self._only_record()
+        self.assertEqual((record['source_path'], record['destination_path']),
+                         ('C:/a.txt', 'C:/b.txt'))
+
+    def test_a_long_command_is_cut_not_dropped(self):
+        cmd = 'python -m tool ' + 'x' * 2000
+        self.logger.log({'action': 'shell', 'command': cmd}, {'status': 'ok'})
+        recorded = self._only_record()['command']
+        self.assertTrue(recorded and cmd.startswith(recorded)
+                        and len(recorded) < len(cmd), len(recorded or ''))
+
     def test_audit_dir_create_failure_disables_logger(self):
         """Bad audit_dir → log() must no-op, NOT raise."""
         bad_cfg = SafetyConfig(audit_dir='\x00invalid\x00path',
@@ -205,6 +294,13 @@ class TestExecuteActionSafetyIntegration(unittest.TestCase):
         mock_exec.return_value = {'output': 'ok'}
         result = execute_action({'action': 'left_click'}, 'inprocess')
         self.assertNotIn('safety_block', result)
+
+    @patch('integrations.vlm.local_computer_tool._execute_inprocess')
+    def test_destructive_command_is_blocked_even_when_optional_safety_is_off(self, mock_exec):
+        from integrations.vlm.local_computer_tool import execute_action
+        result = execute_action({'action': 'shell', 'command': 'shutdown.exe /s'}, 'inprocess')
+        self.assertEqual(result['status'], 'safety_blocked')
+        mock_exec.assert_not_called()
 
     @patch('integrations.vlm.local_computer_tool._execute_inprocess')
     @patch('integrations.vlm.safety.is_window_blocked',

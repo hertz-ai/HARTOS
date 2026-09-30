@@ -474,3 +474,110 @@ def test_grant_rejects_oversize_scope(client):
         headers=_as_user(10),
     )
     assert resp.status_code == 400
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Decline: the "Don't allow" answer on a consent card
+# ══════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+def ask(app, monkeypatch):
+    """File a pending ask the way a gate does (ConsentService.request_consent)
+    without broadcasting it, and read back (allowed, declined)."""
+    from sqlalchemy.orm import sessionmaker
+
+    from integrations.social import consent_service
+    from integrations.social.consent_service import ConsentService
+
+    monkeypatch.setattr(consent_service, '_emit', lambda *a, **k: None)
+    Session = sessionmaker(bind=app.test_engine, expire_on_commit=False)
+
+    def _file(uid, agent_id=None, consent_type='computer_control'):
+        db = Session()
+        try:
+            ConsentService.request_consent(db, str(uid), consent_type,
+                                           agent_id=agent_id)
+            db.commit()
+        finally:
+            db.close()
+
+    def _state(uid, agent_id=None, consent_type='computer_control'):
+        db = Session()
+        try:
+            return (
+                ConsentService.check_consent(db, str(uid), consent_type,
+                                             agent_id=agent_id),
+                ConsentService.declined(db, str(uid), consent_type,
+                                        agent_id=agent_id),
+            )
+        finally:
+            db.close()
+
+    return SimpleNamespace(file=_file, state=_state)
+
+
+def _decline(client, uid, agent_id):
+    return client.post(
+        '/api/social/consent/decline',
+        json={'consent_type': 'computer_control', 'scope': '*',
+              'agent_id': agent_id},
+        headers=_as_user(uid),
+    )
+
+
+def test_decline_requires_auth(client):
+    resp = client.post('/api/social/consent/decline',
+                       json={'consent_type': 'computer_control'})
+    assert resp.status_code == 401
+
+
+def test_decline_requires_consent_type(client):
+    resp = client.post('/api/social/consent/decline', json={},
+                       headers=_as_user(10))
+    assert resp.status_code == 400
+
+
+def test_decline_says_no_to_that_agents_ask_only(client, ask):
+    ask.file(10, agent_id='A1')
+    ask.file(10, agent_id='A2')
+
+    resp = _decline(client, 10, 'A1')
+    assert resp.status_code == 200
+    assert resp.get_json()['data']['declined'] is True
+    assert ask.state(10, agent_id='A1') == (False, True)
+    assert ask.state(10, agent_id='A2') == (False, False), (
+        'a no to one agent answered another agent')
+
+
+def test_decline_of_an_unidentified_agents_ask(client, ask):
+    ask.file(10, agent_id=None)
+    assert _decline(client, 10, None).status_code == 200
+    assert ask.state(10, agent_id=None) == (False, True)
+
+
+def test_decline_with_no_ask_returns_404(client):
+    assert _decline(client, 10, 'A1').status_code == 404
+
+
+def test_user_a_cannot_decline_user_b_ask(client, ask):
+    ask.file(20, agent_id='A1')
+    assert _decline(client, 10, 'A1').status_code == 404
+    assert ask.state(20, agent_id='A1') == (False, False)
+
+
+def test_allowing_all_agents_after_a_decline_covers_that_agent(client, ask):
+    """The way back from a no is the privacy page's "Allow ALL agents":
+    POST /consent writes a grant with no agent, which covers every agent,
+    including one the owner said no to."""
+    ask.file(10, agent_id='A1')
+    assert _decline(client, 10, 'A1').status_code == 200
+
+    resp = client.post(
+        '/api/social/consent',
+        json={'consent_type': 'computer_control', 'scope': '*'},
+        headers=_as_user(10),
+    )
+    assert resp.status_code == 201
+    allowed, _declined = ask.state(10, agent_id='A1')
+    assert allowed is True

@@ -543,11 +543,8 @@ class ProviderRegistry:
     """Central catalog of all providers. JSON-persisted, thread-safe."""
 
     def __init__(self, registry_path: Optional[str] = None):
-        try:
-            from core.platform_paths import get_db_dir
-            data_dir = Path(get_db_dir())
-        except ImportError:
-            data_dir = Path.home() / 'Documents' / 'Nunba' / 'data'
+        from core.platform_paths import get_db_dir
+        data_dir = Path(get_db_dir())
         data_dir.mkdir(parents=True, exist_ok=True)
 
         self._path = Path(registry_path) if registry_path else data_dir / 'provider_registry.json'

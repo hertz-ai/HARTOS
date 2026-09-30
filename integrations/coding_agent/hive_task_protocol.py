@@ -43,13 +43,8 @@ logger = logging.getLogger(__name__)
 # platform-standard user data dir: `~/Documents/Nunba/data/agent_data`
 # on all OSes, matching MemoryGraph + every other Nunba data path.
 def _resolve_data_dir() -> str:
-    try:
-        from core.platform_paths import get_data_dir as _gdd
-        _base = _gdd()
-    except Exception:
-        _base = os.path.join(
-            os.path.expanduser('~'), 'Documents', 'Nunba', 'data',
-        )
+    from core.platform_paths import get_data_dir as _gdd
+    _base = _gdd()
     _dir = os.path.join(_base, 'agent_data')
     try:
         os.makedirs(_dir, exist_ok=True)

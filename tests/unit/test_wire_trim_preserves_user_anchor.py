@@ -62,19 +62,38 @@ def test_trim_keeps_the_last_user_message(monkeypatch):
 
 
 def test_a_body_with_no_user_message_gets_exactly_one_seeded(monkeypatch):
-    """This case left THIS fix's scope four days after it was written.
+    """CONTRACT CHANGED 2026-09-03 by 339e891da -- deliberately, and this is
+    the record.
 
-    aa40350 (2026-08-30) added this file and said a producer that never sent a
-    user message was out of scope: preserve an existing anchor, never invent
-    one. 339e891 (2026-09-03) then found the other half of the same 500 in the
-    wild -- a body reaching llama-server with no user turn AT ALL trips the same
-    Qwen3 template raise, and the preserve-only logic could not help because
-    there was nothing to preserve. So the trimmer now seeds one, and says so in
-    the log.
+    aa40350 (2026-08-30) added this file and put this case OUT of scope: "a
+    producer that never sent a user message is out of this fix's scope; the
+    trimmer must not invent one, only refuse to delete an existing one."  The
+    test asserted ``all(role != 'user')`` to pin that.
 
-    That is the current contract, so this pins it rather than the superseded
-    scope note. What "must not invent" still means, and is asserted below, is
-    that seeding is idempotent: it never adds a SECOND user turn.
+    That scope line did not survive contact with the live system.  On
+    2026-09-03 03:40:07 a reuse reply reached the wire as
+    ``[system, assistant, tool, assistant]`` -- user-less at the PRODUCER, not
+    by trimming -- and llama-server's Qwen3 template 500'd with "No user query
+    found in messages."  The preserve-only logic could not help, because there
+    was nothing to preserve.  339e891 therefore made the wire seed one user
+    turn for any user-less body, on the grounds that the wire is the single
+    chokepoint every outbound body crosses, and says so in the log.
+
+    So refusing to invent a user turn is no longer the contract, and the old
+    assertion had become a guard against the fix.  Two things must be pinned
+    instead.  (1) The seed survives the TRIMMED path: ``test_wire_seeds_user_turn``
+    covers the under-budget early-return, this covers the over-budget branch
+    where messages are actually dropped -- the same branch #730a is about.
+    (2) What "must not invent one" still means, asserted below: seeding is
+    idempotent and never adds a SECOND user turn.
+
+    MERGE NOTE 2026-09-11: two lanes rewrote this same test for this same
+    contract change, under two names.  One body asserted only that a user role
+    survives; this one additionally pins the COUNT, the seed CONSTANT and the
+    POSITION, and adds the idempotence case below -- it subsumes the other
+    assertion rather than competing with it, so there is one test here, not
+    two near-duplicates.  The weaker lane's docstring history is folded in
+    above; nothing it guarded was dropped.
     """
     from core.constants import WIRE_USER_SEED_TEXT
     msgs = [_msg('system', 's' * 400)]

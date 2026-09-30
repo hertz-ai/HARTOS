@@ -26,9 +26,8 @@ actions) lives in nixos/modules/hart-base.nix ``security.polkit``.
 """
 
 import logging
-from core.subprocess_safe import no_window_kwargs
+from core.subprocess_safe import call_bounded, no_window_kwargs
 import subprocess
-import threading
 
 logger = logging.getLogger('hevolve.shell.os_bridge.logind')
 
@@ -88,22 +87,16 @@ def _bounded(fn, wait):
 
     Returns ``(finished, value)``. ``(False, None)`` means the worker is still
     running (it keeps going, but the caller is freed) — this guards against a hung
-    bus pinning the shell pool. Mirrors shell_system_apis._run_async_bounded.
+    bus pinning the shell pool.  A worker exception comes back as
+    ``('__exc__', e)``, which logind_call reads as transport uncertainty.
+
+    The worker and the wait are core.subprocess_safe.call_bounded, the one
+    implementation; this keeps only logind's own return shape.
     """
-    holder = {}
-    done = threading.Event()
-
-    def _worker():
-        try:
-            holder['value'] = fn()
-        except Exception as e:  # pragma: no cover - defensive
-            holder['value'] = ('__exc__', e)
-        finally:
-            done.set()
-
-    threading.Thread(target=_worker, name='hart-logind-native', daemon=True).start()
-    finished = done.wait(wait)
-    return finished, holder.get('value')
+    finished, value, error = call_bounded(fn, wait, name='hart-logind-native')
+    if error is not None:
+        return finished, ('__exc__', error)
+    return finished, value
 
 
 def _native_logind_call(method, signature, body, timeout):

@@ -24,6 +24,33 @@ from .api_common import _ok, _err  # single-sourced envelope helpers (#97)
 # AGENTS - Unified list (local + cloud + daemon)
 # ═══════════════════════════════════════════════════════════════
 
+
+def _agent_read_refused(agent_id):
+    """None when the caller may read this agent's history, else the 403.
+
+    Review of 275e8e361: timeline / conversations / thinking served any
+    signed-in user.  They now ask dashboard_service.may_steer through
+    goal_to_steer, like every goal route.  The id is a goal id, or the
+    prompt id a goal runs under; an id no goal claims is a local agent with
+    no owner on record, so it is the machine's: this machine's callers read
+    it, a remote non-admin gets the same 403 as for someone else's.
+    """
+    from types import SimpleNamespace
+    from .dashboard_service import find_goal, goal_to_steer, steering_caller
+    db = g.db  # require_auth's session
+    goal = find_goal(db, agent_id)
+    if goal is None:
+        goal = (db.query(AgentGoal)
+                .filter(AgentGoal.prompt_id == str(agent_id)).first()
+                or SimpleNamespace(owner_id=None, created_by=None,
+                                   user_id=None))
+    _, refused = goal_to_steer(db, agent_id, 'read', steering_caller(),
+                               str(g.user.id), goal=goal, audit=False)
+    if refused is None:
+        return None
+    return jsonify({'success': False, 'data': refused}), 403
+
+
 @audit_bp.route('/agents', methods=['GET'])
 @require_auth
 def list_agents():
@@ -82,6 +109,9 @@ def list_agents():
 @require_auth
 def get_agent_timeline(agent_id):
     """Chronological activity: conversations, tool calls, status transitions, thinking."""
+    refused = _agent_read_refused(agent_id)
+    if refused is not None:
+        return refused
     limit = min(int(request.args.get('limit', 50)), 200)
     events = []
 
@@ -135,6 +165,9 @@ def get_agent_timeline(agent_id):
 @require_auth
 def get_agent_conversations(agent_id):
     """Agent conversation history from MemoryGraph."""
+    refused = _agent_read_refused(agent_id)
+    if refused is not None:
+        return refused
     conversations = []
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph
@@ -165,6 +198,9 @@ def get_agent_conversations(agent_id):
 @require_auth
 def get_agent_thinking(agent_id):
     """Agent reasoning chain from MemoryGraph lifecycle events."""
+    refused = _agent_read_refused(agent_id)
+    if refused is not None:
+        return refused
     thinking = []
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph

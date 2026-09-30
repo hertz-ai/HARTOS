@@ -9,6 +9,7 @@ Tier 'http': HTTP to localhost:5001 (omnitool-gui Flask server)
 """
 
 import os
+import re
 from core.subprocess_safe import no_window_kwargs
 import io
 import sys
@@ -63,7 +64,12 @@ SUPPORTED_ACTIONS = {
     'cursor_position', 'hover', 'list_folders_and_files',
     'Open_file_and_copy_paste', 'open_file_gui', 'write_file',
     'read_file_and_understand', 'wait', 'hotkey', 'shell',
+    'scroll_up', 'scroll_down',
 }
+
+#: Wheel notches per scroll when the model gives no amount: about a third
+#: of a typical page, so the next screenshot still overlaps the last one.
+SCROLL_DEFAULT_CLICKS = 5
 
 
 def take_screenshot(tier: str) -> str:
@@ -174,6 +180,111 @@ _REASONING_MISMATCH_PATTERNS = (
 _WINDOW_TARGETED_VERBS = ('minimize', 'close', 'switch to', 'click on')
 
 
+#: Key combinations that CLOSE a window.  Firing one of these at the
+#: wrong window destroys unsaved work and, unlike a stray click, cannot
+#: be undone -- which is why this list gates a hard block while the
+#: broader mismatch detector below only annotates.
+_DESTRUCTIVE_WINDOW_COMBOS = frozenset({
+    'alt+f4', 'ctrl+w', 'ctrl+shift+w', 'cmd+w', 'cmd+q',
+})
+
+#: Matches a run of TWO OR MORE consecutive capitalised words -- the
+#: shape of a real window/app name ("HART Marketing Dashboard", "Budget
+#: Spreadsheet").  Single capitalised words are deliberately NOT matched:
+#: "clicking the X" and "press OK" would otherwise read as targets and
+#: get a legitimate close refused.  Under-blocking is the chosen side of
+#: that trade (see _check_destructive_window_mismatch).
+_NAMED_WINDOW_TARGET = re.compile(r'\b[A-Z][\w&.\-]*(?:\s+[A-Z][\w&.\-]*)+')
+
+
+def _window_matches_target(target: str, active: str) -> bool:
+    """True when `active` window title and `target` name the same window.
+
+    ONE containment rule, shared by both mismatch checks below, so they
+    cannot drift into disagreeing about what "same window" means.
+    Case-insensitive and bidirectional: a title is routinely a superset
+    of the app name ("HART Marketing Dashboard - Chrome") and sometimes
+    a subset of how the model refers to it.
+    """
+    t, a = target.strip().lower(), active.strip().lower()
+    if not t or not a:
+        return False
+    return t in a or a in t
+
+
+def _destructive_window_combo(action: Optional[dict]) -> Optional[str]:
+    """Return the normalised close-combo this action sends, else None."""
+    if not action or action.get('action') not in ('hotkey', 'key', 'keypress'):
+        return None
+    combo = (action.get('text') or action.get('value') or '')
+    combo = combo.strip().lower().replace(' ', '')
+    return combo if combo in _DESTRUCTIVE_WINDOW_COMBOS else None
+
+
+#: Distinguishes "caller did not supply a window" (probe for it) from
+#: "caller supplied None" (foreground genuinely unknown -> allow).
+#: Collapsing the two made an explicit unknown fall through to the live
+#: probe, which returned the junk title ':' and blocked on ignorance.
+_PROBE_ACTIVE_WINDOW = object()
+
+
+def _check_destructive_window_mismatch(
+        action: Optional[dict], active_window=_PROBE_ACTIVE_WINDOW
+) -> Optional[str]:
+    """Refuse a window-CLOSING keystroke aimed at the wrong window.
+
+    MEASURED LIVE 2026-09-10: a loop told to close the HART Marketing
+    Dashboard sent alt+tab, alt+tab, then alt+f4 -- closing whatever it
+    happened to land on.  54 alt+f4 fired that day and
+    _check_reasoning_mismatch flagged NONE of them, because it only knew
+    two hardcoded app names AND only annotated the result dict after
+    _execute_inprocess had already sent the keystroke.
+
+    This one blocks, and it runs from _check_safety so the refusal
+    happens before any pyautogui call -- the same pre-execution position
+    the rate cap and window blocklist already hold.
+
+    Deliberately narrow, in three ways, because a guard that refuses
+    legitimate closes is a worse regression than the bug it fixes:
+      * only close-combos (_DESTRUCTIVE_WINDOW_COMBOS); a wrong click or
+        a wrong keystroke is recoverable, a wrong close is not;
+      * only on POSITIVE evidence -- the reasoning must name a target
+        AND the foreground window must not be it.  "close the window",
+        empty reasoning, or an unknown foreground window all pass
+        through untouched;
+      * only multi-word Title-Case targets (see _NAMED_WINDOW_TARGET),
+        so "clicking the X" is not mistaken for a window name.
+
+    Returns a block reason naming BOTH the intended target and the
+    window actually in front, or None to allow.
+    """
+    combo = _destructive_window_combo(action)
+    if combo is None:
+        return None
+    reasoning = action.get('Reasoning', action.get('reasoning', '')) or ''
+    if not reasoning:
+        return None
+    # Longest run wins: a real window name is the most specific phrase in
+    # the sentence, and this keeps an incidental "Then Click" from
+    # outranking "HART Marketing Dashboard".
+    targets = _NAMED_WINDOW_TARGET.findall(reasoning)
+    if not targets:
+        return None
+    target = max(targets, key=len)
+    # Probed last -- get_active_window_info() shells out on macOS, so it
+    # must not run for the ordinary actions filtered out above.
+    active = (get_active_window_info()
+              if active_window is _PROBE_ACTIVE_WINDOW else active_window)
+    # A title with no letters or digits (':' , '-') names nothing we can
+    # compare against; that is ignorance, not evidence of a mismatch.
+    if not active or not any(ch.isalnum() for ch in active):
+        return None
+    if _window_matches_target(target, active):
+        return None
+    return (f'destructive_window_mismatch: "{combo}" would close '
+            f'"{active}" but the reasoning targets "{target}"')
+
+
 def _check_reasoning_mismatch(action: dict) -> Optional[str]:
     """Detect when the VLM's stated reasoning contradicts the actual
     foreground window.  Returns a human-readable mismatch description
@@ -196,7 +307,8 @@ def _check_reasoning_mismatch(action: dict) -> Optional[str]:
         return None
     active_lower = active.lower()
     for reasoning_kw, window_kw in _REASONING_MISMATCH_PATTERNS:
-        if reasoning_kw in reasoning and window_kw not in active_lower:
+        if (reasoning_kw in reasoning
+                and not _window_matches_target(window_kw, active_lower)):
             return (f"VLM thinks {reasoning_kw.title()} but active window "
                     f"is: {active}")
     return None
@@ -250,12 +362,25 @@ def execute_action(action: dict, tier: str, *,
         'status', 'translated_from', 'translated_to', 'verify_diff',
         'safety_block' (when safety=True and a guard refused).
     """
+    # Mandatory operation policy.  It is intentionally outside ``safety``:
+    # disabling rate/window checks must never make shutdown, reset, erase or
+    # format executable.
+    from integrations.vlm.safety import destructive_computer_operation
+    _operation_block = destructive_computer_operation(action)
+    if _operation_block is not None:
+        return {'output': '', 'status': 'safety_blocked',
+                'error': _operation_block, 'safety_block': _operation_block}
+
     _mismatch = _check_reasoning_mismatch(action)
 
     # Phase 4: per-window translation + occlusion handling.  Mutates
     # action['coordinate'] in place when needed; returns an early
     # status dict when the window can't be acted on safely.
     _window_meta = None
+    block = _input_context_block(action)
+    if block is not None:
+        return block
+
     if window_handle is not None:
         _window_meta, _early = _prepare_window_for_action(
             window_handle, action, if_occluded)
@@ -264,13 +389,15 @@ def execute_action(action: dict, tier: str, *,
                 _emit_audit(action, _early, _window_meta, None,
                             block_reason=_early.get('status'))
             return _early
+        if if_occluded == 'foreground':
+            action['_expected_foreground'] = window_handle
 
     # Phase 6: safety guards run BEFORE any pyautogui call so a refusal
     # never reaches the user's screen.  Order matters — session-level
     # rate cap is cheapest, run first; window blocklist needs window
     # metadata so runs second.
     if safety:
-        _block = _check_safety(_window_meta)
+        _block = _check_safety(_window_meta, action)
         if _block is not None:
             _result = {
                 'output': '', 'status': 'safety_blocked',
@@ -290,10 +417,18 @@ def execute_action(action: dict, tier: str, *,
         except Exception as e:
             logger.debug(f"verify pre-screenshot skipped: {e}")
 
+    # Credentials cross into the real value only here: the guards and the
+    # audit record above saw the {{secret:NAME}} alias, the keystrokes get
+    # the value, and the result is masked back before the model reads it.
+    from core.tool_logging import credential_vault
+    vault = credential_vault()
+    _run = vault.resolve_aliases(action) if vault is not None else action
     if tier == 'inprocess':
-        result = _execute_inprocess(action)
+        result = _execute_inprocess(_run)
     else:
-        result = _execute_http(action)
+        result = _execute_http(_run)
+    if vault is not None:
+        result = vault.mask_secrets(result)
 
     if _mismatch:
         result['window_mismatch'] = _mismatch
@@ -326,19 +461,35 @@ def execute_action(action: dict, tier: str, *,
 
 # ─── Phase 6 helper plumbing ──────────────────────────────────────────
 
-def _check_safety(window_meta):
-    """Run rate guard + window blocklist.  Returns block-reason
-    string when refusing, None when OK."""
+def _check_safety(window_meta, action=None):
+    """Run rate guard + window blocklist + credential + close-target guards.
+    Returns block-reason string when refusing, None when OK.
+
+    ``action`` is optional so the window/rate checks keep working for any
+    caller that has no action in hand; the credential and destructive-close
+    guards simply do not fire in that case.
+    """
     try:
         from integrations.vlm.safety import (
-            get_session_guard, is_window_blocked)
+            get_session_guard, is_placeholder_credential, is_window_blocked)
     except Exception as e:
         logger.debug(f"safety module unavailable: {e}")
-        return None
+        # The destructive-close guard lives in THIS module and needs nothing
+        # from integrations.vlm.safety, so a missing safety module must not
+        # be what lets an alt+f4 through at the wrong window.
+        return _check_destructive_window_mismatch(action)
     reason = get_session_guard().check()
     if reason is not None:
         return reason
-    return is_window_blocked(window_meta)
+    blocked = is_window_blocked(window_meta)
+    if blocked is not None:
+        return blocked
+    # These two run last so every pre-existing block keeps reporting its own
+    # reason unchanged; they only catch what used to fall through and execute.
+    credential = is_placeholder_credential(action)
+    if credential is not None:
+        return credential
+    return _check_destructive_window_mismatch(action)
 
 
 def _emit_audit(action, result, window_meta, screenshot_b64,
@@ -536,6 +687,96 @@ def _quick_image_diff(b64_a: str, b64_b: str) -> float:
         return 0.0
 
 
+#: Seconds the pasted text stays on the clipboard before the previous
+#: content is put back.  The paste is delivered asynchronously to the
+#: target window, so restoring immediately can paste the old content.
+CLIPBOARD_RESTORE_DELAY_S = 0.15
+
+
+def _type_text(text: str, action=None) -> None:
+    """Enter ``text`` into the focused field.
+
+    Pastes through the clipboard when available (reliable for long and
+    non-ASCII text, same as OmniParser), then puts the user's previous
+    clipboard back so a typed credential does not stay readable there.
+    """
+    def check():
+        block = _input_context_block(action or {})
+        if block is not None:
+            raise _InputPreempted(block)
+    check()
+    if pyperclip is None:
+        if action and '_human_input_token' in action:
+            for character in text:
+                check()
+                pyautogui.typewrite(character, interval=0.012)
+        else:
+            pyautogui.typewrite(text, interval=0.012)
+        return
+    try:
+        previous = pyperclip.paste()
+    except Exception:
+        previous = ''
+    pyperclip.copy(text)
+    try:
+        check()  # A person may change focus while the clipboard is copied.
+        pyautogui.hotkey('ctrl', 'v')
+        time.sleep(CLIPBOARD_RESTORE_DELAY_S)
+    finally:
+        # Do not overwrite something the person copied while paste settled.
+        try:
+            if pyperclip.paste() == text:
+                pyperclip.copy(previous)
+        except Exception:
+            logger.warning('Could not restore the clipboard after typing', exc_info=True)
+
+
+class _InputPreempted(Exception):
+    def __init__(self, result):
+        self.result = result
+        super().__init__(result['error'])
+
+def foreground_window_handle():
+    """Foreground identity at capture/dispatch; no titles or text."""
+    if sys.platform != 'win32':
+        return None
+    import ctypes
+    api = ctypes.WinDLL('user32', use_last_error=True)
+    api.GetForegroundWindow.restype = ctypes.c_void_p
+    return api.GetForegroundWindow() or None
+
+_NO_GUI_ACTIONS = frozenset({
+    'list_folders_and_files', 'read_file_and_understand', 'write_file',
+    'Open_file_and_copy_paste', 'open_file_gui', 'wait', 'shell',
+})
+
+def _input_context_block(action):
+    # Local-loop-owned context. Background files/commands use no shared input.
+    if '_human_input_token' not in action:
+        return None
+    act = action.get('action', '')
+    if ((act in _NO_GUI_ACTIONS and act != 'open_file_gui')
+            or act in ('screenshot', 'cursor_position')):
+        return None
+    from core.resource_governor import get_physical_input_state
+    state = get_physical_input_state()
+    token = action['_human_input_token']
+    if state is None or token is None:
+        why = 'Desktop input monitoring is unavailable; withholding interactive input.'
+        status = 'blocked'
+    elif state[0] != token:
+        why = ('Paused because you resumed using the mouse or keyboard. '
+               'Inspect the last action before resuming computer control.')
+        status = 'user_active'
+    else:
+        expected = action.get('_expected_foreground')
+        current = foreground_window_handle()
+        if not expected or not current or expected == current:
+            return None
+        why = 'Foreground changed after capture; take a new screenshot before acting.'
+        status = 'context_changed'
+    return {'output': '', 'status': status, 'error': why, 'block_reason': why}
+
 def _execute_inprocess(action: dict) -> dict:
     """Execute action via direct pyautogui calls."""
     act = action.get('action', '')
@@ -547,11 +788,10 @@ def _execute_inprocess(action: dict) -> dict:
         if not isinstance(coord, (list, tuple)) or len(coord) < 2:
             return {'output': '', 'error': f'Invalid coordinate format: {coord}'}
 
-    # File/wait/shell actions don't need pyautogui
-    _NO_GUI_ACTIONS = {
-        'list_folders_and_files', 'read_file_and_understand', 'write_file',
-        'Open_file_and_copy_paste', 'open_file_gui', 'wait', 'shell',
-    }
+    # File/wait/shell actions don't need pyautogui.
+    block = _input_context_block(action)
+    if block is not None:
+        return block
 
     if act not in _NO_GUI_ACTIONS and pyautogui is None:
         return {'output': '', 'error': 'pyautogui not installed'}
@@ -584,13 +824,10 @@ def _execute_inprocess(action: dict) -> dict:
 
         elif act == 'type':
             if text:
-                # Use clipboard for reliability (same as OmniParser)
-                if pyperclip is not None:
-                    pyperclip.copy(text)
-                    pyautogui.hotkey('ctrl', 'v')
-                else:
-                    pyautogui.typewrite(text, interval=0.012)
-            return {'output': f'Typed: {text[:50]}...'}
+                _type_text(text, action)
+            # The count, never the text: this result goes back into the
+            # model's context, and what was typed may be a credential.
+            return {'output': f'Typed {len(text or "")} characters'}
 
         elif act == 'key':
             if text:
@@ -605,6 +842,22 @@ def _execute_inprocess(action: dict) -> dict:
                     keys = [k.strip() for k in str(text).split('+')]
                 pyautogui.hotkey(*keys)
             return {'output': f'Hotkey: {text}'}
+
+        elif act in ('scroll_up', 'scroll_down'):
+            # The loop offers both to the model; without this branch every
+            # scroll failed as "Unknown action" and nothing below the fold
+            # of a page could be reached.  `value` may carry a notch count.
+            try:
+                clicks = abs(int(str(text).strip())) if text else SCROLL_DEFAULT_CLICKS
+            except ValueError:
+                clicks = SCROLL_DEFAULT_CLICKS
+            if act == 'scroll_down':
+                clicks = -clicks
+            if coord:
+                pyautogui.scroll(clicks, x=coord[0], y=coord[1])
+            else:
+                pyautogui.scroll(clicks)
+            return {'output': f'Scrolled {act[7:]} {abs(clicks)} notches'}
 
         elif act == 'left_click_drag':
             start = action.get('startCoordinate', coord)
@@ -757,6 +1010,8 @@ def _execute_inprocess(action: dict) -> dict:
         else:
             return {'output': '', 'error': f'Unknown action: {act}'}
 
+    except _InputPreempted as e:
+        return e.result
     except Exception as e:
         logger.error(f"Action execution error ({act}): {e}")
         return {'output': '', 'error': str(e)}
@@ -765,6 +1020,9 @@ def _execute_inprocess(action: dict) -> dict:
 def _execute_http(action: dict) -> dict:
     """Execute action via HTTP POST to localhost:5001/execute."""
     try:
+        block = _input_context_block(action)
+        if block is not None:
+            return block
         resp = pooled_post(
             'http://localhost:5001/execute',
             json=action,

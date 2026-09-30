@@ -769,14 +769,16 @@ def create_web_adapter(
     Factory function to create Web adapter.
 
     Args:
-        host: Host to bind to (default: 0.0.0.0)
+        host: Host to bind to (default: core.port_registry.bind_host, which
+            honours WEB_ADAPTER_HOST and binds loopback on a bundled desktop)
         port: Port to bind to (default: 8765, or WEB_ADAPTER_PORT env var)
         **kwargs: Additional config options
 
     Returns:
         Configured WebAdapter
     """
-    host = host or os.getenv("WEB_ADAPTER_HOST", "0.0.0.0")
+    from core.port_registry import bind_host
+    host = host or bind_host("WEB_ADAPTER_HOST")
     port = port or int(os.getenv("WEB_ADAPTER_PORT", "8765"))
 
     config = ChannelConfig(

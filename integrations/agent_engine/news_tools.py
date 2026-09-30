@@ -133,7 +133,9 @@ def register_news_tools(helper, assistant, user_id: str, executor=None):
             try:
                 svc = FeedSubscriptionService(db)
                 result = svc.subscribe(
-                    user_id=int(user_id) if user_id.isdigit() else 0,
+                    # users.id is a string (UUIDs); coercing sent every
+                    # non-numeric owner to user 0, which does not exist.
+                    user_id=str(user_id),
                     feed_url=feed_url.strip(),
                     auto_import=True,
                 )

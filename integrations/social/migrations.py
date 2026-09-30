@@ -4,11 +4,14 @@ Version tracking and migration helpers.
 """
 import logging
 from sqlalchemy import text
+
+from core.constants import ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS
+
 from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 54
+SCHEMA_VERSION = 59
 
 
 # Tables that hold tenant-scoped user content. v40 adds a nullable
@@ -83,6 +86,178 @@ def _is_already_exists_error(exc: Exception) -> bool:
         '1050',  # ER_TABLE_EXISTS_ERROR
     )
     return any(s in msg for s in signals)
+
+
+def _rekey_legacy_consent_flag(engine) -> tuple:
+    """Rename `requires_consent` -> `require_consent` in agent_goals.config_json.
+
+    One spelling for the consent trigger (#96). `goal_seeding` used to emit the
+    plural at three sites while the single enforcement site
+    (`security/hive_guardrails.before_dispatch`) read the singular alone, so those
+    goals dispatched with no consent gate at all. The producers are corrected;
+    this converges rows that were already seeded, so no row loses its gate now
+    that the reader accepts only the canonical key.
+
+    DATA, not schema: no column changes, and only rows carrying the legacy key are
+    rewritten. The stored VALUE is preserved (a deliberate False stays False), and
+    where a row somehow carries both, the canonical key wins and the legacy one is
+    dropped.
+
+    IDEMPOTENT by design, and called on every migration pass rather than once
+    behind a version check -- see the call site for why that distinction cost a
+    silent gate loss. Returns (renamed, remaining) so a caller can tell "nothing
+    to do" from "tried and failed"; `remaining` is what is still on the legacy key
+    after the attempt, which is the number of goals currently running ungated.
+    """
+    import json
+    renamed = 0
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT id, config_json FROM agent_goals "
+                "WHERE config_json LIKE '%requires_consent%'")).fetchall()
+            for _id, _raw in rows:
+                if not _raw:
+                    continue
+                try:
+                    cfg = json.loads(_raw) if isinstance(
+                        _raw, (str, bytes)) else dict(_raw)
+                except (ValueError, TypeError) as pe:
+                    # Leave an unparseable row exactly as it is: a row we cannot
+                    # read is not a row we should rewrite. It is still counted in
+                    # `remaining` below, because it is still ungated.
+                    logger.warning(
+                        "consent re-key: goal %s config_json unparseable, "
+                        "left unchanged: %s", _id, pe)
+                    continue
+                if not isinstance(cfg, dict) or 'requires_consent' not in cfg:
+                    continue
+                legacy = cfg.pop('requires_consent')
+                cfg.setdefault('require_consent', legacy)
+                conn.execute(
+                    text("UPDATE agent_goals SET config_json = :c "
+                         "WHERE id = :i"),
+                    {'c': json.dumps(cfg), 'i': _id})
+                renamed += 1
+            conn.commit()
+    except Exception as e:
+        # Never wedge boot on this. But do not report success either: fall through
+        # to the count below, which is what decides whether to shout.
+        logger.warning("consent re-key failed after %d row(s): %s", renamed, e)
+
+    remaining = -1
+    try:
+        with engine.connect() as conn:
+            remaining = conn.execute(text(
+                "SELECT COUNT(*) FROM agent_goals "
+                "WHERE config_json LIKE '%requires_consent%'")).scalar() or 0
+    except Exception as e:
+        # A fresh database has no agent_goals table yet; that is not a fault.
+        logger.debug("consent re-key: could not count remaining rows: %s", e)
+        return renamed, remaining
+
+    if remaining:
+        # ERROR, not warning: each of these dispatches with no consent gate, and
+        # the whole point of v56 was that nobody notices a quiet one.
+        logger.error(
+            "consent re-key INCOMPLETE: %d goal(s) still carry the legacy "
+            "`requires_consent` key and therefore dispatch UNGATED. Re-keyed %d "
+            "this pass; will retry on next boot.", remaining, renamed)
+    elif renamed:
+        logger.info("consent re-key: %d goal(s) moved to require_consent",
+                    renamed)
+    return renamed, remaining
+
+
+_V59_PERSONA_COLUMNS = (
+    ('bio', 'TEXT'),
+    ('recognize_me', f'VARCHAR({ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS})'),
+    ('interests_discoverable', 'BOOLEAN NOT NULL DEFAULT 0'),
+)
+
+
+def _v59_persona_card(engine) -> bool:
+    """Add the persona-card columns to discoverable_prefs if absent.  True
+    when all of them exist afterwards (inspector check, v58 style)."""
+    from sqlalchemy import inspect as sa_inspect
+
+    def _missing():
+        insp = sa_inspect(engine)
+        if 'discoverable_prefs' not in insp.get_table_names():
+            return [c for c, _ in _V59_PERSONA_COLUMNS]
+        have = {c['name'] for c in insp.get_columns('discoverable_prefs')}
+        return [c for c, _ in _V59_PERSONA_COLUMNS if c not in have]
+
+    for col, ddl in _V59_PERSONA_COLUMNS:
+        if col not in _missing():
+            continue
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(
+                    f"ALTER TABLE discoverable_prefs ADD COLUMN {col} {ddl}"))
+                conn.commit()
+        except Exception as e:
+            logger.warning("v59 migration: ADD COLUMN discoverable_prefs.%s "
+                           "failed: %s", col, e)
+    return not _missing()
+
+
+def _v58_consent_reopened_at(engine) -> bool:
+    """Add user_consents.reopened_at if absent.  True when it exists
+    afterwards (inspector check, v57 style)."""
+    from sqlalchemy import inspect as sa_inspect
+
+    def _has():
+        insp = sa_inspect(engine)
+        if 'user_consents' not in insp.get_table_names():
+            return False
+        return 'reopened_at' in {c['name'] for c in insp.get_columns('user_consents')}
+
+    if not _has():
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "ALTER TABLE user_consents ADD COLUMN reopened_at DATETIME"))
+                conn.commit()
+        except Exception as e:
+            logger.warning("v58 migration: ADD COLUMN user_consents.reopened_at "
+                           "failed: %s", e)
+    return _has()
+
+
+def _v57_requester_user_id(engine) -> bool:
+    """Add metered_api_usage.requester_user_id and its index if absent.
+    True when the column exists afterwards."""
+    from sqlalchemy import inspect as sa_inspect
+
+    def _state():
+        insp = sa_inspect(engine)
+        if 'metered_api_usage' not in insp.get_table_names():
+            return False, False
+        cols = {c['name'] for c in insp.get_columns('metered_api_usage')}
+        idx = {i['name'] for i in insp.get_indexes('metered_api_usage')}
+        return ('requester_user_id' in cols,
+                'ix_metered_api_usage_requester_user_id' in idx)
+
+    has_col, has_idx = _state()
+    for needed, sql, label in [
+        (not has_col,
+         "ALTER TABLE metered_api_usage ADD COLUMN requester_user_id VARCHAR(64)",
+         "ADD COLUMN metered_api_usage.requester_user_id"),
+        (not has_idx,
+         "CREATE INDEX ix_metered_api_usage_requester_user_id "
+         "ON metered_api_usage (requester_user_id)",
+         "CREATE INDEX metered_api_usage(requester_user_id)"),
+    ]:
+        if not needed:
+            continue
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(sql))
+                conn.commit()
+        except Exception as e:
+            logger.warning("v57 migration: %s failed: %s", label, e)
+    return _state()[0]
 
 
 def get_schema_version(engine) -> int:
@@ -844,6 +1019,10 @@ def run_migrations():
         # endpoint accepted `voice_profile` in the request body but silently
         # dropped it because the User model had no column for it.  Adds a
         # JSON column (TEXT-backed on SQLite) so voice presets round-trip.
+        # Retired since: nothing spoke from it, and a voice belongs to the
+        # avatar (core/teacher_avatar.py).  The column is no longer mapped
+        # and a later release drops it; this step stays so schema versions
+        # keep meaning the same thing on every node.
         logger.info("HevolveSocial: migrating to v37 (User.voice_profile column)")
         with engine.connect() as conn:
             try:
@@ -1941,3 +2120,112 @@ def run_migrations():
                     logger.warning(
                         "v54 migration: %s failed: %s", label, e)
         set_schema_version(engine, 54)
+
+    if current < 55:
+        # v55 (2026-09-16): user_consents.label (#111).  A device_access
+        # consent's scope is the phone's public key, which the owner cannot
+        # read; the name the phone signed into its first ask is kept here so
+        # the privacy page can list "Sathish's phone" beside the key's
+        # fingerprint.  Nullable, unused by every other consent type, so
+        # existing rows and paths are unchanged.
+        logger.info("HevolveSocial: migrating to v55 (user_consents.label)")
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "ALTER TABLE user_consents ADD COLUMN label VARCHAR(100)"))
+                conn.commit()
+        except Exception as e:
+            if _is_already_exists_error(e):
+                logger.info("v55 migration: user_consents.label skipped "
+                            "(already exists)")
+            else:
+                logger.warning("v55 migration: ADD COLUMN user_consents.label "
+                               "failed: %s", e)
+        set_schema_version(engine, 55)
+
+    if current < 56:
+        # v56 (2026-09-21): agent_goals.config_json consent-trigger key is
+        # `require_consent`, one spelling (#96).  goal_seeding used to emit
+        # `requires_consent` at three sites while the single enforcement site
+        # (security/hive_guardrails.before_dispatch) read the singular alone, so
+        # those goals dispatched with no consent gate at all.  The producers are
+        # corrected; this renames the key in rows already seeded, so no row
+        # loses its gate when the reader stops accepting the plural.
+        #
+        # DATA, not schema: no column changes, and only rows that carry the
+        # legacy key are rewritten.  The stored VALUE is preserved (a deliberate
+        # False stays False); where a row somehow carries both, the canonical
+        # key wins and the legacy one is dropped.
+        logger.info("HevolveSocial: migrating to v56 "
+                    "(agent_goals.config_json require_consent)")
+        set_schema_version(engine, 56)
+
+    if current < 57:
+        # v57 (2026-09-26): metered_api_usage.requester_user_id.  Owner ruling:
+        # a task run on a node its person does not own is charged "proportinal
+        # to compute spent and earned".  Each node writes one ledger row per
+        # exchange naming the requester (budget_gate.charge_remote_compute on
+        # the requesting node, credit_served_compute on the serving one), so
+        # the fraction of a Spark not yet moved carries per person and
+        # operator.  Nullable, NULL on every other row.
+        #
+        # Plain DDL behind an inspector check, v38 style: MySQL 8 rejects
+        # CREATE INDEX IF NOT EXISTS.  The version is stamped only once the
+        # column exists, so a pass that fails is retried on the next boot
+        # instead of being recorded as done.
+        logger.info("HevolveSocial: migrating to v57 "
+                    "(metered_api_usage.requester_user_id)")
+        if _v57_requester_user_id(engine):
+            set_schema_version(engine, 57)
+        else:
+            logger.warning("v57 migration: metered_api_usage.requester_user_id "
+                           "is still missing; retrying on the next boot")
+
+    if current < 58:
+        # v58 (2026-09-27): user_consents.reopened_at.  "Allow asking again"
+        # (ConsentService.reopen) used to erase revoked_at, losing when the
+        # owner said no.  The no's time stays; the reopen's time goes here,
+        # and a row is declined only while revoked_at is newer.  Nullable,
+        # NULL on every existing row, so every existing no still stands.
+        logger.info("HevolveSocial: migrating to v58 (user_consents.reopened_at)")
+        # Stamped only on an unbroken ladder: stamping 58 over a failed 57
+        # would record 57 as done and it would never be retried.
+        if _v58_consent_reopened_at(engine) and get_schema_version(engine) >= 57:
+            set_schema_version(engine, 58)
+        else:
+            logger.warning("v58 migration: user_consents.reopened_at is still "
+                           "missing; retrying on the next boot")
+
+    if current < 59:
+        # v59 (2026-09-27): the persona card on discoverable_prefs — bio,
+        # recognize_me ("how to recognise me"), interests_discoverable.  An
+        # agent tells a matched person's agent only what is on this card
+        # (owner: agents describe each user to the other so they can
+        # recognise each other; match on bio and interests).  All nullable
+        # or defaulted, so every existing row reads as an empty card with
+        # interest matching off.
+        logger.info("HevolveSocial: migrating to v59 (discoverable_prefs "
+                    "persona card)")
+        if _v59_persona_card(engine) and get_schema_version(engine) >= 58:
+            set_schema_version(engine, 59)
+        else:
+            logger.warning("v59 migration: discoverable_prefs persona columns "
+                           "are still missing; retrying on the next boot")
+
+    # v56's DATA repair, deliberately OUTSIDE the version gate above.
+    #
+    # It used to live inside `if current < 56:` with its exception swallowed and
+    # `set_schema_version(engine, 56)` running unconditionally afterwards. That
+    # combination is the defect: one failed pass marked the migration DONE
+    # FOREVER, and because the reader no longer accepts the plural, every row
+    # left on the legacy key dispatches with NO consent gate -- exactly the harm
+    # v56 exists to prevent. Not hypothetical on this system: the SQLite DB has
+    # held its write lock for hours (#71), and a lock during that one UPDATE was
+    # enough to lose the gate permanently and silently.
+    #
+    # Now it is an idempotent repair that runs on every migration pass. A healthy
+    # database matches zero rows, so the cost is one cheap LIKE per boot, and a
+    # transient failure simply heals on the next boot instead of being recorded
+    # as success. Kept out of the version gate on purpose: bumping the version is
+    # about SCHEMA, and this is DATA that must converge regardless of version.
+    _rekey_legacy_consent_flag(engine)

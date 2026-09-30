@@ -13,7 +13,6 @@ Pattern mirrors:
 import json
 import logging
 import os
-import re as _re
 import threading
 import time
 import uuid
@@ -24,9 +23,51 @@ import requests
 from json_repair import repair_json
 
 from core.http_pool import pooled_get, pooled_post
+from core.tool_traits import reads_persisted_state
 from integrations.service_tools.model_catalog import ModelType
 
 tool_logger = logging.getLogger('tool_execution')
+
+
+def _bounded_observation(text, hint):
+    """``text`` bounded to TOOL_OBSERVATION_MAX_CHARS for a tool result, the
+    cut marked with ``hint`` (#104). The result goes to the model and, through
+    the group chat's write-back, into memory."""
+    from core.constants import TOOL_OBSERVATION_MAX_CHARS
+    from core.token_utils import bound_text
+    return bound_text(text, TOOL_OBSERVATION_MAX_CHARS, f'\n...[cut; {hint}]')
+
+
+def _bounded_recall(contents, max_items, skip_oversize=True):
+    """Recalled memories joined for a tool result, within one budget.
+
+    Both legs of search_long_term_memory use it. On the MemoryGraph leg
+    (``skip_oversize``) a row longer than MEMORY_ITEM_MAX_CHARS is skipped,
+    not cut: every graph write is bounded to that since #104, so a longer row
+    predates the bound. Rows like it (whole data stores, written back and
+    recalled again) grew Guardian Convergence's graph to 28.6M chars and one
+    recall to 3,386,616, and they rank high on any query because they hold so
+    many terms. SimpleMem's item is an answer, not a stored row, so it is cut.
+    """
+    from core.constants import MEMORY_ITEM_MAX_CHARS, TOOL_OBSERVATION_MAX_CHARS
+    from core.token_utils import bound_text
+    picked, used, skipped = [], 0, 0
+    for c in contents:
+        if not isinstance(c, str) or not c.strip():
+            continue
+        if skip_oversize and len(c) > MEMORY_ITEM_MAX_CHARS:
+            skipped += 1
+            continue
+        room = TOOL_OBSERVATION_MAX_CHARS - used
+        if len(picked) >= max_items or room < 40:
+            break
+        piece = bound_text(c, room)
+        picked.append(piece)
+        used += len(piece)
+    if skipped:
+        tool_logger.info(f'[RECALL-BOUND] skipped {skipped} memory row(s) '
+                         f'over {MEMORY_ITEM_MAX_CHARS} chars')
+    return '\n'.join(picked)
 
 
 # ---------------------------------------------------------------------------
@@ -51,293 +92,114 @@ def user_facing_error(e):
     text = str(e)
     low = text.lower()
     if any(m in low for m in _INTERNAL_ERROR_MARKERS) or len(text) > 200:
-        return ("I hit an internal snag finishing that - please try "
-                "again in a moment.")
-    return f"I couldn't finish that: {text[:160]}"
+        return _SNAG_REPLY
+    return f"{_COULD_NOT_FINISH_PREFIX}{text[:160]}"
 
 
-def register_dual(helper, executor, func, name: str, description: str):
-    """Register a single tool on both the LLM-calling and executing agents.
+# The two shapes user_facing_error() produces, named once so the code that has
+# to RECOGNISE a failed turn reads the same strings the code that writes them
+# does.  Changing the wording here changes both.
+_SNAG_REPLY = ("I hit an internal snag finishing that - please try "
+               "again in a moment.")
+_COULD_NOT_FINISH_PREFIX = "I couldn't finish that: "
 
-    AutoGen's tool pattern pairs ``helper.register_for_llm`` with
-    ``executor.register_for_execution`` — create_recipe.py and
-    reuse_recipe.py repeat this pair 40+ times inline. Call sites
-    that define a closure and register it immediately use this
-    helper; batches that already have a ``(name, desc, func)`` list
-    should use :func:`register_core_tools` instead.
 
-    Returns ``func`` unchanged so the call can be inlined after a
-    closure definition without shadowing the name.
+def is_user_facing_error(reply) -> bool:
+    """True when ``reply`` is a failed turn dressed as an answer.
+
+    A turn that fails does not raise to its caller: user_facing_error() turns
+    the exception into a polite, speakable sentence and the pipeline returns
+    it as the reply, and hart_intelligence_entry does the same with
+    LLM_LOADING_REPLY / LLM_GENERIC_ERROR_REPLY, and create_recipe with
+    BUILD_INCOMPLETE_REPLY when an agent build ends without its recipe.  That
+    is right for a person reading it and wrong for any caller that has to
+    decide whether WORK was done.  Measured on central 2026-09-13: the
+    distributed worker submitted "I couldn't finish that: Error code: 429 -
+    ... rate_limit_exceeded ..." as a hive task's result, and the coordinator
+    marked the task completed; later the same day Hive Model Trainer's task
+    was completed with BUILD_INCOMPLETE_REPLY.
+
+    Recognises exactly the strings this codebase emits for a failure, by
+    reference to where they are defined, so rewording one cannot silently stop
+    this check from matching it.
     """
-    helper.register_for_llm(name=name, description=description)(func)
-    executor.register_for_execution(name=name)(func)
-    return func
+    if not isinstance(reply, str):
+        return False
+    text = reply.strip()
+    if not text:
+        return False
+    if text == _SNAG_REPLY or text.startswith(_COULD_NOT_FINISH_PREFIX):
+        return True
+    from core.constants import (
+        BUILD_INCOMPLETE_REPLY, LLM_GENERIC_ERROR_REPLY, LLM_LOADING_REPLY)
+    # The whole sentence as a prefix: what follows it cannot turn a failed
+    # build into work, and nothing shorter is matched.
+    if text.startswith(BUILD_INCOMPLETE_REPLY.strip()):
+        return True
+    return text in (LLM_LOADING_REPLY.strip(), LLM_GENERIC_ERROR_REPLY.strip())
 
 
-# The core closures the MAIN agent leg carries — the helper/assistant pair
-# that drives a user-facing turn, in BOTH the create and reuse pipelines.
-#
-# Canonical home is here, beside build_core_tool_closures() that produces the
-# closures, so the two legs agree by construction.  It was previously a local
-# `_MAIN_LEG_CORE` inside reuse_recipe only, which is why create's identical
-# helper/assistant pair silently carried EVERY core closure instead.
-#
-# Why it has to be a filter at all — measured live 2026-09-05, CREATE of agent
-# 88601674818 action 6:
-#
-#   wire-trim: the TOOL SCHEMA alone is 10544 tokens against an n_ctx of 12288
-#   (72 tool(s)) — no amount of message trimming can make this fit.
-#   -> 400 request (13378 tokens) exceeds the available context size (12288)
-#
-# The turn that 400'd was asking the Helper to WRITE A JSON RECIPE for one
-# step, while carrying payments, video, channel, camera, receipt, Instagram
-# and coding tools it cannot use.  filter_service_tools() already gates the
-# SERVICE registry, but says so explicitly of this set: "the always-on core
-# closures and Tier-2 families are unaffected" — so nothing bounded it.
-#
-# create_scheduled_jobs is deliberately absent: the factory's twin is a
-# create-flow stub and the real live-scheduling version stays inline in
-# reuse_recipe (see the #511 name-collision note at its definition).
-MAIN_LEG_CORE_TOOLS = frozenset({
-    'txt2img', 'img2txt', 'save_data_in_memory', 'get_saved_metadata',
-    'get_data_by_key', 'get_user_id', 'get_prompt_id', 'Generate_video',
-    'get_user_uploaded_file', 'get_user_camera_inp', 'get_chat_history',
-    'search_visual_history', 'search_long_term_memory',
-    'save_to_long_term_memory',
-    'send_message_to_user', 'send_presynthesized_video_to_user',
-    'send_message_in_seconds', 'google_search',
-})
+def is_help_pause(reply) -> bool:
+    """True when ``reply`` says the turn's action was handed to a person or an
+    expert (create_recipe._ask_for_help on an autonomous run).
 
-
-def main_leg_core_tools(tools):
-    """The subset of ``tools`` the main helper/assistant leg registers.
-
-    ONE filter for both pipelines — call this rather than re-deriving the
-    name set, so create and reuse can never drift apart again.
+    Neither a result nor a failure: the action is held, the goal is parked or
+    handed to the expert, and the reply is the notice.  A caller deciding
+    whether work was done (the hive worker) must not record it as a
+    completion, and must not release it for a retry either, since that would
+    run a paused goal.  Recognised by reference to the prefixes in
+    core.constants so rewording one cannot silently stop this check.
     """
-    return [t for t in tools if t[0] in MAIN_LEG_CORE_TOOLS]
+    if not isinstance(reply, str):
+        return False
+    text = reply.strip()
+    if not text:
+        return False
+    from core.constants import HELP_EXPERT_REPLY_PREFIX, HELP_PAUSED_REPLY_PREFIX
+    return text.startswith((HELP_PAUSED_REPLY_PREFIX, HELP_EXPERT_REPLY_PREFIX))
 
 
-def register_core_tools(tools, helper, executor):
-    """Register (name, desc, func) tuples on an AutoGen helper/executor pair.
-
-    Args:
-        tools: list of (name, description, func) tuples from build_core_tool_closures()
-        helper: AutoGen agent that suggests tool use (register_for_llm)
-        executor: AutoGen agent that executes tools (register_for_execution)
-    """
-    for name, desc, func in tools:
-        register_dual(helper, executor, func, name, desc)
-
-
-def filter_service_tools(goal_tags, svc_tools, svc_defs, registry):
-    """Tier-1 hierarchical gate: keep only registry tools the goal unlocks.
-
-    Completes the 'progressive/hierarchical tool injection' design that
-    Tier 2 (goal-gated family loaders in create/reuse_recipe) already
-    follows: goal_manager.register_goal_type rows map goal tags to
-    ServiceToolRegistry capability tags, get_tool_tags reads them, and
-    this filter applies the intersection at the attach site.  Until now
-    the service loop registered EVERY tool unconditionally — measured
-    2026-08-31: 50 rendered defs cost 5,820 of the 6,144-token slot,
-    so a one-message conversation overflowed (12 'Context size has been
-    exceeded' rejections in one boot).
-
-    A goal with no unlocked tags gets NO service tools (need-to-know);
-    the always-on core closures and Tier-2 families are unaffected.
-
-    Args:
-        goal_tags: tags from marketing_tools.detect_goal_tags(goal)
-        svc_tools: {func_name: callable} from get_all_tool_functions()
-        svc_defs:  defs from get_tool_definitions() — each carries
-                   'name' (func name) and 'service_tool' (parent tool)
-        registry:  the ServiceToolRegistry (parent tools carry .tags)
-    """
-    from integrations.agent_engine.goal_manager import get_tool_tags
-    unlocked = set()
-    for t in goal_tags or []:
-        unlocked.update(get_tool_tags(t))
-    if not unlocked:
-        return {}
-    parent_of = {d.get('name'): d.get('service_tool') for d in svc_defs}
-    kept = {}
-    for func_name, func in svc_tools.items():
-        parent = registry._tools.get(parent_of.get(func_name))
-        if parent is not None and set(parent.tags or []) & unlocked:
-            kept[func_name] = func
-    return kept
+def is_action_error_reply(reply) -> bool:
+    """True when ``reply`` is the CREATE pipeline's structured error envelope,
+    {"status": "error", "action": ..., "action_id": ..., "message": ...} — the
+    format create_recipe's prompt tells an agent to return when an action
+    failed and self-heal did not work.  Like a help pause, an error is not a
+    result: a caller deciding whether work was done must not record it as one.
+    Measured 2026-09-15: the daemon counted these as successful dispatches, so
+    a continuous goal whose every run ended in this envelope re-ran every
+    5 minutes for five months (53,949 copilot sessions)."""
+    if not isinstance(reply, str):
+        return False
+    text = reply.strip()
+    if not text:
+        return False
+    if text.startswith('{'):
+        try:
+            import json
+            d = json.loads(text)
+            if isinstance(d, dict):
+                return str(d.get('status', '')).lower() == 'error'
+        except ValueError:
+            pass
+    # The envelope with prose around it: both protocol keys present.
+    import re
+    return '"action_id"' in text and re.search(r'"status"\s*:\s*"error"', text) is not None
 
 
-def discover_and_attach(need, helper, executor, registry, attached_names):
-    """On-demand tool discovery: the never-say-unavailable half of the gate.
-
-    Owner requirement 2026-08-31: the hierarchy must be LAZY, not
-    exclusionary — an agent whose current set lacks a capability calls
-    this (via its always-on `request_tools` wrapper) instead of denying.
-    Searches the FULL service registry by name/description/tags, attaches
-    every match onto the live helper/executor pair right now (autogen
-    updates llm_config immediately, so the NEXT model call carries the
-    defs), and reports what else exists beyond this box: registry tools
-    whose backing service is not running can be self-hosted via the
-    existing install scaffolding, and hive peers may offer the
-    capability (earning mode — requires the user's payment consent;
-    discovery only REPORTS that, it never executes remotely).
-
-    Args:
-        need: free-text capability description from the model
-        helper/executor: the live agent pair to attach onto
-        registry: ServiceToolRegistry
-        attached_names: set of func names already on the agents —
-            updated in place with everything newly attached
-    Returns a human/model-readable summary string.
-    """
-    # Stopwords would over-attach: 'the' passes len>2 AND is a substring of
-    # 'synthesis', so "summarize the page" would match nearly every tool.
-    stop = {'the', 'and', 'for', 'you', 'your', 'with', 'that', 'this',
-            'please', 'need', 'want', 'tool', 'tools', 'use', 'able',
-            'can', 'get', 'have', 'from', 'into', 'about', 'some', 'any'}
-    words = {w for w in str(need).lower().replace(',', ' ').split()
-             if len(w) > 2 and w not in stop}
-    if not words:
-        return "Tell me what capability you need, e.g. 'text to speech'."
-    attached, startable = [], []
-    for tool_name, tool in registry._tools.items():
-        hay = ' '.join([tool_name, ' '.join(tool.tags or []),
-                        getattr(tool, 'description', '') or '']).lower()
-        for ep_name, ep in tool.endpoints.items():
-            fn = (tool_name if ep_name == tool_name
-                  else f"{tool_name}_{ep_name}")
-            hay_ep = hay + ' ' + str(ep.get('description', '')).lower()
-            # Substring alone misses morphological variants ('scrape' is not
-            # a substring of 'scraping') — also match on shared 4-char stems.
-            # Deterministic, no fuzz; a rare extra attach is bounded cost.
-            hay_words = {hw for hw in _re.split(r'[^a-z0-9]+', hay_ep)
-                         if len(hw) >= 4}
-            stems = {hw[:4] for hw in hay_words}
-            if not any(w in hay_ep or (len(w) >= 4 and w[:4] in stems)
-                       for w in words):
-                continue
-            if fn in attached_names:
-                continue
-            func = registry.create_endpoint_function(tool_name, ep_name)
-            if func is None:
-                startable.append(fn)
-                continue
-            register_dual(helper, executor, func, fn,
-                          ep.get('description', f'{tool_name} {ep_name}'))
-            attached_names.add(fn)
-            attached.append(fn)
-    parts = []
-    if attached:
-        # Imperative on purpose: hop-2 probe 2026-08-31 showed the model
-        # attaching crawl4ai then STILL answering "I cannot browse the live
-        # internet" - the trained refusal prior survives a neutral result.
-        parts.append(
-            "Attached and ready to call NOW: " + ', '.join(attached)
-            + ". These execute LOCALLY on this machine, so no "
-              "internet-access or capability restriction applies. "
-              "Immediately CALL the one that fits the task. Do NOT tell "
-              "the user this is unavailable - the tool is live.")
-    if startable:
-        parts.append("Exists locally but the backing service is down — it "
-                     "can be self-hosted/started via the install flow: "
-                     + ', '.join(startable))
-    if not parts:
-        parts.append(
-            "No local registry tool matches. Options that DO exist: ask the "
-            "user to install it (hub install flow), or a hive peer may offer "
-            "this capability — peer execution needs the user's consent and, "
-            "in earning mode, payment approval. Do not tell the user this is "
-            "impossible; offer these routes.")
-    return '  '.join(parts)
-
-
-def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
-    """Attach every registry tool whose capability tags intersect cap_tags.
-
-    The deterministic sibling of discover_and_attach: same attach
-    primitives (create_endpoint_function + register_dual) but matched by
-    registry capability tags, exactly like filter_service_tools.  The
-    per-turn hook in reuse uses this so a conversation that drifts into
-    a capability the construction-time goal never mentioned gets its
-    family attached BEFORE the model sees the turn — zero extra LLM
-    calls, no reliance on the model choosing to call request_tools.
-    Names already in attached_names are skipped (idempotent across
-    turns); the set is updated in place.  Returns the count attached.
-    """
-    cap = set(cap_tags or [])
-    if not cap:
-        return 0
-    n = 0
-    for tool_name, tool in registry._tools.items():
-        if not (set(tool.tags or []) & cap):
-            continue
-        for ep_name, ep in tool.endpoints.items():
-            fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
-            if fn in attached_names:
-                continue
-            func = registry.create_endpoint_function(tool_name, ep_name)
-            if func is None:
-                continue
-            register_dual(helper, executor, func, fn,
-                          ep.get('description', f'{tool_name} {ep_name}'))
-            attached_names.add(fn)
-            n += 1
-    return n
-
-
-def attach_for_names(names, helper, executor, registry, attached_names):
-    """Attach the registry tools a turn NAMES outright.
-
-    Name-keyed sibling of ``attach_for_tags`` — same primitives
-    (``create_endpoint_function`` + ``register_dual``), same idempotent
-    ``attached_names`` set, same return contract.  Not a second attachment
-    mechanism: only the SELECTOR differs, and this one is authoritative
-    where the other infers.
-
-    Why it exists.  ``attach_for_tags`` matches on capability tags derived
-    from a keyword scan of the turn's prose.  That is a good fallback for
-    families nothing mentions, and a bad way to honour an action that says
-    which tool it needs.  Measured live 2026-09-06 on agent 89555447799:
-    recipe action 1 declares ``tool_name: google_search`` and the seeded
-    message carries it verbatim, yet ``detect_goal_tags`` read the words
-    "developer"/"platforms" as the tag ``coding`` and the attach logged
-
-        Tier-1 turn attach: +['coding'] -> 0 tools
-
-    google_search never reached the wire (1 of 96 autogen.reuse calls in a
-    26-minute drive carried any tools[] block; ``INSIDE google search`` fired
-    0 times), so the model could not call the one tool its own recipe named.
-
-    The same gap at population scale: 8,799 ``Error: Function <X> not found``
-    across the log rotations — send_message_to_user x1618 (the path that
-    hands the agent's result to the user), get_user_details x908,
-    execute_windows_or_android_command x418.  Those tools are defined and
-    registerable; they were simply not attached for that turn.  It also
-    explains why one tool both works and fails: same tool, different turn,
-    different tag scan.
-
-    Unknown names are ignored rather than raising — a recipe may name a tool
-    this deployment does not ship, and a turn that mentions one absent tool
-    must still get the others.
-    """
-    want = {str(n) for n in (names or []) if n}
-    if not want:
-        return 0
-    n = 0
-    for tool_name, tool in registry._tools.items():
-        for ep_name, ep in tool.endpoints.items():
-            fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
-            if fn not in want or fn in attached_names:
-                continue
-            func = registry.create_endpoint_function(tool_name, ep_name)
-            if func is None:
-                continue
-            register_dual(helper, executor, func, fn,
-                          ep.get('description', f'{tool_name} {ep_name}'))
-            attached_names.add(fn)
-            n += 1
-    return n
+# The tool menu, schema fitting, registration and runtime attach live in
+# core.agent_tool_menu (split out when this module crossed the 3000-line
+# god-module ratchet).  Re-exported so every `from core.agent_tools import X`
+# and every `core.agent_tools.X` attribute read keeps working unchanged.
+from core.agent_tool_menu import (  # noqa: E402,F401 -- re-export
+    CREATE_ADVERTISED_TOOLS, CREATE_LEG_EXTRA_TOOLS, MAIN_LEG_CORE_TOOLS,
+    REQUEST_TOOLS_DESCRIPTION, attach_for_names, attach_for_tags,
+    create_helper_keep, defer_helper_schema, discover_and_attach,
+    filter_service_tools, fit_schema_to_ctx, helper_tool_names,
+    main_leg_core_tools, main_leg_tool_menu, register_core_tools,
+    register_dual, register_request_tools, registered_tool_menu,
+    _NEED_STOPWORDS, _attach_tool, _join_tool_menu, _need_names_tool,
+    _schema_or_none,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +222,152 @@ _DEFAULT_RECEIPT_TEMPLATE = (
     "{notes}\n"
     "Thank you for your business."
 )
+
+
+from core.game_sound_memo import (  # noqa: E402
+    GAME_STATE_DURATIONS,
+    GAME_STATES,
+    game_state_key,
+    game_sound_action,
+    game_state_match,
+    game_state_record,
+    game_state_sound,
+    record_verdict,
+    rejected_take,
+    set_game_state_sound,
+    set_game_state_sound_at,
+)
+
+
+#: How long a timed-out submit is assumed to still be queued server-side
+#: before this client will submit the same state again -- owned by the memo
+#: module, which answers "composing" with it for the node's route as well.
+from core.game_sound_memo import SUBMIT_COOLDOWN_S  # noqa: E402,F401
+
+#: A task older than this is taken as lost, not slow.  AceStep keeps its job
+#: store in memory, so a restart forgets every id, and it answers a forgotten
+#: id exactly as it answers a queued one (hartos-3a F2).  The slowest job
+#: MEASURED on a shared GPU averaged 907 s; twice that is past any real job.
+TASK_STALE_S = 1800
+
+
+def _pending_submit(games, game_id, state, level=None, user_id=None):
+    """When this state's last submit went out with no id learned, else None.
+
+    A record with 'submitted_at' and neither 'url' nor 'task_id' is a submit
+    whose reply timed out.  The ladder ignores it (nothing to play, nothing to
+    poll), so it is read at its own key."""
+    record = game_state_record(games, game_id, state, level, user_id)
+    if record.get('url') or record.get('task_id'):
+        return None
+    return record.get('submitted_at')
+
+
+def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
+    """Put a newly composed game sound in front of the person, to hear.
+
+    Creation is meant to be liquid: the reviewer hears the piece and
+    answers it on the surface they are already looking at, rather than
+    being told a URL.  This rides the existing agent-to-UI channel
+    (LiquidUIService.agent_ui_update), which is allow-listed, audited and
+    delivered to web, phone and desktop alike.
+
+    Best-effort by design: a node without that service, or a hive the
+    human has halted, must not stop a sound being composed and memoized.
+    Returns True when the card itself was accepted for delivery -- and the
+    person is told on their other surfaces either way, because a node with
+    no screen attached is precisely when the phone matters most.
+    """
+    shown = False
+    try:
+        from core.platform.registry import get_registry
+        service = get_registry().get('LiquidUIService')
+        if service is not None:
+            # The audio FIRST, as the declared 'media' component every
+            # client already renders (props: type, src, alt, controls).  It
+            # used to ride inside the approval card as an undeclared prop,
+            # which no client reads -- so the card invited someone to "have
+            # a listen" and gave them nothing to listen to.  'media_type'
+            # as well as 'type' because the component's own type key is
+            # 'media' and the clients read the modality from media_type.
+            if record.get('url'):
+                service.agent_ui_update(user_id, {
+                    'type': 'media',
+                    'agent_id': str(prompt_id),
+                    'media_type': 'audio',
+                    'src': record.get('url'),
+                    'controls': True,
+                    'alt': f'{state} sound for {game_id}',
+                    'title': f'{state} sound for {game_id}',
+                }, user_id=user_id)
+            shown = bool(service.agent_ui_update(user_id, {
+                'type': 'approval',
+                'agent_id': str(prompt_id),
+                'action': game_sound_action(game_id, state),
+                'description': (
+                    f"New {state} sound for {game_id}. Have a listen: keep "
+                    f"it, or say what is wrong and I will compose another."
+                ),
+                'options': ['Keep it', 'Compose another'],
+            }, user_id=user_id))
+    except Exception as e:
+        # never at the cost of the composition that just succeeded
+        tool_logger.debug(f'game sound: no card on screen ({e})')
+    if not shown:
+        # Only when the card did NOT reach a screen.  A game has fourteen
+        # states, so notifying regardless meant one game cost the person
+        # fourteen phone pushes and fourteen unread rows -- for sounds they
+        # were already being shown one by one.  'shown' was computed and
+        # thrown away; it is the whole signal for whether they need telling
+        # somewhere else.
+        _tell_the_person_elsewhere(user_id, prompt_id, game_id, state, record)
+    return shown
+
+
+def _tell_the_person_elsewhere(user_id, prompt_id, game_id, state, record):
+    """Reach the person who is not looking at the screen it was offered on.
+
+    The card above lands where they are logged in; a sound composed while
+    they are away from that screen would otherwise wait unheard.  This is
+    the same pair the consent ask already uses
+    (integrations/social/device_routing_service): a notification record,
+    which every surface of theirs shows, and an FCM push to the phone.
+    Both are best-effort and both no-op cleanly on a node with no push
+    credential.
+    """
+    message = f"A new {state} sound for {game_id} is ready for you to hear."
+    try:
+        from integrations.social.services import NotificationService
+        from integrations.social.models import db_session
+        with db_session() as db:
+            # target_type/target_id are the schema's own way of saying what
+            # a notification is ABOUT, and the client routes on them.  Without
+            # them the row is inert: it tells the person a sound is ready and
+            # gives them no way to reach it.
+            NotificationService.create(
+                db, str(user_id), 'agent_game_sound_review',
+                source_user_id=str(prompt_id), message=message,
+                target_type='agent', target_id=str(prompt_id),
+            )
+    except Exception as e:
+        tool_logger.debug(f'game sound: no notification record ({e})')
+    try:
+        from core.fcm_sync import send_fcm_push
+        send_fcm_push(
+            str(user_id),
+            'A new game sound',
+            message,
+            data={
+                'type': 'game_sound_review',
+                'agent_id': str(prompt_id),
+                'game_id': str(game_id),
+                'state': str(state),
+                'url': str(record.get('url') or ''),
+                'topic_reply': f'com.hertzai.pupit.{user_id}',
+            },
+        )
+    except Exception as e:
+        tool_logger.debug(f'game sound: no push to the phone ({e})')
 
 
 def build_core_tool_closures(ctx):
@@ -421,7 +429,12 @@ def build_core_tool_closures(ctx):
     def get_user_camera_inp(
         inp: Annotated[str, "The Question to check from visual context"],
     ) -> str:
-        return helper_fun.get_user_camera_inp(inp, int(user_id), request_id_list[user_prompt])
+        # No int() — user_id is a UUID on desktop installs and int() raised
+        # on every call (152/152 failures across three log rotations,
+        # 10/10 on 2026-09-07).  The callee never needs an int: helper.py:2163
+        # does get_frame(str(user_id)) and :2165 interpolates it into a
+        # filename.  An integer id still passes through unchanged.
+        return helper_fun.get_user_camera_inp(inp, user_id, request_id_list[user_prompt])
 
     tools.append((
         "get_user_camera_inp",
@@ -478,14 +491,23 @@ def build_core_tool_closures(ctx):
                     pass
 
             try:
-                stored_value = get_data_by_key(key)
+                # The value as stored, not the tool's page of it.
+                stored_value = _read_saved(key)
                 tool_logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
-                if stored_value == "Key not found in stored data.":
+                if stored_value == _KEY_NOT_FOUND:
                     tool_logger.error(f"VERIFICATION FAILED: Data not properly stored at key {key}")
+                    return f"Error: {key} was written but could not be read back"
             except Exception as e:
                 tool_logger.error(f"VERIFICATION ERROR: {str(e)}")
 
-            return f'{agent_data[prompt_id]}'
+            # Report the save, not the store. This returned the whole
+            # agent_data store on every call, so each save put all of it in
+            # the model's context and, through the group chat's write-back,
+            # into memory again: on central 2026-09-14 (#104) the large
+            # MemoryGraph rows were all this repr, 0.9M to 3.96M chars each.
+            return _bounded_observation(
+                f'Saved at {key}: {json.dumps(validated_value)}',
+                'the whole value was saved')
         except json.JSONDecodeError as je:
             error_msg = f"Invalid JSON structure in value: {str(je)}"
             tool_logger.error(error_msg)
@@ -499,10 +521,472 @@ def build_core_tool_closures(ctx):
             tool_logger.error(error_msg)
             return f"Error: {error_msg} - Data not saved"
 
+    # ------------------------------------------------------------------
+    # bind_game_sound — a game's sounds, composed once and kept
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def bind_game_sound(
+        game_id: Annotated[str, "The game's id as the app knows it (a game config's id, e.g. 'eng-spell-animals-01')"],
+        mood: Annotated[str, "How the game should feel: happy, calm, adventurous, triumphant"] = "happy",
+        description: Annotated[str, "What happens in the game, for the composer"] = "",
+        state: Annotated[str, "Which state of the game: bgm for the music under the game, or correct, wrong, streak, complete, starEarned, intro, countdownTick, countdownEnd, cardFlip, matchFound, dragStart, dragDrop, tap"] = "bgm",
+        level: Annotated[str, "Only when THIS level needs its own sound; leave empty so every level of the game shares one"] = "",
+        scope: Annotated[str, "'agent' binds it for everyone who reuses this agent; 'mine' is a correction for this person alone"] = "agent",
+    ) -> str:
+        """Compose this game's background music and bind it to the game.
+
+        Call it in CREATE for each game this agent plays with.  The music
+        is composed by the node's media capability and recorded against
+        this agent, so REUSE plays the same music rather than composing
+        again, and the reviewer approves one piece of music per game.
+
+        Idempotent: once a game is bound, calling it again returns the
+        binding.  If the composer is still working, call it again later
+        with the same game_id and it picks the task back up.
+        """
+        tool_logger.info(f'INSIDE bind_game_sound for game {game_id}')
+        if not game_id or not str(game_id).strip():
+            return "A game_id is required: use the game config's id."
+        slot = str(game_id).strip()
+
+        which = str(state or 'bgm').strip() or 'bgm'
+        if which not in GAME_STATES:
+            return (f"{which} is not one of a game's states. Use one of: "
+                    f"{', '.join(sorted(GAME_STATES))}.")
+        mine = user_id if str(scope or 'agent').strip() == 'mine' else None
+        games = agent_data.setdefault(prompt_id, {}).setdefault('games', {})
+        bound, matched = game_state_sound(games, slot, which, level, mine,
+                                          own_only=bool(mine))
+        if bound.get('url'):
+            return json.dumps({
+                'status': 'already_bound',
+                'game_id': slot,
+                'state': which,
+                'matched': matched,
+                'music': bound,
+                'note': f'This game already has its {which}; it is never composed twice.',
+            })
+        # NO early return for a composition already under way.  It used to
+        # return here saying "call again with the same arguments to finish
+        # it" -- and calling again hit this same branch and said it again,
+        # forever.  MEASURED 2026-09-22: twelve consecutive calls, the
+        # composition finishing on the server in the middle of them, and the
+        # memo never receiving the url.  The resume path below (`task_id =
+        # bound.get('task_id')`, which skips the submit and polls the
+        # existing task) was unreachable, so the note was a promise the code
+        # could not keep.  Falling through IS the dedupe: an existing
+        # task_id means poll it, never start a second composition.
+
+        def _remember(record):
+            set_game_state_sound(games, slot, which, record, level, mine)
+            try:
+                helper_fun.save_agent_data_to_file(prompt_id, agent_data)
+            except Exception as e:
+                tool_logger.warning(f'bind_game_sound could not persist: {e}')
+            return record
+
+        def _offer(record):
+            """Hand a finished piece to the person, to hear and answer."""
+            if record.get('url'):
+                offer_sound_for_review(user_id, prompt_id, slot, which, record)
+            return record
+
+        try:
+            from integrations.service_tools.media_agent import (
+                MEDIA_FAILED_STATUSES,
+                _reads_as_still_waking,
+                check_media_status,
+                generate_media,
+            )
+        except ImportError as e:
+            tool_logger.warning(f'bind_game_sound: no media capability ({e})')
+            return ("This node cannot compose music (the media capability is "
+                    "not available here), so the game keeps no sound.")
+
+        def _failure_kind(result):
+            """Why a composer call failed, told apart by the module that wrote it.
+
+            media_agent.classify_error is the reader that lives next to the
+            returns it reads (hartos-94, HARTOS 11d0aebee), and it makes
+            distinctions a prose match here could not: a node with NOTHING
+            installed should be offered an install; an AceStep that is
+            installed and merely not running -- or will not fit beside
+            whatever holds the GPU -- must be waited for: not offered again
+            (installing what is on the disk is its own defect) and not
+            reported as a refusal.
+            """
+            try:
+                from integrations.service_tools.media_agent import classify_error
+                return classify_error(result)
+            except Exception:
+                return None
+
+        def _no_composer_here(result):
+            try:
+                from integrations.service_tools.media_agent import ABSENT
+            except Exception:
+                return False
+            return _failure_kind(result) == ABSENT
+
+        def _composer_not_up(result):
+            """Run 8, 2026-09-22: a 3 GB llama-server on the card made the
+            runtime refuse to start the composer, and this tool told the
+            agent the composer REFUSED the game's music.  Nothing was posted,
+            so nothing is remembered; the next call simply asks again."""
+            try:
+                from integrations.service_tools.media_agent import UNREACHABLE
+            except Exception:
+                return False
+            return _failure_kind(result) == UNREACHABLE
+
+        def _ask_for_a_composer(why):
+            """Offer to set a music model up, rather than failing quietly.
+
+            A node with no composer cannot give a game its sounds, and
+            silence tells the person nothing.  The ask is the canonical
+            consent card, scoped to this one capability, and the owner's
+            yes routes into the provisioning that already exists.
+            """
+            try:
+                from integrations.agent_engine.capability_setup import (
+                    request_capability_setup)
+                outcome = request_capability_setup(
+                    'music:acestep',
+                    reason=(f"To give {slot} its {which} sound I need a music "
+                            f"model on this computer. May I set one up?"),
+                    category='subprocess.tool_load',
+                    # NOT 'backend': that key is what the TTS venv repair
+                    # tool reads, and its documented backends are TTS engine
+                    # ids only (backend_repair_tools) -- so naming acestep
+                    # there sent a granted consent into a repair path aimed
+                    # at a tool that cannot install a music model.  With no
+                    # backend, goal_manager routes tool_load to dependency
+                    # remediation instead of a venv rebuild, which is what
+                    # a missing music engine actually needs.
+                    context={'tool': 'acestep', 'game_id': slot,
+                             'state': which},
+                )
+            except Exception as ask_error:
+                tool_logger.warning(f'could not offer a composer: {ask_error}')
+                outcome = 'unavailable'
+            return json.dumps({
+                'status': 'needs_capability',
+                'capability': 'music:acestep',
+                'game_id': slot,
+                'state': which,
+                'asked': outcome,
+                'why': why,
+                'note': {
+                    'provisioning': 'Setting the music model up now; ask again '
+                                    'once it is ready.',
+                    'asked': 'I have asked the owner of this computer whether '
+                             'I may set a music model up.',
+                    'declined': 'The owner said no to a music model, so this '
+                                'game keeps the sounds it already has.',
+                    'unavailable': 'There is nobody to ask on this node, so no '
+                                   'sound can be composed here.',
+                }.get(outcome, 'No music model is available on this node.'),
+            })
+
+        prompt = GAME_STATES[which].format(
+            what=description or slot, mood=mood)
+        # A take the reviewer rejected is composed again WITH the reason
+        # they gave, and kept as the next variant (spec §6.1).
+        rejected = rejected_take(games, slot, which, level, mine)
+        variant = int(rejected.get('variant') or 1) + 1 if rejected else 1
+        if rejected.get('rejected_reason'):
+            prompt = f"{prompt}. Not like the last one: {rejected['rejected_reason']}"
+        # Carried forward, because the new take REPLACES the rejected one at
+        # this key: without this the previous audio would survive exactly
+        # until the next composition and then vanish.
+        previous_takes = list(rejected.get('previous_takes') or [])
+        if rejected.get('rejected_url'):
+            previous_takes.append({
+                'url': rejected['rejected_url'],
+                'variant': int(rejected.get('variant') or 1),
+                'rejected_reason': rejected.get('rejected_reason') or '',
+                'rejected_at': rejected.get('rejected_at'),
+            })
+        task_id = bound.get('task_id')
+
+        def _forget_task(reason):
+            """Drop a task the composer will never finish, keep the rest.
+
+            hartos-3a F2: nothing ever cleared a dead task_id, so after a
+            composer restart this state answered "composing" for good, and
+            after a failure it answered "failed" for good; it could never be
+            composed again.  The rejection history and variant stay.
+            """
+            kept = {k: v for k, v in game_state_record(
+                        games, slot, which, level, mine).items()
+                    if k not in ('task_id', 'task_since', 'submitted_at')}
+            kept['lost_task'] = {'task_id': task_id, 'reason': reason,
+                                 'at': time.time()}
+            _remember(kept)
+
+        # A record from before task_since existed has no age to judge; it is
+        # polled as before rather than composed a second time.
+        if (task_id and bound.get('task_since')
+                and time.time() - float(bound['task_since']) > TASK_STALE_S):
+            _forget_task('no answer within TASK_STALE_S')
+            task_id = None
+        try:
+            if not task_id:
+                # A submit whose RESPONSE timed out may still have been
+                # ACCEPTED.  MEASURED 2026-09-22 on a live AceStep: two
+                # 'warming_up' answers, then a third submit that got an id --
+                # and /v1/stats reported FIVE jobs from this one caller
+                # (2 succeeded, 1 running, 2 queued, avg 907s each).  Every
+                # retry had enqueued a real job the client never learned the
+                # id of, and the one id it did hold sat "queued" behind its
+                # own orphans.  /release_task takes no idempotency key, so
+                # the only dedupe is here: after a timed-out submit, do not
+                # submit again for this state until a cooldown has passed.
+                _pending = _pending_submit(games, slot, which, level, mine)
+                if _pending and time.time() - _pending < SUBMIT_COOLDOWN_S:
+                    return json.dumps({
+                        'status': 'composing',
+                        'game_id': slot,
+                        'state': which,
+                        'note': ("A submission for this state may already be "
+                                 "in the composer's queue (the last one was "
+                                 "accepted but its reply timed out); waiting "
+                                 "for it rather than queueing a second."),
+                    })
+                started = json.loads(generate_media(
+                    context=prompt,
+                    output_modality='audio_music',
+                    input_text=prompt,
+                    # per state: a chime is two seconds, a loop is thirty (spec 3).
+                    duration=GAME_STATE_DURATIONS.get(which, 30),
+                    style=mood,
+                ))
+                if started.get('status') == 'completed':
+                    results = started.get('results') or []
+                    url = results[0].get('url') if results else None
+                    if url:
+                        record = _offer(_remember({'url': url, 'mood': mood,
+                                            'prompt': prompt, 'state': which,
+                                            'level': level or None,
+                                            'variant': variant,
+                                            'previous_takes': previous_takes,
+                                            'composed_at': time.time(),
+                                            'approved_at': None}))
+                        return json.dumps({'status': 'bound', 'game_id': slot,
+                                           'state': which, 'music': record})
+                    return "The composer answered without any music; nothing bound."
+                if started.get('status') == 'warming_up':
+                    # Not a refusal: the composer is getting ready, which on
+                    # a first run means downloading its model.  Saying it
+                    # refused would be wrong AND would leave the game with
+                    # nothing pending to come back to.  And the POST may have
+                    # been accepted: remember WHEN it went out, so the next
+                    # call waits instead of queueing a duplicate.  Written ON
+                    # TOP of what this key already holds: a take the reviewer
+                    # turned down keeps its rejected_url, its reason and its
+                    # variant, so the next call still answers them.  MEASURED
+                    # 2026-09-22 (hartos-14): replacing the record here erased
+                    # all three -- on a node restarted overnight, which is
+                    # exactly when a rejection is waiting.
+                    _remember({'mood': mood, 'prompt': prompt, 'state': which,
+                               'level': level or None, 'variant': variant,
+                               'composed_at': None, 'approved_at': None,
+                               **game_state_record(games, slot, which, level, mine),
+                               'submitted_at': time.time()})
+                    return json.dumps({
+                        'status': 'composing',
+                        'game_id': slot,
+                        'state': which,
+                        'note': started.get(
+                            'message',
+                            'The composer is starting up; ask again shortly.'),
+                    })
+                if started.get('status') != 'pending':
+                    why = str(started.get('error', 'unknown reason'))
+                    if _no_composer_here(started):
+                        return _ask_for_a_composer(why)
+                    if _composer_not_up(started):
+                        return (f"The composer is installed but not running "
+                                f"right now ({why}). Nothing was started; ask "
+                                f"again in a while by calling bind_game_sound "
+                                f"with the same game_id and state.")
+                    return f"The composer refused this game's music: {why}"
+                task_id = started.get('task_id')
+                _remember({'task_id': task_id, 'task_since': time.time(),
+                           'mood': mood, 'prompt': prompt,
+                           'state': which, 'level': level or None,
+                           'variant': variant,
+                           'previous_takes': previous_takes,
+                           'composed_at': None, 'approved_at': None})
+
+            # Give it a while, then hand the task back rather than block.
+            deadline = time.time() + 90
+            while time.time() < deadline:
+                time.sleep(3)
+                progress = json.loads(check_media_status(task_id))
+                state = progress.get('status')
+                if state in ('complete', 'completed', 'done'):
+                    results = progress.get('results') or []
+                    url = (progress.get('url')
+                           or (results[0].get('url') if results else None))
+                    if not url:
+                        return "The composer finished without any music; nothing bound."
+                    record = _offer(_remember({'url': url, 'mood': mood, 'prompt': prompt,
+                                        'state': which, 'level': level or None,
+                                        'variant': variant,
+                                        'previous_takes': previous_takes,
+                                        'composed_at': time.time(),
+                                        'approved_at': None}))
+                    return json.dumps({'status': 'bound', 'game_id': slot,
+                                       'state': which, 'music': record})
+                if state in MEDIA_FAILED_STATUSES:
+                    why = str(progress.get('error', 'unknown reason'))
+                    if progress.get('unreachable') and _reads_as_still_waking(why):
+                        # The POLL can be reset by a busy server just as the
+                        # submit can (MEASURED 2026-09-22: attempts 9-10 of a
+                        # live bind reported "failed" on ConnectionResetError
+                        # 10054 while the composer was mid-generation and went
+                        # on to finish).  Keep polling; the deadline below
+                        # still hands the task back as 'composing'.
+                        continue
+                    if _no_composer_here(progress):
+                        return _ask_for_a_composer(why)
+                    # the task is over: the next call composes this state again
+                    # (hartos-3a F2)
+                    _forget_task(why)
+                    return (f"The composer failed on this game: {why}. Call "
+                            f"bind_game_sound again to compose it afresh.")
+            return json.dumps({
+                'status': 'composing',
+                'game_id': slot,
+                'state': which,
+                'task_id': task_id,
+                'note': 'Still composing. Call bind_game_sound again with the '
+                        'same game_id and state to finish binding it.',
+            })
+        except Exception as e:
+            tool_logger.warning(f'bind_game_sound failed for {slot}: {e}')
+            return f"Could not bind this game's sound: {e}"
+
+    tools.append((
+        "bind_game_sound",
+        "Compose a kids game's background music and bind it to that game for "
+        "good, so every later run of this agent plays the same music. Pass the "
+        "game's id, a mood and a short description. Call it once per game.",
+        bind_game_sound,
+    ))
+
+    # ------------------------------------------------------------------
+    # get_game_sound — what a game is bound to play
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def get_game_sound(
+        game_id: Annotated[str, "The game's id as the app knows it"],
+        state: Annotated[str, "Which state of the game: bgm, correct, wrong, complete, intro…"] = "bgm",
+        level: Annotated[str, "The level being played, when levels have their own sounds"] = "",
+    ) -> str:
+        """A sound this game is bound to play. REUSE reads it; it never composes."""
+        slot = str(game_id or '').strip()
+        which = str(state or 'bgm').strip() or 'bgm'
+        if which not in GAME_STATES:
+            return (f"{which} is not one of a game's states. Use one of: "
+                    f"{', '.join(sorted(GAME_STATES))}.")
+        level = str(level or '').strip()
+        bound, matched = game_state_sound(
+            agent_data.get(prompt_id, {}).get('games', {}), slot, which, level, user_id)
+        if bound.get('url'):
+            return json.dumps({
+                'status': 'bound',
+                'game_id': slot,
+                'state': which,
+                'matched': matched,
+                'approved': bool(bound.get('approved_at')),
+                'music': bound,
+            })
+        if bound.get('task_id'):
+            return json.dumps({'status': 'composing', 'game_id': slot,
+                               'state': which, 'task_id': bound['task_id']})
+        return json.dumps({'status': 'unbound', 'game_id': slot, 'state': which,
+                           'note': f'No {which} is bound to this game yet.'})
+
+    # ------------------------------------------------------------------
+    # approve_game_sound — the reviewer's word on a game's music
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def approve_game_sound(
+        game_id: Annotated[str, "The game whose sound the reviewer just approved"],
+        approved: Annotated[bool, "True when the reviewer accepts this sound, False to drop it so it can be composed again"] = True,
+        state: Annotated[str, "Which state of the game: bgm, correct, wrong, complete, intro…"] = "bgm",
+        reason: Annotated[str, "Why it was rejected, in the reviewer's words — the next take is composed to answer it"] = "",
+        level: Annotated[str, "The level, when this sound belongs to one level"] = "",
+        scope: Annotated[str, "'agent' is the reviewer deciding for everyone; 'mine' is this person correcting their own copy"] = "agent",
+    ) -> str:
+        """Record that the reviewer approved (or rejected) a game's music.
+
+        The reviewer meets this agent in Evaluation Mode after creation and
+        hears the game's music there.  Their word is recorded on the
+        binding, so the person who reuses this agent gets the music that
+        was approved.  A rejection clears the binding, and the next
+        bind_game_sound composes a fresh one.
+        """
+        slot = str(game_id or '').strip()
+        which = str(state or 'bgm').strip() or 'bgm'
+        if which not in GAME_STATES:
+            return (f"{which} is not one of a game's states. Use one of: "
+                    f"{', '.join(sorted(GAME_STATES))}.")
+        level = str(level or '').strip()
+        mine = user_id if str(scope or 'agent').strip() == 'mine' else None
+        games = agent_data.setdefault(prompt_id, {}).setdefault('games', {})
+        # A verdict belongs to the memo it was GIVEN, and the ladder may have
+        # found that under a different key than the one asked for: rejecting
+        # while playing level 3 wrote at 'correct@3' and left 'correct' --
+        # the take actually sounding -- playing on, url intact.  A person
+        # correcting their own copy still writes in their own space.
+        music, matched, write_key = record_verdict(
+            games, slot, which, approved, reason, level, mine)
+        if not music:
+            return (f"No {which} is bound to {slot or 'that game'} yet, so "
+                    f"there is nothing to approve.")
+        try:
+            helper_fun.save_agent_data_to_file(prompt_id, agent_data)
+        except Exception as e:
+            tool_logger.warning(f'approve_game_sound could not persist: {e}')
+        return json.dumps({
+            'status': 'approved' if approved else 'rejected',
+            'game_id': slot,
+            'state': which,
+            'music': game_state_sound(games, slot, which, level, mine,
+                                      own_only=bool(mine))[0] or None,
+            'scope': 'mine' if mine else 'agent',
+            # which memo the verdict landed on, so a caller can see that a
+            # level-3 rejection marked the game-wide take that was playing
+            'matched': matched,
+            'key': write_key,
+        })
+
+    tools.append((
+        "approve_game_sound",
+        "Record the reviewer's decision on a kids game's music during review: "
+        "approved keeps it for everyone who reuses this agent, rejected drops "
+        "it so it can be composed again.",
+        approve_game_sound,
+    ))
+
+    tools.append((
+        "get_game_sound",
+        "The music bound to a kids game by this agent, if any. Use it before "
+        "playing a game so the sound stays the one the reviewer approved.",
+        reads_persisted_state(get_game_sound),
+    ))
+
     tools.append((
         "save_data_in_memory",
         "Use this to Store and retrieve data using key-value storage system",
-        save_data_in_memory,
+        # Marked reads_persisted_state (#104): its result reports what is now
+        # stored, so the group chat's write-back does not store it again. The
+        # same mark goes on every tool below whose result is a read of state
+        # HARTOS already keeps.
+        reads_persisted_state(save_data_in_memory),
     ))
 
     # ------------------------------------------------------------------
@@ -520,16 +1004,23 @@ def build_core_tool_closures(ctx):
     tools.append((
         "get_saved_metadata",
         "Returns the schema of the json from internal memory with all keys but without actual values.",
-        get_saved_metadata,
+        reads_persisted_state(get_saved_metadata),
     ))
 
     # ------------------------------------------------------------------
     # 5. get_data_by_key
     # ------------------------------------------------------------------
-    @log_tool_execution
-    def get_data_by_key(
-        key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."],
-    ) -> str:
+    _KEY_NOT_FOUND = "Key not found in stored data."
+
+    def _read_saved(key):
+        """The value saved at ``key``, whole, or the not-found sentinel.
+
+        For code in this module that needs the value as stored (the receipt
+        template, the save check). The get_data_by_key tool pages what the
+        model reads; the receipt read its template through that tool, so a
+        template longer than a page was cut and the page note was printed into
+        the customer's receipt (#104 review).
+        """
         if prompt_id not in agent_data or not agent_data[prompt_id]:
             tool_logger.info(f"Loading agent data from file for prompt_id {prompt_id}")
             helper_fun.load_agent_data_from_file(prompt_id, agent_data)
@@ -539,7 +1030,11 @@ def build_core_tool_closures(ctx):
             for k in keys:
                 d = d[k]
             return f'{d}'
-        except KeyError:
+        # TypeError too: a path that runs through a None, a string or a list
+        # is as missing as an absent key. It used to escape as a tool
+        # exception and skip the fallback below (central 2026-09-13, a hive
+        # reuse turn asking for a nested key under a None value).
+        except (KeyError, TypeError):
             # Fallback: check MemoryGraph for persisted [KV] data — the
             # read half of save_data_in_memory's dual-write, carried by
             # reuse_recipe's inline twin before the #743 migration and
@@ -551,19 +1046,62 @@ def build_core_tool_closures(ctx):
                         return results[0].content
                 except Exception:
                     pass
-            return "Key not found in stored data."
+            return _KEY_NOT_FOUND
+
+    @log_tool_execution
+    def get_data_by_key(
+        key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."],
+        offset: Annotated[int, "Where to start reading a long value, in characters. Leave 0 to read from the start."] = 0,
+    ) -> str:
+        # One page of the value, not all of it (#104): a key like 'hive'
+        # returned the whole subtree, which went to the model and back into
+        # memory. A long value is read a page at a time, the way book pages
+        # are, and the note names the offset of the next page.
+        from core.constants import TOOL_OBSERVATION_MAX_CHARS as page_chars
+        # A pointer the wire trim put where it elided text
+        # ([elided:<id> ...], core.llm_outbound_logger): the original, whole,
+        # from the store's `elided` namespace -- no per-item cap.
+        from core.llm_outbound_logger import (
+            ELIDED_KEY_PREFIX, elision_scope, read_elided)
+        if str(key).strip().startswith(ELIDED_KEY_PREFIX):
+            # Only this user's elided text (or, when the call that elided it
+            # knew no user, this request's): never another user's.
+            pid = str(key).strip()[len(ELIDED_KEY_PREFIX):]
+            value = read_elided(pid, elision_scope(user_id=user_id))
+            if value is None and request_id_list.get(user_prompt):
+                value = read_elided(pid, elision_scope(
+                    request_id=request_id_list.get(user_prompt)))
+            if value is None:
+                return (f'Nothing is stored for {key}: the elided text is kept '
+                        f'for a day, and this one is gone or never existed.')
+        else:
+            value = _read_saved(key)
+        try:
+            start = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            start = 0
+        if start and start >= len(value):
+            return f'...[offset {start} is past the end of the value ({len(value)} chars)]'
+        page = value[start:start + page_chars]
+        end = start + len(page)
+        if end >= len(value):
+            return page
+        return (f'{page}\n...[chars {start}-{end} of {len(value)}; call '
+                f'get_data_by_key with offset={end} for the rest]')
 
     tools.append((
         "get_data_by_key",
-        "Returns all data from the internal Memory using key",
-        get_data_by_key,
+        "Returns the data saved at a key. A long value comes back one page at a "
+        "time; pass the offset the reply names to read the next page.",
+        reads_persisted_state(get_data_by_key),
     ))
     # Alias — Helper system prompts in reuse_recipe.py advertise this name (#510).
-    # Same closure → identical behavior under both names.  Never remove a
-    # registered tool: phantom tool fixed by adding a real registration.
+    # Same closure → identical behavior under both names, the persisted-read
+    # mark included.  Never remove a registered tool: phantom tool fixed by
+    # adding a real registration.
     tools.append((
         "get_data_from_memory",
-        "Returns all data from the internal Memory using key (alias of get_data_by_key)",
+        "Returns the data saved at a key, a page at a time (alias of get_data_by_key)",
         get_data_by_key,
     ))
 
@@ -601,8 +1139,10 @@ def build_core_tool_closures(ctx):
         from integrations.service_tools.receipt_image import (
             compute_balance, render_receipt_png)
         balance = compute_balance(amount, advance) or ""
-        template = get_data_by_key("receipt_template")
-        if not template or template == "Key not found in stored data.":
+        # The template as saved: the get_data_by_key tool pages what the model
+        # reads, and a paged template printed its page note into the receipt.
+        template = _read_saved("receipt_template")
+        if not template or template == _KEY_NOT_FOUND:
             template = _DEFAULT_RECEIPT_TEMPLATE
         fields = {
             "business_name": business_name,
@@ -620,8 +1160,8 @@ def build_core_tool_closures(ctx):
         text = TemplateEngine().render(template, extra_vars=fields)
         if str(render).lower() != "image":
             return text
-        logo_path = get_data_by_key("receipt_logo_path")
-        if logo_path == "Key not found in stored data.":
+        logo_path = _read_saved("receipt_logo_path")
+        if logo_path == _KEY_NOT_FOUND:
             logo_path = None
         png = render_receipt_png(fields, logo_path=logo_path)
         if not png:
@@ -666,12 +1206,8 @@ def build_core_tool_closures(ctx):
         if ext not in ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'):
             return ("'" + ext + "' is not an image type I can put on a "
                     "receipt - please send PNG or JPG.")
-        try:
-            from core.platform_paths import get_data_dir
-            dest_dir = os.path.join(get_data_dir(), 'receipt_assets', str(prompt_id))
-        except ImportError:
-            dest_dir = os.path.join(os.path.expanduser('~/Documents/Nunba/data'),
-                                    'receipt_assets', str(prompt_id))
+        from core.platform_paths import get_data_dir
+        dest_dir = os.path.join(get_data_dir(), 'receipt_assets', str(prompt_id))
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, 'logo' + ext)
         try:
@@ -814,10 +1350,13 @@ def build_core_tool_closures(ctx):
                 if policy.get('compute_policy') != 'local_only':
                     from integrations.agent_engine.compute_mesh_service import get_compute_mesh
                     mesh = get_compute_mesh()
+                    # user_id: the person this peer's compute is charged to
+                    # (ComputeMeshService._charged).
                     result = mesh.offload_to_best_peer(
                         model_type=ModelType.VIDEO_GEN,
                         prompt=text,
-                        options={'model': 'ltx2', 'timeout': 300},
+                        options={'model': 'ltx2', 'timeout': 300,
+                                 'user_id': str(user_id or '')},
                     )
                     if result and 'error' not in result:
                         video_url = result.get('response', result.get('video_url', ''))
@@ -835,6 +1374,7 @@ def build_core_tool_closures(ctx):
 
         # Default: Avatar-based video generation
         from core.config_cache import get_db_url
+        from core.teacher_avatar import lookup_avatar
         database_url = get_db_url() or 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         tool_logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
@@ -847,20 +1387,16 @@ def build_core_tool_closures(ctx):
             'openvoice': "false",
         }
 
-        try:
-            res = pooled_get(f"{database_url}/get_image_by_id/{avatar_id}")
-            res = res.json()
-            new_image_url = res["image_url"]
-            voice_id = res.get('voice_id')
-        except Exception:
+        # The avatar's image and voice sample: the one lookup a spoken reply
+        # uses too (core/teacher_avatar.py).
+        avatar = lookup_avatar(avatar_id, database_url)
+        if avatar['openvoice']:
             data['openvoice'] = "true"
-            new_image_url = None
-            voice_id = None
 
         data["cartoon_image"] = "True"
         data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
         data['vtoonify'] = "false"
-        data["image_url"] = new_image_url
+        data["image_url"] = avatar['image_url']
         data['im_crop'] = "false"
         data['remove_bg'] = "false"
         data['hd_video'] = "false"
@@ -879,18 +1415,8 @@ def build_core_tool_closures(ctx):
             data['flag_hallo'] = "true"
             data["cartoon_image"] = "False"
 
-        if voice_id is not None:
-            try:
-                voice_sample = pooled_get(f"{database_url}/get_voice_sample_id/{voice_id}")
-                voice_sample = voice_sample.json()
-                data["audio_sample_url"] = voice_sample.get("voice_sample_url")
-                data['voice_id'] = int(voice_id) if voice_id else None
-            except Exception:
-                data["audio_sample_url"] = None
-                data['voice_id'] = None
-        else:
-            data["audio_sample_url"] = None
-            data['voice_id'] = None
+        data["audio_sample_url"] = avatar['audio_sample_url']
+        data['voice_id'] = avatar['voice_id']
 
         conv_id = save_conversation_db(text, user_id, prompt_id, database_url, request_id)
         data['conv_id'] = int(conv_id)
@@ -920,8 +1446,13 @@ def build_core_tool_closures(ctx):
     @log_tool_execution
     def get_user_uploaded_file() -> str:
         tool_logger.info('INSIDE get_user_uploaded_file')
-        if recent_file_id[user_id]:
-            return f'Got user uploaded file the file_id is {recent_file_id[user_id]}'
+        # .get(), not [] — recent_file_id is a TTLCache written only when a
+        # file is actually uploaded, so a user who uploaded nothing has no
+        # key and [] raised KeyError (44/44 failures, 4/4 on 2026-09-07).
+        # That case is exactly the answer below, which was unreachable.
+        file_id = recent_file_id.get(user_id)
+        if file_id:
+            return f'Got user uploaded file the file_id is {file_id}'
         return 'No file uploaded from user'
 
     tools.append((
@@ -1020,9 +1551,17 @@ def build_core_tool_closures(ctx):
             return f'Message directed to {mention} agent, not sending to user'
         tool_logger.info('INSIDE send_message_to_user')
         tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
-        thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '', prompt_id))
-        thread.start()
-        return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
+        # The send runs HERE and its result is the tool's result.  This used
+        # to start the send on a thread and return "sent successfully" before
+        # it ran: Nunba gui_app.log 2026-09-26 00:02:10 the tool answered
+        # sent, 00:02:19 the send failed (WinError 10061), and the agent
+        # waited on a question the user never saw.  Both
+        # send_message_to_user1 copies return "Message sent successfully ..."
+        # or "Failed to send message ...".
+        result = send_message_to_user1(user_id, text, '', prompt_id)
+        if isinstance(result, str) and result:
+            return result
+        return 'Message handed to the sender; its delivery was not confirmed'
 
     tools.append((
         "send_message_to_user",
@@ -1083,7 +1622,7 @@ def build_core_tool_closures(ctx):
     tools.append((
         "get_chat_history",
         "Get Chat history based on text & start & end date",
-        get_chat_history,
+        reads_persisted_state(get_chat_history),
     ))
 
     # ------------------------------------------------------------------
@@ -1104,7 +1643,7 @@ def build_core_tool_closures(ctx):
     tools.append((
         "search_visual_history",
         "Search past camera and screen descriptions by keyword and time range.",
-        search_visual_history,
+        reads_persisted_state(search_visual_history),
     ))
 
     # ------------------------------------------------------------------
@@ -1152,18 +1691,23 @@ def build_core_tool_closures(ctx):
                 try:
                     loop = get_or_create_event_loop()
                     results = loop.run_until_complete(simplemem_store.search(query))
-                    if results:
-                        return results[0].content
-                    return "No relevant memories found."
+                    # SimpleMem's item is an answer, not a stored row: cut it,
+                    # never skip it.
+                    text = _bounded_recall(
+                        [r.content for r in (results or [])], max_items=1,
+                        skip_oversize=False)
+                    return text or "No relevant memories found."
                 except Exception as e:
                     tool_logger.info(f"SimpleMem search error: {e}")
                     return "Memory search unavailable."
             # MemoryGraph leg — same contract, local store, no API key.
             try:
-                results = memory_graph.recall(query, mode='hybrid', top_k=5)
-                if results:
-                    return '\n'.join(r.content for r in results[:5])
-                return "No relevant memories found."
+                # Fetch past the 5 shown: rows _bounded_recall skips as
+                # over-size must not leave real memories unreturned (#104).
+                results = memory_graph.recall(query, mode='hybrid', top_k=10)
+                text = _bounded_recall(
+                    [r.content for r in (results or [])], max_items=5)
+                return text or "No relevant memories found."
             except Exception as e:
                 tool_logger.info(f"MemoryGraph search error: {e}")
                 return "Memory search unavailable."
@@ -1171,7 +1715,7 @@ def build_core_tool_closures(ctx):
         tools.append((
             "search_long_term_memory",
             "Search long-term memory for past conversations, facts, and context using natural language query.",
-            search_long_term_memory,
+            reads_persisted_state(search_long_term_memory),
         ))
 
         @log_tool_execution
@@ -1596,7 +2140,7 @@ def build_core_tool_closures(ctx):
         "get_user_details",
         "Get the current user's profile information (name, email, preferences, etc.). "
         "Use when the user asks about their profile or when you need user context.",
-        get_user_details,
+        reads_persisted_state(get_user_details),
     ))
 
     # ------------------------------------------------------------------
@@ -1607,65 +2151,8 @@ def build_core_tool_closures(ctx):
         resource_description: Annotated[str, "JSON or plain text describing the needed resource. JSON format: {\"resource_type\": \"api_key\", \"key_name\": \"GOOGLE_API_KEY\", \"label\": \"Google API Key\", \"used_by\": \"search tool\", \"description\": \"needed for web search\"}"],
     ) -> str:
         """Request an API key, credential, token, or config value that is not currently available."""
-        try:
-            try:
-                req = json.loads(resource_description)
-            except (ValueError, TypeError):
-                req = {
-                    'resource_type': 'api_key',
-                    'key_name': 'UNKNOWN',
-                    'label': resource_description[:100],
-                    'description': resource_description,
-                    'used_by': 'Agent tool',
-                }
-
-            key_name = req.get('key_name', 'UNKNOWN')
-            resource_type = req.get('resource_type', 'api_key')
-
-            # Check env vars first
-            env_val = os.environ.get(key_name)
-            if env_val:
-                return f"Resource '{key_name}' is already configured and available."
-
-            # Check vault
-            try:
-                from hartos.ai_key_vault import AIKeyVault
-                vault = AIKeyVault.get_instance()
-                val = vault.get_tool_key(key_name) if resource_type != 'channel_secret' else vault.get_channel_secret(req.get('channel_type', ''), key_name)
-                if val:
-                    os.environ[key_name] = val
-                    return f"Resource '{key_name}' loaded from vault and is now available."
-            except Exception:
-                pass
-
-            # Track as pending and request from user
-            try:
-                from hartos.ai_key_vault import AIKeyVault
-                AIKeyVault.get_instance().add_pending_request(
-                    key_name=key_name, resource_type=resource_type,
-                    channel_type=req.get('channel_type', ''),
-                    label=req.get('label', key_name),
-                    description=req.get('description', ''),
-                    used_by=req.get('used_by', 'Agent tool'),
-                )
-            except Exception:
-                pass
-
-            secret_request = json.dumps({
-                '__SECRET_REQUEST__': True, 'type': resource_type,
-                'key_name': key_name, 'label': req.get('label', key_name),
-                'description': req.get('description', f'{key_name} is required.'),
-                'used_by': req.get('used_by', 'Agent tool'),
-                'channel_type': req.get('channel_type', ''),
-            })
-            return (
-                f"I need the user to provide '{req.get('label', key_name)}'. "
-                f"Required for {req.get('used_by', 'a tool')}. "
-                f"{req.get('description', '')} "
-                f"RESOURCE_REQUEST:{secret_request}"
-            )
-        except Exception as e:
-            return f"Resource request failed: {e}"
+        from hartos.ai_key_vault import request_credential
+        return request_credential(resource_description, agent_id=prompt_id)
 
     tools.append((
         "request_resource",
@@ -1898,6 +2385,235 @@ def build_core_tool_closures(ctx):
         # commits C4+ EXTENDS web_crawler.py with cookie injection + B2 CDP
         # attach, instead of building a parallel driver.  See
         # memory/project_browser_research_subsystem.md for the corrected plan.
+
+    @log_tool_execution
+    def validate_json_response(response: Annotated[str, "The response from a tool that should be JSON"]) -> str:
+        """
+        Validates and repairs JSON response from tools.
+
+        Args:
+            response: string responses from a tool that should be JSON formatted
+        Returns:
+            Valid JSON string or the original string if not repairable
+        """
+        tool_logger.info("INSIDE validate json response")
+        try:
+            # First try to parse as is
+            json_obj = json.loads(response)
+            return json.dumps(json_obj)
+        except json.JSONDecodeError:
+            try:
+
+                # If parsing fails, try to repair
+                repaired_json = repair_json(response)
+                # Verify the repaired JSON is valid
+                json_obj = json.loads(repaired_json)
+                return json.dumps(json_obj)
+            except Exception as e:
+                # If repair filas, return the original with a warning
+                tool_logger.info("JSON repair has failed")
+                return f"{response}"
+
+    tools.append((
+        "validate_json_response",
+        "Checks and corrects if the tool response is not JSON but expected to be.",
+        validate_json_response,
+    ))
+
+    # ------------------------------------------------------------------
+    # Coding-agent leg
+    #
+    # These four were inline closures in create_recipe.create_agents
+    # (register_dual, L1674-1816) until 2026-09-10.  CREATE advertised them
+    # to the recipe-authoring LLM while REUSE — which builds its tools from
+    # THIS factory (reuse_recipe.py:2238) — held no copy.  Two consequences,
+    # and the second is the one that hid the first:
+    #   * a saved action naming one could never execute; and
+    #   * _reuse_fabricated_tools could not see the name as `referenced`
+    #     (that helper intersects the action text with names REGISTERED ON
+    #     THE AGENTS), so it returned [] at its second early-return, before
+    #     its log line.  A tool the leg cannot run was indistinguishable
+    #     from an action naming no tool, and the action advanced silently.
+    # Measured live 2026-09-10, agent 88719487304 action 4: FAB-GUARD
+    # watermark 23 in, 23 out — zero tool calls in the whole window — no
+    # verdict line at all, both subtasks closed, parent terminated in 14s.
+    # 36 of the 185 saved recipes on that box name such a tool; 87 actions
+    # name execute_coding_task alone.
+    #
+    # Deliberately NOT added to MAIN_LEG_CORE_TOOLS: reuse reaches them via
+    # attach_for_names, for the action whose own recipe names one, so the
+    # always-on schema stays 18 tools / ~1,859 tokens against the 12,288
+    # slot (#730).  Same rule reuse_recipe.py:2429-2442 already states for
+    # execute_windows_or_android_command — that closure captures 33 locals
+    # of its defining function so ctx cannot build it and it is handed over
+    # inline; these four capture nothing but user_id, which ctx supplies.
+    # ------------------------------------------------------------------
+    async def execute_coding_task(
+        task: Annotated[str, "The coding task to execute (e.g., 'review this function for bugs', 'implement a login form')"],
+        task_type: Annotated[str, "Task type: code_review, feature, bug_fix, refactor, app_build, debugging, multi_session"] = "feature",
+        preferred_tool: Annotated[str, "Optional tool override: kilocode, claude_code, opencode, aider_native, or claw_native (empty = auto-select best)"] = "",
+        working_dir: Annotated[str, "Working directory / repo path for the coding task (empty = use HEVOLVE_CODING_WORKDIR env or cwd)"] = "",
+    ) -> str:
+        """Execute a coding task using the best available coding agent tool (KiloCode, Claude Code, OpenCode, or AiderNative).
+
+        Routes to the best tool based on benchmarks and task type.
+        This is for writing, reviewing, refactoring, or debugging code —
+        NOT for GUI automation (use execute_windows_or_android_command for that).
+        """
+        try:
+            from integrations.coding_agent.orchestrator import get_coding_orchestrator
+            orchestrator = get_coding_orchestrator()
+            result = orchestrator.execute(
+                task=task,
+                task_type=task_type,
+                preferred_tool=preferred_tool,
+                user_id=user_id,
+                model=os.environ.get('HEVOLVE_CODING_MODEL', ''),
+                working_dir=working_dir or os.environ.get('HEVOLVE_CODING_WORKDIR', ''),
+            )
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            tool_logger.exception("execute_coding_task failed: %s", e)
+            return f"Coding task execution error: {e}"
+
+    tools.append((
+        "execute_coding_task",
+        "Execute a coding task (write, review, refactor, debug code) using the best available coding agent tool. Routes to KiloCode, Claude Code, OpenCode, AiderNative, or ClawNative (Rust) based on benchmarks. Pass working_dir for the target repo path.",
+        execute_coding_task,
+    ))
+
+    # Repository map tool — tree-sitter based code understanding.
+    # Import-gated exactly as create_recipe had it: absent, not broken,
+    # when aider_core is not installed.
+    try:
+        from integrations.coding_agent.recipe_bridge import CodingRecipeBridge
+
+        async def get_repository_map(
+            working_dir: Annotated[str, "Directory to map (default: current directory)"] = ".",
+            max_tokens: Annotated[int, "Maximum tokens for the map output"] = 2048,
+        ) -> str:
+            """Generate a tree-sitter based repository map showing key functions, classes, and their relationships.
+
+            Use this to understand a codebase's structure before making changes.
+            Returns a ranked summary of the most important code symbols.
+            """
+            return CodingRecipeBridge.get_repository_map(working_dir, max_tokens)
+
+        tools.append((
+            "get_repository_map",
+            "Generate a tree-sitter repository map showing key functions, classes, and structure. Use before coding tasks to understand the codebase.",
+            get_repository_map,
+        ))
+    except ImportError:
+        tool_logger.debug("Repository map tool not available (aider_core not installed)")
+
+    # Shard Engine: Call-chain context for coding tasks.
+    # Target function + upstream callers + downstream callees = FULL source.
+    # Everything else = interfaces only. Exposure proportional to task.
+    # Call graph from Trueflow MCP (IDE) or AST fallback (headless).
+    try:
+        async def create_code_shard(
+            task: Annotated[str, "Description of the coding task"],
+            target_file: Annotated[str, "Relative path to the file containing the target function"],
+            target_function: Annotated[str, "Name of the function to modify"],
+            repo_path: Annotated[str, "Path to the repository (default: HART OS install dir)"] = "",
+        ) -> str:
+            """Create a code shard with call-chain context for a coding task.
+
+            Returns:
+            - Target function: FULL source (what you're modifying)
+            - Upstream callers: FULL source (who calls it, input contracts)
+            - Downstream callees: FULL source (what it calls, output contracts)
+            - Everything else: Interfaces only (signatures + types)
+
+            Call graph sourced from Trueflow MCP (when IDE running) or AST fallback.
+            Security: exposure proportional to the task. E2E encrypted for peer offload.
+            Use execute_coding_task with working_dir to actually apply edits.
+            """
+            from integrations.agent_engine.shard_engine import ShardEngine
+            engine = ShardEngine(code_root=repo_path) if repo_path else ShardEngine()
+            shard = engine.create_call_chain_shard(
+                task=task, target_file=target_file,
+                target_function=target_function)
+            return json.dumps({
+                'shard_id': shard.shard_id,
+                'task': shard.task_description,
+                'scope': shard.scope.value,
+                'target_files': shard.target_files,
+                'call_chain_source': shard.full_content,
+                'interfaces': [{'file': s.file_path, 'functions': s.functions,
+                               'classes': s.classes} for s in shard.interface_specs],
+            }, indent=2, default=str)
+
+        tools.append((
+            "create_code_shard",
+            "Create a code shard with call-chain context: target function + upstream callers + downstream callees (FULL source), everything else interfaces only.",
+            create_code_shard,
+        ))
+    except Exception:
+        tool_logger.debug("Shard engine tool not available")
+
+    # Benchmark Tracker: Query which coding tool performs best for each task type
+    try:
+        async def get_coding_benchmarks(
+            task_type: Annotated[str, "Task type to check (code_review, feature, bug_fix, refactor, app_build, debugging, multi_session, or 'all')"] = "all",
+        ) -> str:
+            """Get coding tool benchmarks — which tool (KiloCode, Claude Code, OpenCode, AiderNative) performs best.
+
+            Returns success rates, average times, and sample counts per tool per task type.
+            Includes both local benchmarks and hive-aggregated intelligence from peers.
+            """
+            from integrations.coding_agent.benchmark_tracker import get_benchmark_tracker
+            tracker = get_benchmark_tracker()
+            result = {'local': {}, 'hive': {}}
+
+            if task_type == 'all':
+                delta = tracker.export_learning_delta()
+                result['local'] = delta.get('coding_benchmarks', {})
+            else:
+                best = tracker.get_best_tool(task_type)
+                if best:
+                    result['local'][task_type] = {
+                        'best_tool': best[0], 'success_rate': best[1],
+                        'avg_time_s': best[2],
+                    }
+                hive_best = tracker.get_hive_best_tool(task_type)
+                if hive_best:
+                    result['hive'][task_type] = {
+                        'best_tool': hive_best[0], 'success_rate': hive_best[1],
+                        'avg_time_s': hive_best[2],
+                    }
+            return json.dumps(result, indent=2, default=str)
+
+        tools.append((
+            "get_coding_benchmarks",
+            "Query coding tool benchmarks — which tool performs best per task type. Includes local and hive-aggregated data.",
+            get_coding_benchmarks,
+        ))
+    except Exception:
+        tool_logger.debug("Benchmark tracker tool not available")
+
+    # ------------------------------------------------------------------
+    # Book / learning navigation — appended HERE, not via a separate
+    # register_*_if_available() registrar.
+    #
+    # register_remote_desktop_tools_if_available (below) has NO production
+    # caller — only tests/unit/test_remote_desktop_agent_tools.py:235 — so a
+    # tool registered that way never reaches a live turn.  The live path is
+    # build_core_tool_closures() -> register_core_tools(), called from
+    # create_recipe.py:1096/1116 and reuse_recipe.py:2238/2264.  Appending to
+    # `tools` is therefore the only wiring that actually runs.
+    # ------------------------------------------------------------------
+    try:
+        from integrations.learning.book_tools import build_book_tools
+        _book = build_book_tools(ctx)
+        if _book:
+            tools.extend(_book)
+            tool_logger.info("Book navigation tools registered (%d)", len(_book))
+    except ImportError:
+        pass
+    except Exception as e:
+        tool_logger.warning("Book tools registration failed: %s", e)
 
     return tools
 

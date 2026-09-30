@@ -13,6 +13,7 @@ Usage:
     backend = get_vision_backend()
     description = backend.describe(frame_bytes)
 """
+import functools
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -53,11 +54,12 @@ class VisionBackend(AutoReportSubsystemFailures, ABC):
     SUBSYSTEM = 'vlm'
     # Methods whose escaping exceptions auto-feed the self-heal pipe.
     # `start` is the primary failure surface (model load); `describe`
-    # is the runtime synth surface (OOM, dispatch fail); `stop` is
-    # included so an unload that hangs doesn't go silent.  Adding new
-    # methods to a concrete backend (e.g. `embed`) just needs the
-    # method name in this tuple — no per-backend except-block edits.
-    AUTO_REPORTED_METHODS = ('start', 'describe', 'stop')
+    # and `read_document` are the runtime synth surfaces (OOM, dispatch
+    # fail); `stop` is included so an unload that hangs doesn't go
+    # silent.  Adding new methods to a concrete backend (e.g. `embed`)
+    # just needs the method name in this tuple — no per-backend
+    # except-block edits.
+    AUTO_REPORTED_METHODS = ('start', 'describe', 'read_document', 'stop')
 
     @property
     @abstractmethod
@@ -93,6 +95,26 @@ class VisionBackend(AutoReportSubsystemFailures, ABC):
         """
         pass
 
+    def read_document(self, image_bytes: bytes, prompt: str) -> Optional[str]:
+        """Read everything on a document page -- a book page, a scan: its
+        text, layout, tables and figures, in the shape the prompt asks for.
+
+        Not a caption. The page goes at a size its text can be read at, and
+        the answer can run to thousands of tokens. The default is None: this
+        backend cannot read a page (a classifier, a caption-only model, no
+        model at all), and the caller falls back to what it has -- the book
+        pipeline reads the page's own text layer.
+
+        Args:
+            image_bytes: the page, as JPEG/PNG bytes
+            prompt: what to extract, and in what shape
+
+        Returns:
+            The model's answer ('' when it answered with nothing), or None
+            when this backend cannot read a page or could not be reached.
+        """
+        return None
+
     def start(self) -> bool:
         """Initialize the backend model. Returns True if ready."""
         return True
@@ -102,12 +124,138 @@ class VisionBackend(AutoReportSubsystemFailures, ABC):
         pass
 
 
+#: A page's long side, in pixels, when a VLM reads it. Measured 2026-09-14 on
+#: Qwen3.5-0.8B with a dense page of 45 lines of 11 pt text: every line came
+#: back verbatim at 1280 px, as at the full 2200 px render, from 1570 prompt
+#: tokens instead of 3987 -- less of the server's context for one page.
+PAGE_LONG_SIDE = 1280
+#: A page's answer budget. The book page prompt asks for the text and then for
+#: every element of it again, as JSON: the same 45-line page ran past 2048
+#: tokens, and the cut-off JSON came back as prose.
+PAGE_MAX_TOKENS = 4096
+
+
+def _page_jpeg(image_bytes: bytes) -> bytes:
+    """The page as JPEG bytes, no longer than PAGE_LONG_SIDE on its long side."""
+    import io
+    from PIL import Image
+    img = Image.open(io.BytesIO(image_bytes))
+    if max(img.size) > PAGE_LONG_SIDE:
+        scale = PAGE_LONG_SIDE / max(img.size)
+        img = img.resize((round(img.width * scale), round(img.height * scale)),
+                         Image.LANCZOS)
+    buf = io.BytesIO()
+    img.convert('RGB').save(buf, 'JPEG', quality=85)
+    return buf.getvalue()
+
+
+def _read_page_with(completions_url: str, image_bytes: bytes, prompt: str, *,
+                    model: str, headers: Optional[dict] = None) -> Optional[str]:
+    """The one page-reading request to an OpenAI-compatible vision server.
+
+    Thinking is off (core.constants.LLM_THINKING_OFF_KWARGS): a hybrid
+    reasoning model otherwise spends its budget in reasoning_content and
+    answers with nothing. pooled_post admits the call through the priority
+    scheduler, so a page read by a background parse waits behind the user's
+    own turn. Never raises: a page the model does not read, the caller reads
+    from somewhere else.
+    """
+    import base64
+    from core.constants import LLM_THINKING_OFF_KWARGS
+    from core.http_pool import LLM_COMPLETION_TIMEOUT
+    try:
+        b64 = base64.b64encode(_page_jpeg(image_bytes)).decode('ascii')
+    except Exception as e:
+        logger.warning(f"page image could not be prepared for the VLM: {e}")
+        return None
+    body = {
+        'model': model,
+        'messages': [{'role': 'user', 'content': [
+            {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{b64}'}},
+            {'type': 'text', 'text': prompt},
+        ]}],
+        'chat_template_kwargs': dict(LLM_THINKING_OFF_KWARGS),
+        'max_tokens': PAGE_MAX_TOKENS,
+        'temperature': 0.3,
+    }
+    extra = {'headers': headers} if headers else {}
+    try:
+        resp = pooled_post(completions_url, json=body,
+                           timeout=LLM_COMPLETION_TIMEOUT, **extra)
+    except Exception as e:
+        logger.warning(f"page read failed at {completions_url}: {e}")
+        return None
+    if resp.status_code != 200:
+        logger.warning(f"page read at {completions_url} returned HTTP "
+                       f"{resp.status_code}: {resp.text[:200]}")
+        return None
+    try:
+        choice = (resp.json().get('choices') or [{}])[0]
+    except (ValueError, AttributeError) as e:
+        logger.warning(f"page read at {completions_url} answered with no usable JSON: {e}")
+        return None
+    message = choice.get('message') or {}
+    content = (message.get('content') or '').strip()
+    if choice.get('finish_reason') == 'length':
+        logger.warning("page read stopped at its %d-token budget: the answer is cut off",
+                       PAGE_MAX_TOKENS)
+    if not content:
+        logger.warning("page read produced EMPTY content (finish_reason=%s, "
+                       "reasoning_content=%d chars)", choice.get('finish_reason'),
+                       len(message.get('reasoning_content') or ''))
+    return content
+
+
 class MiniCPMBackend(VisionBackend):
-    """Full MiniCPM-V-2 backend — existing sidecar subprocess."""
+    """Full MiniCPM-V-2 backend — existing sidecar subprocess.
+
+    Port resolution, most specific first:
+      1. an explicit `port=` argument, or HEVOLVE_MINICPM_PORT
+      2. the port RuntimeToolManager gave the sidecar it started
+      3. port_registry's 'vision' (9891) — the fixed-port deployment
+         (nixos/modules/hart-vision.nix passes --port explicitly)
+
+    (2) is why this class and RuntimeToolManager used to be two
+    unconnected paths: RTM's contract is "all sidecar servers use dynamic
+    port allocation (no fixed ports)", so a sidecar it starts listens on
+    an OS-assigned high port, while this class only ever looked at 9891.
+    `start_tool('minicpm')` could therefore succeed and `get_vision_backend()`
+    still talk to nobody.  RTM owns the process, so RTM owns the port, and
+    it is asked at call time — a backend object may well be constructed
+    before the sidecar is started.
+    """
 
     def __init__(self, port: int = None):
         from core.port_registry import get_port
-        self._port = int(os.environ.get('HEVOLVE_MINICPM_PORT', port or get_port('vision')))
+        self._explicit_port = (
+            int(os.environ['HEVOLVE_MINICPM_PORT'])
+            if os.environ.get('HEVOLVE_MINICPM_PORT') else port)
+        self._registry_port = int(get_port('vision'))
+        self._port = int(self._explicit_port or self._registry_port)
+
+    def _resolve_port(self) -> int:
+        """The port to talk to RIGHT NOW (see the class docstring).
+
+        Asks RTM only if RTM is ALREADY imported in this process, via
+        sys.modules rather than an `import`.  `_ports` is per-process
+        in-memory state, so a process that never imported the manager
+        cannot have a sidecar it started — the answer would be None
+        anyway — and importing it here would register its atexit
+        `stop_all` hook in every process that merely captions a frame.
+        Same answer, no side effect.
+        """
+        if self._explicit_port:
+            return int(self._explicit_port)
+        try:
+            import sys
+            rm = sys.modules.get('integrations.service_tools.runtime_manager')
+            if rm is not None:
+                live = rm.runtime_tool_manager.get_tool_port('minicpm')
+                if live:
+                    return int(live)
+        except Exception as e:
+            logger.debug(f"RuntimeToolManager port lookup failed: {e}")
+        return self._registry_port
 
     @property
     def name(self) -> str:
@@ -122,29 +270,68 @@ class MiniCPMBackend(VisionBackend):
         return 4000
 
     def is_available(self) -> bool:
+        """A GPU AND the weights on disk.
+
+        Every sibling checks its own prerequisites — Qwen08B wants its
+        GGUF or a live server, MobileVLM wants onnxruntime, CLIP wants
+        torch+clip — but this one asked only "is there a GPU", so any
+        GPU box claimed the MiniCPM backend was available with no weights
+        and no sidecar anywhere.  get_vision_backend()'s catalog branch
+        and its "last resort: try minicpm" both gate on this call, so the
+        answer decided whether a node SELECTED a backend that could not
+        possibly answer a frame.  (MEASURED 2026-09-21 on this box:
+        list_available_backends() reported minicpm available=True while
+        nothing was listening on the vision port — true by luck, since
+        the weights are here.)
+        """
         try:
             from .minicpm_installer import MiniCPMInstaller
             installer = MiniCPMInstaller()
-            return installer.detect_gpu()
+            return bool(installer.detect_gpu()) and installer.is_installed()
         except Exception:
             return False
 
     def describe(self, frame_bytes: bytes, prompt: str = '') -> Optional[str]:
-        import base64
+        """Caption a frame through the MiniCPM sidecar's /describe endpoint.
+
+        The wire shape is dictated by integrations/vision/minicpm_server.py
+        `describe_raw()`: RAW image bytes as the body, the prompt as a QUERY
+        param, and the caption under the key `result`.  This method used to
+        send `{"image": <base64>, "prompt": ...}` as JSON and read a
+        `description` key — the server would have handed that JSON body to
+        PIL.Image.open and answered HTTP 500, and even a hypothetical success
+        carries no `description` key.  Nothing caught it because the only
+        test mocked pooled_post and asserted the invented shape.  The two
+        callers that DO reach this server — VisionService._describe_frame and
+        hart_intelligence_entry's MiniCPM tier — already speak raw-bytes/
+        `result`; this is now the third.
+        """
+        port = self._resolve_port()
+        # 30 s was the old budget and it only ever fit a GPU sidecar.  The
+        # same model on CPU — where VRAMManager.suggest_offload_mode sends it
+        # on an 8 GB card with an LLM resident — is minutes per caption
+        # (MEASURED 2026-09-21: 61 s just to reach the first decode step),
+        # and a client timeout shorter than the server turns a slow success
+        # into a silent None.  HEVOLVE_MINICPM_TIMEOUT_S overrides.
         try:
-            b64 = base64.b64encode(frame_bytes).decode('utf-8')
+            timeout_s = float(os.environ.get('HEVOLVE_MINICPM_TIMEOUT_S', 120))
+        except ValueError:
+            timeout_s = 120.0
+        try:
             resp = pooled_post(
-                f'http://localhost:{self._port}/describe',
-                json={
-                    'image': b64,
-                    'prompt': prompt or 'Describe what you see in this image.',
-                },
-                timeout=30,
+                f'http://localhost:{port}/describe',
+                data=frame_bytes,
+                params={'prompt': prompt or 'Describe what you see in this image.'},
+                headers={'Content-Type': 'application/octet-stream'},
+                timeout=timeout_s,
             )
             if resp.status_code == 200:
-                return resp.json().get('description', '')
+                return resp.json().get('result', '')
+            logger.warning(
+                f"MiniCPM /describe at :{port} returned HTTP "
+                f"{resp.status_code}: {resp.text[:200]}")
         except Exception as e:
-            logger.debug(f"MiniCPM describe error: {e}")
+            logger.debug(f"MiniCPM describe error (port {port}): {e}")
         return None
 
 
@@ -371,31 +558,54 @@ class Qwen3VLVisionBackend(VisionBackend):
     def stop(self):
         self._backend = None
 
-    def describe(self, frame_bytes: bytes, prompt: str = '') -> Optional[str]:
+    def _endpoint(self):
+        """The shared Qwen3-VL backend: the same one computer use drives."""
         if self._backend is None:
-            try:
-                from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
-                self._backend = get_qwen3vl_backend()
-            except Exception:
-                return None
+            from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
+            self._backend = get_qwen3vl_backend()
+        return self._backend
+
+    def completions_url(self) -> str:
+        return f'{self._endpoint().base_url.rstrip("/")}/chat/completions'
+
+    def describe(self, frame_bytes: bytes, prompt: str = '') -> Optional[str]:
+        try:
+            endpoint = self._endpoint()
+        except Exception:
+            return None
         try:
             import base64
             b64 = base64.b64encode(frame_bytes).decode('utf-8')
-            return self._backend.describe_scene(
+            return endpoint.describe_scene(
                 b64, prompt or 'Describe what you see in this image.'
             )
         except Exception as e:
             logger.debug(f"Qwen3-VL describe error: {e}")
             return None
 
+    def read_document(self, image_bytes: bytes, prompt: str) -> Optional[str]:
+        """A page, through the same Qwen3-VL endpoint describe() uses, with
+        the page request (thinking off, a page-sized budget) instead of the
+        scene request."""
+        try:
+            endpoint = self._endpoint()
+            url = self.completions_url()
+        except Exception as e:
+            logger.warning(f"Qwen3-VL unavailable for a page read: {e}")
+            return None
+        return _read_page_with(url, image_bytes, prompt, model=endpoint.model_name,
+                               headers={'Authorization': f'Bearer {endpoint.api_key}'})
+
 
 class Qwen08BBackend(VisionBackend):
     """Qwen3.5-0.8B — fast continuous captioning (1s/frame).
 
-    Runs on a dedicated llama-server instance (port 8081 by default),
-    separate from the 4B model used for computer use / action planning.
+    Runs on a dedicated llama-server instance (its port from
+    core.port_registry, 'vlm_caption'), separate from the 4B model used for
+    computer use / action planning.
 
-    Purpose: always-on frame captioning → FrameStore activity table.
+    Purpose: always-on frame captioning → FrameStore activity table, and
+    reading document pages (read_document) for the book pipeline.
     NOT for computer use (use 4B Qwen3VLVisionBackend for that).
 
     Model: Qwen3.5-0.8B-UD-Q4_K_XL.gguf (~558MB) + mmproj-F16.gguf (~195MB)
@@ -426,13 +636,11 @@ class Qwen08BBackend(VisionBackend):
         backend be selected at boot; describe() / start() preserve the
         original lazy-launch contract — we don't burn VRAM until a frame
         actually arrives.
+
+        "Selectable", not "serving": the launch path asks _is_serving().
         """
-        try:
-            resp = pooled_get(f'http://127.0.0.1:{self._port}/health', timeout=2)
-            if resp.status_code == 200:
-                return True
-        except Exception:
-            pass
+        if self._is_serving():
+            return True
         home = os.path.expanduser('~')
         for d in [os.path.join(home, '.nunba', 'models'),
                   os.path.join(home, '.trueflow', 'models')]:
@@ -440,86 +648,47 @@ class Qwen08BBackend(VisionBackend):
                 return True
         return False
 
+    def _is_serving(self) -> bool:
+        """True only when the caption server answers /health on its port."""
+        try:
+            resp = pooled_get(f'http://127.0.0.1:{self._port}/health', timeout=2)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
     def start(self) -> bool:
         """Lazy: don't boot at VisionService.start(). describe() does the
         launch on the first frame so we don't burn VRAM when the user has
         no camera/screen stream active."""
-        if self.is_available():
+        if self._is_serving():
             logger.info(f"Qwen3.5-0.8B caption backend ready on port {self._port}")
         else:
             logger.info(
                 "Qwen3.5-0.8B not running — will start on first frame")
         return True  # Stay selected; lazy start in describe().
 
-        # Find llama-server binary (reuse model_lifecycle's finder)
-
-        # Find llama-server binary (reuse model_lifecycle's finder)
-        try:
-            from integrations.service_tools.model_lifecycle import ModelLifecycleManager
-            server = ModelLifecycleManager._find_llama_server_binary()
-        except Exception:
-            server = None
-        if not server:
-            logger.info("Qwen3.5-0.8B: llama-server binary not found — caption disabled")
-            return False
-
-        # Find 0.8B model + mmproj (fixed filenames, known locations)
-        home = os.path.expanduser('~')
-        model = mmproj = None
-        for d in [os.path.join(home, '.nunba', 'models'),
-                  os.path.join(home, '.trueflow', 'models')]:
-            p = os.path.join(d, 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf')
-            if os.path.isfile(p) and not model:
-                model = p
-            p = os.path.join(d, 'qwen08b', 'mmproj-F16.gguf')
-            if os.path.isfile(p) and not mmproj:
-                mmproj = p
-
-        if not model or not mmproj:
-            logger.info("Qwen3.5-0.8B: model files not found — run 'python scripts/setup_vlm.py'")
-            return False
-
-        import subprocess, time
-        cmd = [server, '--model', model, '--mmproj', mmproj,
-               '--port', str(self._port), '--ctx-size', '512',
-               '--n-gpu-layers', '99', '--threads', '4', '--flash-attn', 'on']
-        log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
-        try:
-            # APPEND mode — caption-server can crash + respawn; each
-            # restart's truncation erased the previous crash evidence.
-            # Root-cause class: truncate-on-restart log loss.
-            _log_fh = open(log_path, 'a')
-            try:
-                import datetime as _lb_dt
-                _log_fh.write(
-                    f"\n===== llama-caption (lightweight) session "
-                    f"{_lb_dt.datetime.now().isoformat()} port={self._port} =====\n"
-                )
-                _log_fh.flush()
-            except Exception:
-                pass
-            _kw = dict(stdout=_log_fh, stderr=subprocess.STDOUT)
-            if os.name == 'nt':
-                _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
-            subprocess.Popen(cmd, **_kw)
-            for _ in range(30):
-                time.sleep(1)
-                if self.is_available():
-                    logger.info(f"Qwen3.5-0.8B caption server started on port {self._port}")
-                    return True
-        except Exception as e:
-            logger.error(f"Qwen3.5-0.8B start failed: {e}")
-        return False
+        # DELETED 2026-09-22: ~60 lines of a SECOND caption-server launcher
+        # used to sit here, after that unconditional `return True`.  It was
+        # unreachable — dead since the lazy-start contract moved the launch
+        # into _ensure_running — but it was a byte-for-byte duplicate of the
+        # launcher below, including its own hardcoded 512-token window.  A dead
+        # parallel path still costs: it is the copy a reader greps up first,
+        # and it is the copy a future edit lands in.  The live launcher is
+        # _ensure_running; there is now exactly one.
 
     # 0.8B optimal: 512x288 (11KB JPEG) — only needs scene understanding, not coords
     CAPTION_WIDTH = 512
     CAPTION_HEIGHT = 288
     IDLE_TIMEOUT_S = 300  # Unload after 5 min with no frames
+    #: How long a FAILED launch suppresses the next attempt.  Not forever:
+    #: see _ensure_running for why permanence was a defect (#102).
+    LAUNCH_RETRY_S = 120
 
     def __init__(self, port: int = None):
         from core.port_registry import get_port
         self._port = port or get_port('vlm_caption')
         self._launch_attempted = False
+        self._launch_attempted_at = 0.0
         self._last_describe_time = 0.0
         self._server_proc = None  # subprocess.Popen object (not just PID)
 
@@ -531,12 +700,49 @@ class Qwen08BBackend(VisionBackend):
         In standalone mode, HARTOS uses model_lifecycle to launch directly.
 
         Dependency direction: Nunba → HARTOS (never HARTOS → Nunba).
+
+        Every "is it up" check here is _is_serving(), never is_available():
+        is_available() is also True when only the weights are on disk, and
+        using it here returned True with nothing listening -- no launch was
+        ever asked for.  Measured 2026-09-27: GGUF present, :8081 refused,
+        VisionService described=0 over 697 frames.
         """
-        if self.is_available():
+        if self._is_serving():
             return True
+        import time as _t
         if self._launch_attempted:
-            return False
+            # A COOLDOWN, not a latch (#102, found by hartos-94).  This flag
+            # was cleared in exactly one place -- the tail of stop() -- and
+            # check_idle only reaches stop() through `if self._server_proc`,
+            # which is None after a FAILED launch.  So one failure set the
+            # flag forever and captioning was dead for the life of the
+            # process, on a backend whose whole design is to start lazily
+            # per frame.
+            #
+            # Transient failure is the normal case here, not the exception:
+            # the event wait below is only 5x1s so a still-booting Nunba
+            # loses the race, the standalone path needs a llama-server
+            # binary that aborts on this box, and it competes for VRAM with
+            # the resident LLM.  Any of those should cost one cooldown, not
+            # the feature.
+            if _t.time() - self._launch_attempted_at < self.LAUNCH_RETRY_S:
+                return False
+            logger.info(
+                f"Qwen3.5-0.8B: retrying launch after "
+                f"{self.LAUNCH_RETRY_S}s cooldown")
+            if self._server_proc is not None:
+                # The process WE launched is still not serving after a whole
+                # cooldown: wedged, not slow.  Relaunching over it spawned a
+                # second llama-server every LAUNCH_RETRY_S and leaked the
+                # first process and its log handle (hartos-3a F7).  Stop it
+                # through the one stop path first.
+                logger.warning(
+                    f"Qwen3.5-0.8B: PID={self._server_proc.pid} still not "
+                    f"serving after {self.LAUNCH_RETRY_S}s; stopping it "
+                    f"before relaunching")
+                self.stop()
         self._launch_attempted = True
+        self._launch_attempted_at = _t.time()
 
         # Emit event — Nunba subscribes in bundled mode and starts the server
         try:
@@ -549,7 +755,7 @@ class Qwen08BBackend(VisionBackend):
         import time
         for _ in range(5):
             time.sleep(1)
-            if self.is_available():
+            if self._is_serving():
                 logger.info(f"Qwen3.5-0.8B started (event-driven) on port {self._port}")
                 return True
 
@@ -576,8 +782,24 @@ class Qwen08BBackend(VisionBackend):
                 return False
 
             import subprocess
+            # 512 is correct for this backend and is NOT a main-model size:
+            # a caption turn is one 512x288 JPEG plus one sentence of prompt,
+            # and the whole point of the 0.8B captioner is that it costs
+            # almost nothing.  It is a legitimately separate model class, so
+            # it keeps a fixed small window — what it must not keep is its own
+            # copy of that number.  core.llama_geometry.ROLE_CTX['caption'] is
+            # where the value lives, beside the tier table, so "the captioner
+            # runs at 512" is a policy statement one grep can answer rather
+            # than a literal repeated at each subprocess.Popen.
+            #
+            # This spawn also does NOT publish_geometry: it is a caption
+            # server on the vlm_caption port, not the main engine, and
+            # publishing 512 would tell HARTOS's wire trimmer that every
+            # agentic request must fit in 512 tokens.
+            from core.llama_geometry import ctx_for_role
             cmd = [server, '--model', model, '--mmproj', mmproj,
-                   '--port', str(self._port), '--ctx-size', '512',
+                   '--port', str(self._port),
+                   '--ctx-size', str(ctx_for_role('caption')),
                    '--n-gpu-layers', '99', '--threads', '4', '--flash-attn', 'on']
             log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
             # APPEND mode — same root-cause class as the caption-server
@@ -600,7 +822,7 @@ class Qwen08BBackend(VisionBackend):
             logger.info(f"Qwen3.5-0.8B launching PID={self._server_proc.pid} port={self._port}")
             for _ in range(30):
                 time.sleep(1)
-                if self.is_available():
+                if self._is_serving():
                     logger.info(f"Qwen3.5-0.8B ready on port {self._port}")
                     return True
         except Exception as e:
@@ -688,6 +910,18 @@ class Qwen08BBackend(VisionBackend):
         except Exception as e:
             logger.debug(f"Qwen08B describe error: {e}")
         return None
+
+    def read_document(self, image_bytes: bytes, prompt: str) -> Optional[str]:
+        """A page, through the caption server: the same lazy start and port
+        as describe(), none of its caption shrink (512x288 at 100 tokens is
+        far too little to read a page)."""
+        import time
+        if not self._ensure_running():
+            return None
+        self._last_describe_time = time.time()
+        return _read_page_with(
+            f'http://127.0.0.1:{self._port}/v1/chat/completions', image_bytes, prompt,
+            model='local')
 
 
 class NoneBackend(VisionBackend):
@@ -806,6 +1040,39 @@ def get_vision_backend(name: str = '') -> VisionBackend:
     return NoneBackend()
 
 
+def get_document_readers() -> list:
+    """How this node reads a document page, best first: each is
+    read(image_bytes, prompt) -> Optional[str], and a page goes to the next
+    when one does not answer.
+
+    First the node's vision backend -- get_vision_backend(), the one camera,
+    screen and media captions use -- when it can read a page at all. Then the
+    node's own main model (core.port_registry.get_local_llm_url), which read
+    every book page before 2026-09-14: a node whose vision backend cannot
+    read a page (MiniCPM, MobileVLM, CLIP, none), or whose caption server
+    does not answer, reads no fewer pages than it did. The fallback is always
+    this node's own model, never a configured remote endpoint.
+    """
+    readers = []
+    node = get_vision_backend()
+    if type(node).read_document is not VisionBackend.read_document:
+        readers.append(node.read_document)
+    try:
+        from core.port_registry import get_local_llm_url
+        main_url = get_local_llm_url().rstrip('/') + '/chat/completions'
+    except Exception as e:
+        logger.warning(f"the main model's address is unknown; pages have no fallback: {e}")
+        return readers
+    if isinstance(node, Qwen3VLVisionBackend):
+        try:
+            if node.completions_url() == main_url:
+                return readers          # its VLM endpoint IS the main model
+        except Exception as e:
+            logger.debug(f"Qwen3-VL endpoint unresolved: {e}")
+    readers.append(functools.partial(_read_page_with, main_url, model='qwen'))
+    return readers
+
+
 def list_available_backends():
     """Return list of (name, available, ram_mb) for all backends."""
     results = []
@@ -881,7 +1148,12 @@ def populate_vlm_catalog(catalog) -> int:
     added = 0
     for (mid, name, vram, ram, disk, quality, speed, min_tier,
          backend, sup_gpu, sup_cpu, caps, tags) in vlm_models:
-        if catalog.get(mid) is not None:
+        # Claiming skip -- see ModelCatalog.already_registered.  Skipping an
+        # entry this populator still owns must not read as abandoning it:
+        # populate_from_subsystems sweeps auto-prefixed entries nobody
+        # claimed, and vlm-minicpm-v2 was OSCILLATING because of this line
+        # (added by one populate, swept by the next, added by the third).
+        if catalog.already_registered(mid):
             continue
         entry = ModelEntry(
             id=mid, name=name, model_type=ModelType.VLM,

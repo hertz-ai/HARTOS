@@ -233,6 +233,101 @@ capture path and honours this same gate. The brain-side caller is
 `integrations/agent_engine/hart_wm_client.py` (the same singleton that drives every other
 verb); it maps a `screen` cut/restore from `core.ai_sensing` to `screen.kill {on}`.
 
+### 4.12 `shell.native` · `ShellNative(on)` *(the native scene render path, for THIS session)*
+**args:** `{ "on": true }` (omit → defaults `true`)
+**result:** `{ "native": true }`, or an `unsupported` error when the flag did not move.
+
+Turns the native scene (top bar, hero, rows, taskbar, orb) on or off in the running
+session. It changes **only this session**: the M6 default is untouched and a reboot
+forgets the call.
+
+It exists for **measurement**. `latency.rs` attributes an input to a component
+(`TOPBAR`, `CARD`, `ORB`…) by hit-testing the native scene tree, so while the scene is
+not drawn every sample is `component=shell` **by construction**. That is what the box
+reported on 2026-09-10: ~4,200 samples swept across the whole output, one distinct
+component, and every per-component row in `latency_budgets.json` therefore dead. Before
+this verb, turning the scene on meant an env var read once at session start: build a
+generation, reboot, and reboot again to get back. Over this socket both halves of the
+native-versus-shell comparison can be measured on one machine minutes apart.
+
+**The error case is the point.** `set_native_shell_flag` is a no-op on any backend
+without the field, so the verb reads the flag back and compares it with the request. If
+it did not move, the answer is an `unsupported` error naming the state the flag is still
+in, never an `ok` for something that did not happen. (`window.resize` was caught doing
+exactly that on 2026-09-10: it answered `ok: true` for a resize the client had declined.)
+
+**What it does NOT do:** tell the WebView shell to stand down. The shell keeps painting
+its own home while the native scene draws above it, so with `on: true` the desktop shows
+both. That hand-off is one of M6's four named obligations
+(`docs/architecture/NATIVE_SHELL_PARITY_PROGRAM.md`) and is a contract decision, not a
+toggle. For a latency sweep the doubling is cosmetic; for anything else, expect it.
+
+### 4.13 `shell.chrome` · `ShellChrome(chrome)` *(the bar content the home feed does not carry)*
+**args:** the chrome payload below, every key optional
+**result:** `{ "composed": true, "top_bar": bool, "taskbar": bool }`
+
+The sibling of `shell.compose`. That verb carries the HOME (hero, rows, mood), which is
+what the A2UI feed already composes. It never carried the clock, the tray, the agent
+cluster, the notification badge or the taskbar chips, because none of them is home
+content and the compositor can see none of them: the clock is local time that an
+`unsafe_code = "deny"` crate cannot format, the tray and the agent cluster come from
+polls the render path must not make, and the chips are DOM inside the shell's one
+surface. This verb hands them over from the ONE producer that already computes every
+one of them for the WebView bar, `liquid_ui_service`, over the same socket, on the same
+per-connection request/response, so there is no second transport and no second feed.
+
+```json
+{
+  "clock": { "time": "02:05 PM", "date": "Tuesday, September 23" },
+  "tray": {
+    "wifi": "wifi", "bluetooth": "bluetooth_disabled", "volume": "volume_up",
+    "battery": "battery_4_bar", "battery_pct": "64%", "live": true
+  },
+  "notifications": { "unread": 2 },
+  "agents": ["Scout", "Archivist"],
+  "tasks": [ { "id": "files", "title": "Files", "icon": "folder", "active": true } ],
+  "start": { "open": false },
+  "toast": { "title": "Bluetooth", "message": "Not available", "severity": "warning" },
+  "menu": { "x": 412, "y": 300, "items": [ { "label": "Open", "icon": "open_in_new" },
+                                            { "sep": true },
+                                            { "label": "Delete", "danger": true } ] }
+}
+```
+
+| Key | What the bar shows today | Producer |
+|---|---|---|
+| `clock.time`, `clock.date` | `.top-bar-right .clock` (`tickClock`), and the lock screen's date | local time, formatted as `toLocaleTimeString({hour:'2-digit',minute:'2-digit'})` and `toLocaleDateString({weekday:'long',month:'long',day:'numeric'})` are |
+| `tray.*` | the `hartConnectivity.js` cluster: four Material LIGATURE NAMES resolved from the connectivity summary by the same thresholds `wifiGlyph`/`btGlyph`/`batGlyph`/`volGlyph` use, the battery percent text, and `live` (whether any domain is available; the cluster dims otherwise) | `_ConnectivityCache.summary()` |
+| `notifications.unread` | the `#notif-badge` dot on the notifications tray button | the notification store |
+| `agents` | `#agent-status`: the RUNNING agents' names, at most four, each at most 16 characters, exactly as `refreshAgentStatus` filters them; an empty list is the bar's "No agents running" | `/api/social/dashboard/agents` through `ContextEngine` |
+| `tasks` | the `.taskbar-chip` row: one chip per open panel, `active` for the focused one | the shell's open-panel registry; ABSENT until the shell reports it, and absence is meaningful (below) |
+| `start.open` | whether the start menu is open. Carried for completeness of the bar's state; the shell draws no distinct start-button state for it and neither does the compositor | the shell |
+| `toast` | one `showToast(title, message, severity)`; `severity` is one of `info`, `warning`, `error`, `success` | the shell |
+| `menu` | one open `HartCtxMenu`: viewport `x`, `y` and its rows (`label`, optional `icon`, `danger`, `disabled`) or dividers (`sep`) | the shell |
+
+**Decode is tolerant, in both directions.** An unknown key is ignored, a wrong-typed
+value is dropped, and a missing key decodes as ABSENT rather than as an empty default.
+That distinction is the whole claim rule: `"tasks": []` is a composed, empty taskbar and
+`tasks` missing is a taskbar the shell did not compose. Strings are the producer's
+sanitised text; the compositor draws what it is given and the producer is the only
+thing keeping a hostile string off the surface, exactly as for `shell.compose`.
+
+**The claim rule (extends the native-chrome bridge, not a second signal).** The
+compositor claims a BAND on `/run/hart/session/native-chrome` (`topbar`, `taskbar`, beside
+`bloom`, `orb`, `home`) only when that band is FULLY composed by this payload AND a
+presented frame carried pixels inside it. Fully composed means: for `topbar`, `clock`,
+`tray`, `notifications` and `agents` are all present; for `taskbar`, `tasks` is present.
+A band drawn from a partial payload is never claimed, because a claimed band makes the
+shell stop painting its own, and a bar missing its clock or its chips is the empty
+desktop failure wearing a smaller hat. The result echoes which bands are now fully
+composed so the producer's logs and the tests can see the rule from either side.
+
+**What it does NOT do:** route input. A press on a native tab, tray button or chip is
+not yet emitted as a `shell.activate`, so while a band is claimed the shell keeps its
+bar's hit targets and stands down only its PAINT (see `read_native_chrome` in
+`liquid_ui_service.py`), which is why the native bar's geometry follows the shell's CSS
+literals rather than a design of its own.
+
 ---
 
 ## 5. Events

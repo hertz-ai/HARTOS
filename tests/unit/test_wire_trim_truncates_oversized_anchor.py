@@ -143,10 +143,10 @@ class WireTrimTruncatesOversizedAnchor(unittest.TestCase):
         self.assertIn('user', roles, 'anchor must survive as a user message')
         a_text = next(m['content'] for m in trimmed['messages']
                       if m.get('role') == 'user')
-        self.assertTrue(a_text.startswith(WIRE_TRIM_MARKER),
+        self.assertIn(WIRE_TRIM_MARKER, a_text,
                         'truncated anchor must carry the wire-trim marker')
         self.assertIn('TASK TAIL.', a_text,
-                      'left-truncation must preserve the tail of the task')
+                      'the middle cut must preserve the tail of the task')
         self.assertGreater(n_chars, 0)
 
     def test_small_anchor_is_left_untouched(self):
@@ -174,8 +174,8 @@ class WireTrimTruncatesOversizedAnchor(unittest.TestCase):
         on its own.  Dropping and truncating other messages can never fix
         that, so every such turn was sent doomed and rejected.  As a LAST
         resort (everything else already trimmed), the system content gets
-        the same left-truncation: the boilerplate head is cut, the
-        actionable recipe tail survives."""
+        the same cut (of the middle, since 111c458b0): the persona head and
+        the actionable recipe tail survive."""
         messages = [
             {'role': 'system',
              'content': 'CULTURAL BOILERPLATE. ' + ('wisdom ' * 4000)
@@ -190,9 +190,9 @@ class WireTrimTruncatesOversizedAnchor(unittest.TestCase):
             'the oversized system message was never truncated, so the '
             'request goes out doomed (measured 86x live)')
         sys_text = trimmed['messages'][0]['content']
-        self.assertTrue(sys_text.startswith(WIRE_TRIM_MARKER))
+        self.assertIn(WIRE_TRIM_MARKER, sys_text)
         self.assertIn('ACTIONABLE TAIL.', sys_text,
-                      'left-truncation must keep the system tail')
+                      'the middle cut must keep the system tail')
 
     def test_small_system_is_never_touched(self):
         """System stays intact whenever anything else can absorb the cut."""
@@ -201,8 +201,11 @@ class WireTrimTruncatesOversizedAnchor(unittest.TestCase):
             {'role': 'user', 'content': 'HEAD. ' + ('data ' * 4000) + ' TAIL.'},
         ]
         trimmed, *_ = self._trim(messages)
-        self.assertEqual(trimmed['messages'][0]['content'],
-                         'small system prompt')
+        # A cut message carries a pointer, and the pointer explanation is
+        # appended to the system message (test_wire_trim_elided_pointers.py);
+        # the system prompt's own text is untouched.
+        self.assertEqual(trimmed['messages'][0]['content'].split(
+            lol.ELIDED_POINTER_EXPLANATION)[0], 'small system prompt')
 
     def test_anchor_as_last_message_is_not_double_truncated(self):
         """When the anchor IS messages[-1], the existing last-message step

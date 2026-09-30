@@ -35,17 +35,34 @@ cryptography==43.0.0
 # so 23.1.2 is what actually runs -- and autobahn >=25.9 requires Python >=3.11,
 # which the py3.10 image cannot satisfy at all (it failed the whole build here).
 autobahn==23.1.2
-# pyautogen: production imports `autogen` (core/labeled_autogen_function.py
+# autogen-agentchat: production imports `autogen` (core/labeled_autogen_function.py
 # at module scope; create_recipe lazily). It was only ever satisfied by a
 # LOOSE VENDORED autogen-0.2.37/ directory that was never committed, so
-# every fresh checkout (CI included) failed. 0.2.37 was never published to
-# PyPI under any name (pyautogen tops out at 0.2.35 in that line); 0.2.35
-# is the same 0.2 API and the full autogen test family passes against it.
+# every fresh checkout (CI included) failed.
+#
+# ONE autogen distribution everywhere: autogen-agentchat==0.2.37, the same pin
+# as pyproject.toml, Dockerfile, deploy/cloud/Dockerfile.prod,
+# nixos/packages/hart-app.nix and Nunba (requirements.txt, requirements-lock.txt,
+# scripts/deps.py). It provides the same top-level `autogen` package, so never
+# install pyautogen alongside it (both write into autogen/).
+#
+# This line used to pin pyautogen==0.2.35 on the claim that "0.2.37 was never
+# published to PyPI under any name". That was false: autogen-agentchat 0.2.36..
+# 0.2.40 are on PyPI. And 0.2.35 is NOT the same API the code is written for:
+#   - GroupChat has no select_speaker_transform_messages= (added in 0.2.36);
+#     reuse_recipe.create_agents_for_role passes it, so the role group raised
+#     TypeError at construction (CI: 3 setup ERRORs in the group-log tests).
+#   - MessageHistoryLimiter / MessageTokenLimiter do not pop a window that
+#     opens on a tool result; helper._context_limiter_classes corrects the
+#     0.2.37 pop, so under 0.2.35 it duplicated the newest message and ran
+#     past the token budget (CI: 85 failures in
+#     test_context_limiters_keep_the_newest.py).
+# Requires-Dist is identical to pyautogen 0.2.35; Requires-Python is >=3.8,<3.13.
 # ddgs SERP parsing (see the ddgs note above) - NOT transitive in this image
 lxml==6.1.2
 # ddgs HTTP layer, browser TLS impersonation - NOT transitive in this image
 primp==2.0.0
-pyautogen==0.2.35
+autogen-agentchat==0.2.37
 coloredlogs==15.0.1
 config==0.5.1
 crossbarhttp3==1.1
@@ -172,7 +189,14 @@ pydantic==2.9.2
 PyJWT==2.7.0
 pyparsing==3.1.0
 pypdf==3.17.1
-PyPDF2==3.0.1
+# The book pipeline's one PDF engine (integrations/learning/book_pipeline.py):
+# PDFium renders each page, extracts its text and reads the outline. No
+# dependencies of its own, so it is safe under the Dockerfile's --no-deps
+# install; prebuilt wheels for Windows, macOS 13+, Linux glibc+musl (x86/ARM)
+# and Android. It replaced PyPDF2, which nothing imports any more and whose
+# final release (3.0.1) loops forever on a crafted content stream
+# (CVE-2023-36464, reproduced 2026-09-13).
+pypdfium2==5.13.0
 pyreadline3==3.4.1 ; sys_platform == "win32"
 python-dateutil==2.8.2
 python-dotenv==1.0.0
@@ -242,8 +266,16 @@ hypercorn==0.17.3
 # h2 in turn requires hpack>=4.0,<5 and hyperframe>=6.0,<7; wsproto requires
 # h11 (already pinned above at 0.16.0).  Keep this block in step with the
 # hypercorn pin -- if hypercorn moves, re-check `importlib.metadata.requires`.
+#
+# hpack is 4.2.0, not 4.0.0: CVE-2026-59980 / GHSA-8v8h-hg4w-mvq2 (published
+# 2026-09-24) -- hpack <4.2.0 decodes an unbounded varint in O(n^2) CPU, so one
+# malformed HTTP/2 header block pins a core (a 200 KB payload took ~14 s to
+# reject on 4.0.0, ~1 ms on 4.2.0). 4.2.0 is inside h2 4.1.0's declared
+# hpack>=4.0,<5, so the --no-deps image stays consistent. hpack 4.2.0 requires
+# Python >=3.10, which this file already needs (langchain-core). Fixed by the
+# pin, NOT by an entry in .github/security-scan/pip-audit-ignore.txt.
 h2==4.1.0
-hpack==4.0.0
+hpack==4.2.0
 hyperframe==6.0.1
 priority==2.0.0
 wsproto==1.2.0
@@ -318,7 +350,7 @@ tree-sitter==0.23.2
 tree-sitter-language-pack==0.6.0
 diff-match-patch==20230430
 gitpython==3.1.44
-json-repair>=0.25.0
+json-repair>=0.59.4
 psutil>=5.9.0
 pyautogui>=0.9.54; sys_platform != "linux"
 

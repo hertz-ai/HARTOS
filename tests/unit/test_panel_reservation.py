@@ -1137,3 +1137,152 @@ def test_the_payout_pill_and_the_stat_carry_the_shells_own_literals():
     assert "HERO_SHIELD: f32 = %s.0;" % shield in scene
     assert "HERO_SHIELD_GAP: f32 = %s.0;" % re.search(
         r"gap:\s*(\d+)px", mini).group(1) in scene
+
+
+def _rust_fn_body(src, decl):
+    """A Rust fn's text, from its declaration to the first bare closing brace.
+
+    Deliberately not a regex: this file is edited from a Windows shell where a
+    heredoc silently eats backslashes, and a mangled pattern here would fail open.
+    """
+    i = src.index(decl)
+    out = []
+    for line in src[i:].splitlines():
+        out.append(line)
+        if line == "}":
+            break
+    return chr(10).join(out)
+
+
+def test_the_native_scene_owns_the_reservation_once_it_paints_the_bars():
+    """The M6 inversion, pinned from the side that can see both processes.
+
+    While the WebView draws the bars it publishes the reservation and the
+    compositor reads the file. Once the compositor paints them, the file's only
+    publisher is the process M6 demotes: nothing writes it, the parse fails safe to
+    zero, and a maximized window covers the native bars. That is the 2026-08-29
+    "taskbar unreachable" report arriving again through the new renderer.
+
+    The merge rule is unit-tested in Rust. What no Rust test can reach is the
+    WIRING, because work_area_for needs a mapped output and a real State, so a
+    correct merge function that nothing calls would pass every Rust test. Reading a
+    value nothing acts on is the same dead-contract shape as a budget row nothing
+    measures, so the wiring is pinned here.
+    """
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+
+    body = _rust_fn_body(comp, "pub fn work_area_for<S: CompState>")
+    assert "native_shell_on()" in body, (
+        "work_area_for no longer consults native_shell_on, so once the WebView is "
+        "demoted nothing reserves the bars the compositor itself paints")
+    assert "effective_reservation" in body, (
+        "work_area_for no longer merges the published and the native reservation")
+    assert "panel_reservation()" in body, (
+        "work_area_for stopped reading what the shell publishes, which regresses "
+        "the WebView desktop that is still the one shipping")
+
+    # And the two numbers stay READ rather than restated. A literal here would be a
+    # third source for a value this file already pins in two places.
+    native = _rust_fn_body(comp, "pub fn native_chrome_reservation()")
+    assert "top_bar_h" in native, (
+        "the native top reservation stopped coming from the theme, so a 36px theme "
+        "would reserve a hardcoded 40 again")
+    assert "TASKBAR_H" in native, (
+        "the native bottom reservation stopped coming from scene.rs TASKBAR_H, the "
+        "constant this file already ties to the shell's own")
+    assert "40" not in native and "44" not in native, (
+        "native_chrome_reservation restates a bar height as a literal instead of "
+        "reading it, which is the drift every other pin in this file exists to stop")
+
+
+def test_the_native_icon_face_is_the_one_the_shell_asks_for():
+    """The compositor must shape icons in the face the shell names FIRST.
+
+    A card icon, a tray glyph and the omnibox magnifier are Material LIGATURE NAMES.
+    The face turns the whole name into one glyph; any other face renders the letters.
+    That is not a graceful degradation, it is the word "notifications" clipped into a
+    32px tray slot, which is what a fresh offline ISO once showed and what
+    hart-subsystems.nix bundles the fonts to prevent.
+
+    The two sides pick the face differently and cannot be allowed to drift. CSS falls
+    through a stack on a MISSING FAMILY; cosmic-text falls back per CODEPOINT, and a
+    ligature name is pure ASCII that every sans face covers, so its fallback never
+    fires. The compositor therefore names exactly one family, and it has to be the
+    shell's first choice or the two renderers draw different icons.
+
+    Read from both sources, never restated here, because a literal in this test would
+    pass happily after either side was renamed.
+    """
+    shell = _read_service()
+    rule_at = shell.index(".mi, .material-icons-round {")
+    block = shell[rule_at:shell.index("}", rule_at)]
+    assert "font-family" in block, ".mi no longer sets a font-family"
+    fams = block[block.index("font-family:") + len("font-family:"):]
+    fams = fams[:fams.index(";")]
+    first = fams.split(",")[0].strip().strip("'").strip('"')
+
+    rust = open(os.path.join(REPO, "compositor", "src", "text_render.rs"),
+                encoding="utf-8").read()
+    marker = 'pub const ICON_FAMILY: &str = "'
+    assert marker in rust, "text_render.rs no longer declares ICON_FAMILY"
+    tail = rust[rust.index(marker) + len(marker):]
+    native = tail[:tail.index('"')]
+
+    assert native == first, (
+        "the compositor shapes icons in %r while the shell asks for %r first"
+        % (native, first))
+
+    # And the face is actually REQUESTED, not merely declared. A constant nothing
+    # passes to the shaper is how the icons came to render as words in the first place.
+    assert "Family::Name(ICON_FAMILY)" in rust, (
+        "ICON_FAMILY is declared but never handed to the shaper")
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+    assert "icon: true," in scene, (
+        "no scene node asks for the icon face, so every run shapes in the UI face")
+    assert "icon_width(" in scene, (
+        "icons are measured as text, so the glyph is centred against the wrong width")
+
+
+def _read_service():
+    with open(SERVICE_SRC, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_the_native_desktop_paints_below_windows_and_above_the_shell():
+    """Z-order is a property of the ORDER OF PUSHES, so it is pinned as one.
+
+    build_frame_elements builds the list front-to-back: the cursor is prepended so it
+    draws on top, and the bloom's own comment says "last in the list = drawn UNDER
+    everything". The native scene therefore has to be pushed AFTER the toplevels and
+    BEFORE the Bottom/Background layer.
+
+    Below the windows, because the scene is the desktop and windows must cover it; the
+    bars stay reachable through the panel reservation, which is the same mechanism that
+    keeps the WebView shell's bars reachable and not a second copy of it. It was pushed
+    ABOVE the toplevels before this, so a maximized window got hero copy painted over it
+    while surface_under still routed the clicks to the window.
+
+    Above the Background layer, because during the transition the WebView is still running
+    underneath with an opaque surface, and below it the native scene would be invisible.
+
+    No Rust test can state this: it needs a mapped output, real windows and a live layer
+    shell. Source order is the honest place to hold it.
+    """
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+
+    def at(marker):
+        assert comp.count(marker) == 1, "marker moved or duplicated: %s" % marker
+        return comp.index(marker)
+
+    cursor = at("// ── 1. SOFTWARE CURSOR")
+    top_overlay = at("// ── 2. TOP / OVERLAY layer surfaces")
+    toplevels = at("// ── 3. WINDOW TOPLEVELS")
+    scene = at("// ── 3c. NATIVE SHELL M3 scene")
+    background = at("// ── 4. BOTTOM / BACKGROUND layer surfaces")
+
+    assert cursor < top_overlay < toplevels < scene < background, (
+        "native scene is out of z-order: cursor=%d top/overlay=%d toplevels=%d "
+        "scene=%d background=%d (front-to-back, so larger index = further back)"
+        % (cursor, top_overlay, toplevels, scene, background))

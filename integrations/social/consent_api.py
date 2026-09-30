@@ -18,8 +18,14 @@ encounter_api._has_cloud_drafting_consent (encounter_api.py:616).
 Endpoints (all mounted at /api/social/consent*, JWT auth required):
 
   POST /api/social/consent          grant — APPEND a NEW row
-  POST /api/social/consent/revoke   revoke — set revoked_at on most-recent
+  POST /api/social/consent/revoke   revoke — set revoked_at on every
                                     active row (granted_at preserved)
+  POST /api/social/consent/decline  decline — say no to a pending ask,
+                                    for the ask's agent only
+                                    (ConsentService.revoke_consent)
+  POST /api/social/consent/reopen   take a no back: the combination is
+                                    undecided again, nothing is granted
+                                    (ConsentService.reopen)
   GET  /api/social/consent          list — newest-first; supports
                                     consent_type + active_only filters
 
@@ -63,7 +69,7 @@ from flask import Blueprint, g, jsonify, request
 
 from .auth import require_auth
 from .models import UserConsent
-from .consent_service import ConsentService
+from .consent_service import ConsentService, device_fingerprint
 
 logger = logging.getLogger('hevolve_social')
 
@@ -98,15 +104,28 @@ def _row_to_dict(row: UserConsent) -> dict[str, Any]:
     Avoids leaking columns the UI doesn't need (created_at,
     updated_at, agent_id) while staying compatible with
     UserConsent.to_dict() callers elsewhere in the codebase.
+
+    A device_access row is the trusted-phones listing (#111): its scope is
+    the phone's key, unreadable, so it carries the ``label`` the phone
+    signed into its ask (self-asserted) and the key's ``fingerprint``, the
+    thing to match against the phone.
     """
-    return {
+    out = {
         'id': row.id,
         'consent_type': row.consent_type,
         'scope': row.scope,
         'granted': bool(row.granted),
         'granted_at': row.granted_at.isoformat() if row.granted_at else None,
         'revoked_at': row.revoked_at.isoformat() if row.revoked_at else None,
+        # A no taken back ("Allow asking again") keeps its revoked_at; the
+        # row is declined only while revoked_at is newer than this.
+        'reopened_at': (row.reopened_at.isoformat()
+                        if getattr(row, 'reopened_at', None) else None),
     }
+    if row.consent_type == 'device_access':
+        out['label'] = row.label
+        out['fingerprint'] = device_fingerprint(row.scope)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -138,6 +157,11 @@ def grant_consent():
         return _err('consent_type exceeds 30 chars')
     if len(scope) > 100:
         return _err('scope exceeds 100 chars')
+    # A phone is allowed by its key, never by a blanket: the gate reads the
+    # key back from the granted row (auth.verify_device_jwt), so a '*' row
+    # admits no phone and would only look like "all phones allowed".
+    if consent_type == 'device_access' and device_fingerprint(scope) is None:
+        return _err('device_access is granted per phone: scope must be device:<key>')
 
     # Delegate the WRITE to the canonical ConsentService so this UI surface gets
     # the SAME immutable-audit entry, `consent.granted` event, consent-type
@@ -170,9 +194,10 @@ def grant_consent():
 @consent_bp.route('/consent/revoke', methods=['POST'])
 @require_auth
 def revoke_consent():
-    """Revoke the most-recent active consent for (user, type, scope).
+    """Revoke every active consent for (user, type, scope).
 
-    Active = granted=True AND revoked_at IS NULL.
+    Active = granted=True AND revoked_at IS NULL.  The response names the
+    most recent of them.
 
     Body: {consent_type: str, scope: str (default '*')}
     Returns: {id, revoked_at}
@@ -192,24 +217,28 @@ def revoke_consent():
     if not consent_type:
         return _err('consent_type required')
 
-    # Most-recent active row.  Sort by granted_at desc so a re-grant
-    # made after a previous revoke is the row we touch.
-    row = g.db.query(UserConsent).filter(
+    # Every active row.  A grant appends a row, so two Allow clicks are two
+    # rows; revoking only the newest left the older one passing
+    # check_consent (tests/unit/test_consent_revoke_is_honoured.py).
+    # Newest first, so the response still names the most recent grant.
+    rows = g.db.query(UserConsent).filter(
         UserConsent.user_id == uid,
         UserConsent.consent_type == consent_type,
         UserConsent.scope == scope,
         UserConsent.granted == True,  # noqa: E712 — SQLAlchemy idiom
         UserConsent.revoked_at.is_(None),
-    ).order_by(UserConsent.granted_at.desc()).first()
+    ).order_by(UserConsent.granted_at.desc()).all()
 
-    if row is None:
+    if not rows:
         return _err('no active consent', 404)
 
     # Audit-evidence-discipline: NEVER overwrite granted_at.  The
     # event of "this consent was granted at T" is immutable history.
     now = datetime.utcnow()
-    row.revoked_at = now
+    for r in rows:
+        r.revoked_at = now
     g.db.flush()
+    row = rows[0]
 
     # Parallel-path parity (audit #4): this UI surface keeps its OWN append-only
     # row model on purpose — granted stays True and revoked_at is the tombstone
@@ -238,6 +267,96 @@ def revoke_consent():
 
 
 # ──────────────────────────────────────────────────────────────────────
+# POST /api/social/consent/decline — say no to a pending ask
+# ──────────────────────────────────────────────────────────────────────
+
+@consent_bp.route('/consent/decline', methods=['POST'])
+@require_auth
+def decline_consent():
+    """Say no to a pending ask: the "Don't allow" answer on a consent card.
+
+    The write is ConsentService.revoke_consent.  With no active grant it
+    marks the ask declined, which stops request_consent asking again and
+    makes ConsentService.declined true, so a gate that is waiting refuses at
+    once.  agent_id is the ask's agent: a no to one agent's ask leaves every
+    other agent's ask open.  The way back is a grant (POST /consent), which
+    covers every agent.
+
+    Body: {consent_type: str, scope: str (default '*'), agent_id: str|null}
+    Returns: {declined: true, id}
+    Errors:
+      400 — missing or unknown consent_type
+      404 — no ask for this combination (neutral message)
+    """
+    uid = _user_id()
+    if uid is None:
+        return _err('unauthenticated', 401)
+
+    body = _json()
+    consent_type = str(body.get('consent_type', '')).strip()
+    scope = str(body.get('scope', '*')).strip() or '*'
+    agent_id = body.get('agent_id')
+    if agent_id is not None:
+        agent_id = str(agent_id).strip() or None
+
+    if not consent_type:
+        return _err('consent_type required')
+
+    try:
+        row = ConsentService.decline(g.db, uid, consent_type, scope, agent_id)
+    except ValueError as e:
+        return _err(str(e))  # unknown consent_type -> 400
+    if row is None:
+        return _err('no such ask', 404)
+
+    logger.info(
+        'consent.decline user=%s type=%s scope=%s agent=%s id=%s',
+        uid, consent_type, scope, agent_id, row.id,
+    )
+    return _ok({'declined': True, 'id': row.id})
+
+
+# ──────────────────────────────────────────────────────────────────────
+# POST /api/social/consent/reopen — take a "no" back
+# ──────────────────────────────────────────────────────────────────────
+
+@consent_bp.route('/consent/reopen', methods=['POST'])
+@require_auth
+def reopen_consent():
+    """Take back a "no" (ConsentService.reopen): the privacy page's "Allow
+    asking again" for an ask with no on/off card to grant from, such as a
+    credential.  The combination is undecided again, for every agent, and
+    the next ask shows the card.  Nothing is granted.
+
+    Body: {consent_type: str, scope: str (default '*')}
+    Returns: {reopened: n}
+    Errors:
+      400 — missing or unknown consent_type
+      404 — nothing declined for this combination (neutral message)
+    """
+    uid = _user_id()
+    if uid is None:
+        return _err('unauthenticated', 401)
+
+    body = _json()
+    consent_type = str(body.get('consent_type', '')).strip()
+    scope = str(body.get('scope', '*')).strip() or '*'
+    if not consent_type:
+        return _err('consent_type required')
+
+    try:
+        n = ConsentService.reopen(g.db, uid, consent_type, scope)
+    except ValueError as e:
+        return _err(str(e))  # unknown consent_type -> 400
+    if not n:
+        return _err('nothing declined', 404)
+
+    logger.info('consent.reopen user=%s type=%s scope=%s rows=%d',
+                uid, consent_type, scope, n)
+    return _ok({'reopened': n})
+
+
+# ──────────────────────────────────────────────────────────────────────
 # GET /api/social/consent — list this user's consents
 # ──────────────────────────────────────────────────────────────────────
 
@@ -252,7 +371,8 @@ def list_consents():
                      revoked_at IS NULL (default: return all rows)
 
     Returns: {consents: [{id, consent_type, scope, granted,
-                          granted_at, revoked_at}, ...]}
+                          granted_at, revoked_at}, ...]}; a device_access
+             row also carries label + fingerprint (#111).
     """
     uid = _user_id()
     if uid is None:

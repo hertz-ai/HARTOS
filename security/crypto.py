@@ -160,3 +160,12 @@ class A2ACrypto:
         """Decrypt a JSON payload."""
         plaintext = self.decrypt_message(ciphertext)
         return json.loads(plaintext)
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HEVOLVE_DATA_KEY',
+)

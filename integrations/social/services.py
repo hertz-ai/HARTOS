@@ -11,13 +11,13 @@ from typing import Optional, List, Tuple
 
 logger = logging.getLogger('hevolve_social')
 
-from sqlalchemy import desc, asc, func, event
+from sqlalchemy import desc, asc, func
 from sqlalchemy.orm import Session, joinedload
 
 from .models import (
     User, Post, Comment, Vote, Follow, Community, CommunityMembership,
     Notification, Report, TaskRequest, RecipeShare, AgentSkillBadge,
-    _uuid,
+    _uuid, after_commit,
 )
 from .auth import hash_password, verify_password, generate_api_token, generate_jwt
 
@@ -324,6 +324,41 @@ class UserService:
     @staticmethod
     def get_by_id(db: Session, user_id: str) -> Optional[User]:
         return db.query(User).filter(User.id == user_id).first()
+
+    @staticmethod
+    def person_to_notify(db: Session, user_id: str) -> Optional[str]:
+        """The PERSON a notification about ``user_id`` should reach, or None.
+
+        ``users`` holds agents and system identities beside people
+        (core.constants.NON_PERSON_USER_TYPES).  Nobody signs in as one, so a
+        notification written to one sits unread and its push reaches no
+        subscriber.  Measured 2026-09-25: 3003 goal_contribution rows
+        addressed to hevolve_system_agent (user_type 'agent'), none read.
+
+        - a person (human, guest, or a NULL legacy type): that user;
+        - an agent or system account: the person who owns it (owner_id),
+          if that owner is a person;
+        - an agent or system account with no human owner: None;
+        - an id with no local users row: returned unchanged, because a goal
+          submitted on another node names a requester this node never saw.
+        """
+        from core.constants import NON_PERSON_USER_TYPES
+        user = UserService.get_by_id(db, user_id)
+        if user is None:
+            return user_id
+        if user.user_type not in NON_PERSON_USER_TYPES:
+            return user.id
+        if not user.owner_id:
+            return None
+        # One hop only, so an ownership cycle cannot loop.  An owner that is
+        # itself an agent is not a person (live: analysis.local.sage is owned
+        # by hevolve_system_agent).
+        owner = UserService.get_by_id(db, user.owner_id)
+        if owner is None:
+            return user.owner_id
+        if owner.user_type in NON_PERSON_USER_TYPES:
+            return None
+        return owner.id
 
     @staticmethod
     def get_by_username(db: Session, username: str) -> Optional[User]:
@@ -1132,6 +1167,14 @@ class CommunityService:
 
 # ─── Notification Service ───
 
+def _push_read(user_id: str, ids: list) -> None:
+    """Fan a read or dismissed state out to the user's other devices (the
+    'notification.read' event every client filters on).  Queued with
+    models.after_commit, so it only leaves for a change that committed."""
+    from .realtime import on_notification_read
+    on_notification_read(user_id, ids)
+
+
 class NotificationService:
 
     @staticmethod
@@ -1144,17 +1187,14 @@ class NotificationService:
         )
         db.add(notif)
         db.flush()
-        # Push to SSE + WAMP in real-time AFTER commit (fire-and-forget)
-        # Defer notification to after_commit to ensure data consistency
+        # Push to SSE + WAMP once the row has committed, never for a row
+        # that rolls back (models.after_commit; a failed push is logged there).
         notif_dict = notif.to_dict()
-        _uid = user_id
-        def _push_after_commit(session):
-            try:
-                from .realtime import on_notification
-                on_notification(_uid, notif_dict)
-            except Exception:
-                pass
-        event.listen(db, 'after_commit', _push_after_commit, once=True)
+
+        def _push():
+            from .realtime import on_notification
+            on_notification(user_id, notif_dict)
+        after_commit(db, _push)
         return notif
 
     @staticmethod
@@ -1187,13 +1227,7 @@ class NotificationService:
         # ('notification.read') is what clients filter on.
         _ids = list(notification_ids or [])
         if _ids:
-            def _push_read_after_commit(_session):
-                try:
-                    from .realtime import on_notification_read
-                    on_notification_read(user_id, _ids)
-                except Exception:
-                    pass
-            event.listen(db, 'after_commit', _push_read_after_commit, once=True)
+            after_commit(db, lambda: _push_read(user_id, _ids))
 
     @staticmethod
     def mark_all_read(db: Session, user_id: str):
@@ -1215,13 +1249,7 @@ class NotificationService:
         }, synchronize_session=False)
         db.flush()
         if ids_to_flip:
-            def _push_read_all_after_commit(_session):
-                try:
-                    from .realtime import on_notification_read
-                    on_notification_read(user_id, ids_to_flip)
-                except Exception:
-                    pass
-            event.listen(db, 'after_commit', _push_read_all_after_commit, once=True)
+            after_commit(db, lambda: _push_read(user_id, ids_to_flip))
 
     @staticmethod
     def mark_dismissed(db: Session, notification_ids: List[str], user_id: str):
@@ -1240,13 +1268,7 @@ class NotificationService:
         }, synchronize_session=False)
         db.flush()
         _ids = list(notification_ids)
-        def _push_dismissed_after_commit(_session):
-            try:
-                from .realtime import on_notification_read
-                on_notification_read(user_id, _ids)
-            except Exception:
-                pass
-        event.listen(db, 'after_commit', _push_dismissed_after_commit, once=True)
+        after_commit(db, lambda: _push_read(user_id, _ids))
 
 
 # ─── Report Service ───

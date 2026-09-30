@@ -230,8 +230,14 @@ def get_tier_thresholds() -> Dict[str, Any]:
 def get_boot_decision() -> Dict[str, Any]:
     """Report why the current draft-gate / speculation state was chosen.
 
-    Reads the last line of `~/Documents/Nunba/logs/draft_decision.jsonl`
-    (written by `LlamaConfig.should_boot_draft` — commit 12c9304).
+    Reads the last line of `<get_log_dir()>/draft_decision.jsonl`
+    (written by Nunba's `LlamaConfig._log_draft_decision` into the same
+    core.platform_paths.get_log_dir()).  A dev run's log dir is `logs-dev`,
+    the installed build's is `logs` (get_installed_log_dir); both are
+    checked and the one written most recently is read, so a stale dev log
+    never hides a newer installed boot and HARTOS on its own (which writes
+    neither) still answers about the installed app.  `log_path` names the
+    file read; `checked` names every file looked at.
 
     Use when the user asks: "why is speculation off on my 8GB GPU?",
     "why didn't Nunba load the draft model?", "what's the cohort
@@ -239,16 +245,32 @@ def get_boot_decision() -> Dict[str, Any]:
     """
     import json
     from pathlib import Path
-    log_path = Path.home() / 'Documents' / 'Nunba' / 'logs' / 'draft_decision.jsonl'
-    if not log_path.exists():
+    from core.platform_paths import get_installed_log_dir, get_log_dir
+    checked = []
+    for d in (get_log_dir(), get_installed_log_dir()):
+        p = Path(d) / 'draft_decision.jsonl'
+        if p not in checked:
+            checked.append(p)
+    present = []
+    for p in checked:
+        try:
+            present.append((p.stat().st_mtime, p))
+        except OSError as exc:
+            # Absent is the common case (a dev run has no logs-dev copy);
+            # named in 'checked' below, and here for the other errnos.
+            logger.debug("boot decision log %s not readable: %s", p, exc)
+    if not present:
         return {
             'available': False,
+            'checked': [str(p) for p in checked],
             'summary': (
-                "Draft decision log not yet written — this usually means "
-                "Nunba has not been booted since the cohort-aware gate "
-                "landed (commit 12c9304), or log directory is missing."
+                "Draft decision log not yet written (looked at "
+                + ', '.join(str(p) for p in checked) + ") — this usually "
+                "means Nunba has not been booted since the cohort-aware "
+                "gate landed (commit 12c9304), or log directory is missing."
             ),
         }
+    log_path = max(present, key=lambda t: t[0])[1]
     try:
         with log_path.open(encoding='utf-8') as f:
             lines = [line for line in f if line.strip()]
@@ -264,6 +286,7 @@ def get_boot_decision() -> Dict[str, Any]:
             'vram_free_gb': last.get('vram_free_gb'),
             'active_tts': last.get('active_tts'),
             'ts': last.get('ts'),
+            'log_path': str(log_path),
             'summary': (
                 f"Last boot decision (ts={last.get('ts')}): "
                 f"{last.get('decision')} — reason: {last.get('reason')}.  "
@@ -385,7 +408,8 @@ _DECISION_REGISTRY: Dict[str, Dict[str, str]] = {
         'module': 'hart_intelligence_entry',
         'symbol': '_read_preferred_lang',
         'description': (
-            "Reads ~/Documents/Nunba/data/hart_language.json written by "
+            "Reads <data dir>/data/hart_language.json (core.user_lang; "
+            "~/Documents/Nunba/data on Windows) written by "
             "the frontend language selector.  Falls back to 'en' if "
             "missing.  Passed through to whisper.transcribe(language=) "
             "on STT path so short Tamil utterances aren't misrouted as "

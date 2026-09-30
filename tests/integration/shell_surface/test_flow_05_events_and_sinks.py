@@ -141,6 +141,87 @@ def test_ch05_scene1_notification_send_list_ack(client, fake_os):
     assert resp.get_json()['marked'] >= 1
 
 
+def _send_one(client, title='gate-probe'):
+    return client.post('/api/shell/notifications/send', json={
+        'title': title, 'body': 'b', 'urgency': 'normal',
+        'icon': 'dialog-information', 'timeout': 1000})
+
+
+def test_ch05_scene1b_native_toast_uses_the_ai_consent_gate_when_installed(
+        client, fake_os, monkeypatch):
+    """F14: HARTOS's own toast must go through HARTOS's own gate.
+
+    nixos/modules/hart-notify.nix ships `hart-notify-send`, which asks
+    core.ai_sensing.query_authority('screen') FAIL-CLOSED before painting and
+    exits 77 when the human has cut the AI's 'screen' sense. Its comment is
+    explicit that foreign apps keep using the ungated `notify-send` -- so when
+    this route called `notify-send` directly, HARTOS was painting native toasts
+    as a foreign app and escaping the one gate built to stop exactly that.
+    """
+    import shutil as _shutil
+    monkeypatch.setattr(_shutil, 'which', lambda n: (
+        '/run/current-system/sw/bin/hart-notify-send'
+        if n == 'hart-notify-send' else None))
+
+    before_plain = len(_calls_for(fake_os, 'notify-send'))
+    resp = _send_one(client, 'gated-toast')
+    assert resp.status_code == 200
+    body = resp.get_json()
+
+    gated = _calls_for(fake_os, 'hart-notify-send')
+    assert gated, 'the gated emitter was never invoked'
+    assert gated[-1] == ['hart-notify-send', '-u', 'normal', '-i',
+                         'dialog-information', '-t', '1000', 'gated-toast', 'b']
+    # And it did NOT ALSO fire the ungated one -- a bypass that still paints is
+    # not a gate.
+    assert len(_calls_for(fake_os, 'notify-send')) == before_plain
+    # rc 0 from the faked boundary means the gate ALLOWED and libnotify ran.
+    assert body['dbus_delivered'] is True
+    assert 'suppressed_by_consent' not in body
+
+
+def test_ch05_scene1c_a_refusal_is_reported_as_a_refusal_not_a_failure(
+        client, fake_os, monkeypatch):
+    """Exit 77 is the gate's REFUSED convention, shared with
+    hart-screencast-gate. It must read as 'the human said no', not as a broken
+    D-Bus leg and not as a delivered toast -- and the in-shell queue still
+    carries the message, which is the RECOVERY half of the gate."""
+    import shutil as _shutil
+    monkeypatch.setattr(_shutil, 'which', lambda n: (
+        '/run/current-system/sw/bin/hart-notify-send'
+        if n == 'hart-notify-send' else None))
+    fake_os.rc_for['hart-notify-send'] = 77
+
+    resp = _send_one(client, 'withheld-toast')
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body['suppressed_by_consent'] is True
+    assert body['dbus_delivered'] is False
+    assert 'screen' in body['reason']
+    # The record survives so the person can still see it in the shell.
+    assert body['notification']['title'] == 'withheld-toast'
+    assert body['sent'] is True
+
+
+def test_ch05_scene1d_no_gate_installed_behaves_exactly_as_before(
+        client, fake_os, monkeypatch):
+    """The gated binary exists only on the NixOS appliance. Everywhere else the
+    lookup misses and the plain client is used, unchanged -- and a 77 from PLAIN
+    notify-send means nothing in particular, so it must NOT be dressed up as a
+    consent refusal."""
+    import shutil as _shutil
+    monkeypatch.setattr(_shutil, 'which', lambda n: None)
+    fake_os.rc_for['notify-send'] = 77
+
+    resp = _send_one(client, 'ungated-toast')
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert _calls_for(fake_os, 'notify-send')[-1][0] == 'notify-send'
+    assert not _calls_for(fake_os, 'hart-notify-send')
+    assert 'suppressed_by_consent' not in body
+    assert body['dbus_delivered'] is False
+
+
 # ─── Scene 2: the agent-event SSE sink (/api/notifications/stream) ──────────
 
 def test_ch05_scene2_agent_event_stream_delivers_a2ui_pushes(

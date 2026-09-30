@@ -126,3 +126,40 @@ def test_guard_was_absent_before_the_fix():
     if "_remedy_replay_exceeded" in old:
         pytest.skip("fix is committed; HEAD no longer predates it")
     assert _guard_key_kinds(old) == set(), "pre-fix file should have no guards"
+
+
+# ── the AUTO-ADVANCE site (2026-09-13) ────────────────────────────────
+
+def _innermost_if_containing(source: str, needle: str):
+    """Smallest ``if`` whose body carries a string constant containing needle."""
+    best = None
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.If):
+            continue
+        consts = [c.value for b in node.body for c in ast.walk(b)
+                  if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+        if any(needle in s for s in consts):
+            span = node.end_lineno - node.lineno
+            if best is None or span < best[0]:
+                best = (span, node)
+    return best[1] if best else None
+
+
+def test_auto_advance_recipe_site_is_guarded():
+    """The third re-request site: get_response_group's AUTO-ADVANCE branch.
+
+    It asked for the recipe again on every lap while the file was missing,
+    with its own parse-failure counter and no bound.  Live 2026-09-13, agent
+    87400889007 action 8 return_to_idle: 31 [AUTO-ADVANCE] re-requests in
+    2m48s, attempt counter at 31, stopped only by the HTTP turn ending.  Same
+    shape as the 170x 'recipe' site above, so it takes the same guard.
+    """
+    node = _innermost_if_containing(SRC.read_text(encoding="utf-8"),
+                                    "done but recipe not saved")
+    assert node is not None, "AUTO-ADVANCE recipe branch not found"
+    guarded = any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                  and c.func.id == "_remedy_replay_exceeded"
+                  for c in ast.walk(node))
+    assert guarded, (
+        "the AUTO-ADVANCE branch re-requests a recipe with no "
+        "_remedy_replay_exceeded bound (live: 31 identical re-requests)")

@@ -118,6 +118,14 @@ def test_p2s4_chat_reply_passes_channel_type_to_persist():
             f"P2-S4: persist call missing channel_type='interview'. "
             f"role={c.args[1]!r} kwargs={c.kwargs}"
         )
+    # The reply is spoken here too.  A per-agent voice read from flask `g`
+    # used to raise NameError in this isolated namespace, and the TTS try
+    # swallowed it, so this test ran with speech silently skipped.  The
+    # voice now comes from the request's avatar id; this stub carries none.
+    tts = ns['_tts_synthesize_and_publish']
+    assert tts.call_count == 1, (
+        f"the reply must be spoken once, got {tts.call_count} TTS calls")
+    assert tts.call_args.kwargs.get('avatar_id') is None
 
 
 def test_p2s4_chat_reply_defaults_channel_type_to_chat():
@@ -186,6 +194,10 @@ def test_p2s4_interview_agent_posts_with_channel_type():
         '_err': lambda msg, code: ('ERR', msg, code),
         '_ok': lambda data: ('OK', data),
         '_get_goal_for_post': MagicMock(return_value=fake_goal),
+        # The route now asks the steering gate first (53ddce89); this test is
+        # about what the POST carries once allowed, so the gate admits.
+        '_agent_for_post': lambda post_id, verb: (
+            fake_goal, None, MagicMock(user_id='caller-1')),
         'request': fake_request,
         'g': fake_g,
         'logger': MagicMock(),
@@ -211,6 +223,8 @@ def test_p2s4_interview_agent_posts_with_channel_type():
         f"P2-S4: POST body must carry request_id=post_id so the "
         f"interview turns thread together, got {body.get('request_id')!r}"
     )
+    assert body.get('user_id') == 'user-7', (
+        "the interview runs as the goal's owner, not the caller")
 
 
 # ─── P2-S5 (iOS): chat.new subscription wired ────────────────────────

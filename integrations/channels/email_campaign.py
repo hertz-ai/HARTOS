@@ -634,7 +634,26 @@ def send_campaign(recipients: Iterable[str],
 def _run_sends(todo, subject, html, text, ctx, log_path, pw,
                per_conn, delay, result, campaign):
     """The send loop itself. Split out so the lock in send_campaign() can be
-    released in a finally: without wrapping the whole body in a try:."""
+    released in a finally: without wrapping the whole body in a try:.
+
+    ONE OF TWO SENDERS, AND DELIBERATELY NOT SHARED (audited 2026-09-22).
+    The other is `channels/extensions/email_adapter._send_smtp`, which sends a
+    single conversational message per call from per-instance `email_config`, as
+    one method of the channel adapter interface (reply_to, attachments, typing).
+    This one is BULK: it reuses a connection for `per_conn` addresses, paces with
+    `delay`, writes a dated log so the daily cap survives a restart, halts on
+    MAX_CONSECUTIVE_FAILURES to protect sender reputation, and runs under a PID
+    lock because two concurrent runs double-send to the same list.
+
+    A shared "open a connection and send this message" helper would open one
+    connection PER ADDRESS and throw away the batching and pacing that exist for
+    deliverability; pushing this lock, cap and log onto a single chat reply is
+    equally wrong in the other direction. They both call smtplib, which is not
+    the same thing as being the same sender. Merge on evidence, not on shape.
+
+    A third SMTP caller, `channels/mailing_list.is_catch_all_domain`, is NOT a
+    sender at all: it speaks ehlo/mail/rcpt and never DATA.
+    """
     consecutive = 0
     idx = 0
     while idx < len(todo):

@@ -136,7 +136,7 @@ def test_the_parallel_branch_reaches_the_gate():
         '_try_parallel_dispatch runs before the last_dispatched_at stamp, so a '
         'parallel goal is dispatched without ever being recorded as dispatched')
 
-    settle = src.index('_settle_dispatched_goal(db, goal, goal_key)')
+    settle = src.index('_settle_dispatched_goal(db, goal, goal_key')
     assert settle > attempt, 'the settlement gate no longer follows the parallel branch'
     between = src[attempt:settle]
     assert 'parallel-handoff' in between, \
@@ -273,3 +273,46 @@ def test_continuous_goals_are_still_never_auto_completed_even_when_grounded():
     with _with_coordinator({'total_tasks': 1, 'completed': 1}):
         _settle_dispatched_goal(Db(), g, 'g1')
     assert g.status == 'active'
+
+
+def test_a_goal_parked_during_its_dispatch_is_left_as_it_is():
+    """#106: the create loop asked for help on a stuck action and parked the
+    goal while the dispatch ran.  The gate must neither complete it (work
+    nobody verified) nor overwrite its pause reason with a noop strike."""
+    reason = 'Needs help: action 9 (Search prior threat patterns) could not be done'
+    for spark in (141, 101):     # spent something this dispatch, and a noop
+        g = Goal(spark=spark, status='paused',
+                 cfg={'spark_at_dispatch': 101, 'pause_reason': reason,
+                      'escalation': {'action_id': 9}})
+        with _with_coordinator(None):
+            _settle_dispatched_goal(Db(), g, 'g1')
+        assert g.status == 'paused'
+        assert g.config_json['pause_reason'] == reason
+        assert 'completed_at' not in g.config_json
+        assert 'noop_dispatch_count' not in g.config_json
+
+
+def test_the_ticks_staged_config_does_not_erase_the_ask():
+    """#106, the race: the tick staged config_json (spark_at_dispatch) before
+    the dispatch, and the dispatch parked the goal with the ask in config.  The
+    gate re-reads what is committed and carries over only its own key, so the
+    ask and its reason survive the tick's flush."""
+    committed = {'bootstrap_slug': 'gc', 'pause_reason': 'Needs help: action 9',
+                 'escalation': {'action_id': 9}}
+
+    class RacingDb:
+        def refresh(self, goal, attribute_names=None):
+            if attribute_names:          # what the create loop committed
+                goal.config_json = dict(committed)
+                goal.status = 'paused'
+
+        def flush(self):
+            pass
+
+    g = Goal(spark=141, cfg={'bootstrap_slug': 'gc', 'spark_at_dispatch': 101})
+    _settle_dispatched_goal(RacingDb(), g, 'g1')
+    assert g.status == 'paused'
+    assert g.config_json['escalation'] == {'action_id': 9}
+    assert g.config_json['pause_reason'] == 'Needs help: action 9'
+    assert g.config_json['spark_at_dispatch'] == 101
+    assert 'completed_at' not in g.config_json

@@ -83,6 +83,96 @@ def get_bootstrap_thread() -> Optional[threading.Thread]:
     return _BOOTSTRAP_THREAD
 
 
+def _install_api_gate(app) -> None:
+    """Step 1b: the API gate on the host app, the socket other machines reach
+    (security.middleware.install_api_gate).  A boot must not die here, but a
+    node serving without its gate has to say so where an operator looks."""
+    try:
+        from security.middleware import install_api_gate
+        install_api_gate(app)
+    except Exception as e:
+        logger.critical(f"HARTOS API gate not installed on the host app: {e}")
+
+
+def _install_device_verifier() -> None:
+    """Step 1c: the verifier a phone's PeerLink HELLO is checked with (HARTOS
+    #111): the same verify_device_jwt the API gate uses, against the same
+    device_access grant, injected into core.peer_link so core never imports
+    integrations.  A node with no owner (central) refuses every device HELLO,
+    as its gate admits no device."""
+    try:
+        from core.peer_link.link_manager import get_link_manager
+        from integrations.social.auth import (
+            file_device_access_ask, verify_device_jwt)
+        from integrations.social.consent_service import device_fingerprint
+        from integrations.social.models import db_session
+
+        def verify(token: str, peer_address: str) -> dict:
+            owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+            if not owner:
+                return {'status': 'invalid'}
+            with db_session(commit=True) as db:
+                verdict = verify_device_jwt(db, token, owner)
+                if verdict.get('status') == 'pending':
+                    from integrations.social.discovery import _check_announce_rate
+                    peer_host = peer_address.rsplit(':', 1)[0]
+                    if _check_announce_rate(peer_host):
+                        file_device_access_ask(
+                            db, owner, verdict['public_key'],
+                            verdict.get('claims') or {})
+                    else:
+                        logger.warning('device PeerLink ask from %s not filed: rate limit',
+                                       peer_host)
+            if verdict.get('status') == 'ok':
+                verdict['peer_id'] = device_fingerprint(verdict['public_key'])
+            return verdict
+
+        get_link_manager().set_device_verifier(verify)
+    except Exception as e:
+        logger.critical(f"PeerLink device verifier not installed: {e}")
+
+
+def _install_peer_admission_ask() -> None:
+    """Step 1d: the owner's say on a peer that signed nothing.
+
+    Enforcement mode is a flag, and until today it decided this alone and
+    silently: unset (the state of this desktop and of 192.168.0.15, both
+    measured 2026-09-21) it ADMITTED an unsigned peer, and the fix that
+    makes the default 'hard' would REFUSE one just as silently.  The owner
+    ruled against both -- "do not gulp, the consent shd be shown when a flag
+    gates a useful logic" -- so the refusal files the canonical ask instead,
+    the way a phone's 'pending' verdict already does one screen away.
+
+    Same seam as the device verifier and for the same reason: core.peer_link
+    must not import integrations.  Scope is the peer's HOST, because an
+    unsigned peer has no key to name and the card must not pretend
+    otherwise.  A node with no owner (central) asks nobody and admits
+    nobody.
+    """
+    try:
+        from core.peer_link.link_manager import get_link_manager
+        from integrations.social.consent_service import ConsentService
+        from integrations.social.models import db_session
+
+        def ask(peer_id: str, peer_address: str) -> bool:
+            owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+            if not owner:
+                return False
+            host = (peer_address or '').rsplit(':', 1)[0] or 'unknown'
+            named = f' calling itself {peer_id[:8]}' if peer_id else ''
+            with db_session(commit=True) as db:
+                return ConsentService.check_or_request(
+                    db, owner, 'peer_admission', scope=f'peer:{host}',
+                    reason=(f'A computer at {host}{named} asks to link with '
+                            f'this one. It signed nothing, so it has proved '
+                            f'no identity: allowing trusts whatever answers '
+                            f'at that address on your network.'))
+
+        get_link_manager().set_peer_admission_ask(ask)
+    except Exception as e:
+        logger.critical(f"PeerLink admission ask not installed: {e}")
+
+
 def bootstrap(
     app,
     config: Optional[Mapping[str, Any]] = None,
@@ -171,6 +261,8 @@ def _run_bootstrap(app, cfg: dict) -> None:
     Specifically:
 
       1. setup-lock bypass ON
+      1b. the API gate on the host app (security.middleware.install_api_gate),
+          added 2026-09-14: the host app is the socket other machines reach
       2. init_social
       3. social_bp + distributed_agent_bp
       4. consumer routes (Nunba: kids_media / kids_recommendation /
@@ -196,6 +288,11 @@ def _run_bootstrap(app, cfg: dict) -> None:
     try:
         bypass_active = _enable_setup_lock_bypass(app)
         try:
+            # The gate first.  It covers every route on the app, including
+            # the ones registered below (see _install_api_gate).
+            _install_api_gate(app)
+            _install_device_verifier()
+            _install_peer_admission_ask()
             _init_social_subsystem(app)
             _register_core_blueprints(app)
             _run_consumer_hook(app, cfg)
@@ -749,3 +846,15 @@ def _run_on_bootstrap_complete(cfg: dict) -> None:
         cb()
     except Exception as e:
         logger.warning(f"on_bootstrap_complete callback failed: {e}")
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+ENV_SECRETS = (
+    'DISCORD_BOT_TOKEN',
+    'SLACK_BOT_TOKEN',
+    'TELEGRAM_BOT_TOKEN',
+    'WHATSAPP_ACCESS_TOKEN',
+)

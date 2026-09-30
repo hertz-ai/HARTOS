@@ -50,6 +50,7 @@ from .core import (
     # Utilities
     get_production_backend,
     create_ledger_from_actions,
+    add_actions_to_ledger,
     enable_vlm_integration,
     disable_vlm_integration,
     is_vlm_enabled,
@@ -106,6 +107,7 @@ __all__ = [
     # Core utilities
     "get_production_backend",
     "create_ledger_from_actions",
+    "add_actions_to_ledger",
     "enable_vlm_integration",
     "disable_vlm_integration",
     "is_vlm_enabled",

@@ -343,6 +343,37 @@ class TestScheduleExpertBackgroundReasonPlumb:
         assert 'escalation_reason' not in entry
 
 
+class TestAvatarRidesTheActiveEntry:
+    """The avatar the user's turn is spoken as rides the expert's active
+    entry, where _deliver_expert_response reads it to speak the expert's
+    reply in the same voice (core/teacher_avatar.py)."""
+
+    _RAW = ('{"reply": "Working on it", "delegate": "local", '
+            '"confidence": 0.5}')
+
+    def _draft_first(self, dispatcher, monkeypatch, **kwargs):
+        _mock_guardrails(monkeypatch)
+        with patch.object(dispatcher, '_dispatch_to_model',
+                          return_value=self._RAW), \
+             patch.object(dispatcher, '_record_interaction_safely'), \
+             patch.object(dispatcher, '_check_and_reserve_budget',
+                          return_value=True), \
+             patch.object(dispatcher._expert_pool, 'submit'):
+            result = dispatcher.dispatch_draft_first(
+                'do something', user_id='u', prompt_id='p', **kwargs)
+        return dispatcher._active[result['speculation_id']]
+
+    def test_draft_first_carries_the_avatar(self, dispatcher, monkeypatch):
+        entry = self._draft_first(dispatcher, monkeypatch,
+                                  avatar_id=1000000007)
+        assert entry['avatar_id'] == 1000000007
+
+    def test_no_avatar_leaves_the_entry_as_before(
+            self, dispatcher, monkeypatch):
+        entry = self._draft_first(dispatcher, monkeypatch)
+        assert 'avatar_id' not in entry
+
+
 class TestPromptIdNoLeak:
     """Regression for 2026-05-12 c38e8b7c-… duplicate-agent bug.
 

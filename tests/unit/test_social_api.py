@@ -271,3 +271,38 @@ class TestAdminEndpoints:
         resp = client.get('/api/social/admin/stats',
                           headers=auth_header(token))
         assert resp.status_code == 403
+
+    @staticmethod
+    def _admin_token(client, username='stats_admin'):
+        token = register_user(client, username)
+        from integrations.social.models import User, get_db
+        db = get_db()
+        try:
+            user = db.query(User).filter_by(username=username).first()
+            user.is_admin = True
+            db.commit()
+        finally:
+            db.close()
+        return token
+
+    def test_stats_counts_real_rows(self, client):
+        token = self._admin_token(client)
+        register_user(client, 'a_second_human')
+        resp = client.get('/api/social/admin/stats', headers=auth_header(token))
+        assert resp.status_code == 200
+        data = resp.get_json()['data']
+        assert data['total_users'] == 2
+        assert data['pending_reports'] == 0
+
+    def test_stats_failure_is_an_error_not_a_row_of_zeros(self, client):
+        """A failed aggregate query must not answer success with zeros: an
+        operator reads 0 users as a fact, and the dashboard already renders
+        a failed call as empty (adminApi.stats({silentError: true}))."""
+        from unittest.mock import MagicMock, patch
+        token = self._admin_token(client)
+        with patch('integrations.social.api.User', MagicMock()):
+            resp = client.get('/api/social/admin/stats', headers=auth_header(token))
+        assert resp.status_code == 503
+        body = resp.get_json()
+        assert body['success'] is False
+        assert 'data' not in body

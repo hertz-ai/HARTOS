@@ -484,3 +484,12 @@ def get_erxes_client() -> Optional[ErxesCRMClient]:
             _client_instance = ErxesCRMClient(api_url, email, password)
             logger.info('Erxes client initialized: %s', api_url)
         return _client_instance
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+ENV_SECRETS = (
+    'ERXES_PASSWORD',
+)

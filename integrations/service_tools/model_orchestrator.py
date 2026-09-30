@@ -175,13 +175,19 @@ class ModelOrchestrator:
         """
         cs = self._get_compute_state()
         budget_vram_gb = cs['vram_free_gb']
-        if model_type != 'llm':
-            # Reserve the primary LLM's footprint.  It is not a
-            # RuntimeToolManager tool so allocate() is never called for it,
-            # which means cs['vram_free_gb'] counts VRAM the LLM needs and
-            # whichever subsystem boots FIRST wins.  See the "llm_main" row
-            # in vram_manager.VRAM_BUDGETS for the measured incident.  Same
-            # idiom as llamacpp_manager.py reserving for TTS in reverse.
+        if model_type != 'llm' and not self._llm_resident():
+            # Reserve the primary LLM's footprint only until it is resident.
+            # Before llama-server is up, cs['vram_free_gb'] still counts the
+            # room the LLM needs and whichever subsystem boots FIRST wins --
+            # see the "llm_main" row in vram_manager.VRAM_BUDGETS for the
+            # 2026-08-18 incident.  Once the LLM has booked its row
+            # (llama_config after the health check, or notify_loaded), the
+            # free figure already excludes it and the ledger revision has
+            # re-probed any older reading (vram_manager._memo_is_current),
+            # so subtracting again is a double count.  MEASURED 2026-09-16
+            # (live app, PID 26452): free 3.11 GB with llama-server holding
+            # 4.83 GB and allocations {"llm": 2.84} -> budget 3.11 - 4.3 =
+            # 0.00 for every STT/TTS/VLM selection.
             try:
                 from integrations.service_tools.vram_manager import vram_manager
                 _llm = vram_manager.get_effective_budget('llm_main')
@@ -646,16 +652,36 @@ class ModelOrchestrator:
         'video_gen-ltx2':   'ltx2',
     }
 
+    # The one row the main LLM books in VRAMManager._allocations.  Nunba's
+    # llama_config writes the same literal directly (after llama-server's
+    # health check) and pops it on stop; this side books it via
+    # notify_loaded and pops it via notify_unloaded / the lifecycle's
+    # dead-process handler.  select_best reads it as "is the LLM resident".
+    LLM_VRAM_KEY = 'llm'
+
     def _vram_key(self, entry: ModelEntry) -> str:
         """Get the VRAMManager allocation key for a catalog entry.
 
-        For LLMs, always uses 'llm' — there's only one LLM loaded at a time
-        (llama-server is single-model). This makes registration idempotent
-        regardless of whether LlamaConfig or the Orchestrator registers first.
+        For LLMs, always uses LLM_VRAM_KEY — there's only one LLM loaded at
+        a time (llama-server is single-model). This makes registration
+        idempotent regardless of whether LlamaConfig or the Orchestrator
+        registers first.
         """
         if entry.model_type == 'llm':
-            return 'llm'
+            return self.LLM_VRAM_KEY
         return self._CATALOG_TO_VRAM_KEY.get(entry.id, entry.id)
+
+    def _llm_resident(self) -> bool:
+        """True while the main LLM holds its VRAM row (LLM_VRAM_KEY in the
+        raw ledger -- not get_allocations_display(), which re-keys rows by
+        catalog name for the UI).  Unknown counts as not resident, which
+        keeps select_best's reserve in place."""
+        try:
+            from integrations.service_tools.vram_manager import vram_manager
+            return self.LLM_VRAM_KEY in vram_manager.get_allocations()
+        except Exception:
+            logger.exception("_llm_resident: swallowed Exception")
+            return False
 
     def _register_vram(self, entry: ModelEntry, run_mode: str) -> bool:
         """Register VRAM allocation. Returns False if GPU is full."""

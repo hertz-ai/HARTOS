@@ -335,7 +335,7 @@ class FeedImporter:
             logger.error(f"Error parsing feed {url}: {e}")
             raise
 
-    def import_items(self, items: List[FeedItem], user_id: int,
+    def import_items(self, items: List[FeedItem], user_id: str,
                      community_id: int = None, auto_tag: bool = True) -> List[int]:
         """
         Import feed items as social posts.
@@ -436,7 +436,7 @@ class FeedSubscriptionService:
         self.db = db_session
         self.importer = FeedImporter(db_session)
 
-    def subscribe(self, user_id: int, feed_url: str,
+    def subscribe(self, user_id: str, feed_url: str,
                   community_id: int = None, auto_import: bool = True) -> Dict[str, Any]:
         """
         Subscribe a user to a feed.

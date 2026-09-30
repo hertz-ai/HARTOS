@@ -94,7 +94,8 @@ def rate_limit(action: str = 'global'):
             user_id = getattr(g, 'user', None)
             if user_id is None:
                 # Use IP as fallback for unauthenticated requests
-                user_id = request.remote_addr or 'anonymous'
+                from core.auth_local import client_key
+                user_id = client_key() or 'anonymous'
             else:
                 user_id = g.user.id
 

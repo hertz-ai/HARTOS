@@ -10,10 +10,13 @@ import random
 import logging
 import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 from core.http_pool import pooled_get, pooled_post
-from core.session_cache import TTLCache  # bounded + TTL dedup (peer churn safe)
+# AutoDiscovery (the LAN UDP beacon) lives in lan_discovery; peer_discovery still owns
+# the auto_discovery singleton and re-exports the class, so every import path holds.
+from integrations.social.lan_discovery import AutoDiscovery
 from core.ttl_cache import ttl_cached  # hard-TTL discovery cache (gossip counts)
 
 import ipaddress as _ipaddress
@@ -83,37 +86,112 @@ def is_unroutable_peer_url(url):
 logger = logging.getLogger('hevolve_social')
 
 
-def _load_or_create_node_id() -> str:
-    """Persist node_id under platform_paths.get_data_dir() / 'node_id.json'.
+# localhost / 127.x / ::1 (and ::ffff:127.x): an address that means "this
+# machine" to whoever reads it.  The one definition, in core.auth_local.
+from core.auth_local import _is_loopback  # noqa: E402
 
-    Returns existing id on subsequent boots so the central side can
-    dedupe joins by node_id.  Falls back to a fresh in-memory uuid if
-    the data dir is unwritable (degraded environments such as
-    cx_Freeze read-only mode).
-    """
-    import json
+
+def _is_this_host(ip):
+    """Is ``ip`` (a measured source address) this machine: loopback, or the
+    LAN address core.port_registry.get_lan_ip reports for it."""
+    ip = (ip or '').strip().strip('[]').lower()
+    if not ip:
+        return False
+    if _is_loopback(ip):
+        return True
     try:
-        from core.platform_paths import get_data_dir
-        data_dir = get_data_dir()
-        os.makedirs(data_dir, exist_ok=True)
-        path = os.path.join(data_dir, 'node_id.json')
-        if os.path.exists(path):
-            try:
-                with open(path, 'r', encoding='utf-8') as fh:
-                    payload = json.load(fh)
-                nid = payload.get('node_id', '')
-                if nid:
-                    return nid
-            except Exception:
-                pass  # Corrupt file → regenerate
-        nid = str(uuid.uuid4())
-        try:
-            with open(path, 'w', encoding='utf-8') as fh:
-                json.dump({'node_id': nid, 'created_at': datetime.utcnow().isoformat()}, fh)
-        except Exception:
-            pass  # Best-effort persist; in-memory id is still valid for this boot
-        return nid
+        from core.port_registry import get_lan_ip
+        return ip == (get_lan_ip() or '').lower()
     except Exception:
+        return False
+
+
+def address_evidence(url, observed_ip='', relayed=False):
+    """What this node has SEEN of ``url`` reaching it: (verdict, reason).
+
+    'confirmed'    a direct announce came from the host the url names, or
+                   from this machine for a loopback url, or the vantage is
+                   unknown (no measured source; judged as before);
+    'unconfirmed'  a relayed hint, or a direct announce from some other
+                   address: the row is kept; unless the node signed that
+                   announce itself (_merge_peer), only the health round's
+                   ping can make it active;
+    'refused'      a loopback url relayed by another node or announced from
+                   another machine: from here it names this machine, never
+                   the subject.
+
+    Reachability, not address class: a 10.x or 192.168.x url is never
+    refused (they are real LANs, test_peer_url_hygiene); it waits for a ping.
+    Measured 2026-09-26: 81% of this desktop's integrity challenges timed
+    out against relayed rows that had been stored 'active' on hearsay.
+    """
+    host = ''
+    try:
+        host = (_urlparse(url if '://' in url else 'http://' + url).hostname
+                or '').lower()
+    except Exception:
+        pass
+    if _is_loopback(host):
+        if relayed:
+            return 'refused', ('loopback url in a relayed peer list: it names '
+                               'the relayer\'s machine or this one, never the '
+                               'subject')
+        if observed_ip and not _is_this_host(observed_ip):
+            return 'refused', (f'loopback url announced from {observed_ip}, '
+                               f'another machine: from here it would name '
+                               f'this node')
+        return 'confirmed', ''
+    if relayed:
+        return 'unconfirmed', ''
+    if not observed_ip:
+        return 'confirmed', ''
+    if host == observed_ip.strip().strip('[]').lower():
+        return 'confirmed', ''
+    return 'unconfirmed', ''
+
+
+# The reason prefix an announcer reads when a node_id it announces is held
+# under another key (#140 B).  Stable: the sender acts on it (_consume_key_reply).
+KEY_CONFLICT = 'key_conflict'
+
+# A foreign-signed stream can repeat every announce interval; warn once per
+# node_id and keep the rest at debug so the log it informs is not flooded.
+# Bounded: node_ids are chosen by the sender.
+_key_conflicts_warned = set()
+
+
+def _warn_key_conflict_once(node_id):
+    if len(_key_conflicts_warned) > 10000:
+        _key_conflicts_warned.clear()
+    _log = logger.debug if node_id in _key_conflicts_warned else logger.warning
+    _key_conflicts_warned.add(node_id)
+    _log("Key conflict for %s: a direct announce verified under a key other "
+         "than the one held for it; row left unchanged, announcer told",
+         (node_id or '')[:8])
+
+
+def _legacy_node_id_path() -> str:
+    """node_id.json, the legacy home of the id.  Read, never written: the id
+    now lives next to its key (node_integrity.load_or_create_node_identity)."""
+    from core.platform_paths import get_identity_data_dir
+    return os.path.join(get_identity_data_dir(), 'node_id.json')
+
+
+def _load_or_create_node_id() -> str:
+    """This node's persistent id, from security.node_integrity.load_or_create_node_identity.
+
+    Returns the same id on subsequent boots so the central side can
+    dedupe joins by node_id.  Falls back to a fresh in-memory uuid if
+    identity storage is unusable (degraded environments such as
+    cx_Freeze read-only mode).  Under pytest the owner's real data root
+    is swapped for a temp dir (see get_identity_data_dir).
+    """
+    try:
+        from security.node_integrity import load_or_create_node_identity
+        return load_or_create_node_identity(_legacy_node_id_path())
+    except Exception as e:
+        logger.warning('node identity unavailable (%s); using a temporary id '
+                       'for this boot only', e)
         return str(uuid.uuid4())
 
 
@@ -363,11 +441,20 @@ class GossipProtocol:
             u.strip().rstrip('/') for u in seed_str.split(',')
             if u.strip()
         ]
-        # Merge: env peers first (user-specified), then genesis (always present)
+        # Merge: env peers first (user-specified), then genesis (always
+        # present on a real node).  A test or CI process never dials the
+        # real centrals, from either list (superadmins.real_centrals_allowed;
+        # task #98: CI shards registered throwaway nodes in the live hive).
+        try:
+            from core.superadmins import real_centrals_allowed
+            _real = real_centrals_allowed()
+        except Exception:
+            _real = True
+        _genesis = {u.rstrip('/') for u in _GENESIS_PEERS}
         seen = set()
         self.seed_peers = []
         for url in env_peers + _GENESIS_PEERS:
-            if url not in seen:
+            if url not in seen and (_real or url.rstrip('/') not in _genesis):
                 seen.add(url)
                 self.seed_peers.append(url)
 
@@ -775,72 +862,142 @@ class GossipProtocol:
                 peers = peers[_cursor:] + peers[:_cursor]
             _examined = 0
 
-            for peer in peers:
-                if not self._running:
-                    break
-                if time.time() - _started > _budget_s:
-                    self._health_cursor = (
-                        getattr(self, '_health_cursor', 0) + _examined)
-                    logger.warning(
-                        "Health round hit its %.0fs budget after %d/%d peers; "
-                        "yielding so the integrity round is not starved "
-                        "(resumes from this point next round)",
-                        _budget_s, _examined, len(peers))
-                    break
-                _examined += 1
-                if peer.node_id == self.node_id:
-                    continue
-                # #38: a structurally-unroutable row (loopback / docker-bridge /
-                # dead :677) can never be a real remote peer, and a local ping
-                # to it SUCCEEDS — so the age logic below would keep it 'active'
-                # forever and inflate every count. Delete it outright rather
-                # than age it out; ingest (_merge_peer) now rejects new ones, so
-                # it will not come back.
-                _bad_url, _ = is_unroutable_peer_url(peer.url)
-                if _bad_url:
-                    db.delete(peer)
-                    purged += 1
-                    self._flush_health_row(db)
-                    continue
-                live_peers.append(peer)
+            # Probe a batch concurrently, apply the results one row at a time.
+            #
+            # Probing one row at a time made this round visit 3-5 rows per 30s
+            # window on central once the table's junk stopped being re-stamped
+            # by relays: a private 10.x address from someone else's LAN costs
+            # the full 3s connect timeout, so ~1,000 rows that were all past
+            # dead_threshold took hours to age out (measured 2026-09-22
+            # 13:45-13:52Z: 5, 5, 3, 4 per window), and the integrity round
+            # crawled the same tail behind it.
+            #
+            # Only the network waits overlap.  Every DB change below still
+            # happens on THIS thread, one row at a time, with the same per-row
+            # commit, so the rule that the write lock never spans a network
+            # call (374f5ab6, the comment above _flush_health_row) holds
+            # exactly as before; the budget is checked between batches, so one
+            # batch, i.e. at most one timeout, is the most a round overruns by.
+            _workers = max(1, int(os.environ.get(
+                'HEVOLVE_HEALTH_PING_WORKERS', '8')))
+
+            def _probe(peer):
+                # Runs on a pool thread.  The identity the answer carried is
+                # kept per thread by _ping_peer, so it is read here, on the
+                # same thread, and returned with the verdict.
                 reachable = self._ping_peer(peer.url)
-                self._heartbeat()
-                if reachable:
-                    peer.last_seen = now
-                    peer.status = 'active'
-                else:
-                    age = (now - (peer.last_seen or peer.first_seen)).total_seconds()
-                    if age > self.dead_threshold:
-                        peer.status = 'dead'
-                    elif age > self.stale_threshold:
-                        peer.status = 'stale'
-                # Commit THIS row before probing the next peer.
-                #
-                # The round previously accumulated every delete + status change
-                # in one session and committed only after the whole sweep. The
-                # first mutation opens SQLite's single write transaction, so the
-                # write lock was then held across all the remaining _ping_peer
-                # calls. That is a lock held across network I/O.
-                #
-                # It wedged central on 2026-09-01: a probe hung (pooled_get's
-                # timeout=3 bounds the socket, NOT the wait for a free pooled
-                # connection, and a hang raises nothing for the RequestException
-                # handler to catch), the loop never advanced, so the wall-clock
-                # budget below -- which is only checked BETWEEN peers -- never
-                # got to fire. The write lock stayed held for ~2h. The agent
-                # daemon's `UPDATE agent_goals SET last_dispatched_at` lost its
-                # 5s busy_timeout on every tick, which poisoned its session
-                # ("rolled back due to a previous exception during flush") and
-                # aborted the tick. Goals were selected and never recorded:
-                # max(last_dispatched_at) frozen while the daemon looked alive.
-                #
-                # Committing per row keeps the lock held for microseconds
-                # instead of for the length of a network sweep. A hung probe
-                # then stalls only THIS round, which the budget already covers,
-                # rather than every writer in the process. It also means the #38
-                # purge persists incrementally instead of being rolled back
-                # wholesale when the round cannot finish.
-                self._flush_health_row(db)
+                return reachable, self._last_ping_identity()
+
+            _next = 0
+            with ThreadPoolExecutor(max_workers=_workers) as _pool:
+                while _next < len(peers):
+                    if not self._running:
+                        break
+                    if time.time() - _started > _budget_s:
+                        self._health_cursor = (
+                            getattr(self, '_health_cursor', 0) + _examined)
+                        logger.warning(
+                            "Health round hit its %.0fs budget after %d/%d peers; "
+                            "yielding so the integrity round is not starved "
+                            "(resumes from this point next round)",
+                            _budget_s, _examined, len(peers))
+                        break
+                    _batch = peers[_next:_next + _workers]
+                    _next += len(_batch)
+                    _to_probe = []
+                    for peer in _batch:
+                        _examined += 1
+                        if peer.node_id == self.node_id:
+                            continue
+                        # #38: a structurally-unroutable row (docker-bridge /
+                        # dead :677) can never be a real remote peer, and a
+                        # local ping to it SUCCEEDS — so the age logic below
+                        # would keep it 'active' forever and inflate every
+                        # count. Delete it outright rather than age it out;
+                        # ingest (_merge_peer) now rejects new ones, so it will
+                        # not come back.
+                        _bad_url, _ = is_unroutable_peer_url(peer.url)
+                        if _bad_url:
+                            db.delete(peer)
+                            purged += 1
+                            self._flush_health_row(db)
+                            continue
+                        _to_probe.append(peer)
+                    if not _to_probe:
+                        continue
+                    _results = list(_pool.map(_probe, _to_probe))
+                    self._heartbeat()
+                    for peer, (reachable, responder) in zip(_to_probe, _results):
+                        if reachable and responder and responder != peer.node_id:
+                            # The address answers, but as a DIFFERENT node than
+                            # the row claims.  Two cases, one rule: it answers
+                            # as THIS node (a row that advertised localhost, its
+                            # docker bridge, or this host's own LAN address under
+                            # some other node_id), or as some other node (a
+                            # reinstall on the same host:port minted a fresh
+                            # identity and the old rows are zombies).  Either
+                            # way the row's address no longer belongs to the
+                            # row's node, a ping to it succeeds forever, so the
+                            # age logic below would keep it 'active' for good,
+                            # and it holds a slot against the per-host cap:
+                            # measured 2026-09-22, the office desktop's sixth
+                            # identity (46329c87) was refused by central while
+                            # five dead identities of its own, all answering as
+                            # 46329c87, sat 'active' at 192.168.0.165:5000.
+                            # Central itself also held 378 loopback rows that
+                            # answered as central (the 133 'passed' self-audits
+                            # per integrity pass).  is_unroutable_peer_url keeps
+                            # loopback on purpose (co-located nodes on distinct
+                            # ports are real), so the address alone cannot
+                            # decide; who ANSWERS can.  The live node announces
+                            # itself; delete the stale row like the #38 rows.
+                            # A reachable answer that carries no node_id (an
+                            # older node) is still a live peer.
+                            db.delete(peer)
+                            purged += 1
+                            self._flush_health_row(db)
+                            continue
+                        live_peers.append(peer)
+                        if reachable:
+                            peer.last_seen = now
+                            peer.status = 'active'
+                        else:
+                            age = (now - (peer.last_seen or peer.first_seen)).total_seconds()
+                            if age > self.dead_threshold:
+                                peer.status = 'dead'
+                            elif age > self.stale_threshold:
+                                peer.status = 'stale'
+                        # Commit THIS row before touching the next one.
+                        #
+                        # The round previously accumulated every delete + status
+                        # change in one session and committed only after the
+                        # whole sweep. The first mutation opens SQLite's single
+                        # write transaction, so the write lock was then held
+                        # across all the remaining _ping_peer calls. That is a
+                        # lock held across network I/O.
+                        #
+                        # It wedged central on 2026-09-01: a probe hung
+                        # (pooled_get's timeout=3 bounds the socket, NOT the wait
+                        # for a free pooled connection, and a hang raises nothing
+                        # for the RequestException handler to catch), the loop
+                        # never advanced, so the wall-clock budget -- which is
+                        # only checked BETWEEN batches -- never got to fire. The
+                        # write lock stayed held for ~2h. The agent daemon's
+                        # `UPDATE agent_goals SET last_dispatched_at` lost its 5s
+                        # busy_timeout on every tick, which poisoned its session
+                        # ("rolled back due to a previous exception during
+                        # flush") and aborted the tick. Goals were selected and
+                        # never recorded: max(last_dispatched_at) frozen while
+                        # the daemon looked alive.
+                        #
+                        # Committing per row keeps the lock held for
+                        # microseconds instead of for the length of a network
+                        # sweep. A hung probe then stalls only THIS round, which
+                        # the budget already covers, rather than every writer in
+                        # the process. It also means the #38 purge persists
+                        # incrementally instead of being rolled back wholesale
+                        # when the round cannot finish.
+                        self._flush_health_row(db)
             # Dead is not deleted. The main query above excludes 'dead' rows,
             # so a peer that aged out during an outage was never re-pinged and
             # could only come back via an INBOUND announce — two nodes that
@@ -864,6 +1021,15 @@ class GossipProtocol:
                     purged += 1
                     continue
                 if self._ping_peer(peer.url):
+                    _responder = self._last_ping_identity()
+                    if _responder and _responder != peer.node_id:
+                        # Same rule as the main loop above: an address that
+                        # answers as some other node (this one included) is
+                        # not a peer to revive, it is a stale row to drop.
+                        db.delete(peer)
+                        purged += 1
+                        self._heartbeat()
+                        continue
                     peer.last_seen = now
                     peer.status = 'active'
                     logger.info("Dead peer revived by re-probe: %s", peer.url)
@@ -871,8 +1037,9 @@ class GossipProtocol:
             db.commit()
             if purged:
                 logger.info(
-                    "Peer purge (#38): removed %d unroutable rows "
-                    "(loopback / docker-172.17 / dead :677)", purged)
+                    "Peer purge (#38): removed %d rows that are structurally "
+                    "unroutable (docker-172.17 / dead :677) or answer as this "
+                    "node itself", purged)
             # Update contribution scores for active/stale peers (live rows only;
             # purged rows are gone from the session).
             try:
@@ -922,21 +1089,160 @@ class GossipProtocol:
                 self._heartbeat()
 
     def _announce_to_peer(self, peer_url):
+        if self._blocked_for_key_conflict(peer_url):
+            return False
         try:
+            info = self._self_info()
             resp = pooled_post(
                 f"{peer_url}/api/social/peers/announce",
-                json=self._self_info(),
+                json=info,
                 timeout=5,
             )
             if resp.status_code == 200:
                 self._record_peer_success(peer_url)
                 self._consume_observed_ip_echo(resp)
+                self._consume_key_reply(peer_url, resp, info.get('nonce', ''))
                 return True
             self._record_peer_failure(peer_url)
             return False
         except requests.RequestException:
             self._record_peer_failure(peer_url)
             return False
+
+    # ─── Identity: what a seed's reply may and may not do (#140 B3) ───
+    #
+    # Resolved by the node, never by the owner ("No user would care about
+    # node identity, whatever is the mechanism shd autoresolve", owner
+    # 2026-09-24).  A configured seed's "accepted" confirms a provisional
+    # legacy id.  Its key_conflict names the key it holds for our id:
+    #   A1  a key on this machine matches: switch to it, keep the id.
+    #   A2  none matches and the conflict is AUTHENTICATED: this node's key
+    #       was replaced for real (a reinstall) and cannot prove the old id,
+    #       so it takes a new identity.
+    #   else  never re-identify on it: stay off that seed for a while, retry.
+    # Authenticated = the reply came over verified HTTPS from the seed's own
+    # host (the genesis seeds are https), and, when this node holds a key for
+    # that seed, is also signed by it and bound to this announce's node_id
+    # and nonce.  Only configured seeds count; any other peer's reply is
+    # ignored.
+
+    _KEY_CONFLICT_BACKOFF_S = 1800
+
+    def _is_seed(self, peer_url):
+        return (peer_url or '').strip().rstrip('/') in (self.seed_peers or [])
+
+    def _consume_key_reply(self, peer_url, resp, nonce=''):
+        if not self._is_seed(peer_url):
+            return
+        try:
+            body = resp.json() or {}
+        except Exception:
+            return
+        reason = str(body.get('reason') or '')
+        if reason.startswith(KEY_CONFLICT):
+            self._on_key_conflict(peer_url, resp, body, nonce)
+            return
+        if body.get('accepted') is not True:
+            return
+        try:
+            from security import node_integrity as _ni
+            if _ni.identity_state == 'legacy_provisional':
+                recorded = _ni.confirm_node_identity(self.node_id)
+                logger.info("Seed %s accepted node_id %s under this key; "
+                            "identity recorded", peer_url, recorded[:8])
+        except Exception as e:
+            logger.warning("Could not record the confirmed node identity: %s", e)
+
+    def _seed_key_held(self, seed_node_id):
+        """The key this node stored from the seed's own direct announce, or ''."""
+        if not seed_node_id:
+            return ''
+        try:
+            from .models import get_db, PeerNode
+            db = get_db()
+            try:
+                row = db.query(PeerNode).filter_by(node_id=seed_node_id).first()
+                return (row.public_key or '') if row else ''
+            finally:
+                db.close()
+        except Exception:
+            return ''
+
+    def _reply_is_authentic(self, peer_url, resp, body, nonce):
+        seed = _urlparse((peer_url or '').strip().rstrip('/'))
+        # The FINAL url: a redirect off https, or to another host, loses the
+        # TLS property even though the request went to the seed.
+        final = _urlparse(str(getattr(resp, 'url', '') or ''))
+        https_ok = (seed.scheme == 'https' and final.scheme == 'https'
+                    and (final.hostname or '').lower() == (seed.hostname or '').lower())
+        held = self._seed_key_held(str(body.get('node_id') or ''))
+        if not held:
+            return https_ok
+        reply_to = body.get('reply_to') or {}
+        if body.get('public_key') != held or not nonce:
+            return False
+        if reply_to.get('node_id') != self.node_id or reply_to.get('nonce') != nonce:
+            return False
+        try:
+            from security.node_integrity import verify_json_signature
+            return bool(verify_json_signature(held, body, str(body.get('signature') or '')))
+        except Exception:
+            return False
+
+    def _on_key_conflict(self, peer_url, resp, body, nonce):
+        import re as _re
+        from security import node_integrity as _ni
+        seed = (peer_url or '').strip().rstrip('/')
+        m = _re.search(r'held_key_fp=([0-9a-fA-F]{16,})', str(body.get('reason') or ''))
+        fp = m.group(1).lower() if m else ''
+
+        # A1: the seed holds a key this machine already has.  Safe on any
+        # reply: it can only move this process to a key it owns.
+        key_dir = _ni.local_key_dir_holding(fp) if fp else None
+        if key_dir and os.path.abspath(key_dir) != os.path.abspath(_ni._KEY_DIR):
+            old = self.node_id or ''
+            _ni.switch_key_dir(key_dir)
+            self.node_id = _ni.load_or_create_node_identity(_legacy_node_id_path())
+            self._clear_key_conflict(seed)
+            logger.info("Seed %s holds this node's id under the key in %s; "
+                        "switched to it (id %s -> %s)", seed, key_dir,
+                        old[:8], (self.node_id or '')[:8])
+            return
+
+        # A2: no local key proves the id, and the seed really said so.
+        if self._reply_is_authentic(peer_url, resp, body, nonce):
+            old = self.node_id or ''
+            default_name = self.node_name == f'hevolve-{old[:8]}'
+            self.node_id = _ni.take_new_node_identity(
+                f'seed {seed} holds {old[:8]} under a key this machine does not have')
+            if default_name:
+                self.node_name = f'hevolve-{self.node_id[:8]}'
+            self._clear_key_conflict(seed)
+            return
+
+        # Unauthenticated: never re-identify on it.
+        until = getattr(self, '_key_conflict_until', None)
+        if until is None:
+            until = self._key_conflict_until = {}
+        first = seed not in until
+        until[seed] = time.time() + self._KEY_CONFLICT_BACKOFF_S
+        if first:
+            logger.warning(
+                "Seed %s answered with an unverifiable key conflict for %s; "
+                "keeping this identity and retrying that seed in %d min",
+                seed, (self.node_id or '')[:8], self._KEY_CONFLICT_BACKOFF_S // 60)
+
+    def _clear_key_conflict(self, seed):
+        until = getattr(self, '_key_conflict_until', None)
+        if until:
+            until.pop(seed, None)
+
+    def _blocked_for_key_conflict(self, peer_url):
+        until = getattr(self, '_key_conflict_until', None)
+        if not until:
+            return False
+        t = until.get((peer_url or '').strip().rstrip('/'))
+        return bool(t and time.time() < t)
 
     def _consume_observed_ip_echo(self, resp):
         """Learn our own public IP from a peer's announce response.
@@ -1036,19 +1342,80 @@ class GossipProtocol:
             pass
         return ''
 
+    def _ping_thread_state(self):
+        _tl = getattr(self, '_ping_tl', None)
+        if _tl is None:
+            _tl = self._ping_tl = threading.local()
+        return _tl
+
+    def _last_ping_identity(self):
+        """node_id the last ``_ping_peer`` on THIS thread got back, or None.
+
+        Per thread, because the health round pings a batch of rows
+        concurrently and each worker must read its own answer, not whatever
+        another thread wrote last.
+        """
+        return getattr(self._ping_thread_state(), 'node_id', None)
+
     def _ping_peer(self, peer_url):
+        """True when ``peer_url`` answers /api/social/peers/health.
+
+        The responder's node_id from that answer (None when it gave none) is
+        kept per thread and read back with ``_last_ping_identity``, so a row
+        whose address answers as THIS node is recognised without a second
+        request.
+        """
+        _tl = self._ping_thread_state()
+        _tl.node_id = None
         if self._is_peer_backed_off(peer_url):
             return False
         try:
             resp = pooled_get(f"{peer_url}/api/social/peers/health", timeout=3)
             if resp.status_code == 200:
+                try:
+                    _tl.node_id = (resp.json() or {}).get('node_id')
+                except Exception:
+                    _tl.node_id = None
                 self._record_peer_success(peer_url)
+                self._record_ping_verdict(peer_url, True)
                 return True
             self._record_peer_failure(peer_url)
+            self._record_ping_verdict(peer_url, False)
             return False
         except requests.RequestException:
             self._record_peer_failure(peer_url)
+            self._record_ping_verdict(peer_url, False)
             return False
+
+    # Bound on remembered verdicts: urls come from peers' announces.
+    _PING_VERDICTS_MAX = 20000
+
+    def _record_ping_verdict(self, peer_url, reachable):
+        """Remember what the last real ping of ``peer_url`` measured.
+
+        Only an attempt that went out counts; a backed-off skip changes
+        nothing.  Read by _ping_unreachable."""
+        verdicts = getattr(self, '_unreachable_urls', None)
+        if verdicts is None:
+            verdicts = self._unreachable_urls = {}
+        key = (peer_url or '').rstrip('/')
+        if reachable:
+            verdicts.pop(key, None)
+            return
+        if len(verdicts) >= self._PING_VERDICTS_MAX:
+            verdicts.clear()
+        verdicts[key] = time.time()
+
+    def _ping_unreachable(self, peer_url) -> bool:
+        """Did the last real ping of ``peer_url`` from this node fail?
+
+        Reachability, not liveness: a NAT'd peer that keeps announcing is
+        alive and stays 'active' (_merge_peer), but a call to its LAN url
+        from here is a timeout.  The integrity round skips such a row
+        instead of spending its budget on it (the 81% timeouts 02da559f7
+        measured); a url never pinged is not presumed unreachable."""
+        verdicts = getattr(self, '_unreachable_urls', None) or {}
+        return (peer_url or '').rstrip('/') in verdicts
 
     # ─── Handlers (called by Flask endpoints) ───
 
@@ -1269,6 +1636,9 @@ class GossipProtocol:
             'agent_count': self._get_count('agent'),
             'post_count': self._get_count('post'),
             'timestamp': int(time.time()),
+            # Echoed in the signed reply (discovery.peer_announce reply_to),
+            # so a recorded reply cannot answer a later announce (#140 B3).
+            'nonce': uuid.uuid4().hex,
             'tier': self.tier,
             'hart_tag': self._hart_tag,
         }
@@ -1455,15 +1825,26 @@ class GossipProtocol:
         try:
             new_count = 0
             for p in peer_list:
-                if p.get('node_id') and p.get('node_id') != self.node_id:
+                if not p.get('node_id') or p.get('node_id') == self.node_id:
+                    continue
+                # One commit per record, not one for the list.  _merge_peer
+                # queries before it adds, so autoflush opens the SQLite write
+                # transaction at the second record; a single commit at the
+                # end held that lock for the whole list.  Live 2026-09-15
+                # 11:28:50-11:29:02 a merge of ~1,000 relayed records held it
+                # for 12s, the owner's consent grant waited out busy_timeout
+                # (3s) and failed "database is locked", and the SPA showed
+                # "Something's off on our end".  The records are hints (see
+                # above), so nothing needs them committed together.
+                try:
                     if self._merge_peer(db, p, relayed=True):
                         new_count += 1
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    logger.debug(f"Merge peer error: {e}")
             if new_count > 0:
                 logger.info(f"Gossip: merged {new_count} new peers")
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            logger.debug(f"Merge peer list error: {e}")
         finally:
             db.close()
 
@@ -1483,7 +1864,7 @@ class GossipProtocol:
         if not observed_ip:
             return ''
         ip = observed_ip.strip().strip('[]')
-        if ip in ('127.0.0.1', '::1', 'localhost') or ip.startswith('127.'):
+        if _is_loopback(ip):
             return ''
         try:
             from urllib.parse import urlparse
@@ -1603,17 +1984,33 @@ class GossipProtocol:
         if node_id == self.node_id:
             return _reject('announcement is from this node itself')
 
-        # Structural gate: a peer whose URL is loopback / docker-bridge / :677
-        # can never be dialed as a REMOTE node (it points at self or nowhere).
-        # This is the source of the localhost:6777 flood — the Sybil check
-        # below deliberately EXEMPTS loopback, so without this gate those rows
-        # accumulate without limit and then fool the age-based health check
-        # (a local ping to them succeeds). Reject at ingest; #38.
+        # Structural gate: a peer whose URL is docker-bridge / :677 /
+        # unspecified can never be dialed as a REMOTE node (it points at self
+        # or nowhere).  Reject at ingest; #38.  Loopback is decided just
+        # below by address_evidence, from where the record came from: the
+        # Sybil check further down deliberately EXEMPTS loopback, so a
+        # loopback url from another machine must be refused there or those
+        # rows accumulate without limit (898 on the owner's desktop).  The
+        # same measurement says whether the address has been seen to reach
+        # this node, which decides 'active' vs 'stale' below.
         _bad_url, _bad_why = is_unroutable_peer_url(url)
         if _bad_url:
             return _reject('unroutable peer url (%s)' % _bad_why)
+        _evidence, _evidence_why = address_evidence(url, observed_ip, relayed)
+        if _evidence == 'refused':
+            return _reject(_evidence_why)
 
-        # Sybil protection: max 5 nodes per IP/hostname.
+        # A node we already hold is not a NEW identity for its host, so the
+        # per-host cap below does not apply to it.  Looked up here, before the
+        # cap, because counting a node's own row against it meant that once a
+        # host had max_per_ip rows none of them could ever announce again:
+        # their own row was among the count.  Measured on central 2026-09-22:
+        # 36,777 "Sybil limit" rejections in 40 minutes, 1,246 distinct node
+        # ids, and this office's desktop refused since 09-19 with exactly its
+        # five known rows named in the log.
+        existing = db.query(PeerNode).filter(PeerNode.node_id == node_id).first()
+
+        # Sybil protection: max 5 LIVE nodes per IP/hostname.
         # Loopback addresses are exempt - single-user dev installs
         # naturally accumulate many node_ids on localhost (one per
         # reboot / data-dir reset / clean-install), and rejecting
@@ -1623,18 +2020,26 @@ class GossipProtocol:
         try:
             from urllib.parse import urlparse
             host = (urlparse(url).hostname or '').lower()
-            _is_loopback = host in (
-                'localhost', '127.0.0.1', '::1', '0.0.0.0',
-            ) or host.startswith('127.')
-            if host and not _is_loopback:
-                from .models import PeerNode
+            # (0.0.0.0 never reaches here: is_unroutable_peer_url refused it.)
+            if host and not _is_loopback(host) and existing is None:
                 same_host_count = db.query(PeerNode).filter(
                     PeerNode.url.contains(host),
                     PeerNode.integrity_status != 'banned',
+                    # Dead rows hold no slot: the cap bounds LIVE identities,
+                    # or a host that reinstalled five times (one node_id per
+                    # data-dir reset, normal for a dev install) is locked out
+                    # forever, long after every old identity has aged out.
+                    PeerNode.status != 'dead',
                 ).count()
                 max_per_ip = int(os.environ.get('HEVOLVE_MAX_PEERS_PER_IP', '5'))
                 if same_host_count >= max_per_ip:
-                    logger.warning(f"Sybil limit: {same_host_count} nodes from {host}, rejecting {node_id[:8]}")
+                    # A refused relayed hint is routine (a peer list carries
+                    # every row its sender holds, hundreds per exchange); a
+                    # refused DIRECT announce is a node turned away, worth a
+                    # line.  At WARNING for both, central wrote ~15 of these a
+                    # second.
+                    _log = logger.debug if relayed else logger.warning
+                    _log(f"Sybil limit: {same_host_count} nodes from {host}, rejecting {node_id[:8]}")
                     return _reject(
                         f'sybil limit: {same_host_count} nodes already '
                         f'registered from {host}, max {max_per_ip}')
@@ -1642,7 +2047,6 @@ class GossipProtocol:
             pass  # URL parsing failed — proceed with other checks
 
         # Reject banned nodes
-        existing = db.query(PeerNode).filter(PeerNode.node_id == node_id).first()
         if existing and existing.integrity_status == 'banned':
             logger.debug(f"Rejecting banned node: {node_id[:8]}")
             return _reject('node is banned')
@@ -1669,7 +2073,18 @@ class GossipProtocol:
                 logger.warning(f"Unexpected error verifying signature for {node_id[:8]}: {e}")
                 return _reject(f'signature verification errored: {e}')
 
-        integrity_status = 'verified' if signature_valid else 'unverified'
+        # A valid announce signature proves that this KEY asserted this
+        # payload.  It proves nothing about the code the node runs, so it
+        # does not confer proof: 'verified' is written by
+        # IntegrityService.evaluate_challenge_response, on an answered
+        # challenge, and by nothing else (tests/unit/test_peer_trust_requires_proof).
+        # This line used to grant 'verified' here, and the update branch
+        # below re-granted it on every direct announce (~60 s), which undid
+        # the challenge evaluator's withheld grant within a minute of any
+        # inconclusive or failed code_hash_check (self-review of 5e83047b5).
+        # The signature's validity itself is kept in public_key and the
+        # rejection of an INVALID signature above.
+        integrity_status = 'unverified'
 
         # Enforcement gate: reject unsigned peers in hard mode.
         # Skipped for relayed hints, which cannot carry one by construction.
@@ -1840,22 +2255,95 @@ class GossipProtocol:
             certificate_verified = False
             integrity_status = 'unverified'
 
+        # Who may speak for a node (#140 part B).  A challenge answer is
+        # bound to the key STORED for its target (4b0b005eb), so the writer
+        # of that key decides who a node is.  It was "whoever spoke last":
+        # an announce signed by ANY key, or a relayed hint carrying no
+        # signature at all, replaced the stored key and moved the url that
+        # challenges are delivered to, so anyone could take over a node's
+        # audit.  Now a key is taken only from the node's own DIRECT signed
+        # announce, and once stored it holds for that node_id: a new key is
+        # a new identity.  4b0b005eb leaves a proven node's standing
+        # untouched while its address answers with a foreign key, which is
+        # right against framing only because this stops a foreign announce
+        # from moving the address in the first place.
+        speaks_for_itself = bool(signature_valid and not relayed and public_key)
+
+        # 'active' means ALIVE and admitted, which every fleet path reads
+        # (OTA fan-out, halt/estop, sync, regional assignment, uptime
+        # reward).  A node that signed its own direct announce, through the
+        # guardrail-hash gate above, is exactly that, wherever it announced
+        # from: central sees every announcer as its docker gateway
+        # (172.21.0.1) and can never ping a home desktop's LAN url, so
+        # judging aliveness by the address kept every honest NAT'd peer
+        # 'stale' forever and out of all of those paths (review of
+        # 02da559f7).  Whether this node can DIAL the url is a different
+        # question, asked only where dialling happens: the integrity round
+        # skips a row the health round could not reach (_ping_unreachable).
+        # A relayed hint or an unsigned claim from another address is still
+        # only an address: 'stale' until a ping reaches it.
+        _alive = _evidence == 'confirmed' or speaks_for_itself
+
         if existing:
-            existing.last_seen = datetime.utcnow()
+            stored_key = existing.public_key or ''
+            if stored_key and not (speaks_for_itself and public_key == stored_key):
+                # Not provably the node: a foreign key, no signature, or
+                # hearsay.  It changes nothing about the row, not even
+                # liveness.  A DIRECT announce that verifies under a DIFFERENT
+                # key is told so (KEY_CONFLICT), with the fingerprint of the
+                # key held: an impostor learns only a public key, and the real
+                # node can look for that key on its own disk before it gives
+                # up the id (_consume_key_reply).
+                if speaks_for_itself:
+                    if reasons is not None:
+                        reasons.append(
+                            f'{KEY_CONFLICT}: node_id {node_id[:8]} is held '
+                            f'under another key (held_key_fp={stored_key[:16]})')
+                    _warn_key_conflict_once(node_id)
+                return False
+            # last_seen is DIRECT evidence of liveness: the node's own announce
+            # (this branch with relayed=False) or a successful ping in the
+            # health round.  A relayed row is a third party's hearsay and must
+            # not move it.  It did, and that was the whole D4 (#62) mechanism:
+            # central relays its entire non-dead table to every node that
+            # exchanges with it, every node hands its own list back, so a row
+            # nobody had reached in months got a fresh last_seen every gossip
+            # round, the health round's age check never tripped, and 1,149
+            # junk rows (369 loopback, 774 private addresses from other LANs)
+            # stayed 'active' on every node forever.  Measured on central
+            # 2026-09-22 once #71 made the loop tick: the health round covered
+            # 3-4 of 1,156 rows per 30s window and the budgeted integrity
+            # round spent each window on one unroutable address.  The
+            # resurrect check below (`now - last_seen < 60`) also read the
+            # value this line had just written, so hearsay brought every dead
+            # row straight back.  A hint still updates the address and still
+            # adds a peer we did not know; it may not vouch for liveness.
+            if not relayed:
+                existing.last_seen = datetime.utcnow()
             existing.url = url
             existing.name = peer_data.get('name', existing.name)
             existing.version = peer_data.get('version', existing.version)
             existing.agent_count = peer_data.get('agent_count', existing.agent_count)
             existing.post_count = peer_data.get('post_count', existing.post_count)
-            # Update integrity fields
-            if public_key:
+            # A keyless row takes its first key only from the node itself
+            # (B2, bounded TOFU).  Whatever the row held was never bound to a
+            # key, so no challenge it passed proved anything (4b0b005eb):
+            # binding a key restarts its standing at 'unverified', and trust
+            # is earned only by challenges answered with THIS key.  The fraud
+            # score and history stay: a rebind never wipes a record (#141).
+            # A squatter can take an id nobody had bound, and moves its url;
+            # harmless, since the row carried no standing, and the real node
+            # hears KEY_CONFLICT and asks its owner.
+            if speaks_for_itself and not stored_key:
                 existing.public_key = public_key
+                existing.integrity_status = 'unverified'
             if peer_data.get('code_hash'):
                 existing.code_hash = peer_data['code_hash']
             if peer_data.get('version'):
                 existing.code_version = peer_data['version']
-            if signature_valid:
-                existing.integrity_status = 'verified'
+            # integrity_status is NOT touched by an announce, signed or not:
+            # a signature is identity, proof is a challenge (see the note at
+            # the new-row assignment above).  Neither granted nor downgraded.
             # A relayed hint must not DOWNGRADE a peer that already proved
             # itself with a direct signed announce. It carries no evidence
             # either way, and letting hearsay clear master_key_verified,
@@ -1885,10 +2373,11 @@ class GossipProtocol:
             # Update X25519 public key for E2E encryption
             if peer_data.get('x25519_public'):
                 existing.x25519_public = peer_data['x25519_public']
-            if existing.status == 'dead':
+            if existing.status in ('dead', 'stale'):
                 # Only resurrect if announcement is recent (not stale gossip)
                 if (datetime.utcnow() - existing.last_seen).total_seconds() < 60:
-                    existing.status = 'active'
+                    # Same rule as a new row (_alive, above).
+                    existing.status = 'active' if _alive else 'stale'
             # Direct announces update the observed-address hint; relayed
             # records carry the RELAYER's vantage, not the subject's, so
             # they must not overwrite what a direct announce established.
@@ -1901,18 +2390,26 @@ class GossipProtocol:
             return False
 
         _obs = '' if relayed else self._observed_url_for(url, observed_ip)
-        _new_meta = dict(peer_data.get('metadata', {}) or {})
+        # A relayed record is a PeerNode.to_dict() of the RELAYER's row: its
+        # metadata is the relayer's bookkeeping and the relayer's vantage
+        # (central's observed_url 172.21.0.1, its docker gateway, sat on every
+        # relayed 10.1.x row on the owner's desktop).  None of it is ours.
+        _new_meta = {} if relayed else dict(peer_data.get('metadata', {}) or {})
         if _obs:
             _new_meta['observed_url'] = _obs
         new_peer = PeerNode(
             node_id=node_id, url=url,
             name=peer_data.get('name', ''),
             version=peer_data.get('version', ''),
-            status='active',
+            # _alive (above); the health round's successful ping promotes a
+            # 'stale' one.
+            status='active' if _alive else 'stale',
             agent_count=peer_data.get('agent_count', 0),
             post_count=peer_data.get('post_count', 0),
             metadata_json=_new_meta,
-            public_key=public_key or '',
+            # Hearsay never plants a key: a relayer could otherwise fix X's
+            # identity to its own key before X ever speaks.
+            public_key=public_key if speaks_for_itself else '',
             code_hash=peer_data.get('code_hash', ''),
             code_version=peer_data.get('version', ''),
             integrity_status=integrity_status,
@@ -2067,32 +2564,92 @@ class GossipProtocol:
             if active_peers:
                 from .integrity_service import IntegrityService
 
-                # 1. Guardrail audit: re-verify ALL active peers' guardrail hashes.
-                #    This is the continuous audit - every node checks every other node.
+                # 1+2. Guardrail audit (GET) and deep challenge (POST): ONE
+                #    pass, both steps per peer, under a WALL-CLOCK BUDGET with
+                #    a resume cursor -- the isolation-against-duration the
+                #    health round has (see _health_check_round), for the same
+                #    reason.  This is the continuous audit: every node checks
+                #    every other node, and each peer gets a different challenge
+                #    type per pass (round-robin).
                 #
-                #    Commit after EVERY peer, in this loop and the next.  Both
-                #    make one network call per active peer and used to commit
-                #    once after the whole loop, so from the first fraud-score
-                #    flush onward the round held SQLite's single write lock
-                #    across every remaining probe (5s GET here, a 30s POST
-                #    below).  Measured on a desktop 2026-09-02: 525 active
-                #    peers, most unroutable, one round ran for hours,
-                #    integrity_interval is 300s, and the agent daemon logged
-                #    "database is locked" on every tick with zero goal updates
-                #    persisted (#71).  Same shape, same fix as the health
-                #    round (374f5ab6); create_challenge also commits its own
-                #    row before it POSTs.
-                for peer in active_peers:
+                #    Commit after EVERY peer.  Both steps make one network call
+                #    per active peer and used to commit once after the whole
+                #    loop, so from the first fraud-score flush onward the round
+                #    held SQLite's single write lock across every remaining
+                #    probe (5s GET, 30s POST).  Measured on a desktop
+                #    2026-09-02: 525 active peers, most unroutable, one round
+                #    ran for hours, integrity_interval is 300s, and the agent
+                #    daemon logged "database is locked" on every tick with zero
+                #    goal updates persisted (#71).  Same shape, same fix as the
+                #    health round (374f5ab6); create_challenge also commits its
+                #    own row before it POSTs.
+                #
+                #    The per-row commit fixed the LOCK and left the DURATION.
+                #    Measured on central 2026-09-22: 1,149 'active' rows, 774
+                #    of them private 10.x/192.168.x addresses unroutable from
+                #    the container, so the audit pass alone ate ~65 min (774 x
+                #    5s) before the FIRST challenge row could exist, then the
+                #    challenge pass ran ~30s per peer: one "300s" round took
+                #    ~10h, and gossip and health (same thread, in sequence)
+                #    did not run either.  Under a deploy cadence of a container
+                #    every 20-60 min the challenge pass was never reached:
+                #    newest row 2026-09-21 21:50Z, zero rows across the next 13
+                #    containers, one health-round line in 45 min of log.  So:
+                #    audit AND challenge each peer as it comes (challenges
+                #    begin inside the first window), stop at the budget,
+                #    remember where we were, resume there next tick.  A
+                #    structurally-unroutable row (#38) is skipped, not probed:
+                #    the health round deletes those, and a call to nowhere is
+                #    exactly the cost this budget exists to bound.
+                challenge_types = ['agent_count_verify', 'code_hash_check',
+                                   'stats_probe', 'guardrail_verify']
+                _budget_s = float(os.environ.get(
+                    'HEVOLVE_INTEGRITY_ROUND_BUDGET_S', '30'))
+                _started = time.time()
+                #    A peer that just spoke for itself and was never
+                #    challenged goes FIRST, ahead of the cursor: since
+                #    cc281c3c3 only a 'verified' peer runs a shared agent, and
+                #    verification waited behind every row the cursor had not
+                #    reached (first seen -> first pass measured 23.6 h to
+                #    942.9 h on the owner's desktop; one unreachable row can
+                #    spend the whole budget).  Same challenge, same verdict
+                #    writer; only the order changes.  The cursor counts the
+                #    other rows only, so the backlog keeps advancing.
+                _first = self._never_challenged_live_peers(active_peers)
+                _first_ids = {p.node_id for p in _first}
+                _rest = [p for p in active_peers
+                         if p.node_id not in _first_ids]
+                _cursor = (getattr(self, '_integrity_cursor', 0)
+                           % max(len(_rest), 1))
+                _ordered = _first + _rest[_cursor:] + _rest[:_cursor]
+                _examined = 0
+                for i, peer in enumerate(_ordered):
+                    if not self._running:
+                        break
+                    if time.time() - _started > _budget_s:
+                        self._integrity_cursor = (
+                            getattr(self, '_integrity_cursor', 0) + _examined)
+                        logger.warning(
+                            "Integrity round hit its %.0fs budget after %d/%d "
+                            "peers; yielding so the gossip and health rounds "
+                            "are not starved (resumes from this point next "
+                            "round)", _budget_s, i, len(_ordered))
+                        break
+                    if peer.node_id not in _first_ids:
+                        _examined += 1
+                    _bad_url, _ = is_unroutable_peer_url(peer.url)
+                    if _bad_url:
+                        continue
+                    # Alive but not reachable from here (a NAT'd peer): no
+                    # dial, the row stays in the fleet.  Rechecked each
+                    # health round.
+                    if self._ping_unreachable(peer.url):
+                        continue
                     self._audit_peer_guardrails(db, peer)
                     self._flush_health_row(db, round_name='Integrity round')
                     self._heartbeat()
-
-                # 2. Deep challenge: cycle through challenge types across all peers.
-                #    Each peer gets a different challenge type per round (round-robin).
-                challenge_types = ['agent_count_verify', 'code_hash_check',
-                                   'stats_probe', 'guardrail_verify']
-                for i, peer in enumerate(active_peers):
-                    challenge_type = challenge_types[i % len(challenge_types)]
+                    challenge_type = challenge_types[
+                        (_cursor + i) % len(challenge_types)]
                     try:
                         IntegrityService.create_challenge(
                             db, self.node_id, peer.node_id,
@@ -2149,6 +2706,25 @@ class GossipProtocol:
             logger.debug(f"Integrity round error: {e}")
         finally:
             db.close()
+
+    def _never_challenged_live_peers(self, peers):
+        """The peers the integrity round challenges before its cursor.
+
+        A peer qualifies when it spoke for ITSELF (a key on file: _merge_peer
+        stores one only from the node's own signed announce), has never been
+        challenged (last_challenge_at is None; create_challenge stamps it
+        whatever the outcome, so a peer gets one prompt attempt, then the
+        cursor), and was heard from within the stale threshold (live: a
+        one-shot identity that announced once and went away drops out).
+        Newest first.  Relayed hints (no key) never jump the queue.
+        """
+        stale_s = getattr(self, 'stale_threshold',
+                          BANDWIDTH_PROFILES['full']['stale_threshold'])
+        horizon = datetime.utcnow() - timedelta(seconds=stale_s)
+        live = [p for p in peers
+                if p.public_key and p.last_challenge_at is None
+                and p.last_seen is not None and p.last_seen >= horizon]
+        return sorted(live, key=lambda p: p.last_seen, reverse=True)
 
     def _audit_peer_guardrails(self, db, peer):
         """Re-verify a peer's guardrail hash by directly querying it.
@@ -2230,435 +2806,6 @@ class GossipProtocol:
             return 0
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# AutoDiscovery — Zero-Config LAN Peer Finding via UDP Broadcast
-# ═══════════════════════════════════════════════════════════════════════
-
-class AutoDiscovery:
-    """LAN-based zero-config peer discovery using UDP broadcast.
-
-    After boot verification, broadcasts a signed beacon every 30s on UDP port 6780.
-    Listens for beacons from other nodes on the same network.
-    Discovered peers are fed into GossipProtocol as additional seeds.
-
-    This is ADDITIVE — works alongside seed peers and registry.
-    """
-
-    BEACON_MAGIC = b'HEVOLVE_DISCO_V1'
-    MAX_PACKET_SIZE = 2048
-
-    def __init__(self, gossip_protocol: GossipProtocol,
-                 port: int = None, beacon_interval: int = None):
-        self._gossip = gossip_protocol
-        from core.port_registry import get_port
-        # Legacy env var takes precedence for backward compat
-        _legacy = os.environ.get('HEVOLVE_DISCOVERY_PORT')
-        self._port = port or (int(_legacy) if _legacy else get_port('discovery'))
-        self._beacon_interval = beacon_interval or int(
-            os.environ.get('HEVOLVE_DISCOVERY_INTERVAL', '30'))
-        self._running = False
-        self._send_thread = None
-        self._recv_thread = None
-        self._lock = threading.Lock()
-        # First-beacon dedup (suppresses re-logging + re-gossiping the same
-        # node every ~30s beacon).  Was an unbounded `set` that only ever grew
-        # — on a long-running node in a churny LAN (peers cycling through new
-        # node_ids) it leaked memory without bound (#83).  TTLCache caps size
-        # (FIFO-evicts the oldest) and expires entries after a TTL, so a node
-        # absent for the TTL is simply re-discovered (re-logged once) if it
-        # returns — correct + bounded.  Accessed only from the single recv
-        # thread, so no extra locking needed.
-        self._discovered_nodes = TTLCache(
-            ttl_seconds=int(os.environ.get('HEVOLVE_DISCOVERY_DEDUP_TTL', '3600')),
-            max_size=int(os.environ.get('HEVOLVE_DISCOVERY_DEDUP_MAX', '2048')),
-            name='peer_discovered_nodes')
-        self._sock = None
-        # Cached list of broadcast addresses (one per usable IPv4 NIC).
-        # Refreshed on start; iterated each beacon send.  Replaces the
-        # naive `<broadcast>` (255.255.255.255) target which on multi-NIC
-        # Windows boxes (Wi-Fi + Hyper-V + VMware + Docker virtual NICs)
-        # leaves the box on a single OS-chosen interface — usually a
-        # virtual subnet, not the physical LAN where peers actually live.
-        self._broadcast_targets: list = []
-
-    def start(self) -> None:
-        """Start beacon sender and listener threads."""
-        import socket as _socket
-        with self._lock:
-            if self._running:
-                return
-            self._running = True
-
-        try:
-            self._sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-            self._sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
-            self._sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-            self._sock.bind(('', self._port))
-            self._sock.settimeout(2.0)
-        except OSError as e:
-            logger.warning(f"AutoDiscovery: cannot bind UDP port {self._port}: {e}")
-            self._running = False
-            return
-
-        # Enumerate per-NIC broadcast addresses.  Always include the
-        # limited-broadcast 255.255.255.255 as a fallback.
-        self._broadcast_targets = self._enumerate_broadcast_targets()
-        logger.info(f"AutoDiscovery broadcast targets: "
-                    f"{', '.join(self._broadcast_targets) or '<broadcast>'}")
-
-        self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
-        self._recv_thread.start()
-        self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
-        self._send_thread.start()
-        logger.info(f"AutoDiscovery started on UDP port {self._port} "
-                    f"(interval={self._beacon_interval}s)")
-
-    # NIC name patterns that indicate a virtual/tunnel adapter we
-    # should NOT broadcast onto.  Case-insensitive substring match.
-    # Catches WSL/Hyper-V vSwitch, VMware/VirtualBox host-only adapters,
-    # Bluetooth PAN, Docker bridges, and Windows loopback.
-    _VIRTUAL_NIC_HINTS = (
-        'loopback', 'pseudo', 'bluetooth', 'vethernet', 'wsl',
-        'hyper-v', 'vmware', 'virtualbox', 'vbox', 'docker',
-        'tap-', 'tun', 'npcap',
-    )
-
-    @staticmethod
-    def _derive_broadcast(addr: str, netmask: str) -> str:
-        """Compute IPv4 broadcast = addr | ~netmask.  Returns '' on parse failure."""
-        try:
-            a = [int(x) for x in addr.split('.')]
-            m = [int(x) for x in netmask.split('.')]
-            if len(a) != 4 or len(m) != 4:
-                return ''
-            bcast = [(a[i] | (~m[i] & 0xFF)) for i in range(4)]
-            return '.'.join(str(b) for b in bcast)
-        except Exception:
-            return ''
-
-    def _enumerate_broadcast_targets(self) -> list:
-        """Return one broadcast address per usable IPv4 NIC.
-
-        On Windows, ``sock.sendto((b'…', '<broadcast>', port))`` only
-        traverses the OS-chosen default-route interface.  On boxes with
-        multiple physical/virtual NICs this is roulette — the beacon
-        often leaves on a virtual NIC the LAN peers aren't on.
-
-        Implementation notes:
-        - psutil returns ``snic.broadcast = None`` on Windows even for
-          NICs with valid IPv4 addresses, so we derive broadcast from
-          ``address | ~netmask`` ourselves.
-        - We skip virtual / tunnel NICs by name (Bluetooth, vEthernet,
-          WSL, Hyper-V, VMware, Docker, loopback) so a beacon never
-          leaks into a virtual subnet our LAN peers aren't on.
-        - Fallback: if no usable NIC is found, return the limited
-          broadcast so degraded environments still emit something.
-        """
-        try:
-            import psutil
-        except ImportError:
-            return ['255.255.255.255']
-        targets = []
-        try:
-            stats = {}
-            try:
-                stats = psutil.net_if_stats()
-            except Exception:
-                pass
-            for nic_name, addrs in psutil.net_if_addrs().items():
-                # Skip virtual/tunnel NICs by name pattern.
-                lower_name = nic_name.lower()
-                if any(hint in lower_name for hint in self._VIRTUAL_NIC_HINTS):
-                    continue
-                # Skip if the NIC is down (when stats are available).
-                nic_stat = stats.get(nic_name)
-                if nic_stat is not None and not nic_stat.isup:
-                    continue
-                for snic in addrs:
-                    if getattr(snic, 'family', None) is None:
-                        continue
-                    fam_val = int(snic.family) if hasattr(snic.family, 'value') else snic.family
-                    if fam_val != 2:  # AF_INET
-                        continue
-                    addr = snic.address or ''
-                    netmask = snic.netmask or ''
-                    bcast = snic.broadcast or ''
-                    # Skip loopback (127.x) and APIPA (169.254.x).
-                    if addr.startswith('127.') or addr.startswith('169.254.'):
-                        continue
-                    # Derive broadcast on Windows (psutil leaves it None).
-                    if not bcast and netmask:
-                        bcast = self._derive_broadcast(addr, netmask)
-                    if not bcast:
-                        continue
-                    if bcast in ('0.0.0.0', '255.255.255.255'):
-                        continue  # Treat as "no useful broadcast"
-                    if bcast not in targets:
-                        targets.append(bcast)
-        except Exception as e:
-            logger.debug(f"AutoDiscovery NIC enumeration error: {e}")
-        # Always keep limited broadcast as a final fallback so a host
-        # without psutil-readable NICs (rare degraded environments) still
-        # gets at least one outbound packet.
-        if '255.255.255.255' not in targets:
-            targets.append('255.255.255.255')
-        return targets
-
-    def stop(self) -> None:
-        """Stop discovery threads and close socket."""
-        with self._lock:
-            self._running = False
-        if self._sock:
-            try:
-                self._sock.close()
-            except Exception:
-                pass
-
-    def _build_beacon(self) -> bytes:
-        """Build a signed beacon packet: MAGIC + JSON payload."""
-        import json as _json
-        payload = {
-            'type': 'hevolve-discovery',
-            'node_id': self._gossip.node_id,
-            'url': self._gossip.base_url,
-            'name': self._gossip.node_name,
-            'version': self._gossip.version,
-            'tier': self._gossip.tier,
-            'timestamp': int(time.time()),
-        }
-        try:
-            from security.hive_guardrails import get_guardrail_hash
-            payload['guardrail_hash'] = get_guardrail_hash()
-        except Exception:
-            pass
-        try:
-            from security.node_integrity import (
-                get_public_key_hex, compute_code_hash, sign_json_payload,
-            )
-            payload['public_key'] = get_public_key_hex()
-            payload['code_hash'] = compute_code_hash()
-        except Exception:
-            pass
-        # Include release version if manifest available
-        try:
-            from security.master_key import load_release_manifest
-            manifest = load_release_manifest()
-            if manifest:
-                payload['release_version'] = manifest.get('version', '')
-        except Exception:
-            pass
-        # Include X25519 public key for E2E encryption
-        try:
-            from security.channel_encryption import get_x25519_public_hex
-            payload['x25519_public'] = get_x25519_public_hex()
-        except Exception:
-            pass
-        # Include robot capabilities for fleet dispatch
-        try:
-            from integrations.robotics.capability_advertiser import (
-                get_capability_advertiser,
-            )
-            adv = get_capability_advertiser()
-            payload['robot_capabilities'] = adv.get_gossip_payload()
-        except Exception:
-            pass
-        try:
-            from security.node_integrity import sign_json_payload
-            payload['signature'] = sign_json_payload(payload)
-        except Exception:
-            pass
-
-        json_bytes = _json.dumps(payload, separators=(',', ':')).encode('utf-8')
-        return self.BEACON_MAGIC + json_bytes
-
-    def _parse_beacon(self, data: bytes) -> dict:
-        """Parse and verify a beacon packet. Returns payload dict or empty dict."""
-        import json as _json
-        if not data.startswith(self.BEACON_MAGIC):
-            return {}
-        try:
-            json_bytes = data[len(self.BEACON_MAGIC):]
-            payload = _json.loads(json_bytes.decode('utf-8'))
-        except (ValueError, UnicodeDecodeError):
-            return {}
-
-        # Untrusted UDP input: a valid-JSON NON-dict (e.g. b'[1,2,3]' or b'"x"')
-        # would sail past the except above, then the payload.get(...) calls below
-        # raise AttributeError — which is NOT caught here and would bubble into
-        # the recv loop. Reject anything that isn't a dict explicitly.
-        if not isinstance(payload, dict):
-            return {}
-
-        if payload.get('type') != 'hevolve-discovery':
-            return {}
-        # node_id is REQUIRED by the beacon spec and is used downstream as the
-        # dedup key and as `node_id[:8]` in the recv-loop log line. A beacon
-        # missing it (or carrying a non-string) would otherwise sail past here
-        # and crash the recv loop at node_id[:8]; reject it now, same as the
-        # type guard above (completes the malformed-beacon hardening).
-        node_id = payload.get('node_id')
-        if not isinstance(node_id, str) or not node_id:
-            return {}
-        if node_id == self._gossip.node_id:
-            return {}
-
-        # Verify guardrail hash
-        peer_hash = payload.get('guardrail_hash', '')
-        if peer_hash:
-            try:
-                from security.hive_guardrails import get_guardrail_hash
-                if peer_hash != get_guardrail_hash():
-                    logger.debug(f"AutoDiscovery: rejecting beacon from "
-                                 f"{payload.get('node_id', '?')[:8]}: guardrail mismatch")
-                    return {}
-            except Exception:
-                pass
-
-        # Verify code hash against release hash registry
-        peer_code_hash = payload.get('code_hash', '')
-        if peer_code_hash:
-            try:
-                from security.release_hash_registry import get_release_hash_registry
-                from security.master_key import get_enforcement_mode
-                registry = get_release_hash_registry()
-                if not registry.is_known_release_hash(peer_code_hash):
-                    enforcement = get_enforcement_mode()
-                    if enforcement == 'hard':
-                        logger.warning(
-                            f"AutoDiscovery: rejecting beacon from "
-                            f"{payload.get('node_id', '?')[:8]}: "
-                            f"unknown code hash {peer_code_hash[:16]}...")
-                        return {}
-                    elif enforcement in ('soft', 'warn'):
-                        logger.info(
-                            f"AutoDiscovery: unknown code hash from "
-                            f"{payload.get('node_id', '?')[:8]} "
-                            f"(enforcement={enforcement})")
-            except Exception:
-                pass
-
-        # Verify Ed25519 signature
-        sig = payload.get('signature')
-        pubkey = payload.get('public_key')
-        if sig and pubkey:
-            try:
-                from security.node_integrity import verify_json_signature
-                clean = {k: v for k, v in payload.items() if k != 'signature'}
-                if not verify_json_signature(pubkey, clean, sig):
-                    logger.warning(f"AutoDiscovery: invalid signature from "
-                                   f"{payload.get('node_id', '?')[:8]}")
-                    return {}
-            except Exception:
-                pass
-
-        # Reject stale beacons (> 5 minutes old)
-        ts = payload.get('timestamp', 0)
-        if abs(time.time() - ts) > 300:
-            return {}
-
-        return payload
-
-    def _send_loop(self) -> None:
-        """Periodically broadcast beacon on LAN.
-
-        Sleeps via ``NodeWatchdog.sleep_with_heartbeat`` so an interval
-        longer than the watchdog's frozen threshold (30s × 10 = 300s by
-        default) can't age the heartbeat out mid-sleep. The default
-        beacon interval is well below the threshold, but running with
-        HEVOLVE_BEACON_INTERVAL=600 (or similar operator overrides) used
-        to trigger the restart cascade documented in the 2026-04-11
-        incident.
-        """
-        while self._running:
-            try:
-                beacon = self._build_beacon()
-                # Send the beacon to every usable per-NIC broadcast
-                # address (Win11 multi-NIC: Wi-Fi + Hyper-V + VMware +
-                # Docker virtuals).  A failure on one NIC must not
-                # abort the round.
-                targets = self._broadcast_targets or ['255.255.255.255']
-                for tgt in targets:
-                    try:
-                        self._sock.sendto(beacon, (tgt, self._port))
-                    except Exception as e:
-                        logger.debug(f"AutoDiscovery send to {tgt} failed: {e}")
-            except Exception as e:
-                logger.debug(f"AutoDiscovery send error: {e}")
-            try:
-                from security.node_watchdog import get_watchdog
-                wd = get_watchdog()
-                if wd is not None:
-                    wd.sleep_with_heartbeat(
-                        'auto_discovery', self._beacon_interval,
-                        stop_check=lambda: not self._running,
-                    )
-                    continue
-            except Exception:
-                pass
-            # Fallback path if watchdog is unavailable: plain sleep +
-            # best-effort heartbeat. Preserves original behavior.
-            time.sleep(self._beacon_interval)
-
-    def _recv_loop(self) -> None:
-        """Listen for beacons from other nodes on the network.
-
-        The socket has a 2s timeout (set in start()) so recvfrom wakes
-        regularly and we can heartbeat between calls. The heartbeat is
-        now emitted on BOTH timeout and successful receipt — the
-        previous code only heartbeated on timeout, so a node that kept
-        receiving packets every 2s could still let the heartbeat age
-        if the recv path itself blocked past the frozen threshold.
-        """
-        import socket as _socket
-
-        def _wd_heartbeat_safe():
-            try:
-                from security.node_watchdog import get_watchdog
-                wd = get_watchdog()
-                if wd:
-                    wd.heartbeat('auto_discovery')
-            except Exception:
-                pass
-
-        while self._running:
-            try:
-                data, addr = self._sock.recvfrom(self.MAX_PACKET_SIZE)
-            except _socket.timeout:
-                _wd_heartbeat_safe()
-                continue
-            except OSError:
-                if not self._running:
-                    break
-                continue
-            # Successful receipt — refresh heartbeat before processing
-            # the payload, which involves JSON parsing + gossip handoff
-            # and could itself block for a noticeable fraction of a second.
-            _wd_heartbeat_safe()
-
-            payload = self._parse_beacon(data)
-            if not payload:
-                continue
-
-            node_id = payload.get('node_id')
-            if node_id in self._discovered_nodes:   # TTL-aware membership
-                continue
-
-            self._discovered_nodes[node_id] = True   # bounded; FIFO-evicts oldest
-            url = payload.get('url', '')
-            logger.info(f"AutoDiscovery: found node "
-                        f"{payload.get('name', node_id[:8])} at {url} via LAN")
-
-            # Feed into gossip
-            try:
-                self._gossip.handle_announce(payload)
-            except Exception:
-                pass
-            try:
-                self._gossip._announce_to_peer(url)
-            except Exception:
-                pass
-
-
 # Module-level singletons
 gossip = GossipProtocol()
 auto_discovery = AutoDiscovery(gossip)
@@ -2684,3 +2831,12 @@ def get_auto_discovery() -> AutoDiscovery:
     singleton wired here.
     """
     return auto_discovery
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HEVOLVE_REQUIRE_KNOWN_CODE_HASH',
+)

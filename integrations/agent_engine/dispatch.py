@@ -23,6 +23,7 @@ import requests
 from typing import Dict, List, Optional
 
 from core.http_pool import pooled_post
+from core.chat_client import daemon_request_id, normalize_chat_body
 from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
@@ -121,6 +122,42 @@ def _internal_auth_headers() -> Optional[Dict[str, str]]:
 _LOCAL_LLM_MAX_CONCURRENT = int(os.environ.get('HEVOLVE_LOCAL_LLM_MAX_CONCURRENT', '1'))
 _local_llm_semaphore = threading.Semaphore(_LOCAL_LLM_MAX_CONCURRENT)
 
+# How long a daemon turn WAITS for that permit before giving up.
+#
+# It was a flat 5 seconds, which turned ordinary contention into refusal: the
+# turn was handed back as 'deferred' and the coordinator paid a claim, a
+# deferral and an undeferral for work that only needed to wait its turn
+# (measured 2026-09-21: 18 such cycles in eight minutes).  The number now
+# comes from what a local model call actually costs on this node rather than
+# from taste -- 24,384 'total time' lines in llama_server_8080.log, the
+# server's own per-task figure:
+#
+#            whole file      last 4,000 calls
+#   p50         2.3 s              5.4 s
+#   p90         5.0 s             10.1 s
+#   p95         6.5 s             13.3 s
+#   p99        11.8 s             48.0 s
+#   longest    80.6 s             80.6 s
+#
+# So 5 s was not a rare miss: 2,475 of the last 4,000 calls (62%) run longer
+# than that, and the waiter gave up on most of them.  30 s covers 98.4% of
+# recent calls -- it is a real timeout, not a cover-everything one, and 66 of
+# those 4,000 would still expire it.  That is deliberate: past half a minute
+# the blocked worker thread costs more than the re-claim does.
+#
+# Read the two columns as a warning, not a trend.  The recent tail is
+# inflated by the runaway reuse loop still live on this node, which is
+# hammering the one slot; sizing this constant off that window alone would
+# bake a defect into a default.  HEVOLVE_LOCAL_LLM_WAIT_S overrides it on a
+# node whose model is slower or faster.
+#
+# Still fail-CLOSED: when the wait really does expire the answer is
+# 'deferred', never "proceed anyway".  Unbounded daemon concurrency is what
+# drove the llama-server watchdog-restart cascade this module was built
+# around, and the scheduler's own fail-open (right at the transport, where a
+# queue must never block a call) would be wrong here.
+_LOCAL_LLM_WAIT_S = float(os.environ.get('HEVOLVE_LOCAL_LLM_WAIT_S', '30'))
+
 
 # ── User-priority gate ──────────────────────────────────────────────────
 # When a human user is chatting, daemon dispatch must yield the LLM.
@@ -149,13 +186,78 @@ def get_last_yield_reason():
     return _last_yield_reason
 
 
+def _native_chat(text=None, user_id=None, agent_id=None, create_agent=True,
+                 casual_conv=False, autonomous=True, request_id=None,
+                 model_config=None, **_kw):
+    """NATIVE HARTOS (no Nunba adapter; that module lives only in Nunba): the
+    in-process /chat through the app's OWN test client, the SAME canonical
+    route the HTTP tier uses, minus the loopback socket, exactly as
+    routes.hartos_backend_adapter.chat does in Nunba.  Reuses the /chat
+    pipeline and _internal_auth_headers; no new dispatch path.  The /chat
+    body's model_config is the per-turn model override, so this path can run
+    a turn on a named model."""
+    from hart_intelligence_entry import app as _app
+    _payload = {
+        'prompt': text, 'user_id': user_id, 'prompt_id': agent_id,
+        'create_agent': create_agent, 'casual_conv': casual_conv,
+        'autonomous': autonomous, 'request_id': request_id,
+        'task_source': 'own',
+    }
+    if model_config:
+        _payload['model_config'] = model_config
+    with _app.test_client() as _c:
+        _r = _c.post('/chat', json=_payload, headers=_internal_auth_headers())
+        return _r.get_json() or {}
+
+
+def _in_process_chat(native_fallback=True, model_config=None):
+    """The callable that reaches this node's own /chat in-process, or None:
+    Nunba's adapter when it is present, else (with ``native_fallback``) the
+    native test-client path.
+
+    A turn that names its model (``model_config``) always takes the native
+    path (#106d).  Nunba's adapter builds its /chat body from named fields,
+    so it would drop the override and the turn would run on the default
+    model.  The native path posts to the same HARTOS app the adapter posts
+    to, as the speculative expert transport already does in bundled mode
+    (_dispatch_expert_langchain)."""
+    if model_config:
+        return _native_chat
+    try:
+        from routes.hartos_backend_adapter import chat
+        return chat
+    except ImportError:
+        logger.debug('routes.hartos_backend_adapter not importable; trying '
+                     'the flat adapter module')
+    try:
+        from hartos_backend_adapter import chat
+        return chat
+    except ImportError:
+        logger.debug('No Nunba backend adapter importable; native /chat '
+                     'fallback=%s', native_fallback)
+    return _native_chat if native_fallback else None
+
+
 def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
-                        native_fallback=True):
+                        native_fallback=True, model_config=None,
+                        cancel_event=None):
     """The ONE in-process call to this node's own /chat.  Returns
     ``(status, text)`` where status is ``'ok'`` (text is the reply),
     ``'deferred'`` (a human has the LLM, or it is saturated — retry later,
     NOT a failure) or ``'unavailable'`` (no in-process route; the caller may
-    fall back to its HTTP tier).
+    fall back to its HTTP tier).  ``model_config`` runs the turn on that
+    model; _in_process_chat says which path carries it.
+
+    ``cancel_event`` (a threading.Event): set by whoever stopped waiting for
+    this turn (the A2A task/cancel of a peer that gave up).  Honoured while
+    the turn waits for the LLM permit, right after it is taken, and during
+    the turn: it is bound to the turn's request id in core.llama_scheduler,
+    which refuses the turn's NEXT local LLM call (TurnCancelled), so the
+    turn ends and the permit comes back.  Returns ``('cancelled', None)``.
+    The one call already on the wire finishes: llama-server can abort a
+    request only by its connection closing, and the connection is the
+    SHARED background client (core.foreground's preempt), which would stop
+    every other background call too.
 
     ``native_fallback=False`` says "only use this if the Nunba adapter is
     present".  On native HARTOS (central) the loopback POST already reaches
@@ -196,42 +298,37 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
         absence is what pile-drove the local llama-server into the
         watchdog-restart cascade this module already documents.
     """
+    # #106b (b): the node's own LLM provider refusing the account.  The httpx
+    # feed (core.llm_outbound_logger) opens a per-host breaker on 401/402/403
+    # and closes it on a 2xx.  Check it FIRST, before resolving the route, so an
+    # OPEN breaker DEFERS regardless of whether an in-process route exists.  On
+    # native HARTOS (central) the worker calls with native_fallback=False, so
+    # _in_process_chat returns None and this function would otherwise answer
+    # 'unavailable' -- which sends the worker to its raw HTTP /chat POST
+    # (worker_loop), the path that bypasses this breaker (measured on central
+    # 2026-09-15: 402s kept firing per turn inside the OPEN window).  Returning
+    # 'deferred' re-queues the turn instead.  state() is NON-consuming (the feed
+    # is the sole resolver of the half-open probe); HALF_OPEN falls through and
+    # lets one turn run.  Keyed by the same _dispatch_provider_host as the feed;
+    # try/except so a check error never blocks a dispatch.
+    _prov_host = local_dispatch_provider_breaker_open(model_config)
+    if _prov_host:
+        logger.info(f"Provider {_prov_host} refusing the account (breaker "
+                    f"open), deferring local /chat for "
+                    f"{daemon_id or prompt_id}")
+        return 'deferred', None
+
+    # Any error resolving the path still lets the caller fall through to its
+    # HTTP tier (bounded-safe).
     try:
-        try:
-            from routes.hartos_backend_adapter import chat as hevolve_chat
-        except ImportError:
-            try:
-                from hartos_backend_adapter import chat as hevolve_chat
-            except ImportError:
-                if not native_fallback:
-                    # Native HARTOS and the caller has its own HTTP tier that
-                    # already reaches the right /chat here. Say so rather than
-                    # importing the Flask app into this thread.
-                    return 'unavailable', None
-                # NATIVE HARTOS (no Nunba adapter — the module lives only in
-                # Nunba): call the in-process /chat via the app's OWN test
-                # client, the SAME canonical route the HTTP tier uses, minus
-                # the loopback socket, exactly as
-                # routes.hartos_backend_adapter.chat does in Nunba.  Reuses
-                # the /chat pipeline + _internal_auth_headers; no new dispatch
-                # path.  Any error here still lets the caller fall through to
-                # its HTTP tier (bounded-safe).
-                def hevolve_chat(text=None, user_id=None, agent_id=None,
-                                 create_agent=True, casual_conv=False,
-                                 autonomous=True, request_id=None, **_kw):
-                    from hart_intelligence_entry import app as _app
-                    _payload = {
-                        'prompt': text, 'user_id': user_id, 'prompt_id': agent_id,
-                        'create_agent': create_agent, 'casual_conv': casual_conv,
-                        'autonomous': autonomous, 'request_id': request_id,
-                        'task_source': 'own',
-                    }
-                    with _app.test_client() as _c:
-                        _r = _c.post('/chat', json=_payload,
-                                     headers=_internal_auth_headers())
-                        return _r.get_json() or {}
+        hevolve_chat = _in_process_chat(native_fallback, model_config)
     except Exception as e:
         logger.debug(f"No in-process /chat route available: {e}")
+        return 'unavailable', None
+    if hevolve_chat is None:
+        # Native HARTOS and the caller has its own HTTP tier that already
+        # reaches the right /chat here. Say so rather than importing the Flask
+        # app into this thread.
         return 'unavailable', None
 
     # USER PRIORITY: if a user chatted recently, yield the LLM to them.
@@ -240,35 +337,99 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
                     f"deferring local /chat for {daemon_id or prompt_id}")
         return 'deferred', None
 
-    if not _local_llm_semaphore.acquire(timeout=5):
-        logger.info(f"LLM busy ({_LOCAL_LLM_MAX_CONCURRENT} in flight), "
-                    f"deferring local /chat for {daemon_id or prompt_id}")
+    if not _acquire_llm_permit(cancel_event):
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info(f"Local /chat for {daemon_id or prompt_id} cancelled "
+                        f"while waiting for the LLM permit")
+            return 'cancelled', None
+        logger.info(f"LLM busy ({_LOCAL_LLM_MAX_CONCURRENT} in flight) for "
+                    f"{_LOCAL_LLM_WAIT_S:.0f}s, deferring local /chat for "
+                    f"{daemon_id or prompt_id}")
         return 'deferred', None
+    if cancel_event is not None and cancel_event.is_set():
+        _local_llm_semaphore.release()
+        logger.info(f"Local /chat for {daemon_id or prompt_id} cancelled "
+                    f"before its turn; permit given back")
+        return 'cancelled', None
 
-    # Signal to the watchdog that this thread is in a legitimate LLM call.
-    _notify_watchdog_llm_start()
+    # The permit is held from here, so enter the try IMMEDIATELY: everything
+    # below must be inside it, because whatever raises, the finally is the
+    # only place that gives the permit back.  The watchdog notify used to sit
+    # between the acquire and the try, so a raise there leaked the semaphore
+    # permanently -- one permit, so the node's background LLM would have been
+    # wedged for the life of the process.
+    _bound = None
     try:
+        # Signal to the watchdog that this thread is in a legitimate LLM call.
+        _notify_watchdog_llm_start()
         # A daemon-specific request_id keeps background thinking traces out of
         # user responses via drain_thinking_traces(), and is what
         # dispatch.is_genuine_user_request reads to classify the turn.
-        request_id = f'daemon_{daemon_id}' if daemon_id is not None else None
+        request_id = daemon_request_id(daemon_id) if daemon_id is not None else None
+        if cancel_event is not None and request_id:
+            from core.llama_scheduler import get_scheduler
+            get_scheduler().bind_cancel(request_id, cancel_event)
+            _bound = request_id
         result = hevolve_chat(
             text=prompt, user_id=user_id, agent_id=prompt_id,
             create_agent=True, casual_conv=False, autonomous=True,
             request_id=request_id,
+            **({'model_config': model_config} if model_config else {}),
         )
     except Exception as e:
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info(f"Local /chat for {daemon_id or prompt_id} cancelled "
+                        f"mid-turn ({type(e).__name__}); permit given back")
+            return 'cancelled', None
         logger.warning(f"In-process /chat failed for {daemon_id or prompt_id}: {e}")
         return 'unavailable', None
     finally:
+        if _bound:
+            try:
+                from core.llama_scheduler import get_scheduler
+                get_scheduler().unbind_cancel(_bound)
+            except Exception as e:
+                # INFO: a binding left behind refuses every later call of
+                # that request id (review of f5c21ec2a).
+                logger.info(f"unbind_cancel({_bound}) failed: {e}")
         _local_llm_semaphore.release()
         try:
             _notify_watchdog_llm_end()
         except Exception:
-            pass
+            logger.debug('watchdog LLM-end notify failed', exc_info=True)
 
+    if cancel_event is not None and cancel_event.is_set():
+        # The turn swallowed the refusal and returned: its answer is for a
+        # caller that has gone.
+        return 'cancelled', None
     result = result or {}
+    # The Nunba adapter explicitly stamps an agent-addressed request made
+    # during HARTOS warm-up as loading.  That text is an availability notice,
+    # not work performed by the agent.  Returning it as ``ok`` let distributed
+    # workers submit it as a completed ledger result, which in turn emitted a
+    # success notification and polluted verified-learning inputs.  Keep the
+    # existing deferred outcome: every caller already knows it means retry
+    # later without falling through to a weaker, non-agent HTTP path.
+    if result.get('loading') or result.get('source') == 'hartos_loading':
+        logger.info('HARTOS still loading; deferring agent turn for %s',
+                    daemon_id or prompt_id)
+        return 'deferred', None
     return 'ok', (result.get('text') or result.get('response', ''))
+
+
+def _acquire_llm_permit(cancel_event=None) -> bool:
+    """Take the local LLM permit within _LOCAL_LLM_WAIT_S.  With a
+    cancel_event, wait in short slices and stop as soon as it is set."""
+    if cancel_event is None:
+        return _local_llm_semaphore.acquire(timeout=_LOCAL_LLM_WAIT_S)
+    deadline = _time.monotonic() + _LOCAL_LLM_WAIT_S
+    while not cancel_event.is_set():
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return False
+        if _local_llm_semaphore.acquire(timeout=min(0.25, remaining)):
+            return True
+    return False
 
 
 def _note_yield_reason(reason) -> None:
@@ -292,9 +453,35 @@ def _note_yield_reason(reason) -> None:
 def mark_user_chat_activity():
     """Call on every GENUINE user /chat request (including user-initiated
     autonomous CREATE).  MUST NOT be called for the agent_daemon's own
-    background dispatches — see is_genuine_user_request()."""
+    background dispatches (see is_genuine_user_request()).
+
+    Also touches the cross-process ``user-chat`` marker (core.foreground),
+    because hart-agent-daemon runs in its own process where this module's
+    ``_last_user_chat_at`` is the daemon's own, never-stamped copy; the
+    marker is how that process learns the person chatted.  Best-effort, so
+    a marker dir that is missing or not writable never affects the turn."""
     global _last_user_chat_at
     _last_user_chat_at = _time.time()
+    try:
+        from core.foreground import touch_marker, USER_CHAT_MARKER
+        touch_marker(USER_CHAT_MARKER)
+    except Exception:
+        logger.debug('user-chat marker touch failed', exc_info=True)
+
+
+def _user_chat_marker_recent() -> bool:
+    """Another process on this machine recorded a genuine user chat within
+    the cooldown window (core.foreground.marker_age_s: the youngest foreign
+    marker; a stale one or this process's own reads as no).  The writer need
+    not be alive: the chat is a fact about the person, and a backend restart
+    does not send them away.  Fail-open False, like the gate's other
+    best-effort reads."""
+    try:
+        from core.foreground import marker_age_s, USER_CHAT_MARKER
+        return marker_age_s(USER_CHAT_MARKER, _USER_CHAT_COOLDOWN,
+                            require_live=False) is not None
+    except Exception:
+        return False
 
 
 def is_genuine_user_request(request_id) -> bool:
@@ -389,10 +576,17 @@ def mark_create_end():
 
 
 def is_user_recently_active() -> bool:
-    """True if user chatted recently OR a CREATE pipeline is running."""
+    """True if user chatted recently OR a CREATE pipeline is running.
+
+    The in-process timestamp is the answer whenever it has ever been set
+    (this process served the chat and is the marker's writer).  Only when it
+    says nothing, which in the agent daemon's own process is always, does
+    the cross-process ``user-chat`` marker answer instead."""
     if _active_create_sessions > 0:
         return True
-    return (_time.time() - _last_user_chat_at) < _USER_CHAT_COOLDOWN
+    if _last_user_chat_at > 0.0:
+        return (_time.time() - _last_user_chat_at) < _USER_CHAT_COOLDOWN
+    return _user_chat_marker_recent()
 
 
 def is_transient_deferral() -> bool:
@@ -411,6 +605,20 @@ def is_transient_deferral() -> bool:
     try:
         if is_user_recently_active() or _cb_is_open():
             return True
+        # The node's own LLM provider refusing the account (#106b b) is a
+        # transient wait, not a dispatch failure: the goal should hold for the
+        # top-up, never accrue the 5-strike auto-pause (which would need a
+        # manual resume of every goal after the balance is restored).
+        try:
+            from core.circuit_breaker import (llm_provider_breaker,
+                                              provider_host, CircuitState)
+            from integrations.agent_engine.model_registry import _own_llm_target
+            _h = provider_host(str((_own_llm_target() or ('', ''))[0] or ''))
+            if _h and llm_provider_breaker.state(_h) == CircuitState.OPEN:
+                return True
+        except Exception:
+            logger.debug('provider-breaker check failed in '
+                         'is_transient_deferral', exc_info=True)
         # A goal whose in-flight LLM call was just PREEMPTED for a live user turn
         # (foreground abort / llama_scheduler eviction) is a transient defer too —
         # re-queue it next tick, never count it toward auto-pause.  The user may
@@ -420,6 +628,134 @@ def is_transient_deferral() -> bool:
         return preempted_recently()
     except Exception:
         return False
+
+
+# Why dispatch_goal last returned None for a goal whose turn ran and failed,
+# by goal id, for the callers that report it (the daemon's pause reason, the
+# MCP tool, a parallel subtask's ledger error).  Each dispatch_goal call
+# clears its goal's entry first and a read removes it, so a reason always
+# describes the latest call; the cap only bounds callers that never read.
+_TURN_FAILURES_MAX = 256
+_turn_failures: Dict[str, str] = {}
+_turn_failures_lock = threading.Lock()
+
+
+def _turn_failure(reply) -> Optional[str]:
+    """Why ``reply`` is a failed turn dressed as an answer, or None when it is
+    a real reply.
+
+    The pipeline does not raise when its LLM call fails: user_facing_error()
+    turns the exception into a polite sentence and the turn returns it as the
+    reply.  core.agent_tools.is_user_facing_error is the one recogniser;
+    worker_loop._after_response uses it the same way."""
+    from core.agent_tools import is_user_facing_error
+    if not is_user_facing_error(reply):
+        return None
+    return f'turn failed: {reply.strip()[:160]}'
+
+
+def _failed_turn(goal_id, reply) -> bool:
+    """True when ``reply`` is a failed turn, recording why for
+    dispatch_failure_reason(goal_id).
+
+    dispatch_goal used to return a failed turn's sentence as the goal's
+    response, so its callers counted it as work: a parallel subtask was
+    marked COMPLETED and unblocked its dependents, the daemon cleared the
+    goal's backoff, and a goal whose every turn failed (every hosted call
+    402 on central, 2026-09-14) was dispatched again each tick with no
+    backoff.  dispatch_goal now returns None for it, which every caller
+    treats as no result."""
+    reason = _turn_failure(reply)
+    if reason is None:
+        return False
+    with _turn_failures_lock:
+        _turn_failures[str(goal_id)] = reason
+        while len(_turn_failures) > _TURN_FAILURES_MAX:
+            _turn_failures.pop(next(iter(_turn_failures)))
+    logger.warning(f"Goal {goal_id}: {reason[:140]!r}; no response returned")
+    return True
+
+
+def dispatch_failure_reason(goal_id) -> Optional[str]:
+    """Why the latest dispatch_goal for ``goal_id`` returned None after its
+    turn ran and failed, or None.  Read once: the entry is removed."""
+    with _turn_failures_lock:
+        return _turn_failures.pop(str(goal_id), None)
+
+
+def _dispatch_provider_host(model_config) -> str:
+    """Host of the LLM endpoint this dispatch will use, for the provider
+    breaker (#106b b): the expert override's base_url when one is given, else
+    this node's own configured backend (model_registry._own_llm_target).  Only
+    the host is read — the base_url carries the API key and is never logged."""
+    try:
+        from core.circuit_breaker import provider_host
+        if model_config:
+            entry = model_config[0] if model_config else {}
+            return provider_host(str((entry or {}).get('base_url') or ''))
+        from integrations.agent_engine.model_registry import _own_llm_target
+        base_url, _model = _own_llm_target()
+        return provider_host(str(base_url or ''))
+    except Exception:
+        return ''
+
+
+def local_dispatch_llm_busy() -> bool:
+    """True when every local LLM slot is taken, so a dispatch right now would
+    only be deferred.
+
+    The fourth of local_chat_dispatch's defer conditions, and the one the
+    distributed worker could not ask: measured live 2026-09-21 on the
+    installed build, 18 claims and 18 deferrals in eight minutes, each
+    claiming a task, blocking the full five seconds of
+    ``_local_llm_semaphore.acquire(timeout=5)``, then deferring, and costing
+    the coordinator a claim, a deferral and an undeferral write.
+
+    Asks core.llama_scheduler, the node's one admission controller for the
+    local model: it already knows the server's real slot count and what holds
+    each slot, and it is where every llama call is admitted regardless of
+    transport.  Reading it rather than a private counter here means the
+    worker and the dispatcher cannot disagree about capacity, and there is no
+    second tally to drift or leak.
+
+    Not re-entrant, which is why this only READS.  A slot is keyed by a
+    unique token, so acquiring one here would consume a second slot for the
+    same logical turn, and on a one-slot node the inner transport acquire
+    would then wait out its whole timeout for a slot this function is
+    holding.
+
+    Racy by nature and deliberately so: a stale False claims and defers
+    exactly as before, a stale True skips one tick.  Fail-OPEN like its three
+    siblings -- any read error answers False, "not busy" -- because a
+    capacity check must be able to skip a tick and never to wedge the worker.
+    """
+    try:
+        from core.llama_scheduler import get_scheduler
+        s = get_scheduler().stats()
+        return int(s.get('in_flight', 0)) >= int(s.get('n_slots', 1))
+    except Exception:
+        return False
+
+
+def local_dispatch_provider_breaker_open(model_config=None) -> str:
+    """The host whose provider breaker is OPEN for this dispatch, else ''.
+
+    The check local_chat_dispatch makes first (#106b b), in one place so the
+    distributed worker can ask it BEFORE claim_next_task: a claim the
+    dispatcher would only defer costs the coordinator ledger three full
+    writes (claim, defer, undefer).  state() is non-consuming: the httpx feed
+    stays the sole resolver of the half-open probe.  A check error is '' --
+    a breaker-check error must never block a dispatch.
+    """
+    try:
+        from core.circuit_breaker import llm_provider_breaker, CircuitState
+        host = _dispatch_provider_host(model_config)
+        if host and llm_provider_breaker.state(host) == CircuitState.OPEN:
+            return host
+    except Exception:
+        logger.debug('provider-breaker check failed; not blocking the '
+                     'dispatch', exc_info=True)
+    return ''
 
 
 # Concurrency ceiling for autonomous dispatch — single source both daemons call
@@ -467,6 +803,19 @@ def should_yield_to_user() -> bool:
 
     1. ``is_user_recently_active()`` — user chatted in the last 10
        minutes or a CREATE pipeline is running.
+    1b. ``ResourceGovernor.user_present()`` — a person is AT THE DESK:
+       the governor's live monitor last read the OS idle probe (the
+       compositor's input-alive heartbeat on HART OS, GetLastInputInfo
+       on Windows, IOHIDSystem on macOS) as not idle. Chatting is not
+       the only way to be present; clicking around the desktop is the
+       common one, and it was invisible here until 2026-09-24. Reason
+       #3 was supposed to cover it (ACTIVE mode -> throttle 0.05) but
+       ACTIVE_CPU_LIMIT has been 0.50 by default, above the 0.3 floor,
+       so it never fired for presence. Measured on generation 11 of the
+       Samsung box: llama calls once a minute through seven minutes of
+       continuous input, 94 C, 1.1 GHz, press p50 600-1500 ms. A governor
+       with no live monitor answers False, so a process that never
+       started one keeps the old behaviour instead of stalling.
     2. ``model_lifecycle.get_system_pressure().throttle_factor < 0.1``
        — VRAM/CPU pressure is so high the LLM throttle factor has
        collapsed; running another LLM call would saturate the
@@ -505,7 +854,7 @@ def should_yield_to_user() -> bool:
         if foreground_active():
             reason = 'foreground_request'
     except Exception:
-        pass
+        logger.debug('yield gate: foreground check failed', exc_info=True)
     # Reason #1 — user recently active (is_user_recently_active stays the
     # single source; we only LABEL which sub-condition fired).
     if reason is None:
@@ -514,8 +863,20 @@ def should_yield_to_user() -> bool:
                 reason = ('create_in_flight' if _active_create_sessions > 0
                           else 'user_active')
         except Exception:
-            pass
+            logger.debug('yield gate: user-activity check failed',
+                         exc_info=True)
     # Reason #2 — LLM throttle collapsed under VRAM/CPU pressure.
+    if reason is None:
+        try:
+            from core.resource_governor import get_governor
+            _present = getattr(get_governor(), 'user_present', None)
+            # `is True`, not truthiness: a fake governor in a test is often a
+            # MagicMock, whose every attribute call is truthy.
+            if callable(_present) and _present() is True:
+                reason = 'user_present'
+        except Exception:
+            logger.debug('yield gate: user-presence check failed',
+                         exc_info=True)
     if reason is None:
         try:
             from integrations.service_tools.model_lifecycle import (
@@ -524,7 +885,8 @@ def should_yield_to_user() -> bool:
             if _pressure.get('throttle_factor', 1.0) < 0.1:
                 reason = 'model_pressure'
         except Exception:
-            pass
+            logger.debug('yield gate: model-pressure check failed',
+                         exc_info=True)
     # Reason #3 — generic resource-governor throttle (now driven by
     # EXTERNAL cpu, so our OWN idle-compute work no longer trips this).
     if reason is None:
@@ -534,7 +896,8 @@ def should_yield_to_user() -> bool:
             if _gov is not None and _gov.get_throttle() < _GATE_THROTTLE_FLOOR:
                 reason = 'governor_throttle'
         except Exception:
-            pass
+            logger.debug('yield gate: governor throttle check failed',
+                         exc_info=True)
     _note_yield_reason(reason)
     return reason is not None
 
@@ -549,7 +912,8 @@ try:
     from core.foreground import set_yield_gate as _set_yield_gate
     _set_yield_gate(should_yield_to_user)
 except Exception:
-    pass
+    logger.debug('core.foreground yield-gate registration failed; the core '
+                 'accessor fails open', exc_info=True)
 
 
 def _notify_watchdog_llm_start():
@@ -583,9 +947,9 @@ def _notify_watchdog_llm_start():
                 wd.mark_in_llm_call(source)
                 return
         except Exception:
-            pass
+            logger.debug('watchdog task-source lookup failed', exc_info=True)
     except Exception:
-        pass
+        logger.debug('watchdog LLM-start marker failed', exc_info=True)
 
 
 def _notify_watchdog_llm_end():
@@ -598,7 +962,7 @@ def _notify_watchdog_llm_end():
                 wd.clear_llm_call(name)
                 wd.heartbeat(name)
     except Exception:
-        pass
+        logger.debug('watchdog LLM-end marker clear failed', exc_info=True)
 
 
 def _get_distributed_coordinator():
@@ -652,7 +1016,8 @@ def _decompose_goal(prompt: str, goal_id: str, goal_type: str,
             prompt, goal_id, goal_type, user_id, subtask_defs)
         return tasks
     except Exception:
-        pass
+        logger.debug('ledger decomposition unavailable for goal %s; using a '
+                     'single task', goal_id, exc_info=True)
 
     # capabilities are NOT goal types.  A worker claims a task only when one
     # of the names here is in its own advertised set
@@ -687,12 +1052,37 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
         return None
 
     tasks = _decompose_goal(prompt, goal_id, goal_type, user_id)
+
+    # A continuous goal's hive task is re-armed after every finished run
+    # (owner decision 2026-09-13), and submit_goal can only do that if told.
+    # Same read-only goal lookup dispatch_goal already does for its guardrail
+    # checks.  A failed lookup means "not continuous": a missed re-arm, never
+    # a wrong one.
+    continuous = False
+    try:
+        from integrations.social.models import db_session, AgentGoal
+        with db_session(commit=False) as _cdb:
+            _crow = _cdb.query(AgentGoal).filter_by(id=goal_id).first()
+            continuous = bool(_crow is not None
+                              and (_crow.config_json or {}).get('continuous'))
+    except Exception as _cerr:
+        logger.debug(f"continuous lookup failed for goal {goal_id}: {_cerr}")
+
+    # The context goes to the shared coordinator ledger and to gossip peers:
+    # other people's nodes.  A real user id must not (owner's egress ruling,
+    # 2026-09-26), so the ``user_id`` slot carries an opaque per-goal handle
+    # this node maps back (integrations.distributed_agent.requesters): its own
+    # worker runs the task as the person, and the contribution notification
+    # reaches them.  A remote worker runs under the handle; it has no such
+    # user either way.
+    from integrations.distributed_agent.requesters import requester_handle
     context = {
         'goal_type': goal_type,
-        'user_id': user_id,
+        'user_id': requester_handle(goal_id, user_id),
         'prompt': prompt,
         'source_node': os.environ.get('HEVOLVE_NODE_ID', 'unknown'),
         'task_source': 'hive',
+        'continuous': continuous,
     }
 
     try:
@@ -798,6 +1188,10 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     Returns:
         Response text or None on failure
     """
+    # A failure reason describes this call only (dispatch_failure_reason).
+    with _turn_failures_lock:
+        _turn_failures.pop(str(goal_id), None)
+
     # BUDGET GATE: check goal budget + platform affordability before dispatch
     try:
         from integrations.agent_engine.budget_gate import pre_dispatch_budget_gate
@@ -806,7 +1200,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             logger.warning(f"Dispatch blocked by budget gate for {goal_type} goal {goal_id}: {bg_reason}")
             return None
     except ImportError:
-        pass
+        logger.warning('budget_gate not importable; goal %s dispatched without '
+                       'the budget check', goal_id)
 
     # TOOL ALLOWLIST: resolve model tier and attach to dispatch context.
     # Tier is sent to /chat as body['model_tier']; create_recipe uses it
@@ -817,14 +1212,18 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             from integrations.agent_engine.model_registry import model_registry
             first_model = model_config[0].get('model', '') if model_config else ''
             if first_model:
-                info = model_registry.get(first_model)
-                if info:
-                    _dispatch_model_tier = (info.get('tier') or info.get('model_tier'))
+                # get_model: the registry has no get(), and the AttributeError
+                # was swallowed below, so no override ever carried its tier.
+                backend = model_registry.get_model(first_model)
+                if backend is not None:
+                    _dispatch_model_tier = backend.tier
                     if _dispatch_model_tier:
                         logger.info(f"Dispatch model tier: {_dispatch_model_tier.value} "
                                     f"for {goal_type} goal {goal_id}")
         except Exception:
-            pass  # Model registry unavailable — no tier restriction
+            # Model registry unavailable — no tier restriction
+            logger.debug('model registry unavailable for goal %s; no tier '
+                         'restriction', goal_id, exc_info=True)
 
     # GUARDRAIL: full pre-dispatch gate (fail-closed: block if guardrails unavailable)
     # Pass the goal dict + user_id so before_dispatch's goal-specific checks
@@ -860,11 +1259,26 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             action=f'dispatch {goal_type} goal {goal_id}',
             target_id=goal_id)
     except Exception:
-        pass  # Audit is best-effort
+        # Audit is best-effort
+        logger.debug('audit log write failed for goal %s', goal_id,
+                     exc_info=True)
+
+    # A turn with a model override runs HERE, never on the hive.  The hive
+    # task carries no model config (an override's entry can hold a peer's
+    # token and is never written to the ledger), so a distributed submit
+    # would run the goal on the worker's own model and, since submit_goal
+    # dedups onto the existing task set, would not even do that.  Today the
+    # one caller that passes model_config is the daemon's expert turn
+    # (#106d): with it distributed, the daemon's settle judged an instant
+    # "turn" that never ran and parked the goal for a person one tick
+    # later, so on a node with peers the expert never got its turn.  ONE
+    # decision for both distributed branches below (hartos-3e review of
+    # 510392ae4: the robot branch had escaped the guard).
+    _can_distribute = not model_config
 
     # ROBOT: capability-matched dispatch — prefer distributed for hardware mismatches
     _tried_distributed = False
-    if not _check_robot_capability_match(goal_type, goal_id):
+    if _can_distribute and not _check_robot_capability_match(goal_type, goal_id):
         coordinator = _get_distributed_coordinator()
         if coordinator and _has_hive_peers():
             _tried_distributed = True
@@ -875,7 +1289,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
 
     # DISTRIBUTED: auto-distribute when coordinator is reachable and hive has peers
     # Skip if robot dispatch already tried distributed (avoid double submission)
-    if not _tried_distributed:
+    if _can_distribute and not _tried_distributed:
         coordinator = _get_distributed_coordinator()
         if coordinator and _has_hive_peers():
             result = dispatch_goal_distributed(prompt, user_id, goal_id, goal_type)
@@ -911,17 +1325,51 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     #   Tier 3: llama.cpp fallback (direct LLM, no agent pipeline)
     resp = None
 
+    # #106b (b): goal-level early-out that also records dispatch_failure_reason.
+    # The AUTHORITATIVE consumer is in local_chat_dispatch (the convergence
+    # layer every dispatch path uses, including the worker that never calls
+    # dispatch_goal); this checks the SAME breaker with the SAME key
+    # (_dispatch_provider_host) first, so it cannot diverge -- it just lets a
+    # goal turn skip the local_chat_dispatch call and names the host in the
+    # reason.  Don't start a turn on a provider that is refusing the account.
+    # The httpx feed (core.llm_outbound_logger) opens a per-host breaker on
+    # 401/402/403 and closes it on a 2xx.  Here we only READ it via state()
+    # (which does NOT consume the half-open probe — the feed is the sole
+    # consumer that resolves it), and refuse only when OPEN, keyed by the host
+    # THIS turn will use (the expert override's endpoint, else this node's own
+    # configured backend).  A refusal is a transient wait (is_transient_deferral
+    # counts it), not a dispatch failure, so goals hold for the top-up instead
+    # of accruing auto-pause strikes; on central 2026-09-14 every hosted call
+    # 402'd and the daemon re-tried every tick.
+    _prov_host = _dispatch_provider_host(model_config)
+    if _prov_host:
+        try:
+            from core.circuit_breaker import (llm_provider_breaker,
+                                              CircuitState)
+            if llm_provider_breaker.state(_prov_host) == CircuitState.OPEN:
+                _reason = (f'provider {_prov_host} is refusing the account '
+                           f'(breaker open)')
+                with _turn_failures_lock:
+                    _turn_failures[str(goal_id)] = _reason
+                logger.warning(f"Goal {goal_id}: {_reason}; not dispatching "
+                               f"this tick")
+                return None
+        except Exception:
+            logger.debug('provider-breaker check failed for goal %s',
+                         goal_id, exc_info=True)
+
     # Tier 1: the canonical in-process /chat call.  The adapter resolution,
     # the user-priority gate and the local-LLM semaphore all live in
     # local_chat_dispatch now, so the instruction queue and the distributed
     # worker reach /chat exactly the way this goal path does instead of
     # hand-rolling a raw POST that lands on Nunba's route.
     _status, response = local_chat_dispatch(
-        prompt, user_id, prompt_id, daemon_id=goal_id)
+        prompt, user_id, prompt_id, daemon_id=goal_id, model_config=model_config)
     if _status == 'deferred':
         return None
     if _status == 'ok' and response:
-        return response
+        # A turn that ran and failed is not retried on Tier 2 in the same call.
+        return None if _failed_turn(goal_id, response) else response
 
     # Tier 2: HTTP proxy to HARTOS backend port
     # Circuit breaker: skip HTTP if server recently unresponsive
@@ -932,12 +1380,19 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     base_url = _local_dispatch_base_url()  # #71: probe live port, not dead 6777
 
     try:
-        resp = pooled_post(f'{base_url}/chat', json=body,
+        # Tagged like Tier 1 (daemon_<goal_id>) so the create pipeline runs the
+        # turn AUTONOMOUS; an untagged body reads as a live user (#97).
+        resp = pooled_post(f'{base_url}/chat',
+                           json=normalize_chat_body(body, daemon_id=goal_id),
                            headers=_internal_auth_headers(), timeout=120)
         if resp.status_code == 200:
             _cb_record_success()
             result = resp.get_json() if hasattr(resp, 'get_json') else resp.json()
             response = result.get('response', '')
+            # Before the guardrail and the world-model record: a failed turn
+            # is neither a response nor training data.
+            if _failed_turn(goal_id, response):
+                return None
 
             # GUARDRAIL: post-response check (fail-closed)
             try:
@@ -981,7 +1436,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                     goal_id=goal_id,
                 )
             except Exception:
-                pass
+                logger.debug('world-model record failed for goal %s',
+                             goal_id, exc_info=True)
 
             return response
         else:
@@ -1001,7 +1457,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                         related_goal_id=goal_id,
                     )
                 except Exception:
-                    pass
+                    logger.warning('goal %s not re-queued after HTTP %s',
+                                   goal_id, resp.status_code, exc_info=True)
     except requests.RequestException as e:
         _cb_record_failure()
         logger.warning(f"Goal dispatch failed for {goal_type} goal {goal_id}: {e}")
@@ -1050,7 +1507,9 @@ def _dispatch_single_instruction(base_url: str, user_id: str, inst,
         inst.text, user_id, body['prompt_id'], daemon_id=batch_id,
         native_fallback=False)
     if _status == 'ok' and _text:
-        return (inst.id, _text[:500], None)
+        # A failed turn is not the instruction's result (_turn_failure).
+        _failed = _turn_failure(_text)
+        return (inst.id, None, _failed) if _failed else (inst.id, _text[:500], None)
     if _status == 'deferred':
         # A human has the LLM, or it is saturated. NOT a failure: reporting it
         # as one burns an attempt and (once instructions get an attempt cap)
@@ -1058,11 +1517,15 @@ def _dispatch_single_instruction(base_url: str, user_id: str, inst,
         return (inst.id, None, 'deferred: user active or LLM busy')
 
     try:
-        resp = pooled_post(f'{base_url}/chat', json=body,
+        # Same daemon_<batch_id> tag as the in-process call above (#97).
+        resp = pooled_post(f'{base_url}/chat',
+                           json=normalize_chat_body(body, daemon_id=batch_id),
                            headers=_internal_auth_headers(), timeout=300)
         if resp.status_code == 200:
             result_text = resp.json().get('response', '')
-            return (inst.id, result_text[:500], None)
+            _failed = _turn_failure(result_text)
+            return ((inst.id, None, _failed) if _failed
+                    else (inst.id, result_text[:500], None))
         return (inst.id, None, f'HTTP {resp.status_code}')
     except requests.RequestException as e:
         return (inst.id, None, str(e))

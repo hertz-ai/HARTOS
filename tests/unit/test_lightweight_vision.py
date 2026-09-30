@@ -87,18 +87,121 @@ class TestMiniCPMBackend:
             assert backend._port == 9999
 
     def test_describe_http_call(self):
-        """describe() makes HTTP POST to MiniCPM sidecar."""
+        """describe() makes HTTP POST to MiniCPM sidecar.
+
+        The response key is `result` — that is what minicpm_server.py's
+        describe_raw() returns.  This test used to assert `description`,
+        a key no HART OS server has ever produced, so the mock agreed
+        with the client while the client disagreed with the server.
+        test_describe_matches_the_real_sidecar_contract (below) is the
+        one that can catch that, because it drives the real server view.
+        """
         import integrations.vision.lightweight_backend as lvb
         backend = MiniCPMBackend(port=9891)
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {'description': 'A cat sitting on a desk'}
+        mock_resp.json.return_value = {'result': 'A cat sitting on a desk'}
 
         with patch.object(lvb, 'pooled_post',
                           return_value=mock_resp) as mock_post:
             result = backend.describe(b'fake_jpeg_bytes')
             assert result == 'A cat sitting on a desk'
             mock_post.assert_called_once()
+
+    def test_describe_matches_the_real_sidecar_contract(self):
+        """The request describe() builds is one minicpm_server actually serves.
+
+        Both halves are real: MiniCPMBackend.describe builds the request,
+        and integrations.vision.minicpm_server's own Flask view handles it
+        (only the weights are stubbed).  A base64-JSON body — what this
+        client sent before 2026-09-21 — reaches PIL.Image.open as JSON
+        text and comes back HTTP 500, so this fails on the old shape.
+        """
+        import integrations.vision.lightweight_backend as lvb
+        from integrations.vision import minicpm_server
+
+        png = (b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00'
+               b'\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx'
+               b'\x9cc```\x00\x00\x00\x04\x00\x01\xf6\x178U\x00\x00\x00\x00I'
+               b'END\xaeB`\x82')
+        client = minicpm_server.app.test_client()
+        seen = {}
+
+        def _forward(url, **kwargs):
+            seen['url'] = url
+            resp = client.post(
+                '/describe',
+                data=kwargs.get('data'),
+                query_string=kwargs.get('params') or {},
+                headers=kwargs.get('headers') or {},
+            )
+            out = MagicMock()
+            out.status_code = resp.status_code
+            out.json.return_value = resp.get_json()
+            out.text = resp.get_data(as_text=True)
+            return out
+
+        with patch.object(minicpm_server, '_process_image_sync',
+                          lambda image, prompt: f'a 1x1 image; asked: {prompt}'), \
+             patch.object(lvb, 'pooled_post', _forward):
+            result = MiniCPMBackend(port=9891).describe(png, 'What is this?')
+
+        assert result == 'a 1x1 image; asked: What is this?'
+        assert seen['url'].endswith('/describe')
+
+    def test_is_available_needs_the_weights_not_just_a_gpu(self):
+        """A GPU with no MiniCPM weights is not a MiniCPM node.
+
+        get_vision_backend() gates its catalog branch and its last-resort
+        branch on this, so a True here made a node SELECT a backend with
+        nothing behind it.
+        """
+        from integrations.vision import minicpm_installer as mi
+
+        backend = MiniCPMBackend()
+        with patch.object(mi.MiniCPMInstaller, 'detect_gpu', return_value=True), \
+             patch.object(mi.MiniCPMInstaller, 'is_installed', return_value=False):
+            assert backend.is_available() is False
+        with patch.object(mi.MiniCPMInstaller, 'detect_gpu', return_value=True), \
+             patch.object(mi.MiniCPMInstaller, 'is_installed', return_value=True):
+            assert backend.is_available() is True
+        with patch.object(mi.MiniCPMInstaller, 'detect_gpu', return_value=False), \
+             patch.object(mi.MiniCPMInstaller, 'is_installed', return_value=True):
+            assert backend.is_available() is False
+
+    def test_resolve_port_prefers_the_sidecar_runtime_manager_started(self):
+        """A RUNNING RTM sidecar's dynamic port wins over the fixed 9891.
+
+        RTM allocates an OS-assigned port; before this, MiniCPMBackend only
+        ever read port_registry's 'vision', so start_tool('minicpm') could
+        succeed while the backend posted into a dead port.
+        """
+        from integrations.service_tools import runtime_manager as rm
+
+        backend = MiniCPMBackend()
+        registry_port = backend._registry_port
+
+        fake_rtm = MagicMock()
+        fake_rtm.get_tool_port.return_value = 55897
+        with patch.object(rm, 'runtime_tool_manager', fake_rtm):
+            assert backend._resolve_port() == 55897
+        fake_rtm.get_tool_port.assert_called_with('minicpm')
+
+        # Nothing running -> fall back to the fixed-port deployment
+        fake_rtm.get_tool_port.return_value = None
+        with patch.object(rm, 'runtime_tool_manager', fake_rtm):
+            assert backend._resolve_port() == registry_port
+
+    def test_explicit_port_outranks_the_runtime_manager(self):
+        """HEVOLVE_MINICPM_PORT / port= is an operator override; it wins."""
+        from integrations.service_tools import runtime_manager as rm
+
+        fake_rtm = MagicMock()
+        fake_rtm.get_tool_port.return_value = 55897
+        with patch.object(rm, 'runtime_tool_manager', fake_rtm):
+            assert MiniCPMBackend(port=9999)._resolve_port() == 9999
+            with patch.dict(os.environ, {'HEVOLVE_MINICPM_PORT': '7777'}):
+                assert MiniCPMBackend()._resolve_port() == 7777
 
     def test_describe_failure_returns_none(self):
         import integrations.vision.lightweight_backend as lvb
@@ -271,6 +374,167 @@ class TestGetVisionBackend:
              patch.object(MiniCPMBackend, 'is_available', return_value=False):
             backend = get_vision_backend()
             assert backend.name == 'none'
+
+
+class TestReadDocument:
+    """read_document(): a book page through the node's own vision backend."""
+
+    @staticmethod
+    def _page(size=(1700, 2200)):
+        import io
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new('RGB', size, 'white').save(buf, 'JPEG')
+        return buf.getvalue()
+
+    @staticmethod
+    def _answer(content='page text', finish='stop', status=200):
+        resp = MagicMock(status_code=status)
+        resp.json.return_value = {'choices': [{'message': {'content': content},
+                                               'finish_reason': finish}]}
+        return resp
+
+    @staticmethod
+    def _sent_size(post):
+        import base64
+        import io
+        from PIL import Image
+        url = post.call_args.kwargs['json']['messages'][0]['content'][0]['image_url']['url']
+        with Image.open(io.BytesIO(base64.b64decode(url.split(',', 1)[1]))) as im:
+            return im.size
+
+    @pytest.mark.parametrize("cls", [MiniCPMBackend, MobileVLMBackend,
+                                      CLIPBackend, NoneBackend])
+    def test_a_backend_that_cannot_read_a_page_says_so(self, cls):
+        """None, so the caller reads the page from elsewhere -- never a scene
+        label or a caption stored as the page's text."""
+        assert cls().read_document(self._page(), 'read it') is None
+
+    def test_the_caption_server_reads_a_page_at_a_readable_size(self):
+        import integrations.vision.lightweight_backend as lvb
+        from core.http_pool import LLM_COMPLETION_TIMEOUT
+        backend = lvb.Qwen08BBackend(port=9555)
+        with patch.object(backend, '_ensure_running', return_value=True), \
+             patch.object(lvb, 'pooled_post', return_value=self._answer()) as post:
+            assert backend.read_document(self._page(), 'read every line') == 'page text'
+        # The caption server's own port, the one describe() uses.
+        assert post.call_args.args[0] == 'http://127.0.0.1:9555/v1/chat/completions'
+        body = post.call_args.kwargs['json']
+        assert body['chat_template_kwargs'] == {'enable_thinking': False}
+        assert body['max_tokens'] == lvb.PAGE_MAX_TOKENS
+        assert post.call_args.kwargs['timeout'] == LLM_COMPLETION_TIMEOUT
+        assert body['messages'][0]['content'][1] == {'type': 'text', 'text': 'read every line'}
+        # Not the caption shrink (512x288): the long side at PAGE_LONG_SIDE.
+        assert self._sent_size(post) == (989, lvb.PAGE_LONG_SIDE)
+
+    def test_a_small_page_is_not_enlarged(self):
+        import integrations.vision.lightweight_backend as lvb
+        backend = lvb.Qwen08BBackend(port=9555)
+        with patch.object(backend, '_ensure_running', return_value=True), \
+             patch.object(lvb, 'pooled_post', return_value=self._answer()) as post:
+            backend.read_document(self._page((600, 800)), 'x')
+        assert self._sent_size(post) == (600, 800)
+
+    def test_no_caption_server_means_no_request(self):
+        import integrations.vision.lightweight_backend as lvb
+        backend = lvb.Qwen08BBackend(port=9555)
+        with patch.object(backend, '_ensure_running', return_value=False), \
+             patch.object(lvb, 'pooled_post') as post:
+            assert backend.read_document(self._page(), 'x') is None
+        post.assert_not_called()
+
+    @pytest.mark.parametrize('answer,expected', [
+        (dict(content=''), ''),                          # answered with nothing
+        (dict(content='cut off', finish='length'), 'cut off'),
+        (dict(status=500), None),
+    ])
+    def test_what_the_server_answered_is_what_comes_back(self, answer, expected):
+        import integrations.vision.lightweight_backend as lvb
+        backend = lvb.Qwen08BBackend(port=9555)
+        with patch.object(backend, '_ensure_running', return_value=True), \
+             patch.object(lvb, 'pooled_post', return_value=self._answer(**answer)):
+            assert backend.read_document(self._page(), 'x') == expected
+
+    def test_an_unreachable_server_is_none_not_an_exception(self):
+        import requests
+        import integrations.vision.lightweight_backend as lvb
+        backend = lvb.Qwen08BBackend(port=9555)
+        with patch.object(backend, '_ensure_running', return_value=True), \
+             patch.object(lvb, 'pooled_post', side_effect=requests.ConnectionError('refused')):
+            assert backend.read_document(self._page(), 'x') is None
+
+    def test_qwen3vl_reads_a_page_through_its_own_endpoint(self):
+        import integrations.vision.lightweight_backend as lvb
+        backend = lvb.Qwen3VLVisionBackend()
+        backend._backend = MagicMock(base_url='http://10.0.0.5:7000/v1/',
+                                     model_name='qwen-vl', api_key='k')
+        with patch.object(lvb, 'pooled_post', return_value=self._answer('p')) as post:
+            assert backend.read_document(self._page(), 'x') == 'p'
+        assert post.call_args.args[0] == 'http://10.0.0.5:7000/v1/chat/completions'
+        assert post.call_args.kwargs['headers'] == {'Authorization': 'Bearer k'}
+        assert post.call_args.kwargs['json']['model'] == 'qwen-vl'
+        assert post.call_args.kwargs['json']['chat_template_kwargs'] == {'enable_thinking': False}
+
+
+class TestDocumentReaders:
+    """get_document_readers(): the vision backend first, then the node's own
+    main model -- where book pages were read before -- so no node reads
+    fewer pages than it did."""
+
+    MAIN = 'http://127.0.0.1:8123/v1'
+
+    def _readers(self, node, main=MAIN):
+        import integrations.vision.lightweight_backend as lvb
+        with patch.object(lvb, 'get_vision_backend', return_value=node), \
+             patch('core.port_registry.get_local_llm_url', return_value=main):
+            return lvb.get_document_readers()
+
+    @staticmethod
+    def _posted_to(read):
+        import integrations.vision.lightweight_backend as lvb
+        resp = TestReadDocument._answer('p')
+        with patch.object(lvb, 'pooled_post', return_value=resp) as post:
+            assert read(TestReadDocument._page(), 'x') == 'p'
+        return post.call_args
+
+    def test_the_vision_backend_then_the_nodes_own_main_model(self):
+        import integrations.vision.lightweight_backend as lvb
+        node = lvb.Qwen08BBackend(port=9555)
+        readers = self._readers(node)
+        assert len(readers) == 2 and readers[0] == node.read_document
+        call = self._posted_to(readers[1])
+        assert call.args[0] == f'{self.MAIN}/chat/completions'
+        assert 'headers' not in call.kwargs              # no remote endpoint's key
+        assert call.kwargs['json']['chat_template_kwargs'] == {'enable_thinking': False}
+
+    @pytest.mark.parametrize("cls", [MiniCPMBackend, MobileVLMBackend,
+                                      CLIPBackend, NoneBackend])
+    def test_a_backend_that_cannot_read_pages_leaves_the_main_model(self, cls):
+        readers = self._readers(cls())
+        assert len(readers) == 1
+        assert self._posted_to(readers[0]).args[0] == f'{self.MAIN}/chat/completions'
+
+    def test_a_vlm_endpoint_that_is_the_main_model_is_not_asked_twice(self):
+        import integrations.vision.lightweight_backend as lvb
+        node = lvb.Qwen3VLVisionBackend()
+        node._backend = MagicMock(base_url=f'{self.MAIN}/', model_name='m', api_key='k')
+        assert self._readers(node) == [node.read_document]
+
+    def test_a_remote_vlm_endpoint_still_falls_back_to_this_nodes_model(self):
+        import integrations.vision.lightweight_backend as lvb
+        node = lvb.Qwen3VLVisionBackend()
+        node._backend = MagicMock(base_url='http://10.0.0.5:7000/v1', model_name='m',
+                                  api_key='k')
+        readers = self._readers(node)
+        assert len(readers) == 2
+        assert self._posted_to(readers[1]).args[0] == f'{self.MAIN}/chat/completions'
+
+    def test_no_main_model_address_means_no_fallback(self):
+        import integrations.vision.lightweight_backend as lvb
+        node = lvb.Qwen08BBackend(port=9555)
+        with patch.object(lvb, 'get_vision_backend', return_value=node), \
+             patch('core.port_registry.get_local_llm_url', side_effect=RuntimeError('none')):
+            assert lvb.get_document_readers() == [node.read_document]
 
 
 class TestBackendProperties:
@@ -472,3 +736,110 @@ class TestModelRegistryVisionLite:
             config_list_entry={}, gpu_tdp_watts=0.0,
         )
         assert mb.tier == ModelTier.FAST
+
+
+# ── #102: a failed launch must not kill captioning for good ───────────
+
+def test_a_failed_launch_is_retried_after_the_cooldown():
+    """Found by hartos-94, read from the path and fixed here.
+
+    _launch_attempted was cleared in exactly ONE place -- the tail of
+    stop() -- and check_idle only reaches stop() through
+    `if self._server_proc`, which is None after a FAILED launch. So one
+    failure set the flag forever and captioning was dead for the life of
+    the process, on a backend whose whole design is a lazy per-frame
+    start. Transient failure is the normal case: the event wait is 5x1s,
+    the standalone path needs a llama-server binary that aborts on this
+    box, and it competes for VRAM with the resident LLM.
+    """
+    from integrations.vision.lightweight_backend import Qwen08BBackend
+
+    backend = Qwen08BBackend(port=59999)
+    backend._is_serving = lambda: False
+
+    # An ATTEMPT is what moves the timestamp. is_available() is consulted
+    # on every call before the cooldown -- correctly, it is the cheap "is
+    # it already up" check -- so counting it proves nothing about whether
+    # a launch was tried.
+    assert backend._ensure_running() is False
+    first_attempt = backend._launch_attempted_at
+    assert first_attempt > 0, 'never even tried'
+
+    # immediately after: suppressed by the cooldown, as intended
+    assert backend._ensure_running() is False
+    assert backend._launch_attempted_at == first_attempt, (
+        'hammered the launch instead of waiting out the cooldown')
+
+    # once the cooldown has passed, it tries AGAIN rather than latching off
+    backend._launch_attempted_at -= (backend.LAUNCH_RETRY_S + 1)
+    stale = backend._launch_attempted_at
+    assert backend._ensure_running() is False
+    assert backend._launch_attempted_at > stale, (
+        'captioning stayed dead after one failed launch (#102)')
+
+
+def test_a_wedged_server_is_stopped_before_another_is_launched():
+    """hartos-3a F7: after the cooldown a retry launched a second
+    llama-server while the first -- alive but never serving -- kept running,
+    and its log handle leaked.  One process at a time."""
+    from unittest.mock import MagicMock
+    from integrations.vision.lightweight_backend import Qwen08BBackend
+
+    backend = Qwen08BBackend(port=59997)
+    backend._is_serving = lambda: False
+    wedged = MagicMock(pid=4321)
+    wedged.poll.return_value = None
+    log = MagicMock()
+    backend._server_proc, backend._log_fh = wedged, log
+    backend._launch_attempted = True
+    backend._launch_attempted_at -= (backend.LAUNCH_RETRY_S + 1)
+
+    backend._ensure_running()
+
+    assert wedged.terminate.called or wedged.kill.called, (
+        'relaunched over a process that was still running')
+    assert log.close.called, 'the first log handle leaked'
+
+
+def test_the_cooldown_is_not_a_permanent_latch():
+    """A guard on the mechanism itself, since the defect was its permanence."""
+    from integrations.vision.lightweight_backend import Qwen08BBackend
+
+    assert isinstance(Qwen08BBackend.LAUNCH_RETRY_S, (int, float))
+    assert Qwen08BBackend.LAUNCH_RETRY_S > 0
+    backend = Qwen08BBackend(port=59998)
+    assert hasattr(backend, '_launch_attempted_at'), (
+        'without a timestamp the flag can only be permanent')
+
+
+def test_weights_on_disk_do_not_stand_in_for_a_running_server(
+        tmp_path, monkeypatch):
+    """Measured live 2026-09-27: the 0.8B GGUF is in ~/.nunba/models, :8081
+    refuses connections, and VisionService logged described=0 over 697
+    frames.  is_available() answers True from the file alone -- right for
+    SELECTING this backend -- and _ensure_running used that same answer to
+    mean "serving", so it returned True without ever asking Nunba to start
+    the server, and every describe() failed at debug level."""
+    from unittest.mock import patch
+    from integrations.vision import lightweight_backend as lvb
+
+    models = tmp_path / '.nunba' / 'models'
+    models.mkdir(parents=True)
+    (models / 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf').write_bytes(b'gguf')
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('USERPROFILE', str(tmp_path))
+
+    backend = lvb.Qwen08BBackend(port=59996)
+    backend._is_serving = lambda: False
+    assert backend.is_available() is True      # still selectable
+
+    emitted = []
+    with patch('core.platform.events.emit_event',
+               side_effect=lambda topic, data: emitted.append(topic)), \
+         patch('time.sleep'), \
+         patch('integrations.service_tools.model_lifecycle.'
+               'ModelLifecycleManager._find_llama_server_binary',
+               return_value=None):
+        assert backend._ensure_running() is False
+    assert 'vlm_caption.requested' in emitted, (
+        'a server that is not running was never asked for')

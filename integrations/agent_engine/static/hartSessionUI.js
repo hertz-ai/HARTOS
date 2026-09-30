@@ -10,7 +10,9 @@
  *   window.HartSession      — the single state blob (stores lock_pw_hash, salt)
  *   window.HartTimeoutSignal — WebKitGTK-safe fetch timeout
  *   #lock-screen / #lock-pw  — the existing lock overlay (we drive it)
- *   /api/shell/system/metrics — the existing CPU/RAM/disk source
+ *   window.HartShellState    — the server's 'metrics' push (the SSE stream);
+ *                               /api/shell/system/metrics is the 30 s fallback
+ *                               poll for a stream that is down (poll diet)
  *
  * The lock is a UX lock (per-user shell state), NOT the OS security boundary —
  * that remains the display-manager login. Password is stored only as a salted
@@ -69,6 +71,10 @@
 
   // ── live clock (lock screen + desktop widget) ─────────────────────────────
   function pad(n) { return (n < 10 ? '0' : '') + n; }
+  // Write the DOM only when the text CHANGES: a minute clock ticking once a
+  // second re-set four elements to the same strings 59 times out of 60, and on
+  // the software-paint rung each re-set is a repaint (poll diet, 2026-09-23).
+  var lastTime = '', lastDate = '';
   function tick() {
     var d = new Date();
     var hh = d.getHours(), mm = pad(d.getMinutes());
@@ -82,6 +88,8 @@
     var time12 = pad((hh % 12) || 12) + ':' + mm + ' ' + (hh < 12 ? 'AM' : 'PM');
     var date = d.toLocaleDateString(undefined,
       { weekday: 'long', month: 'long', day: 'numeric' });
+    if (time12 === lastTime && date === lastDate) return;
+    lastTime = time12; lastDate = date;
     [['lock-clock', time12], ['lock-date', date],
      ['hw-clock-time', time12], ['hw-clock-date', date]].forEach(function (p) {
       var el = $(p[0]); if (el) el.textContent = p[1];
@@ -98,11 +106,44 @@
       : (window.HartLock.hasPassword() ? '' : 'No password set - press Enter to enter');
     var pw = $('lock-pw');
     if (pw) { pw.value = ''; pw.placeholder = setup ? 'New password' : 'Password'; }
+    // The setup prompt must be DECLINABLE by a mouse-only user: a visible
+    // "Not now" beside the status line (Escape is the keyboard equivalent).
+    // Only an explicit decline records lock_setup_skipped; see maybeSetup().
+    var skip = $('lock-skip');
+    if (!skip && setup) {
+      skip = document.createElement('button');
+      skip.type = 'button';
+      skip.id = 'lock-skip';
+      skip.className = 'ds-btn ds-btn-text lock-skip';
+      skip.textContent = 'Not now';
+      skip.addEventListener('click', declineSetup);
+      if (st && st.parentNode) st.parentNode.insertBefore(skip, st.nextSibling);
+      else ls.appendChild(skip);
+    }
+    if (skip) skip.style.display = setup ? '' : 'none';
     ls.classList.add('active');
     if (pw) setTimeout(function () { pw.focus(); }, 50);
   }
   window.HartLock.show = function () { showLock(false); };
   window.HartLock.promptSetup = function () { showLock(true); };
+
+  // An explicit decline of the first-run setup: the ONE place the skipped flag
+  // is written. Being offered the prompt writes nothing (the 2026-09-22 defect:
+  // one offer used to hide the prompt forever, answered or not).
+  function declineSetup() {
+    var ls = $('lock-screen');
+    if (!ls || !ls.classList.contains('setup')) return;
+    if (window.HartSession) window.HartSession.set('lock_setup_skipped', true);
+    ls.classList.remove('setup', 'active');
+  }
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' && e.key !== 'Esc') return;
+    var ls = $('lock-screen');
+    if (ls && ls.classList.contains('setup') && ls.classList.contains('active')) {
+      e.preventDefault();
+      declineSetup();
+    }
+  });
 
   function onEnter() {
     var ls = $('lock-screen'), pw = $('lock-pw'), st = $('lock-status');
@@ -131,22 +172,33 @@
       '">' + Math.round(pct) + '%</span></div><div class="hw-bar"><i style="width:' +
       Math.max(0, Math.min(100, pct)) + '%"></i></div>';
   }
+  // ONE painter for both sources: the server's 'metrics' push (cpu_percent,
+  // ram.percent, disk_percent) and the fallback GET of the full route.
+  function paintMetrics(m) {
+    if (!m) return;
+    // /api/shell/system/metrics returns cpu_percent (flat), ram.percent
+    // (NESTED — not a flat memory_percent), and a disks[] array. The live
+    // floor boot showed Memory stuck at 0% reading the flat key; read
+    // ram.percent first (fall back to the flat key for any other source).
+    var cpu = m.cpu_percent || 0;
+    var mem = (m.ram && m.ram.percent) || m.memory_percent || 0;
+    var disk = m.disk_percent;
+    if (disk == null && m.disks && m.disks.length) disk = m.disks[0].percent;
+    var el = $('hw-sys-body');
+    if (el) el.innerHTML = bar(cpu, 'CPU') + bar(mem, 'Memory') + bar(disk || 0, 'Disk');
+  }
   function pollMetrics() {
     fetch(SHELL + '/api/shell/system/metrics', { signal: ts(4000) })
       .then(function (r) { return r.json(); })
-      .then(function (m) {
-        // /api/shell/system/metrics returns cpu_percent (flat), ram.percent
-        // (NESTED — not a flat memory_percent), and a disks[] array. The live
-        // floor boot showed Memory stuck at 0% reading the flat key; read
-        // ram.percent first (fall back to the flat key for any other source).
-        var cpu = m.cpu_percent || 0;
-        var mem = (m.ram && m.ram.percent) || m.memory_percent || 0;
-        var disk = m.disk_percent;
-        if (disk == null && m.disks && m.disks.length) disk = m.disks[0].percent;
-        var el = $('hw-sys-body');
-        if (el) el.innerHTML = bar(cpu, 'CPU') + bar(mem, 'Memory') + bar(disk || 0, 'Disk');
-      }).catch(function (e) { console.debug('hartSessionUI: system metrics fetch failed', e); });
+      .then(paintMetrics)
+      .catch(function (e) { console.debug('hartSessionUI: system metrics fetch failed', e); });
   }
+  // The poll diet: the stream pushes 'metrics' every few seconds; this GET is
+  // the fallback for a stream that is down, and an iframed shell never polls.
+  var FALLBACK_POLL_MS = 30000;
+  function bus() { return window.HartShellState || null; }
+  function sseUp() { var b = bus(); return !!(b && b.sseUp()); }
+  function isHost() { var b = bus(); return b ? b.isHost() : true; }
 
   function mountWidgets() {
     var host = $('hart-widgets');
@@ -160,8 +212,11 @@
       '  <div class="hw-title">System</div>' +
       '  <div id="hw-sys-body"><div class="hw-row"><span>loading…</span></div></div>' +
       '</div>';
-    pollMetrics();
-    setInterval(pollMetrics, 4000);
+    if (!isHost()) return;                         // the host document owns the polls
+    var b = bus();
+    if (b) b.on('metrics', paintMetrics);
+    if (!(b && b.last('metrics'))) pollMetrics();  // first paint before the stream's snapshot lands
+    setInterval(function () { if (!sseUp()) pollMetrics(); }, FALLBACK_POLL_MS);
   }
 
   // ── boot ──────────────────────────────────────────────────────────────────
@@ -177,9 +232,13 @@
       var bootPw = $('lock-pw');
       if (bootPw) setTimeout(function () { try { bootPw.focus(); } catch (e) { console.debug('hartSessionUI: lock password focus failed', e); } }, 60);
     }
-    // First-run: if onboarding is already done but no lock password exists yet,
-    // offer to set one. hartOnboarding.js removes .onboarding-active when it
-    // finishes; we wait for that, then prompt once.
+    // First-run: if onboarding is done but no lock password exists yet, offer to
+    // set one. Offered at most ONCE per session ('prompted'), and the offer
+    // itself writes nothing: only declineSetup() records lock_setup_skipped, so
+    // an offer nobody answered is made again next boot instead of vanishing.
+    // (Before 2026-09-23 the flag was written the moment the prompt was
+    // OFFERED, and the check ran exactly once, 4 s after the session loaded,
+    // so a user still inside onboarding at that moment was never asked.)
     var prompted = false;
     function maybeSetup() {
       if (prompted) return;
@@ -187,11 +246,21 @@
       if (!onboarding && window.HartSession && !window.HartLock.hasPassword()
           && !window.HartSession.get('lock_setup_skipped')) {
         prompted = true;
-        if (window.HartSession) window.HartSession.set('lock_setup_skipped', true);
         window.HartLock.promptSetup();
       }
     }
     if (window.HartSession) window.HartSession.ready(function () { setTimeout(maybeSetup, 4000); });
+    // Re-check when onboarding ENDS. hartOnboarding.js removes .onboarding-active
+    // from <html> both when the ceremony finishes and on its Esc hatch (which
+    // does not mark the user onboarded), so the class change is the one signal
+    // that covers both. Observed, never polled.
+    try {
+      if (typeof MutationObserver !== 'undefined') {
+        new MutationObserver(function () {
+          if (!document.documentElement.classList.contains('onboarding-active')) maybeSetup();
+        }).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+      }
+    } catch (e) { console.debug('hartSessionUI: onboarding-end observer unavailable', e); }
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);

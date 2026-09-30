@@ -281,7 +281,7 @@ class TestEventBusSSEDenylist:
     the denylist."""
 
     def test_denylist_holds_only_justified_internal_prefixes(self):
-        from core.platform.events import _SSE_DENYLIST_PREFIXES
+        from core.platform.events import _NODE_INTERNAL_TOPIC_PREFIXES
         # The instruction was "allow all UNLESS some events need not be
         # published to SSE" -- `bus.*` is exactly that exception, and it was
         # added on live evidence: the EventBus auto-bridge re-published every
@@ -306,7 +306,7 @@ class TestEventBusSSEDenylist:
         # This guard keeps its teeth via the user-facing assertions below:
         # its purpose is to stop a denylist that silences UI traffic, not to
         # freeze the tuple. Any future entry still has to be justified here.
-        assert _SSE_DENYLIST_PREFIXES == ('bus.', 'channel.')
+        assert _NODE_INTERNAL_TOPIC_PREFIXES == ('bus.', 'channel.')
 
     def test_denylist_never_silences_user_facing_topics(self):
         """The real intent of the guard above -- a denylist that swallows UI

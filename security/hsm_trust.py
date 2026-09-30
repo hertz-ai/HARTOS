@@ -338,3 +338,12 @@ def start_hsm_monitor():
     monitor = get_path_monitor()
     monitor.start()
     return monitor
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HART_HSM_CLIENT_KEY',
+)

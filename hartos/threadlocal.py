@@ -1,4 +1,7 @@
+import logging
 import threading
+
+_log = logging.getLogger(__name__)
 
 
 class ThreadLocalData:
@@ -63,6 +66,147 @@ class ThreadLocalData:
 
     def get_prompt_id(self):
         return getattr(self._local, 'prompt_id', None)
+
+    # --- Handing this thread's request state to a worker acting for it ---
+    # A worker thread starts with an EMPTY threading.local, so work moved
+    # onto one stops seeing the request's prompt_id, user_id, request_id and
+    # activity run -- and the shell tool's consent check reads prompt_id.
+    # local_loop runs one computer-use action on a worker (so its time budget
+    # can bound it) and uses this pair to keep that action inside its run.
+
+    def snapshot(self):
+        """This thread's per-request state, as a dict to hand to a worker.
+
+        A DEEP copy, per value: a worker that appends to an adopted list or
+        dict changes its own copy, never the caller's (review F6,
+        2026-09-27 -- the shallow copy let a worker's append land in the
+        caller's recognize_intent list).  A value that cannot be copied is
+        passed by reference and said so in the log, rather than dropped.
+        """
+        import copy
+        out = {}
+        for key, value in vars(self._local).items():
+            try:
+                out[key] = copy.deepcopy(value)
+            except Exception as e:
+                _log.warning("threadlocal snapshot: %r shared by reference, "
+                             "not copied (%s: %s)", key, type(e).__name__, e)
+                out[key] = value
+        return out
+
+    def adopt(self, snapshot):
+        """Take on a snapshot() from the thread this one is acting for.
+
+        MERGE, not replace: each key in ``snapshot`` is set on this thread;
+        keys this thread already has and the snapshot lacks are kept.
+        Values are NOT copied again, so whoever holds ``snapshot`` shares
+        those objects with this thread.  That is deliberate: the VLM loop
+        keeps the snapshot it handed an action's worker and marks the
+        worker's ``activity_run`` closed when it abandons the action.
+        Nothing flows back: the caller never sees what the worker sets.
+        """
+        for key, value in (snapshot or {}).items():
+            setattr(self._local, key, value)
+
+    def carry(self, fn):
+        """``fn``, wrapped to run on another thread as THIS thread's request.
+
+        The one way to hand work to a worker: snapshot() now, adopt() on the
+        worker before ``fn`` runs.  The wrapper's ``.snapshot`` is the dict
+        the worker adopts (shared, per adopt()), so a caller can still mark
+        state it hands over, as the VLM loop does to close an abandoned
+        action's run.  Callers: integrations.vlm.local_loop (one computer-use
+        action), integrations.agentic_router (the plan's LLM calls, which ran
+        with no user, prompt or request id until 2026-09-27).
+        """
+        snap = self.snapshot()
+
+        def _carried(*args, **kwargs):
+            self.adopt(snap)
+            return fn(*args, **kwargs)
+
+        _carried.snapshot = snap
+        return _carried
+
+    def turn_of(self, prompt_id):
+        """Context manager: run a block as agent ``prompt_id``'s turn, then
+        give the thread back its own agent.
+
+        For a request /chat hands to ANOTHER agent (autonomous routing to an
+        existing agent that matches, hart_intelligence_entry): the thread
+        still carried the request's own prompt_id, so a tool acting for "the
+        calling agent" (cast_experiment_vote) acted as the wrong one.  Only
+        prompt_id is swapped and restored (via adopt()): whatever the turn
+        sets for the handler to read afterwards (ui_actions, creation flags)
+        is kept, and user_id is the same person either way.
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            saved = {'prompt_id': self.get_prompt_id()}
+            self.set_prompt_id(prompt_id)
+            try:
+                yield
+            finally:
+                self.adopt(saved)
+        return _cm()
+
+    def detached(self):
+        """Context manager: run a block with NO request state on this thread,
+        then put this thread's state back exactly as it was.
+
+        For work that is no request's turn but runs on a thread a request
+        used.  The /chat handler sets this state and never clears it, so a
+        reused worker thread still carries the last chat's prompt_id,
+        user_id, request_id, user_role, activity run and model override;
+        measured 2026-09-27, an MCP tool saw them (mcp_http_bridge._invoke_
+        tool is the caller).  Inside the block every getter answers its
+        default.  The saved values are put back by reference, not copied,
+        so an object the thread shares (a run the VLM loop may close) stays
+        the same object.
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            saved = dict(vars(self._local))
+            for key in saved:
+                delattr(self._local, key)
+            try:
+                yield
+            finally:
+                for key in list(vars(self._local)):
+                    delattr(self._local, key)
+                for key, value in saved.items():
+                    setattr(self._local, key, value)
+        return _cm()
+
+    # --- Computer-use run context (set by integrations.vlm.local_loop) ---
+    # The run a desktop action belongs to, so a tool that executes DURING a
+    # run can announce itself as a step of that run instead of inventing its
+    # own.  The shell tool is the case that needs it: it reaches
+    # hart_intelligence_entry._handle_shell_command_tool on the loop's OWN
+    # thread (local_loop already relies on that for prompt_id), but the run id
+    # was a bare local in run_local_agentic_loop, so the shell step could only
+    # write the ribbon and never reached the computer_use.update topic.
+
+    def set_activity_run(self, run_id, user_id=None, prompt_id=None):
+        self._local.activity_run = {
+            'run_id': run_id, 'user_id': user_id, 'prompt_id': prompt_id,
+        } if run_id else None
+
+    def get_activity_run(self):
+        """The enclosing run's {run_id, user_id, prompt_id}, or None.
+
+        May also carry ``closed: True``: the run ended while work adopted
+        from it was still running (integrations.vlm.activity_stream.
+        close_run_stamp), so that work must not announce steps into it.
+        """
+        return getattr(self._local, 'activity_run', None)
+
+    def clear_activity_run(self):
+        self._local.activity_run = None
 
     # --- Agent creation signals (set by LangChain Create_Agent tool) ---
 

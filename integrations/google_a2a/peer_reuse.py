@@ -260,28 +260,64 @@ def admitted_peers(limit: int = 8) -> List[Dict[str, str]]:
     Same selection filter the integrity/gradient services use: active,
     not banned, not self. Rows only enter this table through the
     gossip admission gate (guardrail_hash + Ed25519), so presence here
-    IS the trust rail. Returns [] on any failure (logged)."""
+    IS the trust rail. Returns [] on any failure (logged).
+
+    One entry per url: several rows can share an address (a node that
+    re-keyed, one-shot identities behind one host; 106 such urls on the
+    owner's desktop, 2026-09-26), and the node answering there is one node.
+    The row kept is the one _admitted_query ranks first for that url;
+    ``verified`` says whether this node verified it.  An unverified row is
+    a guess at who answers there, so a caller that signs for the peer asks
+    the node (try_peer_recipe_reuse -> peer_node_id_for).
+
+    Streamed in pages until ``limit`` distinct urls are found: a fixed
+    over-fetch (limit*8 rows) returned fewer peers than ``limit`` whenever
+    more duplicate rows than that ranked first (review of 4cf4411d0)."""
+    try:
+        from integrations.social.models import db_session
+        with db_session(commit=False) as db:
+            out, seen = [], set()
+            for r in _admitted_query(db).yield_per(max(limit, 1) * 8):
+                key = (r.url or '').rstrip('/')
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                out.append({'node_id': r.node_id, 'url': r.url,
+                            'verified': r.integrity_status == 'verified'})
+                if len(out) >= limit:
+                    break
+            return out
+    except Exception as e:
+        logger.info(f'peer_reuse: peer store unavailable: {e}')
+        return []
+
+
+def _admitted_query(db):
+    """The admitted-peer filter (active, not banned, not self) as a query,
+    so a lookup of ONE peer applies the same rule as the list.
+
+    Ordered: rows this node VERIFIED first (the identity that answered this
+    node's integrity challenge, signed by its key, at that address), then
+    the most recently seen.  last_seen alone is a guess: a one-shot identity
+    that announced from the same address a minute ago outranks the real
+    node, and the peer refuses a request signed for it."""
+    from integrations.social.models import PeerNode
     self_id = None
     try:
         from integrations.social.peer_discovery import gossip
         self_id = getattr(gossip, 'node_id', None)
     except Exception as e:
         logger.debug(f'peer_reuse: gossip node_id unavailable: {e}')
-    try:
-        from integrations.social.models import db_session, PeerNode
-        with db_session(commit=False) as db:
-            q = db.query(PeerNode).filter(
-                PeerNode.status == 'active',
-                PeerNode.integrity_status != 'banned',
-            )
-            if self_id:
-                q = q.filter(PeerNode.node_id != self_id)
-            rows = q.limit(limit).all()
-            return [{'node_id': r.node_id, 'url': r.url}
-                    for r in rows if r.url]
-    except Exception as e:
-        logger.info(f'peer_reuse: peer store unavailable: {e}')
-        return []
+    from sqlalchemy import case
+    q = db.query(PeerNode).filter(
+        PeerNode.status == 'active',
+        PeerNode.integrity_status != 'banned',
+    )
+    if self_id:
+        q = q.filter(PeerNode.node_id != self_id)
+    return q.order_by(
+        case((PeerNode.integrity_status == 'verified', 0), else_=1),
+        PeerNode.last_seen.desc())
 
 
 # ─── Discovery ───────────────────────────────────────────────────────
@@ -372,6 +408,17 @@ def discover_peer_agent(
     _match_entry. Returns (peer_url, entry) or None. Bounded: per-peer
     timeout + optional monotonic *deadline* across the sweep. Every
     failure is logged and skipped; never raises."""
+    found = _discover_peer(identity, peers, timeout, deadline)
+    if not found:
+        return None
+    peer, entry = found
+    return (peer.get('url') or '').rstrip('/'), entry
+
+
+def _discover_peer(identity, peers=None, timeout=_DIRECTORY_TIMEOUT_S,
+                   deadline=None):
+    """discover_peer_agent, returning the PEER it matched (node_id + url)
+    instead of its url, so the invoke can be signed for that node."""
     if peers is None:
         peers = admitted_peers()
     for peer in peers:
@@ -397,56 +444,187 @@ def discover_peer_agent(
             logger.info(
                 f"peer_reuse: matched agent {entry.get('agent_id')} "
                 f"on {url} (slug={identity.get('goal_slug') or '-'})")
-            return url, entry
+            return peer, entry
     return None
 
 
 # ─── Invoke (JSON-RPC message/send, the existing contract) ──────────
 
+def peer_node_id_for(peer_url: str, ask_the_node: bool = False) -> str:
+    """The node_id of the peer at ``peer_url`` (the audience a signed
+    request is bound to), or '' when none is known.
+
+    The peer store first: a row this node VERIFIED at that url is the
+    answer.  With ``ask_the_node`` (hart a2a send, which may name a node
+    this one never gossiped with; try_peer_recipe_reuse when the row it
+    matched is unverified), anything short of that is asked of the node's
+    own /api/social/peers/health, and the store's unverified guess is kept
+    only when the ask fails (logged).  Without it, the store's best row."""
+    want = (peer_url or '').rstrip('/')
+    if not want:
+        return ''
+    held, verified = _held_node_id_for(want)
+    if verified or not ask_the_node:
+        return held
+    try:
+        asked = (pooled_get(f'{want}/api/social/peers/health',
+                            timeout=_DIRECTORY_TIMEOUT_S).json() or {}
+                 ).get('node_id') or ''
+    except Exception as e:
+        logger.info(f'peer_reuse: could not ask {want} for its node_id: {e}')
+        asked = ''
+    return asked or held
+
+
+def _held_node_id_for(want: str) -> Tuple[str, bool]:
+    # (node_id, verified) of the row _admitted_query ranks first at the url
+    # (verified, then most recent); ('', False) when none.  One lookup by
+    # url in SQL, not a scan of the first 1000 admitted rows.
+    try:
+        from integrations.social.models import db_session, PeerNode
+        with db_session(commit=False) as db:
+            row = (_admitted_query(db)
+                   .filter(PeerNode.url.in_([want, want + '/']))
+                   .first())
+            if row is None:
+                return '', False
+            return (row.node_id or ''), row.integrity_status == 'verified'
+    except Exception as e:
+        logger.info(f'peer_reuse: peer store unavailable for {want}: {e}')
+        return '', False
+
+
 def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
-                      timeout: float = _INVOKE_TIMEOUT_S) -> Optional[dict]:
-    """POST the existing /a2a/<id>/jsonrpc message/send contract.
+                      timeout: float = _INVOKE_TIMEOUT_S,
+                      peer_node_id: Optional[str] = None) -> Optional[dict]:
+    """Run ``agent_id`` on the peer through the existing /a2a/<id>/jsonrpc
+    contract, within ``timeout`` seconds in all.
+
+    message/send goes out with configuration.blocking=false, so the peer
+    answers with the task at once; this polls message/get until the task
+    ends or the budget runs out, and then sends task/cancel, so the peer
+    gives its LLM permit back instead of finishing a turn nobody reads
+    (review finding M2: the caller used to time out and fall back to local
+    CREATE while the peer ran the orphaned turn).  A peer that ignores the
+    flag answers with the finished task, which is returned as before.
+
+    Every request is signed with this node's gossip identity
+    (discovery.signed_peer_request: sender {node_id, public_key},
+    timestamp, Ed25519 signature) and names the agent it is for, so a
+    peer that admitted this node runs a shared agent without any other
+    credential (owner ruling 2026-09-26; the server half is
+    discovery.admitted_peer_sender, which also requires that the peer has
+    VERIFIED this node).  The signature is bound to the receiving node
+    (``peer_node_id``, else the node_id held for ``peer_url`` in the peer
+    store).  A node that cannot sign sends the body unsigned, which only a
+    LAN-trusted peer admits.
 
     Returns the A2A task envelope (id/contextId/state/content) or None
-    on any transport / JSON-RPC failure (logged). NOTE: an envelope
-    with state == 'failed' is returned as-is; callers decide."""
+    on any transport / JSON-RPC failure or when the budget ran out
+    (logged). NOTE: an envelope with state == 'failed' is returned as-is;
+    callers decide."""
+    deadline = time.monotonic() + max(float(timeout), 0.5)
     url = f"{peer_url.rstrip('/')}/a2a/{agent_id}/jsonrpc"
-    rpc = {
-        'jsonrpc': '2.0',
-        'id': uuid.uuid4().hex,
-        'method': 'message/send',
-        'params': {
-            'message': {
-                'messageId': uuid.uuid4().hex,
-                'contextId': uuid.uuid4().hex,
-                'parts': [{'type': 'text', 'text': prompt}],
-            }
+    audience = peer_node_id or peer_node_id_for(peer_url)
+
+    def _call(method, params):
+        rpc = {'jsonrpc': '2.0', 'id': uuid.uuid4().hex, 'method': method,
+               'params': params, 'agent_id': agent_id}
+        try:
+            from integrations.social.discovery import signed_peer_request
+            rpc = signed_peer_request(rpc, audience=audience)
+        except Exception as e:
+            logger.warning(f'peer_reuse: could not sign {method} for '
+                           f'{agent_id} ({e}); sending unsigned, which a peer '
+                           f'that is not LAN-trusted refuses with 401')
+        left = max(deadline - time.monotonic(), 0.5)
+        try:
+            resp = pooled_post(url, json=rpc, timeout=left)
+        except Exception as e:
+            logger.info(f'peer_reuse: {method} {agent_id} on {peer_url} '
+                        f'failed: {e}')
+            return None
+        if resp.status_code != 200:
+            logger.info(f'peer_reuse: {method} {agent_id} on {peer_url} '
+                        f'returned {resp.status_code}')
+            return None
+        try:
+            body = resp.json()
+        except ValueError as e:
+            logger.info(f'peer_reuse: {method} {agent_id} returned '
+                        f'non-JSON: {e}')
+            return None
+        if body.get('error'):
+            logger.info(f"peer_reuse: {method} {agent_id} JSON-RPC error: "
+                        f"{body['error']}")
+            return None
+        return body.get('result')
+
+    task = _call('message/send', {
+        'message': {
+            'messageId': uuid.uuid4().hex,
+            'contextId': uuid.uuid4().hex,
+            'parts': [{'type': 'text', 'text': prompt}],
         },
-    }
+        'configuration': {'blocking': False},
+    })
+    if not task or task.get('state') not in _OPEN_TASK_STATES:
+        return task
+    task_id = task.get('id')
+    interval = _POLL_INTERVAL_S
+    while True:
+        # The last sleep is cut to what is left, so the budget is spent
+        # before the cancel: the loop used to stop a whole backed-off
+        # interval (up to 2 s) early.
+        left = deadline - time.monotonic()
+        if left <= _POLL_INTERVAL_S / 5:
+            break
+        time.sleep(min(interval, left))
+        # Back off: 0.25 s, then up to 2 s, so a 30 s wait is ~20 signed
+        # reads, not 120 (review of a4ea04651).
+        interval = min(interval * 2, _POLL_INTERVAL_MAX_S)
+        got = _call('message/get', {'taskId': task_id})
+        if got is None:
+            continue
+        # State first: a FAILED task also carries an 'error' string, and it
+        # is an answer to return, not a reason to cancel (review of a4ea04651).
+        if got.get('state') and got.get('state') not in _OPEN_TASK_STATES:
+            return got
+        if isinstance(got.get('error'), dict):
+            logger.info(f"peer_reuse: message/get {agent_id}: {got['error']}")
+            return None
+    logger.info(f'peer_reuse: {agent_id} on {peer_url} still running when the '
+                f'{timeout:.1f}s budget ran out; cancelling it there')
+    refused = _cancel_remote(_call, task_id)
+    if refused:
+        # It ended while the cancel was on its way: one last look.
+        last = _call('message/get', {'taskId': task_id})
+        if last and last.get('state') and last['state'] not in _OPEN_TASK_STATES:
+            return last
+    return None
+
+
+#: Task states in which a remote turn has not ended: the protocol's own
+#: TaskState values, not a second spelling of them.
+from .google_a2a_integration import TaskState as _TaskState  # noqa: E402
+_OPEN_TASK_STATES = (_TaskState.SUBMITTED.value, _TaskState.WORKING.value)
+_POLL_INTERVAL_S = 0.25
+_POLL_INTERVAL_MAX_S = 2.0
+
+
+def _cancel_remote(call, task_id) -> bool:
+    """Best-effort task/cancel; the budget is spent, so it gets a short
+    timeout of its own through ``call``'s floor.  True when the peer REFUSED
+    it (the task had already ended), so the caller takes one last look."""
     try:
-        resp = pooled_post(url, json=rpc, timeout=timeout)
+        out = call('task/cancel', {'taskId': task_id})
     except Exception as e:
-        logger.info(f'peer_reuse: invoke {agent_id} on {peer_url} '
-                    f'failed: {e}')
-        return None
-    if resp.status_code != 200:
-        logger.info(f'peer_reuse: invoke {agent_id} on {peer_url} '
-                    f'returned {resp.status_code}')
-        return None
-    try:
-        body = resp.json()
-    except ValueError as e:
-        logger.info(f'peer_reuse: invoke {agent_id} returned '
-                    f'non-JSON: {e}')
-        return None
-    if body.get('error'):
-        logger.info(f"peer_reuse: invoke {agent_id} JSON-RPC error: "
-                    f"{body['error']}")
-        return None
-    return body.get('result')
+        logger.info(f'peer_reuse: task/cancel {task_id} failed: {e}')
+        return False
+    return bool(out and isinstance(out.get('error'), dict))
 
 
-def _result_text(result: Optional[dict]) -> str:
+def result_text(result: Optional[dict]) -> str:
     """Extract the text parts from an A2A task envelope's content."""
     try:
         content = (result or {}).get('content') or {}
@@ -813,10 +991,11 @@ def try_peer_recipe_reuse(identity: Dict[str, str], local_prompt_id: str,
         logger.debug('peer_reuse: no admitted peers')
         return None
 
-    found = discover_peer_agent(identity, peers, deadline=deadline)
+    found = _discover_peer(identity, peers, deadline=deadline)
     if not found:
         return None
-    peer_url, entry = found
+    peer, entry = found
+    peer_url = (peer.get('url') or '').rstrip('/')
     agent_id = entry.get('agent_id') or ''
     if not agent_id:
         logger.info(f'peer_reuse: matched entry on {peer_url} has no '
@@ -839,9 +1018,16 @@ def try_peer_recipe_reuse(identity: Dict[str, str], local_prompt_id: str,
     if not prompt_text:
         logger.info('peer_reuse: no prompt text for remote invoke')
         return None
+    # Signed for the node this sweep matched when this node VERIFIED it
+    # there; otherwise the matched row is only the most recent of the
+    # identities seen at that url, and the node itself is asked.
+    audience = (peer.get('node_id') if peer.get('verified')
+                else peer_node_id_for(peer_url, ask_the_node=True)
+                or peer.get('node_id'))
     result = invoke_peer_agent(
         peer_url, agent_id, prompt_text,
-        timeout=min(_INVOKE_TIMEOUT_S, remaining))
+        timeout=min(_INVOKE_TIMEOUT_S, remaining),
+        peer_node_id=audience or None)
     if not result or result.get('state') != 'completed':
         if result:
             logger.info(
@@ -865,7 +1051,7 @@ def _record_remote_outcome(identity: Dict[str, str], local_prompt_id: str,
             user_id=identity.get('owner_id') or 'hive_peer',
             prompt_id=local_prompt_id,
             prompt=prompt_text,
-            response=_result_text(result),
+            response=result_text(result),
             goal_id=identity.get('goal_id') or '',
         )
     except Exception as e:

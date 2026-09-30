@@ -309,10 +309,19 @@ class TestGraphStateMachine:
                 f"Graph allows IN_PROGRESS->{target} but Task rejects it"
 
     def test_terminal_states_have_no_transitions(self):
-        for status in [TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.TERMINATED,
+        for status in [TaskStatus.CANCELLED, TaskStatus.TERMINATED,
                        TaskStatus.SKIPPED, TaskStatus.NOT_APPLICABLE, TaskStatus.ROLLED_BACK]:
             assert TaskStateMachine.TRANSITIONS[status] == [], \
                 f"Terminal state {status} should have no transitions"
+
+    def test_failed_only_recovers_forward(self):
+        """FAILED is terminal EXCEPT for forward recovery to a success
+        terminal, which the Task has always allowed (a stale FAILED from the
+        zombie reaper must follow genuine success). The graph's old copied
+        table said [] here and disagreed with the ledger it describes; it is
+        now derived from the one table. FAILED never re-enters active work."""
+        assert TaskStateMachine.TRANSITIONS[TaskStatus.FAILED] == [
+            TaskStatus.COMPLETED, TaskStatus.TERMINATED]
 
     def test_completed_only_to_rolled_back(self):
         allowed = TaskStateMachine.TRANSITIONS[TaskStatus.COMPLETED]
@@ -389,18 +398,27 @@ class TestJSONBackendAtomic:
 class TestNoDirectBypasses:
     """Tests that state transitions always go through proper validation."""
 
-    def test_sequential_chain_uses_record_transition(self):
-        """Sequential chain should properly record BLOCKED state."""
+    def test_sequential_chain_waits_without_a_forbidden_transition(self):
+        """A later step waits PENDING on its prerequisite, never forced to BLOCKED.
+
+        PENDING -> BLOCKED is not an edge in the state machine, so
+        create_sequential_tasks records the wait as blocked_by + pending_reason
+        and lets get_ready_tasks gate on prerequisites. The chain must still run
+        in order.
+        """
         ledger = SmartLedger("test", "sess", backend=InMemoryBackend())
         tasks = ledger.create_sequential_tasks(
             ["step 1", "step 2", "step 3"],
             task_type=TaskType.PRE_ASSIGNED
         )
-        # Second and third tasks should be BLOCKED with history
-        assert tasks[1].status == TaskStatus.BLOCKED
-        assert len(tasks[1].state_history) >= 2  # PENDING + BLOCKED
-        blocked_entry = [h for h in tasks[1].state_history if h["status"] == "blocked"]
-        assert len(blocked_entry) > 0
+        assert [t.status for t in tasks] == [TaskStatus.PENDING] * 3
+        assert tasks[1].blocked_by == [tasks[0].task_id]
+        assert tasks[1].pending_reason == "awaiting_prerequisites"
+        assert [t.task_id for t in ledger.get_ready_tasks()] == [tasks[0].task_id]
+
+        ledger.update_task_status(tasks[0].task_id, TaskStatus.IN_PROGRESS)
+        ledger.complete_task(tasks[0].task_id, result="done")
+        assert [t.task_id for t in ledger.get_ready_tasks()] == [tasks[1].task_id]
 
 
 # ==================== P5: Dependency Auto-Unblock ====================

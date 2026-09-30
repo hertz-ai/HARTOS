@@ -112,11 +112,23 @@ def verify_brand_markers(code_root: str = None) -> Tuple[bool, str]:
         candidate_roots.append(os.path.join(_sys.prefix, 'share', 'hartos'))
     except Exception:
         pass
+    # Located, never imported.  `import hart_intelligence` executed
+    # hart_intelligence_entry, whose module body runs init_social and boots
+    # a whole node (gossip, daemons, sync to central, a second integrity
+    # monitor).  So any process that only ran this check -- the runtime
+    # monitor's loop, a test, a CLI -- joined the hive, and during boot it
+    # was a circular import of a half-loaded module.  find_spec answers the
+    # same question (where the file is) without running it; for a module
+    # already imported it returns that module's own __spec__, so a running
+    # app resolves the identical directory.
     try:
-        import hart_intelligence as _hi
-        candidate_roots.append(os.path.dirname(_hi.__file__))
-    except Exception:
-        pass
+        import importlib.util as _ilu
+        _spec = _ilu.find_spec('hart_intelligence')
+        if _spec is not None and _spec.has_location and _spec.origin:
+            candidate_roots.append(os.path.dirname(_spec.origin))
+    except Exception as e:
+        logger.debug("brand markers: cannot locate hart_intelligence (%s); "
+                     "that candidate root is skipped", e)
 
     for rel_path, marker in BRAND_MARKER_FILES.items():
         # Pick the first candidate root where this file actually exists.

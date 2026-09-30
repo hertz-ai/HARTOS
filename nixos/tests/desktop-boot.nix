@@ -437,7 +437,17 @@ in
           # proof — un-fakeable by a half-started shell. A screenshot is saved to
           # the build output for the run log either way.
           shell.screenshot("hart_shell_first_frame")
-          shell.wait_for_text("HART", timeout=120)
+          # What text is on a fresh node's FIRST frame changed on 2026-09-23: the
+          # shell's read-only state now arrives over SSE before the first paint
+          # (3c30807), so a node that has not finished onboarding paints the
+          # onboarding language picker straight away instead of the brand hero
+          # for a poll interval first. The claim here is "pixels presented", the
+          # brand was only the text that proved it; the picker's copy proves it
+          # just as hard and is what a fresh VM actually shows. Measured on the
+          # 2026-09-24 nixosTests runs (8c963b1 and babefb0): the OCR read
+          # "What language feels like home?" and this waited 120 s for "HART".
+          # An onboarded node still paints the brand, so both are accepted.
+          shell.wait_for_text("HART|language feels like home", timeout=120)
 
       with subtest("PAINT+MARKER PARITY: the cage GTK3 host TOUCHES /run/hart/session/shell-ready on first paint"):
           # The cage GTK3 Tier-3 floor host must satisfy the SAME paint-watchdog

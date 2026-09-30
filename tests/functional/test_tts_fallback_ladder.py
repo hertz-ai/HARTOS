@@ -65,6 +65,80 @@ class TestTTSEngineRegistry:
                     f"{lang} should have cosyvoice3, got {engines}"
 
 
+def _installed_engines_for(lang='en'):
+    """The engines on THIS node's ladder for ``lang``, measured.
+
+    These are functional tests: they drive the real router against the real
+    machine, with nothing mocked.  Until 2026-09-21 select_engines appended
+    espeak unconditionally, so they could assert ">= 1 candidate" and
+    "espeak is always present" on any box.  That floor was a fabrication --
+    the ladder offered an engine it had already been told was absent, and a
+    voiced turn then spent its time failing on it (c9bbcd91b).  espeak is
+    bundled on the shipped OS, so the guarantee is real THERE; on a bare dev
+    box nothing is installed and the honest answer is an empty ladder.
+
+    So the shape assertions below run where a node has something to offer,
+    and TestBareNodeIsHonest covers the other case.
+    """
+    from integrations.channels.media.tts_router import (
+        LANG_ENGINE_PREFERENCE, _DEFAULT_PREFERENCE, _is_engine_installed,
+    )
+    ladder = LANG_ENGINE_PREFERENCE.get(lang, _DEFAULT_PREFERENCE)
+    return [e for e in ladder if _is_engine_installed(e)]
+
+
+def _node_can_serve(lang='en'):
+    """Whether this node can offer ANY engine for ``lang`` right now.
+
+    Installed is not the predicate -- fitting is.  Measured on the owner's
+    desktop 2026-09-21: chatterbox_turbo IS installed, in its own venv, and
+    is GPU-only against 2.97 GB free beside a resident LLM, so the ladder is
+    correctly empty even though an engine is on disk.  Gating on
+    "is something installed" would have kept these tests red for a router
+    that was behaving exactly right.
+    """
+    from integrations.channels.media.tts_router import TTSRouter
+    return bool(TTSRouter().select_engines('Hello', language=lang))
+
+
+needs_an_installed_engine = pytest.mark.skipif(
+    not _node_can_serve('en'),
+    reason='no TTS engine on this node can serve English right now, so the '
+           'ladder is correctly empty -- see TestBareNodeIsHonest',
+)
+
+def _node_can_serve_clone(lang='en'):
+    """Whether this node can offer a CLONE-capable engine for ``lang`` now.
+
+    A stricter question than ``_node_can_serve``: a runner can serve English
+    with kokoro (voice_clone=False) and have no cloning engine at all.
+    Measured 2026-09-26 on this box: select_engines('Hello', 'en') gave
+    [kokoro], and require_clone=True gave [].  The router's filter itself is
+    covered on every node by TestCloneFilterIsHermetic, so skipping the
+    live-machine check here never leaves the filter unexercised.
+    """
+    from integrations.channels.media.tts_router import TTSRouter
+    return any(
+        c.engine.voice_clone
+        for c in TTSRouter().select_engines(
+            'Hello', language=lang, require_clone=True))
+
+
+needs_a_clone_engine = pytest.mark.skipif(
+    not _node_can_serve_clone('en'),
+    reason='no clone-capable TTS engine on this node can serve English right '
+           'now; the require_clone filter is still driven on every node by '
+           'TestCloneFilterIsHermetic',
+)
+
+needs_espeak = pytest.mark.skipif(
+    'espeak' not in _installed_engines_for('en'),
+    reason='espeak-ng is not on this box; it is bundled on the shipped OS, '
+           'where this guarantee holds',
+)
+
+
+@needs_an_installed_engine
 class TestTTSRouterSelection:
     """T16: TTS engine selection under various constraints."""
 
@@ -77,7 +151,8 @@ class TestTTSRouterSelection:
         candidates = router.select_engines("Hello world", language="en")
         assert len(candidates) >= 1, "Should return at least one candidate"
 
-    def test_select_english_espeak_always_present(self, router):
+    @needs_espeak
+    def test_select_english_espeak_is_the_floor_where_it_exists(self, router):
         candidates = router.select_engines("Hello world", language="en")
         names = [c.engine.engine_id if hasattr(c.engine, 'engine_id') else c.engine for c in candidates]
         assert 'espeak' in names, f"espeak should always be a candidate, got {names}"
@@ -107,15 +182,78 @@ class TestTTSRouterSelection:
         candidates = router.select_engines("Hello", language="en", urgency="quality")
         assert len(candidates) >= 1
 
+    @needs_a_clone_engine
     def test_voice_clone_filter(self, router):
         candidates = router.select_engines("Hello", language="en", require_clone=True)
-        # Clone filter returns clone-capable engines + espeak (always appended)
         clone_capable = [c for c in candidates
                          if hasattr(c, 'engine') and hasattr(c.engine, 'voice_clone')
                          and c.engine.voice_clone]
         assert len(clone_capable) >= 1, "Should have at least one clone-capable engine"
 
 
+class TestCloneFilterIsHermetic:
+    """The require_clone filter, driven through the REAL select_engines on
+    every node, whatever is installed on it.
+
+    Only the machine boundary is patched: which engines are installed, the
+    GPU report, whether a model fits, the compute policy and the hive peer
+    lookup.  The ladder, the ENGINE_REGISTRY specs and the filter are the
+    production ones.  This is the companion that makes the live-machine
+    ``needs_a_clone_engine`` skip above safe: that test may skip on a
+    runner with no cloning engine, this one never does.
+
+    espeak is reported absent on purpose.  Whether Step 5 should append it
+    to a require_clone request is a separate open defect (task #63) and
+    this test must not pin either answer.
+    """
+
+    # One clone-capable GPU engine and two non-clone neural engines, all on
+    # the 'en' ladder.
+    CLONE = 'f5_tts'
+    NON_CLONE = ('kokoro', 'melotts')
+
+    @pytest.fixture
+    def machine(self):
+        installed = {self.CLONE, *self.NON_CLONE}
+        mod = 'integrations.channels.media.tts_router'
+        with patch(f'{mod}._is_engine_installed',
+                   side_effect=lambda e: e in installed), \
+                patch(f'{mod}._get_gpu_info',
+                      return_value={'cuda_available': True,
+                                    'vram_total_gb': 24.0,
+                                    'vram_free_gb': 20.0}), \
+                patch(f'{mod}._can_fit_on_gpu', return_value=True), \
+                patch(f'{mod}._get_compute_policy',
+                      return_value={'compute_policy': 'local_only'}), \
+                patch(f'{mod}._find_hive_peer_for_tts', return_value=None):
+            yield
+
+    @staticmethod
+    def _ids(candidates):
+        return [c.engine.engine_id for c in candidates]
+
+    def test_precondition_the_machine_offers_the_non_clone_engines(self, machine):
+        """Anti-vacuity: without require_clone the same machine offers all
+        three, so the filter below has something to remove."""
+        from integrations.channels.media.tts_router import (
+            ENGINE_REGISTRY, LANG_ENGINE_PREFERENCE, TTSRouter,
+        )
+        for eid in (self.CLONE, *self.NON_CLONE):
+            assert eid in LANG_ENGINE_PREFERENCE['en'], eid
+        assert ENGINE_REGISTRY[self.CLONE].voice_clone is True
+        assert not any(ENGINE_REGISTRY[e].voice_clone for e in self.NON_CLONE)
+        ids = self._ids(TTSRouter().select_engines('Hello', language='en'))
+        assert sorted(ids) == sorted([self.CLONE, *self.NON_CLONE]), ids
+
+    def test_require_clone_keeps_the_clone_engine_and_drops_the_rest(self, machine):
+        from integrations.channels.media.tts_router import TTSRouter
+        candidates = TTSRouter().select_engines(
+            'Hello', language='en', require_clone=True)
+        assert self._ids(candidates) == [self.CLONE]
+        assert all(c.engine.voice_clone for c in candidates)
+
+
+@needs_an_installed_engine
 class TestTTSResourceConstraints:
     """T16: Simulated resource constraints."""
 
@@ -194,3 +332,33 @@ class TestTTSQualityBaselines:
             for i in range(len(scores) - 1):
                 if scores[i] < scores[i + 1] - 0.1:
                     pass  # Allow some flexibility in ordering
+
+
+class TestBareNodeIsHonest:
+    """A node with no TTS engine must say so rather than offer one.
+
+    The counterpart to the skips above: where those classes have nothing to
+    assert, this is what the router owes the caller instead.
+    """
+
+    @pytest.fixture
+    def router(self):
+        from integrations.channels.media.tts_router import TTSRouter
+        return TTSRouter()
+
+    @pytest.mark.skipif(
+        _node_can_serve('en'),
+        reason='this node can serve English, so the bare-node path is not live here',
+    )
+    def test_no_engine_means_no_candidates(self, router):
+        assert router.select_engines('Hello', language='en') == []
+
+    def test_synthesize_names_the_absence_rather_than_a_failure(self, router):
+        """Distinguishing "nothing is installed" from "engines were tried and
+        failed" is what lets the caller offer a setup instead of a shrug."""
+        from unittest.mock import patch
+        with patch('integrations.channels.media.tts_router._is_engine_installed',
+                   return_value=False):
+            result = router.synthesize('Hello', language='en')
+        assert result.error == 'No TTS engine is installed for this language'
+        assert result.path == ''

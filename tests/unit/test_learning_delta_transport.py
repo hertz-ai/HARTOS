@@ -93,11 +93,12 @@ class TestLearningDeltaBootstrap:
 class TestBroadcastTransportSelection:
     """broadcast_delta delivers each sampled peer PeerLink-first."""
 
-    def _run_broadcast(self, link):
+    def _run_broadcast(self, link, status_code=200, agg=None):
         """Drive broadcast_delta against ONE active peer 'peerB', with a
         PeerLink manager whose get_link returns `link` (or None). Returns the
-        pooled_post mock so the caller can assert HTTP was / was not used."""
-        agg = fa.FederatedAggregator()
+        pooled_post mock so the caller can assert HTTP was / was not used.
+        `status_code` is what the receiver answers an HTTP POST with."""
+        agg = agg or fa.FederatedAggregator()
         delta = {'version': 1, 'node_id': 'selfNode', 'timestamp': time.time()}
 
         peer = MagicMock()
@@ -117,6 +118,8 @@ class TestBroadcastTransportSelection:
         fake_gossip.gossip_fanout = 3
 
         pooled_post = MagicMock()
+        pooled_post.return_value.status_code = status_code
+        pooled_post.return_value.text = 'unverified build' if status_code == 403 else '{}'
 
         with patch.object(fa, '_sign_delta'), \
              patch('security.edge_privacy.get_scope_guard', return_value=guard), \
@@ -158,3 +161,56 @@ class TestBroadcastTransportSelection:
 
         link.send.assert_called_once_with('learning', delta)
         assert pooled_post.call_count == 1
+
+
+# ── 4. The receiver's answer is read, not discarded ────────────────────────
+
+class TestTheReceiversAnswerCounts:
+    """Measured 2026-09-23 on the owner's Lenovo (nightly df5536d): a node
+    whose origin attestation failed kept 'delivering' deltas, and nothing
+    anywhere recorded that central refused them. _deliver_one discarded
+    pooled_post's response and returned success for ANY answer, so a
+    403 'unverified build' counted as delivered, fed record_success, and left
+    no log line. The answer decides the outcome now, and a change in it is
+    logged once, so a rejection (and its recovery) is visible."""
+
+    URL = 'http://192.168.0.83:6777'
+
+    def _agg(self):
+        agg = fa.FederatedAggregator()
+        agg._peer_backoff = MagicMock()
+        agg._peer_backoff.is_backed_off.return_value = False
+        return agg
+
+    def test_a_refused_delta_is_a_failed_delivery(self):
+        agg = self._agg()
+        TestBroadcastTransportSelection()._run_broadcast(None, status_code=403, agg=agg)
+        agg._peer_backoff.record_failure.assert_called_once_with(self.URL)
+        agg._peer_backoff.record_success.assert_not_called()
+
+    def test_an_accepted_delta_is_a_success(self):
+        agg = self._agg()
+        TestBroadcastTransportSelection()._run_broadcast(None, status_code=200, agg=agg)
+        agg._peer_backoff.record_success.assert_called_once_with(self.URL)
+        agg._peer_backoff.record_failure.assert_not_called()
+
+    def test_the_refusal_is_logged_with_its_status_once(self, caplog):
+        import logging
+        agg = self._agg()
+        run = TestBroadcastTransportSelection()._run_broadcast
+        with caplog.at_level(logging.WARNING):
+            run(None, status_code=403, agg=agg)
+            run(None, status_code=403, agg=agg)     # same answer: no repeat
+        hits = [r for r in caplog.records
+                if '403' in r.getMessage() and self.URL in r.getMessage()]
+        assert len(hits) == 1, [r.getMessage() for r in caplog.records]
+
+    def test_recovery_is_logged_when_the_answer_turns_good(self, caplog):
+        import logging
+        agg = self._agg()
+        run = TestBroadcastTransportSelection()._run_broadcast
+        run(None, status_code=403, agg=agg)
+        with caplog.at_level(logging.INFO):
+            run(None, status_code=200, agg=agg)
+        assert any('accepted' in r.getMessage() and self.URL in r.getMessage()
+                   for r in caplog.records), [r.getMessage() for r in caplog.records]

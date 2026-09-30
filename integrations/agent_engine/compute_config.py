@@ -32,6 +32,16 @@ _policy_cache = {}    # {node_id: (timestamp, policy_dict)}
 _CACHE_TTL = 30       # seconds
 
 
+#: Keys an env pin may only ever RESTRICT, never grant. These are PERMISSIONS --
+#: the node operator's answer about what their machine is allowed to spend or
+#: accept -- as opposed to CAPACITY numbers (max_hive_gpu_pct,
+#: offered_gpu_hours_per_day, metered_daily_limit_usd) where an env pin in either
+#: direction is just configuration and stays fully honoured.
+#: Deliberately a set rather than a check inlined at one key: the next permission
+#: added to _DEFAULTS should join this set, not grow a second mechanism.
+_ENV_MAY_ONLY_RESTRICT = frozenset({'allow_metered_for_hive'})
+
+
 def get_compute_policy(node_id: str = None) -> dict:
     """Resolve effective compute policy. Precedence: env > DB > defaults.
 
@@ -78,11 +88,32 @@ def get_compute_policy(node_id: str = None) -> dict:
     }
     for env_var, (key, converter) in env_map.items():
         val = os.environ.get(env_var)
-        if val is not None:
-            try:
-                policy[key] = converter(val)
-            except (ValueError, TypeError):
-                pass
+        if val is None:
+            continue
+        try:
+            converted = converter(val)
+        except (ValueError, TypeError):
+            continue
+        if key in _ENV_MAY_ONLY_RESTRICT and converted:
+            # A PERMISSION, so the pin may only ever take away. Two concrete
+            # things an env grant defeated here:
+            #   * the DB row is the node operator's own answer. env > DB meant
+            #     HEVOLVE_ALLOW_METERED_HIVE=1 spent their metered link after
+            #     they had declined it.
+            #   * /api/.../compute-policy REFUSES this field with 403 on a
+            #     central node (hart_intelligence_entry.py:12897, "Central nodes
+            #     cannot enable metered APIs for hive"). The env layer sat above
+            #     that guard and granted exactly what the API forbids.
+            # Same asymmetry, and the same reasoning, as copilot_enabled()
+            # (66386a45e): an override must never GRANT what the human withheld,
+            # it may only restrict. A falsy pin still applies, below, so the
+            # headless kill-switch use keeps working.
+            logger.info(
+                "compute_config: ignoring %s=%r as a GRANT for %s; an env pin "
+                "may only restrict a permission. Set it in NodeComputeConfig "
+                "to allow.", env_var, val, key)
+            continue
+        policy[key] = converted
 
     # Cache and return
     _policy_cache[cache_key] = (now, policy)

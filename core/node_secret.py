@@ -87,3 +87,12 @@ def get_tracking_secret() -> str:
     if env:
         return env
     return get_hmac_secret()
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HEVOLVE_TRACK_SECRET',
+)

@@ -41,7 +41,7 @@ try:
         filters,
         ContextTypes,
     )
-    from telegram.constants import ChatAction, ParseMode
+    from telegram.constants import ChatAction
     from telegram.error import TelegramError, RetryAfter
     HAS_TELEGRAM = True
 except ImportError:
@@ -336,7 +336,14 @@ class TelegramAdapter(ChannelAdapter, RoomCapableAdapter):
                 text=text,
                 reply_to_message_id=reply_to_id,
                 reply_markup=keyboard,
-                parse_mode=ParseMode.MARKDOWN,
+                # Agent-generated text isn't authored Markdown — legacy
+                # Markdown mode treats a single unescaped "_"/"*"/"`" as
+                # opening a formatting entity, so any reply containing one
+                # (e.g. "agent_name") 400s with "can't find end of the
+                # entity" and silently never reaches the user. Confirmed
+                # live 2026-07-28. Plain text sidesteps entity parsing
+                # entirely — safe default for unstructured agent replies.
+                parse_mode=None,
             )
 
             return SendResult(
@@ -463,7 +470,10 @@ class TelegramAdapter(ChannelAdapter, RoomCapableAdapter):
                 message_id=int(message_id),
                 text=text,
                 reply_markup=keyboard,
-                parse_mode=ParseMode.MARKDOWN,
+                # Same fix as send_message above — plain text avoids
+                # unescaped-Markdown entity-parsing errors on
+                # agent-generated content.
+                parse_mode=None,
             )
 
             return SendResult(
@@ -667,3 +677,12 @@ def create_telegram_adapter(token: str = None, **kwargs) -> TelegramAdapter:
 
     config = ChannelConfig(token=token, **kwargs)
     return TelegramAdapter(config)
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+ENV_SECRETS = (
+    'TELEGRAM_BOT_TOKEN',
+)

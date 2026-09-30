@@ -6,6 +6,7 @@ Separate from per-agent A2A cards - this advertises the platform itself.
 import json
 import os
 import logging
+import threading
 import time as _time
 from flask import Blueprint, jsonify, request
 from core.port_registry import get_port
@@ -23,22 +24,55 @@ discovery_bp = Blueprint('social_discovery', __name__)
 
 # ─── Gossip Rate Limiter ───
 _ANNOUNCE_RATE = {}   # ip -> list of timestamps
-_RATE_LIMIT = 10      # max announcements per window per IP
+_RATE_LIMIT = 10      # max announcements per window per CLIENT IP (_observed_ip)
 _RATE_WINDOW = 60     # window in seconds
+_RATE_LOCK = threading.Lock()
+_rate_last_sweep = [0.0]
 
 
 def _check_announce_rate(ip: str) -> bool:
     """Returns True if request is allowed, False if rate-limited.
-    Prevents gossip flooding from rapid peer announcements."""
+    Prevents gossip flooding from rapid peer announcements.
+
+    Once per window, clients with no request inside the window are dropped,
+    so the table holds at most the clients active in one window instead of
+    every key ever seen."""
     now = _time.time()
-    times = _ANNOUNCE_RATE.get(ip, [])
-    # Prune expired entries
-    times = [t for t in times if now - t < _RATE_WINDOW]
-    if len(times) >= _RATE_LIMIT:
-        return False
-    times.append(now)
-    _ANNOUNCE_RATE[ip] = times
-    return True
+    with _RATE_LOCK:
+        if now - _rate_last_sweep[0] >= _RATE_WINDOW:
+            for k in [k for k, v in _ANNOUNCE_RATE.items()
+                      if not v or now - v[-1] >= _RATE_WINDOW]:
+                del _ANNOUNCE_RATE[k]
+            _rate_last_sweep[0] = now
+        times = _ANNOUNCE_RATE.get(ip, [])
+        # Prune expired entries
+        times = [t for t in times if now - t < _RATE_WINDOW]
+        if len(times) >= _RATE_LIMIT:
+            _ANNOUNCE_RATE[ip] = times
+            return False
+        times.append(now)
+        _ANNOUNCE_RATE[ip] = times
+        return True
+
+
+def _rate_client_key() -> str:
+    """Who to charge a rate-limited request to: core.auth_local.
+    client_address(), the one "client address" rule.
+
+    Behind Kong the socket peer is the gateway for EVERY node, so keying on
+    it made the whole network share one budget (55d8b9152); a node behind a
+    gateway sets TRUSTED_PROXY to it.  X-Forwarded-For is believed from that
+    forwarder or loopback only: d35926896 also believed it from any private
+    socket peer, and every LAN host escaped both limiters by rotating the
+    header (review: 199/199 announces, 100/100 device asks)."""
+    from core.auth_local import client_address
+    from core.auth_local import client_key
+    return client_key() or '0.0.0.0'
+
+
+def check_client_rate() -> bool:
+    """_check_announce_rate for the requesting client (see _rate_client_key)."""
+    return _check_announce_rate(_rate_client_key())
 
 _BASE_URL = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
 
@@ -170,7 +204,9 @@ def discover_communities():
 # ════════════════════════════════════════════════════════════════
 
 def _observed_ip() -> str:
-    """The IP this request ACTUALLY came from, as seen by us or our proxy.
+    """The IP this request ACTUALLY came from: core.auth_local.
+    client_address(), the one rule the rate limiter and the local-caller
+    check use too.
 
     Why: the peer registry is poisoned by claimed addresses — measured
     2026-08-07 on central's live table, 147 peers, 67 advertising
@@ -178,26 +214,26 @@ def _observed_ip() -> str:
     behind NAT cannot know its own public address, but the RECEIVER of its
     announce can see it.  This is the one place that truth exists.
 
-    Proxy handling: behind Kong the socket peer is the gateway, and the real
-    client is in X-Forwarded-For.  We take the LAST entry — the one appended
-    by the outermost proxy we trust — never the first, which a direct client
-    can forge outright.  (A client-forged XFF still gets the real address
-    APPENDED by Kong, so last-wins survives spoofing; and on a direct LAN
-    request there is no XFF and remote_addr is already the truth.)  Worst
-    case this field is a wrong dial CANDIDATE, never a trust input.
+    Behind Kong the real client is the LAST X-Forwarded-For hop (the one the
+    gateway appended), believed only from a forwarder this node runs
+    (TRUSTED_PROXY or loopback).  It used to be believed from ANY caller;
+    since 02da559f7 it also decides whether a direct announce makes its row
+    'active' (peer_discovery.address_evidence), so a forged header must not
+    move it.
     """
-    xff = (request.headers.get('X-Forwarded-For') or '').strip()
-    if xff:
-        last_hop = xff.split(',')[-1].strip()
-        if last_hop:
-            return last_hop
-    return request.remote_addr or ''
+    from core.auth_local import client_address
+    # A trusted proxy that names no client gives '': fall back to the socket
+    # peer (the proxy), never to "unknown", which address_evidence reads as
+    # an unverifiable in-process caller and confirms (review of 291e548df,
+    # F2: the row went active on no evidence).
+    from core.auth_local import client_key
+    return client_key()
 
 
 @discovery_bp.route('/api/social/peers/announce', methods=['POST'])
 def peer_announce():
     """Receive a peer announcement. Merge into local peer list."""
-    if not _check_announce_rate(request.remote_addr):
+    if not check_client_rate():
         return jsonify({'success': False, 'error': 'Rate limited'}), 429
     from .peer_discovery import gossip
     data = request.get_json(force=True, silent=True) or {}
@@ -231,6 +267,18 @@ def peer_announce():
     }
     if reasons:
         body['reason'] = reasons[0]
+    # Signed, and bound to the announce it answers (node_id + the nonce the
+    # announcer sent), so a node that holds this node's key can trust a reply
+    # that did not come over verified HTTPS, and a recorded reply cannot be
+    # replayed to another node or a later announce (#140 B3).
+    body['reply_to'] = {'node_id': str(data.get('node_id') or ''),
+                        'nonce': str(data.get('nonce') or '')}
+    try:
+        from security.node_integrity import get_public_key_hex, sign_json_payload
+        body['public_key'] = get_public_key_hex()
+        body['signature'] = sign_json_payload(body)
+    except Exception as e:
+        logger.debug("announce reply left unsigned: %s", e)
     return jsonify(body)
 
 
@@ -257,7 +305,7 @@ def peer_list():
 @discovery_bp.route('/api/social/peers/exchange', methods=['POST'])
 def peer_exchange():
     """Gossip exchange: receive their peers, return ours."""
-    if not _check_announce_rate(request.remote_addr):
+    if not check_client_rate():
         return jsonify({'success': False, 'error': 'Rate limited'}), 429
     from .peer_discovery import gossip
     data = request.get_json(force=True, silent=True) or {}
@@ -448,12 +496,17 @@ def peer_broadcast():
                                   (pulls full packet from the sender's
                                   /v1/ralt/skills/export/<task_id> and
                                   installs it locally via import_skill)
+      * 'recipe_available'      → peer_reuse.on_recipe_available_advert
+                                  (caches the pointer so the daemon can
+                                  pull directly)
+      * 'model_available'       → model_mesh.on_model_available_advert
+                                  (caches the OFFER; registers nothing
+                                  and fetches no weights)
 
     Unknown types are acknowledged but not dispatched, so new gossip
     payload types can be added without wire-breaking older peers.
     """
-    ip = request.remote_addr or '0.0.0.0'
-    if not _check_announce_rate(ip):
+    if not check_client_rate():  # the client, not the Kong gateway
         return jsonify({'success': False, 'reason': 'rate_limited'}), 429
 
     msg = request.get_json(force=True, silent=True) or {}
@@ -487,6 +540,25 @@ def peer_broadcast():
             logger.debug(f"peer_broadcast recipe advert dispatch failed: {e}")
             return jsonify({'success': False, 'reason': str(e)}), 500
 
+    elif msg_type == 'model_available':
+        # MODEL capability mesh: an admitted peer installed a model and
+        # advertised it (model_mesh.announce_model_available). Cache the
+        # OFFER so the Model Management page can show what the hive has
+        # that this node does not. Nothing is registered and no weights
+        # are fetched — select_best() does not filter on `downloaded`,
+        # so a catalog row would be a live selection candidate scored
+        # with numbers a peer chose. Trust + echo-skip live in
+        # on_model_available_advert.
+        try:
+            from integrations.service_tools.model_mesh import (
+                on_model_available_advert)
+            result = on_model_available_advert(msg)
+            status = 200 if result.get('success') else 202
+            return jsonify(result), status
+        except Exception as e:
+            logger.debug(f"peer_broadcast model advert dispatch failed: {e}")
+            return jsonify({'success': False, 'reason': str(e)}), 500
+
     # Forward-compatible: ack unknown types without error so older
     # peers don't see 5xx from newer payloads, but mark dispatched=False
     # so the sender knows nothing happened.
@@ -504,8 +576,7 @@ def peer_embedding_delta():
     Phase 1 gradient sync: peers submit embedding deltas via gossip.
     Deltas are validated and fed to FederatedAggregator's embedding channel.
     """
-    ip = request.remote_addr or '0.0.0.0'
-    if not _check_announce_rate(ip):
+    if not check_client_rate():  # the client, not the Kong gateway
         return jsonify({'success': False, 'reason': 'rate_limited'}), 429
 
     body = request.get_json(silent=True) or {}
@@ -696,7 +767,7 @@ def federation_follow_notification():
             'node_id': follower_node,
             'url': follower_url,
             'name': f'follower-{follower_node[:8]}',
-        })
+        }, observed_ip=_observed_ip())
         # RECORD the follow — for this handler's whole life it logged "now
         # follows us" while writing nothing, so get_followers() stayed empty
         # on every node and push_to_followers never had a single target
@@ -1340,6 +1411,76 @@ def hierarchy_node_assignment(node_id):
         db.close()
 
 
+def _sender_signature_valid(db, data: dict, node_id=None) -> bool:
+    """STRICT node-identity check: True ONLY when ``data`` carries a node_id +
+    signature that verifies against a peer's REGISTERED PeerNode.public_key,
+    looked up by the DECLARED node_id (or the legacy key-prefix fallback, which
+    still resolves to a key ALREADY ON FILE).  Never trusts a key from the
+    request, and has NO enforcement-mode escape.
+
+    ``node_id``: the declared sender when the payload names it somewhere other
+    than a top-level 'node_id' (admitted_peer_sender's ``sender`` block); the
+    signature still covers the whole payload.
+
+    Two policies over one verify: _verify_sync_sender layers the migration
+    escape (apply unsigned/invalid under non-hard enforcement) on top of this
+    for hierarchy_sync's un-upgraded senders.  A route that CREATES or
+    AUTHORIZES — /api/social/auth/sync-user (#59, an admin-takeover: a synced
+    user can be role 'central' which passes require_admin) — calls THIS
+    directly, so a soft/warn node cannot be spoofed by an unsigned or forged
+    batch.  The signed/verified surface excludes only 'signature'
+    (node_integrity.canonical_payload); keep the payload otherwise clean or
+    update _signed_send_payload in lockstep."""
+    from .models import PeerNode
+    node_id = node_id or data.get('node_id')
+    sig = data.get('signature', '')
+    if not node_id or not sig:
+        return False
+    try:
+        from security.node_integrity import verify_json_signature
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        pk = getattr(peer, 'public_key', None) if peer else None
+        if not peer:
+            # LEGACY SENDERS (delete once the fleet has rolled past the
+            # 2026-08-08 identity unification): before that fix, sync stamped
+            # node_id = get_public_key_hex()[:16] — a public-key PREFIX —
+            # while PeerNode keys on the gossip UUID, so the exact lookup
+            # missed for every node.  An un-upgraded peer still declares the
+            # prefix, so resolve it to the peer whose registered public_key
+            # STARTS WITH it.  This proves exactly as much as the modern path:
+            # the signature is still verified against a key ALREADY ON FILE,
+            # never one from the request — it just finds the row a second way.
+            if len(node_id) == 16 and all(
+                    c in '0123456789abcdef' for c in node_id.lower()):
+                peer = db.query(PeerNode).filter(
+                    PeerNode.public_key.startswith(node_id)).first()
+                pk = getattr(peer, 'public_key', None) if peer else None
+                if pk:
+                    logger.info(
+                        "sync sender: resolved legacy key-prefix sender "
+                        "%s -> node %s", node_id, peer.node_id)
+        if pk:
+            if verify_json_signature(pk, data, sig):
+                return True
+            # "Resolved but wrong key" is a COMPLETELY different fault from
+            # "unknown sender"; a node whose keypair moved lands HERE.
+            logger.warning(
+                "sync sender: node_id=%s resolved to peer %s, but the batch "
+                "signature does NOT match the public_key on file (%s...) — "
+                "signing with a DIFFERENT keypair than is registered",
+                node_id, getattr(peer, 'node_id', '?'), str(pk)[:16])
+        else:
+            logger.warning(
+                "sync sender: NO peer row resolves node_id=%s (tried exact, "
+                "then the legacy key-prefix branch) — sender unknown, cannot "
+                "verify", node_id)
+    except Exception:
+        logger.warning(
+            "sync sender: verification RAISED for node_id=%s — treating as "
+            "unverified", node_id, exc_info=True)
+    return False
+
+
 def _verify_sync_sender(db, data: dict) -> bool:
     """P4 node-identity gate for hierarchy_sync — central must know WHICH node
     sent a batch before applying it (closes the unauthenticated-ingress IDOR).
@@ -1348,68 +1489,15 @@ def _verify_sync_sender(db, data: dict) -> bool:
     against the node's registered PeerNode.public_key) always passes. An
     unsigned/invalid batch passes ONLY when enforcement mode is not 'hard'
     (a non-breaking migration path for un-upgraded nodes), logging a warning.
-    'hard' mode requires a valid signature — fail-closed."""
-    from .models import PeerNode
-    node_id = data.get('node_id')
-    sig = data.get('signature', '')
-    if node_id and sig:
-        try:
-            from security.node_integrity import verify_json_signature
-            # The signed/verified surface is EXACTLY {items, node_id}: the node
-            # signs it pre-E2E and decrypt_json_from_peer pops _provenance back
-            # off before we see `data`. Any key added to `data` before this
-            # verify would break every signature — keep the decrypted payload
-            # clean, or update _signed_send_payload in lockstep.
-            peer = db.query(PeerNode).filter_by(node_id=node_id).first()
-            pk = getattr(peer, 'public_key', None) if peer else None
-            if not peer:
-                # LEGACY SENDERS (delete once the fleet has rolled past the
-                # 2026-08-08 identity unification): before that fix, sync
-                # stamped node_id = get_public_key_hex()[:16] — a public-key
-                # PREFIX — while PeerNode keys on the gossip UUID.  The lookup
-                # above therefore missed for every node, and hard enforcement
-                # turned that into a fleet-wide 403 (measured: 65 dead rows
-                # here, central holding our correct key on the UUID row the
-                # whole time).  An un-upgraded peer still declares the prefix,
-                # so resolve it by the only thing it can mean: the peer whose
-                # registered public_key STARTS WITH that prefix.  This proves
-                # exactly as much as the modern path — the signature is still
-                # verified against a key we already had on file — it just
-                # finds the row a second way.
-                if len(node_id) == 16 and all(
-                        c in '0123456789abcdef' for c in node_id.lower()):
-                    peer = db.query(PeerNode).filter(
-                        PeerNode.public_key.startswith(node_id)).first()
-                    pk = getattr(peer, 'public_key', None) if peer else None
-                    if pk:
-                        logger.info(
-                            "hierarchy_sync: resolved legacy key-prefix "
-                            "sender %s -> node %s", node_id, peer.node_id)
-            if pk:
-                if verify_json_signature(pk, data, sig):
-                    return True
-                # "Resolved but wrong key" is a COMPLETELY different fault from
-                # "unknown sender", and until 2026-08-08 both produced the same
-                # opaque 403.  A node whose keypair moved (the CWD-relative
-                # key-dir split) lands HERE, not in the else-branch — say so.
-                logger.warning(
-                    "hierarchy_sync: node_id=%s resolved to peer %s, but the "
-                    "batch signature does NOT match the public_key on file "
-                    "(%s...) — the sender is signing with a DIFFERENT keypair "
-                    "than this node has registered for it",
-                    node_id, getattr(peer, 'node_id', '?'), str(pk)[:16])
-            else:
-                logger.warning(
-                    "hierarchy_sync: NO peer row resolves node_id=%s (tried "
-                    "exact node_id, then the legacy key-prefix branch) — the "
-                    "sender is unknown to this node, cannot verify",
-                    node_id)
-        except Exception:
-            logger.warning(
-                "hierarchy_sync: sender verification RAISED for node_id=%s — "
-                "treating as unverified", node_id, exc_info=True)
+    'hard' mode requires a valid signature — fail-closed.
+
+    The signature check itself is _sender_signature_valid (strict, shared with
+    the sync-user route); this function adds ONLY the migration escape."""
+    if _sender_signature_valid(db, data):
+        return True
     # No valid signature. Apply ONLY outside hard enforcement (migration path).
     # If the mode can't be determined, fail closed — this module's whole job.
+    node_id = data.get('node_id')
     try:
         from security.master_key import get_enforcement_mode
         mode = get_enforcement_mode()
@@ -1422,6 +1510,127 @@ def _verify_sync_sender(db, data: dict) -> bool:
     logger.warning("hierarchy_sync: applying unverified batch from node_id=%s "
                    "(no/invalid signature; non-hard enforcement)", node_id)
     return True
+
+
+# ─── A request from a node the hive admitted ───
+#
+# OWNER RULING 2026-09-26: "we had trust created in same network and when
+# auto mode the consent is implicit only a hash verified node is enough what
+# other creds are we talking about? torrents is the analogy for our design".
+# A node that passed the gossip admission gate (guardrail hash + Ed25519; a
+# PeerNode row) proves who it is with the key it gossips under: no API key,
+# no second credential.  signed_peer_request is the sending half and
+# admitted_peer_sender the receiving half, so the two can never disagree on
+# the shape.  First caller: the A2A jsonrpc route (google_a2a_integration).
+
+# Signatures already admitted, until they fall out of the freshness window:
+# a captured request replayed inside the window is refused.  Bounded by the
+# window: every entry expires, and pruning runs on each insert.
+_seen_peer_signatures = {}
+_seen_peer_signatures_lock = threading.Lock()
+
+
+def signed_peer_request(payload: dict, audience: str) -> dict:
+    """``payload`` plus ``sender`` {node_id, public_key}, ``audience``,
+    ``timestamp`` and ``signature``: signed by this node's Ed25519 key over
+    every field but 'signature' (node_integrity.canonical_payload).
+
+    node_id is SyncEngine.canonical_node_id(), the id this node's PeerNode row
+    carries on every peer (gossip.node_id).  ``audience`` is the node_id of
+    the node the request is FOR, so a captured request cannot be replayed to
+    another node that also admitted the sender.  No new key material.  Raises
+    if the node cannot sign; the caller decides whether to send unsigned."""
+    from security.node_integrity import get_public_key_hex, sign_json_payload
+    from .sync_engine import SyncEngine
+    body = {k: v for k, v in payload.items() if k != 'signature'}
+    body['sender'] = {'node_id': SyncEngine.canonical_node_id(),
+                      'public_key': get_public_key_hex()}
+    body['audience'] = audience
+    body['timestamp'] = int(_time.time())
+    body['signature'] = sign_json_payload(body)
+    return body
+
+
+def admitted_peer_sender(db, payload: dict, audience: str):
+    """(node_id, '') when ``payload`` was signed by a node this node has
+    VERIFIED, for this node, else (None, reason).  The ONE rule for "is this
+    request from an admitted peer":
+
+      - ``sender.node_id`` names a PeerNode row whose integrity_status is
+        'verified'.  A row alone is not admission: POST
+        /api/social/peers/announce is open, checks the guardrail hash only
+        when one is sent and admits an unknown code hash as untrusted, so any
+        fresh key gets an 'unverified' row (review of a5364ba66, probed
+        through the real handle_announce).  'verified' is written by one
+        thing, IntegrityService.evaluate_challenge_response, when the node
+        answered this node's integrity challenge (nonce, signed by the key
+        on file; guardrail_verify compares its live guardrail hash, and a
+        failed or undecided code_hash_check withholds or revokes it).  That
+        is the hive's hash verification.  'unverified', 'claimed' (a
+        self-reported hash, never proven), 'suspicious' (fraud score >= 40)
+        and 'banned' are refused;
+      - no ban_until still in the future, whatever the status says;
+      - ``audience`` is this node's own id: a request signed for another node
+        does not run here;
+      - the key the sender names is the key on file, and the signature
+        verifies against the key on file (_sender_signature_valid: never a
+        key from the request);
+      - ``timestamp`` is within WITNESS_TIMESTAMP_MAX_AGE of now either way,
+        the named freshness rule for a node-signed peer request (gossip
+        announces carry none; the LAN beacon's 300 is an unnamed literal);
+      - the signature has not been admitted before inside that window.
+
+    Row status (active/stale/dead) is not consulted: a node calling us is
+    alive, and liveness is the health round's business, not trust.
+
+    Measured on the owner's desktop DB (2026-09-26): the integrity round
+    does verify real peers (LAN desktop 230c3115 verified by passed
+    challenges; 73 distinct peers have passed at least one), but slowly on a
+    large table: 230c3115's first challenge came ~23.6 h after it was first
+    seen.  Until then the invoke is refused and the caller falls through to
+    local CREATE, as before this rule existed.
+    """
+    from datetime import datetime
+    from .integrity_service import WITNESS_TIMESTAMP_MAX_AGE
+    from .models import PeerNode
+
+    sender = payload.get('sender')
+    signature = payload.get('signature')
+    if not isinstance(sender, dict) or not signature \
+            or not isinstance(signature, str):
+        return None, 'unsigned'
+    node_id = sender.get('node_id')
+    sent_key = sender.get('public_key')
+    if not node_id or not isinstance(node_id, str) or not sent_key:
+        return None, 'no sender'
+    if not audience or payload.get('audience') != audience:
+        return None, 'signed for another node'
+    ts = payload.get('timestamp')
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None, 'no timestamp'
+    now = _time.time()
+    if abs(now - ts) > WITNESS_TIMESTAMP_MAX_AGE:
+        return None, 'stale timestamp'
+    peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+    if peer is None:
+        return None, 'unknown node'
+    if peer.integrity_status == 'banned' or (
+            peer.ban_until is not None and peer.ban_until > datetime.utcnow()):
+        return None, 'node is banned'
+    if peer.integrity_status != 'verified':
+        return None, f'node not verified ({peer.integrity_status})'
+    if not peer.public_key or peer.public_key != sent_key:
+        return None, 'key is not the key on file'
+    if not _sender_signature_valid(db, payload, node_id=node_id):
+        return None, 'signature does not verify'
+    with _seen_peer_signatures_lock:
+        for sig, expires in list(_seen_peer_signatures.items()):
+            if expires <= now:
+                del _seen_peer_signatures[sig]
+        if signature in _seen_peer_signatures:
+            return None, 'replayed request'
+        _seen_peer_signatures[signature] = now + 2 * WITNESS_TIMESTAMP_MAX_AGE
+    return node_id, ''
 
 
 @discovery_bp.route('/api/social/hierarchy/sync', methods=['POST'])
@@ -1694,11 +1903,8 @@ def hierarchy_verify_upgrade():
     # Signature valid — upgrade to central
     # Note: private key is NOT stored. Only the tier is persisted.
     try:
-        try:
-            from core.platform_paths import get_db_dir
-            data_dir = get_db_dir()
-        except ImportError:
-            data_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data')
+        from core.platform_paths import get_db_dir
+        data_dir = get_db_dir()
         os.makedirs(data_dir, exist_ok=True)
         config_path = os.path.join(data_dir, 'node_config.json')
         config = {}

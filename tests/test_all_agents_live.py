@@ -3,7 +3,23 @@ Live test of ALL HARTOS agent types via the running server.
 Run: PYTHONIOENCODING=utf-8 python tests/test_all_agents_live.py
 Requires: HARTOS server running on port 6777, LLM on port 8080
 """
+import os
 import sys
+
+import pytest
+
+# A LIVE-SERVER script, not a hermetic test: the module body logs into a
+# running backend at import time, so under a bare pytest it ERRORs at
+# collection (connection refused on :6777). It is gated on an opt-in so the
+# release shards never dial a server that is not there, and stays runnable
+# by hand exactly as its header says.
+if not os.environ.get("HARTOS_LIVE_TEST"):
+    pytest.skip(
+        "live-server test: needs a running HART backend on :6777 and an LLM "
+        "on :8080; set HARTOS_LIVE_TEST=1 to run it",
+        allow_module_level=True,
+    )
+
 sys.stdout.reconfigure(line_buffering=True)
 import requests, json, time
 

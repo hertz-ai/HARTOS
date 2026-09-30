@@ -62,6 +62,7 @@ class RedisRateLimiter:
         'p2p_health': (15, 60),          # 15 health ops per 60 seconds
         'p2p_logistics': (20, 60),       # 20 logistics ops per 60 seconds
         'autoresearch': (5, 3600),       # 5 autoresearch sessions per hour
+        'book_parse': (20, 3600),        # 20 book uploads per hour (each is minutes of VLM work)
         'wifi': (30, 60),                # 30 wifi operations per 60 seconds
         'vpn': (20, 60),                 # 20 vpn operations per 60 seconds
         'trash': (30, 60),               # 30 trash operations per 60 seconds
@@ -108,7 +109,8 @@ class RedisRateLimiter:
     def _get_key(self, action: str) -> str:
         """Build composite rate limit key from user_id + IP."""
         user_id = getattr(g, 'user_id', None) if hasattr(g, 'user_id') else None
-        ip = request.remote_addr or 'unknown'
+        from core.auth_local import client_key
+        ip = client_key() or 'unknown'
 
         if user_id:
             return f"rl:{action}:user:{user_id}"

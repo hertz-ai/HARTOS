@@ -20,6 +20,7 @@ dispatches them through the existing agent goal system.
 """
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -36,11 +37,26 @@ logger = logging.getLogger('hevolve.auto_evolve')
 AUTO_EVOLVE_MAX_PARALLEL_DISPATCH = 4
 
 # PRODUCT_MAP §10: super-majority threshold for VOTE stage — candidates must
-# clear 2/3 of the weighted tally, not a simple majority.  Expressed as a
-# fraction of the maximum possible score so callers can still tune per-session
-# via min_approval_score (which is applied as an absolute-score floor in
-# addition to this ratio).
-AUTO_EVOLVE_SUPERMAJORITY_RATIO = 2.0 / 3.0
+# clear 2/3 of the weighted tally, not a simple majority.  The rule itself
+# (quorum + this ratio as a floor + the decision context's threshold and
+# steward) lives in voting_rules.approval_verdict, shared with the
+# evaluation-goal writer; this name is kept for existing importers only.
+# Callers can still tune per-session via min_approval_score (an absolute-score
+# floor applied in addition to the rule).
+from integrations.social.voting_rules import (  # noqa: E402
+    SUPERMAJORITY_RATIO as AUTO_EVOLVE_SUPERMAJORITY_RATIO)
+
+# How long a dispatched cycle may stay un-terminal before reconcile() closes
+# it out.  This exists because 'paused' is NOT a terminal goal status (six
+# throttle/budget paths write it while the goal is still alive), so a cycle
+# whose goal is parked would otherwise stay 'running' forever -- and both
+# start() and the agent daemon's tick refuse to open a new cycle while one is
+# running, so auto-evolve would be wedged permanently on a single parked goal.
+# The bound is generous: it must be long enough that a normal budget pause
+# resumes well inside it, and it is the ONLY thing that releases the
+# orchestrator when a goal never comes back.
+AUTO_EVOLVE_SESSION_MAX_AGE_S = float(
+    os.getenv('HEVOLVE_AUTO_EVOLVE_SESSION_MAX_AGE_S', 6 * 3600))
 
 # Active-learning bias for the VOTE stage.  When the world model
 # (HevolveAI side, queried via world_model_bridge.get_learning_feedback)
@@ -128,6 +144,11 @@ class EvolveSession:
     failed: int = 0
     experiments: List[Dict] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    # Who started the cycle: the admin's id from the API, 'system' from the
+    # agent daemon.  _emit_event addresses every auto_evolve.* event to this
+    # id.  Deliberately NOT in to_dict(): the status endpoint is open to any
+    # authenticated user, and the initiator is not theirs to see.
+    user_id: str = 'system'
 
     def to_dict(self) -> Dict:
         return {
@@ -174,14 +195,16 @@ class AutoEvolveOrchestrator:
             Session info dict
         """
         with self._lock:
-            if self._active_session and self._active_session.status == 'running':
+            if (self._active_session
+                    and self._active_session.status in (
+                        'selecting', 'dispatching', 'running')):
                 return {
                     'success': False,
                     'reason': 'Auto-evolve cycle already running',
                     'session': self._active_session.to_dict(),
                 }
 
-        session = EvolveSession()
+        session = EvolveSession(user_id=user_id or 'system')
         session.started_at = time.time()
         session.status = 'selecting'
 
@@ -217,6 +240,109 @@ class AutoEvolveOrchestrator:
                 return self._active_session.to_dict()
         return {'status': 'idle', 'message': 'No active auto-evolve session'}
 
+    def reconcile(self) -> Dict:
+        """Project dispatched AgentGoal states back onto the active cycle.
+
+        Dispatch deliberately stays in the existing goal engine.  This is the
+        missing return handoff: the orchestrator stores each created goal id,
+        then reads that canonical goal's state until every dispatched experiment
+        is terminal.  It never infers completion from an agent's prose.
+        """
+        with self._lock:
+            session = self._active_session
+            if session is None:
+                return {'status': 'idle',
+                        'message': 'No active auto-evolve session'}
+            if session.status != 'running':
+                return session.to_dict()
+            goal_ids = [
+                item.get('goal_id') for item in session.experiments
+                if item.get('goal_id')
+            ]
+
+        if not goal_ids:
+            with self._lock:
+                session.status = 'failed'
+                if 'No dispatched goal ids to reconcile' not in session.errors:
+                    session.errors.append('No dispatched goal ids to reconcile')
+                return session.to_dict()
+
+        try:
+            from integrations.social.models import AgentGoal, db_session
+            with db_session(commit=False) as db:
+                goals = db.query(AgentGoal).filter(
+                    AgentGoal.id.in_(goal_ids)).all()
+            by_id = {str(goal.id): str(goal.status or '').lower()
+                     for goal in goals}
+        except Exception as exc:
+            logger.warning(
+                "[%s] Auto-evolve reconciliation skipped: %s",
+                session.session_id, exc)
+            return session.to_dict()
+
+        # 'paused' is NOT terminal.  Six throttle and budget paths write it
+        # while the goal is still alive (agent_daemon, budget_gate,
+        # goal_manager, coding_daemon), and four readers -- goal_seeding,
+        # content_gen_tracker, api_tracker, dashboard_service -- all treat
+        # ['active', 'paused'] as live.  Closing the experiment on a pause
+        # left its row at status 'evaluating' with no evaluation recorded,
+        # so the next cycle's _gather_candidates picked it up again and
+        # request_agent_evaluation created a SECOND AgentGoal for the same
+        # experiment.  The paused goal then resumed alongside it.
+        terminal = {'completed', 'failed', 'archived'}
+        # Because 'paused' no longer closes an experiment, something else has
+        # to release a cycle whose goal never comes back -- start() and the
+        # daemon tick both refuse to open a new cycle while one is 'running'.
+        aged_out = bool(session.started_at) and (
+            time.time() - session.started_at) > AUTO_EVOLVE_SESSION_MAX_AGE_S
+        with self._lock:
+            for item in session.experiments:
+                goal_id = item.get('goal_id')
+                if not goal_id:
+                    continue
+                goal_status = by_id.get(str(goal_id))
+                if goal_status is None:
+                    item['status'] = 'failed'
+                    item['reason'] = 'dispatched goal is missing'
+                elif goal_status == 'completed':
+                    item['status'] = 'completed'
+                elif goal_status in terminal:
+                    item['status'] = 'failed'
+                    item['reason'] = f'goal ended as {goal_status}'
+                elif aged_out:
+                    item['status'] = 'failed'
+                    item['reason'] = (
+                        f'goal still {goal_status} after '
+                        f'{AUTO_EVOLVE_SESSION_MAX_AGE_S:.0f}s; '
+                        'cycle aged out')
+                    item['goal_status'] = goal_status
+                    logger.warning(
+                        "[%s] Experiment %s aged out with its goal still %s; "
+                        "closing the cycle so auto-evolve can run again",
+                        session.session_id, item.get('id'), goal_status)
+                else:
+                    item['status'] = 'running'
+                    item['goal_status'] = goal_status
+
+            session.completed = sum(
+                item.get('status') == 'completed'
+                for item in session.experiments)
+            session.failed = sum(
+                item.get('status') == 'failed'
+                for item in session.experiments)
+            all_terminal = bool(session.experiments) and all(
+                item.get('status') in ('completed', 'failed')
+                for item in session.experiments)
+            if all_terminal:
+                session.status = (
+                    'completed' if session.completed > 0 else 'failed')
+                payload = session.to_dict()
+            else:
+                return session.to_dict()
+
+        self._emit_event('auto_evolve.completed', session, payload)
+        return payload
+
     def _execute_cycle(self, session: EvolveSession,
                        max_experiments: int,
                        min_approval_score: float,
@@ -230,7 +356,7 @@ class AutoEvolveOrchestrator:
         if not candidates:
             session.status = 'completed'
             session.errors.append('No eligible experiments found')
-            self._emit_event('auto_evolve.no_candidates', session.to_dict())
+            self._emit_event('auto_evolve.no_candidates', session)
             return
 
         # Phase 2: FILTER through constitutional gate
@@ -245,7 +371,7 @@ class AutoEvolveOrchestrator:
             session.status = 'completed'
             session.errors.append(
                 f'No experiments met approval threshold ({min_approval_score})')
-            self._emit_event('auto_evolve.none_approved', session.to_dict())
+            self._emit_event('auto_evolve.none_approved', session)
             return
 
         # Phase 4: SELECT top-N
@@ -253,7 +379,7 @@ class AutoEvolveOrchestrator:
 
         # Phase 5: DISPATCH to type-aware iteration (parallel per PRODUCT_MAP §10)
         session.status = 'dispatching'
-        self._emit_event('auto_evolve.dispatching', {
+        self._emit_event('auto_evolve.dispatching', session, {
             'count': len(winners),
             'experiments': [w['id'] for w in winners],
         })
@@ -261,7 +387,7 @@ class AutoEvolveOrchestrator:
         self._dispatch_winners_parallel(session, winners, user_id)
 
         session.status = 'running' if session.dispatched > 0 else 'failed'
-        self._emit_event('auto_evolve.started', session.to_dict())
+        self._emit_event('auto_evolve.started', session)
 
         logger.info(f"[{session.session_id}] Auto-evolve dispatched "
                      f"{session.dispatched}/{len(winners)} experiments")
@@ -277,9 +403,25 @@ class AutoEvolveOrchestrator:
             with db_session(commit=False) as db:
                 all_experiments = []
                 for status in statuses:
+                    # Only experiments that HAVE votes: a zero-vote row can
+                    # never pass _rank_by_votes (score 0, super-majority 0).
+                    # The newest-50 window used to hide every voted row once
+                    # unvoted ones piled up -- measured on a live node, the
+                    # human-voted experiments sat at rank ~693 of 807 and
+                    # every cycle ended none_approved.  This changes what is
+                    # looked at, never what is approved: the gate is intact.
                     exps = ThoughtExperimentService.get_active_experiments(
-                        db, status=status, limit=50)
-                    all_experiments.extend(exps)
+                        db, status=status, limit=200, with_votes_only=True)
+                    # One evaluation goal already contains the experiment's
+                    # type-aware iteration loop.  Re-dispatching an evaluating
+                    # row that has recorded an evaluation creates duplicate
+                    # goals forever because the explicit decide step belongs to
+                    # the steward/API.  A failed goal records no evaluation and
+                    # therefore remains eligible for retry.
+                    all_experiments.extend(
+                        exp for exp in exps
+                        if not (status == 'evaluating'
+                                and exp.get('agent_evaluations_json')))
                 return all_experiments
         except Exception as e:
             logger.warning(f"[{session.session_id}] Gather failed: {e}")
@@ -317,6 +459,11 @@ class AutoEvolveOrchestrator:
         super-majority gate protects against a small but highly-weighted
         vocal minority flipping a low-participation tally into approval.
 
+        The gate FAILS CLOSED.  If the tally cannot be read at all -- a
+        locked SQLite database, a schema error -- nothing is dispatched
+        this cycle.  A tally that could not be counted is not an approval,
+        and the daemon retries on its next interval.
+
         Once the gates pass, the rank is biased by an active-learning
         signal pulled from the world model (HevolveAI) — see
         _active_learning_multiplier docstring.  The bias only nudges
@@ -327,34 +474,54 @@ class AutoEvolveOrchestrator:
             from integrations.social.models import db_session
             from integrations.social.thought_experiment_service import (
                 ThoughtExperimentService)
+            from integrations.social.voting_rules import approval_verdict
 
             with db_session(commit=False) as db:
                 for exp in candidates:
                     tally = ThoughtExperimentService.tally_votes(
                         db, exp['id'])
                     score = tally.get('weighted_score', 0)
-                    total_for = tally.get('total_for', 0) or 0
-                    total_against = tally.get('total_against', 0) or 0
-                    decisive = total_for + total_against
-                    # Super-majority: ≥ 2/3 of DECISIVE (non-abstain) weight
-                    # must be FOR.  Abstains are excluded from denominator.
-                    super_ratio = (total_for / decisive) if decisive > 0 else 0.0
+                    # The ONE approval rule (voting_rules.approval_verdict):
+                    # quorum of DISTINCT identities -- no single identity
+                    # approves alone, a tally that does not answer fails
+                    # closed -- AND a FOR share of the decisive weight of at
+                    # least max(2/3, the context's threshold), one vote per
+                    # identity -- AND the steward's FOR where the context
+                    # requires one.  The evaluation-goal writer asks the same
+                    # rule, so ranking and dispatch cannot disagree.
+                    verdict = approval_verdict(tally)
+                    super_ratio = verdict['super_majority']
+                    quorate = verdict['quorum_met']
                     exp['_approval_score'] = score
-                    exp['_super_majority'] = round(super_ratio, 4)
+                    exp['_super_majority'] = super_ratio
                     exp['_tally'] = tally
-                    if (score >= min_score
-                            and super_ratio >= AUTO_EVOLVE_SUPERMAJORITY_RATIO):
+                    if score >= min_score and verdict['approved']:
                         scored.append(exp)
                     else:
                         logger.debug(
                             f"[{session.session_id}] Rejected {exp.get('id')}: "
                             f"score={score} super_ratio={super_ratio:.3f} "
+                            f"quorum_met={quorate} "
+                            f"distinct_voters={tally.get('distinct_voters')} "
+                            f"verdict={verdict['reason']} "
                             f"(need score>={min_score} and "
-                            f"ratio>={AUTO_EVOLVE_SUPERMAJORITY_RATIO:.3f})"
+                            f"ratio>={verdict['threshold']:.3f} "
+                            f"and quorum)"
                         )
         except Exception as e:
-            logger.warning(f"[{session.session_id}] Vote tally failed: {e}")
-            return candidates  # Fall through unranked
+            # Fail CLOSED.  This gate is the constitutional supermajority: an
+            # experiment reaches dispatch only when the weighted vote approves
+            # it.  Returning the candidates unranked returned them UNGATED --
+            # every constitutionally-eligible experiment dispatched with zero
+            # votes counted.  That was already wrong when a human pressed the
+            # admin button; it became autonomous when the daemon started
+            # calling start(user_id='system') on a timer.  A locked SQLite
+            # database is not an approval.  The cycle is skipped and the
+            # daemon retries on its next interval.
+            logger.error(
+                "[%s] Vote tally failed, refusing to dispatch unvoted "
+                "experiments this cycle: %s", session.session_id, e)
+            return []
 
         # Active-learning bias: pull a global epistemic-uncertainty
         # multiplier from the world model and apply it as a small
@@ -508,6 +675,7 @@ class AutoEvolveOrchestrator:
                     success = (
                         isinstance(goal_result, dict)
                         and bool(goal_result.get('success'))
+                        and bool(goal_result.get('goal_id'))
                     )
                     with self._lock:
                         if success:
@@ -574,11 +742,22 @@ class AutoEvolveOrchestrator:
                 db.commit()
             return result
 
-    def _emit_event(self, topic: str, data: Dict):
-        """Emit progress event via EventBus."""
+    def _emit_event(self, topic: str, session: EvolveSession,
+                    data: Optional[Dict] = None):
+        """Emit a progress event via EventBus, addressed to the initiator.
+
+        The payload defaults to the session snapshot.  Every event is stamped
+        with the cycle initiator's user_id here, in one place: the EventBus
+        P3a guard refuses an SSE broadcast that names no user (live, every
+        cycle: "SSE broadcast refused ... topic='auto_evolve.none_approved'"),
+        and these topics are not public -- the status they carry is behind
+        auth -- so they route to the person who started the cycle.
+        """
+        payload = dict(data) if data is not None else session.to_dict()
+        payload['user_id'] = session.user_id
         try:
             from core.platform.events import emit_event
-            emit_event(topic, data)
+            emit_event(topic, payload)
         except Exception:
             pass
 

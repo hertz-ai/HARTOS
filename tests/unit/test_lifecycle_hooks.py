@@ -3,6 +3,7 @@ Comprehensive tests for lifecycle_hooks.py — ActionState state machine,
 lifecycle hook functions, ledger sync, retry tracking, and enforcement.
 """
 
+import copy
 import os
 import sys
 import threading
@@ -139,6 +140,7 @@ from hartos.lifecycle_hooks import (
     register_ledger_for_session,
     get_registered_ledger,
     block_for_user_input,
+    mark_action_waiting_for_user,
     resume_from_user_input,
     retry_tracker,
     flow_lifecycle,
@@ -190,9 +192,13 @@ UP = "test_user_prompt"
 
 
 def _reset():
-    """Clear global action_states between tests."""
+    """Clear isolated state without invoking the production ledger loader."""
     action_states.clear()
     _ledger_registry.clear()
+    # This module uses a lightweight TTLCache stub.  A cache miss must stay
+    # local to the unit test: invoking the real loader imports the full
+    # production ledger and Transformers/Torch before a lifecycle assertion.
+    _ledger_registry._loader = None
     retry_tracker.pending_counts.clear()
 
 
@@ -735,6 +741,44 @@ class TestAutoSyncToLedger:
         # Both map to IN_PROGRESS — no-op
         ledger.update_task_status.assert_not_called()
 
+    def test_verified_completion_routes_grounded_result_once(self):
+        """The canonical state projection owns dependency routing.
+
+        ``SmartLedger.update_task_status(COMPLETED)`` invokes its existing
+        dependency handler. Passing the accepted receipt here lets dependents
+        receive the real result without CREATE calling a second routing path.
+        """
+        task = self._make_task(_LedgerTaskStatus.IN_PROGRESS)
+        task.is_terminal.return_value = False
+        ledger = MagicMock()
+        ledger.tasks = {"action_1": task}
+        _ledger_registry[UP] = ledger
+
+        _auto_sync_to_ledger(
+            UP, 1, ActionState.COMPLETED, result='grounded tool result')
+
+        ledger.update_task_status.assert_called_once_with(
+            'action_1', _LedgerTaskStatus.COMPLETED,
+            result='grounded tool result',
+            reason='ActionState: completed')
+
+    def test_failed_ledger_commit_does_not_project_completed_action_state(self):
+        task = self._make_task(_LedgerTaskStatus.IN_PROGRESS)
+        task.is_terminal.return_value = False
+        ledger = MagicMock()
+        ledger.tasks = {'action_1': task}
+        ledger.update_task_status.return_value = False
+        _ledger_registry[UP] = ledger
+        action_states[UP] = {
+            1: ActionState.STATUS_VERIFICATION_REQUESTED,
+        }
+
+        assert safe_set_state(
+            UP, 1, ActionState.COMPLETED,
+            'backend rejected completion', result='receipt') is False
+        assert get_action_state(
+            UP, 1) == ActionState.STATUS_VERIFICATION_REQUESTED
+
     def test_paused_to_in_progress_resumes(self):
         task = self._make_task(_LedgerTaskStatus.PAUSED)
         ledger = MagicMock()
@@ -761,6 +805,37 @@ class TestAutoSyncToLedger:
         assert statuses == [_LedgerTaskStatus.PENDING, _LedgerTaskStatus.IN_PROGRESS]
         assert task.blocked_reason is None
         ledger.save.assert_called()
+
+    @pytest.mark.parametrize('starting_status', ['paused', 'blocked'])
+    def test_resume_rolls_back_every_mutation_when_save_fails(
+            self, tmp_path, starting_status):
+        from agent_ledger.backends import InMemoryBackend
+        from agent_ledger.core import SmartLedger, Task, TaskStatus, TaskType
+
+        class RejectingBackend(InMemoryBackend):
+            reject = False
+
+            def save(self, key, data):
+                if self.reject:
+                    return False
+                return super().save(key, data)
+
+        backend = RejectingBackend()
+        ledger = SmartLedger('agent', f'resume_{starting_status}',
+                             str(tmp_path), backend=backend)
+        task = Task('action_1', 'work', TaskType.PRE_ASSIGNED)
+        assert ledger.add_task(task)
+        assert ledger.update_task_status('action_1', TaskStatus.IN_PROGRESS)
+        assert ledger.update_task_status(
+            'action_1', (TaskStatus.PAUSED if starting_status == 'paused'
+                         else TaskStatus.BLOCKED))
+        before = copy.deepcopy(task.to_dict())
+        _ledger_registry[UP] = ledger
+        backend.reject = True
+
+        assert _auto_sync_to_ledger(
+            UP, 1, ActionState.FALLBACK_RECEIVED) is False
+        assert task.to_dict() == before
 
     def test_claims_ownership_on_in_progress(self):
         task = self._make_task(_LedgerTaskStatus.PENDING, is_owned=False)
@@ -972,6 +1047,91 @@ class TestBlockResumeUserInput:
         resume_from_user_input(UP, 1)
         task.resume.assert_not_called()
 
+    def test_mark_waiting_blocks_ledger_before_pending_projection(self):
+        task = MagicMock()
+        task.status = _LedgerTaskStatus.IN_PROGRESS
+        ledger = MagicMock()
+        ledger.tasks = {"action_1": task}
+        _ledger_registry[UP] = ledger
+
+        with patch('hartos.lifecycle_hooks.safe_set_state', return_value=True) as set_state:
+            assert mark_action_waiting_for_user(UP, 1, 'Need account choice') is True
+
+        task.block.assert_called_once_with('Need account choice')
+        task.set_blocked_reason.assert_called_once_with('input_required')
+        set_state.assert_called_once_with(UP, 1, ActionState.PENDING, 'Need account choice')
+
+    def test_mark_waiting_does_not_project_when_block_is_not_persisted(self):
+        class Task:
+            def __init__(self):
+                self.status = _LedgerTaskStatus.IN_PROGRESS
+                self.blocked_reason = None
+                self.error_message = None
+                self.state_history = []
+
+            def block(self, reason):
+                self.status = _LedgerTaskStatus.BLOCKED
+                self.error_message = reason
+                self.state_history.append(reason)
+                return True
+
+            def set_blocked_reason(self, reason):
+                self.blocked_reason = reason
+
+        task = Task()
+        ledger = MagicMock()
+        ledger.tasks = {"action_1": task}
+        ledger.save.return_value = False
+        _ledger_registry[UP] = ledger
+
+        with patch('hartos.lifecycle_hooks.safe_set_state') as set_state:
+            assert mark_action_waiting_for_user(
+                UP, 1, 'Need account choice') is False
+
+        assert task.status == _LedgerTaskStatus.IN_PROGRESS
+        assert task.blocked_reason is None
+        assert task.error_message is None
+        assert task.state_history == []
+        set_state.assert_not_called()
+
+    def test_resume_records_answer_on_the_blocked_task(self):
+        task = MagicMock()
+        task.status = _LedgerTaskStatus.BLOCKED
+        task.context = {}
+        ledger = MagicMock()
+        ledger.tasks = {"action_1": task}
+        _ledger_registry[UP] = ledger
+
+        assert resume_from_user_input(UP, 1, 'User chose account', 'Use account A') is True
+
+        task.resume.assert_called_once_with('User chose account')
+        assert task.context['user_input_evidence'][0]['action_id'] == 1
+        assert task.context['user_input_evidence'][0]['answer'] == 'Use account A'
+
+    def test_resume_rejection_restores_exact_blocked_task(self):
+        class Task:
+            def __init__(self):
+                self.status = _LedgerTaskStatus.BLOCKED
+                self.blocked_reason = 'input_required'
+                self.context = {}
+                self.state_history = ['blocked']
+
+            def resume(self, reason):
+                self.status = _LedgerTaskStatus.IN_PROGRESS
+                self.state_history.extend(['resuming', reason])
+                return True
+
+        task = Task()
+        before = copy.deepcopy(task.__dict__)
+        ledger = MagicMock()
+        ledger.tasks = {"action_1": task}
+        ledger.save.return_value = False
+        _ledger_registry[UP] = ledger
+
+        assert resume_from_user_input(
+            UP, 1, 'User chose account', 'Use account A') is False
+        assert task.__dict__ == before
+
 
 # ===================================================================
 # 22. restore_action_states_from_ledger
@@ -1004,13 +1164,174 @@ class TestRestoreFromLedger:
 # ===================================================================
 
 class TestProcessVerifierResponse:
-    def test_completed_status(self):
+    def test_completed_status_without_receipt_does_not_advance(self):
         from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
-        set_action_state(UP, 1, ActionState.IN_PROGRESS)
-        set_action_state(UP, 1, ActionState.STATUS_VERIFICATION_REQUESTED)
+        action_states[UP] = {1: ActionState.STATUS_VERIFICATION_REQUESTED}
         action = _make_action_obj(current_action=1)
         result = lifecycle_hook_process_verifier_response(UP, {"status": "completed"}, action)
+        assert result["action"] == "force_completion"
+        assert get_action_state(UP, 1) == ActionState.STATUS_VERIFICATION_REQUESTED
+
+    def test_completed_status_with_tool_receipt_advances(self, monkeypatch):
+        import hartos.lifecycle_hooks as hooks
+        from hartos.lifecycle_hooks import (
+            lifecycle_hook_process_verifier_response,
+            register_groupchat_for_session,
+            register_ledger_for_session,
+        )
+        action_states[UP] = {1: ActionState.STATUS_VERIFICATION_REQUESTED}
+        # set_action_state also starts best-effort recipe telemetry, whose real
+        # imports are intentionally outside this lifecycle unit test.
+        projected = {}
+
+        def _project(prompt, action_id, state, reason, result=None):
+            projected['result'] = result
+            action_states[prompt][action_id] = state
+            return True
+
+        monkeypatch.setattr(
+            hooks, 'safe_set_state',
+            _project,
+        )
+        register_groupchat_for_session(UP, _make_group_chat([
+            {"role": "user", "name": "ChatInstructor", "content": "Execute Action 1: check it"},
+            {"role": "assistant", "name": "Assistant", "content": "I will check it."},
+            {"role": "tool", "name": "Helper", "content": "result received"},
+        ]))
+        register_ledger_for_session(
+            UP, MagicMock(tasks={
+                'action_1': types.SimpleNamespace(context={})
+            }))
+        action = _make_action_obj(current_action=1)
+        result = lifecycle_hook_process_verifier_response(
+            UP,
+            {"status": "completed", "evidence": {"message_index": 2, "kind": "tool_receipt"}},
+            action,
+        )
         assert result["action"] == "force_fallback"
+        assert projected['result'] == 'result received'
+
+    def test_completed_receipt_without_ledger_does_not_advance(self,
+                                                                monkeypatch):
+        import hartos.lifecycle_hooks as hooks
+        action_states[UP] = {1: ActionState.STATUS_VERIFICATION_REQUESTED}
+        hooks.register_groupchat_for_session(UP, _make_group_chat([
+            {"role": "user", "name": "ChatInstructor",
+             "content": "Execute Action 1: check it"},
+            {"role": "tool", "name": "Helper",
+             "content": "result received"},
+        ]))
+        projected = MagicMock(return_value=True)
+        monkeypatch.setattr(hooks, 'safe_set_state', projected)
+
+        result = hooks.lifecycle_hook_process_verifier_response(
+            UP,
+            {"status": "completed", "evidence": {
+                "message_index": 1, "kind": "tool_receipt"}},
+            _make_action_obj(current_action=1),
+        )
+
+        assert result['action'] == 'force_completion'
+        projected.assert_not_called()
+        assert get_action_state(UP, 1) == \
+            ActionState.STATUS_VERIFICATION_REQUESTED
+
+    def test_completed_receipt_promotes_one_verified_world_model_sample(
+            self, monkeypatch):
+        import hartos.lifecycle_hooks as hooks
+        from hartos.lifecycle_hooks import (
+            lifecycle_hook_process_verifier_response,
+            register_groupchat_for_session,
+            register_ledger_for_session,
+        )
+        action_states[UP] = {1: ActionState.STATUS_VERIFICATION_REQUESTED}
+        monkeypatch.setattr(
+            hooks, 'safe_set_state',
+            lambda prompt, action_id, state, reason, result=None: (
+                action_states[prompt].__setitem__(action_id, state) is None),
+        )
+        messages = [
+            {"role": "user", "name": "ChatInstructor",
+             "content": "Execute Action 1: check it"},
+            {"role": "tool", "name": "Helper",
+             "content": "result received"},
+        ]
+        register_groupchat_for_session(UP, _make_group_chat(messages))
+        task = types.SimpleNamespace(
+            description='check it', context={'goal_id': 'goal-1'})
+        ledger = MagicMock(tasks={'action_1': task})
+        register_ledger_for_session(UP, ledger)
+        bridge = MagicMock()
+        with patch(
+                'integrations.agent_engine.world_model_bridge.'
+                'get_world_model_bridge', return_value=bridge):
+            result = lifecycle_hook_process_verifier_response(
+                UP,
+                {"status": "completed", "evidence": {
+                    "message_index": 1, "kind": "tool_receipt"}},
+                _make_action_obj(current_action=1),
+            )
+        assert result['action'] == 'force_fallback'
+        bridge.record_interaction.assert_called_once()
+        kwargs = bridge.record_interaction.call_args.kwargs
+        assert kwargs['response'] == 'result received'
+        assert kwargs['verification'] == {
+            'verified': True,
+            'source': 'status_verifier',
+            'outcome': 'success',
+            'action_id': 1,
+            'evidence': {'message_index': 1, 'kind': 'tool_receipt'},
+        }
+        assert kwargs['persist_conversation'] is False
+        assert kwargs['ingest_user_utterance'] is False
+
+    def test_receipt_from_an_earlier_action_cannot_complete_current_action(self):
+        from hartos.lifecycle_hooks import (
+            lifecycle_hook_process_verifier_response,
+            register_groupchat_for_session,
+        )
+        action_states[UP] = {2: ActionState.STATUS_VERIFICATION_REQUESTED}
+        register_groupchat_for_session(UP, _make_group_chat([
+            {"role": "user", "name": "ChatInstructor", "content": "Execute Action 1: check it"},
+            {"role": "tool", "name": "Helper", "content": "action one result"},
+            {"role": "user", "name": "ChatInstructor", "content": "Execute Action 2: do the next thing"},
+        ]))
+        result = lifecycle_hook_process_verifier_response(
+            UP,
+            {"status": "completed", "evidence": {"message_index": 1, "kind": "tool_receipt"}},
+            _make_action_obj(current_action=2),
+        )
+        assert result["action"] == "force_completion"
+        assert get_action_state(UP, 2) == ActionState.STATUS_VERIFICATION_REQUESTED
+
+    def test_success_alias_uses_the_same_receipt_gate(self, monkeypatch):
+        import hartos.lifecycle_hooks as hooks
+        from hartos.lifecycle_hooks import (
+            lifecycle_hook_process_verifier_response,
+            register_groupchat_for_session,
+            register_ledger_for_session,
+        )
+        action_states[UP] = {1: ActionState.STATUS_VERIFICATION_REQUESTED}
+        monkeypatch.setattr(
+            hooks, 'safe_set_state',
+            lambda prompt, action_id, state, reason, result=None: (
+                action_states[prompt].__setitem__(action_id, state) is None),
+        )
+        register_groupchat_for_session(UP, _make_group_chat([
+            {"role": "user", "name": "ChatInstructor", "content": "Execute Action 1: check it"},
+            {"role": "tool", "name": "Helper", "content": "result received"},
+        ]))
+        register_ledger_for_session(
+            UP, MagicMock(tasks={
+                'action_1': types.SimpleNamespace(context={})
+            }))
+        result = lifecycle_hook_process_verifier_response(
+            UP,
+            {"status": "success", "evidence": {"message_index": 1, "kind": "tool_receipt"}},
+            _make_action_obj(current_action=1),
+        )
+        assert result["action"] == "force_fallback"
+        assert get_action_state(UP, 1) == ActionState.COMPLETED
 
     def test_pending_status(self):
         from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
@@ -1019,6 +1340,21 @@ class TestProcessVerifierResponse:
         action = _make_action_obj(current_action=1)
         result = lifecycle_hook_process_verifier_response(UP, {"status": "pending"}, action)
         assert result["action"] == "force_completion"
+
+    def test_pending_user_input_blocks_before_pending_state(self):
+        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
+        set_action_state(UP, 1, ActionState.IN_PROGRESS)
+        set_action_state(UP, 1, ActionState.STATUS_VERIFICATION_REQUESTED)
+        action = _make_action_obj(current_action=1)
+        with patch('hartos.lifecycle_hooks.mark_action_waiting_for_user', return_value=True) as wait:
+            result = lifecycle_hook_process_verifier_response(
+                UP,
+                {"status": "pending", "can_perform_without_user_input": "no",
+                 "message": "Choose an account"},
+                action,
+            )
+        wait.assert_called_once_with(UP, 1, 'Choose an account')
+        assert result == {'action': 'force_completion', 'message': 'Choose an account'}
 
     def test_error_status(self):
         from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response

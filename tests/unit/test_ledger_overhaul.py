@@ -745,6 +745,25 @@ class TestGraphStateMachineConsistency(unittest.TestCase):
                     f"Graph says {from_status} -> {target} is valid, "
                     f"but _validate_transition disagrees")
 
+    def test_the_graph_allows_everything_the_task_allows(self):
+        """The other direction. test_transitions_match only checks graph ⊆
+        task, so a transition the Task allows and the graph refuses went
+        unseen: measured 2026-09-23 (fix-all's cross-review of ee5377f2a),
+        three of them -- in_progress->deferred, and the FAILED recovery
+        moves failed->completed / failed->terminated. Both directions,
+        every pair: there is one table."""
+        from agent_ledger.graph import TaskStateMachine
+        disagree = []
+        for a in TaskStatus:
+            for b in TaskStatus:
+                if a == b:
+                    continue
+                task_ok = _make_task(status=a).transition_refusal(b) is None
+                graph_ok = TaskStateMachine.is_valid_transition(a, b)
+                if task_ok != graph_ok:
+                    disagree.append(f"{a.value}->{b.value} task={task_ok} graph={graph_ok}")
+        self.assertEqual(disagree, [])
+
 
 # ===========================================================================
 # 15. Lifecycle hooks: BLOCKED -> PENDING -> IN_PROGRESS path

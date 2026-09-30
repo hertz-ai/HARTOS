@@ -87,6 +87,22 @@
 //! max=19.2ms budget=16ms verdict=PASS` — plus raw samples to
 //! /run/hart/latency.jsonl only when HART_LATENCY_JSONL=1 (harness runs; the
 //! always-on path costs a mutex and some arithmetic per event, no io).
+//!
+//! THE FRAME-TIME INSTRUMENT shares this module, this window and these rules,
+//! because the two NFRs it serves ("frame budget 16.6 ms, p99 < 12 ms" and
+//! "p99.9 zero dropped frames") had no instrument at all while the input-to-photon
+//! one had been proven on hardware. It measures the compositor's OWN cost per frame:
+//! from the render tick starting to build a frame to `queue_frame` accepting it.
+//! That is deliberately NOT queue-to-present, which on a 60 Hz panel is always about
+//! one refresh interval whatever the compositor did, so a p99 of it against 12 ms
+//! would FAIL forever and be ignored. Queue-to-present is measured too, but as the
+//! thing it actually tells you: a flip that took more than one and a half refresh
+//! intervals missed its vblank, and is counted as a DROPPED frame. One line per 10 s
+//! window: `hart-frame n=600 p50=3.2ms p99=9.8ms max=17.1ms budget=16.6ms
+//! target=12ms violations=1 dropped=0 verdict=PASS`. Same anti-gaming posture: a
+//! distribution, never a mean; every queued frame counts, under load or idle; and
+//! the window closes on the compositor's own clock, so a box nobody has touched
+//! still reports its frame times rather than staying silent until the first input.
 
 #![allow(dead_code)] // the default (no-smithay) build compiles the pure core for tests
 
@@ -178,6 +194,11 @@ pub enum Surface {
     Taskbar,
     HomeCard,
     HomeRow,
+    /// A toast and a context menu, native scene components since `shell.chrome` carries
+    /// them. Their budget rows had `animate-start` from the start and nothing could ever
+    /// attribute a sample to them; the surface is what makes the row reachable.
+    Toast,
+    ContextMenu,
 }
 
 impl Surface {
@@ -192,9 +213,11 @@ impl Surface {
             Surface::Taskbar => "taskbar",
             Surface::HomeCard => "home-card",
             Surface::HomeRow => "home-row",
+            Surface::Toast => "toast",
+            Surface::ContextMenu => "context-menu",
         }
     }
-    const ALL: [Surface; 8] = [
+    const ALL: [Surface; 10] = [
         Surface::Shell,
         Surface::WorkspaceSwitch,
         Surface::Orb,
@@ -203,6 +226,8 @@ impl Surface {
         Surface::Taskbar,
         Surface::HomeCard,
         Surface::HomeRow,
+        Surface::Toast,
+        Surface::ContextMenu,
     ];
     fn idx(self) -> usize {
         match self {
@@ -214,6 +239,8 @@ impl Surface {
             Surface::Taskbar => 5,
             Surface::HomeCard => 6,
             Surface::HomeRow => 7,
+            Surface::Toast => 8,
+            Surface::ContextMenu => 9,
         }
     }
 }
@@ -298,10 +325,24 @@ impl Drops {
 pub struct Stall {
     /// Vblanks reaped since the last report.
     pub presented: u64,
-    /// Frames queued in the same span. Zero is the diagnosis.
+    /// Frames queued in the same span. Zero means `frame_queued` is not being
+    /// reached, so nothing can bind.
     pub queued: u64,
-    /// Inputs sitting unbound because nothing ever queued.
+    /// Inputs waiting to be bound to a frame.
     pub pending: usize,
+    /// Samples that actually resolved. Zero WITH a non-zero `queued` means
+    /// binding happened but the sample was refused -- an unanchored clock or a
+    /// latency outside the sane window.
+    pub samples: u64,
+    /// Whether the clock offset has been established at all. `false` means no
+    /// input observation was ever accepted, which is its own distinct fault.
+    pub anchored: bool,
+    /// Render passes in the span, and how many decided nothing had changed.
+    /// `attempted` high with `unchanged` equally high is a compositor that
+    /// believes the screen is static; `attempted` near zero is a render loop
+    /// that is not running at all. The two need completely different fixes.
+    pub attempted: u64,
+    pub unchanged: u64,
 }
 
 impl Stall {
@@ -310,8 +351,48 @@ impl Stall {
     /// no reading at all.
     pub fn journal_line(&self) -> String {
         format!(
-            "hart-latency stalled presented={} queued={} pending={} verdict=NO-SAMPLES",
-            self.presented, self.queued, self.pending
+            "hart-latency stalled rendered={} unchanged={} queued={} presented={} \
+             pending={} samples={} anchored={} verdict=NO-SAMPLES",
+            self.attempted, self.unchanged, self.queued, self.presented,
+            self.pending, self.samples, self.anchored
+        )
+    }
+}
+
+/// One 10 s window of the compositor's own frame times, and the flips that missed.
+///
+/// `violations` counts frames over `FRAME_BUDGET_US` (each one missed the vblank it was
+/// built for). `dropped` counts flips whose vblank came more than one and a half
+/// refresh intervals after the queue, which is a frame the person saw held. The verdict
+/// is the NFR pair read as the user experiences it: p99 inside the target AND nothing
+/// dropped. A window with a 9 ms p99 and one dropped frame is a stutter, not a pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameSummary {
+    pub n: usize,
+    pub p50_us: u64,
+    pub p99_us: u64,
+    pub max_us: u64,
+    pub violations: u64,
+    pub dropped: u64,
+    pub pass: bool,
+}
+
+impl FrameSummary {
+    /// Byte-stable, like `Summary::journal_line`, and greppable by its own prefix so a
+    /// reader can ask for frame times without wading through per-component lines. The
+    /// budget and target are printed so the verdict's basis travels with the numbers.
+    pub fn journal_line(&self) -> String {
+        format!(
+            "hart-frame n={} p50={:.1}ms p99={:.1}ms max={:.1}ms budget={:.1}ms target={}ms violations={} dropped={} verdict={}",
+            self.n,
+            self.p50_us as f64 / 1000.0,
+            self.p99_us as f64 / 1000.0,
+            self.max_us as f64 / 1000.0,
+            FRAME_BUDGET_US as f64 / 1000.0,
+            FRAME_P99_TARGET_US / 1000,
+            self.violations,
+            self.dropped,
+            if self.pass { "PASS" } else { "FAIL" },
         )
     }
 }
@@ -333,12 +414,32 @@ const WINDOW_US: u64 = 10_000_000;
 /// not an interaction; refuse it (anti-gaming: report nothing over almost).
 const MAX_SANE_LATENCY_US: u64 = 5_000_000;
 
-/// Vblanks between stall reports. At 60Hz this is about ten seconds, matching
-/// the summary window, so a stalled box speaks at the same cadence a healthy
-/// one does and neither floods the journal.
-const STALL_REPORT_EVERY: u64 = 600;
+/// Vblanks between stall reports.
+///
+/// Was 600, chosen as "ten seconds at 60Hz". That reasoning assumed a desktop
+/// that flips 60 times a second, and the desktop this runs on is DAMAGE-TRACKED:
+/// when nothing moves it flips a handful of times a minute. 600 vblanks is then
+/// tens of minutes away, so the diagnostic that exists to explain silence was
+/// itself silent through a two-minute probe on real hardware 2026-09-10.
+///
+/// 60 is reachable on a quiet box within a probe, and still rare enough on a
+/// busy one (one line per second at full rate) to stay readable.
+const STALL_REPORT_EVERY: u64 = 60;
 /// Offset observations kept for the rolling-min estimator.
 const OFFSET_WINDOW: usize = 64;
+
+/// The compositor's own frame budget: one 60 Hz refresh. Mirrors
+/// latency_budgets.json `_frame.budget_ms`; a Python guard pins the two together. A
+/// frame that took longer than this from the tick starting to build it to `queue_frame`
+/// accepting it has missed the vblank it was aimed at, and is counted as a VIOLATION
+/// whether or not the flip later landed.
+pub const FRAME_BUDGET_US: u64 = 16_600;
+/// The binding NFR on the distribution: p99 of frame time under 12 ms
+/// (NATIVE_SHELL_PARITY_PROGRAM, "frame budget 16.6 ms, p99 < 12 ms"). Mirrors
+/// `_frame.p99_ms`.
+pub const FRAME_P99_TARGET_US: u64 = 12_000;
+/// The refresh period assumed until the DRM backend reports the mode it actually set.
+const DEFAULT_REFRESH_US: u64 = 16_667;
 
 /// The pure instrument core. NO clock reads, NO io, NO Smithay types — every
 /// timestamp comes in as an argument, so the whole state machine runs under
@@ -364,11 +465,30 @@ pub struct LatencyCore {
     /// Their DIVERGENCE is the stall signal (see `Stall`).
     frames_queued: u64,
     frames_presented: u64,
+    samples_recorded: u64,
+    /// Render attempts, and how many reported "nothing changed". These are the
+    /// only counters that move on a box that never presents, which is why the
+    /// stall report is gated on them rather than on presented frames.
+    renders_attempted: u64,
+    renders_unchanged: u64,
     stall_reported_at: u64,
-    /// [surface][kind]. Forty-two fixed buckets, allocated once and reused: an input
-    /// rate this cannot cover does not exist, and a map would put an allocation on the
-    /// input path for no benefit.
-    window: [[Vec<u64>; 6]; 8],
+    /// [surface][kind]. Sixty fixed buckets, allocated once and reused: an input rate
+    /// this cannot cover does not exist, and a map would put an allocation on the input
+    /// path for no benefit.
+    window: [[Vec<u64>; 6]; 10],
+    /// Frame times (tick start to `queue_frame` Ok) in the open window, same cap as the
+    /// latency buckets.
+    frame_window: Vec<u64>,
+    frame_violations: u64,
+    frame_dropped: u64,
+    /// Instant-domain queue time of each frame handed to DRM and not yet presented,
+    /// paired FIFO with vblanks exactly as `inflight` is. The F1 gate allows one flip in
+    /// flight per CRTC, and this stream is single-CRTC by the documented limitation, so
+    /// at queue time this is empty unless a vblank was LOST.
+    queued_at: VecDeque<u64>,
+    refresh_us: u64,
+    /// The closed window's frame summary, waiting for `take_frame_report`.
+    frame_report: Option<FrameSummary>,
 }
 
 impl LatencyCore {
@@ -385,9 +505,53 @@ impl LatencyCore {
             window_start_us: None,
             frames_queued: 0,
             frames_presented: 0,
+            samples_recorded: 0,
+            renders_attempted: 0,
+            renders_unchanged: 0,
             stall_reported_at: 0,
             window: Default::default(),
+            frame_window: Vec::new(),
+            frame_violations: 0,
+            frame_dropped: 0,
+            queued_at: VecDeque::new(),
+            refresh_us: DEFAULT_REFRESH_US,
+            frame_report: None,
         }
+    }
+
+    /// The output's refresh period, from the mode the backend actually set (millihertz,
+    /// as wl_output reports it). Only decides what "this flip missed its vblank" means.
+    pub fn set_refresh_mhz(&mut self, mhz: u64) {
+        if mhz > 0 {
+            self.refresh_us = 1_000_000_000 / mhz;
+        }
+    }
+
+    /// A frame was handed to DRM (`queue_frame` Ok), `frame_us` after the tick started
+    /// building it, at `instant_us`. Records the frame time against the budget and starts
+    /// the flip timer the matching vblank will stop.
+    ///
+    /// Anything still waiting here at queue time is a flip whose vblank never came: the
+    /// gate does not queue on top of an in-flight flip, so the only way to arrive with the
+    /// queue non-empty is the lost-vblank hatch having retired one. Each is a frame the
+    /// person never saw, counted as dropped, and cleared so the FIFO pairing stays honest
+    /// instead of misattributing every later vblank by one.
+    pub fn note_frame_queued(&mut self, frame_us: u64, instant_us: u64) {
+        if self.frame_window.len() < MAX_WINDOW_SAMPLES {
+            self.frame_window.push(frame_us);
+        }
+        if frame_us > FRAME_BUDGET_US {
+            self.frame_violations += 1;
+        }
+        while self.queued_at.pop_front().is_some() {
+            self.frame_dropped += 1;
+        }
+        self.queued_at.push_back(instant_us);
+    }
+
+    /// The frame summary of the last closed window, once.
+    pub fn take_frame_report(&mut self) -> Option<FrameSummary> {
+        self.frame_report.take()
     }
 
     /// The estimated (event-domain minus instant-domain) clock offset, or None
@@ -453,6 +617,16 @@ impl LatencyCore {
         }
     }
 
+    /// One pass of the render loop finished. `unchanged` is the compositor's own
+    /// verdict that nothing needed drawing, which is the branch that does NOT
+    /// queue a frame and therefore cannot bind any input.
+    pub fn note_render(&mut self, unchanged: bool) {
+        self.renders_attempted += 1;
+        if unchanged {
+            self.renders_unchanged += 1;
+        }
+    }
+
     /// A frame carrying current damage was handed to DRM (`queue_frame` Ok).
     /// Binds every pending input to it.
     pub fn frame_queued(&mut self) {
@@ -474,6 +648,15 @@ impl LatencyCore {
     /// caller's job.
     pub fn frame_presented(&mut self, instant_us: u64) -> Vec<Summary> {
         self.frames_presented += 1;
+        // The flip that just completed is the oldest queued one. Longer than one and a
+        // half refresh intervals from queue to vblank means it missed the vblank it was
+        // aimed at and the person saw the previous frame held: a dropped frame.
+        if let Some(queued) = self.queued_at.pop_front() {
+            let flip_us = instant_us.saturating_sub(queued);
+            if flip_us > self.refresh_us + self.refresh_us / 2 {
+                self.frame_dropped += 1;
+            }
+        }
         let batch = self.inflight.pop_front().unwrap_or_default();
         if let Some(off) = self.offset_us() {
             // Refuse to fabricate: no offset means no anchored photon time.
@@ -486,18 +669,26 @@ impl LatencyCore {
                 if lat == 0 || lat > MAX_SANE_LATENCY_US {
                     continue; // unanchored or wedge artifact, not a report
                 }
+                self.samples_recorded += 1;
                 let w = &mut self.window[surface.idx()][kind.idx()];
                 if w.len() < MAX_WINDOW_SAMPLES {
                     w.push(lat);
                 }
             }
-            if self.window_start_us.is_none() {
-                self.window_start_us = Some(photon_event_us);
-            }
-            if let Some(start) = self.window_start_us {
-                if photon_event_us.saturating_sub(start) >= WINDOW_US {
-                    return self.close_window(photon_event_us);
-                }
+        }
+        // The 10 s window is paced on the compositor's own clock. It used to be paced on
+        // the kernel epoch and only once an input had anchored the estimator, which was
+        // harmless while every sample needed an input anyway. Frame times do not: an
+        // untouched box still builds and presents frames, and the frame instrument must
+        // report them rather than stay silent until someone touches the mouse. Both
+        // clocks are monotonic and the window is a duration, so the latency summaries
+        // close on exactly the boundary they did before.
+        if self.window_start_us.is_none() {
+            self.window_start_us = Some(instant_us);
+        }
+        if let Some(start) = self.window_start_us {
+            if instant_us.saturating_sub(start) >= WINDOW_US {
+                return self.close_window(instant_us);
             }
         }
         Vec::new()
@@ -535,6 +726,29 @@ impl LatencyCore {
             w.clear();
         }
         }
+        // The frame-time summary for the same window, parked for `take_frame_report` so
+        // the return type the latency tests pin stays what it was. Same percentile
+        // arithmetic as above, deliberately: one definition of p99 in this module.
+        if !self.frame_window.is_empty() {
+            let w = &mut self.frame_window;
+            w.sort_unstable();
+            let n = w.len();
+            let p50 = w[(n - 1) / 2];
+            let p99 = w[((n - 1) * 99) / 100];
+            let max = *w.last().unwrap();
+            self.frame_report = Some(FrameSummary {
+                n,
+                p50_us: p50,
+                p99_us: p99,
+                max_us: max,
+                violations: self.frame_violations,
+                dropped: self.frame_dropped,
+                pass: p99 <= FRAME_P99_TARGET_US && self.frame_dropped == 0,
+            });
+            w.clear();
+        }
+        self.frame_violations = 0;
+        self.frame_dropped = 0;
         self.window_start_us = Some(now_us);
         out
     }
@@ -552,26 +766,40 @@ impl LatencyCore {
     /// than numbers. Reported at most once per `STALL_REPORT_EVERY` vblanks so a
     /// genuinely wedged box says it periodically instead of every frame.
     pub fn take_stall(&mut self) -> Option<Stall> {
-        let since = self.frames_presented - self.stall_reported_at;
+        // Gated on RENDER ATTEMPTS, not presented frames. Gating on presentation
+        // made this silent on exactly the box it was written for: one that
+        // presents almost nothing. A diagnostic must not require the absence of
+        // the fault it reports.
+        let since = self.renders_attempted - self.stall_reported_at;
         if since < STALL_REPORT_EVERY {
             return None;
         }
-        // Nothing waiting means nobody touched the box, which is not a stall.
-        if self.pending.is_empty() {
-            self.stall_reported_at = self.frames_presented;
+        self.stall_reported_at = self.renders_attempted;
+
+        // Nothing waiting AND nothing ever anchored means nobody has touched the
+        // box. That is not a stall, and saying so at an idle desk is how a
+        // diagnostic becomes noise and then gets ignored.
+        if self.pending.is_empty() && self.offset_obs.is_empty() {
             return None;
         }
-        // Frames ARE binding, so the instrument is working; silence would then
-        // be a real absence of interaction, and this must not cry wolf.
-        if self.frames_queued > 0 {
-            self.stall_reported_at = self.frames_presented;
+        // Samples ARE resolving, so the instrument works end to end. Any silence
+        // after this is a genuine absence of interaction.
+        if self.samples_recorded > 0 {
             return None;
         }
-        self.stall_reported_at = self.frames_presented;
+        // Input has been seen and frames have been presented, yet nothing
+        // resolved. Report the counters rather than a guess: `queued == 0` says
+        // frame_queued is never reached, `anchored == false` says no clock
+        // observation was accepted, and both non-zero with samples == 0 says the
+        // sample was computed and refused.
         Some(Stall {
-            presented: since,
-            queued: 0,
+            presented: self.frames_presented,
+            queued: self.frames_queued,
             pending: self.pending.len(),
+            samples: self.samples_recorded,
+            anchored: !self.offset_obs.is_empty(),
+            attempted: since,
+            unchanged: self.renders_unchanged,
         })
     }
 
@@ -650,26 +878,57 @@ pub fn on_animation_started(surface: Surface) {
     }
 }
 
-pub fn on_frame_queued() {
+/// Called once per render pass with the compositor's own "nothing changed"
+/// verdict, so the instrument can tell a static desktop from a dead render loop.
+///
+/// Returns the stall record when the span has earned one, and THIS is the only
+/// place it is taken. It used to be taken inside `on_frame_presented`, which
+/// meant the diagnostic whose entire job is to report "frames are not reaching
+/// the screen" could only speak from the code path that runs when a frame
+/// reaches the screen. Moving the GATE onto render attempts earlier the same day
+/// fixed which counter it watched and left that reachability untouched, so it
+/// stayed silent on hardware for another day. A diagnostic has to be reachable
+/// on the path that is still alive during the fault it describes.
+pub fn on_render(unchanged: bool) -> Option<Stall> {
+    let g = global();
+    let mut c = g.core.lock().ok()?;
+    c.note_render(unchanged);
+    c.take_stall()
+}
+
+/// The output's refresh, in millihertz as the DRM backend has it, so "dropped" is
+/// judged against the panel actually driven rather than an assumed 60 Hz.
+pub fn on_output_refresh_mhz(mhz: u64) {
+    let g = global();
+    if let Ok(mut c) = g.core.lock() {
+        c.set_refresh_mhz(mhz);
+    }
+}
+
+/// A frame was handed to DRM. `frame_us` is how long the tick took to build, composite
+/// and queue it (the compositor's own frame time); the pending inputs bind to it.
+pub fn on_frame_queued(frame_us: u64) {
     let g = global();
     if let Ok(mut c) = g.core.lock() {
         c.frame_queued();
+        c.note_frame_queued(frame_us, instant_us());
     }
 }
 
 /// Called from the vblank reaper. Emits the journal lines and (opt-in) the
 /// jsonl sink here so udev.rs stays one line.
-pub fn on_frame_presented() -> (Vec<Summary>, Option<Drops>, Option<Stall>) {
+pub fn on_frame_presented() -> (Vec<Summary>, Option<Drops>, Option<FrameSummary>) {
     let g = global();
-    // Both under ONE lock: the drops belong to the window the summaries describe, and
-    // taking them separately would let a drop land between the two and be attributed
-    // to the next window, which is the one place this record must not lie.
-    let (summaries, drops, stall) = match g.core.lock() {
+    // All three under ONE lock: the drops and the frame report belong to the window the
+    // summaries describe, and taking them separately would let a drop land between the
+    // two and be attributed to the next window, which is the one place this record must
+    // not lie.
+    let (summaries, drops, frames) = match g.core.lock() {
         Ok(mut c) => {
             let s = c.frame_presented(instant_us());
             let d = c.take_drops();
-            let st = c.take_stall();
-            (s, d, st)
+            let f = c.take_frame_report();
+            (s, d, f)
         }
         Err(_) => (Vec::new(), None, None),
     };
@@ -714,7 +973,25 @@ pub fn on_frame_presented() -> (Vec<Summary>, Option<Drops>, Option<Stall>) {
             }
         }
     }
-    (summaries, drops, stall)
+    // The frame report rides the same opt-in sink for the same reason: a harness run
+    // diffing builds needs the frame-time distribution beside the latency one.
+    if let Some(fr) = &frames {
+        if std::env::var("HART_LATENCY_JSONL").ok().as_deref() == Some("1") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/run/hart/latency.jsonl")
+            {
+                let _ = writeln!(
+                    f,
+                    "{{\"frame\":true,\"n\":{},\"p50_us\":{},\"p99_us\":{},\"max_us\":{},\"violations\":{},\"dropped\":{},\"pass\":{}}}",
+                    fr.n, fr.p50_us, fr.p99_us, fr.max_us, fr.violations, fr.dropped, fr.pass
+                );
+            }
+        }
+    }
+    (summaries, drops, frames)
 }
 
 #[cfg(test)]
@@ -1079,7 +1356,7 @@ mod tests {
         assert_eq!(
             labels,
             ["shell", "workspace-switch", "orb", "top-bar", "omnibox", "taskbar",
-             "home-card", "home-row"]
+             "home-card", "home-row", "toast", "context-menu"]
         );
         for (i, a) in labels.iter().enumerate() {
             assert!(!a.is_empty() && !a.contains(' '), "{a:?} is not a bare slug");
@@ -1089,7 +1366,7 @@ mod tests {
         }
         // The index each one buckets under must be unique and in range, since the window
         // is a fixed array rather than a map.
-        let mut seen = [false; 8];
+        let mut seen = [false; 10];
         for s in Surface::ALL {
             assert!(!seen[s.idx()], "two surfaces share bucket {}", s.idx());
             seen[s.idx()] = true;
@@ -1112,6 +1389,116 @@ mod tests {
             s.journal_line(),
             "hart-latency component=shell kind=drag n=142 p50=8.1ms p99=14.7ms max=19.2ms budget=16ms verdict=PASS"
         );
+    }
+
+    // ── the frame-time instrument: the NFR that had none ─────────────────────
+
+    #[test]
+    fn the_frame_line_matches_its_contract_byte_for_byte() {
+        let f = FrameSummary {
+            n: 600,
+            p50_us: 3_200,
+            p99_us: 9_800,
+            max_us: 17_100,
+            violations: 1,
+            dropped: 0,
+            pass: true,
+        };
+        assert_eq!(
+            f.journal_line(),
+            "hart-frame n=600 p50=3.2ms p99=9.8ms max=17.1ms budget=16.6ms target=12ms violations=1 dropped=0 verdict=PASS"
+        );
+    }
+
+    #[test]
+    fn frame_times_are_reported_per_window_on_an_untouched_box() {
+        // No input ever: the estimator is unanchored and the latency half must stay
+        // silent (anti-gaming). The frame half must NOT, because the box was building
+        // and presenting frames the whole time, and a window that closes only once a
+        // person shows up would report the easy case only.
+        let mut c = LatencyCore::new();
+        let mut t = 0u64;
+        for i in 0..100u64 {
+            // 99 frames at 5 ms and one 20 ms frame that missed its vblank.
+            let frame_us = if i == 42 { 20_000 } else { 5_000 };
+            c.note_frame_queued(frame_us, t);
+            assert!(c.frame_presented(t + 16_000).is_empty(), "no anchored samples, no latency line");
+            t += 16_667;
+        }
+        assert!(c.take_frame_report().is_none(), "the window has not closed yet");
+        // One more present past the 10 s boundary closes the window.
+        c.note_frame_queued(5_000, t + WINDOW_US);
+        assert!(c.frame_presented(t + WINDOW_US + 16_000).is_empty());
+        let r = c.take_frame_report().expect("the frame window closed on the compositor clock");
+        assert_eq!(r.n, 101);
+        assert_eq!(r.p50_us, 5_000);
+        assert_eq!(r.p99_us, 5_000, "one outlier in a hundred is max's job, not p99's");
+        assert_eq!(r.max_us, 20_000);
+        assert_eq!(r.violations, 1, "the 20 ms frame is over the 16.6 ms budget");
+        assert_eq!(r.dropped, 0, "every flip landed on its next vblank");
+        assert!(r.pass);
+        assert!(r.journal_line().starts_with("hart-frame "));
+        assert!(c.take_frame_report().is_none(), "reported once, not restated");
+    }
+
+    #[test]
+    fn a_flip_that_missed_its_vblank_is_a_dropped_frame_and_fails_the_window() {
+        // Queue-to-present on a 60 Hz panel is normally under one interval. Forty
+        // milliseconds is more than one and a half, so that frame was held on screen
+        // while the next waited: the stutter the p99.9 NFR is about. A single one fails
+        // the window even with a comfortable p99.
+        let mut c = LatencyCore::new();
+        c.note_frame_queued(4_000, 0);
+        let _ = c.frame_presented(16_000); // landed
+        c.note_frame_queued(4_000, 16_667);
+        let _ = c.frame_presented(16_667 + 40_000); // missed
+        c.note_frame_queued(4_000, WINDOW_US);
+        let _ = c.frame_presented(WINDOW_US + 16_000);
+        let r = c.take_frame_report().expect("window closed");
+        assert_eq!(r.dropped, 1);
+        assert_eq!(r.violations, 0, "the frame itself was cheap; the FLIP was late");
+        assert!(r.p99_us <= FRAME_P99_TARGET_US);
+        assert!(!r.pass, "a dropped frame is a FAIL whatever the p99 says");
+    }
+
+    #[test]
+    fn a_lost_vblank_is_counted_as_dropped_and_does_not_skew_every_later_flip() {
+        // The lost-vblank hatch retires a flip whose event never came and the tick
+        // queues again. Without clearing the FIFO here, every later vblank would pair
+        // with the frame before it and read as ~two intervals late forever.
+        let mut c = LatencyCore::new();
+        c.note_frame_queued(4_000, 0); // its vblank is lost
+        c.note_frame_queued(4_000, 100_000); // the hatch fired, we queued again
+        assert_eq!(c.frame_dropped, 1, "the lost flip is a dropped frame");
+        let _ = c.frame_presented(100_000 + 16_000); // pairs with the SECOND queue
+        assert_eq!(c.frame_dropped, 1, "and the healthy flip after it is not blamed");
+    }
+
+    #[test]
+    fn the_refresh_period_decides_what_dropped_means() {
+        // A 120 Hz panel drops at 12.5 ms where a 60 Hz one is still inside its interval.
+        let mut c = LatencyCore::new();
+        c.set_refresh_mhz(120_000);
+        assert_eq!(c.refresh_us, 8_333);
+        c.note_frame_queued(1_000, 0);
+        let _ = c.frame_presented(13_000);
+        assert_eq!(c.frame_dropped, 1);
+        let mut c = LatencyCore::new();
+        c.set_refresh_mhz(0); // a bogus mode leaves the 60 Hz default
+        assert_eq!(c.refresh_us, DEFAULT_REFRESH_US);
+        c.note_frame_queued(1_000, 0);
+        let _ = c.frame_presented(13_000);
+        assert_eq!(c.frame_dropped, 0);
+    }
+
+    #[test]
+    fn the_frame_consts_are_the_nfr_and_in_the_right_order() {
+        // latency_budgets.json `_frame` is the declaration; the Python guard pins these
+        // to it. This pins the shape: the p99 target sits inside a one-refresh budget.
+        assert_eq!(FRAME_BUDGET_US, 16_600);
+        assert_eq!(FRAME_P99_TARGET_US, 12_000);
+        assert!(FRAME_P99_TARGET_US < FRAME_BUDGET_US);
+        assert!(FRAME_BUDGET_US <= DEFAULT_REFRESH_US);
     }
 
     #[test]
@@ -1137,14 +1524,21 @@ mod tests {
     fn a_stall_is_reported_when_vblanks_reap_but_nothing_ever_queues() {
         // The real-hardware shape, 2026-09-10: flips happening, input arriving,
         // no frame ever queued, and a journal that said nothing at all.
+        const GAP: u64 = 1_000_000;
         let mut c = LatencyCore::new();
-        c.note_input(Surface::Shell, Kind::Hover, 1_000, 1_100);
+        let t = 2_000_000;
+        c.note_input(Surface::Shell, Kind::Hover, t, t - GAP);
+        // Renders happen and all report "nothing changed", so nothing ever
+        // queues. This is the shape the report is gated on now: render passes,
+        // not presented frames.
         for i in 0..STALL_REPORT_EVERY {
-            assert!(c.frame_presented(2_000 + i).is_empty());
+            c.note_render(true);
+            assert!(c.frame_presented(t - GAP + i).is_empty());
         }
         let st = c.take_stall().expect("silence with input waiting must explain itself");
         assert_eq!(st.queued, 0, "zero queued frames IS the diagnosis");
-        assert_eq!(st.presented, STALL_REPORT_EVERY);
+        assert_eq!(st.attempted, STALL_REPORT_EVERY, "gated on render passes");
+        assert_eq!(st.unchanged, STALL_REPORT_EVERY, "every pass said nothing changed");
         assert!(st.pending >= 1, "the unbound input is what makes it a stall");
         assert!(st.journal_line().contains("verdict=NO-SAMPLES"));
         assert!(
@@ -1155,18 +1549,27 @@ mod tests {
 
     #[test]
     fn no_stall_is_reported_when_frames_are_binding() {
-        // Frames queue, so the instrument works; any silence after this is a
-        // real absence of interaction and must not be blamed on the pipeline.
+        // Frames queue AND samples resolve, so the instrument works end to end;
+        // any silence after this is a real absence of interaction and must not
+        // be blamed on the pipeline. Clocks paired the way a booted node pairs
+        // them (kernel stamps since BOOT, Instant readings since COMPOSITOR
+        // START) -- the old same-origin pairing recorded no offset at all, so
+        // this test passed for the wrong reason.
+        const GAP: u64 = 1_000_000;
         let mut c = LatencyCore::new();
-        c.note_input(Surface::Shell, Kind::Hover, 1_000, 1_100);
+        let t = 2_000_000; // kernel stamp, since boot
+        c.note_input(Surface::Shell, Kind::Hover, t, t - GAP);
         c.frame_queued();
-        c.note_input(Surface::Shell, Kind::Hover, 3_000, 3_100);
+        // The flip that carried it, 8ms later, expressed in the Instant domain.
+        let out = c.frame_presented(t - GAP + 8_000);
+        assert!(!out.is_empty() || c.samples_recorded > 0,
+                "the pairing must actually resolve a sample");
         for i in 0..STALL_REPORT_EVERY {
-            let _ = c.frame_presented(4_000 + i);
+            let _ = c.frame_presented(t - GAP + 20_000 + i);
         }
         assert!(
             c.take_stall().is_none(),
-            "a pipeline that binds must never be reported as stalled"
+            "a pipeline that binds and resolves must never be reported as stalled"
         );
     }
 
@@ -1189,16 +1592,63 @@ mod tests {
     #[test]
     fn the_stall_report_is_rate_limited() {
         // A wedged box should say so periodically, not 60 times a second.
+        const GAP: u64 = 1_000_000;
         let mut c = LatencyCore::new();
-        c.note_input(Surface::Shell, Kind::Hover, 1_000, 1_100);
+        let t = 2_000_000;
+        c.note_input(Surface::Shell, Kind::Hover, t, t - GAP);
         for i in 0..STALL_REPORT_EVERY {
-            let _ = c.frame_presented(2_000 + i);
+            c.note_render(true);
+            let _ = c.frame_presented(t - GAP + i);
         }
         assert!(c.take_stall().is_some(), "first crossing reports");
         assert!(c.take_stall().is_none(), "and does not repeat until the next span");
         for i in 0..STALL_REPORT_EVERY {
-            let _ = c.frame_presented(10_000 + i);
+            c.note_render(true);
+            let _ = c.frame_presented(t - GAP + 10_000 + i);
         }
         assert!(c.take_stall().is_some(), "the next span reports again");
+    }
+
+    #[test]
+    fn the_stall_is_reachable_with_nothing_ever_presented() {
+        // THE REACHABILITY GUARD. Every other stall test drives take_stall()
+        // directly, so all of them passed while the only production caller sat
+        // inside the vblank handler: on hardware the line could not be reached
+        // unless frames were being presented, which is the opposite of the
+        // condition it reports. This test uses the shape of a box that renders
+        // and never presents -- frames_presented stays 0 throughout.
+        let mut c = LatencyCore::new();
+        c.note_input(Surface::Shell, Kind::Press, 1_000_000, 0);
+        for _ in 0..STALL_REPORT_EVERY {
+            c.note_render(true);
+        }
+        let st = c
+            .take_stall()
+            .expect("a render loop that never presents must be able to say so");
+        assert_eq!(st.presented, 0, "nothing was ever presented");
+        assert_eq!(st.attempted, STALL_REPORT_EVERY, "the renders are what counted");
+        assert_eq!(st.unchanged, STALL_REPORT_EVERY, "and all of them were no-ops");
+        assert_eq!(st.samples, 0, "so no sample could resolve");
+
+        // The structural half of the guard: `on_frame_presented` no longer
+        // returns a Stall at all, so the presented path CANNOT be the emitter
+        // again by accident. `on_render` is the only source, and it is called
+        // from every arm of the render match including the failure arms.
+    }
+
+    #[test]
+    fn a_render_loop_that_fails_every_tick_still_reports() {
+        // udev.rs:1006's shape: render_frame refuses on every tick. The loop is
+        // running at full speed, nothing reaches the screen, and before the
+        // error arms started counting, `attempted` stayed 0 and the instrument
+        // read this as an idle desk.
+        let mut c = LatencyCore::new();
+        c.note_input(Surface::Shell, Kind::Press, 1_000_000, 0);
+        for _ in 0..STALL_REPORT_EVERY {
+            c.note_render(false); // a failed attempt is not "unchanged"
+        }
+        let st = c.take_stall().expect("a failing render loop must report");
+        assert_eq!(st.unchanged, 0, "nothing claimed the screen was static");
+        assert_eq!(st.queued, 0, "and nothing ever reached queue_frame");
     }
 }

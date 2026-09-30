@@ -951,12 +951,19 @@ class AppMarketplace:
 
         try:
             from integrations.agent_engine.dispatch import dispatch_goal
+            goal_id = f'distribute_{listing_id}_{channel}'
             response = dispatch_goal(
                 prompt=prompt,
                 user_id=listing['owner_id'],
-                goal_id=f'distribute_{listing_id}_{channel}',
+                goal_id=goal_id,
                 goal_type='distribution',
             )
+            if response is None:
+                # Nothing was set up on the channel, so it is not recorded as
+                # one the app is distributed on.
+                from integrations.agent_engine.dispatch import dispatch_failure_reason
+                return {'error': 'Distribution failed: '
+                        + (dispatch_failure_reason(goal_id) or 'no response')}
             # Track distribution
             with self._lock:
                 listings = self._listings()
@@ -1249,13 +1256,17 @@ class AppPromotionAgent:
 
         try:
             from integrations.agent_engine.dispatch import dispatch_goal
-            dispatch_goal(
+            response = dispatch_goal(
                 prompt=f"Send this welcome message to user {user_id}: {welcome_msg}",
                 user_id=user_id,
                 goal_id=f'onboard_{listing_id}_{user_id}',
                 goal_type='onboarding',
             )
-            results['actions'].append({'type': 'welcome_sent', 'success': True})
+            results['actions'].append(
+                {'type': 'welcome_sent', 'success': True}
+                if response is not None else
+                {'type': 'welcome_sent', 'success': False,
+                 'error': 'dispatch returned no response'})
         except Exception as e:
             results['actions'].append({'type': 'welcome_sent', 'success': False, 'error': str(e)})
 
@@ -1323,7 +1334,7 @@ class AppPromotionAgent:
                 results['benchmarks'].append({
                     'listing_id': lid,
                     'name': listing['name'],
-                    'status': 'dispatched',
+                    'status': 'dispatched' if response is not None else 'failed',
                     'response': response,
                 })
             except Exception as e:
@@ -1403,7 +1414,7 @@ class AppPromotionAgent:
         """Schedule periodic re-promotion based on performance."""
         try:
             from integrations.agent_engine.dispatch import dispatch_goal
-            dispatch_goal(
+            response = dispatch_goal(
                 prompt=(
                     f"Re-promote marketplace app {listing_id}. "
                     f"Check current install count and rating. "
@@ -1414,7 +1425,7 @@ class AppPromotionAgent:
                 goal_id=f'repromo_{listing_id}_{int(time.time())}',
                 goal_type='marketing',
             )
-            return 'scheduled'
+            return 'scheduled' if response is not None else 'dispatch_failed'
         except Exception as e:
             return f'schedule_error: {e}'
 

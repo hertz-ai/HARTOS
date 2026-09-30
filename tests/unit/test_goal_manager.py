@@ -516,6 +516,140 @@ class TestGoalManagerUpdate(unittest.TestCase):
         self.assertEqual(fake.description, 'New from seed')
 
 
+class TestGoalManagerEscalate(unittest.TestCase):
+    """GoalManager.escalate_goal (#106): a stuck action parks its goal the way
+    every other pause path does, with the ask recorded for the owner or the
+    co-pilot, and never goes through the persona consensus gate."""
+
+    def setUp(self):
+        self.gm = _fresh_import()
+        self.db = FakeSession()
+
+    def _escalate(self, fake, escalation, expert=None):
+        """``expert`` is this node's escalation expert; None, the default,
+        is a node with none (the lookup is fixed so the machine running the
+        test, with or without Claude Code, does not decide the branch)."""
+        with patch.dict('sys.modules', {
+            'integrations.social.models': MagicMock(AgentGoal=type(fake)),
+            'security.hive_guardrails': MagicMock(
+                HiveEthos=MagicMock(enforce_ephemeral_agents=MagicMock())),
+        }), patch(
+            'integrations.agent_engine.hive_consensus.HiveConsensus.upgrade_proposal',
+            side_effect=AssertionError('an escalation is not a persona change'),
+        ), patch.object(self.gm.GoalManager, '_escalation_expert',
+                        return_value=expert):
+            self.db.query = lambda cls: FakeQuery([fake])
+            return self.gm.GoalManager.escalate_goal(self.db, fake.id, escalation)
+
+    def test_the_goal_is_paused_with_the_ask_recorded(self):
+        original = {'bootstrap_slug': 'guardian', 'continuous': True}
+        fake = FakeGoal(id='70', goal_type='marketing', status='active',
+                        config_json=original)
+        result = self._escalate(fake, {
+            'action_id': 9, 'action': 'Search prior threat patterns',
+            'reason': 'the loop-break fired on an unverified action',
+            'tried': ['local']})
+        self.assertTrue(result['success'])
+        self.assertEqual(fake.status, 'paused')
+        cfg = fake.config_json
+        self.assertIsNot(cfg, original,
+                         'a mutated config dict is not written back')
+        self.assertEqual(cfg['bootstrap_slug'], 'guardian')
+        self.assertTrue(cfg['continuous'])
+        esc = cfg['escalation']
+        self.assertEqual((esc['action_id'], esc['tried']), (9, ['local']))
+        self.assertIn('unverified action', esc['reason'])
+        self.assertTrue(esc['at'])
+        self.assertIn('action 9', cfg['pause_reason'])
+        self.assertIn('unverified action', cfg['pause_reason'])
+        self.assertEqual(cfg['paused_at'], esc['at'])
+
+    def test_a_missing_goal_is_reported(self):
+        with patch.dict('sys.modules', {
+            'integrations.social.models': MagicMock(AgentGoal=FakeGoal),
+        }):
+            self.db.query = lambda cls: FakeQuery([])
+            result = self.gm.GoalManager.escalate_goal(
+                self.db, 'ghost', {'action_id': 1})
+        self.assertFalse(result['success'])
+
+    def test_it_writes_only_through_the_existing_writers(self):
+        fake = FakeGoal(id='71', goal_type='marketing', status='active',
+                        config_json={})
+        gm = self.gm.GoalManager
+        with patch.object(gm, 'update_goal', wraps=gm.update_goal) as fields, \
+                patch.object(gm, 'update_goal_status',
+                             wraps=gm.update_goal_status) as status:
+            self._escalate(fake, {'action_id': 2, 'reason': 'needs input'})
+        fields.assert_called_once()
+        status.assert_called_once_with(self.db, '71', 'paused')
+
+    # -- #106d: the node's expert model gets the action before a person --
+
+    def test_the_expert_takes_it_first_and_the_goal_stays_active(self):
+        fake = FakeGoal(id='72', goal_type='marketing', status='active',
+                        config_json={})
+        expert = MagicMock(model_id='claude-code', config_list_entry={
+            'api_key': 'hive-secret-token',
+            'base_url': 'http://127.0.0.1:5000/api/claude/v1'})
+        gm = self.gm.GoalManager
+        with patch.object(gm, 'update_goal_status',
+                          wraps=gm.update_goal_status) as status:
+            result = self._escalate(fake, {
+                'action_id': 3, 'action': 'Post the thread',
+                'reason': 'it did not complete after 3 attempts',
+                'tried': ['local'], 'user_prompt': 'u1_42', 'prompt_id': 42,
+                'flow': 0}, expert=expert)
+        self.assertTrue(result['success'])
+        self.assertEqual(result['stage'], 'expert')
+        self.assertEqual(fake.status, 'active')
+        status.assert_not_called()
+        esc = fake.config_json['escalation']
+        self.assertEqual((esc['next'], esc['expert'], esc['tried']),
+                         ('expert', 'claude-code', ['local']))
+        self.assertEqual((esc['prompt_id'], esc['flow']), (42, 0))
+        self.assertNotIn('pause_reason', fake.config_json)
+        self.assertNotIn('hive-secret-token', repr(fake.config_json),
+                         'the expert is stored by id, never by its config')
+
+    def test_after_the_expert_the_same_action_goes_to_a_person(self):
+        prior = {'action_id': 3, 'user_prompt': 'u1_42', 'next': 'expert',
+                 'expert': 'claude-code', 'tried': ['local'], 'at': 'earlier'}
+        fake = FakeGoal(id='73', goal_type='marketing', status='active',
+                        config_json={'escalation': prior})
+        result = self._escalate(fake, {
+            'action_id': 3, 'reason': 'the expert model did not finish it',
+            'tried': ['local'], 'user_prompt': 'u1_42'},
+            expert=MagicMock(model_id='claude-code'))
+        self.assertEqual(result['stage'], 'human')
+        self.assertEqual(fake.status, 'paused')
+        esc = fake.config_json['escalation']
+        self.assertEqual((esc['next'], esc['tried']), ('human', ['local', 'expert']))
+        self.assertIn('expert model did not finish', fake.config_json['pause_reason'])
+
+    def test_a_different_action_gets_its_own_expert_turn(self):
+        prior = {'action_id': 3, 'user_prompt': 'u1_42', 'next': 'expert',
+                 'tried': ['local']}
+        fake = FakeGoal(id='74', goal_type='marketing', status='active',
+                        config_json={'escalation': prior})
+        result = self._escalate(fake, {
+            'action_id': 4, 'reason': 'needs input', 'tried': ['local'],
+            'user_prompt': 'u1_42'}, expert=MagicMock(model_id='claude-code'))
+        self.assertEqual(result['stage'], 'expert')
+        self.assertEqual(fake.status, 'active')
+        esc = fake.config_json['escalation']
+        self.assertEqual((esc['action_id'], esc['tried']), (4, ['local']))
+
+    def test_a_node_with_no_expert_parks_for_a_person_at_once(self):
+        fake = FakeGoal(id='75', goal_type='marketing', status='active',
+                        config_json={})
+        result = self._escalate(fake, {
+            'action_id': 5, 'reason': 'needs input', 'tried': ['local']})
+        self.assertEqual(result['stage'], 'human')
+        self.assertEqual(fake.status, 'paused')
+        self.assertEqual(fake.config_json['escalation']['next'], 'human')
+
+
 # ===========================================================================
 # FT: ProductManager CRUD
 # ===========================================================================

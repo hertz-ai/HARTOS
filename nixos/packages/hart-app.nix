@@ -8,28 +8,42 @@ let
   python = pkgs.python310;
 
   # Python environment with all dependencies
-  # pyautogen 0.2.35 — the multi-agent framework the ONE agentic pipeline
-  # runs on. Same failure class as json_repair below, one dependency deeper:
-  # measured live on .69 (2026-09-01, image ead46e3), POST /chat returned
+  # autogen-agentchat 0.2.37 — the multi-agent framework the ONE agentic
+  # pipeline runs on (import name `autogen`). Same failure class as
+  # json_repair below, one dependency deeper: measured live on .69
+  # (2026-09-01, image ead46e3), POST /chat returned
   #   503 {"error": "Agent creation requires the 'pyautogen' package",
   #        "reason": "optional_capability_missing"}
   # so CREATE/REUSE recipes — the node's entire agentic surface — were
   # unavailable on the appliance while working on every pip-installed desktop.
   #
-  # Version contract comes from requirements.txt: pyautogen==0.2.35 exactly
-  # ("0.2.37 was never published to PyPI under any name; 0.2.35 is the same
-  # 0.2 API and the full autogen test family passes against it"). NOT in this
-  # nixpkgs pin (pkgs/development/python-modules/pyautogen: 404 at 50ab793),
-  # hence fetchPypi rather than an attr — and deliberately NOT a newer
-  # pyautogen/ag2 0.4.x, which shares the import name but breaks the 0.2 API.
+  # Version contract comes from requirements.txt: autogen-agentchat==0.2.37
+  # exactly — the ONE autogen pin shared with pyproject.toml, both Dockerfiles
+  # and Nunba. This derivation used to build pyautogen 0.2.35 on the false
+  # claim that 0.2.37 "was never published to PyPI"; it is published as
+  # autogen-agentchat, and 0.2.35 lacks GroupChat(select_speaker_transform_messages=)
+  # (reuse role groups raise TypeError) and the limiter pop that
+  # hartos/helper.py corrects (0.2.35 duplicated the newest message and blew
+  # the token budget). NOT in this nixpkgs pin, hence fetchPypi rather than an
+  # attr — and deliberately NOT autogen-agentchat 0.4+ (or pyautogen 0.10,
+  # which pulls it), whose API is not the 0.2 one this code is written for.
+  #
+  # Source: the sdist autogen-agentchat-0.2.37.tar.gz (fetchPypi's
+  # mirror://pypi/a/autogen-agentchat/ path; PyPI sha256
+  # c6a674b33075aa3a5ac684e45d4895e7de96e865a3f87846d690fe90b885c3b9, the
+  # SRI hash below, recomputed from the downloaded file 2026-09-26). The
+  # Nix BUILD of this derivation was not run on the dev box; CI's
+  # nix-build-matrix is the check that it fetches, builds and imports.
   #
   # Runtime deps are the sdist's requires_dist verbatim (PyPI JSON,
-  # non-extra): diskcache docker flaml numpy<2 openai>=1.3 packaging
-  # pydantic>=1.10,<3 python-dotenv termcolor tiktoken. The pin satisfies the
-  # two tight ones: numpy is 1.x and pydantic is 1.10.x in nixpkgs 24.11.
+  # non-extra), identical to pyautogen 0.2.35's: diskcache docker flaml
+  # numpy<2 openai>=1.3 packaging pydantic>=1.10,<3,!=2.6.0 python-dotenv
+  # termcolor tiktoken. Requires-Python >=3.8,<3.13 (this is python310). The
+  # pin satisfies the two tight ones: numpy is 1.x and pydantic is 1.10.x in
+  # nixpkgs 24.11.
   # Tests need network + API keys, so doCheck=false; pythonImportsCheck still
   # proves the package imports inside the closed build.
-  # flaml — required (not optional) by pyautogen 0.2.x: autogen.oai imports it
+  # flaml — required (not optional) by autogen 0.2.x: autogen.oai imports it
   # at module top, so dropping it from the dep set fails pythonImportsCheck.
   # NOT in the 24.11 pin either (the eval gate proved it: "undefined variable
   # 'flaml'" x14 on 4beff37, every build skipped). Core install_requires is
@@ -53,13 +67,13 @@ let
     pythonImportsCheck = [ "flaml" ];
   };
 
-  pyautogenPkg = python.pkgs.buildPythonPackage rec {
-    pname = "pyautogen";
-    version = "0.2.35";
+  autogenPkg = python.pkgs.buildPythonPackage rec {
+    pname = "autogen-agentchat";
+    version = "0.2.37";
     format = "setuptools";
     src = pkgs.fetchPypi {
       inherit pname version;
-      hash = "sha256-dELgu+iBBniginAaZF1XNPiHzMIjstIc2Vv2i+KYcqE=";
+      hash = "sha256-xqZ0szB1qjpaxoTkXUiV596W6GWj+HhG1pD+kLiFw7k=";
     };
     propagatedBuildInputs = (with python.pkgs; [
       diskcache
@@ -200,9 +214,9 @@ let
     # dead on the node. Pure-python, tiny; present in this nixpkgs pin.
     json-repair
 
-    # AutoGen (multi-agent framework) — see pyautogenPkg above for the
+    # AutoGen (multi-agent framework) — see autogenPkg above for the
     # version contract and the live 503 this closes.
-    pyautogenPkg
+    autogenPkg
   ]);
 in
 pkgs.stdenv.mkDerivation {

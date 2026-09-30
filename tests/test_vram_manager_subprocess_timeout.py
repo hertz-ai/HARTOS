@@ -62,6 +62,17 @@ class _WedgedPopen:
         return self.returncode
 
 
+def _tools_present(name, *a, **kw):
+    """Pretend nvidia-smi / rocm-smi are on PATH.
+
+    _probe_gpu (2026-08-12) stats PATH first and caches "no vendor tools" as
+    a permanent negative, skipping the probes outright, so on a box without
+    the tools no Popen is ever spawned and the wedge these tests simulate can
+    never occur. The wedge is only reachable when the tool EXISTS and hangs,
+    which is the real-hardware case the fix was written for."""
+    return "/usr/bin/" + name
+
+
 class _FakePipe:
     def __init__(self):
         self.closed = False
@@ -89,7 +100,7 @@ class DetectGPUBoundedByWatchdogTests(unittest.TestCase):
         because torch may legitimately report a GPU here.
         """
         mgr = self._fresh_manager()
-        with patch("subprocess.Popen", _WedgedPopen):
+        with patch("shutil.which", _tools_present),              patch("subprocess.Popen", _WedgedPopen):
             t0 = time.monotonic()
             info = mgr.detect_gpu()
             elapsed = time.monotonic() - t0
@@ -109,40 +120,16 @@ class DetectGPUBoundedByWatchdogTests(unittest.TestCase):
         for k in ("name", "total_gb", "free_gb", "cuda_available"):
             self.assertIn(k, info)
 
-    def test_detect_gpu_closes_pipes_on_timeout(self):
-        """On TimeoutExpired, both stdout and stderr must be close()d.
-
-        This is the load-bearing line of the fix: explicit .close()
-        is what releases the OS handle so any orphaned _readerthread
-        unblocks from fh.read().  If close() is skipped, the bug
-        returns even with a timeout — the test must fail in that case.
-        """
-        observed_pipes = []
-
-        class _TrackingPopen(_WedgedPopen):
-            def __init__(self, cmd, **kwargs):
-                super().__init__(cmd, **kwargs)
-                observed_pipes.append((self.stdout, self.stderr))
-
-        mgr = self._fresh_manager()
-        with patch("subprocess.Popen", _TrackingPopen):
-            mgr.detect_gpu()
-
-        self.assertGreaterEqual(
-            len(observed_pipes), 1,
-            "Popen must be spawned at least once (nvidia-smi path)",
-        )
-        for stdout, stderr in observed_pipes:
-            self.assertTrue(
-                stdout.closed,
-                "stdout pipe must be closed after timeout — without "
-                "this, _readerthread orphans forever",
-            )
-            self.assertTrue(
-                stderr.closed,
-                "stderr pipe must be closed after timeout — without "
-                "this, _readerthread orphans forever",
-            )
+    # test_detect_gpu_closes_pipes_on_timeout used to live here and asserted the
+    # OPPOSITE of the current contract: that run_bounded close()s the child's
+    # stdout/stderr after a timeout. Closing them is exactly what deadlocked
+    # (D36, measured 2026-09-09: fh.close() blocks on the file lock a parked
+    # _readerthread holds inside fh.read()), so _safe_kill_and_close now leaves
+    # the pipes to their reader threads by design. The deliberately arranged
+    # test for that contract is tests/unit/test_subprocess_safe.py
+    # (TestKillReachesDescendants); this file keeps only the half that is still
+    # true, that detect_gpu() RETURNS within the watchdog budget when a probe
+    # wedges.
 
 
 class RunBoundedUnitTests(unittest.TestCase):

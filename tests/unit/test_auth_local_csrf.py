@@ -205,7 +205,8 @@ def test_origin_host_parser():
 def test_module_imports_cleanly():
     from core import auth_local  # noqa: F401
     assert hasattr(auth_local, 'require_local_or_token_csrf_safe')
-    assert hasattr(auth_local, '_is_safe_csrf_origin')
+    # Public: Nunba's routes/auth.py imports it for its own csrf-safe guard.
+    assert hasattr(auth_local, 'is_safe_csrf_origin')
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -349,16 +350,46 @@ def test_csrf_safe_non_ascii_bearer_does_not_500(app, monkeypatch):
 # ── _is_local_request: TRUSTED_PROXY + X-Forwarded-For decision ────
 
 
-def test_trusted_proxy_forwarded_loopback_accepted(app, monkeypatch):
-    """Behind a trusted reverse proxy, the real client IP arrives in
-    X-Forwarded-For.  Proxy addr matches TRUSTED_PROXY and XFF is
-    loopback → treat as local, accept without a token."""
+def test_the_staging_container_trusts_every_caller(app, monkeypatch):
+    """NUNBA_CI=1, set only by Nunba's docker-compose.staging.yml, trusts
+    every caller, as Nunba's own rule does: the e2e probe reaches the
+    container through Docker's port mapping, never from 127.0.0.1.  Without
+    it the same caller is remote."""
+    client = app.test_client()
+    monkeypatch.setenv('NUNBA_CI', '1')
+    resp = client.post('/test/local-only', environ_base={'REMOTE_ADDR': '172.18.0.1'})
+    assert resp.status_code == 200
+    monkeypatch.delenv('NUNBA_CI')
+    resp = client.post('/test/local-only', environ_base={'REMOTE_ADDR': '172.18.0.1'})
+    assert resp.status_code == 401
+
+
+def test_an_installed_build_ignores_nunba_ci(app, monkeypatch):
+    """Staging always runs from source, so NUNBA_CI on a frozen (installed)
+    build can only be a misconfiguration: the same caller stays remote."""
+    import sys
+    monkeypatch.setenv('NUNBA_CI', '1')
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    resp = app.test_client().post('/test/local-only',
+                                  environ_base={'REMOTE_ADDR': '172.18.0.1'})
+    assert resp.status_code == 401
+
+
+@pytest.mark.parametrize('claimed', ['127.0.0.1', '::1', 'localhost',
+                                     '::ffff:127.0.0.1', '127.0.0.1, 127.0.0.1'])
+def test_a_forwarded_loopback_claim_is_never_local(app, monkeypatch, claimed):
+    """SECURITY (review of 291e548df, F1): local means the SOCKET peer is
+    loopback, never an address taken from a header.  A proxy that appends
+    nothing (docker's userland proxy on -p) passes a client's own
+    'X-Forwarded-For: 127.0.0.1' through; with TRUSTED_PROXY set to it, the
+    header used to make any external caller local.  A forwarded request is
+    a remote one, whatever it says."""
     monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
     client = app.test_client()
     resp = client.post('/test/local-only',
                        environ_base={'REMOTE_ADDR': PROXY_IP},
-                       headers={'X-Forwarded-For': '127.0.0.1'})
-    assert resp.status_code == 200
+                       headers={'X-Forwarded-For': claimed})
+    assert resp.status_code == 401
 
 
 def test_trusted_proxy_forwarded_remote_rejected(app, monkeypatch):
@@ -372,35 +403,56 @@ def test_trusted_proxy_forwarded_remote_rejected(app, monkeypatch):
     assert resp.status_code == 401
 
 
-def test_trusted_proxy_uses_first_forwarded_hop(app, monkeypatch):
-    """XFF can be a comma list (client, proxy1, proxy2).  The original
-    client is the FIRST hop; a loopback first hop is accepted even when
-    later hops are non-loopback."""
+def test_the_client_address_is_the_hop_the_proxy_appended(app, monkeypatch):
+    """XFF is a comma list the CLIENT starts and each proxy appends to; only
+    the LAST hop was written by our trusted proxy."""
+    from core.auth_local import client_address
     monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
-    client = app.test_client()
-    resp = client.post('/test/local-only',
-                       environ_base={'REMOTE_ADDR': PROXY_IP},
-                       headers={'X-Forwarded-For': '127.0.0.1, 10.0.0.9'})
+    with app.test_request_context(
+            environ_base={'REMOTE_ADDR': PROXY_IP},
+            headers={'X-Forwarded-For': '127.0.0.1, 198.51.100.7'}):
+        assert client_address() == '198.51.100.7'
+
+
+def test_trusted_proxy_accepts_a_list(app, monkeypatch):
+    """TRUSTED_PROXY may name several forwarders, comma-separated (two
+    gateway replicas, IPv4 + IPv6)."""
+    from core.auth_local import client_address
+    monkeypatch.setenv('TRUSTED_PROXY', '10.0.0.2, ' + PROXY_IP)
+    with app.test_request_context(
+            environ_base={'REMOTE_ADDR': PROXY_IP},
+            headers={'X-Forwarded-For': '198.51.100.7'}):
+        assert client_address() == '198.51.100.7'
+
+
+@pytest.mark.parametrize('peer', ['127.0.0.1', '::1', '::ffff:127.0.0.1'])
+def test_a_loopback_socket_peer_is_local(app, monkeypatch, peer):
+    """F4: an IPv4-mapped loopback (dual-stack servers report it) is
+    loopback, not a silent 401."""
+    monkeypatch.delenv('TRUSTED_PROXY', raising=False)
+    resp = app.test_client().post('/test/local-only',
+                                  environ_base={'REMOTE_ADDR': peer})
     assert resp.status_code == 200
 
 
-def test_trusted_proxy_forwarded_ipv6_loopback_accepted(app, monkeypatch):
-    monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
-    client = app.test_client()
-    resp = client.post('/test/local-only',
-                       environ_base={'REMOTE_ADDR': PROXY_IP},
-                       headers={'X-Forwarded-For': '::1'})
+def test_a_proxy_on_this_machine_forwarding_a_local_client_is_local(
+        app, monkeypatch):
+    """nginx on this host forwarding this host's own browser: the socket
+    peer is loopback and so is the client it names (IPv4-mapped too)."""
+    monkeypatch.delenv('TRUSTED_PROXY', raising=False)
+    resp = app.test_client().post('/test/local-only',
+                                  environ_base={'REMOTE_ADDR': '127.0.0.1'},
+                                  headers={'X-Forwarded-For': '::ffff:127.0.0.1'})
     assert resp.status_code == 200
 
 
-def test_trusted_proxy_forwarded_localhost_string_accepted(app, monkeypatch):
-    """The literal token 'localhost' is in the accepted forwarded set."""
-    monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
-    client = app.test_client()
-    resp = client.post('/test/local-only',
-                       environ_base={'REMOTE_ADDR': PROXY_IP},
-                       headers={'X-Forwarded-For': 'localhost'})
-    assert resp.status_code == 200
+def test_a_proxy_on_this_machine_forwarding_a_remote_client_is_not_local(
+        app, monkeypatch):
+    monkeypatch.delenv('TRUSTED_PROXY', raising=False)
+    resp = app.test_client().post('/test/local-only',
+                                  environ_base={'REMOTE_ADDR': '127.0.0.1'},
+                                  headers={'X-Forwarded-For': '203.0.113.55'})
+    assert resp.status_code == 401
 
 
 def test_trusted_proxy_empty_forwarded_header_rejected(app, monkeypatch):
@@ -452,3 +504,25 @@ def test_trusted_proxy_remote_client_with_valid_token_accepted(app,
                        headers={'X-Forwarded-For': '203.0.113.55',
                                 'Authorization': 'Bearer secret-token-123'})
     assert resp.status_code == 200
+
+
+def test_a_trusted_loopback_proxy_that_sends_no_header_fails_closed(
+        app, monkeypatch):
+    """A proxy on this machine declared as TRUSTED_PROXY speaks for its
+    clients; one that strips X-Forwarded-For names no client, so its request
+    is not treated as this machine's own (core.auth_local.client_address)."""
+    monkeypatch.setenv('TRUSTED_PROXY', '127.0.0.1')
+    resp = app.test_client().post('/test/local-only',
+                                  environ_base={'REMOTE_ADDR': '127.0.0.1'})
+    assert resp.status_code == 401
+
+
+def test_an_ipv4_mapped_socket_peer_matches_its_trusted_proxy(app, monkeypatch):
+    """F4: a dual-stack server reports the proxy as ::ffff:10.0.0.1; it is
+    still the TRUSTED_PROXY 10.0.0.1."""
+    from core.auth_local import client_address
+    monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
+    with app.test_request_context(
+            environ_base={'REMOTE_ADDR': '::ffff:' + PROXY_IP},
+            headers={'X-Forwarded-For': '198.51.100.7'}):
+        assert client_address() == '198.51.100.7'

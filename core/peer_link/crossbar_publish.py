@@ -59,6 +59,7 @@ def publish_thinking_trace(
     full_schema: bool = False,
     preffered_language: str = 'en-US',
     action: str = CHAT_ACTION_THINKING,
+    page_image_url: str = '',
 ) -> bool:
     """Build a priority-49 'Thinking' bubble + publish to the user's chat topic.
 
@@ -77,6 +78,12 @@ def publish_thinking_trace(
             status pushes.
         preffered_language: Language tag (typo preserved). Only
             emitted when full_schema=True.
+        page_image_url: URL of a page image the bubble is quoting —
+            e.g. '/uploads/pdf_parse/<stem>/page_7.jpg' from
+            integrations/learning/book_tools.py. Only emitted when
+            full_schema=True (the non-full envelope has never carried
+            the field). Defaults to '' so existing callers produce a
+            byte-identical envelope.
 
     Returns:
         True if publish_async was invoked, False if HARTOS publisher
@@ -106,7 +113,13 @@ def publish_thinking_trace(
             'options': [],
             'newoptions': [],
             'bot_type': bot_type,
-            'page_image_url': '',
+            # Was an unconditional '' — the field has been in the wire schema
+            # and parsed by every client all along (web/desktop
+            # Demopage.js:2267 setUploadedImage(parsed.page_image_url);
+            # Android CrossbarAnalogyResponse.java:21 @SerializedName), but
+            # HARTOS never populated it, so no agent could quote a page image.
+            # Default '' keeps every existing caller byte-identical on the wire.
+            'page_image_url': page_image_url or '',
             'analogy_image_url': '',
             'request_id': request_id,
             'msg_id': _msg_id,
@@ -167,3 +180,61 @@ def publish_chat_stage(stage: str, *, user_id: str, request_id: str = '', text: 
         text=text, user_id=str(user_id), request_id=str(request_id or ''),
         bot_type='Agent', full_schema=False, action=CHAT_ACTION_STATUS,
     )
+
+
+def publish_agent_message(
+    *,
+    text: Any,
+    user_id: str,
+    request_id: str,
+    prompt_id: Any,
+    inp: Any = '',
+) -> bool:
+    """Deliver an agent's message to the user on the local chat topic.
+
+    The one on-device path for send_message_to_user1 in BOTH create_recipe
+    and reuse_recipe.  REUSE had no such path and POSTed every message to
+    the cloud host aws_rasa:9890, which a desktop cannot reach (measured in
+    the Nunba gui_app.log 2026-09-26: WinError 10061, the agent's question
+    never arrived).  The envelope is the one CREATE has published since
+    2026-06-09 and chat-stream subscribers parse (text, request_id,
+    prompt_id, bot_type, options, page_image_url).
+
+    Returns True only when publish_async was resolved and returned without
+    raising; False for empty text or user, an unresolvable publisher, or a
+    raising one.  Callers report that result instead of claiming delivery.
+    """
+    text_str = text if isinstance(text, str) else str(text or '')
+    # An elided-text pointer a model copied into its message is never shown
+    # to the user (owner ruling 2026-09-27; core.llm_outbound_logger).
+    from core.llm_outbound_logger import strip_elided_pointers
+    text_str = strip_elided_pointers(text_str)
+    if not user_id or not text_str:
+        return False
+    payload = {
+        'text': [text_str],
+        'request_id': request_id,
+        'prompt_id': prompt_id,
+        'bot_type': 'Custom GPT',
+        'options': [],
+        'newoptions': [],
+        'page_image_url': '',
+        'analogy_image_url': '',
+        'probe': False,
+        'inp': inp,
+    }
+    try:
+        from core.peer_link.message_bus import chat_topic_for
+        from core.safe_hartos_attr import safe_hartos_attr
+        publish_async = safe_hartos_attr('publish_async')
+        if publish_async is None:
+            logger.warning(
+                "publish_agent_message: HARTOS publish_async unresolvable; "
+                "message for user %s not delivered", user_id)
+            return False
+        publish_async(chat_topic_for(user_id), payload)
+        return True
+    except Exception as e:
+        logger.warning(
+            "publish_agent_message: publish for user %s failed: %s", user_id, e)
+        return False

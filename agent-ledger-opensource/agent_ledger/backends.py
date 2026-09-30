@@ -130,7 +130,7 @@ class JSONBackend(StorageBackend):
             os.replace(str(tmp_path), str(path))
             return True
         except Exception as e:
-            print(f"[JSONBackend] Save error: {e}")
+            print(f"[JSONBackend] Save error for {path}: {e}")
             # Clean up temp file on failure
             try:
                 if tmp_path.exists():
@@ -147,7 +147,7 @@ class JSONBackend(StorageBackend):
             with open(path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
-            print(f"[JSONBackend] Load error: {e}")
+            print(f"[JSONBackend] Load error for {path}: {e}")
             return None
 
     def exists(self, key: str) -> bool:
@@ -160,7 +160,7 @@ class JSONBackend(StorageBackend):
                 path.unlink()
             return True
         except Exception as e:
-            print(f"[JSONBackend] Delete error: {e}")
+            print(f"[JSONBackend] Delete error for {path}: {e}")
             return False
 
     def list_keys(self, pattern: str = "*") -> List[str]:

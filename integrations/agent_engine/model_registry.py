@@ -118,6 +118,30 @@ class ModelBackend:
             self.avg_latency_ms = sum(self._latency_samples) / len(self._latency_samples)
 
 
+def _llm_target(entry) -> tuple:
+    """(base_url, model) of a config_list entry, to tell two backends apart.
+    A trailing /v1 is dropped: the same endpoint is written both ways."""
+    entry = entry or {}
+    url = str(entry.get('base_url') or '').rstrip('/')
+    if url.endswith('/v1'):
+        url = url[:-3]
+    return (url, str(entry.get('model') or ''))
+
+
+def _own_llm_target() -> tuple:
+    """(base_url, model) of the LLM this node's own turns run on.
+
+    Read from resolve_llm_backend(), whose entry also carries the API key, so
+    only these two fields leave this function and nothing here is logged.
+    """
+    try:
+        from core.autogen_config import resolve_llm_backend
+        _kind, entry = resolve_llm_backend()
+    except Exception:
+        return ('', '')
+    return _llm_target(entry)
+
+
 # ─── Model Registry (Singleton) ───
 
 class ModelRegistry:
@@ -233,6 +257,27 @@ class ModelRegistry:
                 if m.cost_per_1k_tokens <= max_cost
                 and m.tier != ModelTier.DRAFT
                 and m.is_dispatchable()
+            ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda m: m.accuracy_score)
+
+    def get_escalation_expert(self) -> Optional[ModelBackend]:
+        """The model a stuck goal action is handed to before a person (#106d).
+
+        An EXPERT-tier backend this node can dispatch to, other than the model
+        its own turns already run on: handing the action back to that model is
+        a retry, not an expert.  In practice Claude Code where it is logged
+        in, or a hive peer's verified expert.  None on a node with neither,
+        and the action goes to the owner and the co-pilot.
+        """
+        own = _own_llm_target()
+        with self._lock:
+            candidates = [
+                m for m in self._models.values()
+                if m.tier == ModelTier.EXPERT
+                and m.is_dispatchable()
+                and _llm_target(m.config_list_entry) != own
             ]
         if not candidates:
             return None
@@ -365,6 +410,86 @@ model_registry = ModelRegistry()
 
 # ─── Default backend registration ───
 
+def ensure_claude_code_registered() -> bool:
+    """Keep the claude-code EXPERT backend's registration equal to the
+    copilot's availability; True when it is registered afterwards.
+
+    Called at boot from _register_defaults, by the daemon before an expert
+    turn, and by the switch itself (claude_code_backend.set_copilot_enabled):
+    claude_code_available() is read live, so a copilot switched ON after
+    boot (admin page, or the owner answering an agent's ask) gets its
+    backend without a restart, and one switched OFF loses it -- the
+    selectors stop offering it and get_escalation_expert() answers None,
+    exactly as on a logged-out node.
+
+    This used to return early whenever the backend was registered, on the
+    belief that OFF "took effect (the endpoint refuses)".  The endpoint's
+    completion handler never consulted the switch, so measured 2026-09-16
+    on the bundled desktop the backend registered at boot kept the expert
+    tier spawning `claude -p` for the whole time the copilot was off.  The
+    spawn is now gated in invoke_claude; this keeps the offer honest."""
+    try:
+        from integrations.coding_agent.claude_code_backend import claude_code_available
+        if claude_code_available():
+            if model_registry.get_model('claude-code') is None:
+                _register_claude_code()
+        elif model_registry.unregister('claude-code'):
+            logger.info("claude-code backend unregistered: the copilot is "
+                        "switched off or logged out")
+    except Exception as _cc_err:                    # never break registry init
+        logger.debug("claude-code backend not synced: %s", _cc_err)
+    return model_registry.get_model('claude-code') is not None
+
+
+def _register_claude_code():
+    """Register the claude-code EXPERT backend (the copilot is usable)."""
+    # 5a2. Claude Code (the SUBSCRIPTION path — NOT the API key above). The
+    #      resident, already-authorized `claude -p` served as an
+    #      OpenAI-compatible endpoint by integrations.providers
+    #      .claude_code_endpoint (/api/claude/v1). This is how HARTOS "wears
+    #      Claude as its engine" using the ONE credential the copilot logged in
+    #      with — no ANTHROPIC_API_KEY, no per-token cost. It is a LOCAL expert
+    #      (is_local=True) in the same registry the hive uses for remote experts.
+    #
+    #      Gated on claude_code_available() by the caller: a node without Claude
+    #      Code logged in simply lacks THIS frontier tier and falls back to the
+    #      hive experts / local models — it never registers a backend that 503s
+    #      every call.  Higher latency + lower nominal accuracy-vs-cost than
+    #      the API path is deliberate: `claude -p` is the agent binary in print
+    #      mode, so it is the frontier/background tier, never the hot draft path.
+    #
+    #      base_url must dial where HARTOS is actually SERVING, not the port it
+    #      was ASSIGNED. get_port('backend') answers 6777, which is DEAD on the
+    #      bundled desktop (HARTOS runs in-process on the Flask port 5000) — a
+    #      reuse turn routed to this copilot backend then hits a closed socket
+    #      (WinError 10061 -> openai APIConnectionError -> '_tier: direct'
+    #      fallback, live-pinned 2026-09-03). Same #71 bug the co-pilot daemon
+    #      carried (fixed a34b6244); get_local_backend_url is the ONE canonical
+    #      resolver — it probes 'backend' then 'flask' and returns the first
+    #      ACTUALLY LISTENING (standalone backend:6777 / bundled flask:5000),
+    #      with HEVOLVE_BASE_URL winning. No hardcoded port, no parallel path.
+    #      Guarded by tests/unit/test_copilot_backend_resolution.py +
+    #      test_copilot_model_registry_base_url.
+    from core.port_registry import get_local_backend_url
+    _cc_base = get_local_backend_url().rstrip('/') + '/api/claude/v1'
+    model_registry.register(ModelBackend(
+        model_id='claude-code',
+        display_name='Claude Code (Frontier, subscription)',
+        tier=ModelTier.EXPERT,
+        config_list_entry={
+            'model': 'claude-code',
+            'api_key': 'dummy',            # local shim; auth is the sub
+            'base_url': _cc_base,
+            'price': [0, 0],               # subscription, not per-token
+        },
+        avg_latency_ms=6000.0,             # agent binary in print mode
+        accuracy_score=0.95,
+        cost_per_1k_tokens=0.0,
+        is_local=True,
+        hardware_dependent=False,
+    ))
+
+
 def _register_defaults():
     """Register default model backends.
 
@@ -491,56 +616,7 @@ def _register_defaults():
             gpu_tdp_watts=170.0,
         ))
 
-    # 5a2. Claude Code (the SUBSCRIPTION path — NOT the API key above). The
-    #      resident, already-authorized `claude -p` served as an
-    #      OpenAI-compatible endpoint by integrations.providers
-    #      .claude_code_endpoint (/api/claude/v1). This is how HARTOS "wears
-    #      Claude as its engine" using the ONE credential the copilot logged in
-    #      with — no ANTHROPIC_API_KEY, no per-token cost. It is a LOCAL expert
-    #      (is_local=True) in the same registry the hive uses for remote experts.
-    #
-    #      Gated on claude_code_available(): a node without Claude Code logged in
-    #      simply lacks THIS frontier tier and falls back to the hive experts /
-    #      local models — it never registers a backend that 503s every call.
-    #      Higher latency + lower nominal accuracy-vs-cost than the API path is
-    #      deliberate: `claude -p` is the agent binary in print mode, so it is
-    #      the frontier/background tier, never the hot draft path.
-    try:
-        from integrations.coding_agent.claude_code_backend import claude_code_available
-        if claude_code_available():
-            # base_url must dial where HARTOS is actually SERVING, not the port it
-            # was ASSIGNED. get_port('backend') answers 6777, which is DEAD on the
-            # bundled desktop (HARTOS runs in-process on the Flask port 5000) — a
-            # reuse turn routed to this copilot backend then hits a closed socket
-            # (WinError 10061 -> openai APIConnectionError -> '_tier: direct'
-            # fallback, live-pinned 2026-09-03). Same #71 bug the co-pilot daemon
-            # carried (fixed a34b6244); get_local_backend_url is the ONE canonical
-            # resolver — it probes 'backend' then 'flask' and returns the first
-            # ACTUALLY LISTENING (standalone backend:6777 / bundled flask:5000),
-            # with HEVOLVE_BASE_URL winning. No hardcoded port, no parallel path.
-            # Guarded by tests/unit/test_copilot_backend_resolution.py +
-            # test_copilot_model_registry_base_url.
-            from core.port_registry import get_local_backend_url
-            _cc_base = get_local_backend_url().rstrip('/') + '/api/claude/v1'
-            model_registry.register(ModelBackend(
-                model_id='claude-code',
-                display_name='Claude Code (Frontier, subscription)',
-                tier=ModelTier.EXPERT,
-                config_list_entry={
-                    'model': 'claude-code',
-                    'api_key': 'dummy',            # local shim; auth is the sub
-                    'base_url': _cc_base,
-                    'price': [0, 0],               # subscription, not per-token
-                },
-                avg_latency_ms=6000.0,             # agent binary in print mode
-                accuracy_score=0.95,
-                cost_per_1k_tokens=0.0,
-                is_local=True,
-                hardware_dependent=False,
-            ))
-    except Exception as _cc_err:                    # never break registry init
-        import logging as _l
-        _l.getLogger(__name__).debug("claude-code backend not registered: %s", _cc_err)
+    ensure_claude_code_registered()
 
     # 5c. Distributed shard cluster (WAN pipeline-parallel inference) — feature-flagged.
     #     A model too big for one node is served by K peers, each holding a

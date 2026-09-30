@@ -38,15 +38,17 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 #:
 #: NOTE: "unmigrated" is a SUPERSET of "broken". Membership here means the file
 #: does not route through the canonical client; it does NOT mean the file omits
-#: request_id. The second group below already sends one (dispatch.py correctly
-#: sends `daemon_<goal_id>`), so migrating those is a DRY fix, not a correctness
-#: one. Do not quote this list's length as a count of broken callers.
+#: request_id. The second group below already sends one, so migrating those is a
+#: DRY fix, not a correctness one. Do not quote this list's length as a count of
+#: broken callers. "Already sends one" must hold on EVERY path of the file:
+#: dispatch.py was listed here while its two HTTP fallbacks sent no id, so on
+#: native HARTOS the hive worker's and the instruction queue's turns reached the
+#: create pipeline untagged and ran in INTERACTIVE mode, asking a user who was
+#: not there (#97, central 2026-09-13).
 KNOWN_UNMIGRATED = {
     # --- omit request_id entirely: a real person is classified as background ---
     'hartos_bootstrap.py',
     'hart_cli.py',
-    'worker_loop.py',              # legitimately background, but by OMISSION not
-                                   # declaration — should send an explicit daemon tag
     'hart_dbus_service.py',
     'intelligence_api.py',
     'shell_openclaw_apis.py',
@@ -58,7 +60,6 @@ KNOWN_UNMIGRATED = {
     'crossbar_server.py',
     'api_tracker.py',
     'commercial_api.py',           # the paid API surface — user turns
-    'dispatch.py',                 # already sends daemon_<goal_id> correctly
     'model_bus_service.py',
     'speculative_dispatcher.py',
 }

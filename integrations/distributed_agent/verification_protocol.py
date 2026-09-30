@@ -159,7 +159,9 @@ class VerificationProtocol:
 
             from integrations.social.services import NotificationService
             message = f'Your contribution to "{objective}" was verified by peer consensus!'
-            notif = NotificationService.create(
+            # create() pushes it once the row commits (models.after_commit):
+            # on the commit below, or on the request's own commit.
+            NotificationService.create(
                 db, agent_id, 'goal_verified',
                 source_user_id=None,
                 target_type='goal',
@@ -170,12 +172,6 @@ class VerificationProtocol:
             if owns_session:
                 db.commit()
                 db.close()
-
-            try:
-                from integrations.social.realtime import on_notification
-                on_notification(agent_id, notif.to_dict())
-            except Exception:
-                pass
 
             logger.info(f"Notified user {agent_id}: verification accepted for {task_id}")
         except Exception as e:

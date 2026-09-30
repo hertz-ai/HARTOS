@@ -160,6 +160,26 @@ fn nested_wayland_socket(before: &[String]) -> Option<String> {
     wayland_sockets().into_iter().find(|s| !before.contains(s))
 }
 
+/// Run `grim` against the nested compositor socket. `Some(bytes)` when grim exited 0 and
+/// wrote a file (the byte count of the PNG); `None` when it was refused or failed, which
+/// is what a `failed()` screencopy frame produces. The output file is always removed.
+fn grim_capture(nested: &str) -> Option<u64> {
+    let out = std::env::temp_dir().join(format!("hart_comp_smoke_capture_{}.png", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let status = Command::new("grim")
+        .arg(out.to_str().unwrap())
+        .env("WAYLAND_DISPLAY", nested)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    let _ = std::fs::remove_file(&out);
+    match status {
+        Ok(s) if s.success() => Some(bytes),
+        _ => None,
+    }
+}
+
 /// Extract the first window handle string from a `window.list` response (`win_<hex>`),
 /// so the geometry verbs can target a real mapped window.
 fn first_handle(list_resp: &str) -> Option<String> {
@@ -254,24 +274,19 @@ fn smoke_e2e_boot_map_arrange_capture() {
     // appeared since `pre_sockets` was snapshotted, point grim at it, and assert the
     // captured PNG is non-empty (proves the hand-rolled zwlr_screencopy read-back
     // serviced a frame against HART-comp's framebuffer — not the host re-composite).
+    // `grim_works` remembers whether the capture path is live on this host, so step 5
+    // can prove the gate THROUGH the protocol and not only through the IPC reply.
+    let mut grim_works = false;
+    let nested = nested_wayland_socket(&pre_sockets);
     if on_path("grim") {
-        if let Some(nested) = nested_wayland_socket(&pre_sockets) {
-            let out = std::env::temp_dir().join("hart_comp_smoke_capture.png");
-            let _ = std::fs::remove_file(&out);
-            let status = Command::new("grim")
-                .arg(out.to_str().unwrap())
-                .env("WAYLAND_DISPLAY", &nested)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            match status {
-                Ok(s) if s.success() => {
-                    let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        if let Some(nested) = nested.as_deref() {
+            match grim_capture(nested) {
+                Some(bytes) => {
                     assert!(bytes > 0, "grim captured a NON-EMPTY frame from HART-comp ({bytes} bytes)");
-                    let _ = std::fs::remove_file(&out);
+                    grim_works = true;
                 }
-                other => eprintln!(
-                    "smoke_e2e: grim capture on nested {nested} did not complete ({other:?}) — \
+                None => eprintln!(
+                    "smoke_e2e: grim capture on nested {nested} did not complete — \
                      screencopy proof falls back to the killswitch round-trip below"
                 ),
             }
@@ -284,8 +299,25 @@ fn smoke_e2e_boot_map_arrange_capture() {
     //   screen.kill{on:true} blocks capture; screen.kill{on:false} restores it.
     let killed = ipc_call("screen.kill", r#"{"on":true}"#).expect("screen.kill on");
     assert!(killed.contains("\"blocked\":true"), "screen.kill on → blocked: {killed}");
+    // ...and, where grim proved the capture path live, the cut is proven ON THE WIRE
+    // (IPC_PROTOCOL 4.11 point 3): a `copy` while cut is `failed()`, so grim exits
+    // non-zero and writes nothing. A reply saying `blocked` is not that proof; a refused
+    // capture is.
+    if grim_works {
+        let nested = nested.as_deref().expect("grim_works implies the nested socket was found");
+        assert_eq!(
+            grim_capture(nested),
+            None,
+            "while the screen is cut, grim must be refused (the frame is failed), not served"
+        );
+    }
     let restored = ipc_call("screen.kill", r#"{"on":false}"#).expect("screen.kill off");
     assert!(restored.contains("\"blocked\":false"), "screen.kill off → unblocked: {restored}");
+    if grim_works {
+        let nested = nested.as_deref().expect("grim_works implies the nested socket was found");
+        let bytes = grim_capture(nested).expect("after the restore edge grim is served again");
+        assert!(bytes > 0, "the restored capture is a real frame ({bytes} bytes)");
+    }
 
     // Clean shutdown handled by Reaper::drop.
     drop(reaper);

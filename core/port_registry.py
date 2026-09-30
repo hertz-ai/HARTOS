@@ -201,6 +201,29 @@ def check_port_available(port: int, host: str = '0.0.0.0') -> bool:
         s.close()
 
 
+def find_free_port(host: str = '127.0.0.1') -> int:
+    """Ask the OS for an unused port (bind to 0, read it back, release).
+
+    The RuntimeToolManager sidecar contract ("all sidecar servers use
+    dynamic port allocation (no fixed ports)") needs this on the CHILD
+    side: the server binds :0, prints ``PORT=NNNNN`` on stdout, and
+    ``RuntimeToolManager._read_port_from_stdout`` reads it back.  Ports
+    are this module's concern -- get_port / check_port_available /
+    _is_port_listening already live here -- so the dynamic case belongs
+    here too rather than as another private copy per sidecar.
+
+    NOTE: the port is released before it is returned, so the caller must
+    bind it promptly; this is the same TOCTOU window every OS-assigned
+    port carries.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
 def get_mode_label() -> str:
     """Return 'OS' or 'APP' for display."""
     return 'OS' if is_os_mode() else 'APP'
@@ -329,6 +352,30 @@ def get_advertisable_base_url() -> str:
     if not port.isdigit():
         port = str(get_port('backend'))
     return f'http://{ip}:{port}'
+
+
+def bind_host(service_env: str = None) -> str:
+    """The interface a node's own listener binds to.
+
+    An operator's explicit choice wins: the service's own variable when it
+    has one (WEB_ADAPTER_HOST), then NUNBA_BIND_HOST, which a desktop sets
+    once for every listener.  Otherwise a bundled desktop binds loopback.  It
+    is one person's machine on whatever network it joined, and these
+    listeners serve that machine: the SPA dials ws://127.0.0.1:5460.  Every
+    other node keeps 0.0.0.0, where cameras, web clients or peers may sit on
+    its LAN.
+
+    Measured 2026-09-14 on an installed desktop: the vision frame socket
+    (5460) and the web channel (8765) listened on 0.0.0.0 with no credential,
+    under a firewall rule that allows inbound on Private and Public networks,
+    so any device on the same Wi-Fi could open them.
+    """
+    for name in (service_env, 'NUNBA_BIND_HOST'):
+        value = (os.environ.get(name) or '').strip() if name else ''
+        if value:
+            return value
+    from core.config_cache import is_bundled
+    return '127.0.0.1' if is_bundled() else '0.0.0.0'
 
 
 # ── LLM URL Resolution ──────────────────────────────────────

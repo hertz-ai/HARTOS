@@ -49,7 +49,10 @@ import pytest
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 _REUSE = os.path.join(_ROOT, 'hartos', 'reuse_recipe.py')
-_TOOLS = os.path.join(_ROOT, 'core', 'agent_tools.py')
+# attach_for_names, _attach_tool and register_dual live in core.agent_tool_menu
+# (split out of core/agent_tools.py, which re-exports them); the "same file,
+# same primitives" invariant below is asserted where they are defined.
+_TOOLS = os.path.join(_ROOT, 'core', 'agent_tool_menu.py')
 
 
 def _src(path):
@@ -66,32 +69,58 @@ class TestAttachByNameExists:
             'sibling of attach_for_tags')
 
     def test_it_reuses_the_same_attach_primitives(self):
-        """Same file, same primitives — not a second attachment mechanism."""
+        """Same file, same primitives -- not a second attachment mechanism.
+
+        Since the review of f526c4580 the three attach paths share ONE
+        primitive, _attach_tool, which is what calls register_dual; the
+        assertion follows that one indirection rather than being dropped."""
         tree = ast.parse(_src(_TOOLS))
-        fn = next((n for n in ast.walk(tree)
-                   if isinstance(n, ast.FunctionDef)
-                   and n.name == 'attach_for_names'), None)
-        assert fn is not None, 'attach_for_names not found'
-        called = {c.func.id for c in ast.walk(fn)
-                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
-        attrs = {c.func.attr for c in ast.walk(fn)
-                 if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)}
-        assert 'register_dual' in called, (
-            'must attach through register_dual, the same primitive '
-            'attach_for_tags uses — schema on one agent, execution on the other')
+
+        def _calls(name):
+            fn = next((n for n in ast.walk(tree)
+                       if isinstance(n, ast.FunctionDef) and n.name == name),
+                      None)
+            assert fn is not None, f'{name} not found'
+            names = {c.func.id for c in ast.walk(fn)
+                     if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            attrs = {c.func.attr for c in ast.walk(fn)
+                     if isinstance(c, ast.Call)
+                     and isinstance(c.func, ast.Attribute)}
+            return names, attrs
+
+        called, attrs = _calls('attach_for_names')
+        assert '_attach_tool' in called or 'register_dual' in called
+        if 'register_dual' not in called:
+            assert 'register_dual' in _calls('_attach_tool')[0], (
+                'must attach through register_dual, the same primitive '
+                'attach_for_tags uses -- schema on one agent, execution on '
+                'the other')
         assert 'create_endpoint_function' in attrs, (
             'must build the callable with registry.create_endpoint_function, '
-            'like its sibling — no second construction path')
+            'like its sibling -- no second construction path')
 
     def test_it_is_idempotent_across_turns(self):
-        src = _src(_TOOLS)
-        m = re.search(r'def attach_for_names\(.*?(?=\ndef )', src, re.DOTALL)
-        assert m, 'attach_for_names body not found'
-        body = m.group(0)
-        assert 'attached_names' in body and 'add(' in body, (
-            'must skip names already in attached_names and update the set in '
-            'place, exactly like attach_for_tags — the per-turn hook runs on '
-            'every round')
+        """Behavioural: the per-turn hook runs every round, so a second
+        attach of the same name adds nothing and the ledger records it."""
+        autogen = pytest.importorskip('autogen')
+        from core.agent_tools import attach_for_names
+
+        def save(key: str) -> str:
+            """Save a value."""
+            return key
+        cfg = {'config_list': [{'model': 'x', 'api_key': 'x',
+                                'base_url': 'http://127.0.0.1:1/v1'}]}
+        helper = autogen.AssistantAgent('Helper', llm_config=dict(cfg))
+        executor = autogen.UserProxyAgent('Executor', human_input_mode='NEVER',
+                                          code_execution_config=False)
+        empty = type('R', (), {'_tools': {}})()
+        ledger = set()
+        core = [('save_it', 'save', save)]
+        assert attach_for_names(['save_it'], helper, executor, empty, ledger,
+                                core_tools=core) == 1
+        assert 'save_it' in ledger
+        assert attach_for_names(['save_it'], helper, executor, empty, ledger,
+                                core_tools=core) == 0
 
 
 class TestReuseConsultsTheActionsNamedTools:
@@ -110,22 +139,49 @@ class TestReuseConsultsTheActionsNamedTools:
             'authoring pipeline records which tool the action needs')
 
     def test_turn_attach_calls_it(self):
-        """The Tier-1 hook must use the named tools, not tags alone."""
+        """The Tier-1 hook must use the named tools, not tags alone.
+
+        RE-POINTED 2026-09-11 for 703112bcd (#778), which is why this had been
+        failing on main.  The named-attach lines used to sit inline in this
+        block; that made the attach per-CALL while the walk advances per-ACTION
+        (measured: 2 attach lines across drives that walked 6-9 actions), so
+        they were lifted into ``_attach_named_tools_for_action`` and called
+        from BOTH the entry hook and ``_advance_or_steer``.  The contract is
+        unchanged -- the attach must consult the action's named tools -- so the
+        assertions follow the one indirection instead of being deleted.
+        """
         src = _src(_REUSE)
         m = re.search(r'Tier-1 per-turn attach(.*?)except Exception as _e',
                       src, re.DOTALL)
         assert m, 'Tier-1 per-turn attach block not found'
         block = m.group(1)
-        assert '_reuse_action_tool_names(' in block, (
-            'the per-turn attach must consult the action\'s named tools. Live '
-            "2026-09-06 it used only detect_goal_tags(message), which inferred "
+
+        helper = ''
+        if '_attach_named_tools_for_action(' in block:
+            h = re.search(r'^def _attach_named_tools_for_action\(.*\n'
+                          r'(?:(?:[ \t].*)?\n)*', src, re.M)
+            assert h, ('the block delegates to _attach_named_tools_for_action '
+                       'but that helper does not exist')
+            helper = h.group(0)
+        reach = block + helper
+
+        assert '_reuse_action_tool_names(' in reach, (
+            'the per-turn attach must consult the action\'s named tools, '
+            'directly or through the helper it delegates to. Live 2026-09-06 '
+            "it used only detect_goal_tags(message), which inferred "
             "['coding'] from prose and attached 0 tools while the action named "
             'google_search outright')
-        assert 'attach_for_names(' in block, (
+        assert 'attach_for_names(' in reach, (
             'and must attach them via the name-keyed primitive')
-        assert 'detect_goal_tags(' in block, (
+        # The tag scan moved into core.agent_tool_menu.attach_for_turn, the
+        # one per-turn attach CREATE's turn now shares (review of d99b1aa88);
+        # follow that indirection as the named attach's is followed above.
+        assert 'attach_for_turn(' in block, (
             'the tag scan stays — it is the fallback for families nothing '
             'names; this fix is ADDITIVE, not a replacement')
+        from core.agent_tool_menu import attach_for_turn
+        import inspect
+        assert 'detect_goal_tags(' in inspect.getsource(attach_for_turn)
 
 
 class TestNamedToolExtraction:
@@ -163,3 +219,120 @@ class TestNamedToolExtraction:
     def test_absent_session_is_safe(self):
         rr = pytest.importorskip('hartos.reuse_recipe')
         assert rr._reuse_action_tool_names('no_such_session', 1) == []
+
+
+class TestAuthoredToolNameNormalisation(TestNamedToolExtraction):
+    """A REAL tool name with its argument glued on must still resolve.
+
+    ``attach_for_names`` matches EXACTLY (core/agent_tools.py:372,
+    ``if fn not in want``).  The authoring model frequently writes the tool and
+    its argument into the one field, so the exact match rejects a tool that is
+    registered, working, and named by the action.
+
+    Measured 2026-09-07 over all 165 banked recipes in
+    ~/Documents/Nunba/data/prompts (1,473 recipe steps, 978 naming a tool):
+
+        identifier-shaped   848
+        prose-shaped        130   <- can never match by exact comparison
+        files with >=1      37 of 165  (22.4%)
+
+    Splitting those 130 on ':' / ',' recovers an identifier for 34 of them:
+
+        execute_windows_or_android_command: click the 'Search' button
+        execute_windows_or_android_command: type 'vegan pasta' into the search field
+        google_search, crawl4ai, retry_logic
+
+    SCOPE OF THE WIN — measured after an earlier version of this docstring
+    (and commit 5dd2b406d's message) overstated it.  ``attach_for_names``
+    iterates ``service_tool_registry._tools`` ONLY, and the live app registers
+    just 13 names there (payments x3, seo_audit_score, gh_pr_open, crawl4ai,
+    crawl4ai_crawl, pocket_tts x3, acestep x3 — counted from its own
+    "Registered service tool:" log lines).  ``execute_windows_or_android_command``
+    and ``google_search`` are core tools registered by the decorators at
+    reuse_recipe.py:1483-1948 and are NOT in that registry, so this matcher
+    could never attach them however they are spelled.  Exactly ONE of the 34
+    (crawl4ai) is actionable by this route.
+
+    That does not make the normalisation pointless — it makes it a CORRECTNESS
+    fix, not a throughput one.  The reader's job is to answer "which tool does
+    this action name"; returning a 60-character sentence was answering wrongly,
+    and 90 of the 130 fields are not tool names at all.  Do NOT cite these
+    tests as evidence that a tool started working.
+
+    The remaining 96 are not tools at all — the model pasting Python source
+    line by line into the field (``ENGINE_REGISTRY = router.ENGINE_REGISTRY``,
+    ``for eid in engine_ids``), or the literal string ``N/A``.  Those must
+    yield NOTHING rather than a plausible-looking candidate.
+
+    WHY HERE AND NOT IN attach_for_names: this function is the ONE reader of
+    the authored field (its own docstring calls itself "the authoritative
+    answer to which tool does this action need"), and reuse_recipe.py:3521 is
+    its only caller.  attach_for_names is the MATCHER — "given names, attach
+    those that exist, ignore the rest" — and teaching a matcher to parse prose
+    would be scope creep.  Normalising in the reader also needs no registry
+    access: unknown candidates are already discarded for free by the matcher's
+    existing exact comparison, which is exactly what should happen to the 96.
+
+    Inherits the whole parent class, so the clean-identifier cases above are
+    re-run here as regression cover: normalisation must not disturb them.
+    """
+
+    def test_real_tool_with_glued_argument_is_recovered(self):
+        """The 28-occurrence case — a working tool withheld by a glued suffix."""
+        acts = [{'recipe': [{
+            'tool_name': "execute_windows_or_android_command: click the "
+                         "'Search' button to trigger web_search"}]}]
+        assert self._call(acts) == ['execute_windows_or_android_command']
+
+    def test_comma_separated_list_yields_each_candidate(self):
+        """18088688973 action 1 names three tools in one field."""
+        acts = [{'recipe': [{'tool_name': 'google_search, crawl4ai, retry_logic'}]}]
+        assert self._call(acts) == ['crawl4ai', 'google_search', 'retry_logic']
+
+    def test_pasted_source_code_yields_nothing(self):
+        """18895904180 banked Python statements into tool_name."""
+        for frag in ('ENGINE_REGISTRY = router.ENGINE_REGISTRY',
+                     'for eid in engine_ids',
+                     'import integrations.channels.media.tts_router as router',
+                     "filters = [spec for spec in ENGINE_REGISTRY "
+                     "if spec.install_target == 'venv']"):
+            acts = [{'recipe': [{'tool_name': frag}]}]
+            assert self._call(acts) == [], f'{frag!r} is not a tool name'
+
+    def test_invented_tool_with_a_path_yields_nothing(self):
+        """88761328396 action 1 — the agent this whole walk is blocked on.
+
+        The model invented a tool called "Read file" (its own step text says
+        "using the 'Read file' tool") and wrote the action title plus a Windows
+        path into the field.  Nothing here may resolve: a drive-letter colon
+        must not leave 'C' behind as a candidate.
+        """
+        acts = [{'recipe': [{
+            'tool_name': 'Read file: C:\\Users\\sathi\\Documents\\Nunba'
+                         '\\logs\\latest.log'}]}]
+        assert self._call(acts) == []
+
+    def test_literal_na_yields_nothing(self):
+        acts = [{'recipe': [{'tool_name': 'N/A'}]}]
+        assert self._call(acts) == []
+
+    def test_dotted_registry_name_survives(self):
+        """tts.package_installer is real and identifier-shaped — 5 uses."""
+        acts = [{'recipe': [{'tool_name': 'tts.package_installer'}]}]
+        assert self._call(acts) == ['tts.package_installer']
+
+    def test_no_duplicate_candidates(self):
+        """1 of the 130 doubles the tool: 'X: X: wait for the cook to confirm'.
+
+        Asserts DEDUPLICATION, not a single element: a trailing bare word like
+        'wait' is identifier-shaped and is emitted as a candidate, which is
+        correct — attach_for_names discards names that match no registry entry
+        (core/agent_tools.py:372), so an unknown candidate costs nothing.  What
+        must never happen is the same tool being offered for attachment twice.
+        """
+        acts = [{'recipe': [{
+            'tool_name': 'execute_windows_or_android_command: '
+                         'execute_windows_or_android_command: wait'}]}]
+        got = self._call(acts)
+        assert got.count('execute_windows_or_android_command') == 1
+        assert len(got) == len(set(got)), f'duplicate candidates in {got}'

@@ -31,6 +31,9 @@ def _reset(monkeypatch):
 
 
 # ── get_data_dir precedence + platform branches ─────────────────────────────
+# The branch tests ask _platform_default_data_dir, the branch selector: under
+# pytest get_data_dir swaps the platform default for a temp dir (see
+# test_identity_is_hermetic.py), and these patch the platform to BE the default.
 def test_nunba_data_dir_override_wins(monkeypatch, tmp_path):
     monkeypatch.setenv('NUNBA_DATA_DIR', str(tmp_path))
     assert pp.get_data_dir() == str(tmp_path)
@@ -55,7 +58,7 @@ def test_embedded_hartos_release(monkeypatch):
     monkeypatch.setattr(pp, '_IS_MACOS', False, raising=False)
     monkeypatch.setattr(os.path, 'isfile',
                         lambda p: p == '/etc/hartos-release')
-    assert pp.get_data_dir() == '/var/lib/hartos'
+    assert pp._platform_default_data_dir() == '/var/lib/hartos'
 
 
 def test_windows_default(monkeypatch):
@@ -64,7 +67,7 @@ def test_windows_default(monkeypatch):
     monkeypatch.setattr(pp, '_IS_LINUX', False, raising=False)
     monkeypatch.setattr(os.path, 'isfile', lambda p: False)
     monkeypatch.setattr(os.path, 'expanduser', lambda p: '/home/u')
-    assert pp.get_data_dir() == os.path.join('/home/u', 'Documents', 'Nunba')
+    assert pp._platform_default_data_dir() == os.path.join('/home/u', 'Documents', 'Nunba')
 
 
 def test_macos_default(monkeypatch):
@@ -73,7 +76,7 @@ def test_macos_default(monkeypatch):
     monkeypatch.setattr(pp, '_IS_LINUX', False, raising=False)
     monkeypatch.setattr(os.path, 'isfile', lambda p: False)
     monkeypatch.setattr(os.path, 'expanduser', lambda p: '/Users/u')
-    assert pp.get_data_dir() == os.path.join(
+    assert pp._platform_default_data_dir() == os.path.join(
         '/Users/u', 'Library', 'Application Support', 'Nunba')
 
 
@@ -83,7 +86,7 @@ def test_linux_xdg(monkeypatch, tmp_path):
     monkeypatch.setattr(pp, '_IS_LINUX', True, raising=False)
     monkeypatch.setattr(os.path, 'isfile', lambda p: False)
     monkeypatch.setenv('XDG_DATA_HOME', str(tmp_path))
-    assert pp.get_data_dir() == os.path.join(str(tmp_path), 'nunba')
+    assert pp._platform_default_data_dir() == os.path.join(str(tmp_path), 'nunba')
 
 
 def test_linux_no_xdg_falls_back_to_config(monkeypatch):
@@ -92,7 +95,7 @@ def test_linux_no_xdg_falls_back_to_config(monkeypatch):
     monkeypatch.setattr(pp, '_IS_LINUX', True, raising=False)
     monkeypatch.setattr(os.path, 'isfile', lambda p: False)
     monkeypatch.setattr(os.path, 'expanduser', lambda p: '/home/u')
-    assert pp.get_data_dir() == os.path.join('/home/u', '.config', 'nunba')
+    assert pp._platform_default_data_dir() == os.path.join('/home/u', '.config', 'nunba')
 
 
 def test_derived_dirs_hang_off_data_dir(monkeypatch, tmp_path):

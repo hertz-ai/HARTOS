@@ -40,8 +40,16 @@ class DeliveryTracker:
     Cloud confirmation.py tracks pending messages and sends FCM push notifications
     if not confirmed within 30s. Locally, we:
     1. Track pending messages with timestamps
-    2. After TTL, emit a local notification event (no FCM — that's cloud-only)
-    3. Multi-device peers handle their own delivery via PeerLink acks
+    2. After TTL, emit a local notification event
+    3. For a PERSONAL message, also push via FCM using the LOCALLY-cached token
+       (see the send below) — no crossbar, no cloud round-trip, no-op without a
+       token, so it is safe on every node
+    4. Multi-device peers handle their own delivery via PeerLink acks
+
+    This line used to read "no FCM — that's cloud-only", which the send ~120 lines
+    below already contradicted and annotated as such. Corrected rather than left
+    for the next reader to trip over: a docstring that disagrees with its own
+    module is how a plan ends up prescribing the wrong fold.
     """
 
     def __init__(self):

@@ -191,22 +191,21 @@ def supervisor_should_run() -> bool:
 def _resolve_python_exe() -> str:
     """Pick the interpreter the child should run under.
 
-    Frozen Nunba: ``<app_dir>/python-embed/python.exe``.  Using
-    ``sys.executable`` directly would launch a new Nunba GUI instance
-    instead of starting Python.  Mirrors the resolution in
-    ``integrations/audio/diarization_service.py``.
-
-    Dev mode (PyCharm): plain ``sys.executable`` is the active venv's
-    python -- exactly what the developer expects.
+    ``core.venv_paths.venv_creator_python``, the one answer every worker
+    spawn uses (gpu_worker, diarization_service): frozen Nunba's bundled
+    python-embed, found beside the resolved app binary; ``sys.executable``
+    from source.  Using ``sys.executable`` on a frozen build would launch
+    a new Nunba GUI instead of Python, so that is only the last resort
+    when no python-embed exists (logged; ``_child_can_import_torch`` then
+    keeps a torch-less child from crash-looping).
     """
-    if getattr(sys, 'frozen', False):
-        app_dir = os.path.dirname(sys.executable)
-        embed_python = os.path.join(app_dir, 'python-embed', 'python.exe')
-        if os.path.isfile(embed_python):
-            return embed_python
-        logger.warning(
-            "hevolveai_supervisor: python-embed/python.exe not found at %s; "
-            "falling back to sys.executable", embed_python)
+    from core.venv_paths import python_embed_dir, venv_creator_python
+    creator = venv_creator_python()
+    if creator:
+        return creator
+    logger.warning(
+        "hevolveai_supervisor: no python interpreter under %s; "
+        "falling back to sys.executable", python_embed_dir())
     return sys.executable
 
 
@@ -315,6 +314,51 @@ def _resolve_repo_python() -> Optional[str]:
 # None = not yet probed; True/False = the cached result for this process.
 _CHILD_TORCH_OK: Optional[bool] = None
 
+# What the probe runs in the child interpreter.  Finding torch is not
+# enough: find_spec only sees the directory entry.  Live 2026-09-25 the
+# child resolved ~/.nunba/site-packages/torch (first on sys.path via the
+# embed's sitecustomize), whose files had an Administrators-only ACL, so
+# find_spec passed and the child then died reading torch/__init__.py with
+# PermissionError, 5x per breaker window.  Opening the resolved origin is
+# the read the child's import does first; it proves that without paying
+# for a full torch import.
+#
+# A torch/ directory with no __init__.py (an empty leftover of an
+# uninstall) is a namespace package: find_spec returns it with origin None,
+# so there is no file to open, and ``import torch`` yields an empty module
+# the brain's first ``torch.<attr>`` dies on -- the same crash loop
+# (review of 865130b86).  A real torch is a regular package, so a spec
+# without an origin fails the gate.
+#
+# The probe's exit codes, named; each failing one prints its detail
+# (path, errno) for the supervisor's log.
+TORCH_PROBE_EXIT_NOT_FOUND = 3       # find_spec('torch') is None
+TORCH_PROBE_EXIT_UNREADABLE = 4      # found, torch/__init__.py cannot be read
+TORCH_PROBE_EXIT_NOT_A_PACKAGE = 5   # found only as a namespace dir
+TORCH_PROBE_EXIT_REASONS = {
+    TORCH_PROBE_EXIT_NOT_FOUND: 'not found',
+    TORCH_PROBE_EXIT_UNREADABLE: 'not readable',
+    TORCH_PROBE_EXIT_NOT_A_PACKAGE: 'not a package',
+}
+_TORCH_PROBE_SNIPPET = (
+    "import importlib.util as u, sys\n"
+    "s = u.find_spec('torch')\n"
+    "if s is None:\n"
+    "    print('torch not found'); sys.exit(%(not_found)d)\n"
+    "if not (s.origin and s.has_location):\n"
+    "    print('torch at %%s is not a package (no __init__.py)'"
+    " %% ', '.join(s.submodule_search_locations or []));"
+    " sys.exit(%(not_a_package)d)\n"
+    "try:\n"
+    "    open(s.origin, 'rb').close()\n"
+    "except OSError as e:\n"
+    "    print('torch at %%s is not readable: errno %%s %%s'"
+    " %% (s.origin, e.errno, e.strerror)); sys.exit(%(unreadable)d)\n"
+    "print('torch at %%s' %% s.origin)\n"
+) % {'not_found': TORCH_PROBE_EXIT_NOT_FOUND,
+     'unreadable': TORCH_PROBE_EXIT_UNREADABLE,
+     'not_a_package': TORCH_PROBE_EXIT_NOT_A_PACKAGE}
+
 
 def _child_can_import_torch() -> bool:
     """True when the CHILD interpreter can resolve ``torch``.
@@ -337,8 +381,11 @@ def _child_can_import_torch() -> bool:
     normally.  This is a POSITIVE capability gate, not an OS check: the
     brain auto-enables on any box where the child can import torch.
 
-    One short, cached subprocess per process (``find_spec`` only -- does
-    not load torch).  Conservative: any probe failure / timeout ->
+    One short, cached subprocess per process (``_TORCH_PROBE_SNIPPET``:
+    find_spec, then open the resolved ``torch/__init__.py`` -- does not
+    load torch).  A torch the child finds but cannot read, or finds only
+    as an empty namespace dir, fails the gate, and the log names the
+    exit code's reason (``TORCH_PROBE_EXIT_REASONS``), the file and errno.  Conservative: any probe failure / timeout ->
     unavailable, so a flaky probe never starts a crash-looping child.
     macOS incident 2026-06-16: the post-build ``Nunba --validate`` smoke
     test spawned this brain, which crash-looped on ``import torch`` (torch
@@ -349,6 +396,7 @@ def _child_can_import_torch() -> bool:
     if _CHILD_TORCH_OK is not None:
         return _CHILD_TORCH_OK
     verdict = False
+    _probe_exe: Optional[str] = None
     try:
         from core.subprocess_safe import run_bounded
         # Probe the interpreter that will ACTUALLY run the child: the
@@ -359,22 +407,27 @@ def _child_can_import_torch() -> bool:
             if _repo_py:
                 _probe_exe = _repo_py
         res = run_bounded(
-            [_probe_exe, '-c',
-             "import importlib.util as u, sys; "
-             "sys.exit(0 if u.find_spec('torch') else 3)"],
+            [_probe_exe, '-c', _TORCH_PROBE_SNIPPET],
             timeout=30.0,
         )
         verdict = (res.returncode == 0 and not res.timed_out)
+        _detail = (res.stdout or res.stderr or '').strip()[-500:]
+        _reason = TORCH_PROBE_EXIT_REASONS.get(res.returncode)
+        if not verdict and _reason:
+            _detail = f'exit {res.returncode}: {_reason}' + (
+                f'; {_detail}' if _detail else '')
     except Exception as e:  # FileNotFoundError / OSError / anything
         logger.warning(
             "hevolveai_supervisor: torch probe failed (%s); treating torch "
             "as unavailable and skipping brain spawn", e)
         verdict = False
+        _detail = ''
     if not verdict:
         logger.info(
             "hevolveai_supervisor: child interpreter (%s) cannot import "
-            "torch; brain spawn disabled (install torch where the child "
-            "resolves it to enable embodied-AI)", _resolve_python_exe())
+            "torch%s; brain spawn disabled (install torch where the child "
+            "resolves it, readable by this user, to enable embodied-AI)",
+            _probe_exe, f' ({_detail})' if _detail else '')
     _CHILD_TORCH_OK = verdict
     return verdict
 
@@ -964,6 +1017,13 @@ class _Supervisor(ProcessSupervisor):
         # (Qwen-VL still uses GPU INTERNALLY via qwen_llamacpp_wrapper's
         # auto-upgrade -- that path is independent of this hint.)
         env.setdefault('HEVOLVE_DEVICE', 'cpu')
+        # THE SPOKEN WORD REACHES GROUNDING with no knob to set. This line used to
+        # export HEVOLVE_AUDIO_TRANSCRIPT_GROUNDING=1 (hevolveai C265). hevolveai
+        # a951136 (C265b) graduated that flag: the child now grounds any delivered
+        # transcript unconditionally and no longer reads the variable. Exporting it
+        # here was dead, and its comment promised an operator that =0 turns
+        # grounding off, which it no longer does. Removed so no one relies on a
+        # switch that is not wired (review 2026-09-22, meta_fix-all F4).
         # Hand the child the ONE canonical local-LLM URL (port_registry's 4-tier
         # resolver) so HevolveAI's QwenAutoEncoder reuses HARTOS's existing
         # llama-server instead of spawning a SECOND one on :8080 (#137).  Explicit
@@ -1004,6 +1064,30 @@ class _Supervisor(ProcessSupervisor):
             # propagate; atexit() handles graceful stop.
             kw['start_new_session'] = True
         return kw
+
+    def _child_working_dir(self) -> str:
+        """Return the one writable working directory for this launch mode.
+
+        Repo mode deliberately runs from the checkout because ``run_server.py``
+        and the development checkpoint layout are repo-relative.  The installed
+        package command has no such requirement and must never inherit Nunba's
+        read-only Program Files directory: several HevolveAI components still
+        use relative ``data/``, ``checkpoints/`` and ``proof_reports/`` paths.
+
+        ``get_data_dir`` preserves the existing ``NUNBA_DATA_DIR`` /
+        ``HARTOS_DATA_DIR`` operator overrides.  Directory creation is allowed
+        to fail loudly here; starting the brain in a known read-only directory
+        and then reporting a partially initialized service is worse than a
+        visible supervisor spawn failure.
+        """
+        if (getattr(self, 'repo_root', None) is not None
+                and getattr(self, 'repo_python', None) is not None):
+            return str(self.repo_root)
+
+        from core.platform_paths import get_data_dir
+        data_root = os.path.abspath(get_data_dir())
+        os.makedirs(data_root, exist_ok=True)
+        return data_root
 
     def _register_with_governor(self, pid: int) -> None:
         """Notify the resource governor about the new managed PID so it
@@ -1096,11 +1180,11 @@ class _Supervisor(ProcessSupervisor):
         cmd = self._build_cmd()
         kw = self._popen_kwargs()
         kw['env'] = self._build_env()
-        if (getattr(self, 'repo_root', None) is not None
-                and getattr(self, 'repo_python', None) is not None):
-            # run_server.py resolves its src/ and data dirs relative to
-            # the repo root, exactly as start.bat's `cd /d %~dp0\..` does.
-            kw['cwd'] = str(self.repo_root)
+        # Always choose the working directory explicitly.  In installed mode
+        # inheriting Nunba's Program Files cwd makes HevolveAI's remaining
+        # relative state paths unwritable.  Repo mode retains its established
+        # checkout cwd through the same resolver.
+        kw['cwd'] = self._child_working_dir()
         return cmd, kw
 
     def _on_started(self, proc) -> None:

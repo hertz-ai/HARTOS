@@ -74,6 +74,7 @@ Usage:
 import json
 import logging
 import os
+from core.error_advice import FAILED_STEP_PIP_INSTALL, FAILED_STEP_SETUP_OFFER
 from core.subprocess_safe import no_window_kwargs
 import queue
 import subprocess
@@ -495,6 +496,40 @@ class GPUWorker:
             return
         self._self_heal_seen_modules.add(pkg)
 
+        # A module this process imports from its OWN tree cannot be
+        # missing from the child for lack of a dependency: the child's
+        # module path is wrong.  pip has nothing to install (measured
+        # 2026-09-20: ``pip install integrations`` rc=1, then an agentic
+        # self-heal goal dispatched for a path defect), so say what is
+        # wrong and stop here.
+        try:
+            from core.venv_paths import parent_package_root_of
+            app_root = parent_package_root_of(pkg)
+        except Exception as e:
+            logger.debug(f"{self.name}: parent-package check skipped: {e}")
+            app_root = None
+        if app_root:
+            logger.error(
+                f"{self.name}: worker interpreter {self.python_exe} cannot "
+                f"import '{pkg}', which this process loads from {app_root}: "
+                f"that is the worker's module path, not a missing "
+                f"dependency; no pip install, no self-heal goal"
+            )
+            return
+
+        # An engine declared to live in its OWN venv (tts_router
+        # install_target='venv') that ran on any other interpreter has no
+        # usable venv: none was built, or another interpreter built it and
+        # core.venv_paths refused it.  The engine is not installed, and a
+        # --target pip into the shared user site is the place its venv
+        # exists to keep it out of (measured 2026-09-25: f5_tts and TTS,
+        # both rc=1, then an agentic goal each).  Installing an engine is
+        # the owner's call: offer it through capability_setup, whose
+        # consent-gated work runs repair_backend_venv -> install_backend_full.
+        if self._engine_is_outside_its_venv():
+            self._offer_engine_setup(pkg)
+            return
+
         logger.warning(
             f"{self.name}: subprocess missing Python package '{pkg}' — "
             f"dispatching to error_advice + deterministic self-heal"
@@ -513,15 +548,20 @@ class GPUWorker:
         def _install_async():
             rc = None
             try:
-                # `--target` to user-site keeps it consistent with
-                # tts.package_installer's existing pattern: bundled
-                # python-embed is read-only on Program Files installs,
-                # so user-writable site-packages is required.  We rely
-                # on the user-site already being on sys.path (set by
-                # platform_paths.ensure_user_site_on_path at boot) and
-                # inherited by future worker spawns via PYTHONPATH (see
-                # _spawn).
-                target = self._user_site_packages_dir()
+                # Install where the CHILD reads.  For a python-embed
+                # worker that is the user site (`--target`, the pattern
+                # tts.package_installer uses: bundled python-embed is
+                # read-only under Program Files, and the child reaches
+                # the user site through python-embed's sitecustomize).
+                # A per-backend venv never sees the user site (isolated
+                # interpreter, measured 2026-09-20), so a --target there
+                # would land a package the worker can never import; its
+                # own site-packages is user-writable, so pip's default
+                # destination under the venv's python is the right one.
+                if self._child_is_backend_venv():
+                    target = None
+                else:
+                    target = self._user_site_packages_dir()
                 pip_args = [
                     self.python_exe, '-m', 'pip', 'install',
                     '--no-build-isolation', '--progress-bar', 'off',
@@ -529,9 +569,11 @@ class GPUWorker:
                 ]
                 if target:
                     pip_args.extend(['--target', target])
-                pip_args.append(pkg)
+                dist = self._pip_name_for(pkg)
+                pip_args.append(dist)
                 logger.info(
-                    f"{self.name}: deterministic pip install: {pkg} → "
+                    f"{self.name}: deterministic pip install: {dist}"
+                    f"{'' if dist == pkg else f' (import {pkg})'} → "
                     f"{target or '<default site>'}"
                 )
                 rc = subprocess.run(
@@ -572,41 +614,171 @@ class GPUWorker:
                 f"{self.name}: deterministic install of '{pkg}' failed "
                 f"(rc={rc}); dispatching agentic self-heal fallback."
             )
-            try:
-                from core.error_advice import handle_exception
-                synthetic = ModuleNotFoundError(f"No module named '{pkg}'")
-                synthetic.name = pkg  # type: ignore[attr-defined]
-                handle_exception(
-                    synthetic,
-                    category='subprocess.tool_load',
-                    severity='high',
-                    agent_remediation=True,
-                    context={
-                        'worker_name': self.name,
-                        'worker_module': self.module,
-                        'missing_package': pkg,
-                        'remediation_hint': (
-                            f"Deterministic `pip install {pkg}` FAILED. "
-                            f"Do NOT edit source to fix a missing package. "
-                            f"Diagnose the pip failure (network / build "
-                            f"deps / wrong index), then add '{pkg}' to the "
-                            f"freeze pip plan (Nunba "
-                            f"scripts/setup_freeze_nunba.py _tts_deps or "
-                            f"the appropriate _<X>_deps tuple) AND to "
-                            f"tts/package_installer.py legacy fallback "
-                            f"plan so the next build bundles it."
-                        ),
-                    },
-                )
-            except Exception as e:
-                logger.debug(
-                    f"{self.name}: error_advice dispatch skipped: {e}"
-                )
+            self._raise_missing_package_goal(
+                pkg,
+                f"Deterministic `pip install {pkg}` FAILED. "
+                f"Do NOT edit source to fix a missing package. "
+                f"Diagnose the pip failure (network / build "
+                f"deps / wrong index), then add '{pkg}' to the "
+                f"freeze pip plan (Nunba "
+                f"scripts/setup_freeze_nunba.py _tts_deps or "
+                f"the appropriate _<X>_deps tuple) AND to "
+                f"tts/package_installer.py legacy fallback "
+                f"plan so the next build bundles it.",
+                failed_step=FAILED_STEP_PIP_INSTALL,
+            )
 
         threading.Thread(
             target=_install_async, daemon=True,
             name=f"self-heal-{self.name}-{pkg}",
         ).start()
+
+    @staticmethod
+    def _pip_name_for(import_name: str) -> str:
+        """The distribution to pip-install for a missing import: Nunba's
+        one alias table (``tts.package_installer._PIP_TO_IMPORT``, read
+        backwards by ``pip_name_for_import``) when present, else the
+        import name itself, which pip reads with '-' and '_' alike.
+        Measured 2026-09-20: `import coqpit` failed, the heal installed
+        the PyPI package `coqpit`, and coqui-tts, which needs the fork
+        `coqpit-config`, then refused to import at all."""
+        try:
+            from tts.package_installer import pip_name_for_import  # type: ignore
+            return pip_name_for_import(import_name)
+        except Exception as e:
+            logger.debug(
+                f"pip name for '{import_name}' fell back to the import "
+                f"name: {e}"
+            )
+            return import_name
+
+    def _child_is_backend_venv(self) -> bool:
+        """True when this worker's interpreter is the per-backend venv
+        for ``self.name`` (``core.venv_paths``), which does not read the
+        user site-packages that python-embed workers share with the
+        parent."""
+        try:
+            from core.venv_paths import venv_python_if_exists
+            venv_py = venv_python_if_exists(self.name)
+        except Exception as e:
+            logger.debug(f"{self.name}: backend venv lookup skipped: {e}")
+            return False
+        if not venv_py or not self.python_exe:
+            return False
+        return (os.path.normcase(os.path.abspath(venv_py))
+                == os.path.normcase(os.path.abspath(self.python_exe)))
+
+    def _engine_is_outside_its_venv(self) -> bool:
+        """True when ``self.name`` is a TTS engine declared to run from its
+        own venv (``tts_router.ENGINE_REGISTRY[...].install_target ==
+        'venv'``) and this worker's interpreter is not that venv."""
+        try:
+            from integrations.channels.media.tts_router import ENGINE_REGISTRY
+            spec = ENGINE_REGISTRY.get(self.name)
+        except Exception as e:
+            logger.debug(f"{self.name}: engine spec lookup skipped: {e}")
+            return False
+        if getattr(spec, 'install_target', None) != 'venv':
+            return False
+        return not self._child_is_backend_venv()
+
+    def _offer_engine_setup(self, pkg: str) -> None:
+        """Say why this worker cannot run, and offer the engine's setup to
+        the owner once per worker (``capability_setup`` dedupes the card
+        across workers and turns)."""
+        if getattr(self, '_engine_setup_offered', False):
+            return
+        self._engine_setup_offered = True
+        logger.error(
+            f"{self.name}: worker ran on {self.python_exe}, not its own "
+            f"venv, and cannot import '{pkg}': the engine is not installed "
+            f"(no venv, or one another interpreter built).  No pip into the "
+            f"shared site; offering its setup to the owner"
+        )
+
+        def _offer():
+            try:
+                from integrations.agent_engine.capability_setup import (
+                    request_capability_setup,
+                )
+                outcome = request_capability_setup(
+                    f'tts:{self.name}',
+                    reason=(
+                        f"The {self.name} voice is not installed on this "
+                        f"computer, so it could not speak. Set it up? It "
+                        f"downloads and installs here; until then replies "
+                        f"use another voice."
+                    ),
+                    category='subprocess.tool_load',
+                    context={'backend': self.name, 'missing_package': pkg},
+                )
+            except Exception as e:
+                self._setup_offer_failed(pkg, f"{type(e).__name__}: {e}")
+                return
+            if outcome == 'unavailable':
+                # request_capability_setup's return for "nobody could be
+                # asked" (no owner, consent unreachable): no card was filed.
+                self._setup_offer_failed(
+                    pkg,
+                    "request_capability_setup returned 'unavailable' (no "
+                    "owner to ask, or consent could not be reached)")
+                return
+            # 'asked' (card filed), 'declined' (the owner said no; a goal
+            # would override that), 'provisioning' (the work is raised).
+            logger.info(f"{self.name}: setup offer: {outcome}")
+
+        threading.Thread(
+            target=_offer, daemon=True, name=f"setup-offer-{self.name}",
+        ).start()
+
+    def _setup_offer_failed(self, pkg: str, cause: str) -> None:
+        """The owner could not be offered the engine's setup.  The once-flag
+        is already set, so this worker never offers again: tell the owner
+        through the goal instead of falling back to another voice in
+        silence."""
+        logger.error(
+            f"{self.name}: setup could not be offered: {cause}; raising the "
+            f"missing-package goal instead")
+        self._raise_missing_package_goal(
+            pkg,
+            f"The {self.name} engine is not installed (its worker ran on "
+            f"{self.python_exe}, not its own venv, and cannot import "
+            f"'{pkg}'), and offering its setup to the owner failed: {cause}. "
+            f"Do NOT pip '{pkg}' into the shared site. Diagnose why "
+            f"capability_setup.request_capability_setup failed so the owner "
+            f"can be asked to set up tts:{self.name}.",
+            failed_step=FAILED_STEP_SETUP_OFFER,
+        )
+
+    def _raise_missing_package_goal(self, pkg: str, hint: str, *,
+                                    failed_step: str) -> None:
+        """Raise the agentic self-heal goal for a package this worker could
+        not import (``core.error_advice``, throttled per failure shape).
+        ``failed_step`` (core.error_advice.FAILED_STEP_*) is what the goal's
+        prompt reads to say which step failed.  The context names no
+        ``backend``, so the prompt takes the missing-dependency route,
+        never ``repair_backend_venv`` (an install without the owner's yes)."""
+        try:
+            from core.error_advice import handle_exception
+            synthetic = ModuleNotFoundError(f"No module named '{pkg}'")
+            synthetic.name = pkg  # type: ignore[attr-defined]
+            handle_exception(
+                synthetic,
+                category='subprocess.tool_load',
+                severity='high',
+                agent_remediation=True,
+                context={
+                    'worker_name': self.name,
+                    'worker_module': self.module,
+                    'missing_package': pkg,
+                    'failed_step': failed_step,
+                    'remediation_hint': hint,
+                },
+            )
+        except Exception as e:
+            logger.error(
+                f"{self.name}: the '{pkg}' self-heal goal could not be "
+                f"raised: {type(e).__name__}: {e}")
 
     def _user_site_packages_dir(self) -> Optional[str]:
         """Return the user-writable site-packages dir for runtime
@@ -902,21 +1074,17 @@ def _resolve_python_exe() -> str:
 
     Preference:
       1. $HARTOS_WORKER_PYTHON env var (explicit override)
-      2. python-embed next to the frozen exe (Nunba bundled build)
-      3. sys.executable (dev mode)
+      2. the interpreter that builds backend venvs
+         (``core.venv_paths.venv_creator_python``): python-embed next to
+         the frozen exe, sys.executable from source
+      3. sys.executable (a frozen build with no python-embed)
     """
     override = os.environ.get('HARTOS_WORKER_PYTHON')
     if override and os.path.isfile(override):
         return override
 
-    # Frozen build: python-embed sibling to Nunba.exe
-    if getattr(sys, 'frozen', False):
-        app_dir = os.path.dirname(os.path.abspath(sys.executable))
-        candidate = os.path.join(app_dir, 'python-embed', 'python.exe')
-        if os.path.isfile(candidate):
-            return candidate
-
-    return sys.executable
+    from core.venv_paths import venv_creator_python
+    return venv_creator_python() or sys.executable
 
 
 def _resolve_backend_venv_python(tool_name: Optional[str]) -> Optional[str]:
@@ -927,9 +1095,22 @@ def _resolve_backend_venv_python(tool_name: Optional[str]) -> Optional[str]:
     The single source of truth lives in ``core.venv_paths`` and is
     shared with ``tts.backend_venv`` so install + spawn paths can
     never drift apart.
+
+    When a venv exists, its ``nunba_parent_packages.pth`` is brought up
+    to date first (``core.venv_paths.ensure_parent_packages_visible``).
+    A venv made from python-embed runs isolated and ignores the
+    PYTHONPATH that ``_spawn`` sets (measured 2026-09-20), so that file
+    is the only way the worker can import the dispatcher it is started
+    with.  Venvs created before the file existed (chatterbox_turbo,
+    2026-05-03) are repaired here on their next spawn.
     """
-    from core.venv_paths import venv_python_if_exists
-    return venv_python_if_exists(tool_name)
+    from core.venv_paths import (
+        ensure_parent_packages_visible, venv_python_if_exists,
+    )
+    python_exe = venv_python_if_exists(tool_name)
+    if python_exe:
+        ensure_parent_packages_visible(tool_name)
+    return python_exe
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1360,10 +1541,11 @@ class ToolWorker:
         try_free_vram(needed_gb=model_gb, exclude_tool=self.tool_name)
 
     def _get_output_dir(self) -> Path:
-        d = Path(os.environ.get(
-            'HEVOLVE_MODEL_DIR',
-            os.path.expanduser('~/.hevolve/models'),
-        )) / self.output_subdir
+        # HEVOLVE_MODEL_DIR is resolved by model_storage.get_base_dir(),
+        # the single authority for the model-storage root, so a worker's
+        # output/ and its weights can never land on different drives.
+        from integrations.service_tools.model_storage import get_base_dir
+        d = get_base_dir() / self.output_subdir
         d.mkdir(parents=True, exist_ok=True)
         return d
 

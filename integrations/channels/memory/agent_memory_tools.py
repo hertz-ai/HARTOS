@@ -20,6 +20,8 @@ import time
 from datetime import datetime
 from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple
 
+from core.tool_traits import reads_persisted_state
+
 logger = logging.getLogger(__name__)
 
 # UUID hex pattern (16 chars) — used to detect direct vs semantic backtrace
@@ -229,8 +231,10 @@ def create_memory_tools(
             "Save important facts, decisions, or insights to persistent memory with provenance tracking. "
             "Automatically links to recent memories for backtrace.",
         ),
+        # The three reads of the graph are marked so the group chat's
+        # write-back does not store their results again (#104).
         "recall_memory": (
-            recall_memory,
+            reads_persisted_state(recall_memory),
             "Search past conversation memories by natural-language query, OPTIONALLY filtered to a "
             "time window via since/until (ISO date '2026-05-22', or relative '15d'/'7d'/'24h'). USE "
             "THIS for recall questions about the past — e.g. 'what did we discuss 15 days back' → "
@@ -238,13 +242,13 @@ def create_memory_tools(
             "memories with IDs for backtrace_memory.",
         ),
         "backtrace_memory": (
-            backtrace_memory,
+            reads_persisted_state(backtrace_memory),
             "Trace a memory back to its origin. Pass a memory ID (from recall_memory) for direct "
             "backtrace, or a natural language query for semantic backtrace. Shows the chain of "
             "memories that led to the current one.",
         ),
         "get_memory_context": (
-            get_memory_context,
+            reads_persisted_state(get_memory_context),
             "Get relevant memories from past sessions based on the current conversation context. "
             "Useful for recalling related information without an explicit query.",
         ),

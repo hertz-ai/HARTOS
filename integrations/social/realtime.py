@@ -36,46 +36,25 @@ def _get_publisher():
     return _publisher
 
 
-# Topics that may fan out to all authenticated subscribers (public feed,
-# aggregate counters, community rooms the user has joined).  Anything
-# else MUST be per-user — the topic string must end with the user_id
-# so the WAMP router can gate subscriptions via role-based authorizer.
-_PUBLIC_TOPIC_PREFIXES = (
-    'community.feed',
-    'community.message',
-    'social.post.',       # post-scoped (aggregate vote counts)
-    'social.comment.',    # comment-scoped
-    'social.user.',       # user-scoped (public profile fan-out)
-    'chat.social',        # per-user, user_id threaded via data
-    'dm.',                # per-conversation, gated elsewhere
-    'presence.',          # per-user presence
-    'game.',              # game session id in the topic
-    'setup_progress',     # boot-time setup progress (pre-auth, no user_id)
-    'setup.',             # boot-time setup (broader)
-    'system.',            # system-wide events (catalog/orchestrator)
-    'catalog.',           # model catalog updates
-    'model.',             # per-model lifecycle
-    'tts.',               # per-user audio-ready event (audio URL per request)
-    'admin.',             # admin-console broadcasts
-    'agent.',             # agent lifecycle (creation/review/complete/error) — scoped by agent_id
-)
-
-# Phase 7c.7+ tenant-scoped topic shapes — checked separately so we
-# can apply per-shape rules (per-conv membership at service layer,
-# per-user topics enforce .{user_id} suffix here as defense in depth).
-# Reviewer-flagged H3: blanket 'tenant.' prefix was too permissive.
-_TENANT_PUBLIC_PREFIX = 'tenant.'
+# Tenant-scoped topic shapes (tenant.<tid>.<scope>...) are checked by their
+# own per-shape rules below.  Every other topic asks the one classifier,
+# realtime_acl.topic_open_to (everyone's per core.platform.events
+# .topic_audience, the publisher's per-user bus topic, or a topic naming
+# them).  The old _PUBLIC_TOPIC_PREFIXES list was a second answer to "whose
+# is this topic" and called tts./agent./game./presence./admin. public;
+# measured publish_event callers use none of those prefixes.
+_TENANT_TOPIC_PREFIX = 'tenant.'
 
 
 def _authorize_topic_for_user_id(topic: str, user_id: str) -> bool:
     """Validate that `topic` is publishable for `user_id`.
 
-    A topic is considered owned-by-user_id iff:
-      - it is in the public prefix whitelist above, OR
-      - it ends with `.{user_id}` or `/{user_id}` (per-user fanout topic), OR
+    A topic is publishable by user_id iff:
       - it is a tenant.* topic shape that the per-shape rule below
         accepts (conv-scoped requires service-layer membership check;
-        user-scoped requires the standard .{user_id} suffix match).
+        user-scoped requires the standard .{user_id} suffix match), OR
+      - otherwise, realtime_acl.topic_open_to says so (everyone's topic,
+        the user's per-user bus topic, or a topic naming the user).
 
     Returns True when the pair is OK, False otherwise.  Callers log +
     refuse on False so the WAMP router's subscribe-side authorizer
@@ -84,10 +63,8 @@ def _authorize_topic_for_user_id(topic: str, user_id: str) -> bool:
     """
     if not topic:
         return False
-    # Public / aggregate — every authenticated user may receive.
-    for pref in _PUBLIC_TOPIC_PREFIXES:
-        if topic == pref or topic.startswith(pref):
-            return True
+    from security.edge_privacy import uri_names_user
+    from .realtime_acl import topic_open_to
     # Tenant-scoped topics — split by shape:
     #   tenant.<tid>.conv.<cid>.{typing|read|message}  → service-layer
     #     membership check is the gate (ConversationService.emit_typing /
@@ -96,7 +73,7 @@ def _authorize_topic_for_user_id(topic: str, user_id: str) -> bool:
     #     the second layer is the WAMP router's subscribe ACL (Phase 8).
     #   tenant.<tid>.user.<uid>.<event>  → must end with .{user_id} so
     #     a user can't forge events targeting another user's inbox.
-    if topic.startswith(_TENANT_PUBLIC_PREFIX):
+    if topic.startswith(_TENANT_TOPIC_PREFIX):
         # Pass-2 N-NEW-4 + Review M2 fix: parse via shared helper so
         # publish-side and subscribe-side gates can never drift on
         # topic-shape semantics (substring vs segment match).
@@ -110,21 +87,17 @@ def _authorize_topic_for_user_id(topic: str, user_id: str) -> bool:
             return True
         # User-scoped: enforce suffix match.
         if scope == 'user' and user_id:
-            if topic.endswith(f'.{user_id}') or topic.endswith(f'/{user_id}'):
+            if uri_names_user(topic, user_id):
                 return True
             # Allow .user.<uid>.<event> shape — strip event suffix and
             # check.
             head, _, _ = topic.rpartition('.')
-            if head.endswith(f'.{user_id}'):
+            if uri_names_user(head, user_id):
                 return True
             return False
         # Unknown tenant shape — refuse.
         return False
-    # Per-user topic must end with the publisher's user_id.
-    if user_id:
-        if topic.endswith(f'.{user_id}') or topic.endswith(f'/{user_id}'):
-            return True
-    return False
+    return topic_open_to(topic, user_id, publish=True)
 
 
 _PUBLISH_COUNTERS = {
@@ -198,44 +171,18 @@ def publish_event(topic: str, data: dict, user_id: str = ''):
         logger.debug(f"WAMP publish failed for {topic}: {e}")
 
 
-# Fields that must NEVER reach a public WAMP topic (community.feed,
-# community.message, social.post.*).  User.to_dict() does not currently
-# include email/phone — but any future schema addition would silently
-# leak through every broadcast site below.  Strip defensively at the
-# boundary so the leak surface is one helper, not every call site.
-#
-# Why each field:
-#   email, phone, phone_number, password_hash, api_token  → PII / creds
-#   voice_profile                                          → biometric pointer
-#   idle_compute_opt_in                                    → infra disclosure
-#   location_sharing_enabled                               → privacy preference
-#   referral_code                                          → cross-tracking risk
-#   last_active_at                                         → presence/inference leak
-_AUTHOR_PUBLIC_BLOCKLIST = (
-    'email', 'phone', 'phone_number', 'password_hash', 'api_token',
-    'voice_profile', 'idle_compute_opt_in', 'location_sharing_enabled',
-    'referral_code', 'last_active_at',
+# What of a person record never reaches a public topic, and the helpers
+# that strip it, live in the one egress home (security.edge_privacy
+# PERSON_PRIVATE_FIELDS / strip_person_private / public_payload).  Public
+# broadcasts strip it BEFORE publishing, so this node's own SSE clients
+# (every signed-in user on a multi-user node) never get it either; the
+# MessageBus egress scrub strips it again on legs to other nodes.  The
+# names below are the ones this module and its tests have always used.
+from security.edge_privacy import (  # noqa: E402
+    PERSON_PRIVATE_FIELDS as _AUTHOR_PUBLIC_BLOCKLIST,
+    public_payload as _sanitize_for_public_broadcast,
+    strip_person_private as _sanitize_author_for_public,
 )
-
-
-def _sanitize_author_for_public(author: dict) -> dict:
-    """Return a shallow copy of `author` with sensitive fields removed.
-    Idempotent — safe to call on already-sanitized dicts."""
-    if not isinstance(author, dict):
-        return author
-    return {k: v for k, v in author.items() if k not in _AUTHOR_PUBLIC_BLOCKLIST}
-
-
-def _sanitize_for_public_broadcast(payload: dict) -> dict:
-    """Shallow-copy `payload` with `author` (if present) sanitized.
-    Used for post/comment dicts bound for community.feed / social.post.*.
-    Returns a new dict; original is not mutated."""
-    if not isinstance(payload, dict):
-        return payload
-    cleaned = dict(payload)
-    if isinstance(cleaned.get('author'), dict):
-        cleaned['author'] = _sanitize_author_for_public(cleaned['author'])
-    return cleaned
 
 
 # ─── Canonical lifecycle fan-out (#49-#52, #54) ─────────────────

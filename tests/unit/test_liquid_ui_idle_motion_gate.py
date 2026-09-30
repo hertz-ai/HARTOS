@@ -91,6 +91,129 @@ _KEEP = {
     "hart-orbit-spin": "gated via --hart-motion-rings (set to paused on webkit-flat)",
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# THE IDLE RULE (2026-09-24, the shell hot-path diet). The webkit-flat gate
+# above stops idle motion on the software-paint rung. On the GPU rung the
+# same animations run forever, and a box nobody is sitting at still spends a
+# frame clock on them. hartVisibility.js already stamps `data-idle="1"` on
+# <html> after 6 s without input (nothing lights on a timer, but a pause on a
+# measured absence is the same engine's job), so every infinite animation
+# that is NOT the orb's breathing and NOT a state-driven interaction cue must
+# be paused under html[data-idle="1"], on every rung. The signal survives:
+# only the play state changes, never the colour.
+#
+# This extends the enumeration to every stylesheet the shell serves, not just
+# the inline one: hartHome.css, hartResponsive.css and the CSS the modules
+# inject from JS strings. `.hob-orb` was missed by a survey of one file; the
+# next one could hide in any of these.
+# ─────────────────────────────────────────────────────────────────────────────
+_STATIC_SOURCES = ("hartHome.css", "hartResponsive.css", "hartHero.js",
+                   "hartContextMenu.js", "hartConnectivity.js", "hartDismiss.js")
+
+_IDLE_KEEP = {
+    # THE ORB. Checklist c2 (a living, breathing orb, the feel-alive pillar) and
+    # c8 (breathing is the user's toggle, DEFAULT ON). The steward's rule is
+    # that the orb breathes, not the chrome around it. These are the orb's
+    # brand aura (hartHero.js) and the top-bar orb, and the GPU rung is the
+    # only rung they run on (webkit-flat pauses them by selector above).
+    "hha-breathe": "the orb's brand aura rings: c2/c8, breathing default ON",
+    "hha-halo": "the orb's brand aura halo: c2/c8, breathing default ON",
+    "tbOrbBreathe": "the top-bar orb: the same orb presence, gpu-hardware only",
+    "hob-breathe": ("the onboarding orb on the Light Your HART screen: the orb, "
+                    "c2; paused by selector on webkit-flat, where it measured "
+                    "97.4 percent of a core"),
+    # THE LIVING CANVAS (hartHome.css). Ambient blobs, hue drift, the orb float
+    # and breathe, the ring spin and the live dots are the home's own life
+    # (checklist b4/i3 audit), each on a --hart-motion-* var the user and the
+    # webkit-flat rule can pause centrally; on the GPU rung they are composited
+    # layers, not software repaints.
+    "vBlob1": "home ambient layer, --hart-motion-ambient",
+    "vHue": "home ambient hue drift, --hart-motion-ambient",
+    "vFloat": "home orb float, --hart-motion-orb (c2)",
+    "vBreathe": "home orb breathe, --hart-motion-orb (c2/c8)",
+    "vSpin": "home ring spin, --hart-motion-rings",
+    "hhLiveDot": "home live dots, --hart-motion-detail",
+}
+
+
+def _served_sources() -> dict:
+    """{name: source} for every stylesheet-bearing file the shell serves."""
+    static = _SVC.parent / "static"
+    out = {"liquid_ui_service.py": _src()}
+    for name in _STATIC_SOURCES:
+        p = static / name
+        if p.is_file():
+            out[name] = p.read_text(encoding="utf-8")
+    return out
+
+
+def _infinite_in(src: str) -> dict:
+    """animation-name -> {selectors} for one source (same walk as below)."""
+    found = {}
+    for m in re.finditer(r"animation:\s*([A-Za-z0-9_-]+)[^;}]*?infinite", src):
+        name = m.group(1)
+        brace = src.rfind("{", 0, m.start())
+        if brace < 0:
+            continue
+        prev_close = src.rfind("}", 0, brace)
+        selector = src[prev_close + 1:brace]
+        selector = re.sub(r"/\*.*?\*/", " ", selector, flags=re.S)
+        selector = " ".join(selector.split())
+        for boundary in ("'", '"', ";"):
+            if boundary in selector:
+                selector = selector.rsplit(boundary, 1)[-1].strip()
+        if selector:
+            found.setdefault(name, set()).add(selector)
+    return found
+
+
+def _all_infinite() -> dict:
+    """animation-name -> {(file, selector)} across every served source."""
+    out = {}
+    for fname, src in _served_sources().items():
+        for name, sels in _infinite_in(src).items():
+            for sel in sels:
+                out.setdefault(name, set()).add((fname, sel))
+    return out
+
+
+def _idle_pause_rules() -> str:
+    """Every rule whose selector list carries html[data-idle="1"] and whose
+    body pauses the animation, as one string of selectors."""
+    src = _src()
+    out = []
+    for m in re.finditer(r'((?:html\[data-idle="1"\][^{}]*?)\{[^}]*animation-play-state\s*:\s*paused[^}]*\})', src):
+        out.append(m.group(1))
+    return "\n".join(out)
+
+
+@pytest.mark.parametrize("name", sorted(_all_infinite()))
+def test_every_infinite_animation_pauses_at_idle_unless_it_is_the_orb(name):
+    """The idle rule, on every rung and every served stylesheet."""
+    if name in _KEEP or name in _IDLE_KEEP:
+        assert (_KEEP.get(name) or _IDLE_KEEP.get(name)).strip(), (
+            "a keep-list entry must state WHY")
+        return
+    idle = _idle_pause_rules()
+    for fname, sel in _all_infinite()[name]:
+        tail = sel.split(",")[-1].strip()
+        if tail and tail in idle:
+            return
+    pytest.fail(
+        "the infinite animation '%s' (declared in %s) keeps running while nobody "
+        "is at the desk: it is neither paused under html[data-idle=\"1\"] "
+        "(animation-play-state:paused, the visibility engine's own idiom) nor "
+        "the orb's breathing (_IDLE_KEEP) nor a state-driven cue (_KEEP). Add "
+        "its selector to the idle rule in liquid_ui_service.py, or add it to a "
+        "keep-list WITH the reason it earns idle frames."
+        % (name, ", ".join(sorted("%s: %s" % fs for fs in _all_infinite()[name]))))
+
+
+def test_the_idle_rule_exists_and_is_the_visibility_engines_attribute():
+    idle = _idle_pause_rules()
+    assert idle, "no html[data-idle=\"1\"] ... {animation-play-state:paused} rule is served"
+    assert 'html[data-idle="1"]' in _src(), "the idle attribute hartVisibility.js stamps is not read by any CSS"
+
 
 def _infinite_animations() -> dict:
     """Map animation-name -> the selector(s) of the rule(s) declaring it.

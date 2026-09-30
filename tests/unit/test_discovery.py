@@ -387,6 +387,62 @@ class TestRelayedPeersAreHints:
         joined = ' '.join(reasons)
         assert 'requires a certificate' not in joined, joined
 
+    def _known(self, status='active', age_s=3600):
+        """A row this node already holds, last DIRECTLY seen ``age_s`` ago."""
+        from datetime import datetime, timedelta
+        from integrations.social.models import PeerNode
+        seen = datetime.utcnow() - timedelta(seconds=age_s)
+        row = PeerNode(node_id='known-1', url='http://192.0.2.80:5000',
+                       status=status, integrity_status='unverified',
+                       first_seen=seen - timedelta(seconds=60), last_seen=seen)
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = row
+        db.query.return_value.filter.return_value.count.return_value = 0
+        return db, row, seen
+
+    def test_relayed_hint_does_not_refresh_last_seen(self):
+        """last_seen is direct evidence of liveness: the node's own announce
+        or a successful ping in the health round.  A relayed row is a third
+        party's hearsay and must not move it.  It did (D4, #62): central
+        relays its whole non-dead table to every node that exchanges with it
+        and every node hands its list back, so a row nobody had reached in
+        months got a fresh last_seen every gossip round, the health round's
+        age check never tripped, and 1,149 junk rows stayed 'active' on
+        every node forever.  Measured on central 2026-09-22: the health round
+        covered 3-4 of 1,156 rows per 30s window because of them.
+        """
+        from integrations.social.peer_discovery import gossip
+        db, row, seen = self._known()
+        gossip._merge_peer(db, {'node_id': 'known-1',
+                                'url': 'http://192.0.2.81:5000'}, relayed=True)
+        assert row.last_seen == seen, 'a relayed hint re-stamped last_seen'
+        assert row.url == 'http://192.0.2.81:5000', (
+            'a hint may still update the address; that is what a hint is for')
+
+    def test_relayed_hint_does_not_resurrect_a_dead_row(self):
+        """The resurrect check (`now - last_seen < 60`) read a last_seen the
+        same merge had just set to now, so it was always true and hearsay
+        brought every dead row straight back."""
+        from integrations.social.peer_discovery import gossip
+        db, row, _ = self._known(status='dead')
+        gossip._merge_peer(db, {'node_id': 'known-1',
+                                'url': 'http://192.0.2.80:5000'}, relayed=True)
+        assert row.status == 'dead', 'hearsay resurrected a dead row'
+
+    def test_direct_announce_still_refreshes_last_seen_and_resurrects(self):
+        """The node speaking for itself IS the evidence: last_seen moves and
+        a dead row comes back.  Enforcement pinned to soft so an unsigned
+        direct announce reaches the update branch at all."""
+        from unittest.mock import patch
+        from integrations.social.peer_discovery import gossip
+        db, row, seen = self._known(status='dead')
+        with patch('security.master_key.get_enforcement_mode',
+                   return_value='soft'):
+            gossip._merge_peer(db, {'node_id': 'known-1',
+                                    'url': 'http://192.0.2.80:5000'})
+        assert row.last_seen > seen, 'a direct announce did not refresh last_seen'
+        assert row.status == 'active', 'a direct announce did not resurrect the row'
+
     def test_direct_central_tier_without_certificate_is_still_refused(self):
         """The certificate gate still guards a DIRECT central-tier claim.
 

@@ -153,10 +153,17 @@ def validate_comment(content: str) -> str:
     )
 
 
-def validate_url(url: str, allow_private: bool = False) -> str:
+def validate_url(url: str, allow_private: bool = True) -> str:
     """Validate URL is safe for server-side requests (SSRF protection).
 
-    Blocks: private/reserved IPs, non-http(s) schemes, cloud metadata endpoints.
+    Always blocks what is never a legitimate target: non-http(s) schemes and
+    cloud metadata endpoints. Private, LAN and loopback addresses are allowed
+    by default -- owner, 2026-09-14: "Allow shd be default on everywhere, no
+    unnecessarily redirecting in the name of security". A node serves its own
+    uploads on localhost and reads from the user's LAN, and refusing those
+    refused the user, not an attacker. A caller that must refuse them passes
+    allow_private=False.
+
     Raises ValueError on unsafe URLs.
     """
     if not isinstance(url, str) or not url.strip():

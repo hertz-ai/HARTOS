@@ -21,14 +21,14 @@ through the SAME complete_delegation_with_tracking(success=False) path a real
 failure takes — so reclaim can never drift from completion, and the ledger FSM
 stays the single authority on legal transitions.
 
-These are behavioural tests: a real SmartLedger, a real bridge, real state
-transitions asserted through the ledger's own API.
+These are behavioural tests: a real SmartLedger, a real bridge, a real
+(isolated) A2AContextExchange, and real state transitions asserted through the
+ledger's own API.
 """
 import os
 import sys
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO)
@@ -37,16 +37,31 @@ if os.path.isdir(_LEDGER_SRC) and _LEDGER_SRC not in sys.path:
     sys.path.insert(0, _LEDGER_SRC)
 
 from agent_ledger import SmartLedger, Task, TaskType, TaskStatus  # noqa: E402
+from integrations.internal_comm.internal_agent_communication import (  # noqa: E402
+    A2AContextExchange, AgentSkillRegistry,
+)
 from integrations.internal_comm.task_delegation_bridge import (  # noqa: E402
     TaskDelegationBridge,
 )
 
+#: The one peer able to take the delegated slice; reclaim must name it.
+_PEER = 'peer-b'
+
 
 def _a2a():
-    """A2A context stubbed at the boundary — this file is about ledger state."""
-    ctx = MagicMock()
-    ctx.delegate_task.return_value = 'deleg-1'
-    return ctx
+    """A REAL, isolated A2A exchange with one peer registered for the skill.
+
+    Fresh instances, never the module-global ``a2a_context``, so no delegation
+    or registration leaks between tests. A MagicMock here used to hand the
+    bridge a MagicMock ``to_agent``; the bridge stores that in the child's
+    context, every later ledger save then fails JSON serialisation, and the
+    ledger (correctly) rolls back each status change -- so the tests measured
+    the stub, not the bridge. The real exchange stores ``to_agent`` as the
+    peer's id string, which is the shape the bridge reads in production.
+    """
+    registry = AgentSkillRegistry()
+    registry.register_agent(_PEER, [{'name': 'anything', 'proficiency': 0.9}])
+    return A2AContextExchange(registry)
 
 
 class _Fixture:
@@ -143,7 +158,10 @@ class AStaleDelegationIsReclaimed(unittest.TestCase):
         [rec] = self.f.bridge.reclaim_stale_delegations(
             max_age_seconds=900, now=later)
         self.assertEqual(self.f.parent_id, rec['parent_task_id'])
-        self.assertIn('delegated_to', rec)
+        self.assertEqual(
+            _PEER, rec['delegated_to'],
+            "the reclaim record does not name the peer that held the "
+            "delegation, so an operator cannot see which peer vanished")
         self.assertGreater(rec['age_seconds'], 900)
 
     def test_reclaim_is_IDEMPOTENT(self):

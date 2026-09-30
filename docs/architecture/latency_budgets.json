@@ -1,5 +1,10 @@
 {
   "_doc": "Input-to-photon budgets in MILLISECONDS. See LATENCY_HARNESS.md. Continuous interactions (drag/hover/scroll/window-move) are ONE FRAME by construction: exceeding 16ms means an easing layer sits between the input and the transform, which is the exact model error behind the 2026-07-20 rubber-band drag. A budget may only be RAISED with a justification recorded in the same commit.",
+  "_frame": {
+    "_note": "The compositor's OWN frame time, not input-to-photon: from the render tick starting to build a frame to that frame being handed to DRM (queue_frame Ok). budget_ms is one 60 Hz refresh; a frame over it missed its vblank and is counted as a violation. p99_ms is the binding NFR (NATIVE_SHELL_PARITY_PROGRAM: frame budget 16.6 ms, p99 < 12 ms). latency.rs mirrors both as consts and journals one hart-frame line per 10 s window; a Python guard pins the mirror to this file.",
+    "budget_ms": 16.6,
+    "p99_ms": 12
+  },
   "_defaults": {
     "drag": 16,
     "hover": 16,

@@ -29,12 +29,19 @@ import integrations.vlm.vlm_adapter as adapter_mod
 
 @pytest.fixture(autouse=True)
 def reset_adapter_state():
-    """Reset module-level globals before each test."""
+    """Reset routing globals and isolate routing from the consent contract.
+
+    Computer-control consent has its own behavioural suite.  These tests pin
+    the tier/circuit-breaker logic after that canonical gate has allowed the
+    request, just as Nunba boot supplies its signed-in or local-guest owner.
+    """
     adapter_mod._tier1_fail_count = 0
     adapter_mod._tier2_fail_count = 0
     adapter_mod._probe_cache['ts'] = 0
     adapter_mod._probe_cache['result'] = None
-    yield
+    with patch('integrations.vlm.safety.computer_control_block',
+               return_value=None):
+        yield
     adapter_mod._tier1_fail_count = 0
     adapter_mod._tier2_fail_count = 0
     adapter_mod._probe_cache['ts'] = 0
@@ -59,6 +66,14 @@ class TestExecuteVlmInstruction:
             assert result == expected
         finally:
             adapter_mod._HAS_PYAUTOGUI = orig_has
+
+    def test_destructive_instruction_never_reaches_a_tier(self):
+        with patch('integrations.vlm.local_loop.run_local_agentic_loop') as mock_loop:
+            result = adapter_mod.execute_vlm_instruction(
+                {'instruction_to_vlm_agent': 'Restart the system'})
+        assert result['status'] == 'blocked'
+        assert result['exit_reason'] == 'destructive_operation'
+        mock_loop.assert_not_called()
 
     def test_tier1_failure_increments_circuit_breaker(self):
         """Tier 1 failure increments fail count."""
@@ -356,14 +371,21 @@ class TestThreadSafety:
 
             def do_call():
                 barrier.wait()
-                with patch('integrations.vlm.local_loop.run_local_agentic_loop', side_effect=RuntimeError("fail")):
-                    adapter_mod.execute_vlm_instruction({"instruction_to_vlm_agent": "test"})
+                adapter_mod.execute_vlm_instruction({"instruction_to_vlm_agent": "test"})
 
-            threads = [threading.Thread(target=do_call) for _ in range(call_count)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
+            # ONE patch, installed before the threads start and removed after
+            # they all finish.  It used to be entered and exited inside each
+            # of the 50 threads at once; mock.patch is not thread-safe, so an
+            # interleaved exit restored another thread's MagicMock as the
+            # "original" (5 of 6 full runs, 2026-09-28) and every later loop
+            # test in the session raised RuntimeError('fail').
+            with patch('integrations.vlm.local_loop.run_local_agentic_loop',
+                       side_effect=RuntimeError("fail")):
+                threads = [threading.Thread(target=do_call) for _ in range(call_count)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
 
             # Not atomic, so we check >= rather than == (GIL helps but not guaranteed)
             assert adapter_mod._tier1_fail_count >= 1

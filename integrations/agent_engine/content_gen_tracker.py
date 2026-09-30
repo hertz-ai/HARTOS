@@ -476,41 +476,66 @@ def _classify_status(goal_status: str, progress_pct: float, delta_24h: float) ->
     return 'generating'
 
 
+# media_type -> RuntimeToolManager tool name.  Single source of truth for
+# both helpers below; they had two near-identical copies that had already
+# drifted (only the check map carried the identity/ltx2 rows).
+#
+# Names must match runtime_manager.TOOL_CONFIGS, which as of 2026-09-21 is
+# {acestep, diffrhythm, ltx2, minicpm, tts_audio_suite, wan2gp, whisper}.
+# The old map used 'acestep_generate'/'wan2gp_generate'/'ltx2_generate' --
+# endpoint-function names, not tool names -- so those rows could never have
+# matched a tool even once the API calls were right.
+# 'txt2img' is deliberately NOT a TOOL_CONFIGS key: image gen is an external
+# service, so it resolves to {'error': 'Unknown tool'} and reports offline,
+# which is the truthful answer for a service RTM does not manage.
+_MEDIA_TYPE_TO_TOOL = {
+    'image': 'txt2img',
+    'txt2img': 'txt2img',
+    'tts': 'tts_audio_suite',
+    'tts_audio_suite': 'tts_audio_suite',
+    'music': 'acestep',
+    'acestep': 'acestep',
+    'video': 'wan2gp',
+    'wan2gp': 'wan2gp',
+    'ltx2': 'ltx2',
+}
+
+
 def _check_media_service(media_type: str) -> bool:
-    """Check if a media generation service is available."""
+    """Check if a media generation service is available.
+
+    Uses the RuntimeToolManager module singleton and its real API.  The
+    previous body called RuntimeToolManager.get_instance() and
+    .is_tool_running() -- NEITHER EXISTS on the class -- inside a bare
+    `except Exception: return False`, so the AttributeError was swallowed
+    and every media service always reported 'offline'.  That made
+    get_services_health() a constant, not a measurement.
+    """
+    tool_name = _MEDIA_TYPE_TO_TOOL.get(media_type, media_type)
     try:
-        from integrations.service_tools.runtime_manager import RuntimeToolManager
-        manager = RuntimeToolManager.get_instance()
-        tool_map = {
-            'image': 'txt2img',
-            'txt2img': 'txt2img',
-            'tts': 'tts_audio_suite',
-            'tts_audio_suite': 'tts_audio_suite',
-            'music': 'acestep_generate',
-            'acestep': 'acestep_generate',
-            'video': 'wan2gp_generate',
-            'wan2gp': 'wan2gp_generate',
-            'ltx2': 'ltx2_generate',
-        }
-        tool_name = tool_map.get(media_type, media_type)
-        return manager.is_tool_running(tool_name)
-    except Exception:
+        from integrations.service_tools.runtime_manager import runtime_tool_manager
+        status = runtime_tool_manager.get_tool_status(tool_name)
+        return bool(status.get('running'))
+    except Exception as e:
+        logger.warning(f"Media service check failed for {media_type} "
+                       f"(tool={tool_name}): {e}")
         return False
 
 
 def _restart_media_service(media_type: str) -> bool:
-    """Attempt to restart a media generation service."""
+    """Attempt to restart a media generation service.
+
+    setup_tool() is the manager's idempotent download+start entry point;
+    it returns a dict carrying 'running' on success or 'error' on failure
+    (it never returns None, so the old `result is not None` test would
+    have reported success even for an error dict).
+    """
+    tool_name = _MEDIA_TYPE_TO_TOOL.get(media_type, media_type)
     try:
-        from integrations.service_tools.runtime_manager import RuntimeToolManager
-        manager = RuntimeToolManager.get_instance()
-        tool_map = {
-            'image': 'txt2img',
-            'tts': 'tts_audio_suite',
-            'music': 'acestep_generate',
-            'video': 'wan2gp_generate',
-        }
-        tool_name = tool_map.get(media_type, media_type)
-        result = manager.ensure_tool_running(tool_name)
-        return result is not None
-    except Exception:
+        from integrations.service_tools.runtime_manager import runtime_tool_manager
+        result = runtime_tool_manager.setup_tool(tool_name)
+        return bool(result.get('running'))
+    except Exception as e:
+        logger.warning(f"Media service restart failed for {media_type} "
+                       f"(tool={tool_name}): {e}")
         return False

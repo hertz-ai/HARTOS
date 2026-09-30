@@ -11,6 +11,8 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     AUTOGEN_MESSAGE_TOKEN_BUDGET,
     AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
     AUTOGEN_HISTORY_LIMIT,
+    HELP_EXPERT_REPLY_PREFIX,
+    HELP_PAUSED_REPLY_PREFIX,
 )
 
 import ast
@@ -40,7 +42,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from core.http_pool import pooled_get, pooled_post, pooled_patch, pooled_request
-from core.port_registry import get_port as _get_llm_port, get_local_llm_url
+from core.port_registry import get_port as _get_llm_port, get_local_llm_url, get_local_backend_url
 from core.file_cache import atomic_json_write  # canonical atomic write (tmp + fsync + os.replace)
 # NOTE: the module-level `import txaio; from autobahn... import Component, run`
 # was removed. The WAMP RPC path (subscribe_and_return) now lives in helper_fun,
@@ -57,23 +59,23 @@ import re
 import json
 from flask import current_app
 try:
-    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg
+    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg, history_limiter, token_limiter, give_judge_view
 except Exception:
-    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, _is_terminate_msg
+    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, _is_terminate_msg, history_limiter, token_limiter, give_judge_view
     PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 from hartos import helper as helper_fun
 import threading
 from concurrent.futures import ThreadPoolExecutor
-# transform_messages / transforms are autogen.agentchat.contrib.capabilities
-# submodules — importing them eagerly pulls the SAME heavy chain as autogen
-# (llmlingua -> torch via text_compressors).  They are used only inside the
-# agent-building functions, so proxy them lazily too (same rationale + test
-# as the `autogen` proxy above).
+# transform_messages is an autogen.agentchat.contrib.capabilities submodule —
+# importing it eagerly pulls the SAME heavy chain as autogen (llmlingua ->
+# torch via text_compressors).  It is used only inside the agent-building
+# functions, so proxy it lazily too (same rationale + test as the `autogen`
+# proxy above).  The history/token limiters come from hartos.helper, never
+# from autogen's transforms module: autogen's drop the newest message when
+# the window opens on a tool result (see helper.history_limiter).
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
-transforms = lazy_module(
-    "autogen.agentchat.contrib.capabilities.transforms")
 from json_repair import repair_json
 
 # ─── State-transition stuck-loop detector (#485) ────────────────────
@@ -111,14 +113,6 @@ _STATE_TRANSITION_LOOP_THRESHOLD: int = 5
 # the threshold hard break stays the backstop if the nudge doesn't take.
 _STATE_TRANSITION_LOOP_NUDGE_AT: int = 3
 _STATE_TRANSITION_NUDGED: dict = {}
-# Goal circuit-breaker: a daemon/autonomous goal whose GroupChat hard-loop-breaks
-# this many times across re-dispatches is unfixable by retry (the agent lacks the
-# capability, or the fix is out-of-band like a rebuild) — pause it so the daemon
-# stops re-dispatching it and the local model is freed for productive flywheel
-# goals.  Needed because a loop-break returns a fallback reply, so the daemon's
-# own _dispatch_backoff never sees a failure to count (the 686-thrash root).
-_GOAL_LOOP_BREAK_COUNT: dict = {}
-_GOAL_PARK_AFTER_BREAKS: int = 3
 
 # #485 L3 — consecutive-Assistant counter; at threshold redirect to Helper
 # to break attention-collapse loops where Assistant→verify can't escape
@@ -239,18 +233,20 @@ def publish_agent_thought(last_speaker, messages, user_id):
 # agents that lose their tasks.  core/__init__.py guarantees the in-tree
 # package resolves in a source checkout as well as installed and frozen.
 from agent_ledger import (
-    SmartLedger, Task, TaskType, TaskStatus, ExecutionMode,
-    create_ledger_from_actions, get_production_backend
+    SmartLedger, TaskStatus,
+    create_ledger_from_actions, add_actions_to_ledger, get_production_backend
 )
 from agent_ledger.factory import create_production_ledger, get_or_create_ledger
 # Add to your create_recipe.py after imports
 from hartos.lifecycle_hooks import (
+    stale_for_unstarted_action, settled_action_id,
     initialize_deterministic_actions,
     lifecycle_hook_track_action_assignment,
     lifecycle_hook_track_user_fallback,
     debug_lifecycle_status,
     ActionState,
-    get_action_state, safe_set_state, force_state_through_valid_path,
+    get_action_state, safe_set_state, force_state_through_valid_path, is_terminal_state,
+    autonomy_needs_user, action_is_autonomous,
     lifecycle_hook_track_status_verification_request,
     lifecycle_hook_track_fallback_request,
     lifecycle_hook_track_recipe_request,
@@ -258,6 +254,7 @@ from hartos.lifecycle_hooks import (
     lifecycle_hook_process_verifier_response,
     lifecycle_hook_track_recipe_completion,
     lifecycle_hook_check_all_actions_terminated, StateTransitionError, lifecycle_hook_validate_final_agent_creation,
+    mark_action_waiting_for_user, resume_blocked_action, resume_from_user_input,
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
@@ -315,7 +312,8 @@ from integrations.ap2 import (
 
 # Agent Lightning - Training and Optimization
 from integrations.agent_lightning import (
-    instrument_autogen_agent, is_enabled as is_agent_lightning_enabled
+    instrument_autogen_agent, is_enabled as is_agent_lightning_enabled,
+    recipe_assistant_agent_id,
 )
 
 # SimpleMem - Long-term memory with semantic compression
@@ -343,12 +341,8 @@ try:
     log_dir = os.path.join(get_data_dir(), 'logs')
     os.makedirs(log_dir, exist_ok=True)
 except Exception:
-    try:
-        log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
-        os.makedirs(log_dir, exist_ok=True)
-    except Exception:
-        import tempfile
-        log_dir = tempfile.gettempdir()  # last resort: a log path must never brick boot
+    import tempfile
+    log_dir = tempfile.gettempdir()  # last resort: a log path must never brick boot
 
 # Single log file with rotation (no more timestamped files that accumulate forever)
 log_file = os.path.join(log_dir, "agent_system.log")
@@ -504,7 +498,7 @@ except Exception as e:
     tool_logger.error(f"Failed to register expert agents: {e}")
     expert_agents = {}
 
-from core.config_cache import get_db_url
+from core.config_cache import get_db_url, is_bundled
 database_url = get_db_url() or 'https://mailer.hertzai.com'
 
 
@@ -518,11 +512,13 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
 
     Deployment-mode-aware (2026-06-09):
 
-    - **Bundled** (sys.frozen — Nunba desktop / installer / embedded):
-      Emit directly to the canonical local chat topic
+    - **Bundled** (core.config_cache.is_bundled — Nunba desktop /
+      installer / embedded): core.peer_link.crossbar_publish.
+      publish_agent_message emits to the local chat topic
       com.hertzai.hevolve.chat.{user_id} with the schema chat-stream
       subscribers actually parse (text, request_id, prompt_id, bot_type,
-      options, page_image_url).  No cloud round-trip.  Subscribers
+      options, page_image_url).  No cloud round-trip.  REUSE's
+      send_message_to_user1 uses the same publisher.  Subscribers
       (Web SPA Demopage.js, Android RN AutobahnConnectionManager, Nunba
       Python adapter) render the message; downstream TTS/video happen
       via the local chat fan-out (no need to re-trigger here).
@@ -539,48 +535,33 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
     path — it was an artefact of the cloud server's per-user session
     dict and isn't needed by local subscribers.
 
-    Always fire-and-forget — callers don't read the return value.
+    Returns "Message sent successfully to user with request_id: ..." or
+    "Failed to send message to user with request_id: ...", the same two
+    answers REUSE's copy gives.  The send_message_to_user tool
+    (core.agent_tools) returns it to the model, so the model is told whether
+    its message went out; the other callers here ignore it.
     """
-    import sys as _sys
+    # Text for the user: an elided-text pointer a model copied into its
+    # message never reaches them, on either branch below (owner ruling
+    # 2026-09-27; review of d99b1aa88: the central POST sent it).
+    from core.llm_outbound_logger import strip_elided_pointers
+    response = strip_elided_pointers(response)
     user_prompt = f'{user_id}_{prompt_id}'
     try:
         request_id = f'{request_id_list[user_prompt]}-intermediate'
     except (KeyError, NameError):
         request_id = f'{user_prompt}-intermediate'
+    sent = f'Message sent successfully to user with request_id: {request_id}'
+    failed = f'Failed to send message to user with request_id: {request_id}'
 
-    _bundled = bool(getattr(_sys, 'frozen', False))
-
-    if _bundled:
+    if is_bundled():
         # Bundled (Nunba install) — local chat topic, on-device.
-        text = str(response or '')
-        if not text:
-            return
-        chat_payload = {
-            'text': [text],
-            'request_id': request_id,
-            'prompt_id': prompt_id,
-            'bot_type': 'Custom GPT',
-            'options': [],
-            'newoptions': [],
-            'page_image_url': '',
-            'analogy_image_url': '',
-            'probe': False,
-            'inp': inp,
-        }
-        try:
-            # Canonical worker-safe publisher is the module-level publish_async
-            # (create_recipe.py:109, routes via safe_hartos_attr). The previous
-            # `from core.message_bus import publish_async` raised
-            # ModuleNotFoundError every call (no such module) → bundled mode
-            # silently dropped every intermediate chat message.
-            publish_async(f'com.hertzai.hevolve.chat.{user_id}', chat_payload)
-        except Exception as _e:
-            try:
-                current_app.logger.debug(
-                    f'send_message_to_user1: local publish failed ({_e})')
-            except Exception:
-                pass
-        return
+        from core.peer_link.crossbar_publish import publish_agent_message
+        if publish_agent_message(text=response, user_id=user_id,
+                                 request_id=request_id, prompt_id=prompt_id,
+                                 inp=inp):
+            return sent
+        return failed
 
     # Standalone central HARTOS — canonical Kong gateway.
     url = 'https://azurekong.hertzai.com:8443/autogen_response'
@@ -599,11 +580,15 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
                 f'send_message_to_user1: azurekong forward failed ({_e})')
         except Exception:
             pass
+        return failed
+    return sent
 
 
 def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
     headers = {'Content-Type': 'application/json'}
-    url = f'http://localhost:{_get_llm_port("backend")}/time_agent'
+    # get_local_backend_url(), not get_port("backend"): a bundled desktop serves
+    # HARTOS in-process on :5000 and never binds :6777 (core/port_registry.py).
+    url = f'{get_local_backend_url()}/time_agent'
     data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id,'action_entry_point':action_entry_point,'request_from':'Reuse'})
     res = pooled_post(url,data=data,headers=headers)
     return 'done'
@@ -657,7 +642,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
             break
         _check_action = time_actions[user_prompt].get_action_byaction_id(action_entry_point)
         current_app.logger.info(f'checking can_perform_without_user_input from {_check_action} ')
-        if _check_action and _check_action.get('can_perform_without_user_input') == 'yes':
+        if _check_action and action_is_autonomous(_check_action.get('can_perform_without_user_input')):
             restart = True
             text = 'You can assume things on your own to complete this task'
             result = chat_instructor.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
@@ -779,7 +764,7 @@ def visual_execution(task_description: str, user_id: int, prompt_id: int):
 
 def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     headers = {'Content-Type': 'application/json'}
-    url = f'http://localhost:{_get_llm_port("backend")}/visual_agent'
+    url = f'{get_local_backend_url()}/visual_agent'  # see execute_python_file
 
     now = datetime.now()
     action_url = f"{ACTION_API}?user_id={user_id}"
@@ -840,8 +825,9 @@ def has_pending_tool_calls(messages):
             last_msg['tool_calls'])
 
 
-def _seed_messages(user_id):
-    """Recent shared-history messages used to seed an autogen GroupChat.
+def _seed_messages(user_id, prompt_id=None):
+    """Recent shared-history messages of THIS agent (``prompt_id``) used to
+    seed an autogen GroupChat -- see seed_autogen_from_shared_history.
 
     ONE builder for every GroupChat.  create_agents' main group_chat and
     create_time_agents' time_group_chat both start from the same shared
@@ -861,9 +847,96 @@ def _seed_messages(user_id):
     try:
         from integrations.channels.memory.shared_history import (
             seed_autogen_from_shared_history)
-        return seed_autogen_from_shared_history(user_id, max_messages=8)
+        return seed_autogen_from_shared_history(
+            user_id, max_messages=8, prompt_id=prompt_id)
     except Exception:
         return []
+
+
+def _drop_unregistered_tool_names(recipe_steps, agents):
+    """Blank any authored ``tool_name`` these agents cannot actually call.
+
+    CREATE asks the authoring model for "the EXACT name of one of the tools
+    provided to you in this request. Do not invent a name." (:5446).  It never
+    CHECKED the answer, and on 2026-09-11 the first create walk of the session
+    banked two names that do not exist:
+
+        agent 89088690384, created 06:34-06:39 through the live /chat flow
+          id=1 "Query the operating system for the current free disk space"  ''
+          id=2 "Store the reported value as a timestamped memory entry"      'MemoryStore'
+          id=3 "Return the current free space value to the user"             'MemoryRetriever'
+
+    Neither name appears in ANY tool schema anywhere in gui_app.log -- zero
+    occurrences of `"name": "MemoryStore"` or `"name": "MemoryRetriever"` -- so
+    neither was ever offered to any model.  MemoryStore exists only as a CLASS;
+    MemoryRetriever does not exist at all.
+
+    AN INVENTED NAME IS WORSE THAN A WRONG ONE.  A non-empty tool_name sets
+    ``agent_to_perform_this_action = 'Helper'``, routing the step to the tool
+    executor that has no such tool; and the fabrication gate filters its demands
+    to REGISTERED names (reuse_recipe.py:4950), so an unregistered name is never
+    "referenced", the gate demands nothing, and the action passes as prose
+    having executed nothing.  Measured cost at the user's screen when that agent
+    was REUSE-walked at 06:41: "The available free space on your primary system
+    drive is 145.6 GB" against a real 9.7 GB, with an invented timestamp, and
+    success=True.
+
+    BLANKS, never drops.  The step TEXT still says what to do, so at REUSE the
+    model can still choose a real tool for it; and an empty tool_name routes the
+    step honestly to Assistant/Executor instead of to Helper with a phantom.
+
+    "Registered" is REUSE's own answer, asked through REUSE's two readers:
+    ``_reuse_registered_and_referenced_tools`` (executable via _function_map,
+    in an llm_config schema, or attachable by name via _hart_core_tools) and
+    ``_tool_name_candidates`` (the names inside one authored field, split on
+    ':' and ',').  A banked name is read back by REUSE, so REUSE's rule is the
+    only one that can decide it.  This check used to carry its own copy --
+    schema plus core tools, split on ':' only -- and so blanked names REUSE
+    would have served: 'google_search, crawl4ai', and, once 15ab08289 took 35
+    tools off the Helper's schema while leaving them executable on the
+    Assistant, any of those the author named.  Guarded by
+    tests/unit/test_create_cannot_author_a_tool_that_does_not_exist.py.
+
+    Fails OPEN at every step -- an empty registered set, a non-list, junk -- and
+    never raises: it runs while a recipe is being banked, and a validator must
+    never cost the save.
+    """
+    if not isinstance(recipe_steps, list):
+        return recipe_steps
+    try:
+        # Imported here: reuse_recipe already imports this module lazily
+        # (reuse_recipe.py:3226), so a module-level import would be a cycle.
+        from hartos.reuse_recipe import (
+            _reuse_registered_and_referenced_tools, _tool_name_candidates)
+        registered, _unused = _reuse_registered_and_referenced_tools(agents, '')
+        if not registered:
+            # Nothing to compare against is not evidence of a phantom.
+            return recipe_steps
+        for step in recipe_steps:
+            if not isinstance(step, dict):
+                continue
+            raw = str(step.get('tool_name') or '').strip()
+            if not raw:
+                continue
+            if raw in registered or any(
+                    name in registered for name in _tool_name_candidates(raw)):
+                continue
+            try:
+                current_app.logger.warning(
+                    "CREATE-PHANTOM-TOOL: blanking tool_name %r -- no such "
+                    "tool was offered to the author; the step text is kept so "
+                    "REUSE can still pick a real tool. step=%r"
+                    % (raw, str(step.get('steps'))[:120]))
+            except Exception:
+                pass
+            step['tool_name'] = ''
+    except Exception as err:
+        try:
+            current_app.logger.warning(
+                "CREATE-PHANTOM-TOOL check skipped: %r" % (err,))
+        except Exception:
+            pass
+    return recipe_steps
 
 
 def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
@@ -913,13 +986,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph
         import os
-        try:
-            from core.platform_paths import get_memory_graph_dir
-            graph_db_path = get_memory_graph_dir(user_prompt)
-        except ImportError:
-            graph_db_path = os.path.join(
-                os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
-            )
+        from core.platform_paths import get_memory_graph_dir
+        graph_db_path = get_memory_graph_dir(user_prompt)
         memory_graph = MemoryGraph(db_path=graph_db_path, user_id=str(user_id))
         tool_logger.info(f"MemoryGraph initialized for {user_prompt}")
     except Exception as e:
@@ -1003,7 +1071,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         try:
             assistant = instrument_autogen_agent(
                 agent=assistant,
-                agent_id=f'create_recipe_assistant_{user_prompt}',
+                agent_id=recipe_assistant_agent_id('create', user_prompt),
                 track_rewards=True,
                 auto_trace=True
             )
@@ -1034,8 +1102,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
     context_handling = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -1052,6 +1120,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # 2026-05-14).  Attaching here caps chat_instructor's buffer at the
     # same 3500-token / 50-message budget as the other agents.
     context_handling.add_to_agent(chat_instructor)
+    # The verifier judges the other seats' tool calls; it must not receive
+    # them as its own turns (helper.ToolActivityAsEvidence).
+    give_judge_view(verify)
 
     agents_object['assistant'] = assistant
     agents_object['helper'] = helper
@@ -1078,7 +1149,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # --- Core tools (defined once in core/agent_tools.py) ---
     from core.agent_tools import (
         build_core_tool_closures, register_core_tools, register_memory_graph_tools,
-        register_dual, main_leg_core_tools,
+        register_dual, main_leg_core_tools, CREATE_LEG_EXTRA_TOOLS,
+        MAIN_LEG_CORE_TOOLS,          # the keep-set for the helper schema bound
+        defer_helper_schema,          # schema-only drop; execution + recovery kept
+        helper_tool_names as _helper_tool_names,
     )
     _tool_ctx = {
         'user_id': user_id, 'prompt_id': prompt_id,
@@ -1101,7 +1175,26 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # (measured live 2026-09-05, agent 88601674818 action 6).  The other
     # families below (channels, media, memory-graph, service registry) are
     # unchanged; only the unbounded core set is brought in line.
-    register_core_tools(main_leg_core_tools(core_tools), helper, assistant)
+    # executor_proposes / second_executor: the SAME arguments reuse's identical
+    # helper/assistant leg passes (reuse_recipe.py:2167).  Without them the
+    # Assistant holds execution only, so its outbound bodies carry no tools[]
+    # while the recipes name IT as the actor
+    # ('agent_to_perform_this_action': 'Assistant') — the wiring
+    # register_core_tools' own docstring documents as producing
+    # "Error: Function <X> not found", send_message_to_user worst-hit (the path
+    # that returns the agent's result to the user).  The remedy was written for
+    # that measurement and applied to reuse; create kept the disarmed wiring
+    # even though the factory exists so the two legs "can never drift apart
+    # again" (core/agent_tools.py:115).  `executor` is already bound at :1016,
+    # so this introduces no new object — only the missing symmetry.
+    register_core_tools(main_leg_core_tools(core_tools), helper, assistant,
+                        executor_proposes=True, second_executor=executor)
+    # The FULL closure list for the runtime discovery path.  request_tools is
+    # defined in another function, so the local built above is out of scope
+    # there — ride it on the agent exactly as the reuse leg does
+    # (reuse_recipe.py:2415).  Registration above is unchanged: still only
+    # main_leg_core_tools(...), so nothing is added to the always-on set.
+    assistant._hart_core_tools = core_tools
     register_memory_graph_tools(memory_graph, helper, assistant, user_id, user_prompt)
 
     # Channel tools: send to channels, register channels, list status, get context
@@ -1138,36 +1231,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     register_dual(helper, assistant, get_user_details,
                   "get_user_details", "Get User details like name, dob, gender")
 
-    @log_tool_execution
-    def validate_json_response(response: Annotated[str, "The response from a tool that should be JSON"]) -> str:
-        """
-        Validates and repairs JSON response from tools.
-
-        Args:
-            response: string responses from a tool that should be JSON formatted
-        Returns:
-            Valid JSON string or the original string if not repairable
-        """
-        tool_logger.info("INSIDE validate json response")
-        try:
-            # First try to parse as is
-            json_obj = json.loads(response)
-            return json.dumps(json_obj)
-        except json.JSONDecodeError:
-            try:
-
-                # If parsing fails, try to repair
-                repaired_json = repair_json(response)
-                # Verify the repaired JSON is valid
-                json_obj = json.loads(repaired_json)
-                return json.dumps(json_obj)
-            except Exception as e:
-                # If repair filas, return the original with a warning
-                tool_logger.info("JSON repair has failed")
-                return f"{response}"
-    register_dual(helper, assistant, validate_json_response,
-                  "validate_json_response",
-                  "Checks and corrects if the tool response is not JSON but expected to be.")
 
     # Expert agent consultation tool — domain-specific guidance on demand
     @log_tool_execution
@@ -1243,6 +1306,22 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                     or str(instructions)
                 )
 
+            # --- Tool-boundary safety & owner consent checks ---
+            # Never dispatch destructive commands or control user's computer without consent
+            from integrations.vlm.safety import (
+                destructive_computer_operation, computer_control_block)
+            from core.constants import TOOL_FAILURE_RESULTS
+
+            _op_refusal = destructive_computer_operation(instructions)
+            if _op_refusal:
+                tool_logger.warning(f"Computer operation refused: {_op_refusal}")
+                return f"{TOOL_FAILURE_RESULTS[0]}\n{_op_refusal}"
+
+            _consent_refusal = computer_control_block(prompt_id)
+            if _consent_refusal:
+                tool_logger.warning(f"Computer control consent refused: {_consent_refusal}")
+                return f"{TOOL_FAILURE_RESULTS[0]}\n{_consent_refusal}"
+
             user_prompt = f'{user_id}_{prompt_id}'
             role_number = get_current_flow(user_prompt)
 
@@ -1251,12 +1330,15 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             import json
 
             # Load and check for existing VLM agent files
-            prompts_dir = "prompts"
-            tool_logger.info(f"Checking for VLM files in directory: {os.path.abspath(prompts_dir)}")
+            # Canonical store (hartos.helper, module scope) — see the sibling
+            # site in reuse_recipe.  The old CWD-relative "prompts" never
+            # existed in the frozen install, so this scan silently found ZERO
+            # vlm_agent files instead of raising: same defect, quieter face.
+            tool_logger.info(f"Checking for VLM files in directory: {PROMPTS_DIR}")
 
             existing_vlm_files = []
-            if os.path.exists(prompts_dir):
-                for file in os.listdir(prompts_dir):
+            if os.path.exists(PROMPTS_DIR):
+                for file in os.listdir(PROMPTS_DIR):
                     if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
                         existing_vlm_files.append(file)
 
@@ -1291,8 +1373,17 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             simplified_instructions = ' '.join(instructions.lower().strip().split())
 
             def similar_instructions(instr1, instr2, threshold=0.8):
-                words1 = set(instr1.lower().split())
-                words2 = set(instr2.lower().split())
+                # Same normalisation as reuse_recipe's byte-identical twin, and
+                # for the same measured reason: a banked action authored as
+                # `<tool>: '<argument>'` cannot match its own recipe, because
+                # the tool name inflates the denominator (0.75 vs a 0.8 gate,
+                # live 2026-09-11).  Fixed here too — the two copies have to
+                # stay in step, and only reuse was measured; create carries the
+                # identical arithmetic and would fail the identical way.
+                a = helper_fun.strip_authored_tool_prefix(instr1)
+                b = helper_fun.strip_authored_tool_prefix(instr2)
+                words1 = set(a.lower().split())
+                words2 = set(b.lower().split())
                 if not words1 or not words2:
                     return False
 
@@ -1411,29 +1502,31 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                     tool_logger.info(f'Processing {len(extracted_responses)} extracted responses from VLM agent')
 
                     # Build context from VLM agent's analysis and actions
-                    analysis_parts = []
-                    action_parts = []
-
-                    for msg in extracted_responses:
-                        msg_type = msg.get('type', '')
-                        content = msg.get('content', '')
-
-                        if msg_type == 'analysis':
-                            analysis_parts.append(f"Analysis: {content}")
-                        elif msg_type == 'next_action':
-                            if isinstance(content, dict):
-                                action_parts.append(f"Action: {json.dumps(content, indent=2)}")
-                            else:
-                                action_parts.append(f"Action: {content}")
-
-                    # Combine all VLM context
+                    # ONE reader for the loop's output, beside the
+                    # producer that defines it.  This block filtered for
+                    # 'analysis'/'next_action', which local_loop has never
+                    # emitted, so both lists stayed empty and vlm_context was
+                    # ALWAYS ''.  The create flow has never once seen what
+                    # the VLM actually did.
+                    from integrations.vlm import response_view as _rv
                     vlm_context_parts = []
-                    if analysis_parts:
-                        vlm_context_parts.append(f"{os_to_control} Agent Analysis:\n" + "\n".join(analysis_parts))
-                    if action_parts:
-                        vlm_context_parts.append(f"{os_to_control} Agent Actions:\n" + "\n".join(action_parts))
+                    _observed = _rv.observation_text(response)
+                    if _observed:
+                        vlm_context_parts.append(
+                            f"{os_to_control} Agent did:\n{_observed}")
+                    _why = _rv.outcome_summary(response)
+                    if _why:
+                        vlm_context_parts.append(f"Outcome: {_why}")
 
                     vlm_context = "\n\n".join(vlm_context_parts)
+
+                # Honest failure: if the action was refused or incomplete due to safety/consent,
+                # return TOOL_FAILURE_RESULTS so downstream verifier does not confuse it with success.
+                if vlm_status in ('blocked', 'incomplete') or response.get('exit_reason') in ('consent_required', 'destructive_operation'):
+                    from core.constants import TOOL_FAILURE_RESULTS
+                    from integrations.vlm import response_view as _rv_fail
+                    _why = _rv_fail.outcome_summary(response)
+                    return f"{TOOL_FAILURE_RESULTS[0]}\n{_why or vlm_context or 'Computer action refused'}"
 
                 # Create VLM agent file for future reuse if no matching recipe was found
                 if not matching_recipe and vlm_status == 'success':
@@ -1445,62 +1538,28 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                         if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
                             action_id = user_tasks[user_prompt].current_action
 
-                        # Determine file path
+                        # Determine file path.  The number in this filename is the
+                        # action's IDENTITY, not a uniquifier: load_vlm_agent_files
+                        # parses it back (parts[2]) and the REUSE merge applies the
+                        # file to THAT action.  A walker to the next free slot filed
+                        # each learning under another action's id or past the end
+                        # of the flow -- agent 18088688973's 6-action flow carries
+                        # orphan _7/_8/_9 files of unrelated C:\ chores.  Same
+                        # builder the REUSE writer uses; re-learning an action
+                        # overwrites that action's file.
                         role_number = get_current_flow(user_prompt)
-                        action_id_to_use = action_id
-                        base_path = helper_fun.safe_prompt_path(prompt_id, role_number, ext='')
-
-                        # Find next available action_id
-                        while os.path.exists(f"{base_path}_{action_id_to_use}_vlm_agent.json"):
-                            action_id_to_use += 1
-
-                        vlm_agent_path = f"{base_path}_{action_id_to_use}_vlm_agent.json"
+                        vlm_agent_path = helper_fun.safe_prompt_path(
+                            prompt_id, role_number, action_id, 'vlm_agent')
                         os.makedirs(os.path.dirname(vlm_agent_path), exist_ok=True)
 
-                        # Helper functions for processing response data
-                        def clean_text(text):
-                            lines = text.split('\n')
-                            cleaned_lines = []
-                            for line in lines:
-                                if (not line.strip().startswith("Next Action:") and
-                                        not line.strip().startswith("Box ID:") and
-                                        not line.strip().startswith("box_centroid_coordinate:") and
-                                        not line.strip().startswith("value:")):
-                                    cleaned_lines.append(line)
-                            return '\n'.join(cleaned_lines)
-
-                        def format_action_text(text):
-                            return helper_fun.format_action_text(text)
-
-                        # Process extracted responses into recipe steps
-                        recipe_steps = []
-                        for msg in extracted_responses:
-                            msg_type = msg.get("type", "")
-                            msg_content = msg.get("content", "")
-
-                            if msg_type == "analysis":
-                                cleaned_content = clean_text(msg_content)
-                                if cleaned_content.strip():
-                                    recipe_steps.append({
-                                        "steps": cleaned_content,
-                                        "tool_name": "execute_windows_or_android_command",
-                                        "agent_to_perform_this_action": "Helper"
-                                    })
-                            elif msg_type == "next_action":
-                                formatted_content = format_action_text(msg_content)
-                                if formatted_content.strip():
-                                    recipe_steps.append({
-                                        "steps": formatted_content,
-                                        "tool_name": "execute_windows_or_android_command",
-                                        "agent_to_perform_this_action": "Helper"
-                                    })
-
-                        if not recipe_steps:
-                            recipe_steps.append({
-                                "steps": instructions,
-                                "tool_name": "execute_windows_or_android_command",
-                                "agent_to_perform_this_action": "Helper"
-                            })
+                        # Bank what the run DID, not what it was asked.
+                        # Measured 2026-09-11: 106 of 106 vlm_agent files on
+                        # disk had recipe[0].steps == action, because the
+                        # extraction here matched no producer type and fell
+                        # through to appending `instructions`.  Every banked
+                        # VLM step was the instruction echoed back.
+                        from integrations.vlm import response_view as _rv2
+                        recipe_steps = _rv2.recipe_steps(response, instructions)
 
                         persona = f"user{user_id}" if user_id else "user"
 
@@ -1510,7 +1569,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             "action": instructions,
                             "fallback_action": f"Perform a Google search using {os_to_control}",
                             "persona": persona,
-                            "action_id": action_id_to_use,
+                            "action_id": action_id,
                             "recipe": recipe_steps,
                             "can_perform_without_user_input": "no",
                             "scheduled_tasks": [],
@@ -1649,148 +1708,26 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                   "execute_windows_or_android_command",
                   "Processes user-defined commands on a personal Windows or Android system and returns detailed computer/mobile use agent execution context.")
 
-    # Coding Agent Aggregator: Route coding tasks to best CLI tool
-    # This is a LEAF tool — calls external subprocess (kilocode/claude/opencode),
-    # never re-dispatches to /chat. Safe from callback loops.
-    async def execute_coding_task(
-        task: Annotated[str, "The coding task to execute (e.g., 'review this function for bugs', 'implement a login form')"],
-        task_type: Annotated[str, "Task type: code_review, feature, bug_fix, refactor, app_build, debugging, multi_session"] = "feature",
-        preferred_tool: Annotated[str, "Optional tool override: kilocode, claude_code, opencode, aider_native, or claw_native (empty = auto-select best)"] = "",
-        working_dir: Annotated[str, "Working directory / repo path for the coding task (empty = use HEVOLVE_CODING_WORKDIR env or cwd)"] = "",
-    ) -> str:
-        """Execute a coding task using the best available coding agent tool (KiloCode, Claude Code, OpenCode, or AiderNative).
-
-        Routes to the best tool based on benchmarks and task type.
-        This is for writing, reviewing, refactoring, or debugging code —
-        NOT for GUI automation (use execute_windows_or_android_command for that).
-        """
-        try:
-            from integrations.coding_agent.orchestrator import get_coding_orchestrator
-            orchestrator = get_coding_orchestrator()
-            result = orchestrator.execute(
-                task=task,
-                task_type=task_type,
-                preferred_tool=preferred_tool,
-                user_id=user_id,
-                model=os.environ.get('HEVOLVE_CODING_MODEL', ''),
-                working_dir=working_dir or os.environ.get('HEVOLVE_CODING_WORKDIR', ''),
-            )
-            import json
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            return f"Coding task execution error: {e}"
-
-    register_dual(helper, assistant, execute_coding_task,
-                  "execute_coding_task",
-                  "Execute a coding task (write, review, refactor, debug code) using the best available coding agent tool. Routes to KiloCode, Claude Code, OpenCode, AiderNative, or ClawNative (Rust) based on benchmarks. Pass working_dir for the target repo path.")
-
-    # Repository map tool — tree-sitter based code understanding
-    try:
-        from integrations.coding_agent.recipe_bridge import CodingRecipeBridge
-
-        async def get_repository_map(
-            working_dir: Annotated[str, "Directory to map (default: current directory)"] = ".",
-            max_tokens: Annotated[int, "Maximum tokens for the map output"] = 2048,
-        ) -> str:
-            """Generate a tree-sitter based repository map showing key functions, classes, and their relationships.
-
-            Use this to understand a codebase's structure before making changes.
-            Returns a ranked summary of the most important code symbols.
-            """
-            return CodingRecipeBridge.get_repository_map(working_dir, max_tokens)
-
-        register_dual(helper, assistant, get_repository_map,
-                      "get_repository_map",
-                      "Generate a tree-sitter repository map showing key functions, classes, and structure. Use before coding tasks to understand the codebase.")
-        tool_logger.info("Registered get_repository_map tool")
-    except ImportError:
-        tool_logger.debug("Repository map tool not available (aider_core not installed)")
-
-    # Shard Engine: Call-chain context for coding tasks.
-    # Target function + upstream callers + downstream callees = FULL source.
-    # Everything else = interfaces only. Exposure proportional to task.
-    # Call graph from Trueflow MCP (IDE) or AST fallback (headless).
-    try:
-        async def create_code_shard(
-            task: Annotated[str, "Description of the coding task"],
-            target_file: Annotated[str, "Relative path to the file containing the target function"],
-            target_function: Annotated[str, "Name of the function to modify"],
-            repo_path: Annotated[str, "Path to the repository (default: HART OS install dir)"] = "",
-        ) -> str:
-            """Create a code shard with call-chain context for a coding task.
-
-            Returns:
-            - Target function: FULL source (what you're modifying)
-            - Upstream callers: FULL source (who calls it, input contracts)
-            - Downstream callees: FULL source (what it calls, output contracts)
-            - Everything else: Interfaces only (signatures + types)
-
-            Call graph sourced from Trueflow MCP (when IDE running) or AST fallback.
-            Security: exposure proportional to the task. E2E encrypted for peer offload.
-            Use execute_coding_task with working_dir to actually apply edits.
-            """
-            from integrations.agent_engine.shard_engine import ShardEngine
-            import json
-            engine = ShardEngine(code_root=repo_path) if repo_path else ShardEngine()
-            shard = engine.create_call_chain_shard(
-                task=task, target_file=target_file,
-                target_function=target_function)
-            return json.dumps({
-                'shard_id': shard.shard_id,
-                'task': shard.task_description,
-                'scope': shard.scope.value,
-                'target_files': shard.target_files,
-                'call_chain_source': shard.full_content,
-                'interfaces': [{'file': s.file_path, 'functions': s.functions,
-                               'classes': s.classes} for s in shard.interface_specs],
-            }, indent=2, default=str)
-
-        register_dual(helper, assistant, create_code_shard,
-                      "create_code_shard",
-                      "Create a code shard with call-chain context: target function + upstream callers + downstream callees (FULL source), everything else interfaces only.")
-        tool_logger.info("Registered shard engine tool (create_code_shard)")
-    except Exception:
-        tool_logger.debug("Shard engine tool not available")
-
-    # Benchmark Tracker: Query which coding tool performs best for each task type
-    try:
-        async def get_coding_benchmarks(
-            task_type: Annotated[str, "Task type to check (code_review, feature, bug_fix, refactor, app_build, debugging, multi_session, or 'all')"] = "all",
-        ) -> str:
-            """Get coding tool benchmarks — which tool (KiloCode, Claude Code, OpenCode, AiderNative) performs best.
-
-            Returns success rates, average times, and sample counts per tool per task type.
-            Includes both local benchmarks and hive-aggregated intelligence from peers.
-            """
-            from integrations.coding_agent.benchmark_tracker import get_benchmark_tracker
-            import json
-            tracker = get_benchmark_tracker()
-            result = {'local': {}, 'hive': {}}
-
-            if task_type == 'all':
-                delta = tracker.export_learning_delta()
-                result['local'] = delta.get('coding_benchmarks', {})
-            else:
-                best = tracker.get_best_tool(task_type)
-                if best:
-                    result['local'][task_type] = {
-                        'best_tool': best[0], 'success_rate': best[1],
-                        'avg_time_s': best[2],
-                    }
-                hive_best = tracker.get_hive_best_tool(task_type)
-                if hive_best:
-                    result['hive'][task_type] = {
-                        'best_tool': hive_best[0], 'success_rate': hive_best[1],
-                        'avg_time_s': hive_best[2],
-                    }
-            return json.dumps(result, indent=2, default=str)
-
-        register_dual(helper, assistant, get_coding_benchmarks,
-                      "get_coding_benchmarks",
-                      "Query coding tool benchmarks — which tool performs best per task type. Includes local and hive-aggregated data.")
-        tool_logger.info("Registered get_coding_benchmarks tool")
-    except Exception:
-        tool_logger.debug("Benchmark tracker tool not available")
+    # Coding-agent leg.  These four closures moved to
+    # core.agent_tools.build_core_tool_closures on 2026-09-10 so the REUSE
+    # leg can reach them too.  Defined only here, they were create-only: a
+    # saved action naming one could never execute on reuse, AND
+    # _reuse_fabricated_tools could not see the name as `referenced`, so the
+    # fabrication gate returned [] and the action advanced having run
+    # nothing (agent 88719487304 action 4, 2026-09-10, watermark 23 -> 23).
+    # See the factory's "Coding-agent leg" note and
+    # tests/unit/test_create_tools_reachable_from_reuse.py.
+    #
+    # CREATE's behaviour is unchanged: the same closures, names and
+    # descriptions, registered always-on — the recipe-AUTHORING model has to
+    # be able to call them while it builds.  They are absent from
+    # MAIN_LEG_CORE_TOOLS on purpose (reuse attaches them per-action), so
+    # this explicit pass is what keeps create's set identical to before.
+    for _coding_name, _coding_desc, _coding_func in core_tools:
+        if _coding_name in CREATE_LEG_EXTRA_TOOLS:
+            register_dual(helper, assistant, _coding_func,
+                          _coding_name, _coding_desc)
+            tool_logger.info(f"Registered {_coding_name} tool")
 
     # MCP Integration: Load and register user-provided MCP server tools
     try:
@@ -1826,6 +1763,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # gather LLM has no real tool to map "fetch a webpage" onto and invents
     # fake tool names (2026-05-12 IPL refusal forensic).
     goal_tags = []  # bound before the gated blocks; detected inside the try
+    # Same reason as goal_tags: the deferral keep-set below reads this, and if
+    # the try raises before the assignment an unbound name would take down
+    # agent construction over a tool-budget optimisation.
+    svc_tools = {}
     try:
         from integrations.service_tools import (
             service_tool_registry, Crawl4AITool, AceStepTool,
@@ -1835,6 +1776,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         AceStepTool.register()    # port 8001
         SeoAuditTool.register()   # native in-process (no port)
         GhPrTool.register()       # native in-process (no port)
+        from integrations.agent_engine.thought_experiment_tools import (
+            ExperimentVoteTool)
+        ExperimentVoteTool.register()  # native: the agent's own vote
         service_tool_registry.load_config()  # load any user-added tools from service_tools.json
 
         svc_tools = service_tool_registry.get_all_tool_functions()
@@ -1859,18 +1803,15 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # Never-say-unavailable: always-on discovery that attaches gated-out
         # or newly-needed tools mid-conversation (owner req 2026-08-31).
         _attached_names = set(svc_tools)
-
-        def request_tools(need: str) -> str:
-            from core.agent_tools import discover_and_attach
-            return discover_and_attach(need, helper, assistant,
-                                       service_tool_registry, _attached_names)
-        register_dual(helper, assistant, request_tools, 'request_tools',
-                      "Discover and attach additional tools by describing the "
-                      "capability you need, e.g. 'text to speech' or 'crawl a "
-                      "webpage'. Call this FIRST whenever your current tools "
-                      "lack a capability - never tell the user something is "
-                      "unavailable without trying this. If it finds no "
-                      "match, call it once more with different wording.")
+        # The ledger the per-turn attach reads (core.agent_tool_menu.
+        # attach_for_turn, from _attach_for_create_turn), on the agent the
+        # register_dual above executes service tools on, as REUSE does.
+        # CREATE used to attach only at build time, from the task.
+        from core.agent_tool_menu import arm_turn_attach
+        arm_turn_attach(assistant, _attached_names, goal_tags)
+        from core.agent_tools import register_request_tools
+        register_request_tools(helper, assistant, service_tool_registry,
+                               _attached_names)
 
         for tool_name, tool_func in svc_tools.items():
             tool_def = next((d for d in svc_defs if d['name'] == tool_name), None)
@@ -2036,6 +1977,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         tool_logger.warning(f"AP2 Agentic Commerce error (non-critical): {e}")
         # Continue without payment capabilities if AP2 fails
 
+    # Snapshot before the goal-gated block so the deferral below can tell a
+    # DELIBERATE Tier-2 attachment from an unconditional one.  Tier-2 families
+    # are chosen for THIS agent's goal, so they are kept; the unconditional
+    # families are not, so they are deferred.
+    _pre_tier2_tools = _helper_tool_names(helper)
+
     # Goal-aware Tier 2 tool loading (marketing, coding, etc.)
     try:
         # goal_tags comes from the single Tier-1 detection above — the
@@ -2068,6 +2015,21 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             from integrations.agent_engine.revenue_tools import register_revenue_tools
             register_revenue_tools(helper, assistant, user_id)
             tool_logger.info("Revenue tools loaded (Tier 2) based on prompt content")
+        if 'finance' in goal_tags:
+            # Finance tools: get_financial_health / track_revenue_split /
+            # assess_sustainability / manage_invite_participation.  EXACTLY
+            # the same defect the news branch below records ("defined, never
+            # wired"): register_finance_tools had zero production callers,
+            # its only caller being tests/e2e/test_e2e_pipelines.py:615.
+            # Measured live 2026-09-07 — a Finance agent's action reported
+            # 'error' on twelve consecutive nudges because the tool it names
+            # could never attach.  NOTE: this block's convention omits
+            # executor= (reuse_recipe.py:2540 passes it); that asymmetry is
+            # pre-existing across revenue/news here and is not widened by
+            # this change.
+            from integrations.agent_engine.finance_tools import register_finance_tools
+            register_finance_tools(helper, assistant, user_id)
+            tool_logger.info("Finance tools loaded (Tier 2) based on prompt content")
         if 'news' in goal_tags:
             # News tools: fetch_news_feeds / subscribe_news_feed /
             # mark_news_for_web etc.  Required by the seeded
@@ -2086,6 +2048,53 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # goal "completes" with zero side-effects).  Silent for ~6 weeks
         # before being caught.  Loud now so any future regression surfaces.
         tool_logger.warning(f"Goal-aware tool loading FAILED: {e}")
+
+    # ── Bound the HELPER's schema to what CREATE actually uses ─────────────
+    # register_dual puts the schema on the helper and execution on the
+    # assistant, so the helper accumulates EVERY family registered above while
+    # the assistant keeps only the bounded MAIN_LEG_CORE_TOOLS set.  Measured
+    # live 2026-09-12 on agent 87400889007 (Nunba, the default agent):
+    #
+    #   wire-trim: the TOOL SCHEMA alone is 7191 tokens against an n_ctx of
+    #              8192 (54 tool(s)) -- no amount of message trimming can fit
+    #   [TRIM] trim could not reach budget -- messages 1673 tok + schema 7191
+    #              tok = 8864 tok against n_ctx 8192
+    #
+    # 88% of the window is schema; the walk banked actions 1-4 then died at
+    # action 5 on a 400 exceed_context_size_error.  Every unfittable body was
+    # the Helper seat; all 43 fitting bodies were Assistant/Executor with 18.
+    #
+    # Safe because it is DEFERRAL, not exclusion: the callable stays on the
+    # assistant's _function_map and discover_and_attach consults that map
+    # (a160020fd), so request_tools re-arms anything the agent actually asks
+    # for.  KEEP = core + request_tools + the Tier-1-gated service tools +
+    # whatever the Tier-2 goal gate deliberately attached for THIS goal.
+    #
+    # Justified by use, not by taste: across 1,568 wire rows (21:31-00:47)
+    # autogen.create made 20 tool calls over 9 distinct tools and every one is
+    # in MAIN_LEG_CORE_TOOLS -- none of the other 36.  At CREATE the helper
+    # AUTHORS a recipe; it does not execute.  REUSE is untouched: the same
+    # window shows it calling 17 distinct non-core tools, so its set is load-
+    # bearing and this narrowing deliberately does not touch that leg.
+    #
+    # The prompts ADVERTISE execute_windows_or_android_command; deferring it
+    # left a webmail agent unable to touch the screen (2026-09-25), so the
+    # keep rule lives in core.agent_tools beside the advertised list.
+    try:
+        from core.agent_tools import create_helper_keep
+        _keep = create_helper_keep(_helper_tool_names(helper),
+                                   _pre_tier2_tools, svc_tools)
+        _dropped = defer_helper_schema(
+            helper, _helper_tool_names(helper) - _keep)
+        if _dropped:
+            tool_logger.info(
+                "CREATE helper schema bounded: deferred %d tool(s) -- "
+                "still executable on the assistant and re-attachable via "
+                "request_tools: %s",
+                len(_dropped), ', '.join(sorted(_dropped)))
+    except Exception as e:
+        # Never let a token optimisation be the reason an agent fails to build.
+        tool_logger.warning(f"CREATE helper schema bounding skipped: {e}")
 
     assistant.description = 'this is an assistant agent that coordinates & executes requested tasks & actions'
     executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'
@@ -2197,41 +2206,38 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 except Exception as _inject_err:
                     current_app.logger.warning(
                         f"[LOOP-BREAK] fallback inject failed: {_inject_err}")
-                # Mark action TERMINATED so recipe pipeline doesn't re-enter
-                try:
-                    force_state_through_valid_path(
-                        user_prompt, current_action_id,
-                        ActionState.TERMINATED,
-                        "Loop-break: state_transition stuck-loop guard fired (#485)",
-                    )
-                except Exception as _stb_err:
-                    current_app.logger.warning(
-                        f"[LOOP-BREAK] state-set failed: {_stb_err}")
-                # Circuit-breaker (achieve-flywheel): count hard loop-breaks for
-                # this goal across re-dispatches; once it exceeds the threshold the
-                # goal is unfixable by retry, so PAUSE it — the daemon then stops
-                # re-dispatching it (capping the 686-style thrash) and the model is
-                # freed for productive goals.  Only autonomous goals (UUID
-                # prompt_id, len>=30); human chat (int prompt_id) is never paused.
-                try:
-                    _gbc = _GOAL_LOOP_BREAK_COUNT.get(user_prompt, 0) + 1
-                    _GOAL_LOOP_BREAK_COUNT[user_prompt] = _gbc
-                    if _gbc >= _GOAL_PARK_AFTER_BREAKS and len(str(prompt_id)) >= 30:
-                        from integrations.agent_engine.goal_manager import (
-                            GoalManager)
-                        from integrations.social.models import db_session
-                        with db_session(commit=True) as _cb_db:
-                            GoalManager.update_goal_status(
-                                _cb_db, str(prompt_id), 'paused')
-                        _GOAL_LOOP_BREAK_COUNT.pop(user_prompt, None)
+                # Close the action only if it was verified, the same rule as the
+                # flow-complete close.  Loop-break used to force TERMINATED on
+                # whatever action was current, so an action that never finished
+                # was recorded as done, and on an autonomous run AUTO-ADVANCE
+                # then had the verifier write a recipe for it (#104, Guardian
+                # Convergence action 9).  An unverified action stays open and is
+                # flagged; the outer loop's user-input gate then asks for help
+                # once, through _ask_for_help (#106), which parks an autonomous
+                # goal with the ask.  That retires the goal circuit breaker that
+                # stood here: it paused only prompt ids of 30 characters or
+                # more, and daemon turns carry a short numeric prompt id, so it
+                # never fired for them.
+                _lb_state = get_action_state(user_prompt, current_action_id)
+                if _lb_state in (ActionState.COMPLETED, ActionState.RECIPE_RECEIVED):
+                    try:
+                        force_state_through_valid_path(
+                            user_prompt, current_action_id,
+                            ActionState.TERMINATED,
+                            "Loop-break on a verified action (#485)",
+                        )
+                    except Exception as _stb_err:
                         current_app.logger.warning(
-                            f"[GOAL-CIRCUIT-BREAKER] goal {prompt_id} hard "
-                            f"loop-broke {_gbc}x — paused; daemon stops "
-                            f"re-dispatching it so the model is freed for "
-                            f"productive flywheel goals.")
-                except Exception as _cb_err:
+                            f"[LOOP-BREAK] state-set failed: {_stb_err}")
+                else:
+                    user_tasks[user_prompt]._needs_user_input_action_id = current_action_id
+                    user_tasks[user_prompt]._needs_user_input_kind = 'recoverable_stall'
+                    user_tasks[user_prompt]._needs_help_reason = (
+                        'the conversation looped without finishing it')
                     current_app.logger.warning(
-                        f"[GOAL-CIRCUIT-BREAKER] park failed: {_cb_err}")
+                        f"[LOOP-BREAK] action {current_action_id} is "
+                        f"{_lb_state.value}, not verified: left open and "
+                        f"flagged for help")
                 # Reset loop-state for this user — next turn starts fresh
                 _STATE_TRANSITION_LOOP_STATE.pop(user_prompt, None)
                 _STATE_TRANSITION_NUDGED.pop(user_prompt, None)
@@ -2300,8 +2306,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # ``is_termination_msg`` callback would if GroupChatManager
         # ran it between rounds.
         try:
-            _last_content = (groupchat.messages[-1].get('content') or '') if groupchat.messages else ''
-            if _last_content and 'TERMINATE' in _last_content.upper():
+            # Decide with the canonical predicate, hartos.helper._is_terminate_msg --
+            # the one every agent's is_termination_msg in this file already uses.
+            # It matches the TERMINATE token case-sensitively.  Case-folding the
+            # content read the English word inside a recipe as the control token:
+            # live 2026-09-13, agent 87400889007 action 8 return_to_idle, whose
+            # recipe says "...terminate idle timer...", had 31 valid recipe
+            # replies discarded here before the save branch -- 31 re-requests.
+            if groupchat.messages and _is_terminate_msg(groupchat.messages[-1]):
                 current_app.logger.info(
                     "[EARLY-TERMINATE] last message contains TERMINATE "
                     "(speaker=%r) — ending GroupChat round so the "
@@ -2472,49 +2484,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                         if json_obj['status'].lower() == 'error' and 'message' in json_obj:
                             safe_set_state(user_prompt, current_action_id, ActionState.ERROR, "verifier error")
                             return author
-                        elif json_obj['status'].lower() == 'completed' or json_obj['status'].lower() == 'success':
-                            json_action_id = int(float(json_obj.get('action_id', user_tasks[user_prompt].current_action)))
-
-
-                            # Normal Set ActionState To Complete
-                            if json_obj['status'].lower() == 'completed' and 'action_id' in json_obj.keys():
-                                if user_tasks[user_prompt].fallback == False and user_tasks[user_prompt].recipe == False:
-                                    current_app.logger.info('UPDATED TIMER for this action')
-                                    end = time.time()
-                                    task_time[prompt_id]['times'].append(end-task_time[prompt_id]['timer'])
-                                user_tasks[user_prompt].actions[json_action_id-1] = json_obj.get('action', user_tasks[user_prompt].actions[json_action_id-1])
-                                user_tasks[user_prompt].new_json.append(json_obj)
-                                current_app.logger.info(f'CHECKING FOR FALLBACK user_tasks[user_prompt].current_action={user_tasks[user_prompt].current_action} json_obj["action_id"]={json_obj["action_id"]}')
-
-                                # After completion, only request fallback from user if LLM didn't provide one
-                                # This enables autonomous operation - LLM generates fallback strategies automatically
-                                fallback_action = json_obj.get('fallback_action', '').strip()
-                                if not fallback_action or len(fallback_action) == 0:
-                                    current_app.logger.warning(f'Action {json_action_id} completed but no fallback_action provided by StatusVerifier - this should not happen with updated instructions')
-                                    # Request fallback from user only if LLM failed to generate one
-                                    user_tasks[user_prompt].fallback = True
-                                else:
-                                    current_app.logger.info(f'Action {json_action_id} completed with auto-generated fallback: {fallback_action[:100]}...')
-                                    # Fallback was provided by LLM, proceed to recipe phase
-                                    user_tasks[user_prompt].fallback = False
-                                    user_tasks[user_prompt].recipe = True
-
-                                force_state_through_valid_path(user_prompt, json_action_id, ActionState.COMPLETED,"verified complete")
-
-
+                        elif json_obj['status'].lower() in ('completed', 'success'):
+                            # The main-loop lifecycle hook below is the only
+                            # completion owner.  It validates the cited receipt,
+                            # persists it, and advances the ledger; doing that
+                            # here used the verifier JSON itself as proof.
                             return chat_instructor
-                        elif json_obj['status'].lower() == 'updated':
-                            if 'entire_actions' in json_obj.keys() and type(json_obj['entire_actions'])==list:
-                                update_entire_actions(json_obj, user_prompt)
-
-                            elif 'action_id' in json_obj.keys():
-                                user_tasks[user_prompt].actions[int(json_obj['action_id'])-1] = json_obj['updated_action']
-                                user_tasks[user_prompt].new_json.append(json_obj)
-                                safe_set_state(user_prompt, int(json_obj['action_id']), ActionState.COMPLETED)
-                                user_tasks[user_prompt].fallback = True
-
                         elif json_obj['status'].lower() == 'pending':
-                            safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "verifier pending")
                             # USER-INPUT GATE (code-level enforcement of the
                             # prompt-level rule above):  if the verifier
                             # explicitly returned `can_perform_without_user_input:
@@ -2530,20 +2506,42 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             # 2026-05-08 langchain.log (Action 3 / Confirm
                             # sitemap looped 8 iterations before
                             # hallucinating user confirmation).
+                            _needs_user_input = False
                             try:
                                 _gate_value = (json_obj.get('can_perform_without_user_input') or '').strip().lower()
-                                if _gate_value.startswith('no'):
+                                # `safe_set_state(..., PENDING)` above is REFUSED on a
+                                # terminal action, so the verdict can arrive for an
+                                # action that is already over.  Flagging that one asks
+                                # the user a question no answer can resolve — see
+                                # _should_block_on_user_input for the 20-minute live
+                                # stall this closes.
+                                if _should_block_on_user_input(user_prompt, current_action_id, _gate_value):
+                                    _needs_user_input = True
                                     user_tasks[user_prompt]._needs_user_input_action_id = current_action_id
+                                    user_tasks[user_prompt]._needs_user_input_kind = 'human_required'
                                     current_app.logger.info(
                                         f"[USER-INPUT-GATE] Action {current_action_id} flagged "
                                         f"as blocked on user input "
                                         f"(can_perform_without_user_input={_gate_value!r}); "
                                         f"OUTER loop will break and return control to user."
                                     )
+                                elif autonomy_needs_user(_gate_value):
+                                    current_app.logger.info(
+                                        f"[USER-INPUT-GATE] NOT flagging action {current_action_id}: "
+                                        f"verdict said {_gate_value!r} but the action is already "
+                                        f"{get_action_state(user_prompt, current_action_id).value} — "
+                                        f"a finished action cannot be waiting for the user."
+                                    )
                             except Exception as _gate_err:
                                 current_app.logger.debug(
                                     f"[USER-INPUT-GATE] flag set failed (non-blocking): {_gate_err}"
                                 )
+                            if _needs_user_input:
+                                mark_action_waiting_for_user(
+                                    user_prompt, current_action_id,
+                                    json_obj.get('message') or 'Waiting for user input')
+                            else:
+                                safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "verifier pending")
                             return assistant
                         elif json_obj['status'].lower() == 'requires_breakdown':
                             # Handle subtask breakdown request from StatusVerifier
@@ -2569,6 +2567,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             # Normal Set ActionState To Terminate After getting Recipe json for each action
                             if 'recipe' in json_obj.keys() and json_obj['status'].lower() == 'done' and json_action_id > len(user_tasks[user_prompt].actions): # Done state when recipe is created
                                 create_individual_flow_recipe_and_terminate_flow(json_action_id, json_obj, user_prompt)
+                            elif 'action_id' in json_obj:
+                                # An action's own recipe belongs to the posted action,
+                                # whatever id the model wrote: the saves below name the
+                                # file, move current_action and terminate by this id.
+                                json_obj['action_id'] = settled_action_id(json_obj['action_id'], current_action_id)
 
                             recipe_result = lifecycle_hook_track_recipe_completion(user_prompt, json_obj,
                                                                                    user_tasks)  # 10. Track recipe completion
@@ -2606,6 +2609,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 # Same guard as :2599 below.
                                 if prompt_id in task_time and task_time[prompt_id].get('times'):
                                     json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
+                                # Validate BEFORE the role assignment below: a non-empty
+                                # tool_name sends the step to 'Helper', the tool executor, so a
+                                # phantom name has to be gone by then.  Both save blocks, because
+                                # either can bank a recipe (normal path and the late-save twin).
+                                _drop_unregistered_tool_names(json_obj.get('recipe'),
+                                                              [assistant, helper])
                                 for i in json_obj['recipe']:
                                     if 'tool_name' in i and i['tool_name'] != "":
                                         i['agent_to_perform_this_action'] = 'Helper'
@@ -2654,6 +2663,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                         json_obj['metadata'] = metadata
                                         if prompt_id in task_time and task_time[prompt_id].get('times'):
                                             json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
+                                        # Validate BEFORE the role assignment below: a non-empty
+                                        # tool_name sends the step to 'Helper', the tool executor, so a
+                                        # phantom name has to be gone by then.  Both save blocks, because
+                                        # either can bank a recipe (normal path and the late-save twin).
+                                        _drop_unregistered_tool_names(json_obj.get('recipe'),
+                                                                      [assistant, helper])
                                         for i in json_obj['recipe']:
                                             if 'tool_name' in i and i['tool_name'] != "":
                                                 i['agent_to_perform_this_action'] = 'Helper'
@@ -2794,38 +2809,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # existing call site inside create_agents continues to work.
         publish_agent_thought(last_speaker, messages, user_id)
 
-    def update_entire_actions(json_obj, user_prompt):
-        current_app.logger.info('GOT UPDATED WITH entire actions')
-        try:
-
-            current_app.logger.info(
-                f"user_tasks[user_prompt].actions:{len(user_tasks[user_prompt].actions)}, len(json_obj['entire_actions']:{len(json_obj['entire_actions'])}")
-            current_app.logger.info(
-                f"user_tasks[user_prompt].actions:{user_tasks[user_prompt].actions}, len(json_obj['entire_actions']:{json_obj['entire_actions']}")
-
-            current_app.logger.info('')
-            entire_actions = json_obj['entire_actions']
-            user_tasks[user_prompt].actions = entire_actions
-            user_tasks[user_prompt].current_action = 1
-            user_tasks[user_prompt].fallback = False
-            user_tasks[user_prompt].recipe = False
-            config, total_actions = get_total_actions_for_current_flow_and_reset_actions(prompt_id, user_prompt)
-            reset_to_assigned_for_all_actions(total_actions, user_prompt)
-
-        except Exception as e:
-            current_app.logger.info(f'error is here:{e}')
-
-            user_tasks[user_prompt].actions[int(json_obj['action_id']) - 1] = json_obj['updated_action']
-            user_tasks[user_prompt].new_json.append(json_obj)
-            safe_set_state(user_prompt, int(json_obj['action_id']), ActionState.ERROR, "Exception ")
-
-            user_tasks[user_prompt].fallback = True
-
-    def reset_to_assigned_for_all_actions(total_actions, user_prompt):
-        for action_id in range(1, total_actions + 1):
-            safe_set_state(user_prompt, action_id, ActionState.ASSIGNED,
-                           "entire_actions got updated and hence starting again")
-
     def create_individual_flow_recipe_and_terminate_flow(current_action_id, json_obj, user_prompt):
         current_app.logger.info('Recipe created successfully, Saving Pending')
         _push_thinking(user_id, f'Recipe saved for action {user_tasks[user_prompt].current_action}. Learning complete.')
@@ -2869,15 +2852,15 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     all_agents.extend(custom_agents)
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
 
     # Try to use select_speaker_transform_messages if supported (added in AutoGen 0.2.36+)
     # Seed autogen with recent messages from shared LangChain/autogen buffer
-    _seed_msgs = _seed_messages(user_id)
+    _seed_msgs = _seed_messages(user_id, prompt_id)
 
     group_chat_kwargs = {
         'agents': all_agents,
@@ -2928,6 +2911,21 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         else:
             raise
 
+    # The group's per-message write-back, installed BEFORE the manager.
+    # GroupChatManager keeps copy.copy(group_chat) (autogen register_reply) and
+    # run_chat appends to that copy, so a list rebound onto group_chat after the
+    # manager exists receives no message. That was the case here: the create
+    # loop read a frozen list, missed every "completed" status the
+    # StatusVerifier posted, and kept its action at 1 (#99, central 2026-09-13;
+    # the reuse factories had the same order, fixed in f12fe04f7).
+    try:
+        _install_create_group_writeback(
+            group_chat, user_id, prompt_id, user_prompt,
+            simplemem_store=simplemem_store, memory_graph=memory_graph)
+    except Exception:
+        current_app.logger.warning(
+            "create-group write-back not installed", exc_info=True)
+
     manager = autogen.GroupChatManager(
         groupchat=group_chat,
         llm_config=get_llm_config()
@@ -2947,98 +2945,54 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     except Exception:
         current_app.logger.debug("groupchat registry hook skipped", exc_info=True)
 
-    # Auto-ingest group_chat messages into SimpleMem + shared LangChain buffer
-    _original_append = group_chat.messages.append
-    def _unified_ingest_hook(msg):
-        # Strip non-ASCII (emoji etc) from content — prevents cp1252 crashes on Windows
-        # and JSON parse errors in llama.cpp tool call parsing
-        if isinstance(msg, dict) and isinstance(msg.get('content'), str):
-            msg['content'] = msg['content'].encode('ascii', 'replace').decode('ascii')
-        _original_append(msg)
-        if isinstance(msg, dict) and msg.get('_from_shared'):
-            return  # seeded message, already in buffer
-        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-        if not content or len(content.strip()) <= 5 or _is_terminate(content):
-            return
-        speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-        # SimpleMem ingest
-        if simplemem_store is not None:
-            try:
-                loop = get_or_create_event_loop()
-                loop.run_until_complete(simplemem_store.add(content, {
-                    "sender_name": speaker,
-                    "user_id": user_id,
-                    "prompt_id": prompt_id,
-                }))
-            except Exception:
-                pass
-        # Shared PersistentChatHistory write-back (dedup-aware)
-        try:
-            from integrations.channels.memory.shared_history import _get_persistent_history
-            hist = _get_persistent_history(user_id)
-            if hist:
-                from langchain_core.messages import HumanMessage, AIMessage
-                role = msg.get("role", "assistant") if isinstance(msg, dict) else "assistant"
-                lc_msg = HumanMessage(content=content) if role == "user" else AIMessage(content=content)
-                last_msgs = hist.messages[-3:] if hist.messages else []
-                if not any(m.content == content for m in last_msgs):
-                    from datetime import datetime
-                    hist.add_message(lc_msg, metadata={
-                        'timestamp': datetime.now().isoformat(),
-                        'source': 'autogen',
-                    })
-        except Exception:
-            pass
-    # Hook into message flow using a wrapper list instead of overriding append
-    # (plain list.append is read-only in Python — can't be replaced on instances)
-    class _HookedList(list):
-        def append(self, msg):
-            super().append(msg)
-            try:
-                _unified_ingest_hook(msg)
-            except Exception:
-                pass
+    return author, assistant, executor, group_chat, manager, chat_instructor, agents_object
 
-    _hooked = _HookedList(group_chat.messages)
-    group_chat.messages = _hooked
 
-    # Auto-ingest group_chat messages into MemoryGraph (provenance tracking)
+def _install_create_group_writeback(group_chat, user_id, prompt_id, user_prompt,
+                                    simplemem_store=None, memory_graph=None):
+    """Wire the create group's per-message write-back through the canonical
+    installer: shared history and SimpleMem, stamped with prompt_id, plus
+    MemoryGraph provenance and the resonance stream as extra sinks.
+
+    Call it before the GroupChatManager is built (see create_agents). It never
+    rewrites a message: run_chat broadcasts the same dict it appends, so an
+    edit here would reach every seat's prompt. The hand-rolled hook this
+    replaces stripped non-ASCII text in place, which would have fed the model
+    '?' for a Tamil or Hindi user's words once the hook ran. It only ever sat
+    behind the late rebind, so the model has always read the unstripped text.
+    """
+    from integrations.channels.memory.shared_history import (
+        graph_conversation_sink, install_history_writeback)
+    sinks = []
     if memory_graph is not None:
-        _prev_append = group_chat.messages.append
-        def _graph_ingest_hook(msg):
-            _prev_append(msg)
-            try:
-                content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-                speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-                if content and len(content.strip()) > 5:
-                    memory_graph.register_conversation(speaker, content, user_prompt)
-            except Exception:
-                pass  # Non-blocking
-        group_chat.messages.append = _graph_ingest_hook
+        sinks.append(graph_conversation_sink(memory_graph, user_prompt))
 
     # Resonance stream: continuous in-conversation tuning via HevolveAI
     try:
         from core.resonance_tuner import get_resonance_tuner
         _res_tuner = get_resonance_tuner()
-        _res_prev_append = group_chat.messages.append
-        def _resonance_stream_hook(msg):
-            _res_prev_append(msg)
-            try:
-                content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-                speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-                is_user = speaker.lower() in ('user', 'user_proxy', 'author')
-                _res_tuner.stream.on_message(
-                    str(user_id), speaker, content, is_user_message=is_user)
-            except Exception:
-                pass
-        group_chat.messages.append = _resonance_stream_hook
+
+        def _resonance_sink(msg):
+            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+            speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
+            is_user = speaker.lower() in ('user', 'user_proxy', 'author')
+            _res_tuner.stream.on_message(
+                str(user_id), speaker, content, is_user_message=is_user)
+        sinks.append(_resonance_sink)
     except ImportError:
         pass
 
-    return author, assistant, executor, group_chat, manager, chat_instructor, agents_object
+    return install_history_writeback(
+        group_chat, user_id, simplemem_store, extra_sinks=sinks,
+        simplemem_metadata={'prompt_id': prompt_id}, prompt_id=prompt_id)
 
 
 def instantiate_executor_agent():
+    from core.agent_tools import main_leg_tool_menu, CREATE_ADVERTISED_TOOLS
+    # create_scheduled_jobs is NOT registered on this leg -- see the note on
+    # MAIN_LEG_CORE_TOOLS.  execute_windows_or_android_command is, via
+    # register_dual(helper, assistant, ...) at :1670.
+    _tool_menu = main_leg_tool_menu(CREATE_ADVERTISED_TOOLS)
     # Inject cultural wisdom — even code execution should embody care
     _executor_cultural = ""
     try:
@@ -3082,7 +3036,7 @@ def instantiate_executor_agent():
         Calling Other Agents:
             When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
         Things You cannot do but Helper Agent can:
-            1. Tools Helper Agent can use: Can use tools like send_message_in_seconds, send_message_to_user,send_presynthesized_video_to_user, execute_windows_or_android_command, text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory.
+            1. Tools Helper Agent can use: Can use tools like {_tool_menu}.
             2. Create Scheduled Jobs: For tasks involving timers or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 - If you want to save some data ask helper agent to use "save_data_in_memory" tool.
@@ -3098,26 +3052,64 @@ def instantiate_executor_agent():
 
 
 def instantiate_status_verifier_agent(user_prompt):
+    # This agent AUTHORS every recipe.  state_transition pins recipe-creation
+    # requests to it deterministically (is_recipe_creation_request -> return
+    # verify), and the authoring prompt orders it verbatim to "put the EXACT
+    # name of one of the tools provided to you in this request. Do not invent a
+    # name."  Nothing provided it one: the request is
+    # RECIPE_CREATE_PROMPT_PREFIX + a JSON template with no tool list, its
+    # system message named no tool, and every register_* call in create_agents
+    # targets the helper/assistant pair -- verify is passed to none, so it
+    # carries no tools[] schema either.  It was the ONE agent in the group that
+    # could not see a single tool name, while being the one asked to name them.
+    #
+    # Live 2026-09-11 that produced the only two answers available to a blind
+    # author, and nothing else:
+    #   invent -- agent 89088690384 banked tool_name 'MemoryStore' and
+    #     'MemoryRetriever' (a class, and a name that exists nowhere).  An
+    #     unregistered name is never demanded by the fabrication gate, so the
+    #     action advanced having executed nothing and the agent reported
+    #     "145.6 GB" free against a real 9.7 GB, with success=True.
+    #   omit   -- agent 89090102140 banked every tool_name as '' and authored
+    #     `df -h`, a Linux command, on Windows.
+    # main_leg_tool_menu's docstring records the corpus-wide cost of authoring
+    # without the list: 241 of 1,034 banked steps (23.3%) name a tool the
+    # runtime actually serves.
+    #
+    # Advertise the SAME canonical menu the Assistant (:3202) and Executor
+    # (:3063) legs already derive, with the same `extra` -- ONE source, so the
+    # advertised set cannot drift from the set this leg registers.  Names only:
+    # the verifier is still told not to perform actions, and registering tools
+    # on it would change what it does, not what it can name.
+    from core.agent_tools import main_leg_tool_menu, CREATE_ADVERTISED_TOOLS
+    _tool_menu = main_leg_tool_menu(CREATE_ADVERTISED_TOOLS)
     verify = autogen.AssistantAgent(
         name="StatusVerifier",
         llm_config=get_llm_config(),
         code_execution_config=False,
         system_message=""""You are a Status Verification Agent in a multi-agent system.
-        AUTONOMOUS MODE: Prefer "completed" over "updated" or "pending". If the Assistant made a reasonable attempt (even simulated), mark "completed". Only use "updated" when the action definition itself needs changing. Do NOT return "updated" or "pending" just because user preferences are unknown — use sensible defaults.
+        AUTONOMOUS MODE: Use sensible defaults for ordinary preferences, but never treat a plan, a claimed click, a simulated attempt, or a model statement as completion. Mark an action "completed" only when a matching tool receipt or a user-visible result is already present in this conversation. If it is not, return "pending" and state the missing evidence or user input.
         USER-INPUT GATE (HARD RULE): If a previous turn for THIS action returned `can_perform_without_user_input: "no"` (explicitly marked as requiring user input — e.g. "Confirm sitemap with user", "Choose payment method", "Approve plan"), you MUST NOT flip it to `"yes"` and you MUST NOT mark `"status": "completed"` until the user has actually replied. The autonomous-mode preference for "completed" does NOT override an explicit user-input requirement. For these actions, return `"status": "pending"` and keep `can_perform_without_user_input: "no"` until a fresh user message arrives in the conversation. Hallucinating a user confirmation ("user confirmed the structure", "sitemap approved") when the user hasn't actually replied is a contract violation — the user's reply must be visibly present in the message history.
         Role: Track, validate and verify the status of actions performed by other agents. Respond strictly in JSON:
         Response formats:
-            1. Action Completed: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"yes by default. Only no when absolutely impossible (e.g. payment auth, physical access) OR when the action verbatim asks the user to choose/confirm/approve","persona_name":"persona name","fallback_action": "Context-aware retry strategy. NEVER leave empty."}
+            1. Action Completed: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","evidence": {"message_index": 0,"kind": "tool_receipt|user_visible_result"},"can_perform_without_user_input":"yes by default. Only no when absolutely impossible (e.g. payment auth, physical access) OR when the action verbatim asks the user to choose/confirm/approve","persona_name":"persona name","fallback_action": "Context-aware retry strategy. NEVER leave empty."}
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "error details"}
-            3. Action Updated: {"status": "updated","action": "current action text","updated_action": "updated text","action_id": 1/2/3...,"message": "why updated","persona_name":"persona name","fallback_action": "fallback strategy"}
-            4. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending","can_perform_without_user_input":"yes/no — must match the prior turn's value if action verbatim asks for user input"}
-            5. Requires Breakdown: {"status": "requires_breakdown","action": "current action","action_id": 1/2/3...,"reason": "why","subtasks": [{"subtask_id": "1.1","description": "subtask desc","depends_on": [],"can_perform_autonomously": true}]}
+            3. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending","can_perform_without_user_input":"yes/no — must match the prior turn's value if action verbatim asks for user input"}
+            4. Requires Breakdown: {"status": "requires_breakdown","action": "current action","action_id": 1/2/3...,"reason": "why","subtasks": [{"subtask_id": "1.1","description": "subtask desc","depends_on": [],"can_perform_autonomously": true}]}
         Error Detection Rules:
             - HTTP 403/404/500/401, connection timeouts, permission denied = report "error" (not "pending")
             - Only "pending" for: first attempt, waiting for user, transient rate limits
             - Same failure 2+ times = always "error"
+        Completion evidence rule: for a completed verdict, evidence.message_index must identify an EARLIER conversation message. kind="tool_receipt" may point only to a non-empty role="tool" result. kind="user_visible_result" may point only to a non-empty Assistant result that was already presented as the requested output. Never cite your own verdict, a plan, or an assistant claim of an external side effect as evidence.
         Fallback: Always provide non-empty fallback_action with context-aware recovery strategies.
-        Do not perform actions yourself — only report status. Maintain exact JSON structure.""" + f"\nActions list: {user_tasks[user_prompt].actions}",
+        Do not perform actions yourself — only report status. Maintain exact JSON structure."""
+        + f"\nActions list: {user_tasks[user_prompt].actions}"
+        + f"\nTOOLS THAT EXIST: [{_tool_menu}]."
+          " When you author a recipe, every step's tool_name MUST be copied"
+          " EXACTLY from that list, or left as an empty string if no listed"
+          " tool fits. These are the only tool names this system can call."
+          " A name that is not on the list cannot be executed and the step"
+          " will silently do nothing, so never invent one.",
 
         is_termination_msg=_is_terminate_msg,
     )
@@ -3173,6 +3165,11 @@ def instantiate_helper_agent():
 
 
 def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, resonance_profile=None, autonomous=False):
+    from core.agent_tools import main_leg_tool_menu, CREATE_ADVERTISED_TOOLS
+    # create_scheduled_jobs is NOT registered on this leg -- see the note on
+    # MAIN_LEG_CORE_TOOLS.  execute_windows_or_android_command is, via
+    # register_dual(helper, assistant, ...) at :1670.
+    _tool_menu = main_leg_tool_menu(CREATE_ADVERTISED_TOOLS)
     # Build personality injection for the primary user-facing agent
     _personality_block = ""
     if personality:
@@ -3299,7 +3296,7 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
         •Code Execution: Executor Agent: Executes code as needed. Ensure the final response is printed in code using print() before sending to Executor. Only executor can execute the code and not user, hence never ask user the code or code/api execution response.
 
         •Tools Helper Agent can use:
-            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,execute_windows_or_android_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search, save_data_in_memory, search_long_term_memory and save_to_long_term_memory.
+            1. The tools are: """ + _tool_menu + """.
             2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 - If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
@@ -3348,8 +3345,31 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
 
 
 def create_time_agents(user_id, prompt_id,role,goal,actions):
+    from core.agent_tools import (
+        build_core_tool_closures, register_core_tools, registered_tool_menu,
+    )
     user_prompt = f'{user_id}_{prompt_id}'
     time_actions[user_prompt] = Action(actions)
+
+    # Built here rather than beside register_core_tools below because the
+    # three prompts under it must NAME what this leg registers, and this leg
+    # registers the list UNFILTERED.  Nothing between here and the old build
+    # site touches these ctx values.
+    _tool_ctx_time = {
+        'user_id': user_id, 'prompt_id': prompt_id,
+        'agent_data': agent_data, 'helper_fun': helper_fun,
+        'user_prompt': user_prompt, 'request_id_list': request_id_list,
+        'recent_file_id': recent_file_id, 'scheduler': scheduler,
+        'simplemem_store': user_simplemem.get(user_prompt) if user_simplemem else None,
+        'memory_graph': None,
+        'log_tool_execution': log_tool_execution,
+        'send_message_to_user1': send_message_to_user1,
+        'retrieve_json': retrieve_json,
+        'strip_json_values': strip_json_values,
+        'save_conversation_db': save_conversation_db,
+    }
+    core_tools_time = build_core_tool_closures(_tool_ctx_time)
+    _time_tool_menu = registered_tool_menu(core_tools_time)
 
     time_agent = autogen.AssistantAgent(
         name='time_agent',
@@ -3364,7 +3384,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             After completing the current action ask the StatusVerifier to verify the status of current action.
         """
         f"When you want to communicate with {role} connect main agent using 'connect_time_main' tool."
-        "Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory.]"
+        f"Tools Helper Agent can use [{_time_tool_menu}.]"
         "if you have any task which is not doable by these tool check recipe first else create python code to do so"
         "the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video."
         f'IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: `@user {{"message2user": "Your message here"}}`'
@@ -3388,7 +3408,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools you have [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory.]
+            4. Tools you have [{_time_tool_menu}.]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continuously you should not do it.
@@ -3411,7 +3431,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory.]
+            4. Tools Helper Agent can use [{_time_tool_menu}.]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continuously you should not do it.
@@ -3465,22 +3485,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         is_termination_msg=_is_terminate_msg,
     )
 
-    # --- Core tools for time_agent (reuse same definitions) ---
-    from core.agent_tools import build_core_tool_closures, register_core_tools
-    _tool_ctx_time = {
-        'user_id': user_id, 'prompt_id': prompt_id,
-        'agent_data': agent_data, 'helper_fun': helper_fun,
-        'user_prompt': user_prompt, 'request_id_list': request_id_list,
-        'recent_file_id': recent_file_id, 'scheduler': scheduler,
-        'simplemem_store': user_simplemem.get(user_prompt) if user_simplemem else None,
-        'memory_graph': None,
-        'log_tool_execution': log_tool_execution,
-        'send_message_to_user1': send_message_to_user1,
-        'retrieve_json': retrieve_json,
-        'strip_json_values': strip_json_values,
-        'save_conversation_db': save_conversation_db,
-    }
-    core_tools_time = build_core_tool_closures(_tool_ctx_time)
+    # --- Core tools for time_agent (list built above, next to the prompts
+    # that advertise it) ---
     register_core_tools(core_tools_time, helper1, time_agent)
 
     # Channel tools for time_agent too
@@ -3492,8 +3498,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     context_handling = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -3506,6 +3512,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     # block (line ~903).  Same unbounded-buffer risk applies in the
     # time-based-execution path; chat_instructor1 needs the same cap.
     context_handling.add_to_agent(chat_instructor1)
+    give_judge_view(verify1)  # see the verifier in create_agents above
 
     time_agent_object = {}
     time_agent_object['time_agent'] = time_agent
@@ -3556,7 +3563,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
                     return chat_instructor1
 
                 currentaction_id = last_json['action_id']
-                if final_recipe[prompt_id]['actions'][currentaction_id-1]['can_perform_without_user_input'] == 'yes':
+                if action_is_autonomous(final_recipe[prompt_id]['actions'][currentaction_id-1]['can_perform_without_user_input']):
                     return time_agent
         except Exception as e:
             current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
@@ -3603,14 +3610,14 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
     time_group_chat = autogen.GroupChat(
         agents=[time_agent, helper1, time_user,multi_role_agent1,executor1,chat_instructor1,verify1],
-        messages=_seed_messages(user_id),  # same seed builder as main group_chat
+        messages=_seed_messages(user_id, prompt_id),  # same seed builder as main group_chat
         max_round=10,
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition1,  # using an LLM to decide
@@ -3682,43 +3689,6 @@ def inject_ledger_awareness(message: str, user_prompt: str) -> str:
     except Exception as e:
         current_app.logger.warning(f"Failed to inject ledger awareness: {e}")
         return message
-
-
-def complete_action_and_route(user_prompt: str, action_id: int, outcome: str, result: any = None):
-    """
-    Complete an action in the ledger and determine next task.
-
-    Uses the smart routing to respect:
-    - Hierarchical relationships (parent/child)
-    - Prerequisites and dependencies
-    - Outcome-based conditional tasks
-    - Priority ordering
-
-    Args:
-        user_prompt: User prompt identifier
-        action_id: The action ID that completed
-        outcome: 'success' or 'failure'
-        result: Optional result data
-
-    Returns:
-        Next task to execute, or None
-    """
-    if user_prompt not in user_ledgers:
-        return None
-
-    ledger = user_ledgers[user_prompt]
-    task_id = f"action_{action_id}"
-
-    try:
-        next_task = ledger.complete_task_and_route(task_id, outcome, result)
-        if next_task:
-            current_app.logger.info(f"[Ledger Routing] Completed {task_id} -> Next: {next_task.task_id}: {next_task.description}")
-        else:
-            current_app.logger.info(f"[Ledger Routing] Completed {task_id} -> No next task available")
-        return next_task
-    except Exception as e:
-        current_app.logger.error(f"Error in complete_action_and_route: {e}")
-        return None
 
 
 def get_smart_next_task(user_prompt: str):
@@ -3856,12 +3826,16 @@ def should_continue_autonomously(user_prompt: str) -> bool:
     next_task = ledger.get_next_executable_task()
 
     if next_task:
-        # Check if task requires user input based on context
-        can_do_without_user = next_task.context.get('can_perform_without_user_input', True)
+        # Does the task need the user?  The ONE rule (core.constants.
+        # autonomy_needs_user): a leading 'no'.  A missing value does not
+        # block, as before.  This read `.get(..., True)` and a truthiness
+        # test, so the string 'no' continued (review of cc1393825).
+        needs_user = autonomy_needs_user(
+            next_task.context.get('can_perform_without_user_input'))
         blocked_reason = next_task.blocked_reason
 
         # Don't continue if task needs user input
-        if blocked_reason == 'input_required' or not can_do_without_user:
+        if blocked_reason == 'input_required' or needs_user:
             current_app.logger.info(f'[Autonomous] Next task requires user input: {next_task.description}')
             return False
 
@@ -3904,7 +3878,8 @@ def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int,
     autonomous, and user-requested).
 
     Args:
-        actions: List of action dictionaries
+        actions: The flow's actions as the prompt config holds them -- dicts
+            or bare strings (307 of 749 configs on 2026-09-13 use strings)
         user_id: User ID
         prompt_id: Prompt ID
         user_prompt: Combined user_prompt string (user_id_prompt_id)
@@ -3996,28 +3971,12 @@ def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int,
             user_delegation_bridges[user_prompt] = delegation_bridge
             current_app.logger.info(f"Created TaskDelegationBridge for existing ledger {user_prompt}")
 
-        # Add any new actions that aren't already in ledger
-        for action in actions:
-            task_id = f"action_{action.get('action_id', 'unknown')}"
-            if task_id not in ledger.tasks:
-                has_prereqs = bool(action.get('prerequisites', []))
-                execution_mode = ExecutionMode.SEQUENTIAL if has_prereqs else ExecutionMode.PARALLEL
-
-                task = Task(
-                    task_id=task_id,
-                    description=action.get('description', action.get('action', '')),
-                    task_type=TaskType.PRE_ASSIGNED,
-                    execution_mode=execution_mode,
-                    status=TaskStatus.PENDING,
-                    prerequisites=[f"action_{p}" for p in action.get('prerequisites', [])],
-                    context={
-                        "action_id": action.get('action_id'),
-                        "flow": action.get('flow'),
-                        "persona": action.get('persona')
-                    },
-                    priority=100 - action.get('action_id', 0)
-                )
-                ledger.add_task(task)
+        # Add the actions this ledger does not hold yet through the ledger's
+        # own conversion.  This branch used to rebuild the Tasks in a copy of
+        # create_ledger_from_actions' loop that had no string case; live
+        # 2026-09-13 (agent 87400889007) increment_current_flow reached it at
+        # the first flow boundary and died on 'str' object has no attribute 'get'.
+        add_actions_to_ledger(ledger, actions, flow_id=flow_id)
 
     # Attach ledger to Action instance
     action_instance.set_ledger(ledger)
@@ -4143,12 +4102,257 @@ def _is_terminate(content):
     return _strip_memory_skeleton(content).upper().startswith('TERMINATE')
 
 
+def _should_block_on_user_input(user_prompt, action_id, gate_value) -> bool:
+    """Should the StatusVerifier's `can_perform_without_user_input` block this action?
+
+    Only an action that still has work left can be waiting on the USER.  A
+    TERMINAL action is over — nothing the user types can change its outcome — so
+    flagging one blocks the build on a question that can never resolve.
+
+    MEASURED LIVE 2026-09-07, agent 88761328396: all five action files were on
+    disk by 11:40:05 (action 5 = 'Output the extracted line verbatim',
+    status='done', can_perform_without_user_input='yes'), and the state machine
+    agreed — 11:41:40 `Action 5: terminated`, plus repeated `[LOCKED] Action 5 in
+    terminated - skipping assignment hook`.  From 11:43:32 the gate nonetheless
+    flagged action 5 eight times and the loop returned the "Step 5 ... isn't
+    coming together" question at 11:46:15 and again at 11:59:52 — 20.4 minutes of
+    user-visible wall clock spent asking about a step finished 6 minutes before
+    the first ask.  The user answered; the build could not advance, because the
+    answer addressed an action that was already over.
+
+    WHY IT HAPPENED: the caller's `pending` branch runs
+    `safe_set_state(..., PENDING)` and then sets the sticky flag.  The state
+    change is correctly REFUSED on a terminal action — verified against the real
+    state machine, not inferred:
+
+        validate_state_transition(TERMINATED -> PENDING)   -> False
+        [ERROR] Invalid transition: Action 5 cannot go from terminated to pending
+        state after safe_set_state(PENDING)                -> terminated
+
+    but nothing checked whether it took, so the flag was set anyway.
+
+    DELIBERATELY NARROW.  Terminal is the only state with evidence, so terminal
+    is the only case this refuses.  The stronger-looking predicate — require the
+    state to read back as PENDING — would also stop blocking for ASSIGNED and
+    IN_PROGRESS (ASSIGNED->PENDING is refused by the same table), changing a
+    second behaviour on a hunch.  The gate's real job is untouched: a live action
+    whose verifier says 'no' still blocks, which is what stops the 2026-05-08
+    drift-to-'yes' that hallucinated a user confirmation.
+
+    Terminality is asked of `lifecycle_hooks.is_terminal_state` rather than
+    re-listed here — a fourth copy of that tuple is the drift this codebase keeps
+    paying for.
+    """
+    if not autonomy_needs_user(gate_value):
+        return False
+    try:
+        if is_terminal_state(get_action_state(user_prompt, action_id)):
+            return False
+    except Exception:
+        # Never raise into the create loop; an unreadable state degrades to the
+        # previous behaviour (block), which is the safe side of this gate.
+        return True
+    return True
+
+
 def _needs_input_reply(action_id, action_text):
     step = f' ("{action_text}")' if action_text else ''
     return (f"I need your input to finish building this agent. Step {action_id}"
             f"{step} isn't coming together from what I have so far — tell me "
             f"more about how this step should work, and I'll continue building "
             f"from there.")
+
+
+def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
+    """Hand an action the agent could not finish to someone who can (#106).
+
+    Owner, 2026-09-14: when an autonomous agent cannot do an action, ask a
+    human or an expert (the Claude co-pilot, which reaches goals through MCP
+    list_goals and steer_goal); never record a completion that did not happen.
+    This is the one place the create loop asks.  A live user is asked directly,
+    as before.  On an autonomous run nobody reads a question, so the action is
+    held as waiting (PENDING, which the ledger records as BLOCKED, with
+    blocked_reason input_required) and handed on through
+    GoalManager.escalate_goal: to this node's expert model first when it has
+    one (the daemon runs the goal's next turn on it, #106d), else to the owner
+    and the co-pilot, with the goal parked where they see it.
+    """
+    from integrations.agent_engine.dispatch import is_current_request_autonomous
+    if not is_current_request_autonomous():
+        return _needs_input_reply(action_id, action_text)
+    _ledger = user_ledgers.get(user_prompt)
+    _task = _ledger.tasks.get(f"action_{action_id}") if _ledger else None
+    if _task is not None:
+        _task.set_blocked_reason('input_required')
+    if get_action_state(user_prompt, action_id) == ActionState.ASSIGNED:
+        safe_set_state(user_prompt, action_id, ActionState.IN_PROGRESS,
+                       'asked for help before it started')
+    safe_set_state(user_prompt, action_id, ActionState.PENDING,
+                   f'asked for help: {reason}')
+    from core.chat_client import daemon_goal_id
+    from hartos.threadlocal import thread_local_data
+    goal_id = daemon_goal_id(thread_local_data.get_request_id())
+    stage = None
+    if goal_id:
+        try:
+            from integrations.agent_engine.goal_manager import GoalManager
+            from integrations.social.models import db_session
+            with db_session(commit=True) as _db:
+                _handed = GoalManager.escalate_goal(_db, goal_id, {
+                    'action_id': int(action_id),
+                    'action': str(action_text or '')[:500],
+                    'reason': reason,
+                    'tried': ['local'],
+                    # So the daemon can tell whether the expert's turn banked
+                    # this action (#106d).
+                    'user_prompt': user_prompt,
+                    'prompt_id': prompt_id,
+                    'flow': get_current_flow(user_prompt),
+                })
+                if _handed.get('success'):
+                    stage = _handed.get('stage') or 'human'
+        except Exception as _park_err:
+            current_app.logger.warning(
+                f'[ASK-FOR-HELP] could not hand on goal {goal_id}: {_park_err}')
+    current_app.logger.warning(
+        f'[ASK-FOR-HELP] action {action_id} of {user_prompt}: {reason}; '
+        f'goal {goal_id or "unknown"} handed to {stage or "nobody"}')
+    step = f' ("{action_text}")' if action_text else ''
+    # The prefixes live in core.constants: the hive worker recognises this
+    # reply by them (core.agent_tools.is_help_pause) and holds its task
+    # instead of recording the sentence as a result.
+    if stage == 'expert':
+        return (f"{HELP_EXPERT_REPLY_PREFIX} step {action_id}{step} could not "
+                f"be finished autonomously ({reason}). It takes this goal's "
+                f"next turn.")
+    return (f"{HELP_PAUSED_REPLY_PREFIX} step {action_id}{step} could not be "
+            f"finished autonomously ({reason}). It is waiting for the owner or "
+            f"the co-pilot.")
+
+
+def _is_serving_escalation_expert(user_prompt, action_id, request_id):
+    """Whether this daemon turn is the expert assigned to this exact block.
+
+    The goal row is the existing escalation authority used by the daemon to
+    select its model. Checking it here avoids a second flag and prevents an
+    ordinary background retry from clearing either consent or user-input
+    gates. Only recoverable stalls call this helper.
+    """
+    try:
+        from core.chat_client import daemon_goal_id
+        goal_id = daemon_goal_id(request_id)
+        if not goal_id:
+            return False
+        from integrations.social.models import AgentGoal, db_session
+        with db_session(commit=False) as db:
+            goal = db.query(AgentGoal).filter_by(id=goal_id).first()
+            escalation = (
+                (getattr(goal, 'config_json', None) or {}).get('escalation')
+                if goal is not None else None
+            ) or {}
+        return (
+            escalation.get('next') == 'expert'
+            and str(escalation.get('action_id')) == str(action_id)
+            and escalation.get('user_prompt') == user_prompt
+        )
+    except Exception:
+        logging.getLogger(__name__).debug(
+            '[USER-INPUT-GATE] Expert escalation lookup failed',
+            exc_info=True)
+        return False
+
+
+def _resume_prior_user_input_block(user_prompt, text, failure=False):
+    """Resume only a block that predates a genuine inbound user turn.
+
+    ``get_response_group`` can set ``_needs_user_input_action_id`` while its
+    own AutoGen round is running. Clearing the flag after that round treated
+    the request which created the block as the answer to it. Background daemon
+    retries were also able to clear it. Checking at function entry with the
+    canonical request classifier keeps both cases apart.
+    """
+    if failure:
+        return False
+    task = user_tasks.get(user_prompt)
+    action_id = getattr(task, '_needs_user_input_action_id', None)
+    if not isinstance(action_id, int):
+        return False
+    gate_kind = getattr(task, '_needs_user_input_kind', 'human_required')
+    try:
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+        request_id = request_id_list.get(user_prompt)
+        is_user = is_genuine_user_request(request_id)
+        is_expert = (
+            gate_kind == 'recoverable_stall'
+            and _is_serving_escalation_expert(
+                user_prompt, action_id, request_id)
+        )
+        if not is_user and not is_expert:
+            logging.getLogger(__name__).info(
+                '[USER-INPUT-GATE] Keeping action %s blocked: request %r is '
+                'neither a user reply nor its assigned expert turn',
+                action_id, request_id)
+            return False
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            '[USER-INPUT-GATE] Could not classify request; keeping action %s '
+            'blocked: %s', action_id, exc)
+        return False
+
+    if is_user:
+        resumed = resume_from_user_input(
+            user_prompt, action_id,
+            'User supplied input for the blocked action', text)
+    else:
+        resumed = resume_blocked_action(
+            user_prompt, action_id,
+            'Assigned expert is retrying the recoverable stalled action',
+            evidence={
+                'source': 'escalation_expert',
+                'action_id': action_id,
+                'request_id': str(request_id),
+                'timestamp': datetime.utcnow().isoformat(),
+            })
+    # Clear the CREATE-loop gate only after the canonical ledger accepted the
+    # resume.  If storage is unavailable the same attributed answer can be
+    # retried; clearing the marker here would strand the still-BLOCKED task.
+    if not resumed:
+        logging.getLogger(__name__).warning(
+            '[USER-INPUT-GATE] Keeping action %s blocked: durable resume from '
+            '%s failed', action_id,
+            'a genuine user reply' if is_user else 'its assigned expert turn')
+        return False
+    task._needs_user_input_action_id = None
+    task._needs_user_input_kind = None
+    task._needs_help_reason = None
+    logging.getLogger(__name__).info(
+        '[USER-INPUT-GATE] %s action %s from %s',
+        'Resumed', action_id,
+        'a genuine user reply' if is_user else 'its assigned expert turn')
+    return True
+
+
+def _attach_for_create_turn(agents_object, text, user_prompt):
+    """CREATE's Tier-1 per-turn attach, the one REUSE's turn uses
+    (core.agent_tool_menu.attach_for_turn, which also fits the grown schema
+    to the live n_ctx): a turn that drifts into a capability the build-time
+    task never named (an agent asked to vote on an experiment) gets it
+    before the model sees the turn.  On the pair create_agents registered
+    service tools on: the Helper proposes, the Assistant executes.  Never
+    raises; a failure is logged and the turn runs with the tools it has."""
+    try:
+        from core.agent_tool_menu import attach_for_turn
+        from integrations.service_tools import service_tool_registry
+        _new, _n = attach_for_turn(text, agents_object['helper'],
+                                   agents_object['assistant'],
+                                   service_tool_registry)
+        if _new:
+            current_app.logger.info(
+                f"Tier-1 turn attach: +{_new} -> {_n} tools")
+    except Exception as _e:
+        current_app.logger.warning(
+            f"turn attach skipped: {_e} for session: {user_prompt}",
+            exc_info=True)
 
 
 def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
@@ -4165,6 +4369,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     """
     user_prompt = f'{user_id}_{prompt_id}'
     current_app.logger.info(f"START: get_response_group for user_prompt={user_prompt}, Failure={Failure}")
+    # Run before initiate_chat. A marker created by the upcoming AutoGen round
+    # is a new request for input, not an answer to itself.
+    _resume_prior_user_input_block(user_prompt, text, failure=Failure)
     # Get or create agents for this user
     if user_prompt not in user_agents:
         current_app.logger.info(f"Creating new agents for user_prompt={user_prompt}")
@@ -4206,6 +4413,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             except Exception:
                 message = ""
                 text = f'Properly Execute Action {user_tasks[user_prompt].current_action}: {message} '
+    _attach_for_create_turn(agents_object, text, user_prompt)
+
     # Initiate or resume chat
     try:
         current_app.logger.info(f"Messages in user_prompt before init: {len(messages.get(user_prompt, []))}")
@@ -4296,26 +4505,6 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             current_app.logger.info(f"[MSG-RECOVERY] Recovered {len(_chat_history)} messages from chat_instructor")
         current_app.logger.info(f"group_chat.messages len={len(group_chat.messages)}")
 
-        # USER-INPUT GATE clear (companion to the gate set in
-        # state_transition's pending handler):  this function is called
-        # from /chat once per user message, so the arrival of THIS call
-        # IS the user's reply.  Clear any sticky `_needs_user_input_action_id`
-        # flag set by a prior call so the OUTER loop doesn't break out
-        # before processing the new user input.
-        try:
-            if hasattr(user_tasks[user_prompt], '_needs_user_input_action_id'):
-                _prior_block = user_tasks[user_prompt]._needs_user_input_action_id
-                user_tasks[user_prompt]._needs_user_input_action_id = None
-                current_app.logger.info(
-                    f"[USER-INPUT-GATE] Clearing prior block on action "
-                    f"{_prior_block} — fresh /chat call indicates user has "
-                    f"replied; OUTER loop will resume normal iteration."
-                )
-        except Exception as _gate_clear_err:
-            current_app.logger.debug(
-                f"[USER-INPUT-GATE] flag clear failed (non-blocking): {_gate_clear_err}"
-            )
-
         # Main processing loop
         while_loop_iterations = 0
         max_iterations = 300  # Time-based: ~5s per iteration = ~25 min max
@@ -4323,6 +4512,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         _pipeline_timeout = 1800  # 30 minutes — CREATE is the learning phase, needs time
         # Per-run replay ledger for _remedy_replay_exceeded (see its docstring).
         _remedy_attempts = {}
+        # The verdict message [LAST-ACTION] has already settled (see there).
+        _spent_verdict = None
 
         while while_loop_iterations < max_iterations:
             # Hard timeout: don't let pipeline run forever
@@ -4379,7 +4570,12 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     # escape deliberately does NOT — it never did.  The two sites
                     # differ on purpose; do not unify without measuring that.)
                     messages[user_prompt] = group_chat.messages
-                    return _needs_input_reply(current_action_id, _blocked_text)
+                    _help_reason = (
+                        getattr(user_tasks[user_prompt], '_needs_help_reason', None)
+                        or 'the verifier says it needs input from a person')
+                    user_tasks[user_prompt]._needs_help_reason = None
+                    return _ask_for_help(user_prompt, prompt_id, current_action_id,
+                                         _blocked_text, _help_reason)
             except Exception as _gate_err:
                 current_app.logger.debug(
                     f"[USER-INPUT-GATE] outer-loop gate check failed (non-blocking): {_gate_err}"
@@ -4470,7 +4666,36 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     f"breaking clean instead of draining max_iterations")
                 break
 
-            if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and _is_terminate(group_chat.messages[-1]['content']):
+            # A verdict left over from the previous action is not this one's
+            # (#101): after [ADVANCE] the old verdict and TERMINATE stay last,
+            # and crediting them to the new action completed it unrun.  The
+            # branches below post the current action instead.  Only for an
+            # action that has not started: a started action's own recipe or
+            # fallback round carries no dispatch marker and is still its own.
+            _stale_owner = None
+            if (len(group_chat.messages) >= 2
+                    and group_chat.messages[-1]['name'] == 'ChatInstructor'
+                    and _is_terminate(group_chat.messages[-1]['content'])):
+                _stale_owner = stale_for_unstarted_action(
+                    group_chat.messages, -2, user_prompt, current_action_id)
+            _stale_verdict = _stale_owner is not None
+            if _stale_verdict:
+                current_app.logger.info(
+                    f"[STALE-VERDICT] messages[-2] belongs to action "
+                    f"{_stale_owner}; not crediting it to action "
+                    f"{current_action_id}, which has not started")
+            elif (_spent_verdict is not None
+                    and len(group_chat.messages) >= 2
+                    and group_chat.messages[-2] is _spent_verdict):
+                # Already settled by [LAST-ACTION]; the branches below route
+                # the finished flow ([AUTO-ADVANCE] -> [FLOW-COMPLETE]).
+                _stale_verdict = True
+                current_app.logger.info(
+                    f"[SPENT-VERDICT] messages[-2] was already settled for "
+                    f"action {current_action_id}; completing the flow")
+            if (not _stale_verdict and group_chat.messages
+                    and group_chat.messages[-1]['name'] == 'ChatInstructor'
+                    and _is_terminate(group_chat.messages[-1]['content'])):
                 current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                 json_obj = retrieve_json(group_chat.messages[-2]["content"])
 
@@ -4478,16 +4703,94 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 hook_result = lifecycle_hook_process_verifier_response(user_prompt, json_obj,
                                                                        user_tasks)  # 4-6. Process verifier response
 
+                if hook_result['action'] == 'gave_up':
+                    # The gate refused this action's completion claims to its
+                    # bound and recorded GAVE_UP (an honest, retryable failure).
+                    # Move on the way [RECIPE-GIVEUP] does; posting nothing,
+                    # because the old verdict + TERMINATE still at the tail are
+                    # then stale for the next action and route it to
+                    # [EXECUTE-PENDING].  Re-reading them here instead would
+                    # spin: the COMPLETION-GATE below `continue`s without
+                    # posting for any action that is not COMPLETED.
+                    current_app.logger.warning(
+                        f"[GAVE-UP] action {current_action_id}: "
+                        f"{hook_result['message']}")
+                    if current_action_id < len(user_tasks[user_prompt].actions):
+                        user_tasks[user_prompt].current_action = current_action_id + 1
+                        user_tasks[user_prompt].recipe = False
+                        user_tasks[user_prompt].fallback = False
+                        continue
+                    break
                 if hook_result['action'] != 'allow':
                     if hook_result['action'] == 'force_fallback':
-                        # Automatically request fallback after completion
-                        safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.FALLBACK_REQUESTED, "hook_result force_fallback")
-                        # Set flags for fallback flow
-                        user_tasks[user_prompt].fallback = True
-                        user_tasks[user_prompt].recipe = False
+                        # The lifecycle hook is the sole owner of the verified
+                        # COMPLETED transition.  Preserve the completion-side
+                        # bookkeeping that used to live in state_transition:
+                        # timing, verdict history, and autonomous fallback
+                        # routing are not duplicate state authorities.
+                        _verified_action_id = settled_action_id(
+                            json_obj.get('action_id'), current_action_id)
+                        if (not user_tasks[user_prompt].fallback
+                                and not user_tasks[user_prompt].recipe
+                                and prompt_id in task_time):
+                            current_app.logger.info(
+                                'UPDATED TIMER for verified action %s',
+                                _verified_action_id)
+                            _timing = task_time[prompt_id]
+                            _timing.setdefault('times', []).append(
+                                time.time() - _timing.get('timer', time.time()))
+                        user_tasks[user_prompt].new_json.append(json_obj)
+
+                        _generated_fallback = str(
+                            json_obj.get('fallback_action') or '').strip()
+                        _flow_now = get_current_flow(user_prompt)
+                        if (_generated_fallback
+                                and _bank_action_recipe_from_trace(
+                                    user_prompt, prompt_id, _flow_now,
+                                    _verified_action_id, group_chat)):
+                            # The work that ran IS the recipe (#88, #106), as
+                            # in the claim handler below; asking the model to
+                            # describe it is a fallible round-trip.  Close the
+                            # verified action and post nothing: next lap the
+                            # claim handler finds it done with its file on
+                            # disk ([ALREADY DONE] / [LAST-ACTION]) and moves
+                            # on.  This path became live on 2026-09-27: before,
+                            # the TERMINATE after each verdict had already
+                            # closed the action (without a receipt) before
+                            # this hook ran.
+                            user_tasks[user_prompt].fallback = False
+                            user_tasks[user_prompt].recipe = False
+                            force_state_through_valid_path(
+                                user_prompt, _verified_action_id,
+                                ActionState.TERMINATED,
+                                'verified; recipe banked from its trace')
+                            continue
+                        if _generated_fallback:
+                            # The verifier already supplied the fallback, so
+                            # keep the autonomous path and request the recipe
+                            # directly.  The direct edge is part of the
+                            # canonical lifecycle transition table.
+                            user_tasks[user_prompt].fallback = False
+                            user_tasks[user_prompt].recipe = True
+                            safe_set_state(
+                                user_prompt, _verified_action_id,
+                                ActionState.RECIPE_REQUESTED,
+                                'verified completion supplied fallback')
+                            message = request_recipe_for_action(
+                                _verified_action_id, prompt_id, role,
+                                user_prompt)
+                        else:
+                            safe_set_state(
+                                user_prompt, _verified_action_id,
+                                ActionState.FALLBACK_REQUESTED,
+                                "hook_result force_fallback")
+                            user_tasks[user_prompt].fallback = True
+                            user_tasks[user_prompt].recipe = False
+                            message = hook_result['message']
+                    else:
+                        message = hook_result['message']
 
                     current_app.logger.error(f"lifecycle_hook_check_json_status {hook_result['message']}")
-                    message = hook_result['message']
                     result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False)
                     continue
 
@@ -4528,13 +4831,10 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         _rejection_reason = None
                         _claim_ledger = user_ledgers.get(user_prompt)
 
-                        # Check 1: Does the LLM-claimed action_id match what we assigned?
-                        if json_action_id != current_action_id:
-                            current_app.logger.warning(
-                                f"[HALLUCINATION?] LLM claims action_id={json_action_id} "
-                                f"but pipeline assigned action_id={current_action_id}")
-                            # Use the KNOWN action_id from scope — not the LLM's claim
-                            json_action_id = current_action_id
+                        # Check 1: the verdict settles the posted action, whatever
+                        # id the model wrote.  One rule, shared with
+                        # state_transition and reuse (settled_action_id).
+                        json_action_id = settled_action_id(json_action_id, current_action_id)
 
                         if _claim_ledger:
                             _claimed_task_id = f"action_{json_action_id}"
@@ -4611,6 +4911,20 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                             user_tasks[user_prompt].recipe = False
                                             current_app.logger.info(
                                                 f"[LAST-ACTION] action {json_action_id} is last in flow")
+                                            if (get_action_state(user_prompt, json_action_id)
+                                                    == ActionState.TERMINATED):
+                                                # Lifecycle over and recipe on disk: there is
+                                                # no fallback left to ask for.  Falling through
+                                                # hit the COMPLETION-GATE (COMPLETED only), which
+                                                # `continue`d without posting, so this verdict
+                                                # was re-read every lap to max_iterations and
+                                                # no flow recipe was saved (live 2026-09-25,
+                                                # prompts 91790350001 / 7700000611).  Mark it
+                                                # spent: next lap takes [AUTO-ADVANCE] ->
+                                                # [FLOW-COMPLETE], the canonical flow finish.
+                                                user_tasks[user_prompt].fallback = False
+                                                _spent_verdict = group_chat.messages[-2]
+                                                continue
                                     if json_action_id < len(user_tasks[user_prompt].actions) and os.path.exists(_recipe_file):
                                         continue
 
@@ -4652,16 +4966,17 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                 logger=current_app.logger)
                             continue
 
-                        # Only set COMPLETED if not already done by state_transition
+                        # A ledger claim is not a completion receipt.  This
+                        # branch runs after the lifecycle hook; if it did not
+                        # establish COMPLETED, re-drive the canonical verifier
+                        # instead of repairing state drift by fabricating it.
                         _current_state = get_action_state(user_prompt, json_action_id)
                         if _current_state != ActionState.COMPLETED:
-                            force_state_through_valid_path(user_prompt, json_action_id, ActionState.COMPLETED,
-                                                           "verified complete")
-                        # Auto-sync handles ledger update via force_state_through_valid_path above
-
-                        # Use smart ledger routing to complete and find next task
-                        result_data = json_obj.get('result', json_obj.get('output', None))
-                        next_ledger_task = complete_action_and_route(user_prompt, json_action_id, 'success', result_data)
+                            current_app.logger.warning(
+                                '[COMPLETION-GATE] action %s reached ledger routing '
+                                'without lifecycle evidence; leaving it open',
+                                json_action_id)
+                            continue
 
                         # Detect and add any dynamic tasks from the response
                         detect_and_add_dynamic_tasks(user_prompt, json_obj, json_action_id, text)
@@ -4756,12 +5071,16 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         # Save the flow recipe (topologically sorted + scheduler)
                         _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat)
 
-                        if get_current_flow(user_prompt)  < get_total_flows(user_prompt):
+                        if _has_more_flows(user_prompt):
                             _next_flow = get_current_flow(user_prompt) + 1
                             _total_flows = get_total_flows(user_prompt)
                             _push_thinking(user_id, f'Flow {_next_flow} of {_total_flows}: Starting next persona...')
                             current_app.logger.info(f'Completed ONE FLOW NOW WE SHOULD WORK ON NEXT FLOW')
                             current_app.logger.info(f'DELETE CURRENT AGENTS AND CREATE NEW')
+                            # Move the index BEFORE re-reading, exactly as the
+                            # exception path below already does.  Without this
+                            # the next line re-reads the flow we just finished.
+                            safe_increment_flow(user_prompt, prompt_id)
                             config = get_prompt_config_json(prompt_id)
                             flow_actions = config['flows'][get_current_flow(user_prompt)]['actions']
                             # Fresh ledger for new flow
@@ -4880,7 +5199,34 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     # Check if recipe file exists before advancing
                     _flow = get_current_flow(user_prompt)
                     _recipe_path = helper_fun.safe_prompt_path(prompt_id, _flow, _ca)
+                    if (not os.path.exists(_recipe_path)
+                            and _ca_state != ActionState.GAVE_UP
+                            and _bank_action_recipe_from_trace(
+                                user_prompt, prompt_id, _flow, _ca, group_chat)):
+                        # The tool calls that ran are the recipe (#88), as in the
+                        # claim handler; asking the verifier to write one is a
+                        # description of the work, not the work (#106).
+                        continue
                     if not os.path.exists(_recipe_path):
+                        # Same bound as the 'recipe' site above (#485).  Asking
+                        # again is the only remedy on this branch, and a reply that
+                        # never parses leaves the file missing, so without a cap
+                        # it re-sent the request every lap: live 2026-09-13,
+                        # agent 87400889007 action 8, 31 re-requests in 2m48s,
+                        # stopped only when the HTTP turn ended.  Keyed per flow
+                        # so flow 1's action 8 cannot inherit flow 0's budget.
+                        if _remedy_replay_exceeded(
+                                _remedy_attempts, ('recipe', prompt_id, _flow, _ca)):
+                            current_app.logger.warning(
+                                f'[RECIPE-GIVEUP] action {_ca}: still unbanked after '
+                                f'{_REMEDY_MAX_ATTEMPTS} AUTO-ADVANCE requests — '
+                                f'stopping instead of replaying')
+                            if _ca < len(user_tasks[user_prompt].actions):
+                                user_tasks[user_prompt].current_action = _ca + 1
+                                user_tasks[user_prompt].recipe = False
+                                user_tasks[user_prompt].fallback = False
+                                continue
+                            break
                         # #89: count consecutive re-requests for THIS action with
                         # no recipe landing — each one means the model's prior
                         # recipe response failed to parse.  Pass the PRIOR-failure
@@ -4976,8 +5322,12 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             # Save the flow recipe (same function as first path)
                             _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat)
 
-                            if get_current_flow(user_prompt) < get_total_flows(user_prompt):
+                            if _has_more_flows(user_prompt):
                                 current_app.logger.info(f'[NEXT-FLOW] Completed flow {get_current_flow(user_prompt)}, starting next')
+                                # Move the index BEFORE re-reading (see the
+                                # exception path); otherwise this re-authors
+                                # the flow that just completed.
+                                safe_increment_flow(user_prompt, prompt_id)
                                 config = get_prompt_config_json(prompt_id)
                                 flow_actions = config['flows'][get_current_flow(user_prompt)]['actions']
                                 # Fresh ledger for new flow — old one tracked previous flow's actions
@@ -4998,7 +5348,14 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 # If the current action hasn't been executed yet, start it
                 _ca_pending = user_tasks[user_prompt].current_action
                 _ca_pending_state = get_action_state(user_prompt, _ca_pending)
-                if _ca_pending_state in (ActionState.ASSIGNED, ActionState.PENDING, ActionState.IN_PROGRESS):
+                # STATUS_VERIFICATION_REQUESTED too: an action whose completion
+                # claim the gate refused sits there with no verdict at the
+                # tail, and nothing else re-posts it.  Before 2026-09-27 the
+                # TERMINATE hook closed such an action (without a receipt);
+                # left open, it spun here silently to the stall guard.  Re-
+                # posting it is bounded by the three attempts below.
+                if _ca_pending_state in (ActionState.ASSIGNED, ActionState.PENDING, ActionState.IN_PROGRESS,
+                                         ActionState.STATUS_VERIFICATION_REQUESTED):
                     # Track retries to detect actions stuck needing user input
                     if not hasattr(user_tasks[user_prompt], '_exec_retries'):
                         user_tasks[user_prompt]._exec_retries = {}
@@ -5022,7 +5379,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         current_app.logger.info(
                             f'[NEEDS-INPUT] action {_ca_pending} not completing after {_attempt-1} attempts, '
                             f'returning control to user')
-                        return _needs_input_reply(_ca_pending, _stuck_action_text)
+                        return _ask_for_help(
+                            user_prompt, prompt_id, _ca_pending, _stuck_action_text,
+                            f'it did not complete after {_attempt - 1} attempts')
 
                     actions_prompt = user_tasks[user_prompt].get_action(_ca_pending - 1)
                     current_app.logger.info(f'[EXECUTE-PENDING] Starting action {_ca_pending} (attempt {_attempt}): {actions_prompt}')
@@ -5199,6 +5558,24 @@ def get_total_flows(user_prompt):
     return total_persona_actions[user_prompt]
 
 
+def _has_more_flows(user_prompt):
+    """True when a flow AFTER the current one still needs authoring.
+
+    `get_current_flow` is 0-BASED; `get_total_flows` is a COUNT.  The two
+    inline guards this replaces compared them directly, so on the LAST flow of
+    a single-flow agent the test read `0 < 1` -> True: the terminal
+    [ALL-FLOWS-DONE] return became unreachable and the branch re-authored the
+    SAME flow forever.  MEASURED live 2026-09-10, agent 28160128202:
+
+        Current Flow -> recipe_for_persona:0  total_persona_actions:1
+        [NEXT-FLOW] Completed flow 0, starting next   x9 over 27 minutes
+        [ALL-FLOWS-DONE]                              x0
+
+    One derivation, both call sites: two copies are what drifted.
+    """
+    return get_current_flow(user_prompt) + 1 < get_total_flows(user_prompt)
+
+
 def all_flows_completed(prompt_id, total_personas, user_prompt):
     """Check if ALL flows for ALL personas are complete"""
     config = get_prompt_config_json(prompt_id)
@@ -5226,7 +5603,12 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
     flow = get_current_flow(user_prompt)
     set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
     group_chat.messages[-1]['content'] = f'{individual_recipe}'
-    assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
+    # The dependency instruction is carried by `message` below (byte-identical
+    # text), which is what actually reaches the model.  Assigning to
+    # `update_system_message` did NOT set a system message: on autogen's
+    # ConversableAgent it is a method that writes
+    # _oai_system_message[0]['content'], so the assignment only shadowed the
+    # bound method with a str and left it non-callable for that agent's life.
     flow = get_current_flow(user_prompt)
     for num, action in enumerate(user_tasks[user_prompt].actions, 1):
         try:
@@ -5286,7 +5668,8 @@ def after_all_actions_terminated_from_exception(assistant_agent, chat_instructor
     individual_recipe = []
     set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
     group_chat.messages[-1]['content'] = f'{individual_recipe}'
-    assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
+    # Same dead assignment as the sibling above: the instruction is delivered
+    # by `message` inside the loop, not by a system message.
     for num, action in enumerate(user_tasks[user_prompt].actions, 1):
         message = f'''Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
         result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
@@ -5388,8 +5771,7 @@ def get_execute_next_action_message( prompt_id, user_prompt):
 def begin_agent_convo_to_get_schedulers_not_last(assistant_agent, chat_instructor,  manager, prompt_id,  updated_actions, user_prompt):
 
     final_recipe[prompt_id] = {"status": "completed", "actions": updated_actions}
-    assistant_agent.update_system_message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                        { "status": "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
+    # Dead assignment removed: same scheduler schema is sent as `message`.
     message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
                         { "status": "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
     chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
@@ -5407,8 +5789,7 @@ def begin_agent_convo_to_get_schedulers(assistant_agent, chat_instructor, manage
     message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
                             { "status": "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
     final_recipe[prompt_id] = {"status": "completed", "actions": updated_actions}
-    assistant_agent.update_system_message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                        { "status": "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
+    # Dead assignment removed: same scheduler schema is sent as `message` above.
     current_app.logger.info(
         f'user_tasks[user_prompt].current_action:{user_tasks[user_prompt].current_action} == len(user_tasks[user_prompt].actions)')
     chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
@@ -5545,56 +5926,183 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
     action recipe in 3 weeks), so every restart re-walked from Action 1 and
     no flow ever reached the completion charge.
 
-    Trace-derived banking records what really ran — only the executed tool
-    calls, never fabricated steps. An action with NO tool work banks an
+    Trace-derived banking records what really ran — the tool calls that did
+    not fail and the code blocks the Executor ran with exitcode 0, never
+    fabricated steps. An action with NO such work banks an
     explicit no-op marker (the 2026-06-04 "synthesis poisons validator"
     guard). Must only be called IN-RUN: the trace lives in this dispatch's
     group_chat and is gone after a restart. Returns True if banked.
     """
     try:
         msgs = list(getattr(group_chat, 'messages', []) or [])
-        # The action's window: everything after the LAST "Execute Action N"
-        # message (re-dispatches of the same action overwrite the window).
-        start = 0
-        for i, m in enumerate(msgs):
-            c = m.get('content') if isinstance(m, dict) else None
-            # Trailing ':' delimiter is required — dispatch markers are
-            # 'Execute Action N: ...', so without the colon 'Execute Action 2'
-            # also matches 'Execute Action 20:'..'29:' and banks the wrong
-            # action's tool calls for flows with >=10 actions (CREATE routinely
-            # decomposes into 11-23).
-            if isinstance(c, str) and f'Execute Action {action_id}:' in c:
-                start = i
-        # Window ENDS at the next action's dispatch so a later action's tool
-        # calls don't bleed into this one (the trace can hold later dispatches
-        # when banking runs at/after a flow boundary). start is THIS action's
-        # last dispatch, so the next 'Execute Action ' marker is a different one.
-        end = len(msgs)
-        for j in range(start + 1, len(msgs)):
-            cj = msgs[j].get('content') if isinstance(msgs[j], dict) else None
-            if isinstance(cj, str) and 'Execute Action ' in cj:
-                end = j
-                break
-        steps = []
-        for m in msgs[start:end]:
-            if not isinstance(m, dict):
-                continue
-            for tc in (m.get('tool_calls') or []):
-                fn = (tc.get('function') or {}) if isinstance(tc, dict) else {}
-                nm = fn.get('name', '')
-                if not nm:
+        # Every dispatch of THIS action.  The ChatInstructor re-posts the same
+        # "Execute Action N:" when it wraps a round, so an action's work can
+        # sit in an earlier window while its last window holds only a closing
+        # reply.
+        #
+        # A dispatch is what hartos.lifecycle_hooks.dispatch_action_id says it
+        # is -- the one parser, used for every window below.  It reads only a
+        # LEADING marker (colon-delimited, so 2 never matches 20), because
+        # CREATE's own dispatch appends the user's text after its marker and
+        # that text can quote another one: "Execute Action 5: ... ,Latest User
+        # message: Properly Execute Action 2: ...".  The containment test that
+        # stood here opened action 2's window on that message and banked
+        # action 5's post_to_social as action 2's recipe (review, 2026-09-26).
+        from hartos.lifecycle_hooks import dispatch_action_id
+
+        def _dispatched(m):
+            return dispatch_action_id(m.get('content')) if isinstance(m, dict) else None
+
+        starts = [i for i, m in enumerate(msgs)
+                  if _dispatched(m) == int(action_id)]
+        if not starts:
+            # No dispatch marker: this run never started the action, so the
+            # trace holds none of its work.  The IN-RUN rule above, enforced
+            # here.  Banking anyway wrote "no-op" recipes for actions that ran
+            # tools in an earlier process: measured on central 2026-09-13
+            # (task #90), 23 of 23 actions of one agent and 33 of 34 of
+            # another, banked within 76 s of a restart, which the flow-recipe
+            # reconciler then assembled into agents that replay nothing.
+            current_app.logger.info(
+                f"[TRACE-BANK] action {action_id} was not dispatched in this "
+                f"run; nothing to bank from the trace")
+            return False
+        def _window_steps(start):
+            # The window ENDS at the next dispatch marker, so a later action's
+            # tool calls don't bleed into this one (the trace can hold later
+            # dispatches when banking runs at/after a flow boundary).
+            # Any dispatch ends it, by the same parser: text that only QUOTES
+            # a marker is not a dispatch and must not cut the action's work.
+            end = len(msgs)
+            for j in range(start + 1, len(msgs)):
+                if _dispatched(msgs[j]) is not None:
+                    end = j
+                    break
+            # Only work that SUCCEEDED is a step (CR3, live 2026-09-25).  Two
+            # kinds of work run in the group chat:
+            #  * a tool call, answered by a tool message whose tool_responses
+            #    carry the call's id.  A reply that core.constants
+            #    .tool_reply_failed reads as a failure means the call did not
+            #    do its work: the executor's "Error: ...", core.tool_logging's
+            #    error envelope, or one of TOOL_FAILURE_RESULTS -- which this
+            #    module's own execute_windows_or_android_command returns when
+            #    it refuses (operator gate, computer-control consent, a VLM
+            #    loop that could not finish).  Banking those made a failed
+            #    save_data_in_memory the recipe, and (review of dd46b4da0) a
+            #    desktop action refused for want of consent a step REUSE
+            #    would replay.  The REUSE fabrication gate reads the same
+            #    predicate, so the two ends cannot disagree about a failure.
+            #  * a code block the Executor ran: the Assistant posts ```lang
+            #    fences and the Executor answers "exitcode: 0 ...".  Reading
+            #    only tool_calls dropped this work, so a code-only action
+            #    banked "no-op" and REUSE had no code to replay.
+            from core.constants import tool_reply_failed
+            from autogen.code_utils import extract_code, UNKNOWN
+            window = [m for m in msgs[start:end] if isinstance(m, dict)]
+            failed_ids = set()
+            for m in window:
+                for r in (m.get('tool_responses') or []):
+                    if (isinstance(r, dict) and r.get('tool_call_id')
+                            and tool_reply_failed(r.get('content'))):
+                        failed_ids.add(r['tool_call_id'])
+            # Window positions of the code messages already banked.  One
+            # authored block can earn several "exitcode: 0" replies: measured
+            # with the real autogen 0.2.37 executor configured as this module
+            # configures its Executor (last_n_messages=2, no docker) and a side-effect counter in the
+            # block, the Executor selected twice in a row ran the ONE block
+            # twice, and the Assistant (which also executes code here) a third
+            # time.  That is the executor re-scanning the same message, not
+            # new work, so the block is one step; banking it per reply made
+            # REUSE replay it, side effects and all, once per re-scan.
+            banked_code = set()
+            found = []
+            for k, m in enumerate(window):
+                for tc in (m.get('tool_calls') or []):
+                    fn = (tc.get('function') or {}) if isinstance(tc, dict) else {}
+                    nm = fn.get('name', '')
+                    if not nm or tc.get('id') in failed_ids:
+                        continue
+                    found.append({
+                        'steps': f"{nm}({str(fn.get('arguments') or '')[:400]})",
+                        'tool_name': nm,
+                        'generalized_functions': '',
+                        'agent_to_perform_this_action': 'Helper',
+                    })
+                c = m.get('content')
+                if not (isinstance(c, str) and c.startswith('exitcode: 0 ')):
                     continue
-                steps.append({
-                    'steps': f"{nm}({str(fn.get('arguments') or '')[:400]})",
-                    'tool_name': nm,
-                    'generalized_functions': '',
-                    'agent_to_perform_this_action': 'Helper',
-                })
+                # The code that ran is the newest earlier message holding a
+                # fenced block -- the one the Executor scanned.  Newest first
+                # (a retry's corrected block, not the failed one), over the
+                # whole window: NOT bounded by the executor's last_n_messages,
+                # because autogen scans the agent's TRANSFORMED view, where
+                # ToolMessageHandler merges consecutive user turns, so "last 2"
+                # can span more group messages than 2 (review of ff929cd08,
+                # probed with the real Executor: a block three group messages
+                # back ran).
+                for j in range(k - 1, -1, -1):
+                    blocks = [(lang, code) for lang, code
+                              in extract_code(window[j].get('content') or '')
+                              if lang != UNKNOWN]
+                    if blocks:
+                        if j in banked_code:
+                            break
+                        banked_code.add(j)
+                        found.append({
+                            'steps': 'run the code in generalized_functions',
+                            'tool_name': '',
+                            'generalized_functions': '\n\n'.join(
+                                f"```{lang}\n{code}\n```"
+                                for lang, code in blocks),
+                            'agent_to_perform_this_action': 'Executor',
+                        })
+                        break
+            return found
+
+        # Newest window first: a re-dispatch that did the work supersedes the
+        # earlier attempt.  An earlier window counts only when the newest holds
+        # no tool call.  Measured on central 2026-09-13 (Compute Recruiter,
+        # action 2): the searches ran from 20:15:13, the ChatInstructor
+        # re-posted the action at 20:17:13, and banking the empty last window
+        # wrote "no-op" for work that really ran.
+        steps = []
+        for start in reversed(starts):
+            steps = _window_steps(start)
+            if steps:
+                break
         action_obj = {}
         try:
             action_obj = user_tasks[user_prompt].get_action(action_id - 1) or {}
         except Exception:
             pass
+        # The create flow stores each action as its plain text (every action
+        # in all three hive agents' configs on central, 2026-09-13), which
+        # request_recipe_for_action already reads with str().  Calling .get on
+        # that text raised "'str' object has no attribute 'get'" below, so no
+        # action was ever banked from its trace and every restart re-walked
+        # the flow from action 1.
+        if not isinstance(action_obj, dict):
+            action_obj = {'action': str(action_obj)}
+        # Bookkeeping is not the work (core.constants.BOOKKEEPING_TOOLS).  A
+        # window whose every step is a note-to-self the action does not name
+        # did nothing a replay should repeat: live 2026-09-27 (CREATE
+        # daemon_255bd83f) two execute_coding_task actions banked as recipes
+        # 28345960934_0_1/_0_2 made of request_tools, get_saved_metadata,
+        # search_long_term_memory and save_data_in_memory writes of
+        # {"status": "completed"}, with no coding run.  Nothing is banked, so
+        # the caller asks for the recipe or gives up instead of REUSE replaying
+        # the notes.  A step with generalized_functions (code that ran) is work.
+        from core.constants import BOOKKEEPING_TOOLS
+        _action_text = str(action_obj.get('action', '')).lower()
+        if steps and all(
+                s['tool_name'] in BOOKKEEPING_TOOLS
+                and s['tool_name'].lower() not in _action_text
+                for s in steps):
+            current_app.logger.warning(
+                f"[TRACE-BANK] action {action_id} ran only bookkeeping tools "
+                f"({', '.join(sorted({s['tool_name'] for s in steps}))}); "
+                f"not banking that as its recipe")
+            return False
         if not steps:
             steps = [{
                 'steps': 'no-op: action completed without tool execution',
@@ -5618,8 +6126,9 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         try:
             from security.secret_redactor import redact_secrets
             for _ri in json_obj['recipe']:
-                if isinstance(_ri.get('steps'), str):
-                    _ri['steps'], _ = redact_secrets(_ri['steps'])
+                for _rk in ('steps', 'generalized_functions'):
+                    if isinstance(_ri.get(_rk), str):
+                        _ri[_rk], _ = redact_secrets(_ri[_rk])
         except ImportError:
             pass
         name = helper_fun.safe_prompt_path(prompt_id, flow, action_id)
@@ -5845,43 +6354,38 @@ def detect_and_resume_progress(prompt_id, user_prompt):
 # FIX: State setting for resume - Replace set_states_from_progress function
 
 def set_states_from_progress(user_prompt, prompt_id, current_flow, flow_progress):
+    """Set the CURRENT flow's action states from the progress found on disk.
+
+    ActionState is keyed (user_prompt, action_id) -- one flow's worth of keys,
+    and every gate reads get_action_state(user_prompt, N) as "the current
+    flow's action N".  This used to write every flow into those keys: earlier
+    flows forced through in_progress -> completed -> terminated, later flows
+    set ASSIGNED.  Each transition auto-syncs into the ledger registered for
+    the session, which is the current flow's (initialize_with_resume builds it
+    first), so live 2026-09-13 10:15:31 (agent 87400889007) a fresh flow-1
+    ledger held all 7 tasks COMPLETED before any action ran, and AUTO-ADVANCE
+    requested recipes for actions that never executed.  Earlier flows are
+    recorded by their files and ledgers; a later flow's states are set when it
+    starts (safe_increment_flow).
     """
-    Fixed version: Set appropriate states based on detected progress using valid transitions
-    """
-    config = get_prompt_config_json(prompt_id)
-
-    for flow_idx, progress in flow_progress.items():
-        if flow_idx < current_flow:
-            # Previous flows - all actions should be TERMINATED
-            for action_id in range(1, progress['total_actions'] + 1):
-                # [OK] FIX: Use force_state_through_valid_path to handle transitions properly
-                force_state_through_valid_path(user_prompt, action_id, ActionState.TERMINATED,
-                                               "resumed - previous flow")
-
-        elif flow_idx == current_flow:
-            # Current flow - set states based on completion
-            for action_id in range(1, progress['total_actions'] + 1):
-                if action_id in progress['completed_actions']:
-                    # [OK] FIX: Action has JSON file - use proper state path to TERMINATED
-                    force_state_through_valid_path(user_prompt, action_id, ActionState.TERMINATED,
-                                                   "resumed - action complete")
-                else:
-                    # Action not yet complete - mark as ASSIGNED
-                    safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "resumed - pending action")
-
+    progress = flow_progress.get(current_flow)
+    if not progress:
+        return
+    for action_id in range(1, progress['total_actions'] + 1):
+        if action_id in progress['completed_actions']:
+            # Action has JSON file - use proper state path to TERMINATED
+            force_state_through_valid_path(user_prompt, action_id, ActionState.TERMINATED,
+                                           "resumed - action complete")
         else:
-            # Future flows - all actions ASSIGNED but not started yet
-            for action_id in range(1, progress['total_actions'] + 1):
-                safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "resumed - future flow")
+            # Action not yet complete - mark as ASSIGNED
+            safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "resumed - pending action")
 
 
 # FIX: Enhanced boundary check before while loop - Add this in get_response_group()
 
-_BUILD_INCOMPLETE_REPLY = (
-    "I couldn't finish building that agent — its steps didn't complete, so it "
-    "wouldn't be usable yet. Tell me a bit more about what it should do and "
-    "I'll pick up where it stopped."
-)
+# A failure notice, not an answer: defined in core.constants beside the other
+# canonical failure replies so the hive worker can recognise it by reference.
+from core.constants import BUILD_INCOMPLETE_REPLY as _BUILD_INCOMPLETE_REPLY  # noqa: E402
 
 
 def _agent_build_is_complete(prompt_id) -> bool:
@@ -6263,10 +6767,45 @@ def get_total_actions_for_current_flow_and_reset_actions(prompt_id, user_prompt)
     return config, total_actions
 
 
+def _drop_non_flow_entries(config, prompt_id):
+    """Remove anything in config['flows'] that is not a flow.
+
+    A flow is a dict carrying 'actions'.  Every other entry is malformed model
+    JSON that a lenient repair let through, and indexing it crashes the whole
+    /chat request: live 2026-09-09 agent 28160128202 died 5/5 turns on
+    `config['flows'][flow_idx]['actions']` -> KeyError, so recipe() never
+    reached the authoring loop and a tool-less fallback answered instead.
+
+    Measured over all 720 on-disk configs (1151 flow entries): exactly two are
+    affected -- 28160128202 has the TOP-LEVEL keys extra_information /
+    review_required misplaced into flows[], and 79991757345 has a bare '}'.
+    For the other 718 this is a no-op, so flow indices (which name the
+    <id>_<flow>_<action>.json files) do not move.
+    """
+    if not isinstance(config, dict):
+        return config
+    flows = config.get('flows')
+    if not isinstance(flows, list):
+        return config
+    kept = [f for f in flows if isinstance(f, dict) and 'actions' in f]
+    if len(kept) != len(flows):
+        # getLogger, not current_app.logger: this loader has 16 call sites and
+        # not all are inside a Flask request (daemon ticks read configs too).
+        # Logging through current_app raised "needed the current application"
+        # in 3/9 of this fix's own tests -- i.e. the guard would itself have
+        # crashed the very config read it exists to protect.
+        logging.getLogger(__name__).error(
+            f"[CONFIG] prompt_id={prompt_id}: dropped {len(flows) - len(kept)} "
+            f"non-flow entrie(s) from flows[] (no 'actions' key) -- malformed "
+            f"saved config, keeping {len(kept)} real flow(s)")
+        config['flows'] = kept
+    return config
+
+
 def get_prompt_config_json(prompt_id):
     with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
         config = json.load(f)
-    return config
+    return _drop_non_flow_entries(config, prompt_id)
 
 
 def acknowledgment(user_id,prompt_id,request_id):

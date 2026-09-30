@@ -47,7 +47,7 @@ _STATIC_DIR = os.path.join(
 # NONE of them — it is the terminal/Conky degraded surface only.
 _SHELL_JS_MODULES = [
     "hartAskMenu.js", "hartBloom.js", "hartBootSplash.js", "hartBrandArt.js",
-    "hartConnectivity.js", "hartCredits.js", "hartDesktop.js", "hartDock.js",
+    "hartConnectivity.js", "hartCredits.js", "hartDesktop.js", "hartDismiss.js", "hartDock.js",
     "hartEffects.js", "hartFiles.js", "hartFlash.js", "hartHero.js",
     "hartHome.js", "hartMarketplace.js", "hartNav.js", "hartOnboarding.js",
     "hartOSBridge.js", "hartPersonalize.js", "hartSenses.js", "hartSession.js",

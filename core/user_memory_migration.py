@@ -73,8 +73,9 @@ def migrate_user_memory(from_user_id, to_user_id) -> Dict[str, int]:
     #    path reads via ConversationEntry).  A plain UPDATE — non-destructive,
     #    and idempotent (a re-run finds no rows still keyed to `from`).
     try:
-        from integrations.social._models_local import ConversationEntry
-        from integrations.social.models import get_db
+        # From the facade, never from _models_local (see
+        # tests/unit/test_models_local_is_imported_only_by_the_facade.py).
+        from integrations.social.models import ConversationEntry, get_db
         db = get_db()
         try:
             n = db.query(ConversationEntry).filter(

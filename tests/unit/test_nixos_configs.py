@@ -476,6 +476,64 @@ class TestSecurityHardening:
         agent = read_nix(os.path.join(MODULES_DIR, "hart-agent.nix"))
         assert 'User = "hart"' in agent
 
+    # Units that hold or read the session markers (core.foreground:
+    # foreground-active.<pid>, user-chat.<pid>) under /run/hart/session.
+    # ProtectSystem=strict mounts the whole FS read-only except ReadWritePaths,
+    # so a unit that writes a marker and does not declare the dir fails the
+    # write (logged once) and hart-agent-daemon, its own process, never learns
+    # a person is being served: found 2026-09-24, both units lacked it.
+    SESSION_MARKER_UNITS = ["hart-backend.nix", "hart-agent.nix"]
+
+    @staticmethod
+    def _read_write_paths(content):
+        m = re.search(r"ReadWritePaths\s*=\s*\[(.*?)\];", content, re.S)
+        assert m, "no ReadWritePaths list"
+        body = "\n".join(line for line in m.group(1).splitlines()
+                         if not line.strip().startswith("#"))
+        return body
+
+    @pytest.mark.parametrize("module", SESSION_MARKER_UNITS)
+    def test_session_marker_unit_declares_the_marker_dir(self, module):
+        content = read_nix(os.path.join(MODULES_DIR, module))
+        assert 'ProtectSystem = "strict"' in content, (
+            f"{module}: the marker dir is declared BECAUSE the unit is strict; "
+            "loosening ProtectSystem is not the way to make it writable")
+        rw = self._read_write_paths(content)
+        assert '"-/run/hart/session"' in rw, (
+            f"{module} writes session markers under ProtectSystem=strict and "
+            "must list /run/hart/session in ReadWritePaths, with the leading "
+            "'-' so systemd ignores it where the dir does not exist")
+        assert '"/run/hart/session"' not in rw, (
+            f"{module}: a plain (non '-') /run/hart/session entry takes the unit "
+            "down on every variant without a session supervisor: measured on "
+            "the 2026-09-24 nixosTests run, hart-server-boot and "
+            "hart-peer-discovery both red with 'Failed to set up mount "
+            "namespacing: /run/hart/session: No such file or directory'")
+
+    def test_backend_creates_the_marker_dir_where_no_supervisor_does(self):
+        """Server and edge have no session supervisor, so nothing created
+        /run/hart/session there and the cross-process chat markers had nowhere
+        to land. The backend module declares the dir, gated so the desktop
+        (where the supervisor already declares the identical line) does not
+        get a duplicate tmpfiles line on every boot."""
+        backend = read_nix(os.path.join(MODULES_DIR, "hart-backend.nix"))
+        m = re.search(
+            r'systemd\.tmpfiles\.rules = lib\.mkIf \(!\(config\.hart\.sessionSupervisor\.enable or false\)\) \[(.*?)\];',
+            backend, re.S)
+        assert m, "hart-backend.nix must declare /run/hart/session for variants without a supervisor"
+        assert '"d /run/hart/session 0770 hart hart -"' in m.group(1), (
+            "the backend's rule must be the SAME 0770 hart:hart line the supervisor uses")
+
+    def test_session_marker_dir_is_the_one_the_supervisor_declares(self):
+        """The dir the units open for writing is the dir the session
+        supervisor creates (0770 hart:hart), and the same dir the governor's
+        input-alive reader and core.foreground.session_marker_dir use: one
+        dir, not a second convention."""
+        sup = read_nix(os.path.join(MODULES_DIR, "hart-session-supervisor.nix"))
+        assert re.search(r'"d /run/hart/session 0770 hart hart -"', sup)
+        from core.foreground import _SESSION_RUN_DIR
+        assert _SESSION_RUN_DIR == "/run/hart/session"
+
     def test_discovery_has_hardening(self):
         discovery = read_nix(os.path.join(MODULES_DIR, "hart-discovery.nix"))
         assert "NoNewPrivileges" in discovery or "ProtectSystem" in discovery
@@ -4630,6 +4688,18 @@ class TestCargoRegistryPinnedOffThe403Endpoint:
     What this guards is NOT the fix regressing -- it is a THIRD call site
     landing later on the default host and going red the same silent way. So it
     DISCOVERS the call sites instead of listing them.
+
+    RE-POINTED 2026-09-10, at the mechanism rather than at one spelling of it.
+    The first fix passed `extraRegistries` keyed on the crates.io index, which
+    replaced the download URL and then broke the build one step further on:
+    import-cargo-lock.nix emits `[source.crates-io]` unconditionally AND a
+    `[source."<url>"]` block per extraRegistries key, so naming the crates.io
+    index there defines one registry twice and cargo refuses the vendor config
+    ("defines source registry `crates-io`, but that source is already defined
+    by `crates-io`"). The host is therefore swapped one layer lower, at
+    fetchurl, where nothing is written into config.toml. This guard follows it:
+    what must hold is that a call site's module rewrites crate downloads to
+    static.crates.io, not that it does so through any particular attribute.
     """
 
     API_HOST = "crates.io/api/v1/crates"
@@ -4682,22 +4752,43 @@ class TestCargoRegistryPinnedOffThe403Endpoint:
             "found %d -- if the idiom moved, re-point this guard rather than "
             "deleting it" % len(sites))
 
-    def test_every_call_site_overrides_the_download_registry(self):
-        for rel, block in self._call_sites():
-            assert "extraRegistries" in block, (
-                "%s: a cargoLock without extraRegistries falls back to %s, which "
-                "403s Nix's curl fetcher" % (rel, self.API_HOST))
-            assert self.INDEX_KEY in block, (
-                "%s: extraRegistries must re-use the crates.io-index key so it "
-                "REPLACES the default download URL instead of adding a second "
-                "registry that nothing in the lock refers to" % rel)
-            assert self.WANT in block, (
+    def test_every_call_site_rewrites_crate_downloads_to_the_working_host(self):
+        """The module that owns a cargoLock must also own the host rewrite.
+
+        Asserted per FILE, not per block, because the rewrite now lives in the
+        module's `let` (it wraps fetchurl for the whole Rust instance) while the
+        cargoLock sits further down. A third call site landing in a new module
+        still fails here, which is what this guard is for.
+        """
+        for rel, _block in self._call_sites():
+            code = self._uncommented(read_nix(os.path.join(REPO_ROOT, rel)))
+            assert "crateHostOverlay" in code, (
+                "%s has a cargoLock but no crateHostOverlay, so its crates come "
+                "from %s, which 403s Nix's curl fetcher" % (rel, self.API_HOST))
+            assert "overlays = [ crateHostOverlay ]" in code, (
+                "%s defines the overlay but never applies it to the Rust "
+                "instance it builds with, which is a no-op" % rel)
+            assert self.WANT in code, (
                 "%s: expected the download host %s" % (rel, self.WANT))
 
-    def test_no_module_pins_the_403_host_in_code(self):
-        """Comments may name the bad host; code may not."""
+    def test_the_403_host_appears_only_as_the_thing_being_rewritten(self):
+        """Comments may name the bad host. Code may name it only to replace it.
+
+        The rewrite has to match the URL importCargoLock builds, so the string
+        cannot be banned outright any more. What can be banned is the shape that
+        matters: the bad host reached by a `url =`/`urls =` assignment, i.e. a
+        module that FETCHES from it rather than one that rewrites it away.
+        """
         for path in glob.glob(os.path.join(NIXOS_DIR, "**", "*.nix"), recursive=True):
+            rel = os.path.relpath(path, REPO_ROOT)
             code = self._uncommented(read_nix(path))
-            assert self.API_HOST not in code, (
-                "%s pins the 403 download host outside a comment"
-                % os.path.relpath(path, REPO_ROOT))
+            for line in code.splitlines():
+                if self.API_HOST not in line:
+                    continue
+                assert "url" not in line.split("=")[0], (
+                    "%s assigns the 403 download host to a url attribute: %s"
+                    % (rel, line.strip()))
+                assert ("hasPrefix" in line or "removePrefix" in line
+                        or line.strip().startswith("api =")), (
+                    "%s names the 403 host outside the rewrite: %s"
+                    % (rel, line.strip()))

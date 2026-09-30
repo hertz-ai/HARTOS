@@ -612,7 +612,17 @@ in
           # fails. THE authoritative "pixels presented" proof for the GTK4 path —
           # un-fakeable by a half-started host. A screenshot is saved either way.
           paint.screenshot("hart_gtk4_layer_shell_first_frame")
-          paint.wait_for_text("HART", timeout=120)
+          # What text is on a fresh node's FIRST frame changed on 2026-09-23: the
+          # shell's read-only state now arrives over SSE before the first paint
+          # (3c30807), so a node that has not finished onboarding paints the
+          # onboarding language picker straight away instead of the brand hero
+          # for a poll interval first. The claim here is "pixels presented", the
+          # brand was only the text that proved it; the picker's copy proves it
+          # just as hard and is what a fresh VM actually shows. Measured on the
+          # 2026-09-24 nixosTests runs (8c963b1 and babefb0): the OCR read
+          # "What language feels like home?" and this waited 120 s for "HART".
+          # An onboarded node still paints the brand, so both are accepted.
+          paint.wait_for_text("HART|language feels like home", timeout=120)
 
       with subtest("PAINT+MARKER E2E: the GTK4 host TOUCHES /run/hart/session/shell-ready on first paint"):
           # The full paint+marker contract, end-to-end on a live session. OCR above
@@ -641,8 +651,12 @@ in
       with subtest("Kill the GTK4 host -> the cage GTK3 floor is present + still software-GL (crash lands on a painting tier)"):
           # SIGKILL the GTK4 layer-shell host (the crash the floor must survive).
           paint.succeed(
-              "pkill -KILL -f 'hart-glass-shell-gtk4' "
-              "|| pkill -KILL -f 'GlassShellLayer' || true")
+              # The bracket spelling keeps pkill from matching the shell that
+              # runs this very command line (its argv holds the pattern): on the
+              # 900b88f nixosTests run pkill killed that shell first and the step
+              # died with exit 137 before the host was touched.
+              "pkill -KILL -f '[h]art-glass-shell-gtk4' "
+              "|| pkill -KILL -f '[G]lassShellLayer' || true")
           cage_launcher = paint.succeed(
               "find /nix/store -maxdepth 4 -name 'hart-shell-session' -type f "
               "-print -quit; true").strip()

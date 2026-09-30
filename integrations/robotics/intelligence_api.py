@@ -80,6 +80,18 @@ _REGISTRY_PATH = os.path.join(
 )
 _REGISTRY_PATH = os.path.normpath(_REGISTRY_PATH)
 
+# Asks for the shape `_extract_target` (:1094) and `_fuse_results` (:729)
+# already consume: objects as {label,x,y} dicts, obstacles as labels.  Those
+# two are the only readers, and both have received [] for the life of this
+# module because the old code read them off a producer that emits neither.
+_SCENE_PROMPT = (
+    'Describe this scene for a robot. Reply ONLY with JSON of the form '
+    '{"scene": "<one sentence>", '
+    '"objects": [{"label": "<name>", "x": <pixel>, "y": <pixel>}], '
+    '"obstacles": ["<name>"]}. '
+    'List what you can actually see; use an empty list if there is none.'
+)
+
 # ---------------------------------------------------------------------------
 # Singleton
 # ---------------------------------------------------------------------------
@@ -127,9 +139,11 @@ def think(request: Optional[Dict] = None, **kwargs) -> dict:
 class RobotIntelligenceAPI:
     """Unified Robot Intelligence API.
 
-    Fires 7 intelligences in parallel via ThreadPoolExecutor, fuses the
-    results into a single action plan, and returns within the timeout
-    budget even if some intelligences are unavailable.
+    Fires 6 intelligences in parallel via ThreadPoolExecutor, then runs
+    SAFETY on the motor trajectory that will execute, fuses the results
+    into a single action plan, and returns within the timeout budget even
+    if some intelligences are unavailable. The plan halts unless safety
+    positively reports safe.
 
     Thread-safe.
     """
@@ -183,14 +197,17 @@ class RobotIntelligenceAPI:
             if robot_id in self._registry:
                 self._registry[robot_id]['last_seen'] = time.time()
 
-        # Dispatch map: intelligence name -> (callable, args)
+        # Dispatch map: intelligence name -> (callable, args). SAFETY is not in
+        # it: safety must judge the plan that will EXECUTE, so it runs after
+        # motor below. It used to be dispatched here with an EMPTY plan, so
+        # the workspace, stairs and speed checks never saw the motor
+        # trajectory the robot then ran (hevolveai Master 11.435 S3).
         dispatches: Dict[str, tuple] = {
             'vision': (self._invoke_vision, (sensors,)),
             'language': (self._invoke_language, (context, history)),
             'motor': (self._invoke_motor, ({}, {}, constraints)),
             'spatial': (self._invoke_spatial, (sensors,)),
             'social': (self._invoke_social, (context, robot_id)),
-            'safety': (self._invoke_safety, ({}, constraints)),
             'hivemind': (self._invoke_hivemind, (context, sensors)),
         }
 
@@ -233,6 +250,25 @@ class RobotIntelligenceAPI:
         # wasn't ready. We accept the parallelism trade-off — motor
         # uses whatever constraints it got.  For robots that need tight
         # coupling, the recipe_adapter pipeline handles sequencing.
+
+        # SAFETY, on the trajectory that will execute (the steps _fuse_results
+        # hands to the robot). Local and cheap (E-stop + position and
+        # constraint checks), so it runs inline; if it fails for any reason
+        # the verdict is UNSAFE, never a missing key that reads as safe.
+        motor_result = results.get('motor', {})
+        motor_steps = ([] if 'error' in motor_result
+                       else motor_result.get('trajectory', []))
+        try:
+            results['safety'] = self._invoke_safety(
+                {'steps': motor_steps}, constraints)
+            used += 1
+        except Exception as exc:
+            logger.error("Safety check failed for robot %s: %s", robot_id, exc,
+                         exc_info=True)
+            results['safety'] = {'safe': False, 'estop': False,
+                                 'warnings': [f'safety check failed: {exc}']}
+            with self._lock:
+                self._stats['total_errors'] += 1
 
         # Fuse
         action_plan = self._fuse_results(results)
@@ -284,27 +320,43 @@ class RobotIntelligenceAPI:
         except ImportError:
             pass
 
+        # describe_scene is the ONE entry point that takes a CALLER-SUPPLIED
+        # image.  What was here before sent {'type','image','prompt'} to
+        # execute_vlm_instruction, which forwards the dict verbatim to
+        # run_local_agentic_loop — a DESKTOP-CONTROL loop that reads exactly
+        # five keys (local_loop.py:246-250):
+        #
+        #   instruction_to_vlm_agent  enhanced_instruction  user_id
+        #   prompt_id                 max_ETA_in_seconds
+        #
+        # None of the three sent is among them.  So the robot's camera frame
+        # was discarded, `instruction` defaulted to '', and the loop
+        # screenshotted the operator's monitor and drove mouse/keyboard.
+        # The reply was read the same way: result['objects'] /
+        # result['obstacles'] are keys no producer has ever emitted, so
+        # _extract_target (:1094) never once derived a target from vision and
+        # plan['obstacles_detected'] (:730) was never set.
+        #
+        # JSON is REQUESTED but not required — a VLM answering in prose is
+        # normal, and prose is still a real observation, so it becomes the
+        # scene rather than being dropped.  extract_json is the canonical
+        # reader (it handles fenced blocks and nested objects); parsing it
+        # here a second way is what produced the defect above.
         try:
-            from integrations.vlm.vlm_adapter import execute_vlm_instruction
-            msg = {
-                'type': 'describe',
-                'image': camera,
-                'prompt': (
-                    'Describe this scene for a robot. '
-                    'List objects, obstacles, and navigable paths.'
-                ),
+            from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
+            from integrations.vlm.parser import extract_json
+
+            raw = get_qwen3vl_backend().describe_scene(camera, _SCENE_PROMPT)
+            parsed = extract_json(raw) or {}
+            objects = parsed.get('objects')
+            obstacles = parsed.get('obstacles')
+            scene = str(parsed.get('scene') or '').strip() or str(raw or '').strip()
+            return {
+                'scene': scene or 'unknown',
+                'objects': objects if isinstance(objects, list) else [],
+                'obstacles': obstacles if isinstance(obstacles, list) else [],
+                'raw': raw,
             }
-            result = execute_vlm_instruction(msg)
-            if result and isinstance(result, dict):
-                description = result.get('extracted_responses', [''])[0] \
-                    if isinstance(result.get('extracted_responses'), list) \
-                    else str(result.get('extracted_responses', ''))
-                return {
-                    'scene': description or 'unknown',
-                    'objects': result.get('objects', []),
-                    'obstacles': result.get('obstacles', []),
-                    'raw': result,
-                }
         except Exception as exc:
             logger.debug("Vision intelligence fallback: %s", exc)
 
@@ -612,8 +664,11 @@ class RobotIntelligenceAPI:
                         )
                         safe = False
         except Exception as exc:
-            logger.debug("Safety monitor unavailable: %s", exc)
+            # An unknown E-stop state is not a safe state: without the
+            # monitor neither the E-stop nor the workspace can be checked.
+            logger.warning("Safety monitor unavailable: %s", exc)
             warnings.append(f'safety_monitor_unavailable: {exc}')
+            safe = False
 
         # Constraint checks
         if constraints:
@@ -697,9 +752,11 @@ class RobotIntelligenceAPI:
             'confidence': 0.0,
         }
 
-        # Safety gate — if unsafe, return halt plan
+        # Safety gate: HALT unless safety positively said safe. A timeout,
+        # an error or a missing verdict used to read as safe through
+        # .get('safe', True) (hevolveai Master 11.435 S3).
         safety = results.get('safety', {})
-        if safety.get('estop') or (not safety.get('safe', True)):
+        if safety.get('estop') or safety.get('safe') is not True:
             plan['primary_action'] = 'halt'
             plan['steps'] = []
             plan['confidence'] = 1.0

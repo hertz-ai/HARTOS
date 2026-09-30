@@ -15,6 +15,8 @@ import time
 
 from flask import Blueprint, jsonify, request, make_response
 
+from .auth import require_local_or_auth
+
 logger = logging.getLogger('hevolve_social')
 
 dashboard_bp = Blueprint('social_dashboard', __name__)
@@ -385,6 +387,28 @@ def get_topology():
         db.close()
 
 
+def _STEER_REFUSED():
+    from .dashboard_service import STEER_REFUSED
+    return STEER_REFUSED
+
+
+def _refusal(fields):
+    """The ONE refusal answer for a goal route: 403, whether the goal is
+    someone else's or does not exist (so it never says which ids exist)."""
+    return jsonify({'success': False, 'data': fields}), 403
+
+
+def _read_refused(db, agent_id, verb):
+    """None when the caller may read this goal, else the refusal response.
+    Reads ask may_steer too (review of 924b8e9dc: snapshot / chat / a2a had
+    no auth, and a remote caller with no token read another user's live
+    GroupChat).  Not audit-logged: the drawer polls every 2 s."""
+    from .dashboard_service import goal_to_steer, steering_caller
+    _, refused = goal_to_steer(db, agent_id, verb, steering_caller(),
+                               'dashboard-read', audit=False)
+    return None if refused is None else _refusal(refused)
+
+
 # ─── Agent Ops Console (Phase B drill-down) ──────────────────────────────
 # Same blueprint, same ETag pattern, same auth posture as the agents
 # list endpoint above.  No new blueprint, no new auth system.
@@ -393,6 +417,7 @@ def get_topology():
     '/api/social/dashboard/agents/<agent_id>/snapshot',
     methods=['GET'],
 )
+@require_local_or_auth
 def get_agent_snapshot(agent_id):
     """Return the drill-down snapshot payload for ONE agent.
 
@@ -410,9 +435,12 @@ def get_agent_snapshot(agent_id):
 
     db = get_db()
     try:
+        refused = _read_refused(db, agent_id, 'snapshot')
+        if refused is not None:
+            return refused
         snapshot = DashboardService.get_agent_snapshot(db, agent_id)
         if snapshot is None:
-            return jsonify({'success': False, 'error': 'agent not found'}), 404
+            return _refusal({'error': _STEER_REFUSED(), 'forbidden': True})
         return jsonify({'success': True, 'data': snapshot}), 200
     except Exception as e:
         logger.exception(f"snapshot error for agent_id={agent_id}: {e}")
@@ -425,6 +453,7 @@ def get_agent_snapshot(agent_id):
     '/api/social/dashboard/agents/<agent_id>/chat',
     methods=['GET'],
 )
+@require_local_or_auth
 def get_agent_chat(agent_id):
     """Return the latest autogen GroupChat turns for ONE agent.
 
@@ -455,6 +484,14 @@ def get_agent_chat(agent_id):
     except (TypeError, ValueError):
         limit = 50
 
+    from .models import get_db
+    db = get_db()
+    try:
+        refused = _read_refused(db, agent_id, 'chat')
+        if refused is not None:
+            return refused
+    finally:
+        db.close()
     try:
         data = DashboardService.get_agent_chat_tail(
             agent_id, since_index=since, limit=limit)
@@ -470,6 +507,7 @@ def get_agent_chat(agent_id):
     '/api/social/dashboard/agents/<agent_id>/a2a',
     methods=['GET'],
 )
+@require_local_or_auth
 def get_agent_a2a(agent_id):
     """Return A2A delegation graph centred on this agent.
 
@@ -484,6 +522,14 @@ def get_agent_a2a(agent_id):
         depth = max(1, min(int(request.args.get('depth', 2) or 2), 5))
     except (TypeError, ValueError):
         depth = 2
+    from .models import get_db
+    db = get_db()
+    try:
+        refused = _read_refused(db, agent_id, 'a2a')
+        if refused is not None:
+            return refused
+    finally:
+        db.close()
     try:
         data = get_a2a_graph(agent_id, depth=depth)
         return jsonify({'success': True, 'data': data}), 200
@@ -498,10 +544,14 @@ def _steer(agent_id, verb):
     Each verb writes one ImmutableAuditLog ``agent_steered`` entry.
     Body schema (optional): ``{reason: <str>}``.
 
-    Auth posture matches the rest of the dashboard blueprint — the
-    /agents list endpoint above is also unauthenticated for parity
-    with the existing operator console.  Phase C5 (owner-or-admin)
-    is gated until the dashboard moves behind @require_auth.
+    Every steering route is @require_local_or_auth and passes the caller
+    to dashboard_service.may_steer (via steer_agent / inject_instruction):
+    401 for a remote caller without a token, 403 for anyone else may_steer
+    refuses: it admits the goal's owner (an agent counts as its owner), an
+    admin, and -- for a goal no person owns -- this machine's own callers.
+    An unknown id gets the same 403.  Until 2026-09-27 these three had no
+    identity or ownership check at all (the same hole as inject, c3651a483).
+    ``actor_id`` is a label, never identity.
     """
     from .dashboard_service import steer_agent
     from .models import get_db
@@ -512,8 +562,10 @@ def _steer(agent_id, verb):
     db = get_db()
     try:
         result = steer_agent(db, agent_id, verb,
-                             actor_id=actor_id, reason=reason)
-        status = 200 if result.get('ok') else 400
+                             actor_id=actor_id, reason=reason,
+                             caller=_steering_caller())
+        status = (200 if result.get('ok')
+                  else 403 if result.get('forbidden') else 400)
         return jsonify({'success': result.get('ok'),
                         'data': result}), status
     except Exception as e:
@@ -527,6 +579,7 @@ def _steer(agent_id, verb):
     '/api/social/dashboard/agents/<agent_id>/pause',
     methods=['POST'],
 )
+@require_local_or_auth
 def steer_pause(agent_id):
     """Pause an agent goal.  Idempotent on already-paused."""
     return _steer(agent_id, 'pause')
@@ -536,6 +589,7 @@ def steer_pause(agent_id):
     '/api/social/dashboard/agents/<agent_id>/resume',
     methods=['POST'],
 )
+@require_local_or_auth
 def steer_resume(agent_id):
     """Resume a paused agent goal.  400 if not paused."""
     return _steer(agent_id, 'resume')
@@ -545,6 +599,7 @@ def steer_resume(agent_id):
     '/api/social/dashboard/agents/<agent_id>/cancel',
     methods=['POST'],
 )
+@require_local_or_auth
 def steer_cancel(agent_id):
     """Cancel (archive) an agent goal.  Terminal — cannot resume."""
     return _steer(agent_id, 'cancel')
@@ -552,15 +607,27 @@ def steer_cancel(agent_id):
 
 # ─── Agent Ops Console (Phase D: operator inject) ────────────────────────
 
+def _steering_caller():
+    """dashboard_service.steering_caller: the one reader of who is calling."""
+    from .dashboard_service import steering_caller
+    return steering_caller()
+
+
 @dashboard_bp.route(
     '/api/social/dashboard/agents/<agent_id>/inject',
     methods=['POST'],
 )
+@require_local_or_auth
 def inject_into_groupchat(agent_id):
     """Inject an operator instruction into the agent's live GroupChat.
 
     Body: ``{"instruction": <str>, "actor_id": <str>?}``.  Returns
     ``{ok: bool, message_index: int|null, error: str|null}``.
+
+    Only a caller dashboard_service.may_steer admits (the goal's owner, an
+    admin, or this machine for a goal no human owns): 401 for a remote
+    caller without a token, 403 for anyone else.  ``actor_id`` is a label
+    for the audit line and the GroupChat message name, never identity.
 
     Returns 400 when the GroupChat is not registered (process restart,
     8h TTL eviction, or /chat never ran for this agent in this process).
@@ -577,8 +644,10 @@ def inject_into_groupchat(agent_id):
     db = get_db()
     try:
         result = inject_instruction(db, agent_id, instruction,
-                                    actor_id=actor_id)
-        status = 200 if result.get('ok') else 400
+                                    actor_id=actor_id,
+                                    caller=_steering_caller())
+        status = (200 if result.get('ok')
+                  else 403 if result.get('forbidden') else 400)
         return jsonify({'success': result.get('ok'),
                         'data': result}), status
     except Exception as e:

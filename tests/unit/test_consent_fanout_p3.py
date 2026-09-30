@@ -231,11 +231,12 @@ def test_p3b_mark_read_sets_read_at():
 
         captured_update = {}
         sentinel_now = object()
-        # Patch both `func` (so func.now() returns our sentinel) AND
-        # `event` (so event.listen doesn't blow up on a MagicMock db).
+        # Patch `func` so func.now() returns our sentinel, and the
+        # after-commit queue (models.after_commit) so nothing is queued on
+        # a MagicMock session.
         with patch.object(services, 'func',
                           MagicMock(now=lambda: sentinel_now)), \
-             patch.object(services, 'event', MagicMock()):
+             patch.object(services, 'after_commit', MagicMock()):
             fake_db = MagicMock()
             fake_db.query.return_value.filter.return_value.update.side_effect = (
                 lambda d, **kw: captured_update.update(d)
@@ -280,14 +281,10 @@ def test_p3b_mark_dismissed_exists_and_sets_dismissed_at():
         )
 
         captured_update = {}
-        listeners_registered = []
-        fake_event = MagicMock()
-        fake_event.listen.side_effect = (
-            lambda target, name, fn, **kw: listeners_registered.append(
-                (target, name, fn, kw))
-        )
-        with patch.object(services, 'event', fake_event), \
-             patch.object(services, 'func', MagicMock(now=lambda: 'NOW')):
+        queued = []
+        with patch.object(services, 'func', MagicMock(now=lambda: 'NOW')), \
+             patch.object(services, 'after_commit',
+                          lambda db, effect: queued.append((db, effect))):
             fake_db = MagicMock()
             fake_db.query.return_value.filter.return_value.update.side_effect = (
                 lambda d, **kw: captured_update.update(d)
@@ -305,11 +302,16 @@ def test_p3b_mark_dismissed_exists_and_sets_dismissed_at():
         "P3b: mark_dismissed must NOT flip is_read — dismissed is a "
         "distinct state.  If you want both, call mark_read separately."
     )
-    after_commit = [l for l in listeners_registered if l[1] == 'after_commit']
-    assert after_commit, (
-        "P3b: mark_dismissed must register after_commit listener for "
+    assert len(queued) == 1, (
+        "P3b: mark_dismissed must queue an after-commit effect for "
         "cross-device fan-out (same pipe mark_read uses)."
     )
+    stub_realtime = MagicMock()
+    with patch.dict(sys.modules,
+                    {'integrations.social.realtime': stub_realtime}):
+        queued[0][1]()
+    stub_realtime.on_notification_read.assert_called_once_with(
+        'user-7', ['n1', 'n2'])
 
 
 def test_p3b_notification_model_exposes_read_at_dismissed_at():

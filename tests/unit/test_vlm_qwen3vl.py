@@ -169,6 +169,32 @@ def _make_health_fail():
 # Qwen3VLBackend Tests
 # ═══════════════════════════════════════════════════════════════════════════
 
+
+def _shell_handler(return_value):
+    """The shared shell handler, as local_computer_tool finds it.
+
+    local_computer_tool resolves _handle_shell_command_tool through
+    core.safe_hartos_attr, which never imports.  These tests used to patch
+    'hart_intelligence_entry._handle_shell_command_tool', and patch()
+    IMPORTS its target: the entry module ran, pinged Redis on
+    azure_all_vms.hertzai.com:6369 (106.51.181.24), ran init_social's
+    8.8.8.8:443 check, and started a delayed vision-init thread that later
+    probed 127.0.0.1:8081 in whichever test was running (socket spy,
+    2026-09-28).  Enters to the handler mock.
+    """
+    import contextlib
+    from core import safe_hartos_attr as sha
+    handler = MagicMock(return_value=return_value)
+    real = sha.safe_hartos_attr
+
+    @contextlib.contextmanager
+    def _cm():
+        with patch.object(sha, 'safe_hartos_attr', side_effect=lambda name, default=None: (
+                handler if name == '_handle_shell_command_tool'
+                else real(name, default))):
+            yield handler
+    return _cm()
+
 class TestQwen3VLBackendSingleton:
     """Singleton pattern for Qwen3VLBackend."""
 
@@ -609,7 +635,8 @@ class TestQwen3VLImageDimensions:
         """Without PIL, defaults to 1920x1080."""
         from integrations.vlm.qwen3vl_backend import Qwen3VLBackend
 
-        with patch.dict('sys.modules', {'PIL': None, 'PIL.Image': None}):
+        from tests.unit.module_swap import swap_modules
+        with swap_modules({'PIL': None, 'PIL.Image': None}):
             # Force ImportError path by passing invalid base64
             w, h = Qwen3VLBackend._get_image_dimensions("not-valid-base64")
             assert w == 1920
@@ -1011,8 +1038,16 @@ class TestVLMAgentContextFeedbackAndTools:
 # VLM Adapter Tests
 # ═══════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.usefixtures('computer_control_granted')
 class TestVLMAdapterTierSelection:
-    """Tier routing: Qwen3VL > OmniParser > lightweight."""
+    """Tier routing: Qwen3VL > OmniParser > lightweight.
+
+    execute_vlm_instruction asks the consent gate before any tier is
+    chosen (8b64cbb58).  These tests are about tier selection, so the
+    owner's permission is declared as a precondition; the refusal itself
+    is pinned by test_agent_engine.py::TestVLMAdapter::
+    test_refuses_when_the_owner_has_not_allowed_computer_control.
+    """
 
     @patch('integrations.vlm.vlm_adapter._HAS_PYAUTOGUI', True)
     @patch('integrations.vlm.local_loop.run_local_agentic_loop')
@@ -1064,6 +1099,7 @@ class TestVLMAdapterTierSelection:
         assert result is None
 
 
+@pytest.mark.usefixtures('computer_control_granted')
 class TestVLMAdapterCircuitBreaker:
     """Circuit breaker opens after 2 consecutive failures."""
 
@@ -1119,6 +1155,7 @@ class TestVLMAdapterCircuitBreaker:
         assert mod._probe_cache['result'] is None
 
 
+@pytest.mark.usefixtures('computer_control_granted')
 class TestVLMAdapterFallbackChain:
     """When primary tier fails, falls back to next tier."""
 
@@ -1284,6 +1321,7 @@ class TestQwen3VLReplacesOmniParserPipeline:
         assert mock_api.call_count == 1
 
 
+@pytest.mark.usefixtures('computer_control_granted')
 class TestFullActionLoop:
     """Full pipeline: screenshot -> parse -> reason -> action -> verify."""
 
@@ -1495,8 +1533,7 @@ class TestVLMDeterministicActions:
         handler for denylist + timeout + output truncation. Any parallel
         subprocess path is a security regression."""
         from integrations.vlm.local_computer_tool import _execute_inprocess
-        with patch('hart_intelligence_entry._handle_shell_command_tool',
-                   return_value='Exit code: 0\nok') as mock_handler:
+        with _shell_handler(return_value='Exit code: 0\nok') as mock_handler:
             result = _execute_inprocess({'action': 'shell', 'command': 'echo hi'})
         mock_handler.assert_called_once_with('echo hi')
         assert result['output'].startswith('Exit code: 0')
@@ -1512,8 +1549,7 @@ class TestVLMDeterministicActions:
         """Non-zero exit from the handler flips status to 'error' so
         the loop's consecutive-error counter can back off."""
         from integrations.vlm.local_computer_tool import _execute_inprocess
-        with patch('hart_intelligence_entry._handle_shell_command_tool',
-                   return_value='Exit code: 1\nsomething went wrong'):
+        with _shell_handler(return_value='Exit code: 1\nsomething went wrong'):
             result = _execute_inprocess({'action': 'shell', 'command': 'false'})
         assert result['status'] == 'error'
 
@@ -1521,8 +1557,7 @@ class TestVLMDeterministicActions:
         """If the handler refuses the command (denylist match), we must
         surface it as an error, not a success."""
         from integrations.vlm.local_computer_tool import _execute_inprocess
-        with patch('hart_intelligence_entry._handle_shell_command_tool',
-                   return_value='Shell_Command refused: destructive pattern'):
+        with _shell_handler(return_value='Shell_Command refused: destructive pattern'):
             result = _execute_inprocess({'action': 'shell', 'command': 'rm -rf /'})
         assert result['status'] == 'error'
         assert 'refused' in result['output'].lower()
@@ -1598,8 +1633,7 @@ class TestVLMDeterministicActions:
         apply. Single safety layer across platforms."""
         from integrations.vlm import local_computer_tool as lct
         with patch.object(lct.sys, 'platform', 'darwin'), \
-             patch('hart_intelligence_entry._handle_shell_command_tool',
-                   return_value='Exit code: 0\nok') as mock_handler:
+             _shell_handler(return_value='Exit code: 0\nok') as mock_handler:
             result = lct._execute_inprocess(
                 {'action': 'open_file_gui', 'path': '/tmp/foo.pdf'}
             )
@@ -1613,8 +1647,7 @@ class TestVLMDeterministicActions:
         the shared shell handler."""
         from integrations.vlm import local_computer_tool as lct
         with patch.object(lct.sys, 'platform', 'linux'), \
-             patch('hart_intelligence_entry._handle_shell_command_tool',
-                   return_value='Exit code: 0\nok') as mock_handler:
+             _shell_handler(return_value='Exit code: 0\nok') as mock_handler:
             result = lct._execute_inprocess(
                 {'action': 'open_file_gui', 'path': '/home/u/doc.pdf'}
             )
@@ -1658,11 +1691,12 @@ class TestVLMDeterministicActions:
         assert 'PREFER' in local_loop._VLM_ACTION_LIST
         # SYSTEM_PROMPT must embed the shared list so legacy branch sees them
         assert local_loop._VLM_ACTION_LIST in local_loop.SYSTEM_PROMPT
-        # And the unified combined_prompt in run_local_agentic_loop must
-        # embed it too — regression guard against someone re-forking the
-        # action list inside the function body.
+        # And the unified combined_prompt in the loop body must embed it
+        # too — regression guard against someone re-forking the action list
+        # inside the function body.  The body is _drive_local_agentic_loop;
+        # run_local_agentic_loop is the entry that asks the owner first.
         import inspect
-        src = inspect.getsource(local_loop.run_local_agentic_loop)
+        src = inspect.getsource(local_loop._drive_local_agentic_loop)
         assert '_VLM_ACTION_LIST' in src
 
 

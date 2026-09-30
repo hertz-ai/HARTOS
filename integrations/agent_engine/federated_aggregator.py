@@ -481,6 +481,27 @@ class FederatedAggregator:
 
         return results
 
+    def _note_delta_answer(self, peer_url, status, ok, resp) -> None:
+        """Log a peer's answer to our delta when it CHANGES, once.
+
+        Every round re-sends to the seeds, so logging each refusal would flood;
+        logging only the transitions (first refusal, recovery) is what makes a
+        rejected node visible and its recovery provable from its own log.
+        """
+        answers = self.__dict__.setdefault('_delta_answers', {})
+        key = status if isinstance(status, int) else 'ok'
+        if answers.get(peer_url) == key:
+            return
+        previous = answers.get(peer_url)
+        answers[peer_url] = key
+        if not ok:
+            body = (getattr(resp, 'text', '') or '')[:200]
+            logger.warning("Federation delta REFUSED by %s: HTTP %s %s",
+                           peer_url, status, body)
+        elif previous is not None:
+            logger.info("Federation delta accepted again by %s (HTTP %s, was %s)",
+                        peer_url, status, previous)
+
     def broadcast_delta(self, delta: dict):
         """Gossip the delta to central seeds + a bounded sample of peers.
 
@@ -633,13 +654,20 @@ class FederatedAggregator:
                         except Exception:
                             pass  # fall through to HTTP
                 # HTTP fallback — the authenticated, genuine-build-gated endpoint.
+                # Its ANSWER decides the outcome: a 403 'unverified build' is a
+                # refused delta, not a delivered one (measured 2026-09-23: the
+                # response was discarded, so a refusal fed record_success and
+                # left no trace on the sending node).
                 try:
-                    pooled_post(
+                    _resp = pooled_post(
                         f"{_peer_url}/api/social/peers/federation-delta",
                         json=delta, timeout=3)
-                    return (_peer_url, True)
                 except Exception:
                     return (_peer_url, False)
+                _status = getattr(_resp, 'status_code', None)
+                _ok = not isinstance(_status, int) or 200 <= _status < 300
+                self._note_delta_answer(_peer_url, _status, _ok, _resp)
+                return (_peer_url, _ok)
 
             # ONE bounded, concurrent delivery for BOTH seeds and the peer
             # sample.  Nothing is synchronous: a single row — even a seed —

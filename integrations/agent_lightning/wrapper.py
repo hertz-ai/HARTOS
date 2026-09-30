@@ -8,6 +8,7 @@ Provides minimal-change integration with automatic tracing.
 import logging
 import time
 import json
+import weakref
 from typing import Any, Dict, List, Optional, Callable
 from datetime import datetime
 from functools import wraps
@@ -17,6 +18,14 @@ from .tracer import LightningTracer
 from .rewards import RewardCalculator, RewardType
 
 logger = logging.getLogger(__name__)
+
+
+# Instrumentation patches the real AutoGen agent in place.  Keep a weak lookup
+# to that existing wrapper so the lifecycle can attach the final, verified
+# outcome to the same trace without changing GroupChat identity or introducing
+# a second training pipeline.
+_instrumented_wrappers = weakref.WeakValueDictionary()
+_agent_wrappers = weakref.WeakKeyDictionary()
 
 
 def _is_recoverable_generation_failure(exc) -> bool:
@@ -37,6 +46,58 @@ def _is_recoverable_generation_failure(exc) -> bool:
     if isinstance(exc, openai.APIConnectionError):
         return True
     return isinstance(exc, openai.APIStatusError) and exc.status_code >= 500
+
+
+def _describe_llm_failure(exc) -> str:
+    """The failure, with the endpoint it happened on.
+
+    Sibling of ``_is_recoverable_generation_failure``: that one reads the
+    exception's CLASS to decide what to do, this one reads its IDENTITY to
+    say what happened.  Both exist because ``str(exc)`` is not enough.
+
+    ``openai.APIConnectionError``'s message is the constant string
+    ``"Connection error."`` — the SDK raises it as
+    ``APIConnectionError(request=request) from err`` for ANY failure inside
+    ``httpx.send``, so the two facts that identify it live on the object and
+    never in its message:
+
+        exc.request.url   the endpoint that was dialled
+        exc.__cause__     the real error, e.g. WinError 10061 / a closed client
+
+    Measured 2026-09-09: eleven generations failed in one reuse drive and all
+    eleven logged only ``Connection error.``, on a box with two live LLM
+    endpoints (:5000, :8080) and two dead ones (:8081, :6777).  "the expert
+    tier answered 5xx" and "we dialled a dead port" want opposite fixes and
+    were indistinguishable.  model_registry.py:515 records the same chain
+    costing a live investigation on 2026-09-03.
+
+    Endpoint FIRST so it survives the callers' truncation.  Never raises: it
+    runs inside ``except`` on the chat hot path, where a throwing formatter
+    would turn a recoverable generation failure into a crash.
+    """
+    parts = []
+    try:
+        url = getattr(getattr(exc, 'request', None), 'url', None)
+        if url:
+            parts.append('endpoint=%s' % (url,))
+    except Exception as e:
+        logger.debug('LLM failure has no readable request url: %r', e)
+    try:
+        msg = str(exc)
+    except Exception:
+        msg = ''
+    parts.append(msg or type(exc).__name__)
+    try:
+        cause = exc.__cause__
+        if cause is not None:
+            ctext = str(cause)
+            # A 5xx already carries its status and body in `msg`; only append
+            # a cause that says something the message does not.
+            if ctext and ctext not in msg:
+                parts.append('cause=%s: %s' % (type(cause).__name__, ctext))
+    except Exception as e:
+        logger.debug('LLM failure cause unreadable: %r', e)
+    return ' | '.join(parts)
 
 
 class AgentLightningWrapper:
@@ -156,24 +217,11 @@ class AgentLightningWrapper:
                         result={'execution_time': execution_time}
                     )
 
-                # Calculate reward
-                if self.reward_calculator:
-                    reward = self.reward_calculator.calculate_reward(
-                        reward_type=RewardType.TASK_COMPLETION,
-                        context={
-                            'execution_time': execution_time,
-                            'success': True
-                        }
-                    )
-
-                    if self.tracer and span_id:
-                        self.tracer.emit_reward(span_id, reward)
-
                 self.execution_count += 1
                 return result
 
             except Exception as e:
-                logger.error(f"Error in generate_reply: {e}")
+                logger.error("Error in generate_reply: %s", _describe_llm_failure(e))
 
                 # Track failure
                 if self.tracer and span_id:
@@ -217,7 +265,7 @@ class AgentLightningWrapper:
                             "[LLM-GEN-FAIL] %s (attempt %d/%d) — re-sampling "
                             "generate_reply. Error: %s",
                             type(_last_exc).__name__, _attempt, _GEN_RETRIES,
-                            str(_last_exc)[:200])
+                            _describe_llm_failure(_last_exc)[:400])
                         try:
                             _retry_result = original_func(*args, **kwargs)
                             logger.info(
@@ -258,7 +306,8 @@ class AgentLightningWrapper:
                         "retries (%s: %s).  Returning the fallback reply "
                         "instead of propagating, to avoid lifecycle FSM "
                         "churn.", _GEN_RETRIES,
-                        type(_last_exc).__name__, str(_last_exc)[:300])
+                        type(_last_exc).__name__,
+                        _describe_llm_failure(_last_exc)[:400])
                     return (
                         "I had trouble getting a usable response from the "
                         "model for that step.  Could you rephrase the request, "
@@ -268,6 +317,27 @@ class AgentLightningWrapper:
                 raise
 
         return wrapped
+
+    def record_verified_task_outcome(self, succeeded: bool, context: Optional[Dict] = None) -> None:
+        """Record a ledger-verified task outcome on this agent's trace.
+
+        A reply or tool invocation only proves that an attempt occurred.  The
+        lifecycle invokes this after it has accepted a concrete receipt, so
+        Agent Lightning learns from the same outcome the task ledger exposes.
+        """
+        if not self.reward_calculator or not self.tracer:
+            return
+        context = dict(context or {})
+        context['success'] = bool(succeeded)
+        span_id = self.tracer.start_span('verified_task_outcome', context)
+        reward_type = RewardType.TASK_COMPLETION if succeeded else RewardType.TASK_FAILURE
+        reward = self.reward_calculator.calculate_reward(reward_type, context)
+        self.tracer.emit_reward(span_id, reward, context)
+        self.tracer.end_span(
+            span_id,
+            'success' if succeeded else 'error',
+            {'verified': True, 'success': bool(succeeded)},
+        )
 
     def _wrap_tool_execution(self, original_func: Callable) -> Callable:
         """Wrap tool execution method"""
@@ -306,7 +376,7 @@ class AgentLightningWrapper:
                 return result
 
             except Exception as e:
-                logger.error(f"Error in tool execution: {e}")
+                logger.error("Error in tool execution: %s", _describe_llm_failure(e))
 
                 # Negative reward for tool failure
                 if self.reward_calculator:
@@ -362,6 +432,42 @@ class AgentLightningWrapper:
         return f"AgentLightningWrapper({self.agent_id}, wrapped={self.agent.__class__.__name__})"
 
 
+def record_verified_outcome(agent_id: str, succeeded: bool, context: Optional[Dict] = None) -> bool:
+    """Attach a canonical lifecycle outcome to an already-instrumented agent."""
+    wrapper = _instrumented_wrappers.get(agent_id)
+    if wrapper is None:
+        return False
+    wrapper.record_verified_task_outcome(succeeded, context)
+    return True
+
+
+def record_verified_outcome_for_agents(agents, succeeded: bool,
+                                       context: Optional[Dict] = None) -> bool:
+    """Credit the instrumented participant that actually owns this chat.
+
+    CREATE and REUSE may both have wrappers alive for the same session key.
+    The registered GroupChat is the canonical ownership boundary, so matching
+    its real participant objects avoids rewarding the inactive flow.
+    """
+    for agent in agents or ():
+        # A GroupChat may carry a participant that cannot be weak-referenced
+        # (a plain object, a slotted class).  WeakKeyDictionary.get raises
+        # TypeError on those, which would abandon the scan before reaching a
+        # real instrumented agent later in the list -- the outcome would then
+        # look "not credited" for a reason that has nothing to do with it.
+        try:
+            wrapper = _agent_wrappers.get(agent)
+        except TypeError:
+            logger.debug(
+                'Skipping non-weak-referenceable GroupChat participant %r '
+                'while crediting a verified outcome', type(agent).__name__)
+            continue
+        if wrapper is not None:
+            wrapper.record_verified_task_outcome(succeeded, context)
+            return True
+    return False
+
+
 # Register as virtual subclass of autogen.Agent so isinstance() checks pass
 # in GroupChat (speaker selection, transition validation, graph validity).
 # This is the ABC way to say "this class IS-A Agent" without inheriting.
@@ -401,9 +507,9 @@ def instrument_autogen_agent(
     agent_id: str,
     track_rewards: bool = True,
     auto_trace: bool = True
-) -> AgentLightningWrapper:
+) -> Any:
     """
-    Convenience function to instrument an AutoGen agent
+    Instrument an AutoGen agent in place and return the SAME agent.
 
     Args:
         agent: AutoGen agent
@@ -412,21 +518,40 @@ def instrument_autogen_agent(
         auto_trace: Enable automatic tracing
 
     Returns:
-        Wrapped agent
+        ``agent`` itself, with its generate_reply / _execute_function traced.
+        Never the AgentLightningWrapper.
+
+    The wrapper patches the agent's own methods (_wrap_agent_methods), so the
+    tracing lives on the agent and the patched methods keep the wrapper alive.
+    Returning the wrapper put a proxy into the GroupChat of both callers
+    (create_recipe, reuse_recipe).  AutoGen keys each peer's message buffer by
+    agent identity; the proxy forwards send() to the real agent, so the
+    manager filed every reply under the real agent while run_chat read
+    last_message(proxy) -- the manager's own broadcast to the proxy -- and
+    logged that as the agent's turn.  Measured 2026-09-13 (CREATE, agent
+    87400889007): 25 "Execute Action" dispatches, 24 logged back as the
+    Assistant's reply; replaying one logged request returned a tool call twice
+    and new prose once, so the model never echoed.  Guarded by
+    tests/unit/test_lightning_instrumented_agent_speaks_as_itself.py.
     """
     if not is_enabled():
         logger.info("Agent Lightning disabled, returning unwrapped agent")
         return agent
 
-    return AgentLightningWrapper(
+    wrapper = AgentLightningWrapper(
         agent=agent,
         agent_id=agent_id,
         track_rewards=track_rewards,
         auto_trace=auto_trace
     )
+    _instrumented_wrappers[agent_id] = wrapper
+    _agent_wrappers[agent] = wrapper
+    return agent
 
 
 __all__ = [
     'AgentLightningWrapper',
     'instrument_autogen_agent',
+    'record_verified_outcome',
+    'record_verified_outcome_for_agents',
 ]

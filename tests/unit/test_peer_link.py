@@ -426,6 +426,21 @@ class TestLinkManager(unittest.TestCase):
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0]['answer'], 42)
 
+    def test_collect_forwards_query_payload(self):
+        link = MagicMock(spec=PeerLink)
+        link.is_connected = True
+        link.kind = 'node'
+        link.send.return_value = {'thought': 'answer'}
+        self.mgr._links['peer1'] = link
+
+        payload = {'type': 'query', 'query': 'actual question'}
+        responses = self.mgr.collect(
+            'hivemind', timeout_ms=500, payload=payload)
+
+        self.assertEqual(responses, [{'thought': 'answer'}])
+        link.send.assert_called_once_with(
+            'hivemind', payload, wait_response=True, timeout=0.5)
+
     def test_collect_skips_disconnected(self):
         link = MagicMock(spec=PeerLink)
         link.is_connected = False

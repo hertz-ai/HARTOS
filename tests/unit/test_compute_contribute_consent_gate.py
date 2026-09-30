@@ -50,3 +50,32 @@ def test_gate_helper_fails_closed_on_any_error():
     mesh = ComputeMeshService()
     # No real consent DB in the unit env → the helper's except-branch returns False.
     assert mesh._compute_contribute_consented() is False
+
+
+def test_active_consent_query_excludes_revoked_rows():
+    """A REVOKED compute_contribute consent must not keep authorising compute.
+
+    revoke_consent() sets revoked_at and LEAVES granted=True, so a query that
+    filters on granted alone treats a withdrawn grant as live and the device
+    keeps serving peer compute after the human took the permission back. Pin
+    that revoked_at is part of the active-consent predicate (the same one
+    ConsentService.active_grant / check_consent use).
+    """
+    import contextlib
+    mesh = ComputeMeshService()
+    db = mock.MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
+
+    @contextlib.contextmanager
+    def _sess(commit=False):
+        yield db
+
+    # the helper imports db_session at call time, so patch the module attr
+    with mock.patch('integrations.social.models.db_session', _sess):
+        assert mesh._compute_contribute_consented() is False
+
+    criteria = ' '.join(
+        str(c) for c in db.query.return_value.filter.call_args[0])
+    assert 'revoked_at' in criteria, (
+        "active-consent query must filter revoked_at IS NULL, or a revoked "
+        f"grant keeps authorising peer compute; got: {criteria}")

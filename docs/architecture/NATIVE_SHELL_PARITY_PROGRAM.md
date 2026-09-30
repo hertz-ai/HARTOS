@@ -314,6 +314,54 @@ milestone that regresses latency fails even if it looks better.
   never regress iso-desktop build time.
 
 ## Status
+- 2026-09-11: ALL FOUR of M6's pre-flip obligations are closed. What remains before
+  the default can flip is EVIDENCE ON HARDWARE, not code.
+    3. The last one, and it did not need the payload channel it was written around.
+       `NATIVE_CHROME_EMITTED` grew one name, `home`: the compositor claims the band
+       between the bars, the shell hides `#hart-home` and KEEPS its own top bar and
+       taskbar, so the taskbar chips, the agent cluster and the clock go on working
+       exactly as now. The claim is geometric evidence and whole-band only, because
+       over-claiming costs an empty desktop and the paint watchdog does not catch a
+       wrong-looking one.
+    Input, which the audit rated the blocker above all others: a press hit-tests the
+    scene and emits `shell.activate {row, card}`; HartWmClient subscribes to the
+    compositor's fan-out (which had never had a subscriber); the SSE store the shell
+    already drains carries it; `HartHome.activate` runs the SAME `cardAction` a DOM
+    click runs. Identity, not intent, so there is one executor. The press is CONSUMED
+    only when the activation reached a live subscriber, so the chain could land before
+    its consumer without ever swallowing a click.
+  Also fixed, all found by the 16-agent audit: the scene painted ABOVE every app
+  window; nothing called `shell.compose`, so a flip would have shipped `demo_ref` as
+  the desktop; the icon face was never REQUESTED (installed and detected, but no run
+  asked for it, so the tray would have drawn the words); tracking was passed in px to
+  an EM parameter; `HART_NATIVE_SHELL=0` turned the shell ON; shell-ready's evidence
+  tested whether the ORB imported rather than whether the scene painted; and the wheel
+  scrolled a row everywhere except over its cards.
+  STILL TRUE and still the honest gate on flipping the default: none of this has been
+  seen on a screen. The pixel proofs are headless. `shell.native {on}` makes the A/B
+  takeable on one machine without a reboot, and it is in the cache now, but generation
+  7 predates it, so the box needs one more OTA and it has 1.2G free with nothing
+  reclaimable.
+- 2026-09-10: THREE of M6's four pre-flip obligations are now closed, and the
+  remaining one is the only thing between here and the flip.
+    1. shell-ready native writer: DONE (written from the vblank reaper, on the
+       frame that actually carried the scene).
+    2. Panel reservation: DONE. Theme half earlier, inversion today. `work_area_for`
+       merges the compositor's own claim per edge by maximum whenever the scene is
+       on, so the shell needs no change and there is no flag day.
+    4. Image lowering: card ART done (it was never the picture), card ICONS done
+       (Material faces are installed and `fc-list` on the node confirms the exact
+       families the detector matches). Only the optional photo layer is left, and a
+       card without its photo is a correct card.
+    3. STILL OPEN, and it is a contract decision rather than code: the taskbar, the
+       agent-status cluster and the clock need bar content `home_compose` does not
+       carry. Nothing else blocks M6.
+  Also true and worth stating plainly, because the program's headline claim has
+  never had a number beside it: on generation 7 the node sets no HART_NATIVE_SHELL
+  at all, so every pixel measured there is the WebView. `shell.native {on}` (landed
+  today) makes the comparison takeable on one machine without a reboot, but it is
+  NOT in generation 7's compositor, so seeing the native scene on hardware needs one
+  more OTA.
 - 2026-07-20: program created (this doc). M0/M1 next; owner: hive session +
   steward review at each milestone flip.
 - 2026-09-05: M0..M3 LANDED and CI-green on main; M4 partly wired; M6 not flipped,
@@ -325,10 +373,25 @@ milestone that regresses latency fails even if it looks better.
   reactivity (orb hover + press, card hover), a retained scene tree and a pooled
   solid buffer (the zero-per-frame-alloc NFR). Proven HEADLESS in CI: the demo
   scene lowers, its buffers import, and it composites real pixels over a sentinel
-  on a pixman target. NOT proven: on-screen DRM scanout, fps, and input-to-photon
-  p50/p99. Those need a person at the box (see the injection-seat finding: a
-  uinput device is not granted to the compositor's libseat session, so synthetic
-  motion never reaches the input path and emits no samples).
+  on a pixman target.
+- 2026-09-11: INPUT-TO-PHOTON IS MEASURED, per component, on generation 8
+  (`image-rev 4e09e01`). Two things that were written here as blockers are retired.
+  The injection-seat finding is wrong as stated: a uinput device DOES reach the
+  compositor's input path, and the sweeps below ran on synthetic motion with no
+  person at the box. And the flag no longer needs a generation: `shell.native {on}`
+  (IPC_PROTOCOL.md 4.12) turns the scene on and off for the running session, which
+  is what made an A/B on one boot possible at all.
+  What the instrument now prints, sweeping five points at human cadence: with the
+  scene OFF, one row, `component=shell p50~14ms p99~59ms max~220ms`. With it ON,
+  fourteen rows naming SEVEN components: `top-bar 25.4/46.4`, `omnibox 18.0/33.3`,
+  `orb 24.0/46.9`, `home-row 22.0`, `home-card 31.1/48.8`, `taskbar 25.4/38.8`,
+  `shell 25.0/50.5` (p50/p99 ms). Every one is FAIL against the 16ms budget.
+  The ~220ms tail is the 200ms IDLE_HEARTBEAT (main.rs:586), not a stall: it
+  collapses to 40-66ms as soon as the scene animates and the compositor stops
+  coasting. And the p50 rising to ~25ms is NOT a verdict on native rendering:
+  `shell.native` does not demote the WebView, so that half measured both renderers
+  at once. The M6 comparison still needs obligation 3.
+  Full numbers and the caveat in docs/VERIFICATION.md.
 
 ### Text measure: LANDED, and it unblocks the rest of P5
 P5 could not be finished as specified, and neither could the row See-all
@@ -384,14 +447,45 @@ only the first one is blocked.
    WebView host holds itself to: the marker means MAPPED and painted, not
    "started", so the native writer owes the same.
 
-2. **The panel reservation points the wrong way.** The shell publishes how much
-   chrome it owns and `work_area` subtracts it from every placement path. Once
-   the compositor paints the bars, the compositor is what knows their size, so
-   the contract has to invert and the native scene has to become the publisher.
-   Until it does, scene.rs hardcodes 40/44 against a value the theme can move,
-   which is the 2026-08-29 "taskbar unreachable" report waiting to happen again
-   through the new renderer. Pinned meanwhile by
-   tests/unit/test_panel_reservation.py so the two cannot drift silently.
+2. **The panel reservation points the wrong way.** DONE. The theme half was
+   closed earlier (see "Obligation 2's actual bug" below); the inversion itself is
+   closed now, and it turned out NOT to need the shell side it was expected to.
+
+   The file's only publisher is the WebView, and M6 is precisely when the WebView
+   stops drawing the bars: nothing writes it, `parse_panel_reservation` fails safe
+   to zero exactly as designed, and a maximized window swallows the bars the
+   compositor is now painting. The 2026-08-29 report through the new renderer.
+
+   Rather than hand the file to a new publisher, `work_area_for` MERGES a native
+   reservation in whenever the scene is on. That is why no shell change was
+   needed and there is no flag day: `native_chrome_reservation` reads
+   `theme.top_bar_h` and `scene::TASKBAR_H`, the same two numbers the scene lays
+   out from and the two this file's guard already pins, so the reservation cannot
+   disagree with the pixels and no third source appears.
+
+   Merged PER EDGE BY MAXIMUM, not replacing. During the transition
+   `shell.native {on}` draws the scene WITHOUT standing the WebView down, so both
+   sets of bars are genuinely on screen and only the larger edge covers what is
+   drawn. After the demotion the file is absent and the maximum is the native
+   value. A stale file can then only OVER-reserve, which costs a band of unused
+   desktop where an under-reservation costs a bar the user cannot reach.
+
+   **One deliberate difference from the chrome bridge next door.** That bridge
+   publishes from the RENDER PATH on principle: the shell stands down on its
+   claim, so a promise instead of evidence yields a desktop with no background.
+   The reservation reads the CONFIG flag instead, and should, because its
+   asymmetry runs the other way. Over-reserving is harmless, under-reserving is
+   the bug, and the flag is already true on the first frame where evidence would
+   arrive a frame late. It reads `native_shell_on` rather than
+   `native_scene_drawn` for the same reason: the killswitch blacks the screen for
+   a frame and the bars have not stopped existing, so placement must not reshuffle
+   every window because the display went dark.
+
+   Five Rust tests cover the merge. None of them can reach the WIRING, because
+   `work_area_for` needs a mapped output and a real State, so a correct merge that
+   nothing calls would pass every one: the dead-layer shape this tree keeps
+   meeting. The wiring is pinned from tests/unit/test_panel_reservation.py beside
+   the other cross-language pins, and mutation-checked by cutting the call.
 
 3. **Three surfaces need bar content that home_compose does not carry.** These
    looked like separate gaps and are one decision, which is whether the A2UI feed
@@ -430,11 +524,42 @@ only the first one is blocked.
    not a Material name (an emoji) renders as plain text too. So the native path
    needs no image pipeline for icons at all: it needs the Material face loaded
    into the same cosmic-text FontSystem that already shapes every other run, and
-   `Shaping::Advanced` (already used) does ligature substitution. The obstacle is
-   packaging, not rendering: the shell bundles the face as `.woff2` for the
-   browser, fontdb reads TTF/OTF, and the box's fonts.packages carries only noto
-   and liberation. Get an OTF/TTF of the face in front of fontdb and icons come
-   out of the existing text path.
+   `Shaping::Advanced` (already used) does ligature substitution.
+
+   DONE as of 2026-09-10, but NOT for the reason recorded here earlier that day, and
+   the correction is the useful part.
+
+   The packaging half was already done and had been for a while: hart-subsystems.nix
+   installs `material-icons` and `material-symbols` into the fontconfig set so the
+   shell renders offline, and cosmic-text's fontdb reads the same fontconfig. I
+   checked that on the node with `fc-list`, saw eight Material families, saw
+   `has_icon_face` match them, and wrote this entry as done. That was wrong. `fc-list`
+   proves the font is INSTALLED. It says nothing about whether a run is SHAPED with
+   it, and those are different claims.
+
+   Nothing selected the family. `attrs_for` was the only Attrs constructor and set
+   weight and tracking only, so every run shaped in cosmic-text's default
+   `Family::SansSerif`. Ligature names are pure ASCII, so sans covers every codepoint
+   and the per-codepoint fallback never fired to correct it. The gate made it worse
+   rather than better: because the box HAS Material families, `has_icon_face` returned
+   true, `icons_available` admitted the runs, and the tray painted the literal words
+   "notifications", "palette", "shield", each then clamped by `centered_box` into a
+   32px slot. Exactly the fresh-offline-ISO failure hart-subsystems.nix bundles the
+   fonts to prevent, arriving through the new renderer.
+
+   Now: `SceneNode::Text` carries `icon: bool`, set at the three sites that emit icons
+   and false at the other twenty-one, because it cannot be inferred from the string
+   ("inbox" is a valid ligature name and a plausible card title). `ICON_FAMILY` names
+   ONE family rather than the shell's four-deep stack, because CSS falls through on a
+   missing family while cosmic-text falls back per codepoint. `has_icon_face` matches
+   that exact family, so the question it answers and the family the shaper requests
+   are one string. Icons are measured through `TextMeasure::icon_width`, since a
+   ligature collapses to one square glyph and layout centres icons in fixed slots.
+
+   The generalisable lesson, which cost this program a false "done": a capability has
+   three separate states here, and this tree keeps confusing them. Installed. Wired.
+   Requested. `fc-list` answers the first, `has_icon_face` answered the second, and
+   only the shaping attrs answer the third.
 
    **Card art was never the picture.** This was measured wrong the first time and
    the correction is worth keeping, because the wrong reading turned a mostly-done
@@ -847,9 +972,51 @@ equal the fallbacks theme_service publishes for the same case. That is what the
 reservation guard compares now; a separate guard asserts both sides read the same
 theme keys by name, since agreeing today is exactly what the hardcoded 40 also did.
 
-What is still open in obligation 2 is only the inversion itself: who PUBLISHES the
-reservation once the compositor paints the chrome. That remains a contract question
-with a shell side.
+What was still open in obligation 2 was only the inversion itself: who PUBLISHES
+the reservation once the compositor paints the chrome. That is now closed, and the
+answer sidesteps the contract question rather than settling it. NOBODY publishes a
+second file. `work_area_for` merges the compositor's own claim in whenever the
+scene is on, taking the larger of each edge, so the shell keeps publishing exactly
+what it publishes today and needs no change at all. See obligation 2 above.
+
+### Obligation 3 may not need its payload channel at all
+Recorded 2026-09-10, after reading both bridges rather than the checklist. The
+obligation is framed as a choice: grow the A2UI feed a second payload for chrome
+state, or add an IPC verb to carry it. Both readings assume the compositor must
+end up DRAWING the taskbar, the agent cluster and the clock. It does not have to,
+and the machinery for the alternative already ships.
+
+`NATIVE_CHROME_EMITTED` is a name allowlist, not a fixed pair. The compositor
+claims what a PRESENTED frame contained, `claim_names` turns the mask into words,
+and liquid_ui_service intersects them against `_NATIVE_CHROME_KNOWN`
+(`{bloom, orb}`) and hides just those elements. Fail-empty means the shell draws
+everything, which is today's desktop byte for byte. That bridge has been extended
+by one name twice already.
+
+Add `home` to it and the flip splits cleanly in two. The compositor claims the home
+SURFACE; the shell hides `#hart-home` (one element, from `mountRoot`) and keeps its
+own bars. The dotted sun becomes the renderer for the desktop, which is the visible
+half of M6 and the whole of its thermal case, since the WebKit core-burn that keeps
+this node at 94C is the home surface rasterising, not the bar. And the taskbar,
+agent cluster and clock keep working exactly as they do now, drawn by the shell
+from data it already has, so nothing regresses and no contract has to be settled.
+Carrying them natively becomes a later, optional milestone rather than a blocker.
+
+What it needs first, and why it is NOT a two-line change: the claim has to be
+EVIDENCE, and the scene has no home-content provenance. `render_native_scene`
+accumulates one bit, `NATIVE_CHROME_ORB`, set where the orb buffer imports. Every
+other leaf kind (Rect, Text, Art) pushes an element and sets nothing, and the walk
+cannot tell a card's background from the top bar's fill, because both are a Rect
+under a Container. So a naive "the scene emitted something" claim would let a frame
+that drew only the bar tell the shell to hide the home, and the result is an empty
+desktop that the paint watchdog does not catch: it watches for hangs, not for
+wrong-looking desktops. That is the exact failure the bloom half of this bridge was
+written to avoid.
+
+So the order is: mark home-content nodes in `layout_home`, set the bit only where
+such a leaf actually imports, then add the name on both sides. The scene-side
+marker is the real work and it belongs with the layout, not bolted onto the
+lowering walk.
 
 ### The parity ledger's rule 4, and the one motion switch the scene honoured
 NATIVE_SHELL_CSS_PARITY_LEDGER.md is a binding contract and only one thing in the
@@ -1741,3 +1908,67 @@ The reusable part: when an instrument reports nothing, the interesting question
 is not "is it broken" but "which of its preconditions is the system failing to
 meet". Both hypotheses here were about the instrument. Both were wrong. The
 preconditions were.
+
+### HERO_H: the proposal for the steward (2026-09-24, stream S4)
+
+`HERO_H` is still one constant doing two jobs (recorded above, at "HERO_H is left
+open, deliberately"): the home orb's slot AND the vertical budget the hero takes
+before the rows begin. This section is the decision the box needs, written out with
+the numbers, so it can be taken by looking rather than by re-deriving. Nothing in the
+layout changes until it is taken; NATIVE_OS_PROGRAM 6.4 lists it as a steward call.
+
+**What the shell does.** `.hart-hero-orbwrap` is 300px and FLOATS (z 1450), outside
+the home's flow. `.hh-hero` is `flex: 0 0 auto`, so its height is its content's, and
+`.hh-rows` takes the rest. The shell has no number for the hero band at all.
+
+**What the native scene does today.** `HERO_H = 200`: the orb is drawn 200px, floated
+right of the hero copy, and the rows begin at `content.y + 200 + CONTENT_PAD_Y`
+whatever the hero's content came to. Two consequences: the orb is two thirds of the
+shell's, and the hero band is a fixed 200 where the shell's is content-sized.
+
+**The proposal.** Split the constant: `HERO_ORB_D = 300` for the floating orb, sized
+and placed like `.hart-hero-orbwrap` (right of the hero copy, top of the content
+band), and the hero band's height taken from where the hero's own content ends
+(eyebrow, figure, meta strip, calls to action, each already laid out top-down in
+`layout_home`), plus the row gap. The orb stays out of that flow exactly as it does
+in the shell, so it no longer subtracts from the row budget.
+
+**What that changes on screen, measured from the layout's own constants.** The
+hero's content is eyebrow (16 * 1.6 = 25.6), figure (`amount_px * 1.35`), meta strip
+(`HERO_PILL_H` 29.5 plus half a 15px line = 37) and the calls to action (`HERO_BTN_H`
+= 53.4); the rows then start after `ROW_GAP` (18). Today they start at `content.y +
+200 + 12`, that is 264 from the top on every panel.
+
+| Panel | Figure | Hero content | Rows start (today -> proposal) | Rows that fit (today -> proposal) |
+|---|---|---|---|---|
+| 1920x1080 | 88 | 235 | 264 -> 305 | 3 -> 3 (760 and 719 available, 3 rows need 612) |
+| 1600x900 | 88 | 235 | 264 -> 305 | 2 -> 2 (580 and 539 available; 3 rows never fit here) |
+| 1366x768 (figure 58, cards 132) | 58 | 194 | 264 -> 264 | 2 -> 2 (448 available, 2 rows need 366) |
+
+So on a large panel the rows start about 40px lower than today, which is where the
+shell starts them, and on the 768-high laptop panel exactly where they start today.
+No panel in `the_shells_two_breakpoints_still_fit_every_row_on_a_real_panel` loses a
+row under the proposal.
+
+**The orb.** At 300 it overlaps the first row's right end on any panel narrower than
+about 1700px (orb left edge = `content.right() - 300`; the first row's cards run to
+`content.right()`), exactly as the shell's floating orb does over `.hh-rows`. That
+overlap is the visual call: on the shell it is accepted because the orb is
+translucent at its rim and breathes; natively the orb texture is the same M2 compose,
+so the look should match, but nobody has seen it on a panel.
+
+**Options, for the steward to pick one.**
+
+1. Take the proposal: `HERO_ORB_D = 300`, band from content. Parity with the shell,
+   the orb at its designed size, rows start where the shell starts them.
+2. Keep `HERO_H = 200` as is: no overlap, a smaller orb than designed, a fixed band
+   that is 50px short of the shell's on a large panel.
+3. `HERO_H = 300` in place: the orb at size but the band 300 too, which spends 100px
+   of row budget the shell never spends and drops the second row on 768-high panels.
+   Recorded only to say why it is not proposed.
+
+The change for option 1 is confined to `layout_home` (the hero block and the
+`cursor_y` the rows start from) and the constant itself. No cross-language guard pins
+`HERO_H` today (only `HERO_PILL_H` is pinned); option 1 adds one for `HERO_ORB_D`
+against `.hart-hero-orbwrap`'s 300px, a pixel proof that the orb slot is 300, and a
+layout test that the band follows the content on the three panels above.

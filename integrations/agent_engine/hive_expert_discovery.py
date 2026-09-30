@@ -17,11 +17,10 @@ This module closes that gap on the **consumer** side.  When a peer
 emits a ``peer.capability.announce`` event (producer side is
 ``hive_capability_advertiser``, attached at boot), this subscriber:
 
-  1. Validates the peer's trust signature against the master-key
-     delegation chain (``security.key_delegation.verify_peer_attestation``).
-     Until that API ships, an env-var allowlist
-     (``HEVOLVE_HIVE_TRUSTED_PEERS``) is the safe fallback so an
-     operator can manually whitelist peers they trust.
+  1. Verifies the peer's signed origin attestation
+     (``security.origin_attestation.verify_peer_attestation``) — the same
+     function, payload key and contract the federated delta path uses.
+     No attestation, or an invalid one, and the advert is dropped.
   2. Pings the advertised endpoint for reachability and latency
      (re-uses the same HTTP probe pattern ``LlamaConfig`` uses for
      llama-server health — see commit 3f9be3be for the 503-aware
@@ -70,7 +69,6 @@ Nothing in this file duplicates existing primitives:
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set
@@ -311,7 +309,10 @@ class HiveExpertDiscovery:
               "peer_id":          str,         # opaque, stable per node
               "endpoint":         str,         # https://node-x.example
               "auth_token":       str,         # bearer for HTTP calls
-              "trust_signature":  str,         # signed by master-key chain
+              "origin_attestation": {...},     # signed; REQUIRED, see
+                                              # _verify_peer_trust. Same key
+                                              # and shape as the federated
+                                              # delta path's attestation.
               "models": [
                 {
                   "model_id":          str,
@@ -350,12 +351,15 @@ class HiveExpertDiscovery:
         # The check belongs here, not in the producer, because any
         # consumer can apply it whether or not the local producer is
         # running.
-        local_peer = (os.environ.get('HEVOLVE_NODE_ID') or '').strip()
-        if local_peer and local_peer.lower() != 'local' and (
-                peer_id == local_peer):
+        # The id this node's own advertiser announces with (HEVOLVE_NODE_ID,
+        # else the canonical gossip id): one resolver for both ends.
+        from integrations.agent_engine.hive_capability_advertiser import (
+            _local_peer_id)
+        local_peer = _local_peer_id()
+        if local_peer and peer_id == local_peer:
             logger.debug(
                 "HiveExpertDiscovery: ignoring self-announce from "
-                "peer_id=%r (matches HEVOLVE_NODE_ID)", peer_id)
+                "peer_id=%r (this node's own id)", peer_id)
             return 0
 
         if not self._verify_peer_trust(msg):
@@ -408,6 +412,9 @@ class HiveExpertDiscovery:
                     'base_url': f'{endpoint}/v1',
                     'price': [0, 0],
                     'specialty': list(model.get('specialty') or []),
+                    # The serving node: whoever this backend's turns are
+                    # charged against (budget_gate.charge_remote_compute).
+                    'peer_id': peer_id,
                 },
                 avg_latency_ms=latency_ms,
                 accuracy_score=baseline,
@@ -539,33 +546,47 @@ class HiveExpertDiscovery:
 
     @staticmethod
     def _verify_peer_trust(msg: Dict[str, Any]) -> bool:
-        """Trust gate.  Prefer the master-key delegation chain when
-        ``security.key_delegation.verify_peer_attestation`` is available.
+        """Trust gate: a signed origin attestation, and nothing else.
 
-        Until that API ships, fall back to an env-var allowlist so an
-        operator can run the discovery path against a known-trusted
-        peer they control (typical for a regional deployment in
-        bring-up).  When the API lands, ImportError path goes dead
-        without code change here.
+        ONE mechanism, the one the federated delta path already uses —
+        ``federated_aggregator`` does
+        ``verify_peer_attestation(delta['origin_attestation'])`` and treats a
+        present-but-invalid attestation as a fork/impersonator signal.  Same
+        function, same payload key, same 2-tuple contract here.
+
+        What this replaced, and why none of it worked: the import was
+        ``security.key_delegation.verify_peer_attestation``, which that module
+        does not define, so it raised ImportError on EVERY advert and fell
+        through to an env allowlist (``HEVOLVE_HIVE_TRUSTED_PEERS``) that is
+        unset in the field -- ``peer_id in set()`` -- so no peer was ever
+        trusted and this whole discovery path was inert.  Meanwhile the producer
+        sent ``trust_signature: ''``.  Three mechanisms for one decision, all
+        three dead.
+
+        ``verify_peer_attestation`` lives in ``security.origin_attestation`` and
+        takes the INNER attestation dict (``get_attestation_for_federation``
+        returns ``{'valid', 'attestation'}``).  Handing it the wrapper fails
+        with "Origin fingerprint mismatch" on a genuine node, which reads like a
+        rejected peer and is really a caller bug -- hence the shared helper on
+        the producer side rather than two hand-built payloads.
         """
         peer_id = (msg.get('peer_id') or '').strip()
         if not peer_id:
             return False
+        attestation = msg.get('origin_attestation')
+        if not attestation:
+            logger.warning(
+                "HiveExpertDiscovery: peer %s advertised with no origin "
+                "attestation — denying", peer_id)
+            return False
         try:
-            from security.key_delegation import (  # type: ignore
-                verify_peer_attestation,
-            )
-            return bool(verify_peer_attestation(
-                peer_id=peer_id,
-                signature=msg.get('trust_signature', ''),
-                payload=msg,
-            ))
-        except ImportError:
-            allowlist_env = os.environ.get('HEVOLVE_HIVE_TRUSTED_PEERS', '')
-            trusted = {
-                p.strip() for p in allowlist_env.split(',') if p.strip()
-            }
-            return peer_id in trusted
+            from security.origin_attestation import verify_peer_attestation
+            ok, reason = verify_peer_attestation(attestation)
+            if not ok:
+                logger.warning(
+                    "HiveExpertDiscovery: peer %s attestation rejected: %s",
+                    peer_id, reason)
+            return bool(ok)
         except Exception as e:
             logger.warning(
                 "HiveExpertDiscovery: trust verification raised for "

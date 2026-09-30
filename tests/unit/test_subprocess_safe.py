@@ -349,6 +349,137 @@ class TestShellApiProbeContract:
             r = fn(_py("import sys; sys.exit(4)"), timeout=30)
             assert r is not None and r.returncode == 4, \
                 f"{name}._run collapsed a real failure into 'tool missing'"
+
+
+class TestKillReachesDescendants:
+    r"""The gap that let D36 through: a kill whose pipes never reach EOF.
+
+    Every existing boundedness test here kills a child whose stdout pipe THEN
+    reaches EOF, so `_safe_kill_and_close`'s `fh.close()` is uncontended and
+    returns instantly. That is the easy half of the problem, and passing it
+    told us nothing about the hard half.
+
+    THE HARD HALF, measured live on 2026-09-09 (agent 33323830039). A reuse
+    turn sat in this exact frame for 85+ seconds across three thread dumps:
+
+        core/subprocess_safe.py:174, in run_bounded
+            _safe_kill_and_close(proc, ...)
+        core/subprocess_safe.py:256, in _safe_kill_and_close
+            fh.close()
+
+    while the SAME dump held two live reader threads:
+
+        Thread-373 / Thread-374 (_readerthread)
+            File "C:\Python312\Lib\subprocess.py", line 1599, in _readerthread
+                buffer.append(fh.read())
+
+    `fh.read()` holds the file object's lock for its whole duration and
+    `fh.close()` must acquire that same lock, so the parent blocks for exactly
+    as long as the reader stays in read().  The module docstring's premise —
+    "Closing the parent FD causes the read() to return EOF -> thread exits
+    cleanly" — does not hold once a reader is ALREADY inside read().
+
+    This test builds that state deliberately: the direct child spawns a
+    GRANDCHILD that inherits the same stdout pipe, then the child is killed.
+    kill() reaches only the direct child, the grandchild keeps the write end
+    open, so no EOF ever arrives and the reader never returns.
+
+    It asserts WALL CLOCK from a watchdog thread rather than calling
+    run_bounded inline, because the pre-fix failure mode is an unbounded
+    block: called inline it would hang the whole suite instead of failing it.
+    """
+
+    # Child spawns a grandchild that inherits stdout (so it holds the pipe's
+    # write end), then sleeps.  Killing the child cannot close that handle.
+    _HOLDS_PIPE_AFTER_DEATH = (
+        "import subprocess,sys,time;"
+        "subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
+        "time.sleep(60)"
+    )
+
+    def test_surviving_grandchild_does_not_wedge_the_caller(self):
+        import threading
+
+        box = {}
+
+        def _run():
+            t0 = time.monotonic()
+            try:
+                box["result"] = run_bounded(
+                    _py(self._HOLDS_PIPE_AFTER_DEATH), timeout=2.0)
+            except Exception as exc:            # pragma: no cover - diagnostic
+                box["error"] = exc
+            box["secs"] = time.monotonic() - t0
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        # timeout 2s + wait_after_kill 2s + tree-kill + generous slack.
+        worker.join(25.0)
+
+        assert not worker.is_alive(), (
+            "run_bounded did not return within 25s for a child whose pipe "
+            "never reaches EOF — it is blocked in _safe_kill_and_close's "
+            "fh.close(), waiting on the lock a live _readerthread holds "
+            "inside fh.read(). This is D36, measured live 2026-09-09."
+        )
+        assert "error" not in box, f"run_bounded raised: {box.get('error')!r}"
+        result = box["result"]
+        assert result.timed_out is True
+        assert result.returncode == -1
+        assert box["secs"] < 25.0, (
+            f"bounded call took {box['secs']:.1f}s for a 2s budget"
+        )
+
+    def test_the_scenario_actually_outlives_the_direct_child(self):
+        """Anti-vacuity: prove the fixture really does keep the pipe open.
+
+        If the grandchild died with its parent, the test above would pass
+        against the BROKEN code and verify nothing. So assert the shape
+        directly: kill the child, and confirm its stdout pipe still has not
+        reached EOF a moment later.
+        """
+        proc = subprocess.Popen(
+            _py(self._HOLDS_PIPE_AFTER_DEATH),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, text=True,
+        )
+        try:
+            time.sleep(1.5)                     # let the grandchild spawn
+            proc.kill()
+            proc.wait(timeout=10)
+            # The direct child is gone...
+            assert proc.returncode is not None
+            # ...but a read must NOT return promptly with EOF, because the
+            # grandchild still owns the write end. Probe it off-thread.
+            import threading
+            got = {}
+
+            def _read():
+                try:
+                    got["data"] = proc.stdout.read()
+                except Exception as exc:        # pragma: no cover
+                    got["error"] = exc
+
+            r = threading.Thread(target=_read, daemon=True)
+            r.start()
+            r.join(4.0)
+            assert r.is_alive(), (
+                "the grandchild did NOT keep the pipe open, so this fixture "
+                "cannot reproduce D36 and the test above would be vacuous"
+            )
+        finally:
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=10)
+
+
+# MERGE NOTE 2026-09-11: two lanes each appended a test class here. They
+# guard different invariants of the same module -- one that kill() must be
+# bounded even when a grandchild holds the pipe open (D36), one that a
+# missing tool is reported rather than silently degraded -- so both are
+# kept. Neither was dropped to make the merge tidy.
+
 class TestAMissingToolIsSaidOutLoudOnce:
     """A silent degrade is how the same defect survived four rounds.
 
@@ -472,3 +603,152 @@ class TestTheProbeLooksWhereALoginShellWould:
         assert env['MARKER'] == 'kept'
         assert env['PATH'].startswith('/mine')
         assert '/run/current-system/sw/bin' in env['PATH']
+
+
+class TestCallBounded:
+    """call_bounded: the one bounded wait for a blocking IN-PROCESS call.
+
+    Added 2026-09-27 for the VLM loop, where one os.startfile held a daemon
+    for 6979 s past an 1800 s budget; logind._bounded and
+    shell_system_apis._run_async_bounded were private copies of it.
+    """
+
+    def test_a_fast_call_returns_its_value(self):
+        assert subprocess_safe.call_bounded(lambda: 42, 2) == (True, 42, None)
+
+    def test_a_stuck_call_releases_the_caller_on_time(self):
+        import threading
+        release = threading.Event()
+        t0 = time.monotonic()
+        finished, value, error = subprocess_safe.call_bounded(
+            lambda: release.wait(10), 0.3)
+        elapsed = time.monotonic() - t0
+        release.set()
+        assert (finished, value, error) == (False, None, None)
+        assert elapsed < 2.0
+
+    def test_an_exception_is_handed_back_not_swallowed(self):
+        boom = PermissionError('not executable')
+
+        def _raise():
+            raise boom
+
+        finished, value, error = subprocess_safe.call_bounded(_raise, 2)
+        assert finished is True and value is None and error is boom
+
+    def test_no_wait_left_does_not_block(self):
+        import threading
+        release = threading.Event()
+        t0 = time.monotonic()
+        finished, _, _ = subprocess_safe.call_bounded(
+            lambda: release.wait(10), -5)
+        release.set()
+        assert finished is False
+        assert time.monotonic() - t0 < 1.0
+
+
+class TestTheOtherBoundedWaitsDelegate:
+    """The collapse guard: the two helpers that carried a private copy of the
+    worker+Event shape must go through call_bounded, so a fix to it (or a
+    third copy) cannot quietly skip them."""
+
+    def _spy(self, module):
+        calls = []
+        real = subprocess_safe.call_bounded
+
+        def spy(fn, wait, **kw):
+            calls.append(kw.get('name'))
+            return real(fn, wait, **kw)
+        return calls, patch.object(module, 'call_bounded', side_effect=spy)
+
+    def test_logind_bounded_goes_through_call_bounded(self):
+        from integrations.agent_engine.os_bridge import logind
+        calls, p = self._spy(logind)
+        with p:
+            assert logind._bounded(lambda: 'v', 2) == (True, 'v')
+        assert calls == ['hart-logind-native']
+
+    def test_logind_keeps_its_exception_shape(self):
+        from integrations.agent_engine.os_bridge import logind
+        err = RuntimeError('bus gone')
+
+        def _raise():
+            raise err
+        assert logind._bounded(_raise, 2) == (True, ('__exc__', err))
+
+    def test_shell_run_async_bounded_goes_through_call_bounded(self):
+        from integrations.agent_engine import shell_system_apis as mod
+        calls, p = self._spy(mod)
+        with p, patch.object(mod, '_run', return_value='r'):
+            assert mod._run_async_bounded(['x'], wait=2, name='hart-t') == (True, 'r')
+        assert calls == ['hart-t']
+
+    def test_shell_run_async_bounded_logs_a_raising_run(self, caplog):
+        from integrations.agent_engine import shell_system_apis as mod
+        with patch.object(mod, '_run', side_effect=PermissionError('nope')), \
+                caplog.at_level(logging.WARNING, logger='hevolve.shell.system'):
+            assert mod._run_async_bounded(['tool'], wait=2) == (True, None)
+        assert any('PermissionError' in r.getMessage() for r in caplog.records)
+
+    def test_an_enormous_wait_is_clamped_not_an_overflow(self):
+        """Windows raises OverflowError past threading.TIMEOUT_MAX; a caller
+        passing a huge budget (an env-configured ETA) must still get a value."""
+        # The call must still be running when wait() starts: an Event that is
+        # already set returns before the timeout is ever checked.
+        def _slow():
+            time.sleep(0.3)
+            return 'v'
+        assert subprocess_safe.call_bounded(_slow, 1e12) == (True, 'v', None)
+
+
+class TestCallBoundedValidatesBeforeItStarts:
+    """Review F5 (2026-09-27, probe vlm_exit.py): a bad wait raised AFTER fn
+    had started, leaving a worker running that nobody would ever wait for."""
+
+    @pytest.mark.parametrize('bad, exc', [(None, TypeError),
+                                          ('soon', ValueError),
+                                          (float('nan'), ValueError)])
+    def test_a_bad_wait_raises_and_fn_never_runs(self, bad, exc):
+        import threading
+        ran = threading.Event()
+        with pytest.raises(exc):
+            subprocess_safe.call_bounded(ran.set, bad)
+        time.sleep(0.2)
+        assert not ran.is_set()
+
+    def test_infinity_is_clamped(self):
+        def _slow():
+            time.sleep(0.2)
+            return 7
+        assert subprocess_safe.call_bounded(_slow, float('inf')) == (True, 7, None)
+
+
+class TestCallBoundedCancel:
+    """Review F4: the VLM loop's Stop must end the wait, not the budget."""
+
+    def test_setting_cancel_releases_the_caller(self):
+        import threading
+        cancel, release = threading.Event(), threading.Event()
+        timer = threading.Timer(0.3, cancel.set)
+        timer.daemon = True
+        timer.start()
+        t0 = time.monotonic()
+        finished, value, error = subprocess_safe.call_bounded(
+            lambda: release.wait(10), 8, cancel=cancel)
+        elapsed = time.monotonic() - t0
+        release.set()
+        assert (finished, value, error) == (False, None, None)
+        assert elapsed < 1.5
+
+    def test_cancel_already_set_does_not_start_fn(self):
+        import threading
+        cancel, ran = threading.Event(), threading.Event()
+        cancel.set()
+        assert subprocess_safe.call_bounded(ran.set, 5, cancel=cancel) == (False, None, None)
+        time.sleep(0.2)
+        assert not ran.is_set()
+
+    def test_an_unset_cancel_changes_nothing(self):
+        import threading
+        assert subprocess_safe.call_bounded(
+            lambda: 'v', 2, cancel=threading.Event()) == (True, 'v', None)

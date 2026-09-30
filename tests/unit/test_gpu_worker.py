@@ -70,6 +70,22 @@ def _make_echo_worker(
     )
 
 
+def _wait_for_idle_stop(tool: ToolWorker) -> float:
+    """Wait for the idle timer to stop ``tool``'s worker; return seconds waited.
+
+    A fixed sleep of idle_timeout + 0.5s raced the stop itself: the timer
+    fires on time, but ``_worker`` is cleared only after GPUWorker.stop()
+    returns, and a loaded CI runner can take longer than 0.5s to reap the
+    subprocess. Poll up to the idle timeout plus the release budget instead,
+    so a slow-but-correct stop passes and a stop that never happens fails.
+    """
+    t0 = time.monotonic()
+    deadline = t0 + tool.idle_timeout + latency_budget('gpu_worker_idle_release_s')
+    while tool._worker is not None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return time.monotonic() - t0
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Fixtures
 # ═══════════════════════════════════════════════════════════════════
@@ -277,8 +293,9 @@ def test_nft04_idle_timer_stops_worker():
         assert t._worker is not None and t._worker.is_alive()
 
         # Wait past the idle timeout
-        time.sleep(2.0)
-        assert t._worker is None, 'idle timer should have stopped the worker'
+        waited = _wait_for_idle_stop(t)
+        assert t._worker is None, (
+            'idle timer should have stopped the worker (waited %.1fs)' % waited)
     finally:
         t.stop()
 
@@ -624,8 +641,10 @@ def test_ft18_set_idle_timeout_updates_threshold():
         assert t.idle_timeout == 1.0
 
         # Wait past the new deadline → worker stops
-        time.sleep(1.8)
-        assert t._worker is None
+        waited = _wait_for_idle_stop(t)
+        assert t._worker is None, (
+            'shrunk idle timeout should have stopped the worker (waited %.1fs)'
+            % waited)
 
         # Also test disabling: spawn again, set to 0, confirm no auto-stop
         t.call({'op': 'echo'})
@@ -692,8 +711,9 @@ def test_ft15_idle_timer_stops_after_final_call_then_wait():
         t.call({'op': 'echo', 'i': 2})
         assert t._worker is not None and t._worker.is_alive()
 
-        time.sleep(1.5)  # past idle_timeout
-        assert t._worker is None, 'worker should be stopped by idle timer'
+        waited = _wait_for_idle_stop(t)  # past idle_timeout
+        assert t._worker is None, (
+            'worker should be stopped by idle timer (waited %.1fs)' % waited)
     finally:
         t.stop()
 

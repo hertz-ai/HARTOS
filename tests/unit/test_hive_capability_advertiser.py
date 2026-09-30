@@ -117,9 +117,40 @@ def _isolated_env(monkeypatch):
         'HEVOLVE_HIVE_AUTH_TOKEN',
         'HEVOLVE_HIVE_ADVERTISE_TIER',
         'HEVOLVE_NODE_ID',
-        'HEVOLVE_HIVE_TRUSTED_PEERS',
     ]:
         monkeypatch.delenv(var, raising=False)
+
+
+def _gossip_id(monkeypatch, value):
+    """Stand in for this node's canonical gossip id (None: unavailable)."""
+    def _id():
+        if value is None:
+            raise RuntimeError('gossip unavailable')
+        return value
+    monkeypatch.setattr(
+        'integrations.social.sync_engine.SyncEngine.canonical_node_id',
+        staticmethod(_id))
+
+
+def _real_attestation():
+    """This node's signed attestation, from the PRODUCTION producer.
+
+    Reused rather than hand-built: a fixture attestation would have to be signed
+    to pass the gate, and a fixture that skips the signature would only prove the
+    test agrees with itself. Going through ``_origin_attestation`` also means the
+    wrapper-vs-inner-dict unwrap is the one the advert really uses.
+
+    Skips (loudly) when the checkout cannot self-attest — that is an origin
+    problem, not a defect in what these tests cover.
+    """
+    from integrations.agent_engine.hive_capability_advertiser import (
+        _origin_attestation,
+    )
+    att = _origin_attestation()
+    if att is None:
+        pytest.skip('this checkout cannot self-attest (origin verification '
+                    'failed) — unrelated to the behaviour under test')
+    return att
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -169,20 +200,32 @@ class TestIdentityHelpers:
 
     def test_peer_id_local_sentinel(self, monkeypatch):
         """The 'local' sentinel is the default in hart_intelligence_entry —
-        treat it as "unset" so the advertiser uses a generated UUID
-        instead of advertising under the literal string 'local'."""
+        treat it as "unset": the node advertises under its gossip id, never
+        the literal string 'local'."""
         from integrations.agent_engine.hive_capability_advertiser import (
             _local_peer_id,
         )
+        _gossip_id(monkeypatch, 'gossip-uuid-1')
         monkeypatch.setenv('HEVOLVE_NODE_ID', 'local')
-        assert _local_peer_id() == ''
+        assert _local_peer_id() == 'gossip-uuid-1'
         monkeypatch.setenv('HEVOLVE_NODE_ID', 'LOCAL')
-        assert _local_peer_id() == ''
+        assert _local_peer_id() == 'gossip-uuid-1'
 
-    def test_peer_id_unset(self):
+    def test_peer_id_unset_is_the_gossip_id(self, monkeypatch):
+        """Nothing sets HEVOLVE_NODE_ID on a default install.  The id peers
+        see must be the one every PeerNode row is keyed by, or a requester
+        that charges this node's served compute finds no operator."""
         from integrations.agent_engine.hive_capability_advertiser import (
             _local_peer_id,
         )
+        _gossip_id(monkeypatch, 'gossip-uuid-1')
+        assert _local_peer_id() == 'gossip-uuid-1'
+
+    def test_peer_id_unset_and_no_gossip_is_the_sentinel(self, monkeypatch):
+        from integrations.agent_engine.hive_capability_advertiser import (
+            _local_peer_id,
+        )
+        _gossip_id(monkeypatch, None)
         assert _local_peer_id() == ''
 
     def test_endpoint_trims(self, monkeypatch):
@@ -289,18 +332,20 @@ class TestPeerIdResolution:
         monkeypatch.setenv('HEVOLVE_NODE_ID', 'node-prod-7')
         assert advertiser._peer_id() == 'node-prod-7'
 
-    def test_fallback_uuid_stable_across_calls(self, advertiser):
-        """When HEVOLVE_NODE_ID isn't set, a per-process UUID is
-        generated lazily — must be stable across multiple calls."""
+    def test_fallback_uuid_stable_across_calls(self, advertiser, monkeypatch):
+        """When neither HEVOLVE_NODE_ID nor the gossip id is available, a
+        per-process UUID is generated lazily — stable across calls."""
+        _gossip_id(monkeypatch, None)
         first = advertiser._peer_id()
         second = advertiser._peer_id()
         assert first == second
         assert first.startswith('auto-')
 
-    def test_fallback_uuid_unique_per_instance(self, fresh_registry):
+    def test_fallback_uuid_unique_per_instance(self, fresh_registry, monkeypatch):
         from integrations.agent_engine.hive_capability_advertiser import (
             HiveCapabilityAdvertiser,
         )
+        _gossip_id(monkeypatch, None)
         a = HiveCapabilityAdvertiser(registry=fresh_registry)
         b = HiveCapabilityAdvertiser(registry=fresh_registry)
         # Different instances → different fallback IDs
@@ -427,7 +472,15 @@ class TestBuildPayload:
         assert payload['peer_id'] == 'node-x'
         assert payload['endpoint'] == 'https://node-x.example.com'
         assert payload['auth_token'] == 'tok-xyz'
-        assert payload['trust_signature'] == ''
+        # The signed origin attestation the consumer's trust gate verifies.
+        # Was 'trust_signature': '' — a field no verifier could ever accept.
+        att = payload['origin_attestation']
+        if att is not None:
+            assert 'origin_fingerprint' in att, (
+                'the advert must carry the INNER attestation dict')
+            assert 'attestation' not in att and 'valid' not in att, (
+                "the WRAPPER from get_attestation_for_federation went on the "
+                'wire — the consumer reads that as "not genuine HART OS"')
         assert isinstance(payload['models'], list)
         assert len(payload['models']) == 1
         assert before <= payload['announced_at'] <= after
@@ -632,8 +685,10 @@ class TestSelfEchoGuard:
         )
         from integrations.agent_engine.model_registry import ModelRegistry
         monkeypatch.setenv('HEVOLVE_NODE_ID', 'local')
-        monkeypatch.setenv(
-            'HEVOLVE_HIVE_TRUSTED_PEERS', 'auto-abc123')
+        # A REAL attestation from the production producer, so this is the whole
+        # wire: what the advertiser publishes is what the gate accepts. The env
+        # allowlist this used to set no longer exists.
+        att = _real_attestation()
         disc = HiveExpertDiscovery(registry=ModelRegistry())
         try:
             with patch(
@@ -645,7 +700,7 @@ class TestSelfEchoGuard:
                     'peer_id': 'auto-abc123',
                     'endpoint': 'https://other.example.com',
                     'auth_token': 'tok',
-                    'trust_signature': '',
+                    'origin_attestation': att,
                     'models': [{
                         'model_id': 'qwen-27b', 'tier': 'expert',
                         'verified_baseline': 0.8, 'display_name': 'Q',
@@ -661,7 +716,7 @@ class TestSelfEchoGuard:
         )
         from integrations.agent_engine.model_registry import ModelRegistry
         monkeypatch.setenv('HEVOLVE_NODE_ID', 'node-x')
-        monkeypatch.setenv('HEVOLVE_HIVE_TRUSTED_PEERS', 'node-y')
+        att = _real_attestation()
         disc = HiveExpertDiscovery(registry=ModelRegistry())
         try:
             with patch(
@@ -673,7 +728,7 @@ class TestSelfEchoGuard:
                     'peer_id': 'node-y',  # different from HEVOLVE_NODE_ID
                     'endpoint': 'https://node-y.example.com',
                     'auth_token': 'tok',
-                    'trust_signature': '',
+                    'origin_attestation': att,
                     'models': [{
                         'model_id': 'qwen-27b', 'tier': 'expert',
                         'verified_baseline': 0.8, 'display_name': 'Q',

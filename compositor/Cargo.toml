@@ -68,6 +68,9 @@ smithay = [
     # framed-JSON deps too. Same two crates the winit feature pulls — symmetric.
     "dep:serde",
     "dep:serde_json",
+    # NATIVE HOME card art: the bundled SVGs rasterised at compose time (see the
+    # `resvg` dependency below). Symmetric with the winit list, like everything above.
+    "dep:resvg",
     "smithay/backend_drm",
     "smithay/backend_gbm",
     "smithay/backend_libinput",
@@ -107,6 +110,7 @@ winit = [
     # default dev-box build never resolves them.
     "dep:serde",
     "dep:serde_json",
+    "dep:resvg",
     "smithay/backend_winit",
     "smithay/renderer_gl",
     "smithay/backend_egl",
@@ -119,6 +123,18 @@ winit = [
 
 [dependencies]
 cosmic-text = { version = "0.14.2", optional = true }
+# NATIVE HOME card art (NATIVE_OS_PROGRAM 3.2, decision (a)): the compositor renders
+# the 51 bundled card SVGs itself, at compose time, into the same texture cache the
+# rounded tiles use. `resvg` is pure Rust (usvg parses, tiny-skia rasterises, no C
+# dependency), so it costs the nix build no new native library. Default features OFF:
+# the raster-image decoders (png/jpeg/gif) are not wanted, since every bundled asset is
+# an SVG and a remote `image_url` is never fetched by the compositor. `text` and
+# `system-fonts` ARE wanted: 39 of the 51 (`app_art/apps/*.svg`) carry their app's
+# initial as a `<text>` run in a sans stack, which the parity program's inventory
+# missed, and without a font database those tiles would render as a letterless
+# gradient. Optional, keyed to the two features that compile the render path, so the
+# default dev-box build never resolves it.
+resvg = { version = "0.45", optional = true, default-features = false, features = ["text", "system-fonts"] }
 # The DEFAULT (no-feature) build is PURE LOGIC: the Phase-3 render-path/boot-config
 # never-fail-floor decision AND the Phase-5 window bookkeeping (handle minting + the
 # manifest↔toplevel map + the no-phantom-window SummonApp state machine — all

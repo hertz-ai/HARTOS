@@ -104,6 +104,19 @@ def test_inbound_reads_reply_from_response_key_standalone():
     assert reply == 'pong'
 
 
+def test_self_chat_reply_is_not_delivered_twice():
+    """SelfChatHandler performs its own registry delivery."""
+    try:
+        fi = _bare_integration()
+    except Exception as e:
+        pytest.skip(f"flask_integration unavailable: {e}")
+    fi._self_chat.is_self_message.return_value = True
+    fi._self_chat.handle.return_value = 'already delivered'
+
+    assert fi._handle_message(_msg()) is None
+    fi._self_chat.handle.assert_called_once()
+
+
 # ── chat_contract: the single source both inbound paths share ──────────
 
 def test_chat_contract_request_sends_both_keys():

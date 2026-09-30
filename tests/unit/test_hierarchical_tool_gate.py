@@ -11,6 +11,7 @@ exceeded rejections in one boot).
 
     python -m pytest tests/unit/test_hierarchical_tool_gate.py --noconftest -q
 """
+import ast
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -21,6 +22,13 @@ from integrations.agent_engine.goal_manager import get_tool_tags
 from integrations.agent_engine.marketing_tools import detect_goal_tags
 
 _ROOT = Path(__file__).resolve().parents[2]
+
+
+def _called_names(tree):
+    """Every called function's name, bare or through a module/object."""
+    return [n.func.id if isinstance(n.func, ast.Name) else n.func.attr
+            for n in ast.walk(tree) if isinstance(n, ast.Call)
+            and isinstance(n.func, (ast.Name, ast.Attribute))]
 
 
 def _fake_registry():
@@ -179,31 +187,67 @@ class HierarchicalToolGate(unittest.TestCase):
             self.assertIn(route, out)
 
     def test_single_detection_and_gate_in_both_constructors(self):
-        """Parity + no-parallel-path: sanctioned resolution sites only.
-        Construction gates now call resolve_goal_tags (stored ∪ detected,
-        Lever 2); reuse keeps ONE extra detect_goal_tags in the per-turn
-        drift hook (message-driven, stored tags already resolved at
-        construction).  create: 1 resolution.  reuse: 2.
-        Any count above these means a detection regrew somewhere."""
-        expected_detect = {'create_recipe.py': 1, 'reuse_recipe.py': 2}
-        for fname, n_expected in expected_detect.items():
+        """Parity + no-parallel-path: sanctioned goal-tag scan sites only.
+
+        Each pipeline resolves goal tags ONCE at construction
+        (resolve_goal_tags: stored tags united with detected, Lever 2) and
+        runs the per-turn drift scan through ONE shared helper,
+        core.agent_tool_menu.attach_for_turn, called once from each turn
+        entry (REUSE get_agent_response, CREATE _attach_for_create_turn;
+        review of d99b1aa88).  So per file: 1 resolution, 1 gate, 1
+        attach_for_turn, and no attach_for_tags of its own (that primitive
+        is attach_for_turn's; a direct call is a second per-turn attach).
+
+        Calls are counted by name whether bare (``detect_goal_tags(...)``)
+        or through a module (``marketing_tools.detect_goal_tags(...)``):
+        counting bare names only let an attribute call slip past (review of
+        a4dc8cf3b, F3).  Any count above these means a scan regrew."""
+        attach_primitive_owner = _ROOT / 'core' / 'agent_tool_menu.py'
+        for fname in ('create_recipe.py', 'reuse_recipe.py'):
             src = (_ROOT / 'hartos' / fname).read_text(encoding='utf-8',
                                                        errors='replace')
-            # count CODE lines only — reuse_recipe:2691 names the function
-            # inside a #510 history comment
-            code = [ln for ln in src.splitlines()
-                    if not ln.lstrip().startswith('#')]
-            n_detect = sum(('detect_goal_tags(' in ln)
-                           or ('resolve_goal_tags(' in ln) for ln in code)
-            n_filter = sum('filter_service_tools(' in ln for ln in code)
+            # Count REAL CALLS via AST, not text: a docstring or comment that
+            # names a function is not a call site (measured 2026-09-08, the
+            # text count scored prose inside _reuse_action_tool_names).
+            called = _called_names(ast.parse(src))
+            n_scan = sum(name in ('detect_goal_tags', 'resolve_goal_tags')
+                         for name in called)
             self.assertEqual(
-                n_detect, n_expected,
-                f'{fname}: expected exactly {n_expected} goal-tag '
-                f'resolution call(s) (construction gate; reuse also has '
-                f'the per-turn attach hook)')
+                n_scan, 1,
+                f'{fname}: expected exactly 1 goal-tag resolution call (the '
+                f'construction gate); the per-turn scan is attach_for_turn\'s')
             self.assertEqual(
-                n_filter, 1,
+                called.count('filter_service_tools'), 1,
                 f'{fname}: expected exactly one Tier-1 gate call')
+            self.assertEqual(
+                called.count('attach_for_turn'), 1,
+                f'{fname}: expected exactly one per-turn attach call')
+        # attach_for_tags is called only inside core/agent_tool_menu.py.
+        stray = []
+        for top in ('hartos', 'integrations', 'core', 'security'):
+            for path in (_ROOT / top).rglob('*.py'):
+                if path == attach_primitive_owner or '__pycache__' in path.parts:
+                    continue
+                try:
+                    tree = ast.parse(path.read_text(encoding='utf-8',
+                                                    errors='replace'))
+                except SyntaxError:
+                    continue
+                if 'attach_for_tags' in _called_names(tree):
+                    stray.append(str(path.relative_to(_ROOT)))
+        self.assertEqual(stray, [], 'attach_for_tags called outside '
+                         'core/agent_tool_menu.py: use attach_for_turn')
+
+    def test_the_scan_counter_sees_attribute_calls(self):
+        """Anti-vacuity for the guard above."""
+        tree = ast.parse('import m\n'
+                         'def f(x):\n'
+                         '    m.detect_goal_tags(x)\n'
+                         '    detect_goal_tags(x)\n'
+                         '    menu.attach_for_tags(1, 2, 3, 4, 5)\n')
+        called = _called_names(tree)
+        self.assertEqual(called.count('detect_goal_tags'), 2)
+        self.assertEqual(called.count('attach_for_tags'), 1)
 
     def test_attach_for_tags_attaches_matching_family(self):
         """Per-turn drift: capability tags attach the matching family via

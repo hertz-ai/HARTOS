@@ -1339,7 +1339,18 @@ in
         StandardOutput = "socket";
         StandardError = "journal";
         TimeoutStartSec = "10s";
-        RuntimeMaxSec = "60s";
+        # NO RuntimeMaxSec here, unlike the sway relay above. This endpoint
+        # carries one connection that is long-lived BY DESIGN: the shell's
+        # `events.subscribe` (IPC_PROTOCOL.md 4.10), which is how a press on
+        # the native desktop reaches hartHome's cardAction. Measured on the
+        # box 2026-09-22 with the 60 s cap in place: the subscription was
+        # killed exactly one minute after boot ("Service reached runtime time
+        # limit", one FAILED hart-comp-ipc@ instance per boot as the
+        # fingerprint) and the native desktop was unclickable from then on.
+        # The cap existed as a backstop for a half-closed upstream leaving the
+        # reader blocked; the relay now tears the upstream down hard on client
+        # exit (see to_upstream above), so a connection lives exactly as long
+        # as its client, and a query still ends the moment it is answered.
       };
     };
 

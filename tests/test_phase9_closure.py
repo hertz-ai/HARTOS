@@ -480,7 +480,7 @@ def test_vlm_stop_post_bearer_token_bypasses_csrf(vlm_stop_app, monkeypatch):
         "the task wording implies does NOT exist in HARTOS.  The "
         "production CSRF defense for /api/vlm/stop is Origin/Referer "
         "header inspection (see core/auth_local.py "
-        "_is_safe_csrf_origin) plus the HARTOS_API_TOKEN bearer bypass. "
+        "is_safe_csrf_origin) plus the HARTOS_API_TOKEN bearer bypass. "
         "Migrating to a double-submit-cookie + body csrf_token model "
         "would require a session layer the Nunba bundled install "
         "doesn't currently run.  Locking this as xfail-strict so the "

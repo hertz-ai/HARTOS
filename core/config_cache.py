@@ -149,6 +149,43 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def should_start_background_services() -> bool:
+    """Whether this process may start the node's background daemons.
+
+    `hart_intelligence_entry.py:1062` calls `init_social(app)` from a bare
+    module-level try, and init_social starts SEVEN real subsystems: peer
+    gossip, UDP LAN auto-discovery, the runtime integrity monitor, the
+    sync-engine drain, the coding-agent daemon, an outbound registration to
+    HEVOLVE_REGISTRY_URL, and the node watchdog.  So merely importing the
+    chat entry point boots a node — correct for the app, wrong for any
+    process that only wants to read or exercise the code.
+
+    Measured 2026-09-09 on tests/unit (reuse+vlm+recipe), same flags both runs:
+
+        daemons started   crashed at 89%, no summary, 66 errors
+        monitor stubbed   100% complete, 40 failed / 780 passed, 219s
+
+    The crash is a Windows access violation on the integrity monitor's own
+    thread while it walks the code tree (runtime_monitor._stat_sweep ->
+    node_integrity._collect_py_files -> pathlib.iterdir, during GC).
+    Suppressing only that starter removed it, so the suite had no completable
+    baseline for as long as importing the code booted the node.
+
+    Defaults True: a real node is unaffected unless the flag is set
+    explicitly falsy, and junk never silently flips it (env_flag semantics).
+    Under pytest (core.platform_paths.under_test) the default is False: a
+    test process that imports the entry point must not join the live hive.
+    Measured 2026-09-26 (task #98): CI pytest shards started gossip and the
+    superadmin report-in this way, and the throwaway nodes they registered
+    (1,967 10.1.x rows on the owner's desktop) were relayed to every node.
+    A test that needs the daemons sets the flag.
+    Callers MUST log when they skip — a node that quietly starts nothing has
+    to be distinguishable from a healthy one.
+    """
+    from core.platform_paths import under_test
+    return env_flag('HEVOLVE_START_BACKGROUND_SERVICES', not under_test())
+
+
 # ── Endpoint Resolution ──
 # Single source of truth for API URLs.
 # In bundled Nunba mode (NUNBA_BUNDLED=1), all DB/action/prompt/vision
@@ -270,13 +307,6 @@ def get_vision_api() -> str:
     if is_bundled():
         return f'{_local_base()}/upload/vision'
     return get_secret('LLAVA_API', '')
-
-
-def get_book_parsing_api() -> str:
-    """PDF/book parsing API URL."""
-    if is_bundled():
-        return f'{_local_base()}/upload/parse_pdf'
-    return get_secret('BOOKPARSING_API', '')
 
 
 def get_visual_context_api(user_id, mins=5) -> str:

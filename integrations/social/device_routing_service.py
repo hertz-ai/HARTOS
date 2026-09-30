@@ -184,6 +184,35 @@ class DeviceRoutingService:
         Returns:
             {success, command_id, device_id} dict.
         """
+        # FILE THE ASK AS A CONSENT RECORD FIRST.
+        #
+        # This method shares its name with ConsentService.request_consent, and
+        # that one writes a UserConsent row while this one used to write none —
+        # same name, same apparent job, one leaving nothing to revoke, nothing
+        # on the privacy page and nothing for check_consent to find. A reader
+        # cannot tell them apart at the call site, which is how a caller ends up
+        # believing an ask was recorded when it was only pushed.
+        #
+        # Rather than rename (this has no production callers, only tests, so a
+        # rename would move the hazard rather than remove it), the two are made
+        # to AGREE: both now record. The three legs below stay what they always
+        # were — transports for an ask that is already on file, never the store.
+        #
+        # consent_type_for_action maps the action; an action that governs no
+        # consent type records nothing and still pushes, exactly as before, so
+        # no caller loses its notification.
+        try:
+            from .consent_service import ConsentService, consent_type_for_action
+            _ct = consent_type_for_action(action)
+            if _ct:
+                ConsentService.request_consent(
+                    db, str(user_id), _ct, scope='*', agent_id=agent_id,
+                    reason=description or action)
+        except Exception as _e:  # never cost the user the ask itself
+            logger.warning(
+                'device consent ask not recorded for %s/%s: %s',
+                user_id, action, _e)
+
         # Create persistent notification (visible on all devices)
         NotificationService.create(
             db, user_id, 'agent_consent_request',

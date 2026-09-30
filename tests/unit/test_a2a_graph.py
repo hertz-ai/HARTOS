@@ -182,7 +182,7 @@ def test_steer_pause_sets_status_paused(monkeypatch):
     fake_db = _install_fake_models(monkeypatch, goal=goal)
     captured = _install_fake_audit(monkeypatch)
 
-    out = ds.steer_agent(fake_db, 'agent-1', 'pause', actor_id='alice')
+    out = ds.steer_agent(fake_db, 'agent-1', 'pause', actor_id='alice', caller=_OWNER(ds))
 
     assert out['ok'] is True
     assert out['new_status'] == 'paused'
@@ -199,10 +199,11 @@ def test_steer_resume_requires_paused(monkeypatch):
     fake_db = _install_fake_models(monkeypatch, goal=goal)
     _install_fake_audit(monkeypatch)
 
-    out = ds.steer_agent(fake_db, 'agent-1', 'resume')
+    out = ds.steer_agent(fake_db, 'agent-1', 'resume', caller=_OWNER(ds))
 
     assert out['ok'] is False
-    assert 'paused' in out['error']
+    # Worded as the outcome (review of 275e8e361), not the rule.
+    assert out['error'] == 'This run is already running.'
     assert goal.status == 'active'  # unchanged
     fake_db.commit.assert_not_called()
 
@@ -213,7 +214,7 @@ def test_steer_resume_from_paused_succeeds(monkeypatch):
     fake_db = _install_fake_models(monkeypatch, goal=goal)
     _install_fake_audit(monkeypatch)
 
-    out = ds.steer_agent(fake_db, 'agent-1', 'resume')
+    out = ds.steer_agent(fake_db, 'agent-1', 'resume', caller=_OWNER(ds))
 
     assert out['ok'] is True
     assert out['new_status'] == 'active'
@@ -226,7 +227,7 @@ def test_steer_cancel_archives(monkeypatch):
     fake_db = _install_fake_models(monkeypatch, goal=goal)
     _install_fake_audit(monkeypatch)
 
-    out = ds.steer_agent(fake_db, 'agent-1', 'cancel')
+    out = ds.steer_agent(fake_db, 'agent-1', 'cancel', caller=_OWNER(ds))
 
     assert out['ok'] is True
     assert out['new_status'] == 'archived'
@@ -238,10 +239,10 @@ def test_steer_cancel_blocks_already_archived(monkeypatch):
     fake_db = _install_fake_models(monkeypatch, goal=goal)
     _install_fake_audit(monkeypatch)
 
-    out = ds.steer_agent(fake_db, 'agent-1', 'cancel')
+    out = ds.steer_agent(fake_db, 'agent-1', 'cancel', caller=_OWNER(ds))
 
     assert out['ok'] is False
-    assert 'archived' in out['error']
+    assert out['error'] == 'This run was already cancelled.'
 
 
 def test_steer_unknown_verb_rejected(monkeypatch):
@@ -249,7 +250,7 @@ def test_steer_unknown_verb_rejected(monkeypatch):
     goal = _make_goal()
     fake_db = _install_fake_models(monkeypatch, goal=goal)
 
-    out = ds.steer_agent(fake_db, 'agent-1', 'detonate')
+    out = ds.steer_agent(fake_db, 'agent-1', 'detonate', caller=_OWNER(ds))
     assert out['ok'] is False
     assert 'detonate' in out['error']
 
@@ -258,18 +259,28 @@ def test_steer_missing_agent_returns_error(monkeypatch):
     ds = pytest.importorskip('integrations.social.dashboard_service')
     fake_db = _install_fake_models(monkeypatch, goal=None)
 
-    out = ds.steer_agent(fake_db, 'nope', 'pause')
+    out = ds.steer_agent(fake_db, 'nope', 'pause', caller=_OWNER(ds))
     assert out['ok'] is False
     assert 'not found' in out['error']
 
 
 # ─── inject_instruction ───────────────────────────────────────────────
 
+def _OWNER(ds):
+    """A caller may_steer admits without a users table.  These tests fake
+    the models module, so the person behind an owner id cannot be resolved
+    here; an admin is admitted before that lookup.  Who may and may NOT
+    steer is pinned against a real DB by tests/unit/
+    test_inject_requires_goal_owner.py and
+    test_every_steering_verb_requires_goal_owner.py."""
+    return ds.SteeringCaller(user_id='ops', is_admin=True)
+
+
 def test_inject_rejects_empty_instruction(monkeypatch):
     ds = pytest.importorskip('integrations.social.dashboard_service')
     fake_db = _install_fake_models(monkeypatch, goal=_make_goal())
 
-    out = ds.inject_instruction(fake_db, 'agent-1', '   ')
+    out = ds.inject_instruction(fake_db, 'agent-1', '   ', caller=_OWNER(ds))
     assert out['ok'] is False
     assert 'empty' in out['error']
 
@@ -280,7 +291,8 @@ def test_inject_no_groupchat_registered(monkeypatch):
     monkeypatch.setitem(sys.modules, 'hartos.lifecycle_hooks',
                         SimpleNamespace(get_registered_groupchat=lambda key: None))
 
-    out = ds.inject_instruction(fake_db, 'agent-1', 'retry now')
+    out = ds.inject_instruction(fake_db, 'agent-1', 'retry now',
+                                caller=_OWNER(ds))
     assert out['ok'] is False
     assert 'no live GroupChat' in out['error']
 
@@ -298,7 +310,7 @@ def test_inject_appends_to_groupchat_and_audits(monkeypatch):
     captured = _install_fake_audit(monkeypatch)
 
     out = ds.inject_instruction(fake_db, 'agent-1', 'switch to cloud',
-                                actor_id='alice')
+                                actor_id='alice', caller=_OWNER(ds))
 
     assert out['ok'] is True
     assert out['message_index'] == 1
@@ -314,7 +326,7 @@ def test_inject_missing_agent_returns_error(monkeypatch):
     ds = pytest.importorskip('integrations.social.dashboard_service')
     fake_db = _install_fake_models(monkeypatch, goal=None)
 
-    out = ds.inject_instruction(fake_db, 'nope', 'hi')
+    out = ds.inject_instruction(fake_db, 'nope', 'hi', caller=_OWNER(ds))
     assert out['ok'] is False
     assert 'not found' in out['error']
 

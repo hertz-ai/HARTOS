@@ -50,18 +50,8 @@ if not SECRET_KEY:
     def _load_or_create_secret_key():
         # Single-sourced with the JWTManager reader (core.platform_paths) so the
         # writer and reader never diverge on WHERE the key lives (#98e).
-        try:
-            from core.platform_paths import social_secret_key_write_target
-            key_file = social_secret_key_write_target()
-        except ImportError:
-            # Fail-safe: same priority, inlined, if platform_paths is unavailable.
-            db_path = os.environ.get('HEVOLVE_DB_PATH', '')
-            if db_path and db_path != ':memory:' and os.path.isabs(db_path):
-                key_file = os.path.join(os.path.dirname(db_path), '.social_secret_key')
-            elif os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-                key_file = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', '.social_secret_key')
-            else:
-                key_file = os.path.join('agent_data', '.social_secret_key')
+        from core.platform_paths import social_secret_key_write_target
+        key_file = social_secret_key_write_target()
         try:
             if os.path.exists(key_file):
                 with open(key_file, 'r') as f:
@@ -180,6 +170,19 @@ def verify_hive_jwt(token: str, issuer_public_key_hex: str) -> dict:
     """Verify a HIVE-scoped JWT from another node using its Ed25519 public key.
 
     Returns payload dict on success, empty dict on failure.
+
+    TRUSTED KEY ONLY — NEVER a key from the request (#59).  ``issuer_public_key_hex``
+    MUST be resolved from a trusted source (a peer's registered
+    PeerNode.public_key by the claimed node_id, or a key that traces to the
+    node's master trust anchor via the delegation chain), the way
+    discovery._sender_signature_valid resolves it.
+    Passing a caller-supplied key is self-certification: it always verifies and
+    proves nothing.  That was the /api/social/auth/sync-user admin-takeover
+    (a caller signed with its own key, sent that key as ``node_public_key``,
+    and created a role-'central' user); that route now uses
+    _sender_signature_valid and no longer calls this.  This function has NO
+    production caller (grep: only tests); a new route MUST NOT reuse the
+    key-as-parameter shape — resolve the key by identity first.
     """
     mgr = _get_jwt_manager()
     if mgr:
@@ -187,6 +190,81 @@ def verify_hive_jwt(token: str, issuer_public_key_hex: str) -> dict:
         return result or {}
     return {}
 
+
+def verify_device_jwt(db, token: str, owner_id: str) -> dict:
+    """Verify a hive-shaped token from a person's phone against the key the
+    desktop owner allowed for it (#111).
+
+    The phone signs the same token nodes exchange (scope 'hive', node_sig
+    over the canonical payload, verify_hive_jwt) with its own PeerLink
+    Ed25519 key, and carries that key's hex in a ``node_public_key`` claim.
+    The claim is read ONLY to find the row: the key on file is the owner's
+    GRANTED ``device_access`` consent whose scope is that key
+    (consent_service.device_scope), the row the owner wrote with "Always
+    allow" on the ask.  The signature is verified against the key read back
+    from that row (ConsentService.active_grant, an exact-scope lookup), so
+    the claim can select a row and nothing more, and a blanket '*' grant
+    admits no device.
+
+    Before any ask is filed the token must verify against the key it
+    CLAIMS: that proves the caller holds that key, so nobody can file asks
+    in the name of another phone's key, and an ask always names a key its
+    sender can answer for.  (Holding a key is not identity; only the
+    owner's grant is.)
+
+    Returns ``{'status': 'ok', 'payload': ..., 'public_key': ...}``,
+    ``{'status': 'pending', 'public_key': ..., 'claims': ...}`` (no grant
+    yet: the caller files the ask), ``{'status': 'denied', 'public_key':
+    ...}`` (the owner said no), or ``{'status': 'invalid'}`` (not a device
+    token, or the signature does not verify).
+    """
+    from .consent_service import ConsentService, device_scope
+    if not HAS_JWT or not token or not owner_id:
+        return {'status': 'invalid'}
+    try:
+        claims = pyjwt.decode(token, options={'verify_signature': False,
+                                              'verify_exp': False},
+                              algorithms=['HS256'])
+    except Exception:
+        return {'status': 'invalid'}
+    scope = device_scope(claims.get('node_public_key'))
+    if scope is None or claims.get('scope') != 'hive':
+        return {'status': 'invalid'}
+    row = ConsentService.active_grant(db, owner_id, 'device_access',
+                                      scope=scope, agent_id=None)
+    if row is None:
+        claimed_key = scope[len('device:'):]
+        if not verify_hive_jwt(token, claimed_key):
+            return {'status': 'invalid'}
+        declined = ConsentService.declined(db, owner_id, 'device_access',
+                                           scope=scope, agent_id=None)
+        return {'status': 'denied' if declined else 'pending',
+                'public_key': claimed_key, 'claims': claims}
+    granted_key = row.scope[len('device:'):]
+    payload = verify_hive_jwt(token, granted_key)
+    if not payload:
+        logger.warning("device token for granted key %s... did not verify",
+                       granted_key[:16])
+        return {'status': 'invalid'}
+    return {'status': 'ok', 'payload': payload, 'public_key': granted_key}
+
+
+def file_device_access_ask(db, owner_id: str, public_key: str, claims: dict) -> None:
+    """File the one canonical owner-consent ask for a proven phone key.
+
+    Both the HTTP gate and PeerLink admission call this only after
+    ``verify_device_jwt`` has verified proof of possession.  Keeping the
+    wording, scope, record, and realtime fanout here prevents the two
+    transports from drifting into separate device-trust flows.
+    """
+    from .consent_service import ConsentService, device_scope
+
+    name = ' '.join(str(claims.get('username') or '').split())[:100]
+    who = f'A phone calling itself "{name}"' if name else 'An unnamed phone'
+    ConsentService.request_consent(
+        db, owner_id, 'device_access', scope=device_scope(public_key),
+        reason=f"{who} asks to use this computer's agents from the network.",
+        requester_name=name)
 
 def generate_token_pair(user_id: str, username: str, role: str = 'flat') -> dict:
     """Generate access + refresh token pair."""
@@ -341,6 +419,30 @@ def _get_user_from_token(token: str):
     return None, db
 
 
+def user_id_for_token(token):
+    """The user id a bearer token belongs to, or None.
+
+    The public form of _get_user_from_token, for callers that need only the
+    id and are not decorated routes (an SSE stream, a sync endpoint in the
+    desktop app).  Accepts everything require_auth accepts: a local JWT, a
+    hive JWT from this node, and a stored api_token.  The last is how a cloud
+    login works on a desktop: the login sync stores the Kong-issued token as
+    the user's api_token.  Decoding the token as a JWT instead rejects every
+    cloud login (measured 2026-09-25: /agents/sync 401 while /api/social/
+    auth/me answered 200 for the same token).  The DB session is closed here.
+    """
+    if not token:
+        return None
+    user, db = _get_user_from_token(token)
+    try:
+        if user is None or getattr(user, 'is_banned', False):
+            return None
+        return str(user.id)
+    finally:
+        if db is not None:
+            db.close()
+
+
 def require_auth(f):
     """Decorator: requires valid Bearer token. Sets g.user and g.db.
 
@@ -450,13 +552,53 @@ def optional_auth(f):
     return decorated
 
 
+def require_local_or_auth(f):
+    """Decorator: loopback callers pass as they are; anyone else needs a user token.
+
+    For routes a local client calls without a session that every HARTOS node
+    must ALSO be able to serve to the network. The bundled desktop's own SPA has
+    always called the book routes from 127.0.0.1 with no Authorization header;
+    once any node serves them, a remote caller must be a known user, scoped to
+    their own data. So:
+
+      * local  -> g.user = g.user_id = None; the route decides what a local
+                  request may name (a desktop is single-user).
+      * remote -> require_auth: g.user / g.user_id identify the caller.
+
+    Composes the two canonical gates -- core.auth_local._is_local_request (the
+    same loopback test, TRUSTED_PROXY included, that require_local_or_token
+    uses) and require_auth -- rather than re-implementing either.
+    """
+    remote = require_auth(f)
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        from core.auth_local import _is_local_request
+        if _is_local_request():
+            g.user = None
+            g.user_id = None
+            return f(*args, **kwargs)
+        return remote(*args, **kwargs)
+
+    return decorated
+
+
+# The User.role strings that confer elevated authority.  require_admin honors
+# 'central' (below), require_moderator honors 'regional'/'central'; the extra
+# 'admin'/'moderator' are kept as a conservative superset so a role STRING of
+# that name is never treated as an ordinary profile field.  ONE definition,
+# imported by sync_engine's role-strip (#59/#65) so the set a sync may set or
+# preserve can never drift from the set the authority checks honor.  A new
+# privileged role added here is stripped from syncs automatically.
+PRIVILEGED_ROLES = frozenset({'central', 'regional', 'admin', 'moderator'})
+
+
 def require_admin(f):
     """Decorator: requires central (cloud admin) role or is_admin flag."""
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
-        user_role = getattr(g.user, 'role', None) or 'flat'
-        if not (g.user.is_admin or user_role in ('central',)):
+        if not holds_central_role(g.user):
             return jsonify({'success': False, 'error': 'Admin access required'}), 403
         return f(*args, **kwargs)
     return decorated
@@ -474,13 +616,23 @@ def require_moderator(f):
     return decorated
 
 
+def holds_central_role(user) -> bool:
+    """True when ``user`` holds the central (steward) account role: role
+    'central', or the is_admin flag UserService.set_user_role keeps in step
+    with it.  The ONE check require_central applies, and the one
+    voting_rules.is_steward builds on; None is never central."""
+    if user is None:
+        return False
+    return ((getattr(user, 'role', None) or 'flat') == 'central'
+            or bool(getattr(user, 'is_admin', False)))
+
+
 def require_central(f):
     """Decorator: requires central (cloud admin) role."""
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
-        user_role = getattr(g.user, 'role', None) or 'flat'
-        if user_role != 'central' and not g.user.is_admin:
+        if not holds_central_role(g.user):
             return jsonify({'success': False, 'error': 'Central access required'}), 403
         return f(*args, **kwargs)
     return decorated
