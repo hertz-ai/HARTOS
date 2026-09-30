@@ -7787,9 +7787,13 @@ if(!PERF.potato && HartShellState.isHost()) {{
 // ═══ Approval Helper ═══
 function _postApproval(agentId, action, decision) {{
   try {{
+    // The node names the approver from the caller's Bearer, never the body.
+    var _tok = ''; try {{ _tok = localStorage.getItem('access_token') || ''; }} catch(e) {{}}
+    var _hdr = {{'Content-Type':'application/json'}};
+    if(_tok) _hdr['Authorization'] = 'Bearer ' + _tok;
     fetch(SHELL+'/api/agent/approval', {{
       method:'POST',
-      headers:{{'Content-Type':'application/json'}},
+      headers:_hdr,
       body:JSON.stringify({{agent_id:agentId, action:action, decision:decision}})
     }}).catch(function(){{}});
   }} catch(e) {{}}
