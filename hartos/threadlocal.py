@@ -293,6 +293,14 @@ class ThreadLocalData:
     # requests clobbered each other's channel; see set_/get_request_id for the
     # canonical _local-backed pattern every other per-request field follows.)
 
+    def set_client_user_agent(self, user_agent):
+        """The User-Agent of the request this thread serves ('' when none):
+        what a tool reads to tell a phone from a desktop."""
+        self._local.client_user_agent = user_agent or ''
+
+    def get_client_user_agent(self):
+        return getattr(self._local, 'client_user_agent', '')
+
     def set_channel_context(self, channel_context):
         self._local.channel_context = channel_context
 

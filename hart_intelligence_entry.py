@@ -3704,37 +3704,55 @@ def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
         logger.debug("Connect_Channel: _wire_qr_pair_emitter failed: %s", e)
 
 
-def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
-    """Conversational pair-code OTP flow for gateway_qr channels (WhatsApp).
+# A phone or tablet: its browser (Android / iPhone / iPad / iPod / Mobile) or
+# a React Native app's HTTP client (okhttp on Android, CFNetwork on iOS).
+# A desktop browser, Nunba's desktop webview and a server-side python client
+# match none of these.
+_PHONE_USER_AGENT = re.compile(
+    r'\b(?:Android|iPhone|iPad|iPod|Mobile|okhttp|CFNetwork)\b', re.IGNORECASE)
 
-    Orchestrates the steps the steward proved manually on 2026-05-25:
-      1. Ensure the embedded gateway session is started (idempotent —
-         Baileys gateway short-circuits if session already exists for
-         this user under ~/.hevolve/whatsapp/auth/<sid>/).
-      2. Mint an 8-char pair code at the gateway.
-      3. Emit agent_ui_update kind='pair_code' for the in-chat copy
-         card (LiquidUIService routes via WAMP to the user's Demopage).
-      4. Persist a Notification of type='consent.channel_pair_code'
-         with the payload as JSON in the message field.  The
-         consent.* prefix is the canonical route — NotificationBell
-         resolveTargetPath catches it on web/desktop, and Android
-         AutobahnConnectionManager onEventSocial dispatches consent.*
-         events to ConsentOverlayService.  RN ConsentOverlayService
-         (Hevolve_React_Native) reads kind/code/clipboard_payload/
-         deeplink from there, does Clipboard.setString(code), and shows
-         the "Open WhatsApp" banner.  When user taps it, WhatsApp opens
-         to Linked Devices and the code is already on the system
-         clipboard ready to paste.
-      5. Spawn a daemon thread polling /api/sessions/<sid>/status.
-         When WhatsApp confirms pairing (state=connected, authenticated
-         =true — happens after baileys auto-reconnects on code 515
-         restart-required), emit agent_ui_update kind='channel_connected'
-         so chat shows the success card with no further user action.
 
-    Fail-safe at every step: any branch logs at debug and returns.
-    The agent's text reply (composed by _handle_connect_channel_tool)
-    is the only guaranteed surface — UI cards and mobile push are
-    additive.
+def _user_agent_is_phone(user_agent) -> bool:
+    """Does this User-Agent belong to a phone or tablet?  One that is the
+    device a WhatsApp QR would have to be scanned WITH, so showing it a QR
+    leaves nothing to scan it."""
+    return bool(_PHONE_USER_AGENT.search(user_agent or ''))
+
+
+def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
+                                phone: str = None, owner=None):
+    """Link a gateway_qr channel (WhatsApp) from chat, by the method that
+    works on the device the user is holding.
+
+      * A number is known -- given (the phone form, or 'whatsapp +91...'),
+        HEVOLVE_WHATSAPP_PHONE (operator choice) or the user's profile --
+        the pair code: chat card, consent.* notification that puts the code
+        on the phone's clipboard with an "Open WhatsApp" banner, and the iOS
+        fleet command.  One tap on the phone, on any device.
+      * No number and the request came from a phone or tablet
+        (_user_agent_is_phone): the form asking for the number.  A QR shown
+        on the phone cannot be scanned by that same phone.
+      * No number, on a desktop: WhatsApp's linked-device QR (``qr_pair``
+        cards), refreshed as WhatsApp rotates it (~20s) until it is scanned,
+        with "Link with phone number" on the card as the alternative.
+
+    The gateway serves the two methods on different sockets
+    (request-pair-code tears the QR socket down), so one attempt uses one.
+    One watcher polls /api/sessions/<sid>/status; when WhatsApp confirms, it
+    registers the binding, wires the live adapter and sends the
+    channel_connected card.  Every failure (gateway down, no code, the
+    window running out, a card or push not delivered) is a warning in the
+    log, and the ones the user must act on are a toast in chat.
+
+    Args:
+        phone: explicit number for "Link with phone number"; any format,
+            digits are kept.
+        owner: the user the cards are for, when the caller is a request
+            handler without a thread-local user (the re-entry route).
+
+    Returns 'pair_code', 'qr' or 'ask_phone': what the user was shown, for
+    the reply to describe.  None when the link could not start (the user
+    was told why in chat).
     """
     import os
     import json as _json
@@ -3742,7 +3760,12 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
     import threading
     import time
 
-    import requests as _req
+    # The ONE gateway client (api_channels): same base URL resolution as
+    # the /whatsapp/qr route and the X-Api-Key a remote WAHA needs.  Never
+    # raises; an unreachable gateway is (None, 503).
+    from integrations.social.api_channels import (
+        _proxy_gateway, _whatsapp_gateway_base,
+    )
 
     # Self-contained logger so the helper works whether the module's
     # global `logger` is initialised yet or not (helps in standalone
@@ -3751,7 +3774,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
 
     # _owner is who the cards are FOR (None -> agent_ui_update's resolved
     # owner); user_id keeps its 'system' placeholder for the gateway session.
-    _owner = thread_local_data.get_user_id() or None
+    _owner = owner or thread_local_data.get_user_id() or None
     user_id = _owner or 'system'
     sid = user_id if str(user_id).startswith('user_') else f"user_{user_id}"
     display_name = meta.get('display_name') or channel_type
@@ -3763,28 +3786,146 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
         else meta.get('mobile_deeplink')
     )
 
-    # Phone resolution: env override > stored user profile > ask in chat.
+    def _emit(payload: dict) -> None:
+        """One card to this user's chat; a missing service is logged."""
+        try:
+            from core.platform.registry import get_registry
+            _lui = get_registry().get_or_none('LiquidUIService')
+            if _lui is None:
+                _log.warning("gateway_qr: %s card not delivered, no "
+                             "LiquidUIService", payload.get('type'))
+                return
+            _lui.agent_ui_update(user_id, payload, user_id=_owner)
+        except Exception as e:
+            _log.warning("gateway_qr: %s card not delivered: %s",
+                         payload.get('type'), e)
+
+    def _fail(text: str) -> None:
+        _log.warning("gateway_qr: %s: %s", channel_type, text)
+        _emit({'type': 'toast', 'severity': 'error',
+               'channel': channel_type, 'channel_type': channel_type,
+               'text': text})
+
+    # The number, in order: given, the operator's, the user's profile.
     # WhatsApp's pair-code endpoint REQUIRES E.164 digits-only.
-    phone = (os.environ.get('HEVOLVE_WHATSAPP_PHONE', '') or '').strip()
-    phone = ''.join(ch for ch in phone if ch.isdigit())
-    if not phone:
+    phone = phone or os.environ.get('HEVOLVE_WHATSAPP_PHONE', '') or ''
+    if not phone and _owner:
         try:
             from integrations.social.models import db_session, User as _SocialUser
             with db_session(commit=False) as db:
-                u = db.query(_SocialUser).filter_by(
-                    id=str(user_id)).first()
-                _p = (
-                    ((u and getattr(u, 'phone', '') or '') or '').strip()
-                    if u else ''
+                u = db.query(_SocialUser).filter_by(id=str(_owner)).first()
+                phone = (getattr(u, 'phone', '') or '') if u else ''
+        except Exception as e:
+            _log.warning("gateway_qr: profile phone not read for %s (%s); "
+                         "linking without it", _owner, e)
+    phone = ''.join(ch for ch in str(phone) if ch.isdigit())
+
+    if not phone and _user_agent_is_phone(thread_local_data.get_client_user_agent()):
+        # On the phone itself: ask for the number, then send the pair code.
+        # The form posts to the re-entry route, which calls back here with
+        # the number.
+        _emit({
+            'type': 'form',
+            'title': f"Connect {display_name}",
+            'channel': channel_type,
+            'fields': [{
+                'name': 'phone',
+                'label': f'Your {display_name} number, with country code',
+                'placeholder': '+91 ...',
+                'help': ("Used once to get a linking code for this phone. "
+                         "Not stored."),
+                'type': 'tel',
+                'secret': False,
+            }],
+            'submit_label': 'Send me a code',
+            'action': f'/api/social/channels/{channel_type}/connect-pair-code',
+        })
+        return 'ask_phone'
+
+    base = _whatsapp_gateway_base()
+    started, start_status = _proxy_gateway('POST', f'/api/sessions/{sid}/start')
+    if started is None or start_status >= 400:
+        _fail(f"Couldn't reach the {display_name} link service on this "
+              f"computer (HTTP {start_status}"
+              f"{': ' + str(started.get('error')) if started and started.get('error') else ''}"
+              f"). It may still be starting; try again in a minute.")
+        return None
+
+    # One live attempt per session: a newer connect (say, the phone form
+    # after the QR) supersedes this watcher, so two never both announce.
+    # An attempt removes itself when it ends (_retire), so the map holds
+    # only live attempts.
+    _attempts = _start_gateway_qr_pair_push.__dict__.setdefault('attempts', {})
+    attempt = object()
+    _attempts[sid] = attempt
+
+    def _retire() -> None:
+        if _attempts.get(sid) is attempt:
+            _attempts.pop(sid, None)
+
+    if phone:
+        # Baileys needs ~3s for the WA noise handshake before
+        # requestPairingCode succeeds — manual probe earlier today (the
+        # FA9K4NHK code) verified this timing.
+        time.sleep(3)
+        body, _st = _proxy_gateway(
+            'POST', f'/api/sessions/{sid}/request-pair-code',
+            json={'phone': phone})
+        body = body or {}
+        code = body.get('code') if _st < 400 else None
+        if not code:
+            _retire()
+            _fail(f"{display_name} didn't return a pairing code "
+                  f"({body.get('error') or 'no code'}). Say 'connect "
+                  f"{channel_type}' without a number to scan a QR instead.")
+            return None
+
+        push_payload = {
+            'kind': 'channel_pair_code',
+            'channel': channel_type,
+            'display_name': display_name,
+            'color': color,
+            'icon': icon,
+            'code': code,
+            'clipboard_payload': code,
+            'deeplink': deeplink,
+            'expires_in': 60,
+        }
+
+        # Mobile push via existing NotificationService.  Type uses the
+        # canonical 'consent.*' prefix so the existing NotificationBell
+        # resolveTargetPath route (consent.* → /admin/consent/{ref}) and
+        # AutobahnConnectionManager 'consent.*' Intent dispatch (P0-D)
+        # catch it without per-type bell code.  target_id carries the
+        # channel name so /admin/consent/{whatsapp} lands on the right
+        # channel admin context.  Message JSON keeps the deeplink so the
+        # generic P0-C deeplink override in resolveTargetPath wins on
+        # click — that takes the user to the channel pair page directly.
+        #
+        # Order matters: NotificationService.create runs BEFORE the
+        # LiquidUI emit so we can pass notif.id into the chat-card
+        # payload.  PairCodeOverlay (P1-S3) calls notificationsApi.markRead
+        # with that id on countdown expiry so the bell doesn't carry an
+        # orphan unread row for an expired pair code.
+        notif_id = None
+        try:
+            from integrations.social.services import NotificationService
+            from integrations.social.models import db_session
+            with db_session() as db:
+                notif = NotificationService.create(
+                    db,
+                    user_id=str(user_id),
+                    type='consent.channel_pair_code',
+                    target_id=channel_type,
+                    target_type='channel',
+                    message=_json.dumps(push_payload),
                 )
-                phone = ''.join(ch for ch in _p if ch.isdigit())
-        except Exception:
-            logging.getLogger(__name__).exception("_start_gateway_qr_pair_push: swallowed Exception")
-    if not phone:
-        # Fall through to the existing form path — surface a one-field
-        # form asking for the phone number.  Re-running connect with
-        # HEVOLVE_WHATSAPP_PHONE set, or after the user submits the
-        # form, will land in this branch with phone populated.
+                notif_id = getattr(notif, 'id', None)
+        except Exception as e:
+            _log.warning("gateway_qr: pair code not pushed to %s's phone "
+                         "(it is still in chat): %s", user_id, e)
+
+        # In-chat card via the existing LiquidUI emit pipe.
         try:
             from core.platform.registry import get_registry
             _lui = get_registry().get('LiquidUIService')
@@ -3792,261 +3933,169 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                 _lui.agent_ui_update(
                     user_id,
                     {
-                        'type': 'form',
-                        'title': f"Connect {display_name}",
+                        'type': 'pair_code',
                         'channel': channel_type,
-                        'fields': [{
-                            'name': 'phone',
-                            'label': 'WhatsApp phone (E.164, e.g. +91 90030 54371)',
-                            'placeholder': '+91...',
-                            'help': (
-                                'Used once to mint the linked-device '
-                                'pair-code.  Not stored on our servers.'
-                            ),
-                            'type': 'text',
-                            'secret': False,
-                        }],
-                        'submit_label': 'Send pair code',
-                        # FormOverlay (AgentOverlay.jsx:362) reads `data.action`,
-                        # not `submit_action` — the latter was a stale name used
-                        # by the pre-existing register_channel form that no
-                        # caller wires.  This URL re-enters
-                        # _start_gateway_qr_pair_push with phone bound in
-                        # request body.
-                        'action': f'/api/social/channels/{channel_type}/connect-pair-code',
+                        'channel_type': channel_type,
+                        'display_name': display_name,
+                        'color': color,
+                        'icon': icon,
+                        'code': code,
+                        'expires_in': 60,
+                        'clipboard_payload': code,
+                        'deeplink': deeplink,
+                        'notification_id': notif_id,
+                        'instructions': (
+                            f"Open {display_name} on your phone → "
+                            f"Settings → Linked Devices → Link a Device → "
+                            f"Link with phone number → enter {code} "
+                            f"(60-second window).  I've also pushed it "
+                            f"to your phone with auto-copy to clipboard."
+                        ),
                     }, user_id=_owner,
                 )
-        except Exception:
-            logging.getLogger(__name__).exception("_start_gateway_qr_pair_push: swallowed Exception")
-        return
+        except Exception as e:
+            _log.warning("gateway_qr: pair-code card not delivered: %s", e)
 
-    base = (os.environ.get('WHATSAPP_GATEWAY_URL', '') or 'http://localhost:3000').rstrip('/')
-    try:
-        _req.post(f"{base}/api/sessions/{sid}/start", timeout=5)
-    except Exception as e:
-        _log.warning("gateway_qr: session start failed: %s", e)
-        return
-    # Baileys needs ~3s for the WA noise handshake before
-    # requestPairingCode succeeds — manual probe earlier today (the
-    # FA9K4NHK code) verified this timing.
-    time.sleep(3)
-    try:
-        r = _req.post(
-            f"{base}/api/sessions/{sid}/request-pair-code",
-            json={'phone': phone},
-            timeout=10,
-        )
-        body = r.json() if r.ok else {}
-        code = body.get('code')
-    except Exception as e:
-        _log.warning("gateway_qr: pair-code request error: %s", e)
-        return
-    if not code:
-        _log.warning(
-            "gateway_qr: gateway did not return a pair-code: %s", body)
-        return
-
-    push_payload = {
-        'kind': 'channel_pair_code',
-        'channel': channel_type,
-        'display_name': display_name,
-        'color': color,
-        'icon': icon,
-        'code': code,
-        'clipboard_payload': code,
-        'deeplink': deeplink,
-        'expires_in': 60,
-    }
-
-    # Mobile push via existing NotificationService.  Type uses the
-    # canonical 'consent.*' prefix so the existing NotificationBell
-    # resolveTargetPath route (consent.* → /admin/consent/{ref}) and
-    # AutobahnConnectionManager 'consent.*' Intent dispatch (P0-D)
-    # catch it without per-type bell code.  target_id carries the
-    # channel name so /admin/consent/{whatsapp} lands on the right
-    # channel admin context.  Message JSON keeps the deeplink so the
-    # generic P0-C deeplink override in resolveTargetPath wins on
-    # click — that takes the user to the channel pair page directly.
-    #
-    # Order matters: NotificationService.create runs BEFORE the
-    # LiquidUI emit so we can pass notif.id into the chat-card
-    # payload.  PairCodeOverlay (P1-S3) calls notificationsApi.markRead
-    # with that id on countdown expiry so the bell doesn't carry an
-    # orphan unread row for an expired pair code.
-    notif_id = None
-    try:
-        from integrations.social.services import NotificationService
-        from integrations.social.models import db_session
-        with db_session() as db:
-            notif = NotificationService.create(
-                db,
-                user_id=str(user_id),
-                type='consent.channel_pair_code',
-                target_id=channel_type,
-                target_type='channel',
-                message=_json.dumps(push_payload),
-            )
-            notif_id = getattr(notif, 'id', None)
-    except Exception as e:
-        _log.debug("gateway_qr: mobile push skipped: %s", e)
-
-    # In-chat card via the existing LiquidUI emit pipe.
-    try:
-        from core.platform.registry import get_registry
-        _lui = get_registry().get('LiquidUIService')
-        if _lui:
-            _lui.agent_ui_update(
-                user_id,
+        # ── 2026-05-26 P0-E ──────────────────────────────────────────────
+        # Fleet fanout for iOS native (Nunba-Companion-iOS) which
+        # subscribes to com.hertzai.hevolve.fleet.user.{user_id} and routes
+        # the existing 'agent_consent' cmd_type via FleetCommandReceiver
+        # allowlist — no iOS code change required.  Per
+        # core/peer_link/ui_commands.py module docstring: consent flows
+        # MUST use cmd_type='agent_consent' (NOT ui_overlay_show); the
+        # helper is "future work" per that docstring, so we publish via
+        # message_bus directly with the documented shape.  Web/desktop
+        # already get this card via the agent_ui_update + Notification
+        # emits above; Android gets it via the consent.* WAMP dispatcher
+        # (P0-D); this closes the iOS gap with one canonical route.
+        try:
+            from core.peer_link.message_bus import get_message_bus
+            get_message_bus().publish(
+                'fleet.command.user',
                 {
-                    'type': 'pair_code',
+                    'cmd_type': 'agent_consent',
+                    'id': f"consent-{channel_type}-{int(time.time())}",
+                    'title': f"Connect {display_name}",
+                    'body': (
+                        f"Code {code} auto-copied to clipboard.  Open "
+                        f"{display_name} → Linked Devices and enter the "
+                        f"code within 60s."
+                    ),
+                    'code': code,
+                    'clipboard_payload': code,
+                    'deeplink': deeplink,
+                    'expires_in_seconds': 60,
+                    'channel': channel_type,
+                    'display_name': display_name,
+                },
+                user_id=str(user_id),
+            )
+        except Exception as e:
+            _log.warning("gateway_qr: pair code not sent to the iOS "
+                         "companion: %s", e)
+
+    def _watch():
+        """Show each fresh QR; on pairing, register, go live and confirm.
+
+        Window covers 4 pair-code retries (each WA expires after ~60s) and
+        several QR rotations.  Daemon, so shutdown never waits on it.
+        """
+        deadline = time.time() + 240
+        last_qr = None
+        shown = 0
+        while time.time() < deadline:
+            if _attempts.get(sid) is not attempt:
+                _log.info("gateway_qr: %s watcher for %s superseded by a "
+                          "newer connect", channel_type, sid)
+                return
+            body, _st = _proxy_gateway('GET', f'/api/sessions/{sid}/status')
+            if body is None or _st >= 400:
+                _log.debug("gateway_qr: status poll HTTP %s", _st)
+                body = {}
+            if body.get('authenticated'):
+                # Register binding so Hevolve/Nunba see channel as
+                # connected.  Re-uses the SAME register_channel
+                # closure Connect_Channel calls — single code path.
+                try:
+                    from integrations.channels.agent_tools import (
+                        build_channel_tool_closures,
+                    )
+                    _tools = build_channel_tool_closures(
+                        {'user_id': str(user_id),
+                         'prompt_id': thread_local_data.get_prompt_id()},
+                    ) or []
+                    _reg = next(
+                        (t[2] for t in _tools
+                         if isinstance(t, tuple) and len(t) >= 3
+                         and t[0] == 'register_channel'),
+                        None,
+                    )
+                    if _reg is not None:
+                        reg_out = _reg(channel_type, '{}')
+                        _log.info(
+                            "gateway_qr: register_channel after "
+                            "pair: %s", str(reg_out)[:200])
+                except Exception as reg_err:
+                    _log.warning(
+                        "gateway_qr: register_channel after pair "
+                        "failed: %s", reg_err)
+                # Live adapter: register_channel above only writes the
+                # UserChannelBinding row (so the UI shows "connected")
+                # — it never wires a real WhatsAppAdapter into the
+                # running ChannelRegistry, so inbound messages never
+                # reached the agent.  This is the actual transport.
+                if channel_type == 'whatsapp':
+                    _adapter_out = _ensure_whatsapp_live_adapter(
+                        user_id, sid=sid, base=base)
+                    _log.info(
+                        "gateway_qr: live adapter registration: %s",
+                        _adapter_out)
+                # Chat success card.
+                _emit({
+                    'type': 'channel_connected',
                     'channel': channel_type,
                     'channel_type': channel_type,
                     'display_name': display_name,
                     'color': color,
                     'icon': icon,
-                    'code': code,
-                    'expires_in': 60,
-                    'clipboard_payload': code,
-                    'deeplink': deeplink,
-                    'notification_id': notif_id,
-                    'instructions': (
-                        f"Open {display_name} on your phone → "
-                        f"Settings → Linked Devices → Link a Device → "
-                        f"Link with phone number → enter {code} "
-                        f"(60-second window).  I've also pushed it "
-                        f"to your phone with auto-copy to clipboard."
-                    ),
-                }, user_id=_owner,
-            )
-    except Exception as e:
-        _log.debug("gateway_qr: chat card emit failed: %s", e)
+                    'message': f"✅ {display_name} connected.",
+                })
+                _retire()
+                return
+            qr = body.get('qr')
+            if qr and qr != last_qr and not phone:
+                last_qr = qr
+                shown += 1
+                _emit({
+                    'type': 'qr_pair',
+                    'channel': channel_type,
+                    'channel_type': channel_type,
+                    'title': f"Scan to connect {display_name}",
+                    'help': (f"Open {display_name} on your phone → Settings "
+                             f"→ Linked devices → Link a device, and scan "
+                             f"this code."),
+                    'qr': qr,
+                    # One id per code; the overlay replaces the channel's
+                    # card in place with each newer code.
+                    'msg_id': f"qr_pair-{channel_type}-{sid}-{shown}",
+                    # The alternative for someone whose only device is the
+                    # phone: "Link with phone number" posts {phone} here.
+                    'pair_code_action': (
+                        f'/api/social/channels/{channel_type}/connect-pair-code'),
+                })
+            time.sleep(2)
+        if _attempts.get(sid) is not attempt:
+            return
+        _retire()
+        _fail(f"The {display_name} link expired before it was completed. "
+              f"Say 'connect {channel_type}' to get a new "
+              f"{'code' if phone else 'QR code'}.")
 
-    # ── 2026-05-26 P0-E ──────────────────────────────────────────────
-    # Fleet fanout for iOS native (Nunba-Companion-iOS) which
-    # subscribes to com.hertzai.hevolve.fleet.user.{user_id} and routes
-    # the existing 'agent_consent' cmd_type via FleetCommandReceiver
-    # allowlist — no iOS code change required.  Per
-    # core/peer_link/ui_commands.py module docstring: consent flows
-    # MUST use cmd_type='agent_consent' (NOT ui_overlay_show); the
-    # helper is "future work" per that docstring, so we publish via
-    # message_bus directly with the documented shape.  Web/desktop
-    # already get this card via the agent_ui_update + Notification
-    # emits above; Android gets it via the consent.* WAMP dispatcher
-    # (P0-D); this closes the iOS gap with one canonical route.
-    try:
-        from core.peer_link.message_bus import get_message_bus
-        get_message_bus().publish(
-            'fleet.command.user',
-            {
-                'cmd_type': 'agent_consent',
-                'id': f"consent-{channel_type}-{int(time.time())}",
-                'title': f"Connect {display_name}",
-                'body': (
-                    f"Code {code} auto-copied to clipboard.  Open "
-                    f"{display_name} → Linked Devices and enter the "
-                    f"code within 60s."
-                ),
-                'code': code,
-                'clipboard_payload': code,
-                'deeplink': deeplink,
-                'expires_in_seconds': 60,
-                'channel': channel_type,
-                'display_name': display_name,
-            },
-            user_id=str(user_id),
-        )
-    except Exception as e:
-        _log.debug("gateway_qr: iOS fleet publish skipped: %s", e)
-
-    # Polling thread — emits the success card to chat AND registers
-    # the channel binding in HARTOS DB when WhatsApp confirms pairing.
-    # Window covers 4 pair-code retries (each WA expires after ~60s).
-    # Daemon so the server can shut down at any time without joining
-    # this thread.
-    #
-    # Why the binding-register call inside the thread (not before):
-    # the user's manual pair on 2026-05-25 (FA9K4NHK) bypassed
-    # register_channel entirely — gateway state was 'connected' but
-    # HARTOS had no UserChannelBinding row, so neither the
-    # whatsapp_adapter daemon nor the admin Channels page nor any
-    # agent tool could see WhatsApp as a usable channel.  Registering
-    # in the success branch retroactively closes that loop for ANY
-    # path (chat conversational OR manual-via-curl) — single canonical
-    # success handler.  Idempotent: register_channel's UserChannelBinding
-    # query at agent_tools.py:204 short-circuits on existing rows.
-    def _poll():
-        deadline = time.time() + 240
-        while time.time() < deadline:
-            try:
-                rr = _req.get(
-                    f"{base}/api/sessions/{sid}/status", timeout=5)
-                if rr.ok and rr.json().get('authenticated'):
-                    # Register binding so Hevolve/Nunba see channel as
-                    # connected.  Re-uses the SAME register_channel
-                    # closure Connect_Channel calls — single code path.
-                    try:
-                        from integrations.channels.agent_tools import (
-                            build_channel_tool_closures,
-                        )
-                        _tools = build_channel_tool_closures(
-                            {'user_id': str(user_id),
-                             'prompt_id': thread_local_data.get_prompt_id()},
-                        ) or []
-                        _reg = next(
-                            (t[2] for t in _tools
-                             if isinstance(t, tuple) and len(t) >= 3
-                             and t[0] == 'register_channel'),
-                            None,
-                        )
-                        if _reg is not None:
-                            reg_out = _reg(channel_type, '{}')
-                            _log.info(
-                                "gateway_qr: register_channel after "
-                                "pair: %s", str(reg_out)[:200])
-                    except Exception as reg_err:
-                        _log.warning(
-                            "gateway_qr: register_channel after pair "
-                            "failed: %s", reg_err)
-                    # Live adapter: register_channel above only writes the
-                    # UserChannelBinding row (so the UI shows "connected")
-                    # — it never wires a real WhatsAppAdapter into the
-                    # running ChannelRegistry, so inbound messages never
-                    # reached the agent.  This is the actual transport.
-                    if channel_type == 'whatsapp':
-                        _adapter_out = _ensure_whatsapp_live_adapter(
-                            user_id, sid=sid, base=base)
-                        _log.info(
-                            "gateway_qr: live adapter registration: %s",
-                            _adapter_out)
-                    # Chat success card.
-                    try:
-                        from core.platform.registry import get_registry
-                        _lui = get_registry().get('LiquidUIService')
-                        if _lui:
-                            _lui.agent_ui_update(
-                                user_id,
-                                {
-                                    'type': 'channel_connected',
-                                    'channel': channel_type,
-                                    'channel_type': channel_type,
-                                    'display_name': display_name,
-                                    'color': color,
-                                    'icon': icon,
-                                    'message': (
-                                        f"✅ {display_name} connected."
-                                    ),
-                                }, user_id=_owner,
-                            )
-                    except Exception:
-                        logging.getLogger(__name__).exception("_poll: swallowed Exception")
-                    return
-            except Exception:
-                logging.getLogger(__name__).exception("_poll: swallowed Exception")
-            time.sleep(3)
     threading.Thread(
-        target=_poll, daemon=True,
+        target=_watch, daemon=True,
         name=f'connect_channel_poll_{channel_type}',
     ).start()
+    return 'pair_code' if phone else 'qr'
 
 
 _whatsapp_adapter_lock = threading.Lock()
@@ -4414,7 +4463,11 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                                 # before pasting the resulting token.
                                 'external_url': meta.get('external_url'),
                                 'submit_label': 'Connect',
-                                'submit_action': 'register_channel',
+                                # The renderer POSTs the field values to
+                                # `action` (Nunba FormOverlay).  The old
+                                # submit_action name was read by nothing,
+                                # so Connect dropped the typed token.
+                                'action': f'/api/social/channels/{channel_type}/connect',
                             },
                             user_id=thread_local_data.get_user_id() or None,
                         )
@@ -4468,9 +4521,43 @@ def _handle_connect_channel_tool(input_text: str) -> str:
             from integrations.channels.metadata import get_channel_metadata
             meta = get_channel_metadata(channel_type) or {}
             if meta.get('auth_method') == 'gateway_qr':
-                _start_gateway_qr_pair_push(channel_type, meta)
+                # A number in the input asks for a pair code.  Accepts the
+                # JSON form ('whatsapp {"phone": "+91..."}') or a bare number
+                # ('whatsapp +91 90030 54371'); fewer than 8 digits is not a
+                # phone number.  With none, the helper picks by the number on
+                # file and the device (_start_gateway_qr_pair_push).
+                try:
+                    _cfg = _json.loads(config_json or '{}')
+                except ValueError:
+                    _cfg = config_json
+                if isinstance(_cfg, dict):
+                    _cfg = _cfg.get('phone') or _cfg.get('phone_number') or ''
+                _phone = ''.join(ch for ch in str(_cfg or '') if ch.isdigit())
+                if len(_phone) < 8:
+                    _phone = ''
+                _how = _start_gateway_qr_pair_push(channel_type, meta,
+                                                   phone=_phone or None)
+                _name = meta.get('display_name') or channel_type
+                result = f"{result} " + {
+                    'pair_code': (
+                        f"I sent a linking code to this chat and to your "
+                        f"phone, where it is already copied: in {_name} open "
+                        f"Linked devices > Link a device > Link with phone "
+                        f"number and paste it."),
+                    'ask_phone': (
+                        f"Enter your {_name} number in the form I sent and "
+                        f"I'll send you a linking code: a QR code can't be "
+                        f"scanned by the phone showing it."),
+                    'qr': (
+                        f"Scan the QR code in this chat from {_name} on your "
+                        f"phone (Linked devices > Link a device). If you "
+                        f"can't scan, use 'Link with phone number' on the "
+                        f"card."),
+                }.get(_how, f"But the {_name} link couldn't start; the "
+                            f"message in chat says why.")
         except Exception as e:
-            logger.debug("Connect_Channel: gateway_qr push skipped: %s", e)
+            logger.warning("Connect_Channel: %s link not started: %s",
+                           channel_type, e)
         return result
     except Exception as e:
         return f"Channel connect error: {str(e)[:200]}"
@@ -5477,8 +5564,11 @@ def get_tools(req_tool, is_first: bool = False):
                     # LLM call. Doubling escapes them to literals. See
                     # langchain.log 2026-04-11 22:46:01 for the crash.
                     "with credentials (e.g. 'telegram {{\"bot_token\":\"123:ABC\"}}'). "
-                    "For WhatsApp specifically, passing just 'whatsapp' starts a QR "
-                    "authentication flow. Do NOT ask the user for credentials first — "
+                    "For WhatsApp specifically, passing just 'whatsapp' shows a QR "
+                    "code to scan; if the user can't scan (WhatsApp is on the same "
+                    "phone) or asks to link with their number, pass 'whatsapp "
+                    "<their phone number>' to send a pairing code instead. "
+                    "Do NOT ask the user for credentials first — "
                     "call this tool with just the channel name and it will tell you "
                     "what's needed."
                 ),
@@ -9634,6 +9724,10 @@ def chat():
     # each other's (the old `thread_local_data.channel_context = …` put it on the
     # shared singleton instance, not _local — a cross-request leak).
     thread_local_data.set_channel_context(channel_context)
+    # Which device asked (always set, like channel_context): connecting
+    # WhatsApp on the phone itself needs a pair code, not a QR that phone
+    # cannot scan (_start_gateway_qr_pair_push).
+    thread_local_data.set_client_user_agent(request.headers.get('User-Agent', ''))
 
     # USER PRIORITY: mark user activity so daemon dispatch yields the LLM.
     #

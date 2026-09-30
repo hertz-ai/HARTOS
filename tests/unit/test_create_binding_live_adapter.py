@@ -63,6 +63,18 @@ def client(app):
     return app.test_client()
 
 
+@pytest.fixture(autouse=True)
+def _no_live_watch(monkeypatch):
+    """create_binding starts _report_when_live after a successful wiring:
+    a 35s thread that would outlive the test and post cards into whatever
+    LiquidUIService the next test registers.  Its behaviour is tested in
+    test_channel_onboarding_completes; here it is a boundary."""
+    from unittest.mock import MagicMock
+    watch = MagicMock()
+    monkeypatch.setattr('integrations.channels.agent_tools._report_when_live', watch)
+    return watch
+
+
 def _register(client, username='binding_tester'):
     resp = client.post('/api/social/auth/register', json={
         'username': username,

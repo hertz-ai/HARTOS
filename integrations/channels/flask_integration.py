@@ -656,6 +656,10 @@ class FlaskChannelIntegration:
         call_kwargs = dict(kwargs)
         spec = self._CHANNEL_SPECS.get(channel_type)
         if spec:
+            unmet = self.unmet_required_settings(channel_type, call_kwargs)
+            if unmet:
+                logger.warning(f"{channel_type} requires {', '.join(unmet)} — skipping")
+                return False
             if token:
                 call_kwargs[spec['token_param']] = token
             for p in spec.get('extra', ()):
@@ -663,14 +667,8 @@ class FlaskChannelIntegration:
                 if call_kwargs.get(name):
                     continue  # explicit kwarg wins over env/default
                 val = (os.getenv(p['env']) if p.get('env') else None) or p.get('default')
-                if not val:
-                    if p.get('required'):
-                        env_hint = f" ({p['env']})" if p.get('env') else ''
-                        logger.warning(
-                            f"{channel_type} requires {name}{env_hint} — skipping")
-                        return False
-                    continue
-                call_kwargs[name] = val
+                if val:
+                    call_kwargs[name] = val
 
         try:
             import importlib
@@ -703,6 +701,29 @@ class FlaskChannelIntegration:
         except Exception as e:
             logger.warning(f"{channel_type} adapter registration failed: {e}")
             return False
+
+    @classmethod
+    def unmet_required_settings(cls, channel_type: str,
+                                provided: Dict[str, Any] = None) -> list:
+        """The required extra settings ``channel_type`` cannot run without,
+        named by the env var an operator sets (or the parameter when it has
+        no env var).  Empty when every one is supplied by ``provided``, the
+        environment or its default.
+
+        The one statement of this rule: register_channel refuses on it, and
+        the connect tool uses it to tell a user WHICH setting the server
+        lacks (Slack's SLACK_APP_TOKEN) instead of "returned False".
+        """
+        provided = provided or {}
+        spec = cls._CHANNEL_SPECS.get(channel_type) or {}
+        unmet = []
+        for p in spec.get('extra', ()):
+            if not p.get('required') or provided.get(p['param']):
+                continue
+            if (os.getenv(p['env']) if p.get('env') else None) or p.get('default'):
+                continue
+            unmet.append(p.get('env') or p['param'])
+        return unmet
 
     @staticmethod
     def _credential_kwarg(factory_fn, token: str) -> Dict[str, str]:
@@ -1096,9 +1117,7 @@ class FlaskChannelIntegration:
 
                     reason = 'no stored credential'
                     for row in candidates:
-                        meta = row.metadata_json
-                        if not isinstance(meta, dict):
-                            meta = {}
+                        meta = unseal_binding_metadata(ct, row.metadata_json)
                         token, extras = self._binding_credentials(ct, meta)
                         if not token:
                             # A credential-less row is not a configuration:
@@ -1211,6 +1230,49 @@ def get_channel_integration() -> FlaskChannelIntegration:
     if _integration is None:
         _integration = FlaskChannelIntegration()
     return _integration
+
+
+def seal_binding_credential(channel_type: str, value: str) -> str:
+    """The form a channel credential is kept in on its UserChannelBinding:
+    encrypted with the secrets vault's key (SecretsManager.encrypt_value).
+
+    Without HEVOLVE_MASTER_KEY there is no key, and the credential is kept
+    in plain text anyway: it is what brings the channel back after a restart
+    (restore_persisted_channels).  That is said loudly, naming the channel
+    and never the value.  The one sealer for both binding writers (the
+    register_channel tool and POST /api/social/channels/bindings)."""
+    try:
+        from security.secrets_manager import SecretsManager
+        return SecretsManager.get_instance().encrypt_value(value)
+    except (RuntimeError, ImportError) as e:
+        logger.warning(
+            "%s credential stored in PLAIN TEXT in its channel binding (%s). "
+            "Set HEVOLVE_MASTER_KEY and connect the channel again to store it "
+            "encrypted.", channel_type, e)
+        return value
+
+
+def unseal_binding_metadata(channel_type: str, meta) -> Dict[str, Any]:
+    """A copy of a binding's metadata_json with every sealed credential
+    opened (plain-text values, from before sealing or a keyless node, read
+    as they are).  A credential that cannot be opened is left out, with an
+    error: its ciphertext must never reach an adapter as the token."""
+    out: Dict[str, Any] = {}
+    if not isinstance(meta, dict):
+        return out
+    from security.secrets_manager import SEALED_PREFIX, SecretsManager
+    for key, value in meta.items():
+        if isinstance(value, str) and value.startswith(SEALED_PREFIX):
+            try:
+                value = SecretsManager.get_instance().decrypt_value(value)
+            except ValueError as e:
+                logger.error(
+                    "%s: the stored %s cannot be decrypted (%s); the channel "
+                    "stays offline until it is connected again",
+                    channel_type, key, e)
+                continue
+        out[key] = value
+    return out
 
 
 def _kong_stamped(headers) -> bool:
