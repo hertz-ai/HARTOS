@@ -42,7 +42,8 @@ def commerce_session():
         return _json_error('commerce session exchange is not configured', 503)
     given = request.headers.get('X-Commerce-Secret', '')
     if not hmac.compare_digest(given.encode('utf-8'), expected.encode('utf-8')):
-        logger.warning('commerce session: bad secret from %s', request.remote_addr)
+        from core.auth_local import client_key
+        logger.warning('commerce session: bad secret from %s', client_key())
         return _json_error('forbidden', 403)
     data = request.get_json(silent=True) or {}
     customer_id = data.get('customerId')
