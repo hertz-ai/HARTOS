@@ -2087,8 +2087,19 @@ class _LinuxPhysicalInputMonitor(_PhysicalInputMonitor):
                         data = os.read(fd, events.size * 64)
                     except BlockingIOError:
                         continue
+                    except OSError as e:
+                        # ENODEV: the device was unplugged between select and
+                        # read.  One device going away must not end the
+                        # monitor: nothing restarts this thread, so every GUI
+                        # action would read "monitoring unavailable" until the
+                        # process restarts.  Drop it; the next scan rebuilds.
+                        data = b''
+                        logger.info('Physical input device went away: %s', e)
                     if not data:
-                        raise OSError('Physical input device disconnected')
+                        path = next(p for p, d in descriptors.items() if d == fd)
+                        os.close(descriptors.pop(path))
+                        self.record_activity()  # topology changed; recapture
+                        continue
                     for offset in range(0, len(data) - events.size + 1, events.size):
                         _, _, event_type, code, value = events.unpack_from(data, offset)
                         self.record_event(event_type, code, value)

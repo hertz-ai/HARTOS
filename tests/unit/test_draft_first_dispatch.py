@@ -285,14 +285,20 @@ class TestDispatchDraftFirstDelegation:
         from integrations.agent_engine.model_registry import ModelRegistry, ModelBackend, ModelTier
         from integrations.agent_engine.speculative_dispatcher import SpeculativeDispatcher
         reg = ModelRegistry()
+        # Each backend needs an http(s) endpoint: the selectors return only a
+        # model the router can POST to (ModelBackend.is_dispatchable), so a
+        # registry of endpoint-less entries has no draft at all and the
+        # dispatcher answers 'no_draft_model', not the fallback under test.
         reg.register(ModelBackend(
             model_id='draft-only', display_name='D', tier=ModelTier.DRAFT,
-            config_list_entry={'model': 'd', 'api_key': 'x'},
+            config_list_entry={'model': 'd', 'api_key': 'x',
+                               'base_url': 'http://localhost:8080/v1'},
             avg_latency_ms=200.0, accuracy_score=0.4, is_local=True,
         ))
         reg.register(ModelBackend(
             model_id='fast-only', display_name='F', tier=ModelTier.FAST,
-            config_list_entry={'model': 'f', 'api_key': 'x'},
+            config_list_entry={'model': 'f', 'api_key': 'x',
+                               'base_url': 'http://localhost:8080/v1'},
             avg_latency_ms=700.0, accuracy_score=0.6, is_local=True,
         ))
         d = SpeculativeDispatcher(model_registry=reg)

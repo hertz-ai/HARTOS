@@ -102,3 +102,58 @@ def test_installed_sdk_uses_owned_timeout_over_real_local_http(slow):
         server.shutdown()
         server.server_close()
         worker.join(timeout=2)
+
+
+def test_an_outage_is_announced_once_and_its_end_once(caplog):
+    """Offline Crossbar is an ordinary state: one warning (no traceback) when
+    publishing starts failing, debug while it keeps failing, one line when it
+    recovers -- not an ERROR traceback on every publish."""
+    state = {'down': True}
+    client = SimpleNamespace(timeout=None)
+    def publish(topic, payload):
+        if state['down']:
+            raise ConnectionError('refused')
+    client.publish = publish
+    send = transport(client)
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(3):
+            send('topic', 'x')
+        state['down'] = False
+        send('topic', 'x')
+        send('topic', 'x')
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and 'refused' in warnings[0].getMessage()
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not [r for r in caplog.records if r.exc_info]
+    assert sum('still failing' in r.getMessage() for r in caplog.records) == 2
+    assert sum('recovered' in r.getMessage() for r in caplog.records) == 1
+
+
+def test_one_failing_topic_beside_healthy_ones_warns_once(caplog):
+    """A single global flag flipped on every alternation: a warning and a
+    "recovered" line per publish.  Tracked per topic, the broken topic warns
+    once and the healthy ones say nothing."""
+    client = SimpleNamespace(timeout=None)
+    def publish(topic, payload):
+        if topic == 'bad':
+            raise ValueError('rejected')
+    client.publish = publish
+    send = transport(client)
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(5):
+            send('bad', 'x')
+            send('good', 'x')
+    assert sum(r.levelno == logging.WARNING for r in caplog.records) == 1
+    assert not [r for r in caplog.records if 'recovered' in r.getMessage()]
+
+
+def test_concurrent_failures_warn_once(caplog):
+    client = SimpleNamespace(timeout=None)
+    def publish(topic, payload):
+        raise ConnectionError('refused')
+    client.publish = publish
+    send = transport(client)
+    with caplog.at_level(logging.WARNING), ThreadPoolExecutor(max_workers=4) as pool:
+        for f in [pool.submit(send, 'topic', 'x') for _ in range(20)]:
+            f.result(timeout=5)
+    assert sum(r.levelno == logging.WARNING for r in caplog.records) == 1

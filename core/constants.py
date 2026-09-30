@@ -1000,6 +1000,10 @@ LATENCY_BUDGETS = {
     'gpu_worker_crash_detect_s': 2.0,
     # Startup failure of a model server, incl. its retry window.
     'gpu_worker_startup_fail_s': 6.0,
+    # Idle auto-stop: once the idle timer fires, the worker must be gone
+    # (VRAM released) within GPUWorker.stop()'s own window -- 5s graceful
+    # shutdown, then kill with a 2s wait. Past that, the stop is hung.
+    'gpu_worker_idle_release_s': 7.0,
     # Dedup/coordination decisions are pure-compute; sub-second or the
     # coordinator becomes the bottleneck it exists to remove.
     'coordinator_dedup_s': 0.5,

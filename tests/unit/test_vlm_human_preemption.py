@@ -172,3 +172,68 @@ def test_linux_touch_slot_metadata_and_releases_are_not_takeover(code, value, ex
     monitor = rg._LinuxPhysicalInputMonitor()
     monitor.record_event(3, code, value)
     assert monitor._generation == expected
+
+
+def test_linux_monitor_survives_a_device_going_away(monkeypatch):
+    """An unplugged device (EOF, or ENODEV on read) used to end the monitor
+    thread, and nothing restarts it: every GUI action then read "monitoring
+    unavailable" until the process restarted.  Drives the real _listen loop
+    over real pipes standing in for /dev/input nodes."""
+    import errno
+    import os as _os
+    import struct
+    import time as _time
+
+    pipes = {name: _os.pipe() for name in ('eof', 'enodev', 'kept')}
+    for r, _w in pipes.values():
+        _os.set_blocking(r, False)
+    present = ['eof', 'enodev', 'kept']
+    finished = []
+
+    def devices():
+        if finished:   # end the thread before the patches are undone
+            raise RuntimeError('test over')
+        return list(present)
+    monkeypatch.setattr(rg._LinuxPhysicalInputMonitor, '_devices',
+                        staticmethod(devices))
+    real_open, real_read = _os.open, _os.read
+    monkeypatch.setattr(rg.os, 'open',
+                        lambda path, flags, *a: pipes[path][0] if path in pipes
+                        else real_open(path, flags, *a))
+    enodev_fd = pipes['enodev'][0]
+
+    def read(fd, n):
+        if fd == enodev_fd and read.armed:
+            raise OSError(errno.ENODEV, 'No such device')
+        return real_read(fd, n)
+    read.armed = False
+    monkeypatch.setattr(rg.os, 'read', read)
+
+    monitor = rg._LinuxPhysicalInputMonitor()
+    assert monitor.snapshot(start=True) is not None
+    press = struct.pack('@llHHi', 0, 0, 1, 30, 1)
+
+    # Device 1 unplugged: EOF.  Device 2 unplugged: ENODEV on read.  Each
+    # leaves the device list BEFORE its failure is triggered, as a real
+    # unplug does, so the next scan cannot reopen the dead node.
+    present.remove('eof')
+    _os.close(pipes['eof'][1])
+    present.remove('enodev')
+    read.armed = True
+    _os.write(pipes['enodev'][1], press)
+    _time.sleep(0.6)
+
+    before = monitor._generation
+    _os.write(pipes['kept'][1], press)
+    deadline = _time.monotonic() + 3
+    while monitor._generation == before and _time.monotonic() < deadline:
+        _time.sleep(0.05)
+
+    try:
+        assert monitor._thread.is_alive()
+        assert monitor._generation > before       # the kept device still counts
+        assert monitor.snapshot(start=False) is not None
+    finally:
+        finished.append(True)
+        monitor._thread.join(timeout=3)
+    assert not monitor._thread.is_alive()

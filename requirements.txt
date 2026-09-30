@@ -350,7 +350,7 @@ tree-sitter==0.23.2
 tree-sitter-language-pack==0.6.0
 diff-match-patch==20230430
 gitpython==3.1.44
-json-repair>=0.25.0
+json-repair>=0.59.4
 psutil>=5.9.0
 pyautogui>=0.9.54; sys_platform != "linux"
 

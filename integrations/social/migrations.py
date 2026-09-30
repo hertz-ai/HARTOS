@@ -2188,7 +2188,9 @@ def run_migrations():
         # and a row is declined only while revoked_at is newer.  Nullable,
         # NULL on every existing row, so every existing no still stands.
         logger.info("HevolveSocial: migrating to v58 (user_consents.reopened_at)")
-        if _v58_consent_reopened_at(engine):
+        # Stamped only on an unbroken ladder: stamping 58 over a failed 57
+        # would record 57 as done and it would never be retried.
+        if _v58_consent_reopened_at(engine) and get_schema_version(engine) >= 57:
             set_schema_version(engine, 58)
         else:
             logger.warning("v58 migration: user_consents.reopened_at is still "
@@ -2204,7 +2206,7 @@ def run_migrations():
         # interest matching off.
         logger.info("HevolveSocial: migrating to v59 (discoverable_prefs "
                     "persona card)")
-        if _v59_persona_card(engine):
+        if _v59_persona_card(engine) and get_schema_version(engine) >= 58:
             set_schema_version(engine, 59)
         else:
             logger.warning("v59 migration: discoverable_prefs persona columns "

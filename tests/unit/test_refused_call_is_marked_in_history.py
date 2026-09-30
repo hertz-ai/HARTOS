@@ -37,9 +37,16 @@ from core.tool_logging import log_tool_execution
 from hartos.helper import (REFUSED_ARGUMENTS_KEY, REFUSED_BECAUSE_KEY,
                            ToolMessageHandler, force_apply_autogen_json_fix)
 
-UNQUOTED = ('{"text": Financial Dashboard Revenue (Monthly): - Trading: '
-            '$10,000\n- Consulting: $5,000\n- Education: $2,500\n- TOTAL: '
-            '$17,500 Net Profit Margin: 28.6%}')
+from tests.unit.json_repair_split import UNQUOTED, old_json_repair_split
+
+
+def _replay_old_split(test):
+    """json_repair's old split of UNQUOTED for the rest of ``test``: these
+    tests pin the refusal of a split, which json-repair >= 0.59.4 no longer
+    makes for this text (tests/unit/json_repair_split.py)."""
+    split = old_json_repair_split()
+    split.__enter__()
+    test.addCleanup(split.__exit__, None, None, None)
 
 
 class _Chat(unittest.TestCase):
@@ -57,6 +64,7 @@ class _Chat(unittest.TestCase):
                            return_value=None)
         vault.start()
         self.addCleanup(vault.stop)
+        _replay_old_split(self)
 
         self.calls = []
 
@@ -201,6 +209,7 @@ class GroupChatSeesTheMark(unittest.TestCase):
              ConversableAgent.a_execute_function) = orig
         self.addCleanup(restore)
         self.assertTrue(force_apply_autogen_json_fix())
+        _replay_old_split(self)
         calls = []
 
         def send_message_to_user(text: str) -> str:
@@ -284,6 +293,7 @@ class ProductionTransformsKeepTheMark(unittest.TestCase):
         ctx = Flask(__name__).app_context()
         ctx.push()
         self.addCleanup(ctx.pop)
+        _replay_old_split(self)
         self.calls = []
 
         def send_message_to_user(text: str) -> str:
