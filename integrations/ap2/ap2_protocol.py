@@ -789,7 +789,8 @@ class PaymentLedger:
         Returns:
             True if authorization successful
         """
-        from integrations.ap2.ap2_mandate import NON_HUMAN_APPROVERS
+        from integrations.ap2.ap2_mandate import (NON_HUMAN_APPROVERS,
+                                                  PERSON_ID_PREFIX)
         approver_id = str(approver_id or '').strip()
         with self.lock:
             if payment_id not in self.payments:
@@ -804,7 +805,8 @@ class PaymentLedger:
                 return False
 
             if (approver_id.lower() in NON_HUMAN_APPROVERS
-                    or approver_id == payment.requester_agent_id):
+                    or (approver_id == payment.requester_agent_id
+                        and not approver_id.startswith(PERSON_ID_PREFIX))):
                 logger.warning(f"Payment {payment_id}: approver {approver_id!r} "
                                f"is not a person; refused")
                 return False

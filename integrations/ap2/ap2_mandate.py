@@ -51,6 +51,10 @@ MANDATE_STATUSES = ('pending', 'approved', 'rejected', 'expired', 'consumed')
 NON_HUMAN_APPROVERS = frozenset({'', 'system', 'assistant', 'agent', 'helper',
                                  'executor', 'llm'})
 
+#: A ``user:<id>`` id names a logged-in PERSON (the API-tier upgrade and
+#: ``hart pay`` paths request and authorize as the same person).
+PERSON_ID_PREFIX = 'user:'
+
 APPROVAL_ACTION_PREFIX = 'ap2_pay:'
 AP2_AGENT_ID = 'ap2_payments'
 KIND_GENERIC = 'generic'
@@ -549,6 +553,6 @@ def get_mandate_store() -> MandateStore:
 __all__ = [
     'MandateError', 'IntentMandate', 'CartMandate', 'MandateStore',
     'canonical_cart_hash', 'get_mandate_store', 'DEFAULT_MANDATE_TTL_S',
-    'NON_HUMAN_APPROVERS', 'approval_action', 'parse_approval_action',
+    'NON_HUMAN_APPROVERS', 'PERSON_ID_PREFIX', 'approval_action', 'parse_approval_action',
     'request_human_approval', 'register_settler', 'settle', 'decide_payment',
 ]
