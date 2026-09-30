@@ -67,6 +67,21 @@ class TestCreate:
         raw = json.load(open(store.path))
         assert raw['mandates'][m.mandate_id]['cart_hash'] == m.cart_hash
 
+    def test_payment_metadata_carries_this_nodes_gateway_urls(
+            self, store, monkeypatch):
+        monkeypatch.setenv('HARTOS_PUBLIC_URL', 'https://node7.example/')
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        meta = store.ledger.get_payment(m.payment_id).metadata
+        assert meta['callback_url'] == (
+            'https://node7.example/api/v1/intelligence/phonepe/callback')
+        assert meta['redirect_url'].startswith('https://node7.example')
+
+    def test_no_public_base_leaves_the_gateway_default(self, store, monkeypatch):
+        monkeypatch.delenv('HARTOS_PUBLIC_URL', raising=False)
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        meta = store.ledger.get_payment(m.payment_id).metadata
+        assert 'callback_url' not in meta
+
     def test_over_cap_is_refused(self, store):
         with pytest.raises(MandateError, match='over the cap'):
             store.create_cart_mandate('u1', 'mcgroce', CART, cap=200)

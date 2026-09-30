@@ -67,6 +67,22 @@ _MANDATES_FILENAME = 'ap2_mandates.json'
 _MANDATE_KEY_FILENAME = '.ap2_mandate_key'
 
 
+def _own_gateway_urls() -> Dict[str, str]:
+    """This node's redirect/callback URLs from its configured public base
+    (integrations.channels.oauth_api._public_base_url: HARTOS_PUBLIC_URL, else
+    the live request's root).  Empty when neither exists -- the gateway
+    default then applies."""
+    try:
+        from integrations.channels.oauth_api import _public_base_url
+        base = _public_base_url()
+    except Exception:
+        return {}
+    if not base:
+        return {}
+    return {'redirect_url': base + '/',
+            'callback_url': base + '/api/v1/intelligence/phonepe/callback'}
+
+
 class MandateError(ValueError):
     """A mandate could not be created (bad cart, over the cap)."""
 
@@ -260,15 +276,20 @@ class MandateStore:
         cart_hash = canonical_cart_hash(cart)
         mandate_id = f'mdt_{uuid.uuid4().hex}'
         ledger = self.ledger
+        meta = {'kind': kind, 'mandate_id': mandate_id,
+                'merchant': merchant, 'user_id': str(user_id),
+                'cart_hash': cart_hash}
+        # A redirect gateway (PhonePe) returns the buyer and posts its
+        # confirmation to THIS node, which owns the checkout; without these
+        # the gateway defaults to hevolve.ai and the order is never placed.
+        meta.update(_own_gateway_urls())
         payment = ledger.create_payment_request(
             amount=amount, currency=currency,
             description=description or f'{merchant} order',
             requester_agent_id=requester_agent_id or f'ap2:{merchant}',
             gateway=ledger.select_gateway(currency),
             require_approval=True,
-            metadata={'kind': kind, 'mandate_id': mandate_id,
-                      'merchant': merchant, 'user_id': str(user_id),
-                      'cart_hash': cart_hash},
+            metadata=meta,
         )
         m = CartMandate(
             mandate_id=mandate_id, user_id=str(user_id), merchant=merchant,

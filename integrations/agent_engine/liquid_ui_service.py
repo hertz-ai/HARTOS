@@ -950,7 +950,8 @@ COMPONENT_TYPES = {
     'checkout': {'props': ['items', 'total', 'payment_methods', 'shipping_options',
                            'confirm_action']},
     'payment_status': {'props': ['status', 'amount', 'method', 'transaction_id']},
-    'order_tracking': {'props': ['order_id', 'status', 'steps', 'eta']},
+    'order_tracking': {'props': ['order_id', 'status', 'steps', 'current_step',
+                                 'eta']},
     'comparison': {'props': ['apps', 'features', 'winner']},
     'agent_action': {'props': ['agent_id', 'action_type', 'description',
                                'status', 'result', 'timestamp']},
@@ -10719,6 +10720,35 @@ def run_home_compose(reason: str = 'idle') -> bool:
         return False
 
 
+#: commerce status words -> what every renderer already accepts
+#: (shell JS, Nunba AgentOverlay, Android): success | pending | error.
+_PAYMENT_STATUS_CLIENT = {'completed': 'success', 'processing': 'pending',
+                          'failed': 'error', 'cancelled': 'error'}
+
+
+def _to_client_vocabulary(component: dict):
+    """The ONE place commerce payment_status / order_tracking props are put
+    into the vocabulary the renderers read.  Returns ``(component, link)``:
+    payment_status has no redirect_url prop in any client, so the gateway
+    link is returned separately to be shown as the card's action link."""
+    ctype = component.get('type')
+    if ctype == 'payment_status':
+        component = dict(component)
+        component['status'] = _PAYMENT_STATUS_CLIENT.get(
+            component.get('status'), component.get('status'))
+        return component, component.pop('redirect_url', None)
+    if ctype == 'order_tracking' and isinstance(component.get('steps'), list):
+        component = dict(component)
+        steps = [dict(st) if isinstance(st, dict) else {'label': st}
+                 for st in component['steps']]
+        for st in steps:
+            st['completed'] = bool(st.get('completed', st.get('done')))
+        component['steps'] = steps
+        component['current_step'] = sum(1 for st in steps if st['completed'])
+        return component, None
+    return component, None
+
+
 def push_agent_ui(agent_id: str, component: dict,
                   user_id: Optional[str] = None) -> bool:
     """Push one agent UI component to its user, from code that holds no
@@ -10743,6 +10773,14 @@ def push_agent_ui(agent_id: str, component: dict,
     """
     if not isinstance(component, dict):
         return False
+    component, _link = _to_client_vocabulary(component)
+    if _link:
+        push_agent_ui(agent_id, {
+            'type': 'oauth_link', 'title': 'Complete your payment',
+            'provider': component.get('method') or 'payment',
+            'authorize_url': _link,
+            'description': 'Finish paying on your bank or UPI page.'},
+            user_id=user_id)
     comp_type = component.get('type', '')
     svc = None
     try:

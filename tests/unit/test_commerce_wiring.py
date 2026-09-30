@@ -212,3 +212,45 @@ def test_shell_later_leaves_the_payment_waiting(shell_world):
         'decision': 'later'}, headers=_bearer('mcg-1'))
     assert r.status_code == 200
     assert ledger.get_payment(m.payment_id).status == PaymentStatus.APPROVAL_REQUIRED
+
+
+# ── The emitted props are what the three renderers read ──
+
+def _emitted(monkeypatch, card):
+    from unittest.mock import MagicMock
+    from integrations.agent_engine import liquid_ui_service as lui
+    shell = MagicMock()
+    shell.agent_ui_update.return_value = True
+    registry = MagicMock()
+    registry.get_or_none.return_value = shell
+    monkeypatch.setattr('core.platform.registry.get_registry', lambda: registry)
+    assert lui.push_agent_ui('mcgroce', card)
+    return [c.args[1] for c in shell.agent_ui_update.call_args_list]
+
+
+@pytest.mark.parametrize('sent,shown', [
+    ('completed', 'success'), ('processing', 'pending'),
+    ('failed', 'error'), ('cancelled', 'error')])
+def test_payment_status_uses_the_renderers_vocabulary(monkeypatch, sent, shown):
+    got = _emitted(monkeypatch, {'type': 'payment_status', 'status': sent,
+                                 'amount': 5, 'method': 'mock'})
+    assert got[-1]['status'] == shown
+
+
+def test_payment_redirect_becomes_the_cards_action_link(monkeypatch):
+    got = _emitted(monkeypatch, {
+        'type': 'payment_status', 'status': 'processing', 'method': 'phonepe',
+        'redirect_url': 'https://pay.example/x'})
+    status = [c for c in got if c['type'] == 'payment_status'][0]
+    link = [c for c in got if c['type'] == 'oauth_link'][0]
+    assert 'redirect_url' not in status
+    assert link['authorize_url'] == 'https://pay.example/x'
+
+
+def test_order_tracking_steps_carry_every_clients_progress_marker(monkeypatch):
+    got = _emitted(monkeypatch, {
+        'type': 'order_tracking', 'order_id': 9, 'status': 'SUBMITTED',
+        'steps': [{'label': 'a', 'done': True}, {'label': 'b', 'done': True},
+                  {'label': 'c', 'done': False}]})[-1]
+    assert [s['completed'] for s in got['steps']] == [True, True, False]
+    assert got['current_step'] == 2
