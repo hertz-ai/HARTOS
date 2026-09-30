@@ -212,7 +212,7 @@ class ProximityService:
     @staticmethod
     def reveal_self(db, match_id, user_id):
         """Reveal yourself to a proximity match. Returns updated match."""
-        from .models import ProximityMatch, User
+        from .models import ProximityMatch
         now = datetime.utcnow()
         match = db.query(ProximityMatch).filter(
             ProximityMatch.id == match_id,
@@ -269,17 +269,7 @@ class ProximityService:
             except Exception as e:
                 logger.warning(f"Failed to create encounter from proximity: {e}")
 
-        # Get user info for matched state
-        result = match.to_dict(viewer_id=user_id)
-        if match.status == 'matched':
-            a = db.query(User).filter(User.id == match.user_a_id).first()
-            b = db.query(User).filter(User.id == match.user_b_id).first()
-            if a:
-                result['user_a'] = {'id': a.id, 'username': a.username, 'display_name': a.display_name, 'avatar_url': a.avatar_url}
-            if b:
-                result['user_b'] = {'id': b.id, 'username': b.username, 'display_name': b.display_name, 'avatar_url': b.avatar_url}
-
-        return result
+        return match.to_dict(viewer_id=user_id)
 
     @staticmethod
     def create_missed_connection(db, user_id, lat, lon, location_name, description, was_at_iso):
