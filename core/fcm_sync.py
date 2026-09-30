@@ -322,19 +322,72 @@ def _post_fcm_message(access, project, token, title, body, data, timeout):
         return False
 
 
-def send_fcm_push(user_id, title, body, data=None, timeout=8):
+def hand_push_to_central(user_id, title, body, data=None):
+    """Give a push to central's relay when this node has no FCM credential.
+
+    A consumer install has no Firebase service account, and must not: central
+    already holds one (chatbot_pipeline/confirmation.py).  The node publishes
+    the message as a PENDING confirmation on the bus (topic 'task.confirmation',
+    which the default relay bridge carries to central); central looks up the
+    user's token and pushes it after its own delay, carrying ``push_title`` and
+    ``push_data`` through so the phone receives what was meant to be sent.
+
+    Central keys the token by the numeric account id (it does int() on the
+    topic suffix), so a local id with no known central mapping is not handed
+    off -- a non-numeric suffix would raise inside central's loop.
+
+    Returns True when the message was handed to the bus (NOT a delivery
+    receipt), False when there is nothing to hand off or the bus refused.
+    Best-effort, never raises.
+    """
+    try:
+        central_id = resolve_central_id(user_id) or str(user_id)
+        if not str(central_id).isdigit():
+            logger.debug("hand_push_to_central(%s): no numeric central id", user_id)
+            return False
+        import uuid
+        from core.peer_link.message_bus import get_message_bus
+        push_data = {str(k): str(v) for k, v in (data or {}).items()}
+        push_data['privacy_tier_skipped'] = 'true'
+        push_data['privacy_notice'] = _PRIVACY_TIER_NOTICE
+        get_message_bus().publish(
+            'task.confirmation',
+            {
+                'request_id': 'push-' + uuid.uuid4().hex,
+                'topic_name': f'com.hertzai.pupit.{central_id}',
+                'bot_type': 'Hevolve',
+                'confirmation': False,
+                'user_id': str(central_id),
+                'text': [body or ''],
+                'push_title': title or '',
+                'push_data': push_data,
+            },
+            user_id=str(user_id), skip_sse=True, skip_peerlink=True)
+        return True
+    except Exception as e:
+        logger.debug("hand_push_to_central failed: %s", e)
+        return False
+
+
+def send_fcm_push(user_id, title, body, data=None, timeout=8, relay=True):
     """Push an FCM notification to ``user_id``'s device using the LOCALLY-cached
     token (syncing it first if absent) — the decentralized, no-crossbar send.
 
     Best-effort, never raises.  Returns True on a 200 from FCM, else False (no
     token, no credential/project, network/HTTP error).  The edge credential
-    (HART_FCM_SA_FILE / HART_FCM_ACCESS_TOKEN) + HART_FCM_PROJECT gate the real
-    send, so a node with no push credential degrades cleanly to a no-op.
+    (HART_FCM_SA_FILE / HART_FCM_ACCESS_TOKEN) + HART_FCM_PROJECT gate the
+    direct send; a node without one (every consumer install) hands the push to
+    central's relay instead (``hand_push_to_central``), unless ``relay`` is
+    False -- for a caller whose message central already tracks, where a second
+    hand-off would push twice.
     """
     if not user_id:
         return False
     access, project = _fcm_credential()
     if not access:
+        if relay:
+            # No credential on this node: central sends it (see above).
+            return hand_push_to_central(user_id, title, body, data)
         logger.debug("send_fcm_push(%s): no FCM credential/project — push disabled", user_id)
         return False
     token = get_local_fcm_token(user_id) or sync_fcm_token(user_id)

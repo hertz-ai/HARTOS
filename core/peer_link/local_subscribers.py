@@ -186,7 +186,8 @@ class DeliveryTracker:
                         send_fcm_push(
                             _uid, title='HART',
                             body='You have a new notification',
-                            data={'topic': info.get('topic', ''), 'msg_id': msg_id})
+                            data={'topic': info.get('topic', ''), 'msg_id': msg_id},
+                            relay=False)  # central tracks this message itself
                     except Exception:
                         pass
 
