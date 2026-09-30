@@ -51,6 +51,12 @@ in
     nodes = {
       # ── Gen 2 / modern hardware: UEFI via OVMF ──
       uefi = mkNode "desktop" {
+        # mkNode forces hostName = "desktop" for BOTH nodes, and the VM state
+        # dir and disk image are named after the hostname: two VMs then open
+        # the same vm-state-desktop/desktop.qcow2 and qemu aborts with
+        # "Failed to get write lock".  A higher-priority override keeps the
+        # desktop profile and gives each node its own disk.
+        networking.hostName = pkgs.lib.mkOverride 40 "uefi";
         virtualisation = {
           memorySize = 2048;
           cores = 2;
@@ -64,6 +70,7 @@ in
       # ── Gen 1 / legacy hardware: SeaBIOS (QEMU's default, no OVMF) ──
       # Deliberately NOT setting useEFIBoot — the absence IS the test input.
       bios = mkNode "desktop" {
+        networking.hostName = pkgs.lib.mkOverride 40 "bios";
         virtualisation = {
           memorySize = 2048;
           cores = 2;
@@ -72,9 +79,9 @@ in
     };
 
     testScript = ''
-      uefi = machines[0]
-      bios = machines[1]
-
+      # `uefi` and `bios` are the driver-injected machine globals (they exist
+      # because each node now has its own hostname).  Do NOT bind by index:
+      # machines[] follows the alphabetical node order (bios, uefi).
       uefi.start()
       bios.start()
 
