@@ -23,7 +23,7 @@ import json
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Dict, Tuple, List, Any
+from typing import Optional, Dict, Tuple, List, Any, Union
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ class PairingStatus(Enum):
 class PairingCode:
     """Represents a pairing code for user verification."""
     code: str
-    user_id: int
+    user_id: Union[int, str]
     prompt_id: int
     created_at: datetime = field(default_factory=datetime.now)
     expires_at: Optional[datetime] = None
@@ -91,7 +91,7 @@ class PairedSession:
     """Represents a verified pairing between channel user and agent user."""
     channel: str
     sender_id: str
-    user_id: int
+    user_id: Union[int, str]
     prompt_id: int
     paired_at: datetime = field(default_factory=datetime.now)
     last_active: datetime = field(default_factory=datetime.now)
@@ -171,7 +171,7 @@ class PairingManager:
 
     def generate_pairing_code(
         self,
-        user_id: int,
+        user_id: Union[int, str],
         prompt_id: int,
         expiry_minutes: Optional[int] = None,
     ) -> str:
@@ -179,7 +179,8 @@ class PairingManager:
         Generate a new pairing code for a user.
 
         Args:
-            user_id: Agent user ID
+            user_id: Agent user ID (a UUID string for accounts created by the
+                social API, or an int)
             prompt_id: Agent prompt ID
             expiry_minutes: Optional custom expiry time
 
@@ -277,7 +278,7 @@ class PairingManager:
         self,
         channel: str,
         sender_id: str,
-    ) -> Optional[Tuple[int, int]]:
+    ) -> Optional[Tuple[Union[int, str], int]]:
         """
         Get the user mapping for a paired channel user.
 
@@ -310,7 +311,7 @@ class PairingManager:
             return True
         return False
 
-    def unpair_user(self, user_id: int) -> int:
+    def unpair_user(self, user_id: Union[int, str]) -> int:
         """
         Remove all pairings for a user.
 
@@ -331,7 +332,7 @@ class PairingManager:
 
         return len(to_remove)
 
-    def list_user_pairings(self, user_id: int) -> List[PairedSession]:
+    def list_user_pairings(self, user_id: Union[int, str]) -> List[PairedSession]:
         """List all pairings for a user."""
         return [
             session for session in self._paired_sessions.values()
@@ -427,7 +428,7 @@ class PairingMiddleware:
     class CheckResult:
         """Result of pairing check."""
         is_paired: bool
-        user_id: Optional[int] = None
+        user_id: Optional[Union[int, str]] = None
         prompt_id: Optional[int] = None
         instructions: Optional[str] = None
 
@@ -435,7 +436,7 @@ class PairingMiddleware:
         self,
         manager: PairingManager,
         require_pairing: bool = True,
-        default_user_id: Optional[int] = None,
+        default_user_id: Optional[Union[int, str]] = None,
         default_prompt_id: Optional[int] = None,
     ):
         self.manager = manager
