@@ -55,11 +55,18 @@ def _add_user(Session, uid, user_type, owner_id=None):
 def _notify_for_requester(Session, requester):
     led = _ledger()
     coord = _coordinator(led)
+    # A raw requester id (the shape before requester handles) counts only
+    # when THIS node stamped it: source_node is this node
+    # (requesters.resolve_requester; tests/unit/
+    # test_requester_never_leaves_the_node.py pins the refusals).
     coord.submit_goal('objective', [{'task_id': 'g1_task_0',
                                       'description': 'd'}],
-                      {'user_id': requester}, goal_id='g1')
+                      {'user_id': requester, 'source_node': 'node-here'},
+                      goal_id='g1')
     with patch('integrations.social.models.get_db', side_effect=Session), \
-         patch('integrations.social.realtime.on_notification'):
+         patch('integrations.social.realtime.on_notification'), \
+         patch('integrations.distributed_agent.requesters.this_node_id',
+               return_value='node-here'):
         coord._notify_goal_contribution('g1_task_0', agent_id='node-abc',
                                         task_description='d')
     from integrations.social.models import Notification

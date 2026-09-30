@@ -61,6 +61,8 @@ import pytz
 import aiohttp
 import asyncio
 import os
+import threading
+from core.file_cache import atomic_json_write
 from bs4 import BeautifulSoup
 from json_repair import repair_json
 import traceback
@@ -3135,6 +3137,10 @@ class Action:
         self.new_json = []
         self.recipe = False
         self.ledger = None  # Smart Ledger for persistent task tracking
+        # One id per execution of these actions.  bank_vlm_learning keys on
+        # it: computer-use calls inside one execution of an action extend
+        # that action's learning; a later execution re-learns it.
+        self.run_id = uuid.uuid4().hex
 
     def get_action(self, array_index):
         if array_index < 0 or array_index >= len(self.actions):
@@ -3316,6 +3322,21 @@ def get_frame(user_id, frame_store=None):
         raise e
 
 def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual context"],user_id:int,request_id:str) -> str:
+    """Answer ``inp`` from the user's latest camera frame.
+
+    Raises RuntimeError when there is nothing to answer from: no frame for
+    this user, or a frame no vision model could read.  Both used to RETURN
+    'failed to get visual context ask user to check if the camera is turned
+    on', so core.tool_logging logged TOOL EXECUTION SUCCESS and
+    core.constants.tool_reply_failed (CREATE's trace banker, REUSE's
+    fabrication gate) counted the call as done work.  Measured on the MSI
+    desktop, agent_system.log + .1, 2026-09-22 to 09-29: 732 calls, all 732
+    that sentence, all 732 logged as a success, 530 of them from the daemon's
+    own account (hevolve_system_agent), which no camera is ever keyed to.
+    Raised, the call reaches the model as the canonical failure envelope.
+    The text names the camera, never the Redis leg of get_frame: naming Redis
+    sent agents off to start it (tests/unit/test_get_frame_redis_down.py).
+    """
     current_app.logger.info('Using Vision to answer question')
     frame = get_frame(str(user_id))
     if frame is not None:
@@ -3347,8 +3368,9 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
                 _c = _vlm_r.json().get('choices', [{}])[0].get('message', {}).get('content', '')
                 if _c:
                     return _c
-        except Exception:
-            pass  # Fall through to MiniCPM/cloud
+        except Exception as e:
+            # Fall through to MiniCPM/cloud, saying why.
+            current_app.logger.info('Local VLM did not answer the camera question: %s', e)
 
         from core.config_cache import get_vision_api
         url = get_vision_api() or "http://azurekong.hertzai.com:8000/minicpm/upload"
@@ -3367,9 +3389,16 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
             return response
         except Exception as e:
             current_app.logger.info('ERROR: Got error in visual QA: %s', e)
-            return 'failed to get visual context ask user to check if the camera is turned on'
+            raise RuntimeError(
+                "The user's camera frame was captured, but no vision model "
+                "could read it, so this question about the camera was not "
+                "answered.") from e
     else:
-        return 'failed to get visual context ask user to check if the camera is turned on'
+        raise RuntimeError(
+            "No camera frame is shared for this user right now, so there is "
+            "nothing to look at. get_user_camera_inp only answers questions "
+            "about what the user's live camera shows; it cannot answer "
+            "anything else.")
 
 
 
@@ -4969,8 +4998,133 @@ def apply_autogen_fix_on_startup():
 # ========================================================================================
 # END AUTOGEN JSON HANDLING ENHANCEMENT
 # ========================================================================================
+# ── VLM learnings: a file must prove which action it belongs to ─────────────
+#
+# A ``<agent>_<flow>_<action>_vlm_agent.json`` file is a computer-use run's
+# learned steps, and _vlm_merged_actions (reuse_recipe) REPLACES the steps of
+# the action whose id the filename names.  Until 5d6343409 the CREATE writer
+# (and the REUSE writer until dcf4c6b4b) walked to the next FREE number, so
+# the filename number was a free slot, not the action that ran.  MEASURED
+# 2026-09-28 on the live prompts dir, through the real loader and merge: 96
+# in-range files, all 96 replacing their action's steps, 77 of them below
+# _RELEARN_IDENTITY_THRESHOLD against that action.  Agent 18088688973's action
+# 3 replayed 'ls -la /data', action 6 'Create a temporary directory at
+# C:\Users\testuser\...', action 4 a click on 'Allow' in a Windows Security
+# network-access dialog.  Nothing in such a file says which action it ran
+# under, and similarity cannot tell (the 'Allow' file scores 0.5, above 0.45).
+#
+# So the one writer stamps VLM_PROVENANCE_KEY = {prompt_id, flow, action_id}
+# from the action that was running, and the one reader accepts a file only
+# when that stamp names the file's own coordinates.  A refused file costs the
+# action nothing it needs: it keeps its CREATE-authored steps.
+VLM_PROVENANCE_KEY = 'learned_for'
+VLM_QUARANTINE_DIRNAME = '_quarantine_vlm_unproven'
+VLM_QUARANTINE_MARKER = 'quarantine.done.json'
+_VLM_FILE_RE = re.compile(
+    r'^(?P<prompt_id>.+)_(?P<flow>\d+)_(?P<action_id>\d+)_vlm_agent\.json$')
+_vlm_warned = set()
+_vlm_warned_lock = threading.Lock()
+
+
+def vlm_warn_once(logger, key, msg, *args):
+    """``logger.warning(msg, *args)`` the first time ``key`` is seen in this
+    process.  A refused or orphaned learning is re-read on every agent build;
+    one line per file keeps it countable without flooding the log (23 orphan
+    warnings per build, measured 2026-09-28)."""
+    with _vlm_warned_lock:
+        if key in _vlm_warned:
+            return False
+        _vlm_warned.add(key)
+    logger.warning(msg, *args)
+    return True
+
+
+def vlm_learning_refusal(record, prompt_id, flow, action_id):
+    """None when ``record`` proves it was learned for exactly this action of
+    this flow of this agent; otherwise the reason it cannot be applied there.
+
+    Pure, never raises: it runs while an agent is being built."""
+    if not isinstance(record, dict):
+        return 'not a JSON object'
+    stamp = record.get(VLM_PROVENANCE_KEY)
+    if not isinstance(stamp, dict):
+        return ('no %s: written before a learning recorded the action it ran '
+                'under (a next-free-slot walker filed those under other '
+                "actions' ids)" % VLM_PROVENANCE_KEY)
+    try:
+        same = (str(stamp.get('prompt_id')) == str(prompt_id)
+                and int(stamp.get('flow')) == int(flow)
+                and int(stamp.get('action_id')) == int(action_id))
+    except (TypeError, ValueError):
+        same = False
+    if not same:
+        return '%s %r names another action than prompt %s flow %s action %s' % (
+            VLM_PROVENANCE_KEY, stamp, prompt_id, flow, action_id)
+    return None
+
+
+def _read_vlm_file(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def read_vlm_learning(prompt_id, flow, action_id):
+    """The proven learning of ONE action, or None (absent, unreadable, or not
+    this action's).  What both tools' direct read injects as "steps from a
+    previous successful execution", under the loader's rule."""
+    file_path = safe_prompt_path(prompt_id, flow, action_id, 'vlm_agent')
+    if not os.path.exists(file_path):
+        return None
+    try:
+        record = _read_vlm_file(file_path)
+    except Exception as e:
+        vlm_warn_once(current_app.logger, ('unreadable', file_path),
+                      '[VLM-UNPROVEN] ignoring %s: unreadable (%s)', file_path, e)
+        return None
+    why = vlm_learning_refusal(record, prompt_id, flow, action_id)
+    if why:
+        vlm_warn_once(current_app.logger, ('unproven', file_path),
+                      '[VLM-UNPROVEN] ignoring %s: %s', file_path, why)
+        return None
+    record['action_id'] = int(action_id)
+    return record
+
+
+def bank_vlm_learning(prompt_id, flow, action_id, run_id, record):
+    """Save a computer-use run's learning as THIS action's, and return the path.
+
+    The ONE writer (CREATE and REUSE both call it).  The filename and the
+    stamp both come from ``action_id``, the action that was running, so the
+    reader's rule holds by construction.  Calls inside one execution of the
+    action (same ``run_id``, helper.Action.run_id) extend its steps in order;
+    a new execution, or an unknown one (``run_id`` None), replaces them, so a
+    re-learning never piles steps up across runs.  Atomic write.
+    """
+    file_path = safe_prompt_path(prompt_id, flow, action_id, 'vlm_agent')
+    stamp = {'prompt_id': str(prompt_id), 'flow': int(flow),
+             'action_id': int(action_id), 'run': run_id}
+    out = dict(record)
+    out['action_id'] = int(action_id)
+    out[VLM_PROVENANCE_KEY] = stamp
+    out['recipe'] = list(out.get('recipe') or [])
+    if run_id and os.path.exists(file_path):
+        try:
+            prior = _read_vlm_file(file_path)
+        except Exception:
+            prior = None
+        if (isinstance(prior, dict)
+                and vlm_learning_refusal(prior, prompt_id, flow, action_id) is None
+                and prior[VLM_PROVENANCE_KEY].get('run') == run_id):
+            out['recipe'] = list(prior.get('recipe') or []) + out['recipe']
+    atomic_json_write(file_path, out, indent=4)
+    return file_path
+
+
 def load_vlm_agent_files(prompt_id, role_number):
-    """Loads any VLM agent JSON files for the given prompt_id and role_number and integrates them with existing recipes."""
+    """Every PROVEN VLM learning of one flow, each with ``action_id`` set to
+    the action it was learned for.  A file that cannot prove it (see
+    vlm_learning_refusal) is left out and logged once: it would otherwise
+    replace a real action's steps with another run's job."""
     vlm_actions = []
 
     # Look for existing VLM agent files.  PROMPTS_DIR (module scope, above) is
@@ -4982,29 +5136,109 @@ def load_vlm_agent_files(prompt_id, role_number):
     # loaded agent on an installed build.
     try:
         for file in os.listdir(PROMPTS_DIR):
-            if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
-                file_path = os.path.join(PROMPTS_DIR, file)
-                try:
-                    with open(file_path, 'r') as f:
-                        recipe_data = json.load(f)
-                        current_app.logger.info(f"Found VLM agent recipe: {file_path}")
-
-                        # Extract the action ID from the filename (assuming format: prompt_id_role_number_action_id_vlm_agent.json)
-                        parts = file.split('_')
-                        if len(parts) >= 4:
-                            try:
-                                action_id = int(parts[2]) # Get the action ID
-                                # Add or replace action in the actions list
-                                recipe_data["action_id"] = action_id
-                                vlm_actions.append(recipe_data)
-                            except (ValueError, IndexError):
-                                current_app.logger.error(f"Couldn't parse action ID from filename {file}")
-                except Exception as e:
-                    current_app.logger.error(f"Error reading VLM agent file {file_path}: {e}")
+            m = _VLM_FILE_RE.match(file)
+            if not m or m.group('prompt_id') != str(prompt_id) \
+                    or m.group('flow') != str(role_number):
+                continue
+            file_path = os.path.join(PROMPTS_DIR, file)
+            action_id = int(m.group('action_id'))
+            try:
+                recipe_data = _read_vlm_file(file_path)
+            except Exception as e:
+                vlm_warn_once(current_app.logger, ('unreadable', file_path),
+                              '[VLM-UNPROVEN] ignoring %s: unreadable (%s)',
+                              file_path, e)
+                continue
+            why = vlm_learning_refusal(recipe_data, prompt_id, role_number,
+                                       action_id)
+            if why:
+                vlm_warn_once(current_app.logger, ('unproven', file_path),
+                              '[VLM-UNPROVEN] ignoring %s: %s', file_path, why)
+                continue
+            current_app.logger.info(f"Found VLM agent recipe: {file_path}")
+            recipe_data["action_id"] = action_id
+            vlm_actions.append(recipe_data)
     except Exception as e:
         current_app.logger.error(f"Error listing files in prompts directory: {e}")
 
     return vlm_actions
+
+
+def unproven_vlm_learnings(prompts_dir):
+    """``{filename: reason}`` for every VLM learning in ``prompts_dir`` that
+    the loader would refuse.  Read-only."""
+    found = {}
+    for name in sorted(os.listdir(prompts_dir)):
+        m = _VLM_FILE_RE.match(name)
+        if not m:
+            continue
+        try:
+            record = _read_vlm_file(os.path.join(prompts_dir, name))
+        except Exception as e:
+            found[name] = 'unreadable (%s)' % e
+            continue
+        why = vlm_learning_refusal(record, m.group('prompt_id'),
+                                   m.group('flow'), m.group('action_id'))
+        if why:
+            found[name] = why
+    return found
+
+
+def quarantine_unproven_vlm_learnings_once(prompts_dir=None):
+    """Move every unproven VLM learning into ``<prompts>/VLM_QUARANTINE_DIRNAME``,
+    once.  Never deletes: a moved file is the same bytes under the same name.
+
+    The marker pattern of core.file_cache.adopt_legacy_json_once: a marker
+    (VLM_QUARANTINE_MARKER, inside the quarantine dir so no ``<prompts>/*.json``
+    listing mistakes it for a prompt) records what moved and why; while it
+    exists nothing runs again.  A move that fails leaves it unmarked, so the
+    next start retries.  Logged, never raised: it runs at boot.
+
+    Returns 'done' (marked before), 'none' (nothing to move), 'moved',
+    'partial' (some moves failed) or 'failed'.
+    """
+    log = logging.getLogger(__name__)
+    prompts_dir = os.path.abspath(prompts_dir or PROMPTS_DIR)
+    qdir = os.path.join(prompts_dir, VLM_QUARANTINE_DIRNAME)
+    marker = os.path.join(qdir, VLM_QUARANTINE_MARKER)
+    try:
+        if os.path.exists(marker):
+            return 'done'
+        if not os.path.isdir(prompts_dir):
+            return 'none'
+        todo = unproven_vlm_learnings(prompts_dir)
+        moved, failed = {}, {}
+        if todo:
+            os.makedirs(qdir, exist_ok=True)
+        for name, why in todo.items():
+            dst = os.path.join(qdir, name)
+            n = 1
+            while os.path.exists(dst):          # never overwrite a kept copy
+                dst = os.path.join(qdir, '%s.%d' % (name, n))
+                n += 1
+            try:
+                os.replace(os.path.join(prompts_dir, name), dst)
+                moved[name] = why
+            except OSError as e:
+                failed[name] = str(e)
+        if failed:
+            log.warning('[VLM-QUARANTINE] moved %d unproven VLM learning(s) to '
+                        '%s; %d could not be moved and are retried next start: '
+                        '%s', len(moved), qdir, len(failed), sorted(failed))
+            return 'partial'
+        atomic_json_write(marker, {
+            'at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'from': prompts_dir, 'moved': moved}, indent=2)
+        if moved:
+            log.warning('[VLM-QUARANTINE] moved %d VLM learning(s) that do not '
+                        'say which action they ran under to %s (restore by '
+                        'moving them back; the loader refuses them either way)',
+                        len(moved), qdir)
+            return 'moved'
+        return 'none'
+    except Exception as e:
+        log.warning('[VLM-QUARANTINE] not completed for %s: %s', prompts_dir, e)
+        return 'failed'
 
 
 # ── Canonical WAMP RPC helper — ONE implementation ──────────────────────────

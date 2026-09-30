@@ -235,6 +235,9 @@ class DistributedTaskCoordinator:
             # redeploys because the coordinator ledger is file-backed.  Healing
             # here fixes every node on its next tick, with no manual surgery.
             healed = self._heal_goal_type_demands(goal_id)
+            # The requester this dispatch names (a handle, never a user id)
+            # replaces whatever an older version stamped on the task set.
+            refreshed = self._refresh_requester(goal_id, context)
             # A continuous goal's hive work comes back after every finished
             # run (owner decision 2026-09-13); see _reopen_finished_run.
             reopened = (self._reopen_finished_run(goal_id)
@@ -247,6 +250,8 @@ class DistributedTaskCoordinator:
                 f"(skipping duplicate task creation)"
                 + (f"; healed {healed} unclaimable requirement(s)"
                    if healed else "")
+                + (f"; re-stamped the requester on {refreshed} task(s)"
+                   if refreshed else "")
                 + (f"; re-armed {reopened} task(s) for the next run"
                    if reopened else "")
                 + (f"; released {released} task(s) held for help"
@@ -359,6 +364,39 @@ class DistributedTaskCoordinator:
                 f"capability healing for goal {goal_id}", snapshots):
             return 0
         return healed
+
+    def _refresh_requester(self, goal_id: str, context: Dict[str, Any]) -> int:
+        """Stamp the requester the re-dispatch names onto the goal's tasks.
+
+        The dedup branch reused a task set exactly as its first submission
+        wrote it, so a goal submitted before requester handles kept the
+        REAL user id in its context for as long as the ledger lived -- and
+        /tasks/available served it (review of e9daad6c5, measured:
+        REAL-USER-OLD still served).  The dispatch's ``user_id`` (a handle)
+        and ``source_node`` replace the stored ones on the parent and every
+        child.  Only keys the caller supplied, and saves only when a value
+        changed: this runs every tick for every in-flight goal (#145).
+        Returns how many tasks changed.
+        """
+        from .requesters import REQUESTER_KEYS
+        wanted = {k: context[k] for k in REQUESTER_KEYS if k in context}
+        if not wanted:
+            return 0
+        parent = self._ledger.get_task(goal_id)
+        tasks = [parent] + [self._ledger.get_task(c) for c in
+                            (getattr(parent, 'child_task_ids', None) or [])]
+        tasks = [t for t in tasks if t is not None]
+        stale = [t for t in tasks
+                 if any(t.context.get(k) != v for k, v in wanted.items())]
+        if not stale:
+            return 0
+        snapshots = self._snapshot_tasks(stale)
+        for task in stale:
+            task.context.update(wanted)
+        if not self._commit_deferred(
+                f"requester re-stamp for goal {goal_id}", snapshots):
+            return 0
+        return len(stale)
 
     def _reopen_finished_run(self, goal_id: str) -> int:
         """Re-arm a CONTINUOUS goal's hive work once its last run has finished.
@@ -821,12 +859,13 @@ class DistributedTaskCoordinator:
             # ownership field so a completed remote task is reported to its
             # owner rather than creating a notification for a node id such as
             # ``unknown``.
-            user_id = task.context.get("user_id") or parent.context.get("user_id")
+            ctx = task.context if task.context.get("user_id") else parent.context
             # The context holds an opaque requester handle; only the node
             # that minted it knows the person (requesters.resolve_requester).
-            # Another node's handle is nobody here: no notification.
+            # Another node's handle, or a raw id this node did not stamp, is
+            # nobody here: no notification.
             from integrations.distributed_agent.requesters import resolve_requester
-            user_id = resolve_requester(user_id)
+            user_id = resolve_requester(ctx.get("user_id"), ctx.get("source_node"))
             if not user_id:
                 logger.debug("No human owner for goal contribution task %s; "
                              "skipping user notification", task_id)

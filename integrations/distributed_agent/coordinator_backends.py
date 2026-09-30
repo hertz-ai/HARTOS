@@ -372,22 +372,29 @@ def _try_redis_backend(agent_id: str):
         return None
 
 
+def coordinator_storage_dir() -> str:
+    """Where the coordinator's JSON ledger lives.  THE one answer: the ledger
+    here and the requester tables (requesters.py) beside it, so those are
+    shared exactly when the coordinator's store is.
+
+    Absolute and writable -- never a relative path, which resolves to the
+    read-only install dir in bundled mode: beside HEVOLVE_DB_PATH when that
+    is an absolute file path, else under the user-writable agent_data dir.
+    """
+    db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+        return os.path.join(os.path.dirname(db_path), 'distributed_tasks')
+    from core.platform_paths import get_agent_data_dir
+    return os.path.join(get_agent_data_dir(), 'distributed_tasks')
+
+
 def _create_inmemory_backend(agent_id: str):
     """Create coordinator with in-memory/JSON backend (no Redis needed)."""
     try:
         from agent_ledger import SmartLedger, JSONBackend
         from agent_ledger.verification import TaskVerification, TaskBaseline
 
-        # Use agent_data directory for JSON persistence (must be absolute
-        # and writable — never use relative paths, which resolve to the
-        # read-only install dir in bundled mode).
-        db_path = os.environ.get('HEVOLVE_DB_PATH', '')
-        if db_path and db_path != ':memory:' and os.path.isabs(db_path):
-            storage_dir = os.path.join(os.path.dirname(db_path), 'distributed_tasks')
-        else:
-            # Always fall back to user-writable data dir
-            from core.platform_paths import get_agent_data_dir
-            storage_dir = os.path.join(get_agent_data_dir(), 'distributed_tasks')
+        storage_dir = coordinator_storage_dir()
         os.makedirs(storage_dir, exist_ok=True)
 
         backend = JSONBackend(storage_dir=storage_dir)

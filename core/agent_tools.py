@@ -427,7 +427,7 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     @log_tool_execution
     def get_user_camera_inp(
-        inp: Annotated[str, "The Question to check from visual context"],
+        inp: Annotated[str, "A question about what the user's live camera shows right now, e.g. 'what is the user holding?'"],
     ) -> str:
         # No int() — user_id is a UUID on desktop installs and int() raised
         # on every call (152/152 failures across three log rotations,
@@ -436,9 +436,19 @@ def build_core_tool_closures(ctx):
         # filename.  An integer id still passes through unchanged.
         return helper_fun.get_user_camera_inp(inp, user_id, request_id_list[user_prompt])
 
+    # The schema says what the tool does.  It read "Get user's visual
+    # information to process somethings" with one argument "The Question to
+    # check from visual context" -- on the main leg the only core tool besides
+    # google_search that takes any question -- and goals whose own tool was
+    # missing asked it about gradient sync and build status: 732 calls
+    # 2026-09-22..29 on the MSI desktop, none with a frame (helper.py
+    # get_user_camera_inp now raises for that).
     tools.append((
         "get_user_camera_inp",
-        "Get user's visual information to process somethings",
+        "Look through the user's live camera and answer a question about what "
+        "it shows right now. Only for what is in front of the camera: it cannot "
+        "answer anything else, and it fails when the user is not sharing a "
+        "camera.",
         get_user_camera_inp,
     ))
 

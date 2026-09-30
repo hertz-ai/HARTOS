@@ -30,10 +30,16 @@ def _agent_read_refused(agent_id):
 
     Review of 275e8e361: timeline / conversations / thinking served any
     signed-in user.  They now ask dashboard_service.may_steer through
-    goal_to_steer, like every goal route.  The id is a goal id, or the
-    prompt id a goal runs under; an id no goal claims is a local agent with
-    no owner on record, so it is the machine's: this machine's callers read
-    it, a remote non-admin gets the same 403 as for someone else's.
+    goal_to_steer, like every goal route.  The id is a goal id, the prompt
+    id a goal runs under, or a users row: a trained agent (user_type
+    'agent') the dashboard lists by its user id.  A users row is judged as
+    owned by that user, so may_steer's person rule (UserService.
+    person_to_notify) maps an agent to its human owner -- review of
+    d4146f843: the owner of a trained agent got 403 from another machine,
+    and Hevolve web (auditApi.getTimeline) is always another machine.  An id
+    none of those claim (daemon_*, expert_*) has no owner on record, so it
+    is the machine's: this machine's callers read it, a remote non-admin
+    gets the same 403 as for someone else's.
     """
     from types import SimpleNamespace
     from .dashboard_service import find_goal, goal_to_steer, steering_caller
@@ -41,9 +47,11 @@ def _agent_read_refused(agent_id):
     goal = find_goal(db, agent_id)
     if goal is None:
         goal = (db.query(AgentGoal)
-                .filter(AgentGoal.prompt_id == str(agent_id)).first()
-                or SimpleNamespace(owner_id=None, created_by=None,
-                                   user_id=None))
+                .filter(AgentGoal.prompt_id == str(agent_id)).first())
+    if goal is None:
+        account = db.query(User).filter(User.id == str(agent_id)).first()
+        goal = SimpleNamespace(owner_id=str(account.id) if account else None,
+                               created_by=None, user_id=None)
     _, refused = goal_to_steer(db, agent_id, 'read', steering_caller(),
                                str(g.user.id), goal=goal, audit=False)
     if refused is None:

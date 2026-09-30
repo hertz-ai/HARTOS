@@ -256,7 +256,11 @@ def announce_tasks():
     goal_id = data.get('goal_id')
     objective = data.get('objective', '')
     tasks = data.get('tasks', [])
-    context = data.get('context', {})
+    # A peer's word names no requester here: its user id and source node are
+    # dropped (requesters.peer_view), so no task in this ledger can claim a
+    # local user, or this node as its source, on a peer's say-so.
+    from .requesters import peer_view
+    context = peer_view(data.get('context', {}))
 
     sender_host = data.get('sender_host', '')
 
@@ -309,6 +313,7 @@ def list_available_tasks():
         return _no_coordinator()
 
     from agent_ledger.core import TaskStatus
+    from .requesters import peer_view
     available = []
     for task_id in coordinator._ledger.task_order:
         task = coordinator._ledger.get_task(task_id)
@@ -317,7 +322,8 @@ def list_available_tasks():
                 'task_id': task.task_id,
                 'description': task.description,
                 'capabilities_required': task.context.get('capabilities_required', []),
-                'context': task.context,
+                # Served to peers: never who asked (requesters.peer_view).
+                'context': peer_view(task.context),
             })
 
     return jsonify({'success': True, 'tasks': available})
@@ -367,11 +373,13 @@ def claim_task():
 
     task = coordinator.claim_next_task(agent_id, capabilities)
     if task:
+        from .requesters import peer_view
         return jsonify({
             'success': True,
             'task_id': task.task_id,
             'description': task.description,
-            'context': task.context,
+            # The claimant may be another node: never who asked.
+            'context': peer_view(task.context),
         })
     return jsonify({'success': True, 'task_id': None, 'message': 'No tasks available'})
 
@@ -486,9 +494,11 @@ def goal_progress(goal_id):
 
     The goal is the AgentGoal / CodingGoal with this id when there is one
     (dispatch submits under the goal's own id), else the coordinator's goal,
-    owned by whoever submitted it HERE (requesters.submitter_of).  A goal
-    a peer gossiped names nobody on this node -- any user id in its context
-    is the peer's -- so it is this machine's: local callers read it.
+    owned by whoever submitted it HERE (requesters.submitter_of), else by
+    the requester its own context names when this node stamped it
+    (resolve_requester: a handle minted here, or a raw id with this node as
+    its source).  A goal a peer gossiped names nobody on this node, so it
+    is this machine's: local callers read it.
     Judged by dashboard_service.may_steer; an unknown id and someone else's
     goal answer the same 403.  Review of dc32b1146: any signed-in user read
     any goal's tasks.
@@ -503,9 +513,13 @@ def goal_progress(goal_id):
     progress = coordinator.get_goal_progress(goal_id)
     goal = find_goal(g.db, goal_id)
     if goal is None and 'error' not in progress:
-        from .requesters import submitter_of
-        goal = SimpleNamespace(owner_id=submitter_of(goal_id),
-                               created_by=None, user_id=None)
+        from .requesters import resolve_requester, submitter_of
+        ctx = progress.get('context') or {}
+        goal = SimpleNamespace(
+            owner_id=(submitter_of(goal_id)
+                      or resolve_requester(ctx.get('user_id'),
+                                           ctx.get('source_node'))),
+            created_by=None, user_id=None)
     _, refused = goal_to_steer(g.db, goal_id, 'read', steering_caller(),
                                str(g.user.id), goal=goal, audit=False)
     if refused:

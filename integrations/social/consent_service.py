@@ -1048,9 +1048,16 @@ class ConsentService:
         reads that same last answer here.  An answer is a grant (granted_at)
         or a No (revoked_at: revoke_consent, the privacy page's revoke, a
         declined ask); a pending ask is neither.  On a tie the No wins.
+
+        A database with no consent table has no answer on file: False.  It
+        is a fresh install read before init_db creates the schema, or a file
+        whose migrations never ran; no answer can have been recorded in it,
+        so this is not a read error (those raise, and the caller decides).
         """
         _validate_consent_type(consent_type)
-        from sqlalchemy import func
+        from sqlalchemy import func, inspect
+        if not inspect(db.get_bind()).has_table(UserConsent.__tablename__):
+            return False
         last_yes, last_no = db.query(
             func.max(UserConsent.granted_at), func.max(UserConsent.revoked_at),
         ).filter(UserConsent.consent_type == consent_type).one()

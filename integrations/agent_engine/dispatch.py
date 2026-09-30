@@ -1102,13 +1102,17 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
     # this node maps back (integrations.distributed_agent.requesters): its own
     # worker runs the task as the person, and the contribution notification
     # reaches them.  A remote worker runs under the handle; it has no such
-    # user either way.
-    from integrations.distributed_agent.requesters import requester_handle
+    # user either way.  source_node is this node's canonical id (the one the
+    # worker claims as), never the shared literal 'unknown'; a re-dispatch
+    # rewrites both onto a task set already in the ledger
+    # (DistributedTaskCoordinator._refresh_requester).
+    from integrations.distributed_agent.requesters import (
+        requester_handle, this_node_id)
     context = {
         'goal_type': goal_type,
         'user_id': requester_handle(goal_id, user_id),
         'prompt': prompt,
-        'source_node': os.environ.get('HEVOLVE_NODE_ID', 'unknown'),
+        'source_node': this_node_id(),
         'task_source': 'hive',
         'continuous': continuous,
     }

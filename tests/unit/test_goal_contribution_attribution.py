@@ -15,8 +15,10 @@ from tests.unit.test_coordinator_dedup import _coordinator, _ledger
 def _goal_with_child(context):
     led = _ledger()
     coord = _coordinator(led)
+    # A raw requester id counts only when THIS node stamped it
+    # (requesters.resolve_requester): source_node is this node.
     coord.submit_goal('objective', [{'task_id': 'g1_task_0', 'description': 'd'}],
-                      context, goal_id='g1')
+                      dict(context, source_node='node-here'), goal_id='g1')
     return coord
 
 
@@ -28,7 +30,9 @@ def _notify(coord):
     # database in test_goal_contribution_reaches_a_person.py.
     db.query.return_value.filter.return_value.first.return_value = None
     with patch('integrations.social.services.NotificationService.create', created), \
-         patch('integrations.social.models.get_db', return_value=db):
+         patch('integrations.social.models.get_db', return_value=db), \
+         patch('integrations.distributed_agent.requesters.this_node_id',
+               return_value='node-here'):
         coord._notify_goal_contribution('g1_task_0', agent_id='node-abc',
                                         task_description='d')
     return created

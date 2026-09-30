@@ -223,8 +223,9 @@ class TestAReLearningNeverCreatesAnAction:
             self, tmp_path, monkeypatch):
         """End to end through helper.load_vlm_agent_files: the filename id is
         what the reader reports, so files _7.._9 beside a 6-action flow must
-        still yield 6 actions."""
-        import json
+        still yield 6 actions.  Banked through the one writer, so each file
+        carries the provenance the loader requires (files without it are
+        refused outright: test_vlm_learning_must_prove_its_action.py)."""
         import logging
         import types
         import hartos.helper as helper
@@ -233,8 +234,7 @@ class TestAReLearningNeverCreatesAnAction:
             logger=logging.getLogger('test_vlm_orphans')))
         flow, vlm = self._live()
         for v in vlm:
-            (tmp_path / ('18088688973_0_%d_vlm_agent.json' % v['action_id'])
-             ).write_text(json.dumps(v), encoding='utf-8')
+            helper.bank_vlm_learning('18088688973', 0, v['action_id'], 'run', v)
         loaded = helper.load_vlm_agent_files('18088688973', 0)
         assert sorted(v['action_id'] for v in loaded) == list(range(1, 10))
         out = _vlm_merged_actions(flow, loaded)
