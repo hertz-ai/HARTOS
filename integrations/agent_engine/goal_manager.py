@@ -12,6 +12,8 @@ import logging
 from typing import Dict, List, Optional, Callable
 from sqlalchemy.orm import Session
 
+from core.error_advice import FAILED_STEP_SETUP_OFFER
+
 logger = logging.getLogger('hevolve_social')
 
 # ─── Goal Type Groups ───
@@ -1105,14 +1107,40 @@ def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
             f"to inspect actual pip output before drawing conclusions.\n"
         )
 
+    if (category == 'subprocess.tool_load' and missing_package and not backend
+            and ctx.get('failed_step') == FAILED_STEP_SETUP_OFFER):
+        # gpu_worker._setup_offer_failed: an engine that lives in its own
+        # venv is not installed, and offering its setup to the owner failed.
+        # No pip was run (the shared site is where its venv keeps it out
+        # of), and installing it is the owner's call, so the work is making
+        # the offer reachable, never installing it from here.
+        return base + (
+            f"FAILURE SHAPE: an engine's setup could not be offered\n"
+            f"  Missing package: {missing_package!r}\n\n"
+            f"This is NOT a source-code bug in the engine.  The engine runs "
+            f"from its own venv, which is not installed; the runtime tried "
+            f"to ask the owner to set it up and that ask failed (the cause "
+            f"is in the Description's context, remediation_hint).  Nothing "
+            f"was installed and nothing may be installed without the "
+            f"owner's yes.\n\n"
+            f"REMEDIATION:\n"
+            f"1. Diagnose why integrations/agent_engine/capability_setup."
+            f"request_capability_setup could not ask: no owner "
+            f"(HEVOLVE_OWNER_USER_ID unset), the consent store unreachable, "
+            f"or an import failure.\n"
+            f"2. Fix that so the owner's setup card can be filed.\n"
+            f"3. Do NOT install {missing_package!r} into the shared site "
+            f"and do NOT build the engine's venv yourself.\n"
+        )
+
     if category == 'subprocess.tool_load' and missing_package and not backend:
         # A missing Python dependency — NOT a source bug.  Editing source
         # can never summon a package, so the generic "read source, write
         # fix" path below just loops.  The runtime already tried a
-        # deterministic `pip install` and it FAILED (that's the only
-        # reason this agentic goal was dispatched — see
-        # gpu_worker._maybe_self_heal_from_line).  Route to dependency
-        # remediation, not code editing.
+        # deterministic `pip install` and it FAILED (gpu_worker's
+        # failed_step FAILED_STEP_PIP_INSTALL; a goal filed before that key existed
+        # is the same case).  Route to dependency remediation, not code
+        # editing.
         return base + (
             f"FAILURE SHAPE: a Python dependency is missing\n"
             f"  Missing package: {missing_package!r}\n\n"

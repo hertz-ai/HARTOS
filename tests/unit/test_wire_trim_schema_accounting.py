@@ -81,12 +81,20 @@ def test_trim_that_cannot_reach_budget_says_so(caplog):
     Before this fix nothing reported that; the only signal was the eventual
     HTTP 400 from llama-server.
     """
+    # The trim now sizes each cut at the message's own chars/token and can
+    # cut the system message too, so an oversized system prompt alone no
+    # longer makes it fail.  What it still will not cut is a dispatch turn's
+    # marker and words (must_keep_head), so words longer than the budget are
+    # the untrimmable shape.
+    from core.constants import ACTION_STEPS_SEPARATOR
     body = {
         'model': 'llama',
         'max_tokens': 1500,
         'messages': [
             {'role': 'system', 'content': 'S ' * 4000},   # far over any budget
-            {'role': 'user', 'content': 'U ' * 200},
+            {'role': 'user',
+             'content': ('Perform this action -> Action #1:x' + '\n' * 2
+                         + 'word ' * 6000 + ACTION_STEPS_SEPARATOR + '[]')},
         ],
         'tools': [_mk_tool(f't{i}', 'd' * 400) for i in range(60)],
     }

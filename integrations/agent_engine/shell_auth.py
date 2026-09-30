@@ -31,8 +31,10 @@ def shell_auth_ok():
     ``(True, None, None)``; otherwise ``(False, <json>, 403)``.
     """
     from flask import request, jsonify
-    remote = request.remote_addr or ''
-    if remote in LOCAL_ORIGINS:
+    from core.auth_local import _is_local_request
+    # The one local check (core.auth_local): loopback socket peer, never a
+    # forwarded claim; 0.0.0.0 is not loopback.
+    if _is_local_request():
         return True, None, None
     token = request.headers.get('X-Shell-Token', '')
     expected = os.environ.get('HART_SHELL_TOKEN', '')
@@ -72,3 +74,12 @@ def require_shell_auth(f):
             return err, status
         return f(*args, **kwargs)
     return decorated
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HART_SHELL_TOKEN',
+)

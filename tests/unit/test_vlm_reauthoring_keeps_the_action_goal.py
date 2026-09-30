@@ -146,14 +146,14 @@ class TestReauthoringKeepsTheGoal(unittest.TestCase):
         out = self.merge([dict(_SAVED_ACTION_3)], [dict(_RELEARNED_ACTION_3)])
         self.assertEqual(out[0]['can_perform_without_user_input'], 'yes')
 
-    def test_appended_action_keeps_its_own_goal(self):
-        """No predecessor to inherit from — nothing to preserve, nothing to lose."""
+    def test_an_orphan_relearning_adds_no_action(self):
+        """No flow action carries id 99, so there is no goal to refine: the
+        file is an orphan and is dropped.  A re-learning never creates an
+        action (agent 18088688973 grew 6 -> 9 actions when orphans were
+        appended, 2026-09-25)."""
         out = self.merge([dict(_SAVED_ACTION_3)],
-                         [{'action_id': 99, 'action': 'brand new thing'}],
-                         flow_persona='Executor')
-        self.assertEqual(len(out), 2)
-        self.assertEqual(out[1]['action'], 'brand new thing')
-        self.assertEqual(out[1]['persona'], 'Executor')
+                         [{'action_id': 99, 'action': 'brand new thing'}])
+        self.assertEqual(out, [_SAVED_ACTION_3])
 
     def test_action_is_declared_a_contract_field(self):
         """Pin the mechanism, not just the outcome."""

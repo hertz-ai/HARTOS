@@ -37,11 +37,14 @@ logger = logging.getLogger('hevolve.auto_evolve')
 AUTO_EVOLVE_MAX_PARALLEL_DISPATCH = 4
 
 # PRODUCT_MAP §10: super-majority threshold for VOTE stage — candidates must
-# clear 2/3 of the weighted tally, not a simple majority.  Expressed as a
-# fraction of the maximum possible score so callers can still tune per-session
-# via min_approval_score (which is applied as an absolute-score floor in
-# addition to this ratio).
-AUTO_EVOLVE_SUPERMAJORITY_RATIO = 2.0 / 3.0
+# clear 2/3 of the weighted tally, not a simple majority.  The rule itself
+# (quorum + this ratio as a floor + the decision context's threshold and
+# steward) lives in voting_rules.approval_verdict, shared with the
+# evaluation-goal writer; this name is kept for existing importers only.
+# Callers can still tune per-session via min_approval_score (an absolute-score
+# floor applied in addition to the rule).
+from integrations.social.voting_rules import (  # noqa: E402
+    SUPERMAJORITY_RATIO as AUTO_EVOLVE_SUPERMAJORITY_RATIO)
 
 # How long a dispatched cycle may stay un-terminal before reconcile() closes
 # it out.  This exists because 'paused' is NOT a terminal goal status (six
@@ -141,6 +144,11 @@ class EvolveSession:
     failed: int = 0
     experiments: List[Dict] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    # Who started the cycle: the admin's id from the API, 'system' from the
+    # agent daemon.  _emit_event addresses every auto_evolve.* event to this
+    # id.  Deliberately NOT in to_dict(): the status endpoint is open to any
+    # authenticated user, and the initiator is not theirs to see.
+    user_id: str = 'system'
 
     def to_dict(self) -> Dict:
         return {
@@ -196,7 +204,7 @@ class AutoEvolveOrchestrator:
                     'session': self._active_session.to_dict(),
                 }
 
-        session = EvolveSession()
+        session = EvolveSession(user_id=user_id or 'system')
         session.started_at = time.time()
         session.status = 'selecting'
 
@@ -332,7 +340,7 @@ class AutoEvolveOrchestrator:
             else:
                 return session.to_dict()
 
-        self._emit_event('auto_evolve.completed', payload)
+        self._emit_event('auto_evolve.completed', session, payload)
         return payload
 
     def _execute_cycle(self, session: EvolveSession,
@@ -348,7 +356,7 @@ class AutoEvolveOrchestrator:
         if not candidates:
             session.status = 'completed'
             session.errors.append('No eligible experiments found')
-            self._emit_event('auto_evolve.no_candidates', session.to_dict())
+            self._emit_event('auto_evolve.no_candidates', session)
             return
 
         # Phase 2: FILTER through constitutional gate
@@ -363,7 +371,7 @@ class AutoEvolveOrchestrator:
             session.status = 'completed'
             session.errors.append(
                 f'No experiments met approval threshold ({min_approval_score})')
-            self._emit_event('auto_evolve.none_approved', session.to_dict())
+            self._emit_event('auto_evolve.none_approved', session)
             return
 
         # Phase 4: SELECT top-N
@@ -371,7 +379,7 @@ class AutoEvolveOrchestrator:
 
         # Phase 5: DISPATCH to type-aware iteration (parallel per PRODUCT_MAP §10)
         session.status = 'dispatching'
-        self._emit_event('auto_evolve.dispatching', {
+        self._emit_event('auto_evolve.dispatching', session, {
             'count': len(winners),
             'experiments': [w['id'] for w in winners],
         })
@@ -379,7 +387,7 @@ class AutoEvolveOrchestrator:
         self._dispatch_winners_parallel(session, winners, user_id)
 
         session.status = 'running' if session.dispatched > 0 else 'failed'
-        self._emit_event('auto_evolve.started', session.to_dict())
+        self._emit_event('auto_evolve.started', session)
 
         logger.info(f"[{session.session_id}] Auto-evolve dispatched "
                      f"{session.dispatched}/{len(winners)} experiments")
@@ -466,28 +474,28 @@ class AutoEvolveOrchestrator:
             from integrations.social.models import db_session
             from integrations.social.thought_experiment_service import (
                 ThoughtExperimentService)
+            from integrations.social.voting_rules import approval_verdict
 
             with db_session(commit=False) as db:
                 for exp in candidates:
                     tally = ThoughtExperimentService.tally_votes(
                         db, exp['id'])
                     score = tally.get('weighted_score', 0)
-                    total_for = tally.get('total_for', 0) or 0
-                    total_against = tally.get('total_against', 0) or 0
-                    decisive = total_for + total_against
-                    # Super-majority: ≥ 2/3 of DECISIVE (non-abstain) weight
-                    # must be FOR.  Abstains are excluded from denominator.
-                    super_ratio = (total_for / decisive) if decisive > 0 else 0.0
+                    # The ONE approval rule (voting_rules.approval_verdict):
+                    # quorum of DISTINCT identities -- no single identity
+                    # approves alone, a tally that does not answer fails
+                    # closed -- AND a FOR share of the decisive weight of at
+                    # least max(2/3, the context's threshold), one vote per
+                    # identity -- AND the steward's FOR where the context
+                    # requires one.  The evaluation-goal writer asks the same
+                    # rule, so ranking and dispatch cannot disagree.
+                    verdict = approval_verdict(tally)
+                    super_ratio = verdict['super_majority']
+                    quorate = verdict['quorum_met']
                     exp['_approval_score'] = score
-                    exp['_super_majority'] = round(super_ratio, 4)
+                    exp['_super_majority'] = super_ratio
                     exp['_tally'] = tally
-                    # Quorum of DISTINCT identities (voting_rules): no single
-                    # identity approves alone, however unanimous its vote.
-                    # A tally that does not answer it fails closed.
-                    quorate = tally.get('quorum_met') is True
-                    if (score >= min_score
-                            and super_ratio >= AUTO_EVOLVE_SUPERMAJORITY_RATIO
-                            and quorate):
+                    if score >= min_score and verdict['approved']:
                         scored.append(exp)
                     else:
                         logger.debug(
@@ -495,8 +503,9 @@ class AutoEvolveOrchestrator:
                             f"score={score} super_ratio={super_ratio:.3f} "
                             f"quorum_met={quorate} "
                             f"distinct_voters={tally.get('distinct_voters')} "
+                            f"verdict={verdict['reason']} "
                             f"(need score>={min_score} and "
-                            f"ratio>={AUTO_EVOLVE_SUPERMAJORITY_RATIO:.3f} "
+                            f"ratio>={verdict['threshold']:.3f} "
                             f"and quorum)"
                         )
         except Exception as e:
@@ -733,11 +742,22 @@ class AutoEvolveOrchestrator:
                 db.commit()
             return result
 
-    def _emit_event(self, topic: str, data: Dict):
-        """Emit progress event via EventBus."""
+    def _emit_event(self, topic: str, session: EvolveSession,
+                    data: Optional[Dict] = None):
+        """Emit a progress event via EventBus, addressed to the initiator.
+
+        The payload defaults to the session snapshot.  Every event is stamped
+        with the cycle initiator's user_id here, in one place: the EventBus
+        P3a guard refuses an SSE broadcast that names no user (live, every
+        cycle: "SSE broadcast refused ... topic='auto_evolve.none_approved'"),
+        and these topics are not public -- the status they carry is behind
+        auth -- so they route to the person who started the cycle.
+        """
+        payload = dict(data) if data is not None else session.to_dict()
+        payload['user_id'] = session.user_id
         try:
             from core.platform.events import emit_event
-            emit_event(topic, data)
+            emit_event(topic, payload)
         except Exception:
             pass
 

@@ -689,13 +689,19 @@ def _engine_id_to_catalog_id(engine_id: str) -> str:
     return 'tts-' + engine_id.replace('_', '-')
 
 
-def _catalog_id_to_engine_id(catalog_id: str) -> str:
+def catalog_id_to_engine_id(catalog_id: str) -> str:
     """Inverse of `_engine_id_to_catalog_id`: 'tts-f5-tts' → 'f5_tts'.
+
+    THE catalog-id → engine-name rule, public because Nunba converts the
+    same ids (tts_engine.catalog_entry_backend, TTSLoader) and must not
+    carry a second rule: a hand-rolled ``replace('tts-', '', 1)`` kept the
+    dashes, so a multi-word id named one engine here and another there.
 
     Registry keys are underscore-canonical (they must match the names in
     LANG_ENGINE_PREFERENCE); catalog ids are dash-canonical.  Dropping the
     underscore restoration was the root cause of language_priority={} on
-    every populate after the first (task #16).
+    every populate after the first (task #16).  Only a LEADING 'tts-' is
+    a prefix.
     """
     raw = catalog_id[4:] if catalog_id.startswith('tts-') else catalog_id
     return raw.replace('-', '_')
@@ -2093,7 +2099,7 @@ def populate_tts_catalog(catalog) -> int:
     # persisted catalog on every boot (task #16).
     _drop_ids: List[str] = []
     for entry in list(catalog.list_by_type('tts')):
-        if _catalog_id_to_engine_id(entry.id) in _SEED_SPECS:
+        if catalog_id_to_engine_id(entry.id) in _SEED_SPECS:
             continue
         err = _validate_engine_caps(entry.capabilities or {})
         if err:
@@ -2254,7 +2260,7 @@ def _catalog_entry_to_spec(entry) -> Optional[TTSEngineSpec]:
         excluded from the ENGINE_REGISTRY snapshot.
     """
     caps = entry.capabilities or {}
-    engine_id = _catalog_id_to_engine_id(entry.id)
+    engine_id = catalog_id_to_engine_id(entry.id)
 
     seed = _SEED_SPECS.get(engine_id)
     if seed is not None:

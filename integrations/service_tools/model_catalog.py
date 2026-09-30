@@ -15,6 +15,7 @@ This is purely metadata + state tracking.
 
 import json
 import logging
+import ntpath
 import os
 import struct
 import threading
@@ -788,11 +789,8 @@ class ModelCatalog:
     """
 
     def __init__(self, catalog_path: Optional[str] = None):
-        try:
-            from core.platform_paths import get_db_dir
-            data_dir = Path(get_db_dir())
-        except ImportError:
-            data_dir = Path.home() / 'Documents' / 'Nunba' / 'data'
+        from core.platform_paths import get_db_dir
+        data_dir = Path(get_db_dir())
         data_dir.mkdir(parents=True, exist_ok=True)
         self._path = Path(catalog_path) if catalog_path else data_dir / 'model_catalog.json'
         self._entries: Dict[str, ModelEntry] = {}
@@ -1144,14 +1142,19 @@ class ModelCatalog:
 
         Matches on the BASENAME, because callers hold a full path (the
         spawn) or a bare name (the catalog row), and the row stores the
-        bare name.
+        bare name. The basename is cut with ``ntpath``, which splits on
+        both '\\' and '/' on every OS, so the key does not depend on the
+        host: ``os.path`` on Linux is posixpath, which leaves a
+        Windows-authored path (``F:\\models\\x.gguf``) whole, and the lookup
+        would answer None for a file it knows. GGUF names never contain a
+        backslash, so splitting on it costs nothing.
 
         Returns None when two rows claim the same file. The catalog has
         known self-duplicate pairs (#107), and "I do not know which" is the
         honest answer -- guessing would attach a measurement to the wrong
         model, which is worse than having none.
         """
-        name = os.path.basename(str(weight_file or '').strip())
+        name = ntpath.basename(str(weight_file or '').strip())
         if not name:
             return None
         hits = [e for e in self._entries.values()

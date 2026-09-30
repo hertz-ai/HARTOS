@@ -102,6 +102,21 @@ def test_repair_backend_venv_engine_registry_unavailable(monkeypatch):
     assert 'unavailable' in payload['message'].lower()
 
 
+def _consent(monkeypatch, answer):
+    """The owner's answer, at the consent boundary the tool asks."""
+    calls = []
+
+    def ask(capability, *, reason):
+        calls.append((capability, reason))
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(
+        'integrations.agent_engine.capability_setup.ask_owner_for_setup', ask)
+    return calls
+
+
 def test_repair_backend_venv_known_backend_routed_to_install(monkeypatch):
     """A known backend short-circuits validation and reaches the
     install_backend_full call site (or its ImportError fallback)."""
@@ -109,6 +124,7 @@ def test_repair_backend_venv_known_backend_routed_to_install(monkeypatch):
 
     monkeypatch.setattr(backend_repair_tools, '_get_known_backends',
                         lambda: {'piper', 'indic_parler', 'kokoro'})
+    _consent(monkeypatch, 'granted')
 
     out = backend_repair_tools.repair_backend_venv('piper')
     payload = json.loads(out)
@@ -135,6 +151,7 @@ def test_repair_backend_venv_source_mode_returns_graceful_message(
 
     monkeypatch.setattr(backend_repair_tools, '_get_known_backends',
                         lambda: {'indic_parler'})
+    _consent(monkeypatch, 'granted')
 
     # Block imports of the Nunba modules to simulate source-mode HARTOS.
     real_import = __builtins__['__import__'] if isinstance(
@@ -156,6 +173,91 @@ def test_repair_backend_venv_source_mode_returns_graceful_message(
     assert payload['success'] is False
     assert 'bundled' in payload['message'].lower()
     assert payload['wiped'] is False
+
+
+# ── The owner's consent, in the tool itself ─────────────────────
+#
+# Review of 9908ae456: leaving `backend` out of a goal only steers the
+# prompt.  Any caller (a self_heal goal, the bootstrap provisioner, an
+# agent that reads the tool list) could still install an engine without the
+# owner's yes, so the tool asks, and touches nothing until the answer is yes.
+
+
+@pytest.fixture
+def nunba_venv_layer(monkeypatch):
+    """Nunba's venv layer at its boundary: records every wipe and install."""
+    import types
+    calls = []
+    bv = types.ModuleType('tts.backend_venv')
+    bv.wipe_venv = lambda name: calls.append(('wipe', name))
+    pi = types.ModuleType('tts.package_installer')
+
+    def install_backend_full(name):
+        calls.append(('install', name))
+        return True, 'Ready'
+
+    pi.install_backend_full = install_backend_full
+    monkeypatch.setitem(sys.modules, 'tts', types.ModuleType('tts'))
+    monkeypatch.setitem(sys.modules, 'tts.backend_venv', bv)
+    monkeypatch.setitem(sys.modules, 'tts.package_installer', pi)
+    from integrations.coding_agent import backend_repair_tools
+    monkeypatch.setattr(backend_repair_tools, '_get_known_backends',
+                        lambda: {'f5_tts'})
+    return calls
+
+
+@pytest.mark.parametrize('answer', ['asked', 'declined', 'unavailable'])
+def test_without_the_owners_yes_nothing_is_installed_or_wiped(
+        monkeypatch, nunba_venv_layer, answer):
+    from integrations.coding_agent import backend_repair_tools
+    asked = _consent(monkeypatch, answer)
+
+    payload = json.loads(backend_repair_tools.repair_backend_venv(
+        'f5_tts', wipe_first=True))
+
+    assert nunba_venv_layer == []
+    assert payload['success'] is False
+    assert payload['consent'] == answer
+    assert payload['wiped'] is False
+    assert 'tts:f5_tts' in payload['message']
+    assert [c for c, _ in asked] == ['tts:f5_tts']
+
+
+def test_a_consent_check_that_fails_installs_nothing(
+        monkeypatch, nunba_venv_layer):
+    from integrations.coding_agent import backend_repair_tools
+    _consent(monkeypatch, RuntimeError('consent store down'))
+
+    payload = json.loads(backend_repair_tools.repair_backend_venv('f5_tts'))
+
+    assert nunba_venv_layer == []
+    assert payload['success'] is False
+    assert payload['consent'] == 'unavailable'
+
+
+def test_with_the_owners_yes_the_repair_runs(monkeypatch, nunba_venv_layer):
+    from integrations.coding_agent import backend_repair_tools
+    asked = _consent(monkeypatch, 'granted')
+
+    payload = json.loads(backend_repair_tools.repair_backend_venv(
+        'f5_tts', wipe_first=True))
+
+    assert nunba_venv_layer == [('wipe', 'f5_tts'), ('install', 'f5_tts')]
+    assert payload['success'] is True
+    assert payload['wiped'] is True
+    assert asked[0][0] == 'tts:f5_tts' and asked[0][1].strip()
+
+
+def test_an_unknown_backend_is_refused_before_anyone_is_asked(
+        monkeypatch, nunba_venv_layer):
+    from integrations.coding_agent import backend_repair_tools
+    asked = _consent(monkeypatch, 'granted')
+
+    payload = json.loads(backend_repair_tools.repair_backend_venv('../evil'))
+
+    assert payload['success'] is False
+    assert asked == []
+    assert nunba_venv_layer == []
 
 
 # ── Prompt branching ────────────────────────────────────────────

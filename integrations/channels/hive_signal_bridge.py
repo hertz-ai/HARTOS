@@ -125,6 +125,19 @@ _SINGLE_WORD_MAP: Dict[str, frozenset] = {
 }
 
 
+def _sender_ref(message) -> str:
+    """The sender as hive.signal.* events carry it: a salted per-node
+    pseudonym, never the raw handle.  A channel's sender_id is a phone
+    number (Signal, WhatsApp, iMessage) or an email; hive.* events are
+    EVERYONE-class, so they reach every SSE client on this node and, over
+    the EventBus bridge, other nodes.  The same sender maps to the same
+    reference on this node (per-sender counting still works); nothing else
+    can reverse it.  No in-process consumer of hive.signal.* reads
+    sender_id (measured 2026-09-28)."""
+    from security.edge_privacy import pseudonym
+    return pseudonym(getattr(message, 'sender_id', ''), 'hive.signal.sender')
+
+
 # =====================================================================
 # Signal Feed Entry
 # =====================================================================
@@ -340,7 +353,7 @@ class HiveSignalBridge:
             emit_event('hive.signal.received', {
                 'message_id': getattr(message, 'id', ''),
                 'channel': channel_type,
-                'sender_id': getattr(message, 'sender_id', ''),
+                'sender_id': _sender_ref(message),
                 'signals': signals,
                 'is_group': getattr(message, 'is_group', False),
                 'timestamp': time.time(),
@@ -360,7 +373,7 @@ class HiveSignalBridge:
             from core.platform.events import emit_event
             emit_event('hive.signal.spark', {
                 'channel': channel_type,
-                'sender_id': getattr(message, 'sender_id', ''),
+                'sender_id': _sender_ref(message),
                 'signal_count': len(signals),
                 'signals': signals,
                 'timestamp': time.time(),
@@ -609,7 +622,7 @@ class HiveSignalBridge:
                 from core.platform.events import emit_event
                 emit_event('hive.signal.sentiment', {
                     'channel': channel,
-                    'sender_id': getattr(message, 'sender_id', ''),
+                    'sender_id': _sender_ref(message),
                     'positive_sentiment': extracted.positive_sentiment,
                     'formality': extracted.formality_markers,
                     'is_group': getattr(message, 'is_group', False),

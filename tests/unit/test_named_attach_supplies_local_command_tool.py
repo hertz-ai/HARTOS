@@ -74,6 +74,36 @@ def _core_tools_assignments(tree):
     return out
 
 
+def _builder_carries_tool(src):
+    """What in ``build_core_tool_closures`` would make it carry TOOL itself.
+
+    Returns None when the builder is absent, else a list of
+    ``(kind, lineno)``: a nested def of TOOL, a Name/Attribute reference to
+    it, or a string constant EQUAL to it (the registration-name slot of a
+    ``(name, desc, func)`` triple or a ``{'name': ...}`` schema).  Comments
+    are not in the AST, and a docstring that merely mentions the tool is a
+    constant that is not equal to it, so prose routing guidance never
+    counts.
+    """
+    fn = next((n for n in ast.walk(ast.parse(src))
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name == 'build_core_tool_closures'), None)
+    if fn is None:
+        return None
+    hits = []
+    for n in ast.walk(fn):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and n.name == TOOL:
+            hits.append(('def', n.lineno))
+        elif isinstance(n, ast.Name) and n.id == TOOL:
+            hits.append(('name', n.lineno))
+        elif isinstance(n, ast.Attribute) and n.attr == TOOL:
+            hits.append(('attribute', n.lineno))
+        elif isinstance(n, ast.Constant) and n.value == TOOL:
+            hits.append(('registration-name', n.lineno))
+    return hits
+
+
 class TestThePremise:
     """Anti-vacuity: prove the tool really is local and really is unreachable
     from the builder, before asserting anything about the fix."""
@@ -107,15 +137,26 @@ class TestThePremise:
             f'{assigns} — the closure must already exist at the assignment')
 
     def test_the_builder_does_not_carry_it(self):
-        """If the builder ever gains it, THIS fix becomes the wrong one."""
+        """If the builder ever gains it, THIS fix becomes the wrong one.
+
+        Scoped to the builder's own AST, not a text slice: the old check cut
+        the source from ``def build_core_tool_closures`` to END OF FILE and
+        substring-matched, so a comment and the LLM-facing docstring of
+        execute_coding_task ("use execute_windows_or_android_command for
+        that") -- prose that states the very rule guarded here -- read as
+        the builder carrying the tool (7fd83678f).  What would make this fix
+        wrong is a def, a reference, or a registration name; see
+        _builder_carries_tool."""
         with open(os.path.join(os.path.dirname(RR), '..', 'core',
                                'agent_tools.py'), encoding='utf-8') as fh:
-            src = fh.read()
-        seg = src[src.index('def build_core_tool_closures'):]
-        assert TOOL not in seg, (
-            'build_core_tool_closures now defines the tool itself; the local '
-            'hand-over this file guards is redundant and should be removed '
-            'rather than kept as a second source')
+            hits = _builder_carries_tool(fh.read())
+        assert hits is not None, (
+            'build_core_tool_closures not found in core/agent_tools.py; the '
+            'premise this file guards has moved and needs re-reading')
+        assert not hits, (
+            f'build_core_tool_closures now carries the tool itself {hits}; '
+            'the local hand-over this file guards is redundant and should be '
+            'removed rather than kept as a second source')
 
 
 class TestTheWiring:
@@ -163,3 +204,44 @@ class TestTheDetectorIsNotVacuous:
             'execute_windows_or_android_command)]\n')
         found = _core_tools_assignments(sample)
         assert found and TOOL in ast.dump(found[0])
+
+
+class TestTheBuilderDetectorIsNotVacuous:
+    """_builder_carries_tool must flag every way the builder could gain the
+    tool, and must NOT flag prose that only names it."""
+
+    @pytest.mark.parametrize('body, kind', [
+        ('    def execute_windows_or_android_command(cmd):\n'
+         '        return cmd\n', 'def'),
+        ('    async def execute_windows_or_android_command(cmd):\n'
+         '        return cmd\n', 'def'),
+        ('    tools.append(("execute_windows_or_android_command", "d", f))\n',
+         'registration-name'),
+        ('    tools.append({"name": "execute_windows_or_android_command"})\n',
+         'registration-name'),
+        ('    tools.append(("x", "d", execute_windows_or_android_command))\n',
+         'name'),
+        ('    tools.append(("x", "d", '
+         'helpers.execute_windows_or_android_command))\n', 'attribute'),
+    ])
+    def test_flags_a_builder_that_gains_the_tool(self, body, kind):
+        src = ('def build_core_tool_closures(ctx):\n'
+               '    tools = []\n' + body + '    return tools\n')
+        hits = _builder_carries_tool(src)
+        assert hits and kind in [k for k, _ in hits], (kind, hits)
+
+    def test_passes_a_builder_that_only_mentions_it_in_prose(self):
+        src = ('def build_core_tool_closures(ctx):\n'
+               '    # same rule as execute_windows_or_android_command: inline\n'
+               '    def execute_coding_task(task):\n'
+               '        """NOT for GUI automation (use '
+               'execute_windows_or_android_command for that)."""\n'
+               '        return task\n'
+               '    return [("execute_coding_task", "d", execute_coding_task)]\n'
+               '\n'
+               'def execute_windows_or_android_command(cmd):\n'
+               '    return cmd\n')
+        assert _builder_carries_tool(src) == []
+
+    def test_absent_builder_is_reported_not_passed(self):
+        assert _builder_carries_tool('def other():\n    pass\n') is None

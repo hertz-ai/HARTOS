@@ -26,10 +26,6 @@ from typing import List, Dict, Any, Optional, Callable
 
 logger = logging.getLogger(__name__)
 
-# Canonical buffer root — same as simplemem_langchain.py
-SIMPLEMEM_DB_ROOT = os.path.join(
-    os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'simplemem')
-
 
 def _get_persistent_history(user_id: int):
     """Get the PersistentChatHistory instance for a user (same one LangChain uses)."""

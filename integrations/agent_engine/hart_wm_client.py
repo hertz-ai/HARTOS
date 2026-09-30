@@ -222,8 +222,8 @@ class HartWmClient:
         finally:
             try:
                 s.close()
-            except OSError:
-                pass
+            except OSError as e:
+                logger.debug('hart-comp socket close failed: %s', e)
         if reply.get('ok'):
             out = {'ok': True}
             result = reply.get('result')
@@ -396,8 +396,8 @@ class HartWmClient:
             finally:
                 try:
                     s.close()
-                except OSError:
-                    pass
+                except OSError as e:
+                    logger.debug('hart-comp event socket close failed: %s', e)
                 logger.info('hart-comp event subscription closed')
                 if on_close is not None:
                     try:

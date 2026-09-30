@@ -47,6 +47,13 @@ FAILURES = {
         'acestep_t', {'code': 200, 'data': [{'task_id': 't', 'status': 1}]}),
     'acestep knows nothing about the task': (
         'acestep_t', {'code': 200, 'data': []}),
+    # 6759fbfa6 (hartos-3a F1): a finished job whose file is not on this
+    # node is an error. The path does not exist, so _keep_composition
+    # returns before it ever touches composer_output_dir().
+    'acestep finished but its file is not on this node': (
+        'acestep_t', {'code': 200, 'data': [{'task_id': 't', 'status': 1,
+            'result': json.dumps([{'file': '/v1/audio?path=%2Fnowhere%2Fgone.wav',
+                                   'status': 1}])}]}),
     'video sidecar passes its own failed through': (
         'wan2gp_t', {'status': 'failed', 'error': 'oom'}),
 }
@@ -64,15 +71,35 @@ def test_every_failure_the_producer_reports_is_in_the_set(case):
 @pytest.mark.parametrize('case,task_id,payload', [
     ('still running', 'acestep_t',
      {'code': 200, 'data': [{'task_id': 't', 'status': 0, 'progress': 30}]}),
-    ('finished with a file', 'acestep_t',
-     {'code': 200, 'data': [{'task_id': 't', 'status': 1,
-                             'audio_url': 'http://node/a.wav'}]}),
 ])
 def test_nothing_running_or_finished_is_in_the_set(case, task_id, payload):
     out = _poll(task_id, payload)
     assert out['status'] not in MEDIA_FAILED_STATUSES, (
         f'{case} read as a failure ({out["status"]!r}): a poller would give up '
         f'on a job that is still going or has already succeeded')
+
+
+def test_a_job_finished_with_a_file_is_not_in_the_set(tmp_path, monkeypatch):
+    """The finished case needs a REAL file: since 6759fbfa6 (hartos-3a F1)
+    a finished AceStep job is kept into composer_output_dir(), and one whose
+    file is not on this node is an error. AceStep's real shape is
+    ``/v1/audio?path=<temp file>`` in a JSON string under 'result'
+    (MEASURED 2026-09-22); the output dir is redirected to tmp_path so the
+    unstubbed keep logic never writes into the real acestep tool dir."""
+    import urllib.parse
+    import integrations.service_tools.media_agent as ma
+    temp = tmp_path / 'acestep_tmp' / 'a.wav'
+    temp.parent.mkdir()
+    temp.write_bytes(b'RIFF\x00\x00\x00\x00WAVE')
+    monkeypatch.setattr(ma, 'composer_output_dir', lambda: tmp_path / 'kept')
+    result = json.dumps([{'file': '/v1/audio?path=' + urllib.parse.quote(str(temp)),
+                          'status': 1}])
+    out = _poll('acestep_t', {'code': 200, 'data': [
+        {'task_id': 't', 'status': 1, 'result': result}]})
+    assert out['status'] not in MEDIA_FAILED_STATUSES, (
+        f'finished with a file read as a failure ({out["status"]!r}): a poller '
+        f'would give up on a job that has already succeeded')
+    assert out['status'] == 'completed', out
 
 
 # The pollers, pinned to the constant. Each entry: file, and the phrase that

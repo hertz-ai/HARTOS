@@ -1319,6 +1319,10 @@ class LiquidUIService:
         self._ui_event_cv = threading.Condition()
         self._running = False
         self._model_available = False
+        # True once this instance serves the glass shell (_register_self). A
+        # headless instance (the backend's, core.platform.bootstrap) stays
+        # False: it has no /api/notifications/stream and no home renderer.
+        self._serves_shell = False
 
         # Shell-state push (the poll diet, 2026-09-23). kind -> the last pushed
         # `shell_state` event, read by the SSE producer's _collect alongside the
@@ -1710,15 +1714,19 @@ class LiquidUIService:
                         user_id: Optional[str] = None) -> bool:
         """Push a UI component from an agent to all connected frontends.
 
-        ``user_id`` names the user the push belongs to.  Omitted, the owner is
-        inferred (core.event_attribution.owner_user_id), exactly as before; a
-        caller serving many users on one node (the McGroce commerce gateway)
-        passes it so the P3a SSE guard routes the card to THAT user.
-
         Delivery paths (best-effort once accepted):
-          1. In-memory store → polled by SSE stream → Nunba LiquidUI (web)
-          2. EventBus → WAMP bridge → Android/iOS React Native via Crossbar
-          3. EventBus → any other subscriber (desktop, CLI dashboard)
+          1. In-memory store → the :6800 shell's /api/notifications/stream
+             (only where this instance serves the glass shell)
+          2. EventBus → SSE for the owning user → the Nunba Demopage's agent
+             component (AgentOverlay), which IS Liquid UI on the desktop
+             (owner ruling 2026-09-26)
+          3. EventBus → WAMP bridge → Android/iOS React Native via Crossbar
+
+        ``user_id`` names the person the push is FOR. Pass it whenever the
+        emitter knows it: it is what the P3a SSE guard routes on. Without it
+        the owner is resolved by core.event_attribution.owner_user_id(), which
+        answers only on a single-tenant node; on a node with more than one
+        human it answers None and the SSE leg is refused (no leak, no card).
 
         Constitutional controls (an agent painting the screen is governed
         like an agent dispatch): the push is REFUSED while the human has
@@ -1843,8 +1851,10 @@ class LiquidUIService:
             # still refused, exactly as before: no leak, no regression.
             # Import is local + guarded so an import problem degrades the
             # user_id to None instead of killing the push entirely.
-            _owner = user_id
-            if not _owner:
+            # An emitter-supplied user_id wins: the emitter knows whose turn
+            # this is, the fallback can only guess the sole tenant.
+            _owner = str(user_id) if user_id else None
+            if _owner is None:
                 try:
                     from core.event_attribution import owner_user_id
                     _owner = owner_user_id()
@@ -8204,11 +8214,14 @@ function renderAgentOverlay(ev) {{
 
     def _create_flask_app(self):
         """Create Flask app serving the glass desktop shell + APIs."""
-        # Register this instance the moment the shell is wired to be served —
-        # covers BOTH standalone serve_forever() AND the Nunba desktop bundle
-        # (HART OS *is* the Nunba desktop, co-located in-process), so every
-        # in-process A2UI emitter reaches the LIVE shell via
-        # get_registry().get_or_none('LiquidUIService').  Idempotent.
+        # Register this instance the moment the shell is wired to be served, so
+        # every in-process A2UI emitter reaches the LIVE shell via
+        # get_registry().get_or_none('LiquidUIService').  Idempotent.  Only the
+        # separately-hosted :6800 shell (serve_forever, the hart-liquid-ui unit
+        # on HART OS) and tests build this app.  The Nunba desktop does NOT: its
+        # Liquid UI is the Demopage agent component (owner ruling 2026-09-26),
+        # and its backend process owns a headless instance registered by
+        # core.platform.bootstrap._register_liquid_ui.
         self._register_self()
         from flask import (Flask, request, jsonify, Response,
                            send_from_directory, stream_with_context)
@@ -8329,6 +8342,9 @@ function renderAgentOverlay(ev) {{
             # never time out; a short connect timeout lets us fail fast to
             # the static floor while the daemon is still coming up.
             _nunba_proxy = {'client': None}
+            # The one Host value the daemon's allowlist admits on the socket;
+            # core.serve owns it so the proxy and the server cannot drift.
+            from core.serve import UNIX_SOCKET_SERVER_NAME
 
             def _nunba_client():
                 if _nunba_proxy['client'] is None:
@@ -8353,7 +8369,8 @@ function renderAgentOverlay(ev) {{
                 fwd = {k: v for k, v in request.headers
                        if k.lower() not in _HOP}
                 # Host MUST be exactly 'Nunba' (capital N). The daemon's
-                # Hypercorn config sets server_names = ['Nunba'], and
+                # Hypercorn config sets server_names from
+                # core.serve.local_server_names (['Nunba'] on the socket), and
                 # Hypercorn treats that as a CASE-SENSITIVE Host allowlist
                 # that answers 404 to everything else -- before the Flask app
                 # ever sees the request. httpx derives Host from the URL
@@ -8363,7 +8380,7 @@ function renderAgentOverlay(ev) {{
                 # Host: nunba -> 404, Host: Nunba -> 200 (and / -> 302, the
                 # SPA redirect). _HOP already strips the inbound Host; this
                 # sets the one the daemon's allowlist accepts.
-                fwd['Host'] = 'Nunba'
+                fwd['Host'] = UNIX_SOCKET_SERVER_NAME
                 try:
                     client = _nunba_client()
                     upstream = client.build_request(
@@ -9802,11 +9819,12 @@ function renderAgentOverlay(ev) {{
             from integrations.agent_engine.media_semantic_index import (
                 register_media_routes, register_idle_indexer)
             register_media_routes(app)
-            # Start the idle captioner here too (idempotent) so the co-located
-            # Nunba desktop bundle — which builds the app via _create_flask_app
-            # but may not run serve_forever — still populates the local caption
-            # catalog the home cards search for photos.  Self-gating (yields to
-            # the user) + local-only, so it never competes with a live session.
+            # Start the idle captioner here too (idempotent) so a host that
+            # builds the app without running serve_forever (tests, the dev
+            # harness scripts) still populates the local caption catalog the
+            # home cards search for photos.  The Nunba desktop is not such a
+            # host: it never builds this app.  Self-gating (yields to the user)
+            # + local-only, so it never competes with a live session.
             register_idle_indexer()
         except Exception as e:
             logger.warning("Media index API registration: %s", e)
@@ -9816,19 +9834,39 @@ function renderAgentOverlay(ev) {{
     # ─── Serve ────────────────────────────────────────────────
 
     def _register_self(self) -> None:
-        """Register this instance so in-process A2UI emitters (channel consent
-        cards, the voice bridge, model-ready toasts) can reach it via
-        get_registry().get_or_none('LiquidUIService') — the in-process half of
-        the A2UI push channel.  A separately-hosted :6800 shell additionally
-        receives pushes through the EventBus/WAMP fan-out inside
-        agent_ui_update.  Idempotent: a second serve is a no-op, not a
-        double-register error.
+        """Register this SERVING instance so in-process A2UI emitters (channel
+        consent cards, the voice bridge, model-ready toasts) reach the shell it
+        streams via get_registry().get_or_none('LiquidUIService').
+
+        The serving instance is the owner of its process.  It displaces a
+        headless instance core.platform.bootstrap._register_liquid_ui put there
+        (serve_forever runs ensure_platform first, so outside HART OS's os mode
+        that one is already registered); otherwise emitters would paint a copy
+        no stream reads.  It never displaces another SERVING instance: the
+        first shell to serve keeps the seat, and a second serve of the same
+        instance is a no-op, not a double-register error.
+
+        The seat is inspected with peek(), which never runs a factory: a
+        serving registration is materialised as it registers (below), so an
+        un-built seat is bootstrap's lazy headless one and is displaced
+        without constructing a throwaway LiquidUIService.
+
+        It does NOT reach a shell in another process: the :6800 unit on HART
+        OS does not subscribe to `agent.ui.update`, so a push made in the
+        backend process is not stored here (see run_home_compose for the one
+        cross-process path that exists).
         """
+        self._serves_shell = True
         try:
             from core.platform.registry import get_registry
             reg = get_registry()
-            if not reg.has('LiquidUIService'):
-                reg.register('LiquidUIService', lambda: self)
+            if reg.has('LiquidUIService'):
+                current = reg.peek('LiquidUIService')
+                if current is self or getattr(current, '_serves_shell', False):
+                    return
+                reg.unregister('LiquidUIService')
+            reg.register('LiquidUIService', lambda: self)
+            reg.get('LiquidUIService')   # materialise: a later peek sees it
         except Exception as e:
             logger.debug("LiquidUIService self-register skipped: %s", e)
 
@@ -10637,7 +10675,13 @@ def run_home_compose(reason: str = 'idle') -> bool:
     rides compose_home -> agent_ui_update directly; falls back, cross-process
     (e.g. NixOS where the agent daemon and the shell are separate units), to the
     EXISTING /api/home/compose route which calls compose_home on the live shell.
-    No new loop, no new transport. Returns True iff a push was accepted."""
+    No new loop, no new transport. Returns True iff a push was accepted.
+
+    "Live in-process shell" means an instance that SERVES the shell. The
+    backend's headless instance (core.platform.bootstrap._register_liquid_ui,
+    the Demopage topology) has no home renderer, so it is not used here and
+    the cross-process path runs exactly as it did before that instance
+    existed."""
     # Cheap kill-switch short-circuit so a halted hive doesn't even spend the
     # LLM call. The AUTHORITATIVE gate is inside agent_ui_update.
     try:
@@ -10652,7 +10696,8 @@ def run_home_compose(reason: str = 'idle') -> bool:
         svc = get_registry().get_or_none('LiquidUIService')
     except Exception:
         svc = None
-    if svc is not None and hasattr(svc, 'compose_home_now'):
+    if (svc is not None and hasattr(svc, 'compose_home_now')
+            and getattr(svc, '_serves_shell', True)):
         try:
             return bool(svc.compose_home_now(reason=reason))
         except Exception as e:

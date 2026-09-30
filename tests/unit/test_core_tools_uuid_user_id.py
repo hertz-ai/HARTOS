@@ -154,5 +154,75 @@ class CoreToolsAcceptUuidUserId(unittest.TestCase):
         self.assertEqual(fn(), 'No file uploaded from user')
 
 
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class GenerateVideoAvatarAcceptsUuidUserId(unittest.TestCase):
+    """Generate_video's default (avatar) branch saves the turn through the
+    REAL hartos.helper.save_conversation_db; only the HTTP boundary is mocked.
+
+    Measured live (agent_system.log 2026-09-22 09:25:46,540):
+        TOOL EXECUTION ERROR: Generate_video - invalid literal for int()
+        with base 10: 'c23d388c-07a0-4a79-816d-5b95642683c0'
+    save_conversation_db built its payload with int(user_id), so every
+    avatar video for a UUID user died before any request was sent.  The
+    bundled /conversation route (Nunba routes/db_routes.py) stores the id
+    as given; central's schema (user_id: int) receives an int user's int.
+    """
+
+    def _run(self, user_id):
+        import json
+        from unittest import mock
+
+        from hartos import helper
+
+        posts = []
+
+        def fake_post(url, data=None, headers=None, timeout=None, **_kw):
+            posts.append((url, json.loads(data)))
+            return _FakeResponse({'conv_id': 41})
+
+        avatar = {'image_url': 'http://img', 'voice_id': 3,
+                  'audio_sample_url': 'http://voice', 'openvoice': False}
+        ctx = _ctx(user_id)
+        ctx['save_conversation_db'] = helper.save_conversation_db
+        with mock.patch.object(helper, 'pooled_post', side_effect=fake_post), \
+                mock.patch('core.agent_tools.pooled_post',
+                           side_effect=fake_post), \
+                mock.patch('core.config_cache.get_db_url',
+                           return_value='http://db.local'), \
+                mock.patch('core.teacher_avatar.lookup_avatar',
+                           return_value=avatar):
+            result = _tool(ctx, 'Generate_video')('I love coding!', 0, True)
+        return result, posts
+
+    def test_avatar_video_is_saved_and_queued_for_a_uuid_user(self):
+        """THE REGRESSION.  Pre-fix: ValueError from int(UUID_USER)."""
+        result, posts = self._run(UUID_USER)
+        self.assertIn('conv_id:41', result)
+        conv = [body for url, body in posts
+                if url == 'http://db.local/conversation']
+        self.assertEqual(len(conv), 1, posts)
+        self.assertEqual(conv[0]['user_id'], UUID_USER,
+                         'the id must reach /conversation intact')
+        queued = [body for url, body in posts
+                  if url == 'http://db.local/video_generate_save']
+        self.assertEqual(len(queued), 1, 'the video request must be sent')
+        self.assertEqual(queued[0]['conv_id'], 41)
+
+    def test_avatar_video_still_sends_an_int_user_as_an_int(self):
+        """No regression for integer-keyed (cloud) deployments."""
+        _result, posts = self._run(7)
+        conv = [body for url, body in posts
+                if url == 'http://db.local/conversation']
+        self.assertEqual(conv[0]['user_id'], 7)
+        self.assertIsInstance(conv[0]['user_id'], int)
+
+
 if __name__ == '__main__':
     unittest.main()

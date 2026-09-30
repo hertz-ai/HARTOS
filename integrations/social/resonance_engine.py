@@ -147,9 +147,17 @@ class ResonanceService:
                     source_type: str, source_id: str = None,
                     description: str = '') -> Tuple[bool, int]:
         wallet = ResonanceService.get_or_create_wallet(db, user_id)
-        if wallet.spark < amount:
+        # One conditional UPDATE, not read-then-write: two concurrent spends
+        # that each read 100 and wrote 100 - amount lost one debit on MySQL.
+        # The database checks the balance and debits in the same statement.
+        debited = db.query(ResonanceWallet).filter(
+            ResonanceWallet.user_id == user_id,
+            ResonanceWallet.spark >= amount,
+        ).update({ResonanceWallet.spark: ResonanceWallet.spark - amount},
+                 synchronize_session=False)
+        db.refresh(wallet)
+        if not debited:
             return False, wallet.spark
-        wallet.spark -= amount
         ResonanceService._log_transaction(
             db, user_id, 'spark', -amount, wallet.spark,
             source_type, source_id, description)

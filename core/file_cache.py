@@ -75,15 +75,27 @@ def atomic_json_write(filepath: str, data, indent: int = 2):
     """Write JSON atomically: write to temp file → os.replace() (atomic on POSIX and Windows).
 
     Prevents corrupt JSON from crash/power loss during write.
+
+    The temp file has a unique name, so concurrent writers of the same path
+    never share one, and it is created with ONE exclusive open.  Not
+    tempfile.mkstemp: on Windows mkstemp retries a PermissionError up to
+    2**31 times while os.access calls the directory writable; measured live
+    2026-09-25 (bff95ab44), a consent Allow spun in it for minutes.  A
+    refused directory now fails the write at once.
     """
-    import tempfile
+    import uuid
     filepath = os.path.abspath(filepath)
     dir_path = os.path.dirname(filepath)
     os.makedirs(dir_path, exist_ok=True)
 
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=dir_path, suffix='.tmp')
+    tmp_path = os.path.join(
+        dir_path, f'.{os.path.basename(filepath)}.{uuid.uuid4().hex}.tmp')
+    tmp_fd = os.open(tmp_path,
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | getattr(os, 'O_BINARY', 0)
+                     | getattr(os, 'O_NOINHERIT', 0), 0o600)
     try:
-        with os.fdopen(tmp_fd, 'w') as f:
+        with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=indent, default=str)
             f.flush()
             os.fsync(f.fileno())
@@ -94,6 +106,81 @@ def atomic_json_write(filepath: str, data, indent: int = 2):
         except OSError:
             pass
         raise
+
+
+def migration_marker_path(new_path: str) -> str:
+    """Where adopt_legacy_json_once records that ``new_path`` took over:
+    ``<dir>/<stem>.migrated.json`` beside it."""
+    stem = os.path.splitext(os.path.basename(new_path))[0]
+    return os.path.join(os.path.dirname(os.path.abspath(new_path)),
+                        f'{stem}.migrated.json')
+
+
+def adopt_legacy_json_once(new_path: str, legacy_path: str, *, what: str,
+                           accept=None, indent=2) -> str:
+    """Carry a JSON file from where it used to live to ``new_path``, once.
+
+    Non-destructive: the old file is never changed or deleted (a rollback or
+    another install may still read it), a file already at ``new_path`` is
+    never overwritten, and an old file that does not parse, or that
+    ``accept(data)`` refuses, is left behind, not copied.  A failure is
+    logged, never raised.
+
+    Once means once: when ``new_path`` is in use (just copied, or found
+    already there) a marker (migration_marker_path) records it, and nothing
+    is copied again while the marker exists.  Deleting ``new_path`` is how an
+    owner resets it; without the marker the next start copied the old file
+    back (admin channels with their bot tokens, 4b1796862's review).
+
+    Returns what happened: 'same' (one path), 'done' (marked before),
+    'none' (no old file), 'marked' (new file already there), 'copied',
+    'refused' (old file unusable; not marked, so a fixed one still moves),
+    or 'failed'.
+    """
+    new = os.path.abspath(new_path)
+    legacy = os.path.abspath(legacy_path)
+    marker = migration_marker_path(new)
+    try:
+        if os.path.normcase(new) == os.path.normcase(legacy):
+            return 'same'
+        if os.path.exists(marker):
+            return 'done'
+        if not os.path.isfile(legacy):
+            return 'none'
+        if os.path.exists(new):
+            _mark_migrated(marker, legacy, copied=False, what=what)
+            return 'marked'
+        try:
+            with open(legacy, encoding='utf-8') as f:
+                data = json.load(f)
+        except ValueError as e:
+            logger.warning("%s at %s is not JSON; not carried over to %s: %s",
+                           what, legacy, new, e)
+            return 'refused'
+        if accept is not None and not accept(data):
+            logger.warning("%s at %s is not usable; not carried over to %s",
+                           what, legacy, new)
+            return 'refused'
+        atomic_json_write(new, data, indent=indent)
+        _mark_migrated(marker, legacy, copied=True, what=what)
+        logger.info("Copied %s from %s to %s", what, legacy, new)
+        return 'copied'
+    except Exception as e:
+        logger.warning("%s at %s not carried over to %s: %s",
+                       what, legacy, new, e)
+        return 'failed'
+
+
+def _mark_migrated(marker: str, legacy: str, *, copied: bool, what: str):
+    import time
+    try:
+        atomic_json_write(marker, {
+            'from': legacy, 'copied': copied,
+            'at': time.strftime('%Y-%m-%d %H:%M:%S'),
+        }, indent=2)
+    except Exception as e:
+        logger.warning("%s move not marked done at %s (%s); a deleted file "
+                       "could be copied again", what, marker, e)
 
 
 def cached_json_save(filepath: str, data: dict, indent: int = 4):

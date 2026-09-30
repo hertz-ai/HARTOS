@@ -25,10 +25,24 @@ OWNER, OTHER = 'mcg-4242', 'mcg-5'
 
 @pytest.fixture(scope='module')
 def app():
+    """The real entry app.  Importing it reconfigures process-wide logging
+    (root level INFO, a handler, its RequestLogRecord factory); that is put
+    back afterwards, because later tests that mock time.time with a fixed
+    side_effect list see every extra INFO record consume a tick (measured:
+    test_bind_game_sound's still-running case failed with StopIteration
+    only when run after this module)."""
+    import logging
+    root = logging.getLogger()
+    saved = (root.level, list(root.handlers), logging.getLogRecordFactory())
     os.environ.setdefault('HEVOLVE_START_BACKGROUND_SERVICES', '0')
     hie = pytest.importorskip('hart_intelligence_entry')
     hie.app.config['TESTING'] = True
-    return hie.app
+    yield hie.app
+    root.setLevel(saved[0])
+    for h in list(root.handlers):
+        if h not in saved[1]:
+            root.removeHandler(h)
+    logging.setLogRecordFactory(saved[2])
 
 
 @pytest.fixture

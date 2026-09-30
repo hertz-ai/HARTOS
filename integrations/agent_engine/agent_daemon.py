@@ -194,20 +194,20 @@ def _send_hitl_notification(db, goal, task):
 
     try:
         from integrations.social.services import NotificationService
-        from integrations.social.realtime import on_notification
         owner_id = goal.created_by or goal.owner_id
         if not owner_id:
             return
         desc_preview = (task.description or '')[:100]
-        notif = NotificationService.create(
+        # create() pushes it to the owner's devices once the daemon's session
+        # commits (models.after_commit).  A second on_notification here
+        # pushed it twice, the extra one BEFORE the commit, for a row that
+        # could still roll back.
+        NotificationService.create(
             db, str(owner_id), 'approval_required',
             target_type='thought_experiment',
             target_id=str(task.id),
             message=f'Agent needs your review: {desc_preview}',
         )
-        on_notification(str(owner_id), notif.to_dict() if hasattr(notif, 'to_dict') else {
-            'type': 'approval_required', 'message': f'Agent needs your review: {desc_preview}',
-        })
         logger.info(f"HITL notification sent for goal={goal.id} task={task.id}")
     except Exception as e:
         logger.debug(f"HITL notification failed: {e}")
@@ -1404,6 +1404,23 @@ class AgentDaemon:
         t.start()
         self._federation_thread = t
 
+    @staticmethod
+    def _settle_metered_usage(db) -> None:
+        """Credit pending MeteredAPIUsage rows (settle_metered_api_costs) and
+        commit them on their own, so a settlement failure rolls back only
+        itself and never the tick that follows."""
+        try:
+            from .revenue_aggregator import settle_metered_api_costs
+            result = settle_metered_api_costs(db)
+            db.commit()
+            if result.get('settled_count'):
+                logger.info(
+                    "Metered settlement: %d row(s), %d Spark credited",
+                    result['settled_count'], result['total_spark_awarded'])
+        except Exception as e:
+            db.rollback()
+            logger.warning("Metered settlement failed (retried next cycle): %s", e)
+
     def _tick(self):
         """Find active goals, find idle agents, dispatch via /chat.
 
@@ -1506,6 +1523,15 @@ class AgentDaemon:
 
         db = get_db()
         try:
+            # Settlement pays operators for compute they served other people
+            # (budget_gate.charge_remote_compute rows, and metered API cost
+            # recovery).  It ran nowhere but a deploy script, so debits taken
+            # on completed remote work were never credited.  Before the
+            # no-goals stop on purpose: a node with nothing to dispatch still
+            # owes the operators who served it.
+            if self._tick_count % self._remediate_every == 0:
+                self._settle_metered_usage(db)
+
             # DETERMINISTIC STOP: no goals = no action = system is inert
             # Skip CODING_GOAL_TYPES — coding_daemon handles those with
             # idle-agent detection + benchmark sync for backend routing.

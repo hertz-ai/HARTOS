@@ -74,11 +74,8 @@ def _resolve_log_path(backend_name: str) -> Optional[str]:
     Best-effort — returns None if the path cannot be derived (the
     repair still runs; only the diagnostic hint is missing).
     """
-    try:
-        from core.platform_paths import get_log_dir  # type: ignore
-        log_dir = Path(get_log_dir())
-    except Exception:
-        log_dir = Path.home() / 'Documents' / 'Nunba' / 'logs'
+    from core.platform_paths import get_log_dir
+    log_dir = Path(get_log_dir())
     try:
         return str(log_dir / f'venv_{backend_name}.log')
     except Exception:
@@ -118,6 +115,11 @@ def repair_backend_venv(backend_name: str, wipe_first: bool = False) -> str:
             or when changing transitive-dep cages.  Default False
             (idempotent reinstall — pip skips already-satisfied specs).
 
+    Consent: nothing is installed or wiped without the owner's yes for
+    ``tts:<backend_name>`` (``capability_setup.ask_owner_for_setup``).
+    Without it the tool returns ``success=False`` with ``consent`` set to
+    ``'asked'`` / ``'declined'`` / ``'unavailable'`` and touches nothing.
+
     Returns:
         JSON string with:
             ``success`` (bool): pip + model_weights both succeeded.
@@ -151,6 +153,40 @@ def repair_backend_venv(backend_name: str, wipe_first: bool = False) -> str:
             'message': (
                 f"Unknown backend {backend_name!r}. "
                 f"Known backends: {sorted(known)}"
+            ),
+            'log_path': log_path,
+            'wiped': False,
+        })
+
+    # The owner's consent, checked HERE so it holds whoever calls the tool
+    # (a self_heal goal, the bootstrap provisioner, any agent): installing
+    # or reinstalling an engine spends the owner's disk and bandwidth.  The
+    # same ask capability_setup makes (scope tts:<engine>); a missing answer
+    # files the card, and nothing is touched until the owner says yes.
+    try:
+        from integrations.agent_engine.capability_setup import (
+            ask_owner_for_setup,
+        )
+        consent = ask_owner_for_setup(
+            f'tts:{backend_name}',
+            reason=(
+                f"Set up the {backend_name} voice? It downloads and installs "
+                f"its packages and model on this computer."
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 -- no answer means no install
+        logger.warning(f"repair_backend_venv: consent for {backend_name!r} "
+                       f"could not be checked ({type(e).__name__}: {e})")
+        consent = 'unavailable'
+    if consent != 'granted':
+        return json.dumps({
+            'success': False,
+            'backend': backend_name,
+            'consent': consent,
+            'message': (
+                f"Not installed: the owner has not allowed setting up "
+                f"tts:{backend_name} (consent {consent}). Nothing was "
+                f"changed; do not retry until the owner answers."
             ),
             'log_path': log_path,
             'wiped': False,

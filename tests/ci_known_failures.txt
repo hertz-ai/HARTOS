@@ -1,0 +1,31 @@
+# Python tests that FAIL ON MAIN, one JUnit id (classname.name) per line.
+#
+# Read by scripts/ci_failure_ratchet.py in the flake-checks gate: a failing
+# test NOT listed here fails the "Python failure ratchet" job; a listed test
+# that passes is reported so its line gets deleted.  This list only shrinks:
+#   * fixed one of these?  delete its line in the same commit.
+#   * never ADD a line to make a PR green.  A new failure is a regression to
+#     fix; the one legitimate addition is a test that already fails on main,
+#     proven by main's own run.
+#
+# Measured on main 492a57aa, flake-checks run 36402628009 (2026-09-28):
+# shards 2, 4, 5 and 7 from their job logs; shard 1's two red files
+# (test_agentic_router, test_draft_first_dispatch) sit past the log API's
+# 5000-line window, so their ids come from running those two files at
+# 492a57aa.  The ratchet's --write-current output on the next nightly is the
+# authoritative refresh.
+#
+# Refreshed to main 53ddce89 (2026-09-29): the ratchet on PR #127's merge of
+# it (run 36530039549) reported 30 new and 4 now passing.  All 30 were then
+# run on 53ddce89 itself and fail there identically (so main broke them, not
+# the PR); the 4 pass there.  30 added, 4 removed.
+#
+# PR #129 fixed the stale tests in six files (bridge_text_sensor,
+# consent_fanout_p2, drm_capture_gate, tool_args_must_be_an_object,
+# venv_built_by_this_interpreter, vision_sidecar): their 15 ids deleted.
+
+#
+# EMPTY since the green-CI change (stacked on #132): the last 8 were stale
+# tests (a registry fixture without base_url, the p2p resolver's CI gate,
+# two source-text checks rewritten as behavioural tests, a caplog double
+# count).  With the list empty, any failing test is a new failure.

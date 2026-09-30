@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import uuid
 from typing import Any, Dict, Optional
 
@@ -60,6 +61,7 @@ STEP_PHASES = frozenset({'executing', 'completed', 'blocked', 'failed', 'stopped
 _EXIT_STATUS = {
     'done': 'COMPLETED',
     'stopped': 'USER_STOPPED',
+    'user_active': 'USER_STOPPED',
     'action_error': 'FAILED',
     'timeout': 'FAILED',
     'max_iterations': 'FAILED',
@@ -70,6 +72,7 @@ _EXIT_STATUS = {
 _EXIT_PHASE = {
     'done': 'completed',
     'stopped': 'stopped',
+    'user_active': 'stopped',
 }
 
 
@@ -172,7 +175,26 @@ def _payload(*, user_id: str, prompt_id: str, run_id: str, task_id: str,
         # True only on the run-level message from finish_run: a client that
         # routes guidance to the run must stop doing so on this message.
         'run_done': run_done,
+        # True on a copy sent to someone who may SEE the run but not steer
+        # it (_disclosure_copy).  The run's own user always gets False.
+        'disclosure_only': False,
     }
+
+
+def _disclosure_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The message for someone who is told about a run but may not steer it.
+
+    The desktop owner sees every step of a run another user started
+    (_recipients), but the run is that user's: its ``agent_id`` is THEIR
+    goal.  Review of de3f89364 (2026-09-27, CRITICAL): the owner's copy
+    carried that goal id, Nunba's liveRunOf took it for a run the owner could
+    guide, and the owner's typed chat was POSTed to
+    /dashboard/agents/<guest goal>/inject.  So this copy has no goal id and
+    says ``disclosure_only``; the same msg_id keeps a client subscribed as
+    both deduping it.  The inject route refuses a non-owner on its own too
+    (dashboard_service.may_steer); this keeps the client from trying.
+    """
+    return {**payload, 'agent_id': '', 'disclosure_only': True}
 
 
 def _ribbon(show: bool, text: str = None) -> None:
@@ -230,16 +252,79 @@ def _ribbon_line(phase: str, caption: str, error: str) -> str:
     return f'{head}: {detail}' if detail else head
 
 
+def _recipients(user_id: str) -> list:
+    """Who is told about a step: the run's user, then this desktop's owner.
+
+    A run drives THIS machine's mouse and keyboard, whoever asked for it, so
+    the owner of the machine (HEVOLVE_OWNER_USER_ID, the same identity the
+    camera, screen and computer-control asks go to) is told every step --
+    the ribbon already shows it to whoever sits at the screen; this is the
+    same line reaching the owner's floating window.  Measured 2026-09-27
+    15:22-15:34: eleven runs for another user drove this desktop, every step
+    was broadcast as targeted=0, and the owner's companion showed nothing.
+    """
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    return [user_id] + ([owner] if owner and owner != user_id else [])
+
+
 def _fan_out(user_id: str, payload: Dict[str, Any]) -> None:
+    for recipient in _recipients(user_id):
+        try:
+            from integrations.social.realtime import on_notification
+            on_notification(recipient, payload if recipient == user_id
+                            else _disclosure_copy(payload))
+        except Exception:
+            # Persistence succeeded; the Task Ledger remains authoritative and
+            # a later refresh recovers the state.  Never roll the task back
+            # because a best-effort fanout leg was unavailable.
+            logger.exception('computer-use projection failed for task=%s',
+                             payload.get('task_id'))
+
+
+#: Task statuses that mean a run is over: every status finish_run writes
+#: (USER_STOPPED is resumable in the ledger's own vocabulary, but a stopped
+#: computer-use run takes no more steps), plus the ledger's terminal ones.
+_CLOSED_STATUS_NAMES = frozenset(_EXIT_STATUS.values())
+
+
+def _run_is_closed(user_id: str, prompt_id: str, run_id: str) -> bool:
+    """True when the run's task has already been closed by finish_run.
+
+    Review F1 (2026-09-27, probe vlm_probe.py q2b): an action abandoned at
+    the loop's budget kept running, and the shell tool inside it announced a
+    step 2 s after the run closed -- ribbon up again, the finished task's
+    context rewritten to phase=failed, run_done=False fanned out, so the
+    companion showed a finished run as live.  Unknown (no ledger, no task,
+    a lookup error, or a task with no status or a status of None) reads as
+    open, so a step is never lost on ignorance.  A task finish_run closed
+    always has a real TaskStatus (it sets one), so a None status is never a
+    closed run.
+    """
     try:
-        from integrations.social.realtime import on_notification
-        on_notification(user_id, payload)
+        from agent_ledger import TaskStatus
+        task = _ledger_for(user_id, prompt_id).get_task(run_task_id(run_id))
     except Exception:
-        # Persistence succeeded; the Task Ledger remains authoritative and a
-        # later refresh recovers the state.  Never roll the task back because
-        # a best-effort fanout leg was unavailable.
-        logger.exception('computer-use projection failed for task=%s',
-                         payload.get('task_id'))
+        logger.debug('computer-use: run %s closed-check unavailable', run_id,
+                     exc_info=True)
+        return False
+    status = getattr(task, 'status', None)
+    if status is None:
+        return False          # no task, or none whose state can be read: open
+    return (getattr(status, 'name', '') in _CLOSED_STATUS_NAMES
+            or TaskStatus.is_terminal_state(status))
+
+
+def close_run_stamp(stamp) -> None:
+    """Mark a run stamp (hartos.threadlocal activity_run) closed.
+
+    The VLM loop calls this on the stamp an abandoned action's worker
+    adopted, when it gives up on that action: every ActivityRun joined from
+    that stamp -- including one joined BEFORE the mark -- then takes no
+    more steps.  record_activity's own closed-run check covers anything
+    that reaches it after finish_run; this covers the window before.
+    """
+    if isinstance(stamp, dict):
+        stamp['closed'] = True
 
 
 def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
@@ -255,10 +340,16 @@ def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
     IN_PROGRESS on the first call; later calls rewrite its context.  Only an
     outcome phase (anything but ``executing``) is written to disk.  The
     returned dict is the safe client payload.  A failed ledger write returns
-    ``None`` and therefore fans out nothing.
+    ``None`` and therefore fans out nothing.  A step of a run that is already
+    closed is refused before anything, the ribbon included (_run_is_closed).
     """
     if phase not in STEP_PHASES:
         logger.warning('computer-use: unknown step phase %r ignored', phase)
+        return None
+    if user_id and prompt_id and run_id and _run_is_closed(
+            str(user_id), str(prompt_id), run_id):
+        logger.info('computer-use: %s step %s (%s) of closed run %s ignored',
+                    phase, iteration, action, run_id)
         return None
     # The ribbon goes first and is never conditional on the durable leg.  It
     # is the owner's live signal that the AI holds this machine's mouse and
@@ -389,22 +480,30 @@ class ActivityRun:
     """
 
     __slots__ = ('run_id', 'user_id', 'prompt_id', 'agent_id',
-                 'steering_agent_id', 'owns')
+                 'steering_agent_id', 'owns', 'stamp')
 
     def __init__(self, *, run_id, user_id, prompt_id, agent_id='',
-                 steering_agent_id='', owns=False):
+                 steering_agent_id='', owns=False, stamp=None):
         self.run_id = run_id
         self.user_id = str(user_id or '')
         self.prompt_id = str(prompt_id or '')
         self.agent_id = str(agent_id or '')
         self.steering_agent_id = str(steering_agent_id or '')
         self.owns = bool(owns)
+        # The thread's run stamp this run was joined from, read LIVE at each
+        # step: close_run_stamp may mark it after this object was made.
+        self.stamp = stamp
 
     def step(self, *, iteration: int, action: str, phase: str,
              caption: str = '', error: str = '',
              audit_ref: Optional[Dict[str, Any]] = None):
         """Announce one step of THIS run.  Binds the run's ids to the one
-        announcer; it is ``record_activity``, not a second implementation."""
+        announcer; it is ``record_activity``, not a second implementation.
+        Nothing, once the stamp it joined was closed (close_run_stamp)."""
+        if isinstance(self.stamp, dict) and self.stamp.get('closed'):
+            logger.info('computer-use: %s step %s (%s) after run %s was '
+                        'closed ignored', phase, iteration, action, self.run_id)
+            return None
         return record_activity(
             user_id=self.user_id, prompt_id=self.prompt_id,
             run_id=self.run_id, iteration=iteration, action=action,
@@ -486,6 +585,6 @@ def current_run(*, user_id: Any, prompt_id: Any, agent_id: str = '',
             user_id=joined.get('user_id') or user_id,
             prompt_id=joined.get('prompt_id') or prompt_id,
             agent_id=agent_id, steering_agent_id=steering_agent_id,
-            owns=False)
+            owns=False, stamp=joined)
     return open_run(user_id=user_id, prompt_id=prompt_id,
                     agent_id=agent_id, steering_agent_id=steering_agent_id)

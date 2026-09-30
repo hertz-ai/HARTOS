@@ -19,11 +19,10 @@ Covers the directive's four legs:
       zero network calls when the flag is off
   (d) invoke_peer_agent happy + failure envelopes
 
-The JSON-RPC invoke tests use a minimal sync Flask app that serves
-the exact wire envelopes A2ATask.to_dict / the jsonrpc route produce
-(the real route is an async view; this env has no flask[async]).
+The JSON-RPC invoke tests use a minimal Flask app that serves the
+exact wire envelopes A2ATask.to_dict / the jsonrpc route produce; the
+REAL jsonrpc route is driven end to end in TestJsonRpcRouteUnauthenticated.
 """
-import asyncio
 import json
 import os
 import sys
@@ -365,7 +364,7 @@ class TestInvokePeerAgent:
                 PEER_URL, f'{PEER_PID}_0', 'collect metrics')
         assert result is not None
         assert result['state'] == 'completed'
-        assert peer_reuse._result_text(result) == 'metrics collected'
+        assert peer_reuse.result_text(result) == 'metrics collected'
 
     def test_failed_state_envelope_is_returned_as_is(self):
         failed = dict(self.HAPPY, state='failed')
@@ -442,15 +441,15 @@ class TestInvokePeerAgent:
 # These exercise the REAL Flask routes an untrusted peer can reach with no
 # credentials:
 #   - GET  /a2a/<agent_id>/recipe   (sync)  -> _safe_filename traversal gate
-#   - POST /a2a/<agent_id>/jsonrpc  (async) -> unknown-agent / unknown-method
+#   - POST /a2a/<agent_id>/jsonrpc  (sync)  -> unknown-agent / unknown-method
 #                                              routing + unauthenticated exec
-# The recipe route runs through the full werkzeug stack via test_client so
-# the "'..' after URL-decode" case is genuinely decoded by the router, not
-# hand-fed. The jsonrpc route is an ``async def`` view and this env has no
-# flask[async] (asgiref absent), so it is driven by running the REAL route
-# coroutine (``app.view_functions['handle_jsonrpc']``) under asyncio.run
-# inside a real request context; the only mock is the agent-executor
-# boundary (a spy coroutine).
+# Both routes run through the full werkzeug + Flask dispatch stack via
+# test_client, exactly as a peer's POST does. The jsonrpc route used to be
+# an ``async def`` view; Flask dispatches those through asgiref, which is
+# not installed, so EVERY live POST (404/400 branches included) came back
+# as an HTML 500. These tests used to call the view coroutine directly under
+# asyncio.run, which bypassed Flask's dispatch and hid that. The only mock
+# is the agent-executor boundary (a spy coroutine).
 # ---------------------------------------------------------------------------
 
 
@@ -508,10 +507,11 @@ class TestRecipeExportTraversalGate:
 
 
 class TestJsonRpcRouteUnauthenticated:
-    """The jsonrpc route carries NO auth: any caller can drive a
-    registered agent's executor. Pin the routing gates (unknown agent,
-    unknown method), document the unauthenticated execution path, and
-    guard the error handler against its own crash on malformed input."""
+    """Routing gates of the jsonrpc route (unknown agent, unknown method),
+    the admission of message/send (as /chat, and only for an agent this
+    node shares; the no-auth surface this class once documented is closed,
+    see tests/unit/test_a2a_dynamic_executor_runs_the_agent.py), and the
+    error handler's own crash guard on malformed input."""
 
     def _server_with_agent(self):
         app, server = _bare_a2a_app()
@@ -523,23 +523,27 @@ class TestJsonRpcRouteUnauthenticated:
 
         server.register_agent('agentX_0', 'X', 'd', [{'id': 's'}], spy)
         server.setup_routes()
-        return app, app.view_functions['handle_jsonrpc'], calls
+        return app, None, calls
 
     @staticmethod
     def _run(app, view, agent_id, *, json_body=None, raw_data=None,
              content_type=None):
+        """POST through Flask's real dispatch (test_client), as a peer does.
+
+        Every jsonrpc answer, error branches included, must be a JSON-RPC
+        envelope with a JSON content type -- never Flask's HTML 500 page.
+        """
         kw = {}
         if json_body is not None:
             kw['json'] = json_body
         if raw_data is not None:
             kw['data'] = raw_data
             kw['content_type'] = content_type or 'text/plain'
-        with app.test_request_context(
-                f'/a2a/{agent_id}/jsonrpc', method='POST', **kw):
-            resp = asyncio.run(view(agent_id))
-            status = resp[1] if isinstance(resp, tuple) else 200
-            body = (resp[0] if isinstance(resp, tuple) else resp).get_json()
-        return status, body
+        resp = app.test_client().post(f'/a2a/{agent_id}/jsonrpc', **kw)
+        assert resp.mimetype == 'application/json', (
+            f'jsonrpc answered {resp.status_code} {resp.mimetype}: '
+            f'{resp.get_data(as_text=True)[:200]}')
+        return resp.status_code, resp.get_json()
 
     def test_unknown_agent_returns_404_envelope(self):
         app, view, calls = self._server_with_agent()
@@ -571,10 +575,14 @@ class TestJsonRpcRouteUnauthenticated:
         assert status == 400
         assert body['error']['code'] == -32601
 
-    def test_message_send_executes_agent_unauthenticated(self):
-        # No token, no signature: the untrusted 'text' part drives the
-        # registered executor and the completed envelope is returned.
-        # This documents the current (auth-free) execution surface.
+    def test_message_send_runs_a_shared_agent_for_an_authorized_caller(
+            self, monkeypatch):
+        # This test used to document the auth-free execution surface.  That
+        # surface is closed (review of 309bcd032): message/send is admitted
+        # as /chat is and only for an agent this node exports.  The default
+        # test tier (flat, no key, local caller) is what /chat admits.
+        import integrations.google_a2a.peer_reuse as _pr
+        monkeypatch.setattr(_pr, 'export_allowed', lambda pid: True)
         app, view, calls = self._server_with_agent()
         status, body = self._run(
             app, view, 'agentX_0',
@@ -588,6 +596,38 @@ class TestJsonRpcRouteUnauthenticated:
         assert result['content']['parts'][0]['text'] == 'ran:attacker input'
         assert calls == [('attacker input', result['contextId'])]
         assert body['id'] == '7'
+
+    def test_message_send_refuses_an_agent_this_node_does_not_share(
+            self, monkeypatch):
+        import integrations.google_a2a.peer_reuse as _pr
+        monkeypatch.setattr(_pr, 'export_allowed', lambda pid: False)
+        app, view, calls = self._server_with_agent()
+        status, body = self._run(
+            app, view, 'agentX_0',
+            json_body={'method': 'message/send', 'id': '7', 'params': {
+                'message': {'parts': [{'kind': 'text', 'text': 'x'}]}}})
+        assert status == 403
+        assert body['error']['code'] == -32001
+        assert calls == []
+
+    def test_message_send_reads_a2a_kind_text_parts(self, monkeypatch):
+        # A2A 0.2.x spells a part's discriminator 'kind'; the local
+        # clients (peer_reuse, hart CLI) still send the legacy 'type'.
+        # Both must reach the executor; a 'kind' part must not arrive
+        # as an empty prompt.
+        import integrations.google_a2a.peer_reuse as _pr
+        monkeypatch.setattr(_pr, 'export_allowed', lambda pid: True)
+        app, view, calls = self._server_with_agent()
+        status, body = self._run(
+            app, view, 'agentX_0',
+            json_body={'method': 'message/send', 'id': '8', 'params': {
+                'message': {'messageId': 'm2',
+                            'parts': [{'kind': 'text', 'text': 'spec '},
+                                      {'type': 'text', 'text': 'legacy'},
+                                      {'kind': 'file', 'text': 'ignored'}]}}})
+        assert status == 200
+        assert calls == [('spec legacy', body['result']['contextId'])]
+        assert body['result']['content']['parts'][0]['text'] ==             'ran:spec legacy'
 
     def test_malformed_body_returns_clean_jsonrpc_error_not_crash(self):
         # request.json raises (415 UnsupportedMediaType) inside the try.

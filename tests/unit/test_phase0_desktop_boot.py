@@ -209,7 +209,16 @@ class TestGate3FirstFramePaints:
         # frame-grab so wait_for_text reads the rendered brand off the QEMU
         # framebuffer. A blank/black screen (the regression) yields no text => fail.
         assert "enableOCR = true" in src
-        assert 'wait_for_text("HART"' in src
+        # eb6c5bab5 widened the wait: a fresh VM paints the onboarding
+        # language picker first (since 3c30807), so the OCR accepts the brand
+        # OR the picker's copy.  wait_for_text is a regex search, so assert
+        # what that regex ACCEPTS: the brand is still proof of a painted frame.
+        import re
+        patterns = re.findall(r'wait_for_text\(\s*"([^"]*)"', src)
+        assert patterns, "no OCR wait_for_text in the paint node"
+        assert any(re.search(p, "HART") for p in patterns), patterns
+        assert any(re.search(p, "What language feels like home?")
+                   for p in patterns), patterns
         # A screenshot is saved either way so the run log always has the frame.
         assert "screenshot(" in src
 

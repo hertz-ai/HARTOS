@@ -121,6 +121,17 @@ def _isolated_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+def _gossip_id(monkeypatch, value):
+    """Stand in for this node's canonical gossip id (None: unavailable)."""
+    def _id():
+        if value is None:
+            raise RuntimeError('gossip unavailable')
+        return value
+    monkeypatch.setattr(
+        'integrations.social.sync_engine.SyncEngine.canonical_node_id',
+        staticmethod(_id))
+
+
 def _real_attestation():
     """This node's signed attestation, from the PRODUCTION producer.
 
@@ -189,20 +200,32 @@ class TestIdentityHelpers:
 
     def test_peer_id_local_sentinel(self, monkeypatch):
         """The 'local' sentinel is the default in hart_intelligence_entry —
-        treat it as "unset" so the advertiser uses a generated UUID
-        instead of advertising under the literal string 'local'."""
+        treat it as "unset": the node advertises under its gossip id, never
+        the literal string 'local'."""
         from integrations.agent_engine.hive_capability_advertiser import (
             _local_peer_id,
         )
+        _gossip_id(monkeypatch, 'gossip-uuid-1')
         monkeypatch.setenv('HEVOLVE_NODE_ID', 'local')
-        assert _local_peer_id() == ''
+        assert _local_peer_id() == 'gossip-uuid-1'
         monkeypatch.setenv('HEVOLVE_NODE_ID', 'LOCAL')
-        assert _local_peer_id() == ''
+        assert _local_peer_id() == 'gossip-uuid-1'
 
-    def test_peer_id_unset(self):
+    def test_peer_id_unset_is_the_gossip_id(self, monkeypatch):
+        """Nothing sets HEVOLVE_NODE_ID on a default install.  The id peers
+        see must be the one every PeerNode row is keyed by, or a requester
+        that charges this node's served compute finds no operator."""
         from integrations.agent_engine.hive_capability_advertiser import (
             _local_peer_id,
         )
+        _gossip_id(monkeypatch, 'gossip-uuid-1')
+        assert _local_peer_id() == 'gossip-uuid-1'
+
+    def test_peer_id_unset_and_no_gossip_is_the_sentinel(self, monkeypatch):
+        from integrations.agent_engine.hive_capability_advertiser import (
+            _local_peer_id,
+        )
+        _gossip_id(monkeypatch, None)
         assert _local_peer_id() == ''
 
     def test_endpoint_trims(self, monkeypatch):
@@ -309,18 +332,20 @@ class TestPeerIdResolution:
         monkeypatch.setenv('HEVOLVE_NODE_ID', 'node-prod-7')
         assert advertiser._peer_id() == 'node-prod-7'
 
-    def test_fallback_uuid_stable_across_calls(self, advertiser):
-        """When HEVOLVE_NODE_ID isn't set, a per-process UUID is
-        generated lazily — must be stable across multiple calls."""
+    def test_fallback_uuid_stable_across_calls(self, advertiser, monkeypatch):
+        """When neither HEVOLVE_NODE_ID nor the gossip id is available, a
+        per-process UUID is generated lazily — stable across calls."""
+        _gossip_id(monkeypatch, None)
         first = advertiser._peer_id()
         second = advertiser._peer_id()
         assert first == second
         assert first.startswith('auto-')
 
-    def test_fallback_uuid_unique_per_instance(self, fresh_registry):
+    def test_fallback_uuid_unique_per_instance(self, fresh_registry, monkeypatch):
         from integrations.agent_engine.hive_capability_advertiser import (
             HiveCapabilityAdvertiser,
         )
+        _gossip_id(monkeypatch, None)
         a = HiveCapabilityAdvertiser(registry=fresh_registry)
         b = HiveCapabilityAdvertiser(registry=fresh_registry)
         # Different instances → different fallback IDs

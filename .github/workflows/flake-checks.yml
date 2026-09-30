@@ -199,6 +199,12 @@ jobs:
           pip install pytest pytest-asyncio pytest-timeout
           pip install grep-ast tree-sitter tree-sitter-language-pack 2>/dev/null || true
           python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True)" 2>/dev/null || true
+          # autogen's MessageTokenLimiter (via helper.TokenLimiter) calls
+          # tiktoken.encoding_for_model, which downloads the cl100k_base BPE
+          # file on first use. test_create_loop_end_to_end.py refuses all
+          # network, so on a fresh runner that download fails every CREATE
+          # turn. Warm the cache here, like the nltk data above.
+          python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
 
       - name: Run unit + functional tests
         env:
@@ -312,21 +318,40 @@ jobs:
           # interpreter+import startup per file; the per-file `timeout` keeps
           # the hung-interpreter class (see the wall-clock note above) bounded
           # per file instead of per shard.
+          # THE RATCHET'S INPUT (2026-09-29). Every red file's exit code and
+          # JUnit report go to $REPORTS/red_files.tsv, uploaded below and read
+          # by the failure-ratchet job, which fails only on a failing test id
+          # that tests/ci_known_failures.txt (main's list) does not have. The
+          # file is created up front with a header line (never zero bytes, so
+          # the upload always carries it).  The END MARKER line is written
+          # only after the loop has run every selected file: a file without
+          # it is a shard killed part-way (the job's time cap has fired
+          # before), and the ratchet treats it as no report at all, because
+          # the files it never reached were never checked.
+          REPORTS="$RUNNER_TEMP/pytest-red"
+          mkdir -p "$REPORTS"
+          printf '# exit code\ttest file\tjunit report\n' > "$REPORTS/red_files.tsv"
           set +e
           overall=0
           declare -a REDFILES=()
           for f in "${SEL[@]}"; do
+            xml_name="$(printf '%s' "$f" | tr '/' '_').xml"
+            xml="$REPORTS/$xml_name"
             timeout -k 30 600 \
               python -m pytest "$f" \
                 --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
                 --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
                 --deselect tests/e2e/test_e2e_pipelines.py::TestVLMVisualAgentPayload \
                 --timeout=120 \
+                --junitxml="$xml" \
                 -q --tb=line
             rc=$?
             # rc 5 = "no tests collected" (a file whose only tests are
             # deselected/skipped here) -- not a failure of the gate.
-            if [ "$rc" -ne 0 ] && [ "$rc" -ne 5 ]; then
+            if [ "$rc" -eq 0 ] || [ "$rc" -eq 5 ]; then
+              rm -f "$xml"
+            else
+              printf '%s\t%s\t%s\n' "$rc" "$f" "$xml_name" >> "$REPORTS/red_files.tsv"
               overall=1
               REDFILES+=( "$f (rc=$rc)" )
               if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
@@ -336,6 +361,7 @@ jobs:
               fi
             fi
           done
+          printf '# complete: %s files\n' "${#SEL[@]}" >> "$REPORTS/red_files.tsv"
           set -e
           if [ "$overall" -ne 0 ]; then
             {
@@ -345,6 +371,19 @@ jobs:
             printf '::error::red file: %s\n' "${REDFILES[@]}"
           fi
           exit $overall
+
+      # Always, so the ratchet sees green shards (an empty red_files.tsv) as
+      # well as red ones; a shard with no artifact reached no verdict.
+      - name: Upload red-file reports for the failure ratchet
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-red-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/pytest-red/
+          # warn, not ignore: nothing to upload means the test step died
+          # before writing its header, and the ratchet will fail closed.
+          if-no-files-found: warn
+          retention-days: 14
 
       # Integration + e2e — cross-module flows. Best-effort: surfaced but
       # non-blocking (they exercise live-ish paths a hermetic runner can't fully
@@ -378,6 +417,56 @@ jobs:
             --ignore=tests/e2e/runtime_tests \
             --timeout=120 \
             -q --tb=line || echo "E2E tests had failures (non-blocking)"
+
+  # ─── Python: the failure RATCHET — red only on a NEW failing test ─────────
+  # The shards above are red whenever ANY test fails, and main has carried
+  # known failures for weeks, so their red no longer separates "this PR broke
+  # something" from "main was already red". Every PR was being diffed against
+  # main's run by hand, red file by red file. This job is that diff:
+  # scripts/ci_failure_ratchet.py compares every failing test id with
+  # tests/ci_known_failures.txt and fails only on an id main does not already
+  # fail. It adds no test run and relaxes nothing: the shards keep their own
+  # verdict, and nixos-tests still needs them green.
+  failure-ratchet:
+    name: Python failure ratchet (no new failing tests vs main)
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    # Runs when the shards are red (that is when it matters), but not on a
+    # cancelled run: a superseded push has no verdict to compare.
+    if: ${{ !cancelled() }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pytest-red-shard-*
+          path: pytest-red
+
+      - name: Compare failing test ids with main's known failures
+        # --shards is the unit-tests matrix size (and its `% 8`): change all
+        # three together, or a shard's missing report goes unnoticed.
+        run: |
+          python scripts/ci_failure_ratchet.py \
+            --reports pytest-red \
+            --baseline tests/ci_known_failures.txt \
+            --shards 8 \
+            --write-current current_failures.txt
+
+      # The refresh source for tests/ci_known_failures.txt: on the nightly
+      # this is main's exact list, in the file's own format.
+      - name: Upload this run's failing ids
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: current-failures
+          path: current_failures.txt
+          if-no-files-found: warn
+          retention-days: 14
 
   # ─── Compositor: default-feature pure-logic floor (the dev-box build path) ──
   cargo-test:

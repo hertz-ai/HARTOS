@@ -18,6 +18,7 @@ source substrings.
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -124,6 +125,17 @@ class TestVenvPython:
         assert install_side == spawn_side
 
 
+def _write_own_pyvenv_cfg(backend):
+    """The pyvenv.cfg `python -m venv` leaves when THIS interpreter builds
+    the venv; venv_python_if_exists uses no venv another one built."""
+    base = getattr(sys, "_base_executable", None) or sys.executable
+    os.makedirs(venv_paths.venv_path(backend), exist_ok=True)
+    with open(os.path.join(venv_paths.venv_path(backend), "pyvenv.cfg"), "w",
+              encoding="utf-8") as fh:
+        fh.write(f"home = {os.path.dirname(os.path.abspath(base))}\n"
+                 f"version = {'%d.%d.%d' % sys.version_info[:3]}\n")
+
+
 # ── venv_python_if_exists: existence-checked fallthrough ─────────────────────
 class TestVenvPythonIfExists:
     def test_none_and_empty_return_none(self):
@@ -144,6 +156,7 @@ class TestVenvPythonIfExists:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8") as fh:
             fh.write("#!/bin/sh\n")
+        _write_own_pyvenv_cfg("realbackend")
         assert venv_paths.venv_python_if_exists("realbackend") == target
 
 
@@ -167,8 +180,10 @@ def _touch(path):
 
 
 def _fake_venv(backend):
-    """A venv as the writer sees it: the interpreter file + site-packages."""
+    """A venv as the writer sees it: the interpreter file + site-packages,
+    built (per its pyvenv.cfg) by this interpreter."""
     _touch(venv_paths.venv_python(backend))
+    _write_own_pyvenv_cfg(backend)
     site_dir = venv_paths.venv_site_packages(backend)
     os.makedirs(site_dir, exist_ok=True)
     return site_dir
@@ -311,6 +326,7 @@ class TestEnsureParentPackagesVisible:
 
     def test_a_venv_without_site_packages_is_left_alone_and_logged(self, caplog):
         _touch(venv_paths.venv_python("b"))
+        _write_own_pyvenv_cfg("b")
         with caplog.at_level("WARNING", logger=venv_paths.logger.name):
             assert venv_paths.ensure_parent_packages_visible("b") is None
         assert any("site-packages" in r.getMessage() for r in caplog.records)

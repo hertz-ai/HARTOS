@@ -210,6 +210,17 @@ class ServiceRegistry:
         except KeyError:
             return None
 
+    def peek(self, name: str) -> Any:
+        """The instance a singleton entry has ALREADY built, else None.
+
+        Never runs a factory: for a caller that must inspect the seat without
+        creating what sits in it (LiquidUIService._register_self).  None for
+        an unregistered name, an un-instantiated entry, or a non-singleton.
+        """
+        with self._lock:
+            entry = self._entries.get(name)
+            return entry.instance if entry is not None else None
+
     def names(self) -> List[str]:
         """Return all registered service names."""
         return list(self._entries.keys())

@@ -1105,8 +1105,9 @@ class ResourceGovernor:
              **no_window_kwargs())
             if result.returncode == 0:
                 return float(result.stdout.strip())
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug('xprintidle unavailable (%s); trying the input-alive '
+                         'marker', e)
         # Wayland: the compositor's input-alive marker (see the docstring).
         marker = os.environ.get('HART_INPUT_ALIVE_MARKER', '').strip()
         if not marker:
@@ -1115,7 +1116,8 @@ class ResourceGovernor:
                 from core.foreground import session_marker_dir
                 marker_dir = session_marker_dir()
             except Exception:
-                pass
+                logger.debug('session marker dir unresolved; using the '
+                             'default input-alive path', exc_info=True)
             # The literal, not a join: on a Windows dev box os.path.join would
             # put a backslash into a Linux path the tests pin verbatim.
             marker = (os.path.join(marker_dir, 'input-alive') if marker_dir
@@ -1438,8 +1440,8 @@ class ResourceGovernor:
                         return fh.read().strip() == '1'
                 except OSError:
                     continue
-        except OSError:
-            pass
+        except OSError as e:
+            logger.debug('power_supply sysfs unreadable: %s', e)
         return None
 
     def _get_battery_status(self) -> tuple:
@@ -1846,3 +1848,284 @@ def should_proceed(resource: str = 'cpu_heavy') -> bool:
     if gov is None or not gov._running:
         return True
     return gov.should_allow(resource)
+
+
+class _PhysicalInputMonitor:
+    """Physical input signal for active desktop-control takeover detection.
+
+    GetLastInputInfo includes injected automation. Low-level event flags
+    distinguish it from hardware input. No keys/text/coordinates are stored.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._thread = None
+        self._available = False
+        self._generation = 0
+        self._last_input = None
+
+    def record_activity(self):
+        with self._lock:
+            self._generation += 1
+            self._last_input = time.monotonic()
+
+    def snapshot(self, start=True):
+        with self._lock:
+            if start and self._thread is None:
+                self._thread = threading.Thread(target=self._listen,
+                    name='physical-desktop-input', daemon=True)
+                self._thread.start()
+            thread = self._thread
+        if start and thread is not None:
+            self._ready.wait(1.0)
+        with self._lock:
+            if not self._available or thread is None or not thread.is_alive():
+                return None
+            return self._generation, self._last_input
+
+class _WindowsPhysicalInputMonitor(_PhysicalInputMonitor):
+    def record_event(self, kind, flags, message):
+        injected = 0x10 if kind == 'keyboard' else 0x01
+        presses = (0x100, 0x104) if kind == 'keyboard' else (
+            0x200, 0x201, 0x204, 0x207, 0x20A, 0x20B, 0x20E)
+        if not flags & injected and message in presses:
+            self.record_activity()
+
+    def _listen(self):
+        from ctypes import wintypes
+        hooks = []
+        user32 = None
+        try:
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            hook_proc = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                           ctypes.c_size_t, ctypes.c_ssize_t)
+            class KeyboardInput(ctypes.Structure):
+                _fields_ = [('vkCode', wintypes.DWORD), ('scanCode', wintypes.DWORD),
+                    ('flags', wintypes.DWORD), ('time', wintypes.DWORD),
+                    ('extra', ctypes.c_size_t)]
+            class MouseInput(ctypes.Structure):
+                _fields_ = [('point', wintypes.POINT), ('data', wintypes.DWORD),
+                    ('flags', wintypes.DWORD), ('time', wintypes.DWORD),
+                    ('extra', ctypes.c_size_t)]
+            user32.SetWindowsHookExW.argtypes = [ctypes.c_int, hook_proc,
+                                               wintypes.HINSTANCE, wintypes.DWORD]
+            user32.SetWindowsHookExW.restype = wintypes.HANDLE
+            user32.CallNextHookEx.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                             ctypes.c_size_t, ctypes.c_ssize_t]
+            user32.CallNextHookEx.restype = ctypes.c_ssize_t
+            user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
+            user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),
+                                           wintypes.HWND, wintypes.UINT, wintypes.UINT]
+            user32.GetMessageW.restype = ctypes.c_int
+            kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+            kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+            def callback(kind, structure):
+                def receive(code, message, data):
+                    if code >= 0:
+                        event = ctypes.cast(data, ctypes.POINTER(structure)).contents
+                        self.record_event(kind, event.flags, message)
+                    return user32.CallNextHookEx(None, code, message, data)
+                return hook_proc(receive)
+            # Callbacks must remain referenced throughout the message pump.
+            callbacks = [callback('keyboard', KeyboardInput), callback('mouse', MouseInput)]
+            module = kernel32.GetModuleHandleW(None)
+            for kind, cb in zip((13, 14), callbacks):
+                hook = user32.SetWindowsHookExW(kind, cb, module, 0)
+                if not hook:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                hooks.append(hook)
+            with self._lock:
+                self._available = True
+            self._ready.set()
+            message = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                pass
+        except Exception:
+            logger.warning('Physical desktop input monitoring unavailable', exc_info=True)
+        finally:
+            with self._lock:
+                self._available = False
+            self._ready.set()
+            if user32 is not None:
+                for hook in hooks:
+                    user32.UnhookWindowsHookEx(hook)
+
+class _MacPhysicalInputMonitor(_PhysicalInputMonitor):
+    """Listen through the existing pynput dependency; never suppress input."""
+    def __init__(self):
+        super().__init__()
+        self._modifier_flags = 0
+
+    def record_event(self, event_type, source_pid, flags=None):
+        # Quartz marks posted events with their source process ID. Releasing
+        # Ctrl/Shift after submitting a run is not a new user takeover.
+        if source_pid != 0:
+            return
+        if event_type == 12:  # flagsChanged contains both press and release.
+            if flags is None:
+                return
+            modifiers = int(flags) & 0x9E0000  # Shift, Ctrl, Option, Cmd, Fn.
+            with self._lock:
+                gained = modifiers & ~self._modifier_flags
+                self._modifier_flags = modifiers
+            if gained:
+                self.record_activity()
+        elif event_type in (1, 3, 5, 6, 7, 10, 22, 25, 27):
+            self.record_activity()
+
+    def _listen(self):
+        listeners = []
+        try:
+            from pynput import keyboard, mouse
+            from Quartz import (CGEventGetIntegerValueField, CGEventGetFlags,
+                                kCGEventSourceUnixProcessID)
+
+            def observe(event_type, event):
+                self.record_event(event_type, CGEventGetIntegerValueField(
+                    event, kCGEventSourceUnixProcessID), CGEventGetFlags(event))
+                return event  # Observe only, never swallow the person's input.
+
+            for factory in (keyboard.Listener, mouse.Listener):
+                listener = factory(darwin_intercept=observe, suppress=False)
+                listeners.append(listener)
+                listener.start()
+                listener.wait()
+            with self._lock:
+                self._available = all(
+                    item.is_alive() and item.IS_TRUSTED for item in listeners)
+            self._ready.set()
+            while self._available and all(item.is_alive() for item in listeners):
+                time.sleep(0.1)
+        except Exception:
+            logger.warning('macOS physical input monitoring unavailable', exc_info=True)
+        finally:
+            with self._lock:
+                self._available = False
+            self._ready.set()
+            for listener in listeners:
+                listener.stop()
+
+
+class _LinuxPhysicalInputMonitor(_PhysicalInputMonitor):
+    """Read hardware evdev events on X11 or Wayland, never grab devices.
+
+    Virtual uinput devices are excluded so automation cannot pause itself.
+    Missing read access is unavailable, not evidence that the user is idle.
+    """
+    @staticmethod
+    def _devices():
+        from pathlib import Path
+        devices = []
+        for entry in Path('/sys/class/input').glob('event*'):
+            device = (entry / 'device').resolve()
+            if '/virtual/input/' in device.as_posix():
+                continue
+            try:
+                words = (device / 'capabilities/key').read_text().split()
+                word_bits = ctypes.sizeof(ctypes.c_void_p) * 8
+                keys = sum(int(word, 16) << (index * word_bits)
+                           for index, word in enumerate(reversed(words)))
+                # Keyboard letters, mouse buttons, or touch digitizer.
+                if not any(keys & (1 << bit) for bit in (30, 272, 330)):
+                    continue
+            except (OSError, ValueError):
+                continue
+            devices.append('/dev/input/' + entry.name)
+        return devices
+
+    def record_event(self, event_type, code, value):
+        # EV_KEY press/repeat; EV_REL motion/wheel; EV_ABS pointer/touch.
+        # EV_SYN and key/button releases carry no new takeover.
+        if ((event_type == 1 and value in (1, 2))
+                or (event_type == 2 and value != 0)
+                or (event_type == 3 and (
+                    code in (0, 1, 53, 54)  # ABS / multitouch X and Y.
+                    or (code == 57 and value >= 0)  # New tracking contact.
+                    or (code in (24, 58) and value > 0)))):
+            self.record_activity()
+
+    def _listen(self):
+        import select
+        import struct
+        events = struct.Struct('@llHHi')  # native timeval + type/code/value
+        descriptors = {}
+        try:
+            while True:
+                devices = set(self._devices())
+                for path in list(descriptors):
+                    if path not in devices:
+                        os.close(descriptors.pop(path))
+                        self.record_activity()  # topology changed; recapture
+                denied = False
+                for path in devices - descriptors.keys():
+                    fd = None
+                    try:
+                        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                        # Discard queued events from before this monitor opened.
+                        try:
+                            while os.read(fd, events.size * 64):
+                                pass
+                        except BlockingIOError:
+                            pass
+                        descriptors[path] = fd
+                        self.record_activity()  # includes hot-plug during a run
+                    except OSError:
+                        if fd is not None:
+                            os.close(fd)
+                        denied = True
+                with self._lock:
+                    self._available = bool(descriptors) and not denied
+                self._ready.set()
+                if not descriptors:
+                    time.sleep(0.2)
+                    continue
+                readable, _, _ = select.select(list(descriptors.values()), [], [], 0.2)
+                for fd in readable:
+                    try:
+                        data = os.read(fd, events.size * 64)
+                    except BlockingIOError:
+                        continue
+                    except OSError as e:
+                        # ENODEV: the device was unplugged between select and
+                        # read.  One device going away must not end the
+                        # monitor: nothing restarts this thread, so every GUI
+                        # action would read "monitoring unavailable" until the
+                        # process restarts.  Drop it; the next scan rebuilds.
+                        data = b''
+                        logger.info('Physical input device went away: %s', e)
+                    if not data:
+                        path = next(p for p, d in descriptors.items() if d == fd)
+                        os.close(descriptors.pop(path))
+                        self.record_activity()  # topology changed; recapture
+                        continue
+                    for offset in range(0, len(data) - events.size + 1, events.size):
+                        _, _, event_type, code, value = events.unpack_from(data, offset)
+                        self.record_event(event_type, code, value)
+        except Exception:
+            logger.warning('Linux physical input monitoring unavailable', exc_info=True)
+        finally:
+            with self._lock:
+                self._available = False
+            self._ready.set()
+            for fd in descriptors.values():
+                os.close(fd)
+
+
+_monitor_types = {'win32': _WindowsPhysicalInputMonitor,
+                  'darwin': _MacPhysicalInputMonitor,
+                  'linux': _LinuxPhysicalInputMonitor}
+_monitor_type = _monitor_types.get(sys.platform)
+_physical_input_monitor = _monitor_type() if _monitor_type else None
+
+
+def get_physical_input_state(*, start=True):
+    """Physical-input generation/last activity, or unavailable.
+
+    Lazily started only for active computer control. Daemon idle scheduling
+    retains its own unchanged thresholds and platform detection.
+    """
+    if _physical_input_monitor is None:
+        return None
+    return _physical_input_monitor.snapshot(start=start)

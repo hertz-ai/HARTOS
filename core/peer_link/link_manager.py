@@ -160,7 +160,8 @@ class PeerLinkManager:
 
     def broadcast(self, channel: str, data: dict,
                   trust_filter: Optional[TrustLevel] = None,
-                  exclude_peer: str = '') -> int:
+                  exclude_peer: str = '',
+                  link_filter: Optional[Callable[[PeerLink], bool]] = None) -> int:
         """Broadcast message to all connected peers.
 
         Args:
@@ -170,6 +171,9 @@ class PeerLinkManager:
             exclude_peer: Skip this peer_id (e.g. the inbound sender on a
                 multi-hop relay re-broadcast, so a message never echoes back
                 the link it arrived on).
+            link_filter: Only send to links for which this returns True
+                (MessageBus splits one publish by who owns each link's far
+                end: raw to the message user's own, scrubbed to the rest).
 
         Returns:
             Number of peers successfully sent to
@@ -184,6 +188,8 @@ class PeerLinkManager:
             if not link.is_connected:
                 continue
             if trust_filter and link.trust != trust_filter:
+                continue
+            if link_filter is not None and not link_filter(link):
                 continue
             if link.kind == 'device' and not self._device_gets(link, channel, data):
                 continue

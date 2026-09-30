@@ -133,11 +133,8 @@ class EfficiencyMatrix:
     """Continuous benchmarking system for provider/model selection."""
 
     def __init__(self, matrix_path: Optional[str] = None):
-        try:
-            from core.platform_paths import get_db_dir
-            data_dir = Path(get_db_dir())
-        except ImportError:
-            data_dir = Path.home() / 'Documents' / 'Nunba' / 'data'
+        from core.platform_paths import get_db_dir
+        data_dir = Path(get_db_dir())
         data_dir.mkdir(parents=True, exist_ok=True)
 
         self._path = Path(matrix_path) if matrix_path else data_dir / 'efficiency_matrix.json'

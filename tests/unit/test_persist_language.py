@@ -29,8 +29,12 @@ SUPPORTED_LANG_DICT = {
     "ml": "Malayalam", "en": "English",
 }
 
-_HART_LANG_PATH = os.path.join(
-    os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'hart_language.json')
+# Through platform_paths, like core.user_lang: under pytest that is a temp
+# file.  It used to be ~/Documents/Nunba/data/hart_language.json itself, and
+# the unpatched calls below (e.g. _persist_language('en')) wrote the owner's
+# real language preference.
+from core.platform_paths import get_db_path  # noqa: E402
+_HART_LANG_PATH = get_db_path('hart_language.json')
 
 
 def _persist_language(lang: str) -> bool:

@@ -138,7 +138,10 @@ def test_pii_is_scrubbed_on_the_wire_and_raw_in_the_local_record(_desktop):
     sent_prompt = cmd[cmd.index('-p') + 1]
     sent_system = cmd[cmd.index('--system-prompt') + 1]
     assert 'sathi@example.com' not in sent_prompt and '4111' not in sent_prompt
-    assert '[EMAIL_REDACTED]' in sent_prompt and '[CC_REDACTED]' in sent_prompt
+    # the one egress scrub (edge_privacy.scrub_text) runs the secret
+    # redactor first, whose Luhn-checked card tag replaces the number
+    assert '[EMAIL_REDACTED]' in sent_prompt
+    assert '[REDACTED:credit_card]' in sent_prompt
     assert '555-123-4567' not in sent_system and '[PHONE_REDACTED]' in sent_system
     # the local record is the raw truth, like every llama record beside it
     rec = _records(_desktop)[-1]

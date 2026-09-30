@@ -363,3 +363,12 @@ def send_fcm_push_to_node(node_id, title, body, data=None, timeout=8):
     if not token:
         return False
     return _post_fcm_message(access, project, token, title, body, data, timeout)
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HART_FCM_ACCESS_TOKEN',
+)

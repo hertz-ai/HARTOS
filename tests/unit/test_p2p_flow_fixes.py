@@ -23,10 +23,16 @@ import pytest
 # ─── core.superadmins.resolve_reachable_central ──────────────────────────────
 
 @pytest.fixture
-def fresh_resolver_cache():
+def fresh_resolver_cache(monkeypatch):
+    """The resolver with an empty cache and its real-centrals gate open.
+
+    real_centrals_allowed() is False in every test process, so the
+    resolver returns '' before probing anything; these tests are about the
+    probe walk, whose network boundary (pooled_get) each test mocks."""
     from core import superadmins
     saved = dict(superadmins._resolve_cache)
     superadmins._resolve_cache.update({'url': '', 'expires': 0.0})
+    monkeypatch.setattr(superadmins, 'real_centrals_allowed', lambda: True)
     yield superadmins
     superadmins._resolve_cache.update(saved)
 
@@ -65,6 +71,18 @@ def test_resolver_caches_positive_answer(fresh_resolver_cache):
     assert first == second != ''
     # Second call served from cache — no extra probe.
     assert pg.call_count == 1
+
+
+def test_resolver_probes_nothing_when_real_centrals_are_not_allowed(
+        fresh_resolver_cache, monkeypatch):
+    """In a test or CI process the resolver dials no real central (task
+    #98: CI nodes were announced to the genesis centrals)."""
+    sa = fresh_resolver_cache
+    monkeypatch.setattr(sa, 'real_centrals_allowed', lambda: False)
+    with mock.patch('core.http_pool.pooled_get',
+                    return_value=_resp(200)) as pg:
+        assert sa.resolve_reachable_central(force=True) == ''
+    pg.assert_not_called()
 
 
 def test_resolver_rejects_non_200(fresh_resolver_cache):

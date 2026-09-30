@@ -1809,17 +1809,24 @@ class SpeculativeDispatcher:
                 return ''
             try:
                 import requests as _req
+                from .budget_gate import (
+                    REQUESTER_USER_HEADER, REQUESTER_NODE_HEADER, _this_node_id)
                 headers = (
                     {'Authorization': f'Bearer {api_key}'} if api_key else {})
+                # Who asked: the serving node credits its operator only for a
+                # person who is not its operator (credit_served_compute).
+                headers[REQUESTER_USER_HEADER] = str(user_id or '')
+                headers[REQUESTER_NODE_HEADER] = _this_node_id()
+                body = {
+                    'model': inner_model_id,
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'max_tokens': 1500,
+                    'temperature': 0.7,
+                }
                 resp = _req.post(
                     f'{base_url}/chat/completions',
                     headers=headers,
-                    json={
-                        'model': inner_model_id,
-                        'messages': [{'role': 'user', 'content': prompt}],
-                        'max_tokens': 1500,
-                        'temperature': 0.7,
-                    },
+                    json=body,
                     timeout=60,
                 )
                 if resp.status_code == 200:
@@ -1827,7 +1834,13 @@ class SpeculativeDispatcher:
                     choices = data.get('choices') or []
                     if choices:
                         msg = (choices[0] or {}).get('message') or {}
-                        return msg.get('content') or ''
+                        content = msg.get('content') or ''
+                        if content:
+                            # Completed on a peer's node: the requester pays
+                            # the compute it spent (owner ruling 2026-09-26).
+                            self._charge_hive_expert(
+                                user_id, cfg, inner_model_id, body, data)
+                        return content
                 else:
                     logger.debug(
                         "hive expert %s returned HTTP %s",
@@ -1915,6 +1928,24 @@ class SpeculativeDispatcher:
         except Exception as e:
             logger.debug("local expert HTTP dispatch failed: %s", e)
         return ''
+
+    @staticmethod
+    def _charge_hive_expert(user_id, cfg: dict, model_id: str,
+                            request_body: dict, response_body: dict) -> int:
+        """Charge the requester for a COMPLETED hive expert turn, measured by
+        completion_exchange from the request sent and the reply received (the
+        same measure the serving node credits with; the peer's own ``usage``
+        can lower it, never raise it).  The serving node is the peer
+        HiveExpertDiscovery registered the backend for.  Never raises."""
+        try:
+            from .budget_gate import charge_remote_compute, completion_exchange
+            tin, tout = completion_exchange(request_body, response_body)
+            return charge_remote_compute(
+                user_id, (cfg or {}).get('peer_id', ''), tin, tout,
+                source='hive_expert', model_id=model_id)
+        except Exception as e:
+            logger.warning("hive expert compute charge skipped: %s", e)
+            return 0
 
     # ─── Helpers ───
 
@@ -2053,6 +2084,10 @@ class SpeculativeDispatcher:
         """
         from core.safe_hartos_attr import safe_hartos_attr
         from core.peer_link.message_bus import chat_topic_for
+        # Text for the user, spoken too: no elided-text pointer (owner
+        # ruling 2026-09-27; review of d99b1aa88).
+        from core.llm_outbound_logger import strip_elided_pointers
+        response = strip_elided_pointers(response)
 
         # 1. Publish text via canonical publish_async (MessageBus → Crossbar)
         try:

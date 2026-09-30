@@ -385,7 +385,8 @@ def require_api_key(f):
     def decorated(*args, **kwargs):
         from integrations.social.models import get_db
 
-        if _check_brute_force(request.remote_addr):
+        from core.auth_local import client_key
+        if _check_brute_force(client_key()):
             # Brute-force window = 15 min; surface that as Retry-After.
             return _rate_limit_response('Too many failed attempts', 900)
 
@@ -397,7 +398,7 @@ def require_api_key(f):
         try:
             key_data = CommercialAPIService.validate_api_key(db, raw_key)
             if not key_data:
-                _record_failed_attempt(request.remote_addr)
+                _record_failed_attempt(client_key())
                 return jsonify({'success': False, 'error': 'Invalid, expired, or quota-exceeded API key'}), 401
 
             if not CommercialAPIService.check_rate_limit(db, key_data['id']):

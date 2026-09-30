@@ -23,6 +23,10 @@ def _goal_with_child(context):
 def _notify(coord):
     created = MagicMock()
     db = MagicMock()
+    # No users row for the requester: UserService.person_to_notify returns
+    # the id unchanged.  Who a row resolves to is covered with a real
+    # database in test_goal_contribution_reaches_a_person.py.
+    db.query.return_value.filter.return_value.first.return_value = None
     with patch('integrations.social.services.NotificationService.create', created), \
          patch('integrations.social.models.get_db', return_value=db):
         coord._notify_goal_contribution('g1_task_0', agent_id='node-abc',

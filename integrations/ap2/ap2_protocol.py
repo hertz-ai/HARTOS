@@ -1270,3 +1270,13 @@ __all__ = [
     'create_payment_request_function', 'create_payment_authorization_function',
     'create_payment_processing_function', 'get_ap2_tools_for_autogen'
 ]
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+ENV_SECRETS = (
+    'PHONEPE_SALT_KEY',
+    'STRIPE_API_KEY',
+)

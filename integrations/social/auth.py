@@ -50,18 +50,8 @@ if not SECRET_KEY:
     def _load_or_create_secret_key():
         # Single-sourced with the JWTManager reader (core.platform_paths) so the
         # writer and reader never diverge on WHERE the key lives (#98e).
-        try:
-            from core.platform_paths import social_secret_key_write_target
-            key_file = social_secret_key_write_target()
-        except ImportError:
-            # Fail-safe: same priority, inlined, if platform_paths is unavailable.
-            db_path = os.environ.get('HEVOLVE_DB_PATH', '')
-            if db_path and db_path != ':memory:' and os.path.isabs(db_path):
-                key_file = os.path.join(os.path.dirname(db_path), '.social_secret_key')
-            elif os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-                key_file = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', '.social_secret_key')
-            else:
-                key_file = os.path.join('agent_data', '.social_secret_key')
+        from core.platform_paths import social_secret_key_write_target
+        key_file = social_secret_key_write_target()
         try:
             if os.path.exists(key_file):
                 with open(key_file, 'r') as f:
@@ -608,8 +598,7 @@ def require_admin(f):
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
-        user_role = getattr(g.user, 'role', None) or 'flat'
-        if not (g.user.is_admin or user_role in ('central',)):
+        if not holds_central_role(g.user):
             return jsonify({'success': False, 'error': 'Admin access required'}), 403
         return f(*args, **kwargs)
     return decorated
@@ -627,13 +616,23 @@ def require_moderator(f):
     return decorated
 
 
+def holds_central_role(user) -> bool:
+    """True when ``user`` holds the central (steward) account role: role
+    'central', or the is_admin flag UserService.set_user_role keeps in step
+    with it.  The ONE check require_central applies, and the one
+    voting_rules.is_steward builds on; None is never central."""
+    if user is None:
+        return False
+    return ((getattr(user, 'role', None) or 'flat') == 'central'
+            or bool(getattr(user, 'is_admin', False)))
+
+
 def require_central(f):
     """Decorator: requires central (cloud admin) role."""
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
-        user_role = getattr(g.user, 'role', None) or 'flat'
-        if user_role != 'central' and not g.user.is_admin:
+        if not holds_central_role(g.user):
             return jsonify({'success': False, 'error': 'Central access required'}), 403
         return f(*args, **kwargs)
     return decorated

@@ -842,7 +842,8 @@ class LlamaCppManager:
                     "server (Nunba's model settings / LlamaConfig.switch_model)")
                 return False
         except ImportError:
-            pass          # no canonical prober here; fall through to launching
+            # no canonical prober here; fall through to launching
+            logger.debug("adopt-probe skipped: core.health_probe not importable")
         except Exception as exc:
             logger.debug("adopt-probe skipped: %r", exc)
 

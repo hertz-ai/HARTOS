@@ -123,7 +123,8 @@ class DistributedWorkerLoop:
                 if tier in ('performance', 'compute_host'):
                     caps.append('vision')
         except Exception:
-            pass
+            logger.debug('hardware tier unavailable; worker advertises base '
+                         'capabilities only', exc_info=True)
         return caps
 
     def start(self):
@@ -185,7 +186,8 @@ class DistributedWorkerLoop:
             if wd:
                 wd.heartbeat('distributed_worker')
         except Exception:
-            pass
+            logger.debug('distributed_worker watchdog heartbeat failed',
+                         exc_info=True)
 
     def _loop(self):
         # Lazy-import redis so tests that never touch Redis don't need
@@ -217,7 +219,8 @@ class DistributedWorkerLoop:
                 if HiveCircuitBreaker.is_halted():
                     continue
             except ImportError:
-                pass
+                logger.debug('hive_guardrails not importable; circuit-breaker '
+                             'check skipped this tick')
             try:
                 self._tick()
                 # Tick succeeded → reset backoff so the next cycle runs
@@ -380,7 +383,7 @@ class DistributedWorkerLoop:
             if should_yield_to_user():
                 return get_last_yield_reason() or 'yield'
         except Exception:
-            pass
+            logger.debug('worker gate: yield check failed', exc_info=True)
         try:
             from integrations.agent_engine.dispatch import (
                 local_dispatch_provider_breaker_open)
@@ -388,22 +391,25 @@ class DistributedWorkerLoop:
             if host:
                 return f'provider breaker open ({host})'
         except Exception:
-            pass
+            logger.debug('worker gate: provider-breaker check failed',
+                         exc_info=True)
         try:
             from integrations.agent_engine.dispatch import (
                 local_dispatch_llm_busy)
             if local_dispatch_llm_busy():
                 return 'local LLM busy'
         except Exception:
-            pass
+            logger.debug('worker gate: LLM-busy check failed', exc_info=True)
         try:
             from routes.hartos_backend_adapter import is_hartos_initialized
             if not is_hartos_initialized():
                 return 'hartos_loading'
         except ImportError:
-            pass    # native HARTOS: no adapter, nothing to warm up
+            # native HARTOS: no adapter, nothing to warm up
+            logger.debug('worker gate: no Nunba adapter; no warm-up to wait for')
         except Exception:
-            pass
+            logger.debug('worker gate: adapter readiness check failed',
+                         exc_info=True)
         return None
 
     def _execute_task(self, task) -> Union[str, HeldForHelp, None]:
@@ -414,7 +420,14 @@ class DistributedWorkerLoop:
         nothing was produced (the claim is released for a retry).
         """
         prompt = task.context.get('prompt', task.description)
-        user_id = task.context.get('user_id', self._node_id)
+        # The context carries an opaque requester handle, not a user
+        # (dispatch_goal_distributed).  On the node that minted it, the task
+        # runs as the person; anywhere else as the handle, which is only a
+        # session key and a world-model tag here: there is no such user.
+        from integrations.distributed_agent.requesters import resolve_requester
+        _requester = task.context.get('user_id')
+        user_id = (resolve_requester(_requester) or _requester
+                   or self._node_id)
 
         # GUARDRAIL: pre-dispatch gate
         try:
@@ -589,7 +602,8 @@ class DistributedWorkerLoop:
                 goal_id=task.task_id,
             )
         except Exception:
-            pass
+            logger.debug('world-model record failed for task %s',
+                         task.task_id, exc_info=True)
 
         return response
 

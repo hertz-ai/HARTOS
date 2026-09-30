@@ -397,7 +397,8 @@ class TestSubmitCorrection(unittest.TestCase):
         self.bridge._http_disabled = False
         self.bridge._api_url = 'http://localhost:9999'
         mock_resp = MagicMock(status_code=200)
-        mock_resp.json.return_value = {'success': True, 'correction_id': '123'}
+        mock_resp.json.return_value = {'success': True, 'learned': True,
+                                       'correction_id': '123'}
         mock_post.return_value = mock_resp
 
         result = self.bridge.submit_correction('orig', 'fixed')

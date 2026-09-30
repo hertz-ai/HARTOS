@@ -442,14 +442,22 @@ def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Respons
     if rid and isinstance(_body, dict) and not _body.get('user'):
         _body['user'] = rid                       # carry the rid on the wire
     session = _llama_session_for(kind)
+    from core.llama_scheduler import TurnCancelled
     try:
         from core.llama_scheduler import get_scheduler
         with get_scheduler().slot(rid, kind,
                                   cancel_fn=close_bg_llm_requests_session,
                                   timeout=_SCHED_ACQUIRE_TIMEOUT_S):
             resp = session.post(url, timeout=timeout, **kwargs)
+    except TurnCancelled:
+        raise   # the turn's caller stopped waiting: never fail open into a call
     except Exception:
-        # Scheduler import/error → fail-open: never block the call on the queue.
+        # A scheduler error (not a cancel) fails OPEN: never block the call
+        # on the queue.  Note this also re-sends when session.post itself
+        # raised inside the slot; the retry is the historical behaviour.
+        # TurnCancelled is imported unguarded above: core.llama_scheduler is
+        # part of this package, and a stand-in that lacks it is a broken
+        # stand-in (review of f97b6bed8, F5).
         resp = session.post(url, timeout=timeout, **kwargs)
     # Log LLM input/output for observability
     if '/chat/completions' in url:

@@ -101,6 +101,23 @@ class TestWriterNamesTheActionItBelongsTo:
             f"appends a phantom non-autonomous action to the agent's ledger "
             f"(measured live: agent 33323830039, 1 recipe action -> 4)")
 
+    def test_source_guard_create_has_no_uniquifier_either(self):
+        """The CREATE twin of the same writer (create_recipe.py, inside its
+        execute_windows_or_android_command) kept the walker after REUSE's was
+        removed.  MEASURED: agent 18088688973's 6-action flow has orphan files
+        _7/_8/_9_vlm_agent.json (mtimes 2026-09-09 10:50, 2026-09-17 06:53,
+        2026-09-09 10:57), and a walk from action 1 over existing _1.._6
+        files also filed action 1's run as _2.._6 -- another action's steps.
+        Source guard (create_recipe cannot be imported in a bare env); the
+        behaviour it protects is tested in test_vlm_merge_preserves_persona
+        (TestAReLearningNeverCreatesAnAction)."""
+        cr = os.path.join(os.path.dirname(RR_PATH), 'create_recipe.py')
+        with open(cr, encoding='utf-8') as fh:
+            loops = _vlm_uniquifier_loops(ast.parse(fh.read()))
+        assert not loops, (
+            f"create_recipe.py still walks to the next free vlm_agent slot at "
+            f"line(s) {loops}; the reader takes that number as the action id")
+
     def test_writer_uses_the_canonical_path_helper(self, rr_tree):
         """Same builder the reader already uses — agreement by construction.
 

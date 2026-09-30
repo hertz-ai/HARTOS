@@ -69,6 +69,12 @@ def _calls_in(node):
     return names
 
 
+def _mentions(node, text):
+    """True if a string constant inside `node` equals or contains `text`."""
+    return any(isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+               and text in sub.value for sub in ast.walk(node))
+
+
 def _functions(tree):
     return [n for n in ast.walk(tree)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
@@ -82,12 +88,19 @@ class BreakdownPersistsWhereItReads(unittest.TestCase):
 
     def test_the_consumer_of_subtasks_is_also_their_producer(self):
         """add_subtasks must be reachable from the scope that reads them."""
+        # A reader of the requires_breakdown VERDICT, not any caller of
+        # get_pending_subtasks: helpers that close or hold an already
+        # persisted subtask (_reuse_complete_pending_subtask, a401c14a0) read
+        # the ledger too, but never see the verdict that carries the
+        # subtasks, so co-location is not asked of them.
         readers = [f for f in _functions(self.tree)
-                   if 'get_pending_subtasks' in _calls_in(f)]
+                   if 'get_pending_subtasks' in _calls_in(f)
+                   and _mentions(f, 'requires_breakdown')]
         self.assertTrue(
             readers,
-            'no function calls get_pending_subtasks — the breakdown consumer '
-            'has gone missing entirely')
+            'no function reads the requires_breakdown verdict and calls '
+            'get_pending_subtasks — the breakdown consumer has gone missing '
+            'entirely')
 
         # Innermost reader wins: ast.walk yields enclosing functions too, and
         # an outer function trivially "contains" both calls while the inner

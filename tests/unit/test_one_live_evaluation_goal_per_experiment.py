@@ -26,7 +26,7 @@ os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
 os.environ.setdefault('SOCIAL_DB_PATH', ':memory:')
 
 from integrations.social.models import (  # noqa: E402
-    AgentGoal, Base, ThoughtExperiment, User)
+    AgentGoal, Base, ExperimentVote, ThoughtExperiment, User)
 from integrations.social.thought_experiment_service import (  # noqa: E402
     ThoughtExperimentService)
 
@@ -50,7 +50,22 @@ def experiment(db):
         hypothesis='h', expected_outcome='o', status='evaluating')
     db.add(e)
     db.commit()
+    _approve(db, e.id)
     return e
+
+
+def _approve(db, exp_id):
+    """The writer starts a goal only for a vote-approved experiment
+    (test_evaluation_needs_the_vote.py): 2 FOR / 1 AGAINST from three
+    distinct registered identities is the smallest approval."""
+    for value in (2, 2, -1):
+        voter = User(username=f'v_{uuid.uuid4().hex[:8]}', user_type='human')
+        db.add(voter)
+        db.flush()
+        db.add(ExperimentVote(experiment_id=exp_id, voter_id=voter.id,
+                              voter_type='human', vote_value=value,
+                              confidence=1.0))
+    db.commit()
 
 
 def _goals_for(db, exp_id):
@@ -105,6 +120,7 @@ def test_other_experiments_are_not_blocked(db, experiment):
         hypothesis='h', expected_outcome='o', status='evaluating')
     db.add(other)
     db.commit()
+    _approve(db, other.id)
     a = ThoughtExperimentService.request_agent_evaluation(db, experiment.id)
     b = ThoughtExperimentService.request_agent_evaluation(db, other.id)
     db.commit()

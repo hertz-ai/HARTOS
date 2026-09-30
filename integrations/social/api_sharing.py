@@ -9,6 +9,7 @@ import secrets
 from datetime import datetime
 
 from flask import Blueprint, request, jsonify, g
+from core.auth_local import client_key as _client_key
 from sqlalchemy import func
 
 from .auth import require_auth, optional_auth
@@ -201,7 +202,7 @@ def create_share_link():
         db.add(link)
 
         # Log share event
-        ip_raw = request.remote_addr or ''
+        ip_raw = _client_key()
         ip_hash = hashlib.sha256(ip_raw.encode()).hexdigest()[:16]
         event = ShareEvent(
             link_id=link.id,
@@ -337,7 +338,7 @@ def track_share_view(token):
         link.view_count = (link.view_count or 0) + 1
 
         # Log view event
-        ip_raw = request.remote_addr or ''
+        ip_raw = _client_key()
         ip_hash = hashlib.sha256(ip_raw.encode()).hexdigest()[:16]
         viewer_id = getattr(g, 'user_id', None)
         event = ShareEvent(
@@ -428,7 +429,7 @@ def grant_consent(token):
             return _err("This link is not private")
 
         # Log consent event
-        ip_raw = request.remote_addr or ''
+        ip_raw = _client_key()
         ip_hash = hashlib.sha256(ip_raw.encode()).hexdigest()[:16]
         event = ShareEvent(
             link_id=link.id,

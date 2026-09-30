@@ -111,9 +111,12 @@ def _snapshot_and_restore_services():
 
 
 def test_p1s1_mark_read_registers_after_commit_callback():
-    """mark_read must register an after_commit hook that fires
-    on_notification_read.  Behavioural: patch the SQLAlchemy event
-    listener, call mark_read, capture the listener registration."""
+    """mark_read must queue an after-commit effect that fires
+    on_notification_read.  Behavioural: patch services.after_commit (the
+    one after-commit queue, models.after_commit), call mark_read, capture
+    what it queued.  Patched on the module actually used: when services was
+    imported earlier in the session, `from integrations.social import
+    services` returns that module, not a fresh one bound to the stubs."""
     stub_models = MagicMock()
     stub_models.Notification = MagicMock()
     stub_auth = MagicMock()
@@ -125,34 +128,26 @@ def test_p1s1_mark_read_registers_after_commit_callback():
             del sys.modules['integrations.social.services']
         from integrations.social import services
 
-        listeners_registered = []
-        fake_event = MagicMock()
-        fake_event.listen.side_effect = (
-            lambda target, name, fn, **kw: listeners_registered.append(
-                (target, name, fn, kw))
-        )
-        with patch.object(services, 'event', fake_event):
-            fake_db = MagicMock()
+        queued = []
+        fake_db = MagicMock()
+        with patch.object(services, 'after_commit',
+                          lambda db, effect: queued.append((db, effect))):
             services.NotificationService.mark_read(
                 fake_db, ['n1', 'n2'], 'user-42')
 
-        # After-commit listener must have been registered with the
-        # caller's session and the canonical SQLAlchemy event name.
-        after_commit_listeners = [
-            l for l in listeners_registered if l[1] == 'after_commit'
-        ]
-        assert after_commit_listeners, (
-            "P1-S1: mark_read must register an after_commit listener "
+        # The effect must be queued on the caller's session.
+        assert [db for db, _ in queued] == [fake_db], (
+            "P1-S1: mark_read must queue an after-commit effect "
             "to fan out the read-state change."
         )
-        # And the callback must call on_notification_read when invoked.
-        cb = after_commit_listeners[0][2]
+        # And the effect must call on_notification_read when run.
+        cb = queued[0][1]
         # Patch the realtime module so the callback's lazy import lands
         # on our stub.
         stub_realtime = MagicMock()
         with patch.dict(sys.modules,
                         {'integrations.social.realtime': stub_realtime}):
-            cb(MagicMock())  # invoke the after_commit fn
+            cb()  # what the commit runs
         stub_realtime.on_notification_read.assert_called_once_with(
             'user-42', ['n1', 'n2'])
 
@@ -177,28 +172,21 @@ def test_p1s1_mark_all_read_collects_ids_before_flipping():
             [row1, row2]
         )
 
-        listeners_registered = []
-        fake_event = MagicMock()
-        fake_event.listen.side_effect = (
-            lambda target, name, fn, **kw: listeners_registered.append(
-                (target, name, fn, kw))
-        )
-        with patch.object(services, 'event', fake_event):
+        queued = []
+        with patch.object(services, 'after_commit',
+                          lambda db, effect: queued.append((db, effect))):
             services.NotificationService.mark_all_read(fake_db, 'user-42')
 
-        # Listener must have been registered.
-        after_commit_listeners = [
-            l for l in listeners_registered if l[1] == 'after_commit'
-        ]
-        assert after_commit_listeners, (
-            "P1-S1: mark_all_read must also register the after_commit "
+        # The effect must be queued on the caller's session.
+        assert [db for db, _ in queued] == [fake_db], (
+            "P1-S1: mark_all_read must also queue the after-commit "
             "fan-out — 'Mark all read' should propagate too."
         )
-        cb = after_commit_listeners[0][2]
+        cb = queued[0][1]
         stub_realtime = MagicMock()
         with patch.dict(sys.modules,
                         {'integrations.social.realtime': stub_realtime}):
-            cb(MagicMock())
+            cb()
         stub_realtime.on_notification_read.assert_called_once_with(
             'user-42', ['n7', 'n8'])
 

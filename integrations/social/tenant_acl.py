@@ -47,13 +47,12 @@ def authorize_subscribe(topic: str,
 
     Decision tree:
       1. No topic → refuse.
-      2. Public topic (`community.feed`, `chat.social`, etc.) →
-         allow for any authenticated user.
-      3. Tenant-scoped topic (`tenant.<tid>.*`) → allow iff JWT
-         `tid` claim matches.
-      4. Per-user topic ending in `.<user_id>` → allow iff JWT
-         `user_id` claim matches.
-      5. Anything else → refuse (unknown shape).
+      2. Tenant-scoped topic (`tenant.<tid>.*`) → allow iff JWT
+         `tid` claim matches (then per scope).
+      3. Otherwise, for an authenticated user: realtime_acl.topic_open_to
+         (everyone's topic, the user's per-user bus topic such as
+         `chat.social`, or a topic ending in `.<user_id>`).
+      4. Anything else → refuse.
 
     `jwt_payload` is the decoded JWT body the router parsed from the
     subscriber's `WAMP-Auth` header.  Caller (the crossbar dynamic
@@ -67,14 +66,6 @@ def authorize_subscribe(topic: str,
     if not topic:
         return False
     payload = jwt_payload or {}
-
-    # Public topics — any authenticated user may subscribe.
-    PUBLIC_PREFIXES = (
-        'community.feed', 'chat.social',
-        'social.post.', 'social.comment.', 'social.vote.',
-    )
-    if any(topic == p or topic.startswith(p) for p in PUBLIC_PREFIXES):
-        return bool(payload.get('user_id'))
 
     # Tenant-scoped: `tenant.<tid>.<scope>.<id>.<event>`.
     # Review M2 fix: parse via the shared `parse_topic` helper so
@@ -116,15 +107,16 @@ def authorize_subscribe(topic: str,
         # Unknown scope — refuse.
         return False
 
-    # Per-user topic without `tenant.` prefix (legacy):
-    # `com.hertzai.hevolve.social.<user_id>`
+    # Every other topic, for an authenticated user only: the one classifier
+    # the publish gate asks too (realtime_acl.topic_open_to -- everyone's
+    # topic per core.platform.events.topic_audience, the user's per-user
+    # bus topic, or a topic naming the user, e.g. the legacy
+    # `com.hertzai.hevolve.social.<user_id>`).  Anything else: refuse.
     user_id = payload.get('user_id')
-    if user_id and (
-            topic.endswith(f'.{user_id}') or topic.endswith(f'/{user_id}')):
-        return True
-
-    # Anything else: refuse.
-    return False
+    if not user_id:
+        return False
+    from .realtime_acl import topic_open_to
+    return topic_open_to(topic, user_id)
 
 
 def resolve_tenant_slug(db, slug: str) -> Optional[Dict[str, Any]]:

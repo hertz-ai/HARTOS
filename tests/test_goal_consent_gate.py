@@ -509,7 +509,8 @@ def test_v56_rekeys_a_legacy_row_so_it_keeps_its_gate(tmp_path, monkeypatch):
     assert 'requires_consent' not in cfg, "the legacy key survived the migration"
     assert cfg['bootstrap_slug'] == 'seo' and cfg['enabled'] is True, \
         "the migration disturbed unrelated config keys"
-    assert mig.get_schema_version(engine) == 56
+    # v56 ran; later steps (v57+) run in the same pass.
+    assert mig.get_schema_version(engine) == mig.SCHEMA_VERSION >= 56
 
     # and the migrated row is actually gated by the real gate
     _quiet_other_policies(monkeypatch)

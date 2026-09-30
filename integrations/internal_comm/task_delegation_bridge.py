@@ -394,7 +394,10 @@ class TaskDelegationBridge:
                 continue
 
             mapping = self.delegation_map.get(delegation_id) or {}
-            delegated_to = mapping.get('delegated_to', 'unknown')
+            # delegation_map stores the peer under 'to_agent' (set in
+            # delegate_task_with_tracking); 'delegated_to' is only the name of
+            # the field this reclaim REPORTS it under.
+            delegated_to = mapping.get('to_agent', 'unknown')
             logger.warning(
                 "Reclaiming stale delegation %s: %s has held it for %.0fs "
                 "(ttl %.0fs) and is presumed gone. Failing the child so parent "

@@ -135,17 +135,34 @@ def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
         return {'success': False, 'url': url, 'error': str(e)}
 
 
-def _run_async(coro):
-    """Run an async coroutine from sync context."""
+#: Longest a crawl run from inside an already-running event loop may take.
+_ASYNC_BRIDGE_TIMEOUT_S = 120
+
+
+def _run_async(coro, timeout=_ASYNC_BRIDGE_TIMEOUT_S):
+    """Run an async coroutine from sync context.
+
+    Inside a running event loop the coroutine gets its own loop on a worker,
+    and the caller waits at most ``timeout`` seconds (TimeoutError after
+    that; every caller already turns an exception into its fallback).  This
+    was `with ThreadPoolExecutor(max_workers=1) as pool:` +
+    result(timeout=120), and the `with` exit joined the stuck worker, so the
+    120 s never released the caller (review F7, 2026-09-27).
+    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
 
     if loop and loop.is_running():
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(lambda: asyncio.run(coro)).result(timeout=120)
+        from core.subprocess_safe import call_bounded
+        finished, value, error = call_bounded(
+            lambda: asyncio.run(coro), timeout, name='hart-crawl-async')
+        if not finished:
+            raise TimeoutError(f'crawl did not finish within {timeout}s')
+        if error is not None:
+            raise error
+        return value
     else:
         return asyncio.run(coro)
 

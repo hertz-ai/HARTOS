@@ -133,13 +133,15 @@ def invoke_claude(prompt, *, mode='agentic', cwd=None, timeout_s=None,
 
 
 def _scrub_for_egress(text):
-    """``text`` with PII replaced, by the ONE DLP engine; '' / None unchanged.
-    Raises ImportError when the engine is not importable -- the caller
+    """``text`` as it may leave this device: the ONE egress scrub
+    (security.edge_privacy.scrub_text -- structured secrets such as
+    ``sk-ant-...`` / ``password=...`` and PII); '' / None unchanged.
+    Raises ImportError when a scrubber is not importable -- the caller
     refuses the egress rather than sending raw text."""
     if not text:
         return text
-    from security.dlp_engine import get_dlp_engine
-    return get_dlp_engine().redact(text)
+    from security.edge_privacy import scrub_text
+    return scrub_text(text)
 
 
 def _warn_no_redactor(exc):
@@ -147,7 +149,7 @@ def _warn_no_redactor(exc):
     if not _no_redactor_warned:
         _no_redactor_warned = True
         logger.warning("copilot egress REFUSED: the DLP redactor "
-                       "(security.dlp_engine) is not importable, so no prompt "
+                       "(security.edge_privacy.scrub_text) is not importable, so no prompt "
                        "leaves this device until it is: %s", exc)
     else:
         logger.debug("copilot egress refused again: no DLP redactor (%s)", exc)

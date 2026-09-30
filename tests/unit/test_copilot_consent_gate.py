@@ -107,16 +107,25 @@ def test_the_grant_unparks_by_itself_on_the_next_tick():
         goal = _goal(db)
         assert _escalation_model_config(db, goal) == (None, True)
         ConsentService.grant_consent(db, OWNER, cc.COPILOT_CONSENT_TYPE)
+        # the switch flips once the grant is on disk, as the consent API's
+        # request session commits it
+        db.commit()
         assert cc.copilot_enabled() is True
         cfg, parked = _escalation_model_config(db, goal)
-        assert parked is False
         registered = model_registry.get_model('claude-code') is not None
         # With the CLI present the turn proceeds on claude-code; without it the
-        # backend cannot register and the existing "unavailable" park applies.
+        # backend cannot register and the existing "unavailable" park applies
+        # (_escalation_model_config's docstring: an expert that is no longer
+        # registered cannot take the turn, so ``parked`` is True).  Either
+        # way the grant itself never leaves the goal waiting on the copilot
+        # ask: the verdict is the backend's, not the consent gate's.
         if registered:
+            assert parked is False
             assert cfg and cfg[0]['model'] == 'claude-code'
         else:
+            assert parked is True
             assert cfg is None and goal.status == 'paused'
+            assert 'no longer available' in str(goal.config_json)
 
 
 def test_a_standing_no_hands_the_action_to_a_person():

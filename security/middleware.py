@@ -328,6 +328,10 @@ def _apply_api_auth(app: Flask, register: bool = True):
         if expected_key:
             api_key = request.headers.get('X-API-Key')
             if api_key and _constant_time_compare(api_key, expected_key):
+                # Recorded like 'jwt' below: who the gate verified.  A route
+                # binding state to a caller reads THIS, never the raw header
+                # (review of 436580009: an unchecked X-API-Key was an identity).
+                g.auth_source = 'api_key'
                 return None
             # Fall through to Bearer check so API-key-configured deploys
             # still accept JWTs (useful for admin UI + k8s probes).
@@ -373,9 +377,11 @@ def _apply_api_auth(app: Flask, register: bool = True):
         user can stand in for it.
 
         Filing is what an unauthenticated peer can trigger, so it is paced
-        per address with the gossip announce limiter (discovery.
-        _check_announce_rate): past the limit the ask is not filed and the
-        answer is still ``consent_pending``, which an honest phone retries.
+        per CLIENT with the gossip announce limiter (discovery.
+        check_client_rate, keyed by core.auth_local.client_address: a LAN
+        host cannot rotate X-Forwarded-For into a fresh budget): past the
+        limit the ask is not filed and the answer is still
+        ``consent_pending``, which an honest phone retries.
         """
         auth_header = request.headers.get('Authorization', '')
         if not auth_header.startswith('Bearer '):
@@ -391,13 +397,14 @@ def _apply_api_auth(app: Flask, register: bool = True):
             with db_session(commit=True) as db:
                 verdict = verify_device_jwt(db, token, owner)
                 if verdict['status'] == 'pending':
-                    from integrations.social.discovery import _check_announce_rate
-                    if _check_announce_rate(request.remote_addr or ''):
+                    from integrations.social.discovery import check_client_rate
+                    if check_client_rate():
                         file_device_access_ask(db, owner, verdict['public_key'],
                                                verdict.get('claims') or {})
                     else:
+                        from core.auth_local import client_key
                         logger.warning("device ask from %s not filed: rate limit",
-                                       request.remote_addr)
+                                       client_key())
         except Exception:
             logger.warning("device credential check failed; refusing",
                            exc_info=True)
@@ -436,8 +443,14 @@ def _apply_api_auth(app: Flask, register: bool = True):
         except Exception:
             return os.environ.get('HEVOLVE_API_KEY', '')
 
-    def check_api_auth():
-        path = request.path
+    def check_api_auth(as_path=None):
+        # ``as_path``: judge THIS request as if it had been sent to that path.
+        # For a route under an exempt prefix that nonetheless does what a
+        # gated path does: A2A message/send runs a /chat turn, so it is
+        # admitted exactly as /chat would be, by this one gate rather than a
+        # copy of it (review of 309bcd032: the exempt /a2a/ prefix let an
+        # unauthenticated caller on another machine run a /chat turn).
+        path = as_path or request.path
         # Bundled desktop.  This machine's own callers (the SPA, the tray,
         # in-process test clients) are trusted, as they always were.  But the
         # socket is Nunba's app on 0.0.0.0, the address the desktop advertises

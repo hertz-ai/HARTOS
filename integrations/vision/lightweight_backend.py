@@ -636,13 +636,11 @@ class Qwen08BBackend(VisionBackend):
         backend be selected at boot; describe() / start() preserve the
         original lazy-launch contract — we don't burn VRAM until a frame
         actually arrives.
+
+        "Selectable", not "serving": the launch path asks _is_serving().
         """
-        try:
-            resp = pooled_get(f'http://127.0.0.1:{self._port}/health', timeout=2)
-            if resp.status_code == 200:
-                return True
-        except Exception:
-            pass
+        if self._is_serving():
+            return True
         home = os.path.expanduser('~')
         for d in [os.path.join(home, '.nunba', 'models'),
                   os.path.join(home, '.trueflow', 'models')]:
@@ -650,11 +648,19 @@ class Qwen08BBackend(VisionBackend):
                 return True
         return False
 
+    def _is_serving(self) -> bool:
+        """True only when the caption server answers /health on its port."""
+        try:
+            resp = pooled_get(f'http://127.0.0.1:{self._port}/health', timeout=2)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
     def start(self) -> bool:
         """Lazy: don't boot at VisionService.start(). describe() does the
         launch on the first frame so we don't burn VRAM when the user has
         no camera/screen stream active."""
-        if self.is_available():
+        if self._is_serving():
             logger.info(f"Qwen3.5-0.8B caption backend ready on port {self._port}")
         else:
             logger.info(
@@ -694,8 +700,14 @@ class Qwen08BBackend(VisionBackend):
         In standalone mode, HARTOS uses model_lifecycle to launch directly.
 
         Dependency direction: Nunba → HARTOS (never HARTOS → Nunba).
+
+        Every "is it up" check here is _is_serving(), never is_available():
+        is_available() is also True when only the weights are on disk, and
+        using it here returned True with nothing listening -- no launch was
+        ever asked for.  Measured 2026-09-27: GGUF present, :8081 refused,
+        VisionService described=0 over 697 frames.
         """
-        if self.is_available():
+        if self._is_serving():
             return True
         import time as _t
         if self._launch_attempted:
@@ -743,7 +755,7 @@ class Qwen08BBackend(VisionBackend):
         import time
         for _ in range(5):
             time.sleep(1)
-            if self.is_available():
+            if self._is_serving():
                 logger.info(f"Qwen3.5-0.8B started (event-driven) on port {self._port}")
                 return True
 
@@ -810,7 +822,7 @@ class Qwen08BBackend(VisionBackend):
             logger.info(f"Qwen3.5-0.8B launching PID={self._server_proc.pid} port={self._port}")
             for _ in range(30):
                 time.sleep(1)
-                if self.is_available():
+                if self._is_serving():
                     logger.info(f"Qwen3.5-0.8B ready on port {self._port}")
                     return True
         except Exception as e:

@@ -147,6 +147,20 @@ def observation_text(response, max_chars=TOOL_OBSERVATION_MAX_CHARS):
         return ''
 
 
+def _last_step_result_unknown(response):
+    """True when the loop's last action was let go of while still running.
+
+    local_loop records such a step ok=None (its status 'unknown'): it did
+    not fail and did not succeed, it may yet complete (review F2,
+    2026-09-27).  Read from the raw record, since observed_records folds
+    ok into a bool.
+    """
+    msgs = [m for m in (response or {}).get('extracted_responses') or []
+            if isinstance(m, dict) and m.get('type') == 'action'
+            and isinstance(m.get('content'), dict)]
+    return bool(msgs) and msgs[-1]['content'].get('ok', True) is None
+
+
 def outcome_summary(response):
     """An HONEST one-liner about how the loop ended, for any exit_reason.
 
@@ -161,15 +175,23 @@ def outcome_summary(response):
             'done' if resp.get('status') == 'success' else 'incomplete')
         n = len(observed_records(resp))
         secs = resp.get('execution_time_seconds') or 0
+        # CREATE hands the model TOOL_FAILURE_RESULTS + this line and not the
+        # observation, so the one fact that decides a retry is said here.
+        unknown = (' Its last step was still running when it stopped; that '
+                   'result is unknown - check its effect before repeating it.'
+                   if reason in ('timeout', 'stopped')
+                   and _last_step_result_unknown(resp) else '')
         return {
             'done': 'Completed in %.0fs after %d step(s).' % (secs, n),
             'timeout': 'Ran out of time after %.0fs (%d step(s)) before '
-                       'finishing.' % (secs, n),
+                       'finishing.' % (secs, n) + unknown,
             'max_iterations': 'Tried %d step(s) without reaching a clear '
                               'completion.' % n,
             'action_error': 'Hit errors on 3 consecutive actions after %d '
                             'step(s) and stopped.' % n,
-            'stopped': 'Stopped at your request after %d step(s).' % n,
+            'user_active': 'Paused because you resumed using the computer after %d step(s).' % n,
+            'stopped': 'Stopped at your request after %d step(s).' % n
+                       + unknown,
             'grounding_failed': 'Could not reliably locate the UI element '
                                 'after %d attempt(s).' % n,
             'consent_required': 'Did not act: the owner has not allowed '

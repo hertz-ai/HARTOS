@@ -30,6 +30,7 @@ logger = logging.getLogger('hevolve.shell.system')
 # beneath it, which is what they always should have done — so the duplicate
 # can finally go. Any test that patches `_run` is unaffected by this alias.
 from core.subprocess_safe import run_probe as _run
+from core.subprocess_safe import call_bounded
 
 
 def _first_int(r, default=0):
@@ -60,19 +61,20 @@ def _run_async_bounded(cmd, run_timeout=20, wait=6, name='hart-shell-op', **kw):
     box. A 30s synchronous connect would pin a pool thread and queue every other
     shell fetch behind it (the click-to-freeze). Bounding the caller's wait keeps
     the pool responsive while a slow op finishes out-of-band.
+
+    The worker and the wait are core.subprocess_safe.call_bounded, the one
+    implementation.  ``_run`` is looked up at call time, so a test that
+    patches this module's ``_run`` still intercepts it.
     """
-    holder = {}
-    done = threading.Event()
-
-    def _worker():
-        try:
-            holder['result'] = _run(cmd, timeout=run_timeout, **kw)
-        finally:
-            done.set()
-
-    threading.Thread(target=_worker, name=name, daemon=True).start()
-    finished = done.wait(wait)
-    return finished, holder.get('result')
+    finished, result, error = call_bounded(
+        lambda: _run(cmd, timeout=run_timeout, **kw), wait, name=name)
+    if error is not None:
+        # _run raised (e.g. PermissionError on a non-executable).  The old
+        # private worker let that escape into threading's excepthook; say it
+        # here instead, and keep the documented (True, None) "no result".
+        logger.warning("%s: %r raised %s: %s", name, list(cmd)[:1],
+                       type(error).__name__, error)
+    return finished, result
 
 
 def _load_json(path, default=None):

@@ -755,7 +755,7 @@ def test_a_failed_launch_is_retried_after_the_cooldown():
     from integrations.vision.lightweight_backend import Qwen08BBackend
 
     backend = Qwen08BBackend(port=59999)
-    backend.is_available = lambda: False
+    backend._is_serving = lambda: False
 
     # An ATTEMPT is what moves the timestamp. is_available() is consulted
     # on every call before the cooldown -- correctly, it is the cheap "is
@@ -786,7 +786,7 @@ def test_a_wedged_server_is_stopped_before_another_is_launched():
     from integrations.vision.lightweight_backend import Qwen08BBackend
 
     backend = Qwen08BBackend(port=59997)
-    backend.is_available = lambda: False
+    backend._is_serving = lambda: False
     wedged = MagicMock(pid=4321)
     wedged.poll.return_value = None
     log = MagicMock()
@@ -810,3 +810,36 @@ def test_the_cooldown_is_not_a_permanent_latch():
     backend = Qwen08BBackend(port=59998)
     assert hasattr(backend, '_launch_attempted_at'), (
         'without a timestamp the flag can only be permanent')
+
+
+def test_weights_on_disk_do_not_stand_in_for_a_running_server(
+        tmp_path, monkeypatch):
+    """Measured live 2026-09-27: the 0.8B GGUF is in ~/.nunba/models, :8081
+    refuses connections, and VisionService logged described=0 over 697
+    frames.  is_available() answers True from the file alone -- right for
+    SELECTING this backend -- and _ensure_running used that same answer to
+    mean "serving", so it returned True without ever asking Nunba to start
+    the server, and every describe() failed at debug level."""
+    from unittest.mock import patch
+    from integrations.vision import lightweight_backend as lvb
+
+    models = tmp_path / '.nunba' / 'models'
+    models.mkdir(parents=True)
+    (models / 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf').write_bytes(b'gguf')
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('USERPROFILE', str(tmp_path))
+
+    backend = lvb.Qwen08BBackend(port=59996)
+    backend._is_serving = lambda: False
+    assert backend.is_available() is True      # still selectable
+
+    emitted = []
+    with patch('core.platform.events.emit_event',
+               side_effect=lambda topic, data: emitted.append(topic)), \
+         patch('time.sleep'), \
+         patch('integrations.service_tools.model_lifecycle.'
+               'ModelLifecycleManager._find_llama_server_binary',
+               return_value=None):
+        assert backend._ensure_running() is False
+    assert 'vlm_caption.requested' in emitted, (
+        'a server that is not running was never asked for')

@@ -218,6 +218,11 @@ def _flush_bridge(monkeypatch, breaker_open=False):
     b._stats = {'total_flushed': 0}
     b._last_flush_at = None
     b._experience_queue = collections.deque(maxlen=5)
+    # The flush-timer state __init__ sets (53ddce89); without it the flush
+    # path raises AttributeError before it reaches what these tests check.
+    b._flush_timer = None
+    b._flush_closed = False
+    b._flush_max_wait = 1.0
     b._is_external_target = lambda: False
     state = {'open': breaker_open, 'fail': 0, 'ok': 0}
     b._cb_is_open = lambda: state['open']

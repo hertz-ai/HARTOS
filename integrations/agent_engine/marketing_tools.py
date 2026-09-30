@@ -540,6 +540,30 @@ def _mentions(lower: str, keywords) -> bool:
     return False
 
 
+#: A thought experiment's id (uuid4, ThoughtExperimentService.create_experiment).
+_EXPERIMENT_ID_RE = re.compile(
+    r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b')
+
+
+def _names_a_known_experiment(lower: str) -> bool:
+    """True when ``lower`` holds the id of a thought experiment that exists.
+    Asked only after a vote word matched, so a turn without one never
+    reaches the database.  A lookup that fails reads as False and is logged:
+    the tool is then not attached for this turn, which request_tools can
+    still undo."""
+    ids = _EXPERIMENT_ID_RE.findall(lower)
+    if not ids:
+        return False
+    try:
+        from integrations.social.models import ThoughtExperiment, db_session
+        with db_session(commit=False) as db:
+            return db.query(ThoughtExperiment.id).filter(
+                ThoughtExperiment.id.in_(ids)).first() is not None
+    except Exception as e:
+        logger.warning("experiment id lookup for a vote turn failed: %s", e)
+        return False
+
+
 def detect_goal_tags(prompt) -> list:
     """Detect goal type tags from a prompt for category-based tool loading.
 
@@ -704,6 +728,25 @@ def detect_goal_tags(prompt) -> list:
     ]
     if _mentions(lower, media_keywords):
         tags.append('media')
+
+    # goal_manager maps 'thought_experiment' to its tool tag, which unlocks
+    # the agent's own vote (thought_experiment_tools.ExperimentVoteTool).
+    # People ask to vote without the phrase "thought experiment" ("cast your
+    # vote on experiment abc"), so a vote word paired with the word
+    # "experiment", or with the id of an experiment that EXISTS, counts too
+    # (review of d99b1aa88).  Not "proposal" (it tripped political and
+    # business chat, review of a4dc8cf3b) and not any UUID after a vote
+    # word.  A vote word alone ("vote for the best pizza") and an
+    # experiment alone ("run an experiment") do not.
+    thought_experiment_keywords = [
+        'thought experiment', 'thought-experiment',
+    ]
+    vote_keywords = ['vote', 'voting', 'ballot']
+    if (_mentions(lower, thought_experiment_keywords)
+            or (_mentions(lower, vote_keywords)
+                and (_mentions(lower, ['experiment'])
+                     or _names_a_known_experiment(lower)))):
+        tags.append('thought_experiment')
 
     return tags
 

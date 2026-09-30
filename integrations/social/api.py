@@ -6,6 +6,7 @@ Compatible with both Nunba web app and HART React Native CommunityView.
 import os
 import logging
 from flask import Blueprint, request, jsonify, g
+from core.auth_local import client_key as _client_key
 
 from .auth import require_auth, optional_auth, require_admin, require_moderator, revoke_token
 from .rate_limiter import rate_limit, get_limiter
@@ -118,7 +119,7 @@ def register():
                 try:
                     _record_marketing_event(
                         referral_code, 'signup', 'web',
-                        (request.remote_addr or '').encode(),
+                        _client_key().encode(),
                         (request.headers.get('User-Agent') or '')[:200])
                 except Exception:
                     pass
@@ -354,7 +355,7 @@ def guest_register():
             try:
                 _record_marketing_event(
                     referral_code, 'signup', 'web',
-                    (request.remote_addr or '').encode(),
+                    _client_key().encode(),
                     (request.headers.get('User-Agent') or '')[:200])
             except Exception:
                 pass
@@ -2710,7 +2711,7 @@ def track_marketing_event():
         return _err('invalid event', 400)
     row = _record_marketing_event(
         code, event, (data.get('platform') or '').strip()[:32],
-        (request.remote_addr or '').encode(),
+        _client_key().encode(),
         (request.headers.get('User-Agent') or '')[:200])
     return _ok({'tracked': True, 'code': row['code'], 'event': row['event'], 'ts': row['ts']})
 

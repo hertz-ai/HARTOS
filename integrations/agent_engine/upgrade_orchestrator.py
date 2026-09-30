@@ -23,11 +23,8 @@ def _resolve_agent_engine_path(*parts):
     if db_path and db_path != ':memory:' and os.path.isabs(db_path):
         return os.path.join(os.path.dirname(db_path), 'agent_data', *parts)
     if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-        try:
-            from core.platform_paths import get_agent_data_dir
-            return os.path.join(get_agent_data_dir(), *parts)
-        except ImportError:
-            return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', *parts)
+        from core.platform_paths import get_agent_data_dir
+        return os.path.join(get_agent_data_dir(), *parts)
     return os.path.join('agent_data', *parts)
 
 STATE_FILE = _resolve_agent_engine_path('upgrade_state.json')

@@ -543,6 +543,15 @@ def _generate_image(context: str, input_text: str, style: str) -> dict:
     try:
         from hartos.helper import txt2img
         img_url = txt2img(prompt)
+        if not img_url:
+            # txt2img answers '' for a failed request, an open circuit
+            # breaker and a reply with no img_url alike.  Wrapped as
+            # 'completed' with url '', the agent told the person an image was
+            # made and they got nothing (Nunba desktop, 2026-09-26).
+            return {'status': 'error',
+                    'error': 'txt2img returned no image (the image service '
+                             'did not deliver one)',
+                    'output_modality': 'image'}
         return {
             'status': 'completed',
             'output_modality': 'image',

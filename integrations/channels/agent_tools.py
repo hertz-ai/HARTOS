@@ -248,9 +248,13 @@ def build_channel_tool_closures(ctx):
                 adapter = registry.get(channel_type) if registry else None
                 if adapter is not None:
                     import threading as _threading
-                    _probe_uid = (
-                        user_id or _get_user_id_from_threadlocal() or 'system'
+                    # _probe_owner is who the toast is FOR: None lets
+                    # agent_ui_update fall back to the resolved owner
+                    # instead of routing to a user named 'system'.
+                    _probe_owner = (
+                        user_id or _get_user_id_from_threadlocal() or None
                     )
+                    _probe_uid = _probe_owner or 'system'
                     _probe_meta = meta  # capture for the thread closure
 
                     def _probe_in_thread():
@@ -282,7 +286,7 @@ def build_channel_tool_closures(ctx):
                                             f"couldn't connect: "
                                             f"{str(probe_err)[:120]}"
                                         ),
-                                    })
+                                    }, user_id=_probe_owner)
                             except Exception as toast_err:
                                 logger.debug(
                                     "Probe-failure toast emit skipped: %s",
@@ -841,7 +845,7 @@ def build_channel_tool_closures(ctx):
                         'type': 'toast', 'severity': 'info',
                         'channel': channel_type, 'channel_type': channel_type,
                         'text': f"{meta['display_name']} disconnected.",
-                    })
+                    }, user_id=uid)
             except Exception as e:
                 logger.debug("disconnect toast emit skipped: %s", e)
             return (
@@ -1107,3 +1111,13 @@ def register_channel_tools(helper, executor, ctx=None):
     tools = build_channel_tool_closures(ctx)
     from core.agent_tools import register_core_tools
     register_core_tools(tools, helper, executor)
+
+
+# The credentials this module reads from the environment.  A value the
+# owner stored in the vault is delivered there for these names
+# (hartos.ai_key_vault.reads_from_env); tests/unit/
+# test_env_secrets_declared.py fails on a secret read not declared.
+ENV_SECRETS = (
+    'GOOGLE_CALENDAR_TOKEN',
+    'ZOOM_ACCESS_TOKEN',
+)

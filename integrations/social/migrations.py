@@ -4,11 +4,14 @@ Version tracking and migration helpers.
 """
 import logging
 from sqlalchemy import text
+
+from core.constants import ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS
+
 from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 56
+SCHEMA_VERSION = 59
 
 
 # Tables that hold tenant-scoped user content. v40 adds a nullable
@@ -164,6 +167,97 @@ def _rekey_legacy_consent_flag(engine) -> tuple:
         logger.info("consent re-key: %d goal(s) moved to require_consent",
                     renamed)
     return renamed, remaining
+
+
+_V59_PERSONA_COLUMNS = (
+    ('bio', 'TEXT'),
+    ('recognize_me', f'VARCHAR({ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS})'),
+    ('interests_discoverable', 'BOOLEAN NOT NULL DEFAULT 0'),
+)
+
+
+def _v59_persona_card(engine) -> bool:
+    """Add the persona-card columns to discoverable_prefs if absent.  True
+    when all of them exist afterwards (inspector check, v58 style)."""
+    from sqlalchemy import inspect as sa_inspect
+
+    def _missing():
+        insp = sa_inspect(engine)
+        if 'discoverable_prefs' not in insp.get_table_names():
+            return [c for c, _ in _V59_PERSONA_COLUMNS]
+        have = {c['name'] for c in insp.get_columns('discoverable_prefs')}
+        return [c for c, _ in _V59_PERSONA_COLUMNS if c not in have]
+
+    for col, ddl in _V59_PERSONA_COLUMNS:
+        if col not in _missing():
+            continue
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(
+                    f"ALTER TABLE discoverable_prefs ADD COLUMN {col} {ddl}"))
+                conn.commit()
+        except Exception as e:
+            logger.warning("v59 migration: ADD COLUMN discoverable_prefs.%s "
+                           "failed: %s", col, e)
+    return not _missing()
+
+
+def _v58_consent_reopened_at(engine) -> bool:
+    """Add user_consents.reopened_at if absent.  True when it exists
+    afterwards (inspector check, v57 style)."""
+    from sqlalchemy import inspect as sa_inspect
+
+    def _has():
+        insp = sa_inspect(engine)
+        if 'user_consents' not in insp.get_table_names():
+            return False
+        return 'reopened_at' in {c['name'] for c in insp.get_columns('user_consents')}
+
+    if not _has():
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "ALTER TABLE user_consents ADD COLUMN reopened_at DATETIME"))
+                conn.commit()
+        except Exception as e:
+            logger.warning("v58 migration: ADD COLUMN user_consents.reopened_at "
+                           "failed: %s", e)
+    return _has()
+
+
+def _v57_requester_user_id(engine) -> bool:
+    """Add metered_api_usage.requester_user_id and its index if absent.
+    True when the column exists afterwards."""
+    from sqlalchemy import inspect as sa_inspect
+
+    def _state():
+        insp = sa_inspect(engine)
+        if 'metered_api_usage' not in insp.get_table_names():
+            return False, False
+        cols = {c['name'] for c in insp.get_columns('metered_api_usage')}
+        idx = {i['name'] for i in insp.get_indexes('metered_api_usage')}
+        return ('requester_user_id' in cols,
+                'ix_metered_api_usage_requester_user_id' in idx)
+
+    has_col, has_idx = _state()
+    for needed, sql, label in [
+        (not has_col,
+         "ALTER TABLE metered_api_usage ADD COLUMN requester_user_id VARCHAR(64)",
+         "ADD COLUMN metered_api_usage.requester_user_id"),
+        (not has_idx,
+         "CREATE INDEX ix_metered_api_usage_requester_user_id "
+         "ON metered_api_usage (requester_user_id)",
+         "CREATE INDEX metered_api_usage(requester_user_id)"),
+    ]:
+        if not needed:
+            continue
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(sql))
+                conn.commit()
+        except Exception as e:
+            logger.warning("v57 migration: %s failed: %s", label, e)
+    return _state()[0]
 
 
 def get_schema_version(engine) -> int:
@@ -2065,6 +2159,58 @@ def run_migrations():
         logger.info("HevolveSocial: migrating to v56 "
                     "(agent_goals.config_json require_consent)")
         set_schema_version(engine, 56)
+
+    if current < 57:
+        # v57 (2026-09-26): metered_api_usage.requester_user_id.  Owner ruling:
+        # a task run on a node its person does not own is charged "proportinal
+        # to compute spent and earned".  Each node writes one ledger row per
+        # exchange naming the requester (budget_gate.charge_remote_compute on
+        # the requesting node, credit_served_compute on the serving one), so
+        # the fraction of a Spark not yet moved carries per person and
+        # operator.  Nullable, NULL on every other row.
+        #
+        # Plain DDL behind an inspector check, v38 style: MySQL 8 rejects
+        # CREATE INDEX IF NOT EXISTS.  The version is stamped only once the
+        # column exists, so a pass that fails is retried on the next boot
+        # instead of being recorded as done.
+        logger.info("HevolveSocial: migrating to v57 "
+                    "(metered_api_usage.requester_user_id)")
+        if _v57_requester_user_id(engine):
+            set_schema_version(engine, 57)
+        else:
+            logger.warning("v57 migration: metered_api_usage.requester_user_id "
+                           "is still missing; retrying on the next boot")
+
+    if current < 58:
+        # v58 (2026-09-27): user_consents.reopened_at.  "Allow asking again"
+        # (ConsentService.reopen) used to erase revoked_at, losing when the
+        # owner said no.  The no's time stays; the reopen's time goes here,
+        # and a row is declined only while revoked_at is newer.  Nullable,
+        # NULL on every existing row, so every existing no still stands.
+        logger.info("HevolveSocial: migrating to v58 (user_consents.reopened_at)")
+        # Stamped only on an unbroken ladder: stamping 58 over a failed 57
+        # would record 57 as done and it would never be retried.
+        if _v58_consent_reopened_at(engine) and get_schema_version(engine) >= 57:
+            set_schema_version(engine, 58)
+        else:
+            logger.warning("v58 migration: user_consents.reopened_at is still "
+                           "missing; retrying on the next boot")
+
+    if current < 59:
+        # v59 (2026-09-27): the persona card on discoverable_prefs — bio,
+        # recognize_me ("how to recognise me"), interests_discoverable.  An
+        # agent tells a matched person's agent only what is on this card
+        # (owner: agents describe each user to the other so they can
+        # recognise each other; match on bio and interests).  All nullable
+        # or defaulted, so every existing row reads as an empty card with
+        # interest matching off.
+        logger.info("HevolveSocial: migrating to v59 (discoverable_prefs "
+                    "persona card)")
+        if _v59_persona_card(engine) and get_schema_version(engine) >= 58:
+            set_schema_version(engine, 59)
+        else:
+            logger.warning("v59 migration: discoverable_prefs persona columns "
+                           "are still missing; retrying on the next boot")
 
     # v56's DATA repair, deliberately OUTSIDE the version gate above.
     #

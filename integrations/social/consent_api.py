@@ -23,6 +23,9 @@ Endpoints (all mounted at /api/social/consent*, JWT auth required):
   POST /api/social/consent/decline  decline — say no to a pending ask,
                                     for the ask's agent only
                                     (ConsentService.revoke_consent)
+  POST /api/social/consent/reopen   take a no back: the combination is
+                                    undecided again, nothing is granted
+                                    (ConsentService.reopen)
   GET  /api/social/consent          list — newest-first; supports
                                     consent_type + active_only filters
 
@@ -114,6 +117,10 @@ def _row_to_dict(row: UserConsent) -> dict[str, Any]:
         'granted': bool(row.granted),
         'granted_at': row.granted_at.isoformat() if row.granted_at else None,
         'revoked_at': row.revoked_at.isoformat() if row.revoked_at else None,
+        # A no taken back ("Allow asking again") keeps its revoked_at; the
+        # row is declined only while revoked_at is newer than this.
+        'reopened_at': (row.reopened_at.isoformat()
+                        if getattr(row, 'reopened_at', None) else None),
     }
     if row.consent_type == 'device_access':
         out['label'] = row.label
@@ -296,8 +303,7 @@ def decline_consent():
         return _err('consent_type required')
 
     try:
-        row = ConsentService.revoke_consent(
-            g.db, uid, consent_type, scope, agent_id)
+        row = ConsentService.decline(g.db, uid, consent_type, scope, agent_id)
     except ValueError as e:
         return _err(str(e))  # unknown consent_type -> 400
     if row is None:
@@ -308,6 +314,46 @@ def decline_consent():
         uid, consent_type, scope, agent_id, row.id,
     )
     return _ok({'declined': True, 'id': row.id})
+
+
+# ──────────────────────────────────────────────────────────────────────
+# POST /api/social/consent/reopen — take a "no" back
+# ──────────────────────────────────────────────────────────────────────
+
+@consent_bp.route('/consent/reopen', methods=['POST'])
+@require_auth
+def reopen_consent():
+    """Take back a "no" (ConsentService.reopen): the privacy page's "Allow
+    asking again" for an ask with no on/off card to grant from, such as a
+    credential.  The combination is undecided again, for every agent, and
+    the next ask shows the card.  Nothing is granted.
+
+    Body: {consent_type: str, scope: str (default '*')}
+    Returns: {reopened: n}
+    Errors:
+      400 — missing or unknown consent_type
+      404 — nothing declined for this combination (neutral message)
+    """
+    uid = _user_id()
+    if uid is None:
+        return _err('unauthenticated', 401)
+
+    body = _json()
+    consent_type = str(body.get('consent_type', '')).strip()
+    scope = str(body.get('scope', '*')).strip() or '*'
+    if not consent_type:
+        return _err('consent_type required')
+
+    try:
+        n = ConsentService.reopen(g.db, uid, consent_type, scope)
+    except ValueError as e:
+        return _err(str(e))  # unknown consent_type -> 400
+    if not n:
+        return _err('nothing declined', 404)
+
+    logger.info('consent.reopen user=%s type=%s scope=%s rows=%d',
+                uid, consent_type, scope, n)
+    return _ok({'reopened': n})
 
 
 # ──────────────────────────────────────────────────────────────────────

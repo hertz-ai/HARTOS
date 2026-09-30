@@ -800,11 +800,8 @@ def _resolve_prompts_dir(base_dir: str = None) -> str:
     """
     if base_dir and not base_dir.startswith('.'):
         return base_dir  # explicit absolute path — use as-is
-    try:
-        from core.platform_paths import get_prompts_dir
-        return get_prompts_dir()
-    except ImportError:
-        return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'prompts')
+    from core.platform_paths import get_prompts_dir
+    return get_prompts_dir()
 
 
 def save_personality(prompt_id: str, personality: AgentPersonality,
