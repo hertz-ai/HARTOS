@@ -457,6 +457,50 @@ class TestProximityDetection:
         match = db.query(ProximityMatch).filter_by(id=match_id).first()
         assert match.status == 'matched'
 
+    def test_matched_list_carries_names_and_other_side(self, db, two_users):
+        """The client polls get_matches, not reveal_self.  Names used to be
+        added only to the reveal response, so the next poll showed
+        "User & User" and the phone had no way to know whom to chat with."""
+        from integrations.social.proximity_service import ProximityService
+        from integrations.social.models import ProximityMatch
+        u1, u2 = two_users
+        a_id, b_id = sorted([u1.id, u2.id])
+        match = ProximityMatch(
+            user_a_id=a_id, user_b_id=b_id,
+            lat=21.1458, lon=79.0882, distance_m=30.0,
+            status='pending', expires_at=datetime.utcnow() + timedelta(hours=4)
+        )
+        db.add(match)
+        db.flush()
+        ProximityService.reveal_self(db, match.id, a_id)
+        revealed = ProximityService.reveal_self(db, match.id, b_id)
+        listed = [m for m in ProximityService.get_matches(db, a_id)
+                  if m['id'] == match.id][0]
+        names = {u1.id: u1.display_name, u2.id: u2.display_name}
+        for d, viewer, other in ((listed, a_id, b_id), (revealed, b_id, a_id)):
+            assert d['status'] == 'matched'
+            assert d['user_a']['display_name'] == names[a_id]
+            assert d['user_b']['display_name'] == names[b_id]
+            assert d['other_user_id'] == other, viewer
+
+    def test_unmatched_list_hides_identities(self, db, two_users):
+        from integrations.social.proximity_service import ProximityService
+        from integrations.social.models import ProximityMatch
+        u1, u2 = two_users
+        a_id, b_id = sorted([u1.id, u2.id])
+        match = ProximityMatch(
+            user_a_id=a_id, user_b_id=b_id,
+            lat=21.1458, lon=79.0882, distance_m=30.0,
+            status='pending', expires_at=datetime.utcnow() + timedelta(hours=4)
+        )
+        db.add(match)
+        db.flush()
+        ProximityService.reveal_self(db, match.id, a_id)
+        d = [m for m in ProximityService.get_matches(db, b_id)
+             if m['id'] == match.id][0]
+        assert d['other_revealed'] is True and d['you_revealed'] is False
+        assert 'user_a' not in d and 'user_b' not in d and 'other_user_id' not in d
+
 
 class TestMissedConnections:
     """Test missed connections CRUD."""
