@@ -417,10 +417,18 @@ class WeChatAdapter(ChannelAdapter):
         event_type = root.find('Event').text.lower()
         openid = root.find('FromUserName').text
 
-        # Check for registered event handler
+        # Check for registered event handler. register_event_handler()'s own
+        # signature (Callable[[ElementTree.Element], Any]) allows a plain
+        # sync callback, but unconditionally awaiting one raises
+        # "object NoneType can't be used in 'await' expression" — caught by
+        # handle_webhook()'s outer except, which then returns None instead
+        # of "success" and makes WeChat retry-redeliver the same event
+        # indefinitely. Mirror ChannelAdapter._dispatch_message's check.
         if event_type in self._event_handlers:
             handler = self._event_handlers[event_type]
-            await handler(root)
+            result = handler(root)
+            if asyncio.iscoroutine(result):
+                await result
 
         # Log events
         if event_type == 'subscribe':
