@@ -261,8 +261,8 @@ def file_device_access_ask(db, owner_id: str, public_key: str, claims: dict) -> 
 
     name = ' '.join(str(claims.get('username') or '').split())[:100]
     # The name is the phone's own claim: say so, never state it as fact.
-    who = (f'A phone on your network (it says its name is "{name}")'
-           if name else 'A phone on your network')
+    who = (f'A phone (it says its name is "{name}")'
+           if name else 'A phone')
     ConsentService.request_consent(
         db, owner_id, 'device_access', scope=device_scope(public_key),
         reason=f"{who} wants to use this computer's agents. "
