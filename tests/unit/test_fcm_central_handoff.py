@@ -55,6 +55,13 @@ def test_carries_the_pushs_own_data_as_strings_and_the_privacy_notice():
     assert push_data['privacy_notice']
 
 
+def test_a_game_sound_offer_does_not_send_a_reply_topic_either():
+    _, bus = _run(data={'type': 'game_sound_review', 'agent_id': 'a1',
+                        'topic_reply': 'com.hertzai.pupit.9003054371'})
+    assert 'topic_reply' not in _msg(bus)['push_data']
+    assert _msg(bus)['push_data']['type'] == 'game_sound_review'
+
+
 def test_stays_off_the_local_ui_and_peer_links():
     _, bus = _run()
     kw = bus.publish.call_args.kwargs
@@ -114,6 +121,10 @@ def test_a_consent_prompt_is_shaped_for_centrals_consent_path():
     assert msg['request_id'] == 'req-abc'          # the phone's answer maps back by this id
     # type is central's to decide; a relayed push_data type is dropped there
     assert 'type' not in msg['push_data']
+    # central derives or drops these, and the egress scrub rewrites a 10-digit id
+    # inside them (topic_reply became 'pupit.[PHONE_REDACTED]')
+    for key in ('topic_reply', 'user_id', 'request_id', 'action'):
+        assert key not in msg['push_data']
 
 
 def test_a_consent_prompt_without_an_id_still_gets_a_unique_one():
@@ -156,4 +167,4 @@ def test_a_consent_prompt_that_could_not_be_pushed_is_logged_loudly(caplog):
             caplog.at_level(logging.WARNING, logger='hevolve.fcm_sync'):
         assert fcm_sync.send_fcm_push('9003054371', 't', 'b', data=CONSENT,
                                       relay=True) is False
-    assert 'consent prompt' in caplog.text and 'could not be pushed' in caplog.text
+    assert 'consent prompt' in caplog.text and 'was not queued' in caplog.text

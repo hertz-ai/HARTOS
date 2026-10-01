@@ -322,6 +322,11 @@ def _post_fcm_message(access, project, token, title, body, data, timeout):
         return False
 
 
+# Keys central builds for itself (confirmation.py) or drops from a relayed push.
+_CENTRAL_OWNED_PUSH_KEYS = ('type', 'topic_reply', 'user_id', 'request_id', 'action',
+                            'title', 'body', 'bot_type', 'topic_name', 'response')
+
+
 def hand_push_to_central(user_id, title, body, data=None):
     """Give a push to central's relay when this node has no FCM credential.
 
@@ -349,10 +354,11 @@ def hand_push_to_central(user_id, title, body, data=None):
     the way central's existing consent path expects: bot_type='consent_prompt'
     and the consent's own request_id, so the phone's answer maps back.
 
-    Returns True only when a crossbar transport actually accepted the message
-    (the bus counts those); that is NOT a delivery receipt and does not say it
-    reached central.  False when there is nothing to hand off or no transport
-    took it.  Best-effort, never raises.
+    Returns True only when a crossbar transport ACCEPTED (queued) the message,
+    as the bus counts it.  The transport posts asynchronously, so a later
+    failure of the post is not seen here, and True is neither a delivery receipt
+    nor proof the message reached central.  False when there is nothing to hand
+    off or no transport took it.  Best-effort, never raises.
     """
     try:
         central_id = resolve_central_id(user_id) or str(user_id)
@@ -366,8 +372,12 @@ def hand_push_to_central(user_id, title, body, data=None):
         # central keys a consent's answer by this id, so keep the consent's own
         request_id = (str(data['request_id']) if consent and data.get('request_id')
                       else 'push-' + uuid.uuid4().hex)
-        # type is central's to decide (a relayed push_data type is dropped there)
-        push_data = {str(k): str(v) for k, v in data.items() if k != 'type'}
+        # Central derives these itself or drops them, and the shared-URI egress
+        # scrub would rewrite a 10-digit id inside them (a reply topic became
+        # '...pupit.[PHONE_REDACTED]'), so none of them belong in push_data.
+        push_data = {str(k): str(v) for k, v in data.items()
+                     if k not in _CENTRAL_OWNED_PUSH_KEYS}
+        # type is central's to decide for a consent; a game-sound review names its own
         if not consent and data.get('type'):
             push_data['type'] = str(data['type'])
         push_data['privacy_tier_skipped'] = 'true'
@@ -419,9 +429,9 @@ def send_fcm_push(user_id, title, body, data=None, timeout=8, relay=False):
             handed = hand_push_to_central(user_id, title, body, data)
             if not handed and str((data or {}).get('type', '')) == 'consent_prompt':
                 # A consent that could not be pushed must not vanish quietly.
-                logger.warning("consent prompt for %s could not be pushed to the "
+                logger.warning("consent prompt for %s was not queued for the "
                                "phone (no FCM credential and no relay transport "
-                               "took it); it remains pending as a notification "
+                               "accepted it); it remains pending as a notification "
                                "and in the app", user_id)
             return handed
         logger.debug("send_fcm_push(%s): no FCM credential/project — push disabled", user_id)
