@@ -66,6 +66,29 @@ def _route_iteration_budget(route, requested):
     # multi_step, and any verdict route_task gains later: never over-cap.
     return requested
 
+def _shell_dialect_note(os_name):
+    """Which shell the `shell` action actually runs, stated to the model.
+
+    hart_intelligence_entry._handle_shell_command_tool runs cmd.exe on
+    Windows and /bin/sh elsewhere.  The action list used to promise "any
+    shell/PowerShell/bash command", so on Windows the model sent `cat`, `ls`
+    and heredocs, got "'cat' is not recognized", retried a missing program
+    under new spellings, and hit the 3-error abort (six times in one
+    measured window, 2026-09-30 10:56-11:03).
+    """
+    if os_name == 'Windows':
+        return (
+            "      On Windows, shell runs in cmd.exe: Unix tools (cat, ls, "
+            "grep, heredocs such as << 'EOF') do NOT exist. Use dir, type, "
+            "findstr, and write_file to create a file. For PowerShell, "
+            "start the command with 'powershell: '. If a program is "
+            "reported 'not recognized' it is not on PATH: do not retry "
+            "other spellings of it, report that as a blocker.\n")
+    return (
+        "      On Linux/macOS, shell runs in /bin/sh; start the command "
+        "with 'bash: ' to use bash.\n")
+
+
 # Action list — single source of truth for both the legacy SYSTEM_PROMPT
 # and the unified-mode combined_prompt. Keeping one string means the
 # legacy OmniParser path and the unified Qwen3-VL path can never drift
@@ -76,10 +99,11 @@ _VLM_ACTION_LIST = (
     "mouse_move, wait, scroll_up, scroll_down\n"
     "- Deterministic (PREFER these when the task is expressible as a "
     "command — they're 100x faster than GUI grounding):\n"
-    "    * shell: run any shell/PowerShell/bash command. Use for launching "
+    "    * shell: run a command in this machine's shell. Use for launching "
     "apps (command='notepad'), opening files in specific apps "
     "(command='notepad hello.txt'), running git/npm/python, file ops, etc. "
     "Put the full command in the 'command' field.\n"
+    + _shell_dialect_note(platform.system()) +
     "      REFUSED by the safety denylist, do NOT emit them: interpreter "
     "one-liners — python -c, perl -e, ruby -e, node -e, powershell -enc. "
     "For scripted work, write_file the script to disk first, then shell it "
