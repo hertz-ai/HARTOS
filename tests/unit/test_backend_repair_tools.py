@@ -33,19 +33,19 @@ def test_backend_repair_tools_list_shape():
     )
 
     assert isinstance(BACKEND_REPAIR_TOOLS, list)
-    assert len(BACKEND_REPAIR_TOOLS) == 1, (
-        'BACKEND_REPAIR_TOOLS should expose exactly one tool today; '
-        'when more are added, update this guard.'
-    )
-    tool = BACKEND_REPAIR_TOOLS[0]
-    for key in ('name', 'func', 'description', 'tags'):
-        assert key in tool, (
-            f"BACKEND_REPAIR_TOOLS[0] missing {key!r} — breaks the "
-            f"shape that mcp_http_bridge._register_tool_module reads."
-        )
-    assert tool['name'] == 'repair_backend_venv'
-    assert callable(tool['func'])
-    assert 'self_heal' in tool['tags']
+    # repair_backend_venv, and next_tts_venv_to_provision: the engine choice
+    # the bootstrap provisioner makes before repairing (a decline no longer
+    # holds it on the first engine).  When more are added, update this guard.
+    assert [t['name'] for t in BACKEND_REPAIR_TOOLS] == [
+        'repair_backend_venv', 'next_tts_venv_to_provision']
+    for tool in BACKEND_REPAIR_TOOLS:
+        for key in ('name', 'func', 'description', 'tags'):
+            assert key in tool, (
+                f"{tool.get('name')} missing {key!r} — breaks the "
+                f"shape that mcp_http_bridge._register_tool_module reads."
+            )
+        assert callable(tool['func'])
+        assert 'self_heal' in tool['tags']
 
 
 def test_repair_backend_venv_callable_signature():

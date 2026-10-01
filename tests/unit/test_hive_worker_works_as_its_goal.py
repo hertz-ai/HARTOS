@@ -48,6 +48,10 @@ def _worker_may_claim(monkeypatch):
     from integrations.distributed_agent.worker_loop import DistributedWorkerLoop
     monkeypatch.setattr(DistributedWorkerLoop, '_dispatch_would_defer',
                         staticmethod(lambda: None))
+    # This node is the one that stamped the goals below (their source_node),
+    # so their raw user id is trusted and the worker runs as it.
+    monkeypatch.setattr('integrations.distributed_agent.requesters.this_node_id',
+                        lambda: 'node-here')
 
 
 class _MemBackend:
@@ -76,7 +80,11 @@ def _coordinator_with_goal(goal_id=_GOAL):
         verifier=MagicMock(), baseline=MagicMock())
     prompt = 'Recruit compute from believers'
     co.submit_goal(prompt, _decompose_goal(prompt, goal_id, 'hive_growth', 'u1'),
-                   {'goal_type': 'hive_growth', 'user_id': 'u1', 'prompt': prompt},
+                   # A raw user id, as dispatch stamped it before requester
+                   # handles; trusted only with this node as its source
+                   # (requesters.resolve_requester).
+                   {'goal_type': 'hive_growth', 'user_id': 'u1', 'prompt': prompt,
+                    'source_node': 'node-here'},
                    goal_id=goal_id)
     return led, co
 

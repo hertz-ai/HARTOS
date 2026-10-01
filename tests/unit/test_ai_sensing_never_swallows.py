@@ -197,10 +197,16 @@ def test_a_failed_query_answers_no_and_is_logged(monkeypatch, tmp_path, caplog):
         assert _until(lambda: len([r for r in caplog.records
                                    if r.name == LOGGER]) >= 4)
     assert ok_conn.sent == [b'0'], 'a query that failed was not answered No'
-    messages = ' | '.join(r.getMessage() for r in caplog.records
-                          if r.name == LOGGER)
-    assert 'connection reset' in messages
-    assert 'broken pipe' in messages, 'the fail-closed reply not sent, silently'
+    mine = [r for r in caplog.records if r.name == LOGGER]
+    messages = ' | '.join(r.getMessage() for r in mine)
+    # The two that matter to the asker are WARNINGs, not debug lines nobody
+    # reads: a query that failed, and a No that never reached them.
+    warned = ' | '.join(r.getMessage() for r in mine
+                        if r.levelno >= logging.WARNING)
+    assert 'connection reset' in warned, messages
+    assert 'broken pipe' in warned, (
+        'the fail-closed reply not sent, and only a debug line said so: '
+        + messages)
     assert 'close failed' in messages
 
 

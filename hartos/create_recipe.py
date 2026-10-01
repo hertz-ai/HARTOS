@@ -584,14 +584,9 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
     return sent
 
 
-def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
-    headers = {'Content-Type': 'application/json'}
-    # get_local_backend_url(), not get_port("backend"): a bundled desktop serves
-    # HARTOS in-process on :5000 and never binds :6777 (core/port_registry.py).
-    url = f'{get_local_backend_url()}/time_agent'
-    data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id,'action_entry_point':action_entry_point,'request_from':'Reuse'})
-    res = pooled_post(url,data=data,headers=headers)
-    return 'done'
+# No execute_python_file here: the scheduled-job dispatcher is
+# hartos.reuse_recipe.execute_python_file, the one create_schedule and the
+# create_scheduled_jobs tool register.  The copy that stood here had no caller.
 
 
 def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_entry_point:int,actions:list=[]):
@@ -764,7 +759,7 @@ def visual_execution(task_description: str, user_id: int, prompt_id: int):
 
 def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     headers = {'Content-Type': 'application/json'}
-    url = f'{get_local_backend_url()}/visual_agent'  # see execute_python_file
+    url = f'{get_local_backend_url()}/visual_agent'  # see reuse_recipe.execute_python_file
 
     now = datetime.now()
     action_url = f"{ACTION_API}?user_id={user_id}"
@@ -1408,16 +1403,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
                 current_action_id = user_tasks[user_prompt].current_action
 
-            direct_vlm_path = helper_fun.safe_prompt_path(prompt_id, role_number, current_action_id, 'vlm_agent')
-            if os.path.exists(direct_vlm_path):
-                tool_logger.info(f"Found direct VLM file for current action: {direct_vlm_path}")
-                try:
-                    with open(direct_vlm_path, 'r') as f:
-                        direct_recipe = json.load(f)
-                    if similar_instructions(instructions, direct_recipe.get('action', '')):
-                        matching_recipe = direct_recipe
-                except Exception as e:
-                    tool_logger.error(f"Error reading direct VLM file: {e}")
+            # Only a learning that proves it is THIS action's (the loader's
+            # rule, helper.vlm_learning_refusal): an unproven file at this
+            # path may hold another run's job, and its steps would be sent to
+            # the VLM as "steps from a previous successful execution".
+            direct_recipe = helper_fun.read_vlm_learning(
+                prompt_id, role_number, current_action_id)
+            if direct_recipe is not None:
+                tool_logger.info(f"Found direct VLM learning for action {current_action_id}")
+                if similar_instructions(instructions, direct_recipe.get('action', '')):
+                    matching_recipe = direct_recipe
 
             # Create enhanced instruction if matching recipe found
             enhanced_instruction = None
@@ -1538,19 +1533,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                         if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
                             action_id = user_tasks[user_prompt].current_action
 
-                        # Determine file path.  The number in this filename is the
-                        # action's IDENTITY, not a uniquifier: load_vlm_agent_files
-                        # parses it back (parts[2]) and the REUSE merge applies the
-                        # file to THAT action.  A walker to the next free slot filed
-                        # each learning under another action's id or past the end
-                        # of the flow -- agent 18088688973's 6-action flow carries
-                        # orphan _7/_8/_9 files of unrelated C:\ chores.  Same
-                        # builder the REUSE writer uses; re-learning an action
-                        # overwrites that action's file.
+                        # The number in this filename is the action's IDENTITY,
+                        # not a uniquifier: load_vlm_agent_files reads it back and
+                        # the REUSE merge applies the file to THAT action.  A
+                        # walker to the next free slot filed each learning under
+                        # another action's id or past the end of the flow --
+                        # agent 18088688973's 6-action flow carries orphan
+                        # _7/_8/_9 files of unrelated C:\ chores.  The one writer
+                        # (helper.bank_vlm_learning, REUSE's too) names the file
+                        # and stamps its provenance from this action id.
                         role_number = get_current_flow(user_prompt)
-                        vlm_agent_path = helper_fun.safe_prompt_path(
-                            prompt_id, role_number, action_id, 'vlm_agent')
-                        os.makedirs(os.path.dirname(vlm_agent_path), exist_ok=True)
 
                         # Bank what the run DID, not what it was asked.
                         # Measured 2026-09-11: 106 of 106 vlm_agent files on
@@ -1583,8 +1575,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             "actions_this_action_depends_on": []
                         }
 
-                        # Save the recipe (atomic: tmp + fsync + os.replace)
-                        atomic_json_write(vlm_agent_path, recipe_data, indent=4)
+                        # One execution of this action extends its learning (a
+                        # second call keeps the first's steps); a later execution
+                        # re-learns it.  Atomic write.
+                        vlm_agent_path = helper_fun.bank_vlm_learning(
+                            prompt_id, role_number, action_id,
+                            getattr(user_tasks.get(user_prompt), 'run_id', None),
+                            recipe_data)
 
                         tool_logger.info(f"Generated recipe data saved to {vlm_agent_path}")
 

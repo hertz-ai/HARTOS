@@ -192,6 +192,8 @@ _NOT_AGENT_LISTINGS = {
      'create_agents_for_user.execute_windows_or_android_command'):
         "one prompt id's VLM files",
     ('hartos/helper.py', 'load_vlm_agent_files'): "one prompt id's VLM files",
+    ('hartos/helper.py', 'unproven_vlm_learnings'):
+        '*_vlm_agent.json only, for the one-time quarantine',
     ('hartos/hart_cli.py', 'recipe_list'): '*_recipe.json only',
     ('hartos/hart_cli.py', 'recipe_show'): '*_recipe.json only',
     ('hartos/hart_cli.py', 'a2a_agents'): '*_recipe.json only',

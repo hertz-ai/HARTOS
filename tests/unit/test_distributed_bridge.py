@@ -266,7 +266,8 @@ class TestDistributedDispatch:
         from integrations.agent_engine.dispatch import dispatch_goal_distributed
         with patch('integrations.agent_engine.dispatch._get_distributed_coordinator',
                    return_value=mock_coordinator):
-            with patch.dict(os.environ, {'HEVOLVE_NODE_ID': 'node_central'}):
+            with patch('integrations.distributed_agent.requesters.this_node_id',
+                       return_value='node_central'):
                 dispatch_goal_distributed(
                     'Test prompt', 'user_1', 'goal_abc', 'marketing')
                 call_args = mock_coordinator.submit_goal.call_args

@@ -258,13 +258,6 @@ PYSEC-2026-3455  # pyasn1==0.5.0 fixed in 0.6.4
 PYSEC-2026-3456  # pyasn1==0.5.0 fixed in 0.6.4
 PYSEC-2026-3457  # pyasn1==0.5.0 fixed in 0.6.4
 
-# pyjwt==2.7.0: 5 ids; inherited pin, not in KNOWN_ISSUES.md
-PYSEC-2025-183  # pyjwt==2.7.0
-PYSEC-2026-120  # pyjwt==2.7.0 fixed in 2.12.0
-PYSEC-2026-175  # pyjwt==2.7.0 fixed in 2.13.0
-PYSEC-2026-177  # pyjwt==2.7.0 fixed in 2.13.0
-PYSEC-2026-179  # pyjwt==2.7.0 fixed in 2.13.0
-
 # pypdf==3.17.1: 41 ids; inherited pin, not in KNOWN_ISSUES.md
 CVE-2026-57204  # pypdf==3.17.1 fixed in 6.13.3
 PYSEC-2026-1827  # pypdf==3.17.1 fixed in 6.6.2

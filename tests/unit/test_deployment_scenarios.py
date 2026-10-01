@@ -328,7 +328,8 @@ class TestDockerDistributedDispatch:
                    return_value=mock_coordinator), \
              patch('integrations.agent_engine.dispatch._has_hive_peers',
                    return_value=True), \
-             patch.dict(os.environ, {'HEVOLVE_NODE_ID': 'test_node_abc'}):
+             patch('integrations.distributed_agent.requesters.this_node_id',
+                   return_value='test_node_abc'):
 
             with patch('security.hive_guardrails.GuardrailEnforcer') as mock_guard:
                 mock_guard.before_dispatch.return_value = (True, None, 'test prompt')

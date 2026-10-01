@@ -1,4 +1,4 @@
-"""A down Redis means "no camera frame", never a tool failure.
+"""A down Redis means "no camera frame", never a Redis error.
 
 Live 2026-09-13: get_user_camera_inp failed 246 times with "Error 10061
 connecting to localhost:6379".  hartos/helper.py get_frame falls through the
@@ -19,10 +19,6 @@ import pytest
 np = pytest.importorskip('numpy')
 redis = pytest.importorskip('redis')
 flask = pytest.importorskip('flask')
-
-CAMERA_OFF = ('failed to get visual context ask user to check if the camera '
-              'is turned on')
-
 
 @pytest.fixture
 def helper():
@@ -59,11 +55,19 @@ def test_refused_redis_means_no_frame(helper):
         assert helper.get_frame('u-redis-down') is None
 
 
-def test_camera_tool_says_the_camera_is_off_instead_of_failing(helper):
+def test_camera_tool_reports_no_camera_frame_not_a_redis_error(helper):
+    # No frame is a failure of the camera question (it raises, and
+    # core.tool_logging turns that into the failure envelope; see
+    # test_camera_tool_no_frame_is_a_failure.py), but what it says is the
+    # camera, never the Redis connect that failed underneath.
     with patch.object(helper, 'redis_client') as rc:
         rc.get.side_effect = _refused()
-        assert helper.get_user_camera_inp(
-            'what do you see?', 7, 'r-1') == CAMERA_OFF
+        with pytest.raises(RuntimeError) as err:
+            helper.get_user_camera_inp('what do you see?', 7, 'r-1')
+    assert not isinstance(err.value, redis.RedisError)
+    assert 'camera' in str(err.value).lower()
+    assert 'redis' not in str(err.value).lower()
+    assert '10061' not in str(err.value)
 
 
 def test_a_refused_redis_is_not_dialled_again_inside_the_cooldown(helper):

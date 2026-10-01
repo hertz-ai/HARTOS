@@ -2051,30 +2051,40 @@ SEED_BOOTSTRAP_GOALS = [
             'ENGINE_REGISTRY has a healthy private venv at '
             '~/Documents/Nunba/data/venvs/<engine_id>/.\n\n'
             'EXECUTION (do exactly this, no more):\n'
-            "1) Import ENGINE_REGISTRY and filter to specs where "
-            "spec.install_target == 'venv'.\n"
-            "2) For each such engine_id, call tts.backend_venv."
-            "is_venv_healthy(engine_id).\n"
-            "3) Pick the FIRST engine where is_venv_healthy returns "
-            "False.  If none are unhealthy, report 'all venvs healthy' "
-            "and stop — the goal is done for this tick.\n"
-            "4) Call repair_backend_venv(backend_name=<that engine>) "
-            "exactly ONCE per goal dispatch.  The tool wraps "
-            "tts.package_installer.install_backend_full which is "
-            "idempotent + creates the venv if missing + installs the "
-            "spec.pip_install_plan there + downloads model weights.\n"
-            "5) Return the tool's JSON result verbatim and stop.  "
+            "1) Call next_tts_venv_to_provision().  It returns JSON "
+            "{engine, declined, done}: the first engine whose spec "
+            "installs into its own venv (install_target 'venv'), whose "
+            "venv fails tts.backend_venv.is_venv_healthy, and that the "
+            "owner has not declined.  Do not choose an engine yourself: "
+            "an engine the owner declined stays unhealthy forever, and "
+            "choosing 'the first unhealthy one' asked about it on every "
+            "tick while the others were never asked.\n"
+            "2) If done is true, report 'all venvs healthy' (with the "
+            "declined list) and stop.  If error is set, report it and "
+            "stop.\n"
+            "3) Call repair_backend_venv(backend_name=<engine>) "
+            "exactly ONCE per goal dispatch.  The tool asks the owner "
+            "first, then wraps tts.package_installer.install_backend_full "
+            "which is idempotent + creates the venv if missing + installs "
+            "the spec.pip_install_plan there + downloads model weights.\n"
+            "4) Return the tool's JSON result verbatim and stop.  "
             "Do NOT loop over multiple engines in one dispatch — the "
-            "daemon's next tick will pick up the next unhealthy engine "
-            "after the current install completes.  Running multiple "
-            "pip installs in parallel would defeat the whole pacing "
-            "design.\n\n"
+            "daemon's next tick asks next_tts_venv_to_provision again.  "
+            "Running multiple pip installs in parallel would defeat the "
+            "whole pacing design.\n\n"
             'STOP CONDITIONS (any one ends the dispatch):\n'
-            '- All venv-eligible engines pass is_venv_healthy → '
-            "report success and stop.\n"
-            '- repair_backend_venv returns success=False → report the '
-            'failure JSON and stop (the daemon will retry on the next '
-            'tick with exponential backoff already enforced by '
+            '- next_tts_venv_to_provision returns done → report success '
+            "and stop.\n"
+            "- repair_backend_venv returns consent 'asked' → the owner "
+            'has a card to answer; stop.  The next tick offers the same '
+            'engine until it is answered (one card at a time).\n'
+            "- consent 'declined' → stop; the next tick skips that engine "
+            'and offers the next one.\n'
+            '- no_owner is true → report its message and stop: nothing '
+            'installs on this node until an owner is set.\n'
+            '- repair_backend_venv returns success=False otherwise → '
+            'report the failure JSON and stop (the daemon will retry on '
+            'the next tick with exponential backoff already enforced by '
             "consecutive_failures logic in agent_daemon).\n"
             '- yield_to_user fires → daemon skips the dispatch '
             'entirely (no work to undo).\n\n'

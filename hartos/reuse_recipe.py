@@ -39,7 +39,8 @@ from core.optional_import import lazy_module
 autogen = lazy_module("autogen", on_import=install_autogen_iostream)
 import os
 import pytz
-from core.http_pool import pooled_get, pooled_post, pooled_request
+from core.http_pool import (
+    LLM_COMPLETION_TIMEOUT, pooled_get, pooled_post, pooled_request)
 from core.port_registry import get_port as _get_llm_port, get_local_backend_url
 from typing import Dict, Optional, Tuple, Any, List
 import uuid
@@ -258,13 +259,25 @@ def _vlm_merged_actions(existing_actions, vlm_actions):
             # 6 -> 9", "[REUSE-LEDGER] ... actions=9", and three FileNotFound
             # lines for the per-action files only CREATE writes.  The research
             # agent would have replayed three OS-mutating jobs its owner never
-            # authored for it.  Logged so an ignored file is countable.
+            # authored for it.  Logged so an ignored file is countable, ONCE
+            # per file per process: the merge re-runs on every agent build,
+            # and 23 orphans repeated 23 warnings each time (2026-09-28).  The
+            # loader hands over only stamped files, and the stamp names the
+            # file's coordinates, so it is the file's key.  An unstamped dict
+            # names no file and is logged every time.
             import logging as _logging
-            _logging.getLogger(__name__).warning(
-                "[VLM-ORPHAN] ignoring re-learning for action_id=%r: no flow "
-                "action has that id (flow ids %s); action=%r",
-                action_id, [a.get('action_id') for a in out],
-                str(vlm_action.get('action') or '')[:120])
+            from hartos import helper as _helper
+            _stamp = vlm_action.get(_helper.VLM_PROVENANCE_KEY)
+            _args = ("[VLM-ORPHAN] ignoring re-learning for action_id=%r: no "
+                     "flow action has that id (flow ids %s); action=%r",
+                     action_id, [a.get('action_id') for a in out],
+                     str(vlm_action.get('action') or '')[:120])
+            if isinstance(_stamp, dict):
+                _helper.vlm_warn_once(
+                    _logging.getLogger(__name__),
+                    ('orphan', repr(sorted(_stamp.items(), key=str))), *_args)
+            else:
+                _logging.getLogger(__name__).warning(*_args)
     return out
 try:
     from hartos.helper import PROMPTS_DIR
@@ -513,6 +526,10 @@ class Action:
         # Action id whose named tools ALL returned empty, stamped as that
         # action finishes; None when the last one got data (or ran no tool).
         self.evidence_vacuous_action = None
+        # One id per execution, as on hartos.helper.Action (CREATE's):
+        # helper.bank_vlm_learning extends an action's learning within one
+        # execution and replaces it in the next.
+        self.run_id = uuid.uuid4().hex
 
     def get_action(self, current_action):
         try:
@@ -738,13 +755,37 @@ def _coerce_instruction_text(value) -> str:
 
 
 def execute_python_file(task_description: str, user_id: int, prompt_id: int, action_entry_point: int = 0):
+    """The APScheduler job for a scheduled REUSE action: run it via /time_agent.
+
+    The job's outcome is the run's outcome, so APScheduler's "executed
+    successfully" / "raised an exception" line says what the run did.  The
+    route answers only once the whole time-agent group chat has finished, so
+    the job waits for that answer and reads it.
+
+    Measured by the 2026-09-26 sweep of the desktop logs (a '* * * * *' job,
+    186 runs on 2026-09-25): the POST carried no timeout and inherited core.http_pool.DEFAULT_TIMEOUT's
+    15 s read, so 21 runs raised ReadTimeout while the server went on to
+    finish the chat; and the response was never read, so the one run that
+    crashed (500 at 14:27:05,431) was logged 33 ms later as "executed
+    successfully".  LLM_COMPLETION_TIMEOUT is http_pool's budget for a call
+    that waits on local generation.  A run that outlasts its read still
+    reports as failed while the server finishes it.
+
+    Guarded by tests/unit/test_scheduled_job_reports_its_run.py.
+    """
     headers = {'Content-Type': 'application/json'}
     # get_local_backend_url(), not get_port("backend"): a bundled desktop serves
     # HARTOS in-process on :5000 and never binds :6777 (core/port_registry.py).
     url = f'{get_local_backend_url()}/time_agent'
     data = json.dumps({'task_description': task_description, 'user_id': user_id, 'prompt_id': prompt_id,
                        'action_entry_point': action_entry_point, 'request_from': 'Reuse'})
-    res = pooled_post(url, data=data, headers=headers)
+    res = pooled_post(url, data=data, headers=headers,
+                      timeout=LLM_COMPLETION_TIMEOUT)
+    if not 200 <= res.status_code < 300:
+        # Raised, so APScheduler records the job as failed and logs why.
+        raise RuntimeError(
+            f'/time_agent answered HTTP {res.status_code} for the scheduled '
+            f'run of {user_id}_{prompt_id}: {res.text[:300]}')
     return 'done'
 
 
@@ -2043,17 +2084,17 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
                 current_action_id = user_tasks[user_prompt].current_action
 
-            direct_vlm_path = helper_fun.safe_prompt_path(prompt_id, role_number, current_action_id, 'vlm_agent')
-            if os.path.exists(direct_vlm_path):
-                current_app.logger.info(f"Found direct VLM file for current action: {direct_vlm_path}")
-                try:
-                    with open(direct_vlm_path, 'r') as f:
-                        direct_recipe = json.load(f)
-                    # Check if this recipe is relevant for the current instructions
-                    if similar_instructions(instructions, direct_recipe.get('action', '')):
-                        matching_recipe = direct_recipe
-                except Exception as e:
-                    current_app.logger.error(f"Error reading direct VLM file: {e}")
+            # Only a learning that proves it is THIS action's (the loader's
+            # rule, helper.vlm_learning_refusal): an unproven file at this
+            # path may hold another run's job, and its steps would be sent to
+            # the VLM as "steps from a previous successful execution".
+            direct_recipe = helper_fun.read_vlm_learning(
+                prompt_id, role_number, current_action_id)
+            if direct_recipe is not None:
+                current_app.logger.info(f"Found direct VLM learning for action {current_action_id}")
+                # Check if this recipe is relevant for the current instructions
+                if similar_instructions(instructions, direct_recipe.get('action', '')):
+                    matching_recipe = direct_recipe
 
             # If we found a matching recipe, extract guidance steps
             enhanced_instruction = None
@@ -2195,23 +2236,18 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                         import re
                         import json
 
-                        # Same builder the read site above uses, so writer and reader
-                        # agree by construction.  The number in this filename is NOT a
-                        # uniquifier: helper.load_vlm_agent_files parses it back as the
-                        # action's identity (parts[2]), and _vlm_merged_actions used to
-                        # append any id no existing action carries (it now drops it as
-                        # an orphan).  A counter that walked to
-                        # the next free slot therefore filed each re-learned command as
-                        # a NEW action.  Measured on agent 33323830039: a 1-action
-                        # recipe grew to 4 actions over two drives, and the 3 appended
-                        # ones each carry can_perform_without_user_input 'no' below,
-                        # which disarms every driver.  Re-learning an action overwrites
-                        # that action's file.
-                        vlm_agent_path = helper_fun.safe_prompt_path(
-                            prompt_id, role_number, action_id, 'vlm_agent')
-
-                        # Create directory if it doesn't exist
-                        os.makedirs(os.path.dirname(vlm_agent_path), exist_ok=True)
+                        # The number in this filename is NOT a uniquifier:
+                        # helper.load_vlm_agent_files reads it back as the action's
+                        # identity, and _vlm_merged_actions used to append any id no
+                        # existing action carries (it now drops it as an orphan).  A
+                        # counter that walked to the next free slot therefore filed
+                        # each re-learned command as a NEW action.  Measured on agent
+                        # 33323830039: a 1-action recipe grew to 4 actions over two
+                        # drives, and the 3 appended ones each carry
+                        # can_perform_without_user_input 'no' below, which disarms
+                        # every driver.  The one writer (helper.bank_vlm_learning,
+                        # CREATE's too) names the file and stamps its provenance from
+                        # this action id; the loader refuses a file without it.
 
                         # Handle different response format
                         if 'extracted_responses' in response:
@@ -2237,9 +2273,12 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                                 "actions_this_action_depends_on": []
                             }
 
-                            # Save the recipe format with vlm_agent naming
-                            with open(vlm_agent_path, 'w') as json_file:
-                                json.dump(recipe_data, json_file, indent=4)
+                            # One execution of this action extends its learning; a
+                            # later execution re-learns it.  Atomic write.
+                            vlm_agent_path = helper_fun.bank_vlm_learning(
+                                prompt_id, role_number, action_id,
+                                getattr(user_tasks.get(user_prompt), 'run_id', None),
+                                recipe_data)
 
                             current_app.logger.info(f"Generated recipe data saved to {vlm_agent_path}")
 

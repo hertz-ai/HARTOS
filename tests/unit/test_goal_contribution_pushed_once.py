@@ -50,9 +50,13 @@ def test_one_contribution_is_one_push(Session):
     coord = _coordinator(led)
     coord.submit_goal('objective', [{'task_id': 'g1_task_0',
                                       'description': 'd'}],
-                      {'user_id': 'human-1'}, goal_id='g1')
+                      {'user_id': 'human-1', 'source_node': 'node-here'},
+                      goal_id='g1')
     pushes = []
+    # A raw requester id counts only when this node stamped it.
     with patch('integrations.social.models.get_db', side_effect=Session), \
+         patch('integrations.distributed_agent.requesters.this_node_id',
+               return_value='node-here'), \
          patch('integrations.social.realtime.on_notification',
                side_effect=lambda uid, d: pushes.append((uid, d['id']))):
         coord._notify_goal_contribution('g1_task_0', agent_id='node-abc',

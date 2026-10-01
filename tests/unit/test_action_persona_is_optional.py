@@ -23,12 +23,13 @@ at least one action with no persona (4 actions total); 88656227144 has none on
 ANY of its actions.  That producer inconsistency is a SEPARATE defect and is
 NOT what these tests cover.
 
-WHY DEFAULTING TO `role` IS NOT A NEW RULE: _vlm_merged_actions is handed
-`role` as its `flow_persona` (reuse_recipe.py:1127) and assigns exactly that to
-an appended action that has no owner -- "the flow's persona is the only correct
-owner".  Same question, same answer, one derivation.  Defaulting also keeps the
-action in role_actions, so it still RUNS: making the read merely safe would
-have traded a loud crash for a silent omission.
+WHY DEFAULTING TO `role` IS NOT A NEW RULE: every action of a flow runs as
+that flow's role, so "who owns an action with no owner" has the same answer
+the flow itself gives.  (_vlm_merged_actions once took a `flow_persona` for the
+actions it appended; since 3d008fc9e it appends nothing -- a re-learning whose
+id names no flow action is dropped as an orphan -- and the parameter is gone.)
+Defaulting also keeps the action in role_actions, so it still RUNS: making the
+read merely safe would have traded a loud crash for a silent omission.
 """
 
 import ast
