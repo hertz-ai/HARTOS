@@ -442,7 +442,12 @@ in
       # boot must resolve to (after skipping unavailable higher tiers). All three
       # tiers are AVAILABLE here (comp/sway = a harmless real command, cage = the
       # floor) so the resolved tier equals the configured startTier exactly.
-      startTierNode = startTier: mkNode "desktop" {
+      startTierNode = name: startTier: mkNode "desktop" {
+        # mkNode forces hostName = "desktop" on every node, and the VM state dir
+        # and disk image are named after the hostname: three VMs then open the
+        # same vm-state-desktop/desktop.qcow2 and qemu aborts with "Failed to get
+        # write lock".  Each node gets its own name; the script uses the per-node globals.
+        networking.hostName = pkgs.lib.mkOverride 40 name;
         virtualisation = { memorySize = 2048; cores = 2; };
         hart.sessionSupervisor = {
           enable = true;
@@ -475,28 +480,28 @@ in
       node.specialArgs = specialArgs;
 
       nodes = {
-        startcomp = startTierNode "hart-comp";
-        startsway = startTierNode "sway";
-        startcage = startTierNode "cage";
+        startcomp = startTierNode "startcomp" "hart-comp";
+        startsway = startTierNode "startsway" "sway";
+        startcage = startTierNode "startcage" "cage";
       };
 
       testScript = ''
         start_all()
         LATCH = "/var/lib/hart/session-tier"
 
-        # The driver keys each machine global by hostname (mkNode forces it to the
-        # variant "desktop"), so all three share the name — bind by index instead.
-        comp, sway, cage = machines[0], machines[1], machines[2]
+        # Each node has its own hostname, so the driver injects one machine global
+        # per node.  Do NOT bind by index: machines[] follows the alphabetical
+        # node order (startcage, startcomp, startsway).
+        comp, sway, cage = startcomp, startsway, startcage
         for m in (comp, sway, cage):
             m.wait_for_unit("multi-user.target")
             m.wait_for_unit("greetd.service", timeout=120)
 
-        # Each node's hostname collides on "desktop"; address them by the index we
-        # already bound. Pair each with its EXPECTED un-latched start tier.
+        # Pair each node with its EXPECTED un-latched start tier.
         cases = [
-            (machines[0], "hart-comp"),
-            (machines[1], "sway"),
-            (machines[2], "cage"),
+            (comp, "hart-comp"),
+            (sway, "sway"),
+            (cage, "cage"),
         ]
 
         for m, expected in cases:
