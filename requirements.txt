@@ -345,7 +345,7 @@ pymysql==1.1.1
 
 # Aider Core — vendored modules for code intelligence (repo map, search/replace, linting)
 diskcache==5.6.3
-grep-ast==0.3.3
+grep-ast==0.9.0
 tree-sitter==0.23.2
 tree-sitter-language-pack==0.6.0
 diff-match-patch==20230430
