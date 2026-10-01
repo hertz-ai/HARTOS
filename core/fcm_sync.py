@@ -33,10 +33,13 @@ _FCM_REGISTRY = os.environ.get('HART_FCM_REGISTRY', 'https://mailer.hertzai.com'
 def parse_fcm_token_response(payload):
     """Extract the token from a registry response body (pure — unit-testable).
 
-    The registry answers ``{"fcm_token": "..."}`` (or ``{"token": "..."}``) on a
-    hit and ``{"detail": "user not Found"}`` (HTTP 404/200) when unregistered.
+    The registry answers a BARE token string (``get_fcm_token`` /
+    ``get_node_token``) or ``{"fcm_token": "..."}`` / ``{"token": "..."}`` on a
+    hit, and ``{"detail": "user not Found"}`` (HTTP 404/200) when unregistered.
     Returns the token string, or None for any miss / malformed shape.
     """
+    if isinstance(payload, str):
+        return payload.strip() or None
     if not isinstance(payload, dict):
         return None
     token = payload.get('fcm_token') or payload.get('token') or ''
@@ -80,10 +83,7 @@ def fetch_central_fcm_token_by_node(node_id, timeout=8):
         resp = requests.get(f"{_FCM_REGISTRY}/get_node_token/{node_id}", timeout=timeout)
         if resp.status_code != 200:
             return None
-        body = resp.json()
-        if isinstance(body, str):
-            return body.strip() or None
-        return parse_fcm_token_response(body)
+        return parse_fcm_token_response(resp.json())
     except Exception as e:
         logger.debug("fetch_central_fcm_token_by_node(%s) failed: %s", node_id, e)
         return None
@@ -120,6 +120,25 @@ def store_local_fcm_token(user_id, token, synced_at=None):
         return True
     except Exception as e:
         logger.debug("store_local_fcm_token(%s) failed: %s", user_id, e)
+        return False
+
+
+def forget_local_fcm_token(user_id):
+    """Drop the cached token for ``user_id`` (FCM said it is stale), so the
+    next push re-syncs it from the registry.  True on a delete, False on any
+    failure."""
+    if not user_id:
+        return False
+    try:
+        from sqlalchemy import text
+        from integrations.social.models import db_session
+        with db_session() as db:
+            db.execute(text(_CREATE_TABLE))
+            db.execute(text("DELETE FROM fcm_tokens WHERE user_id = :u"),
+                       {'u': str(user_id)})
+        return True
+    except Exception as e:
+        logger.warning("forget_local_fcm_token(%s) failed: %s", user_id, e)
         return False
 
 
@@ -299,9 +318,19 @@ def _fcm_credential():
     return access, project
 
 
-def _post_fcm_message(access, project, token, title, body, data, timeout):
+def _fcm_token_is_stale(status_code, text):
+    """True when FCM says this registration token will never work again:
+    404 (UNREGISTERED), or a 400 INVALID_ARGUMENT that names the token."""
+    if status_code == 404 or 'UNREGISTERED' in (text or ''):
+        return True
+    return status_code == 400 and 'registration token' in (text or '').lower()
+
+
+def _post_fcm_message(access, project, token, title, body, data, timeout,
+                      on_stale=None):
     """POST one built message to FCM v1.  Returns True on a 200, else False.
-    Never raises.  The SINGLE FCM-send implementation shared by both push paths
+    ``on_stale`` is called when FCM reports the token as unregistered or
+    invalid, so a caller holding a cache can drop it.  Never raises.  The SINGLE FCM-send implementation shared by both push paths
     (send_fcm_push by user_id, send_fcm_push_to_node by node_id) — no parallel
     send."""
     try:
@@ -314,8 +343,16 @@ def _post_fcm_message(access, project, token, title, body, data, timeout):
             timeout=timeout)
         if resp.status_code == 200:
             return True
-        logger.debug("FCM send %s %s", resp.status_code,
-                     str(getattr(resp, 'text', ''))[:200])
+        text = str(getattr(resp, 'text', ''))[:200]
+        stale = _fcm_token_is_stale(resp.status_code, text)
+        # A failed push is not routine: say why, at a level that is seen.
+        logger.warning("FCM send failed: HTTP %s%s %s", resp.status_code,
+                       ' (stale token)' if stale else '', text)
+        if stale and on_stale is not None:
+            try:
+                on_stale()
+            except Exception as e:
+                logger.warning("FCM stale-token handler failed: %s", e)
         return False
     except Exception as e:
         logger.debug("_post_fcm_message failed: %s", e)
@@ -340,7 +377,8 @@ def send_fcm_push(user_id, title, body, data=None, timeout=8):
     token = get_local_fcm_token(user_id) or sync_fcm_token(user_id)
     if not token:
         return False
-    return _post_fcm_message(access, project, token, title, body, data, timeout)
+    return _post_fcm_message(access, project, token, title, body, data, timeout,
+                             on_stale=lambda: forget_local_fcm_token(user_id))
 
 
 def send_fcm_push_to_node(node_id, title, body, data=None, timeout=8):
