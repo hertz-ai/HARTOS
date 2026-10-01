@@ -28,7 +28,10 @@ def test_parse_fcm_token_response_variants():
     assert fcm_sync.parse_fcm_token_response({'fcm_token': '   '}) is None
     assert fcm_sync.parse_fcm_token_response({}) is None
     assert fcm_sync.parse_fcm_token_response(None) is None
-    assert fcm_sync.parse_fcm_token_response('notadict') is None
+    # the registry's get_fcm_token answers a BARE token string on a hit
+    assert fcm_sync.parse_fcm_token_response('  tok-bare  ') == 'tok-bare'
+    assert fcm_sync.parse_fcm_token_response('   ') is None
+    assert fcm_sync.parse_fcm_token_response(42) is None
 
 
 # ── fetch (mocked HTTP boundary) ────────────────────────────────────────────
