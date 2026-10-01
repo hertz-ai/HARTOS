@@ -8822,6 +8822,24 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                 app.logger.debug(f"_chat_reply: avatar id unread: {_ae}")
         except RuntimeError:
             pass  # outside a request — keep speaking, as before
+        # A background goal turn ('daemon_<goal>' request id) has no listener:
+        # its audio is published to the agent's own user id, which no client
+        # holds.  Measured 2026-09-30..10-01: 37 syntheses, all targeted=0,
+        # each ~30 s of the same Piper engine a real reply needs.  Only a
+        # NON-EMPTY id that is not a genuine user's is silenced; an empty id
+        # keeps speaking (callers that predate request ids), so the one
+        # discriminator is dispatch.is_genuine_user_request, never a prefix
+        # test here.
+        try:
+            from integrations.agent_engine.dispatch import (
+                is_genuine_user_request as _is_user_rid)
+            if request_id and not _is_user_rid(request_id):
+                _tts_wanted = False
+                app.logger.info(
+                    '_chat_reply: TTS suppressed (background turn) for '
+                    f'request_id={request_id}')
+        except Exception as _dm_err:
+            app.logger.debug(f"_chat_reply: daemon-turn gate skipped: {_dm_err}")
         # preferred_lang resolution must match the chat entry path:
         # body/kwarg → canonical persisted reader → 'en'.  Bare
         # 'en' default forced English Piper on Tamil replies.  Resolved
