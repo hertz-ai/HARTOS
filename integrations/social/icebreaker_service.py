@@ -45,7 +45,7 @@ from typing import Any, Callable, Optional
 
 from core.constants import ENCOUNTER_DRAFT_MAX_CHARS
 
-from .models import DiscoverablePref, Encounter
+from .models import DiscoverablePref, Encounter, ProximityMatch
 
 logger = logging.getLogger('hevolve_social')
 
@@ -159,12 +159,29 @@ def vibe_tags_others_may_see(pref: Optional[DiscoverablePref]) -> list[str]:
     return list(pref.vibe_tags or [])
 
 
-def _peer_id_for(match: Encounter, viewer_uid: str) -> Optional[str]:
+def _peer_id_for(match, viewer_uid: str) -> Optional[str]:
     if match.user_a_id == viewer_uid:
         return match.user_b_id
     if match.user_b_id == viewer_uid:
         return match.user_a_id
     return None
+
+
+ICEBREAKER_KINDS = ('ble', 'proximity')
+
+
+def find_icebreaker_match(db_session, match_id: str, kind: str = 'ble'):
+    """The row an icebreaker is about: a BLE Encounter, or a GPS
+    ProximityMatch once both people revealed themselves.  A GPS match
+    that is still pending names nobody, so it can't be broken into yet.
+    Returns None when there is no such row."""
+    if kind == 'proximity':
+        return db_session.query(ProximityMatch).filter_by(
+            id=match_id, status='matched',
+        ).first()
+    return db_session.query(Encounter).filter_by(
+        id=match_id, context_type='ble',
+    ).first()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -179,12 +196,15 @@ def draft_icebreaker(
     llm_callback: Optional[Callable[[dict], str]] = None,
     cloud_consent_check: Optional[Callable[[str], bool]] = None,
     topology: Optional[str] = None,
+    kind: str = 'ble',
 ) -> dict:
     """Produce a draft icebreaker for the given match, viewed from the
     side of `viewer_user_id`.
 
     Args:
-        match_id: Encounter.id of a row with context_type='ble'.
+        match_id: Encounter.id of a row with context_type='ble', or,
+                  when kind='proximity', ProximityMatch.id of a GPS
+                  match both people have revealed (status 'matched').
         viewer_user_id: the user requesting the draft (must be one of
                         match.user_a_id / user_b_id).
         db_session: SQLAlchemy session.
@@ -216,8 +236,9 @@ def draft_icebreaker(
         }
 
     Raises:
-        ValueError: when match_id doesn't exist, isn't a BLE match, or
-                    viewer_user_id isn't one of the match parties.
+        ValueError: when match_id doesn't exist (or, for a GPS match,
+                    isn't matched yet), or viewer_user_id isn't one of
+                    the match parties.
         PermissionError: when running in central topology and the
                     viewer hasn't opted into cloud-capability for
                     this feature (consent-gated, not prohibited).
@@ -234,11 +255,9 @@ def draft_icebreaker(
                 "cloud_capability consent for encounter_icebreaker",
             )
 
-    match = db_session.query(Encounter).filter_by(
-        id=match_id, context_type='ble',
-    ).first()
+    match = find_icebreaker_match(db_session, match_id, kind)
     if match is None:
-        raise ValueError(f"BLE match {match_id} not found")
+        raise ValueError(f"{kind} match {match_id} not found")
     peer_uid = _peer_id_for(match, viewer_user_id)
     if peer_uid is None:
         raise ValueError(
