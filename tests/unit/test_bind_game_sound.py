@@ -441,6 +441,13 @@ def _offer_a_sound(monkeypatch, push=None, notify=None, ui=True):
     return shown, fcm.send_fcm_push, services.NotificationService.create
 
 
+def test_the_offer_opts_in_to_the_central_relay(monkeypatch):
+    # A node with no FCM credential reaches the phone through central; the
+    # offer can wait the 30-40 s that takes.
+    _shown, push, _notify = _offer_a_sound(monkeypatch, ui=False)
+    assert push.call_args.kwargs.get('relay') is True
+
+
 def test_the_offer_is_pushed_to_the_phone_with_what_it_is_about(monkeypatch):
     # with no screen attached: a card that landed needs no push
     _shown, push, _notify = _offer_a_sound(monkeypatch, ui=False)

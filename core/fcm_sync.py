@@ -336,9 +336,23 @@ def hand_push_to_central(user_id, title, body, data=None):
     topic suffix), so a local id with no known central mapping is not handed
     off -- a non-numeric suffix would raise inside central's loop.
 
-    Returns True when the message was handed to the bus (NOT a delivery
-    receipt), False when there is nothing to hand off or the bus refused.
-    Best-effort, never raises.
+    Reach depends on the node's mode.  The message leaves on the bus's
+    crossbar leg; Nunba points that at central only in Hybrid/Hive mode
+    (main.py), and at the local Flask bridge in local-only mode, where it
+    never reaches central.  Central also pushes only a pending message that is
+    still unacknowledged after 30 s and sweeps every 10 s, so a relayed push
+    lands 30-40 s late.  A consent prompt uses this path too (it is the only
+    way a credential-less node can reach a phone that is not looking at the
+    app); the consent itself stays pending, and is also a notification record
+    and a fleet command, so a prompt that arrives late is still honoured -- the
+    overlay's own 60 s dismiss only hides the overlay.  Its message is shaped
+    the way central's existing consent path expects: bot_type='consent_prompt'
+    and the consent's own request_id, so the phone's answer maps back.
+
+    Returns True only when a crossbar transport actually accepted the message
+    (the bus counts those); that is NOT a delivery receipt and does not say it
+    reached central.  False when there is nothing to hand off or no transport
+    took it.  Best-effort, never raises.
     """
     try:
         central_id = resolve_central_id(user_id) or str(user_id)
@@ -347,39 +361,54 @@ def hand_push_to_central(user_id, title, body, data=None):
             return False
         import uuid
         from core.peer_link.message_bus import get_message_bus
-        push_data = {str(k): str(v) for k, v in (data or {}).items()}
+        data = data or {}
+        consent = str(data.get('type', '')) == 'consent_prompt'
+        # central keys a consent's answer by this id, so keep the consent's own
+        request_id = (str(data['request_id']) if consent and data.get('request_id')
+                      else 'push-' + uuid.uuid4().hex)
+        # type is central's to decide (a relayed push_data type is dropped there)
+        push_data = {str(k): str(v) for k, v in data.items() if k != 'type'}
+        if not consent and data.get('type'):
+            push_data['type'] = str(data['type'])
         push_data['privacy_tier_skipped'] = 'true'
         push_data['privacy_notice'] = _PRIVACY_TIER_NOTICE
-        get_message_bus().publish(
-            'task.confirmation',
-            {
-                'request_id': 'push-' + uuid.uuid4().hex,
-                'topic_name': f'com.hertzai.pupit.{central_id}',
-                'bot_type': 'Hevolve',
-                'confirmation': False,
-                'user_id': str(central_id),
-                'text': [body or ''],
-                'push_title': title or '',
-                'push_data': push_data,
-            },
-            user_id=str(user_id), skip_sse=True, skip_peerlink=True)
-        return True
+        message = {
+            'request_id': request_id,
+            'topic_name': f'com.hertzai.pupit.{central_id}',
+            'bot_type': 'consent_prompt' if consent else 'Hevolve',
+            'confirmation': False,
+            'user_id': str(central_id),
+            'text': [body or ''],
+            'push_title': title or '',
+            'push_data': push_data,
+        }
+        if consent:
+            message['action'] = 'consent_prompt'
+        bus = get_message_bus()
+        before = bus.get_stats().get('delivered_crossbar', 0)
+        bus.publish('task.confirmation', message,
+                    user_id=str(user_id), skip_sse=True, skip_peerlink=True)
+        return bus.get_stats().get('delivered_crossbar', 0) > before
     except Exception as e:
         logger.debug("hand_push_to_central failed: %s", e)
         return False
 
 
-def send_fcm_push(user_id, title, body, data=None, timeout=8, relay=True):
+def send_fcm_push(user_id, title, body, data=None, timeout=8, relay=False):
     """Push an FCM notification to ``user_id``'s device using the LOCALLY-cached
-    token (syncing it first if absent) — the decentralized, no-crossbar send.
+    token (syncing it first if absent): the direct send, needing this node's
+    own FCM credential.  ``relay=True`` lets a credential-less node hand the
+    push to central instead (see ``hand_push_to_central`` for its limits).
 
     Best-effort, never raises.  Returns True on a 200 from FCM, else False (no
     token, no credential/project, network/HTTP error).  The edge credential
     (HART_FCM_SA_FILE / HART_FCM_ACCESS_TOKEN) + HART_FCM_PROJECT gate the
-    direct send; a node without one (every consumer install) hands the push to
-    central's relay instead (``hand_push_to_central``), unless ``relay`` is
-    False -- for a caller whose message central already tracks, where a second
-    hand-off would push twice.
+    direct send.  Without one, ``relay=True`` hands the push to central's relay;
+    the default does nothing, as before.  Callers that opt in: the game-sound
+    offer and the consent prompt (both can wait the 30-40 s the relay takes).
+    The delivery tracker must not: central already tracks its messages for
+    central-originated chats, and for node-originated ones central is never
+    armed, so a relayed copy would not be what that sweep is for.
     """
     if not user_id:
         return False
@@ -387,7 +416,14 @@ def send_fcm_push(user_id, title, body, data=None, timeout=8, relay=True):
     if not access:
         if relay:
             # No credential on this node: central sends it (see above).
-            return hand_push_to_central(user_id, title, body, data)
+            handed = hand_push_to_central(user_id, title, body, data)
+            if not handed and str((data or {}).get('type', '')) == 'consent_prompt':
+                # A consent that could not be pushed must not vanish quietly.
+                logger.warning("consent prompt for %s could not be pushed to the "
+                               "phone (no FCM credential and no relay transport "
+                               "took it); it remains pending as a notification "
+                               "and in the app", user_id)
+            return handed
         logger.debug("send_fcm_push(%s): no FCM credential/project — push disabled", user_id)
         return False
     token = get_local_fcm_token(user_id) or sync_fcm_token(user_id)

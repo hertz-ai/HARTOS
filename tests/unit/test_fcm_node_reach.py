@@ -88,9 +88,10 @@ class UserPathStillWorks(unittest.TestCase):
         with patch('core.fcm_sync._fcm_credential', return_value=(None, None)), \
              patch('core.fcm_sync._post_fcm_message') as post, \
              patch('core.fcm_sync.hand_push_to_central', return_value=True) as hand:
-            self.assertTrue(fcm_sync.send_fcm_push(10202, 't', 'b'))
+            self.assertFalse(fcm_sync.send_fcm_push(10202, 't', 'b'))
+            hand.assert_not_called()
+            self.assertTrue(fcm_sync.send_fcm_push(10202, 't', 'b', relay=True))
             hand.assert_called_once()
-            self.assertFalse(fcm_sync.send_fcm_push(10202, 't', 'b', relay=False))
             post.assert_not_called()
 
 
