@@ -84,8 +84,9 @@ def _phone_asks(phone, name):
     with db_session() as db:
         ConsentService.request_consent(
             db, str(OWNER), 'device_access', scope=device_scope(phone.public_hex),
-            reason=f"A phone calling itself \"{name}\" asks to use "
-                   "this computer's agents from the network.",
+            reason=f"A phone (it says its name is \"{name}\") "
+                   "wants to use this computer's agents. "
+                   "Allow it only if the phone is yours.",
             requester_name=name)
 
 

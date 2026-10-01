@@ -260,10 +260,13 @@ def file_device_access_ask(db, owner_id: str, public_key: str, claims: dict) -> 
     from .consent_service import ConsentService, device_scope
 
     name = ' '.join(str(claims.get('username') or '').split())[:100]
-    who = f'A phone calling itself "{name}"' if name else 'An unnamed phone'
+    # The name is the phone's own claim: say so, never state it as fact.
+    who = (f'A phone (it says its name is "{name}")'
+           if name else 'A phone')
     ConsentService.request_consent(
         db, owner_id, 'device_access', scope=device_scope(public_key),
-        reason=f"{who} asks to use this computer's agents from the network.",
+        reason=f"{who} wants to use this computer's agents. "
+               "Allow it only if the phone is yours.",
         requester_name=name)
 
 def generate_token_pair(user_id: str, username: str, role: str = 'flat') -> dict:
