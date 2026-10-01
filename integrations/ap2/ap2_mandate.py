@@ -254,6 +254,9 @@ class MandateStore:
         Raises MandateError for an empty or malformed cart, a non-positive
         total, or a total over ``cap``.
         """
+        # Expiry is lazy; each new checkout also expires the old ones, so a
+        # mandate nobody reads again does not keep its payment AUTHORIZED.
+        self.sweep_expired()
         if not user_id:
             raise MandateError('a mandate needs an owner')
         if not cart.get('lines'):
@@ -358,6 +361,45 @@ class MandateStore:
                                        'declined by the owner')
             self._save()
             return True, 'rejected'
+
+    def withdraw(self, mandate_id: str, reason: str) -> bool:
+        """approved -> rejected, and the payment is cancelled.
+
+        For an approval that can no longer be honoured (the cart changed
+        after the person approved it).  Nothing was charged, so the payment
+        must not stay AUTHORIZED for something else to take; the person
+        approves a fresh mandate instead.
+        """
+        with self._lock:
+            m = self._mandates.get(mandate_id)
+            if m is None or m.status != 'approved':
+                return False
+            if self._money_in_flight(m.payment_id):
+                return False  # the gateway owns it now
+            m.status = 'rejected'
+            m.sig = self._sign(m)
+            self.ledger.cancel_payment(m.payment_id, 'ap2_mandate', reason)
+            self._save()
+            return True
+
+    def sweep_expired(self) -> int:
+        """Expire every due pending/approved mandate and cancel its payment.
+
+        Expiry is otherwise lazy (it runs only when a mandate is read), so a
+        mandate nobody reads again would leave its payment AUTHORIZED past
+        its expiry.  Returns how many were expired.
+        """
+        now = time.time()
+        expired = 0
+        with self._lock:
+            for m in self._mandates.values():
+                was = m.status
+                self._expire_if_due(m, now)
+                if m.status != was:
+                    expired += 1
+            if expired:
+                self._save()
+        return expired
 
     def verify_for_checkout(self, mandate_id: str, user_id: str,
                             current_cart: Dict[str, Any]) -> Tuple[bool, str]:

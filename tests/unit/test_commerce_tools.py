@@ -267,7 +267,9 @@ class TestCheckout:
         self._assert_refused(env, json.loads(ct.commerce_checkout(UID, out['mandate_id'])),
                              'cart changed')
         m = env['mandates'].get(out['mandate_id'])
-        assert env['ledger'].get_payment(m.payment_id).status == PaymentStatus.AUTHORIZED
+        # The approval is void: nothing may take this payment later.
+        assert m.status == 'rejected'
+        assert env['ledger'].get_payment(m.payment_id).status == PaymentStatus.CANCELLED
 
     def test_refuses_an_expired_mandate(self, env):
         out = self._prepare(env)
@@ -321,7 +323,10 @@ class TestCheckout:
         payload, code = decide_payment(out['payment_id'], UID, True,
                                        store=env['mandates'])
         assert code == 200 and payload['result']['success'] is False
-        assert env['ledger'].get_payment(out['payment_id']).status == PaymentStatus.AUTHORIZED
+        # Nothing was charged and the approval is void: the payment is
+        # cancelled, not left AUTHORIZED for anything else to take.
+        assert env['ledger'].get_payment(out['payment_id']).status == PaymentStatus.CANCELLED
+        assert env['mandates'].find_by_payment_id(out['payment_id']).status == 'rejected'
         assert pushed(env, 'notification')[-1]['title'] == 'Your cart changed'
         assert not env['fake'].called('POST', '/cart/checkout')
 

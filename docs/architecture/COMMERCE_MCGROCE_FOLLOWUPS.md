@@ -16,6 +16,8 @@ Delete an entry when the change that closes it lands.
 | Backend `/api/agent/approval` commerce branch only compile-checked | `tests/unit/test_approval_ap2_branch.py` drives the real `hart_intelligence_entry` app |
 | PR #125 conflicted with `main` in `liquid_ui_service.agent_ui_update` (main independently added the same `user_id` parameter) | `cf93e99`: took main's hunk and docstring, dropped the branch's duplicate paragraph |
 | `test_approval_ap2_branch.py` importing the entry app left root logging at INFO, with its handler and `RequestLogRecord`; `test_bind_game_sound` run after it in one interpreter failed (`StopIteration`) | `cf93e99`: the module fixture restores root level, handlers and record factory |
+| `process_payment` could charge a checkout mandate outside its settler (P1) | The tool refuses any payment whose metadata carries a `mandate_id`; only `ap2_mandate.settle` / `decide_payment` take it |
+| A refused settlement left the payment `AUTHORIZED`; expiry was lazy only (P1) | `MandateStore.withdraw` rejects the mandate and cancels the payment on a cart-hash mismatch; `sweep_expired` runs on every new mandate |
 
 ## Open
 
@@ -57,20 +59,6 @@ Delete an entry when the change that closes it lands.
    tag, but no test runs `create_agents` / `create_agents_for_user` and asserts
    the commerce tools land on the agent.
 
-6. **P1: `process_payment` can charge a checkout mandate outside its
-   settler.**  The generic AP2 tool (`ap2_protocol.
-   create_payment_processing_function`) processes ANY `AUTHORIZED` payment by
-   id.  That includes a McGroce checkout whose settlement `settle_checkout`
-   refused because the cart changed after approval (item 7): money moves,
-   no McGroce order is placed.  Fix: refuse payments carrying a
-   `mandate_id` in metadata (they settle only via `ap2_mandate.settle` /
-   `decide_payment`), with a test.
-7. **P1: a refused settlement leaves the payment `AUTHORIZED`.**  On a
-   cart-hash mismatch `settle_checkout` charges nothing and tells the shopper
-   to re-approve, but the mandate stays `approved` and the payment
-   `AUTHORIZED`.  Expiry is lazy (`MandateStore._expire_if_due` runs only
-   when the mandate is read), and there is no sweeper.  Fix: reject the mandate
-   and cancel the payment on mismatch; add an expiry sweep.
 8. **Merchant drafts are open to any signed-in user.**
    `commerce_onboard_merchant` has no merchant-role check (only the drafter
    can approve).  Decide: require a McGroce merchant binding, or rate-limit.

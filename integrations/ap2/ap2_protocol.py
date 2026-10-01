@@ -1218,6 +1218,19 @@ def create_payment_processing_function() -> Callable:
         Returns:
             Processing result
         """
+        payment = payment_ledger.get_payment(payment_id)
+        if payment is not None and (payment.metadata or {}).get('mandate_id'):
+            # A payment that belongs to a mandate is taken only by its
+            # settler (ap2_mandate.settle / decide_payment), after the
+            # person's approval and, for a checkout, a re-check of the live
+            # cart.  This generic tool would charge it without either: money
+            # moves and no order is placed.
+            return json.dumps({
+                'success': False,
+                'payment_id': payment_id,
+                'error': 'this payment is settled only by the person who '
+                         'approves it; an agent cannot process it'},
+                indent=2)
         result = payment_ledger.process_payment(payment_id)
         return json.dumps(result, indent=2)
 

@@ -424,6 +424,9 @@ def settle_checkout(m) -> Dict[str, Any]:
     ok, reason = store.verify_for_checkout(m.mandate_id, user_id, mandate_cart(view))
     if not ok:
         if 'cart changed' in reason:
+            # Nothing was charged: the approval is void, so the payment must
+            # not stay AUTHORIZED for anything else to take.
+            store.withdraw(m.mandate_id, 'cart changed after approval')
             push_fragment(user_id, {
                 'type': 'notification', 'severity': 'warning',
                 'title': 'Your cart changed',
