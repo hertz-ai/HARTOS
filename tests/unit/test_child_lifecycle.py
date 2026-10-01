@@ -6,7 +6,6 @@ llama-server and GPU worker running (2026-10-01: a 2.2 GB llama-server at
 full CPU after quit, reused by the next launch).  These tests reproduce the
 quit with a real parent process that spawns a child and calls os._exit(0).
 """
-import os
 import subprocess
 import sys
 import textwrap
