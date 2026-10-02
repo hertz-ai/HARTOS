@@ -48,6 +48,105 @@ def _get_user_id_from_threadlocal():
         return None
 
 
+#: How long _report_when_live waits for a freshly started adapter to connect.
+#: Discord allows itself 30s to connect (discord_adapter.connect).
+_LIVE_WAIT_SECONDS = 35
+
+
+def _emit_to_user(owner, payload: dict) -> None:
+    """Send one Liquid UI card to ``owner`` (None -> the resolved owner)."""
+    from core.platform.registry import get_registry
+    lui = get_registry().get_or_none('LiquidUIService')
+    if lui is None:
+        logger.warning("channel card not delivered, no LiquidUIService: %s",
+                       payload.get('type'))
+        return
+    if lui.agent_ui_update(owner or 'system', payload, user_id=owner) is False:
+        # Refused (rate cap or halt): the user saw nothing, so say so here.
+        logger.warning("channel %s card refused by LiquidUIService for %s",
+                       payload.get('type'), owner)
+
+
+def _report_when_live(channel_type: str, meta: dict, owner,
+                      wait_seconds: float = _LIVE_WAIT_SECONDS,
+                      poll_seconds: float = 1.0) -> bool:
+    """Watch a just-started adapter and tell the user how it ended.
+
+    register_channel schedules adapter.start() on the channel loop and
+    returns; whether the credential actually works is only known once the
+    adapter reaches CONNECTED or gives up.  Connected: a channel_connected
+    card, the same one the OAuth and WhatsApp paths send.  Not connected in
+    time: an error toast in chat plus a channel_unhealthy fleet banner on the
+    user's other devices, with the adapter's own status as the reason.
+    Returns whether it connected.  Runs on a daemon thread.
+    """
+    import time as _time
+    from integrations.channels.base import ChannelStatus
+    from integrations.channels.registry import get_registry
+
+    name = meta.get('display_name') or channel_type
+    deadline = _time.monotonic() + wait_seconds
+    status = None
+    while True:
+        try:
+            adapter = get_registry().get(channel_type)
+            status = adapter.get_status() if adapter is not None else None
+        except Exception as e:
+            # Unknown this round; the deadline still ends the watch loudly.
+            logger.warning("%s: adapter status unreadable: %s", channel_type, e)
+            status = None
+        if status == ChannelStatus.CONNECTED:
+            try:
+                _emit_to_user(owner, {
+                    'type': 'channel_connected',
+                    'channel': channel_type, 'channel_type': channel_type,
+                    'display_name': name,
+                    'color': meta.get('color') or '#00e89d',
+                    'icon': meta.get('icon') or channel_type,
+                    'message': f"✅ {name} connected.",
+                })
+            except Exception as e:
+                logger.warning("%s: connected card not delivered: %s", channel_type, e)
+            return True
+        # ERROR is where a failed start ends (ChannelAdapter.start); there is
+        # nothing left to wait for.
+        if status == ChannelStatus.ERROR or _time.monotonic() >= deadline:
+            break
+        _time.sleep(poll_seconds)
+
+    reason = ("its start failed" if status == ChannelStatus.ERROR else
+              f"not connected after {int(wait_seconds)}s (status: "
+              f"{getattr(status, 'value', status) or 'no adapter'})")
+    logger.warning("register_channel: %s %s", channel_type, reason)
+    try:
+        _emit_to_user(owner, {
+            'type': 'toast', 'severity': 'error',
+            'channel': channel_type, 'channel_type': channel_type,
+            'text': f"{name} couldn't connect: {reason}. Check the token.",
+        })
+    except Exception as e:
+        logger.warning("%s: connect-failure toast not delivered: %s", channel_type, e)
+    # PR Q: the same banner on the user's OTHER devices.  Devices belong to
+    # a person; with no owner there is no one's devices to reach.
+    if not owner:
+        logger.warning("%s: channel_unhealthy banner not sent, no owner "
+                       "known for this connect", channel_type)
+        return False
+    try:
+        from integrations.social.fleet_command import emit_channel_unhealthy
+        from integrations.social.models import get_db
+        db = get_db()
+        try:
+            emit_channel_unhealthy(db, user_id=owner,
+                                   channel_type=channel_type, reason=reason)
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("%s: channel_unhealthy fan-out not sent: %s", channel_type, e)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Tool closure factory
 # ---------------------------------------------------------------------------
@@ -195,6 +294,23 @@ def build_channel_tool_closures(ctx):
                 }
             api._save_config()
 
+            from integrations.channels.metadata import required_setup_keys
+            required = required_setup_keys(meta)
+            # A single-credential channel's token is also kept on the user's
+            # binding: that row is what restore_persisted_channels reads at
+            # boot (flask_integration._binding_credentials), and the same
+            # place the /bindings form stores it, so a channel connected
+            # from chat or OAuth comes back after a restart.  Encrypted when
+            # the vault has a key (seal_binding_credential).
+            cred_meta = {}
+            if (len(required) == 1 and meta['auth_method'] != 'gateway_qr'
+                    and config.get(required[0])):
+                from integrations.channels.flask_integration import (
+                    seal_binding_credential,
+                )
+                cred_meta = {required[0]: seal_binding_credential(
+                    channel_type, config[required[0]])}
+
             # Create user binding
             uid = user_id or _get_user_id_from_threadlocal()
             if uid:
@@ -211,126 +327,94 @@ def build_channel_tool_closures(ctx):
                                 channel_type=channel_type,
                                 channel_sender_id='agent_registered',
                                 auth_method=meta['auth_method'],
+                                metadata_json=cred_meta or None,
                                 is_active=True,
                             ))
                         else:
                             existing.is_active = True
+                            if cred_meta:
+                                existing.metadata_json = {
+                                    **(existing.metadata_json or {}), **cred_meta}
                         db.commit()
                     finally:
                         db.close()
                 except Exception as e:
-                    logger.debug("Binding creation during registration: %s", e)
+                    logger.warning("register_channel: %s binding not saved for "
+                                   "user %s (it will not survive a restart): %s",
+                                   channel_type, uid, e)
 
-            required_fields = [f['key'] for f in meta.get('setup_fields', [])]
-            missing = [f for f in required_fields if f not in config]
+            missing = [k for k in required if not config.get(k)]
             if missing:
                 return (f"{meta['display_name']} registered with partial config. "
                         f"Missing: {missing}. Complete setup in the Channels page.")
 
-            # PR P.4 — best-effort adapter probe so we surface a toast
-            # the moment the credential turns out to be wrong.  Runs
-            # in a daemon thread with its own event loop so:
-            #   - the agent-tool return is not delayed by the probe
-            #     (some adapters open long-lived sockets — sub-second
-            #     to seconds depending on provider RTT);
-            #   - the loop we own is closed only after the connect()
-            #     coroutine actually exits, avoiding the dangling-
-            #     adapter / loop-closed-mid-task class of bug;
-            #   - on failure we emit a Liquid UI toast (handled by
-            #     AgentOverlay's case 'toast' renderer) so the user
-            #     sees actionable feedback in chat.
-            #
-            # The registration itself stays committed — the toast is
-            # advisory, not authoritative; operator can fix in admin.
-            try:
-                from integrations.channels.registry import get_registry
-                registry = get_registry()
-                adapter = registry.get(channel_type) if registry else None
-                if adapter is not None:
-                    import threading as _threading
-                    # _probe_owner is who the toast is FOR: None lets
-                    # agent_ui_update fall back to the resolved owner
-                    # instead of routing to a user named 'system'.
-                    _probe_owner = (
-                        user_id or _get_user_id_from_threadlocal() or None
-                    )
-                    _probe_uid = _probe_owner or 'system'
-                    _probe_meta = meta  # capture for the thread closure
+            name = meta['display_name']
+            if meta['auth_method'] == 'gateway_qr':
+                # WhatsApp: the binding is the easy half; the link itself is
+                # the QR scan, and its live adapter is wired by the gateway
+                # pairing watcher once the phone confirms.  A generic adapter
+                # built here would lack the gateway identity (see
+                # FlaskChannelIntegration._RESTORE_EXCLUDED).
+                # How to link (pair code, number form or QR) depends on the
+                # device and whether a number is known; the caller that
+                # starts the link says which.
+                return (f"{name} registered and enabled! Auth: gateway_qr. "
+                        f"Link it from your phone to finish.")
 
-                    def _probe_in_thread():
-                        import asyncio as _asyncio
-                        loop = _asyncio.new_event_loop()
-                        _asyncio.set_event_loop(loop)
-                        try:
-                            loop.run_until_complete(
-                                _asyncio.wait_for(adapter.connect(), timeout=10),
-                            )
-                        except Exception as probe_err:
-                            logger.info(
-                                "register_channel: adapter probe failed "
-                                "for %s: %s", channel_type, probe_err,
-                            )
-                            try:
-                                from core.platform.registry import (
-                                    get_registry,
-                                )
-                                _lui = get_registry().get_or_none('LiquidUIService')
-                                if _lui:
-                                    _lui.agent_ui_update(_probe_uid, {
-                                        'type': 'toast',
-                                        'severity': 'error',
-                                        'channel': channel_type,
-                                        'channel_type': channel_type,
-                                        'text': (
-                                            f"{_probe_meta.get('display_name') or channel_type} "
-                                            f"couldn't connect: "
-                                            f"{str(probe_err)[:120]}"
-                                        ),
-                                    }, user_id=_probe_owner)
-                            except Exception as toast_err:
-                                logger.debug(
-                                    "Probe-failure toast emit skipped: %s",
-                                    toast_err,
-                                )
-                            # PR Q — also fan out a channel_unhealthy
-                            # fleet command so the user's OTHER devices
-                            # surface the same banner (toast above only
-                            # reaches the device currently in the chat).
-                            try:
-                                from integrations.social.fleet_command import (
-                                    emit_channel_unhealthy,
-                                )
-                                from integrations.social.models import get_db
-                                _db = get_db()
-                                try:
-                                    emit_channel_unhealthy(
-                                        _db,
-                                        user_id=_probe_uid,
-                                        channel_type=channel_type,
-                                        reason=str(probe_err)[:120],
-                                    )
-                                    _db.commit()
-                                finally:
-                                    _db.close()
-                            except Exception as fanout_err:
-                                logger.debug(
-                                    "Probe-failure fleet fan-out skipped: %s",
-                                    fanout_err,
-                                )
-                        finally:
-                            loop.close()
+            if len(required) != 1:
+                # Live connect hands the adapter ONE credential (the shape
+                # /api/social/channels/bindings wires and boot restore
+                # reads).  A channel that needs several is saved but NOT
+                # running, and nothing starts it later: say so, rather than
+                # promise a restart that would not bring it up.
+                return (f"{name} was saved, but it can't be started from here: "
+                        f"it needs several credentials, and connecting those "
+                        f"live isn't supported yet. Nothing will arrive on "
+                        f"{name} until an operator starts it.")
 
-                    _threading.Thread(
-                        target=_probe_in_thread,
-                        name=f'channel-probe-{channel_type}',
-                        daemon=True,
-                    ).start()
-            except Exception as e:
-                logger.debug("Probe thread spawn skipped: %s", e)
+            # A setting only the operator can supply (Slack's app-level
+            # SLACK_APP_TOKEN, Zalo's ZALO_OA_ID): name it, instead of the
+            # adapter's bare "returned False".
+            from integrations.channels.flask_integration import (
+                FlaskChannelIntegration,
+            )
+            unmet = FlaskChannelIntegration.unmet_required_settings(channel_type)
+            if unmet:
+                logger.warning("register_channel: %s saved but cannot run, "
+                               "server lacks %s", channel_type, unmet)
+                return (f"{name} was saved, but this server can't run it yet: "
+                        f"the operator must set {', '.join(unmet)}. Nothing "
+                        f"will arrive on {name} until then.")
 
-            return (f"{meta['display_name']} registered and enabled! "
-                    f"Auth: {meta['auth_method']}. "
-                    f"Adapter will connect on restart or via the Channels page.")
+            # Go live now: the same wiring the connect form's /bindings
+            # route uses (it rebuilds an adapter that is dead or holds an
+            # older token), so "connected" means an adapter is running.
+            from integrations.social.api_channels import (
+                _extract_credential, _wire_live_adapter,
+            )
+            _key, credential = _extract_credential(config, meta)
+            wired = _wire_live_adapter(channel_type, credential)
+            if not wired.get('success'):
+                logger.warning("register_channel: %s saved but not started: %s",
+                               channel_type, wired.get('error'))
+                return (f"{name} was saved, but it could not be started: "
+                        f"{wired.get('error')}. Nothing will arrive on {name} "
+                        f"until this is fixed.")
+
+            # The adapter's start() is scheduled, not finished.  Watch its
+            # status and tell the user how it ended: a success card when it
+            # is live, a toast (and a fleet banner on their other devices)
+            # when it is not.  A daemon thread so the tool returns now.
+            owner = user_id or _get_user_id_from_threadlocal() or None
+            import threading as _threading
+            _threading.Thread(
+                target=_report_when_live,
+                args=(channel_type, meta, owner),
+                name=f'channel-probe-{channel_type}',
+                daemon=True,
+            ).start()
+            return (f"{name} registered and enabled! Auth: {meta['auth_method']}. "
+                    f"Connecting now; you'll see a confirmation here once it's live.")
 
         except Exception as e:
             logger.error("register_channel error: %s", e)
@@ -341,7 +425,7 @@ def build_channel_tool_closures(ctx):
         "Register and connect a new messaging channel. Use when the user wants to connect "
         "a Telegram bot, Discord bot, Slack app, or any of the 31 supported channels. "
         "Example: register_channel('telegram', '{\"bot_token\": \"123456:ABC-DEF\"}') or "
-        "register_channel('slack', '{\"bot_token\": \"xoxb-...\", \"signing_secret\": \"...\"}').",
+        "register_channel('slack', '{\"bot_token\": \"xoxb-...\"}').",
         register_channel,
     ))
 

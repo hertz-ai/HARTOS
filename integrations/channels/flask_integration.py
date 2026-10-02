@@ -10,6 +10,8 @@ import logging
 import os
 import json
 import threading
+import time
+from datetime import datetime
 from typing import Optional, Dict, Any
 from functools import wraps
 
@@ -90,7 +92,7 @@ class FlaskChannelIntegration:
             session_manager=self._session_manager,
             response_router=self._response_router,
             registry=self.registry,
-            get_loop=lambda: self._loop,
+            get_loop=self.running_loop,
         )
 
     def _handle_message(self, message: Message) -> str:
@@ -117,9 +119,19 @@ class FlaskChannelIntegration:
             # fan-out). Gated per-adapter via extra.enable_self_chat_agent.
             if self._self_chat.is_self_message(message):
                 logger.debug("self-chat from %s", message.sender_id)
-                # SelfChatHandler owns the in-thread delivery through the
-                # existing registry. Returning its reply here would make
-                # ChannelRegistry._route_to_agent send that same reply again.
+                # SelfChatHandler.handle() ALREADY sends its own reply
+                # (see its docstring) and returns that same text for
+                # callers of handle() directly (e.g. its own unit tests).
+                # But THIS caller is registry._route_to_agent, which
+                # unconditionally re-sends whatever non-empty string it
+                # gets back — so returning the text here made every
+                # escalated self-chat turn deliver its reply TWICE
+                # (found live 2026-08-31: two independent send_message
+                # calls, ~1ms apart, one via self_chat's own
+                # _send_reply_in_thread and one via _route_to_agent).
+                # Returning None tells _route_to_agent "already handled,
+                # nothing to send" — the same contract a mention-gated
+                # group message already relies on.
                 self._self_chat.handle(message, session)
                 return None
 
@@ -132,11 +144,21 @@ class FlaskChannelIntegration:
             # account via Connect_Channel would still hit the chat
             # as user_id=10077 (default) and lose access to their
             # per-user memory / bindings / tool permissions.
+            # The shared guest id must never be one identity for every
+            # stranger: the relay JWT carries this id and /chat trusts the
+            # JWT, so all unbound senders would share one agent session and
+            # one memory.  An operator-configured default is kept.
+            from core.constants import DEFAULT_USER_ID
+            if session and session.user_id:
+                fallback = session.user_id
+            elif self.default_user_id == DEFAULT_USER_ID:
+                fallback = f"{message.channel}:{message.sender_id}"
+            else:
+                fallback = self.default_user_id
             user_id = self._resolve_user_id_for_sender(
                 channel=message.channel,
                 sender_id=message.sender_id,
-                fallback=(session.user_id if session and session.user_id
-                          else self.default_user_id),
+                fallback=fallback,
             )
             # prompt_id priority: session (user override) > per-channel config > global default
             prompt_id = (
@@ -157,7 +179,8 @@ class FlaskChannelIntegration:
                     return None
 
             # Prepare request to agent API
-            from .chat_contract import chat_request_fields, chat_reply
+            from .chat_contract import (
+                chat_request_fields, chat_reply, agent_turn_timeout)
             payload = {
                 "user_id": user_id,
                 "prompt_id": prompt_id,
@@ -197,12 +220,23 @@ class FlaskChannelIntegration:
             # other -- which is precisely how this bug survived. Imported
             # lazily to keep channels -> agent_engine out of module import
             # order. Returns None on flat tier, where no header is needed.
+            # 2026-08-06 fix: pass the REAL resolved user_id here, not the
+            # function's 'system_daemon' default. /chat's JWT-vs-body
+            # check always trusts the JWT over the body (correct — stops
+            # body-spoofing), so leaving this at the default silently
+            # collapsed every channel user's identity into one shared
+            # 'system_daemon' agent session, corrupting concurrent turns
+            # across channels (empty/lost replies). See
+            # _internal_auth_headers' docstring for the full incident.
             try:
                 from integrations.agent_engine.dispatch import (
                     _internal_auth_headers)
-                _auth_headers = _internal_auth_headers()
+                _auth_headers = _internal_auth_headers(user_id=str(user_id))
             except Exception as _auth_err:  # never block a message on this
-                logger.debug("internal auth header unavailable: %s", _auth_err)
+                logger.warning(
+                    "internal auth header unavailable, calling /chat "
+                    "unauthenticated (central/regional will answer 401): %s",
+                    _auth_err)
                 _auth_headers = None
 
             # Call agent API
@@ -210,12 +244,28 @@ class FlaskChannelIntegration:
                 self.agent_api_url,
                 json=payload,
                 headers=_auth_headers,
-                timeout=120,  # 2 minute timeout for agent processing
+                # 2 minute default for agent processing.  Overridable because
+                # a multi-agent turn against a LOCAL model makes several LLM
+                # calls (30-45s each on a 4B), blowing past 120s and replying
+                # "Sorry, the request timed out" even though the agent went on
+                # to produce a perfectly good answer.
+                timeout=agent_turn_timeout(),
             )
 
             if response.status_code == 200:
                 result = response.json()
-                agent_reply = chat_reply(result, "I processed your request.")
+                agent_reply = chat_reply(result)
+                if not agent_reply.strip():
+                    # This used to become "I processed your request." -- a
+                    # success claim for a turn that produced nothing.  ''
+                    # hands the failure to ChannelRegistry._route_to_agent,
+                    # which warns and sends the canonical failure sentence.
+                    logger.warning(
+                        "Agent API returned 200 with no reply text for %s:%s "
+                        "(keys=%s); the user gets the failure sentence",
+                        message.channel, message.sender_id,
+                        sorted(result) if isinstance(result, dict) else type(result).__name__)
+                    return ''
 
                 # Track response in session history
                 if session:
@@ -227,12 +277,16 @@ class FlaskChannelIntegration:
                 self._response_router.log_user_message(
                     user_id, message.channel, message.content)
 
-                # Route response: WAMP desktop + fan-out to bound channels + log
+                # Route response: WAMP desktop + fan-out to bound channels + log.
+                # NOT the originating chat: returning agent_reply below hands it
+                # to ChannelRegistry._route_to_agent, which is the one sender
+                # for this chat.
                 self._response_router.route_response(
                     user_id=user_id,
                     response_text=agent_reply,
                     channel_context=payload.get('channel_context'),
                     fan_out=True,
+                    reply_to_origin=False,
                 )
 
                 return agent_reply
@@ -367,6 +421,34 @@ class FlaskChannelIntegration:
 
     # Channels that register without any external token/credential.
     _NO_TOKEN_CHANNELS = ('web', 'imessage', 'openprose')
+
+    # Credential keys a persisted UserChannelBinding may carry in
+    # metadata_json, in resolution order.  The binding API stores the
+    # credential under ITS OWN naming — discord rows hold 'bot_token' — which
+    # is not necessarily the factory's parameter name
+    # (create_discord_adapter takes 'token').  So whatever is found here is
+    # handed to register_channel as the generic `token` and mapped to the real
+    # parameter by _CHANNEL_SPECS / _credential_kwarg, reusing the one mapping
+    # layer the live-registration path already uses rather than duplicating it.
+    _BINDING_CREDENTIAL_KEYS = (
+        'bot_token', 'token', 'access_token', 'auth_token',
+        'personal_access_token', 'app_password', 'phone_number',
+        'api_url', 'webhook_url', 'private_key',
+    )
+
+    # WhatsApp is deliberately NOT restored generically: its live adapter
+    # needs the self-chat identity from the gateway, which only
+    # _ensure_whatsapp_live_adapter (hart_intelligence_entry) resolves.
+    # Restoring it here would build a second, identity-less adapter and
+    # silently replace that one, since registry.register keys on
+    # adapter.name.  That path runs when a pairing completes, NOT at boot, so
+    # after a restart WhatsApp stays offline until it is re-paired; restore
+    # reports that loudly rather than calling it handled.
+    _RESTORE_EXCLUDED = ('whatsapp',)
+
+    # Skip reasons that are not a failure: the channel is up, or will be
+    # started by the boot configuration rather than by a binding.
+    _RESTORE_BENIGN_SKIPS = ('already registered', 'no credential: boot config starts it')
 
     @classmethod
     def env_names(cls) -> frozenset:
@@ -584,6 +666,10 @@ class FlaskChannelIntegration:
         call_kwargs = dict(kwargs)
         spec = self._CHANNEL_SPECS.get(channel_type)
         if spec:
+            unmet = self.unmet_required_settings(channel_type, call_kwargs)
+            if unmet:
+                logger.warning(f"{channel_type} requires {', '.join(unmet)} — skipping")
+                return False
             if token:
                 call_kwargs[spec['token_param']] = token
             for p in spec.get('extra', ()):
@@ -591,14 +677,8 @@ class FlaskChannelIntegration:
                 if call_kwargs.get(name):
                     continue  # explicit kwarg wins over env/default
                 val = (os.getenv(p['env']) if p.get('env') else None) or p.get('default')
-                if not val:
-                    if p.get('required'):
-                        env_hint = f" ({p['env']})" if p.get('env') else ''
-                        logger.warning(
-                            f"{channel_type} requires {name}{env_hint} — skipping")
-                        return False
-                    continue
-                call_kwargs[name] = val
+                if val:
+                    call_kwargs[name] = val
 
         try:
             import importlib
@@ -631,6 +711,29 @@ class FlaskChannelIntegration:
         except Exception as e:
             logger.warning(f"{channel_type} adapter registration failed: {e}")
             return False
+
+    @classmethod
+    def unmet_required_settings(cls, channel_type: str,
+                                provided: Dict[str, Any] = None) -> list:
+        """The required extra settings ``channel_type`` cannot run without,
+        named by the env var an operator sets (or the parameter when it has
+        no env var).  Empty when every one is supplied by ``provided``, the
+        environment or its default.
+
+        The one statement of this rule: register_channel refuses on it, and
+        the connect tool uses it to tell a user WHICH setting the server
+        lacks (Slack's SLACK_APP_TOKEN) instead of "returned False".
+        """
+        provided = provided or {}
+        spec = cls._CHANNEL_SPECS.get(channel_type) or {}
+        unmet = []
+        for p in spec.get('extra', ()):
+            if not p.get('required') or provided.get(p['param']):
+                continue
+            if (os.getenv(p['env']) if p.get('env') else None) or p.get('default'):
+                continue
+            unmet.append(p.get('env') or p['param'])
+        return unmet
 
     @staticmethod
     def _credential_kwarg(factory_fn, token: str) -> Dict[str, str]:
@@ -875,11 +978,250 @@ class FlaskChannelIntegration:
             self._loop.run_until_complete(self.registry.stop_all())
             self._loop.close()
 
+    # ── The adapters' event loop, for callers on other threads ──────────
+    # The loop is owned here (created in _run_async_loop).  ChannelRegistry
+    # has no loop of its own, and a worker thread has none either, so every
+    # caller outside the loop reaches adapters through these three methods.
+
+    def running_loop(self) -> Optional[asyncio.AbstractEventLoop]:
+        """The adapters' event loop if it is running, else None."""
+        loop = self._loop
+        return loop if loop is not None and loop.is_running() else None
+
+    def ensure_running(self, timeout_s: float = 5.0) -> tuple:
+        """Start the adapters' loop if needed; return ``(loop, started_now)``.
+
+        Entry points that skip hartos_bootstrap never call start(), so the
+        loop can be absent when a binding is wired on demand.  start() is
+        idempotent.  ``started_now`` is True when this call triggered start():
+        the loop's first act is registry.start_all(), which starts adapters
+        registered BEFORE this call, so a caller must not start them again.
+        ``loop`` is None if the loop did not come up within ``timeout_s``.
+        """
+        loop = self.running_loop()
+        if loop is not None:
+            return loop, False
+        self.start()
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            loop = self.running_loop()
+            if loop is not None:
+                return loop, True
+            time.sleep(0.1)
+        logger.warning(
+            "Channel event loop did not come up within %.1fs of start(): "
+            "no adapter can send or receive until it does", timeout_s)
+        return None, True
+
+    def send_threadsafe(self, channel: str, chat_id: str, text: str, *,
+                        wait: Optional[float] = None, **kwargs):
+        """Send through the registry from any thread.
+
+        Returns None when the loop is not running.  Otherwise returns the
+        concurrent Future, or -- with ``wait`` seconds -- its SendResult.
+        """
+        loop = self.running_loop()
+        if loop is None:
+            logger.warning(
+                "Channel send to %s/%s NOT delivered: the channel event loop "
+                "is not running (start() never ran or its thread died)",
+                channel, chat_id)
+            return None
+        future = asyncio.run_coroutine_threadsafe(
+            self.registry.send_to_channel(channel, chat_id, text, **kwargs),
+            loop,
+        )
+        return future.result(timeout=wait) if wait is not None else future
+
+    @classmethod
+    def _binding_credentials(
+        cls, channel_type: str, meta: Dict[str, Any],
+    ) -> tuple:
+        """Extract ``(credential, extra_kwargs)`` from a binding's
+        metadata_json for the given channel type.
+
+        The credential is looked up under the channel's own ``token_param``
+        first (signal stores 'phone_number', slack 'bot_token'), then under
+        the generic key list.  For multi-input channels the declared `extra`
+        params are passed through when the binding carries them, so a stored
+        value beats the env fallback — matching register_channel's documented
+        "explicit kwarg wins over env/default" precedence.
+        """
+        spec = cls._CHANNEL_SPECS.get(channel_type)
+        keys = []
+        if spec and spec.get('token_param'):
+            keys.append(spec['token_param'])
+        keys.extend(k for k in cls._BINDING_CREDENTIAL_KEYS if k not in keys)
+
+        token = None
+        used_key = None
+        for k in keys:
+            v = meta.get(k)
+            if isinstance(v, str) and v.strip():
+                token, used_key = v.strip(), k
+                break
+
+        extras: Dict[str, str] = {}
+        if spec:
+            for p in spec.get('extra', ()):
+                name = p.get('param')
+                v = meta.get(name)
+                if name and name != used_key and isinstance(v, str) and v.strip():
+                    extras[name] = v.strip()
+        return token, extras
+
+    def restore_persisted_channels(self) -> Dict[str, Any]:
+        """Re-register channel adapters from persisted UserChannelBinding rows.
+
+        Bindings survive a restart — that is the table's stated purpose — but
+        the live adapters did not: nothing read them back at boot, so every
+        HARTOS restart left Discord/Telegram/Slack/Signal disconnected until
+        someone re-POSTed the binding by hand.  WhatsApp was the only channel
+        with a rehydration path; this generalises it to the rest.
+
+        Exactly ONE adapter can exist per channel_type (registry.register keys
+        on adapter.name), so where several bindings share a channel_type the
+        most recently updated active one wins — the same row a manual rebind
+        would pick.  Channels already registered are left alone, so explicit
+        env/code registration keeps precedence and this is idempotent.
+
+        Never raises: a binding that cannot be restored is logged and skipped,
+        because one bad row must not stop the server from booting.
+        """
+        summary: Dict[str, Any] = {'restored': [], 'skipped': {}}
+        if os.environ.get(
+            'HEVOLVE_CHANNEL_RESTORE', '1',
+        ).strip().lower() in ('0', 'false', 'no', 'off'):
+            logger.info("Channel restore disabled (HEVOLVE_CHANNEL_RESTORE)")
+            return summary
+
+        try:
+            from integrations.social.models import get_db, UserChannelBinding
+        except ImportError as e:
+            logger.warning(
+                "Channel restore skipped: social models not importable, so "
+                "persisted channel bindings stay disconnected: %s", e)
+            return summary
+
+        try:
+            db = get_db()
+            try:
+                rows = db.query(UserChannelBinding).filter_by(
+                    is_active=True,
+                ).all()
+                # Newest first.  updated_at is NULL on legacy rows, so fall
+                # back to id, which is autoincrement and therefore monotonic.
+                rows.sort(
+                    key=lambda r: (r.updated_at or datetime.min, r.id or 0),
+                    reverse=True,
+                )
+
+                # Group by channel, preserving the newest-first order.  The
+                # newest row is NOT automatically the one to use: a channel
+                # commonly has several bindings and the most recent can be
+                # credential-less (an out-of-band pair, or a stale row from an
+                # ad-hoc script).  Picking it and stopping would skip the
+                # channel entirely and restore nothing, silently — so walk the
+                # candidates until one actually registers.
+                by_channel: Dict[str, list] = {}
+                for row in rows:
+                    ct = (row.channel_type or '').strip().lower()
+                    if ct:
+                        by_channel.setdefault(ct, []).append(row)
+
+                for ct, candidates in by_channel.items():
+                    if ct in self._RESTORE_EXCLUDED:
+                        summary['skipped'][ct] = 'not restored at boot: re-pair to reconnect'
+                        continue
+                    if ct not in self._ADAPTER_FACTORIES:
+                        summary['skipped'][ct] = 'no adapter factory'
+                        continue
+                    if self.registry.get(ct) is not None:
+                        summary['skipped'][ct] = 'already registered'
+                        continue
+
+                    reason = 'no stored credential'
+                    for row in candidates:
+                        meta = unseal_binding_metadata(ct, row.metadata_json)
+                        token, extras = self._binding_credentials(ct, meta)
+                        if not token:
+                            # A credential-less row is not a configuration:
+                            # upsert_binding writes one for every inbound
+                            # message's channel.  Restoring a no-token channel
+                            # from it (web) would open a listener -- on
+                            # 0.0.0.0 on a standalone node -- that nobody
+                            # enabled.  Those channels start from boot config.
+                            if ct in self._NO_TOKEN_CHANNELS:
+                                reason = 'no credential: boot config starts it'
+                            continue
+                        if self.register_channel(ct, token=token, **extras):
+                            summary['restored'].append(ct)
+                            reason = None
+                            break
+                        # register_channel already logged why; a stale token
+                        # on a newer row shouldn't mask an older working one.
+                        reason = 'registration failed'
+                    if reason:
+                        summary['skipped'][ct] = reason
+            finally:
+                try:
+                    db.close()
+                except Exception as e:
+                    logger.warning("Channel restore: closing the DB session "
+                                   "failed: %s", e)
+        except Exception as e:
+            logger.warning("Channel restore failed; persisted channel "
+                           "bindings stay disconnected: %s", e, exc_info=True)
+            return summary
+
+        if summary['restored']:
+            logger.info(
+                f"Restored {len(summary['restored'])} channel adapter(s) "
+                f"from persisted bindings: {', '.join(summary['restored'])}"
+            )
+        # A binding whose channel stays offline is a failure the user sees
+        # (the bot is silent there), so say which and why.
+        dead = {ct: why for ct, why in summary['skipped'].items()
+                if why not in self._RESTORE_BENIGN_SKIPS}
+        if dead:
+            logger.warning(
+                "Channel bindings NOT restored, these channels stay offline: %s",
+                ', '.join(f'{ct} ({why})' for ct, why in sorted(dead.items())))
+        elif not summary['restored']:
+            logger.info(
+                f"No channel adapters restored from bindings "
+                f"(skipped: {summary['skipped'] or 'none'})"
+            )
+        return summary
+
     def start(self) -> None:
         """Start all channel adapters in background thread."""
         if self._thread and self._thread.is_alive():
             logger.warning("Channels already running")
             return
+
+        # Credential-in-environment channels, for every boot path (bundled
+        # hartos_bootstrap calls start() too).  Driven off _ENV_FALLBACKS —
+        # the same declarative map register_channel itself reads — so there is
+        # one list, and it covers every channel in it (google_chat included).
+        #
+        # register_channel resolves the env var itself, so passing no token is
+        # enough; the getenv here only decides whether it is worth attempting
+        # (heavy SDK modules must not be imported speculatively).
+        # _RESTORE_EXCLUDED applies here too: WhatsApp from WHATSAPP_API_URL
+        # would build the identity-less adapter that its dedicated
+        # rehydration path exists to avoid (see _RESTORE_EXCLUDED).
+        for _ct, _env in self._ENV_FALLBACKS.items():
+            if (_ct in self._ADAPTER_FACTORIES and os.environ.get(_env)
+                    and _ct not in self._RESTORE_EXCLUDED
+                    and self.registry.get(_ct) is None):
+                self.register_channel(_ct)
+
+        # Re-wire adapters persisted in UserChannelBinding BEFORE the loop
+        # thread starts: _run_async_loop's first act is registry.start_all(),
+        # which connects whatever is registered by then.  Registering here
+        # therefore needs no extra lifecycle machinery.
+        self.restore_persisted_channels()
 
         self._thread = threading.Thread(target=self._run_async_loop, daemon=True)
         self._thread.start()
@@ -913,6 +1255,49 @@ def get_channel_integration() -> FlaskChannelIntegration:
     if _integration is None:
         _integration = FlaskChannelIntegration()
     return _integration
+
+
+def seal_binding_credential(channel_type: str, value: str) -> str:
+    """The form a channel credential is kept in on its UserChannelBinding:
+    encrypted with the secrets vault's key (SecretsManager.encrypt_value).
+
+    Without HEVOLVE_MASTER_KEY there is no key, and the credential is kept
+    in plain text anyway: it is what brings the channel back after a restart
+    (restore_persisted_channels).  That is said loudly, naming the channel
+    and never the value.  The one sealer for both binding writers (the
+    register_channel tool and POST /api/social/channels/bindings)."""
+    try:
+        from security.secrets_manager import SecretsManager
+        return SecretsManager.get_instance().encrypt_value(value)
+    except (RuntimeError, ImportError) as e:
+        logger.warning(
+            "%s credential stored in PLAIN TEXT in its channel binding (%s). "
+            "Set HEVOLVE_MASTER_KEY and connect the channel again to store it "
+            "encrypted.", channel_type, e)
+        return value
+
+
+def unseal_binding_metadata(channel_type: str, meta) -> Dict[str, Any]:
+    """A copy of a binding's metadata_json with every sealed credential
+    opened (plain-text values, from before sealing or a keyless node, read
+    as they are).  A credential that cannot be opened is left out, with an
+    error: its ciphertext must never reach an adapter as the token."""
+    out: Dict[str, Any] = {}
+    if not isinstance(meta, dict):
+        return out
+    from security.secrets_manager import SEALED_PREFIX, SecretsManager
+    for key, value in meta.items():
+        if isinstance(value, str) and value.startswith(SEALED_PREFIX):
+            try:
+                value = SecretsManager.get_instance().decrypt_value(value)
+            except ValueError as e:
+                logger.error(
+                    "%s: the stored %s cannot be decrypted (%s); the channel "
+                    "stays offline until it is connected again",
+                    channel_type, key, e)
+                continue
+        out[key] = value
+    return out
 
 
 def _kong_stamped(headers) -> bool:
@@ -989,6 +1374,56 @@ def _channel_send_authenticated(req) -> bool:
     return False
 
 
+def register_status_routes(app, integration: FlaskChannelIntegration) -> None:
+    """Register GET /channels/status and POST /channels/send for an EXISTING
+    integration instance, without touching the ``_integration`` singleton.
+
+    Split out of init_channels() so a caller that already holds the live
+    integration (e.g. standalone main()'s get_channel_integration(), which
+    may have been lazily created earlier by an on-demand path like
+    _ensure_whatsapp_live_adapter) can get these two routes wired up too,
+    instead of going through init_channels() — which unconditionally
+    constructs a NEW FlaskChannelIntegration and overwrites the global,
+    orphaning whatever the existing singleton had already set up. Same
+    "standalone launcher never did X" gap as the webhook routes and the web
+    channel registration (see the callers in hart_intelligence_entry.py).
+    """
+    if not app:
+        return
+
+    @app.route("/channels/status", methods=["GET"])
+    def channel_status():
+        return integration.get_status()
+
+    @app.route("/channels/send", methods=["POST"])
+    def channel_send():
+        from flask import request, jsonify
+
+        # AUTHENTICATE FIRST — before the body is read or any message is
+        # sent. Unauthenticated, this route is an outbound spoof/spam relay
+        # (see _channel_send_authenticated). Fail closed on every exposed
+        # tier; only bundled single-user desktop is trusted.
+        if not _channel_send_authenticated(request):
+            return jsonify({"error": "Authentication required"}), 401
+
+        data = request.json
+        channel = data.get("channel")
+        chat_id = data.get("chat_id")
+        text = data.get("text")
+
+        if not all([channel, chat_id, text]):
+            return jsonify({"error": "Missing required fields"}), 400
+
+        result = integration.send_threadsafe(channel, chat_id, text, wait=30)
+        if result is None:
+            return jsonify({"error": "Channels not running"}), 503
+        return jsonify({
+            "success": result.success,
+            "message_id": result.message_id,
+            "error": result.error,
+        })
+
+
 def init_channels(app=None, config: Dict[str, Any] = None) -> FlaskChannelIntegration:
     """
     Initialize channel integrations.
@@ -1023,44 +1458,6 @@ def init_channels(app=None, config: Dict[str, Any] = None) -> FlaskChannelIntegr
     global _integration
     _integration = integration
 
-    # Add Flask routes if app provided
-    if app:
-        @app.route("/channels/status", methods=["GET"])
-        def channel_status():
-            return integration.get_status()
-
-        @app.route("/channels/send", methods=["POST"])
-        def channel_send():
-            from flask import request, jsonify
-
-            # AUTHENTICATE FIRST — before the body is read or any message is
-            # sent. Unauthenticated, this route is an outbound spoof/spam relay
-            # (see _channel_send_authenticated). Fail closed on every exposed
-            # tier; only bundled single-user desktop is trusted.
-            if not _channel_send_authenticated(request):
-                return jsonify({"error": "Authentication required"}), 401
-
-            data = request.json
-            channel = data.get("channel")
-            chat_id = data.get("chat_id")
-            text = data.get("text")
-
-            if not all([channel, chat_id, text]):
-                return jsonify({"error": "Missing required fields"}), 400
-
-            # Run async send in the event loop
-            if integration._loop:
-                future = asyncio.run_coroutine_threadsafe(
-                    integration.registry.send_to_channel(channel, chat_id, text),
-                    integration._loop,
-                )
-                result = future.result(timeout=30)
-                return jsonify({
-                    "success": result.success,
-                    "message_id": result.message_id,
-                    "error": result.error,
-                })
-            else:
-                return jsonify({"error": "Channels not running"}), 503
+    register_status_routes(app, integration)
 
     return integration

@@ -58,6 +58,25 @@ class EnvIntSemantics(unittest.TestCase):
     def test_junk_falls_back_instead_of_raising(self):
         self.assertEqual(self._with('eight', 8080), 8080)
 
+    def test_junk_fallback_is_announced(self):
+        with self.assertLogs('hevolve_core', level='WARNING') as logs:
+            self.assertEqual(self._with('eight', 8080), 8080)
+        self.assertIn('X_TEST_INT', logs.output[0])
+
+    def test_below_minimum_falls_back_loudly(self):
+        env = {k: v for k, v in os.environ.items() if k != 'X_TEST_INT'}
+        env['X_TEST_INT'] = '0'
+        with patch.dict(os.environ, env, clear=True), \
+                self.assertLogs('hevolve_core', level='WARNING') as logs:
+            self.assertEqual(env_int('X_TEST_INT', 4, minimum=1), 4)
+        self.assertIn('minimum', logs.output[0])
+
+    def test_a_value_at_the_minimum_is_used(self):
+        env = {k: v for k, v in os.environ.items() if k != 'X_TEST_INT'}
+        env['X_TEST_INT'] = '1'
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(env_int('X_TEST_INT', 4, minimum=1), 1)
+
 
 if __name__ == '__main__':
     unittest.main()

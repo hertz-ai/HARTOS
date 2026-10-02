@@ -3216,9 +3216,14 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             current_app.logger.info(
                 f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
 
+            # Helper is deliberately NOT routed here: its turn falls through,
+            # so a message2userfinal it writes (its prompt's rule 9: push
+            # proactive data to the user) is delivered and its TERMINATE is
+            # honoured, and it reaches the Assistant at the last line.  The
+            # old "helper" comparison here never matched (the agent is named
+            # "Helper"); matching it skipped both of those.
             if (last_speaker.name == f"user_proxy_{user_id}" or
                     last_speaker.name == "multi_role_agent" or
-                    last_speaker.name == "helper" or
                     last_speaker.name == "Executor" or
                     last_speaker.name == "ChatInstructor"):
                 return assistant
@@ -3270,8 +3275,9 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             # Assistant with a plain turn (no tool call, no mention, no
             # verdict: its work is done -> verify it) and the StatusVerifier
             # or another agent with an unparseable turn (-> back to the
-            # Assistant); Helper, Executor, user_proxy and ChatInstructor were
-            # routed at the name check above.  Returning "auto" would spend an
+            # Assistant); Executor, user_proxy and ChatInstructor were routed
+            # at the name check above, and Helper (whose user-bound message
+            # and TERMINATE are handled above) reaches the Assistant here.  Returning "auto" would spend an
             # extra model call per hop to guess what this state already
             # knows, and that call runs outside the AgentLightningWrapper, so
             # any engine failure inside it ends the whole turn (measured
@@ -6311,7 +6317,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     'turn instead of raising IndexError')
                 break
             last_message = group_chat.messages[-1]
-            content_lower = last_message['content'].lower()
+            content_lower = (last_message.get('content') or '').lower()
             # ONE notion of "the user's answer" at this return too (D84, #850).
             # The two branches below hand any tail carrying the answer key to
             # the user on the spot; the post-loop pick asks
@@ -6463,7 +6469,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
             last_message = group_chat.messages[-2]
 
-        content_lower = last_message['content'].lower()
+        content_lower = (last_message.get('content') or '').lower()
 
         if f'message2userfinal'.lower() in content_lower:
             try:

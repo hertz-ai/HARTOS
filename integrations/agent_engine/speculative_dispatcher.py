@@ -83,7 +83,7 @@ import re
 import time
 import uuid
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 
 from core.port_registry import get_port
 from concurrent.futures import ThreadPoolExecutor
@@ -259,6 +259,8 @@ class SpeculativeDispatcher:
         )
         atexit.register(lambda: self._expert_pool.shutdown(wait=False))
         self._active: Dict[str, dict] = {}  # speculation_id → metadata
+        # speculation_id → prepared expert kwargs (see schedule_expert_for_draft)
+        self._pending_experts: 'OrderedDict[str, dict]' = OrderedDict()
         self._lock = threading.Lock()
         self._results: Dict[str, dict] = {}  # speculation_id → expert result
         self._results_max = 1000  # evict oldest when exceeded
@@ -779,13 +781,20 @@ class SpeculativeDispatcher:
             escalation_reason=recorded_reason,
         )
 
-        # ── 4. Schedule expert if the draft self-delegated ──
+        # ── 4. Prepare (but do NOT submit) the background expert if the
+        # draft self-delegated.  Submission waits for
+        # schedule_expert_for_draft(), which the caller invokes ONLY when it
+        # serves draft_reply as the final answer.  Callers that instead run
+        # their own synchronous full turn for this prompt (delegate routed
+        # to get_ans, is_create_agent -> CREATE, the vision override) never
+        # call it -- submitting here unconditionally ran that same turn a
+        # second time in the background (the 2026-08 duplicate-turn defect).
         expert_pending = False
         hive_consult_scheduled = False
         if delegate in ('local', 'hive'):
             expert_model = self._pick_expert_for_delegate(
                 delegate, user_pref=user_pref)
-            expert_pending = self._schedule_expert_background(
+            self._remember_pending_expert(speculation_id, dict(
                 speculation_id=speculation_id,
                 prompt=prompt,
                 fast_response=draft_reply,
@@ -798,7 +807,7 @@ class SpeculativeDispatcher:
                 escalation_reason=escalation_reason,
                 user_pref=user_pref,
                 avatar_id=avatar_id,
-            )
+            ))
             # When the user explicitly asked for `hive_preferred` AND the
             # draft self-delegated to hive, also fire a best-effort MoE
             # HiveMind fusion consult in the background.  The consult
@@ -863,6 +872,53 @@ class SpeculativeDispatcher:
             'energy_kwh': round(
                 self._registry.get_total_energy_kwh(hours=0.01), 6),
         }
+
+    # Prepared-but-unsubmitted expert tasks, keyed by speculation_id.  Held
+    # here rather than in dispatch_draft_first's result: the kwargs carry a
+    # live ModelBackend and that result is a JSON reply.  Bounded because a
+    # caller that runs its own full turn never collects its entry.
+    _PENDING_EXPERT_MAX = 256
+
+    def _remember_pending_expert(self, speculation_id: str, kwargs: dict) -> None:
+        with self._lock:
+            self._pending_experts[speculation_id] = kwargs
+            while len(self._pending_experts) > self._PENDING_EXPERT_MAX:
+                self._pending_experts.popitem(last=False)
+
+    def schedule_expert_for_draft(self, result: dict) -> bool:
+        """Submit the background expert prepared by dispatch_draft_first().
+
+        Call this ONLY when serving ``result['response']`` (the draft's
+        reply) as the final answer -- the standby-then-replace design this
+        dispatcher exists for.  A caller that runs its own synchronous full
+        turn for the same prompt must not call it: that turn already answers,
+        so a background expert would run the identical turn twice.
+
+        Sets ``result['expert_pending']`` to whether the expert was actually
+        scheduled (the guards in _schedule_expert_background can still
+        refuse).  Idempotent: a second call finds nothing pending.
+        """
+        spec_id = result.get('speculation_id')
+        with self._lock:
+            kwargs = self._pending_experts.pop(spec_id, None)
+        if not kwargs:
+            if result.get('delegate') in ('local', 'hive'):
+                # The draft delegated, so an expert was prepared -- unless it
+                # was evicted (>_PENDING_EXPERT_MAX waiting) or already taken.
+                logger.warning(
+                    "expert not scheduled for %s: no prepared expert (evicted "
+                    "or already scheduled); the draft reply stays final",
+                    spec_id)
+            return False
+        if kwargs.get('expert_model') is None:
+            logger.warning(
+                "expert not scheduled for %s: no expert model available for "
+                "delegate=%s; the draft reply stays final",
+                spec_id, kwargs.get('delegate'))
+            return False
+        scheduled = self._schedule_expert_background(**kwargs)
+        result['expert_pending'] = scheduled
+        return scheduled
 
     # ─── SRP helpers extracted from dispatch_draft_first ───
 
@@ -1281,6 +1337,19 @@ class SpeculativeDispatcher:
                         speculation_id, expert_model.model_id)
             return False
 
+        # The originating messaging channel (Discord/Slack/...), captured on
+        # the request thread the same way #162 captures request_id below:
+        # thread-locals do not cross the pool boundary.  Read back by
+        # _deliver_expert_response's channel leg.
+        try:
+            from hartos.threadlocal import thread_local_data as _tl_cc
+            _channel_context = _tl_cc.get_channel_context()
+        except Exception as e:
+            logger.warning(
+                "expert %s: channel context unreadable, so a channel user "
+                "will not receive the expert's answer: %s", speculation_id, e)
+            _channel_context = None
+
         with self._lock:
             entry = {
                 origin_model_role: origin_model_id,
@@ -1293,6 +1362,7 @@ class SpeculativeDispatcher:
                 # record_interaction on local_only without re-plumbing the
                 # parameter through 3 layers of background-task submission.
                 'user_pref': user_pref,
+                'channel_context': _channel_context,
             }
             if delegate is not None:
                 entry['delegate'] = delegate
@@ -1913,12 +1983,19 @@ class SpeculativeDispatcher:
         try:
             import requests as _req
             from integrations.agent_engine.dispatch import _internal_auth_headers
+            from integrations.channels.chat_contract import agent_turn_timeout
             base = os.environ.get(
                 'HEVOLVE_BASE_URL',
                 f'http://localhost:{get_port("backend")}',
             )
             resp = _req.post(f'{base}/chat', json=payload,
-                             headers=_internal_auth_headers(), timeout=60)
+                             headers=_internal_auth_headers(),
+                             # Same budget every channel's own /chat call
+                             # uses: this runs the same full agent turn,
+                             # which routinely exceeds 60 s on a local model
+                             # -- the old hardcoded 60 silently discarded a
+                             # real answer still being generated.
+                             timeout=agent_turn_timeout())
             if resp.status_code == 200:
                 return (resp.json() or {}).get('response') or ''
             # WARNING, not DEBUG: central emits no INFO/DEBUG after boot,
@@ -1926,7 +2003,8 @@ class SpeculativeDispatcher:
             logger.warning(
                 "local expert /chat HTTP returned %s", resp.status_code)
         except Exception as e:
-            logger.debug("local expert HTTP dispatch failed: %s", e)
+            logger.warning("local expert HTTP dispatch failed, no expert "
+                           "answer for this turn: %s", e)
         return ''
 
     @staticmethod
@@ -2074,7 +2152,8 @@ class SpeculativeDispatcher:
 
     def _deliver_expert_response(self, user_id: str, prompt_id: str,
                                   speculation_id: str, response: str):
-        """Dual-channel async delivery: Crossbar chat topic + TTS pupit topic.
+        """Async delivery: Crossbar chat topic (SSE), TTS pupit topic, and --
+        when the turn came from a messaging channel -- that channel's chat.
 
         Worker-thread safe — uses ``core.safe_hartos_attr`` to read
         hart_intelligence symbols without triggering Python's per-module
@@ -2145,6 +2224,22 @@ class SpeculativeDispatcher:
                 )
         except Exception as e:
             logger.debug(f"Expert TTS publish failed: spec={speculation_id} err={e}")
+
+        # 3. The originating messaging channel (Discord/Slack/...).  Legs 1-2
+        #    are UI-only; integrations/channels/ subscribes to neither, so a
+        #    channel user saw only the draft standby and never the expert's
+        #    answer.  channel_context was captured on the request thread in
+        #    _schedule_expert_background.
+        try:
+            with self._lock:
+                _cc = self._active.get(speculation_id, {}).get('channel_context')
+            if _cc and _cc.get('channel') and _cc.get('chat_id'):
+                from integrations.channels.response.router import get_response_router
+                get_response_router().deliver_to_chat(
+                    _cc['channel'], _cc['chat_id'], response)
+        except Exception as e:
+            logger.warning("Expert channel delivery failed: spec=%s err=%s",
+                           speculation_id, e)
 
         logger.info(f"Expert enhancement delivered: spec={speculation_id}, "
                      f"user={user_id}")
