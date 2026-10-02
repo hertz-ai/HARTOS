@@ -810,18 +810,21 @@ class ComputeMeshService:
         except Exception:
             return False
 
-    def _route_infer(self, body: bytes):
+    def serve_infer(self, data: dict):
+        """Run one peer's inference request on this node: ``(status, body)``.
+
+        The ONE serving path behind both transports: HTTP ``/mesh/infer``
+        (``_route_infer``) and the PeerLink ``compute`` channel
+        (``handle_peerlink_compute``), so the consent gate and the credit
+        cannot differ between them.
+        """
         # compute_contribute gate (opt-in, fail-closed): never run a PEER's inference
         # on this device without the owner's explicit consent.
         if not self._compute_contribute_consented():
-            return self._json_response(
-                {'error': 'compute_contribute consent not granted — this device does '
-                          'not serve hive compute (opt-in required)',
-                 'code': 'consent_required'}, 403)
-        try:
-            data = json.loads(body.decode('utf-8')) if body else {}
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return self._json_response({'error': 'Invalid JSON'}, 400)
+            return 403, {
+                'error': 'compute_contribute consent not granted — this device does '
+                         'not serve hive compute (opt-in required)',
+                'code': 'consent_required'}
         model_type = data.get('model_type', 'llm')
         prompt = data.get('prompt', '')
         max_tokens = _mesh_max_tokens(data.get('options'))
@@ -839,12 +842,33 @@ class ComputeMeshService:
                 result = resp.json()
                 result['served_by'] = self._device_id
                 self._credit_served(data, prompt, max_tokens, result)
-                return self._json_response(result)
-            return self._json_response(
-                {'error': f'Local inference failed: {resp.status_code}'}, 502)
+                return 200, result
+            return 502, {'error': f'Local inference failed: {resp.status_code}'}
         except Exception as e:
-            return self._json_response(
-                {'error': f'Local inference error: {str(e)}'}, 502)
+            return 502, {'error': f'Local inference error: {str(e)}'}
+
+    def _route_infer(self, body: bytes):
+        try:
+            data = json.loads(body.decode('utf-8')) if body else {}
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            # consent first, as before: an unconsented node says so before it
+            # says anything about the body
+            if not self._compute_contribute_consented():
+                return self._json_response(self.serve_infer({})[1], 403)
+            return self._json_response({'error': 'Invalid JSON'}, 400)
+        status, result = self.serve_infer(data)
+        return self._json_response(result, status)
+
+    def handle_peerlink_compute(self, channel: str, data: Any, peer_id: str):
+        """PeerLink ``compute`` handler (3-arg form the receive loop calls).
+
+        The returned dict goes back to the asking peer as the reply, so a node
+        behind a NAT, which the peer cannot dial over HTTP, still serves.  Same
+        gate and credit as ``/mesh/infer`` through ``serve_infer``.
+        """
+        if not isinstance(data, dict):
+            return {'error': 'Invalid payload'}
+        return self.serve_infer(data)[1]
 
     @staticmethod
     def _credit_served(data: dict, prompt: str, max_tokens: int,
@@ -942,6 +966,14 @@ class ComputeMeshService:
             self._running = True
             if not hasattr(self, '_loaded_models_cache'):
                 self._loaded_models_cache = []
+        # Serve inference asked of us over PeerLink too (the HTTP route is
+        # unreachable behind a NAT).  Registered once, with the loops.
+        try:
+            from core.peer_link.link_manager import get_link_manager
+            get_link_manager().register_channel_handler(
+                'compute', self.handle_peerlink_compute)
+        except Exception as e:
+            logger.debug("compute PeerLink handler not registered: %s", e)
         # Prime the loaded-models cache OFF the hot path (see _get_local_capabilities).
         threading.Thread(target=self._refresh_loaded_models, daemon=True).start()
 

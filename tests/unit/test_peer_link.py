@@ -1904,3 +1904,99 @@ class TestVerifySameUserProof(unittest.TestCase):
         with patch.dict(os.environ, {'HEVOLVE_USER_ID': 'user1'}):
             out = self.link._verify_same_user_proof('garbage', 'garbagekey')
         self.assertFalse(out)
+
+
+# ── Request/reply over a real link pair ──────────────────────────────
+
+import queue as _queue
+
+
+class _PairedWS:
+    """One end of an in-memory socket pair: send() lands in the other end's
+    inbox, recv() times out the way an idle websocket does."""
+
+    def __init__(self, inbox, outbox):
+        self._inbox, self._outbox = inbox, outbox
+
+    def send(self, data):
+        self._outbox.put(data)
+
+    def recv(self, timeout=None):
+        try:
+            return self._inbox.get(timeout=min(timeout or 0.1, 0.1))
+        except _queue.Empty:
+            raise TimeoutError()
+
+
+def _linked_pair():
+    """Two real PeerLink objects wired to each other, receive loops running."""
+    a_in, b_in = _queue.Queue(), _queue.Queue()
+    a = PeerLink('peer-b', 'b:1', TrustLevel.SAME_USER)
+    b = PeerLink('peer-a', 'a:1', TrustLevel.SAME_USER)
+    a._ws, b._ws = _PairedWS(a_in, b_in), _PairedWS(b_in, a_in)
+    a._state = b._state = LinkState.CONNECTED
+    for link in (a, b):
+        threading.Thread(target=link._receive_loop, daemon=True).start()
+    return a, b
+
+
+def _stop(*links):
+    for link in links:
+        link._state = LinkState.DISCONNECTED
+
+
+class TestRequestReply(unittest.TestCase):
+    """send(wait_response=True) returns what the far side's handler returned.
+
+    Before this, the receive loop ignored a handler's return value and never
+    sent a frame carrying 're', so a waiting send always timed out (the PeerLink
+    'compute' offload waited its whole 120 s, then fell back to HTTP).
+    """
+
+    def test_a_handler_return_value_comes_back_as_the_reply(self):
+        a, b = _linked_pair()
+        try:
+            b.on_message('compute', lambda ch, data, peer: {'echo': data['q'], 'from': peer})
+            reply = a.send('compute', {'q': 'hi'}, wait_response=True, timeout=3)
+            self.assertEqual(reply, {'echo': 'hi', 'from': 'peer-a'})
+        finally:
+            _stop(a, b)
+
+    def test_a_request_to_a_channel_with_no_handler_gets_a_prompt_error(self):
+        # The sender must not wait out its whole timeout (compute offload used
+        # to wait 120 s, then fall back to HTTP) for a frame nobody handles.
+        a, b = _linked_pair()
+        try:
+            t0 = time.monotonic()
+            reply = a.send('compute', {'q': 'hi'}, wait_response=True, timeout=5)
+            self.assertEqual(reply, {'error': 'no handler'})
+            self.assertLess(time.monotonic() - t0, 2)
+        finally:
+            _stop(a, b)
+
+    def test_a_handler_return_is_not_sent_when_nobody_asked(self):
+        a, b = _linked_pair()
+        try:
+            seen = []
+            a.on_message('events', lambda ch, data, peer: seen.append(data))
+            b.on_message('events', lambda ch, data, peer: {'noise': True})
+            self.assertIsNone(a.send('events', {'x': 1}))
+            time.sleep(0.5)
+            self.assertEqual(seen, [])        # no unsolicited frame came back
+        finally:
+            _stop(a, b)
+
+    def test_every_channel_handler_still_fires_with_its_own_arguments(self):
+        a, b = _linked_pair()
+        try:
+            got = {}
+            for name in ('events', 'learning', 'hivemind', 'compute', 'dispatch'):
+                b.on_message(name, lambda ch, data, peer, n=name: got.setdefault(n, (ch, data, peer)))
+                a.send(name, {'n': name})
+            deadline = time.monotonic() + 3
+            while len(got) < 5 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            for name in ('events', 'learning', 'hivemind', 'compute', 'dispatch'):
+                self.assertEqual(got.get(name), (name, {'n': name}, 'peer-a'))
+        finally:
+            _stop(a, b)

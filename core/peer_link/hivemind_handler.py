@@ -183,6 +183,18 @@ def _handle_deliver(data: dict, sender_peer_id: str) -> Optional[dict]:
         return {'type': 'ack', 'delivered': False, 'reason': str(e)}
 
 
+def _link_handler(channel: str, data: Any, sender_peer_id: str) -> Optional[dict]:
+    """The form PeerLink calls a handler in: ``(channel, data, peer_id)``.
+
+    ``handle_hivemind_message`` keeps the ``ChannelDispatcher`` form
+    ``(data, sender_peer_id)``.  Registering that one on the link raised a
+    TypeError on every frame (swallowed at debug level), so no peer's hivemind
+    frame was ever answered.  The returned dict is now sent back to a peer
+    waiting on it (PeerLink.send(wait_response=True)).
+    """
+    return handle_hivemind_message(data, sender_peer_id)
+
+
 def bootstrap_hivemind_handler() -> bool:
     """Register the HiveMind handler on the channel dispatcher and on the
     PeerLinkManager (so future links pick it up).
@@ -205,7 +217,7 @@ def bootstrap_hivemind_handler() -> bool:
 
     try:
         mgr = get_link_manager()
-        mgr.register_channel_handler('hivemind', handle_hivemind_message)
+        mgr.register_channel_handler('hivemind', _link_handler)
     except Exception as e:
         # dispatcher registration is the source of truth; manager is a
         # convenience for per-link delivery.  Failure here is non-fatal.

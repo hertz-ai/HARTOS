@@ -79,3 +79,43 @@ def test_active_consent_query_excludes_revoked_rows():
     assert 'revoked_at' in criteria, (
         "active-consent query must filter revoked_at IS NULL, or a revoked "
         f"grant keeps authorising peer compute; got: {criteria}")
+
+
+# ── The same gate over PeerLink (a node behind a NAT is served this way) ──
+
+def _serve_over_peerlink(consented):
+    """A requester link asks a serving link; the serving side runs the mesh's
+    PeerLink handler.  Real PeerLink objects on an in-memory socket pair."""
+    from tests.unit.test_peer_link import _linked_pair, _stop
+    mesh = ComputeMeshService()
+    asker, server = _linked_pair()
+    server.on_message('compute', mesh.handle_peerlink_compute)
+    try:
+        with mock.patch.object(mesh, '_compute_contribute_consented',
+                               return_value=consented), \
+             mock.patch('core.http_pool.pooled_post') as pp:
+            pp.return_value = mock.Mock(status_code=200,
+                                        json=lambda: {'response': 'ok', 'model': 'm'})
+            return asker.send('compute', {'prompt': 'hi', 'model_type': 'llm'},
+                              wait_response=True, timeout=5)
+    finally:
+        _stop(asker, server)
+
+
+def test_peerlink_compute_is_refused_without_consent():
+    reply = _serve_over_peerlink(consented=False)
+    assert reply is not None and reply.get('code') == 'consent_required'
+
+
+def test_peerlink_compute_is_served_when_consent_granted():
+    reply = _serve_over_peerlink(consented=True)
+    assert reply is not None and reply.get('response') == 'ok'
+    assert 'error' not in reply and 'served_by' in reply
+
+
+def test_peerlink_and_http_serve_through_one_function():
+    mesh = ComputeMeshService()
+    with mock.patch.object(mesh, 'serve_infer', return_value=(200, {'response': 'x'})) as s:
+        assert mesh.handle_peerlink_compute('compute', {'prompt': 'hi'}, 'p') == {'response': 'x'}
+        mesh._route_infer(b'{"prompt":"hi"}')
+    assert s.call_count == 2

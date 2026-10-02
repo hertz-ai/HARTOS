@@ -417,14 +417,18 @@ class PeerLink:
             return False
 
     def send(self, channel: str, data: dict, wait_response: bool = False,
-             timeout: float = 30.0) -> Optional[dict]:
+             timeout: float = 30.0, reply_to: str = '') -> Optional[dict]:
         """Send JSON message on a channel.
 
         Args:
             channel: Channel name (gossip, federation, compute, etc.)
             data: JSON-serializable dict
-            wait_response: If True, block until response received
+            wait_response: If True, block until response received.  The frame
+                is flagged ('rq') so the far side's handler return value comes
+                back as the reply; without the flag nothing is sent back.
             timeout: Max wait time for response
+            reply_to: the id of the request this frame answers ('re').  Set
+                only by the receive loop when it returns a handler's result.
 
         Returns:
             Response dict if wait_response=True, else None
@@ -433,11 +437,16 @@ class PeerLink:
             return None
 
         msg_id = uuid.uuid4().hex[:12]
-        frame = json.dumps({
+        envelope = {
             'ch': channel,
             'id': msg_id,
             'd': data,
-        }, separators=(',', ':'))
+        }
+        if wait_response:
+            envelope['rq'] = 1
+        if reply_to:
+            envelope['re'] = reply_to
+        frame = json.dumps(envelope, separators=(',', ':'))
 
         frame_bytes = frame.encode('utf-8')
 
@@ -1079,11 +1088,26 @@ class PeerLink:
                     if not self._device_may_send(channel):
                         continue
                     handlers = self._message_handlers.get(channel, [])
+                    reply = None
                     for handler in handlers:
                         try:
-                            handler(channel, data, self.peer_id)
+                            result = handler(channel, data, self.peer_id)
+                            if reply is None and isinstance(result, dict):
+                                reply = result
                         except Exception as e:
                             logger.debug(f"Handler error on {channel}: {e}")
+                    # The sender is waiting (send(wait_response=True) flags the
+                    # frame): the first handler's dict is the answer.  A frame
+                    # nobody is waiting on gets nothing back, whatever its
+                    # handler returned.
+                    if msg.get('rq') and msg_id:
+                        try:
+                            self.send(channel,
+                                      reply if reply is not None
+                                      else {'error': 'no handler'},
+                                      reply_to=msg_id)
+                        except Exception as e:
+                            logger.debug(f"Reply on {channel} failed: {e}")
                     continue
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     pass
