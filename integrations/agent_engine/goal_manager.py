@@ -2266,7 +2266,8 @@ _P2P_PREAMBLE = (
 
 _P2P_TOOLS = (
     "TOOLS (use existing — DO NOT create new endpoints):\n"
-    "- request_payment / authorize_payment / process_payment (AP2 protocol)\n"
+    "- request_payment / authorize_payment / process_payment (AP2 protocol;\n"
+    "  authorize_payment only ASKS the person, who approves on their screen)\n"
     "- web_search (find providers, compare prices, verify businesses)\n"
     "- fetch_news_feeds / get_trending_news (market intelligence)\n"
     "- save_data_in_memory / get_data_from_memory (state persistence)\n"
@@ -2278,13 +2279,13 @@ _P2P_TOOLS = (
     "  settlement, wallet, SOS, chat, driver/rider auth, 22 vehicle types.\n"
     "  API: /api/rides, /api/captains, /api/payments, /api/map, /api/surge,\n"
     "  /api/settlements, /api/wallet, /api/chat, /api/voice, /api/promos\n"
-    "- McGDroid/McGroce (grocery backend): store discovery by GPS/zipcode,\n"
-    "  product search + autocomplete, voice ordering (audio upload/download),\n"
-    "  customer auth, WAMP/Autobahn real-time store events.\n"
-    "  API: /api/v1/zipcodesearch/stores/{zip|lat/lng},\n"
-    "  /api/v1/search/{q}, /api/v1/search/suggest/{q},\n"
-    "  /api/v1/audioorder/upload, /api/v1/cart/voiceorders,\n"
-    "  /api/v1/customer/username, /api/v1/customer/register\n"
+    # Deliberately does NOT spell the grocery backend's name: this block is
+    # in EVERY P2P prompt, and that name is the 'commerce' goal-tag keyword
+    # (marketing_tools.detect_goal_tags), so naming it here attached the
+    # McGroce cart/checkout tools to rideshare, bills, tutoring... agents.
+    # The grocery prompt carries the backend's API itself.
+    "- McGDroid (grocery backend): store discovery, product search, cart,\n"
+    "  AP2 checkout, voice ordering -- used by the P2P grocery agent.\n"
     "- Pupit (POS backend): card/NFC payment processing, receipts, Firebase sync\n"
     "- Enlight21 (social learning): E2E encrypted chat, course structure, quizzes\n"
     "- Hevolve React Native: maps, geolocation, contacts, video — mobile frontend\n"
@@ -2308,7 +2309,8 @@ def _build_p2p_marketplace_prompt(goal_dict, product_dict=None):
         "   and memory lookups. Rank by: proximity, rating, price, freshness.\n"
         "3. NEGOTIATION: Facilitate P2P negotiation via channel messages.\n"
         "   Suggest fair prices based on market data (web_search comparable items).\n"
-        "4. PAYMENT: Use request_payment → authorize_payment → process_payment.\n"
+        "4. PAYMENT: Use request_payment → authorize_payment (asks the buyer;\n"
+        "   you cannot approve) → process_payment once they have approved.\n"
         "   ALWAYS escrow. Release on buyer confirmation.\n"
         "5. FULFILLMENT: For physical goods, coordinate delivery via\n"
         "   logistics APIs (Dunzo, Porter, local couriers). Compare prices.\n"
@@ -2413,7 +2415,7 @@ def _build_p2p_grocery_prompt(goal_dict, product_dict=None):
         "    lat/lng, deliveryAvailable, openHour/closeHour, storeType,\n"
         "    distanceFromMe, deliveryRadius, logoUrl, active)\n"
         "- Product search:\n"
-        f"  GET {mcgroce_url}/search/{{query}} — full search\n"
+        f"  GET {mcgroce_url}/catalog/search?q={{query}} — full search\n"
         f"  GET {mcgroce_url}/search/suggest/{{query}} — autocomplete\n"
         "  Returns: ProductSearchDTO(id, name, url, manu)\n"
         "- Voice ordering:\n"
@@ -2433,7 +2435,7 @@ def _build_p2p_grocery_prompt(goal_dict, product_dict=None):
         "YOUR JOB:\n"
         "1. ORDER: Buyer posts grocery list via any channel (text or voice).\n"
         "   Parse items, quantities, preferences (brand, organic, etc.).\n"
-        "   If McGroce available: search products via /search/{query}.\n"
+        "   If McGroce available: commerce_search_catalog(q) (GET /catalog/search?q=).\n"
         "   If voice: upload audio via /audioorder/upload for processing.\n"
         "   Else: web_search to find prices at nearby stores.\n"
         "2. STORE MATCHING: Use GPS/zipcode to find nearby stores.\n"
@@ -2448,7 +2450,9 @@ def _build_p2p_grocery_prompt(goal_dict, product_dict=None):
         "   Subscribe to WAMP topic 'chat{storeId}' for live inventory.\n"
         "5. DELIVERY: Shopper delivers. Buyer confirms receipt.\n"
         "6. PAYMENT: Escrow via AP2. Item cost + delivery fee.\n"
-        "   Shopper gets item reimbursement + 90% of delivery fee.\n\n"
+        "   Shopper gets item reimbursement + 90% of delivery fee.\n"
+        "   McGroce cart: commerce_prepare_checkout shows the buyer an approval\n"
+        "   card; the buyer's approval pays and places the order.\n\n"
         + _P2P_PREAMBLE + _P2P_TOOLS +
         "FRESHNESS GUARANTEE:\n"
         "- Produce photos required before delivery\n"
@@ -2762,7 +2766,7 @@ register_goal_type('p2p_marketplace', _build_p2p_marketplace_prompt,
 register_goal_type('p2p_rideshare', _build_p2p_rideshare_prompt,
                     tool_tags=['web_search'])
 register_goal_type('p2p_grocery', _build_p2p_grocery_prompt,
-                    tool_tags=['web_search'])
+                    tool_tags=['web_search', 'commerce'])
 register_goal_type('p2p_food', _build_p2p_food_delivery_prompt,
                     tool_tags=['web_search'])
 register_goal_type('p2p_freelance', _build_p2p_freelance_prompt,
@@ -2781,6 +2785,69 @@ register_goal_type('p2p_health', _build_p2p_health_prompt,
                     tool_tags=['web_search'])
 register_goal_type('p2p_logistics', _build_p2p_logistics_prompt,
                     tool_tags=['web_search'])
+
+
+# ─── McGroce agentic commerce (the McGroce SPA's floating agent) ───
+#
+# The SPA and the Nunba embed talk to POST /chat with prompt_id
+# 'mcgroce_shopper' / 'mcgroce_merchant' and a message that starts with
+# "[mcgroce_ctx]{json}" (page, cart, store).  Both prompts name McGroce, so
+# detect_goal_tags gives them the 'commerce' tag and create/reuse attach
+# integrations/commerce/commerce_tools; the merchant prompt also names
+# marketing campaigns, which attaches the existing (consent-gated)
+# marketing tools -- no second campaign tool.
+
+_MCGROCE_COMMON = (
+    "CONTEXT: a message may start with [mcgroce_ctx]{json} -- the page the\n"
+    "person is on, their cart and selected store.  Use it; never echo it.\n\n"
+    "RULES:\n"
+    "- Prices are in rupees (₹).  Say totals exactly as the tools return them.\n"
+    "- Never ask for card, UPI or bank details.  Payment happens only on the\n"
+    "  approval card the person taps themselves.\n"
+    "- Never say an order is placed, or a store/product created, until the\n"
+    "  tool that does it returns success.\n"
+    "- Keep replies short and friendly; the cards on screen carry the detail.\n"
+)
+
+
+def _build_mcgroce_shopper_prompt(goal_dict, product_dict=None):
+    """McGroce shopper: find stores, search, cart, human-approved checkout."""
+    return (
+        "You are the McGroce shopping assistant -- a grocery helper for a\n"
+        "shopper on McGroce.\n\n"
+        "TOOLS: commerce_find_stores, commerce_search_catalog, commerce_suggest,\n"
+        "commerce_product_detail, commerce_cart_view, commerce_cart_add,\n"
+        "commerce_cart_update, commerce_cart_remove, commerce_apply_promo,\n"
+        "commerce_prepare_checkout, commerce_checkout, commerce_order_status.\n\n"
+        "CHECKOUT: call commerce_prepare_checkout (pass cap if the shopper named\n"
+        "a budget).  It shows an Approve card and charges nothing.  You can\n"
+        "NEVER approve.  When the shopper approves, the payment is taken and the\n"
+        "order placed for them; tell them it is waiting on them, then stop.\n"
+        "Call commerce_checkout(mandate_id) only to retry one that did not go\n"
+        "through.  If the cart changed since approval, prepare again.\n\n"
+        + _MCGROCE_COMMON
+    )
+
+
+def _build_mcgroce_merchant_prompt(goal_dict, product_dict=None):
+    """McGroce merchant: store onboarding, SKUs, marketing campaigns."""
+    return (
+        "You are the McGroce merchant assistant -- you help a shop owner get\n"
+        "their store on McGroce, add products, and run marketing campaigns.\n\n"
+        "TOOLS: commerce_onboard_merchant, commerce_create_sku (both file a\n"
+        "draft the owner approves on screen; nothing is created before that),\n"
+        "and the marketing campaign tools for store promotions.\n\n"
+        "ONBOARDING: collect store name, address, 6-digit pincode, phone and\n"
+        "email one question at a time, then call commerce_onboard_merchant.\n"
+        "The owner gets a link to set their password -- never a password.\n\n"
+        + _MCGROCE_COMMON
+    )
+
+
+register_goal_type('mcgroce_shopper', _build_mcgroce_shopper_prompt,
+                   tool_tags=['commerce'])
+register_goal_type('mcgroce_merchant', _build_mcgroce_merchant_prompt,
+                   tool_tags=['commerce', 'marketing'])
 
 
 # ─── Hive Acceleration Goal Types ───

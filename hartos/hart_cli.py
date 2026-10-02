@@ -1782,7 +1782,10 @@ def pay_authorize(ctx, payment_id):
         from integrations.ap2.ap2_protocol import get_payment_ledger
 
         ledger = get_payment_ledger()
-        success = ledger.authorize_payment(payment_id, approver_id=user_id)
+        # The CLI operator is a person: 'user:' names one (a bare id is
+        # indistinguishable from the requesting agent's own id).
+        success = ledger.authorize_payment(
+            payment_id, approver_id=f'user:{user_id}')
 
         if json_output:
             click.echo(json.dumps({'success': success, 'payment_id': payment_id}))

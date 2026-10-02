@@ -2962,7 +2962,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         current_app.logger.info("Initializing AP2 (Agent Protocol 2) - Agentic Commerce...")
 
         # Get AP2 payment tools for this agent
-        ap2_tools = get_ap2_tools_for_autogen('assistant')
+        ap2_tools = get_ap2_tools_for_autogen('assistant', user_id=user_id)
 
         # Register payment tools — wrap with @log_tool_execution so payment
         # operations fire UI status emits + structured-error envelopes
@@ -3037,6 +3037,12 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             from integrations.agent_engine.news_tools import register_news_tools
             register_news_tools(helper, assistant, user_id, executor=executor)
             current_app.logger.info("News tools loaded (Tier 2) for reuse agent")
+        if 'commerce' in goal_tags:
+            # Parity with create_recipe.py: a McGroce recipe authored under the
+            # 'commerce' tag must replay with its cart / checkout tools.
+            from integrations.commerce.commerce_tools import register_commerce_tools
+            register_commerce_tools(helper, assistant, user_id, executor=executor)
+            current_app.logger.info("Commerce tools loaded (Tier 2) for reuse agent")
     except Exception as e:
         # Same observability promotion as create_recipe.py — a failure
         # here strips the agent of goal-specific tools, agent talks
