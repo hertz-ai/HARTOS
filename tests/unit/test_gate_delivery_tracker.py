@@ -66,6 +66,17 @@ def _run_one_tick(monkeypatch, *, yield_value, emit_mock, fcm_mock):
     return tracker, expired_key
 
 
+def test_the_delivery_tracker_never_relays_through_central(monkeypatch):
+    """The expiry sweep's push is the direct send only: relaying it would
+    publish a second pending confirmation (central already tracks
+    central-originated chats; node-originated ones are not armed there)."""
+    fcm_mock = MagicMock()
+    _run_one_tick(monkeypatch, yield_value=False, emit_mock=MagicMock(),
+                  fcm_mock=fcm_mock)
+    fcm_mock.assert_called_once()
+    assert fcm_mock.call_args.kwargs.get('relay') is not True
+
+
 def test_cleanup_loop_skips_sweep_when_user_active(monkeypatch):
     """Gate True → the TTL-expiry sweep (heavy work) is NOT performed this tick."""
     emit_mock = MagicMock()

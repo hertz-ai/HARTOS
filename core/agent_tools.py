@@ -365,6 +365,10 @@ def _tell_the_person_elsewhere(user_id, prompt_id, game_id, state, record):
                 'url': str(record.get('url') or ''),
                 'topic_reply': f'com.hertzai.pupit.{user_id}',
             },
+            # An offer can wait the 30-40 s central's relay takes; a node with
+            # no FCM credential (every consumer install) reaches the phone
+            # through central instead of not at all.
+            relay=True,
         )
     except Exception as e:
         tool_logger.debug(f'game sound: no push to the phone ({e})')

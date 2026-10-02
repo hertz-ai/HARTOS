@@ -246,10 +246,13 @@ class DeviceRoutingService:
                     'action': str(action),
                     'agent_id': str(agent_id),
                 },
+                # No FCM credential on this node (every consumer install):
+                # central's relay sends it, so the overlay can still pop.
+                relay=True,
             )
         except Exception as exc:  # a push failure must never break the record
-            logger.debug('consent_prompt FCM push failed (%s) — notification + '
-                         'fleet command remain', exc)
+            logger.warning('consent_prompt FCM push failed (%s) — notification + '
+                           'fleet command remain', exc)
 
         # Find primary device (phone > desktop > tablet > any)
         devices = db.query(DeviceBinding).filter_by(
