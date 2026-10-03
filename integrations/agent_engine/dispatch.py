@@ -82,7 +82,8 @@ def _local_dispatch_base_url() -> str:
 
 
 def _internal_auth_headers(user_id: str = 'system_daemon',
-                            username: str = None) -> Optional[Dict[str, str]]:
+                            username: str = None,
+                            role: str = 'admin') -> Optional[Dict[str, str]]:
     """Build auth headers for internal /chat dispatch.
 
     Why: on central/regional tiers, security/middleware.py Gate 2 rejects
@@ -127,10 +128,13 @@ def _internal_auth_headers(user_id: str = 'system_daemon',
             headers['X-API-Key'] = api_key
         else:
             from integrations.social.auth import generate_jwt as _mint_jwt
+            # 'admin' for the node's own autonomous callers (the default);
+            # a relay acting for a person passes role='user' -- a channel
+            # sender is a stranger until bound, never an administrator.
             jwt = _mint_jwt(
                 user_id=user_id,
                 username=username or user_id,
-                role='admin',
+                role=role,
             )
             if jwt:
                 headers['Authorization'] = f'Bearer {jwt}'

@@ -72,6 +72,18 @@ def test_inbound_payload_carries_both_prompt_and_text():
     assert p['text'] == 'drive me', "bundled Nunba chat_route reads 'text'"
 
 
+def test_channel_sender_is_never_minted_an_admin_token():
+    """A relay speaks for a stranger on a channel: its /chat token is a user's."""
+    fi = _bare_integration()
+    with patch('integrations.agent_engine.dispatch._internal_auth_headers',
+               return_value=None) as mint, \
+            patch('integrations.channels.flask_integration.pooled_post',
+                  lambda *a, **k: Mock(status_code=200,
+                                       json=lambda: {'response': 'ok'})):
+        fi._handle_message(_msg())
+    assert mint.call_args.kwargs['role'] == 'user'
+
+
 def test_inbound_reads_reply_from_text_when_no_response_key():
     """Bundled chat_route returns the reply under 'text' — the bridge must use
     it, not fall back to the canned 'I processed your request.'"""

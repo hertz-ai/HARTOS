@@ -231,7 +231,8 @@ class FlaskChannelIntegration:
             try:
                 from integrations.agent_engine.dispatch import (
                     _internal_auth_headers)
-                _auth_headers = _internal_auth_headers(user_id=str(user_id))
+                _auth_headers = _internal_auth_headers(user_id=str(user_id),
+                                                       role='user')
             except Exception as _auth_err:  # never block a message on this
                 logger.warning(
                     "internal auth header unavailable, calling /chat "
