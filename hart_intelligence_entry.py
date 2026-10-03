@@ -9007,9 +9007,22 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         # via **payload when known.
         try:
             from integrations.social import chat_messages as _cm
-            _dev = payload.get('device_id')
+            # Order of precedence for the turn's fields: explicit payload
+            # kwarg -> /chat request body -> default.  device_id and
+            # prompt_id are passed by no caller, so the body is what names
+            # the device a turn came from (a client drops its own turns by
+            # it) and the agent it was for.
+            _req_body = {}
+            try:
+                from flask import has_request_context
+                from flask import request as _flask_req
+                if has_request_context():
+                    _req_body = _flask_req.get_json(silent=True) or {}
+            except Exception:
+                _req_body = {}
+            _dev = payload.get('device_id') or _req_body.get('device_id')
             _agent = payload.get('agent_id')
-            _prompt_id = payload.get('prompt_id')
+            _prompt_id = payload.get('prompt_id') or _req_body.get('prompt_id')
             _lang_hint = (payload.get('preferred_lang')
                           or payload.get('language') or _lang)
             _atts = payload.get('attachments')
@@ -9019,20 +9032,8 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
             # land in a separate logical thread from regular chat
             # without forking the persist pipeline.  Default 'chat'
             # preserves existing behaviour for every other caller.
-            # Order of precedence: explicit payload kwarg → request
-            # body → 'chat' default.
-            _chan_type = payload.get('channel_type')
-            if not _chan_type:
-                try:
-                    from flask import has_request_context
-                    from flask import request as _flask_req
-                    if has_request_context():
-                        _body = _flask_req.get_json(silent=True) or {}
-                        _chan_type = _body.get('channel_type') or 'chat'
-                    else:
-                        _chan_type = 'chat'
-                except Exception:
-                    _chan_type = 'chat'
+            _chan_type = (payload.get('channel_type')
+                          or _req_body.get('channel_type') or 'chat')
             if _prompt:
                 _cm.persist_and_publish_async(
                     str(user_id), 'user', _prompt,
