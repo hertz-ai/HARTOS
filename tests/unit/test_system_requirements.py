@@ -128,7 +128,7 @@ class TestResolveFeatures:
         assert 'agent_engine' in enabled
         assert 'coding_agent' in enabled
         assert 'tts' in enabled
-        assert 'whisper' in enabled
+        assert 'whisper' not in enabled      # no reader; the entry was removed
         assert 'video_gen' in disabled
         assert 'media_agent' in disabled
         assert 'regional_host' in disabled
