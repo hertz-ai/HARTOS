@@ -246,9 +246,6 @@ class DeviceRoutingService:
                     'action': str(action),
                     'agent_id': str(agent_id),
                 },
-                # No FCM credential on this node (every consumer install):
-                # central's relay sends it, so the overlay can still pop.
-                relay=True,
             )
         except Exception as exc:  # a push failure must never break the record
             logger.warning('consent_prompt FCM push failed (%s) — notification + '

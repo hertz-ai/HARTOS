@@ -44,14 +44,14 @@ def test_request_consent_fires_consent_prompt_fcm_when_no_device_bound():
     assert MockNS.create.called                  # persistent notice still made
 
 
-def test_the_consent_prompt_opts_in_to_the_central_relay():
+def test_the_consent_prompt_takes_the_central_relay_by_default():
     # No FCM credential on a consumer install: without the relay the overlay
     # never pops for a phone that is not looking at the app.
     db = _db_with_devices([])
     with patch.object(drs, 'NotificationService'),             patch('core.fcm_sync.send_fcm_push') as mock_send:
         DeviceRoutingService.request_consent(
             db, 'u1', 'public_exposure', 'agent1', description='x')
-    assert mock_send.call_args.kwargs.get('relay') is True
+    assert mock_send.call_args.kwargs.get('relay', True) is True
 
 
 def test_request_consent_threads_same_request_id_into_fleet_command():

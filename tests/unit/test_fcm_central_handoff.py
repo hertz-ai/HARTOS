@@ -3,8 +3,9 @@
 A consumer install has no Firebase service account (and must not).  Central's
 confirmation.py holds one and already pushes unacknowledged pending messages;
 hand_push_to_central publishes the push as such a pending message, carrying its
-own title and data so the phone gets what was meant to be sent.  Two callers
-opt in (``relay=True``): the game-sound offer and the consent prompt.
+own title and data so the phone gets what was meant to be sent.  The relay is
+the default for every push (nobody opts in to being reachable); a push takes
+the direct send or the relay, never both.
 """
 from unittest.mock import MagicMock, patch
 
@@ -133,7 +134,7 @@ def test_a_consent_prompt_without_an_id_still_gets_a_unique_one():
     assert msg['request_id'].startswith('push-')
 
 
-# ── send_fcm_push: relay is opt-in ───────────────────────────────────
+# ── send_fcm_push: relay by default, one path per push ───────────────────────────────────
 
 def test_send_fcm_push_hands_off_when_it_has_no_credential_and_relay_is_on():
     with patch.object(fcm_sync, '_fcm_credential', return_value=(None, None)), \
@@ -143,11 +144,39 @@ def test_send_fcm_push_hands_off_when_it_has_no_credential_and_relay_is_on():
     h.assert_called_once_with('9003054371', 't', 'b', {'k': 'v'})
 
 
-def test_relay_is_opt_in_so_nothing_else_starts_relaying_by_accident():
-    with patch.object(fcm_sync, '_fcm_credential', return_value=(None, None)), \
-            patch.object(fcm_sync, 'hand_push_to_central') as h:
-        assert fcm_sync.send_fcm_push('9003054371', 't', 'b') is False
+def test_relay_is_the_default_so_a_caller_that_says_nothing_still_reaches_the_phone():
+    with patch.object(fcm_sync, '_fcm_credential', return_value=(None, None)),             patch.object(fcm_sync, 'hand_push_to_central', return_value=True) as h:
+        assert fcm_sync.send_fcm_push('9003054371', 't', 'b') is True
+    h.assert_called_once()
+
+
+def test_relay_false_keeps_a_push_on_the_node():
+    with patch.object(fcm_sync, '_fcm_credential', return_value=(None, None)),             patch.object(fcm_sync, 'hand_push_to_central') as h:
+        assert fcm_sync.send_fcm_push('9003054371', 't', 'b', relay=False) is False
     h.assert_not_called()
+
+
+def test_a_credential_with_no_token_falls_back_to_the_relay():
+    with patch.object(fcm_sync, '_fcm_credential', return_value=('tok', 'proj')),             patch.object(fcm_sync, 'get_local_fcm_token', return_value=None),             patch.object(fcm_sync, 'sync_fcm_token', return_value=None),             patch.object(fcm_sync, '_post_fcm_message') as post,             patch.object(fcm_sync, 'hand_push_to_central', return_value=True) as h:
+        assert fcm_sync.send_fcm_push('9003054371', 't', 'b') is True
+    post.assert_not_called()
+    h.assert_called_once()
+
+
+def test_a_direct_send_that_fails_falls_back_to_the_relay_once():
+    with patch.object(fcm_sync, '_fcm_credential', return_value=('tok', 'proj')),             patch.object(fcm_sync, 'get_local_fcm_token', return_value='dev'),             patch.object(fcm_sync, '_post_fcm_message', return_value=False) as post,             patch.object(fcm_sync, 'hand_push_to_central', return_value=True) as h:
+        assert fcm_sync.send_fcm_push('9003054371', 't', 'b') is True
+    post.assert_called_once()
+    h.assert_called_once()
+
+
+def test_the_unacknowledged_message_sweep_reaches_the_phone_on_a_consumer_install():
+    with patch.object(fcm_sync, '_fcm_credential', return_value=(None, None)),             patch.object(fcm_sync, 'hand_push_to_central', return_value=True) as h:
+        # exactly the call the sweep makes
+        assert fcm_sync.send_fcm_push(
+            '9003054371', title='HART', body='You have a new notification',
+            data={'topic': 't', 'msg_id': 'm'}) is True
+    h.assert_called_once()
 
 
 def test_send_fcm_push_with_a_credential_still_sends_directly():
@@ -155,7 +184,7 @@ def test_send_fcm_push_with_a_credential_still_sends_directly():
             patch.object(fcm_sync, 'get_local_fcm_token', return_value='dev'), \
             patch.object(fcm_sync, '_post_fcm_message', return_value=True) as post, \
             patch.object(fcm_sync, 'hand_push_to_central') as h:
-        assert fcm_sync.send_fcm_push('9003054371', 't', 'b', relay=True) is True
+        assert fcm_sync.send_fcm_push('9003054371', 't', 'b') is True
     post.assert_called_once()
     h.assert_not_called()                          # no double push
 
@@ -168,3 +197,16 @@ def test_a_consent_prompt_that_could_not_be_pushed_is_logged_loudly(caplog):
         assert fcm_sync.send_fcm_push('9003054371', 't', 'b', data=CONSENT,
                                       relay=True) is False
     assert 'consent prompt' in caplog.text and 'was not queued' in caplog.text
+
+
+def test_a_relayed_push_is_not_tracked_by_the_delivery_tracker_so_it_cannot_loop():
+    from core.peer_link.local_subscribers import DeliveryTracker
+    tracker = DeliveryTracker()
+    relayed = {'request_id': 'push-1', 'topic_name': 'com.hertzai.pupit.9003054371',
+               'confirmation': False, 'push_title': 'HART', 'push_data': {}}
+    tracker.on_confirmation_message('task.confirmation', relayed)
+    assert tracker.get_stats()['pending'] == 0
+    ordinary = {k: v for k, v in relayed.items() if k != 'push_title'}
+    ordinary['request_id'] = 'chat-1'
+    tracker.on_confirmation_message('task.confirmation', ordinary)
+    assert tracker.get_stats()['pending'] == 1     # a real unacked message still tracks

@@ -119,6 +119,12 @@ class DeliveryTracker:
 
         tracking_key = data.get('request_id') or data.get('msg_id', '')
 
+        # A push this node handed to central's relay (core.fcm_sync) rides this
+        # same topic as a pending confirmation, for CENTRAL to push.  Tracking
+        # it here would expire it, push it again through the relay, and loop.
+        if 'push_title' in data:
+            return
+
         if 'confirmation' in data:
             if not data['confirmation']:
                 # confirmation=False → new unconfirmed message, track it
@@ -175,10 +181,12 @@ class DeliveryTracker:
                 # unconfirmed after TTL means the user's device never acked
                 # locally (typically a backgrounded phone), so push it via FCM
                 # using the LOCALLY-cached token (core.fcm_sync) — no crossbar,
-                # no cloud round-trip.  No-op without a registered token / edge
-                # credential, so it is safe on every node; the send stamps the
-                # privacy-tier notice (we left the local tier to reach the
-                # device).  Generic body — the content renders in-app on open.
+                # no cloud round-trip.  A node with no FCM credential or token
+                # hands the push to central's relay instead (send_fcm_push), so
+                # a consumer install reaches the phone too, 30-40 s later; the
+                # send stamps the privacy-tier notice (we left the local tier to
+                # reach the device).  Generic body — the content renders in-app
+                # on open.
                 _uid = info.get('user_id')
                 if _uid:
                     try:

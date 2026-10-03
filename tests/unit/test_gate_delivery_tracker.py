@@ -66,15 +66,14 @@ def _run_one_tick(monkeypatch, *, yield_value, emit_mock, fcm_mock):
     return tracker, expired_key
 
 
-def test_the_delivery_tracker_never_relays_through_central(monkeypatch):
-    """The expiry sweep's push is the direct send only: relaying it would
-    publish a second pending confirmation (central already tracks
-    central-originated chats; node-originated ones are not armed there)."""
+def test_the_delivery_tracker_takes_the_central_relay_by_default(monkeypatch):
+    """The expiry sweep's push must reach a phone on a consumer install, which
+    has no FCM credential: it takes the default (relay on), not an opt-out."""
     fcm_mock = MagicMock()
     _run_one_tick(monkeypatch, yield_value=False, emit_mock=MagicMock(),
                   fcm_mock=fcm_mock)
     fcm_mock.assert_called_once()
-    assert fcm_mock.call_args.kwargs.get('relay') is not True
+    assert fcm_mock.call_args.kwargs.get('relay', True) is True
 
 
 def test_cleanup_loop_skips_sweep_when_user_active(monkeypatch):

@@ -404,42 +404,53 @@ def hand_push_to_central(user_id, title, body, data=None):
         return False
 
 
-def send_fcm_push(user_id, title, body, data=None, timeout=8, relay=False):
-    """Push an FCM notification to ``user_id``'s device using the LOCALLY-cached
-    token (syncing it first if absent): the direct send, needing this node's
-    own FCM credential.  ``relay=True`` lets a credential-less node hand the
-    push to central instead (see ``hand_push_to_central`` for its limits).
+def _relay_push(user_id, title, body, data):
+    """The relay leg of send_fcm_push: central sends it.  A consent that could
+    not be queued must not vanish quietly."""
+    handed = hand_push_to_central(user_id, title, body, data)
+    if not handed and str((data or {}).get('type', '')) == 'consent_prompt':
+        logger.warning("consent prompt for %s was not queued for the phone "
+                       "(the direct send did not go and no relay transport "
+                       "accepted it); it remains pending as a notification "
+                       "and in the app", user_id)
+    return handed
 
-    Best-effort, never raises.  Returns True on a 200 from FCM, else False (no
-    token, no credential/project, network/HTTP error).  The edge credential
-    (HART_FCM_SA_FILE / HART_FCM_ACCESS_TOKEN) + HART_FCM_PROJECT gate the
-    direct send.  Without one, ``relay=True`` hands the push to central's relay;
-    the default does nothing, as before.  Callers that opt in: the game-sound
-    offer and the consent prompt (both can wait the 30-40 s the relay takes).
-    The delivery tracker must not: central already tracks its messages for
-    central-originated chats, and for node-originated ones central is never
-    armed, so a relayed copy would not be what that sweep is for.
+
+def send_fcm_push(user_id, title, body, data=None, timeout=8, relay=True):
+    """Push an FCM notification to ``user_id``'s device.
+
+    One push takes exactly one path.  The direct send comes first: this node's
+    own FCM credential plus the LOCALLY-cached token (synced first if absent).
+    When that did not send (no credential, no token, FCM refused or timed out)
+    the push goes to central's relay instead (see ``hand_push_to_central`` for
+    its limits, notably the 30-40 s it takes).  The relay is only tried after
+    the direct send reported failure, so a push goes down one path per reported
+    result.  (A POST that timed out after FCM accepted it reads as a failure
+    and can be duplicated by the relay; that is the cost of a best-effort send.)
+
+    The relay is on by default: a consumer install has no Firebase credential,
+    and nobody opts in to being reachable.  ``relay=False`` is for a caller
+    that must never leave this node.
+
+    Best-effort, never raises.  Returns True when FCM answered 200 (direct) or
+    the bus queued the message for central (relay; that is not a delivery
+    receipt), else False.  The edge credential (HART_FCM_SA_FILE /
+    HART_FCM_ACCESS_TOKEN) + HART_FCM_PROJECT gate the direct send.
     """
     if not user_id:
         return False
     access, project = _fcm_credential()
-    if not access:
-        if relay:
-            # No credential on this node: central sends it (see above).
-            handed = hand_push_to_central(user_id, title, body, data)
-            if not handed and str((data or {}).get('type', '')) == 'consent_prompt':
-                # A consent that could not be pushed must not vanish quietly.
-                logger.warning("consent prompt for %s was not queued for the "
-                               "phone (no FCM credential and no relay transport "
-                               "accepted it); it remains pending as a notification "
-                               "and in the app", user_id)
-            return handed
-        logger.debug("send_fcm_push(%s): no FCM credential/project — push disabled", user_id)
+    if access:
+        token = get_local_fcm_token(user_id) or sync_fcm_token(user_id)
+        if token and _post_fcm_message(access, project, token, title, body,
+                                       data, timeout):
+            return True
+    else:
+        logger.debug("send_fcm_push(%s): no FCM credential/project, direct send off",
+                     user_id)
+    if not relay:
         return False
-    token = get_local_fcm_token(user_id) or sync_fcm_token(user_id)
-    if not token:
-        return False
-    return _post_fcm_message(access, project, token, title, body, data, timeout)
+    return _relay_push(user_id, title, body, data)
 
 
 def send_fcm_push_to_node(node_id, title, body, data=None, timeout=8):
