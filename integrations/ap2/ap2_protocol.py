@@ -72,6 +72,11 @@ class PaymentGateway(str, Enum):
 REDIRECT_GATEWAYS = frozenset({PaymentGateway.PHONEPE})
 
 
+#: Metadata keys that are credentials: kept in memory for the gateway call,
+#: never persisted or returned (PaymentRequest.to_dict).
+_SECRET_METADATA_KEYS = ('payment_method_token',)
+
+
 class PaymentRequest:
     """Represents a payment request from an agent"""
 
@@ -130,7 +135,10 @@ class PaymentRequest:
             'gateway_transaction_id': self.gateway_transaction_id,
             'approval_chain': self.approval_chain,
             'error_message': self.error_message,
-            'metadata': self.metadata
+            # A card/payment-method token is used once, in memory, by the
+            # gateway call; it is never written to the ledger or returned.
+            'metadata': {k: v for k, v in (self.metadata or {}).items()
+                         if k not in _SECRET_METADATA_KEYS}
         }
 
     def update_status(self, new_status: PaymentStatus, message: Optional[str] = None):
@@ -651,6 +659,7 @@ class PaymentLedger:
             # One-time move of the old CWD-relative default: copy (never
             # delete) so payments recorded before the path moved survive.
             legacy = os.path.join(os.getcwd(), 'agent_data', 'payment_ledger.json')
+            self._legacy_path = legacy
             if (os.path.exists(legacy) and not os.path.exists(ledger_path)
                     and os.path.abspath(legacy) != os.path.abspath(ledger_path)):
                 try:
@@ -661,6 +670,8 @@ class PaymentLedger:
                 except OSError as e:
                     logger.error(f"Payment ledger migration failed: {e}")
         self.ledger_path = ledger_path
+        if not hasattr(self, '_legacy_path'):
+            self._legacy_path = None
         self.payments: Dict[str, PaymentRequest] = {}
         self.lock = threading.Lock()
         self.gateways: Dict[PaymentGateway, PaymentGatewayConnector] = {}
@@ -710,6 +721,7 @@ class PaymentLedger:
             logger.debug(f"PaymentLedger: phonepe auto-register skipped: {_phonepe_err}")
 
         self.load_ledger()
+        self._merge_legacy()
 
     def add_gateway(self, gateway: PaymentGatewayConnector):
         """Add a payment gateway connector"""
@@ -1057,48 +1069,112 @@ class PaymentLedger:
                 'last_updated': datetime.now().isoformat()
             }
 
-            with open(self.ledger_path, 'w') as f:
-                json.dump(data, f, indent=2)
+            # Atomic (temp file + replace): a crash mid-write must not leave
+            # a truncated ledger that the next load reads as empty.
+            from core.file_cache import atomic_json_write
+            atomic_json_write(self.ledger_path, data)
 
             logger.debug(f"Payment ledger saved to {self.ledger_path}")
         except Exception as e:
             logger.error(f"Failed to save payment ledger: {e}")
 
-    def load_ledger(self):
-        """Load payment ledger from disk"""
+    @staticmethod
+    def _payment_from_dict(pid: str, payment_data: Dict[str, Any]) -> 'PaymentRequest':
+        payment = PaymentRequest(
+            amount=Decimal(payment_data['amount']),
+            currency=payment_data['currency'],
+            description=payment_data['description'],
+            requester_agent_id=payment_data['requester_agent_id'],
+            payment_method=PaymentMethod(payment_data['payment_method']),
+            metadata=payment_data.get('metadata', {})
+        )
+        payment.payment_id = pid
+        payment.status = PaymentStatus(payment_data['status'])
+        payment.created_at = datetime.fromisoformat(payment_data['created_at'])
+        payment.updated_at = datetime.fromisoformat(payment_data['updated_at'])
+        if payment_data.get('completed_at'):
+            payment.completed_at = datetime.fromisoformat(payment_data['completed_at'])
+        payment.gateway = PaymentGateway(payment_data['gateway']) if payment_data.get('gateway') else None
+        payment.gateway_transaction_id = payment_data.get('gateway_transaction_id')
+        payment.approval_chain = payment_data.get('approval_chain', [])
+        payment.error_message = payment_data.get('error_message')
+        return payment
+
+    def _preserve_unreadable(self, reason: str) -> None:
+        """Copy the ledger file aside before anything can overwrite it.
+
+        A load that fails (or skips records) followed by the next save would
+        otherwise replace real payment records with what little was read."""
         try:
-            if os.path.exists(self.ledger_path):
-                with open(self.ledger_path, 'r') as f:
-                    data = json.load(f)
-
-                # Reconstruct payment objects
-                for pid, payment_data in data.get('payments', {}).items():
-                    payment = PaymentRequest(
-                        amount=Decimal(payment_data['amount']),
-                        currency=payment_data['currency'],
-                        description=payment_data['description'],
-                        requester_agent_id=payment_data['requester_agent_id'],
-                        payment_method=PaymentMethod(payment_data['payment_method']),
-                        metadata=payment_data.get('metadata', {})
-                    )
-
-                    # Restore state
-                    payment.payment_id = pid
-                    payment.status = PaymentStatus(payment_data['status'])
-                    payment.created_at = datetime.fromisoformat(payment_data['created_at'])
-                    payment.updated_at = datetime.fromisoformat(payment_data['updated_at'])
-                    if payment_data.get('completed_at'):
-                        payment.completed_at = datetime.fromisoformat(payment_data['completed_at'])
-                    payment.gateway = PaymentGateway(payment_data['gateway']) if payment_data.get('gateway') else None
-                    payment.gateway_transaction_id = payment_data.get('gateway_transaction_id')
-                    payment.approval_chain = payment_data.get('approval_chain', [])
-                    payment.error_message = payment_data.get('error_message')
-
-                    self.payments[pid] = payment
-
-                logger.info(f"Loaded {len(self.payments)} payments from ledger")
+            import shutil
+            import time as _time
+            backup = f"{self.ledger_path}.unreadable-{int(_time.time())}"
+            shutil.copy2(self.ledger_path, backup)
+            logger.error(f"Payment ledger {self.ledger_path}: {reason}; the "
+                         f"original is kept at {backup}")
         except Exception as e:
-            logger.warning(f"Could not load payment ledger: {e}")
+            logger.error(f"Payment ledger {self.ledger_path}: {reason}, and it "
+                         f"could not be copied aside: {e}")
+
+    def load_ledger(self):
+        """Load payment ledger from disk.  A record that cannot be read is
+        skipped, and the file is copied aside first, so no save can lose it."""
+        if not os.path.exists(self.ledger_path):
+            return
+        try:
+            with open(self.ledger_path, 'r') as f:
+                data = json.load(f)
+        except Exception as e:
+            self._preserve_unreadable(f'could not be read ({e})')
+            return
+        skipped = []
+        for pid, payment_data in (data.get('payments') or {}).items():
+            try:
+                self.payments[pid] = self._payment_from_dict(pid, payment_data)
+            except Exception as e:
+                skipped.append(f'{pid}: {e}')
+        if skipped:
+            self._preserve_unreadable(f'{len(skipped)} record(s) unreadable '
+                                      f'({skipped[0]})')
+        logger.info(f"Loaded {len(self.payments)} payments from ledger")
+
+    def _merge_legacy(self) -> None:
+        """Bring in payments from the old CWD-relative ledger that the new one
+        lacks, once.  The one-time copy ran only when the new file did not
+        exist, so records written to the old path after that were invisible.
+        Copy-never-delete, as before; a marker file stops repeat merges."""
+        legacy = getattr(self, '_legacy_path', None)
+        if (not legacy or not os.path.exists(legacy)
+                or os.path.abspath(legacy) == os.path.abspath(self.ledger_path)):
+            return
+        marker = self.ledger_path + '.legacy_merged'
+        if os.path.exists(marker):
+            return
+        try:
+            with open(legacy, 'r') as f:
+                old = json.load(f).get('payments') or {}
+        except Exception as e:
+            logger.warning(f"Payment ledger: legacy {legacy} unreadable: {e}")
+            return
+        added = 0
+        with self.lock:
+            for pid, d in old.items():
+                if pid in self.payments:
+                    continue
+                try:
+                    self.payments[pid] = self._payment_from_dict(pid, d)
+                    added += 1
+                except Exception as e:
+                    logger.warning(f"Payment ledger: legacy record {pid} skipped: {e}")
+            if added:
+                self.save_ledger()
+        try:
+            with open(marker, 'w') as f:
+                f.write(f'merged {added} from {legacy}\n')
+        except OSError:
+            pass
+        if added:
+            logger.info(f"Payment ledger: merged {added} legacy payment(s) from {legacy}")
 
 
 # Global payment ledger instance

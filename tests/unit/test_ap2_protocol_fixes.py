@@ -304,3 +304,73 @@ class TestLedgerRefusesNonHumanApprovers:
         assert 'AP2 not available' not in res.output
         listed = json.loads(res.output)
         assert [p['description'] for p in listed] == ['cli test']
+
+
+# ── ledger durability and credentials (review of 22df2e2c1 and save/load) ──
+
+def _good_record(ledger, **meta):
+    from decimal import Decimal as _D
+    return ledger.create_payment_request(
+        amount=_D('5'), currency='INR', description='x',
+        requester_agent_id='agent', metadata=meta or None)
+
+
+class TestLedgerDurability:
+    def test_a_payment_method_token_is_never_written_or_returned(self, tmp_path):
+        import json as _json
+        from integrations.ap2.ap2_protocol import PaymentLedger
+        ledger = PaymentLedger(ledger_path=str(tmp_path / 'l.json'))
+        p = _good_record(ledger, payment_method_token='pm_secret', kind='tier_upgrade')
+        assert 'payment_method_token' not in p.to_dict()['metadata']
+        assert p.to_dict()['metadata']['kind'] == 'tier_upgrade'
+        assert 'pm_secret' not in (tmp_path / 'l.json').read_text()
+        # still in memory for the gateway call in the same request
+        assert p.metadata['payment_method_token'] == 'pm_secret'
+
+    def test_an_unreadable_ledger_is_copied_aside_before_any_save(self, tmp_path):
+        from integrations.ap2.ap2_protocol import PaymentLedger
+        path = tmp_path / 'l.json'
+        path.write_text('{ this is not json')
+        ledger = PaymentLedger(ledger_path=str(path))
+        _good_record(ledger)                          # a save happens here
+        backups = list(tmp_path.glob('l.json.unreadable-*'))
+        assert len(backups) == 1 and backups[0].read_text() == '{ this is not json'
+
+    def test_one_bad_record_does_not_cost_the_others(self, tmp_path):
+        import json as _json
+        from integrations.ap2.ap2_protocol import PaymentLedger
+        path = tmp_path / 'l.json'
+        seed = PaymentLedger(ledger_path=str(path))
+        good = _good_record(seed)
+        data = _json.loads(path.read_text())
+        data['payments']['broken'] = {'amount': 'not-a-number'}
+        path.write_text(_json.dumps(data))
+        ledger = PaymentLedger(ledger_path=str(path))
+        assert good.payment_id in ledger.payments and 'broken' not in ledger.payments
+        assert list(tmp_path.glob('l.json.unreadable-*'))
+
+    def test_legacy_records_the_new_ledger_lacks_are_merged_once(self, tmp_path):
+        import json as _json
+        from integrations.ap2.ap2_protocol import PaymentLedger
+        old_path = tmp_path / 'old.json'
+        old = PaymentLedger(ledger_path=str(old_path))
+        legacy_p = _good_record(old)
+        new = PaymentLedger(ledger_path=str(tmp_path / 'new.json'))
+        own = _good_record(new)
+        new._legacy_path = str(old_path)
+        new._merge_legacy()
+        assert legacy_p.payment_id in new.payments and own.payment_id in new.payments
+        assert (tmp_path / 'new.json.legacy_merged').exists()
+        reread = PaymentLedger(ledger_path=str(tmp_path / 'new.json'))
+        assert legacy_p.payment_id in reread.payments
+        # a second merge changes nothing
+        del new.payments[legacy_p.payment_id]
+        new._merge_legacy()
+        assert legacy_p.payment_id not in new.payments
+
+    def test_a_saved_ledger_reloads_identically(self, tmp_path):
+        from integrations.ap2.ap2_protocol import PaymentLedger
+        a = PaymentLedger(ledger_path=str(tmp_path / 'l.json'))
+        p = _good_record(a, kind='x')
+        b = PaymentLedger(ledger_path=str(tmp_path / 'l.json'))
+        assert b.get_payment(p.payment_id).to_dict() == p.to_dict()
