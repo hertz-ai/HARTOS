@@ -66,6 +66,26 @@ class TestInstaller:
         assert result['success'] is False
         assert 'hermes-agent.nousresearch.com' in result['error']
 
+    def test_npm_install_and_version_launch_the_resolved_path(self):
+        """Same .cmd-shim trap as execute(): npm and every npm-installed
+        binary must be launched by the path shutil.which resolved."""
+        from integrations.coding_agent import installer
+
+        def which(name):
+            return {'npm': r'C:\nodejs\npm.CMD',
+                    'pi': r'C:\npm\pi.CMD'}.get(name) if name != 'pi' or which.installed else None
+        which.installed = False
+        with patch.object(installer.shutil, 'which', side_effect=which), \
+             patch.object(installer.subprocess, 'run') as run:
+            run.return_value = MagicMock(stdout='0.73.1', stderr='', returncode=0)
+            installer.install_tool('pi')
+            assert run.call_args[0][0] == [
+                r'C:\nodejs\npm.CMD', 'install', '-g', '@mariozechner/pi-coding-agent']
+            which.installed = True
+            versions = installer.get_versions()
+        assert versions['pi'] == '0.73.1'
+        assert [r'C:\npm\pi.CMD', '--version'] in [c[0][0] for c in run.call_args_list]
+
     def test_no_tools_message_names_every_registered_tool(self):
         from integrations.coding_agent.installer import TOOL_REGISTRY
         from integrations.coding_agent.orchestrator import CodingAgentOrchestrator
@@ -160,7 +180,8 @@ class TestToolBackends:
     def test_hermes_command_build(self):
         from integrations.coding_agent.tool_backends import HermesBackend
         cmd = HermesBackend().build_command('fix the failing test')
-        assert cmd == ['hermes', 'chat', '-q', 'fix the failing test']
+        # -Q: only the final response on stdout (no banner/spinner/previews)
+        assert cmd == ['hermes', 'chat', '-Q', '-q', 'fix the failing test']
 
     def test_plain_text_backends_report_stdout(self):
         from integrations.coding_agent.tool_backends import HermesBackend, PiBackend

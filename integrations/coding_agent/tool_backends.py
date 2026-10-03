@@ -95,11 +95,8 @@ class CodingToolBackend(ABC):
                 'error': f'{self.name} not installed',
             }
 
-        cmd = self.build_command(task, context)
-        # npm installs kilocode/opencode/pi as .cmd shims; on Windows a bare
-        # name in an argv list is FileNotFoundError (CreateProcess ignores
-        # PATHEXT), so launch the path shutil.which resolved.
-        cmd[0] = shutil.which(cmd[0]) or cmd[0]
+        from .installer import resolved_argv
+        cmd = resolved_argv(self.build_command(task, context))
         logger.info(f"Executing {self.name}: {cmd[0]} ...")
 
         start = time.time()
@@ -264,8 +261,9 @@ class PiBackend(_PlainTextBackend):
 class HermesBackend(_PlainTextBackend):
     """Hermes Agent CLI (Nous Research) — MIT.
 
-    `hermes chat -q` runs a single non-interactive query and prints the
-    final reply; `--model` takes `provider/model`.
+    `hermes chat -q` runs a single non-interactive query; `-Q` keeps stdout
+    to the final reply only (no banner, spinner or tool previews);
+    `--model` takes `provider/model`.
     """
 
     name = 'hermes'
@@ -273,7 +271,7 @@ class HermesBackend(_PlainTextBackend):
     strengths = ['terminal_workflows', 'multi_provider', 'complex_reasoning']
 
     def build_command(self, task: str, context: Optional[Dict] = None) -> List[str]:
-        cmd = [self.binary, 'chat', '-q', task]
+        cmd = [self.binary, 'chat', '-Q', '-q', task]
         if context and context.get('model'):
             cmd.extend(['--model', context['model']])
         return cmd

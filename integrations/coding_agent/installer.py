@@ -17,12 +17,13 @@ import os
 from core.subprocess_safe import no_window_kwargs
 import shutil
 import subprocess
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger('hevolve.coding_agent')
 
 # Tool registry: name → (binary_name, package, license)
-# binary_name='' means in-process (no external binary)
+# binary_name='' means in-process (no external binary); for a tool in
+# SCRIPT_INSTALLS, package is a display label, not an npm name
 TOOL_REGISTRY = {
     'kilocode': ('kilocode', '@kilocode/cli', 'Apache-2.0'),
     'claude_code': ('claude', '@anthropic-ai/claude-code', 'Proprietary'),
@@ -42,6 +43,16 @@ SCRIPT_INSTALLS = {
         'other': 'curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash',
     },
 }
+
+
+def resolved_argv(cmd: List[str]) -> List[str]:
+    """cmd with argv[0] replaced by the path shutil.which resolves.
+
+    npm installs npm itself and kilocode/opencode/pi as .cmd shims; on
+    Windows a bare name in an argv list is FileNotFoundError (CreateProcess
+    ignores PATHEXT).  Every coding-tool launch goes through this.
+    """
+    return [shutil.which(cmd[0]) or cmd[0]] + list(cmd[1:])
 
 
 def detect_installed() -> Dict[str, bool]:
@@ -69,7 +80,7 @@ def get_versions() -> Dict[str, Optional[str]]:
             continue
         try:
             result = subprocess.run(
-                [binary, '--version'],
+                resolved_argv([binary, '--version']),
                 capture_output=True, text=True, timeout=10,
              **no_window_kwargs())
             versions[name] = result.stdout.strip() or result.stderr.strip() or 'unknown'
@@ -79,7 +90,8 @@ def get_versions() -> Dict[str, Optional[str]]:
 
 
 def install(tool_name: str) -> Dict:
-    """Install a coding tool via npm install -g.
+    """Install a CLI coding tool: npm install -g, or for a tool in
+    SCRIPT_INSTALLS, return its official install command for the user.
 
     The user is installing the tool on their own machine.
     HARTOS never bundles or redistributes these tools.
@@ -115,7 +127,7 @@ def install(tool_name: str) -> Dict:
     logger.info(f"Installing {tool_name} ({package}, license: {license_type})")
     try:
         result = subprocess.run(
-            ['npm', 'install', '-g', package],
+            resolved_argv(['npm', 'install', '-g', package]),
             capture_output=True, text=True, timeout=120,
          **no_window_kwargs())
         if result.returncode == 0:
@@ -162,7 +174,7 @@ def install_tool(tool_name: str) -> Dict:
         # In-process tool — use pip
         return pip_install(package)
     else:
-        # CLI tool — use npm
+        # CLI tool — npm, or the official script command (SCRIPT_INSTALLS)
         return install(tool_name)
 
 
