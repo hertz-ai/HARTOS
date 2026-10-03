@@ -198,3 +198,44 @@ class TestBindings:
         row = CommerceBindings(path).get('mcg-m-5')
         assert row['customer_id'] == '5' and row['store_id'] == '3'
         assert row['tenant'] == 'mcgroce'
+
+
+class TestMerchantIsNotAShopper:
+    """A merchant's id comes from McGroce's admin table; sent as customerId it
+    would name whichever shopper has the same number."""
+
+    def _merchant(self, bindings):
+        bindings.upsert(4242, 'shop@example.com', 'merchant')
+        return hartos_user_id(4242, 'merchant')
+
+    def test_a_merchant_cannot_read_a_shoppers_cart(self, client, bindings):
+        uid = self._merchant(bindings)
+        with patch('core.http_pool.pooled_request') as m:
+            out = client.cart_get(uid)
+        assert out['success'] is False and 'merchant' in out['error']
+        m.assert_not_called()
+
+    def test_a_merchant_catalog_read_carries_no_customer_id(self, client, bindings):
+        uid = self._merchant(bindings)
+        with patch('core.http_pool.pooled_request',
+                   return_value=_Resp(200, [])) as m:
+            client.site(uid, 'GET', '/catalog/search', need_customer=False)
+        _, _, kw = _call(m)
+        assert 'customerId' not in kw['headers']
+
+    def test_the_customer_still_shops_as_before(self, client):
+        with patch('core.http_pool.pooled_request',
+                   return_value=_Resp(200, {'id': 1, 'orderItems': []})) as m:
+            assert client.cart_get(hartos_user_id(4242))['success'] is True
+        _, _, kw = _call(m)
+        assert kw['headers']['customerId'] == '4242'
+
+
+class TestIdentityNamespaces:
+    def test_a_customer_id_starting_m_dash_never_lands_on_a_merchant(self):
+        assert hartos_user_id('m-5', 'customer') != hartos_user_id(5, 'merchant')
+        assert hartos_user_id('m-5', 'customer').startswith('mcg-')
+
+    def test_ordinary_ids_map_as_before(self):
+        assert hartos_user_id(4242) == 'mcg-4242'
+        assert hartos_user_id(5, 'merchant') == 'mcg-m-5'

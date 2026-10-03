@@ -160,6 +160,14 @@ class McGroceClient:
         if need_customer and not binding:
             return _err('This account is not linked to McGroce yet; '
                         'open McGroce and sign in first')
+        from integrations.commerce.bindings import is_merchant
+        if is_merchant(binding):
+            # A merchant's id comes from McGroce's admin table: sent as
+            # customerId it names whichever SHOPPER has the same number.
+            if need_customer:
+                return _err('A merchant account has no shopping cart; sign in '
+                            'to McGroce as a customer to shop')
+            binding = None            # catalog reads: no customer at all
         if not (self.user and self.password):
             return _err('McGroce service account is not configured')
         token = base64.b64encode(

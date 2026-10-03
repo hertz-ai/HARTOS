@@ -42,7 +42,6 @@ CURRENCY = 'INR'
 CHECKOUT_KIND = 'commerce_checkout'
 _AGENT_ID = 'mcgroce'
 _MAX_CARDS = 3
-_MERCHANT_ROLES = frozenset({'merchant', 'admin', 'vendor'})
 ORDER_STEPS = ('Submitted', 'Accepted', 'Out for delivery', 'Delivered')
 _STEP_OF_STATUS = {
     'SUBMITTED': 0, 'NEW': 0, 'IN_PROCESS': 1, 'ACCEPTED': 1,
@@ -615,9 +614,9 @@ def commerce_create_sku(
     options: Annotated[Optional[str], "Variants, e.g. '500 ml, 1 L'"] = None,
 ) -> str:
     """Draft a new product for the merchant to review and approve."""
-    from integrations.commerce.bindings import get_bindings
+    from integrations.commerce.bindings import get_bindings, is_merchant
     binding = get_bindings().get(user_id)
-    if not binding or binding.get('role') not in _MERCHANT_ROLES:
+    if not is_merchant(binding):
         return _fail('only a signed-in McGroce merchant can add products')
     if not (name or '').strip():
         return _fail('the product needs a name')

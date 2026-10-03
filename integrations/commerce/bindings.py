@@ -45,10 +45,18 @@ def hartos_user_id(customer_id, role: str = 'customer') -> str:
     cid = str(customer_id if customer_id is not None else '').strip()
     if not cid:
         raise ValueError('a McGroce id is required')
-    if not _SAFE_ID.match(cid):
-        cid = hashlib.sha256(cid.encode('utf-8')).hexdigest()[:32]
     merchant = str(role).lower() in _MERCHANT_ROLES
+    # A shopper id that itself starts with 'm-' would map onto the merchant
+    # namespace ('mcg-m-5' for customer 'm-5' == merchant 5): hash it, as an
+    # id that is not file-name safe already is.
+    if not _SAFE_ID.match(cid) or (not merchant and cid.lower().startswith('m-')):
+        cid = hashlib.sha256(cid.encode('utf-8')).hexdigest()[:32]
     return f"{IDENTITY_PREFIX}{'m-' if merchant else ''}{cid}"
+
+
+def is_merchant(binding: Optional[dict]) -> bool:
+    """A binding for a merchant (an admin-table id), not a shopper."""
+    return bool(binding) and str(binding.get('role') or '').lower() in _MERCHANT_ROLES
 
 
 class CommerceBindings:
