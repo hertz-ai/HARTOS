@@ -251,10 +251,11 @@ class MandateStore:
             from integrations.ap2.ap2_protocol import PaymentStatus
             status = self._payment_status(m.payment_id)
             if status == PaymentStatus.COMPLETED:
-                # The money was taken (e.g. a generic PhonePe mandate, whose
-                # callback has no order step to consume it): it is used, not
-                # waiting to pay again.
-                if m.status == 'approved':
+                # The money was taken.  A generic mandate has no step that
+                # consumes it, so it is used now; any other kind (a commerce
+                # checkout) is consumed by its own order step, which may run
+                # after the TTL and must still find it approved.
+                if m.status == 'approved' and m.kind == KIND_GENERIC:
                     m.status = 'consumed'
                     m.sig = self._sign(m)
                 return

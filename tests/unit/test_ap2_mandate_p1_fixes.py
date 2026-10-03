@@ -226,3 +226,13 @@ class TestMandatesDoNotStickForever:
         m = _approved(store)
         assert self._at(store, m, m.expires_at + 1).status == 'expired'
         assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.CANCELLED
+
+
+def test_a_completed_checkout_mandate_waits_for_its_order_step(store):
+    """A commerce checkout is consumed by its order step, which may run after
+    the TTL (the PhonePe callback): expiry must not consume it first."""
+    m = store.create_cart_mandate('u1', 'mcgroce', CART, kind='commerce_checkout')
+    store.approve(m.mandate_id, 'u1')
+    store.ledger.get_payment(m.payment_id).status = PaymentStatus.COMPLETED
+    with patch('integrations.ap2.ap2_mandate.time.time', return_value=m.expires_at + 3600):
+        assert store.get(m.mandate_id).status == 'approved'
