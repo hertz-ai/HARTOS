@@ -238,7 +238,8 @@ class TestFeatureTierMap:
     def test_new_feature_entries_exist(self):
         from security.system_requirements import FEATURE_TIER_MAP, NodeTierLevel
         assert 'coding_aggregator' in FEATURE_TIER_MAP
-        assert 'vlm_computer_use' in FEATURE_TIER_MAP
+        assert 'vlm_computer_use' not in FEATURE_TIER_MAP   # no reader; removed
+        assert 'whisper' not in FEATURE_TIER_MAP
         assert 'crawl4ai' in FEATURE_TIER_MAP
         assert 'minicpm_vision' in FEATURE_TIER_MAP
         assert 'video_captioning' in FEATURE_TIER_MAP
@@ -247,7 +248,6 @@ class TestFeatureTierMap:
     def test_tier_assignments(self):
         from security.system_requirements import FEATURE_TIER_MAP, NodeTierLevel
         assert FEATURE_TIER_MAP['coding_aggregator'][0] == NodeTierLevel.STANDARD
-        assert FEATURE_TIER_MAP['vlm_computer_use'][0] == NodeTierLevel.STANDARD
         assert FEATURE_TIER_MAP['crawl4ai'][0] == NodeTierLevel.LITE
         assert FEATURE_TIER_MAP['minicpm_vision'][0] == NodeTierLevel.FULL
         assert FEATURE_TIER_MAP['vlm_omniparser'][0] == NodeTierLevel.FULL

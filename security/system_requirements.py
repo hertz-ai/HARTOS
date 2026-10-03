@@ -44,7 +44,7 @@ Usage:
     from security.system_requirements import run_system_check, get_capabilities
     caps = run_system_check()  # Called once at boot
     caps.tier                  # NodeTierLevel.STANDARD
-    caps.enabled_features      # ['agent_engine', 'coding_agent', 'tts', 'whisper']
+    caps.enabled_features      # ['agent_engine', 'coding_agent', 'tts', 'crawl4ai']
 """
 
 import logging
@@ -263,9 +263,7 @@ FEATURE_TIER_MAP: Dict[str, Tuple[NodeTierLevel, str]] = {
     'agent_engine':         (NodeTierLevel.STANDARD,  'HEVOLVE_AGENT_ENGINE_ENABLED'),
     'coding_agent':         (NodeTierLevel.STANDARD,  'HEVOLVE_CODING_AGENT_ENABLED'),
     'coding_aggregator':    (NodeTierLevel.STANDARD,  'HEVOLVE_CODING_AGGREGATOR_ENABLED'),
-    'vlm_computer_use':     (NodeTierLevel.STANDARD,  'HEVOLVE_VLM_COMPUTER_USE_ENABLED'),
     'tts':                  (NodeTierLevel.STANDARD,  'HEVOLVE_TTS_ENABLED'),
-    'whisper':              (NodeTierLevel.STANDARD,  'HEVOLVE_WHISPER_ENABLED'),
     # Lite tier - cloud-backed services
     'crawl4ai':             (NodeTierLevel.LITE,      'HEVOLVE_CRAWL4AI_ENABLED'),
     # Standard tier — features that need a local LLM but NOT full GPU

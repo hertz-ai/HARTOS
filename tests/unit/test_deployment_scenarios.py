@@ -51,7 +51,6 @@ class TestObserverTierMinimum:
         assert 'agent_engine' in disabled
         assert 'coding_agent' in disabled
         assert 'tts' in disabled
-        assert 'whisper' in disabled
         assert 'video_gen' in disabled
         assert 'local_llm' in disabled
         assert 'regional_host' in disabled
@@ -97,7 +96,6 @@ class TestStandardTierAgents:
         assert 'agent_engine' in enabled
         assert 'coding_agent' in enabled
         assert 'tts' in enabled
-        assert 'whisper' in enabled
         assert 'gossip' in enabled
         assert 'flask_server' in enabled
 
