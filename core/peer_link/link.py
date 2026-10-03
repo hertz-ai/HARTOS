@@ -1135,9 +1135,14 @@ class PeerLink:
                                 "one on %s", self.peer_id[:8],
                                 _MAX_CONCURRENT_REQUESTS, channel)
                             continue
-                        threading.Thread(
-                            target=self._answer_request,
-                            args=(channel, data, msg_id), daemon=True).start()
+                        try:
+                            threading.Thread(
+                                target=self._answer_request,
+                                args=(channel, data, msg_id), daemon=True).start()
+                        except Exception as e:
+                            # no thread to run it: give the slot back
+                            self._request_slots.release()
+                            logger.debug(f"Could not start request thread: {e}")
                         continue
                     for handler in self._message_handlers.get(channel, []):
                         try:

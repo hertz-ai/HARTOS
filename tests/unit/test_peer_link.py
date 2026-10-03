@@ -2033,6 +2033,20 @@ class TestRequestReply(unittest.TestCase):
             gate.set()
             _stop(a, b)
 
+    def test_a_thread_that_cannot_start_gives_its_slot_back(self):
+        from core.peer_link.link import _MAX_CONCURRENT_REQUESTS
+        a, b = _linked_pair()
+        try:
+            b.on_message('compute', lambda ch, data, peer: {'ok': True})
+            with patch('core.peer_link.link.threading.Thread') as T:
+                T.return_value.start.side_effect = RuntimeError("can't start new thread")
+                for _ in range(_MAX_CONCURRENT_REQUESTS * 2):
+                    a.send('compute', {}, wait_response=True, timeout=0.05)
+            # every slot is free again: a real request is answered
+            self.assertEqual(a.send('compute', {}, wait_response=True, timeout=3), {'ok': True})
+        finally:
+            _stop(a, b)
+
     def test_a_handler_return_is_not_sent_when_nobody_asked(self):
         a, b = _linked_pair()
         try:
