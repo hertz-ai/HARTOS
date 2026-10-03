@@ -21,9 +21,10 @@ implementation.
 import logging
 from typing import Any, Dict, Optional, Tuple
 
+from integrations.commerce import COMMERCE_ACTION_PREFIXES  # one definition
+
 logger = logging.getLogger(__name__)
 
-COMMERCE_ACTION_PREFIXES = ('ap2_pay:', 'merchant_onboard:', 'merchant_sku:')
 _DRAFT_KIND = {'merchant_onboard': 'merchant', 'merchant_sku': 'sku'}
 
 Reply = Tuple[Dict[str, Any], int]

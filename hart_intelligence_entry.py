@@ -11380,6 +11380,15 @@ def agent_approval():
         except Exception as _com_exc:   # never costs a consent answer
             app.logger.warning(f'agent_approval: commerce unavailable: {_com_exc}')
             is_commerce_action = None
+            # ...but a commerce answer must not fall through to the consent
+            # record below: that would write a consent row against the owner
+            # for a payment and answer as if something were applied.
+            from integrations.commerce import COMMERCE_ACTION_PREFIXES
+            if action.startswith(COMMERCE_ACTION_PREFIXES):
+                return jsonify({'status': 'error', 'action': action_raw,
+                                'reason': 'payments are unavailable on this '
+                                          'node right now; nothing was '
+                                          'approved or charged'}), 503
         if is_commerce_action and is_commerce_action(action):
             _c_body, _c_code = answer_commerce_approval(
                 action_raw, approved, approver_from_request(request))

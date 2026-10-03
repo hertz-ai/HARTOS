@@ -169,3 +169,20 @@ def test_blueprint_registry_mounts_commerce_for_the_nunba_path():
     # a second pass (the standalone entry already mounted it) is a no-op
     again = register_all_blueprints(app)
     assert 'commerce' in again['skipped']
+
+
+@pytest.mark.parametrize('action', ['ap2_pay:pay_123', 'merchant_onboard:d1',
+                                    'MERCHANT_SKU:d2'])
+def test_a_commerce_answer_is_refused_when_commerce_cannot_import(app, action):
+    """Fail closed: with integrations.commerce.approvals unimportable, a
+    commerce answer must not fall through to the consent record (which would
+    write a consent row for the owner and answer as if applied)."""
+    import sys
+    with patch.dict(sys.modules, {'integrations.commerce.approvals': None}), \
+            patch('integrations.social.consent_service.ConsentService.'
+                  'record_capability_decision') as record:
+        resp = app.test_client().post('/api/agent/approval', json={
+            'agent_id': 'a', 'action': action, 'decision': 'approve'})
+    assert resp.status_code == 503
+    assert 'nothing was approved or charged' in resp.get_json()['reason']
+    record.assert_not_called()
