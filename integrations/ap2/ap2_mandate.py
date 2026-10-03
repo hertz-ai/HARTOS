@@ -389,6 +389,8 @@ class MandateStore:
                 return False, 'only the owner can approve this payment'
             if m.status != 'pending':
                 return False, f'mandate is {m.status}'
+            if not self._payment_matches(m, self.ledger.get_payment(m.payment_id)):
+                return False, 'payment amount differs from what was shown'
             if not self.ledger.authorize_payment(m.payment_id,
                                                  f'user:{approver_id}'):
                 return False, 'payment could not be authorized'
@@ -482,7 +484,20 @@ class MandateStore:
         payment = self.ledger.get_payment(payment_id)
         if payment is None or payment.status != PaymentStatus.AUTHORIZED:
             return False, 'payment is not authorized'
+        if not self._payment_matches(m, payment):
+            return False, 'payment amount differs from what was approved'
         return True, 'ok'
+
+    @staticmethod
+    def _payment_matches(m: 'CartMandate', payment) -> bool:
+        """The ledger payment asks exactly what the signed mandate shows the
+        person: same amount, same currency.  The ledger record is not signed,
+        so this is what ties the two together."""
+        try:
+            return (_money(payment.amount) == _money(m.amount)
+                    and str(payment.currency).upper() == str(m.currency).upper())
+        except Exception:
+            return False
 
     def consume(self, mandate_id: str) -> bool:
         """approved -> consumed.  A consumed mandate never pays again."""

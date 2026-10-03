@@ -236,3 +236,27 @@ def test_a_completed_checkout_mandate_waits_for_its_order_step(store):
     store.ledger.get_payment(m.payment_id).status = PaymentStatus.COMPLETED
     with patch('integrations.ap2.ap2_mandate.time.time', return_value=m.expires_at + 3600):
         assert store.get(m.mandate_id).status == 'approved'
+
+
+class TestThePaymentMatchesTheSignedMandate:
+    """The ledger record is unsigned: a changed amount there must not ride on
+    the person's approval of the mandate."""
+
+    def test_approve_refuses_when_the_payment_amount_was_changed(self, store):
+        from decimal import Decimal
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        store.ledger.get_payment(m.payment_id).amount = Decimal('8000')
+        ok, reason = store.approve(m.mandate_id, 'u1')
+        assert not ok and 'differs' in reason
+        assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.APPROVAL_REQUIRED
+
+    def test_checkout_refuses_when_the_payment_changed_after_approval(self, store):
+        from decimal import Decimal
+        m = _approved(store)
+        store.ledger.get_payment(m.payment_id).amount = Decimal('8000')
+        ok, reason = store.verify_for_checkout(m.mandate_id, 'u1', CART)
+        assert not ok and 'differs' in reason
+
+    def test_a_matching_payment_still_checks_out(self, store):
+        m = _approved(store)
+        assert store.verify_for_checkout(m.mandate_id, 'u1', CART) == (True, 'ok')
