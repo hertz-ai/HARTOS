@@ -67,18 +67,43 @@ _MANDATES_FILENAME = 'ap2_mandates.json'
 _MANDATE_KEY_FILENAME = '.ap2_mandate_key'
 
 
-def _own_gateway_urls() -> Dict[str, str]:
-    """This node's redirect/callback URLs from its configured public base
-    (integrations.channels.oauth_api._public_base_url: HARTOS_PUBLIC_URL, else
-    the live request's root).  Empty when neither exists -- the gateway
-    default then applies."""
+def _trusted_request_base() -> str:
+    """The live request's root, but only when its Host is one this node was
+    told to answer for: an explicit ALLOWED_HOSTS entry (never the '*'
+    wildcard) or a loopback address.  '' otherwise, and outside a request.
+
+    The Host header is the caller's to write.  With ALLOWED_HOSTS=* (the
+    deploy default) a forged Host would otherwise become the URL PhonePe
+    returns the buyer to and posts the signed confirmation to.
+    """
     try:
-        from integrations.channels.oauth_api import _public_base_url
-        base = _public_base_url()
-    except Exception as e:
-        logger.debug(f'ap2: no public base for gateway urls: {e}')
-        return {}
+        from flask import has_request_context, request
+        if not has_request_context():
+            return ''
+        host = (request.host or '').rsplit(':', 1)[0].strip('[]').lower()
+        root = request.url_root.rstrip('/')
+    except Exception:
+        return ''
+    if not host:
+        return ''
+    allowed = {h.strip().lower() for h in
+               os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+               if h.strip() and h.strip() != '*'}
+    if host in allowed or host in ('localhost', '127.0.0.1', '::1'):
+        return root
+    return ''
+
+
+def _own_gateway_urls() -> Dict[str, str]:
+    """This node's redirect/callback URLs: HARTOS_PUBLIC_URL, else the live
+    request's root when its Host is trusted (_trusted_request_base).  Empty
+    when neither exists -- the gateway default then applies, and a warning
+    says so, because the order is then placed only if that default can reach
+    this node."""
+    base = (os.environ.get('HARTOS_PUBLIC_URL') or '').rstrip('/')         or _trusted_request_base()
     if not base:
+        logger.warning('ap2: no trusted public base for gateway urls (set '
+                       'HARTOS_PUBLIC_URL); the gateway default applies')
         return {}
     return {'redirect_url': base + '/',
             'callback_url': base + '/api/v1/intelligence/phonepe/callback'}

@@ -154,3 +154,41 @@ class TestLedgerGateForMandatePayments:
             requester_agent_id='agent', require_approval=False)
         store.ledger.authorize_payment(p.payment_id, 'user:anyone')
         assert 'only by the person' not in store.ledger.process_payment(p.payment_id).get('error', '')
+
+
+class TestGatewayUrlsTrustOnlyKnownHosts:
+    """A forged Host must never become the URL the gateway sends the buyer
+    and the signed confirmation to."""
+
+    def _urls(self, host, env):
+        from flask import Flask
+        from integrations.ap2 import ap2_mandate
+        app = Flask('t')
+        with patch.dict('os.environ', env, clear=False), \
+                app.test_request_context('/', headers={'Host': host}):
+            import os
+            if 'HARTOS_PUBLIC_URL' not in env:
+                os.environ.pop('HARTOS_PUBLIC_URL', None)
+            return ap2_mandate._own_gateway_urls()
+
+    def test_a_forged_host_under_the_wildcard_is_not_used(self):
+        assert self._urls('evil.example', {'ALLOWED_HOSTS': '*'}) == {}
+
+    def test_an_explicitly_allowed_host_is_used(self):
+        out = self._urls('shop.hertzai.com', {'ALLOWED_HOSTS': 'shop.hertzai.com'})
+        assert out['callback_url'] == 'http://shop.hertzai.com/api/v1/intelligence/phonepe/callback'
+
+    def test_loopback_is_used(self):
+        assert self._urls('localhost:6777', {'ALLOWED_HOSTS': '*'})['redirect_url'] == 'http://localhost:6777/'
+
+    def test_the_configured_public_url_wins_over_any_host(self):
+        out = self._urls('evil.example', {'ALLOWED_HOSTS': '*',
+                                          'HARTOS_PUBLIC_URL': 'https://node.example/'})
+        assert out['redirect_url'] == 'https://node.example/'
+
+    def test_outside_a_request_without_a_public_url_it_is_empty(self):
+        from integrations.ap2 import ap2_mandate
+        with patch.dict('os.environ', {}, clear=False):
+            import os
+            os.environ.pop('HARTOS_PUBLIC_URL', None)
+            assert ap2_mandate._own_gateway_urls() == {}
