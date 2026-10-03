@@ -43,7 +43,8 @@ class CodingAgentOrchestrator:
         Args:
             task: The coding task description
             task_type: code_review, feature, bug_fix, refactor, app_build
-            preferred_tool: User override (kilocode, claude_code, opencode, claw_native)
+            preferred_tool: User override, any key of tool_backends.BACKENDS
+                (kilocode, claude_code, opencode, pi, hermes, aider_native, claw_native)
             user_id: For benchmark tracking
             model: LLM model override (empty = use tool's default)
             working_dir: Working directory for the coding tool
@@ -129,13 +130,14 @@ class CodingAgentOrchestrator:
         backend = router.route(task, task_type, preferred_tool)
 
         if backend is None:
+            from .installer import TOOL_REGISTRY
             return {
                 'success': False,
                 'output': '',
                 'tool': 'none',
                 'task_type': task_type,
-                'error': 'No coding tools installed. '
-                         'Install one: kilocode, claude (Claude Code), or opencode.',
+                'error': 'No coding tools installed. Install one: '
+                         + ', '.join(TOOL_REGISTRY) + '.',
             }
 
         # Build context for the backend

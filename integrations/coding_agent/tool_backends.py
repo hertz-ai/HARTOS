@@ -1,5 +1,5 @@
 """
-Coding Agent Tool Backends — KiloCode, Claude Code, OpenCode, Aider Native.
+Coding Agent Tool Backends — KiloCode, Claude Code, OpenCode, pi, Hermes, Aider Native.
 
 Subprocess backends wrap CLI tools via subprocess. AiderNativeBackend runs
 in-process using vendored Aider modules for zero-latency code intelligence.
@@ -96,6 +96,10 @@ class CodingToolBackend(ABC):
             }
 
         cmd = self.build_command(task, context)
+        # npm installs kilocode/opencode/pi as .cmd shims; on Windows a bare
+        # name in an argv list is FileNotFoundError (CreateProcess ignores
+        # PATHEXT), so launch the path shutil.which resolved.
+        cmd[0] = shutil.which(cmd[0]) or cmd[0]
         logger.info(f"Executing {self.name}: {cmd[0]} ...")
 
         start = time.time()
@@ -229,6 +233,52 @@ class OpenCodeBackend(CodingToolBackend):
             }
 
 
+class _PlainTextBackend(CodingToolBackend):
+    """A CLI whose one-shot mode prints the agent's final answer as text."""
+
+    def parse_output(self, stdout: str, stderr: str, returncode: int) -> Dict:
+        return {
+            'success': returncode == 0,
+            'output': stdout.strip() or stderr.strip(),
+        }
+
+
+class PiBackend(_PlainTextBackend):
+    """pi coding agent CLI — MIT (npm: @mariozechner/pi-coding-agent).
+
+    `-p/--print` runs one prompt and prints the response; `--model` takes
+    `provider/id`.  The user's own provider key or /login is used.
+    """
+
+    name = 'pi'
+    binary = 'pi'
+    strengths = ['terminal_coding', 'multi_provider', 'feature']
+
+    def build_command(self, task: str, context: Optional[Dict] = None) -> List[str]:
+        cmd = [self.binary, '-p', task]
+        if context and context.get('model'):
+            cmd.extend(['--model', context['model']])
+        return cmd
+
+
+class HermesBackend(_PlainTextBackend):
+    """Hermes Agent CLI (Nous Research) — MIT.
+
+    `hermes chat -q` runs a single non-interactive query and prints the
+    final reply; `--model` takes `provider/model`.
+    """
+
+    name = 'hermes'
+    binary = 'hermes'
+    strengths = ['terminal_workflows', 'multi_provider', 'complex_reasoning']
+
+    def build_command(self, task: str, context: Optional[Dict] = None) -> List[str]:
+        cmd = [self.binary, 'chat', '-q', task]
+        if context and context.get('model'):
+            cmd.extend(['--model', context['model']])
+        return cmd
+
+
 # Lazy import for AiderNativeBackend to avoid hard dependency
 def _get_aider_native_class():
     from .aider_native_backend import AiderNativeBackend
@@ -337,6 +387,8 @@ BACKENDS = {
     'kilocode': KiloCodeBackend,
     'claude_code': ClaudeCodeBackend,
     'opencode': OpenCodeBackend,
+    'pi': PiBackend,
+    'hermes': HermesBackend,
     'aider_native': _LazyAiderNative(),
     'claw_native': _LazyClaw(),
 }

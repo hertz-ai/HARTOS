@@ -49,6 +49,33 @@ class TestInstaller:
         assert result['success'] is False
         assert 'Unknown tool' in result['error']
 
+    def test_pi_and_hermes_in_registry(self):
+        from integrations.coding_agent.installer import TOOL_REGISTRY
+        assert TOOL_REGISTRY['pi'] == ('pi', '@mariozechner/pi-coding-agent', 'MIT')
+        assert TOOL_REGISTRY['hermes'][0] == 'hermes'
+        assert TOOL_REGISTRY['hermes'][2] == 'MIT'
+
+    @patch('shutil.which', return_value=None)
+    def test_hermes_install_is_never_a_piped_remote_script(self, mock_which):
+        """Hermes ships only as an official install script; HARTOS hands the
+        user the command instead of running a remote script itself."""
+        from integrations.coding_agent import installer
+        with patch.object(installer.subprocess, 'run') as run:
+            result = installer.install_tool('hermes')
+        run.assert_not_called()
+        assert result['success'] is False
+        assert 'hermes-agent.nousresearch.com' in result['error']
+
+    def test_no_tools_message_names_every_registered_tool(self):
+        from integrations.coding_agent.installer import TOOL_REGISTRY
+        from integrations.coding_agent.orchestrator import CodingAgentOrchestrator
+        with patch('integrations.coding_agent.tool_router.get_available_backends',
+                   return_value={}):
+            result = CodingAgentOrchestrator()._execute_local(
+                'task', 'feature', '', 'u1', '', '')
+        for name in TOOL_REGISTRY:
+            assert name in result['error']
+
     @patch('shutil.which', return_value=None)
     def test_install_without_npm(self, mock_which):
         from integrations.coding_agent.installer import install
@@ -124,6 +151,49 @@ class TestToolBackends:
         result = backend.parse_output('plain text output', '', 0)
         assert result['success'] is True
         assert result['output'] == 'plain text output'
+
+    def test_pi_command_build(self):
+        from integrations.coding_agent.tool_backends import PiBackend
+        cmd = PiBackend().build_command('refactor module', {'model': 'anthropic/claude-sonnet-4'})
+        assert cmd == ['pi', '-p', 'refactor module', '--model', 'anthropic/claude-sonnet-4']
+
+    def test_hermes_command_build(self):
+        from integrations.coding_agent.tool_backends import HermesBackend
+        cmd = HermesBackend().build_command('fix the failing test')
+        assert cmd == ['hermes', 'chat', '-q', 'fix the failing test']
+
+    def test_plain_text_backends_report_stdout(self):
+        from integrations.coding_agent.tool_backends import HermesBackend, PiBackend
+        for backend in (PiBackend(), HermesBackend()):
+            ok = backend.parse_output('  done: 3 files changed\n', '', 0)
+            assert ok == {'success': True, 'output': 'done: 3 files changed'}
+            bad = backend.parse_output('', 'no API key', 1)
+            assert bad == {'success': False, 'output': 'no API key'}
+
+    def test_pi_and_hermes_are_selectable(self):
+        """Registered, so the router's user override can pick them."""
+        from integrations.coding_agent.tool_backends import BACKENDS, HermesBackend, PiBackend
+        from integrations.coding_agent.tool_router import CodingToolRouter
+        assert BACKENDS['pi'] is PiBackend
+        assert BACKENDS['hermes'] is HermesBackend
+        with patch('integrations.coding_agent.tool_router.get_available_backends',
+                   return_value={'pi': PiBackend(), 'hermes': HermesBackend()}):
+            assert CodingToolRouter().route('t', 'feature', user_override='hermes').name == 'hermes'
+            assert CodingToolRouter().route('t', 'feature', user_override='pi').name == 'pi'
+
+    def test_execute_launches_the_resolved_path(self):
+        """npm installs pi/kilocode/opencode as .cmd shims; on Windows a bare
+        name in the argv list is FileNotFoundError (CreateProcess does not use
+        PATHEXT).  execute() must launch what shutil.which resolved."""
+        from integrations.coding_agent import tool_backends
+        backend = tool_backends.PiBackend()
+        shim = r'C:\Users\x\AppData\Roaming\npm\pi.CMD'
+        with patch.object(tool_backends.shutil, 'which', return_value=shim), \
+             patch.object(tool_backends.subprocess, 'run') as run:
+            run.return_value = MagicMock(stdout='ok', stderr='', returncode=0)
+            result = backend.execute('task')
+        assert run.call_args[0][0][0] == shim
+        assert result['success'] is True and result['tool'] == 'pi'
 
     def test_env_passthrough(self):
         from integrations.coding_agent.tool_backends import KiloCodeBackend
