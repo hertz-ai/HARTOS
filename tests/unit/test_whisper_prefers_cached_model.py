@@ -105,8 +105,130 @@ def test_sherpa_model_cached_reads_the_real_directory(tmp_path, monkeypatch):
     d = tmp_path / cfg['dir']
     d.mkdir(parents=True)
     (d / cfg['files']['tokens']).write_text('x')
+    # tokens alone is a cut-short extraction, not a model
+    assert wt._sherpa_model_cached('moonshine-tiny') is False
+    for f in cfg['files'].values():
+        (d / f).write_text('x')
     assert wt._sherpa_model_cached('moonshine-tiny') is True
     assert wt._sherpa_model_cached('no-such-model') is False
+
+
+def _archive_bytes(tmp_path, cfg, files=None):
+    """A real .tar.bz2 shaped like sherpa's release: one top folder."""
+    import tarfile
+    src = tmp_path / 'src' / cfg['dir']
+    src.mkdir(parents=True)
+    for f in (cfg['files'].values() if files is None else files):
+        (src / f).write_text('w')
+    out = tmp_path / 'a.tar.bz2'
+    with tarfile.open(out, 'w:bz2') as tar:
+        tar.add(src, arcname=cfg['dir'])
+    return out.read_bytes()
+
+
+def _fake_fetch(monkeypatch, data, calls=None):
+    def fetch(url, path):
+        if calls is not None:
+            calls.append(url)
+        with open(path, 'wb') as fh:
+            fh.write(data)
+    monkeypatch.setattr(wt.urllib.request, 'urlretrieve', fetch)
+
+
+def test_download_lands_a_complete_folder_and_leaves_no_work_files(
+        tmp_path, monkeypatch):
+    stt = tmp_path / 'stt'
+    stt.mkdir()
+    monkeypatch.setattr(wt, '_get_stt_dir', lambda: stt)
+    cfg = wt._SHERPA_MODELS['whisper-tiny']
+    _fake_fetch(monkeypatch, _archive_bytes(tmp_path, cfg))
+
+    assert wt._download_model('whisper-tiny') == stt / cfg['dir']
+    assert wt._sherpa_model_cached('whisper-tiny')
+    assert sorted(p.name for p in stt.iterdir()) == [cfg['dir']]
+
+
+def test_a_short_archive_never_becomes_a_model(tmp_path, monkeypatch):
+    stt = tmp_path / 'stt'
+    stt.mkdir()
+    monkeypatch.setattr(wt, '_get_stt_dir', lambda: stt)
+    cfg = wt._SHERPA_MODELS['whisper-tiny']
+    _fake_fetch(monkeypatch,
+                _archive_bytes(tmp_path, cfg, files=[cfg['files']['tokens']]))
+
+    with pytest.raises(RuntimeError):
+        wt._download_model('whisper-tiny')
+    assert list(stt.iterdir()) == []
+
+
+def test_an_old_half_extracted_folder_is_replaced(tmp_path, monkeypatch):
+    stt = tmp_path / 'stt'
+    leftover = stt / wt._SHERPA_MODELS['whisper-tiny']['dir']
+    leftover.mkdir(parents=True)
+    cfg = wt._SHERPA_MODELS['whisper-tiny']
+    (leftover / cfg['files']['tokens']).write_text('stale')
+    monkeypatch.setattr(wt, '_get_stt_dir', lambda: stt)
+    _fake_fetch(monkeypatch, _archive_bytes(tmp_path, cfg))
+
+    wt._download_model('whisper-tiny')
+    assert wt._sherpa_model_cached('whisper-tiny')
+    assert (leftover / cfg['files']['tokens']).read_text() == 'w'
+
+
+def test_a_failed_background_fetch_waits_before_retrying(catalog, monkeypatch):
+    """Every STT request selects; an offline node must not restart a
+    multi-GB fetch on each one."""
+    (big, mid, small), cached = catalog
+    cached(small)
+    monkeypatch.setattr(wt, '_background_failures', {})
+    attempts = []
+
+    def failing(name):
+        attempts.append(name)
+        raise OSError('offline')
+    monkeypatch.setattr(wt, '_download_model', failing)
+    clock = [1000.0]
+    monkeypatch.setattr(wt.time, 'monotonic', lambda: clock[0])
+
+    assert wt.select_whisper_model() == small
+    assert wt.select_whisper_model() == small
+    assert attempts == [big]                      # waited, did not refetch
+    clock[0] += wt._background_retry_wait(1) + 1
+    assert wt.select_whisper_model() == small
+    assert attempts == [big, big]                 # retried after the wait
+    clock[0] += wt._background_retry_wait(1) + 1  # less than the doubled wait
+    wt.select_whisper_model()
+    assert attempts == [big, big]
+
+
+def test_concurrent_selections_start_one_fetch(monkeypatch):
+    import threading as _t
+    real_thread = _t.Thread  # captured before the module's Thread is held
+    big = list(wt._SHERPA_MODELS)[0]
+    monkeypatch.setattr(wt, '_background_failures', {})
+    monkeypatch.setattr(wt, '_background_downloads', set())
+    started = []
+
+    class _Held:  # a thread that never finishes during the test
+        def __init__(self, target=None, **_kw):
+            pass
+
+        def start(self):
+            started.append(1)
+    monkeypatch.setattr(wt.threading, 'Thread', _Held)
+    barrier = _t.Barrier(8)
+    results = []
+
+    def go():
+        barrier.wait()
+        results.append(wt._download_in_background(big))
+    workers = [real_thread(target=go) for _ in range(8)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    assert results.count(True) == 1
+    assert started == [1]
 
 
 def test_a_cached_model_ranked_below_many_other_engines_is_still_found(monkeypatch):

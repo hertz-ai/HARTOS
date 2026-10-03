@@ -24,9 +24,12 @@ import logging
 import math
 import os
 import re
+import shutil
 import sys
 import tarfile
+import tempfile
 import threading
+import time
 import urllib.request
 import wave
 from pathlib import Path
@@ -774,11 +777,31 @@ def _sherpa_model_cached(model_name: str) -> bool:
     except KeyError:
         return False
     model_dir = _get_stt_dir() / cfg["dir"]
-    return model_dir.exists() and (model_dir / cfg["files"]["tokens"]).exists()
+    # EVERY file the recognizer loads, not just tokens: an extraction cut
+    # short (crash, full disk) used to leave a folder with tokens.txt and no
+    # encoder, which then read as cached forever and failed every load.
+    return model_dir.exists() and all(
+        (model_dir / f).exists() for f in cfg["files"].values())
+
+
+# One lock per model: a background fetch and a foreground one for the same
+# model must not write the same archive and folder at once.
+_model_download_locks: dict = {}
+_model_download_locks_guard = threading.Lock()
+
+
+def _model_download_lock(model_name: str) -> threading.Lock:
+    with _model_download_locks_guard:
+        return _model_download_locks.setdefault(model_name, threading.Lock())
 
 
 def _download_model(model_name: str) -> Path:
     """Download and extract a sherpa-onnx model if not already present.
+
+    The archive is fetched and unpacked in a private work folder, checked for
+    every file the recognizer loads, and only then moved into place, so the
+    model folder is either absent or complete -- never half-written for a
+    concurrent selection to pick up.
 
     Returns the path to the extracted model directory.
     """
@@ -789,22 +812,36 @@ def _download_model(model_name: str) -> Path:
     if _sherpa_model_cached(model_name):
         return model_dir
 
-    archive_url = f"{_SHERPA_MODEL_BASE}/{cfg['archive']}"
-    archive_path = stt_dir / cfg["archive"]
+    with _model_download_lock(model_name):
+        if _sherpa_model_cached(model_name):  # another thread just finished it
+            return model_dir
 
-    logger.info(f"Downloading STT model '{model_name}' from {archive_url}...")
-    try:
-        urllib.request.urlretrieve(archive_url, str(archive_path))
-        logger.info(f"Extracting {cfg['archive']}...")
-        with tarfile.open(str(archive_path), "r:bz2") as tar:
-            tar.extractall(path=str(stt_dir))
-        # Clean up archive
-        archive_path.unlink(missing_ok=True)
-        logger.info(f"STT model '{model_name}' ready at {model_dir}")
-    except Exception as e:
-        logger.error(f"Failed to download model '{model_name}': {e}")
-        archive_path.unlink(missing_ok=True)
-        raise
+        archive_url = f"{_SHERPA_MODEL_BASE}/{cfg['archive']}"
+        work = Path(tempfile.mkdtemp(prefix=f".{cfg['dir']}.", dir=str(stt_dir)))
+        archive_path = work / cfg["archive"]
+
+        logger.info(f"Downloading STT model '{model_name}' from {archive_url}...")
+        try:
+            urllib.request.urlretrieve(archive_url, str(archive_path))
+            logger.info(f"Extracting {cfg['archive']}...")
+            with tarfile.open(str(archive_path), "r:bz2") as tar:
+                tar.extractall(path=str(work))
+            extracted = work / cfg["dir"]
+            missing = [f for f in cfg["files"].values()
+                       if not (extracted / f).exists()]
+            if missing:
+                raise RuntimeError(
+                    f"archive {cfg['archive']} lacks {missing}")
+            if model_dir.exists():
+                # An incomplete leftover: it failed the cache check above.
+                shutil.rmtree(model_dir)
+            os.replace(str(extracted), str(model_dir))
+            logger.info(f"STT model '{model_name}' ready at {model_dir}")
+        except Exception as e:
+            logger.error(f"Failed to download model '{model_name}': {e}")
+            raise
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
     return model_dir
 
@@ -1094,7 +1131,19 @@ def _catalog_stt_entry(exclude=None):
         return None
 
 
+_background_lock = threading.Lock()
 _background_downloads: set = set()
+# model -> (consecutive failures, time.monotonic() of the last one)
+_background_failures: dict = {}
+_BACKGROUND_RETRY_BASE_S = 300.0
+_BACKGROUND_RETRY_MAX_S = 6 * 3600.0
+
+
+def _background_retry_wait(failures: int) -> float:
+    """Seconds a failed pick waits before a selection may fetch it again:
+    5 min, doubling per consecutive failure, at most 6 h."""
+    return min(_BACKGROUND_RETRY_BASE_S * (2 ** max(failures - 1, 0)),
+               _BACKGROUND_RETRY_MAX_S)
 
 
 def _download_in_background(model_name: str) -> bool:
@@ -1105,26 +1154,47 @@ def _download_in_background(model_name: str) -> bool:
     this, nothing ever downloaded the pick, since _download_model runs only
     for the model actually chosen, so the node stayed on the smaller cached
     model for good.  Once this finishes, the next selection finds the pick
-    cached.  A failed fetch is logged and may be retried by a later
-    selection.  Returns whether a download was started.
+    cached.  A failed fetch is logged and retried by a later selection once
+    its wait (_background_retry_wait) has passed -- every STT request
+    selects, so without the wait an offline node restarted a multi-GB fetch
+    on each one.  Returns whether a download was started.
     """
-    if model_name in _background_downloads:
-        return False
-    _background_downloads.add(model_name)
+    with _background_lock:
+        if model_name in _background_downloads:
+            return False
+        failed = _background_failures.get(model_name)
+        if failed and (time.monotonic() - failed[1]
+                       < _background_retry_wait(failed[0])):
+            return False
+        _background_downloads.add(model_name)
 
     def _run():
         try:
             _download_model(model_name)
+            with _background_lock:
+                _background_failures.pop(model_name, None)
             logger.info("STT model '%s' downloaded in the background; the next "
                         "selection uses it", model_name)
         except Exception as e:
+            with _background_lock:
+                failures = (_background_failures.get(model_name) or (0, 0))[0] + 1
+                _background_failures[model_name] = (failures, time.monotonic())
             logger.warning("Background download of STT model '%s' failed; a "
-                           "later selection retries it: %s", model_name, e)
+                           "selection retries it in %ds: %s", model_name,
+                           int(_background_retry_wait(failures)), e)
         finally:
-            _background_downloads.discard(model_name)
+            with _background_lock:
+                _background_downloads.discard(model_name)
 
-    threading.Thread(target=_run, name=f'stt-download-{model_name}',
-                     daemon=True).start()
+    try:
+        threading.Thread(target=_run, name=f'stt-download-{model_name}',
+                         daemon=True).start()
+    except Exception as e:
+        with _background_lock:
+            _background_downloads.discard(model_name)
+        logger.warning("Background download of STT model '%s' could not "
+                       "start: %s", model_name, e)
+        return False
     return True
 
 
@@ -1190,7 +1260,8 @@ def select_whisper_model() -> str:
                         "is not downloaded; using cached '%s' for now%s",
                         sherpa_key, fallback_key,
                         "; downloading the pick in the background" if started
-                        else " (the pick's download is already running)")
+                        else " (the pick's download is running or waiting "
+                             "to retry)")
                     return fallback_key
                 logger.warning(
                     "select_whisper_model: catalog picked '%s' but it is not "
