@@ -79,6 +79,13 @@ def _enforcement_is_hard() -> bool:
 #: all. Sized well above any plausible burst of genuine timeouts.
 _MAX_EMPTY_RECVS = 100
 
+#: Requests a link answers at once (frames flagged 'rq', see _answer_request).
+#: Each runs on its own thread so a slow handler cannot stall the receive loop;
+#: this bounds how many a connected peer can start.  Past it a request is
+#: dropped unanswered and the sender's own timeout applies, as it would with a
+#: busy node.
+_MAX_CONCURRENT_REQUESTS = 8
+
 
 def _is_recv_timeout(exc: BaseException) -> bool:
     """Is this exception "no message arrived in time", as opposed to a real fault?
@@ -271,6 +278,7 @@ class PeerLink:
         self._pending_responses: Dict[str, threading.Event] = {}
         self._response_data: Dict[str, Any] = {}
         self._recv_thread: Optional[threading.Thread] = None
+        self._request_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_REQUESTS)
 
         # Stats
         self._connected_at = 0.0
@@ -1039,20 +1047,23 @@ class PeerLink:
         falling back to HTTP; silence leaves their timeout and fallback as they
         were.
         """
-        reply = None
-        for handler in self._message_handlers.get(channel, []):
-            try:
-                result = handler(channel, data, self.peer_id)
-                if reply is None and isinstance(result, dict):
-                    reply = result
-            except Exception as e:
-                logger.debug(f"Handler error on {channel}: {e}")
-        if reply is None:
-            return
         try:
-            self.send(channel, reply, reply_to=msg_id)
-        except Exception as e:
-            logger.debug(f"Reply on {channel} failed: {e}")
+            reply = None
+            for handler in self._message_handlers.get(channel, []):
+                try:
+                    result = handler(channel, data, self.peer_id)
+                    if reply is None and isinstance(result, dict):
+                        reply = result
+                except Exception as e:
+                    logger.debug(f"Handler error on {channel}: {e}")
+            if reply is None:
+                return
+            try:
+                self.send(channel, reply, reply_to=msg_id)
+            except Exception as e:
+                logger.debug(f"Reply on {channel} failed: {e}")
+        finally:
+            self._request_slots.release()
 
     def _receive_loop(self):
         """Background thread: receive and dispatch messages."""
@@ -1118,6 +1129,12 @@ class PeerLink:
                         # runs on its own thread: this loop must keep reading, or
                         # replies to OUR pending requests on this link queue
                         # behind it and their timeouts fire spuriously.
+                        if not self._request_slots.acquire(blocking=False):
+                            logger.debug(
+                                "PeerLink %s: %d requests in flight, dropping "
+                                "one on %s", self.peer_id[:8],
+                                _MAX_CONCURRENT_REQUESTS, channel)
+                            continue
                         threading.Thread(
                             target=self._answer_request,
                             args=(channel, data, msg_id), daemon=True).start()

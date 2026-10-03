@@ -2002,6 +2002,37 @@ class TestRequestReply(unittest.TestCase):
             gate.set()
             _stop(a, b)
 
+    def test_a_burst_of_requests_cannot_start_unbounded_handlers(self):
+        from core.peer_link.link import _MAX_CONCURRENT_REQUESTS
+        a, b = _linked_pair()
+        try:
+            running, peak, lock = [0], [0], threading.Lock()
+            gate = threading.Event()
+
+            def slow(ch, data, peer):
+                with lock:
+                    running[0] += 1
+                    peak[0] = max(peak[0], running[0])
+                gate.wait(5)
+                with lock:
+                    running[0] -= 1
+                return {'ok': True}
+
+            b.on_message('compute', slow)
+            for _ in range(_MAX_CONCURRENT_REQUESTS * 4):
+                threading.Thread(
+                    target=lambda: a.send('compute', {}, wait_response=True, timeout=1),
+                    daemon=True).start()
+            time.sleep(0.8)
+            self.assertLessEqual(peak[0], _MAX_CONCURRENT_REQUESTS)
+            gate.set()
+            time.sleep(0.5)
+            # slots come back once handlers finish: a new request is answered
+            self.assertEqual(a.send('compute', {}, wait_response=True, timeout=3), {'ok': True})
+        finally:
+            gate.set()
+            _stop(a, b)
+
     def test_a_handler_return_is_not_sent_when_nobody_asked(self):
         a, b = _linked_pair()
         try:
