@@ -12732,35 +12732,36 @@ def coding_install():
 def voice_transcribe():
     """Transcribe audio to text using Whisper STT.
 
-    Accepts multipart/form-data with 'audio' file or JSON with 'audio_path'.
+    multipart/form-data: 'audio' (the recording), optional 'language'.
+
+    The audio is the upload, never a path.  A JSON 'audio_path' made any
+    caller this node admits -- a consented phone on a desktop, any user on
+    central -- able to have any file on the node read and transcribed, and a
+    UNC path made it dial out (review of Nunba b07e025f, 2026-10-03).  Same
+    rule as /api/voice/speak's voice/output_path (#67).  In-process callers
+    use whisper_transcribe(path) directly.
     """
+    if not (request.content_type and 'multipart' in request.content_type):
+        return jsonify({'error': "upload the audio as multipart field 'audio'"}), 400
     try:
         from integrations.service_tools.whisper_tool import whisper_transcribe
         import tempfile
         import json as _json
 
-        if request.content_type and 'multipart' in request.content_type:
-            audio_file = request.files.get('audio')
-            if not audio_file:
-                return jsonify({'error': 'No audio file provided'}), 400
-            # Save to temp file
-            suffix = os.path.splitext(audio_file.filename)[1] or '.wav'
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                audio_file.save(tmp)
-                tmp_path = tmp.name
-            try:
-                result = whisper_transcribe(tmp_path)
-                return jsonify(_json.loads(result))
-            finally:
-                os.unlink(tmp_path)
-        else:
-            data = request.get_json() or {}
-            audio_path = data.get('audio_path', '')
-            if not audio_path:
-                return jsonify({'error': 'audio_path is required'}), 400
-            language = data.get('language')
-            result = whisper_transcribe(audio_path, language)
+        audio_file = request.files.get('audio')
+        if not audio_file:
+            return jsonify({'error': 'No audio file provided'}), 400
+        language = request.form.get('language') or None
+        # Save to temp file
+        suffix = os.path.splitext(audio_file.filename or '')[1] or '.wav'
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            audio_file.save(tmp)
+            tmp_path = tmp.name
+        try:
+            result = whisper_transcribe(tmp_path, language)
             return jsonify(_json.loads(result))
+        finally:
+            os.unlink(tmp_path)
 
     except ImportError as e:
         return jsonify({'error': f'Whisper not available: {e}'}), 503
