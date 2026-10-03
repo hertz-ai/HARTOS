@@ -206,6 +206,9 @@ def test_stt_fallback_to_a_cached_model_warns(caplog, monkeypatch):
         (types.SimpleNamespace(id=c) for c in ranking if c not in (exclude or ())),
         None))
     monkeypatch.setattr(wt, '_sherpa_model_cached', lambda key: key == small)
+    # The uncached pick would start a REAL fetch into the user's model dir;
+    # a run killed mid-extract left a truncated model there (2026-09-30).
+    monkeypatch.setattr(wt, '_download_in_background', lambda name: False)
 
     assert wt.select_whisper_model() == small
     assert any(big in w and small in w and 'not downloaded' in w

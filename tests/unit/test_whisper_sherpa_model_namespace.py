@@ -144,6 +144,8 @@ def test_sherpa_transcribe_reports_the_bad_key_instead_of_raising(tmp_path):
 
 def test_select_whisper_model_returns_a_string(monkeypatch):
     """Anchor: the two-namespace contract is real, so the guard is load-bearing."""
+    # Real catalog, real disk: an uncached pick must not start a real fetch.
+    monkeypatch.setattr(whisper_tool, '_download_in_background', lambda name: False)
     out = whisper_tool.select_whisper_model()
     assert isinstance(out, str) and out
     # Deliberately NOT asserting it is a sherpa key — it legitimately may not

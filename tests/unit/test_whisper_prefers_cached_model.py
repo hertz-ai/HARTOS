@@ -244,6 +244,8 @@ def test_a_cached_model_ranked_below_many_other_engines_is_still_found(monkeypat
         (types.SimpleNamespace(id=c) for c in ranking if c not in (exclude or ())),
         None))
     monkeypatch.setattr(wt, '_sherpa_model_cached', lambda key: key == small)
+    # The uncached pick would start a REAL fetch into ~/.hevolve/models/stt.
+    monkeypatch.setattr(wt, '_download_in_background', lambda name: False)
     assert wt.select_whisper_model() == small
 
 
