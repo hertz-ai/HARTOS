@@ -104,3 +104,53 @@ class TestSweepExpired:
                    return_value=old.expires_at + 1):
             store.create_cart_mandate('u2', 'mcgroce', CART)
         assert store.get(old.mandate_id).status == 'expired'
+
+
+class TestLedgerGateForMandatePayments:
+    """The ledger is the one gate every caller (CLI, tool, LLM) goes through,
+    so a mandate's payment is enforced THERE, not only in one tool."""
+
+    def _mandate(self, store):
+        return store.create_cart_mandate('u1', 'mcgroce', CART)
+
+    def test_another_person_cannot_authorize_a_mandate_payment(self, store):
+        m = self._mandate(store)
+        assert store.ledger.authorize_payment(m.payment_id, 'user:someone-else') is False
+        assert store.ledger.authorize_payment(m.payment_id, 'user:cli-operator') is False
+        assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.APPROVAL_REQUIRED
+
+    def test_the_owner_still_authorizes_through_the_store(self, store):
+        m = self._mandate(store)
+        assert store.approve(m.mandate_id, 'u1') == (True, 'approved')
+        assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.AUTHORIZED
+
+    def test_the_owner_may_authorize_directly_as_themselves(self, store):
+        m = self._mandate(store)
+        assert store.ledger.authorize_payment(m.payment_id, 'user:u1') is True
+
+    def test_a_non_mandate_payment_is_authorized_by_any_person_as_before(self, store):
+        p = store.ledger.create_payment_request(
+            amount=5, currency='INR', description='plain',
+            requester_agent_id='agent', require_approval=False)
+        assert store.ledger.authorize_payment(p.payment_id, 'user:anyone') is True
+
+    def test_a_mandate_payment_cannot_be_processed_directly(self, store):
+        m = self._mandate(store)
+        store.ledger.authorize_payment(m.payment_id, 'user:u1')
+        out = store.ledger.process_payment(m.payment_id)           # the CLI's call
+        assert out['success'] is False and 'only by the person' in out['error']
+        assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.AUTHORIZED
+
+    def test_the_settler_still_processes_it(self, store):
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        out = store.ledger.process_payment(m.payment_id, settler=True)
+        assert 'only by the person' not in out.get('error', '')
+        assert store.ledger.get_payment(m.payment_id).status != PaymentStatus.AUTHORIZED
+
+    def test_a_non_mandate_payment_still_processes_directly(self, store):
+        p = store.ledger.create_payment_request(
+            amount=5, currency='INR', description='plain',
+            requester_agent_id='agent', require_approval=False)
+        store.ledger.authorize_payment(p.payment_id, 'user:anyone')
+        assert 'only by the person' not in store.ledger.process_payment(p.payment_id).get('error', '')

@@ -435,7 +435,7 @@ def settle_checkout(m) -> Dict[str, Any]:
         return {'success': False, 'error': f'checkout refused: {reason}'}
     from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
     ledger = get_payment_ledger()
-    paid = ledger.process_payment(m.payment_id)
+    paid = ledger.process_payment(m.payment_id, settler=True)
     payment = ledger.get_payment(m.payment_id)
     method = payment.gateway.value if payment and payment.gateway else None
     if paid.get('status') == 'redirect_required':

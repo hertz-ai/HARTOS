@@ -823,6 +823,18 @@ class PaymentLedger:
                                f"is not a person; refused")
                 return False
 
+            # A payment that belongs to a mandate is authorized only by the
+            # mandate's owner (MandateStore.approve passes exactly that).  Any
+            # other 'user:<id>' -- the CLI operator, an LLM naming a victim --
+            # is refused here, at the one gate every caller goes through.
+            _meta = payment.metadata or {}
+            if _meta.get('mandate_id') and approver_id != (
+                    PERSON_ID_PREFIX + str(_meta.get('user_id') or '')):
+                logger.warning(f"Payment {payment_id}: belongs to a mandate; "
+                               f"only its owner may authorize it, not "
+                               f"{approver_id!r}")
+                return False
+
             # Add to approval chain
             payment.approval_chain.append({
                 'approver_id': approver_id,
@@ -859,9 +871,16 @@ class PaymentLedger:
             self.save_ledger()
             return True
 
-    def process_payment(self, payment_id: str) -> Dict[str, Any]:
+    def process_payment(self, payment_id: str, *,
+                        settler: bool = False) -> Dict[str, Any]:
         """
         Process an authorized payment through the gateway
+
+        ``settler=True`` is passed only by the code that settles a mandate
+        (ap2_mandate.settle and a kind's registered settler): a payment that
+        belongs to a mandate is taken only after the owner's approval and a
+        re-check of the live cart, so any other caller (the CLI, a generic
+        tool) is refused rather than moving money with no order placed.
 
         The gateway calls are network I/O (Stripe SDK, PhonePe with a 15 s
         timeout), so they run OUTSIDE ``self.lock``: the payment is reserved
@@ -889,6 +908,13 @@ class PaymentLedger:
                 return {'success': False, 'error': 'Payment not found'}
 
             payment = self.payments[payment_id]
+
+            if (payment.metadata or {}).get('mandate_id') and not settler:
+                return {
+                    'success': False,
+                    'error': 'this payment is settled only by the person who '
+                             'approves it; it cannot be processed directly'
+                }
 
             if payment.status != PaymentStatus.AUTHORIZED:
                 return {

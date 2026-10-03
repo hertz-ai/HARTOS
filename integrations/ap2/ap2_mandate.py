@@ -514,7 +514,7 @@ def settle(m: CartMandate, store: Optional[MandateStore] = None) -> Dict[str, An
     if fn is not None:
         return fn(m)
     store = store or get_mandate_store()
-    result = store.ledger.process_payment(m.payment_id)
+    result = store.ledger.process_payment(m.payment_id, settler=True)
     if result.get('success'):
         store.consume(m.mandate_id)
     payment = store.ledger.get_payment(m.payment_id)
