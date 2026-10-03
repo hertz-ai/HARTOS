@@ -1331,6 +1331,16 @@ def phonepe_callback():
                 'payment_request_id': payment_req.payment_id,
             }), 200
         order = None
+        if meta.get('mandate_id') and meta.get('kind') != 'commerce_checkout':
+            # A generic mandate has no order step to consume it; the money is
+            # taken, so it is used (a commerce checkout is consumed when its
+            # order is placed).
+            try:
+                from integrations.ap2.ap2_mandate import get_mandate_store
+                get_mandate_store().consume(meta['mandate_id'])
+            except Exception as e:
+                logger.warning(f"PhonePe callback: could not consume mandate "
+                               f"{meta.get('mandate_id')}: {e}")
         if meta.get('kind') == 'commerce_checkout':
             try:
                 from integrations.commerce.commerce_tools import (

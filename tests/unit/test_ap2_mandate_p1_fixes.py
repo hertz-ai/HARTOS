@@ -192,3 +192,37 @@ class TestGatewayUrlsTrustOnlyKnownHosts:
             import os
             os.environ.pop('HARTOS_PUBLIC_URL', None)
             assert ap2_mandate._own_gateway_urls() == {}
+
+
+class TestMandatesDoNotStickForever:
+    def _approved_with(self, store, status):
+        m = _approved(store)
+        store.ledger.get_payment(m.payment_id).status = status
+        return m
+
+    def _at(self, store, m, when):
+        with patch('integrations.ap2.ap2_mandate.time.time', return_value=when):
+            return store.get(m.mandate_id)
+
+    def test_an_approved_mandate_whose_payment_completed_is_consumed(self, store):
+        m = self._approved_with(store, PaymentStatus.COMPLETED)
+        assert self._at(store, m, m.expires_at + 1).status == 'consumed'
+
+    def test_a_processing_payment_holds_its_mandate_within_the_grace(self, store):
+        from integrations.ap2.ap2_mandate import PROCESSING_RECONCILE_AFTER_S
+        m = self._approved_with(store, PaymentStatus.PROCESSING)
+        later = m.expires_at + PROCESSING_RECONCILE_AFTER_S - 60
+        assert self._at(store, m, later).status == 'approved'
+
+    def test_a_processing_payment_past_the_grace_releases_the_mandate_only(self, store):
+        from integrations.ap2.ap2_mandate import PROCESSING_RECONCILE_AFTER_S
+        m = self._approved_with(store, PaymentStatus.PROCESSING)
+        later = m.expires_at + PROCESSING_RECONCILE_AFTER_S + 60
+        assert self._at(store, m, later).status == 'expired'
+        # money may have moved: the payment is left for a person
+        assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.PROCESSING
+
+    def test_an_unpaid_mandate_still_expires_and_cancels(self, store):
+        m = _approved(store)
+        assert self._at(store, m, m.expires_at + 1).status == 'expired'
+        assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.CANCELLED

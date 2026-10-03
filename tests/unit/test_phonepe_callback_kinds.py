@@ -178,3 +178,19 @@ def test_complete_once_is_true_exactly_once(ctx):
     assert ctx['ledger'].complete_once(p.payment_id, 'x') is True
     assert ctx['ledger'].complete_once(p.payment_id, 'x') is False
     assert ctx['ledger'].complete_once('nope', 'x') is False
+
+
+def test_a_generic_mandate_is_consumed_when_its_payment_completes(ctx):
+    _processing(ctx['ledger'], {'kind': 'generic', 'mandate_id': 'mdt_g'})
+    with patch('integrations.ap2.ap2_mandate.get_mandate_store') as store:
+        assert _callback(ctx['client']).get_json()['status'] == 'completed'
+    store.return_value.consume.assert_called_once_with('mdt_g')
+
+
+def test_a_commerce_checkout_is_left_to_its_order_step(ctx):
+    _processing(ctx['ledger'], {'kind': 'commerce_checkout', 'mandate_id': 'mdt_c'})
+    with patch('integrations.ap2.ap2_mandate.get_mandate_store') as store, \
+            patch('integrations.commerce.commerce_tools.complete_redirect_checkout',
+                  return_value={'success': True}):
+        _callback(ctx['client'])
+    store.return_value.consume.assert_not_called()

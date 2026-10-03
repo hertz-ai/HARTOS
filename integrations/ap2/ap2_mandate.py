@@ -63,6 +63,12 @@ KIND_GENERIC = 'generic'
 # A stale approval must not authorize a payment an hour later.
 DEFAULT_MANDATE_TTL_S = 15 * 60
 
+# A redirect payment still PROCESSING this long after its mandate expired was
+# abandoned or lost its callback (a PhonePe checkout session lasts minutes).
+# The mandate is then released and a person is told; the payment itself is
+# left as it is, since money may have moved.
+PROCESSING_RECONCILE_AFTER_S = 24 * 3600
+
 _MANDATES_FILENAME = 'ap2_mandates.json'
 _MANDATE_KEY_FILENAME = '.ap2_mandate_key'
 
@@ -242,9 +248,28 @@ class MandateStore:
 
     def _expire_if_due(self, m: CartMandate, now: float) -> None:
         if m.status in ('pending', 'approved') and now >= m.expires_at:
-            if self._money_in_flight(m.payment_id):
-                # A redirect gateway (PhonePe) is holding or has taken the
-                # money; its callback finishes this mandate, not the clock.
+            from integrations.ap2.ap2_protocol import PaymentStatus
+            status = self._payment_status(m.payment_id)
+            if status == PaymentStatus.COMPLETED:
+                # The money was taken (e.g. a generic PhonePe mandate, whose
+                # callback has no order step to consume it): it is used, not
+                # waiting to pay again.
+                if m.status == 'approved':
+                    m.status = 'consumed'
+                    m.sig = self._sign(m)
+                return
+            if status == PaymentStatus.PROCESSING:
+                # A redirect gateway (PhonePe) is holding the money; its
+                # callback finishes this mandate, not the clock -- unless it
+                # never came.
+                if now < m.expires_at + PROCESSING_RECONCILE_AFTER_S:
+                    return
+                logger.error(f'MANUAL RECONCILIATION NEEDED: payment '
+                             f'{m.payment_id} (mandate {m.mandate_id}) is still '
+                             f'PROCESSING a day after the mandate expired; the '
+                             f'mandate is released, the payment is left as is')
+                m.status = 'expired'
+                m.sig = self._sign(m)
                 return
             m.status = 'expired'
             m.sig = self._sign(m)
@@ -254,14 +279,17 @@ class MandateStore:
             except Exception as e:
                 logger.debug(f'ap2 mandates: cancel on expiry failed: {e}')
 
-    def _money_in_flight(self, payment_id: str) -> bool:
-        from integrations.ap2.ap2_protocol import PaymentStatus
+    def _payment_status(self, payment_id: str):
         try:
             p = self.ledger.get_payment(payment_id)
         except Exception:
-            return False
-        return p is not None and p.status in (PaymentStatus.PROCESSING,
-                                              PaymentStatus.COMPLETED)
+            return None
+        return p.status if p is not None else None
+
+    def _money_in_flight(self, payment_id: str) -> bool:
+        from integrations.ap2.ap2_protocol import PaymentStatus
+        return self._payment_status(payment_id) in (PaymentStatus.PROCESSING,
+                                                    PaymentStatus.COMPLETED)
 
     # ── public API ───────────────────────────────────────────────
     def create_cart_mandate(self, user_id: str, merchant: str,
