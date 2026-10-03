@@ -1962,16 +1962,44 @@ class TestRequestReply(unittest.TestCase):
         finally:
             _stop(a, b)
 
-    def test_a_request_to_a_channel_with_no_handler_gets_a_prompt_error(self):
-        # The sender must not wait out its whole timeout (compute offload used
-        # to wait 120 s, then fall back to HTTP) for a frame nobody handles.
+    def test_a_request_to_a_channel_with_no_handler_gets_no_reply(self):
+        # Callers that wait on a channel (dispatch, gossip, hivemind collect)
+        # read ANY reply as an answer and would skip their HTTP fallback, so
+        # "nobody handles this" is silence and the sender's timeout is unchanged.
         a, b = _linked_pair()
         try:
-            t0 = time.monotonic()
-            reply = a.send('compute', {'q': 'hi'}, wait_response=True, timeout=5)
-            self.assertEqual(reply, {'error': 'no handler'})
-            self.assertLess(time.monotonic() - t0, 2)
+            self.assertIsNone(a.send('dispatch', {'q': 'hi'}, wait_response=True, timeout=0.6))
         finally:
+            _stop(a, b)
+
+    def test_a_handler_that_returns_nothing_sends_no_reply(self):
+        a, b = _linked_pair()
+        try:
+            b.on_message('gossip', lambda ch, data, peer: None)
+            self.assertIsNone(a.send('gossip', {'q': 1}, wait_response=True, timeout=0.6))
+        finally:
+            _stop(a, b)
+
+    def test_a_slow_handler_does_not_stall_the_links_receive_loop(self):
+        # inference can take seconds; a reply to OUR request on the same link
+        # must not wait behind it.
+        a, b = _linked_pair()
+        try:
+            gate = threading.Event()
+            b.on_message('compute', lambda ch, data, peer: (gate.wait(5), {'slow': True})[1])
+            a.on_message('control', lambda ch, data, peer: {'pong': True})
+            out = {}
+            t = threading.Thread(
+                target=lambda: out.setdefault('slow', a.send('compute', {}, wait_response=True, timeout=8)))
+            t.start()
+            time.sleep(0.3)                    # b is now inside the slow handler
+            # b asks a something; a answers at once; b's loop must still be reading
+            self.assertEqual(b.send('control', {}, wait_response=True, timeout=3), {'pong': True})
+            gate.set()
+            t.join(5)
+            self.assertEqual(out.get('slow'), {'slow': True})
+        finally:
+            gate.set()
             _stop(a, b)
 
     def test_a_handler_return_is_not_sent_when_nobody_asked(self):

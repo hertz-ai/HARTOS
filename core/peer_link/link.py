@@ -1029,6 +1029,31 @@ class PeerLink:
                 return None
             raise
 
+    def _answer_request(self, channel: str, data: Any, msg_id: str) -> None:
+        """Run a channel's handlers for a request whose sender is waiting, and
+        send the first handler's dict back as the reply ('re' = the request id).
+
+        No reply when no handler returned a dict.  Callers that wait on a
+        channel (dispatch, gossip, hivemind collect) read ANY reply as an
+        answer, so an error reply for "nobody handles this" would stop them
+        falling back to HTTP; silence leaves their timeout and fallback as they
+        were.
+        """
+        reply = None
+        for handler in self._message_handlers.get(channel, []):
+            try:
+                result = handler(channel, data, self.peer_id)
+                if reply is None and isinstance(result, dict):
+                    reply = result
+            except Exception as e:
+                logger.debug(f"Handler error on {channel}: {e}")
+        if reply is None:
+            return
+        try:
+            self.send(channel, reply, reply_to=msg_id)
+        except Exception as e:
+            logger.debug(f"Reply on {channel} failed: {e}")
+
     def _receive_loop(self):
         """Background thread: receive and dispatch messages."""
         # Second line of defence behind _ws_recv's timeout/error split. That
@@ -1087,6 +1112,22 @@ class PeerLink:
                     # Dispatch to handlers
                     if not self._device_may_send(channel):
                         continue
+                    if msg.get('rq') and msg_id:
+                        # The sender is waiting (send(wait_response=True) flags
+                        # the frame).  The handler may be slow (inference), so it
+                        # runs on its own thread: this loop must keep reading, or
+                        # replies to OUR pending requests on this link queue
+                        # behind it and their timeouts fire spuriously.
+                        threading.Thread(
+                            target=self._answer_request,
+                            args=(channel, data, msg_id), daemon=True).start()
+                        continue
+                    for handler in self._message_handlers.get(channel, []):
+                        try:
+                            handler(channel, data, self.peer_id)
+                        except Exception as e:
+                            logger.debug(f"Handler error on {channel}: {e}")
+                    continue
                     handlers = self._message_handlers.get(channel, [])
                     reply = None
                     for handler in handlers:
