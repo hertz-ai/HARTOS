@@ -1457,6 +1457,10 @@ class SmartLedger:
         self._pubsub = None
         self._heartbeat = None
 
+        # Ids read back from storage when this ledger was opened: work an
+        # EARLIER process recorded.  add_task may replace one of these once
+        # it is terminal; a task this process added is never replaced.
+        self._loaded_task_ids: set = set()
         self.load()
 
     def load(self):
@@ -1470,6 +1474,7 @@ class SmartLedger:
                         for task_id, task_data in data.get("tasks", {}).items()
                     }
                     self.task_order = data.get("task_order", list(self.tasks.keys()))
+                    self._loaded_task_ids = set(self.tasks)
                     logger.info(f"Loaded {len(self.tasks)} tasks from ledger backend")
                 else:
                     logger.info("No existing ledger found, starting fresh")
@@ -1549,24 +1554,34 @@ class SmartLedger:
         """
         with self._lock:
             existing = self.tasks.get(task.task_id)
-            if existing is not None and not existing.is_terminal():
+            loaded = task.task_id in getattr(self, '_loaded_task_ids', ())
+            if existing is not None and not (existing.is_terminal() and loaded):
                 logger.warning(f"Task {task.task_id} already exists")
                 return False
             if existing is not None:
-                # The existing task under this id already reached a terminal
-                # state (completed/failed/terminated/cancelled/...) in an
-                # earlier session -- most commonly a process restart
-                # reloading an old on-disk ledger before a brand new
+                # The existing task under this id reached a terminal state
+                # (completed/failed/terminated/cancelled/...) in an EARLIER
+                # process and was read back from disk when this ledger opened
+                # -- a restart reloading an old ledger before a brand new
                 # caller's actions get added under the same deterministic
                 # key. Replace it instead of silently keeping the dead task
                 # and discarding the new one, which is what let a truly
                 # abandoned action (once it started being marked terminal
                 # via ActionState.GAVE_UP) go on blocking every later
                 # message for that (agent, session) pair forever.
+                #
+                # Only that case.  A task this process added and finished is
+                # still refused, as it always was: the coordinator detects a
+                # colliding child id by this refusal, and replacing would
+                # overwrite a finished result (or another goal's child) in
+                # place.
                 logger.info(
                     f"Task {task.task_id} already exists but is terminal "
                     f"({existing.status.value}); replacing with the new task")
 
+            # From here the id names this process's task.
+            if loaded:
+                self._loaded_task_ids.discard(task.task_id)
             self.tasks[task.task_id] = task
             if task.task_id not in self.task_order:
                 self.task_order.append(task.task_id)
