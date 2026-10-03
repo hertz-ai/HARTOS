@@ -315,18 +315,17 @@ def publish_new(row_dict: dict) -> None:
     if not row_dict or not row_dict.get('user_id'):
         return
     try:
-        from core.constants import CHAT_TOPIC_NEW
-    except ImportError:
-        return
-    topic = f"{CHAT_TOPIC_NEW}.{row_dict['user_id']}"
-    try:
         from core.peer_link.message_bus import get_message_bus
     except ImportError:
         logger.debug("chat_messages.publish_new: message_bus unavailable")
         return
     try:
         bus = get_message_bus()
-        bus.publish(topic, row_dict)
+        # The bus topic, addressed to the row's user: the SSE leg routes it
+        # to that user's streams only, and the Crossbar leg maps it to
+        # CHAT_TOPIC_NEW.<user_id> (TOPIC_MAP['chat.new']).  The raw URI
+        # with no user went to every user's stream and to no WAMP topic.
+        bus.publish('chat.new', row_dict, user_id=str(row_dict['user_id']))
     except Exception as e:  # noqa: BLE001
         logger.debug("chat_messages.publish_new failed for user %s: %s",
                      row_dict.get('user_id'), e)

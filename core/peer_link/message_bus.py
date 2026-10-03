@@ -41,7 +41,7 @@ import uuid
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional
 
-from core.constants import RECIPE_AVAILABLE_TOPIC
+from core.constants import CHAT_TOPIC_NEW, RECIPE_AVAILABLE_TOPIC
 
 logger = logging.getLogger('hevolve.peer_link')
 
@@ -74,6 +74,9 @@ TOPIC_MAP = {
     'chat.analogy': 'com.hertzai.hevolve.analogy.{user_id}',
     'chat.social': 'com.hertzai.hevolve.social.{user_id}',
     'chat.pupit': 'com.hertzai.pupit.{user_id}',
+    # A persisted chat turn, to every device of its user
+    # (integrations.social.chat_messages.publish_new).
+    'chat.new': CHAT_TOPIC_NEW + '.{user_id}',
     # Book parsing (percentage progress → frontend progress bar)
     'book.parsing': 'com.hertzai.bookparsing.{user_id}',
     # Task lifecycle (server-side tracking)
@@ -131,12 +134,9 @@ CATCH_ALL_TOPICS = ('chat.general',)
 # per-user URIs: security.edge_privacy.per_user_uri_owner reads both, and a
 # URI is one user's own (not egress) only if it instantiates one of them.
 # Each is measured at its publisher:
-#   chat.new    -- integrations.social.chat_messages.publish_new
-#                  (core.constants.CHAT_TOPIC_NEW + '.' + user_id)
 #   vision      -- hart_intelligence_entry vision consent event
 #   channel.response -- integrations.channels.response.router
 PER_USER_TOPICS_OUTSIDE_BUS = (
-    'com.hertzai.hevolve.chat.new.{user_id}',
     'com.hertzai.hevolve.vision.{user_id}',
     'com.hertzai.hevolve.channel.response.{user_id}',
 )
@@ -667,8 +667,13 @@ class MessageBus:
 
     def _route_local(self, topic: str, data: dict, msg_id: str):
         """Deliver to local EventBus + direct subscribers."""
-        # Mark as seen for dedup
+        # Mark as seen for dedup -- the bus id, and the payload's own id
+        # when it carries one (a chat row's msg_id), which is the id the
+        # Crossbar leg sends and an echo from the router comes back with.
         self._dedup.check_and_add(msg_id)
+        own_id = data.get('msg_id') if isinstance(data, dict) else None
+        if own_id and own_id != msg_id:
+            self._dedup.check_and_add(own_id)
 
         # Direct subscribers
         self._deliver_to_subscribers(topic, data)
@@ -851,10 +856,11 @@ class MessageBus:
             data = scrubbed
             self._stats['egress_scrubbed'] += 1
 
-        # Add msg_id for dedup
+        # Add msg_id for dedup.  A payload that names itself keeps its own
+        # id: clients dedup a chat row by it, and the SSE leg carries it.
         if isinstance(data, dict):
             data = dict(data)
-            data['msg_id'] = msg_id
+            data.setdefault('msg_id', msg_id)
 
         payload = json.dumps(data, separators=(',', ':')) if isinstance(data, dict) else str(data)
 

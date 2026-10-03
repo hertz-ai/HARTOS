@@ -172,5 +172,71 @@ class PersistExternalRoomEventTest(unittest.TestCase):
         self.assertEqual(platforms, ['whatsapp', 'discord', 'telegram'])
 
 
+class PublishNewTest(unittest.TestCase):
+    """A persisted turn goes to its own user only, on every leg.
+
+    publish_new handed the bus the raw URI with no user: the SSE leg
+    broadcast it to every connected user's stream (live 2026-10-03:
+    `broadcast_sse_event: type=com.hertzai.hevolve.chat.new.10202,
+    user_id=None, targeted=4, total_clients=4`, three users' turns), and
+    the Crossbar leg found no TOPIC_MAP entry for the URI and sent nothing,
+    so no WAMP subscriber of chat.new.<uid> ever received a turn.
+    """
+
+    ROW = {'user_id': 'u-7', 'role': 'user', 'content': 'hi',
+           'msg_id': '0123456789abcdef', 'device_id': 'phone-1'}
+
+    def test_sse_and_crossbar_both_address_the_rows_user(self):
+        from core.peer_link.message_bus import MessageBus
+        from integrations.social import chat_messages as cm
+        bus = MessageBus()
+        sse, crossbar = [], []
+        bus.set_http_transport(lambda topic, payload: crossbar.append(topic))
+
+        def _sse(event_type, data, user_id=None):
+            sse.append((event_type, user_id))
+            return True
+
+        with patch('core.peer_link.message_bus.get_message_bus',
+                   return_value=bus), \
+                patch('core.platform.events.broadcast_sse_safe', _sse):
+            cm.publish_new(dict(self.ROW))
+
+        self.assertEqual(sse, [('chat.new', 'u-7')])
+        self.assertEqual(crossbar, ['com.hertzai.hevolve.chat.new.u-7'])
+
+    def test_the_row_keeps_its_own_msg_id_on_every_leg(self):
+        """Clients dedup a turn by the row's msg_id (the cursor pull returns
+        it too).  The Crossbar leg replaced it with the bus's own id, so the
+        same turn reached a page under two ids, one per transport."""
+        import json
+        from core.peer_link.message_bus import MessageBus
+        from integrations.social import chat_messages as cm
+        bus = MessageBus()
+        sse, crossbar = [], []
+        bus.set_http_transport(
+            lambda topic, payload: crossbar.append(json.loads(payload)))
+
+        def _sse(event_type, data, user_id=None):
+            sse.append(data)
+            return True
+
+        with patch('core.peer_link.message_bus.get_message_bus',
+                   return_value=bus), \
+                patch('core.platform.events.broadcast_sse_safe', _sse):
+            cm.publish_new(dict(self.ROW))
+
+        self.assertEqual(sse[0]['msg_id'], self.ROW['msg_id'])
+        self.assertEqual(crossbar[0]['msg_id'], self.ROW['msg_id'])
+
+        # This node's own publish coming back from the router is an echo:
+        # it is not delivered to local subscribers a second time.
+        got = []
+        bus.subscribe('chat.new', lambda t, d: got.append(d))
+        self.assertFalse(bus.receive_from_crossbar(
+            'com.hertzai.hevolve.chat.new.u-7', dict(crossbar[0])))
+        self.assertEqual(got, [])
+
+
 if __name__ == '__main__':
     unittest.main()
