@@ -10,9 +10,8 @@ This is a leaf tool — never re-dispatches to /chat.
 import json
 import logging
 import os
-from core.subprocess_safe import no_window_kwargs
+from core.subprocess_safe import run_bounded
 import shutil
-import subprocess
 import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
@@ -95,36 +94,20 @@ class CodingToolBackend(ABC):
                 'error': f'{self.name} not installed',
             }
 
-        from .installer import resolved_argv
-        cmd = resolved_argv(self.build_command(task, context))
-        logger.info(f"Executing {self.name}: {cmd[0]} ...")
-
+        from .installer import launch_argv
         start = time.time()
         try:
-            result = subprocess.run(
+            cmd = launch_argv(self.build_command(task, context))
+            logger.info(f"Executing {self.name}: {cmd[0]} ...")
+            # run_bounded kills the whole tree on timeout (an npm tool's
+            # node child keeps the pipes open otherwise) and closes stdin so
+            # a first-run prompt cannot wait out the timeout.
+            result = run_bounded(
                 cmd,
-                capture_output=True,
-                text=True,
                 timeout=timeout,
                 env=self.get_env(),
-                cwd=context.get('working_dir') if context else None,
-             **no_window_kwargs())
-            elapsed = time.time() - start
-            parsed = self.parse_output(result.stdout, result.stderr, result.returncode)
-            parsed['tool'] = self.name
-            parsed['execution_time_s'] = round(elapsed, 2)
-            return parsed
-
-        except subprocess.TimeoutExpired:
-            elapsed = time.time() - start
-            return {
-                'success': False,
-                'output': '',
-                'tool': self.name,
-                'execution_time_s': round(elapsed, 2),
-                'error': f'Timeout after {timeout}s',
-            }
-        except (OSError, FileNotFoundError) as e:
+                cwd=context.get('working_dir') if context else None)
+        except (ValueError, OSError) as e:
             return {
                 'success': False,
                 'output': '',
@@ -132,6 +115,19 @@ class CodingToolBackend(ABC):
                 'execution_time_s': 0,
                 'error': str(e),
             }
+        elapsed = round(time.time() - start, 2)
+        if result.timed_out:
+            return {
+                'success': False,
+                'output': '',
+                'tool': self.name,
+                'execution_time_s': elapsed,
+                'error': f'Timeout after {timeout}s',
+            }
+        parsed = self.parse_output(result.stdout, result.stderr, result.returncode)
+        parsed['tool'] = self.name
+        parsed['execution_time_s'] = elapsed
+        return parsed
 
 
 class KiloCodeBackend(CodingToolBackend):

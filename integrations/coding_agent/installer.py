@@ -14,10 +14,13 @@ Licenses:
 """
 import logging
 import os
-from core.subprocess_safe import no_window_kwargs
+import re
 import shutil
 import subprocess
+import sys
 from typing import Dict, List, Optional
+
+from core.subprocess_safe import no_window_kwargs, run_bounded
 
 logger = logging.getLogger('hevolve.coding_agent')
 
@@ -45,14 +48,53 @@ SCRIPT_INSTALLS = {
 }
 
 
-def resolved_argv(cmd: List[str]) -> List[str]:
-    """cmd with argv[0] replaced by the path shutil.which resolves.
+# npm cmd-shim's last line: "%dp0%\<target>" %*  (target = a .js run by node,
+# or an .exe).  The node.exe probe line has no %* after it, so it never matches.
+_SHIM_TARGET = re.compile(r'"%dp0%\\([^"]+)"\s+%\*')
+# cmd.exe re-parses a batch file's arguments: these break out of or rewrite
+# an argument no matter how Python quotes it (measured: '" & echo X > f'
+# created f; a newline truncated the task; %PATH% expanded).
+_CMD_UNSAFE = set('"&|<>^%!\r\n')
 
-    npm installs npm itself and kilocode/opencode/pi as .cmd shims; on
-    Windows a bare name in an argv list is FileNotFoundError (CreateProcess
-    ignores PATHEXT).  Every coding-tool launch goes through this.
+
+def launch_argv(cmd: List[str]) -> List[str]:
+    """The argv that launches cmd[0] with cmd[1:] reaching it verbatim.
+
+    Every installer.py / tool_backends.py coding-tool launch goes through
+    this (claude_code_backend._spawn still has its own resolver).
+
+    On Windows npm installs npm-based tools as .cmd shims.  A bare name is
+    FileNotFoundError (CreateProcess ignores PATHEXT), and launching the .cmd
+    hands the arguments to cmd.exe.  So a shim is launched as its target —
+    node + script, or the .exe — and a batch file that is not a recognisable
+    npm shim may only receive arguments with no cmd.exe metacharacters.
+
+    Raises ValueError for an empty cmd or an argument cmd.exe would rewrite.
     """
-    return [shutil.which(cmd[0]) or cmd[0]] + list(cmd[1:])
+    if not cmd:
+        raise ValueError('empty command')
+    path = shutil.which(cmd[0]) or cmd[0]
+    args = list(cmd[1:])
+    if sys.platform != 'win32' or not path.lower().endswith(('.cmd', '.bat')):
+        return [path] + args
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            match = _SHIM_TARGET.search(f.read())
+    except OSError:
+        match = None
+    if match:
+        shim_dir = os.path.dirname(os.path.abspath(path))
+        target = os.path.join(shim_dir, match.group(1))
+        if target.lower().endswith('.exe'):
+            return [target] + args
+        local_node = os.path.join(shim_dir, 'node.exe')
+        node = local_node if os.path.isfile(local_node) else shutil.which('node')
+        if node:
+            return [node, target] + args
+    if any(_CMD_UNSAFE & set(a) for a in args):
+        raise ValueError(f'{os.path.basename(path)} runs through cmd.exe, which '
+                         f'would rewrite this argument; refusing to launch it')
+    return [path] + args
 
 
 def detect_installed() -> Dict[str, bool]:
@@ -79,13 +121,13 @@ def get_versions() -> Dict[str, Optional[str]]:
             versions[name] = None
             continue
         try:
-            result = subprocess.run(
-                resolved_argv([binary, '--version']),
-                capture_output=True, text=True, timeout=10,
-             **no_window_kwargs())
-            versions[name] = result.stdout.strip() or result.stderr.strip() or 'unknown'
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            result = run_bounded(launch_argv([binary, '--version']), timeout=10)
+        except (ValueError, OSError):
+            result = None
+        if result is None or result.timed_out:
             versions[name] = 'installed (version unknown)'
+        else:
+            versions[name] = result.stdout.strip() or result.stderr.strip() or 'unknown'
     return versions
 
 
@@ -104,7 +146,6 @@ def install(tool_name: str) -> Dict:
     if tool_name in SCRIPT_INSTALLS:
         if shutil.which(binary):
             return {'success': True, 'message': f'{tool_name} already installed'}
-        import sys
         script = SCRIPT_INSTALLS[tool_name]
         command = script['win32'] if sys.platform == 'win32' else script['other']
         return {
@@ -126,18 +167,15 @@ def install(tool_name: str) -> Dict:
 
     logger.info(f"Installing {tool_name} ({package}, license: {license_type})")
     try:
-        result = subprocess.run(
-            resolved_argv(['npm', 'install', '-g', package]),
-            capture_output=True, text=True, timeout=120,
-         **no_window_kwargs())
-        if result.returncode == 0:
-            return {'success': True, 'message': f'{tool_name} installed successfully'}
-        else:
-            return {'success': False, 'error': result.stderr.strip()}
-    except subprocess.TimeoutExpired:
-        return {'success': False, 'error': 'Installation timed out (120s)'}
-    except OSError as e:
+        result = run_bounded(launch_argv(['npm', 'install', '-g', package]),
+                             timeout=120)
+    except (ValueError, OSError) as e:
         return {'success': False, 'error': str(e)}
+    if result.timed_out:
+        return {'success': False, 'error': 'Installation timed out (120s)'}
+    if result.returncode == 0:
+        return {'success': True, 'message': f'{tool_name} installed successfully'}
+    return {'success': False, 'error': result.stderr.strip()}
 
 
 def pip_install(packages: str) -> Dict:

@@ -12718,13 +12718,14 @@ def coding_benchmarks():
 @app.route('/coding/install', methods=['POST'])
 @_json_endpoint
 def coding_install():
-    """Install a coding tool via npm. JSON body: {tool_name}"""
+    """Install a coding tool (npm, pip, or the official-script command for
+    the user to run — installer.install_tool picks). JSON body: {tool_name}"""
     data = request.get_json(force=True)
     tool_name = data.get('tool_name', '')
     if not tool_name:
         return jsonify({'error': 'tool_name is required'}), 400
-    from integrations.coding_agent.installer import install
-    result = install(tool_name)
+    from integrations.coding_agent.installer import install_tool
+    result = install_tool(tool_name)
     code = 200 if result.get('success') else 500
     return jsonify(result), code
 
