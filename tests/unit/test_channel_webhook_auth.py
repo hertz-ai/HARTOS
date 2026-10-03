@@ -550,6 +550,24 @@ class ChannelSendBehaviour(unittest.TestCase):
         self.assertFalse(body['success'])
         self.assertEqual("unknown channel", body['error'])
 
+    def test_a_send_still_running_after_the_wait_is_202_not_500(self):
+        """A 500 tells the caller to retry; the send is still in flight and
+        may be delivered, so a retry would send the message twice."""
+        import concurrent.futures
+        self._rl = _RealLoop()
+        c, integ, _calls = _send_client(loop=self._rl.loop)
+
+        def _slow(*a, **k):
+            raise concurrent.futures.TimeoutError()
+        integ.send_threadsafe = _slow
+        r = c.post('/channels/send', data=SEND_BODY,
+                   content_type='application/json')
+        self.assertEqual(202, r.status_code)
+        body = r.get_json()
+        self.assertTrue(body['pending'])
+        self.assertIsNone(body['success'])
+        self.assertIn('Do not resend', body['error'])
+
 
 if __name__ == '__main__':
     unittest.main()

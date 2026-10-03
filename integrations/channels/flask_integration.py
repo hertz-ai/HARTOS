@@ -6,6 +6,7 @@ Routes incoming channel messages to the agent system.
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import json
@@ -1415,7 +1416,21 @@ def register_status_routes(app, integration: FlaskChannelIntegration) -> None:
         if not all([channel, chat_id, text]):
             return jsonify({"error": "Missing required fields"}), 400
 
-        result = integration.send_threadsafe(channel, chat_id, text, wait=30)
+        try:
+            result = integration.send_threadsafe(channel, chat_id, text, wait=30)
+        except concurrent.futures.TimeoutError:
+            # The send is still running on the adapter loop and may yet be
+            # delivered.  Unhandled, this was a bare 500, which tells a
+            # caller to retry -- and the retry sent the message twice.
+            logger.warning(
+                "/channels/send to %s/%s still in progress after 30s; "
+                "answered 202, not retried", channel, chat_id)
+            return jsonify({
+                "success": None,
+                "pending": True,
+                "error": ("Send still in progress after 30s; it may still be "
+                          "delivered. Do not resend."),
+            }), 202
         if result is None:
             return jsonify({"error": "Channels not running"}), 503
         return jsonify({
