@@ -987,6 +987,34 @@ class PaymentLedger:
         with self.lock:
             return self.payments.get(payment_id)
 
+    def find_by_gateway_transaction(self, gateway_transaction_id: str
+                                    ) -> Optional[PaymentRequest]:
+        """The payment a gateway transaction id belongs to, read under the
+        lock (a callback must not iterate the dict while another thread
+        writes it)."""
+        if not gateway_transaction_id:
+            return None
+        with self.lock:
+            for p in self.payments.values():
+                if p.gateway_transaction_id == gateway_transaction_id:
+                    return p
+        return None
+
+    def complete_once(self, payment_id: str, note: str) -> bool:
+        """Mark a payment COMPLETED if, and only if, this call is the one that
+        does it: True for the single caller that moved it from PROCESSING (or
+        AUTHORIZED), False for every other -- already completed, terminal, or
+        unknown.  A gateway delivers its confirmation more than once, and only
+        one delivery may go on to place the order."""
+        with self.lock:
+            p = self.payments.get(payment_id)
+            if p is None or p.status not in (PaymentStatus.PROCESSING,
+                                             PaymentStatus.AUTHORIZED):
+                return False
+            p.update_status(PaymentStatus.COMPLETED, note)
+            self.save_ledger()
+            return True
+
     def list_payments(
         self,
         agent_id: Optional[str] = None,

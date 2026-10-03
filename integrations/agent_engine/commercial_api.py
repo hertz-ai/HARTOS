@@ -1236,12 +1236,8 @@ def phonepe_callback():
         logger.warning("PhonePe callback: payload missing merchantTransactionId")
         return jsonify({'success': False, 'error': 'Missing merchantTransactionId'}), 400
 
-    # Recover our payment record by gateway_transaction_id.
-    payment_req = None
-    for p in payment_ledger.payments.values():
-        if p.gateway_transaction_id == merchant_txn_id:
-            payment_req = p
-            break
+    # Recover our payment record by gateway_transaction_id (under the lock).
+    payment_req = payment_ledger.find_by_gateway_transaction(merchant_txn_id)
     if payment_req is None:
         logger.warning(f"PhonePe callback: no payment found for txn {merchant_txn_id}")
         # Don't 5xx — PhonePe would retry forever.  Return 200 with success=False.
@@ -1267,6 +1263,20 @@ def phonepe_callback():
     # Defense in depth: re-query PhonePe status, never trust webhook body alone.
     status_result = gateway.capture_payment(
         payment_req.payment_id, payment_req.gateway_transaction_id)
+    if not status_result.get('success') and 'status' not in status_result:
+        # The status API could not be asked (network, timeout): that says
+        # nothing about the money.  Leave the payment PROCESSING and answer
+        # non-2xx so PhonePe delivers the callback again.
+        logger.warning(f"PhonePe callback: status check for "
+                       f"{payment_req.payment_id} failed, will retry: "
+                       f"{status_result.get('error')}")
+        return jsonify({'success': False, 'status': 'status_check_failed',
+                        'payment_request_id': payment_req.payment_id}), 503
+    if not status_result.get('success') and             status_result.get('status') == 'PAYMENT_PENDING':
+        # Not decided yet: the buyer's bank has not answered.  PhonePe sends
+        # the final callback when it does; the payment stays PROCESSING.
+        return jsonify({'success': False, 'status': 'pending',
+                        'payment_request_id': payment_req.payment_id}), 200
     if not status_result.get('success'):
         payment_req.update_status(
             PaymentStatus.FAILED,
@@ -1279,7 +1289,29 @@ def phonepe_callback():
             'payment_request_id': payment_req.payment_id,
         }), 200
 
-    # Status check confirmed PAYMENT_SUCCESS — finalize.
+    # Status check confirmed PAYMENT_SUCCESS.  The amount PhonePe took must be
+    # the amount this payment asked for (when the status API reports one).
+    _gw_data = (status_result.get('gateway_response') or {}).get('data') or {}
+    if _gw_data.get('amount') is not None:
+        try:
+            _paid = int(_gw_data['amount'])
+            _expected = gateway._to_paise(payment_req)
+        except (TypeError, ValueError):
+            _paid, _expected = None, None
+        if _paid is None or _paid != _expected:
+            logger.error(f"MANUAL RECONCILIATION NEEDED: PhonePe captured "
+                         f"{_gw_data.get('amount')} paise for "
+                         f"{payment_req.payment_id}, which expected "
+                         f"{_expected}; not finalized")
+            payment_req.update_status(
+                PaymentStatus.FAILED,
+                f"amount mismatch: captured {_gw_data.get('amount')} paise, "
+                f"expected {_expected}")
+            payment_ledger.save_ledger()
+            return jsonify({'success': False, 'status': 'amount_mismatch',
+                            'payment_request_id': payment_req.payment_id}), 200
+
+    # Finalize.
     meta = payment_req.metadata or {}
 
     # Not every AP2 PhonePe payment is a tier upgrade: an agent's
@@ -1289,9 +1321,15 @@ def phonepe_callback():
     # below would otherwise mark a captured payment FAILED.  A commerce
     # checkout then places its McGroce order (integrations/commerce).
     if meta.get('kind') != 'tier_upgrade':
-        payment_req.update_status(PaymentStatus.COMPLETED,
-                                  'PhonePe payment captured via callback')
-        payment_ledger.save_ledger()
+        # Only the delivery that completes the payment places the order: two
+        # concurrent callbacks both pass the COMPLETED check above.
+        if not payment_ledger.complete_once(
+                payment_req.payment_id, 'PhonePe payment captured via callback'):
+            return jsonify({
+                'success': True,
+                'status': 'already_completed',
+                'payment_request_id': payment_req.payment_id,
+            }), 200
         order = None
         if meta.get('kind') == 'commerce_checkout':
             try:

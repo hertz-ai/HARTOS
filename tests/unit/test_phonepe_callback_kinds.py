@@ -103,3 +103,78 @@ def test_bad_signature_changes_nothing(ctx):
     p = _processing(ctx['ledger'], {'kind': 'commerce_checkout'})
     assert _callback(ctx['client'], sig='bad').status_code == 401
     assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.PROCESSING
+
+
+# ── duplicate deliveries, pending, transient errors, amount ─────────────
+
+def _set_capture(ctx, fn):
+    ctx['ledger'].gateways[PaymentGateway.PHONEPE].capture_payment = fn
+
+
+def test_a_second_delivery_racing_the_first_places_the_order_once(ctx):
+    p = _processing(ctx['ledger'], {'kind': 'commerce_checkout', 'mandate_id': 'mdt_1'})
+    inner = {}
+
+    def capture(payment_id, txn):
+        if not inner:                       # the first delivery is mid-check...
+            inner['started'] = True
+            inner['r'] = _callback(ctx['client'])   # ...when the second arrives
+        return {'success': True, 'status': 'captured'}
+
+    _set_capture(ctx, capture)
+    with patch('integrations.commerce.commerce_tools.complete_redirect_checkout',
+               return_value={'success': True}) as place:
+        outer = _callback(ctx['client'])
+    statuses = {inner['r'].get_json()['status'], outer.get_json()['status']}
+    assert statuses == {'completed', 'already_completed'}
+    place.assert_called_once_with(p.payment_id)
+
+
+def test_payment_pending_stays_processing(ctx):
+    p = _processing(ctx['ledger'], {'kind': 'commerce_checkout'})
+    _set_capture(ctx, lambda *a: {'success': False, 'status': 'PAYMENT_PENDING'})
+    r = _callback(ctx['client'])
+    assert r.status_code == 200 and r.get_json()['status'] == 'pending'
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.PROCESSING
+
+
+def test_a_failed_status_check_is_retried_not_failed(ctx):
+    p = _processing(ctx['ledger'], {})
+    _set_capture(ctx, lambda *a: {'success': False, 'error': 'PhonePe status check failed: timeout'})
+    r = _callback(ctx['client'])
+    assert r.status_code == 503
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.PROCESSING
+
+
+def test_a_definite_failure_still_fails(ctx):
+    p = _processing(ctx['ledger'], {})
+    _set_capture(ctx, lambda *a: {'success': False, 'status': 'PAYMENT_ERROR', 'error': 'declined'})
+    r = _callback(ctx['client'])
+    assert r.get_json()['status'] == 'payment_failed'
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.FAILED
+
+
+def test_a_captured_amount_that_differs_is_not_finalized(ctx):
+    p = _processing(ctx['ledger'], {'kind': 'commerce_checkout'})
+    _set_capture(ctx, lambda *a: {'success': True, 'status': 'captured',
+                                  'gateway_response': {'data': {'amount': 100}}})
+    with patch('integrations.commerce.commerce_tools.complete_redirect_checkout') as place:
+        r = _callback(ctx['client'])
+    assert r.get_json()['status'] == 'amount_mismatch'
+    place.assert_not_called()
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.FAILED
+
+
+def test_the_right_amount_completes(ctx):
+    p = _processing(ctx['ledger'], {})
+    _set_capture(ctx, lambda *a: {'success': True, 'status': 'captured',
+                                  'gateway_response': {'data': {'amount': 24000}}})
+    assert _callback(ctx['client']).get_json()['status'] == 'completed'
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
+
+
+def test_complete_once_is_true_exactly_once(ctx):
+    p = _processing(ctx['ledger'], {})
+    assert ctx['ledger'].complete_once(p.payment_id, 'x') is True
+    assert ctx['ledger'].complete_once(p.payment_id, 'x') is False
+    assert ctx['ledger'].complete_once('nope', 'x') is False
