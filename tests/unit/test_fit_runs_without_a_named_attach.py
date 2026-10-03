@@ -114,6 +114,42 @@ class FitRunsWheneverTheSessionHasAgents(unittest.TestCase):
         for call in fit.call_args_list:
             self.assertIn('send_message_to_user', call.kwargs['protect'])
 
+    def test_a_failed_attach_still_protects_the_actions_own_tools(self):
+        """The attach binds the recipe's tools, then something after it
+        raises: the fallback fit becomes the turn's protected record, so it
+        must carry those names or the budget evicts the tools just bound."""
+        fit = MagicMock(return_value=set())
+        helper, assistant = _agent('helper'), _agent('assistant')
+        assistant._hart_attached_tools = set()
+
+        def _log(level, msg):
+            if 'Tier-1 named attach' in msg:
+                raise RuntimeError('log sink down')
+
+        ns = {
+            'user_agents': {'sess': [assistant, None, None, None, helper]},
+            'user_tasks': {'sess': SimpleNamespace(current_action=2)},
+            'recipes': {},
+            '_ctx_safe_log': _log,
+            '_reuse_action_tool_names': lambda up, aid: ['crawl4ai_crawl'],
+        }
+        src = _lift('_attach_named_tools_for_action')
+        import sys as _sys
+        _svc = SimpleNamespace(service_tool_registry=MagicMock())
+        with patch('core.agent_tools.fit_schema_to_ctx', fit), \
+                patch('core.agent_tools.attach_for_names',
+                      MagicMock(return_value=1)), \
+                patch.dict(_sys.modules,
+                           {'integrations.service_tools': _svc}):
+            exec(src['_attach_named_tools_for_action'], ns)
+            result = ns['_attach_named_tools_for_action']('sess')
+
+        self.assertIs(result, False)
+        self.assertTrue(fit.call_args_list, 'the failed attach was not fitted')
+        for call in fit.call_args_list:
+            self.assertIn('crawl4ai_crawl', call.kwargs['protect'])
+            self.assertTrue(call.kwargs['turn_protect'])
+
 
 if __name__ == '__main__':
     unittest.main()

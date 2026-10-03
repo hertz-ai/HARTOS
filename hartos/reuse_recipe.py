@@ -7552,11 +7552,15 @@ def _attach_named_tools_for_action(user_prompt):
         # be found by ABSENCE of the attach line.
         _ctx_safe_log('warning',
                       f"named attach skipped: {err} for session: {user_prompt}")
-        # A failed attach must not also leave the schema unbounded.
+        # A failed attach must not also leave the schema unbounded.  It
+        # protects the names this action resolved: the attach may have bound
+        # them before the failure, and turn_protect makes this fit the turn's
+        # record, so an empty one would let this fit and every later one in
+        # the turn evict the action's own tools.
         _late_fit = locals().get('_fit')
         if _late_fit is not None:
             try:
-                _late_fit()
+                _late_fit(locals().get('_named') or ())
             except Exception:
                 pass
         return False
