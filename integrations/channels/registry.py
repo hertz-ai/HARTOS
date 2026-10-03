@@ -6,11 +6,13 @@ Handles routing messages to/from the agent system.
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import re
 from typing import Dict, Optional, Callable, Any, List
 from dataclasses import dataclass, field
+from core.config_cache import env_int
 from core.port_registry import get_port
 
 from .base import (
@@ -23,6 +25,30 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Agent turns are synchronous and can run for minutes (a local multi-agent turn
+# is several sequential LLM calls).  _route_to_agent runs ON the adapter's own
+# asyncio loop -- for Discord that is discord.py's gateway loop, which also
+# drives the heartbeat coroutine.  Calling the handler inline there blocks the
+# whole loop, so discord.py logs "Shard ID None heartbeat blocked for more than
+# N seconds", the gateway drops, and the reply has no live connection left to
+# be delivered on.  Observed live 2026-08-10: heartbeat blocked 150s+ on a
+# single greeting.
+#
+# Offloading is safe: the handler (flask_integration._handle_message) uses no
+# Flask app context -- it reaches /chat over HTTP, which builds its own context
+# server-side.  That was the open question that deferred this fix; it was
+# verified, not assumed.
+#
+# Bounded rather than the default executor so a burst of channel traffic cannot
+# spawn unbounded threads; workers are named so they are identifiable in the
+# SIGUSR1 all-thread dump.
+_AGENT_HANDLER_POOL = concurrent.futures.ThreadPoolExecutor(
+    # env_int, not int(): a junk or zero value used to make this module fail
+    # to import, taking every channel adapter down with it.
+    max_workers=env_int('HEVOLVE_CHANNEL_AGENT_WORKERS', 4, minimum=1),
+    thread_name_prefix='channel-agent',
+)
 
 # ``[[MEDIA:<path>]]`` — the contract between agent tools that produce a
 # file (generate_receipt render='image' is the first) and the channel
@@ -192,12 +218,32 @@ class ChannelRegistry:
             # Send typing indicator
             await adapter.send_typing(message.chat_id)
 
-            # Get response from agent
-            response = self._agent_handler(message)
-            if asyncio.iscoroutine(response):
-                response = await response
+            # Get response from agent.
+            #
+            # A synchronous handler MUST NOT be called inline here: this
+            # coroutine runs on the adapter's event loop, and a multi-minute
+            # agent turn would block the loop (and Discord's heartbeat) for its
+            # whole duration.  See _AGENT_HANDLER_POOL above.
+            if asyncio.iscoroutinefunction(self._agent_handler):
+                response = await self._agent_handler(message)
+            else:
+                _loop = asyncio.get_running_loop()
+                logger.debug(
+                    "offloading sync agent handler for %s to %s",
+                    message.channel, _AGENT_HANDLER_POOL._thread_name_prefix,
+                )
+                response = await _loop.run_in_executor(
+                    _AGENT_HANDLER_POOL, self._agent_handler, message,
+                )
+                if asyncio.iscoroutine(response):
+                    response = await response
 
-            if response:
+            # An empty/blank response used to skip send_message entirely, so the
+            # user got total silence -- no reply, no error, nothing to retry
+            # against.  Observed live 2026-08-10: task-shaped Discord requests
+            # returned '' and simply vanished.  Silence is the worst possible
+            # failure mode on a chat channel; say something instead.
+            if response and str(response).strip():
                 # Send response back to channel.  Tool-produced files ride
                 # [[MEDIA:...]] markers (generate_receipt render='image');
                 # they become real attachments here, on the same channel.
@@ -209,17 +255,56 @@ class ChannelRegistry:
                         reply_to=message.id,
                         media=media or None,
                     )
-                except TypeError:
+                except TypeError as e:
                     # An adapter predating the media kwarg still gets the
                     # text — never lose the reply over an attachment.
+                    logger.warning(
+                        "%s send_message rejected the media kwarg (%s); "
+                        "resending text only%s", message.channel, e,
+                        f", {len(media)} attachment(s) dropped" if media else "")
                     await adapter.send_message(
                         chat_id=message.chat_id,
                         text=clean_text or response,
                         reply_to=message.id,
                     )
+            elif response is None:
+                # None means the handler DELIBERATELY declined this message --
+                # currently a group message with no bot mention, skipped under
+                # adapter.config.require_mention_in_groups (see
+                # flask_integration._handle_message).  That is not a failure and
+                # must stay silent.
+                #
+                # The fallback below originally treated EVERY falsy response as
+                # "the agent produced nothing", so the bot answered "I wasn't
+                # able to put together a reply for that one." to every
+                # unmentioned message in a group -- it spoke on exactly the
+                # messages it was configured to ignore.  Seen on a real Discord
+                # channel 2026-08-12.
+                #
+                # '' still means the agent ran and returned nothing, which IS a
+                # genuine failure and still gets the fallback.
+                logger.debug(
+                    "handler declined %s from %s -- no reply intended",
+                    message.channel, message.sender_id,
+                )
+            else:
+                logger.warning(
+                    "empty agent response for %s from %s -- sending a fallback "
+                    "so the user is not left with silence",
+                    message.channel, message.sender_id,
+                )
+                # The canonical failure sentence (core.constants), which
+                # is_user_facing_error() recognises -- a caller that must tell
+                # a failed turn from real work reads it as a failure.
+                from core.constants import LLM_GENERIC_ERROR_REPLY
+                await adapter.send_message(
+                    chat_id=message.chat_id,
+                    text=LLM_GENERIC_ERROR_REPLY,
+                    reply_to=message.id,
+                )
 
         except Exception as e:
-            logger.error(f"Error routing message to agent: {e}")
+            logger.error(f"Error routing message to agent: {e}", exc_info=True)
             # Optionally send error message to user
             try:
                 await adapter.send_message(
@@ -227,8 +312,11 @@ class ChannelRegistry:
                     text="Sorry, I encountered an error processing your message.",
                     reply_to=message.id,
                 )
-            except Exception:
-                pass
+            except Exception as send_err:
+                logger.error(
+                    "Could not even tell %s/%s about that error; the user "
+                    "got no reply at all: %s", message.channel,
+                    message.chat_id, send_err)
 
     async def send_to_channel(
         self,

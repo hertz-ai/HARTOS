@@ -271,6 +271,7 @@ class TestActiveEntryReason:
              patch.object(dispatcher._expert_pool, 'submit'):
             result = dispatcher.dispatch_draft_first(
                 'do x', user_id='u', prompt_id='p')
+            dispatcher.schedule_expert_for_draft(result)
 
         speculation_id = result['speculation_id']
         assert speculation_id in dispatcher._active
@@ -361,6 +362,11 @@ class TestAvatarRidesTheActiveEntry:
              patch.object(dispatcher._expert_pool, 'submit'):
             result = dispatcher.dispatch_draft_first(
                 'do something', user_id='u', prompt_id='p', **kwargs)
+            # dispatch_draft_first only PREPARES the background schedule now
+            # (2026-08-19 duplicate-turn fix) — a caller must explicitly
+            # commit to serving this draft via schedule_expert_for_draft()
+            # before the entry lands in _active.
+            dispatcher.schedule_expert_for_draft(result)
         return dispatcher._active[result['speculation_id']]
 
     def test_draft_first_carries_the_avatar(self, dispatcher, monkeypatch):

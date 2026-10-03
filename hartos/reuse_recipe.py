@@ -2962,7 +2962,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         current_app.logger.info("Initializing AP2 (Agent Protocol 2) - Agentic Commerce...")
 
         # Get AP2 payment tools for this agent
-        ap2_tools = get_ap2_tools_for_autogen('assistant')
+        ap2_tools = get_ap2_tools_for_autogen('assistant', user_id=user_id)
 
         # Register payment tools — wrap with @log_tool_execution so payment
         # operations fire UI status emits + structured-error envelopes
@@ -3037,6 +3037,12 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             from integrations.agent_engine.news_tools import register_news_tools
             register_news_tools(helper, assistant, user_id, executor=executor)
             current_app.logger.info("News tools loaded (Tier 2) for reuse agent")
+        if 'commerce' in goal_tags:
+            # Parity with create_recipe.py: a McGroce recipe authored under the
+            # 'commerce' tag must replay with its cart / checkout tools.
+            from integrations.commerce.commerce_tools import register_commerce_tools
+            register_commerce_tools(helper, assistant, user_id, executor=executor)
+            current_app.logger.info("Commerce tools loaded (Tier 2) for reuse agent")
     except Exception as e:
         # Same observability promotion as create_recipe.py — a failure
         # here strips the agent of goal-specific tools, agent talks
@@ -3216,9 +3222,14 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             current_app.logger.info(
                 f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
 
+            # Helper is deliberately NOT routed here: its turn falls through,
+            # so a message2userfinal it writes (its prompt's rule 9: push
+            # proactive data to the user) is delivered and its TERMINATE is
+            # honoured, and it reaches the Assistant at the last line.  The
+            # old "helper" comparison here never matched (the agent is named
+            # "Helper"); matching it skipped both of those.
             if (last_speaker.name == f"user_proxy_{user_id}" or
                     last_speaker.name == "multi_role_agent" or
-                    last_speaker.name == "helper" or
                     last_speaker.name == "Executor" or
                     last_speaker.name == "ChatInstructor"):
                 return assistant
@@ -3270,8 +3281,9 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             # Assistant with a plain turn (no tool call, no mention, no
             # verdict: its work is done -> verify it) and the StatusVerifier
             # or another agent with an unparseable turn (-> back to the
-            # Assistant); Helper, Executor, user_proxy and ChatInstructor were
-            # routed at the name check above.  Returning "auto" would spend an
+            # Assistant); Executor, user_proxy and ChatInstructor were routed
+            # at the name check above, and Helper (whose user-bound message
+            # and TERMINATE are handled above) reaches the Assistant here.  Returning "auto" would spend an
             # extra model call per hop to guess what this state already
             # knows, and that call runs outside the AgentLightningWrapper, so
             # any engine failure inside it ends the whole turn (measured
@@ -6311,7 +6323,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     'turn instead of raising IndexError')
                 break
             last_message = group_chat.messages[-1]
-            content_lower = last_message['content'].lower()
+            content_lower = (last_message.get('content') or '').lower()
             # ONE notion of "the user's answer" at this return too (D84, #850).
             # The two branches below hand any tail carrying the answer key to
             # the user on the spot; the post-loop pick asks
@@ -6463,7 +6475,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
             last_message = group_chat.messages[-2]
 
-        content_lower = last_message['content'].lower()
+        content_lower = (last_message.get('content') or '').lower()
 
         if f'message2userfinal'.lower() in content_lower:
             try:
@@ -7420,15 +7432,32 @@ def _attach_named_tools_for_action(user_prompt):
             return False
         assistant = agents[0]
         helper = agents[4]
+
+        def _fit(named=()):
+            # The live-n_ctx reconciliation, run WHETHER OR NOT the named
+            # attach below ran.  It used to sit at the tail, behind the two
+            # early returns, so a session with no armed attach set or no
+            # current action was never fitted: measured 2026-09-30..10-01,
+            # 296 "TOOL SCHEMA alone is N tokens" lines against 5 fits, the
+            # Helper seat sending 70-76 tools (9,497 tok vs a room of 9,216)
+            # and getting HTTP 400.  The fit only removes a tool from the
+            # schema, and only when the schema does not fit.
+            from core.agent_tools import fit_schema_to_ctx
+            _protect = set(named or ()) | {'send_message_to_user'}
+            fit_schema_to_ctx(helper, protect=_protect, turn_protect=True)
+            fit_schema_to_ctx(assistant, protect=_protect, turn_protect=True)
+
         # Gate on the set this actually mutates, not on the tags sibling the
         # inline version tested.  Both are written on adjacent lines at
         # construction (:2446-2447), so this is the same condition — it just
         # names the thing it uses.
         _attached = getattr(assistant, '_hart_attached_tools', None)
         if _attached is None:
+            _fit()
             return False
         _aid = user_tasks[user_prompt].current_action
         if not _aid:
+            _fit()
             return False
 
         from integrations.service_tools import service_tool_registry
@@ -7512,10 +7541,7 @@ def _attach_named_tools_for_action(user_prompt):
         # asks for (see core.agent_tools.defer_helper_schema).  The action's
         # own named tools are protected, so the authoritative selector above is
         # never undone by the budget below it.
-        from core.agent_tools import fit_schema_to_ctx
-        _protect = set(_named or ()) | {'send_message_to_user'}
-        fit_schema_to_ctx(helper, protect=_protect, turn_protect=True)
-        fit_schema_to_ctx(assistant, protect=_protect, turn_protect=True)
+        _fit(_named)
         return _nn
     except Exception as err:
         # WARNING, not debug -- same class as d6495f499.  A failure here
@@ -7526,6 +7552,13 @@ def _attach_named_tools_for_action(user_prompt):
         # be found by ABSENCE of the attach line.
         _ctx_safe_log('warning',
                       f"named attach skipped: {err} for session: {user_prompt}")
+        # A failed attach must not also leave the schema unbounded.
+        _late_fit = locals().get('_fit')
+        if _late_fit is not None:
+            try:
+                _late_fit()
+            except Exception:
+                pass
         return False
 
 

@@ -67,28 +67,24 @@ class CodingAgentDaemon:
         single primitive the agent_daemon uses, so a long sleep
         (e.g. during platform-affordability back-off) can't age the
         heartbeat past the 300s frozen threshold. See the helper
-        docstring for the 2026-04-11 incident context.
+        docstring for the 2026-04-11 incident context.  The module-level
+        helper re-resolves the watchdog every chunk (this daemon can start
+        before it exists), and ``wait=self._stop_event.wait`` keeps the sleep
+        interruptible: a bare time.sleep() could not be woken, so stop()
+        blocked for the whole interval (join(timeout=10) expired in full —
+        measured 10.00s / 10.01s in test_start_stop / test_double_start).
         """
         try:
-            from security.node_watchdog import get_watchdog
-            wd = get_watchdog()
-            if wd is not None:
-                wd.sleep_with_heartbeat(
-                    'coding_daemon', seconds,
-                    stop_check=lambda: not self._running,
-                )
-                return
-        except Exception:
-            pass
-        # FALLBACK — must keep the interruptibility the watchdog path
-        # provides via stop_check. A bare time.sleep() does not: it
-        # cannot be woken, so stop() blocked for the WHOLE interval
-        # (join(timeout=10) then expired in full — measured 10.00s and
-        # 10.01s in test_start_stop / test_double_start, the giveaway
-        # constant). That hits any node where get_watchdog() returns
-        # None or raises, i.e. exactly the degraded case. Event.wait()
-        # sleeps the same duration but returns immediately on stop().
-        self._stop_event.wait(seconds)
+            from security.node_watchdog import sleep_with_heartbeat
+        except Exception as e:
+            logger.warning("coding_daemon: heartbeat sleep unavailable, falling "
+                           "back to a plain sleep (no heartbeats, the "
+                           "watchdog may restart this thread): %s", e, exc_info=True)
+            self._stop_event.wait(seconds)
+            return
+        sleep_with_heartbeat('coding_daemon', seconds,
+                             stop_check=lambda: not self._running,
+                             wait=self._stop_event.wait)
 
     def _loop(self):
         # Boot grace period: let user chat have exclusive LLM access

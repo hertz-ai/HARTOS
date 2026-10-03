@@ -20,6 +20,9 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+#: Default seconds a /chat caller waits for a full agent turn.
+DEFAULT_AGENT_TURN_TIMEOUT_S = 120
+
 
 def chat_request_fields(content: str) -> Dict[str, str]:
     """The dual /chat REQUEST keys — send BOTH so either handler accepts it."""
@@ -32,3 +35,15 @@ def chat_reply(result: Any, default: str = "") -> str:
     if not isinstance(result, dict):
         return default
     return result.get("response") or result.get("text") or default
+
+
+def agent_turn_timeout() -> int:
+    """Seconds a caller of /chat waits for a full agent turn.
+
+    ONE budget for every client of the same multi-agent turn (channel inbound,
+    self-chat, the speculative dispatcher's local expert re-entry), read at call
+    time so HEVOLVE_CHANNEL_AGENT_TIMEOUT applies to all of them alike.
+    """
+    from core.config_cache import env_int
+    return env_int('HEVOLVE_CHANNEL_AGENT_TIMEOUT',
+                   DEFAULT_AGENT_TURN_TIMEOUT_S, minimum=1)

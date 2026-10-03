@@ -138,11 +138,16 @@ class TestP2PPreamble:
 
 class TestP2PToolsSection:
 
-    def test_tools_section_mentions_ap2(self):
-        """The shared tools section references AP2 payment protocol."""
-        assert 'request_payment' in _P2P_TOOLS
-        assert 'authorize_payment' in _P2P_TOOLS
-        assert 'process_payment' in _P2P_TOOLS
+    def test_tools_section_names_exactly_the_ap2_tools_the_agent_gets(self, monkeypatch):
+        """The prompt must name the AP2 tools the agent is really given --
+        authorize_payment is no longer offered to the model (a person
+        authorizes), so naming it would send the agent after a tool it
+        does not have."""
+        from integrations.ap2.ap2_protocol import get_ap2_tools_for_autogen
+        monkeypatch.delenv('AP2_ALLOW_LLM_AUTHORIZE', raising=False)
+        given = {t['name'] for t in get_ap2_tools_for_autogen('assistant')}
+        for name in ('request_payment', 'authorize_payment', 'process_payment'):
+            assert (name in _P2P_TOOLS) == (name in given), name
 
     def test_tools_section_mentions_channels(self):
         """The shared tools section references channel adapters."""

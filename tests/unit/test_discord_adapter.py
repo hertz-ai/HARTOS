@@ -125,9 +125,17 @@ class TestDiscordMessageConversion:
 class TestDiscordFlaskIntegration:
     """Tests for Discord-Flask integration."""
 
-    def test_discord_registration(self):
+    def test_discord_registration(self, monkeypatch):
         """Test Discord adapter registration with Flask integration."""
         from integrations.channels.flask_integration import FlaskChannelIntegration
+        from integrations.channels.registry import ChannelRegistry
+
+        # get_registry() is a process-wide singleton
+        # (integrations.channels.registry._registry): an earlier-run test
+        # module (e.g. test_whatsapp_live_adapter.py) registering real
+        # channels onto it leaks into this test's "starts empty" assumption
+        # unless it gets its own fresh registry.
+        monkeypatch.setattr('integrations.channels.registry._registry', ChannelRegistry())
 
         integration = FlaskChannelIntegration()
 

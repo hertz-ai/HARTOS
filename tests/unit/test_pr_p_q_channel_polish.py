@@ -271,6 +271,10 @@ class TestAdapterProbeBackgroundThread:
             async def connect(self):
                 return True
 
+            def get_status(self):
+                from integrations.channels.base import ChannelStatus
+                return ChannelStatus.CONNECTED
+
         class FakeRegistry:
             def get(self, name):
                 return FakeAdapter()
@@ -283,6 +287,11 @@ class TestAdapterProbeBackgroundThread:
             return_value=FakeRegistry(),
         ), patch(
             'integrations.channels.admin.api.get_api', return_value=fake_api,
+        ), patch(
+            # The watcher starts once the adapter is wired; the wiring
+            # itself (a real channel loop) is not this test's subject.
+            'integrations.social.api_channels._wire_live_adapter',
+            return_value={'success': True},
         ), patch.object(threading.Thread, '__init__', capture_init):
             tools = build_channel_tool_closures({'user_id': 1, 'prompt_id': None})
             register = next(

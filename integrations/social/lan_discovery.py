@@ -459,19 +459,15 @@ class AutoDiscovery:
             except Exception as e:
                 logger.debug(f"AutoDiscovery send error: {e}")
             try:
-                from security.node_watchdog import get_watchdog
-                wd = get_watchdog()
-                if wd is not None:
-                    wd.sleep_with_heartbeat(
-                        'auto_discovery', self._beacon_interval,
-                        stop_check=lambda: not self._running,
-                    )
-                    continue
-            except Exception:
-                pass
-            # Fallback path if watchdog is unavailable: plain sleep +
-            # best-effort heartbeat. Preserves original behavior.
-            time.sleep(self._beacon_interval)
+                from security.node_watchdog import sleep_with_heartbeat
+            except Exception as e:
+                logger.warning("auto_discovery: heartbeat sleep unavailable, falling "
+                               "back to a plain sleep (no heartbeats, the "
+                               "watchdog may restart this thread): %s", e, exc_info=True)
+                time.sleep(self._beacon_interval)
+                continue
+            sleep_with_heartbeat('auto_discovery', self._beacon_interval,
+                                 stop_check=lambda: not self._running)
 
     def _recv_loop(self) -> None:
         """Listen for beacons from other nodes on the network.

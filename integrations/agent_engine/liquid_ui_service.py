@@ -950,7 +950,8 @@ COMPONENT_TYPES = {
     'checkout': {'props': ['items', 'total', 'payment_methods', 'shipping_options',
                            'confirm_action']},
     'payment_status': {'props': ['status', 'amount', 'method', 'transaction_id']},
-    'order_tracking': {'props': ['order_id', 'status', 'steps', 'eta']},
+    'order_tracking': {'props': ['order_id', 'status', 'steps', 'current_step',
+                                 'eta']},
     'comparison': {'props': ['apps', 'features', 'winner']},
     'agent_action': {'props': ['agent_id', 'action_type', 'description',
                                'status', 'result', 'timestamp']},
@@ -7786,9 +7787,13 @@ if(!PERF.potato && HartShellState.isHost()) {{
 // ═══ Approval Helper ═══
 function _postApproval(agentId, action, decision) {{
   try {{
+    // The node names the approver from the caller's Bearer, never the body.
+    var _tok = ''; try {{ _tok = localStorage.getItem('access_token') || ''; }} catch(e) {{}}
+    var _hdr = {{'Content-Type':'application/json'}};
+    if(_tok) _hdr['Authorization'] = 'Bearer ' + _tok;
     fetch(SHELL+'/api/agent/approval', {{
       method:'POST',
-      headers:{{'Content-Type':'application/json'}},
+      headers:_hdr,
       body:JSON.stringify({{agent_id:agentId, action:action, decision:decision}})
     }}).catch(function(){{}});
   }} catch(e) {{}}
@@ -8490,6 +8495,23 @@ function renderAgentOverlay(ev) {{
             decision = data.get('decision', '')  # approve / deny / later
             if decision not in ('approve', 'deny', 'later'):
                 return jsonify({'error': 'Invalid decision, must be approve/deny/later'}), 400
+            # A payment or merchant-onboarding card is DECIDED, not just marked:
+            # the one commerce handler, with the approver taken from the
+            # caller's Bearer token (the same call /api/agent/approval on the
+            # backend makes).  'later' leaves the card pending, as below.
+            if decision != 'later':
+                try:
+                    from integrations.commerce.approvals import (
+                        answer_commerce_approval, approver_from_request,
+                        is_commerce_action)
+                except Exception:   # never costs a non-commerce answer
+                    logger.exception("handle_agent_approval: commerce unavailable")
+                    answer_commerce_approval = is_commerce_action = None
+                if is_commerce_action and is_commerce_action(action):
+                    payload, status = answer_commerce_approval(
+                        action, decision == 'approve',
+                        approver_from_request(request))
+                    return jsonify(payload), status
             # Resolve matching pending approval in _agent_components
             resolved = False
             if agent_id in self._agent_components:
@@ -10700,3 +10722,106 @@ def run_home_compose(reason: str = 'idle') -> bool:
     except Exception as e:
         logger.debug("run_home_compose cross-process failed: %s", e)
         return False
+
+
+#: commerce status words -> what every renderer already accepts
+#: (shell JS, Nunba AgentOverlay, Android): success | pending | error.
+_PAYMENT_STATUS_CLIENT = {'completed': 'success', 'processing': 'pending',
+                          'failed': 'error', 'cancelled': 'error'}
+
+
+def _to_client_vocabulary(component: dict):
+    """The ONE place commerce payment_status / order_tracking props are put
+    into the vocabulary the renderers read.  Returns ``(component, link)``:
+    payment_status has no redirect_url prop in any client, so the gateway
+    link is returned separately to be shown as the card's action link."""
+    ctype = component.get('type')
+    if ctype == 'payment_status':
+        component = dict(component)
+        component['status'] = _PAYMENT_STATUS_CLIENT.get(
+            component.get('status'), component.get('status'))
+        return component, component.pop('redirect_url', None)
+    if ctype == 'order_tracking' and isinstance(component.get('steps'), list):
+        component = dict(component)
+        steps = [dict(st) if isinstance(st, dict) else {'label': st}
+                 for st in component['steps']]
+        for st in steps:
+            st['completed'] = bool(st.get('completed', st.get('done')))
+        component['steps'] = steps
+        component['current_step'] = sum(1 for st in steps if st['completed'])
+        return component, None
+    return component, None
+
+
+def push_agent_ui(agent_id: str, component: dict,
+                  user_id: Optional[str] = None) -> bool:
+    """Push one agent UI component to its user, from code that holds no
+    reference to the shell.  The in-process form of agent_ui_update.
+
+    Two legs, each for a surface the other does not reach:
+
+      1. The live LiquidUIService, when this process serves one (the
+         registry entry _register_self writes).  agent_ui_update applies the
+         allowlist, kill switch, rate cap and XSS gate, stores the card for the
+         shell's SSE stream and emits ``agent.ui.update`` (the WAMP topic the
+         Android AgentOverlayBridge subscribes to).
+      2. When ``user_id`` is given, the user's own stream:
+         ``publish_event('chat.social', ..., user_id)``, which MessageBus maps
+         to WAMP ``com.hertzai.hevolve.social.{user_id}`` and to the per-user
+         SSE event ``chat.social``.  A node without a shell (the cloud gateway
+         the McGroce embed talks to) has only this leg, so the same gates run
+         here first: an unknown type, a halted hive or unsafe content is not
+         published.
+
+    Returns True if either leg accepted the push.  Never raises.
+    """
+    if not isinstance(component, dict):
+        return False
+    component, _link = _to_client_vocabulary(component)
+    if _link:
+        push_agent_ui(agent_id, {
+            'type': 'oauth_link', 'title': 'Complete your payment',
+            'provider': component.get('method') or 'payment',
+            'authorize_url': _link,
+            'description': 'Finish paying on your bank or UPI page.'},
+            user_id=user_id)
+    comp_type = component.get('type', '')
+    svc = None
+    try:
+        from core.platform.registry import get_registry
+        svc = get_registry().get_or_none('LiquidUIService')
+    except Exception:
+        svc = None
+    delivered = False
+    if svc is not None:
+        try:
+            delivered = bool(svc.agent_ui_update(
+                agent_id, dict(component), user_id=user_id))
+        except Exception:
+            logger.exception("push_agent_ui: shell push failed")
+    if not user_id:
+        return delivered
+    if comp_type not in COMPONENT_TYPES or _a2ui_has_xss(component):
+        logger.warning("push_agent_ui: %s from %s not published", comp_type,
+                       agent_id)
+        return delivered
+    try:
+        from security.hive_guardrails import HiveCircuitBreaker
+        if HiveCircuitBreaker.is_halted():
+            return delivered
+    except Exception:
+        logger.exception("push_agent_ui: swallowed Exception")
+    try:
+        from integrations.social.realtime import publish_event
+        card = dict(component)
+        card.setdefault('_ts', time.time())
+        card.setdefault('_agent_id', agent_id)
+        publish_event('chat.social', {
+            'type': 'agent_ui_update',
+            'agent_id': agent_id,
+            'component': card,
+        }, user_id=str(user_id))
+        return True
+    except Exception:
+        logger.exception("push_agent_ui: per-user publish failed")
+        return delivered
