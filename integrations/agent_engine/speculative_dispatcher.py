@@ -807,21 +807,20 @@ class SpeculativeDispatcher:
                 escalation_reason=escalation_reason,
                 user_pref=user_pref,
                 avatar_id=avatar_id,
+                # When the user explicitly asked for `hive_preferred` AND
+                # the draft self-delegated to hive, a best-effort MoE
+                # HiveMind fusion consult goes out WITH the expert, from
+                # schedule_expert_for_draft -- for the same reason the
+                # expert waits: a caller that runs its own full turn for
+                # this prompt would otherwise query the hive for a reply
+                # nobody serves.  The consult result is stored on
+                # self._last_hive_consult for observers and future wiring;
+                # it does NOT replace the expert's reply on the hot path.
+                # Gated by user_pref, so `auto` and `local_only` see no
+                # behavior change.
+                hive_consult=(delegate == 'hive'
+                              and user_pref == 'hive_preferred'),
             ))
-            # When the user explicitly asked for `hive_preferred` AND the
-            # draft self-delegated to hive, also fire a best-effort MoE
-            # HiveMind fusion consult in the background.  The consult
-            # result is stored on self._last_hive_consult for observers
-            # and future wiring; it does NOT replace the expert's reply
-            # on the hot path (preserves the 1.5s chat budget).  Safe on
-            # `auto` and `local_only` paths — gated by user_pref so
-            # existing callers see no behavior change.
-            if delegate == 'hive' and user_pref == 'hive_preferred':
-                hive_consult_scheduled = self._schedule_hive_consult(
-                    prompt=prompt,
-                    user_id=user_id,
-                    speculation_id=speculation_id,
-                )
 
         # Channel name defensively coerced: draft model sometimes emits None,
         # null, or a capitalised string. Normalise to a lowercased str so
@@ -910,6 +909,14 @@ class SpeculativeDispatcher:
                     "or already scheduled); the draft reply stays final",
                     spec_id)
             return False
+        if kwargs.pop('hive_consult', False):
+            # Independent of whether an expert model exists, as it always
+            # was; only the moment moved (see dispatch_draft_first step 4).
+            result['hive_consult_scheduled'] = self._schedule_hive_consult(
+                prompt=kwargs.get('prompt'),
+                user_id=kwargs.get('user_id'),
+                speculation_id=spec_id,
+            )
         if kwargs.get('expert_model') is None:
             logger.warning(
                 "expert not scheduled for %s: no expert model available for "

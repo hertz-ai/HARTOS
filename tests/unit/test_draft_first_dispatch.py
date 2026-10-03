@@ -445,6 +445,38 @@ class TestDeferredExpertScheduling:
         mock_submit.assert_not_called()
         assert result['expert_pending'] is False
 
+    def test_hive_consult_waits_for_the_served_draft_too(
+            self, dispatcher, monkeypatch):
+        """hive_preferred + a hive delegate also queries the hive.  That
+        consult goes out with the expert, not at classification: a caller
+        running its own turn must not query the hive for a reply nobody
+        serves."""
+        _mock_guardrails(monkeypatch)
+        draft_raw = ('{"reply": "Let me check the hive...", "delegate": "hive", '
+                     '"confidence": 0.2}')
+        with patch.object(dispatcher, '_dispatch_to_model',
+                          return_value=draft_raw), \
+             patch.object(dispatcher, '_record_interaction_safely'), \
+             patch.object(dispatcher, '_check_and_reserve_budget',
+                          return_value=True), \
+             patch.object(dispatcher._expert_pool, 'submit'), \
+             patch.object(dispatcher, '_schedule_hive_consult',
+                          return_value=True) as consult:
+            result = dispatcher.dispatch_draft_first(
+                'prove the Riemann hypothesis', user_id='u1', prompt_id='p1',
+                user_pref='hive_preferred')
+            consult.assert_not_called()
+            assert result['hive_consult_scheduled'] is False
+
+            dispatcher.schedule_expert_for_draft(result)
+            dispatcher.schedule_expert_for_draft(result)
+
+        consult.assert_called_once()
+        assert consult.call_args.kwargs['prompt'] == 'prove the Riemann hypothesis'
+        assert consult.call_args.kwargs['user_id'] == 'u1'
+        assert result['hive_consult_scheduled'] is True
+        assert result['expert_pending'] is True
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Recursive-loop prevention
