@@ -142,5 +142,76 @@ class RouteToAgentCarriesMedia(unittest.TestCase):
         self.assertIsNone(sent[0]['media'])
 
 
+class _TextOnlyAdapter(_RecordingAdapter):
+    async def send_message(self, chat_id, text, reply_to=None):
+        self.sent.append({'chat_id': chat_id, 'text': text})
+        return SendResult(success=True)
+
+
+class _SendsThenTypeErrors(_RecordingAdapter):
+    """Delivers, then trips over its own TypeError (e.g. building a result)."""
+
+    async def send_message(self, chat_id, text, reply_to=None,
+                           media=None, buttons=None):
+        self.sent.append({'chat_id': chat_id, 'text': text, 'media': media})
+        raise TypeError("unsupported operand type(s) for +: 'int' and 'str'")
+
+
+class TheReplyGoesOutOnce(unittest.TestCase):
+
+    def _run(self, adapter, response_text='the answer'):
+        registry = ChannelRegistry()
+        registry._adapters['stub'] = adapter
+        registry.set_agent_handler(lambda m: response_text)
+        msg = Message(id='m1', channel='stub', sender_id='u',
+                      sender_name='U', chat_id='c1', text='hi')
+        asyncio.run(registry._route_to_agent(msg))
+        return [s['text'] for s in adapter.sent]
+
+    def test_an_adapter_without_media_gets_the_text(self):
+        self.assertEqual(self._run(_TextOnlyAdapter()), ['the answer'])
+
+    def test_an_adapters_own_typeerror_never_resends_the_reply(self):
+        texts = self._run(_SendsThenTypeErrors())
+        self.assertEqual(texts.count('the answer'), 1, texts)
+
+
+class AFullPoolAnswersAtOnce(unittest.TestCase):
+
+    def test_past_the_bound_a_message_is_not_queued(self):
+        import threading
+        from integrations.channels import registry as reg
+        from core.constants import LLM_GENERIC_ERROR_REPLY
+        slots = threading.BoundedSemaphore(1)
+        slots.acquire()  # the one slot is busy
+        ran = []
+        registry = ChannelRegistry()
+        adapter = _RecordingAdapter()
+        registry._adapters['stub'] = adapter
+        registry.set_agent_handler(lambda m: ran.append(m) or 'late answer')
+        msg = Message(id='m1', channel='stub', sender_id='u',
+                      sender_name='U', chat_id='c1', text='hi')
+        with patch.object(reg, '_agent_handler_slots', slots):
+            asyncio.run(registry._route_to_agent(msg))
+        self.assertEqual(ran, [])
+        self.assertEqual([s['text'] for s in adapter.sent],
+                         [LLM_GENERIC_ERROR_REPLY])
+
+    def test_the_slot_comes_back_when_the_turn_finishes(self):
+        import threading
+        from integrations.channels import registry as reg
+        slots = threading.BoundedSemaphore(1)
+        registry = ChannelRegistry()
+        adapter = _RecordingAdapter()
+        registry._adapters['stub'] = adapter
+        registry.set_agent_handler(lambda m: 'ok')
+        msg = Message(id='m1', channel='stub', sender_id='u',
+                      sender_name='U', chat_id='c1', text='hi')
+        with patch.object(reg, '_agent_handler_slots', slots):
+            asyncio.run(registry._route_to_agent(msg))
+            asyncio.run(registry._route_to_agent(msg))
+        self.assertEqual([s['text'] for s in adapter.sent], ['ok', 'ok'])
+
+
 if __name__ == '__main__':
     unittest.main()

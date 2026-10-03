@@ -7,9 +7,11 @@ Handles routing messages to/from the agent system.
 
 import asyncio
 import concurrent.futures
+import inspect
 import logging
 import os
 import re
+import threading
 from typing import Dict, Optional, Callable, Any, List
 from dataclasses import dataclass, field
 from core.config_cache import env_int
@@ -49,6 +51,31 @@ _AGENT_HANDLER_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=env_int('HEVOLVE_CHANNEL_AGENT_WORKERS', 4, minimum=1),
     thread_name_prefix='channel-agent',
 )
+
+# The pool bounds its THREADS, not its queue: ThreadPoolExecutor queues
+# without limit, so a flood of channel messages piled up behind four
+# multi-minute turns and the last in line was answered long after its sender
+# gave up.  This bounds turns in flight (running + waiting); past it a
+# message is answered at once with the canonical failure sentence instead of
+# joining the back of the line.  Released when the worker FINISHES, not when
+# the awaiting coroutine stops waiting.
+_AGENT_HANDLER_MAX_IN_FLIGHT = _AGENT_HANDLER_POOL._max_workers * 8
+_agent_handler_slots = threading.BoundedSemaphore(_AGENT_HANDLER_MAX_IN_FLIGHT)
+
+
+def _send_accepts(send, **kwargs) -> bool:
+    """Whether ``send`` can be called with these keyword arguments.
+
+    Asked BEFORE the call rather than read from a TypeError after it: an
+    adapter's own TypeError, raised after its message went out, used to be
+    taken for "no media kwarg" and the reply was sent a second time."""
+    try:
+        inspect.signature(send).bind(**kwargs)
+        return True
+    except TypeError:
+        return False
+    except ValueError:  # no signature to read: offer the call as before
+        return True
 
 # ``[[MEDIA:<path>]]`` — the contract between agent tools that produce a
 # file (generate_receipt render='image' is the first) and the channel
@@ -227,14 +254,32 @@ class ChannelRegistry:
             if asyncio.iscoroutinefunction(self._agent_handler):
                 response = await self._agent_handler(message)
             else:
-                _loop = asyncio.get_running_loop()
+                if not _agent_handler_slots.acquire(blocking=False):
+                    logger.warning(
+                        "channel agent pool full (%d turns in flight); "
+                        "answering %s/%s with a retry message instead of "
+                        "queueing it", _AGENT_HANDLER_MAX_IN_FLIGHT,
+                        message.channel, message.chat_id)
+                    from core.constants import LLM_GENERIC_ERROR_REPLY
+                    await adapter.send_message(
+                        chat_id=message.chat_id,
+                        text=LLM_GENERIC_ERROR_REPLY,
+                        reply_to=message.id,
+                    )
+                    return
                 logger.debug(
                     "offloading sync agent handler for %s to %s",
                     message.channel, _AGENT_HANDLER_POOL._thread_name_prefix,
                 )
-                response = await _loop.run_in_executor(
-                    _AGENT_HANDLER_POOL, self._agent_handler, message,
-                )
+                try:
+                    _turn = _AGENT_HANDLER_POOL.submit(
+                        self._agent_handler, message)
+                except BaseException:
+                    _agent_handler_slots.release()
+                    raise
+                _turn.add_done_callback(
+                    lambda _f: _agent_handler_slots.release())
+                response = await asyncio.wrap_future(_turn)
                 if asyncio.iscoroutine(response):
                     response = await response
 
@@ -248,25 +293,21 @@ class ChannelRegistry:
                 # [[MEDIA:...]] markers (generate_receipt render='image');
                 # they become real attachments here, on the same channel.
                 clean_text, media = extract_media_markers(response)
-                try:
-                    await adapter.send_message(
-                        chat_id=message.chat_id,
-                        text=clean_text or response,
-                        reply_to=message.id,
-                        media=media or None,
-                    )
-                except TypeError as e:
+                _reply = dict(
+                    chat_id=message.chat_id,
+                    text=clean_text or response,
+                    reply_to=message.id,
+                    media=media or None,
+                )
+                if not _send_accepts(adapter.send_message, **_reply):
                     # An adapter predating the media kwarg still gets the
                     # text — never lose the reply over an attachment.
+                    _reply.pop('media')
                     logger.warning(
-                        "%s send_message rejected the media kwarg (%s); "
-                        "resending text only%s", message.channel, e,
+                        "%s send_message takes no media kwarg; sending text "
+                        "only%s", message.channel,
                         f", {len(media)} attachment(s) dropped" if media else "")
-                    await adapter.send_message(
-                        chat_id=message.chat_id,
-                        text=clean_text or response,
-                        reply_to=message.id,
-                    )
+                await adapter.send_message(**_reply)
             elif response is None:
                 # None means the handler DELIBERATELY declined this message --
                 # currently a group message with no bot mention, skipped under
