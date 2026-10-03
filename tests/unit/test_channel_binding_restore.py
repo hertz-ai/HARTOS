@@ -121,6 +121,57 @@ class TestCredentialResolution:
         assert fi._binding_credentials('discord', {'bot_token': 12345})[0] is None
 
 
+class _FakeVault:
+    def __init__(self, encrypt_error=None):
+        self.opened = []
+        self._encrypt_error = encrypt_error
+
+    def decrypt_value(self, stored):
+        self.opened.append(stored)
+        return 'plain:' + stored[len('fernet:'):]
+
+    def encrypt_value(self, value):
+        if self._encrypt_error:
+            raise self._encrypt_error
+        return 'fernet:' + value
+
+
+class TestSealedCredentials:
+    """Only the keys a credential is read from are opened; the seal never
+    takes the connect down with it."""
+
+    def _unseal(self, channel_type, meta, vault):
+        from integrations.channels import flask_integration as fi
+        with patch('security.secrets_manager.SecretsManager.get_instance',
+                   return_value=vault):
+            return fi.unseal_binding_metadata(channel_type, meta)
+
+    def test_a_sealed_credential_and_extra_are_opened(self):
+        vault = _FakeVault()
+        out = self._unseal('slack', {'bot_token': 'fernet:a',
+                                     'app_token': 'fernet:b'}, vault)
+        assert out == {'bot_token': 'plain:a', 'app_token': 'plain:b'}
+
+    def test_a_sealed_value_under_any_other_key_is_never_decrypted(self):
+        vault = _FakeVault()
+        out = self._unseal('discord', {'bot_token': 'fernet:a',
+                                       'note': 'fernet:someone-elses'}, vault)
+        assert vault.opened == ['fernet:a']
+        assert out['note'] == 'fernet:someone-elses'
+        assert out['bot_token'] == 'plain:a'
+
+    def test_an_unexpected_vault_failure_keeps_the_credential(self, caplog):
+        from integrations.channels import flask_integration as fi
+        vault = _FakeVault(encrypt_error=TypeError('bad key material'))
+        with patch('security.secrets_manager.SecretsManager.get_instance',
+                   return_value=vault):
+            assert fi.seal_binding_credential('discord', 'tok') == 'tok'
+        assert any('PLAIN TEXT' in r.getMessage() and r.levelname == 'ERROR'
+                   for r in caplog.records)
+        assert not any('tok' in r.getMessage().split('(')[0]
+                       for r in caplog.records)
+
+
 class TestRestorePersistedChannels:
 
     def test_restores_discord_through_the_token_mapping_layer(self):

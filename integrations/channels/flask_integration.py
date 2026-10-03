@@ -1036,6 +1036,27 @@ class FlaskChannelIntegration:
         return future.result(timeout=wait) if wait is not None else future
 
     @classmethod
+    def _credential_token_keys(cls, channel_type: str) -> list:
+        """The metadata keys a binding's credential is read from, in order:
+        the channel's own ``token_param``, then the generic list."""
+        spec = cls._CHANNEL_SPECS.get(channel_type)
+        keys = []
+        if spec and spec.get('token_param'):
+            keys.append(spec['token_param'])
+        keys.extend(k for k in cls._BINDING_CREDENTIAL_KEYS if k not in keys)
+        return keys
+
+    @classmethod
+    def credential_metadata_keys(cls, channel_type: str) -> set:
+        """Every metadata key _binding_credentials reads for this channel:
+        the credential keys plus the channel's declared extra params."""
+        spec = cls._CHANNEL_SPECS.get(channel_type) or {}
+        keys = set(cls._credential_token_keys(channel_type))
+        keys.update(p.get('param') for p in spec.get('extra', ())
+                    if p.get('param'))
+        return keys
+
+    @classmethod
     def _binding_credentials(
         cls, channel_type: str, meta: Dict[str, Any],
     ) -> tuple:
@@ -1050,10 +1071,7 @@ class FlaskChannelIntegration:
         "explicit kwarg wins over env/default" precedence.
         """
         spec = cls._CHANNEL_SPECS.get(channel_type)
-        keys = []
-        if spec and spec.get('token_param'):
-            keys.append(spec['token_param'])
-        keys.extend(k for k in cls._BINDING_CREDENTIAL_KEYS if k not in keys)
+        keys = cls._credential_token_keys(channel_type)
 
         token = None
         used_key = None
@@ -1277,19 +1295,35 @@ def seal_binding_credential(channel_type: str, value: str) -> str:
             "Set HEVOLVE_MASTER_KEY and connect the channel again to store it "
             "encrypted.", channel_type, e)
         return value
+    except Exception as e:
+        # Any other vault failure used to escape, and the whole connect
+        # (POST /bindings, the register_channel tool) died with it.  Kept as
+        # a keyless node keeps it, and said louder: this one is a fault.
+        logger.error(
+            "%s credential stored in PLAIN TEXT in its channel binding: the "
+            "vault failed to encrypt it (%s: %s)", channel_type,
+            type(e).__name__, e)
+        return value
 
 
 def unseal_binding_metadata(channel_type: str, meta) -> Dict[str, Any]:
     """A copy of a binding's metadata_json with every sealed credential
     opened (plain-text values, from before sealing or a keyless node, read
     as they are).  A credential that cannot be opened is left out, with an
-    error: its ciphertext must never reach an adapter as the token."""
+    error: its ciphertext must never reach an adapter as the token.
+
+    Only the keys a credential is read from are opened
+    (FlaskChannelIntegration.credential_metadata_keys).  metadata_json also
+    carries what the client sent, and a sealed-looking value under any
+    other key is copied as stored, never decrypted."""
     out: Dict[str, Any] = {}
     if not isinstance(meta, dict):
         return out
     from security.secrets_manager import SEALED_PREFIX, SecretsManager
+    openable = FlaskChannelIntegration.credential_metadata_keys(channel_type)
     for key, value in meta.items():
-        if isinstance(value, str) and value.startswith(SEALED_PREFIX):
+        if (isinstance(value, str) and value.startswith(SEALED_PREFIX)
+                and key in openable):
             try:
                 value = SecretsManager.get_instance().decrypt_value(value)
             except ValueError as e:
