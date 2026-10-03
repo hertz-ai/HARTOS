@@ -100,6 +100,12 @@ class MeshPeer:
         return (time.monotonic() - self.last_seen_mono) > max_age
 
 
+#: Peer inferences running at once over PeerLink, across all links.  A refused
+#: request gets {'error': 'busy'}; the asking node's offload then falls back.
+_MAX_PEERLINK_INFERENCES = 4
+_PEERLINK_INFER_SLOTS = threading.BoundedSemaphore(_MAX_PEERLINK_INFERENCES)
+
+
 class ComputeMeshService:
     """Same-user device compute aggregation.
 
@@ -866,9 +872,16 @@ class ComputeMeshService:
         behind a NAT, which the peer cannot dial over HTTP, still serves.  Same
         gate and credit as ``/mesh/infer`` through ``serve_infer``.
         """
-        if not isinstance(data, dict):
+        if not isinstance(data, dict) or not str(data.get('prompt') or '').strip():
             return {'error': 'Invalid payload'}
-        return self.serve_infer(data)[1]
+        # One local model server answers every peer: bound what PeerLink can
+        # have running at once, across all links (each link is already capped).
+        if not _PEERLINK_INFER_SLOTS.acquire(blocking=False):
+            return {'error': 'busy', 'code': 'busy'}
+        try:
+            return self.serve_infer(data)[1]
+        finally:
+            _PEERLINK_INFER_SLOTS.release()
 
     @staticmethod
     def _credit_served(data: dict, prompt: str, max_tokens: int,

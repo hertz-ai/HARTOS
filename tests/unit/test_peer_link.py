@@ -2047,6 +2047,37 @@ class TestRequestReply(unittest.TestCase):
         finally:
             _stop(a, b)
 
+    def test_a_late_reply_is_dropped_not_handed_to_the_channel_handler(self):
+        # The sender timed out, then its reply arrived: it carries 're' but
+        # matches nothing pending.  It must not reach the handler as a request.
+        a, b = _linked_pair()
+        try:
+            seen = []
+            b.on_message('compute', lambda ch, data, peer: seen.append(data))
+            a.send('control', {})                      # keep both loops busy and warm
+            a._ws_send(json.dumps(
+                {'ch': 'compute', 'id': 'x1', 're': 'no-such-request', 'd': {'prompt': 'hi'}}
+            ).encode('utf-8'))
+            time.sleep(0.6)
+            self.assertEqual(seen, [])
+        finally:
+            _stop(a, b)
+
+    def test_a_compute_frame_that_asks_for_nothing_is_ignored(self):
+        # compute is request-only: work started inline on the receive thread
+        # with nobody waiting for the result is exactly what the bound prevents.
+        a, b = _linked_pair()
+        try:
+            ran = []
+            b.on_message('compute', lambda ch, data, peer: ran.append(data) or {'ok': True})
+            a.send('compute', {'prompt': 'hi'})                      # no wait_response
+            time.sleep(0.6)
+            self.assertEqual(ran, [])
+            self.assertEqual(a.send('compute', {'prompt': 'hi'}, wait_response=True, timeout=3),
+                             {'ok': True})                           # a real request still works
+        finally:
+            _stop(a, b)
+
     def test_a_handler_return_is_not_sent_when_nobody_asked(self):
         a, b = _linked_pair()
         try:
@@ -2063,13 +2094,15 @@ class TestRequestReply(unittest.TestCase):
         a, b = _linked_pair()
         try:
             got = {}
-            for name in ('events', 'learning', 'hivemind', 'compute', 'dispatch'):
+            # 'compute' is request-only (see the tests below), so not here
+            names = ('events', 'learning', 'hivemind', 'dispatch')
+            for name in names:
                 b.on_message(name, lambda ch, data, peer, n=name: got.setdefault(n, (ch, data, peer)))
                 a.send(name, {'n': name})
             deadline = time.monotonic() + 3
-            while len(got) < 5 and time.monotonic() < deadline:
+            while len(got) < len(names) and time.monotonic() < deadline:
                 time.sleep(0.05)
-            for name in ('events', 'learning', 'hivemind', 'compute', 'dispatch'):
+            for name in names:
                 self.assertEqual(got.get(name), (name, {'n': name}, 'peer-a'))
         finally:
             _stop(a, b)

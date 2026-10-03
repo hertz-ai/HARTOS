@@ -86,6 +86,12 @@ _MAX_EMPTY_RECVS = 100
 #: busy node.
 _MAX_CONCURRENT_REQUESTS = 8
 
+#: Channels whose handlers do real work for the asking peer and whose result is
+#: only useful as a reply.  A frame there that does not ask for a reply (no
+#: 'rq') is ignored, so a peer cannot start that work inline on the receive
+#: thread, outside the bound above, with nobody waiting for the result.
+_REQUEST_ONLY_CHANNELS = frozenset({'compute'})
+
 
 def _is_recv_timeout(exc: BaseException) -> bool:
     """Is this exception "no message arrived in time", as opposed to a real fault?
@@ -1115,9 +1121,15 @@ class PeerLink:
                     data = msg.get('d', {})
 
                     # Check if this is a response to a pending request
-                    if msg.get('re') and msg['re'] in self._pending_responses:
-                        self._response_data[msg['re']] = data
-                        self._pending_responses[msg['re']].set()
+                    if msg.get('re'):
+                        waiter = self._pending_responses.get(msg['re'])
+                        if waiter is not None:
+                            self._response_data[msg['re']] = data
+                            waiter.set()
+                        # A reply nobody is waiting on any more (the sender
+                        # timed out first) is dropped.  Letting it fall through
+                        # would hand a reply dict to the channel's handler as if
+                        # it were a request: on 'compute', an inference.
                         continue
 
                     # Dispatch to handlers
@@ -1144,33 +1156,13 @@ class PeerLink:
                             self._request_slots.release()
                             logger.debug(f"Could not start request thread: {e}")
                         continue
+                    if channel in _REQUEST_ONLY_CHANNELS:
+                        continue
                     for handler in self._message_handlers.get(channel, []):
                         try:
                             handler(channel, data, self.peer_id)
                         except Exception as e:
                             logger.debug(f"Handler error on {channel}: {e}")
-                    continue
-                    handlers = self._message_handlers.get(channel, [])
-                    reply = None
-                    for handler in handlers:
-                        try:
-                            result = handler(channel, data, self.peer_id)
-                            if reply is None and isinstance(result, dict):
-                                reply = result
-                        except Exception as e:
-                            logger.debug(f"Handler error on {channel}: {e}")
-                    # The sender is waiting (send(wait_response=True) flags the
-                    # frame): the first handler's dict is the answer.  A frame
-                    # nobody is waiting on gets nothing back, whatever its
-                    # handler returned.
-                    if msg.get('rq') and msg_id:
-                        try:
-                            self.send(channel,
-                                      reply if reply is not None
-                                      else {'error': 'no handler'},
-                                      reply_to=msg_id)
-                        except Exception as e:
-                            logger.debug(f"Reply on {channel} failed: {e}")
                     continue
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     pass

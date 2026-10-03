@@ -119,3 +119,40 @@ def test_peerlink_and_http_serve_through_one_function():
         assert mesh.handle_peerlink_compute('compute', {'prompt': 'hi'}, 'p') == {'response': 'x'}
         mesh._route_infer(b'{"prompt":"hi"}')
     assert s.call_count == 2
+
+
+def test_peerlink_compute_refuses_a_payload_with_no_prompt():
+    mesh = ComputeMeshService()
+    with mock.patch.object(mesh, 'serve_infer') as s:
+        assert mesh.handle_peerlink_compute('compute', {}, 'p') == {'error': 'Invalid payload'}
+        assert mesh.handle_peerlink_compute('compute', {'prompt': '  '}, 'p') == {'error': 'Invalid payload'}
+        assert mesh.handle_peerlink_compute('compute', 'x', 'p') == {'error': 'Invalid payload'}
+    s.assert_not_called()
+
+
+def test_peerlink_compute_is_capped_across_links():
+    import threading
+    from integrations.agent_engine import compute_mesh_service as cms
+    mesh = ComputeMeshService()
+    gate, started = threading.Event(), []
+
+    def slow(data):
+        started.append(1)
+        gate.wait(5)
+        return 200, {'response': 'ok'}
+
+    results = []
+    with mock.patch.object(mesh, 'serve_infer', side_effect=slow):
+        threads = [threading.Thread(
+            target=lambda: results.append(mesh.handle_peerlink_compute('compute', {'prompt': 'hi'}, 'p')))
+            for _ in range(cms._MAX_PEERLINK_INFERENCES + 3)]
+        for t in threads:
+            t.start()
+        import time
+        time.sleep(0.6)
+        busy = [r for r in results if r.get('code') == 'busy']
+        gate.set()
+        for t in threads:
+            t.join(5)
+    assert len(started) == cms._MAX_PEERLINK_INFERENCES        # no more ran at once
+    assert len(busy) == 3                                       # the rest were told so
