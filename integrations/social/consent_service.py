@@ -873,8 +873,12 @@ class ConsentService:
                 from .federation import federation
                 for _agent in UserService.get_owned_agents(db, user_id):
                     federation.sync_agent_to_parent(db, _agent)
-            except Exception:
-                pass
+            except Exception as e:
+                # Best-effort (the grant stands), never silent: a user who made
+                # their agents public otherwise saw them never appear.
+                _logger.warning(
+                    "public_exposure granted for %s but its agents were not "
+                    "re-synced to central: %s", user_id, e, exc_info=True)
 
         return consent
 
