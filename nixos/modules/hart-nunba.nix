@@ -1,4 +1,4 @@
-{ config, lib, pkgs, hartSrc ? /etc/hart, ... }:
+{ config, lib, pkgs, hartSrc ? /etc/hart, hartRev ? "unknown", ... }:
 
 # HART OS Nunba Module — the FULL Nunba (Python + React) as a NATIVE OS daemon
 #
@@ -28,7 +28,8 @@ let
   cfg = config.hart;
   # ONE package expression (the same file hart-liquid-ui.nix callPackages for the
   # NUNBA_STATIC_DIR floor) → the daemon and the floor share the SAME store path.
-  nunbaPkg = pkgs.callPackage ../packages/nunba.nix { inherit hartSrc; };
+  # hartRev rides along so the package's BUILD_INFO.txt names the HARTOS it ships in.
+  nunbaPkg = pkgs.callPackage ../packages/nunba.nix { inherit hartSrc hartRev; };
   # The NATIVE HARTOS tree (the SAME derivation the backend runs). Nunba's own code
   # imports HARTOS packages directly — models/catalog.py does an unguarded
   # `import integrations.service_tools.model_catalog` (→ integrations/__init__ →

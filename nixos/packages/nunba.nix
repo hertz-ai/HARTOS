@@ -1,4 +1,8 @@
 { lib, pkgs
+, hartRev ? "unknown"  # HART OS short rev (flake.nix hartRev, the same value /etc/hart/image-rev
+                       # carries), passed by hart-nunba.nix so BUILD_INFO.txt below names the
+                       # HARTOS this Nunba was shipped inside. "unknown" only when a caller
+                       # does not pass it (hart-liquid-ui.nix's floor call).
 , hartSrc ? null   # Accepted only for call-site compatibility: hart-liquid-ui.nix
                    # and hart-nunba.nix both `callPackage` this file with
                    # `{ inherit hartSrc; }`, and callPackage passes the override
@@ -223,6 +227,22 @@ pkgs.stdenv.mkDerivation {
     mkdir -p $out/lib/nunba/landing-page
     ln -sfn ${nunbaStatic} $out/lib/nunba/landing-page/build
     ln -sfn ${nunbaStatic} $out/lib/nunba/static
+
+    # BUILD_INFO.txt: the SAME keys the Windows nightly ships beside Nunba.exe
+    # (since Nunba 99af812), so a node can say which Nunba it runs and which
+    # HARTOS it was shipped inside, and two installs can be diffed by one file.
+    # Measured gap 2026-10-05: the owner's PC answered BUILD_SHA/HARTOS_SHA from
+    # C:\\Program Files (x86)\\HevolveAI\\Nunba\\BUILD_INFO.txt in one read; the HART OS
+    # node (generation 13) had no such file under /nix/store/*-nunba-1.0.0/lib/nunba
+    # and its Nunba rev could only be recovered from this .nix. BUILD_SHA is the
+    # full Nunba sha; HARTOS_SHA is the short rev (what /etc/hart/image-rev holds);
+    # BUILD_TIME is not available in a reproducible Nix build and says so.
+    cat > $out/lib/nunba/BUILD_INFO.txt <<EOF
+BUILD_SHA=${nunbaRev}
+HARTOS_SHA=${hartRev}
+BUILD_TIME=reproducible-nix-build
+BUILD_PLATFORM=nixos
+EOF
 
     runHook postInstall
   '';
