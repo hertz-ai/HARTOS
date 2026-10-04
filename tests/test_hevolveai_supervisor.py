@@ -131,43 +131,67 @@ def test_get_stats_still_has_baseline_keys():
 
 # -- the child learns which NODE it is (hevolveai C310) -----------------
 
-def _stub_gossip(monkeypatch, node_id):
+def _stub_canonical(monkeypatch, node_id):
+    """Stub the ONE canonical resolver (SyncEngine.canonical_node_id, which
+    reads gossip) that worker_loop._worker_node_id and now the supervisor use;
+    node_id=Exception makes it raise."""
     import sys
     import types
-    social = types.ModuleType("integrations.social")
-    pd = types.ModuleType("integrations.social.peer_discovery")
-    pd.gossip = types.SimpleNamespace(node_id=node_id)
-    social.peer_discovery = pd
-    monkeypatch.setitem(sys.modules, "integrations.social", social)
-    monkeypatch.setitem(sys.modules, "integrations.social.peer_discovery", pd)
+    se = types.ModuleType("integrations.social.sync_engine")
+
+    class _SyncEngine:
+        @staticmethod
+        def canonical_node_id():
+            if node_id is Exception:
+                raise RuntimeError("identity storage unusable")
+            return node_id or ''
+
+    se.SyncEngine = _SyncEngine
+    monkeypatch.setitem(sys.modules, "integrations.social.sync_engine", se)
+
+
+def _env(monkeypatch):
+    monkeypatch.setattr(_sup, '_resolve_repo_root', lambda: None)
+    return _sup._Supervisor()._build_env()
 
 
 def test_child_gets_the_canonical_gossip_node_id(monkeypatch):
-    """Every hive message hevolveai publishes named a role or 'default', so
+    """Every hive message hevolveai published named a role or 'default', so
     peers could not tell nodes apart. The child must be handed the node id
     this node already gossips under, and HEVOLVE_NODE_NAME (its checkpoint
     folder) must be left alone."""
     monkeypatch.delenv("HEVOLVE_NODE_ID", raising=False)
     monkeypatch.delenv("HEVOLVE_NODE_NAME", raising=False)
-    monkeypatch.setattr(_sup, '_resolve_repo_root', lambda: None)
-    _stub_gossip(monkeypatch, "7f3c-node")
-    env = _sup._Supervisor()._build_env()
+    _stub_canonical(monkeypatch, "7f3c-node")
+    env = _env(monkeypatch)
     assert env["HEVOLVE_NODE_ID"] == "7f3c-node"
     assert "HEVOLVE_NODE_NAME" not in env
 
 
-def test_an_operator_node_id_wins(monkeypatch):
+def test_same_precedence_as_the_distributed_stack(monkeypatch):
+    """The canonical gossip id wins over a configured one, exactly as
+    worker_loop._worker_node_id resolves it; the configured id is the
+    bootstrap fallback when gossip has none."""
     monkeypatch.setenv("HEVOLVE_NODE_ID", "operator-set")
-    monkeypatch.setattr(_sup, '_resolve_repo_root', lambda: None)
-    _stub_gossip(monkeypatch, "7f3c-node")
-    assert _sup._Supervisor()._build_env()["HEVOLVE_NODE_ID"] == "operator-set"
+    _stub_canonical(monkeypatch, "7f3c-node")
+    assert _env(monkeypatch)["HEVOLVE_NODE_ID"] == "7f3c-node"
+    _stub_canonical(monkeypatch, None)
+    assert _env(monkeypatch)["HEVOLVE_NODE_ID"] == "operator-set"
+
+
+def test_a_shared_placeholder_never_reaches_the_child(monkeypatch):
+    """A fleet-wide 'unknown' would make every node read every other node's
+    messages as its own echo (review of 5cea76108, M1)."""
+    for placeholder in ("unknown", "None", "null", "  "):
+        monkeypatch.setenv("HEVOLVE_NODE_ID", placeholder)
+        _stub_canonical(monkeypatch, None)
+        assert "HEVOLVE_NODE_ID" not in _env(monkeypatch), placeholder
 
 
 def test_identity_trouble_never_blocks_the_spawn(monkeypatch):
     monkeypatch.delenv("HEVOLVE_NODE_ID", raising=False)
-    monkeypatch.setattr(_sup, '_resolve_repo_root', lambda: None)
-    _stub_gossip(monkeypatch, None)
-    assert "HEVOLVE_NODE_ID" not in _sup._Supervisor()._build_env()
+    _stub_canonical(monkeypatch, Exception)
+    assert "HEVOLVE_NODE_ID" not in _env(monkeypatch)
 
 
 # -- launch command must work with the Cython-compiled bundle ----------

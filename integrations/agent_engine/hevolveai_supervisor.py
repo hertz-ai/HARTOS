@@ -1044,15 +1044,24 @@ class _Supervisor(ProcessSupervisor):
         # gossips under (GossipProtocol.node_id, persisted by
         # security.node_integrity). HEVOLVE_NODE_NAME is NOT reused: it names the
         # child's checkpoint folder, and changing it would orphan learned state.
-        # setdefault keeps an operator override; best-effort so identity storage
-        # trouble never blocks the spawn (the child then falls back to its name).
-        if 'HEVOLVE_NODE_ID' not in env:
-            try:
-                from integrations.social.peer_discovery import gossip
-                if getattr(gossip, 'node_id', None):
-                    env['HEVOLVE_NODE_ID'] = str(gossip.node_id)
-            except Exception:
-                pass
+        # Resolved by the SAME helper the distributed stack uses
+        # (worker_loop._worker_node_id: SyncEngine.canonical_node_id first, then
+        # a configured HEVOLVE_NODE_ID, never a shared placeholder such as
+        # 'unknown'), so the child's identity, precedence and placeholder filter
+        # match the rest of HARTOS. Best-effort: identity trouble never blocks
+        # the spawn. With no identity the variable is REMOVED from the child's
+        # env, so an inherited placeholder cannot reach it; the child then sends
+        # no node id and behaves exactly as before C310 (no gate).
+        _nid = ''
+        try:
+            from integrations.distributed_agent.worker_loop import _worker_node_id
+            _nid = _worker_node_id()
+        except Exception:
+            logger.debug("hevolveai child: node identity unavailable", exc_info=True)
+        if _nid:
+            env['HEVOLVE_NODE_ID'] = _nid
+        else:
+            env.pop('HEVOLVE_NODE_ID', None)
         if self.pythonpath:
             existing = env.get('PYTHONPATH', '')
             env['PYTHONPATH'] = (
