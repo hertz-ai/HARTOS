@@ -79,3 +79,22 @@ def test_salvage_stub_uses_the_existing_not_done_token():
         assert d['status'].value == 'pending', (
             f"expected the codebase's existing 'pending' token, got "
             f"{d['status'].value!r}")
+
+
+def test_salvage_stub_actions_are_plain_text():
+    """2026-10-04: the stub's one action was banked as the dict
+    {'action': 'Respond to user', 'action_id': 1, 'status': 'pending'}, and the
+    user read it back verbatim in the help question -- 'Step 1 ("{'action':
+    'Respond to user', ...}") isn't coming together...' (agent 20, 17:16).
+    Real configs carry their actions as strings (307 of 749 on 2026-09-13);
+    the stub does too now, so every reader prints 'Respond to user'."""
+    for d in _salvage_dicts():
+        flows = d['flows']
+        assert isinstance(flows, ast.List) and flows.elts
+        for flow in flows.elts:
+            fields = dict(zip([k.value for k in flow.keys], flow.values))
+            actions = fields['actions']
+            assert isinstance(actions, ast.List) and actions.elts
+            for action in actions.elts:
+                assert isinstance(action, ast.Constant) and isinstance(action.value, str), (
+                    f'a salvage action is not plain text: {ast.dump(action)[:90]}')

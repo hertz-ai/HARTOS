@@ -8729,7 +8729,7 @@ def _autonomous_gather_info(user_id, description, prompt_id):
         'goal': description or 'General assistant',
         'broadcast_agent': 'no',
         'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
-        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': [{'action': 'Respond to user', 'action_id': 1, 'status': 'pending'}], 'sub_goal': description or 'Help the user'}],
+        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': ['Respond to user'], 'sub_goal': description or 'Help the user'}],
         'extra_information': f'Auto-generated after {max_iterations} autonomous gather iterations',
         'prompt_id': prompt_id,
         'creator_user_id': user_id,
@@ -10703,7 +10703,7 @@ def chat():
                         'goal': prompt or 'General assistant',
                         'broadcast_agent': 'no',
                         'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
-                        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': [{'action': 'Respond to user', 'action_id': 1, 'status': 'pending'}], 'sub_goal': prompt or 'Help the user'}],
+                        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': ['Respond to user'], 'sub_goal': prompt or 'Help the user'}],
                         'extra_information': f'Auto-generated after {turn_num} gather turns'
                     }
                     _save_and_enter_review(partial)

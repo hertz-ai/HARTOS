@@ -65,6 +65,7 @@ except Exception:
     PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 from hartos import helper as helper_fun
+import contextlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 # transform_messages is an autogen.agentchat.contrib.capabilities submodule —
@@ -818,6 +819,70 @@ def has_pending_tool_calls(messages):
     return (last_msg.get('role') == 'assistant' and
             'tool_calls' in last_msg and
             last_msg['tool_calls'])
+
+
+# The thread running a session's turn, by user_prompt (recipe() marks it).
+# get_response_group re-enters itself (safe_action_boundary_check, the
+# flow-increment sites), so the SAME thread entering again is still the one
+# turn; only a different thread is "another turn in flight".
+_TURNS_IN_FLIGHT = {}
+_TURNS_IN_FLIGHT_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _turn_in_flight(user_prompt):
+    """Mark this thread as the one running ``user_prompt``'s turn for the
+    duration of the block.  Re-entrant: an inner block on the same thread
+    neither replaces nor clears the outer mark."""
+    me = threading.get_ident()
+    with _TURNS_IN_FLIGHT_LOCK:
+        mine = _TURNS_IN_FLIGHT.get(user_prompt) is None
+        if mine:
+            _TURNS_IN_FLIGHT[user_prompt] = me
+    try:
+        yield
+    finally:
+        if mine:
+            with _TURNS_IN_FLIGHT_LOCK:
+                if _TURNS_IN_FLIGHT.get(user_prompt) == me:
+                    del _TURNS_IN_FLIGHT[user_prompt]
+
+
+def _another_turn_in_flight(user_prompt):
+    """True when a thread other than this one is running ``user_prompt``'s
+    turn right now.  The per-user lock is not held across LLM calls
+    (hart_intelligence_entry chat()), so two /chat requests for one session
+    can overlap, and that is the only case in which a pending tool call at
+    the end of the group chat is really being processed."""
+    with _TURNS_IN_FLIGHT_LOCK:
+        owner = _TURNS_IN_FLIGHT.get(user_prompt)
+    return owner is not None and owner != threading.get_ident()
+
+
+def _settle_orphaned_tool_calls(messages):
+    """Answer the tool calls of ``messages[-1]`` that no turn will execute.
+
+    A turn that ends on a tool call -- autogen's max_round cap (live
+    2026-10-04 17:16:36, agent 20, save_data_in_memory) or the user-input
+    gate -- leaves the call unanswered at the end of the group chat, and
+    get_response_group then refused every later message with 'Processing a
+    tool now please try later' until the process restarted.  Each call gets
+    a tool message carrying HISTORICAL_TOOL_PLACEHOLDER, the one vocabulary
+    every reader (ToolMessageHandler.real_tool_answer, the fabrication gate)
+    already knows means "no real result", so nothing can take the settle for
+    the tool having run.  Returns how many calls were settled.
+    """
+    from core.constants import HISTORICAL_TOOL_PLACEHOLDER
+    if not messages:
+        return 0
+    last = messages[-1]
+    calls = last.get('tool_calls') if isinstance(last, dict) else None
+    ids = [c.get('id') for c in (calls or [])
+           if isinstance(c, dict) and c.get('id')]
+    for call_id in ids:
+        messages.append({'role': 'tool', 'tool_call_id': call_id,
+                         'content': HISTORICAL_TOOL_PLACEHOLDER})
+    return len(ids)
 
 
 def _seed_messages(user_id, prompt_id=None):
@@ -2545,8 +2610,21 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 mark_action_waiting_for_user(
                                     user_prompt, current_action_id,
                                     json_obj.get('message') or 'Waiting for user input')
-                            else:
-                                safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "verifier pending")
+                                # END the chat round here, the way the loop-break
+                                # (#485) and the TERMINATE guard do: autogen's
+                                # run_chat breaks on a None speaker, and the OUTER
+                                # loop's gate asks the user on its first iteration.
+                                # Returning the Assistant kept the chat running to
+                                # max_round=30 -- live 2026-10-04 17:10, agent 20:
+                                # six flags in one turn, each re-execution of
+                                # 'Respond to user' sending the user another
+                                # greeting, and turn 2 capped on an unanswered tool
+                                # call (see get_response_group's orphan settle).
+                                current_app.logger.info(
+                                    f"[USER-INPUT-GATE] ending the chat round: action "
+                                    f"{current_action_id} is waiting for the user")
+                                return None
+                            safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "verifier pending")
                             return assistant
                         elif json_obj['status'].lower() == 'requires_breakdown':
                             # Handle subtask breakdown request from StatusVerifier
@@ -3873,6 +3951,24 @@ def should_continue_autonomously(user_prompt: str) -> bool:
 
     return False
 
+def _stub_action_text(entry):
+    """The text of a gather-info salvage stub's action, else ``entry`` as is.
+
+    The salvage writers (hart_intelligence_entry) used to bank their one
+    placeholder action as {'action': 'Respond to user', 'action_id': 1,
+    'status': 'pending'}; 420 such configs were live on 2026-10-04, and every
+    CREATE prompt plus the help question printed the dict verbatim ('Step 1
+    ("{'action': 'Respond to user', ...}")').  Only that exact shape is
+    unwrapped.  A real action dict (tool_name, depends_on, ...) and a string
+    pass through untouched, so REUSE's dict readers (Action.
+    get_action_byaction_id) and the ledger see what they always saw.
+    """
+    if (isinstance(entry, dict) and isinstance(entry.get('action'), str)
+            and set(entry) <= {'action', 'action_id', 'status'}):
+        return entry['action']
+    return entry
+
+
 def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int, user_prompt: str,
                               flow_id: Optional[int] = None) -> Action:
     """
@@ -3900,6 +3996,10 @@ def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int,
     Returns:
         Action instance with Smart Ledger attached
     """
+    # The ONE CREATE-side reader of a config's actions: a salvage stub's dict
+    # reads as its text here, so every prompt, the help question and the
+    # ledger task carry 'Respond to user', not the dict.
+    actions = [_stub_action_text(a) for a in (actions or [])]
     action_instance = Action(actions)
 
     # Resolve the active flow for this ledger.  Caller can override; if
@@ -4395,12 +4495,22 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_prompt]
     clear_history = False
 
-    # TOOL CALL AND RESPONSE CHECK with TIMEOUT
-    tool_timeout = 2  # Timeout in seconds (adjust as needed)
-    current_time = time.time()
-    if len(group_chat.messages)>2 and 'tool_calls' in group_chat.messages[-1]:
-        current_app.logger.warning('GOT INPUT BUT LAST MESSAGE IS tool_calls should wait for tool response')
-        return 'Processing a tool now please try later'
+    # TOOL CALL AND RESPONSE CHECK.  A turn that ends while a tool call is the
+    # last message leaves it unanswered: autogen's max_round cap can land there
+    # (live 2026-10-04 17:16:36, agent 20, save_data_in_memory) and so can the
+    # user-input gate.  Only a turn STILL RUNNING on another thread owns that
+    # call; with none, it is an orphan, and answering the canned line to every
+    # later message kept agent 20 unreachable until a restart.
+    if len(group_chat.messages) > 2 and has_pending_tool_calls(group_chat.messages):
+        if _another_turn_in_flight(user_prompt):
+            current_app.logger.warning(
+                'GOT INPUT BUT LAST MESSAGE IS tool_calls and another turn of '
+                f'{user_prompt} is still running: asking the user to retry')
+            return 'Processing a tool now please try later'
+        _settled = _settle_orphaned_tool_calls(group_chat.messages)
+        current_app.logger.warning(
+            f'[ORPHAN-TOOL-CALL] settled {_settled} unanswered call(s) left by '
+            f'an ended turn of {user_prompt}; this turn proceeds')
 
     if Failure:
         current_app.logger.warning(f'CHECK THIS OUT group_chat.messages:{group_chat.messages[-5:]}')
@@ -6621,13 +6731,17 @@ def recipe(user_id, text, prompt_id, file_id, request_id):
     else:
         current_app.logger.info(f"♻️ Using existing session for {user_prompt}")
 
-    try:
-        last_response = get_response_group(user_id, text, prompt_id)
-    except Exception as e:
-        current_app.logger.error(f"Error occurred in create Recipe: {str(e)}")
-        error_message = traceback.format_exc()
-        current_app.logger.error(f"Error occurred in create Recipe stack trace:\n{error_message}")
-        last_response = get_response_group(user_id, text, prompt_id, True, e)
+    # This thread owns the session's turn until it returns: get_response_group
+    # tells a pending tool call owned by a RUNNING turn from one orphaned by
+    # an ended turn by asking _another_turn_in_flight.
+    with _turn_in_flight(user_prompt):
+        try:
+            last_response = get_response_group(user_id, text, prompt_id)
+        except Exception as e:
+            current_app.logger.error(f"Error occurred in create Recipe: {str(e)}")
+            error_message = traceback.format_exc()
+            current_app.logger.error(f"Error occurred in create Recipe stack trace:\n{error_message}")
+            last_response = get_response_group(user_id, text, prompt_id, True, e)
 
     # Rest of the function remains the same...
     if scheduler_check.get(user_prompt) is True:
