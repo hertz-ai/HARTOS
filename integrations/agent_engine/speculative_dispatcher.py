@@ -1731,6 +1731,31 @@ class SpeculativeDispatcher:
                 self._evict_old_results()
             return
 
+        # A failed turn does not raise: the pipeline answers with
+        # user_facing_error()'s sentence, which is right for a person and
+        # wrong here.  Measured on central 9ce6023f: every spec_expert TTS
+        # marker since boot (30) spoke "I couldn't finish that: 'NoneType'
+        # object is not iterable" over the draft, recorded it for continual
+        # learning and closed the speculation improved=True.  Treat it as
+        # the empty reply it is: the draft standby stays, nothing is
+        # recorded, and /diag can see the expert ran and failed.
+        from core.agent_tools import is_user_facing_error
+        if is_user_facing_error(expert_response):
+            logger.warning(
+                "collapsed expert for %s failed (%s); draft standby remains "
+                "the final reply, nothing delivered or recorded",
+                speculation_id, expert_response.strip()[:120])
+            with self._lock:
+                self._results[speculation_id] = {
+                    'response': fast_response,
+                    'model': expert_model.model_id,
+                    'latency_ms': round(elapsed_ms, 1),
+                    'improved': False,
+                    'expert_failed': True,
+                }
+                self._evict_old_results()
+            return
+
         # GUARDRAIL: constitutional check on expert output before delivery
         from security.hive_guardrails import ConstitutionalFilter
         passed, reason = ConstitutionalFilter.check_prompt(expert_response)
