@@ -798,6 +798,13 @@ HELP_EXPERT_REPLY_PREFIX: str = "Handed to the expert model:"
 # or cloud endpoint.
 LLM_THINKING_OFF_KWARGS: dict = {'enable_thinking': False}
 
+# The same switch in OpenRouter's own request field.  OpenRouter normalises
+# requests across providers and documents `reasoning.effort: "none"` as
+# "disables reasoning entirely"; a llama.cpp/vLLM chat_template_kwargs is not
+# one of its parameters, so sent there it would not reach the model and every
+# agent turn would think at length.
+LLM_THINKING_OFF_REASONING: dict = {'effort': 'none'}
+
 
 TOOL_LABELS: dict = {
     # Memory + history

@@ -54,6 +54,16 @@ def test_the_configured_endpoint_turns_thinking_off():
         'a caller mutating the request must not change the shared constant')
 
 
+def test_openrouter_gets_its_own_reasoning_switch():
+    """OpenRouter has no chat_template_kwargs; it reads reasoning.effort."""
+    from core.constants import LLM_THINKING_OFF_REASONING
+    kind, entry = _central('https://openrouter.ai/api/v1')
+    assert kind == 'api'
+    assert entry['extra_body'] == {'reasoning': {'effort': 'none'}}
+    assert entry['extra_body']['reasoning'] is not LLM_THINKING_OFF_REASONING
+    assert 'chat_template_kwargs' not in entry['extra_body']
+
+
 @pytest.mark.parametrize('endpoint', ['https://api.openai.com/v1',
                                       'https://my-res.openai.azure.com/openai'])
 def test_openai_and_azure_get_no_template_kwargs(endpoint):
