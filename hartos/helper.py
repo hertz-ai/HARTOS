@@ -2261,6 +2261,13 @@ class ToolMessageHandler:
         # Check if the last message contains "Execute action" pattern
         last_message = messages[-1]
         last_content = last_message.get('content', '')
+        # A tool call carries content=None and a multimodal turn carries a list;
+        # neither can be an "Execute action" instruction, and re.search on them
+        # raised TypeError (live 2026-10-04 on central: the whole reuse turn died
+        # inside get_agent_response).  Older messages are already filtered by
+        # isinstance below; the last one gets the same treatment.
+        if not isinstance(last_content, str):
+            return messages
 
         # Use regex to match "Execute Action" followed by optional number and colon
         execute_action_pattern = r'execute\s+action\s*\d*\s*:?'

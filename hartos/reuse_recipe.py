@@ -789,6 +789,15 @@ def execute_python_file(task_description: str, user_id: int, prompt_id: int, act
     return 'done'
 
 
+# A failed action-details poll pauses that URL for a while instead of failing
+# again 2s later.  Live 2026-10-04 (central, bridge-network container whose
+# config.json named localhost:6006): 2,544 "Error getting user action details"
+# in 29 min, one per job run, ~80/min, for an endpoint that was never going to
+# answer.  One ERROR line per pause is the whole signal an operator needs.
+_VISUAL_POLL_PAUSE_S = 300
+_visual_poll_paused_until: dict = {}
+
+
 def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     # NOTE on logging: this function runs inside the APScheduler
     # BackgroundScheduler thread (created at line 174), which has NO Flask
@@ -817,8 +826,10 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     now_utc = datetime.utcnow()
 
     # Get user action data to check for Video Reasoning entries
+    action_url = f"{ACTION_API}?user_id={user_id}"
+    if time.monotonic() < _visual_poll_paused_until.get(action_url, 0.0):
+        return None
     try:
-        action_url = f"{ACTION_API}?user_id={user_id}"
         payload = {}
         headers_api = {}
 
@@ -873,11 +884,15 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
                 return None
 
         else:
-            logger.error(f"Failed to get user actions: {response.status_code}")
+            _visual_poll_paused_until[action_url] = time.monotonic() + _VISUAL_POLL_PAUSE_S
+            logger.error(f"Failed to get user actions: {response.status_code}; "
+                         f"this poll pauses for {_VISUAL_POLL_PAUSE_S}s")
             return 'error'
 
     except Exception as e:
-        logger.error(f"Error getting user action details: {e}")
+        _visual_poll_paused_until[action_url] = time.monotonic() + _VISUAL_POLL_PAUSE_S
+        logger.error(f"Error getting user action details: {e}; "
+                     f"this poll pauses for {_VISUAL_POLL_PAUSE_S}s")
         return 'error'
 
 

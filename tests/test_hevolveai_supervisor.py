@@ -129,6 +129,47 @@ def test_get_stats_still_has_baseline_keys():
         assert key in stats
 
 
+# -- the child learns which NODE it is (hevolveai C310) -----------------
+
+def _stub_gossip(monkeypatch, node_id):
+    import sys
+    import types
+    social = types.ModuleType("integrations.social")
+    pd = types.ModuleType("integrations.social.peer_discovery")
+    pd.gossip = types.SimpleNamespace(node_id=node_id)
+    social.peer_discovery = pd
+    monkeypatch.setitem(sys.modules, "integrations.social", social)
+    monkeypatch.setitem(sys.modules, "integrations.social.peer_discovery", pd)
+
+
+def test_child_gets_the_canonical_gossip_node_id(monkeypatch):
+    """Every hive message hevolveai publishes named a role or 'default', so
+    peers could not tell nodes apart. The child must be handed the node id
+    this node already gossips under, and HEVOLVE_NODE_NAME (its checkpoint
+    folder) must be left alone."""
+    monkeypatch.delenv("HEVOLVE_NODE_ID", raising=False)
+    monkeypatch.delenv("HEVOLVE_NODE_NAME", raising=False)
+    monkeypatch.setattr(_sup, '_resolve_repo_root', lambda: None)
+    _stub_gossip(monkeypatch, "7f3c-node")
+    env = _sup._Supervisor()._build_env()
+    assert env["HEVOLVE_NODE_ID"] == "7f3c-node"
+    assert "HEVOLVE_NODE_NAME" not in env
+
+
+def test_an_operator_node_id_wins(monkeypatch):
+    monkeypatch.setenv("HEVOLVE_NODE_ID", "operator-set")
+    monkeypatch.setattr(_sup, '_resolve_repo_root', lambda: None)
+    _stub_gossip(monkeypatch, "7f3c-node")
+    assert _sup._Supervisor()._build_env()["HEVOLVE_NODE_ID"] == "operator-set"
+
+
+def test_identity_trouble_never_blocks_the_spawn(monkeypatch):
+    monkeypatch.delenv("HEVOLVE_NODE_ID", raising=False)
+    monkeypatch.setattr(_sup, '_resolve_repo_root', lambda: None)
+    _stub_gossip(monkeypatch, None)
+    assert "HEVOLVE_NODE_ID" not in _sup._Supervisor()._build_env()
+
+
 # -- launch command must work with the Cython-compiled bundle ----------
 
 def test_build_cmd_uses_import_not_dash_m(monkeypatch):

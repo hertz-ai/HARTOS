@@ -1037,6 +1037,22 @@ class _Supervisor(ProcessSupervisor):
                     env['HEVOLVE_LOCAL_LLM_URL'] = _llm_url
             except Exception:
                 pass
+        # THE NODE'S HIVE IDENTITY (hevolveai C310). Every hive message the child
+        # publishes names a role ("thinking_engine") or its storage namespace
+        # ("default" on every unconfigured install), so peers could not tell one
+        # node from another. Hand it the ONE canonical node id this node already
+        # gossips under (GossipProtocol.node_id, persisted by
+        # security.node_integrity). HEVOLVE_NODE_NAME is NOT reused: it names the
+        # child's checkpoint folder, and changing it would orphan learned state.
+        # setdefault keeps an operator override; best-effort so identity storage
+        # trouble never blocks the spawn (the child then falls back to its name).
+        if 'HEVOLVE_NODE_ID' not in env:
+            try:
+                from integrations.social.peer_discovery import gossip
+                if getattr(gossip, 'node_id', None):
+                    env['HEVOLVE_NODE_ID'] = str(gossip.node_id)
+            except Exception:
+                pass
         if self.pythonpath:
             existing = env.get('PYTHONPATH', '')
             env['PYTHONPATH'] = (

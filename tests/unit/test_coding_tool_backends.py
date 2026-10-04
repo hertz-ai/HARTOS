@@ -85,6 +85,41 @@ class TestInstaller:
         assert versions['pi'] == '0.73.1'
         assert ['/opt/node/bin/pi', '--version'] in [c[0][0] for c in run.call_args_list]
 
+    def test_pip_install_in_a_frozen_host_uses_the_hosts_pip(self):
+        """In Nunba sys.executable is Nunba.exe, so `sys.executable -m pip`
+        would start a second app, not pip.  A frozen host installs through
+        its own pip runner (python-embed, user site, HARTOS pins)."""
+        from integrations.coding_agent import installer
+        import types
+        host = types.ModuleType('tts.package_installer')
+        host._run_pip = MagicMock(return_value=(True, 'ok'))
+        with patch.object(installer.sys, 'frozen', True, create=True), \
+             patch.dict(sys.modules, {'tts.package_installer': host}), \
+             patch.object(installer, 'run_bounded') as run:
+            result = installer.pip_install('diskcache grep-ast')
+        run.assert_not_called()
+        host._run_pip.assert_called_once()
+        assert host._run_pip.call_args[0][0] == ['install', 'diskcache', 'grep-ast']
+        assert result['success'] is True
+
+    def test_pip_install_frozen_without_a_host_runner_refuses(self):
+        from integrations.coding_agent import installer
+        with patch.object(installer.sys, 'frozen', True, create=True), \
+             patch.dict(sys.modules, {'tts.package_installer': None}), \
+             patch.object(installer, 'run_bounded') as run:
+            result = installer.pip_install('diskcache')
+        run.assert_not_called()
+        assert result['success'] is False
+
+    def test_pip_install_unfrozen_runs_bounded_pip(self):
+        from integrations.coding_agent import installer
+        from core.subprocess_safe import BoundedResult
+        with patch.object(installer, 'run_bounded',
+                          return_value=BoundedResult(0, '', '')) as run:
+            result = installer.pip_install('diskcache')
+        assert run.call_args[0][0] == [sys.executable, '-m', 'pip', 'install', 'diskcache']
+        assert result['success'] is True
+
     def _shim(self, tmp_path, name, target_line):
         shim = tmp_path / f'{name}.cmd'
         shim.write_text('@ECHO off\r\nSETLOCAL\r\nCALL :find_dp0\r\n' + target_line + '\r\n')

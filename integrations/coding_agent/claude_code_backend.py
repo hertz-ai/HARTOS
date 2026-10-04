@@ -238,6 +238,15 @@ def _spawn(prompt, *, mode, cwd, timeout_s, model, system, extra_args):
         cmd += list(extra_args)
 
     try:
+        # npm installs claude as claude.cmd; launching the .cmd hands the
+        # prompt to cmd.exe, which re-parses it (a '" & cmd' in conversation
+        # text executed, a newline truncated it).  launch_argv runs the
+        # shim's target instead, or refuses text cmd.exe would rewrite.
+        from integrations.coding_agent.installer import launch_argv
+        cmd = launch_argv(cmd)
+    except ValueError as e:
+        return {'ok': False, 'error': str(e), 'category': 'other'}
+    try:
         # claude is a console-subsystem binary. Nunba.exe is GUI-subsystem and
         # owns no console, so spawning it bare makes Windows allocate a fresh
         # VISIBLE console for the run's lifetime — a cmd window flashing on the

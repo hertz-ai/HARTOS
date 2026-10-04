@@ -99,6 +99,37 @@ def test_the_env_pin_cannot_spawn_what_the_human_revoked(monkeypatch):
     assert r.get('category') == 'off', r
 
 
+@pytest.mark.skipif(os.name != 'nt' or not __import__('shutil').which('node'),
+                    reason='cmd.exe argument re-parsing is Windows-only; needs node')
+def test_chat_text_reaches_an_npm_shim_verbatim_and_runs_nothing(tmp_path, monkeypatch):
+    """npm installs claude as claude.cmd; launching the .cmd hands the
+    prompt to cmd.exe, which re-parses it (measured: '" & echo X > f'
+    created f, a newline truncated the prompt).  _spawn must launch the
+    shim's target so conversation text cannot become a command."""
+    import json
+    bs = chr(92)
+    (tmp_path / 'node_modules' / 'fake').mkdir(parents=True)
+    (tmp_path / 'node_modules' / 'fake' / 'cli.js').write_text(
+        "require('fs').writeFileSync(require('path').join(__dirname,'..','..','argv.json'),"
+        "JSON.stringify(process.argv.slice(2)));")
+    shim = tmp_path / 'claude.cmd'
+    shim.write_text('@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\n'
+                    'EXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n'
+                    'SET "_prog=node"\r\n'
+                    'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & '
+                    '"%_prog%"  "%dp0%' + bs + 'node_modules' + bs + 'fake' + bs
+                    + 'cli.js" %*\r\n')
+    monkeypatch.setattr(cc, '_resolve_claude_bin', lambda: str(shim))
+    monkeypatch.chdir(tmp_path)
+    prompt = 'summarise this " & echo PWNED > pwned.txt & "\nsecond line %PATH%'
+    r = cc._spawn(prompt, mode='inference', cwd=str(tmp_path), timeout_s=60,
+                  model=None, system=None, extra_args=None)
+    assert r.get('returncode') == 0, r
+    argv = json.loads((tmp_path / 'argv.json').read_text())
+    assert argv[:2] == ['-p', prompt]
+    assert not (tmp_path / 'pwned.txt').exists()
+
+
 def test_off_classifies_as_its_own_category():
     assert cc.classify_failure({'ok': False, 'category': 'off',
                                 'error': 'switched off'}) == 'off'

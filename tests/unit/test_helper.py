@@ -459,6 +459,56 @@ class TestToolMessageHandler:
             result = handler.apply_transform(messages)
         assert len(result) >= 1
 
+    # 2026-10-04, central: re.search(pattern, None) in remove_recipe_prompt_messages
+    # raised TypeError and the whole reuse turn died inside get_agent_response.
+    # The last message of a history is a tool call (content None) or a
+    # multimodal turn (content list) often enough that this is a normal shape.
+
+    def test_remove_recipe_prompt_messages_tolerates_a_tool_call_last_turn(self):
+        from hartos.helper import ToolMessageHandler
+        handler = ToolMessageHandler(user_tasks={}, user_prompt='test')
+        messages = [
+            {'role': 'user', 'content': 'Focus on the current task at hand and create a detailed recipe that includes ...'},
+            {'role': 'assistant', 'content': 'ok'},
+            {'role': 'assistant', 'content': None,
+             'tool_calls': [{'id': 'call_1', 'type': 'function',
+                             'function': {'name': 'google_search', 'arguments': '{}'}}]},
+        ]
+        result = handler.remove_recipe_prompt_messages(messages)
+        assert result == messages, "a non-text last turn is not an Execute action; nothing changes"
+
+    def test_remove_recipe_prompt_messages_tolerates_a_multimodal_last_turn(self):
+        from hartos.helper import ToolMessageHandler
+        handler = ToolMessageHandler(user_tasks={}, user_prompt='test')
+        messages = [
+            {'role': 'user', 'content': 'Focus on the current task at hand and create a detailed recipe that includes ...'},
+            {'role': 'assistant', 'content': 'ok'},
+            {'role': 'user', 'content': [{'type': 'text', 'text': 'Execute action 2:'},
+                                         {'type': 'image_url', 'image_url': {'url': 'data:...'}}]},
+        ]
+        result = handler.remove_recipe_prompt_messages(messages)
+        assert result == messages
+
+    def test_remove_recipe_prompt_messages_still_strips_on_a_text_execute_turn(self):
+        """The text path is unchanged: an 'Execute action' last turn drops the
+        older recipe prompt and keeps the last two messages."""
+        from hartos.helper import ToolMessageHandler
+        from flask import Flask
+        app = Flask(__name__)
+        handler = ToolMessageHandler(user_tasks={}, user_prompt='test')
+        recipe_prompt = {'role': 'user',
+                         'content': 'Focus on the current task at hand and create a detailed recipe that includes the steps'}
+        messages = [
+            recipe_prompt,
+            {'role': 'assistant', 'content': 'recipe drafted'},
+            {'role': 'user', 'content': 'status: done'},
+            {'role': 'user', 'content': 'Execute action 2:'},
+        ]
+        with app.app_context():
+            result = handler.remove_recipe_prompt_messages(messages)
+        assert recipe_prompt not in result
+        assert result[-2:] == messages[-2:]
+
 
 # ============================================================
 # get_llm_config — autogen LLM configuration

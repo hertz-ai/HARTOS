@@ -16,11 +16,10 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import sys
 from typing import Dict, List, Optional
 
-from core.subprocess_safe import no_window_kwargs, run_bounded
+from core.subprocess_safe import run_bounded
 
 logger = logging.getLogger('hevolve.coding_agent')
 
@@ -60,8 +59,9 @@ _CMD_UNSAFE = set('"&|<>^%!\r\n')
 def launch_argv(cmd: List[str]) -> List[str]:
     """The argv that launches cmd[0] with cmd[1:] reaching it verbatim.
 
-    Every installer.py / tool_backends.py coding-tool launch goes through
-    this (claude_code_backend._spawn still has its own resolver).
+    Every coding-tool launch goes through this: installer.py,
+    tool_backends.CodingToolBackend.execute and claude_code_backend._spawn
+    (which resolves its binary first, then launches through here).
 
     On Windows npm installs npm-based tools as .cmd shims.  A bare name is
     FileNotFoundError (CreateProcess ignores PATHEXT), and launching the .cmd
@@ -183,23 +183,34 @@ def pip_install(packages: str) -> Dict:
 
     Used for in-process backends (aider_native) that need pip dependencies
     rather than npm.
+
+    In a frozen host (Nunba) sys.executable is the app itself, so
+    `sys.executable -m pip` would start a second app, not pip; the host's
+    own runner (tts.package_installer._run_pip: python-embed, user-site
+    --target, HARTOS pins) installs instead.
     """
-    import sys
     pkg_list = packages.split()
     logger.info(f"pip installing: {pkg_list}")
-    try:
-        result = subprocess.run(
-            [sys.executable, '-m', 'pip', 'install'] + pkg_list,
-            capture_output=True, text=True, timeout=120,
-         **no_window_kwargs())
-        if result.returncode == 0:
+    if getattr(sys, 'frozen', False):
+        try:
+            from tts.package_installer import _run_pip  # type: ignore
+        except ImportError:
+            return {'success': False,
+                    'error': 'pip is not available in this frozen build'}
+        ok, msg = _run_pip(['install'] + pkg_list, timeout=600)
+        if ok:
             return {'success': True, 'message': f'Installed: {", ".join(pkg_list)}'}
-        else:
-            return {'success': False, 'error': result.stderr.strip()}
-    except subprocess.TimeoutExpired:
-        return {'success': False, 'error': 'pip install timed out (120s)'}
+        return {'success': False, 'error': msg}
+    try:
+        result = run_bounded([sys.executable, '-m', 'pip', 'install'] + pkg_list,
+                             timeout=120)
     except OSError as e:
         return {'success': False, 'error': str(e)}
+    if result.timed_out:
+        return {'success': False, 'error': 'pip install timed out (120s)'}
+    if result.returncode == 0:
+        return {'success': True, 'message': f'Installed: {", ".join(pkg_list)}'}
+    return {'success': False, 'error': result.stderr.strip()}
 
 
 def install_tool(tool_name: str) -> Dict:
