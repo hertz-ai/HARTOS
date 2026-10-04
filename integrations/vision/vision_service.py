@@ -309,15 +309,14 @@ class VisionService:
         existing = getattr(self, '_screen_capture_thread', None)
         if existing is not None and existing.is_alive():
             return
-        owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
-        if not owner:
+        if not os.environ.get('HEVOLVE_OWNER_USER_ID'):
             logger.info("Screen capture idle: no HEVOLVE_OWNER_USER_ID "
                         "identity to consent-ask or file frames under")
             return
         if interval is None:
             interval = float(os.environ.get(
                 'HEVOLVE_SCREEN_CAPTURE_SECONDS', '10'))
-        state = {'capture': None}
+        state = {'capture': None, 'owner': None}
 
         def _consent_ok() -> bool:
             # The owner's No, or the eye button's cut, first: in memory, set
@@ -325,6 +324,16 @@ class VisionService:
             # even before the stored row is read or the service stopped.
             from core.ai_sensing import allowed
             if not allowed('screen'):
+                state['owner'] = None
+                return False
+            # The owner is read EVERY tick, not captured at thread start:
+            # Nunba keeps HEVOLVE_OWNER_USER_ID in step with sign-in and
+            # sign-out, and a captured value kept asking the boot-time guest
+            # (no subscriber) after the real user signed in.  The owner who
+            # consents this tick is the one its frame is filed under.
+            owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+            state['owner'] = owner
+            if not owner:
                 return False
             from integrations.social.models import db_session
             from integrations.social.consent_service import ConsentService
@@ -333,6 +342,11 @@ class VisionService:
                 # exactly one ask reaches the UI.
                 return ConsentService.check_or_request(
                     db, owner, 'screen_capture')
+
+        def _put(jpeg):
+            owner = state['owner']
+            if owner:
+                self.store.put_screen_frame(owner, jpeg)
 
         def _grab():
             if state['capture'] is None:
@@ -350,8 +364,7 @@ class VisionService:
 
         def _run():
             run_screen_capture_loop(
-                _consent_ok, _grab,
-                lambda jpeg: self.store.put_screen_frame(owner, jpeg),
+                _consent_ok, _grab, _put,
                 _yielding,
                 sleep=lambda: time.sleep(interval),
                 stop=lambda: not self._running)
