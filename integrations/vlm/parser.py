@@ -54,6 +54,30 @@ _NUMBER_RE = re.compile(r'\d+')
 
 # ─── ParsedAction dataclass ──────────────────────────────────────────
 
+#: What the loop's prompts show the model as the SHAPE of a field.  The
+#: prompts (local_loop SYSTEM_PROMPT and the unified per-step prompt) read
+#: these constants, so the text the model sees and the text the parser
+#: filters cannot drift apart.
+SHELL_COMMAND_PLACEHOLDER = 'shell command when Next Action is shell'
+OPEN_PATH_PLACEHOLDER = 'file or app name when Next Action is open_file_gui'
+#: Every placeholder spelling so far ('shell command string when Next Action
+#: is shell', 'shell command when Next Action is shell', 'file or app name
+#: when Next Action is open_file_gui') shares this phrase; no command does.
+_TEMPLATE_ECHO_MARK = 'when next action is'
+
+
+def is_template_echo(value) -> bool:
+    """True when a field's value is the prompt's own placeholder echoed back.
+
+    Measured 2026-10-04 17:02:12 (gui_app.log.1): the 4B put its real
+    command in "value" and the template's "shell command when Next Action is
+    shell" in "command"; the executor ran the latter, cmd.exe refused it,
+    and three such steps closed the run as action_error.  A placeholder is
+    an empty field, never a command or a path.
+    """
+    return _TEMPLATE_ECHO_MARK in str(value or '').strip().lower()
+
+
 @dataclass
 class ParsedAction:
     """Normalized result of parsing any of the three VLM response
@@ -275,6 +299,11 @@ def _parse_json_shape(raw: str, *, include_som: bool) -> ParsedAction:
     # execute. Carry them through explicitly.
     pa.command = parsed.get('command', '') or ''
     pa.path = parsed.get('path', '') or ''
+    # The prompt's own placeholder, echoed back, is not a value.
+    if is_template_echo(pa.command):
+        pa.command = ''
+    if is_template_echo(pa.path):
+        pa.path = ''
     pa.coordinate = parsed.get('coordinate')
     pa.box_id = parsed.get('Box ID')
     pa.done = pa.status.upper() == 'DONE'

@@ -3342,7 +3342,13 @@ def _handle_shell_command_tool(input_text: str) -> str:
     # Dispatched directly the same command returns rc=1 with 'Property
     # "FreeGB" cannot be found' — a failure the model can act on.
     shell_override = None
-    m = _re_shell.match(r'^(powershell|pwsh|bash|sh|cmd)\s*:\s*(.+)$', text, _re_shell.IGNORECASE)
+    # 'shell:' / 'terminal:' name the DEFAULT shell: the VLM loop's models
+    # write the tool's name in front of the command ("shell: dir", measured
+    # 2026-10-04 in the daemon's runs), and cmd.exe answered "'shell:' is not
+    # recognized" to every one.  They select nothing (the argv builder below
+    # falls to its default for any other spelling) and only lose the prefix.
+    m = _re_shell.match(r'^(powershell|pwsh|bash|sh|cmd|shell|terminal)\s*:\s*(.+)$',
+                        text, _re_shell.IGNORECASE)
     if m:
         shell_override = m.group(1).lower()
         text = m.group(2).strip()

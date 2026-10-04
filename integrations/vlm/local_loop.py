@@ -93,6 +93,11 @@ def _shell_dialect_note(os_name):
 # and the unified-mode combined_prompt. Keeping one string means the
 # legacy OmniParser path and the unified Qwen3-VL path can never drift
 # on which actions the model is allowed to emit.
+# The prompts below show the model the SHAPE of the shell/open fields with
+# these placeholders; the parser filters the same constants when a model
+# echoes them back as values (parser.is_template_echo, live 2026-10-04).
+from integrations.vlm.parser import OPEN_PATH_PLACEHOLDER, SHELL_COMMAND_PLACEHOLDER
+
 _VLM_ACTION_LIST = (
     "Available actions:\n"
     "- GUI: left_click, right_click, double_click, type, key, hotkey, hover, "
@@ -145,8 +150,8 @@ SYSTEM_PROMPT = (
     '    "Box ID": <element_id if clicking an element>,\n'
     '    "coordinate": [x, y],\n'
     '    "value": "text for type/hotkey actions",\n'
-    '    "command": "shell command string when Next Action is shell",\n'
-    '    "path": "file or app name when Next Action is open_file_gui",\n'
+    '    "command": "' + SHELL_COMMAND_PLACEHOLDER + '",\n'
+    '    "path": "' + OPEN_PATH_PLACEHOLDER + '",\n'
     '    "Status": "IN_PROGRESS or DONE"\n'
     '}\n'
     "\n"
@@ -789,8 +794,8 @@ def _drive_local_agentic_loop(
                         'open_file_gui|None",\n'
                         '  "coordinate": [x, y],\n'
                         '  "value": "text to type or key name",\n'
-                        '  "command": "shell command when Next Action is shell",\n'
-                        '  "path": "file or app name when Next Action is open_file_gui",\n'
+                        '  "command": "' + SHELL_COMMAND_PLACEHOLDER + '",\n'
+                        '  "path": "' + OPEN_PATH_PLACEHOLDER + '",\n'
                         '  "Status": "IN_PROGRESS|DONE"\n'
                         "}\n\n"
                         "For click actions: provide <point>x,y</point> normalized "

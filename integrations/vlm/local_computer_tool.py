@@ -958,7 +958,12 @@ def _execute_inprocess(action: dict) -> dict:
             # fail CLOSED rather than falling back to a bare subprocess.run —
             # a bare fallback would skip the denylist and expose a command
             # injection channel that silently weakens safety posture.
-            cmd = action.get('command', text)
+            # The model's own command field first, else its value.  `or`, not
+            # a default: a caller that passes command='' (the parser once the
+            # prompt placeholder is filtered, an HTTP-tier client) still has
+            # the command in `value`, and the old `get('command', text)` read
+            # the empty field as "no command" and refused the step.
+            cmd = action.get('command') or text
             if not cmd:
                 return {'output': '', 'error': 'shell action needs command string'}
             from core.safe_hartos_attr import safe_hartos_attr
