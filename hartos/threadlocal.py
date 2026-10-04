@@ -182,6 +182,36 @@ class ThreadLocalData:
                     setattr(self._local, key, value)
         return _cm()
 
+    # --- Where the reply being published came from (local | hive | cloud) ---
+    # hart_intelligence_entry.publish_async stamps served_by on every chat
+    # envelope, and _tts_synthesize_and_publish on the spoken bubble.  The one
+    # site that KNOWS the backend (the dispatcher, once an expert answers) names
+    # it here around its delivery.  A context and not a keyword on purpose:
+    # Nunba rebinds hart_intelligence.publish_async with a wrapper that takes
+    # (topic, message, timeout) only, and safe_hartos_attr hands the dispatcher
+    # that wrapper, so a new keyword is a TypeError on the desktop and the
+    # expert's reply is never published.
+
+    def get_served_by(self):
+        """The origin the enclosing reply_from() block names, or None."""
+        return getattr(self._local, 'served_by', None)
+
+    def reply_from(self, served_by):
+        """Context manager: replies published inside the block are served by
+        ``served_by`` (any tag core.constants.canonical_served_by accepts),
+        then this thread gets its previous origin back."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            saved = self.get_served_by()
+            self._local.served_by = served_by
+            try:
+                yield
+            finally:
+                self._local.served_by = saved
+        return _cm()
+
     # --- Computer-use run context (set by integrations.vlm.local_loop) ---
     # The run a desktop action belongs to, so a tool that executes DURING a
     # run can announce itself as a step of that run instead of inventing its

@@ -39,12 +39,26 @@ Primary endpoint for agent interaction.
 ```json
 {
   "response": "Here are the latest trends...",
+  "served_by": "local",
   "prompt_id": "99999",
   "flow_id": "1",
   "actions_completed": 3,
   "recipe_saved": true
 }
 ```
+
+`served_by` says where the reply came from, always one of three values
+(`core.constants.canonical_served_by` is the one rule that names it):
+
+| Value | Meaning |
+|-------|---------|
+| `local` | This node's own LLM wrote the reply. |
+| `hive` | The turn was escalated to a hive peer's model. |
+| `cloud` | A cloud agent (an agent that exists only on central), or central's own LLM when this node is central. |
+
+The same field is stamped on the chat envelopes published through
+`publish_async` (message bus and SSE legs) and on the spoken-reply (TTS)
+bubble, so a client's badge reads it instead of guessing.
 
 ### Security
 

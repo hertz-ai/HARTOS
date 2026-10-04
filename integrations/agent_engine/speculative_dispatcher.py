@@ -1765,22 +1765,38 @@ class SpeculativeDispatcher:
                 reason)
             return
 
+        # Which backend served this turn.  Named BEFORE delivery because the
+        # delivered bubbles carry it (core.constants.canonical_served_by turns
+        # the tag into local | hive | cloud, the value the page's badge reads),
+        # and the same tag is the telemetry value in self._results below: one
+        # computation, two readers.
+        served_by = (
+            'hive_langchain_bg' if not expert_model.is_local
+            else 'local_langchain_bg'
+        )
+
         # Unconditional delivery: the expert is THE expert here, not a
         # "maybe improvement".  Bubble-replace the standby via the
         # existing speculation_id channel (SSE + TTS — see
         # _deliver_expert_response for the dual-channel contract).
-        self._deliver_expert_response(
-            user_id, prompt_id, speculation_id, expert_response)
+        #
+        # The origin goes through a thread context, not a parameter: leg 1
+        # calls the publish_async that safe_hartos_attr resolves, and Nunba
+        # rebinds that on the hart_intelligence facade as a wrapper taking
+        # (topic, message, timeout) only (routes/hartos_backend_adapter.py),
+        # so a keyword it does not know is a TypeError that drops the reply
+        # on the desktop.  _deliver_expert_response keeps its signature for
+        # the same reason.
+        from hartos.threadlocal import thread_local_data
+        with thread_local_data.reply_from(served_by):
+            self._deliver_expert_response(
+                user_id, prompt_id, speculation_id, expert_response)
 
         # Feed continual learning.  Stamp escalation_reason from the
         # _active entry so distillation can weight refusal-overridden
         # turns differently from clean classifier-delegate turns.
         with self._lock:
             active_entry = dict(self._active.get(speculation_id, {}))
-        served_by = (
-            'hive_langchain_bg' if not expert_model.is_local
-            else 'local_langchain_bg'
-        )
         self._record_interaction_safely(
             # #224 — honor user_pref stashed by _schedule_expert_background;
             # local_only users skip WorldModelBridge entirely (no HevolveAI

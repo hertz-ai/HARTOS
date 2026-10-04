@@ -1400,6 +1400,52 @@ def action_is_autonomous(value) -> bool:
     return str(value or '').strip().lower() == 'yes'
 
 
+# ── Where a chat reply came from: the THREE values a client badge reads ──
+# Owner, 2026-10-04: 'local' is a reply this node's own LLM wrote, 'hive' is a
+# reply that was escalated to a hive peer, 'cloud' is a reply from a cloud
+# agent (an agent that exists only on central).  The page's badge
+# (landing-page/src/utils/tier.js formatTier) reads exactly these three, so a
+# reply that carries none is labelled by the page's own guess -- which
+# measured wrong: a reply written by the local llama-server was badged "Cloud"
+# (frozen_debug.log 2026-10-04 17:10, agent 20, all 24 model calls on
+# 127.0.0.1:8080).  ONE rule names it, here, so the envelope publisher, the
+# /chat response, the spoken bubble and the speculative dispatcher cannot each
+# grow their own.  Guarded, with a source guard against a second writer, by
+# tests/unit/test_served_by_is_one_rule.py.
+SERVED_BY_LOCAL: str = 'local'
+SERVED_BY_HIVE: str = 'hive'
+SERVED_BY_CLOUD: str = 'cloud'
+SERVED_BY_VALUES = (SERVED_BY_LOCAL, SERVED_BY_HIVE, SERVED_BY_CLOUD)
+
+
+def canonical_served_by(value=None, node_tier=None) -> str:
+    """The origin of a chat reply, in the vocabulary a client badge reads.
+
+    ``value`` is whatever the dispatch site said: an exact 'local' / 'hive' /
+    'cloud', or one of the tags that grew before this rule ('hive_langchain_bg'
+    and 'local_langchain_bg' from the speculative dispatcher, 'langchain_cloud'
+    and 'hevolve_cloud' from the cloud pipeline).  'hive' wins over 'cloud' in
+    a tag that names both.
+
+    No usable tag means the node's own LLM wrote the reply: 'local', or
+    'cloud' when this IS the central node, whose own LLM is the cloud every
+    client of central sees.  ``node_tier`` is the tier the envelope names (a
+    node relaying central's reply keeps 'central'); None reads
+    HEVOLVE_NODE_TIER, the one place this rule does.  A value that is not a
+    string (a device id, a number) is no tag.  Never raises."""
+    tag = value.strip().lower() if isinstance(value, str) else ''
+    if 'hive' in tag:
+        return SERVED_BY_HIVE
+    if 'cloud' in tag:
+        return SERVED_BY_CLOUD
+    if node_tier is None:
+        import os
+        node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+    if str(node_tier or '').strip().lower() == 'central':
+        return SERVED_BY_CLOUD
+    return SERVED_BY_LOCAL
+
+
 # Tools that record, recall or look up the agent's OWN state -- the scratchpad
 # around an action, never the action's work.  A call to one proves only that
 # the agent kept notes.

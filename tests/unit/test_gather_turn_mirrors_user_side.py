@@ -46,6 +46,8 @@ import pytest
 
 flask = pytest.importorskip('flask')
 
+from core.constants import canonical_served_by as _canonical_served_by  # noqa: E402
+
 _SRC = os.environ.get('HARTOS_ENTRY_SOURCE') or str(
     Path(__file__).resolve().parents[2] / 'hart_intelligence_entry.py')
 
@@ -160,7 +162,13 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
         'security.prompt_guard': MagicMock(
             check_prompt_injection=lambda p: (True, '')),
         'core.recipe_sync': MagicMock(pull_recipe=lambda *a: False),
-        'core.constants': MagicMock(NON_LATIN_SCRIPT_LANGS=frozenset()),
+        # _chat_reply names where the reply came from through the ONE rule
+        # (core.constants.canonical_served_by): the stub passes the REAL
+        # function through, so this isolation never re-implements it and the
+        # lifted _chat_reply gets a string, not an auto-made MagicMock that
+        # jsonify cannot serialize.
+        'core.constants': MagicMock(NON_LATIN_SCRIPT_LANGS=frozenset(),
+                                    canonical_served_by=_canonical_served_by),
         'core.user_lang': MagicMock(get_preferred_lang=lambda: 'en'),
         'core.teacher_avatar': MagicMock(avatar_id_from=lambda v: None),
         'hartos.gather_agentdetails': MagicMock(gather_info=gather_info),
