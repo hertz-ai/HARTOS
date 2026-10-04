@@ -685,3 +685,22 @@ class TestCooldownSentinel:
             clock[0] = 12.0 + peer_reuse._cooldown_s() + 1.0
             peer_reuse.try_peer_recipe_reuse(_identity(), LOCAL_PID)
         assert len(calls) == 2
+
+    def test_a_spent_deadline_does_not_cool_the_goal_down(self, harness):
+        """The daemon shares one deadline across every recipe-less goal in
+        a tick, so a later goal can arrive with none left.  No peer is
+        asked, so no cooldown: the next tick's fresh budget tries again
+        (measured 2026-09-02: the second goal of a tick was cooled down
+        for 600 s having reached nobody)."""
+        calls = []
+        clock = [12.0]
+        with patch.object(peer_reuse, 'admitted_peers',
+                          lambda *a, **k: (calls.append(1), [])[1]), \
+                patch.object(peer_reuse.time, 'monotonic', lambda: clock[0]):
+            assert peer_reuse.try_peer_recipe_reuse(
+                _identity(), LOCAL_PID, deadline=11.0) is None
+            assert calls == [], 'a spent deadline still dialled the peer store'
+            clock[0] = 42.0                      # the next tick, fresh budget
+            peer_reuse.try_peer_recipe_reuse(
+                _identity(), LOCAL_PID, deadline=52.0)
+        assert len(calls) == 1, 'the spent deadline cooled the goal down'

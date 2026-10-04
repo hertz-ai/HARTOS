@@ -986,6 +986,20 @@ def try_peer_recipe_reuse(identity: Dict[str, str], local_prompt_id: str,
             return None
         _attempt_cooldown[key] = now
 
+    # The cooldown is for a goal whose peers were ASKED and had nothing.
+    # The daemon shares one deadline across every recipe-less goal in a
+    # tick, so a later goal can arrive with none left; measured on the
+    # desktop 2026-09-02, the second goal inherited a spent deadline,
+    # discovery stopped before dialling anyone, and the goal was cooled
+    # down for 600 s having reached no peer.  Nothing was asked, so
+    # nothing was hammered: the next tick's fresh budget tries again.
+    if deadline is not None and time.monotonic() >= deadline:
+        logger.info('peer_reuse: no peer budget left this tick for %s; '
+                    'not cooled down', key)
+        with _lock:
+            _attempt_cooldown.pop(key, None)
+        return None
+
     peers = admitted_peers()
     if not peers:
         logger.debug('peer_reuse: no admitted peers')
