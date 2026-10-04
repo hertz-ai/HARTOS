@@ -230,8 +230,19 @@ def test_legacy_return_contract_is_preserved(monkeypatch):
         assert k in rec, f"legacy caller depends on {k}"
 
 
+def _llm(monkeypatch, status, models=None):
+    """Fake the canonical live probe (core.health_probe.probe_llm) so these
+    tests do not depend on whether a llama-server runs on the test box."""
+    out = {'status': status, 'url': 'http://127.0.0.1:8080/v1'}
+    if models is not None:
+        out['models'] = models
+    monkeypatch.setattr('core.health_probe.probe_llm',
+                        lambda include_models=False: dict(out))
+
+
 def test_needs_setup_true_when_no_model_active(monkeypatch):
     monkeypatch.setattr(mo, "get_active_model", lambda: None)
+    _llm(monkeypatch, 'down')
     assert mo.needs_setup() is True
 
 
@@ -240,10 +251,20 @@ def test_needs_setup_false_when_a_model_is_active(monkeypatch):
     assert mo.needs_setup() is False
 
 
+def test_needs_setup_false_when_an_llm_this_process_did_not_start_is_serving(monkeypatch):
+    """RED before: hart-llm.service (HART OS) or Nunba starts llama, never
+    onboard(), so get_active_model() is None and the first-boot wizard offered
+    to provision a model while one was already answering."""
+    monkeypatch.setattr(mo, "get_active_model", lambda: None)
+    _llm(monkeypatch, 'up', ['Qwen3.5-4B-Q4_K_M.gguf'])
+    assert mo.needs_setup() is False
+
+
 def test_needs_setup_failsafe_offers_setup_on_error(monkeypatch):
     def _boom():
         raise RuntimeError("state unavailable")
     monkeypatch.setattr(mo, "get_active_model", _boom)
+    _llm(monkeypatch, 'down')
     assert mo.needs_setup() is True  # fail toward offering, not skipping
 
 

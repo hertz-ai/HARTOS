@@ -1997,6 +1997,10 @@ def model_status(ctx):
         if active:
             click.echo(f"Active: {active.get('model', active.get('model_name', 'unknown'))} ({active.get('quant', '?')})")
             click.echo(f"  Endpoint: {active.get('endpoint', '?')}")
+        elif s.get('server_healthy') and s.get('serving_models'):
+            # Started by Nunba or hart-llm.service, not by this process.
+            click.echo(f"Serving: {', '.join(s['serving_models'])} (not started by hart)")
+            click.echo(f"  Endpoint: {s.get('llm_url', '?')}")
         else:
             click.echo("No model running")
         gpu = s.get('vram', s.get('gpu', {}))
