@@ -311,7 +311,9 @@ class TestTheVerdictStillHasToNameThisAction(_CreateHarness):
     def test_a_verdict_for_another_action_completes_nothing_even_with_a_receipt(self):
         """REUSE 17:35:28 (#125): the verdict's own action_id is not advisory
         for completion -- and finding the receipt ourselves must not turn it
-        back into advice."""
+        back into advice.  The other action is one the flow HAS: an id the
+        flow lacks names no action (test_completion_needs_real_work)."""
+        self.ledger = _Ledger(_ACTION, actions=3)
         self._set_log(_live_window())
         self._state(S.IN_PROGRESS)
         result = self._hook(self._verdict(
@@ -567,6 +569,7 @@ class TestOnlyAWrittenAnswerCompletesAProseAction(_ProseHarness):
         self._refused([self.dispatch])
 
     def test_a_verdict_for_another_action_completes_nothing(self):
+        self.ledger = _Ledger(_PROSE_ACTION, actions=2)
         self._set_log([self.dispatch, _assistant(_LESSON)])
         result = self._hook(self._verdict(
             {'message_index': 1, 'kind': 'user_visible_result'}, action_id=2))

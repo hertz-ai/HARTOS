@@ -71,9 +71,13 @@ _CODING_RESULT = json.dumps({'success': True, 'tool': 'aider_native',
 
 
 class _Ledger:
-    def __init__(self, description):
-        self.tasks = {'action_1': SimpleNamespace(
-            context={}, description=description)}
+    """The flow's ledger: one ``action_<id>`` task per action, as
+    add_actions_to_ledger builds it for CREATE and REUSE alike."""
+
+    def __init__(self, description, actions=1):
+        self.tasks = {f'action_{n}': SimpleNamespace(
+            context={}, description=description if n == 1 else f'step {n}')
+            for n in range(1, actions + 1)}
 
     def save(self):
         return True
@@ -164,8 +168,13 @@ class TestReceiptMustBeTheActionsWork(_Harness):
 
 
 class TestAVerdictCompletesOnlyTheActionItNames(_Harness):
+    """A verdict that names ANOTHER ACTION OF THE FLOW completes nothing.
+    REUSE 17:35:28 ran a flow of four, so the flow here has the other
+    actions a verdict can name."""
+
     def setUp(self):
         super().setUp()
+        self.ledger = _Ledger(_CODING, actions=4)
         self._log(_call('c', 'execute_coding_task'), _result('c', _CODING_RESULT))
         self._state(S.IN_PROGRESS, S.STATUS_VERIFICATION_REQUESTED)
 
@@ -187,6 +196,84 @@ class TestAVerdictCompletesOnlyTheActionItNames(_Harness):
         self.assertTrue(self._commit(None))
 
 
+class TestAVerdictNamingNoActionOfTheFlowIsNotContradicting(_Harness):
+    """LIVE, installed desktop, 2026-10-06: agent 54 ("Personalised
+    Learning") has ONE action, and the turn traced at 03:07:55 (learner
+    777081) went
+
+        Refusing completion of action 1 in 777081_54: the verdict names action 2
+        [REUSE] Cannot advance action 1: state is status_verification_requested
+        [SYNTHESIS] ... unfinished=['action 1 did not finish']
+
+    and the learner got a poor reply 55-67 s later.  The 4B verifier numbers
+    its verdicts as it likes: 18 such refusal lines in the two retained logs,
+    the ids 2, 4 and 6, four learners, every one of them agent 54.
+
+    The refusal is the rule above: a verdict completes only the action it
+    names, because a stale verdict for action 2 completed action 4.  That is
+    a verdict about ANOTHER ACTION OF THE FLOW.  An id the flow does not have
+    names no action, so it cannot be a stale verdict for one; what still has
+    to hold is the receipt in the posted action's own dispatch window.
+    """
+
+    def _flow(self, actions):
+        """A fresh action 1 awaiting its verdict, in a flow of ``actions``."""
+        lh.action_states.pop(self.UP, None)
+        lh.retry_tracker.reset_count(self.UP, 1)
+        self.ledger = _Ledger(_CODING, actions=actions)
+        self._log(_call('c', 'execute_coding_task'),
+                  _result('c', _CODING_RESULT))
+        self._state(S.IN_PROGRESS, S.STATUS_VERIFICATION_REQUESTED)
+
+    def _commit(self, claimed):
+        return lh.commit_verified_action_completion(
+            self.UP, 1, {'message_index': 2, 'kind': 'tool_receipt'},
+            claimed_action_id=claimed)
+
+    def test_the_ids_the_live_verifier_wrote_complete_a_flow_of_one(self):
+        for claimed in (2, 4, 6):
+            with self.subTest(claimed=claimed):
+                self._flow(1)
+                self.assertTrue(self._commit(claimed))
+                self.assertEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)
+
+    def test_any_spelling_of_an_id_the_flow_lacks_is_the_same(self):
+        for claimed in ('2', 2.0, '2.0', 24, 0, -1):
+            with self.subTest(claimed=claimed):
+                self._flow(1)
+                self.assertTrue(self._commit(claimed))
+
+    def test_a_flow_that_has_the_named_action_still_refuses_it(self):
+        self._flow(2)
+        self.assertFalse(self._commit(2))
+        self.assertEqual(lh.get_action_state(self.UP, 1),
+                         S.STATUS_VERIFICATION_REQUESTED)
+
+    def test_the_same_flow_accepts_an_id_it_does_not_have(self):
+        self._flow(2)
+        self.assertTrue(self._commit(3))
+
+    def test_the_receipt_is_still_required(self):
+        """The id check relaxes nothing else: a note saved to memory is no
+        receipt, whatever number the verdict carries."""
+        self._flow(1)
+        self._log(_call('s', 'save_data_in_memory'),
+                  _result('s', _SAVED_COMPLETED))
+        self.assertFalse(self._commit(2))
+        self.assertNotEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)
+
+    def test_no_ledger_completes_nothing(self):
+        """Boundary: with no ledger to record the proof in, no verdict
+        completes an action, whatever it names."""
+        self._flow(1)
+        self.ledger = None
+        for claimed in (None, 1, 2):
+            with self.subTest(claimed=claimed):
+                self.assertFalse(self._commit(claimed))
+                self.assertNotEqual(lh.get_action_state(self.UP, 1),
+                                    S.COMPLETED)
+
+
 class TestTheVerdictPickupJudgesAnInProgressAction(_Harness):
     """CREATE routes the Assistant's turn to the verifier without moving the
     state, so the verdict arrives for an IN_PROGRESS action."""
@@ -204,6 +291,22 @@ class TestTheVerdictPickupJudgesAnInProgressAction(_Harness):
         self._state(S.IN_PROGRESS)
         self.assertEqual(self._hook(self._verdict())['action'], 'force_fallback')
         self.assertEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)
+
+    def test_a_verdict_naming_no_action_of_the_flow_completes_the_posted_one(self):
+        """The live shape: action_id 2 on a flow of one (agent 54)."""
+        self._log(_call('c', 'execute_coding_task'), _result('c', _CODING_RESULT))
+        self._state(S.IN_PROGRESS)
+        self.assertEqual(self._hook(self._verdict(action_id=2))['action'],
+                         'force_fallback')
+        self.assertEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)
+
+    def test_a_verdict_naming_another_action_of_the_flow_is_steered(self):
+        self.ledger = _Ledger(_CODING, actions=2)
+        self._log(_call('c', 'execute_coding_task'), _result('c', _CODING_RESULT))
+        self._state(S.IN_PROGRESS)
+        self.assertEqual(self._hook(self._verdict(action_id=2))['action'],
+                         'force_completion')
+        self.assertNotEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)
 
     def test_the_live_bookkeeping_verdict_is_refused_and_steered(self):
         self._log(_call('s', 'save_data_in_memory'), _result('s', _SAVED_COMPLETED))

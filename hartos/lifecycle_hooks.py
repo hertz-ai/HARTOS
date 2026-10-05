@@ -2018,6 +2018,18 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
         logger.exception('Unable to record verified world-model outcome')
 
 
+def _flow_has_action(user_prompt: str, action_id: int) -> bool:
+    """Whether this session's flow has an action with that id.
+
+    The registered ledger holds one ``action_<id>`` task per action
+    (add_actions_to_ledger, for CREATE and REUSE alike), and a completion is
+    only ever recorded against it (_record_verifier_evidence), so the flow a
+    completion is judged in always has one.
+    """
+    return f'action_{action_id}' in (
+        getattr(get_registered_ledger(user_prompt), 'tasks', None) or {})
+
+
 def commit_verified_action_completion(user_prompt: str, action_id: int,
                                       evidence: dict,
                                       reason: str = 'verified complete',
@@ -2032,19 +2044,26 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
     caller from advancing the pointer while silently skipping the flywheel.
 
     ``claimed_action_id`` is the action_id the verdict itself names, when it
-    names one.  A verdict completes only that action: live 2026-09-27 (REUSE
-    daemon_goal_..._b18bba6f, 17:35:28) a StatusVerifier verdict for action_id
-    2 -- "System health check completed successfully" -- completed action 4.
+    names one.  A verdict completes only the action it names: live 2026-09-27
+    (REUSE daemon_goal_..._b18bba6f, 17:35:28) a StatusVerifier verdict for
+    action_id 2 -- "System health check completed successfully" -- completed
+    action 4.  That is a verdict about ANOTHER ACTION OF THE FLOW.  An id the
+    flow does not have names no action, so it cannot be a stale verdict for
+    one; it is a wrong number, and live 2026-10-06 the 4B verifier wrote 2, 4
+    and 6 on the verdicts of agent 54, whose recipe has ONE action (18
+    refusal lines in the two retained logs).
     settled_action_id still decides which action a verdict is ABOUT (its
     recipe, its log line); this decides only whether it may COMPLETE one.  A
-    verdict that names no action_id is not contradicting anything.
+    verdict that names no action_id, or one the flow does not have, is not
+    contradicting anything.
     """
     if claimed_action_id is not None:
         try:
             _claimed = int(float(claimed_action_id))
         except (TypeError, ValueError):
             _claimed = None
-        if _claimed is not None and _claimed != int(action_id):
+        if (_claimed is not None and _claimed != int(action_id)
+                and _flow_has_action(user_prompt, _claimed)):
             logger.warning(
                 "Refusing completion of action %s in %s: the verdict names "
                 "action %s", action_id, user_prompt, _claimed)

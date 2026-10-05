@@ -336,6 +336,50 @@ class TestReuseAdvancesOnTheLesson(_ReuseOnARealLog, unittest.TestCase):
         self.assertEqual(rr.user_tasks[KEY].current_action, 2)
 
 
+class TestReuseCompletesWhenTheVerdictMisnumbersTheAction(
+        _ReuseOnARealLog, _Harness):
+    """Agent 54 has one action and its 4B verifier numbered a verdict 2: LIVE
+    2026-10-06 03:07:55, "Refusing completion of action 1 ... the verdict names
+    action 2", the action left in status_verification_requested and the
+    learner's lesson replaced by an apology.  Through the real
+    _advance_reuse_action, the real state machine and the real completion
+    gate; only the tool probe and the evidence watermark are stubbed."""
+
+    def setUp(self):
+        super().setUp()
+        import flask
+        self._install_session(self.UP)
+        self.ledger = _Ledger(_ACTION)
+        self.gc = self._reuse_log(self.UP, [('Assistant', _LESSON),
+                                            ('StatusVerifier', _VERDICT)])
+        self.patch(rr, '_reuse_fabricated_tools', lambda *a, **k: [])
+        self.patch(rr, '_stamp_action_evidence_watermark',
+                   lambda *a, **k: None)
+        rr._reuse_resteer_counts.pop((self.UP, 1), None)
+        rr._reuse_fab_pending.pop((self.UP, 1), None)
+        ctx = flask.Flask(__name__).app_context()
+        ctx.push()
+        self.addCleanup(ctx.pop)
+        self._state(S.IN_PROGRESS)
+
+    def _advance(self, claimed):
+        return rr._advance_reuse_action(self.UP, 1, 'test', None,
+                                        claimed_action_id=claimed)
+
+    def test_a_verdict_naming_action_2_of_a_flow_of_one_advances_it(self):
+        self._advance(2)
+        self.assertEqual(lh.get_action_state(self.UP, 1), S.TERMINATED)
+        self.assertEqual(rr.user_tasks[self.UP].current_action, 2)
+
+    def test_a_verdict_naming_another_action_of_the_flow_does_not(self):
+        """REUSE 17:35:28 on the same path: the named action exists."""
+        self.ledger = _Ledger(_ACTION, actions=2)
+        self.assertEqual(self._advance(2), (None, False))
+        self.assertEqual(lh.get_action_state(self.UP, 1),
+                         S.STATUS_VERIFICATION_REQUESTED)
+        self.assertEqual(rr.user_tasks[self.UP].current_action, 1)
+
+
 class TestTheMentionListIsOneList(unittest.TestCase):
     """"Is this message addressed to an agent" has one answer.  REUSE's loop
     and send_message_to_user keep the same five literally (the REUSE module's
