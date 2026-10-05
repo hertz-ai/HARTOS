@@ -380,7 +380,7 @@ from hartos.lifecycle_hooks import (
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
     clear_action_states, settled_action_id, commit_verified_action_completion,
     dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
-    action_is_autonomous, action_named_tools,
+    action_is_autonomous, action_named_tools, is_written_answer,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -4707,8 +4707,14 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
             return None
         for idx in range(len(messages) - 1, dispatch_index, -1):
             if messages[idx] is answer or messages[idx] == answer:
-                if (answer.get('role') == 'assistant'
-                        and answer.get('name') == 'Assistant'):
+                # The Assistant's, in whichever role this log holds it: a
+                # native autogen log reads a plain reply as role 'user', a
+                # resynced one as 'assistant'.  Measured live 2026-10-06 01:26
+                # (agent 54): the role was tested here as 'assistant' only, so
+                # a lesson the Assistant had just written was "no canonical
+                # receipt" and the action GAVE_UP.  The same predicate the
+                # shared gate applies to this message afterwards.
+                if is_written_answer(answer):
                     return {
                         'message_index': idx,
                         'kind': 'user_visible_result',

@@ -428,7 +428,12 @@ _HANDOFF = '@StatusVerifier Please verify the completion of Action 1.'
 
 
 def _assistant(content):
-    return {'role': 'assistant', 'name': 'Assistant', 'content': content}
+    """The Assistant's plain reply as a native group log holds it: role 'user',
+    because autogen's manager stores what it received from a speaker as 'user'.
+    (This fixture said 'assistant' until 2026-10-06, the shape of a log rebuilt
+    from the manager's buffer, and so passed while a live lesson was refused --
+    test_written_answer_in_a_native_group_log.py runs on a real autogen log.)"""
+    return {'role': 'user', 'name': 'Assistant', 'content': content}
 
 
 class _ProseHarness(_CreateHarness):

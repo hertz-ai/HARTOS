@@ -1715,9 +1715,7 @@ def _verifier_completion_has_conversation_evidence(
     # and share what I find" was accepted as the read itself (#147).
     if _tools_this_action_names(user_prompt, action_id)[1]:
         return False
-    return (agent is None
-            and message.get('role') == 'assistant'
-            and message.get('name') == 'Assistant')
+    return agent is None and is_written_answer(message)
 
 
 # The Assistant hands work to other agents by tagging them; a message that
@@ -1727,16 +1725,35 @@ _HANDOFF_TO_AGENT = re.compile(
     re.IGNORECASE)
 
 
-def _is_written_answer(message) -> bool:
-    """An Assistant message that is written work: not a handoff to another
-    agent (``@Helper ...``, ``@StatusVerifier ...``), not a control JSON (the
-    Assistant's own ``{"status": ...}`` report) and not empty.  A reply tagged
-    to the person (``@user {"message2user": ...}``) is an answer."""
-    if not (isinstance(message, dict) and message.get('role') == 'assistant'
-            and message.get('name') == 'Assistant'):
+# The roles the Assistant's own message carries in a group log.  A plain reply
+# is 'user' there -- autogen's manager stores what it RECEIVED from a speaker
+# as 'user' -- and a message that carries tool_calls is 'assistant'; a log
+# rebuilt from the manager's buffer (#725, reuse_recipe._reuse_sync_group_log)
+# can hold a plain reply as 'assistant' too.  Measured live 2026-10-06 (agent
+# 54, state_transition's "Last message role" line): user/Assistant 15 times,
+# every plain reply, and assistant/Assistant 26 times, the tool-calling ones.
+# The receipt of a prose action was accepted only as 'assistant', so a plain
+# lesson could never be one.  'tool' and 'function' are somebody's result.
+_ASSISTANT_WRITTEN_ROLES = ('assistant', 'user')
+
+
+def is_written_answer(message) -> bool:
+    """An Assistant message that is written work.  The ONE judge of it: the
+    completion gate, the CREATE derivation below and REUSE's receipt finder
+    (reuse_recipe._reuse_completion_evidence) all ask this.
+
+    It is the Assistant's (the seat name, in either role a log holds it), not a
+    handoff to another agent (``@Helper ...``, ``@StatusVerifier ...``), not a
+    control JSON (the Assistant's own ``{"status": ...}`` report), not the
+    dispatch echoed back (a seat name does not always survive a log, and a
+    dispatch is the pipeline's text, never the work) and not empty.  A reply
+    tagged to the person (``@user {"message2user": ...}``) is an answer."""
+    if not (isinstance(message, dict) and message.get('name') == 'Assistant'
+            and message.get('role') in _ASSISTANT_WRITTEN_ROLES):
         return False
     text = str(message.get('content') or '').strip()
-    if not text or text == 'TERMINATE' or _HANDOFF_TO_AGENT.match(text):
+    if (not text or text == 'TERMINATE' or _HANDOFF_TO_AGENT.match(text)
+            or _DISPATCH_MARKER.match(text)):
         return False
     return not (text.startswith('{') and '"status"' in text)
 
@@ -1755,7 +1772,7 @@ def _derive_written_answer(user_prompt: str, action_id: int,
         return None
     best, best_size = None, -1
     for index, msg in enumerate(msgs):
-        if not _is_written_answer(msg):
+        if not is_written_answer(msg):
             continue
         size = len(str(msg.get('content')).strip())
         if size < best_size:
