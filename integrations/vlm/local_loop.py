@@ -121,8 +121,14 @@ _VLM_ACTION_LIST = (
     "the task's declared workspace. Open only the resolved path. If it is "
     "absent there, report that blocker; do not retry the same bare name or "
     "inspect a different checkout.\n"
-    "- File: list_folders_and_files, Open_file_and_copy_paste, write_file, "
-    "read_file_and_understand\n"
+    "- File (no screen needed). A relative path means the task's declared "
+    "workspace, the folder shell commands run in too:\n"
+    "    * write_file: the file's path in 'path', its full text in 'value'.\n"
+    "    * read_file_and_understand: the file's path in 'path'; its text "
+    "comes back as the result.\n"
+    "    * list_folders_and_files: the folder in 'path' (empty means the "
+    "workspace).\n"
+    "    * Open_file_and_copy_paste: 'source_path' and 'destination_path'.\n"
 )
 
 # System prompt matching OmniParser vlm_agent.py _get_system_prompt()
@@ -484,7 +490,13 @@ def run_local_agentic_loop(
     prior_prompt_id = thread_local_data.get_prompt_id()
     thread_local_data.set_prompt_id(prompt_id)
     try:
-        return _drive_local_agentic_loop(message, tier, max_iterations)
+        # The run works in its declared workspace: its file actions resolve
+        # relative paths there and its shell steps run there
+        # (hartos.threadlocal workspace; actions on a worker get it through
+        # carry()).  Measured 2026-10-05: both ran in the process cwd, the
+        # install folder, while the task was told the workspace.
+        with thread_local_data.workspace(message.get('workspace_root')):
+            return _drive_local_agentic_loop(message, tier, max_iterations)
     finally:
         thread_local_data.set_prompt_id(prior_prompt_id)
 
@@ -815,9 +827,11 @@ def _drive_local_agentic_loop(
                         '  "Reasoning": "What you see and why this action",\n'
                         '  "Next Action": "left_click|right_click|double_click|'
                         'type|key|hotkey|scroll_up|scroll_down|wait|shell|'
-                        'open_file_gui|None",\n'
+                        'open_file_gui|write_file|read_file_and_understand|'
+                        'list_folders_and_files|None",\n'
                         '  "coordinate": [x, y],\n'
-                        '  "value": "text to type or key name",\n'
+                        '  "value": "text to type, key name, or the file '
+                        'text for write_file",\n'
                         '  "command": "' + SHELL_COMMAND_PLACEHOLDER + '",\n'
                         '  "path": "' + OPEN_PATH_PLACEHOLDER + '",\n'
                         '  "Status": "IN_PROGRESS|DONE"\n'
@@ -987,8 +1001,14 @@ def _drive_local_agentic_loop(
                     _shown = (action_json.get('value')
                               or action_json.get('command')
                               or action_json.get('path') or '')
+                    # The path too: a write_file shows its text as the value,
+                    # and the step whose path never arrived (2026-10-05) was
+                    # unattributable from this line.
+                    _where = (f" path='{action_json.get('path')}'"
+                              if action_json.get('path')
+                              and action_json.get('path') != _shown else '')
                     logger.info(f"Action: {next_action} "
-                                f"value='{str(_shown)[:50]}'")
+                                f"value='{str(_shown)[:50]}'{_where}")
 
                 parsed = {'screen_info': '', 'parsed_content_list': []}
             else:

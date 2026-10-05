@@ -59,14 +59,23 @@ _NUMBER_RE = re.compile(r'\d+')
 #: these constants, so the text the model sees and the text the parser
 #: filters cannot drift apart.
 SHELL_COMMAND_PLACEHOLDER = 'shell command when Next Action is shell'
-OPEN_PATH_PLACEHOLDER = 'file or app name when Next Action is open_file_gui'
+#: The 'path' field serves the file actions as well as open_file_gui.  It
+#: used to read 'file or app name when Next Action is open_file_gui', and
+#: nothing else in the prompt said where a write_file path goes: measured
+#: 2026-10-05 16:12 IST, two write_file steps of daemon goal f984b2cc
+#: reached the executor with no path and it opened ''.
+OPEN_PATH_PLACEHOLDER = ('file or folder path when Next Action is open_file_gui, '
+                         'write_file, read_file_and_understand or '
+                         'list_folders_and_files')
 #: Every placeholder spelling so far ('shell command string when Next Action
 #: is shell', 'shell command when Next Action is shell', 'file or app name
-#: when Next Action is open_file_gui') is a few plain words, this phrase, and
-#: an action name -- the WHOLE value.  A command that merely mentions the
-#: phrase (echo "...", findstr /C:"...") has quotes, switches or paths and is
-#: a command (review of 0cfa782cf: the substring test dropped it).
-_TEMPLATE_ECHO = re.compile(r'^[a-z ]{0,40}\bwhen next action is [a-z_]+$')
+#: when Next Action is open_file_gui', and the path placeholder above, whose
+#: action names are a list) is a few plain words, this phrase, and action
+#: names -- the WHOLE value.  A command that merely mentions the phrase
+#: (echo "...", findstr /C:"...") has quotes, switches or paths and is a
+#: command (review of 0cfa782cf: the substring test dropped it).
+_TEMPLATE_ECHO = re.compile(
+    r'^[a-z ]{0,40}\bwhen next action is [a-z_]+(?:(?:,| or) [a-z_]+)*$')
 
 
 def is_template_echo(value) -> bool:
@@ -107,7 +116,11 @@ class ParsedAction:
     coordinate: Optional[List[int]] = None
     next_action: str = ''          # original 'Next Action' string
     command: str = ''              # for 'shell' actions (the command to run)
-    path: str = ''                 # for 'open_file_gui' actions (the target)
+    path: str = ''                 # open_file_gui's target; a file action's file
+    content: str = ''              # write_file's text when sent as 'content'
+    source_path: str = ''          # Open_file_and_copy_paste: copy from
+    destination_path: str = ''     # Open_file_and_copy_paste: copy to
+    duration: Optional[float] = None  # 'wait' seconds
     ui_elements: List[dict] = field(default_factory=list)
     parsed_content_list: List[dict] = field(default_factory=list)
 
@@ -133,6 +146,14 @@ class ParsedAction:
             out['command'] = self.command
         if self.path:
             out['path'] = self.path
+        if self.content:
+            out['content'] = self.content
+        if self.source_path:
+            out['source_path'] = self.source_path
+        if self.destination_path:
+            out['destination_path'] = self.destination_path
+        if self.duration is not None:
+            out['duration'] = self.duration
         if self.ui_elements:
             out['UI_Elements'] = self.ui_elements
         if self.parsed_content_list:
@@ -307,6 +328,19 @@ def _parse_json_shape(raw: str, *, include_som: bool) -> ParsedAction:
         pa.command = ''
     if is_template_echo(pa.path):
         pa.path = ''
+    # The file actions' own fields were dropped the same way until
+    # 2026-10-05: a model's 'content' never reached write_file (which then
+    # wrote an empty file and reported it written), and
+    # Open_file_and_copy_paste never got either end, so it could not run.
+    pa.content = parsed.get('content', '') or ''
+    pa.source_path = parsed.get('source_path', '') or ''
+    pa.destination_path = parsed.get('destination_path', '') or ''
+    # Seconds as a number: the executor sleeps on it, and time.sleep raises on
+    # "5" or -1, where an ignored duration only ever waited the default 2 s.
+    try:
+        pa.duration = max(0.0, float(parsed['duration']))
+    except (KeyError, TypeError, ValueError):
+        pa.duration = None
     pa.coordinate = parsed.get('coordinate')
     pa.box_id = parsed.get('Box ID')
     pa.done = pa.status.upper() == 'DONE'

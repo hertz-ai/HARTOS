@@ -777,6 +777,29 @@ def _input_context_block(action):
         status = 'context_changed'
     return {'output': '', 'status': status, 'error': why, 'block_reason': why}
 
+def _run_path(path) -> str:
+    """A file action's path as the run means it.
+
+    A relative path resolves in the run's declared workspace
+    (hartos.threadlocal workspace, which local_loop sets for the run), the
+    folder the run's shell steps run in, so a script one step writes is the
+    one the next step runs.  An absolute path is kept, and outside a run
+    nothing is re-rooted.  '' stays '' for the caller to refuse.
+    """
+    path = str(path or '').strip()
+    if not path or os.path.isabs(path):
+        return path
+    try:
+        from hartos.threadlocal import thread_local_data
+        workspace = thread_local_data.get_workspace()
+    except Exception:
+        logger.debug('run workspace unreadable; path kept as given', exc_info=True)
+        workspace = None
+    if isinstance(workspace, str) and workspace:
+        return os.path.join(workspace, path)
+    return path
+
+
 def _execute_inprocess(action: dict) -> dict:
     """Execute action via direct pyautogui calls."""
     act = action.get('action', '')
@@ -880,7 +903,9 @@ def _execute_inprocess(action: dict) -> dict:
             return {'output': f'Cursor at ({pos.x}, {pos.y})'}
 
         elif act == 'list_folders_and_files':
-            path = action.get('path', '.')
+            # No folder named: the run's workspace (the process cwd outside
+            # a run, as before).
+            path = _run_path(action.get('path') or '.')
             try:
                 entries = os.listdir(path)
                 return {'output': '\n'.join(entries[:100])}
@@ -888,7 +913,10 @@ def _execute_inprocess(action: dict) -> dict:
                 return {'output': '', 'error': str(e)}
 
         elif act == 'read_file_and_understand':
-            path = action.get('path', '')
+            path = _run_path(action.get('path'))
+            if not path:
+                return {'output': '', 'error': (
+                    "read_file_and_understand needs the file's path in 'path'")}
             try:
                 with open(path, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read(10000)
@@ -897,8 +925,15 @@ def _execute_inprocess(action: dict) -> dict:
                 return {'output': '', 'error': str(e)}
 
         elif act == 'write_file':
-            path = action.get('path', '')
-            content = action.get('content', text)
+            # Named, never opened: open('') answered "[Errno 2] No such file
+            # or directory: ''", which the model read as a disk problem and
+            # repeated (live 2026-10-05 16:12 IST, twice in one run).
+            path = _run_path(action.get('path'))
+            if not path:
+                return {'output': '', 'error': (
+                    "write_file needs the file's path in 'path' and its full "
+                    "text in 'value'")}
+            content = action.get('content') or text or ''
             try:
                 with open(path, 'w', encoding='utf-8') as f:
                     f.write(content)
@@ -1001,8 +1036,12 @@ def _execute_inprocess(action: dict) -> dict:
             }
 
         elif act == 'Open_file_and_copy_paste':
-            src = action.get('source_path', '')
-            dst = action.get('destination_path', '')
+            src = _run_path(action.get('source_path'))
+            dst = _run_path(action.get('destination_path'))
+            if not src or not dst:
+                return {'output': '', 'error': (
+                    "Open_file_and_copy_paste needs 'source_path' and "
+                    "'destination_path'")}
             try:
                 with open(src, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read()

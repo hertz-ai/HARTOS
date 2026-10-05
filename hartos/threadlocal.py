@@ -238,6 +238,41 @@ class ThreadLocalData:
     def clear_activity_run(self):
         self._local.activity_run = None
 
+    # --- The run's workspace (set by integrations.vlm.local_loop) ---
+    # The folder a computer-use run works in: its declared task workspace
+    # (vlm_adapter.resolve_task_workspace).  A file action's relative path
+    # resolves here and every shell step of the run runs here, so a script
+    # one step writes is the script the next step runs.  Until 2026-10-05
+    # the workspace was only a sentence in the model's prompt: relative
+    # paths resolved in the process cwd and shell steps ran there (the
+    # install folder on the desktop), so the prompt's own route for a
+    # refused `python -c` -- write_file the script, then shell it -- could
+    # not find the file it had just written.  A context and not a keyword,
+    # as prompt_id is: the shell tool is reached through safe_hartos_attr
+    # with the command alone, on the run's thread or on an action worker
+    # that carry() hands this state to.
+
+    def get_workspace(self):
+        """The enclosing run's workspace folder, or None outside a run."""
+        return getattr(self._local, 'workspace', None)
+
+    def workspace(self, path):
+        """Context manager: the block is a run working in ``path``, then the
+        thread gets its previous workspace back.  An empty ``path`` names no
+        workspace, so the enclosing one, if any, stands."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            saved = self.get_workspace()
+            if path and str(path).strip():
+                self._local.workspace = str(path).strip()
+            try:
+                yield
+            finally:
+                self._local.workspace = saved
+        return _cm()
+
     # --- Agent creation signals (set by LangChain Create_Agent tool) ---
 
     def set_creation_requested(self, description=None, autonomous=False):

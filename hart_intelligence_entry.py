@@ -3515,8 +3515,20 @@ def _handle_shell_command_tool(input_text: str) -> str:
                        prompt_id=thread_local_data.get_prompt_id() or '')
     _run.step(iteration=1, action='shell', phase='executing', caption=_caption)
     _phase, _err = 'completed', ''
+    # Inside a computer-use run the command runs in the run's workspace
+    # (hartos.threadlocal workspace, set by integrations.vlm.local_loop),
+    # where the run's file actions resolve too: the prompt's route for a
+    # refused python -c is "write_file the script, then shell it".
+    # Measured 2026-10-05: every shell step ran in the process cwd, the
+    # install folder.  Only an existing folder is handed to the OS; a missing
+    # one would fail the spawn and read as "interpreter not found".
+    # Outside a run (the chat's Shell_Command) nothing changes.
+    _bounded_kw = {}
+    _workspace = thread_local_data.get_workspace()
+    if isinstance(_workspace, str) and _workspace and os.path.isdir(_workspace):
+        _bounded_kw['cwd'] = _workspace
     try:
-        proc = run_bounded(argv, timeout=SHELL_COMMAND_TIMEOUT_S)
+        proc = run_bounded(argv, timeout=SHELL_COMMAND_TIMEOUT_S, **_bounded_kw)
     except FileNotFoundError as e:
         _phase, _err = 'failed', f'interpreter not found — {e}'
         return f"Shell_Command: interpreter not found — {e}"
