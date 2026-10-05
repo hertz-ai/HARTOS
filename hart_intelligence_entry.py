@@ -2539,8 +2539,9 @@ def publish_async(topic, message, timeout=2.0):
         message: Message payload (JSON string or dict)
         timeout: Maximum time for HTTP Crossbar publish (default: 2.0 seconds)
 
-    Where a chat reply came from: every chat.* envelope leaves here stamped
-    ``served_by`` = local | hive | cloud (core.constants.canonical_served_by).
+    Where a chat reply came from: every chat.* envelope but the voice (a
+    'TTS' payload) leaves here stamped ``served_by`` = local | hive | cloud
+    (core.constants.canonical_served_by).
     The envelope's own key wins; else the thread's reply_from() context
     (hartos.threadlocal) -- a context and NOT a keyword, because the wrapper
     Nunba installs above takes (topic, message, timeout) only; else the node's
@@ -2577,7 +2578,13 @@ def publish_async(topic, message, timeout=2.0):
         # imports: test_egress_one_rule exec's this function's source in a
         # namespace that holds none of this module's globals.
         # A failure here costs the badge, never the delivery.
-        if isinstance(data, dict) and bus_topic.startswith('chat.'):
+        # Not the voice: a 'TTS' payload is played and never drawn as a
+        # bubble, and it reaches here on chat.pupit, from the synthesis
+        # thread that no longer knows the reply's origin -- a hive expert's
+        # spoken answer was stamped 'local' on the bus envelope and its
+        # task.confirmation copy (review of 028a8a959).
+        if (isinstance(data, dict) and bus_topic.startswith('chat.')
+                and data.get('action') != 'TTS'):
             try:
                 from core.constants import canonical_served_by
                 from hartos.threadlocal import thread_local_data as _tld_origin

@@ -184,7 +184,7 @@ class ThreadLocalData:
 
     # --- Where the reply being published came from (local | hive | cloud) ---
     # hart_intelligence_entry.publish_async stamps served_by on every chat
-    # envelope, and _tts_synthesize_and_publish on the spoken bubble.  The one
+    # envelope but the voice (a 'TTS' payload carries none).  The one
     # site that KNOWS the backend (the dispatcher, once an expert answers) names
     # it here around its delivery.  A context and not a keyword on purpose:
     # Nunba rebinds hart_intelligence.publish_async with a wrapper that takes

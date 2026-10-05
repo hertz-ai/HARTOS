@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import ast
 import inspect
-import json
 import os
 import sys
 import tempfile
@@ -184,8 +183,12 @@ class TestCanonicalServedBy:
             self, cs, monkeypatch, endpoint, provider, expected):
         _on_api(monkeypatch, endpoint, provider)
         assert cs.canonical_served_by(None, 'flat') == expected
-        # an explicit local model and an escalation keep their own answer
-        assert cs.canonical_served_by('local_langchain_bg', 'flat') == 'local'
+        # The dispatcher tags its own (non-escalated) path local_langchain_bg
+        # whatever that LLM is, so the tag names this node's LLM too: where
+        # it runs (review of 028a8a959: asserting 'local' here locked in an
+        # API node's reply badged On-device).  An escalation keeps its own.
+        assert cs.canonical_served_by('local_langchain_bg', 'flat') == expected
+        assert cs.canonical_served_by('local', 'flat') == expected
         assert cs.canonical_served_by('hive', 'flat') == 'hive'
 
     def test_a_regional_node_on_a_public_api_is_cloud_not_lan(
@@ -457,6 +460,89 @@ class TestChatReplyCarriesServedBy:
         self._reply(hie, tl, served_by='hive')
         assert tl.get_served_by() is None
 
+    def test_the_voice_is_not_handed_an_origin(self, hie, tl, flat_node):
+        """The spoken reply carries no badge, so _chat_reply names no origin
+        around the TTS call (review of 028a8a959: restoring reply_from there
+        survived every test)."""
+        _body, origins = self._reply(hie, tl, served_by='hive_langchain_bg')
+        assert origins == [None], origins
+
+
+# ─────────────────────────────────────────────────────────────────────
+# the spoken reply is the voice, not a bubble: no leg carries a badge
+# ─────────────────────────────────────────────────────────────────────
+
+class _InlineExecutor:
+    def submit(self, fn, *args, **kwargs):
+        fn(*args, **kwargs)
+
+
+class _ThreadExecutor:
+    """The real shape: the synthesis runs on another thread."""
+
+    def submit(self, fn, *args, **kwargs):
+        t = threading.Thread(target=fn, args=args, kwargs=kwargs)
+        t.start()
+        t.join(30)
+
+
+class TestASpokenReplyCarriesNoBadge:
+    """Review of 028a8a959 (12:22Z): the page plays a 'TTS' payload and
+    returns (Demopage.js handleDataReceived), so the voice carries no badge.
+    The payload the TTS site builds had none, but publish_async stamped the
+    chat.pupit envelope it maps the pupit topic to, and the task.confirmation
+    copy of it, with the WRONG origin: the synthesis thread no longer knows
+    it, so a hive expert's spoken answer went out 'local'.
+
+    The real _tts_synthesize_and_publish runs on a real worker thread and
+    calls the real publish_async; only the TTS engine, the bus and SSE are
+    replaced (the engine with tests.unit.module_swap.swap_modules, never a
+    patch.dict on sys.modules)."""
+
+    @staticmethod
+    def _speak(hie, monkeypatch, tl, origin, executor):
+        from tests.unit.module_swap import swap_modules
+        from integrations.channels.media import tts_text_normalizer as tn
+        wav = os.path.join(tempfile.mkdtemp(), 'reply.wav')
+        with open(wav, 'wb') as fh:
+            fh.write(b'RIFF')
+        engine = types.ModuleType('tts.tts_engine')
+        engine.get_tts_engine = lambda: types.SimpleNamespace(
+            backend_name='fake-engine')
+        engine.synthesize_text = lambda t, language='en', **k: wav
+        pkg = types.ModuleType('tts')
+        pkg.tts_engine = engine
+        bus, sse = _Bus(), []
+        monkeypatch.setenv('HEVOLVE_EXTERNAL_URL', 'http://node.test')
+        monkeypatch.setattr(hie, 'client', None, raising=False)
+        with swap_modules({'tts': pkg, 'tts.tts_engine': engine}), \
+                patch.object(hie, '_tts_executor', executor), \
+                patch.object(tn, '_llm_normalize', lambda *a, **k: None), \
+                patch('core.peer_link.message_bus.get_message_bus',
+                      return_value=bus), \
+                patch('core.platform.events.broadcast_sse_safe',
+                      side_effect=_sse_recorder(sse)):
+            with tl.reply_from(origin):
+                hie._tts_synthesize_and_publish(
+                    'a spoken answer', 'user-1', 'req-1', language='en')
+        return bus.published, sse
+
+    @pytest.mark.parametrize('executor', [_InlineExecutor(), _ThreadExecutor()],
+                             ids=['inline', 'worker-thread'])
+    @pytest.mark.parametrize('origin', [None, 'hive_langchain_bg'])
+    def test_no_leg_of_a_spoken_reply_carries_a_badge(
+            self, hie, monkeypatch, tl, flat_node, origin, executor):
+        legs, sse = self._speak(hie, monkeypatch, tl, origin, executor)
+        topics = [topic for topic, _data, _kw in legs]
+        assert 'chat.pupit' in topics, topics
+        assert 'task.confirmation' in topics, topics
+        assert sse, 'the voice never reached SSE: nothing to assert'
+        for topic, data, _kw in legs:
+            assert 'served_by' not in data, (topic, data)
+        for _evt, data, _user in sse:
+            assert data.get('action') == 'TTS', data
+            assert 'served_by' not in data, data
+
 
 # ─────────────────────────────────────────────────────────────────────
 # the escalation: the dispatcher knows, and now says so
@@ -642,6 +728,27 @@ class TestExpertEnvelopeCarriesItsOrigin:
             self, hie, monkeypatch, tl, central_node, local_registry):
         sse, _ = self._run(hie, monkeypatch, tl, local_registry,
                            local_registry.get_fast_model())
+        assert sse[0][1]['served_by'] == 'cloud'
+
+    def test_the_nodes_own_model_on_a_public_api_is_cloud(
+            self, hie, monkeypatch, tl, flat_node):
+        """Review of 028a8a959 (12:22Z), blocker 1: with openrouter as the
+        node's only text model (is_local=True in its catalog entry, the
+        node's own path) the dispatcher tags the reply local_langchain_bg,
+        and the envelope said 'local' while the same node's untagged reply
+        said 'cloud'."""
+        from integrations.agent_engine.model_registry import (
+            ModelBackend, ModelRegistry, ModelTier)
+        _on_api(monkeypatch, 'https://openrouter.ai/api/v1')
+        reg = ModelRegistry()
+        reg.register(ModelBackend(
+            model_id='openrouter-node-model', display_name='OpenRouter model',
+            tier=ModelTier.FAST,
+            config_list_entry={'model': 'some-model', 'api_key': 'test-key',
+                               'base_url': 'https://openrouter.ai/api/v1',
+                               'price': [0, 0]},
+            avg_latency_ms=900.0, accuracy_score=0.7, is_local=True))
+        sse, _ = self._run(hie, monkeypatch, tl, reg, reg.get_fast_model())
         assert sse[0][1]['served_by'] == 'cloud'
 
 

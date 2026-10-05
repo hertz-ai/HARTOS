@@ -1416,8 +1416,9 @@ def action_is_autonomous(value) -> bool:
 # measured wrong: a reply written by the local llama-server was badged "Cloud"
 # (frozen_debug.log 2026-10-04 17:10, agent 20, all 24 model calls on
 # 127.0.0.1:8080).  ONE rule names it, here, so the envelope publisher, the
-# /chat response, the spoken bubble and the speculative dispatcher cannot each
-# grow their own.  Guarded, with a source guard against a second writer, by
+# /chat response and the speculative dispatcher cannot each grow their own.
+# The spoken reply (a 'TTS' payload) is the voice, not a bubble, and carries
+# none.  Guarded, with a source guard against a second writer, by
 # tests/unit/test_served_by_is_one_rule.py.
 SERVED_BY_LOCAL: str = 'local'
 SERVED_BY_HIVE: str = 'hive'
@@ -1440,11 +1441,14 @@ def canonical_served_by(value=None, node_tier=None) -> str:
     relaying central's reply keeps 'central'); None reads HEVOLVE_NODE_TIER,
     the one place this rule does.
 
-    Otherwise a 'local' tag is 'local', and a reply nobody tagged was written
-    by this node's own LLM, so it is where that LLM runs
+    Otherwise the reply was written by this node's own LLM, tagged 'local'
+    or not tagged at all: the dispatcher tags its own (non-escalated) path
+    'local_langchain_bg' whatever that LLM is.  So it is where that LLM runs
     (core.autogen_config.llm_stays_on_premises): 'local' on this machine or
     LAN, 'cloud' when the node sends its prompts to a public API -- a reply
     from openrouter.ai is not on-device (tier.js: local = no cloud egress).
+    Review of 028a8a959: answering 'local' for the tag before asking badged
+    an openrouter node's reply On-device while its untagged reply said Cloud.
     A value that is not a string (a device id, a number) is no tag.  Never
     raises: an unreadable configuration reads 'cloud', the page's own answer
     for an unknown origin."""
@@ -1460,8 +1464,6 @@ def canonical_served_by(value=None, node_tier=None) -> str:
         node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
     if str(node_tier or '').strip().lower() == 'central':
         return SERVED_BY_CLOUD
-    if 'local' in words:
-        return SERVED_BY_LOCAL
     try:
         from core.autogen_config import llm_stays_on_premises
         on_premises = llm_stays_on_premises()
