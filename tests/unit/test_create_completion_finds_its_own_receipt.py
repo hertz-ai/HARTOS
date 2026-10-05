@@ -409,38 +409,169 @@ class TestEvidenceSourcesAreOneDefinition(_CreateHarness):
             self.assertTrue(all(m is e for (_s, m), (_x, e) in zip(got, expected)))
 
 
-class TestAProseActionIsJudgedOnItsWrittenAnswer(_CreateHarness):
-    """An action that names no tool is done by its written answer, which its
-    verdict cites (REUSE splits the same way).  The pipeline does not hand it
-    a tool reply that happens to sit in its window."""
+# A prose action is done by its written answer (REUSE splits the same way:
+# a tool receipt for an action that names a tool, the written answer for one
+# that does not).  LIVE, the same 4B, 2026-10-06 01:11: agent 54 as a ONE
+# prose action ("Teach exactly one next step ... Write the lesson as your
+# reply to the learner").  The Assistant wrote a good lesson and the verdict
+# was refused as ungrounded -- the same citation failure, for a written answer.
+_PROSE_ACTION = ('Teach exactly one next step of the topic the learner chose, '
+                 'simply (when the topic is new, open with one everyday analogy '
+                 'and a two sentence overview), then end with one check question. '
+                 'Write the lesson as your reply to the learner.')
+_LESSON = ('Think of a leaf as a tiny kitchen: sunlight is the stove, water and '
+           'air are the ingredients, and sugar is the meal it cooks.\n\n'
+           'Photosynthesis is how plants turn light, water and carbon dioxide '
+           'into sugar and oxygen. It happens in the chloroplasts.\n\n'
+           'Check question: where inside a plant cell does photosynthesis happen?')
+_HANDOFF = '@StatusVerifier Please verify the completion of Action 1.'
 
-    _PROSE_ACTION = 'Welcome the learner and ask which topic they want to study'
-    _SEARCH = 'Photosynthesis: plants turn light into sugar (3 sources found)'
 
+def _assistant(content):
+    return {'role': 'assistant', 'name': 'Assistant', 'content': content}
+
+
+class _ProseHarness(_CreateHarness):
     def setUp(self):
         super().setUp()
-        self.ledger = _Ledger(self._PROSE_ACTION)
-        self._set_log([
-            {'role': 'assistant', 'name': 'ChatInstructor',
-             'content': f'Execute Action 1: {self._PROSE_ACTION} ,Latest User '
-                        'message: hi'},
-            _call('s1', 'google_search'), _result('s1', self._SEARCH),
-            {'role': 'assistant', 'name': 'Assistant',
-             'content': 'Hello! What shall we study?'}])
+        self.ledger = _Ledger(_PROSE_ACTION)
+        self.dispatch = {'role': 'assistant', 'name': 'ChatInstructor',
+                         'content': f'Execute Action 1: {_PROSE_ACTION} ,Latest '
+                                    'User message: Teach me about photosynthesis.'}
         self._state(S.IN_PROGRESS)
 
-    def test_a_tool_reply_in_its_window_is_not_found_for_it(self):
+    def _wrong_citation(self):
+        return self._verdict({'message_index': 0, 'kind': 'user_visible_result'})
+
+
+class TestTheLessonIsFoundWhenTheVerdictCitesTheWrongMessage(_ProseHarness):
+    def _live_log(self):
+        self._set_log([
+            self.dispatch,
+            _assistant('@Helper Please look up a short explanation of photosynthesis.'),
+            _assistant(_LESSON),
+            _assistant(_HANDOFF)])
+
+    def _assert_completed_on_the_lesson(self, result):
+        self.assertEqual(result['action'], 'force_fallback')
+        self.assertEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)
+        record = self._recorded()[0]
+        self.assertEqual(record['evidence'],
+                         {'message_index': 2, 'kind': 'user_visible_result'})
+        self.assertEqual(record['receipt_sha256'],
+                         hashlib.sha256(_LESSON.encode('utf-8')).hexdigest())
+
+    def test_the_dispatch_cited_as_the_result_is_replaced_by_the_lesson(self):
+        """The live verdict: index 0.  The lesson is the longest written
+        answer, and a newer one-line handoff does not outrank it."""
+        self._live_log()
+        self._assert_completed_on_the_lesson(self._hook(self._wrong_citation()))
+
+    def test_a_verdict_that_cites_nothing_is_judged_on_the_log(self):
+        self._live_log()
+        self._assert_completed_on_the_lesson(self._hook(self._verdict()))
+
+    def test_a_lesson_that_ends_with_a_handoff_is_still_the_lesson(self):
+        self._set_log([self.dispatch, _assistant(_LESSON + '\n\n' + _HANDOFF)])
+        result = self._hook(self._wrong_citation())
+        self.assertEqual(result['action'], 'force_fallback')
+        self.assertEqual(self._recorded()[0]['evidence']['message_index'], 1)
+
+    def test_a_lesson_sent_to_the_user_with_the_message_tag_is_the_lesson(self):
+        tagged = '@user {"message2user": "' + _LESSON.replace('\n', ' ') + '"}'
+        self._set_log([self.dispatch, _assistant(tagged), _assistant(_HANDOFF)])
+        result = self._hook(self._wrong_citation())
+        self.assertEqual(result['action'], 'force_fallback')
+        self.assertEqual(self._recorded()[0]['evidence']['message_index'], 1)
+
+    def test_the_longest_answer_wins_over_a_newer_short_one(self):
+        """The lesson is the work; "Done!" after it is not."""
+        self._set_log([self.dispatch, _assistant(_LESSON), _assistant('Done!')])
+        self.assertEqual(lh.derive_completion_evidence(self.UP, 1),
+                         {'message_index': 1, 'kind': 'user_visible_result'})
+
+    def test_a_correct_citation_is_used_as_cited(self):
+        self._live_log()
+        asked = []
+        self.patch(lh, 'derive_completion_evidence',
+                   lambda *a, **k: asked.append(a) or None)
+        result = self._hook(self._verdict(
+            {'message_index': 2, 'kind': 'user_visible_result'}))
+        self.assertEqual(result['action'], 'force_fallback')
+        self.assertEqual(asked, [])
+
+
+class TestOnlyAWrittenAnswerCompletesAProseAction(_ProseHarness):
+    def _refused(self, msgs, verdict=None):
+        self._set_log(msgs)
         self.assertIsNone(lh.derive_completion_evidence(self.UP, 1))
-        result = self._hook(self._verdict({'message_index': 0, 'kind': 'tool_receipt'}))
+        result = self._hook(verdict or self._wrong_citation())
+        self.assertEqual(result['action'], 'force_completion')
+        self.assertNotEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)
+        self.assertEqual(self._recorded(), [])
+
+    def test_a_delegation_and_a_handoff_are_not_an_answer(self):
+        self._refused([self.dispatch,
+                       _assistant('@Helper Please look up photosynthesis.'),
+                       _assistant(_HANDOFF)])
+
+    def test_the_assistants_own_status_json_is_not_an_answer(self):
+        self._refused([self.dispatch, _assistant(
+            '{"status": "error", "action": "teach", "action_id": 1, '
+            '"message": "could not"}')])
+
+    def test_an_empty_message_is_not_an_answer(self):
+        self._refused([self.dispatch, _assistant('   ')])
+
+    def test_the_verifiers_own_message_is_not_the_assistants_answer(self):
+        self._refused([self.dispatch, {'role': 'user', 'name': 'StatusVerifier',
+                                       'content': _LESSON}])
+
+    def test_a_tool_reply_does_not_complete_a_prose_action(self):
+        """The tool-receipt search is for actions that name a tool."""
+        self._refused([self.dispatch, _call('s1', 'google_search'),
+                       _result('s1', 'Photosynthesis: plants make sugar (3 sources)')])
+
+    def test_the_lesson_of_an_earlier_actions_window_is_not_found(self):
+        self.ledger.tasks['action_2'] = SimpleNamespace(
+            context={}, description=_PROSE_ACTION)
+        lh.retry_tracker.reset_count(self.UP, 2)
+        self.addCleanup(lh.retry_tracker.reset_count, self.UP, 2)
+        self._set_log([self.dispatch, _assistant(_LESSON),
+                       {'role': 'assistant', 'name': 'ChatInstructor',
+                        'content': f'Execute Action 2: {_PROSE_ACTION} ,Latest '
+                                   'User message: go on'}])
+        self.assertIsNone(lh.derive_completion_evidence(self.UP, 2))
+        lh.set_action_state(self.UP, 2, S.IN_PROGRESS, 'test')
+        result = self._hook(self._verdict(
+            {'message_index': 1, 'kind': 'user_visible_result'}, action_id=2),
+            current_action=2)
+        self.assertEqual(result['action'], 'force_completion')
+
+    def test_a_lesson_held_only_in_a_buffer_is_not_found(self):
+        """A written answer is only ever cited from the group log."""
+        peer = _Peer('ChatInstructor')
+        holder = _agent(*_SERVED, name='Assistant',
+                        _oai_messages={peer: [self.dispatch, _assistant(_LESSON)]})
+        self.gc.agents = [holder]
+        self._refused([self.dispatch])
+
+    def test_a_verdict_for_another_action_completes_nothing(self):
+        self._set_log([self.dispatch, _assistant(_LESSON)])
+        result = self._hook(self._verdict(
+            {'message_index': 1, 'kind': 'user_visible_result'}, action_id=2))
         self.assertEqual(result['action'], 'force_completion')
         self.assertNotEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)
 
-    def test_a_cited_tool_receipt_still_completes_it_as_before(self):
-        result = self._hook(self._verdict({'message_index': 2, 'kind': 'tool_receipt'}))
-        self.assertEqual(result['action'], 'force_fallback')
-        self.assertEqual(self._recorded()[0]['evidence']['message_index'], 2)
 
-    def test_a_cited_written_answer_still_completes_it_as_before(self):
+class TestAnActionThatNamesAToolIsNotCompletedOnAnAnswer(_CreateHarness):
+    """#147's rule, on the derived path: the written promise is not the work."""
+
+    def test_a_long_written_answer_is_not_the_named_tools_receipt(self):
+        self._set_log([_DISPATCH_1, _assistant(_LESSON)])
+        self._state(S.IN_PROGRESS)
+        self.assertIsNone(lh.derive_completion_evidence(self.UP, 1))
         result = self._hook(self._verdict(
-            {'message_index': 3, 'kind': 'user_visible_result'}))
-        self.assertEqual(result['action'], 'force_fallback')
+            {'message_index': 1, 'kind': 'user_visible_result'}))
+        self.assertEqual(result['action'], 'force_completion')
+        self.assertNotEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)

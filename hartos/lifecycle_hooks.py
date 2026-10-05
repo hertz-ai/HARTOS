@@ -1720,6 +1720,64 @@ def _verifier_completion_has_conversation_evidence(
             and message.get('name') == 'Assistant')
 
 
+# The Assistant hands work to other agents by tagging them; a message that
+# opens that way is routing, not an answer.
+_HANDOFF_TO_AGENT = re.compile(
+    r'@(?:Helper|Executor|StatusVerifier|ChatInstructor|UserProxy)\b',
+    re.IGNORECASE)
+
+
+def _is_written_answer(message) -> bool:
+    """An Assistant message that is written work: not a handoff to another
+    agent (``@Helper ...``, ``@StatusVerifier ...``), not a control JSON (the
+    Assistant's own ``{"status": ...}`` report) and not empty.  A reply tagged
+    to the person (``@user {"message2user": ...}``) is an answer."""
+    if not (isinstance(message, dict) and message.get('role') == 'assistant'
+            and message.get('name') == 'Assistant'):
+        return False
+    text = str(message.get('content') or '').strip()
+    if not text or text == 'TERMINATE' or _HANDOFF_TO_AGENT.match(text):
+        return False
+    return not (text.startswith('{') and '"status"' in text)
+
+
+def _derive_written_answer(user_prompt: str, action_id: int,
+                           group_chat) -> Optional[dict]:
+    """The action's written answer, for an action that names no tool.
+
+    The longest answer in the action's dispatch window (the lesson, not the
+    one-line handoff that follows it; a tie goes to the newer), judged by the
+    same gate a cited answer faces.  Read from the group log only: that gate
+    accepts a written answer from no other list.
+    """
+    msgs = getattr(group_chat, 'messages', None)
+    if not isinstance(msgs, list):
+        return None
+    best, best_size = None, -1
+    for index, msg in enumerate(msgs):
+        if not _is_written_answer(msg):
+            continue
+        size = len(str(msg.get('content')).strip())
+        if size < best_size:
+            continue
+        candidate = {'message_index': index, 'kind': 'user_visible_result'}
+        if _verifier_completion_has_conversation_evidence(
+                user_prompt, action_id, {'evidence': candidate}):
+            best, best_size = candidate, size
+    if best is not None:
+        logger.info(
+            "[COMPLETION-RECEIPT] action %s in %s: the verdict cited no "
+            "answer the gate accepts; the action's written answer at group "
+            "log message %s stands in", action_id, user_prompt,
+            best['message_index'])
+    else:
+        logger.warning(
+            "[COMPLETION-RECEIPT] action %s in %s: no written answer of "
+            "this action in the group log (len=%s)",
+            action_id, user_prompt, len(msgs))
+    return best
+
+
 def derive_completion_evidence(user_prompt: str,
                                action_id: int) -> Optional[dict]:
     """The action's own tool receipt, found by the pipeline.
@@ -1739,20 +1797,26 @@ def derive_completion_evidence(user_prompt: str,
     by the very gate a cited receipt faces, so a failed call, a note saved to
     memory, another tool's reply, a placeholder or another action's result is
     no receipt here either.  Returns the evidence in the shape resolve_receipt
-    reads, or None.  Only a TOOL receipt is derived: an action that names no
-    tool is judged on the written answer its verdict cites, as before.  It
-    never raises -- it sits on the verdict path -- and a miss says what was
-    looked at.
+    reads, or None.
+
+    An action that names no tool is done by its WRITTEN ANSWER, not by a tool
+    reply (_derive_written_answer): measured live on the same 4B 2026-10-06
+    01:11, agent 54 as one prose action ("Teach exactly one next step ...
+    Write the lesson as your reply to the learner") -- the Assistant wrote a
+    good lesson and the verdict that cited the dispatch instead was refused.
+
+    It never raises -- it sits on the verdict path -- and a miss says what
+    was looked at.
     """
     try:
-        # An action that names no tool is done by its written answer, which
-        # the verdict cites (REUSE splits the same way); a tool reply in its
-        # window is not that action's receipt.
-        if not _tools_this_action_names(user_prompt, action_id)[1]:
-            return None
         group_chat = get_registered_groupchat(user_prompt)
         if group_chat is None:
             return None
+        # REUSE splits the same way: a tool receipt for an action that names a
+        # tool, the written answer for one that does not.  A tool reply in a
+        # prose action's window is not its receipt.
+        if not _tools_this_action_names(user_prompt, action_id)[1]:
+            return _derive_written_answer(user_prompt, action_id, group_chat)
         looked = []
         for source, msgs in evidence_sources(
                 group_chat, getattr(group_chat, 'agents', None)):
