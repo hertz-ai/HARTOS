@@ -3228,15 +3228,52 @@ class ToolActivityAsEvidence:
                 changed)
 
 
-def give_judge_view(seat):
-    """Give a judging seat ToolActivityAsEvidence.
+# A verdict is a JSON object, and the 4B sometimes writes it inside a code
+# fence.  Only a fenced JSON OBJECT is matched: a fenced python block is code
+# and stays one.
+_FENCED_JSON_OBJECT = re.compile(
+    r'```[A-Za-z]*[ \t]*\r?\n?\s*(\{.*?\})\s*\r?\n?```', re.DOTALL)
 
-    Call it after the seat's shared TransformMessages: hooks run in the order
-    they were registered, and the shared chain fills the real tool answers
-    this view reports.
+
+def unfence_verdict_before_send(sender, message, recipient, silent):
+    """autogen ``process_message_before_send`` hook for a judging seat: a
+    verdict leaves it as plain JSON, never as a code block.
+
+    Live 2026-10-06 02:35 (REUSE agent 54, task #163): the verifier fenced its
+    verdict; on the learner's next message the Assistant, whose code execution
+    scans every trailing user message since it last spoke, RAN the fence
+    ("unknown language json", exitcode 1), state_transition handed the turn
+    straight back to it, and ten ~20 s rounds later the turn had taken 231 s.
+    Unwrapped where it is sent, no seat's buffer, the group log or the history
+    ever holds the fence, so there is nothing for a later turn to execute.
+
+    Text around the fence is kept; the input message is not mutated.
+    """
+    content = message.get('content') if isinstance(message, dict) else message
+    if not isinstance(content, str) or '```' not in content:
+        return message
+    plain = _FENCED_JSON_OBJECT.sub(lambda match: match.group(1), content)
+    if plain == content:
+        return message
+    return {**message, 'content': plain} if isinstance(message, dict) else plain
+
+
+def give_judge_view(seat):
+    """Configure a judging seat: what it sees and how it speaks.
+
+    SEES: ToolActivityAsEvidence, the other seats' tool calls told as a report.
+    Call this after the seat's shared TransformMessages: hooks run in the order
+    they were registered, and the shared chain fills the real tool answers this
+    view reports.
+
+    SPEAKS: unfence_verdict_before_send.  Every StatusVerifier seat (CREATE,
+    REUSE, time and visual groups) is configured here, so the verdict rule
+    lives in one place.
     """
     transform_messages.TransformMessages(
         transforms=[ToolActivityAsEvidence(seat)], verbose=False).add_to_agent(seat)
+    seat.register_hook('process_message_before_send',
+                       unfence_verdict_before_send)
 
 
 class Action:
