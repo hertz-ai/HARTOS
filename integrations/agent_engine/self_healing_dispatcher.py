@@ -81,9 +81,15 @@ class SelfHealingDispatcher:
 
         # Housekeeping, so its failure never stops a new goal (review of
         # bef0e1e44): a goal writer that raised made this whole check raise,
-        # and both callers log that only at DEBUG.
+        # and both callers log that only at DEBUG.  In a savepoint, so a
+        # failure undoes only the sweep's own writes (review of c0c3a5d76):
+        # an UPDATE the database refused ('database is locked') failed the
+        # flush and left the session needing a rollback, and the next query
+        # raised PendingRollbackError.  The sweep is idempotent, so the next
+        # check archives what this one could not.
         try:
-            self._archive_engine_outage_goals(db)
+            with db.begin_nested():
+                self._archive_engine_outage_goals(db)
         except Exception:
             logger.warning("Self-heal: the engine-outage archive sweep failed; "
                            "new fix goals are still made", exc_info=True)

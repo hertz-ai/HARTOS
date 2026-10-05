@@ -185,3 +185,73 @@ def test_a_raising_check_leaves_the_watchers_threshold_as_it_was(
         assert dispatcher._min_occurrences == 3
     finally:
         ExceptionWatcher.reset_instance()
+
+
+@pytest.fixture
+def locked_db(tmp_path):
+    """A file database with a second connection that can hold its write lock,
+    the way another writer on this desktop does (live 'database is locked',
+    agentlocks 2026-10-05).  The session gives up on a lock after 0.2 s."""
+    import sqlite3
+    path = str(tmp_path / 'goals.db')
+    engine = create_engine(f'sqlite:///{path}', connect_args={'timeout': 0.2})
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    other = sqlite3.connect(path, timeout=0, isolation_level=None)
+    yield session, other
+    try:
+        other.execute('ROLLBACK')
+    except sqlite3.Error:
+        pass
+    other.close()
+    session.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize('lock', [
+    'IMMEDIATE',   # refuses the sweep's UPDATE: the flush fails
+    'EXCLUSIVE',   # refuses even its first read
+])
+def test_an_archive_the_database_refuses_does_not_stop_a_new_goal(
+        locked_db, collector, dispatcher, monkeypatch, caplog, lock):
+    """Review of c0c3a5d76 (11:39Z): the guard caught the sweep's error but
+    not what it did to the session.  When the database refuses the sweep's
+    UPDATE (another writer holds the lock), the flush fails and the session
+    needs a rollback, so the check's next query raised PendingRollbackError:
+    no new goal, after a warning that said new goals are still made.  The
+    sweep runs in a savepoint now, so only its own writes are undone."""
+    import logging
+    from hartos.exception_collector import report_subsystem_failure
+    db, other = locked_db
+    outage = _goal(db, 'active', 'Fix InternalServerError in llm.reuse_x.generate_reply',
+                   'llm.reuse_x', 'generate_reply', 'InternalServerError')
+    db.commit()
+    for _ in range(3):
+        report_subsystem_failure('tts', 'probe', RuntimeError('probe died'), 'probe')
+
+    other.execute(f'BEGIN {lock}')            # the other writer holds the lock
+    real_check = dispatcher._is_already_being_fixed
+
+    def lock_released_after_the_sweep(db_, key):
+        if other.in_transaction:              # and lets go once the sweep is over
+            other.execute('ROLLBACK')
+        return real_check(db_, key)
+
+    monkeypatch.setattr(dispatcher, '_is_already_being_fixed',
+                        lock_released_after_the_sweep)
+    with caplog.at_level(logging.WARNING, logger='hevolve_social'):
+        assert dispatcher.check_and_dispatch(db) == 1
+    db.commit()
+    assert any(r.levelno == logging.WARNING and 'archive sweep failed' in r.getMessage()
+               for r in caplog.records), [r.getMessage() for r in caplog.records]
+    titles = [g.title for g in _self_heal_goals(db)]
+    assert 'Fix RuntimeError in tts.probe.probe' in titles
+    db.refresh(outage)
+    assert outage.status == 'active'          # the refused archive changed nothing
+
+    # The sweep is asked again on the next check, and archives it then.
+    dispatcher._last_check = 0
+    dispatcher.check_and_dispatch(db)
+    db.commit()
+    db.refresh(outage)
+    assert outage.status == 'archived'
