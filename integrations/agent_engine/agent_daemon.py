@@ -564,6 +564,41 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None):
                 f"spark (lifetime={spark_spent}, noop #{noop_count})")
         goal.config_json = cfg
 
+def _reply_failure(result):
+    """Why a reply dispatch_goal returned is not work done, or None: the
+    CREATE pipeline's {"status": "error"} envelope, or a help pause (the
+    action was handed to a person or the expert).  The rule the hive worker
+    applies (HeldForHelp), for the tick and for a parallel subtask alike.
+    Counted as success, it cleared the backoff and, for a continuous goal,
+    re-ran the impossible action every 5 minutes for five months
+    (593beaf08); a parallel subtask that ended that way was marked
+    COMPLETED and unblocked its dependents."""
+    from core.agent_tools import is_action_error_reply, is_help_pause
+    if is_action_error_reply(result) or is_help_pause(result):
+        return ' '.join(str(result).split())[:200]
+    return None
+
+
+def _subtask_outcome(goal_id, result) -> dict:
+    """One parallel subtask's turn as parallel_dispatch records it: done,
+    failed with its reason, or deferred (it did not run: a person is using
+    this computer, the local model is busy; the subtask goes back to the
+    queue).  Read from the thread that dispatched it (dispatch keys the
+    reason by thread)."""
+    from .dispatch import dispatch_failure_reason, is_transient_deferral
+    if result is None:
+        if is_transient_deferral(goal_id):
+            return {'success': False, 'deferred': True, 'response': None,
+                    'error': dispatch_failure_reason(goal_id) or 'deferred'}
+        return {'success': False, 'response': None,
+                'error': dispatch_failure_reason(goal_id)
+                or 'dispatch returned no response'}
+    why = _reply_failure(result)
+    if why:
+        return {'success': False, 'response': result, 'error': why}
+    return {'success': True, 'response': result}
+
+
 class AgentDaemon:
     """Background daemon: active goals (any type) + idle agents → /chat dispatch."""
 
@@ -748,18 +783,23 @@ class AgentDaemon:
             logger.debug("Auto-evolve daemon tick skipped: %s", exc)
 
     def _try_parallel_dispatch(self, goal, idle_agents, dispatched, max_concurrent):
-        """Check if a goal has parallel subtasks and dispatch them concurrently.
+        """Fan a goal's parallel-ready subtasks out to concurrent turns.
 
-        Returns number of tasks dispatched (0 if no parallel tasks found).
+        Returns how many subtasks ended each way, {'completed', 'failed',
+        'deferred'}, all 0 when the goal has none to run.  A deferred subtask
+        did not run (a person is using this computer, the local model is
+        busy): it is PENDING again for a later tick, and the caller neither
+        settles nor penalises the goal for it.
         """
+        nothing = {'completed': 0, 'failed': 0, 'deferred': 0}
         try:
             ledger = self._get_goal_ledger(goal)
             if not ledger:
-                return 0
+                return nothing
 
             parallel_tasks = ledger.get_parallel_executable_tasks()
             if not parallel_tasks:
-                return 0
+                return nothing
 
             from .parallel_dispatch import dispatch_parallel_tasks
             from .dispatch import dispatch_goal
@@ -770,36 +810,30 @@ class AgentDaemon:
                 max_concurrent - dispatched,
             )
             if batch_count <= 0:
-                return 0
+                return nothing
 
             def _dispatch_task(task):
                 """Dispatch a single parallel subtask via /chat."""
                 goal_id = str(goal.id) if hasattr(goal, 'id') else ''
                 goal_type = goal.goal_type if hasattr(goal, 'goal_type') else 'marketing'
                 user_id = str(goal.user_id) if hasattr(goal, 'user_id') else 'system'
-                result = dispatch_goal(
-                    task.description, user_id, goal_id, goal_type)
-                if result is None:
-                    # parallel_dispatch marks the task FAILED with this error.
-                    from .dispatch import dispatch_failure_reason
-                    return {'success': False, 'response': None,
-                            'error': dispatch_failure_reason(goal_id)
-                            or 'dispatch returned no response'}
-                return {'success': True, 'response': result}
+                return _subtask_outcome(goal_id, dispatch_goal(
+                    task.description, user_id, goal_id, goal_type))
 
             result = dispatch_parallel_tasks(
                 ledger, _dispatch_task, max_concurrent=batch_count)
 
-            count = result['completed'] + result['failed']
-            if count > 0:
+            outcome = {k: int(result.get(k, 0)) for k in nothing}
+            if any(outcome.values()):
                 logger.info(
                     f"Parallel dispatch for goal {goal.id}: "
-                    f"{result['completed']} completed, {result['failed']} failed")
-            return count
+                    f"{outcome['completed']} completed, {outcome['failed']} "
+                    f"failed, {outcome['deferred']} back in the queue")
+            return outcome
 
         except Exception as e:
             logger.debug(f"Parallel dispatch check failed: {e}")
-            return 0
+            return nothing
 
     def _get_goal_ledger(self, goal):
         """Get a SmartLedger for a goal's task graph (if one exists).
@@ -1875,14 +1909,29 @@ class AgentDaemon:
                 # dispatching the goal prompt once.  Treated as a handoff
                 # exactly like speculation: truthy result, backoff cleared,
                 # and the completion gate below still judges it.
-                parallel_dispatched = 0 if _expert_cfg else self._try_parallel_dispatch(
-                    goal, idle_agents, dispatched, max_concurrent)
-                if parallel_dispatched > 0:
-                    dispatched += parallel_dispatched
+                fan_out = ({'completed': 0, 'failed': 0, 'deferred': 0}
+                           if _expert_cfg else self._try_parallel_dispatch(
+                               goal, idle_agents, dispatched, max_concurrent))
+                _ran = fan_out['completed'] + fan_out['failed']
+                _held = fan_out['deferred']
+                if _ran > 0:
+                    dispatched += _ran + _held
                     with _module_lock:
                         _dispatch_backoff.pop(goal_key, None)
                     handed_off = True
                     result = 'parallel-handoff'
+                elif _held > 0:
+                    # Every subtask it fanned out is waiting (a person is
+                    # using this computer, the local model is busy): nothing
+                    # ran.  Not a handoff to settle and not a failure: the
+                    # transient arm below holds it as it holds a paused turn,
+                    # and the subtasks are PENDING again for a later tick.
+                    # Handed off all the same, so the goal prompt is never
+                    # also dispatched whole.
+                    dispatched += _held
+                    handed_off = True
+                    logger.debug(f"Goal {goal_key}: {_held} parallel "
+                                 f"subtask(s) held for later")
                 elif speculative_enabled and not _expert_cfg:
                     try:
                         from .speculative_dispatcher import get_speculative_dispatcher
@@ -1916,47 +1965,45 @@ class AgentDaemon:
                 # Track failures for exponential backoff.  A reply that SAYS the
                 # action failed — the {"status":"error"} envelope the CREATE
                 # prompt tells the agent to return, or a help pause — is a
-                # failure too, not a success (the same rule the hive worker
-                # applies via HeldForHelp).  Counted as success it cleared the
-                # backoff and, for a continuous goal, re-ran the impossible
-                # action every 5 minutes for five months.
-                from core.agent_tools import (is_action_error_reply, is_help_pause,
-                                              is_user_pause)
-                # A turn that stopped between steps because the owner is using
-                # the computer (#129) is a transient deferral like the ones
-                # below: not a failure, not a parked goal, not a completion.  The
-                # goal stays active, the gate above re-admits it once they are
-                # idle, and its session resumes where it stopped.
-                _paused = result is not None and is_user_pause(result)
-                _reply_failed = result is not None and not _paused and (
-                    is_action_error_reply(result) or is_help_pause(result))
-                if result is None or _reply_failed or _paused:
+                # failure too, not a success (_reply_failure, the rule the hive
+                # worker and the parallel subtasks apply).  Counted as success
+                # it cleared the backoff and, for a continuous goal, re-ran the
+                # impossible action every 5 minutes for five months.
+                _reply_why = _reply_failure(result) if result is not None else None
+                if result is None or _reply_why:
                     # dispatch_goal returns None for TRANSIENT defers too (user
-                    # actively chatting / Tier-2 breaker open), not just real
-                    # failures.  Counting those toward the 5-strike AUTO-PAUSE
-                    # below would pause a healthy goal just because the user was
-                    # using the machine — the "goals stuck / 0 progress" bug.
-                    # Reuse the SAME canonical checks dispatch_goal defers on
-                    # (single source — never drifts) and skip without penalty.
-                    # An explicit error reply is never transient: the turn ran.
-                    _transient = _paused
-                    if result is None:
+                    # actively chatting / Tier-2 breaker open / this goal's
+                    # turn paused between steps for a person, #129), not just
+                    # real failures.  Counting those toward the 5-strike
+                    # AUTO-PAUSE below would pause a healthy goal just because
+                    # the user was using the machine — the "goals stuck / 0
+                    # progress" bug.  Reuse the SAME canonical checks
+                    # dispatch_goal defers on (single source — never drifts)
+                    # and skip without penalty: the goal stays active, the gate
+                    # above re-admits it once they are idle, and a paused
+                    # session resumes where it stopped.  An explicit error
+                    # reply is never transient: the turn ran.
+                    # A fan-out whose every subtask waited says so itself:
+                    # their reasons were recorded on the threads that ran
+                    # them, which this thread cannot read.
+                    _transient = _held > 0
+                    if result is None and not _transient:
                         try:
                             from .dispatch import is_transient_deferral
-                            _transient = is_transient_deferral()
+                            _transient = is_transient_deferral(goal_key)
                         except Exception:
                             _transient = False
                     if _transient:
                         logger.debug(
                             f"Goal {goal_key}: transient defer (user active / "
-                            f"breaker open / paused for the user) — no backoff, "
-                            f"no auto-pause")
+                            f"breaker open / paused for the person) — no "
+                            f"backoff, no auto-pause")
                         continue
                     # Why the turn failed, when it ran, so a paused goal says
                     # what to fix (a 402 from the hosted LLM, say) instead of
                     # only counting failures.  An error reply carries its own.
-                    if _reply_failed:
-                        _why = ' '.join(str(result).split())[:200]
+                    if _reply_why:
+                        _why = _reply_why
                     else:
                         try:
                             from .dispatch import dispatch_failure_reason

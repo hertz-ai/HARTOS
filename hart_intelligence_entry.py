@@ -10495,6 +10495,7 @@ def chat():
                 auto_response = _autonomous_gather_info(user_id, prompt, prompt_id)
 
                 # Now immediately create the recipe so next dispatch enters REUSE
+                recipe_response = None
                 _config_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 if os.path.exists(_config_path):
                     try:
@@ -10544,8 +10545,16 @@ def chat():
                 _record_lifecycle('Review Mode', user_id, prompt_id,
                                  f'Autonomous creation via dispatch: {prompt[:100]}')
                 _push_workflow_flowchart(user_id, prompt_id, request_id)
+                # A recipe() that stopped between steps for the person (#129)
+                # answers that, not the gather output: the dispatcher holds
+                # the goal only on a pause it can see (review of 96a9ca9f8:
+                # it took the gather output for the turn's result and
+                # recorded a 0-spark strike).  The flags above send the next
+                # dispatch back into recipe(), which resumes the session.
+                from core.agent_tools import is_user_pause
                 return _chat_reply(
-                    user_id, request_id, auto_response,
+                    user_id, request_id,
+                    recipe_response if is_user_pause(recipe_response) else auto_response,
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0,
                     history_request_id=[],

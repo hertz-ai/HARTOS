@@ -1558,21 +1558,34 @@ def has_pending_tool_calls(messages):
             last_msg['tool_calls'])
 
 
-def yield_between_rounds(task, messages=None):
-    """Stop a background group chat between rounds while the owner is active.
+# The pause a speaker selector asked for, kept for the TURN that asked it:
+# the thread running that turn, since autogen runs a group chat's speaker
+# selection on the thread that called initiate_chat.  Kept on the session's
+# task, it outlived its turn: a daemon turn that set it after its loop's last
+# read handed it to the session's next turn, a person's own, which answered
+# 'Paused for the user' (review of 96a9ca9f8, 2026-10-05).  Per thread,
+# another turn of the session never sees it, and clear_pause_request() starts
+# every turn with none.
+_turn_pause = threading.local()
+
+
+def yield_between_rounds(messages=None):
+    """Stop a background group chat between rounds while a person is using
+    the computer.
 
     Owner ruling 2026-10-04 (#129).  Every speaker selector of the two
     pipelines (create_recipe.state_transition / state_transition1,
-    reuse_recipe's four) asks this FIRST.  True means: return None, which
-    ends autogen's round (run_chat breaks on NoEligibleSpeaker) before the
-    next model call; the outer turn loop then reads ``task._paused_for_user``
-    and answers core.agent_tools.user_pause_reply, leaving every action and
-    ledger state exactly as it was, so the goal's next dispatch -- which the
-    daemon issues only once the gate is open -- resumes the same session.
-    Idempotent: a second call while the owner is still active sets the same
-    mark and ends the round again with no model call.  A genuine user turn
-    never yields (dispatch.background_work_must_yield), and a failing check
-    never stops work.
+    reuse_recipe's four, the persona-selection chat's among them) asks this
+    FIRST.  True means: return None, which ends autogen's round (run_chat
+    breaks on NoEligibleSpeaker) before the next model call, and the turn
+    running on this thread is marked (pause_requested).  Every exit of the
+    turn loops reads the mark and answers through answer_the_pause, leaving
+    every action and ledger state exactly as it was, so the goal's next
+    dispatch -- which the daemon issues only once the gate is open -- resumes
+    the same session.  Idempotent: a second call while the person is still
+    there sets the same mark and ends the round again with no model call.
+    The question is dispatch.background_work_must_yield: a person's own turn
+    never yields to them, and a failing check never stops work.
 
     Never between a tool call and its execution (owner, 2026-10-04): while
     the last of ``messages`` is an unanswered tool call the round goes on,
@@ -1588,18 +1601,54 @@ def yield_between_rounds(task, messages=None):
             return False
     except Exception:
         return False
-    if task is not None:
-        try:
-            task._paused_for_user = True
-        except Exception:
-            pass
+    _turn_pause.requested = True
     try:
         current_app.logger.info(
-            '[YIELD-TO-USER] the owner is active: ending this chat round; '
-            'the turn resumes when they are idle')
+            '[YIELD-TO-USER] a person is using this computer: ending this '
+            'chat round; the turn resumes when they are idle')
     except Exception:
         pass
     return True
+
+
+def pause_requested():
+    """True when a speaker selector of the turn running on this thread ended
+    a round for the person (yield_between_rounds).
+
+    The turn loops read it at every exit that can follow such a round
+    (create_recipe.get_response_group, reuse_recipe.get_agent_response and
+    chat_agent).  A read does not clear it: once a turn was asked to stop it
+    answers only the pause, so an outer frame of create's recursive turn sees
+    the pause its inner frame answered.  It stays set until the next turn on
+    this thread begins (clear_pause_request)."""
+    return bool(getattr(_turn_pause, 'requested', False))
+
+
+def clear_pause_request():
+    """Begin a turn on this thread with no pause pending.
+
+    Called where a turn begins (create_recipe.recipe, reuse_recipe.chat_agent)
+    and nowhere else: a pooled request thread can still carry the mark of an
+    earlier turn, one that set it after its last read and answered with
+    something else."""
+    _turn_pause.requested = False
+
+
+def answer_the_pause(session, action_id, where):
+    """The reply of a turn whose round a speaker selector ended for the
+    person (pause_requested): core.agent_tools.user_pause_reply, which the
+    dispatchers hold for later (dispatch._turn_failure, the hive worker's
+    DeferredForRetry) and never count as a result or a failure.  The caller
+    has touched no action or ledger state, so the goal's next dispatch
+    resumes the session where it stopped."""
+    try:
+        current_app.logger.info(
+            f"[YIELD-TO-USER] {where}: action {action_id} of {session} paused "
+            f"for the person; it resumes on the next dispatch")
+    except Exception:
+        pass
+    from core.agent_tools import user_pause_reply
+    return user_pause_reply(action_id)
 
 
 def answered_call_ids(m):

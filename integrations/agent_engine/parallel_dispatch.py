@@ -36,17 +36,34 @@ def get_executor() -> ThreadPoolExecutor:
     return _executor
 
 
+def _hold_for_later(ledger, task, result) -> None:
+    """Put a subtask that did not run back in the queue: IN_PROGRESS ->
+    DEFERRED -> PENDING through the ledger's own defer/undefer, which keep
+    its pending_reason ('ready'), so get_parallel_executable_tasks offers it
+    again.  A dispatch that answers {'deferred': True} ran nothing (a person
+    is using this computer, the local model is busy).  COMPLETED unblocked
+    its dependents for work never done; FAILED dropped work that only had to
+    wait (review of 96a9ca9f8)."""
+    reason = str(result.get('error') or 'deferred')
+    if not (ledger.defer_task(task.task_id, reason=reason)
+            and ledger.undefer_task(task.task_id, reason='back in the queue')):
+        logger.warning(f"Parallel task {task.task_id} could not be put back "
+                       f"in the queue ({reason})")
+
+
 def dispatch_parallel_tasks(ledger, dispatch_fn: Callable,
                             max_concurrent: int = 8) -> Dict:
     """Fan-out all parallel-ready tasks from the ledger to concurrent workers.
 
     Args:
         ledger: SmartLedger instance with tasks loaded
-        dispatch_fn: Callable(task) -> result dict (e.g., calls /chat)
+        dispatch_fn: Callable(task) -> result dict (e.g., calls /chat);
+            {'deferred': True} means the task did not run and waits
         max_concurrent: Max simultaneous dispatches
 
     Returns:
-        {completed: int, failed: int, results: {task_id: result}}
+        {completed: int, failed: int, deferred: int,
+         results: {task_id: result}}
     """
     from agent_ledger.core import TaskStatus
 
@@ -67,11 +84,15 @@ def dispatch_parallel_tasks(ledger, dispatch_fn: Callable,
 
     completed = 0
     failed = 0
+    deferred = 0
     for future in as_completed(futures):
         task = futures[future]
         try:
             result = future.result(timeout=300)
-            if result.get('success', True):
+            if result.get('deferred'):
+                _hold_for_later(ledger, task, result)
+                deferred += 1
+            elif result.get('success', True):
                 # Use update_task_status to trigger _handle_task_completion
                 # which properly unblocks dependent tasks
                 ledger.update_task_status(
@@ -91,7 +112,8 @@ def dispatch_parallel_tasks(ledger, dispatch_fn: Callable,
             failed += 1
 
     ledger.save()
-    return {'completed': completed, 'failed': failed, 'results': results}
+    return {'completed': completed, 'failed': failed, 'deferred': deferred,
+            'results': results}
 
 
 def dispatch_goal_with_ledger(ledger, dispatch_fn: Callable) -> Dict:
@@ -107,6 +129,7 @@ def dispatch_goal_with_ledger(ledger, dispatch_fn: Callable) -> Dict:
 
     total_completed = 0
     total_failed = 0
+    total_deferred = 0
     all_results = {}
     max_iterations = 100  # Safety cap
 
@@ -118,7 +141,12 @@ def dispatch_goal_with_ledger(ledger, dispatch_fn: Callable) -> Dict:
                 ledger, dispatch_fn, max_concurrent=MAX_PARALLEL_WORKERS)
             total_completed += batch_result['completed']
             total_failed += batch_result['failed']
+            total_deferred += batch_result.get('deferred', 0)
             all_results.update(batch_result['results'])
+            if batch_result.get('deferred'):
+                # Held work waits for a later run: picked again now, it would
+                # only be deferred again.
+                break
             continue
 
         # Fall back to sequential
@@ -129,6 +157,11 @@ def dispatch_goal_with_ledger(ledger, dispatch_fn: Callable) -> Dict:
         ledger.update_task_status(next_task.task_id, TaskStatus.IN_PROGRESS)
         try:
             result = dispatch_fn(next_task)
+            if result.get('deferred'):
+                _hold_for_later(ledger, next_task, result)
+                total_deferred += 1
+                all_results[next_task.task_id] = result
+                break
             if result.get('success', True):
                 ledger.update_task_status(
                     next_task.task_id, TaskStatus.COMPLETED, result=result)
@@ -150,6 +183,7 @@ def dispatch_goal_with_ledger(ledger, dispatch_fn: Callable) -> Dict:
     return {
         'completed': total_completed,
         'failed': total_failed,
+        'deferred': total_deferred,
         'results': all_results,
         'awareness': ledger.get_awareness(),
     }

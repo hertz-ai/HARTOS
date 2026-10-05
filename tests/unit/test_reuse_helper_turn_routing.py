@@ -64,6 +64,9 @@ def route():
         'publish_intermediate_thoughts_to_user': MagicMock(),
         '_reuse_speaker_says_to_user': says,
         're': __import__('re'),
+        # The selector asks helper_fun.yield_between_rounds first (#129); the
+        # real one, which answers False on a turn that is not a daemon's.
+        'helper_fun': __import__('importlib').import_module('hartos.helper'),
     }
     exec(compile(ast.Module(body=[_main_group_selector()], type_ignores=[]),
                  SRC, 'exec'), ns)

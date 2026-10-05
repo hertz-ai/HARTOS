@@ -589,18 +589,64 @@ def machine_is_idle() -> bool:
         return False
 
 
+def person_using_the_machine() -> Optional[str]:
+    """Whether a PERSON is using this computer right now, and how that is
+    known: 'foreground_request' (a person's request is being served:
+    core.foreground.foreground_active, in this process or another on the
+    machine), 'user_present' (the governor's live input monitor last read the
+    OS idle probe as not idle: ResourceGovernor.user_present), or None.
+
+    The ONE definition (owner ruling 2026-10-04: "not multiple user idles
+    paths").  should_yield_to_user names its person reasons (#0 and #1b)
+    from it, and background_work_must_yield asks only it, so the tick gate
+    and the between-steps pause cannot disagree about who is at the
+    computer.  The tick gate holds NEW work back for more than a person (a
+    chat in the last ten minutes, a CREATE in flight, model or CPU
+    pressure); a RUNNING turn stops only for a person.  Review of 96a9ca9f8
+    (2026-10-05, measured): a step that re-asked the whole tick gate paused a
+    daemon CREATE turn on the create_in_flight its own mark_create_start had
+    set, or on a governor in ACTIVE mode with nobody at the desk, and the
+    daemon re-dispatched it every tick.
+
+    The daemon's starvation override admits work only while
+    gate_closed_for_the_person is False, which needs an idle machine, and
+    the governor never reports MODE_IDLE while user_present() is True: its
+    monitor, the only writer of the mode, decides both from one sample.  So a
+    turn the override admits is not paused by its first step.
+
+    Fail-open: an unreadable signal reads as nobody, so a broken read never
+    stops work.
+    """
+    try:
+        from core.foreground import foreground_active
+        if foreground_active():
+            return 'foreground_request'
+    except Exception:
+        logger.debug('person check: foreground read failed', exc_info=True)
+    try:
+        from core.resource_governor import get_governor
+        present = getattr(get_governor(), 'user_present', None)
+        # `is True`, not truthiness: a fake governor in a test is often a
+        # MagicMock, whose every attribute call is truthy.
+        if callable(present) and present() is True:
+            return 'user_present'
+    except Exception:
+        logger.debug('person check: user-presence read failed', exc_info=True)
+    return None
+
+
 def gate_closed_for_the_person() -> bool:
-    """True when the yield gate is closed because a PERSON needs the machine
-    now: a user request in flight, or the machine's own idle detector says it
-    is not idle (the owner at the desk, external load).  False when the gate
-    is closed only on a timer or a reading the idle detector contradicts (the
-    ten-minute chat cooldown with nobody at the desk): that is idle
-    starvation, which the daemon's override already admits work through.
-    ONE answer for that override and for the between-steps yield
-    (background_work_must_yield), so a turn the override admitted is never
-    paused a moment later by the reason it was admitted under.  Fail-closed
-    like the override: an unreadable foreground or governor means the person
-    needs the machine."""
+    """True when the yield gate is closed because the machine is not free for
+    background work now: a user request in flight, or the machine's own idle
+    detector says it is not idle (the owner at the desk, external load).
+    False when the gate is closed only on a timer or a reading the idle
+    detector contradicts (the ten-minute chat cooldown with nobody at the
+    desk): that is idle starvation, which the daemon's starvation override
+    admits work through.  The override's own judgement, and stricter than
+    person_using_the_machine, which is what pauses a running turn: it is True
+    whenever that one names a person, so a turn the override admits is not
+    paused by its first step.  Fail-closed like the override: an unreadable
+    foreground or governor means the machine is not free."""
     try:
         from core.foreground import foreground_active
         if foreground_active() or get_last_yield_reason() == 'foreground_request':
@@ -612,24 +658,21 @@ def gate_closed_for_the_person() -> bool:
 
 def background_work_must_yield() -> bool:
     """The ONE question a long-running background agent asks BETWEEN STEPS:
-    is the owner using this computer right now?
+    is a person using this computer right now?
 
     Owner ruling 2026-10-04: yield-to-user is not only the VLM loop's: every
     autogen group chat and every daemon goal pauses while the owner is
     active and resumes, idempotently, once they are actually idle; there is
-    no second "user is idle" rule.  Composes the two canonical predicates --
-    is_current_request_autonomous (whose turn this is) and
-    should_yield_to_user (the gate every daemon tick already consults) -- so
-    a genuine user turn never yields to its own owner, and the mid-turn
-    decision can never drift from the tick-level one.  Measured before this
-    existed (gui_app.log 2026-10-04): the gate was CLOSED on user_present
-    19:12:55-19:20:56 while coding-daemon turn daemon_d69d24f8 ran autogen
-    rounds straight through it, holding the local LLM.  Fail-open: a raising
-    check never stops work.
+    no second "user is idle" rule.  Composes is_current_request_autonomous
+    (whose turn this is: a person's own turn never yields to them) with
+    person_using_the_machine (the one definition the tick gate names its
+    person reasons from).  Measured before this existed (gui_app.log
+    2026-10-04): the gate was CLOSED on user_present 19:12:55-19:20:56 while
+    coding-daemon turn daemon_d69d24f8 ran autogen rounds straight through
+    it, holding the local LLM.  Fail-open: a raising check never stops work.
     """
     try:
-        return bool(is_current_request_autonomous() and should_yield_to_user()
-                    and gate_closed_for_the_person())
+        return bool(is_current_request_autonomous() and person_using_the_machine())
     except Exception:
         logger.debug('background_work_must_yield: check failed, not yielding',
                      exc_info=True)
@@ -680,10 +723,13 @@ def is_user_recently_active() -> bool:
     return _user_chat_marker_recent()
 
 
-def is_transient_deferral() -> bool:
+def is_transient_deferral(goal_id=None) -> bool:
     """True when a ``dispatch_goal`` ``None`` is a TRANSIENT defer — the user is
-    actively using the LLM, or the Tier-2 circuit breaker is open — rather than a
-    real dispatch failure.
+    actively using the LLM, or the Tier-2 circuit breaker is open, or (given
+    ``goal_id``, asked from the thread that dispatched it) that goal's turn
+    stopped between steps for a person (#129) — rather than a real dispatch
+    failure.  The goal's own recorded reason is read first: a turn paused for
+    the person is held whatever the other checks say by now.
 
     ``dispatch_goal`` returns ``None`` for BOTH cases, so the daemon can't tell
     them apart from the return value alone.  The daemon calls this to avoid
@@ -694,6 +740,11 @@ def is_transient_deferral() -> bool:
     breaker-open), so the daemon's notion of "transient" never drifts from the
     dispatcher's."""
     try:
+        if goal_id is not None:
+            with _turn_failures_lock:
+                _reason = _turn_failures.get(_failure_key(goal_id))
+            if _reason and _reason.startswith(_DEFERRED_PREFIX):
+                return True
         if is_user_recently_active() or _cb_is_open():
             return True
         # The node's own LLM provider refusing the account (#106b b) is a
@@ -721,57 +772,89 @@ def is_transient_deferral() -> bool:
         return False
 
 
-# Why dispatch_goal last returned None for a goal whose turn ran and failed,
-# by goal id, for the callers that report it (the daemon's pause reason, the
-# MCP tool, a parallel subtask's ledger error).  Each dispatch_goal call
-# clears its goal's entry first and a read removes it, so a reason always
-# describes the latest call; the cap only bounds callers that never read.
+# Why dispatch_goal last returned None for a goal whose turn ran and failed
+# or stopped, for the callers that report it (the daemon's pause reason, the
+# MCP tool, a parallel subtask's ledger error), keyed by the goal AND the
+# calling thread.  A goal's parallel subtasks are concurrent dispatch_goal
+# calls under one goal id: keyed by the goal alone, one subtask's call
+# erased the other's reason before it was read, so a paused subtask read as
+# failed (review of 96a9ca9f8).  Every reader asks from the thread that
+# dispatched.  Each dispatch_goal call clears its own entry first and a read
+# removes it, so a reason always describes the latest call; the cap only
+# bounds callers that never read.
 _TURN_FAILURES_MAX = 256
-_turn_failures: Dict[str, str] = {}
+_turn_failures: Dict[tuple, str] = {}
 _turn_failures_lock = threading.Lock()
+
+# The prefix of a reason that means "not done, not failed: retry later,
+# without spending an attempt or a strike".  The instruction queue's drain
+# and is_transient_deferral read it.
+_DEFERRED_PREFIX = 'deferred:'
+#: Why a turn that stopped between steps for a person (#129) returned nothing.
+_PAUSED_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} paused between steps; a person '
+                          f'is using this computer')
+
+
+def _failure_key(goal_id) -> tuple:
+    return (str(goal_id), threading.get_ident())
 
 
 def _turn_failure(reply) -> Optional[str]:
-    """Why ``reply`` is a failed turn dressed as an answer, or None when it is
-    a real reply.
+    """Why ``reply`` is not the turn's result, or None when it is a real
+    reply.
 
-    The pipeline does not raise when its LLM call fails: user_facing_error()
-    turns the exception into a polite sentence and the turn returns it as the
-    reply.  core.agent_tools.is_user_facing_error is the one recogniser;
-    worker_loop._after_response uses it the same way."""
-    from core.agent_tools import is_user_facing_error
+    Two kinds, told apart by the reason's prefix.  A turn that stopped
+    between steps because a person is using this computer
+    (core.agent_tools.is_user_pause, #129) is held: retry later, never
+    counted as done or failed ('deferred: ...').  A turn whose LLM call
+    failed is a failure: the pipeline does not raise, user_facing_error()
+    turns the exception into a polite sentence and the turn returns it as
+    the reply ('turn failed: ...').  core.agent_tools holds the one
+    recogniser of each; worker_loop._after_response uses them the same way."""
+    from core.agent_tools import is_user_facing_error, is_user_pause
+    if is_user_pause(reply):
+        return _PAUSED_FOR_THE_PERSON
     if not is_user_facing_error(reply):
         return None
     return f'turn failed: {reply.strip()[:160]}'
 
 
+def _record_turn_failure(goal_id, reason) -> None:
+    with _turn_failures_lock:
+        _turn_failures[_failure_key(goal_id)] = reason
+        while len(_turn_failures) > _TURN_FAILURES_MAX:
+            _turn_failures.pop(next(iter(_turn_failures)))
+
+
 def _failed_turn(goal_id, reply) -> bool:
-    """True when ``reply`` is a failed turn, recording why for
-    dispatch_failure_reason(goal_id).
+    """True when ``reply`` is not the turn's result (_turn_failure), recording
+    why for dispatch_failure_reason(goal_id) and is_transient_deferral(goal_id).
 
     dispatch_goal used to return a failed turn's sentence as the goal's
     response, so its callers counted it as work: a parallel subtask was
     marked COMPLETED and unblocked its dependents, the daemon cleared the
     goal's backoff, and a goal whose every turn failed (every hosted call
     402 on central, 2026-09-14) was dispatched again each tick with no
-    backoff.  dispatch_goal now returns None for it, which every caller
-    treats as no result."""
+    backoff.  A paused turn's sentence was counted the same way (review of
+    96a9ca9f8: one-shot dispatches recorded it as their result).
+    dispatch_goal now returns None for both, which every caller treats as
+    no result; the reason says whether to retry later."""
     reason = _turn_failure(reply)
     if reason is None:
         return False
-    with _turn_failures_lock:
-        _turn_failures[str(goal_id)] = reason
-        while len(_turn_failures) > _TURN_FAILURES_MAX:
-            _turn_failures.pop(next(iter(_turn_failures)))
-    logger.warning(f"Goal {goal_id}: {reason[:140]!r}; no response returned")
+    _record_turn_failure(goal_id, reason)
+    held = reason.startswith(_DEFERRED_PREFIX)
+    (logger.info if held else logger.warning)(
+        f"Goal {goal_id}: {reason[:140]!r}; no response returned")
     return True
 
 
 def dispatch_failure_reason(goal_id) -> Optional[str]:
     """Why the latest dispatch_goal for ``goal_id`` returned None after its
-    turn ran and failed, or None.  Read once: the entry is removed."""
+    turn ran and failed or stopped, or None.  Read once, from the thread
+    that dispatched: the entry is removed."""
     with _turn_failures_lock:
-        return _turn_failures.pop(str(goal_id), None)
+        return _turn_failures.pop(_failure_key(goal_id), None)
 
 
 def _dispatch_provider_host(model_config) -> str:
@@ -935,17 +1018,14 @@ def should_yield_to_user() -> bool:
     yield reason (e.g. battery-saver mode, network-pressure)
     means editing exactly this function — no per-daemon copy-paste.
     """
-    reason = None
+    # The person reasons (#0 and #1b) come from person_using_the_machine, the
+    # one definition the between-steps pause asks too.
+    person = person_using_the_machine()
     # Reason #0 — a user-facing request is in flight RIGHT NOW (finer + higher
     # priority than the 10-min "recently active" window below).  Background LLM
     # work must never steal the shared model mid-turn; the daemon's starvation
     # override also refuses to fire while this is set (see agent_daemon._tick).
-    try:
-        from core.foreground import foreground_active
-        if foreground_active():
-            reason = 'foreground_request'
-    except Exception:
-        logger.debug('yield gate: foreground check failed', exc_info=True)
+    reason = 'foreground_request' if person == 'foreground_request' else None
     # Reason #1 — user recently active (is_user_recently_active stays the
     # single source; we only LABEL which sub-condition fired).
     if reason is None:
@@ -956,18 +1036,10 @@ def should_yield_to_user() -> bool:
         except Exception:
             logger.debug('yield gate: user-activity check failed',
                          exc_info=True)
+    # Reason #1b — a person at the desk.
+    if reason is None and person == 'user_present':
+        reason = 'user_present'
     # Reason #2 — LLM throttle collapsed under VRAM/CPU pressure.
-    if reason is None:
-        try:
-            from core.resource_governor import get_governor
-            _present = getattr(get_governor(), 'user_present', None)
-            # `is True`, not truthiness: a fake governor in a test is often a
-            # MagicMock, whose every attribute call is truthy.
-            if callable(_present) and _present() is True:
-                reason = 'user_present'
-        except Exception:
-            logger.debug('yield gate: user-presence check failed',
-                         exc_info=True)
     if reason is None:
         try:
             from integrations.service_tools.model_lifecycle import (
@@ -1285,7 +1357,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     """
     # A failure reason describes this call only (dispatch_failure_reason).
     with _turn_failures_lock:
-        _turn_failures.pop(str(goal_id), None)
+        _turn_failures.pop(_failure_key(goal_id), None)
 
     # BUDGET GATE: check goal budget + platform affordability before dispatch
     try:
@@ -1444,8 +1516,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             if llm_provider_breaker.state(_prov_host) == CircuitState.OPEN:
                 _reason = (f'provider {_prov_host} is refusing the account '
                            f'(breaker open)')
-                with _turn_failures_lock:
-                    _turn_failures[str(goal_id)] = _reason
+                _record_turn_failure(goal_id, _reason)
                 logger.warning(f"Goal {goal_id}: {_reason}; not dispatching "
                                f"this tick")
                 return None
@@ -1602,14 +1673,16 @@ def _dispatch_single_instruction(base_url: str, user_id: str, inst,
         inst.text, user_id, body['prompt_id'], daemon_id=batch_id,
         native_fallback=False)
     if _status == 'ok' and _text:
-        # A failed turn is not the instruction's result (_turn_failure).
+        # A failed or paused turn is not the instruction's result
+        # (_turn_failure); a pause comes back 'deferred:', which the drain
+        # re-queues without spending an attempt.
         _failed = _turn_failure(_text)
         return (inst.id, None, _failed) if _failed else (inst.id, _text[:500], None)
     if _status == 'deferred':
         # A human has the LLM, or it is saturated. NOT a failure: reporting it
         # as one burns an attempt and (once instructions get an attempt cap)
         # would dead-letter healthy work just because the user was typing.
-        return (inst.id, None, 'deferred: user active or LLM busy')
+        return (inst.id, None, f'{_DEFERRED_PREFIX} user active or LLM busy')
 
     try:
         # Same daemon_<batch_id> tag as the in-process call above (#97).
@@ -1692,7 +1765,7 @@ def drain_instruction_queue(user_id: str, max_tokens: int = 8000) -> Optional[st
                         # was busy or a human was using it. Burning an attempt
                         # would dead-letter healthy work because someone was
                         # typing.
-                        _transient = str(error).startswith('deferred:')
+                        _transient = str(error).startswith(_DEFERRED_PREFIX)
                         q.fail_instruction(iid, error, transient=_transient)
                         logger.warning(f"Instruction [{iid}] failed: {error}")
                     else:
@@ -1725,7 +1798,7 @@ def drain_instruction_queue(user_id: str, max_tokens: int = 8000) -> Optional[st
                                 # Same deferral exemption as the single-
                                 # instruction branch above: a busy LLM must
                                 # not burn an attempt.
-                                _transient = str(error).startswith('deferred:')
+                                _transient = str(error).startswith(_DEFERRED_PREFIX)
                                 q.fail_instruction(iid, error,
                                                    transient=_transient)
                                 logger.warning(f"Instruction [{iid}] failed: {error}")

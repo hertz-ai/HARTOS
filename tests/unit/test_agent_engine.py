@@ -511,6 +511,8 @@ class TestAgentDaemon:
         the computer is a transient deferral.  No backoff strike (five would
         auto-pause a healthy goal), no settlement (a noop strike there too),
         and the goal stays active for the gate to re-admit when they are idle.
+        The real dispatch_goal classifies the turn's reply (#139: no response,
+        a transient reason); only the in-process /chat call is replaced.
         """
         from core.agent_tools import user_pause_reply
         from integrations.agent_engine import agent_daemon
@@ -524,11 +526,14 @@ class TestAgentDaemon:
             {'user_id': test_user.id, 'username': 'test', 'user_type': 'agent'}]
         agent_daemon._dispatch_backoff.pop(str(goal.id), None)
         with patch('integrations.social.models.get_db', return_value=db), \
-             patch('integrations.agent_engine.dispatch.dispatch_goal',
-                   return_value=user_pause_reply(2)) as dispatched, \
+             patch('integrations.agent_engine.dispatch.local_chat_dispatch',
+                   return_value=('ok', user_pause_reply(2))) as dispatched, \
+             patch('integrations.agent_engine.dispatch._get_distributed_coordinator',
+                   return_value=None), \
              patch('integrations.agent_engine.dispatch.should_yield_to_user',
                    return_value=False), \
-             patch.object(AgentDaemon, '_try_parallel_dispatch', return_value=0), \
+             patch.object(AgentDaemon, '_try_parallel_dispatch',
+                          return_value={'completed': 0, 'failed': 0, 'deferred': 0}), \
              patch.object(agent_daemon, '_settle_dispatched_goal') as settle, \
              patch('security.secret_redactor._model_detect_pii',
                    side_effect=lambda t, *a, **k: t), \
@@ -541,6 +546,44 @@ class TestAgentDaemon:
         assert str(goal.id) not in agent_daemon._dispatch_backoff, (
             'a pause was counted as a dispatch failure')
         settle.assert_not_called()
+        assert goal.status == 'active'
+
+    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_agent_personas')
+    def test_a_fan_out_whose_subtasks_all_waited_is_neither_settled_nor_redispatched(
+            self, mock_idle, db, test_user, test_product):
+        """#139: every parallel subtask the tick fanned out was held (a person
+        is using the computer, the local model is busy).  Nothing ran, so the
+        tick settles nothing (that would be a 0-spark strike), counts no
+        failure, and does not fall back to dispatching the goal prompt whole.
+        """
+        from integrations.agent_engine import agent_daemon
+        from integrations.agent_engine.agent_daemon import AgentDaemon
+
+        goal = AgentGoal(goal_type='marketing', title='Held fan-out probe',
+                         product_id=test_product.id, status='active')
+        db.add(goal)
+        db.flush()
+        mock_idle.return_value = [
+            {'user_id': test_user.id, 'username': 'test', 'user_type': 'agent'}]
+        agent_daemon._dispatch_backoff.pop(str(goal.id), None)
+        with patch('integrations.social.models.get_db', return_value=db), \
+             patch('integrations.agent_engine.dispatch.dispatch_goal') as whole, \
+             patch('integrations.agent_engine.dispatch.should_yield_to_user',
+                   return_value=False), \
+             patch.object(AgentDaemon, '_try_parallel_dispatch',
+                          return_value={'completed': 0, 'failed': 0, 'deferred': 2}) as fanned, \
+             patch.object(agent_daemon, '_settle_dispatched_goal') as settle, \
+             patch('security.secret_redactor._model_detect_pii',
+                   side_effect=lambda t, *a, **k: t), \
+             patch('integrations.agent_engine.budget_gate.pre_dispatch_budget_gate',
+                   return_value=(True, 'OK')), \
+             patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
+                   side_effect=lambda prompt, *a, **k: (True, '', prompt)):
+            AgentDaemon()._tick()
+        assert fanned.called, 'the fan-out was never tried: this proves nothing'
+        whole.assert_not_called()
+        settle.assert_not_called()
+        assert str(goal.id) not in agent_daemon._dispatch_backoff
         assert goal.status == 'active'
 
     @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_opted_in_agents')

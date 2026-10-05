@@ -17,6 +17,19 @@ from datetime import datetime
 logger = logging.getLogger('hevolve_social')
 
 
+def _held_for_later(goal_id) -> bool:
+    """dispatch.is_transient_deferral for a coding goal's empty dispatch: the
+    one rule the agent daemon applies to the same None (#139).  A broken
+    check reads as not held, so a real failure is still counted."""
+    try:
+        from integrations.agent_engine.dispatch import is_transient_deferral
+        return bool(is_transient_deferral(goal_id))
+    except Exception:
+        logger.debug('is_transient_deferral unavailable; counting the failure',
+                     exc_info=True)
+        return False
+
+
 class CodingAgentDaemon:
     """Background daemon: active goals + idle agents → /chat dispatch."""
 
@@ -239,7 +252,15 @@ class CodingAgentDaemon:
                 result = dispatch_to_chat(prompt, str(agent['user_id']), goal.id,
                                           goal_type=goal.goal_type or 'coding')
 
-                if result is None:
+                if result is None and _held_for_later(goal.id):
+                    # Not a failure: the turn stopped between steps for a
+                    # person (#129), or never started (a user chatting, the
+                    # breaker open).  The goal stays active and is dispatched
+                    # again once the gate opens; five of these auto-paused a
+                    # healthy coding goal.
+                    logger.debug(f"Coding goal {goal.id}: held for later; no "
+                                 f"dispatch failure counted")
+                elif result is None:
                     # Dispatch failed — track for backoff
                     fails = (goal.config_json or {}).get('_dispatch_failures', 0) + 1
                     cfg = goal.config_json or {}

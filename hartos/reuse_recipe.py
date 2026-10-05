@@ -1173,8 +1173,7 @@ def create_agents_for_role(user_id: str, prompt_id):
             messages = groupchat.messages
             # A background turn stops between rounds while the owner is using
             # the computer (#129).
-            if helper_fun.yield_between_rounds(user_tasks.get(f'{user_id}_{prompt_id}'),
-                                                   groupchat.messages):
+            if helper_fun.yield_between_rounds(groupchat.messages):
                 return None
             if last_speaker == user_proxy:
                 return assistant
@@ -3088,10 +3087,9 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
-        # A background turn stops between rounds while the owner is using the
+        # A background turn stops between rounds while a person is using the
         # computer (#129); get_agent_response answers for it.
-        if helper_fun.yield_between_rounds(user_tasks.get(user_prompt),
-                                               groupchat.messages):
+        if helper_fun.yield_between_rounds(groupchat.messages):
             return None
         try:
             request_id = f'{request_id_list[user_prompt]}'
@@ -3321,8 +3319,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     def state_transition1(last_speaker, groupchat):
         current_app.logger.info('INSIDE TIMER STATE TRANSITION')
-        if helper_fun.yield_between_rounds(user_tasks.get(user_prompt),
-                                               groupchat.messages):
+        if helper_fun.yield_between_rounds(groupchat.messages):
             return None
         messages = groupchat.messages
         # visual_context = helper_fun.get_visual_context(user_id)
@@ -3391,8 +3388,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     def state_transition2(last_speaker, groupchat):
         current_app.logger.info('INSIDE VISUAL STATE TRANSITION')
-        if helper_fun.yield_between_rounds(user_tasks.get(user_prompt),
-                                               groupchat.messages):
+        if helper_fun.yield_between_rounds(groupchat.messages):
             return None
         messages = groupchat.messages
         # visual_context = helper_fun.get_visual_context(user_id)
@@ -5912,17 +5908,14 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             # YIELD-TO-USER (#129): the same contract as create_recipe's outer
             # loop, where the measurement (daemon_d69d24f8 running through the
             # closed gate 19:12:55-19:20:56 on 2026-10-04) and the rationale
-            # live.  The round ended because this group's state_transition
-            # asked yield_between_rounds and the owner is using the computer:
+            # live.  The round ended because a speaker selector of this turn
+            # asked yield_between_rounds and a person is using the computer:
             # answer for the turn, touch no action or ledger state, and the
             # goal's next dispatch continues this same session.
-            if getattr(user_tasks.get(user_prompt), '_paused_for_user', False):
-                user_tasks[user_prompt]._paused_for_user = False
-                from core.agent_tools import user_pause_reply
-                current_app.logger.info(
-                    f"[YIELD-TO-USER] reuse turn of {user_prompt} paused for the "
-                    f"user at action {user_tasks[user_prompt].current_action}")
-                return user_pause_reply(user_tasks[user_prompt].current_action)
+            if helper_fun.pause_requested():
+                return helper_fun.answer_the_pause(
+                    user_prompt, _reuse_current_action_id(user_prompt),
+                    'reuse turn, at the loop top')
 
             # #725 ROOT-CAUSE FIX (proven live 2026-09-05: nappend=0, conversation in
             # manager._oai_messages).  In this reuse flow autogen accumulates the
@@ -6476,6 +6469,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
 
         # if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
         #     return assistant
+        # A loop exit that followed a round a speaker selector ended for the
+        # person answers the pause, and asks no synthesis round of a session
+        # it will resume (review of 96a9ca9f8, blocker 3).
+        if helper_fun.pause_requested():
+            return helper_fun.answer_the_pause(
+                user_prompt, _reuse_current_action_id(user_prompt),
+                'reuse turn, after the loop')
         if not group_chat.messages:
             current_app.logger.warning(
                 'reuse: no messages to extract a reply from after trimming')
@@ -6485,6 +6485,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         # to the user verbatim.  Ask for the answer first — once, here, where
         # the turn is finalised exactly once (#799/D33).
         _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor)
+        # The synthesis round runs after the loop's last read of the mark.  A
+        # person who arrives during it gets the pause, not the steer or the
+        # verdict left at the tail (review of 96a9ca9f8, blocker 3).
+        if helper_fun.pause_requested():
+            return helper_fun.answer_the_pause(
+                user_prompt, _reuse_current_action_id(user_prompt),
+                'reuse turn, synthesis round')
         last_message = group_chat.messages[-1]
         # THE SYNTHESIS ROUND CAN LEAVE ITS OWN STEER AS THE TAIL.  It posts
         # the steer and then depends on the group taking a turn; when no turn
@@ -7621,6 +7628,8 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
     user_prompt = f'{user_id}_{prompt_id}'
 
     request_id_list[user_prompt] = request_id
+    # A turn begins with no pause pending (helper_fun.clear_pause_request).
+    helper_fun.clear_pause_request()
     try:
         if file_id:
             recent_file_id[user_id] = file_id
@@ -7673,6 +7682,12 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             assistant, user_proxy, group_chat, manager, helper, stop = role_agents[user_prompt]
             result = user_proxy.initiate_chat(manager, message=user_message, speaker_selection={"speaker": "assistant"},
                                               clear_history=False)
+            # The persona-selection chat's selector yields too (#129): a
+            # round it ended for the person is the turn's pause, not the
+            # role chat's last line.
+            if helper_fun.pause_requested():
+                return helper_fun.answer_the_pause(
+                    user_prompt, None, 'reuse persona selection')
             # Print the chat summary
             current_app.logger.info("\n=== Chat Summary ===")
             # current_app.logger.info(result.summary)

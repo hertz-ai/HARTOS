@@ -168,7 +168,11 @@ class _Script:
 
 
 @pytest.fixture
-def create_env(tmp_path, monkeypatch):
+def create_env(tmp_path, monkeypatch, idle_desktop):
+    # The run is a daemon turn (request id daemon_e2e_create), which asks
+    # between steps whether a person is using this computer; nobody is at
+    # this desk (tests/conftest.py idle_desktop), and the pause tests below
+    # say when someone sits down.
     import faulthandler
     # A misrouted script spins inside the loop, and a blocked call never
     # returns: either way, dump every thread's stack and exit instead of
@@ -571,11 +575,12 @@ def test_a_background_turn_pauses_for_the_owner_and_resumes_where_it_stopped(cre
     env = create_env
     gate = {'open': False}
 
-    def closed():
+    def present():
         # The owner sits down the moment action 1 is banked.
-        return not gate['open'] and _action_file(env, 1) is not None
-    monkeypatch.setattr(dispatch, 'should_yield_to_user', closed)
-    monkeypatch.setattr(dispatch, 'gate_closed_for_the_person', lambda: True)
+        if not gate['open'] and _action_file(env, 1) is not None:
+            return 'user_present'
+        return None
+    monkeypatch.setattr(dispatch, 'person_using_the_machine', present)
 
     replies = _run(env, turns=1)
     assert agent_tools.is_user_pause(replies[-1]), replies
@@ -598,3 +603,32 @@ def test_a_background_turn_pauses_for_the_owner_and_resumes_where_it_stopped(cre
     for n in (1, 2, 3):
         assert _action_file(env, n) is not None, f'action {n} has no file after the resume'
     assert not env.llm_calls, env.llm_calls
+
+
+def test_the_timeout_exit_answers_a_pause_made_in_the_last_round(create_env, monkeypatch):
+    """Review of 96a9ca9f8, blocker 3: the create loop checked its 30-minute
+    bound before the pause, so a round the selector ended for the owner,
+    followed by that exit, answered the group chat's tail as the turn's
+    result and left the pause for whoever's turn came next."""
+    import time as real_time
+    from core import agent_tools
+    from integrations.agent_engine import dispatch
+    env = create_env
+    late = {'s': 0.0}
+    clock = SimpleNamespace(**{name: getattr(real_time, name)
+                               for name in dir(real_time) if not name.startswith('_')})
+    clock.time = lambda: real_time.time() + late['s']
+    monkeypatch.setattr(env.cr, 'time', clock)
+
+    def present():
+        if _action_file(env, 1) is None:
+            return None
+        # The owner sits down in the round that is this turn's last before
+        # its bound.
+        late['s'] = 1801.0
+        return 'user_present'
+    monkeypatch.setattr(dispatch, 'person_using_the_machine', present)
+
+    replies = _run(env, turns=1)
+    assert agent_tools.is_user_pause(replies[-1]), replies
+    assert _action_file(env, 2) is None, 'the turn went on past the pause'

@@ -2222,11 +2222,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         user_prompt = f'{user_id}_{prompt_id}'
         current_action_id = user_tasks[user_prompt].current_action
 
-        # A background turn stops between rounds while the owner is using
-        # the computer (#129); the outer loop answers for it and the goal's
+        # A background turn stops between rounds while a person is using
+        # the computer (#129); the turn's loop answers for it and the goal's
         # next dispatch resumes this same session.
-        if helper_fun.yield_between_rounds(user_tasks.get(user_prompt),
-                                           groupchat.messages):
+        if helper_fun.yield_between_rounds(groupchat.messages):
             return None
 
         # ─── STUCK-LOOP GUARD (#485) ───────────────────────────────────
@@ -3656,8 +3655,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         current_app.logger.info('INSIDE TIMER STATE TRANSITION')
         # Same between-round stop as state_transition (#129); the scheduler
         # runs this job again later.
-        if helper_fun.yield_between_rounds(time_actions.get(f'{user_id}_{prompt_id}'),
-                                           groupchat.messages):
+        if helper_fun.yield_between_rounds(groupchat.messages):
             return None
         messages = groupchat.messages
         if not messages:
@@ -4505,6 +4503,16 @@ def _attach_for_create_turn(agents_object, text, user_prompt):
             exc_info=True)
 
 
+def _answer_the_pause(user_prompt, group_chat, where):
+    """get_response_group's reply once a round ended for the person
+    (helper_fun.pause_requested): the transcript is kept for the session's
+    next turn and nothing else is touched (helper_fun.answer_the_pause)."""
+    messages[user_prompt] = group_chat.messages
+    return helper_fun.answer_the_pause(
+        user_prompt, getattr(user_tasks.get(user_prompt), 'current_action', None),
+        where)
+
+
 def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     """
     Handles the response generation process for an agent group.
@@ -4695,10 +4703,11 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             # daemon_d69d24f8 ran autogen rounds straight through it, holding
             # the single local-LLM permit -- the gate was consulted only per
             # daemon tick, never between the rounds of a turn already
-            # running.  Now state_transition asks helper_fun.
+            # running.  Now every speaker selector asks helper_fun.
             # yield_between_rounds first and returns None, which ends the
-            # round before the next model call and sets this mark; this is
-            # the only reader of the mark.
+            # round before the next model call and marks this turn
+            # (helper_fun.pause_requested).  This read, and the one after the
+            # loop for its own exits, answer for it.
             #
             # RETURN, not break: break falls to the tail-message return and
             # hands the user the group chat's last line (the 2026-09-06
@@ -4708,17 +4717,12 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             # issues only once the gate is open -- re-enters this session and
             # continues the same round; a second pause while the person is
             # still there is the same reply again, with no model call.  The
-            # daemon classifies the reply as "resume later" (core.agent_tools.
+            # dispatchers hold the reply for later (core.agent_tools.
             # is_user_pause): not a result, not a failure, not a parked goal.
-            if getattr(user_tasks[user_prompt], '_paused_for_user', False):
-                user_tasks[user_prompt]._paused_for_user = False
-                messages[user_prompt] = group_chat.messages
-                current_app.logger.info(
-                    f"[YIELD-TO-USER] OUTER loop returning at iteration "
-                    f"#{while_loop_iterations}: action {current_action_id} paused "
-                    f"for the user; it resumes on the next dispatch")
-                from core.agent_tools import user_pause_reply
-                return user_pause_reply(current_action_id)
+            if helper_fun.pause_requested():
+                return _answer_the_pause(
+                    user_prompt, group_chat,
+                    f"OUTER loop at iteration #{while_loop_iterations}")
 
             # USER-INPUT GATE (code-level enforcement):  if state_transition
             # has flagged this action as blocked on user input
@@ -5704,6 +5708,14 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             current_app.logger.warning(f"Exited while loop after reaching max iterations ({max_iterations})")
         else:
             current_app.logger.info(f"Exited while loop after {while_loop_iterations} iterations")
+
+        # The loop's own exits -- its 30-minute bound, max_iterations, the
+        # guards that break -- can follow a round a selector ended for the
+        # person.  Answering the group chat's tail then reported a paused
+        # turn as its result and left the mark for the next turn (review of
+        # 96a9ca9f8, blocker 3: the timeout was checked before the mark).
+        if helper_fun.pause_requested():
+            return _answer_the_pause(user_prompt, group_chat, 'after the loop')
 
         # Store messages and prepare final response
         messages[user_prompt] = group_chat.messages
@@ -6785,6 +6797,8 @@ from core.llm_outbound_logger import with_llm_context as _with_llm_context
 def recipe(user_id, text, prompt_id, file_id, request_id):
     user_prompt = f'{user_id}_{prompt_id}'
     request_id_list[user_prompt] = request_id
+    # A turn begins with no pause pending (helper_fun.clear_pause_request).
+    helper_fun.clear_pause_request()
     current_app.logger.info('--' * 100)
 
     # [OK] NEW: Initialize persistent storage for this prompt_id

@@ -172,21 +172,25 @@ def reopen_owner_feed_answers():
 def idle_desktop(monkeypatch):
     """Nobody is at this computer and nothing presses on it.
 
-    A background run reads the live machine twice: the VLM loop's own
-    physical-input check, and the yield gate every background turn asks
-    between steps (dispatch.should_yield_to_user, #129).  On a busy box
-    (a person at the desk, model pressure) both say "stop", so a test that
-    drives a background run passed or failed with the state of the desk:
-    measured 2026-10-05, test_computer_control_consent's two acting tests
-    failed once in five runs, and fail every time with the gate read as busy.
-    Tests that assume an idle desktop declare it here; tests of yielding
-    patch the gate themselves (tests/unit/test_yield_pauses_every_agent.py),
-    and dedicated takeover tests override the input signal with transitions.
+    A background run reads the live machine three ways: the VLM loop's own
+    physical-input check, the one definition of a person at the computer
+    that every background turn asks between steps
+    (dispatch.person_using_the_machine, read by background_work_must_yield,
+    #129), and the tick gate a daemon asks before it starts work
+    (dispatch.should_yield_to_user).  On a box with someone at it all three
+    say "stop", so a test that drives a background run passed or failed with
+    the state of the desk: measured 2026-10-05, test_computer_control_consent's
+    two acting tests failed once in five runs, and fail every time with the
+    gate read as busy.  Tests that assume an idle desktop declare it here;
+    tests of yielding patch the predicate themselves
+    (tests/unit/test_yield_pauses_every_agent.py), and dedicated takeover
+    tests override the input signal with transitions.
     """
     from core import resource_governor
     monkeypatch.setattr(resource_governor, 'get_physical_input_state',
                         lambda **_kw: (0, None))
     from integrations.agent_engine import dispatch
+    monkeypatch.setattr(dispatch, 'person_using_the_machine', lambda: None)
     monkeypatch.setattr(dispatch, 'should_yield_to_user', lambda: False)
 
 
