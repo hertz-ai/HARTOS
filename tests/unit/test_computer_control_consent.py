@@ -362,9 +362,11 @@ class _OneShellCommand:
 
 
 @pytest.fixture
-def loop(monkeypatch):
+def loop(monkeypatch, idle_desktop):
     """The real loop and executor; the screen, the VLM and the machine are
-    replaced.  Yields (local_loop, ran, prompt_ids_seen, ribbon_calls)."""
+    replaced, on an idle desktop (these tests are about the owner's
+    permission, not about yielding to a person at the desk).  Yields
+    (local_loop, ran, prompt_ids_seen, ribbon_calls)."""
     lct = pytest.importorskip('integrations.vlm.local_computer_tool')
     from integrations.vlm import local_loop, qwen3vl_backend, safety
     from hartos.threadlocal import thread_local_data
