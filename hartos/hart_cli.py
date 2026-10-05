@@ -253,6 +253,9 @@ def code(ctx, task, task_type, tool, working_dir, files):
         from integrations.coding_agent.orchestrator import get_coding_orchestrator
 
         orchestrator = get_coding_orchestrator()
+        # The person at their own terminal asked for this run: no agent is
+        # asking for their computer, so the run does not ask them (it
+        # refused with 'nobody is signed in' wherever no owner was set).
         result = orchestrator.execute(
             task=task,
             task_type=task_type,
@@ -260,6 +263,7 @@ def code(ctx, task, task_type, tool, working_dir, files):
             user_id=user_id,
             model=model,
             working_dir=working_dir,
+            requested_by_person=True,
         )
 
         if json_output:

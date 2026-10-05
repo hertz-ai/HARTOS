@@ -228,17 +228,22 @@ def execute_shard():
                 with open(fpath, 'w', encoding='utf-8') as f:
                     f.write(content)
 
-            # Execute via local orchestrator (always local — we ARE the peer)
+            # Execute via local orchestrator (always local — we ARE the peer).
+            # Detached: this request thread may still carry the last /chat
+            # turn's prompt, user and activity run, none of them the peer's
+            # (review of cd99c540d; threadlocal.detached).
             from .orchestrator import get_coding_orchestrator
+            from hartos.threadlocal import thread_local_data
             orchestrator = get_coding_orchestrator()
-            result = orchestrator._execute_local(
-                task=task,
-                task_type=task_type,
-                preferred_tool=preferred_tool,
-                user_id='peer',
-                model=model,
-                working_dir=tmpdir,
-            )
+            with thread_local_data.detached():
+                result = orchestrator._execute_local(
+                    task=task,
+                    task_type=task_type,
+                    preferred_tool=preferred_tool,
+                    user_id='peer',
+                    model=model,
+                    working_dir=tmpdir,
+                )
 
         result['execution_time_s'] = time.time() - start
 

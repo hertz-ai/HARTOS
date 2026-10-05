@@ -12752,14 +12752,22 @@ def coding_execute():
         return jsonify({'error': 'task is required'}), 400
 
     from integrations.coding_agent.orchestrator import get_coding_orchestrator
-    result = get_coding_orchestrator().execute(
-        task=task,
-        task_type=data.get('task_type', 'feature'),
-        preferred_tool=data.get('preferred_tool', ''),
-        user_id=data.get('user_id', ''),
-        model=data.get('model', ''),
-        working_dir=data.get('working_dir', ''),
-    )
+    from hartos.threadlocal import thread_local_data
+    # Detached: this request thread may still carry the last /chat turn's
+    # prompt, user and activity run; the run then worked in that agent's goal
+    # repo and was announced as that user (review of cd99c540d).  And an HTTP
+    # caller cannot be held for the owner's answer (it held one 108.6 s, past
+    # the 30-60 s its clients wait): the owner is asked, the caller told so.
+    with thread_local_data.detached():
+        result = get_coding_orchestrator().execute(
+            task=task,
+            task_type=data.get('task_type', 'feature'),
+            preferred_tool=data.get('preferred_tool', ''),
+            user_id=data.get('user_id', ''),
+            model=data.get('model', ''),
+            working_dir=data.get('working_dir', ''),
+            wait_for_owner=False,
+        )
 
     # If request came from hive peer, encrypt the response back
     if encrypted:

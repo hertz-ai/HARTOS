@@ -28,7 +28,9 @@ class CodingAgentOrchestrator:
     def execute(self, task: str, task_type: str = 'feature',
                 preferred_tool: str = '', user_id: str = '',
                 model: str = '', working_dir: str = '',
-                data_scope: str = '', prompt_id: str = '') -> Dict:
+                data_scope: str = '', prompt_id: str = '',
+                requested_by_person: bool = False,
+                wait_for_owner: bool = True) -> Dict:
         """Execute a coding task using the best available tool.
 
         This is a terminal operation — calls subprocess, never /chat.
@@ -49,13 +51,25 @@ class CodingAgentOrchestrator:
             model: LLM model override (empty = use tool's default)
             working_dir: Working directory for the coding tool
             data_scope: Privacy scope override (empty = auto-classify)
-            prompt_id: The agent asking (its turn's prompt_id); empty = the
-                one stamped on this thread.  The owner's permission and the
-                ribbon name it (see _execute_local).
+            prompt_id: The agent asking (its turn's prompt_id).  Only the
+                caller names it, never this thread's state (see
+                _execute_local); empty means no agent is named.
+            requested_by_person: The person at this computer asked for this
+                run themselves (`hart code` in their terminal): no agent is
+                asking for their computer, so they are not asked.
+            wait_for_owner: Whether the caller can wait for the owner's answer
+                when it asks (safety.computer_control_block).  An HTTP caller
+                cannot: POST /coding/execute held a request 108.6 s.
 
         Returns:
             {success, output, tool, execution_time_s, task_type, error?}
         """
+        # Who asks, carried to every place this task may end up running here
+        # (the hive paths fall back to a local run).
+        who = {'prompt_id': prompt_id,
+               'requested_by_person': requested_by_person,
+               'wait_for_owner': wait_for_owner}
+
         # ── Step 1: Classify data scope ──
         scope = self._classify_scope(task, working_dir, data_scope)
         logger.info(f"[CLASSIFY] task_type={task_type}, scope={scope}")
@@ -64,17 +78,16 @@ class CodingAgentOrchestrator:
         if scope in ('edge_only', 'user_devices'):
             # Private — never leaves this device (or user's own devices)
             return self._execute_local(task, task_type, preferred_tool,
-                                        user_id, model, working_dir,
-                                        prompt_id=prompt_id)
+                                        user_id, model, working_dir, **who)
 
         if not self._can_run_locally():
             # Node can't run locally — distribute with scope-aware sharding
             return self._distribute_to_hive(task, task_type, preferred_tool,
-                                             user_id, model, working_dir, scope)
+                                             user_id, model, working_dir, scope,
+                                             who=who)
 
         return self._execute_local(task, task_type, preferred_tool,
-                                    user_id, model, working_dir,
-                                    prompt_id=prompt_id)
+                                    user_id, model, working_dir, **who)
 
     def _classify_scope(self, task: str, working_dir: str,
                          override: str = '') -> str:
@@ -128,24 +141,39 @@ class CodingAgentOrchestrator:
     def _execute_local(self, task: str, task_type: str,
                         preferred_tool: str, user_id: str,
                         model: str, working_dir: str,
-                        prompt_id: str = '') -> Dict:
+                        prompt_id: str = '',
+                        requested_by_person: bool = False,
+                        wait_for_owner: bool = True) -> Dict:
         """Run one coding task on THIS computer.
 
         Every local coding run starts here: the agent tool
         (core.agent_tools.execute_coding_task), MCP `code`, POST
-        /coding/execute, a peer's shard (api.py) and `hart code`.  A coding run
-        writes files and, through an agentic CLI, runs commands, so it is
-        computer use and passes what every other computer-use dispatcher
-        (the shell tool, _handle_shell_command_tool, and the VLM loop)
-        already passes:
-          1. integrations.vlm.safety.computer_operation_refusal: never power,
-             reset, erase or format, and asks nobody about it;
-          2. integrations.vlm.safety.computer_control_block: the owner's
+        /coding/execute, a peer's shard (api.py), `hart code` and the hive
+        paths' local fallbacks.  A coding run writes files and, through an
+        agentic CLI, runs commands, so it is computer use and passes what the
+        other computer-use dispatchers (the shell tool,
+        _handle_shell_command_tool, and the VLM loop) pass:
+          1. integrations.vlm.safety.computer_control_block: the owner's
              computer_control permission, asked through ConsentService when
-             absent (a daemon run does not wait);
-          3. integrations.vlm.activity_stream.current_run: the AI-control
+             absent.  A daemon run does not wait for the answer, nor does a
+             caller that cannot (wait_for_owner=False).  A run the person at
+             this computer asked for themselves (requested_by_person) is no
+             agent asking for their computer, so they are not asked;
+          2. integrations.vlm.activity_stream.current_run: the AI-control
              ribbon and the companion window show the run while it happens
              and close it after.
+        The desktop-action filter (safety.computer_operation_refusal) is not
+        one of them.  It judges a command or a desktop action, and a coding
+        task's text describes code: it refused 'Add a system shutdown hook
+        that flushes the log' and 'Implement Windows restart detection in the
+        updater' (review of cd99c540d, 6 of 12 plausible tasks), while the
+        commands the CLI runs never reach it.
+
+        The agent is the one the caller names (prompt_id), never this
+        thread's.  /chat leaves its turn's prompt and user on the thread, and
+        a request served on that thread ran the job in that agent's goal repo
+        and announced it as that user (same review).
+
         It works in vlm_adapter.resolve_task_workspace: the caller's
         directory, else the agent's goal repo_path, else the user-data coding
         workspace, never the process cwd.  Measured 2026-10-05: with no
@@ -154,12 +182,7 @@ class CodingAgentOrchestrator:
         (x86)\\HevolveAI\\Nunba and creating folders inside the install.
         """
         from .tool_router import CodingToolRouter
-        from integrations.vlm.safety import (
-            computer_control_block, computer_operation_refusal)
-
-        refusal = computer_operation_refusal(task)
-        if refusal:
-            return self._not_run(task_type, f'Coding task refused: {refusal}')
+        from integrations.vlm.safety import computer_control_block
 
         router = CodingToolRouter()
         backend = router.route(task, task_type, preferred_tool)
@@ -175,11 +198,11 @@ class CodingAgentOrchestrator:
                          + ', '.join(TOOL_REGISTRY) + '.',
             }
 
-        agent, thread_user = _thread_identity()
-        agent = prompt_id or agent
-        refusal = computer_control_block(agent)
-        if refusal:
-            return self._not_run(task_type, refusal, tool=backend.name)
+        agent = prompt_id or None
+        if not requested_by_person:
+            refusal = computer_control_block(agent, wait=wait_for_owner)
+            if refusal:
+                return self._not_run(task_type, refusal, tool=backend.name)
 
         from integrations.vlm.vlm_adapter import resolve_task_workspace
         working_dir = resolve_task_workspace(prompt_id=agent, explicit=working_dir)
@@ -191,8 +214,7 @@ class CodingAgentOrchestrator:
 
         # Execute (leaf operation, no /chat re-entry), announced as it runs
         from integrations.vlm.activity_stream import current_run
-        run = current_run(user_id=user_id or thread_user or '',
-                          prompt_id=agent or '')
+        run = current_run(user_id=user_id or '', prompt_id=agent or '')
         caption = f'Coding: {task[:60]}'
         run.step(iteration=1, action='coding', phase='executing', caption=caption)
         phase, error = 'failed', ''
@@ -303,8 +325,12 @@ class CodingAgentOrchestrator:
     def _distribute_to_hive(self, task: str, task_type: str,
                              preferred_tool: str, user_id: str,
                              model: str, working_dir: str,
-                             scope: str = 'trusted_peer') -> Dict:
+                             scope: str = 'trusted_peer',
+                             who: Optional[Dict] = None) -> Dict:
         """Shard task, fan out to N peers in parallel, merge results.
+
+        ``who`` is execute()'s asker (prompt_id, requested_by_person,
+        wait_for_owner), carried to every local fallback.
 
         Flow:
           1. ShardEngine.decompose_task() → N shards
@@ -346,7 +372,8 @@ class CodingAgentOrchestrator:
             if not shards:
                 logger.info("[DISTRIBUTE] No shards — falling back to single-peer offload")
                 return self._offload_to_hive(task, task_type, preferred_tool,
-                                              user_id, model, working_dir)
+                                              user_id, model, working_dir,
+                                              who=who)
 
             logger.info(f"[DISTRIBUTE] Decomposed into {len(shards)} shards (scope={shard_scope.value})")
 
@@ -374,7 +401,8 @@ class CodingAgentOrchestrator:
             if not cleared_shards:
                 logger.info("[DISTRIBUTE] All shards blocked — executing locally")
                 return self._execute_local(task, task_type, preferred_tool,
-                                            user_id, model, working_dir)
+                                            user_id, model, working_dir,
+                                            **(who or {}))
 
             # ── Get available peers ──
             mesh = get_compute_mesh()
@@ -384,7 +412,8 @@ class CodingAgentOrchestrator:
             if not trusted_peers:
                 logger.info("[DISTRIBUTE] No trusted peers — executing locally")
                 return self._execute_local(task, task_type, preferred_tool,
-                                            user_id, model, working_dir)
+                                            user_id, model, working_dir,
+                                            **(who or {}))
 
             # ── Fan out: assign shards to peers round-robin, execute in parallel ──
             assignments = []
@@ -519,12 +548,16 @@ class CodingAgentOrchestrator:
         except Exception as e:
             logger.warning(f"[DISTRIBUTE] Failed ({e}), falling back to single-peer")
             return self._offload_to_hive(task, task_type, preferred_tool,
-                                          user_id, model, working_dir)
+                                          user_id, model, working_dir,
+                                          who=who)
 
     def _offload_to_hive(self, task: str, task_type: str,
                           preferred_tool: str, user_id: str,
-                          model: str, working_dir: str) -> Dict:
+                          model: str, working_dir: str,
+                          who: Optional[Dict] = None) -> Dict:
         """Offload to a trusted hive peer with sufficient compute.
+
+        ``who`` is execute()'s asker, carried to every local fallback.
 
         Security: E2E encryption (X25519 + AES-256-GCM) with full source context.
         Trust: Only offload code tasks to peers with sufficient trust score.
@@ -547,7 +580,8 @@ class CodingAgentOrchestrator:
             if not peers:
                 logger.info("No hive peers available, attempting local execution")
                 return self._execute_local(task, task_type, preferred_tool,
-                                            user_id, model, working_dir)
+                                            user_id, model, working_dir,
+                                            **(who or {}))
 
             # Filter to code-trusted peers only
             trusted_peers = [
@@ -558,7 +592,8 @@ class CodingAgentOrchestrator:
             if not trusted_peers:
                 logger.info("No code-trusted peers, executing locally")
                 return self._execute_local(task, task_type, preferred_tool,
-                                            user_id, model, working_dir)
+                                            user_id, model, working_dir,
+                                            **(who or {}))
 
             # Pick best trusted peer (by compute score)
             best_peer = max(trusted_peers, key=lambda p: mesh.score(p))
@@ -567,7 +602,8 @@ class CodingAgentOrchestrator:
 
             if not peer_pub or not peer_url:
                 return self._execute_local(task, task_type, preferred_tool,
-                                            user_id, model, working_dir)
+                                            user_id, model, working_dir,
+                                            **(who or {}))
 
             # Include full source context for target files (encrypted)
             # Accuracy > security theater: the peer needs full context to code well
@@ -639,7 +675,8 @@ class CodingAgentOrchestrator:
 
         # Fallback to local
         return self._execute_local(task, task_type, preferred_tool,
-                                    user_id, model, working_dir)
+                                    user_id, model, working_dir,
+                                    **(who or {}))
 
     @staticmethod
     def _is_code_trusted(peer: Dict) -> bool:
@@ -743,16 +780,6 @@ class CodingAgentOrchestrator:
         """Get benchmark dashboard data."""
         from .benchmark_tracker import get_benchmark_tracker
         return get_benchmark_tracker().get_summary()
-
-
-def _thread_identity():
-    """(prompt_id, user_id) stamped on this thread by the turn running it,
-    each None when absent (a CLI or route caller has no turn)."""
-    try:
-        from hartos.threadlocal import thread_local_data
-        return thread_local_data.get_prompt_id(), thread_local_data.get_user_id()
-    except Exception:
-        return None, None
 
 
 # ─── Module-level singleton ───
