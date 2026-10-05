@@ -90,6 +90,31 @@ def _is_frozen() -> bool:
     return bool(getattr(sys, 'frozen', False))
 
 
+def get_install_dir():
+    """The installed (frozen) app's own folder, or None when running from
+    source.  cx_Freeze runs the app as sys.executable inside it; on the
+    desktop that is C:\\Program Files (x86)\\HevolveAI\\Nunba, and it is
+    also the process cwd there.  Nothing a person or an agent works on
+    lives in it."""
+    if not _is_frozen():
+        return None
+    return os.path.dirname(os.path.abspath(sys.executable))
+
+
+def is_inside_install_dir(path) -> bool:
+    """Whether ``path`` is the installed app's own folder or inside it.
+    False when running from source, and for a path on another drive."""
+    install = get_install_dir()
+    if not install or not path:
+        return False
+    try:
+        p = os.path.normcase(os.path.abspath(str(path)))
+        root = os.path.normcase(os.path.abspath(install))
+        return os.path.commonpath([p, root]) == root
+    except ValueError:      # different drives on Windows
+        return False
+
+
 def _off_the_real_root_under_test(path: str, real: str, label: str = '') -> str:
     """`path`, or a per-process temp dir when a test would use `real`, one of
     the owner's real roots (the data root; the macOS log root).  `label`

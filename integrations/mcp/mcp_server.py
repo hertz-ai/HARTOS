@@ -246,7 +246,10 @@ def code(
             preferred_tool=preferred_tool,
             user_id='claude_mcp',
             model=model,
-            working_dir=working_dir or os.getcwd(),
+            # Never this server's own cwd: the orchestrator resolves an
+            # empty directory through vlm_adapter.resolve_task_workspace,
+            # like every other coding entry point (review of c49271ba8).
+            working_dir=working_dir,
         )
         return json.dumps(result, indent=2, default=str)
     except Exception as e:

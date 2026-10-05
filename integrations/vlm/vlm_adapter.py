@@ -66,9 +66,36 @@ def resolve_task_workspace(prompt_id=None, explicit=None) -> str:
     Never the process cwd.  Measured live 2026-09-19 22:07: the loop told the
     VLM "Declared task workspace: C:\\Program Files (x86)\\HevolveAI\\Nunba",
     the frozen install's launch directory, which no task was ever assigned.
+
+    The coding tools resolve their directory here too (execute_coding_task
+    through the orchestrator, get_repository_map).  So a RELATIVE path from 1
+    or 2 is inside the coding workspace, not the cwd: '.' and 'tts' came back
+    unchanged and those tools mapped and edited the cwd, the install folder
+    on the desktop and the clone in a dev run (review of c49271ba8).  And a
+    path inside the installed app's own folder is refused with a warning
+    naming it, and the next source answers: an agent-supplied absolute path
+    still reached it, though a coding run never works there (#137).
     """
-    if explicit and str(explicit).strip():
-        return str(explicit).strip()
+    from core import platform_paths
+
+    def _usable(path, source):
+        path = str(path or '').strip()
+        if not path:
+            return ''
+        if not os.path.isabs(path):
+            path = os.path.normpath(
+                os.path.join(platform_paths.get_coding_workspace_dir(), path))
+        if platform_paths.is_inside_install_dir(path):
+            logger.warning(
+                'Workspace %s (%s) is inside the installed app folder %s: '
+                'refused, the next source answers', path, source,
+                platform_paths.get_install_dir())
+            return ''
+        return path
+
+    chosen = _usable(explicit, "the caller's")
+    if chosen:
+        return chosen
     if prompt_id not in (None, '', 0, '0'):
         try:
             from integrations.social.models import AgentGoal, get_db
@@ -77,15 +104,15 @@ def resolve_task_workspace(prompt_id=None, explicit=None) -> str:
                 for goal in db.query(AgentGoal).filter(
                         AgentGoal.prompt_id == str(prompt_id)).all():
                     cfg = getattr(goal, 'config_json', None) or {}
-                    repo = str(cfg.get('repo_path') or cfg.get('workspace_root') or '').strip()
+                    repo = _usable(cfg.get('repo_path') or cfg.get('workspace_root'),
+                                   f'repo_path of goal {goal.id}')
                     if repo:
                         return repo
             finally:
                 db.close()
         except Exception:
             logger.debug('workspace lookup by prompt_id unavailable', exc_info=True)
-    from core.platform_paths import get_coding_workspace_dir
-    return get_coding_workspace_dir()
+    return platform_paths.get_coding_workspace_dir()
 
 
 def execute_vlm_instruction(message: dict) -> dict | None:
