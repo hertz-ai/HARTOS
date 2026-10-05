@@ -301,3 +301,66 @@ def test_a_run_writes_then_runs_in_its_declared_workspace(tmp_path, monkeypatch,
                      if ln.strip().startswith('"path"'))
     assert 'write_file' in path_line, path_line
     assert vlm_parser.is_template_echo(vlm_parser.OPEN_PATH_PLACEHOLDER)
+
+
+# ─── review of d2b6c6e4c (13:03Z): what carrying the fields newly allowed ────
+
+@pytest.fixture
+def slept(monkeypatch):
+    """What the executor's wait asked time.sleep for (nothing really sleeps)."""
+    asked = []
+    monkeypatch.setattr(lct.time, 'sleep', lambda s: asked.append(s))
+    return asked
+
+
+def test_a_wait_never_outlasts_the_cap(slept):
+    """Carrying 'duration' let the model's 'wait 30' sleep 30 s inside a 3 s
+    budget, and the run's timeout left the action thread asleep.  The parent
+    always waited 2 s."""
+    result = lct._execute_inprocess({'action': 'wait', 'duration': 30})
+    assert slept == [lct.MAX_WAIT_S], slept
+    assert lct.MAX_WAIT_S < 30
+    assert 'error' not in result, result
+    slept.clear()
+    lct._execute_inprocess({'action': 'wait', 'duration': 3})
+    assert slept == [3.0]
+
+
+def test_a_wait_the_executor_cannot_read_waits_the_default(slept):
+    """Other tiers hand the executor the model's raw value; a time.sleep that
+    raises on "soon" or sleeps on -1 is not a wait."""
+    for raw in ('soon', None, -1, '7'):
+        lct._execute_inprocess({'action': 'wait', 'duration': raw})
+    lct._execute_inprocess({'action': 'wait'})
+    assert slept == [2.0, 2.0, 0.0, 7.0, 2.0], slept
+
+
+def test_a_real_command_that_mentions_next_action_is_not_a_placeholder():
+    """The placeholder filter blanked a real command whose words happened to
+    end "when next action is done or failed"; the shell step then ran
+    nothing.  A placeholder is one of the template's own field heads."""
+    for cmd in ('echo retry when next action is done or failed',
+                'echo retry when next action is done',
+                'set flag when next action is shell'):
+        assert not vlm_parser.is_template_echo(cmd), cmd
+    for echo in (vlm_parser.SHELL_COMMAND_PLACEHOLDER,
+                 vlm_parser.OPEN_PATH_PLACEHOLDER,
+                 'shell command string when Next Action is shell',
+                 'file or app name when Next Action is open_file_gui',
+                 'file or folder path when Next Action is write_file'):
+        assert vlm_parser.is_template_echo(echo), echo
+
+
+def test_write_file_text_that_is_not_a_string_is_written_as_text(tmp_path):
+    """A model's content of 42 or a JSON object failed with "write() argument
+    must be str" and left an empty file behind."""
+    number = tmp_path / 'n.txt'
+    result = lct._execute_inprocess({'action': 'write_file', 'path': str(number),
+                                     'content': 42})
+    assert 'error' not in result, result
+    assert number.read_text(encoding='utf-8') == '42'
+    obj = tmp_path / 'o.json'
+    result = lct._execute_inprocess({'action': 'write_file', 'path': str(obj),
+                                     'content': {'a': 1}})
+    assert 'error' not in result, result
+    assert json.loads(obj.read_text(encoding='utf-8')) == {'a': 1}

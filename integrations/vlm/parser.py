@@ -67,15 +67,23 @@ SHELL_COMMAND_PLACEHOLDER = 'shell command when Next Action is shell'
 OPEN_PATH_PLACEHOLDER = ('file or folder path when Next Action is open_file_gui, '
                          'write_file, read_file_and_understand or '
                          'list_folders_and_files')
-#: Every placeholder spelling so far ('shell command string when Next Action
-#: is shell', 'shell command when Next Action is shell', 'file or app name
-#: when Next Action is open_file_gui', and the path placeholder above, whose
-#: action names are a list) is a few plain words, this phrase, and action
-#: names -- the WHOLE value.  A command that merely mentions the phrase
-#: (echo "...", findstr /C:"...") has quotes, switches or paths and is a
-#: command (review of 0cfa782cf: the substring test dropped it).
+#: The template's own field heads, the words before "when Next Action is":
+#: the two the prompts show now (read from the constants above, so they
+#: cannot drift) and the two spellings shown before them ('shell command
+#: string', 'file or app name').
+_PLACEHOLDER_HEADS = tuple(sorted({
+    SHELL_COMMAND_PLACEHOLDER.lower().split(' when next action is ')[0],
+    OPEN_PATH_PLACEHOLDER.lower().split(' when next action is ')[0],
+    'shell command string', 'file or app name'}))
+#: A placeholder is one of those heads, the phrase, and action names (one, or
+#: a list as the path placeholder has) -- the WHOLE value.  A command that
+#: merely mentions the phrase (echo "...", findstr /C:"...") is a command
+#: (review of 0cfa782cf: the substring test dropped it), and so is one whose
+#: own words come first: "echo retry when next action is done or failed"
+#: was blanked while the head was any 40 letters (review of d2b6c6e4c).
 _TEMPLATE_ECHO = re.compile(
-    r'^[a-z ]{0,40}\bwhen next action is [a-z_]+(?:(?:,| or) [a-z_]+)*$')
+    r'^(?:' + '|'.join(re.escape(h) for h in _PLACEHOLDER_HEADS) + r')'
+    r' when next action is [a-z_]+(?:(?:,| or) [a-z_]+)*$')
 
 
 def is_template_echo(value) -> bool:

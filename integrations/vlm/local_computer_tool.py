@@ -12,6 +12,7 @@ import os
 import re
 from core.subprocess_safe import no_window_kwargs
 import io
+import json
 import sys
 import time
 import base64
@@ -692,6 +693,29 @@ def _quick_image_diff(b64_a: str, b64_b: str) -> float:
 #: target window, so restoring immediately can paste the old content.
 CLIPBOARD_RESTORE_DELAY_S = 0.15
 
+#: What a 'wait' step sleeps when the model named no usable duration: the
+#: fixed wait every step took before the model's duration was carried.
+DEFAULT_WAIT_S = 2.0
+#: The longest one 'wait' step sleeps.  Since d2b6c6e4c the model's duration
+#: reaches this executor; obeyed unbounded, "wait 30" inside a 3 s run
+#: budget ended the run as a timeout and left the action thread asleep
+#: (review 2026-10-05 13:03Z).  A longer wait is several steps, each of
+#: which looks at the screen again.
+MAX_WAIT_S = 10.0
+
+
+def _wait_seconds(raw) -> float:
+    """The model's wait as seconds: a number, never negative, at most
+    MAX_WAIT_S; DEFAULT_WAIT_S when it is not a number.  Every tier hands
+    this executor the model's value, parsed or raw."""
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_WAIT_S
+    if seconds != seconds:      # NaN
+        return DEFAULT_WAIT_S
+    return min(max(0.0, seconds), MAX_WAIT_S)
+
 
 def _type_text(text: str, action=None) -> None:
     """Enter ``text`` into the focused field.
@@ -894,9 +918,11 @@ def _execute_inprocess(action: dict) -> dict:
             return {'output': 'Screenshot taken', 'base64_image': take_screenshot('inprocess')}
 
         elif act == 'wait':
-            wait_time = action.get('duration', 2)
+            wait_time = _wait_seconds(action.get('duration'))
             time.sleep(wait_time)
-            return {'output': f'Waited {wait_time}s'}
+            capped = '' if wait_time < MAX_WAIT_S else (
+                f' (one wait step is at most {MAX_WAIT_S:g}s)')
+            return {'output': f'Waited {wait_time:g}s{capped}'}
 
         elif act == 'cursor_position':
             pos = pyautogui.position()
@@ -933,7 +959,15 @@ def _execute_inprocess(action: dict) -> dict:
                 return {'output': '', 'error': (
                     "write_file needs the file's path in 'path' and its full "
                     "text in 'value'")}
-            content = action.get('content') or text or ''
+            content = action.get('content')
+            if content is None or content == '':
+                content = text or ''
+            # A model's 42 or JSON object failed write() with "argument must
+            # be str" AFTER open() had created the file, leaving it empty
+            # (review of d2b6c6e4c).  Text first, then the file.
+            if not isinstance(content, str):
+                content = (json.dumps(content, ensure_ascii=False, indent=2)
+                           if isinstance(content, (dict, list)) else str(content))
             try:
                 with open(path, 'w', encoding='utf-8') as f:
                     f.write(content)
