@@ -1528,11 +1528,86 @@ def tool_call_names(msg_lists) -> Dict[str, str]:
     return out
 
 
+def action_named_tools(agents, action_text):
+    """(every tool these agents can SERVE, the ones the action's TEXT names).
+
+    The ONE rule for "this action names that tool".  Read by the REUSE
+    fabrication gate (reuse_recipe._reuse_fabricated_tools, through
+    _reuse_registered_and_referenced_tools, which delegates here), by the
+    completion gate below and by CREATE's trace banker
+    (create_recipe._bank_action_recipe_from_trace).  It lived in
+    reuse_recipe until 2026-10-05, so only REUSE asked it: the completion
+    gate took ANY tool's reply as the receipt of an action that names a
+    tool, so send_message_to_user's "Message sent" for "Please wait while
+    I read the file" completed "execute_coding_task: read error log file
+    ...", and the banker saved those messages as its recipe (live:
+    prompts/26251890627_0_recipe.json, 2026-09-15, replayed by the coding
+    daemon every dispatch since).
+
+    "Can serve" is three sources, not two: already REGISTERED
+    (_function_map), already in the SCHEMA (llm_config['tools']), and
+    ATTACHABLE BY NAME (_hart_core_tools), the source whose absence made
+    the REUSE gate blind (live 2026-09-10, agent 88719487304 action 4: an
+    action naming execute_coding_task read like a prose action and
+    advanced having run nothing).
+    """
+    names = set()
+    for ag in (agents or []):
+        try:
+            names.update((getattr(ag, '_function_map', None) or {}).keys())
+        except Exception:
+            pass
+        cfg = getattr(ag, 'llm_config', None)
+        if isinstance(cfg, dict):
+            for t in (cfg.get('tools') or []):
+                fn = ((t or {}).get('function') or {}).get('name')
+                if fn:
+                    names.add(fn)
+        # Closures this leg can attach BY NAME but has not attached yet.
+        # attach_for_names(core_tools=...) serves exactly these, unpacking the
+        # same (name, description, func) tuples build_core_tool_closures
+        # returns -- so read [0] the way it does.
+        #
+        # Without this the two sources above only see tools ALREADY attached,
+        # so a recipe-named closure was invisible until something else had
+        # attached it, and _reuse_fabricated_tools returned [] at its
+        # `if not referenced` early-return, which sits ABOVE its log line.
+        # Measured live 2026-09-10, agent 88719487304 action 4 (rid
+        # d60c-223537, taken AFTER 7fd83678f made these closures buildable):
+        # watermark 12 -> 13, and it was the ONLY action of nine with no
+        # `[FAB-GUARD] action N names tool(s)` verdict line at all.  An action
+        # naming execute_coding_task read exactly like a prose action naming
+        # nothing, and advanced having run nothing.
+        # Population: 87 actions across 35 agents name execute_coding_task.
+        for _ct in (getattr(ag, '_hart_core_tools', None) or []):
+            try:
+                _cn = _ct[0]
+            except Exception:
+                continue
+            if _cn:
+                names.add(_cn)
+    text = str(action_text or '').lower()
+    referenced = [n for n in names if n and len(n) > 3 and n.lower() in text]
+    return names, referenced
+
+
+def _tools_this_action_names(user_prompt: str, action_id: int):
+    """(the action's text, the registered tools it names): the action read
+    the way the completion gate reads it -- its ledger description -- and
+    the tools this session's group chat can serve."""
+    ledger = get_registered_ledger(user_prompt)
+    task = (getattr(ledger, 'tasks', None) or {}).get(f'action_{action_id}')
+    action_text = str(getattr(task, 'description', '') or '').lower()
+    group_chat = get_registered_groupchat(user_prompt)
+    return action_text, action_named_tools(
+        getattr(group_chat, 'agents', None), action_text)[1]
+
+
 def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
                           message: dict) -> bool:
     """Whether a role='tool' receipt shows the action's work being done.
 
-    Two things a tool message can carry that are not that work:
+    Three things a tool message can carry that are not that work:
 
       * a FAILED reply (core.constants.tool_reply_failed): the executor's
         "Error: ...", the tool_logging envelope, or a TOOL_FAILURE_RESULTS
@@ -1543,15 +1618,20 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
         not itself name: live 2026-09-27, CREATE daemon_255bd83f, two
         execute_coding_task actions completed on save_data_in_memory writes of
         {"status": "completed"} the model composed, with no coding run.
+      * ANY other tool's reply when the action names a tool
+        (action_named_tools): an action that names a tool is done by that
+        tool's work.  send_message_to_user's "Message sent" completed
+        "execute_coding_task: read error log file ..." (#147).
 
     An aggregate message (autogen's ``tool_responses``) is a receipt when any
     one of its results qualifies.  A result whose function cannot be resolved
-    is judged on its content alone: it cannot be shown to be bookkeeping.
+    is judged on its content alone: it cannot be shown to be bookkeeping.  For
+    an action that names a tool it is no receipt: it cannot be shown to be
+    that tool's work either, the way the REUSE fabrication gate counts only a
+    result it can resolve to a tool the action names.
     """
     names = tool_call_names([messages])
-    ledger = get_registered_ledger(user_prompt)
-    task = (getattr(ledger, 'tasks', None) or {}).get(f'action_{action_id}')
-    action_text = str(getattr(task, 'description', '') or '').lower()
+    action_text, named = _tools_this_action_names(user_prompt, action_id)
     responses = message.get('tool_responses')
     results = responses if isinstance(responses, list) and responses else [message]
     for result in results:
@@ -1564,6 +1644,8 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
             continue
         name = names.get(result.get('tool_call_id') or message.get('tool_call_id'))
         if name in BOOKKEEPING_TOOLS and name.lower() not in action_text:
+            continue
+        if named and name not in named:
             continue
         return True
     return False
@@ -1600,7 +1682,11 @@ def _verifier_completion_has_conversation_evidence(
         return (message.get('role') == 'tool'
                 and _receipt_is_real_work(user_prompt, action_id, messages,
                                           message))
-    # A written answer is only ever cited from the group log.
+    # A written answer is only ever cited from the group log, and is the work
+    # only of an action that names no tool: "I will read the error log file
+    # and share what I find" was accepted as the read itself (#147).
+    if _tools_this_action_names(user_prompt, action_id)[1]:
+        return False
     return (agent is None
             and message.get('role') == 'assistant'
             and message.get('name') == 'Assistant')

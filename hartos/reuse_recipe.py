@@ -380,7 +380,7 @@ from hartos.lifecycle_hooks import (
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
     clear_action_states, settled_action_id, commit_verified_action_completion,
     dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
-    action_is_autonomous,
+    action_is_autonomous, action_named_tools,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -5490,54 +5490,11 @@ def _stamp_action_result_vacuity(user_prompt, action_id):
 def _reuse_registered_and_referenced_tools(agents, action_text):
     """(every tool name this leg can SERVE, the ones this action's TEXT names).
 
-    Lifted verbatim out of _reuse_fabricated_tools so the vacuity stamp asks
-    the same question by the same rule.  Two callers, ONE derivation: a
-    second copy would drift the moment either side changed what counts as
-    "this action names that tool".
-
-    "Can serve" is three sources, not two: already REGISTERED (_function_map),
-    already in the SCHEMA (llm_config['tools']), and ATTACHABLE BY NAME
-    (_hart_core_tools).  The third was missing and made the gate structurally
-    blind -- see the loop below.
+    The ONE derivation lives in hartos.lifecycle_hooks.action_named_tools,
+    which the completion gate and CREATE's trace banker read too (#147);
+    this name stays for its callers here and in create_recipe.
     """
-    names = set()
-    for ag in (agents or []):
-        try:
-            names.update((getattr(ag, '_function_map', None) or {}).keys())
-        except Exception:
-            pass
-        cfg = getattr(ag, 'llm_config', None)
-        if isinstance(cfg, dict):
-            for t in (cfg.get('tools') or []):
-                fn = ((t or {}).get('function') or {}).get('name')
-                if fn:
-                    names.add(fn)
-        # Closures this leg can attach BY NAME but has not attached yet.
-        # attach_for_names(core_tools=...) serves exactly these, unpacking the
-        # same (name, description, func) tuples build_core_tool_closures
-        # returns -- so read [0] the way it does.
-        #
-        # Without this the two sources above only see tools ALREADY attached,
-        # so a recipe-named closure was invisible until something else had
-        # attached it, and _reuse_fabricated_tools returned [] at its
-        # `if not referenced` early-return, which sits ABOVE its log line.
-        # Measured live 2026-09-10, agent 88719487304 action 4 (rid
-        # d60c-223537, taken AFTER 7fd83678f made these closures buildable):
-        # watermark 12 -> 13, and it was the ONLY action of nine with no
-        # `[FAB-GUARD] action N names tool(s)` verdict line at all.  An action
-        # naming execute_coding_task read exactly like a prose action naming
-        # nothing, and advanced having run nothing.
-        # Population: 87 actions across 35 agents name execute_coding_task.
-        for _ct in (getattr(ag, '_hart_core_tools', None) or []):
-            try:
-                _cn = _ct[0]
-            except Exception:
-                continue
-            if _cn:
-                names.add(_cn)
-    text = str(action_text or '').lower()
-    referenced = [n for n in names if n and len(n) > 3 and n.lower() in text]
-    return names, referenced
+    return action_named_tools(agents, action_text)
 
 
 def _reuse_call_id_to_tool_name(msg_lists):

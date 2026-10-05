@@ -49,10 +49,12 @@ import ast
 import io
 import json
 import os
+import sys
 
-MODULE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    'hartos', 'reuse_recipe.py')
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+MODULE = os.path.join(_ROOT, 'hartos', 'reuse_recipe.py')
 
 _WANTED = ('_reuse_result_is_vacuous', '_reuse_tool_results_all_vacuous',
            '_reuse_call_id_to_tool_name',
@@ -94,7 +96,11 @@ def _ns():
             return None
         return v if isinstance(v, dict) else None
 
+    # _reuse_registered_and_referenced_tools delegates to the one rule in
+    # hartos.lifecycle_hooks (#147), which imports without autogen.
+    from hartos.lifecycle_hooks import action_named_tools
     ns = {'retrieve_json': retrieve_json, 'json': json,
+          'action_named_tools': action_named_tools,
           '_reuse_evidence_msg_lists': lambda gc, ag: [gc]}
     mod = ast.Module(body=body, type_ignores=[])
     exec(compile(ast.fix_missing_locations(mod), MODULE, 'exec'), ns)

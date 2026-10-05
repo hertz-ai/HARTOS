@@ -6309,6 +6309,24 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                 f"({', '.join(sorted({s['tool_name'] for s in steps}))}); "
                 f"not banking that as its recipe")
             return False
+        # An action that names a tool is done by that tool's work, the rule
+        # the completion gate and the REUSE fabrication gate read
+        # (lifecycle_hooks.action_named_tools).  A window where none of the
+        # named tools ran successfully is not that action's recipe, and the
+        # no-op marker below is not one either.  Live: 26251890627_0_recipe
+        # .json (2026-09-15) banked three send_message_to_user "Please wait
+        # while I read the file" steps as the recipe of
+        # "execute_coding_task: read error log file ...", and the coding
+        # daemon replays it.
+        from hartos.lifecycle_hooks import action_named_tools
+        _named = action_named_tools(getattr(group_chat, 'agents', None),
+                                    _action_text)[1]
+        if _named and not any(s['tool_name'] in _named for s in steps):
+            current_app.logger.warning(
+                f"[TRACE-BANK] action {action_id} names "
+                f"{', '.join(sorted(_named))} and none of them ran "
+                f"successfully; not banking that as its recipe")
+            return False
         if not steps:
             steps = [{
                 'steps': 'no-op: action completed without tool execution',
