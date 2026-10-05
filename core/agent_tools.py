@@ -2489,7 +2489,7 @@ def build_core_tool_closures(ctx):
         task: Annotated[str, "The coding task to execute (e.g., 'review this function for bugs', 'implement a login form')"],
         task_type: Annotated[str, "Task type: code_review, feature, bug_fix, refactor, app_build, debugging, multi_session"] = "feature",
         preferred_tool: Annotated[str, "Optional tool override: kilocode, claude_code, opencode, aider_native, or claw_native (empty = auto-select best)"] = "",
-        working_dir: Annotated[str, "Working directory / repo path for the coding task (empty = use HEVOLVE_CODING_WORKDIR env or cwd)"] = "",
+        working_dir: Annotated[str, "Working directory / repo path for the coding task (empty = HEVOLVE_CODING_WORKDIR, else this agent's goal repo_path, else the coding workspace)"] = "",
     ) -> str:
         """Execute a coding task using the best available coding agent tool (KiloCode, Claude Code, OpenCode, or AiderNative).
 
@@ -2507,6 +2507,9 @@ def build_core_tool_closures(ctx):
                 user_id=user_id,
                 model=os.environ.get('HEVOLVE_CODING_MODEL', ''),
                 working_dir=working_dir or os.environ.get('HEVOLVE_CODING_WORKDIR', ''),
+                # The asking agent: the owner's permission and the ribbon
+                # name it (orchestrator._execute_local).
+                prompt_id=str(prompt_id or ''),
             )
             return json.dumps(result, indent=2)
         except Exception as e:

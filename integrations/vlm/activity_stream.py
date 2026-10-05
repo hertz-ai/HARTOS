@@ -50,6 +50,7 @@ _ACTION_LABELS = {
     'open_file_gui': 'Opening an app or file',
     'write_file': 'Writing a local file',
     'read_file_and_understand': 'Reading a local file',
+    'coding': 'Working on code',
 }
 
 #: Step phases a client may receive.  ``executing`` is the only non-terminal

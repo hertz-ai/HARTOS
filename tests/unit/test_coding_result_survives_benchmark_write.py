@@ -148,6 +148,9 @@ class TestDefaultDbPath:
             ('bug_fix', 'aider', '', '', 3.0, 0, 0)]
 
 
+# A local run passes the owner's computer_control permission first
+# (orchestrator._execute_local); these tests are about what follows.
+@pytest.mark.usefixtures('computer_control_granted')
 class TestExecuteLocalKeepsResult:
     def test_result_returned_when_benchmark_write_fails(self, tmp_path, caplog, restore_perms):
         tracker, db = _read_only_tracker(tmp_path)
@@ -231,6 +234,9 @@ class TestExecuteLocalKeepsResult:
             ('feature', 'claude_code', '', 'u4', 4.0, 1, 0)]
 
 
+# A local run passes the owner's computer_control permission first
+# (orchestrator._execute_local); these tests are about what follows.
+@pytest.mark.usefixtures('computer_control_granted')
 class TestTrackerThatCannotBeBuilt:
     """The DB dir is created when the tracker is built, so building can fail."""
 

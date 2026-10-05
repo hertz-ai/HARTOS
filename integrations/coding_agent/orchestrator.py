@@ -28,7 +28,7 @@ class CodingAgentOrchestrator:
     def execute(self, task: str, task_type: str = 'feature',
                 preferred_tool: str = '', user_id: str = '',
                 model: str = '', working_dir: str = '',
-                data_scope: str = '') -> Dict:
+                data_scope: str = '', prompt_id: str = '') -> Dict:
         """Execute a coding task using the best available tool.
 
         This is a terminal operation — calls subprocess, never /chat.
@@ -49,6 +49,9 @@ class CodingAgentOrchestrator:
             model: LLM model override (empty = use tool's default)
             working_dir: Working directory for the coding tool
             data_scope: Privacy scope override (empty = auto-classify)
+            prompt_id: The agent asking (its turn's prompt_id); empty = the
+                one stamped on this thread.  The owner's permission and the
+                ribbon name it (see _execute_local).
 
         Returns:
             {success, output, tool, execution_time_s, task_type, error?}
@@ -61,7 +64,8 @@ class CodingAgentOrchestrator:
         if scope in ('edge_only', 'user_devices'):
             # Private — never leaves this device (or user's own devices)
             return self._execute_local(task, task_type, preferred_tool,
-                                        user_id, model, working_dir)
+                                        user_id, model, working_dir,
+                                        prompt_id=prompt_id)
 
         if not self._can_run_locally():
             # Node can't run locally — distribute with scope-aware sharding
@@ -69,7 +73,8 @@ class CodingAgentOrchestrator:
                                              user_id, model, working_dir, scope)
 
         return self._execute_local(task, task_type, preferred_tool,
-                                    user_id, model, working_dir)
+                                    user_id, model, working_dir,
+                                    prompt_id=prompt_id)
 
     def _classify_scope(self, task: str, working_dir: str,
                          override: str = '') -> str:
@@ -122,9 +127,39 @@ class CodingAgentOrchestrator:
 
     def _execute_local(self, task: str, task_type: str,
                         preferred_tool: str, user_id: str,
-                        model: str, working_dir: str) -> Dict:
-        """Execute locally via subprocess."""
+                        model: str, working_dir: str,
+                        prompt_id: str = '') -> Dict:
+        """Run one coding task on THIS computer.
+
+        Every local coding run starts here: the agent tool
+        (core.agent_tools.execute_coding_task), MCP `code`, POST
+        /coding/execute, a peer's shard (api.py) and `hart code`.  A coding run
+        writes files and, through an agentic CLI, runs commands, so it is
+        computer use and passes what every other computer-use dispatcher
+        (the shell tool, _handle_shell_command_tool, and the VLM loop)
+        already passes:
+          1. integrations.vlm.safety.computer_operation_refusal: never power,
+             reset, erase or format, and asks nobody about it;
+          2. integrations.vlm.safety.computer_control_block: the owner's
+             computer_control permission, asked through ConsentService when
+             absent (a daemon run does not wait);
+          3. integrations.vlm.activity_stream.current_run: the AI-control
+             ribbon and the companion window show the run while it happens
+             and close it after.
+        It works in vlm_adapter.resolve_task_workspace: the caller's
+        directory, else the agent's goal repo_path, else the user-data coding
+        workspace, never the process cwd.  Measured 2026-10-05: with no
+        working_dir the in-process backend worked in '.', the installed app's
+        own folder, leaving a 14 MB repo-map cache in C:\\Program Files
+        (x86)\\HevolveAI\\Nunba and creating folders inside the install.
+        """
         from .tool_router import CodingToolRouter
+        from integrations.vlm.safety import (
+            computer_control_block, computer_operation_refusal)
+
+        refusal = computer_operation_refusal(task)
+        if refusal:
+            return self._not_run(task_type, f'Coding task refused: {refusal}')
 
         router = CodingToolRouter()
         backend = router.route(task, task_type, preferred_tool)
@@ -140,15 +175,43 @@ class CodingAgentOrchestrator:
                          + ', '.join(TOOL_REGISTRY) + '.',
             }
 
+        agent, thread_user = _thread_identity()
+        agent = prompt_id or agent
+        refusal = computer_control_block(agent)
+        if refusal:
+            return self._not_run(task_type, refusal, tool=backend.name)
+
+        from integrations.vlm.vlm_adapter import resolve_task_workspace
+        working_dir = resolve_task_workspace(prompt_id=agent, explicit=working_dir)
+
         # Build context for the backend
-        context = {}
+        context = {'working_dir': working_dir}
         if model:
             context['model'] = model
-        if working_dir:
-            context['working_dir'] = working_dir
 
-        # Execute via subprocess (leaf operation, no /chat re-entry)
-        result = backend.execute(task, context)
+        # Execute (leaf operation, no /chat re-entry), announced as it runs
+        from integrations.vlm.activity_stream import current_run
+        run = current_run(user_id=user_id or thread_user or '',
+                          prompt_id=agent or '')
+        caption = f'Coding: {task[:60]}'
+        run.step(iteration=1, action='coding', phase='executing', caption=caption)
+        phase, error = 'failed', ''
+        try:
+            result = backend.execute(task, context)
+            if result.get('success'):
+                phase = 'completed'
+            else:
+                error = str(result.get('error') or 'the coding run did not succeed')
+        except Exception as e:
+            error = f'{type(e).__name__}: {e}'
+            raise
+        finally:
+            run.step(iteration=1, action='coding', phase=phase,
+                     caption=caption, error=error[:160])
+            # Closes only a run this call opened; inside a VLM run the loop
+            # still owns the ribbon and the ledger task.
+            run.finish(exit_reason='done' if phase == 'completed' else 'action_error',
+                       iteration=1, action='coding', error=error[:160])
         result['task_type'] = task_type
 
         self._record_benchmark(
@@ -190,6 +253,13 @@ class CodingAgentOrchestrator:
             pass  # EventBus optional — don't block on it
 
         return result
+
+    @staticmethod
+    def _not_run(task_type: str, reason: str, tool: str = 'none') -> Dict:
+        """A coding run that did not start: nothing ran, nothing to record."""
+        return {'success': False, 'output': '', 'tool': tool,
+                'task_type': task_type, 'execution_time_s': 0,
+                'error': reason}
 
     def _can_run_locally(self) -> bool:
         """Check if this node has sufficient compute for coding tools.
@@ -673,6 +743,16 @@ class CodingAgentOrchestrator:
         """Get benchmark dashboard data."""
         from .benchmark_tracker import get_benchmark_tracker
         return get_benchmark_tracker().get_summary()
+
+
+def _thread_identity():
+    """(prompt_id, user_id) stamped on this thread by the turn running it,
+    each None when absent (a CLI or route caller has no turn)."""
+    try:
+        from hartos.threadlocal import thread_local_data
+        return thread_local_data.get_prompt_id(), thread_local_data.get_user_id()
+    except Exception:
+        return None, None
 
 
 # ─── Module-level singleton ───

@@ -53,6 +53,9 @@ class TestComputeAwareRouting:
         assert orch._can_run_locally() is True
 
 
+# A local run passes the owner's computer_control permission first
+# (orchestrator._execute_local); these tests are about what follows.
+@pytest.mark.usefixtures('computer_control_granted')
 class TestExecuteLocal:
     @patch('integrations.coding_agent.tool_router.CodingToolRouter.route')
     @patch('integrations.coding_agent.benchmark_tracker.get_benchmark_tracker')
