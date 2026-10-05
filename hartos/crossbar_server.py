@@ -118,7 +118,7 @@ async def on_remote_desktop_signal(msg):
         pass
 
 
-async def on_compute_request(msg):
+async def on_compute_request(msg, subscribed_owner=None):
     """Handle compute relay request from phone behind NAT.
 
     Phone publishes to com.hertzai.hevolve.compute.request.{owner_id},
@@ -136,12 +136,20 @@ async def on_compute_request(msg):
     If the body contains a user_id that doesn't match the owner, the
     request is logged as suspicious and dropped.
     """
-    # The owner_id is set at subscription time (line 161) — it's the
-    # only user this node serves compute for. Reading it from env is
-    # safe because HEVOLVE_OWNER_USER_ID is set at boot, not by the
-    # WAMP peer.
-    owner_id = os.environ.get('HEVOLVE_OWNER_USER_ID', '')
+    # The owner is the one this handler was subscribed for
+    # (_subscribe_compute_relay), never the WAMP peer.  HEVOLVE_OWNER_USER_ID
+    # now follows sign-in, so once it no longer names the subscribed owner
+    # this node has changed hands and the old topic's requests are dropped
+    # until the session rejoins and subscribes for the new owner.
+    current_owner = os.environ.get('HEVOLVE_OWNER_USER_ID', '')
+    owner_id = subscribed_owner if subscribed_owner is not None else current_owner
     if not owner_id:
+        return
+    if subscribed_owner is not None and subscribed_owner != current_owner:
+        logging.warning(
+            "Compute relay: node owner changed from %s to %s since subscribing; "
+            "dropping a request on %s's topic until the WAMP session rejoins",
+            subscribed_owner, current_owner or '<none>', subscribed_owner)
         return
 
     try:
@@ -196,6 +204,25 @@ async def on_compute_request(msg):
             )
 
 
+async def _subscribe_compute_relay(session):
+    """Subscribe the compute relay for the user who owns this node NOW.
+
+    The owner is bound into the handler here, at subscription, because the
+    topic is that owner's.  Nunba keeps HEVOLVE_OWNER_USER_ID in step with
+    sign-in and sign-out, so reading it per message would run a request that
+    arrived on the previous owner's topic as the new owner.
+    """
+    owner_id = os.environ.get('HEVOLVE_OWNER_USER_ID', '')
+    if owner_id:
+        compute_topic = f"com.hertzai.hevolve.compute.request.{owner_id}"
+
+        async def _relay(msg, _owner=owner_id):
+            return await on_compute_request(msg, subscribed_owner=_owner)
+
+        await session.subscribe(_relay, compute_topic)
+        print(f"Subscribed to compute relay: {compute_topic}")
+
+
 @component.on_join
 async def joined(session, details):
     """Handles session join and subscription setup."""
@@ -219,14 +246,7 @@ async def joined(session, details):
 
     # Compute relay — same-user phone→HARTOS behind NAT
     try:
-        from integrations.social.models import get_db, User
-        # Subscribe to all active user compute topics
-        # For now, use a wildcard-style approach: subscribe to the user who owns this node
-        owner_id = os.environ.get('HEVOLVE_OWNER_USER_ID', '')
-        if owner_id:
-            compute_topic = f"com.hertzai.hevolve.compute.request.{owner_id}"
-            await session.subscribe(on_compute_request, compute_topic)
-            print(f"Subscribed to compute relay: {compute_topic}")
+        await _subscribe_compute_relay(session)
     except Exception as e:
         print(f"Compute relay subscription skipped: {e}")
 

@@ -1427,7 +1427,9 @@ class AgentDaemon:
                         f"Federation: epoch={fed_result.get('epoch')}, "
                         f"convergence={fed_result.get('convergence', 0):.3f}")
             except Exception as e:
-                logger.debug(f"Federation tick: {e}")
+                # Swallowed so the next tick can retry, but never silently: at
+                # DEBUG a loop failing every minute looked idle.
+                logger.warning(f"Federation tick failed: {e}", exc_info=True)
 
         t = threading.Thread(
             target=_runner, daemon=True, name='federation_tick')

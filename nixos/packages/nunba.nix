@@ -1,4 +1,8 @@
 { lib, pkgs
+, hartRev ? "unknown"  # HART OS short rev (flake.nix hartRev, the same value /etc/hart/image-rev
+                       # carries), passed by hart-nunba.nix so BUILD_INFO.txt below names the
+                       # HARTOS this Nunba was shipped inside. "unknown" only when a caller
+                       # does not pass it (hart-liquid-ui.nix's floor call).
 , hartSrc ? null   # Accepted only for call-site compatibility: hart-liquid-ui.nix
                    # and hart-nunba.nix both `callPackage` this file with
                    # `{ inherit hartSrc; }`, and callPackage passes the override
@@ -6,14 +10,14 @@
                    # "called with unexpected argument 'hartSrc'". The Nunba daemon
                    # is HARTOS-EXCLUDED — it fetches ONLY the Nunba repo, never the
                    # HART tree — so hartSrc is intentionally unused here.
-, nunbaRev ? "776c40797d702a62a78990efb1c39824c89e566f"  # Nunba HEAD carrying the
+, nunbaRev ? "4dbde90480859332f276117f440f3fb55f29f0c1"  # Nunba HEAD carrying the
                    # HART_NUNBA_SOCKET bind (main.py, commit cb849ba9). nunbaHash +
                    # npmDepsHash are now BOTH pinned for THIS rev (CI hash-pin R3,
                    # 2026-07-12); if the rev is bumped, re-pin all three in ONE commit
                    # (npm ci fails the lock-vs-deps integrity check if the rev and the
                    # lock drift apart).
-, nunbaHash ? "sha256-vTg24p5EQbYBPJO5ek8z2l9JQ4YODewrYzHMrjswR38="  # pinned 2026-08-14 for nunbaRev 776c4079 (nunba-hash-pin run 31810930513, build verified GREEN)
-, npmDepsHash ? "sha256-IpqZKwHw5v9lO2H+Wq2Jptru+5a2bVwk8DP+xKEINXQ="  # pinned 2026-08-14 for nunbaRev 776c4079 (nunba-hash-pin run 31810930513 round B); prefetch-npm-deps landing-page/package-lock.json
+, nunbaHash ? "sha256-A8x57XEtXqnpywZDVxu0jo+q4kwo9mazEtTQ2X2AElY="  # pinned 2026-10-05 for nunbaRev 4dbde904 (nunba-hash-pin dry run 37230598688, build verified GREEN)
+, npmDepsHash ? "sha256-mSce+t2+m46xpuz59Ng63U4vkbANa1oCbonPpo2E70M="  # pinned 2026-10-05 for nunbaRev 4dbde904 (nunba-hash-pin dry run 37230598688 round B); prefetch-npm-deps landing-page/package-lock.json
 , backendUrl ? "http://127.0.0.1:6777"
 }:
 
@@ -223,6 +227,22 @@ pkgs.stdenv.mkDerivation {
     mkdir -p $out/lib/nunba/landing-page
     ln -sfn ${nunbaStatic} $out/lib/nunba/landing-page/build
     ln -sfn ${nunbaStatic} $out/lib/nunba/static
+
+    # BUILD_INFO.txt: the SAME keys the Windows nightly ships beside Nunba.exe
+    # (since Nunba 99af812), so a node can say which Nunba it runs and which
+    # HARTOS it was shipped inside, and two installs can be diffed by one file.
+    # Measured gap 2026-10-05: the owner's PC answered BUILD_SHA/HARTOS_SHA from
+    # C:\\Program Files (x86)\\HevolveAI\\Nunba\\BUILD_INFO.txt in one read; the HART OS
+    # node (generation 13) had no such file under /nix/store/*-nunba-1.0.0/lib/nunba
+    # and its Nunba rev could only be recovered from this .nix. BUILD_SHA is the
+    # full Nunba sha; HARTOS_SHA is the short rev (what /etc/hart/image-rev holds);
+    # BUILD_TIME is not available in a reproducible Nix build and says so.
+    cat > $out/lib/nunba/BUILD_INFO.txt <<EOF
+BUILD_SHA=${nunbaRev}
+HARTOS_SHA=${hartRev}
+BUILD_TIME=reproducible-nix-build
+BUILD_PLATFORM=nixos
+EOF
 
     runHook postInstall
   '';

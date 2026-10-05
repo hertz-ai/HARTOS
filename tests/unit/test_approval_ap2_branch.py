@@ -177,8 +177,8 @@ def test_a_commerce_answer_is_refused_when_commerce_cannot_import(app, action):
     """Fail closed: with integrations.commerce.approvals unimportable, a
     commerce answer must not fall through to the consent record (which would
     write a consent row for the owner and answer as if applied)."""
-    import sys
-    with patch.dict(sys.modules, {'integrations.commerce.approvals': None}), \
+    from tests.unit.module_swap import swap_modules
+    with swap_modules({'integrations.commerce.approvals': None}), \
             patch('integrations.social.consent_service.ConsentService.'
                   'record_capability_decision') as record:
         resp = app.test_client().post('/api/agent/approval', json={

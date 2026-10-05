@@ -761,9 +761,13 @@ class HARTOnboardingWindow(Adw.ApplicationWindow):
 
         def _work():
             try:
-                from integrations.service_tools.model_onboarding import onboard
+                from integrations.service_tools.model_onboarding import (
+                    onboard, onboard_succeeded,
+                )
                 result = onboard(rec['model_name'], rec.get('quant', 'auto'))
-                ok = bool(result and result.get('success', result.get('status') == 'ok'))
+                # onboard() reports success as status 'ready'; testing 'ok'
+                # told the user a successful setup 'did not finish'.
+                ok = onboard_succeeded(result)
                 msg = ('Local AI ready. HART is yours.' if ok
                        else 'Setup did not finish; you can set it up later in Settings.')
             except Exception as e:

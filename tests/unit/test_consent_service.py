@@ -40,6 +40,24 @@ def test_request_consent_creates_record():
     assert c.agent_id is None
 
 
+def test_a_failed_up_sync_after_public_exposure_is_a_warning(caplog):
+    """The grant still stands (the up-sync is best-effort), but its failure
+    is visible.  RED before: `except Exception: pass`, so a user who made
+    their agents public saw them never appear, with no trace anywhere."""
+    import logging
+    with patch('integrations.social.services.UserService.get_owned_agents',
+               return_value=[MagicMock(id='agent-1')]), \
+         patch('integrations.social.federation.federation.sync_agent_to_parent',
+               side_effect=RuntimeError('central unreachable')), \
+         caplog.at_level(logging.WARNING):
+        with db_session() as db:
+            c = ConsentService.grant_consent(db, 'u1', 'public_exposure')
+    assert c.granted is True
+    assert any('central unreachable' in r.getMessage()
+               and r.levelno >= logging.WARNING for r in caplog.records), \
+        [r.getMessage() for r in caplog.records]
+
+
 def test_request_consent_returns_existing():
     with db_session() as db:
         c1 = ConsentService.request_consent(db, 'u1', 'data_access')
