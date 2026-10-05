@@ -15,7 +15,8 @@ import re
 import threading
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any
-from core.constants import BOOKKEEPING_TOOLS, tool_reply_failed
+from core.constants import (BOOKKEEPING_TOOLS, HISTORICAL_TOOL_PLACEHOLDER,
+                            tool_reply_failed)
 from core.session_cache import TTLCache
 
 try:
@@ -1505,6 +1506,27 @@ def resolve_receipt(user_prompt: str, evidence) -> Optional[tuple]:
     return messages, index, message, agent
 
 
+def evidence_sources(group_chat, agents):
+    """The message lists a receipt can live in, each with its address.
+
+    Yields ``(source, messages)``: ``source`` is None for the group log, or
+    ``{'source': 'buffer', 'agent': <name>, 'peer': <name>}`` for one
+    participant's pairwise buffer -- the address resolve_receipt reads a
+    receipt back from.  The group log comes first.  The ONE definition: the
+    REUSE fabrication gate and its receipt finder read it through
+    reuse_recipe._reuse_evidence_sources, which delegates here, and
+    derive_completion_evidence below reads it for CREATE.
+    """
+    yield None, getattr(group_chat, 'messages', None) or []
+    for ag in (agents or []):
+        conv = getattr(ag, '_oai_messages', None)
+        if isinstance(conv, dict):
+            for peer, msgs in conv.items():
+                yield ({'source': 'buffer',
+                        'agent': getattr(ag, 'name', None),
+                        'peer': getattr(peer, 'name', peer)}, msgs)
+
+
 def tool_call_names(msg_lists) -> Dict[str, str]:
     """call_id -> function name, read off the PROPOSING assistant message.
 
@@ -1607,7 +1629,7 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
                           message: dict) -> bool:
     """Whether a role='tool' receipt shows the action's work being done.
 
-    Three things a tool message can carry that are not that work:
+    Four things a tool message can carry that are not that work:
 
       * a FAILED reply (core.constants.tool_reply_failed): the executor's
         "Error: ...", the tool_logging envelope, or a TOOL_FAILURE_RESULTS
@@ -1622,6 +1644,11 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
         (action_named_tools): an action that names a tool is done by that
         tool's work.  send_message_to_user's "Message sent" completed
         "execute_coding_task: read error log file ..." (#147).
+      * the PLACEHOLDER helper.py back-fills for a call that returned nothing
+        (core.constants.HISTORICAL_TOOL_PLACEHOLDER).  tool_reply_failed does
+        not cover it by design and the REUSE readers skip it on their own;
+        here it is skipped for the same reason, which matters most for
+        derive_completion_evidence, where no model chose the message.
 
     An aggregate message (autogen's ``tool_responses``) is a receipt when any
     one of its results qualifies.  A result whose function cannot be resolved
@@ -1640,7 +1667,8 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
         body = result.get('content')
         if body is None:
             body = message.get('content')
-        if not str(body or '').strip() or tool_reply_failed(body):
+        if (not str(body or '').strip() or tool_reply_failed(body)
+                or HISTORICAL_TOOL_PLACEHOLDER in str(body)):
             continue
         name = names.get(result.get('tool_call_id') or message.get('tool_call_id'))
         if name in BOOKKEEPING_TOOLS and name.lower() not in action_text:
@@ -1690,6 +1718,75 @@ def _verifier_completion_has_conversation_evidence(
     return (agent is None
             and message.get('role') == 'assistant'
             and message.get('name') == 'Assistant')
+
+
+def derive_completion_evidence(user_prompt: str,
+                               action_id: int) -> Optional[dict]:
+    """The action's own tool receipt, found by the pipeline.
+
+    A completion has to cite a result from this action's dispatch window
+    (_verifier_completion_has_conversation_evidence).  REUSE finds that result
+    itself (reuse_recipe._reuse_completion_evidence); CREATE left it to the
+    verifier MODEL, which has to count message indexes in a transcript of
+    hundreds of messages.  Measured live on the 4B, 2026-10-05 23:53 (task
+    #162): action 1, "get_data_by_key: read key tutor.progress ...", ran
+    get_data_by_key and got a real answer; the verdict cited message 14, a
+    get_chat_history reply; and every action of the run was refused three
+    times and GAVE_UP -- no recipe banked, no agent built.
+
+    This only LOCATES a candidate.  Every tool message, newest first, in the
+    group log and then each participant's buffer (evidence_sources), is judged
+    by the very gate a cited receipt faces, so a failed call, a note saved to
+    memory, another tool's reply, a placeholder or another action's result is
+    no receipt here either.  Returns the evidence in the shape resolve_receipt
+    reads, or None.  Only a TOOL receipt is derived: an action that names no
+    tool is judged on the written answer its verdict cites, as before.  It
+    never raises -- it sits on the verdict path -- and a miss says what was
+    looked at.
+    """
+    try:
+        # An action that names no tool is done by its written answer, which
+        # the verdict cites (REUSE splits the same way); a tool reply in its
+        # window is not that action's receipt.
+        if not _tools_this_action_names(user_prompt, action_id)[1]:
+            return None
+        group_chat = get_registered_groupchat(user_prompt)
+        if group_chat is None:
+            return None
+        looked = []
+        for source, msgs in evidence_sources(
+                group_chat, getattr(group_chat, 'agents', None)):
+            if not isinstance(msgs, list):
+                continue
+            where = ('group log' if source is None
+                     else f"{source['agent']}->{source['peer']} buffer")
+            tool_messages = 0
+            for index in range(len(msgs) - 1, -1, -1):
+                msg = msgs[index]
+                if not isinstance(msg, dict) or msg.get('role') != 'tool':
+                    continue
+                tool_messages += 1
+                candidate = {**(source or {}), 'message_index': index,
+                             'kind': 'tool_receipt'}
+                if _verifier_completion_has_conversation_evidence(
+                        user_prompt, action_id, {'evidence': candidate}):
+                    logger.info(
+                        "[COMPLETION-RECEIPT] action %s in %s: the verdict "
+                        "cited no receipt the gate accepts; the action's own "
+                        "tool result at %s message %s stands in",
+                        action_id, user_prompt, where, index)
+                    return candidate
+            looked.append(f"{where}(len={len(msgs)}, "
+                          f"tool_messages={tool_messages})")
+        logger.warning(
+            "[COMPLETION-RECEIPT] action %s in %s: no tool result of this "
+            "action's work in %s", action_id, user_prompt,
+            ', '.join(looked) or 'any list')
+    except Exception:
+        logger.warning(
+            "[COMPLETION-RECEIPT] action %s in %s: the receipt search failed",
+            action_id, user_prompt, exc_info=True)
+    return None
 
 
 def _record_verifier_evidence(user_prompt: str, action_id: int,
@@ -1961,8 +2058,18 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
         return {'action': 'allow', 'message': None}
 
     if status in ('completed', 'success'):
+        # The citation is the verifier model's to get right, and a small
+        # model's to get wrong; the receipt is the pipeline's to find.  A
+        # citation the gate accepts is used as cited, so a model that does
+        # count the transcript is unchanged.  The verdict still has to name
+        # THIS action (claimed_action_id below).
+        evidence = json_obj.get('evidence')
+        if not _verifier_completion_has_conversation_evidence(
+                user_prompt, current_action_id, json_obj):
+            evidence = derive_completion_evidence(
+                user_prompt, current_action_id) or evidence
         if not commit_verified_action_completion(
-                user_prompt, current_action_id, json_obj.get('evidence'),
+                user_prompt, current_action_id, evidence,
                 "hook tracking lifecycle_hook_process_verifier_response",
                 claimed_action_id=json_obj.get('action_id')):
             # Bounded, on the same per-action counter a 'pending' verdict

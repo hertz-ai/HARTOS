@@ -5390,15 +5390,13 @@ def _reuse_evidence_sources(group_chat, agents):
     ``{'source': 'buffer', 'agent': <name>, 'peer': <name>}`` for one
     participant's pairwise buffer -- the address lifecycle_hooks.resolve_receipt
     reads a receipt back from.  The group log comes first.
+
+    The ONE definition lives in hartos.lifecycle_hooks.evidence_sources, which
+    CREATE's receipt finder (derive_completion_evidence) reads too; this name
+    stays for its callers here.
     """
-    yield None, getattr(group_chat, 'messages', None) or []
-    for ag in (agents or []):
-        conv = getattr(ag, '_oai_messages', None)
-        if isinstance(conv, dict):
-            for peer, msgs in conv.items():
-                yield ({'source': 'buffer',
-                        'agent': getattr(ag, 'name', None),
-                        'peer': getattr(peer, 'name', peer)}, msgs)
+    from hartos.lifecycle_hooks import evidence_sources
+    return evidence_sources(group_chat, agents)
 
 
 def _reuse_evidence_msg_lists(group_chat, agents):
