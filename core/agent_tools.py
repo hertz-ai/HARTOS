@@ -2605,7 +2605,9 @@ def build_core_tool_closures(ctx):
             result = {'local': {}, 'hive': {}}
 
             if task_type == 'all':
-                delta = tracker.export_learning_delta()
+                # None until a tool has MIN_SAMPLES rows under the current
+                # success rule (benchmark_tracker.SUCCESS_RULE).
+                delta = tracker.export_learning_delta() or {}
                 result['local'] = delta.get('coding_benchmarks', {})
             else:
                 best = tracker.get_best_tool(task_type)
