@@ -14,9 +14,10 @@ frontier inference tier would create a SECOND, parallel `claude -p` invocation
 beside the copilot's — the parallel-path trap. One backend, two consumers, the
 same pattern as one _tool_impls behind several MCP transports.
 
-Pure stdlib (subprocess/os) at import so both a bare daemon script and the
-backend can import it without dragging in heavy deps.  core.subprocess_safe is
-the one import-time exception and costs nothing.  The egress accounting below
+Pure stdlib at import so both a bare daemon script and the backend can
+import it without dragging in heavy deps.  core.subprocess_safe (run_bounded,
+the bounded launch every run goes through) is the one import-time exception
+and costs nothing.  The egress accounting below
 (core.llm_outbound_logger, core.circuit_breaker, security.dlp_engine) is
 imported inside invoke_claude, on the call, and each of those modules is
 stdlib-only at import too.
@@ -36,11 +37,10 @@ lapsed login invisible to the breaker.
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import time
 
-from core.subprocess_safe import no_window_kwargs
+from core.subprocess_safe import run_bounded
 
 logger = logging.getLogger('hartos_copilot')
 
@@ -247,21 +247,25 @@ def _spawn(prompt, *, mode, cwd, timeout_s, model, system, extra_args):
     except ValueError as e:
         return {'ok': False, 'error': str(e), 'category': 'other'}
     try:
-        # claude is a console-subsystem binary. Nunba.exe is GUI-subsystem and
-        # owns no console, so spawning it bare makes Windows allocate a fresh
-        # VISIBLE console for the run's lifetime — a cmd window flashing on the
-        # user's desktop. no_window_kwargs() returns {} off win32.
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                              timeout=timeout_s, **no_window_kwargs())
-        return {'ok': proc.returncode == 0, 'returncode': proc.returncode,
-                'stdout': (proc.stdout or ''), 'stderr': (proc.stderr or '')}
+        # run_bounded, not subprocess.run(timeout=...).  An agentic run starts
+        # tool processes of its own; when the timeout passes, subprocess.run
+        # kills only claude and then waits, with no timeout, for output pipes
+        # a surviving tool process still holds open, so the caller waited as
+        # long as that process lived (D35/D36 in core.subprocess_safe;
+        # tests/unit/test_claude_launcher_is_bounded.py).  run_bounded kills
+        # the whole tree and returns.  It also hides the console window:
+        # claude is a console binary, Nunba.exe owns no console, and a bare
+        # spawn flashes a cmd window on the user's desktop.
+        result = run_bounded(cmd, timeout=timeout_s, cwd=cwd)
     except FileNotFoundError:
         return {'ok': False, 'error': 'claude not on PATH', 'category': 'notfound'}
-    except subprocess.TimeoutExpired:
-        return {'ok': False, 'error': 'timed out after %ss' % timeout_s,
-                'category': 'timeout'}
     except Exception as e:  # never let one bad run take down the caller
         return {'ok': False, 'error': str(e), 'category': 'other'}
+    if result.timed_out:
+        return {'ok': False, 'error': 'timed out after %ss' % timeout_s,
+                'category': 'timeout'}
+    return {'ok': result.returncode == 0, 'returncode': result.returncode,
+            'stdout': result.stdout or '', 'stderr': result.stderr or ''}
 
 
 def classify_failure(result):

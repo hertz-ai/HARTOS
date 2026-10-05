@@ -33,6 +33,7 @@ import pytest  # noqa: E402
 
 import integrations.coding_agent.claude_code_backend as cc  # noqa: E402
 import integrations.agent_engine.model_registry as mr  # noqa: E402
+from core.subprocess_safe import BoundedResult  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -49,11 +50,8 @@ def _switch(monkeypatch):
 
 
 def _fake_run(stdout='ok'):
-    class _P:
-        returncode = 0
-    p = _P()
-    p.stdout, p.stderr = stdout, ''
-    return p
+    """What the bounded runner hands back for a run that completed."""
+    return BoundedResult(0, stdout, '')
 
 
 # ── the spawn primitive ──────────────────────────────────────────────────────
@@ -61,7 +59,7 @@ def _fake_run(stdout='ok'):
 @pytest.mark.parametrize('mode', ['inference', 'agentic'])
 def test_off_refuses_at_the_spawn_and_starts_no_process(mode):
     cc.set_copilot_enabled(False)
-    with patch('subprocess.run', return_value=_fake_run()) as sr:
+    with patch.object(cc, 'run_bounded', return_value=_fake_run()) as sr:
         r = cc.invoke_claude('2+2?', mode=mode)
     sr.assert_not_called()
     assert r['ok'] is False and r['category'] == 'off'
@@ -69,7 +67,7 @@ def test_off_refuses_at_the_spawn_and_starts_no_process(mode):
 
 
 def test_on_spawns_as_before():
-    with patch('subprocess.run', return_value=_fake_run('4')) as sr:
+    with patch.object(cc, 'run_bounded', return_value=_fake_run('4')) as sr:
         r = cc.invoke_claude('2+2?', mode='inference')
     sr.assert_called_once()
     assert r['ok'] and r['stdout'] == '4'
@@ -92,7 +90,7 @@ def test_the_env_pin_cannot_spawn_what_the_human_revoked(monkeypatch):
     """
     cc.set_copilot_enabled(False)
     monkeypatch.setenv('HARTOS_COPILOT_ENABLED', '1')
-    with patch('subprocess.run', return_value=_fake_run()) as sr:
+    with patch.object(cc, 'run_bounded', return_value=_fake_run()) as sr:
         r = cc.invoke_claude('q', mode='inference')
     sr.assert_not_called()
     assert not r['ok']
@@ -147,7 +145,7 @@ def _client():
 
 def test_shim_answers_503_with_no_process_when_off():
     cc.set_copilot_enabled(False)
-    with patch('subprocess.run', return_value=_fake_run()) as sr:
+    with patch.object(cc, 'run_bounded', return_value=_fake_run()) as sr:
         resp = _client().post('/api/claude/v1/chat/completions',
                               json={'messages': [{'role': 'user', 'content': 'q'}]})
     sr.assert_not_called()
@@ -164,7 +162,7 @@ def test_daemon_run_claude_reports_the_switch_and_spawns_nothing():
     dae = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(dae)
     cc.set_copilot_enabled(False)
-    with patch('subprocess.run', return_value=_fake_run()) as sr:
+    with patch.object(cc, 'run_bounded', return_value=_fake_run()) as sr:
         out = dae.run_claude('do it')
     sr.assert_not_called()
     assert out['ok'] is False and 'switched off' in out['error']
