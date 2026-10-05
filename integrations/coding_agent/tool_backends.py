@@ -160,20 +160,66 @@ class KiloCodeBackend(CodingToolBackend):
 
 
 class ClaudeCodeBackend(CodingToolBackend):
-    """Claude Code CLI wrapper — Proprietary (Anthropic Commercial ToS).
+    """Claude Code as a coding backend — Proprietary (Anthropic Commercial ToS).
 
-    User must install themselves and provide their own ANTHROPIC_API_KEY.
+    The user installs it and signs in themselves.  Every run starts in
+    claude_code_backend.invoke_claude, the one place a `claude -p` starts on
+    this node: the owner's copilot switch, the DLP scrub of what leaves the
+    device, the llm_outbound.jsonl record and the provider breaker are all
+    there.  This backend used to spawn claude itself, a second launcher with
+    none of them.  Measured 2026-10-05 on the owner's desktop: 23 runs in 25
+    hours while the switch was off (marker since 2026-09-16) and no outbound
+    record of any of them.
+
+    The base class's metered-key stripping (get_env, for 'hive'/'idle' task
+    sources) does not reach these runs; it never did in practice, since no
+    code sets _CURRENT_TASK_SOURCE.
     """
 
     name = 'claude_code'
     binary = 'claude'
     strengths = ['code_review', 'debugging', 'terminal_workflows', 'complex_reasoning']
 
+    #: What a coding run asks the launcher for beyond the prompt and model.
+    _EXTRA_ARGS = ('--output-format', 'json')
+
+    def is_installed(self) -> bool:
+        """MAY and CAN: the launcher's own answer (switch on, binary
+        resolves, a login exists), so the router never offers a run the
+        launcher would refuse."""
+        from .claude_code_backend import claude_code_available
+        return claude_code_available()
+
     def build_command(self, task: str, context: Optional[Dict] = None) -> List[str]:
-        cmd = [self.binary, '-p', task, '--output-format', 'json', '--print']
+        """The argv invoke_claude starts for this task (before its scrub)."""
+        cmd = [self.binary, '-p', task]
         if context and context.get('model'):
             cmd.extend(['--model', context['model']])
+        cmd.extend(self._EXTRA_ARGS)
         return cmd
+
+    def execute(self, task: str, context: Optional[Dict] = None,
+                timeout: int = 300) -> Dict:
+        """One agentic Claude Code run through invoke_claude (full tools,
+        cwd = the task's working_dir)."""
+        from .claude_code_backend import invoke_claude
+        context = context or {}
+        start = time.time()
+        run = invoke_claude(task, mode='agentic',
+                            cwd=context.get('working_dir') or None,
+                            timeout_s=timeout,
+                            model=context.get('model') or None,
+                            extra_args=list(self._EXTRA_ARGS))
+        if 'returncode' in run:      # the run completed, whatever its exit code
+            result = self.parse_output(run.get('stdout') or '',
+                                       run.get('stderr') or '', run['returncode'])
+        else:                        # refused or never ran: switch, binary, timeout
+            result = {'success': False, 'output': '',
+                      'error': run.get('error') or 'claude run failed',
+                      'category': run.get('category')}
+        result['tool'] = self.name
+        result['execution_time_s'] = round(time.time() - start, 2)
+        return result
 
     def parse_output(self, stdout: str, stderr: str, returncode: int) -> Dict:
         try:
