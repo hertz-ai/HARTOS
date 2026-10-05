@@ -476,11 +476,16 @@ class TestTheLessonIsFoundWhenTheVerdictCitesTheWrongMessage(_ProseHarness):
         self._live_log()
         self._assert_completed_on_the_lesson(self._hook(self._verdict()))
 
-    def test_a_lesson_that_ends_with_a_handoff_is_still_the_lesson(self):
+    def test_a_lesson_that_also_tags_the_verifier_is_routing_not_the_lesson(self):
+        """One message that teaches AND tags the verifier is addressed to the
+        verifier, as REUSE reads it (core.constants.AGENT_MENTIONS); the
+        pipeline does not guess which part is the work.  The lesson comes in a
+        message of its own, as the live ones do."""
         self._set_log([self.dispatch, _assistant(_LESSON + '\n\n' + _HANDOFF)])
+        self.assertIsNone(lh.derive_completion_evidence(self.UP, 1))
         result = self._hook(self._wrong_citation())
-        self.assertEqual(result['action'], 'force_fallback')
-        self.assertEqual(self._recorded()[0]['evidence']['message_index'], 1)
+        self.assertEqual(result['action'], 'force_completion')
+        self.assertEqual(self._recorded(), [])
 
     def test_a_lesson_sent_to_the_user_with_the_message_tag_is_the_lesson(self):
         tagged = '@user {"message2user": "' + _LESSON.replace('\n', ' ') + '"}'

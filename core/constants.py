@@ -1498,6 +1498,18 @@ BOOKKEEPING_TOOLS: frozenset = frozenset({
     'get_user_id', 'get_prompt_id', 'get_chat_history', 'request_tools',
 })
 
+# The agents the Assistant hands work to.  A message that tags one of them is
+# addressed to that agent, never to the person: routing, not an answer.
+# Lowercase, to be compared against lowercased text.  Read by the completion
+# gate's written-answer rule (lifecycle_hooks.is_written_answer).  The REUSE
+# loop (hartos.reuse_recipe._REUSE_AGENT_MENTIONS) and send_message_to_user
+# (core.agent_tools) carry the same five literally -- the REUSE module's
+# extract-and-exec tests need its constants literal -- and
+# tests/unit/test_written_answer_in_a_native_group_log.py pins the REUSE copy
+# equal to this one.
+AGENT_MENTIONS: tuple = ("@statusverifier", "@status verifier", "@verification",
+                         "@helper", "@executor")
+
 # How much of what a tool OBSERVED may ride back in its return string.
 #
 # Same family as the failure strings above, hence the same home: both decide

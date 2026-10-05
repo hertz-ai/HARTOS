@@ -15,8 +15,8 @@ import re
 import threading
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any
-from core.constants import (BOOKKEEPING_TOOLS, HISTORICAL_TOOL_PLACEHOLDER,
-                            tool_reply_failed)
+from core.constants import (AGENT_MENTIONS, BOOKKEEPING_TOOLS,
+                            HISTORICAL_TOOL_PLACEHOLDER, tool_reply_failed)
 from core.session_cache import TTLCache
 
 try:
@@ -1718,13 +1718,6 @@ def _verifier_completion_has_conversation_evidence(
     return agent is None and is_written_answer(message)
 
 
-# The Assistant hands work to other agents by tagging them; a message that
-# opens that way is routing, not an answer.
-_HANDOFF_TO_AGENT = re.compile(
-    r'@(?:Helper|Executor|StatusVerifier|ChatInstructor|UserProxy)\b',
-    re.IGNORECASE)
-
-
 # The roles the Assistant's own message carries in a group log.  A plain reply
 # is 'user' there -- autogen's manager stores what it RECEIVED from a speaker
 # as 'user' -- and a message that carries tool_calls is 'assistant'; a log
@@ -1742,18 +1735,22 @@ def is_written_answer(message) -> bool:
     completion gate, the CREATE derivation below and REUSE's receipt finder
     (reuse_recipe._reuse_completion_evidence) all ask this.
 
-    It is the Assistant's (the seat name, in either role a log holds it), not a
-    handoff to another agent (``@Helper ...``, ``@StatusVerifier ...``), not a
-    control JSON (the Assistant's own ``{"status": ...}`` report), not the
-    dispatch echoed back (a seat name does not always survive a log, and a
-    dispatch is the pipeline's text, never the work) and not empty.  A reply
-    tagged to the person (``@user {"message2user": ...}``) is an answer."""
+    It is the Assistant's (the seat name, in either role a log holds it), not
+    the dispatch echoed back (a seat name does not always survive a log, and a
+    dispatch is the pipeline's text, never the work), not a control JSON (the
+    Assistant's own ``{"status": ...}`` report) and not routing: a message that
+    tags another agent (core.constants.AGENT_MENTIONS: ``@Helper``,
+    ``@StatusVerifier``...) is addressed to that agent whatever else it says,
+    the way REUSE reads it.  "Step 1 done. @StatusVerifier please verify." is
+    a note, and the pipeline appends its memory-skeleton line to exactly such
+    messages (create_recipe.state_transition).  A reply tagged to the person
+    (``@user {"message2user": ...}``) is an answer."""
     if not (isinstance(message, dict) and message.get('name') == 'Assistant'
             and message.get('role') in _ASSISTANT_WRITTEN_ROLES):
         return False
     text = str(message.get('content') or '').strip()
-    if (not text or text == 'TERMINATE' or _HANDOFF_TO_AGENT.match(text)
-            or _DISPATCH_MARKER.match(text)):
+    if (not text or text == 'TERMINATE' or _DISPATCH_MARKER.match(text)
+            or any(mention in text.lower() for mention in AGENT_MENTIONS)):
         return False
     return not (text.startswith('{') and '"status"' in text)
 

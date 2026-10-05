@@ -160,6 +160,18 @@ class TestWhatIsNotTheAssistantsAnswerInARealLog(_Harness):
     def test_a_handoff_to_another_agent_is_not_an_answer(self):
         self.assertIsNone(self._derived([('Assistant', _HANDOFF)]))
 
+    def test_a_message_that_tags_an_agent_is_routing_whatever_else_it_says(self):
+        """The scripted create loop's shape (test_create_loop_end_to_end,
+        'a note to self'): the Assistant reports on a step and tags the next
+        agent.  The pipeline appends its memory-skeleton line to such messages
+        and REUSE reads any tag as 'addressed to an agent', so a lesson that
+        also tags the verifier is routing too: the lesson goes in a message of
+        its own, as the live ones do."""
+        for note in ('Step 1 done. @StatusVerifier please verify.',
+                     'Working on step 1. @Helper please save step 1.',
+                     _LESSON + NL + NL + _HANDOFF):
+            self.assertIsNone(self._derived([('Assistant', note)]), note)
+
     def test_the_assistants_own_status_json_is_not_an_answer(self):
         self.assertIsNone(self._derived([('Assistant', _VERDICT)]))
 
@@ -322,6 +334,28 @@ class TestReuseAdvancesOnTheLesson(_ReuseOnARealLog, unittest.TestCase):
         self.assertEqual(self.committed,
                          [{'message_index': 1, 'kind': 'user_visible_result'}])
         self.assertEqual(rr.user_tasks[KEY].current_action, 2)
+
+
+class TestTheMentionListIsOneList(unittest.TestCase):
+    """"Is this message addressed to an agent" has one answer.  REUSE's loop
+    and send_message_to_user keep the same five literally (the REUSE module's
+    extract-and-exec tests need its constants literal), so they are pinned to
+    the one in core.constants that the gate reads."""
+
+    def test_reuse_reads_the_agents_the_gate_reads(self):
+        from core.constants import AGENT_MENTIONS
+        self.assertEqual(tuple(rr._REUSE_AGENT_MENTIONS), AGENT_MENTIONS)
+
+    def test_source_guard_send_message_to_user_reads_the_same_five(self):
+        import ast
+        from core.constants import AGENT_MENTIONS
+        path = os.path.join(_ROOT, 'core', 'agent_tools.py')
+        tree = ast.parse(open(path, encoding='utf-8').read())
+        found = [ast.literal_eval(node.value) for node in ast.walk(tree)
+                 if isinstance(node, ast.Assign)
+                 and any(getattr(t, 'id', None) == '_AGENT_MENTIONS'
+                         for t in node.targets)]
+        self.assertEqual([tuple(v) for v in found], [AGENT_MENTIONS])
 
 
 if __name__ == '__main__':
