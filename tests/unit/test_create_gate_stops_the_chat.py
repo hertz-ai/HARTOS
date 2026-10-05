@@ -209,7 +209,7 @@ class TestAnOrphanedToolCallIsSettled:
         t = threading.Thread(target=lambda: other.append(threading.get_ident()))
         t.start()
         t.join()
-        cr._TURNS_IN_FLIGHT[s.up] = other[0]
+        cr._TURNS_IN_FLIGHT[s.up] = {other[0]: 1}
         try:
             reply = cr.get_response_group(s.user_id, 'and again', s.prompt_id)
         finally:
@@ -226,12 +226,13 @@ def test_the_turn_marker_is_per_session_and_re_entrant():
     so the same thread entering again is still the one turn, and only a
     DIFFERENT thread counts as a turn in flight."""
     up = 'marker_probe_session'
+    me = threading.get_ident()
     assert not cr._another_turn_in_flight(up)
     with cr._turn_in_flight(up):
         assert not cr._another_turn_in_flight(up)
         with cr._turn_in_flight(up):
-            assert cr._TURNS_IN_FLIGHT[up] == threading.get_ident()
-        assert cr._TURNS_IN_FLIGHT[up] == threading.get_ident(), \
+            assert cr._TURNS_IN_FLIGHT[up] == {me: 2}
+        assert cr._TURNS_IN_FLIGHT[up] == {me: 1}, \
             'the inner exit must not clear the outer turn'
         seen = []
         t = threading.Thread(target=lambda: seen.append(cr._another_turn_in_flight(up)))
@@ -239,6 +240,66 @@ def test_the_turn_marker_is_per_session_and_re_entrant():
         t.join()
         assert seen == [True]
     assert up not in cr._TURNS_IN_FLIGHT
+
+
+def test_a_turn_that_ends_does_not_unmark_a_turn_still_running():
+    """Review of ff160f057 (2026-10-05): with ONE owner per session, three
+    overlapping /chat requests emptied the table when the first returned, and
+    the third request then settled the second's live tool call.  Every running
+    thread is counted on its own."""
+    up = 'marker_overlap_probe'
+    first_in, first_may_leave, first_left = (threading.Event(), threading.Event(),
+                                             threading.Event())
+    second_in, second_may_leave = threading.Event(), threading.Event()
+
+    def first():
+        with cr._turn_in_flight(up):
+            first_in.set()
+            first_may_leave.wait(10)
+        first_left.set()
+
+    def second():
+        with cr._turn_in_flight(up):
+            second_in.set()
+            second_may_leave.wait(10)
+
+    t1, t2 = threading.Thread(target=first), threading.Thread(target=second)
+    t1.start()
+    assert first_in.wait(10)
+    t2.start()
+    assert second_in.wait(10)
+    first_may_leave.set()
+    assert first_left.wait(10)
+    try:
+        # This thread is the third request: the second turn is still running.
+        assert cr._another_turn_in_flight(up), (
+            'the first turn ending unmarked the second, still running')
+    finally:
+        second_may_leave.set()
+        t1.join(10)
+        t2.join(10)
+    assert not cr._another_turn_in_flight(up)
+    assert up not in cr._TURNS_IN_FLIGHT
+
+
+def test_the_settle_reaches_every_agents_own_history(session):
+    """The model reads each agent's own history, not the group list, and there
+    the orphaned call was still the newest assistant tool call, which
+    ToolMessageHandler leaves alone as 'active'.  The settle goes where
+    run_chat puts a reply: through the manager to every agent."""
+    s = session
+    a1, a2 = MagicMock(), MagicMock()
+    a1.name, a2.name = 'Assistant', 'Helper'
+    s.group_chat.agents = [a1, a2]
+    manager = cr.user_agents[s.up][4]
+    cr.get_response_group(s.user_id, 'ok, a philosophical one', s.prompt_id)
+    sent_to = [c.args[1] for c in manager.send.call_args_list]
+    assert sent_to == [a1, a2], manager.send.call_args_list
+    for c in manager.send.call_args_list:
+        msg = c.args[0]
+        assert msg['role'] == 'tool'
+        assert h.answered_call_ids(msg) == {'call_memo_1'}
+        assert c.kwargs == {'request_reply': False, 'silent': True}
 
 
 class TestAStubActionReadsAsItsText:

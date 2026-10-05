@@ -20,9 +20,8 @@ finished agents.  Both listing endpoints compute
 is published as an active agent.
 
 Why 'pending' and not a new token: the codebase already uses 'pending' for
-not-done in this exact vocabulary — create_recipe.py:2208 documents
-``{"status":"completed" | "pending"}`` and the salvage stub's OWN action
-literal already carries ``'status': 'pending'``.  No new vocabulary.
+not-done in this exact vocabulary — create_recipe.py documents
+``{"status":"completed" | "pending"}`` for the verifier.  No new vocabulary.
 
 AST-level so it cannot be defeated by moving code, and so it needs no Flask
 app / heavy import.  This is a literal-value defect; the literal is what we pin.

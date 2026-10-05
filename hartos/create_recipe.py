@@ -817,46 +817,57 @@ class SubscriptionHandler:
 from hartos.helper import has_pending_tool_calls  # noqa: E402
 
 
-# The thread running a session's turn, by user_prompt (recipe() marks it).
-# get_response_group re-enters itself (safe_action_boundary_check, the
-# flow-increment sites), so the SAME thread entering again is still the one
-# turn; only a different thread is "another turn in flight".
+# Every thread running a session's turn, by user_prompt (recipe() marks
+# them), each with how deep it has re-entered.  get_response_group re-enters
+# itself (safe_action_boundary_check, the flow-increment sites), so the SAME
+# thread entering again is still its one turn; any OTHER thread in the set is
+# "another turn in flight".  A set, not one owner: with one owner, three
+# overlapping requests for one session emptied the table when the first
+# returned, and the third settled the second's live tool call (review of
+# ff160f057, 2026-10-05).
 _TURNS_IN_FLIGHT = {}
 _TURNS_IN_FLIGHT_LOCK = threading.Lock()
 
 
 @contextlib.contextmanager
 def _turn_in_flight(user_prompt):
-    """Mark this thread as the one running ``user_prompt``'s turn for the
-    duration of the block.  Re-entrant: an inner block on the same thread
-    neither replaces nor clears the outer mark."""
+    """Mark this thread as running ``user_prompt``'s turn for the duration
+    of the block.  Re-entrant: an inner block on the same thread deepens the
+    mark and leaving it only undoes its own level; every thread is counted
+    on its own, so one leaving never clears another's."""
     me = threading.get_ident()
     with _TURNS_IN_FLIGHT_LOCK:
-        mine = _TURNS_IN_FLIGHT.get(user_prompt) is None
-        if mine:
-            _TURNS_IN_FLIGHT[user_prompt] = me
+        running = _TURNS_IN_FLIGHT.setdefault(user_prompt, {})
+        running[me] = running.get(me, 0) + 1
     try:
         yield
     finally:
-        if mine:
-            with _TURNS_IN_FLIGHT_LOCK:
-                if _TURNS_IN_FLIGHT.get(user_prompt) == me:
-                    del _TURNS_IN_FLIGHT[user_prompt]
+        with _TURNS_IN_FLIGHT_LOCK:
+            running = _TURNS_IN_FLIGHT.get(user_prompt)
+            if running is not None:
+                depth = running.get(me, 0) - 1
+                if depth > 0:
+                    running[me] = depth
+                else:
+                    running.pop(me, None)
+                    if not running:
+                        del _TURNS_IN_FLIGHT[user_prompt]
 
 
 def _another_turn_in_flight(user_prompt):
     """True when a thread other than this one is running ``user_prompt``'s
     turn right now.  The per-user lock is not held across LLM calls
-    (hart_intelligence_entry chat()), so two /chat requests for one session
-    can overlap, and that is the only case in which a pending tool call at
-    the end of the group chat is really being processed."""
+    (hart_intelligence_entry chat()), so /chat requests for one session can
+    overlap, and that is the only case in which a pending tool call at the
+    end of the group chat is really being processed."""
+    me = threading.get_ident()
     with _TURNS_IN_FLIGHT_LOCK:
-        owner = _TURNS_IN_FLIGHT.get(user_prompt)
-    return owner is not None and owner != threading.get_ident()
+        return any(t != me for t in _TURNS_IN_FLIGHT.get(user_prompt, ()))
 
 
-def _settle_orphaned_tool_calls(messages):
-    """Answer the tool calls of ``messages[-1]`` that no turn will execute.
+def _settle_orphaned_tool_calls(group_chat, manager=None):
+    """Answer the tool calls of the group chat's last message that no turn
+    will execute.
 
     A turn that ends on a tool call -- autogen's max_round cap (live
     2026-10-04 17:16:36, agent 20, save_data_in_memory) or the user-input
@@ -866,18 +877,42 @@ def _settle_orphaned_tool_calls(messages):
     a tool message carrying HISTORICAL_TOOL_PLACEHOLDER, the one vocabulary
     every reader (ToolMessageHandler.real_tool_answer, the fabrication gate)
     already knows means "no real result", so nothing can take the settle for
-    the tool having run.  Returns how many calls were settled.
+    the tool having run.  No real answer exists to look up (what
+    ToolMessageHandler.real_tool_answer does for a call a peer DID run): the
+    turn ended before any agent executed it.
+
+    The answer takes the shape autogen's own generate_tool_calls_reply gives
+    one (role 'tool', 'tool_responses', the contents joined) and goes where
+    run_chat puts a reply: onto the group chat, and through the manager into
+    every agent's own history.  The model reads each agent's history, not
+    the group list, and there the call was still the newest assistant tool
+    call, which ToolMessageHandler treats as active and leaves unanswered.
+    Returns how many calls were settled.
     """
     from core.constants import HISTORICAL_TOOL_PLACEHOLDER
+    messages = group_chat.messages
     if not messages:
         return 0
     last = messages[-1]
     calls = last.get('tool_calls') if isinstance(last, dict) else None
     ids = [c.get('id') for c in (calls or [])
            if isinstance(c, dict) and c.get('id')]
-    for call_id in ids:
-        messages.append({'role': 'tool', 'tool_call_id': call_id,
-                         'content': HISTORICAL_TOOL_PLACEHOLDER})
+    if not ids:
+        return 0
+    responses = [{'tool_call_id': call_id, 'role': 'tool',
+                  'content': HISTORICAL_TOOL_PLACEHOLDER} for call_id in ids]
+    settle = {'role': 'tool', 'tool_responses': responses,
+              'content': '\n\n'.join(r['content'] for r in responses)}
+    messages.append(settle)
+    if manager is not None:
+        for agent in (getattr(group_chat, 'agents', None) or []):
+            try:
+                manager.send(dict(settle), agent, request_reply=False,
+                             silent=True)
+            except Exception as _send_err:
+                current_app.logger.warning(
+                    f'[ORPHAN-TOOL-CALL] could not hand the settle to '
+                    f'{getattr(agent, "name", agent)}: {_send_err}')
     return len(ids)
 
 
@@ -3966,9 +4001,11 @@ def _stub_action_text(entry):
     placeholder action as {'action': 'Respond to user', 'action_id': 1,
     'status': 'pending'}; 420 such configs were live on 2026-10-04, and every
     CREATE prompt plus the help question printed the dict verbatim ('Step 1
-    ("{'action': 'Respond to user', ...}")').  Only that exact shape is
-    unwrapped.  A real action dict (tool_name, depends_on, ...) and a string
-    pass through untouched, so REUSE's dict readers (Action.
+    ("{'action': 'Respond to user', ...}")').  Unwrapped: a dict whose
+    action is text and whose keys are nothing but that stub's own (action,
+    action_id, status) -- 420 of 420 live matches on 2026-10-05 were the
+    stub.  A real action dict (tool_name, depends_on, ...) and a string pass
+    through untouched, so REUSE's dict readers (Action.
     get_action_byaction_id) and the ledger see what they always saw.
     """
     if (isinstance(entry, dict) and isinstance(entry.get('action'), str)
@@ -4515,7 +4552,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 'GOT INPUT BUT LAST MESSAGE IS tool_calls and another turn of '
                 f'{user_prompt} is still running: asking the user to retry')
             return 'Processing a tool now please try later'
-        _settled = _settle_orphaned_tool_calls(group_chat.messages)
+        _settled = _settle_orphaned_tool_calls(group_chat, manager)
         current_app.logger.warning(
             f'[ORPHAN-TOOL-CALL] settled {_settled} unanswered call(s) left by '
             f'an ended turn of {user_prompt}; this turn proceeds')
