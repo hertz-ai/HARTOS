@@ -835,7 +835,11 @@ def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
     )
 
 
-def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+#: Coding goals already told that they name no repository (logged once each).
+_coding_no_repo_warned: set = set()
+
+
+def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> Optional[str]:
     """Build a coding agent prompt with hive intelligence embedding.
 
     Includes TrueflowPlugin MCP instructions for dead code analysis,
@@ -849,6 +853,26 @@ def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -
     repo_url = config.get('repo_url', goal_dict.get('repo_url', ''))
     repo_branch = config.get('repo_branch', goal_dict.get('repo_branch', 'main'))
     target_path = config.get('target_path', goal_dict.get('target_path', ''))
+    repo_path = config.get('repo_path', goal_dict.get('repo_path', ''))
+    if not (repo_url or repo_path):
+        # A coding goal works on a repository it names.  With none, this
+        # prompt said "You are working on the GitHub repository  (branch
+        # main) ... Clone the repo", and the agent filled the blank itself:
+        # measured 2026-10-05, seed bootstrap_hive_embedding_audit ("Scan all
+        # repositories created by the coding agent", a list nothing keeps)
+        # searched the web and cloned github.com/kotthoff/hartos and
+        # github.com/aden-hive/hive, strangers' repositories, into the coding
+        # workspace, with "create and push commits" in its plan.  No code
+        # fills an empty repo_url, so the goal waits for one, as an SEO goal
+        # with no repo does; the coding daemon leaves its agent for the next
+        # goal.
+        _goal_id = goal_dict.get('id', '')
+        if _goal_id not in _coding_no_repo_warned:
+            _coding_no_repo_warned.add(_goal_id)
+            logger.info(f"Coding goal '{goal_dict.get('title', '')}' names no "
+                        f"repository (repo_url or repo_path): not dispatched "
+                        f"until one is configured")
+        return None
     platform_identity = _get_platform_identity()
     hive_instructions = get_hive_embedding_instructions()
 
@@ -880,12 +904,14 @@ def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -
 
     return (
         f"{platform_identity}\n\n"
-        f"You are working on the GitHub repository {repo_url} "
-        f"(branch {repo_branch}).\n"
+        + (f"You are working on the GitHub repository {repo_url} "
+           f"(branch {repo_branch}).\n" if repo_url else
+           f"You are working on the repository at {repo_path}.\n") +
         f"Target path: {target_path or '(entire repo)'}\n\n"
         f"Goal: {goal_dict['title']}\n"
         f"Description: {goal_dict.get('description', '')}\n\n"
-        f"Clone the repo, analyze the codebase, and make improvements "
+        + ("Clone the repo, analyze" if repo_url else "Analyze") +
+        f" the codebase, and make improvements "
         f"aligned with the goal above. Focus on code quality, bug fixes, "
         f"and missing implementations.\n\n"
         f"{trueflow_usage}"
@@ -1051,7 +1077,11 @@ _BACKEND_REPAIR_CATEGORIES = frozenset({
 })
 
 
-def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+#: Self-heal goals already told that they name no failure (logged once each).
+_self_heal_no_failure_warned: set = set()
+
+
+def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> Optional[str]:
     """Build a self-healing code agent prompt from an exception pattern.
 
     Branches on the goal's ``config.category`` so a venv-install failure
@@ -1064,6 +1094,24 @@ def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
     """
     config = _goal_config(goal_dict)
     category = config.get('category', '') or ''
+    if not (config.get('exc_type') or category or config.get('source_module')
+            or config.get('pattern_key')):
+        # A self-heal goal fixes a failure it names.  With none, this prompt
+        # read "Exception: Unknown / Module: unknown / Occurrences: 0 ...
+        # Write a minimal fix": measured 2026-10-05, the exception-monitor
+        # seed (bootstrap_exception_watcher, mode 'watch') was sent to the
+        # coding agent as that on every dispatch, and replayed a stub that
+        # only replied.
+        # The watching runs in code (SelfHealingDispatcher.check_and_dispatch
+        # from the agent daemon, ExceptionWatcher.process_exceptions), sent
+        # or not; the coding daemon leaves this goal's agent for a real fix.
+        _goal_id = goal_dict.get('id', '')
+        if _goal_id not in _self_heal_no_failure_warned:
+            _self_heal_no_failure_warned.add(_goal_id)
+            logger.info(f"Self-heal goal '{goal_dict.get('title', '')}' names no "
+                        f"failure (exc_type, category, source_module or "
+                        f"pattern_key): not dispatched")
+        return None
     ctx = config.get('context', {}) or {}
     backend = ctx.get('backend') if isinstance(ctx, dict) else None
     missing_package = (
