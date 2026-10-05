@@ -16,6 +16,30 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger('hevolve_social')
 
+#: Why an engine-outage goal is archived; also what the log says.
+_ENGINE_OUTAGE_REASON = (
+    'the LLM engine failed a generation (5xx, or a dropped or timed-out '
+    'connection); the engine is the LLM watchdog\'s '
+    '(service_tools.model_lifecycle), and no source edit restarts it')
+
+
+def _engine_failed_a_generation(module: str, function: str) -> bool:
+    """True for the pattern agent_lightning's wrapper reports when the SERVING
+    ENGINE failed a generation after its re-samples:
+    report_subsystem_failure('llm', <agent>, exc, 'generate_reply'), which it
+    files only for _is_recoverable_generation_failure (an engine 5xx, or a
+    dropped or timed-out connection).
+
+    That is the engine's availability.  The LLM watchdog owns it
+    (integrations/service_tools/model_lifecycle.py, [LLM-WATCHDOG]), and a
+    coding goal cannot restart llama-server, so none is made.  Measured
+    2026-10-05 on the owner's desktop: 120 of the 214 self_heal goals ever
+    created had this signature, 12 still active; the reporter names the
+    agent, so one outage made one goal per agent that hit it, and the coding
+    agent spent its turns searching for a source file named after an agent.
+    """
+    return str(module or '').startswith('llm.') and function == 'generate_reply'
+
 
 class SelfHealingDispatcher:
     """Creates coding fix goals from recurring exception patterns."""
@@ -55,6 +79,8 @@ class SelfHealingDispatcher:
         with self._lock:
             self._last_check = now
 
+        self._archive_engine_outage_goals(db)
+
         try:
             from hartos.exception_collector import ExceptionCollector
             collector = ExceptionCollector.get_instance()
@@ -72,6 +98,13 @@ class SelfHealingDispatcher:
 
         goals_created = 0
         for pattern_key, records in patterns.items():
+            parts = pattern_key.split('::')
+            if len(parts) > 2 and _engine_failed_a_generation(parts[1], parts[2]):
+                # Handled, not lost: marked so it is not re-read every check.
+                collector.mark_pattern_resolved(pattern_key)
+                logger.info("Self-heal: no coding goal for %s: %s",
+                            pattern_key, _ENGINE_OUTAGE_REASON)
+                continue
             if self._is_already_being_fixed(db, pattern_key):
                 continue
 
@@ -164,6 +197,33 @@ class SelfHealingDispatcher:
             spark_budget=100,
             created_by='self_healing_dispatcher',
         )
+
+    def _archive_engine_outage_goals(self, db: Session) -> int:
+        """Archive self_heal goals made from an engine outage before
+        _engine_failed_a_generation kept them from being made.  Through
+        GoalManager, the one writer of goal status; idempotent, so it is
+        simply asked every check.  Returns how many were archived."""
+        try:
+            from integrations.social.models import AgentGoal
+            from .goal_manager import GoalManager
+        except ImportError:
+            return 0
+        archived = 0
+        for goal in db.query(AgentGoal).filter(
+                AgentGoal.goal_type == 'self_heal',
+                AgentGoal.status.in_(('active', 'paused'))).all():
+            config = dict(goal.config_json or {})
+            if not _engine_failed_a_generation(config.get('source_module'),
+                                               config.get('source_function')):
+                continue
+            config['archived_reason'] = _ENGINE_OUTAGE_REASON
+            GoalManager.update_goal(db, goal.id, config_json=config)
+            GoalManager.update_goal_status(db, goal.id, 'archived')
+            archived += 1
+        if archived:
+            logger.info("Self-heal: archived %d goal(s): %s",
+                        archived, _ENGINE_OUTAGE_REASON)
+        return archived
 
     def _is_already_being_fixed(self, db: Session, pattern_key: str) -> bool:
         """Check if an active goal already targets this exception pattern."""
