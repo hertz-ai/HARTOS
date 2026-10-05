@@ -213,6 +213,18 @@ def _unregister_session(user_id: str, prompt_id: str) -> None:
         _vlm_stop_flags.pop(key, None)
 
 
+def _background_run_must_yield() -> bool:
+    """dispatch.background_work_must_yield for the loop: a background run stops
+    between steps while the owner is using the computer (#129); a run the
+    owner asked for in chat never yields to its own owner.  Fail-open: a
+    missing gate never stops a run."""
+    try:
+        from integrations.agent_engine.dispatch import background_work_must_yield
+        return bool(background_work_must_yield())
+    except Exception:
+        return False
+
+
 def _is_stop_requested(user_id: str, prompt_id: str) -> bool:
     """Cheap check called at iteration boundaries inside the loop."""
     key = _stop_key(user_id, prompt_id)
@@ -632,6 +644,18 @@ def _drive_local_agentic_loop(
                 f"{iteration + 1} (user={user_id}, prompt={prompt_id})"
             )
             exit_reason = 'stopped'
+            break
+
+        # YIELD-TO-USER (#129): a background run stops between steps while the
+        # owner is using this computer -- the same exit the foreground-window
+        # check already takes ('user_active' -> USER_STOPPED), and the goal's
+        # next dispatch, issued once the gate is open, runs the action again.
+        if _background_run_must_yield():
+            logger.info(
+                f"VLM loop paused for the user at iteration {iteration + 1} "
+                f"(user={user_id}, prompt={prompt_id})")
+            exit_reason = 'user_active'
+            _finish_error = 'Paused: the owner is using this computer'
             break
 
         elapsed = time.time() - start_time

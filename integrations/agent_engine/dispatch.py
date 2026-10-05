@@ -577,6 +577,65 @@ def is_current_request_autonomous() -> bool:
         return False
 
 
+def machine_is_idle() -> bool:
+    """The ONE idle detector's answer: ResourceGovernor.get_mode() == MODE_IDLE
+    (no input past IDLE_THRESHOLD_SECONDS and no external load).  Fail-CLOSED:
+    a governor that cannot be consulted is not idle, the rule
+    agent_daemon._idle_only_blocked has always applied."""
+    try:
+        from core.resource_governor import MODE_IDLE, get_governor
+        return get_governor().get_mode() == MODE_IDLE
+    except Exception:
+        return False
+
+
+def gate_closed_for_the_person() -> bool:
+    """True when the yield gate is closed because a PERSON needs the machine
+    now: a user request in flight, or the machine's own idle detector says it
+    is not idle (the owner at the desk, external load).  False when the gate
+    is closed only on a timer or a reading the idle detector contradicts (the
+    ten-minute chat cooldown with nobody at the desk): that is idle
+    starvation, which the daemon's override already admits work through.
+    ONE answer for that override and for the between-steps yield
+    (background_work_must_yield), so a turn the override admitted is never
+    paused a moment later by the reason it was admitted under.  Fail-closed
+    like the override: an unreadable foreground or governor means the person
+    needs the machine."""
+    try:
+        from core.foreground import foreground_active
+        if foreground_active() or get_last_yield_reason() == 'foreground_request':
+            return True
+    except Exception:
+        return True
+    return not machine_is_idle()
+
+
+def background_work_must_yield() -> bool:
+    """The ONE question a long-running background agent asks BETWEEN STEPS:
+    is the owner using this computer right now?
+
+    Owner ruling 2026-10-04: yield-to-user is not only the VLM loop's: every
+    autogen group chat and every daemon goal pauses while the owner is
+    active and resumes, idempotently, once they are actually idle; there is
+    no second "user is idle" rule.  Composes the two canonical predicates --
+    is_current_request_autonomous (whose turn this is) and
+    should_yield_to_user (the gate every daemon tick already consults) -- so
+    a genuine user turn never yields to its own owner, and the mid-turn
+    decision can never drift from the tick-level one.  Measured before this
+    existed (gui_app.log 2026-10-04): the gate was CLOSED on user_present
+    19:12:55-19:20:56 while coding-daemon turn daemon_d69d24f8 ran autogen
+    rounds straight through it, holding the local LLM.  Fail-open: a raising
+    check never stops work.
+    """
+    try:
+        return bool(is_current_request_autonomous() and should_yield_to_user()
+                    and gate_closed_for_the_person())
+    except Exception:
+        logger.debug('background_work_must_yield: check failed, not yielding',
+                     exc_info=True)
+        return False
+
+
 def mark_create_start(request_id=None):
     """Call when a CREATE pipeline starts.
 

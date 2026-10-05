@@ -504,6 +504,45 @@ class TestAgentDaemon:
                 assert call_json and call_json.get('autonomous') is True, \
                     f"Dispatch payload missing autonomous=True: {call_json}"
 
+    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_agent_personas')
+    def test_a_turn_paused_for_the_owner_is_neither_failed_nor_settled(
+            self, mock_idle, db, test_user, test_product):
+        """#129: a turn that stopped between steps because the owner is using
+        the computer is a transient deferral.  No backoff strike (five would
+        auto-pause a healthy goal), no settlement (a noop strike there too),
+        and the goal stays active for the gate to re-admit when they are idle.
+        """
+        from core.agent_tools import user_pause_reply
+        from integrations.agent_engine import agent_daemon
+        from integrations.agent_engine.agent_daemon import AgentDaemon
+
+        goal = AgentGoal(goal_type='marketing', title='Pause probe',
+                         product_id=test_product.id, status='active')
+        db.add(goal)
+        db.flush()
+        mock_idle.return_value = [
+            {'user_id': test_user.id, 'username': 'test', 'user_type': 'agent'}]
+        agent_daemon._dispatch_backoff.pop(str(goal.id), None)
+        with patch('integrations.social.models.get_db', return_value=db), \
+             patch('integrations.agent_engine.dispatch.dispatch_goal',
+                   return_value=user_pause_reply(2)) as dispatched, \
+             patch('integrations.agent_engine.dispatch.should_yield_to_user',
+                   return_value=False), \
+             patch.object(AgentDaemon, '_try_parallel_dispatch', return_value=0), \
+             patch.object(agent_daemon, '_settle_dispatched_goal') as settle, \
+             patch('security.secret_redactor._model_detect_pii',
+                   side_effect=lambda t, *a, **k: t), \
+             patch('integrations.agent_engine.budget_gate.pre_dispatch_budget_gate',
+                   return_value=(True, 'OK')), \
+             patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
+                   side_effect=lambda prompt, *a, **k: (True, '', prompt)):
+            AgentDaemon()._tick()
+        assert dispatched.called, 'the goal was never dispatched: this proves nothing'
+        assert str(goal.id) not in agent_daemon._dispatch_backoff, (
+            'a pause was counted as a dispatch failure')
+        settle.assert_not_called()
+        assert goal.status == 'active'
+
     @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_opted_in_agents')
     def test_daemon_tick_no_goals(self, mock_idle, db):
         from integrations.agent_engine.agent_daemon import AgentDaemon

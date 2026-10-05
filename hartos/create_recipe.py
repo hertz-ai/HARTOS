@@ -811,14 +811,10 @@ class SubscriptionHandler:
         await component.stop()  # Stop the component after getting the response
 
 
-def has_pending_tool_calls(messages):
-    """Check if the last message contains tool calls that need execution."""
-    if not messages:
-        return False
-    last_msg = messages[-1]
-    return (last_msg.get('role') == 'assistant' and
-            'tool_calls' in last_msg and
-            last_msg['tool_calls'])
+# The one "is the last message an unanswered tool call" rule lives in
+# hartos.helper, where the yield-to-user check also asks it; re-exported here
+# for this module's two readers.
+from hartos.helper import has_pending_tool_calls  # noqa: E402
 
 
 # The thread running a session's turn, by user_prompt (recipe() marks it).
@@ -2190,6 +2186,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
         user_prompt = f'{user_id}_{prompt_id}'
         current_action_id = user_tasks[user_prompt].current_action
+
+        # A background turn stops between rounds while the owner is using
+        # the computer (#129); the outer loop answers for it and the goal's
+        # next dispatch resumes this same session.
+        if helper_fun.yield_between_rounds(user_tasks.get(user_prompt),
+                                           groupchat.messages):
+            return None
 
         # ─── STUCK-LOOP GUARD (#485) ───────────────────────────────────
         # Detects when the same (last_speaker, last_message_content) pair
@@ -3616,6 +3619,11 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     def state_transition1(last_speaker, groupchat):
         current_app.logger.info('INSIDE TIMER STATE TRANSITION')
+        # Same between-round stop as state_transition (#129); the scheduler
+        # runs this job again later.
+        if helper_fun.yield_between_rounds(time_actions.get(f'{user_id}_{prompt_id}'),
+                                           groupchat.messages):
+            return None
         messages = groupchat.messages
         if not messages:
             current_app.logger.warning("state_transition1 called with empty messages list")
@@ -4640,6 +4648,40 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             json_obj = None  # Reset each iteration — set by state_transition JSON parse paths
 
             current_app.logger.info(f"WHILE LOOP ITERATION #{while_loop_iterations} , Current Action Id:{current_action_id}")
+
+            # YIELD-TO-USER (#129).  Owner ruling 2026-10-04: every background
+            # agent pauses while the person is using the computer and resumes,
+            # idempotently, once they are actually idle; the VLM loop's own
+            # pause was never enough.  Measured that day (gui_app.log): the
+            # one gate (dispatch.should_yield_to_user) was CLOSED on
+            # user_present 19:12:55-19:20:56 while coding-daemon turn
+            # daemon_d69d24f8 ran autogen rounds straight through it, holding
+            # the single local-LLM permit -- the gate was consulted only per
+            # daemon tick, never between the rounds of a turn already
+            # running.  Now state_transition asks helper_fun.
+            # yield_between_rounds first and returns None, which ends the
+            # round before the next model call and sets this mark; this is
+            # the only reader of the mark.
+            #
+            # RETURN, not break: break falls to the tail-message return and
+            # hands the user the group chat's last line (the 2026-09-06
+            # lesson of the USER-INPUT-GATE below).  Nothing else is touched:
+            # the action keeps its state, the ledger its task, messages[] the
+            # transcript, so the goal's next dispatch -- which the daemon
+            # issues only once the gate is open -- re-enters this session and
+            # continues the same round; a second pause while the person is
+            # still there is the same reply again, with no model call.  The
+            # daemon classifies the reply as "resume later" (core.agent_tools.
+            # is_user_pause): not a result, not a failure, not a parked goal.
+            if getattr(user_tasks[user_prompt], '_paused_for_user', False):
+                user_tasks[user_prompt]._paused_for_user = False
+                messages[user_prompt] = group_chat.messages
+                current_app.logger.info(
+                    f"[YIELD-TO-USER] OUTER loop returning at iteration "
+                    f"#{while_loop_iterations}: action {current_action_id} paused "
+                    f"for the user; it resumes on the next dispatch")
+                from core.agent_tools import user_pause_reply
+                return user_pause_reply(current_action_id)
 
             # USER-INPUT GATE (code-level enforcement):  if state_transition
             # has flagged this action as blocked on user input

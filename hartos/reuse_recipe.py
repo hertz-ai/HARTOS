@@ -1171,6 +1171,11 @@ def create_agents_for_role(user_id: str, prompt_id):
 
         def state_transition(last_speaker, groupchat):
             messages = groupchat.messages
+            # A background turn stops between rounds while the owner is using
+            # the computer (#129).
+            if helper_fun.yield_between_rounds(user_tasks.get(f'{user_id}_{prompt_id}'),
+                                                   groupchat.messages):
+                return None
             if last_speaker == user_proxy:
                 return assistant
             # update_persona is registered for execution on Helper only, so its
@@ -3083,6 +3088,11 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
+        # A background turn stops between rounds while the owner is using the
+        # computer (#129); get_agent_response answers for it.
+        if helper_fun.yield_between_rounds(user_tasks.get(user_prompt),
+                                               groupchat.messages):
+            return None
         try:
             request_id = f'{request_id_list[user_prompt]}'
             # Check for specific agent mentions FIRST - this should take precedence
@@ -3311,6 +3321,9 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     def state_transition1(last_speaker, groupchat):
         current_app.logger.info('INSIDE TIMER STATE TRANSITION')
+        if helper_fun.yield_between_rounds(user_tasks.get(user_prompt),
+                                               groupchat.messages):
+            return None
         messages = groupchat.messages
         # visual_context = helper_fun.get_visual_context(user_id)
         # if visual_context:
@@ -3378,6 +3391,9 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     def state_transition2(last_speaker, groupchat):
         current_app.logger.info('INSIDE VISUAL STATE TRANSITION')
+        if helper_fun.yield_between_rounds(user_tasks.get(user_prompt),
+                                               groupchat.messages):
+            return None
         messages = groupchat.messages
         # visual_context = helper_fun.get_visual_context(user_id)
         # if visual_context:
@@ -5893,6 +5909,20 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         _reuse_advanced_actions = set()  # one robust completion-advance per action id
         while True:
             current_app.logger.info('inside reuse while1')
+            # YIELD-TO-USER (#129): the same contract as create_recipe's outer
+            # loop, where the measurement (daemon_d69d24f8 running through the
+            # closed gate 19:12:55-19:20:56 on 2026-10-04) and the rationale
+            # live.  The round ended because this group's state_transition
+            # asked yield_between_rounds and the owner is using the computer:
+            # answer for the turn, touch no action or ledger state, and the
+            # goal's next dispatch continues this same session.
+            if getattr(user_tasks.get(user_prompt), '_paused_for_user', False):
+                user_tasks[user_prompt]._paused_for_user = False
+                from core.agent_tools import user_pause_reply
+                current_app.logger.info(
+                    f"[YIELD-TO-USER] reuse turn of {user_prompt} paused for the "
+                    f"user at action {user_tasks[user_prompt].current_action}")
+                return user_pause_reply(user_tasks[user_prompt].current_action)
 
             # #725 ROOT-CAUSE FIX (proven live 2026-09-05: nappend=0, conversation in
             # manager._oai_messages).  In this reuse flow autogen accumulates the

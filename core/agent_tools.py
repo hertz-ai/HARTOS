@@ -159,6 +159,33 @@ def is_help_pause(reply) -> bool:
     return text.startswith((HELP_PAUSED_REPLY_PREFIX, HELP_EXPERT_REPLY_PREFIX))
 
 
+def user_pause_reply(action_id=None) -> str:
+    """The sentence a background turn answers when it stops for the user.
+
+    Owner ruling 2026-10-04: yield-to-user applies to every background agent
+    (the VLM loop, autogen group chats, daemon goals), pause all, resume
+    idempotently when the user is actually idle.  Written here, beside the
+    predicate that recognises it, so a reworded sentence cannot stop being
+    recognised.
+    """
+    from core.constants import PAUSED_FOR_USER_REPLY_PREFIX
+    step = f' step {action_id}' if action_id else ''
+    return (f"{PAUSED_FOR_USER_REPLY_PREFIX} the owner is using this computer, "
+            f"so{step} stopped between steps; it resumes when they are idle.")
+
+
+def is_user_pause(reply) -> bool:
+    """True when ``reply`` is user_pause_reply: a background turn stopped for
+    the user.  Neither a result nor a failure nor a parked goal.  The daemon
+    counts no failure and keeps the goal active; the hive worker releases the
+    task for a later claim; nobody records it as work done.  Recognised by
+    the prefix in core.constants, never by matching the sentence."""
+    if not isinstance(reply, str):
+        return False
+    from core.constants import PAUSED_FOR_USER_REPLY_PREFIX
+    return reply.strip().startswith(PAUSED_FOR_USER_REPLY_PREFIX)
+
+
 def is_action_error_reply(reply) -> bool:
     """True when ``reply`` is the CREATE pipeline's structured error envelope,
     {"status": "error", "action": ..., "action_id": ..., "message": ...} — the

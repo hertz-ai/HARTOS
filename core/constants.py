@@ -777,6 +777,13 @@ BUILD_INCOMPLETE_REPLY: str = (
 # hashed result.
 HELP_PAUSED_REPLY_PREFIX: str = "Paused for help:"
 HELP_EXPERT_REPLY_PREFIX: str = "Handed to the expert model:"
+#: The reply of a background turn that stopped BETWEEN STEPS because the owner
+#: is using this computer (yield-to-user, owner ruling 2026-10-04).  Not a
+#: result, not a failure, not a parked goal: the goal stays active, and its
+#: next dispatch -- which the daemon issues only once the yield gate is open
+#: -- resumes the same session where it stopped.  core.agent_tools.is_user_pause
+#: recognises it by this prefix; user_pause_reply writes it.
+PAUSED_FOR_USER_REPLY_PREFIX: str = "Paused for the user:"
 
 
 # ── The per-request switch that turns a hybrid-reasoning model's thinking OFF ──

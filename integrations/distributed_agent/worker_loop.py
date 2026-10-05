@@ -559,7 +559,20 @@ class DistributedWorkerLoop:
         # orphan recovery re-queues the task once the claim is old: the same
         # rule that recovers a dead worker paces the retry, which is the
         # backoff a rate-limited endpoint needs.
-        from core.agent_tools import is_help_pause, is_user_facing_error
+        from core.agent_tools import is_help_pause, is_user_facing_error, is_user_pause
+        # The turn stopped between steps because the owner is using the
+        # computer (#129): nothing was done and nothing is parked.  That is
+        # this worker's own 'yielded to an active user' case, so it takes the
+        # same canonical DEFERRED lifecycle as the 'deferred' dispatch status
+        # above -- never None, which _tick logs as an execution failure and
+        # abandons.  The next claim, admitted by _dispatch_would_defer only
+        # once the gate is open, runs it again from where it stopped.
+        if is_user_pause(response):
+            logger.info(
+                f"Worker task {task.task_id}: paused for the user "
+                f"({response[:80]!r}); deferring it until they are idle")
+            return DeferredForRetry('paused between steps: the owner is using '
+                                    'this computer')
         if is_user_facing_error(response):
             logger.warning(
                 f"Worker task {task.task_id}: the turn failed "

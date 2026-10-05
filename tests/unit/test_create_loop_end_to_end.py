@@ -554,3 +554,47 @@ def test_notes_to_self_complete_nothing(create_env, caplog):
     assert not completed, f'an action completed on a note to self: {completed}'
     banked = [n for n in (1, 2, 3) if _action_file(env, n) is not None]
     assert not banked, f'notes were banked as the recipe of action(s) {banked}'
+
+
+def test_a_background_turn_pauses_for_the_owner_and_resumes_where_it_stopped(create_env, monkeypatch):
+    """#129 (owner ruling 2026-10-04): a daemon turn stops between steps the
+    moment the owner is using the computer, records nothing as done or
+    failed, and the goal's next dispatch -- once the gate is open -- resumes
+    the same session from the action it stopped at.
+
+    Measured gap this pins: coding-daemon turn daemon_d69d24f8 ran autogen
+    rounds straight through two gate-CLOSED windows (user_present,
+    19:08-19:10 and 19:12-19:20) because nothing between steps asked.
+    """
+    from core import agent_tools
+    from integrations.agent_engine import dispatch
+    env = create_env
+    gate = {'open': False}
+
+    def closed():
+        # The owner sits down the moment action 1 is banked.
+        return not gate['open'] and _action_file(env, 1) is not None
+    monkeypatch.setattr(dispatch, 'should_yield_to_user', closed)
+    monkeypatch.setattr(dispatch, 'gate_closed_for_the_person', lambda: True)
+
+    replies = _run(env, turns=1)
+    assert agent_tools.is_user_pause(replies[-1]), replies
+    assert _action_file(env, 1) is not None, 'action 1 ran before the owner sat down'
+    assert _action_file(env, 2) is None, 'the turn went on past the pause'
+    assert env.lh.get_action_state(UP, 2).value not in _DONE_STATES
+    assert not (env.prompts / f'{PROMPT_ID}_0_recipe.json').exists()
+    paused_events = len(env.events)
+
+    # Still active: the same answer, nothing moves.
+    again = _run(env, turns=1)
+    assert agent_tools.is_user_pause(again[-1]), again
+    assert _action_file(env, 2) is None
+    assert len(env.events) == paused_events, env.events[paused_events:]
+
+    # Actually idle: the flow resumes at action 2 and finishes.
+    gate['open'] = True
+    resumed = _run(env, turns=2)
+    assert (env.prompts / f'{PROMPT_ID}_0_recipe.json').exists(), resumed
+    for n in (1, 2, 3):
+        assert _action_file(env, n) is not None, f'action {n} has no file after the resume'
+    assert not env.llm_calls, env.llm_calls

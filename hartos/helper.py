@@ -1548,6 +1548,60 @@ def ensure_tool_call_arguments_json(messages):
     return messages
 
 
+def has_pending_tool_calls(messages):
+    """Check if the last message contains tool calls that need execution."""
+    if not messages:
+        return False
+    last_msg = messages[-1]
+    return (last_msg.get('role') == 'assistant' and
+            'tool_calls' in last_msg and
+            last_msg['tool_calls'])
+
+
+def yield_between_rounds(task, messages=None):
+    """Stop a background group chat between rounds while the owner is active.
+
+    Owner ruling 2026-10-04 (#129).  Every speaker selector of the two
+    pipelines (create_recipe.state_transition / state_transition1,
+    reuse_recipe's four) asks this FIRST.  True means: return None, which
+    ends autogen's round (run_chat breaks on NoEligibleSpeaker) before the
+    next model call; the outer turn loop then reads ``task._paused_for_user``
+    and answers core.agent_tools.user_pause_reply, leaving every action and
+    ledger state exactly as it was, so the goal's next dispatch -- which the
+    daemon issues only once the gate is open -- resumes the same session.
+    Idempotent: a second call while the owner is still active sets the same
+    mark and ends the round again with no model call.  A genuine user turn
+    never yields (dispatch.background_work_must_yield), and a failing check
+    never stops work.
+
+    Never between a tool call and its execution (owner, 2026-10-04): while
+    the last of ``messages`` is an unanswered tool call the round goes on,
+    so the executor answers it, and the pause lands on the next choice.
+    Ending the round there would strand the call -- the orphan that kept
+    agent 20 answering 'Processing a tool now please try later'.
+    """
+    if messages and has_pending_tool_calls(messages):
+        return False
+    try:
+        from integrations.agent_engine.dispatch import background_work_must_yield
+        if not background_work_must_yield():
+            return False
+    except Exception:
+        return False
+    if task is not None:
+        try:
+            task._paused_for_user = True
+        except Exception:
+            pass
+    try:
+        current_app.logger.info(
+            '[YIELD-TO-USER] the owner is active: ending this chat round; '
+            'the turn resumes when they are idle')
+    except Exception:
+        pass
+    return True
+
+
 def answered_call_ids(m):
     """Every tool_call_id a single message answers.
 

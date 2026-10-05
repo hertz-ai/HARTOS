@@ -161,11 +161,8 @@ def _idle_only_blocked(cfg) -> bool:
     """
     if not (cfg or {}).get('idle_only', False):
         return False
-    try:
-        from core.resource_governor import get_governor, MODE_IDLE
-        return get_governor().get_mode() != MODE_IDLE
-    except Exception:
-        return True
+    from .dispatch import machine_is_idle
+    return not machine_is_idle()
 
 
 def _get_blocked_hitl_tasks(ledger, goal_id):
@@ -1464,38 +1461,28 @@ class AgentDaemon:
                 logger.debug(
                     "Agent daemon: yielding (reason=%s)", _yreason)
                 return
-            # B1: never override while a user request is in flight RIGHT NOW.
-            # The starvation override is for IDLE starvation (user away, governor
-            # self-throttling) — NOT for stealing the shared model from a live
-            # chat turn.  foreground_request is the most direct "serve me now".
-            try:
-                from core.foreground import foreground_active
-                if foreground_active() or _yreason == 'foreground_request':
-                    logger.debug(
-                        "Agent daemon: foreground request in flight — yielding "
-                        "(starvation override suppressed)")
-                    return
-            except Exception:
-                pass
-            # A person at the desk is neither a foreground request nor
-            # "recently active" (that means chatted), so neither check above
-            # sees them.  The ResourceGovernor is the ONE idle detector (its
-            # Linux backend reads the compositor's input-alive marker), and a
-            # forced tick is idle-only work by definition, so it goes through
-            # the SAME reader every idle_only goal goes through:
-            # _idle_only_blocked, get_mode() != MODE_IDLE, fail closed when
-            # the governor cannot be consulted.  Measured 2026-09-22 on the
-            # Samsung box: this override force-ticked every 120 s on
-            # 'model_pressure' and put llama-server at 207 percent CPU once a
-            # minute while the owner was clicking around the desktop; press
-            # p50 122 ms against a 25 ms budget, clock 1.3 GHz of 3.4,
-            # package 94 C.  With the daemons paused for 120 s: 3.19 GHz,
-            # 84 C, press p50 12 ms.  That headroom belongs to the person.
-            if _idle_only_blocked({'idle_only': True}):
+            # The starvation override is for IDLE starvation (user away,
+            # governor self-throttling), never for taking the machine from a
+            # person: a user request in flight (foreground_request, the most
+            # direct "serve me now"), or the ONE idle detector (the
+            # ResourceGovernor; its Linux backend reads the compositor's
+            # input-alive marker) saying the machine is not idle, suppresses
+            # it.  Measured 2026-09-22 on the Samsung box: this override
+            # force-ticked every 120 s on 'model_pressure' and put
+            # llama-server at 207 percent CPU once a minute while the owner
+            # was clicking around the desktop; press p50 122 ms against a
+            # 25 ms budget, clock 1.3 GHz of 3.4, package 94 C.  With the
+            # daemons paused for 120 s: 3.19 GHz, 84 C, press p50 12 ms.
+            # That headroom belongs to the person.  The answer is read from
+            # dispatch.gate_closed_for_the_person -- the same one the
+            # between-steps yield reads (#129) -- so a turn admitted here is
+            # never paused a moment later by the reason it was admitted under.
+            from .dispatch import gate_closed_for_the_person
+            if gate_closed_for_the_person():
                 logger.debug(
-                    "Agent daemon: governor says the machine is not idle, "
-                    "yielding on '%s' (starvation override suppressed)",
-                    _yreason)
+                    "Agent daemon: a request is in flight or the governor says "
+                    "the machine is not idle, yielding on '%s' (starvation "
+                    "override suppressed)", _yreason)
                 return
             _override_active = True
             logger.warning(
@@ -1933,10 +1920,17 @@ class AgentDaemon:
                 # applies via HeldForHelp).  Counted as success it cleared the
                 # backoff and, for a continuous goal, re-ran the impossible
                 # action every 5 minutes for five months.
-                from core.agent_tools import is_action_error_reply, is_help_pause
-                _reply_failed = result is not None and (
+                from core.agent_tools import (is_action_error_reply, is_help_pause,
+                                              is_user_pause)
+                # A turn that stopped between steps because the owner is using
+                # the computer (#129) is a transient deferral like the ones
+                # below: not a failure, not a parked goal, not a completion.  The
+                # goal stays active, the gate above re-admits it once they are
+                # idle, and its session resumes where it stopped.
+                _paused = result is not None and is_user_pause(result)
+                _reply_failed = result is not None and not _paused and (
                     is_action_error_reply(result) or is_help_pause(result))
-                if result is None or _reply_failed:
+                if result is None or _reply_failed or _paused:
                     # dispatch_goal returns None for TRANSIENT defers too (user
                     # actively chatting / Tier-2 breaker open), not just real
                     # failures.  Counting those toward the 5-strike AUTO-PAUSE
@@ -1945,7 +1939,7 @@ class AgentDaemon:
                     # Reuse the SAME canonical checks dispatch_goal defers on
                     # (single source — never drifts) and skip without penalty.
                     # An explicit error reply is never transient: the turn ran.
-                    _transient = False
+                    _transient = _paused
                     if result is None:
                         try:
                             from .dispatch import is_transient_deferral
@@ -1955,7 +1949,8 @@ class AgentDaemon:
                     if _transient:
                         logger.debug(
                             f"Goal {goal_key}: transient defer (user active / "
-                            f"breaker open) — no backoff, no auto-pause")
+                            f"breaker open / paused for the user) — no backoff, "
+                            f"no auto-pause")
                         continue
                     # Why the turn failed, when it ran, so a paused goal says
                     # what to fix (a 402 from the hosted LLM, say) instead of
