@@ -148,8 +148,12 @@ class ExceptionWatcher:
                 original_min = dispatcher._min_occurrences
                 dispatcher._min_occurrences = 1
                 dispatcher._last_check = 0  # force check
-                fix_count = dispatcher.check_and_dispatch(db)
-                dispatcher._min_occurrences = original_min
+                try:
+                    fix_count = dispatcher.check_and_dispatch(db)
+                finally:
+                    # A raise must not leave every later check making a
+                    # goal from a single occurrence.
+                    dispatcher._min_occurrences = original_min
                 if fix_count > 0:
                     logger.info(f"Watcher triggered {fix_count} critical fix goal(s)")
                 processed += len(critical)

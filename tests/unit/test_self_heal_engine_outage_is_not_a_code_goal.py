@@ -137,3 +137,51 @@ def test_existing_engine_outage_goals_are_archived_and_code_goals_are_kept(
     assert paused.status == 'archived'
     assert 'LLM watchdog' in (active.config_json or {}).get('archived_reason', '')
     assert tts.status == 'active'
+
+
+def test_a_failing_archive_sweep_does_not_stop_a_new_goal(
+        db, collector, dispatcher, monkeypatch, caplog):
+    """Review of bef0e1e44 (08:00Z): the sweep ran first and unguarded.  A
+    goal writer that raised made the whole check raise, so no new goal was
+    made, and both callers (agent_daemon's tick, exception_watcher) log that
+    only at DEBUG.  The sweep is housekeeping; making goals is the check."""
+    import logging
+    from hartos.exception_collector import report_subsystem_failure
+    from integrations.agent_engine.goal_manager import GoalManager
+    _goal(db, 'active', 'Fix InternalServerError in llm.reuse_x.generate_reply',
+          'llm.reuse_x', 'generate_reply', 'InternalServerError')
+
+    def writer_down(*_a, **_k):
+        raise RuntimeError('goal writer down')
+
+    monkeypatch.setattr(GoalManager, 'update_goal', writer_down)
+    for _ in range(3):
+        report_subsystem_failure('tts', 'probe', RuntimeError('probe died'), 'probe')
+    with caplog.at_level(logging.WARNING, logger='hevolve_social'):
+        assert dispatcher.check_and_dispatch(db) == 1
+    assert 'Fix RuntimeError in tts.probe.probe' in [g.title for g in _self_heal_goals(db)]
+    assert any(r.levelno == logging.WARNING and 'archive sweep failed' in r.getMessage()
+               for r in caplog.records), [r.getMessage() for r in caplog.records]
+
+
+def test_a_raising_check_leaves_the_watchers_threshold_as_it_was(
+        db, collector, dispatcher, monkeypatch):
+    """exception_watcher lowers the dispatcher's threshold to 1 for a critical
+    exception and put it back only when the check returned: one raise left
+    every later check making a goal from a single occurrence."""
+    from hartos.exception_collector import report_subsystem_failure
+    from integrations.agent_engine.exception_watcher import ExceptionWatcher
+    ExceptionWatcher.reset_instance()
+    watcher = ExceptionWatcher.get_instance()
+    watcher.assign_watcher('u1', 'watcher-agent')
+    try:
+        report_subsystem_failure('tts', 'probe', MemoryError('out of memory'), 'probe')
+
+        def check_fails(_db):
+            raise RuntimeError('check failed')
+
+        monkeypatch.setattr(dispatcher, 'check_and_dispatch', check_fails)
+        watcher.process_exceptions(db)
+        assert dispatcher._min_occurrences == 3
+    finally:
+        ExceptionWatcher.reset_instance()

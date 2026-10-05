@@ -79,7 +79,14 @@ class SelfHealingDispatcher:
         with self._lock:
             self._last_check = now
 
-        self._archive_engine_outage_goals(db)
+        # Housekeeping, so its failure never stops a new goal (review of
+        # bef0e1e44): a goal writer that raised made this whole check raise,
+        # and both callers log that only at DEBUG.
+        try:
+            self._archive_engine_outage_goals(db)
+        except Exception:
+            logger.warning("Self-heal: the engine-outage archive sweep failed; "
+                           "new fix goals are still made", exc_info=True)
 
         try:
             from hartos.exception_collector import ExceptionCollector
