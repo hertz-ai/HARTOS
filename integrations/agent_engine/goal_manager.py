@@ -855,17 +855,11 @@ def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -
     target_path = config.get('target_path', goal_dict.get('target_path', ''))
     repo_path = config.get('repo_path', goal_dict.get('repo_path', ''))
     if not (repo_url or repo_path):
-        # A coding goal works on a repository it names.  With none, this
-        # prompt said "You are working on the GitHub repository  (branch
-        # main) ... Clone the repo", and the agent filled the blank itself:
-        # measured 2026-10-05, seed bootstrap_hive_embedding_audit ("Scan all
-        # repositories created by the coding agent", a list nothing keeps)
-        # searched the web and cloned github.com/kotthoff/hartos and
-        # github.com/aden-hive/hive, strangers' repositories, into the coding
-        # workspace, with "create and push commits" in its plan.  No code
-        # fills an empty repo_url, so the goal waits for one, as an SEO goal
-        # with no repo does; the coding daemon leaves its agent for the next
-        # goal.
+        # A coding goal works on a repository it names.  With none, the prompt
+        # said "the GitHub repository  (branch main)" and the agent filled the
+        # blank itself: measured 2026-10-05, seed bootstrap_hive_embedding_audit
+        # cloned strangers' repositories into the coding workspace.  Nothing
+        # fills an empty repo_url, so the goal waits for one, like an SEO goal.
         _goal_id = goal_dict.get('id', '')
         if _goal_id not in _coding_no_repo_warned:
             _coding_no_repo_warned.add(_goal_id)
@@ -1096,15 +1090,10 @@ def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
     category = config.get('category', '') or ''
     if not (config.get('exc_type') or category or config.get('source_module')
             or config.get('pattern_key')):
-        # A self-heal goal fixes a failure it names.  With none, this prompt
-        # read "Exception: Unknown / Module: unknown / Occurrences: 0 ...
-        # Write a minimal fix": measured 2026-10-05, the exception-monitor
-        # seed (bootstrap_exception_watcher, mode 'watch') was sent to the
-        # coding agent as that on every dispatch, and replayed a stub that
-        # only replied.
-        # The watching runs in code (SelfHealingDispatcher.check_and_dispatch
-        # from the agent daemon, ExceptionWatcher.process_exceptions), sent
-        # or not; the coding daemon leaves this goal's agent for a real fix.
+        # A self-heal goal fixes a failure it names.  With none, the prompt read
+        # "Exception: Unknown / Module: unknown": measured 2026-10-05, the
+        # exception-monitor seed was sent as that on every dispatch.  Watching
+        # runs in code (SelfHealingDispatcher.check_and_dispatch), sent or not.
         _goal_id = goal_dict.get('id', '')
         if _goal_id not in _self_heal_no_failure_warned:
             _self_heal_no_failure_warned.add(_goal_id)
