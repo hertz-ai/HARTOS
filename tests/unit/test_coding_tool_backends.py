@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import pytest
 from unittest.mock import patch, MagicMock
+from tests.unit.module_swap import swap_modules
 
 
 # ─── Installer Tests ───
@@ -94,7 +95,7 @@ class TestInstaller:
         host = types.ModuleType('tts.package_installer')
         host._run_pip = MagicMock(return_value=(True, 'ok'))
         with patch.object(installer.sys, 'frozen', True, create=True), \
-             patch.dict(sys.modules, {'tts.package_installer': host}), \
+             swap_modules({'tts.package_installer': host}), \
              patch.object(installer, 'run_bounded') as run:
             result = installer.pip_install('diskcache grep-ast')
         run.assert_not_called()
@@ -105,7 +106,7 @@ class TestInstaller:
     def test_pip_install_frozen_without_a_host_runner_refuses(self):
         from integrations.coding_agent import installer
         with patch.object(installer.sys, 'frozen', True, create=True), \
-             patch.dict(sys.modules, {'tts.package_installer': None}), \
+             swap_modules({'tts.package_installer': None}), \
              patch.object(installer, 'run_bounded') as run:
             result = installer.pip_install('diskcache')
         run.assert_not_called()
