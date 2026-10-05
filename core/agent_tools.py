@@ -397,6 +397,17 @@ def _tell_the_person_elsewhere(user_id, prompt_id, game_id, state, record):
         tool_logger.debug(f'game sound: no push to the phone ({e})')
 
 
+def _coding_workdir(working_dir):
+    """The directory a coding tool was handed, else HEVOLVE_CODING_WORKDIR.
+
+    Empty means "resolve it": vlm_adapter.resolve_task_workspace then takes
+    the agent's goal repo_path, else the user-data coding workspace, never
+    the process cwd (the install folder on the desktop).  One rule for
+    every coding tool an agent is given.
+    """
+    return working_dir or os.environ.get('HEVOLVE_CODING_WORKDIR', '')
+
+
 def build_core_tool_closures(ctx):
     """Build session-scoped tool closures.  Returns list of (name, desc, func).
 
@@ -2506,7 +2517,7 @@ def build_core_tool_closures(ctx):
                 preferred_tool=preferred_tool,
                 user_id=user_id,
                 model=os.environ.get('HEVOLVE_CODING_MODEL', ''),
-                working_dir=working_dir or os.environ.get('HEVOLVE_CODING_WORKDIR', ''),
+                working_dir=_coding_workdir(working_dir),
                 # The asking agent: the owner's permission and the ribbon
                 # name it (orchestrator._execute_local).
                 prompt_id=str(prompt_id or ''),
@@ -2529,7 +2540,7 @@ def build_core_tool_closures(ctx):
         from integrations.coding_agent.recipe_bridge import CodingRecipeBridge
 
         async def get_repository_map(
-            working_dir: Annotated[str, "Directory to map (default: current directory)"] = ".",
+            working_dir: Annotated[str, "Directory to map (empty = HEVOLVE_CODING_WORKDIR, else this agent's goal repo_path, else the coding workspace)"] = "",
             max_tokens: Annotated[int, "Maximum tokens for the map output"] = 2048,
         ) -> str:
             """Generate a tree-sitter based repository map showing key functions, classes, and their relationships.
@@ -2537,7 +2548,13 @@ def build_core_tool_closures(ctx):
             Use this to understand a codebase's structure before making changes.
             Returns a ranked summary of the most important code symbols.
             """
-            return CodingRecipeBridge.get_repository_map(working_dir, max_tokens)
+            # Never the process cwd.  The map writes its tags cache under the
+            # root it maps, and '.' put the 14 MB .aider.tags.cache.v4 in the
+            # installed app's own folder (review of cd99c540d).
+            from integrations.vlm.vlm_adapter import resolve_task_workspace
+            root = resolve_task_workspace(prompt_id=prompt_id,
+                                          explicit=_coding_workdir(working_dir))
+            return CodingRecipeBridge.get_repository_map(root, max_tokens)
 
         tools.append((
             "get_repository_map",
