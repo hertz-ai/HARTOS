@@ -62,8 +62,11 @@ SHELL_COMMAND_PLACEHOLDER = 'shell command when Next Action is shell'
 OPEN_PATH_PLACEHOLDER = 'file or app name when Next Action is open_file_gui'
 #: Every placeholder spelling so far ('shell command string when Next Action
 #: is shell', 'shell command when Next Action is shell', 'file or app name
-#: when Next Action is open_file_gui') shares this phrase; no command does.
-_TEMPLATE_ECHO_MARK = 'when next action is'
+#: when Next Action is open_file_gui') is a few plain words, this phrase, and
+#: an action name -- the WHOLE value.  A command that merely mentions the
+#: phrase (echo "...", findstr /C:"...") has quotes, switches or paths and is
+#: a command (review of 0cfa782cf: the substring test dropped it).
+_TEMPLATE_ECHO = re.compile(r'^[a-z ]{0,40}\bwhen next action is [a-z_]+$')
 
 
 def is_template_echo(value) -> bool:
@@ -75,7 +78,7 @@ def is_template_echo(value) -> bool:
     and three such steps closed the run as action_error.  A placeholder is
     an empty field, never a command or a path.
     """
-    return _TEMPLATE_ECHO_MARK in str(value or '').strip().lower()
+    return bool(_TEMPLATE_ECHO.match(' '.join(str(value or '').lower().split())))
 
 
 @dataclass

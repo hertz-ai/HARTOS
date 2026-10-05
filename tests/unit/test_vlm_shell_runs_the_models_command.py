@@ -5,7 +5,7 @@ MEASURED 2026-10-04 17:02:12 (gui_app.log.1, daemon user c23d388c, prompt
 42958291468, task "Search for the file containing the function
 llm.create_recipe_assistant..."):
 
-    Action: shell value='cd C:/Users/sathi/Documents/Nunba/data/coding && f'
+    Action: shell value='cd C:/work/coding && f'
     VLM shell action dispatching: cmd='shell command when Next Action is shell'
 
 The loop's prompt shows the model
@@ -37,7 +37,7 @@ from integrations.vlm import parser as vlm_parser  # noqa: E402
 from integrations.vlm import local_computer_tool as lct  # noqa: E402
 from integrations.vlm import local_loop as ll  # noqa: E402
 
-_REAL_COMMAND = ('cd C:/Users/sathi/Documents/Nunba/data/coding && '
+_REAL_COMMAND = ('cd C:/work/coding && '
                  'findstr /S /N /C:"def generate_reply" *.py')
 _LIVE = json.dumps({
     'Reasoning': 'The previous shell command failed because task is not a '
@@ -77,12 +77,25 @@ def test_the_other_spelling_of_the_placeholder_is_filtered_too():
         assert pa.text == 'dir'
 
 
+def test_a_command_that_mentions_the_phrase_is_still_a_command():
+    """Review of 0cfa782cf: the echo test was a substring match, so a real
+    command carrying the phrase was dropped as a placeholder.  Only a value
+    that IS a placeholder-shaped sentence is one."""
+    for cmd in ('echo "shell command when Next Action is shell"',
+                'findstr /C:"when Next Action is" local_loop.py'):
+        assert not vlm_parser.is_template_echo(cmd), cmd
+        raw = json.dumps({'Next Action': 'shell', 'Reasoning': 'r',
+                          'command': cmd, 'Status': 'IN_PROGRESS'})
+        assert vlm_parser.parse_vlm_action(
+            raw, expected_shape='action_json').command == cmd
+
+
 def test_a_real_command_and_a_real_path_still_come_through():
     raw = json.dumps({'Next Action': 'shell', 'Reasoning': 'list it',
-                      'command': 'dir C:/Users/sathi/Documents/Nunba/data/coding',
+                      'command': 'dir C:/work/coding',
                       'Status': 'IN_PROGRESS'})
     pa = vlm_parser.parse_vlm_action(raw, expected_shape='action_json')
-    assert pa.command == 'dir C:/Users/sathi/Documents/Nunba/data/coding'
+    assert pa.command == 'dir C:/work/coding'
     assert pa.to_action_json_dict()['command'] == pa.command
     raw2 = json.dumps({'Next Action': 'open_file_gui', 'Reasoning': 'open it',
                        'path': 'C:/x/notes.txt', 'Status': 'IN_PROGRESS'})
@@ -93,10 +106,6 @@ def test_a_real_command_and_a_real_path_still_come_through():
 def test_the_prompts_show_the_model_the_placeholder_the_parser_filters():
     """The filter and the prompts are one constant: a template that stopped
     saying what the parser filters would re-open the hole silently."""
-    import inspect
-    src = inspect.getsource(ll)
-    assert 'SHELL_COMMAND_PLACEHOLDER' in src and 'OPEN_PATH_PLACEHOLDER' in src
-    # Behavioural half: the module-level prompt really carries the constant.
     assert vlm_parser.SHELL_COMMAND_PLACEHOLDER in ll.SYSTEM_PROMPT
     assert vlm_parser.OPEN_PATH_PLACEHOLDER in ll.SYSTEM_PROMPT
     assert vlm_parser.is_template_echo(vlm_parser.SHELL_COMMAND_PLACEHOLDER)
@@ -168,3 +177,23 @@ def test_shell_and_terminal_prefixes_name_the_default_shell():
     assert ran[0] == default, ran[0]
     assert ran[1] == default, ran[1]
     assert ran[2][-1] == 'Get-ChildItem' and ran[2][0] in ('powershell', 'pwsh'), ran[2]
+
+
+def test_a_prefixed_native_form_runs_the_shell_it_names():
+    """Review of 0cfa782cf, measured on the MSI 2026-10-05:
+    `shell: powershell -Command "Get-Date -Format yyyy"` ran as
+    `cmd /c powershell -Command "..."` -- exit 0 with the command text as its
+    output, the D73 false success.  'shell:' names no shell, so what follows
+    is read like an unprefixed command, native form included."""
+    ran = []
+    handler = _lifted_shell_handler(ran)
+    with patch('integrations.vlm.safety.computer_operation_refusal', return_value=None), \
+            patch('integrations.vlm.safety.computer_control_block', return_value=None), \
+            patch('integrations.vlm.activity_stream.current_run', return_value=MagicMock()):
+        handler('shell: powershell -Command "Get-Date -Format yyyy"')
+        handler('terminal: powershell -NoProfile -Command "Get-Date"')
+        handler('powershell -Command "Get-Date -Format yyyy"')
+    ps = 'powershell' if sys.platform == 'win32' else 'pwsh'
+    assert ran[0] == [ps, '-NoProfile', '-Command', 'Get-Date -Format yyyy'], ran[0]
+    assert ran[1] == [ps, '-NoProfile', '-Command', 'Get-Date'], ran[1]
+    assert ran[2] == ran[0], 'prefixed and unprefixed must run the same argv'

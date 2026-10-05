@@ -3352,7 +3352,14 @@ def _handle_shell_command_tool(input_text: str) -> str:
     if m:
         shell_override = m.group(1).lower()
         text = m.group(2).strip()
-    else:
+    # Having named no shell, a 'shell:' / 'terminal:' command is read exactly
+    # like an unprefixed one, the native form included.  Stripping the prefix
+    # and stopping there ran `shell: powershell -Command "Get-Date -Format
+    # yyyy"` as `cmd /c powershell -Command "..."`: exit 0 with the command
+    # text as its output, the D73 false success below (review of 0cfa782cf,
+    # measured on the MSI 2026-10-05; before that commit the same input failed
+    # honestly with exit 1).
+    if shell_override in (None, 'shell', 'terminal'):
         # -enc / -EncodedCommand is deliberately NOT accepted as a selector:
         # it is obfuscation, and leaving it unstripped keeps it in front of
         # the denylist pattern that blocks it.  Only the execute-this-string
