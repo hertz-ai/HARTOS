@@ -2576,12 +2576,17 @@ def publish_async(topic, message, timeout=2.0):
         # reply the local llama-server wrote "Cloud" (2026-10-04).  Local
         # imports: test_egress_one_rule exec's this function's source in a
         # namespace that holds none of this module's globals.
+        # A failure here costs the badge, never the delivery.
         if isinstance(data, dict) and bus_topic.startswith('chat.'):
-            from core.constants import canonical_served_by
-            from hartos.threadlocal import thread_local_data as _tld_origin
-            data['served_by'] = canonical_served_by(
-                data.get('served_by') or _tld_origin.get_served_by(),
-                data.get('node_tier'))
+            try:
+                from core.constants import canonical_served_by
+                from hartos.threadlocal import thread_local_data as _tld_origin
+                data['served_by'] = canonical_served_by(
+                    data.get('served_by') or _tld_origin.get_served_by(),
+                    data.get('node_tier'))
+            except Exception as _origin_err:
+                app.logger.warning(
+                    f"publish_async: served_by not stamped: {_origin_err}")
         try:
             bus = get_message_bus()
             # Ensure user_id is in data for per-user routing
@@ -8908,10 +8913,10 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     from core.llm_outbound_logger import strip_elided_pointers
     response_text = strip_elided_pointers(response_text)
     # Where this reply came from (local | hive | cloud): ONE rule, named once
-    # per reply.  The spoken bubble and the /chat JSON below both carry it, so
-    # the page never has to guess -- its guess was 'cloud', which badged a
-    # reply the local llama-server wrote "Cloud" (2026-10-04).  Local import:
-    # _chat_reply's source is exec'd in an isolated namespace by tests.
+    # per reply, on the /chat JSON below, HARTOS's own reply API (Nunba's
+    # route rebuilds its reply and still writes its own 'local' there, its
+    # follow-up).  Local import: _chat_reply's source is exec'd in an
+    # isolated namespace by tests.
     from core.constants import canonical_served_by
     _served_by = canonical_served_by(payload.get('served_by'))
     if response_text:
@@ -8984,14 +8989,8 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                 _lang = 'en'
         if _tts_wanted:
             try:
-                # Local import: module globals do not exist in the isolated
-                # namespace the tests exec this source in (see the flask
-                # import above).  The TTS bubble is stamped from this context.
-                from hartos.threadlocal import thread_local_data as _tld_origin
-                with _tld_origin.reply_from(_served_by):
-                    _tts_synthesize_and_publish(
-                        response_text, user_id, request_id,
-                        language=_lang, avatar_id=_avatar_id)
+                _tts_synthesize_and_publish(response_text, user_id, request_id,
+                                            language=_lang, avatar_id=_avatar_id)
             except Exception as e:
                 # Never let a TTS failure block delivery of the text reply.
                 app.logger.debug(f"_chat_reply: TTS dispatch skipped: {e}")
@@ -9205,17 +9204,10 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
     canonical synth entry, TTSRouter.synthesize, which clones from it (see
     _speak_in_voice).  None, an avatar with no voice, or a voice no engine
     here can clone keeps synthesize_text's default voice.
-    This bubble (text + audio) is what the page renders for a reply, so it
-    carries ``served_by`` (local | hive | cloud, core.constants.
-    canonical_served_by) for the badge: the origin the CALLER's thread names
-    through thread_local_data.reply_from(), else the node's own LLM.
     """
     if not text or not text.strip():
         app.logger.debug("TTS: skipped (empty text)")
         return
-    # Read HERE, on the caller's thread: _bg below runs on the TTS executor,
-    # where that thread-local is empty.
-    _origin = thread_local_data.get_served_by()
     if not language:
         try:
             from core.user_lang import get_preferred_lang
@@ -9382,13 +9374,11 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                         f"TTS async: no advertisable base url for the phone's "
                         f"bundle ({e}); sending {audio_url} as is")
                     _phone_audio_url = audio_url
-                from core.constants import canonical_served_by
                 _tts_payload = {
                     'text': [text[:200]],
                     'generated_audio_url': audio_url,
                     'request_id': str(request_id),
                     'action': 'TTS',
-                    'served_by': canonical_served_by(_origin),
                     'video_link': {
                         'aud_url': _phone_audio_url,
                         'request_id': str(request_id),

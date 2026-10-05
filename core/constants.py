@@ -1429,28 +1429,45 @@ def canonical_served_by(value=None, node_tier=None) -> str:
     """The origin of a chat reply, in the vocabulary a client badge reads.
 
     ``value`` is whatever the dispatch site said: an exact 'local' / 'hive' /
-    'cloud', or one of the tags that grew before this rule ('hive_langchain_bg'
-    and 'local_langchain_bg' from the speculative dispatcher, 'langchain_cloud'
-    and 'hevolve_cloud' from the cloud pipeline).  'hive' wins over 'cloud' in
-    a tag that names both.
+    'cloud', or the speculative dispatcher's telemetry tags
+    'hive_langchain_bg' / 'local_langchain_bg'.  Matched as WORDS of the tag
+    (split on anything not a letter or digit), so 'archive' is not 'hive' and
+    'cloudless' is not 'cloud'.  'hive' wins over 'cloud' in a tag naming both.
 
-    No usable tag means the node's own LLM wrote the reply: 'local', or
-    'cloud' when this IS the central node, whose own LLM is the cloud every
-    client of central sees.  ``node_tier`` is the tier the envelope names (a
-    node relaying central's reply keeps 'central'); None reads
-    HEVOLVE_NODE_TIER, the one place this rule does.  A value that is not a
-    string (a device id, a number) is no tag.  Never raises."""
+    On the central node every reply its own LLM writes is 'cloud', the cloud
+    each client of central talks to (owner call open: tier.js labels local +
+    central 'On-host').  ``node_tier`` is the tier the envelope names (a node
+    relaying central's reply keeps 'central'); None reads HEVOLVE_NODE_TIER,
+    the one place this rule does.
+
+    Otherwise a 'local' tag is 'local', and a reply nobody tagged was written
+    by this node's own LLM, so it is where that LLM runs
+    (core.autogen_config.llm_stays_on_premises): 'local' on this machine or
+    LAN, 'cloud' when the node sends its prompts to a public API -- a reply
+    from openrouter.ai is not on-device (tier.js: local = no cloud egress).
+    A value that is not a string (a device id, a number) is no tag.  Never
+    raises: an unreadable configuration reads 'cloud', the page's own answer
+    for an unknown origin."""
+    import re
     tag = value.strip().lower() if isinstance(value, str) else ''
-    if 'hive' in tag:
+    words = set(re.split(r'[^a-z0-9]+', tag))
+    if 'hive' in words:
         return SERVED_BY_HIVE
-    if 'cloud' in tag:
+    if 'cloud' in words:
         return SERVED_BY_CLOUD
     if node_tier is None:
         import os
         node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
     if str(node_tier or '').strip().lower() == 'central':
         return SERVED_BY_CLOUD
-    return SERVED_BY_LOCAL
+    if 'local' in words:
+        return SERVED_BY_LOCAL
+    try:
+        from core.autogen_config import llm_stays_on_premises
+        on_premises = llm_stays_on_premises()
+    except Exception:
+        on_premises = False
+    return SERVED_BY_LOCAL if on_premises else SERVED_BY_CLOUD
 
 
 # Tools that record, recall or look up the agent's OWN state -- the scratchpad

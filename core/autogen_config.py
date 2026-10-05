@@ -52,6 +52,46 @@ def _report_once(key, msg):
         log.error(msg)
 
 
+def configured_api_endpoint():
+    """The endpoint this node's LLM calls go to when it runs on an API, or ''
+    when it runs its own llama-server.
+
+    The ONE answer to "local or api", read from the environment alone: no
+    probe, no entry, no report.  resolve_llm_backend builds its entry on it;
+    core.constants.canonical_served_by asks it where a reply nobody tagged
+    was written (a node on an API sends every prompt off the box, and a
+    reply from it is not on-device).
+    """
+    endpoint = os.environ.get(ENDPOINT_VAR, '')
+    if os.environ.get('HEVOLVE_NODE_TIER', 'flat') in ('regional', 'central') and endpoint:
+        return endpoint
+    provider = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
+    if provider and os.environ.get(API_KEY_VAR, '') and (endpoint or provider == 'openai'):
+        return endpoint or OPENAI_SDK_DEFAULT_BASE
+    return ''
+
+
+def llm_stays_on_premises():
+    """True when this node's own LLM runs on this machine or this LAN: its own
+    llama-server, or an API endpoint whose host is loopback or a non-global
+    address (a LAN box).  A public endpoint (openrouter.ai, api.openai.com)
+    is not, and neither is a host NAME other than localhost: it is not
+    provably local, and saying 'on-device' about bytes that left is the
+    wrong way to be wrong.  Pure: no probe."""
+    api = configured_api_endpoint()
+    if not api:
+        return True
+    from urllib.parse import urlparse
+    import ipaddress
+    host = (urlparse(api).hostname or '').lower()
+    if host == 'localhost':
+        return True
+    try:
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        return False
+
+
 def resolve_llm_backend():
     """Return ``(kind, entry)``.
 
@@ -69,8 +109,11 @@ def resolve_llm_backend():
     endpoint = os.environ.get(ENDPOINT_VAR, '')
     api_key = os.environ.get(API_KEY_VAR, '')
     model = os.environ.get(MODEL_VAR, '')
+    # The kind is configured_api_endpoint's answer; the branches below only
+    # build the entry for it.
+    api_endpoint = configured_api_endpoint()
 
-    if node_tier in ('regional', 'central') and endpoint:
+    if api_endpoint and node_tier in ('regional', 'central') and endpoint:
         if not model:
             _report_once('model', "%s is set but %s is empty: the configured "
                          "endpoint decides the model, HARTOS will not guess one"
@@ -105,19 +148,20 @@ def resolve_llm_backend():
                 "chat_template_kwargs": dict(LLM_THINKING_OFF_KWARGS)}
         return 'api', entry
 
+    if api_endpoint:
+        if not model:
+            _report_once('model', "provider %s is active but %s is empty: "
+                         "HARTOS will not guess a model" % (provider, MODEL_VAR))
+        entry = {
+            "model": model,
+            "api_key": api_key,
+            "price": [0.0025, 0.01],
+        }
+        if endpoint:
+            entry["base_url"] = endpoint
+        return 'api', entry
+
     if provider and api_key:
-        if endpoint or provider == 'openai':
-            if not model:
-                _report_once('model', "provider %s is active but %s is empty: "
-                             "HARTOS will not guess a model" % (provider, MODEL_VAR))
-            entry = {
-                "model": model,
-                "api_key": api_key,
-                "price": [0.0025, 0.01],
-            }
-            if endpoint:
-                entry["base_url"] = endpoint
-            return 'api', entry
         # anthropic / google_gemini / groq with no endpoint exported: only the
         # vendor SDK ladder in get_llm() can reach them.  autogen and the raw
         # callers speak OpenAI-compatible chat/completions only, and posting

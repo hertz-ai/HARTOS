@@ -22,9 +22,15 @@ that wrapper, so a new keyword is a TypeError on the desktop and the expert's
 reply is never published.  The end-to-end class below runs the real dispatcher
 through a wrapper of exactly that shape.
 
-These tests drive the REAL publish_async, _chat_reply, _tts_synthesize_and_publish
-and SpeculativeDispatcher; only the bus, SSE, executor and persistence boundaries
-are replaced.
+Review of 2026-10-04 (rework): a reply nobody tagged is where the node's own LLM
+runs (core.autogen_config.llm_stays_on_premises): a node that sends its prompts
+to a public API (openrouter.ai) is not on-device, and tier.js defines local as
+"no cloud egress".  Tags are matched as words ('archive' is not 'hive').  The
+TTS payload carries no badge: the page plays a 'TTS' payload and returns
+(Demopage.js handleDataReceived), so nothing read it.
+
+These tests drive the REAL publish_async, _chat_reply and SpeculativeDispatcher;
+only the bus, SSE, executor and persistence boundaries are replaced.
 
     python -m pytest tests/unit/test_served_by_is_one_rule.py -q
 """
@@ -71,6 +77,30 @@ def hie():
     return module
 
 
+_LLM_ENV = ('HEVOLVE_LLM_ENDPOINT_URL', 'HEVOLVE_ACTIVE_CLOUD_PROVIDER',
+            'HEVOLVE_LLM_API_KEY', 'HEVOLVE_LLM_MODEL_NAME')
+
+
+@pytest.fixture(autouse=True)
+def own_llama_server(monkeypatch):
+    """No cloud provider and no API endpoint: the node runs its own LLM.  A
+    developer box with a provider exported must not decide these tests."""
+    for var in _LLM_ENV:
+        monkeypatch.delenv(var, raising=False)
+
+
+def _on_api(monkeypatch, endpoint, provider='openrouter', tier=None):
+    monkeypatch.setenv('HEVOLVE_ACTIVE_CLOUD_PROVIDER', provider)
+    monkeypatch.setenv('HEVOLVE_LLM_API_KEY', 'test-key')
+    monkeypatch.setenv('HEVOLVE_LLM_MODEL_NAME', 'some-model')
+    if endpoint is None:
+        monkeypatch.delenv('HEVOLVE_LLM_ENDPOINT_URL', raising=False)
+    else:
+        monkeypatch.setenv('HEVOLVE_LLM_ENDPOINT_URL', endpoint)
+    if tier:
+        monkeypatch.setenv('HEVOLVE_NODE_TIER', tier)
+
+
 @pytest.fixture
 def flat_node(monkeypatch):
     monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
@@ -110,6 +140,10 @@ class TestCanonicalServedBy:
         ('', 'flat', 'local'),
         (None, 'regional', 'local'),
         ('an-unknown-device-id', 'flat', 'local'),
+        # words, not substrings (review: 'archive' read as hive)
+        ('archive', 'flat', 'local'),
+        ('beehive-sync', 'flat', 'local'),
+        ('cloudless-local', 'flat', 'local'),
         # on central the node's own LLM IS the cloud, which is what every
         # client of central sees; an escalation to peers is still 'hive'
         (None, 'central', 'cloud'),
@@ -130,6 +164,75 @@ class TestCanonicalServedBy:
         assert cs.canonical_served_by(None) == 'local'
         monkeypatch.delenv('HEVOLVE_NODE_TIER')
         assert cs.canonical_served_by(None) == 'local'
+
+    @pytest.mark.parametrize('endpoint, provider, expected', [
+        # review MUST FIX 1: a flat node on a public API sends every prompt
+        # off the box; its reply is not on-device
+        ('https://openrouter.ai/api/v1', 'openrouter', 'cloud'),
+        (None, 'openai', 'cloud'),               # the openai SDK's own base
+        # an API endpoint on this machine or this LAN is still local
+        ('http://localhost:8080/v1', 'custom', 'local'),
+        ('http://127.0.0.1:8080/v1', 'custom', 'local'),
+        ('http://192.168.0.69:8080/v1', 'custom', 'local'),
+        ('http://[::1]:8080/v1', 'custom', 'local'),
+        # a host NAME is not provably local
+        ('http://my-nas:8080/v1', 'custom', 'cloud'),
+        # a provider with no endpoint the chat callers can reach runs local
+        (None, 'anthropic', 'local'),
+    ])
+    def test_an_untagged_reply_is_where_the_nodes_llm_runs(
+            self, cs, monkeypatch, endpoint, provider, expected):
+        _on_api(monkeypatch, endpoint, provider)
+        assert cs.canonical_served_by(None, 'flat') == expected
+        # an explicit local model and an escalation keep their own answer
+        assert cs.canonical_served_by('local_langchain_bg', 'flat') == 'local'
+        assert cs.canonical_served_by('hive', 'flat') == 'hive'
+
+    def test_a_regional_node_on_a_public_api_is_cloud_not_lan(
+            self, cs, monkeypatch):
+        """tier.js badges local + regional 'LAN'; a regional node whose LLM is
+        openrouter.ai sent the prompt to the internet."""
+        monkeypatch.setenv('HEVOLVE_NODE_TIER', 'regional')
+        monkeypatch.setenv('HEVOLVE_LLM_ENDPOINT_URL', 'https://openrouter.ai/api/v1')
+        assert cs.canonical_served_by(None) == 'cloud'
+        monkeypatch.setenv('HEVOLVE_LLM_ENDPOINT_URL', 'http://10.0.0.5:8080/v1')
+        assert cs.canonical_served_by(None) == 'local'
+
+    def test_an_unreadable_configuration_is_cloud_the_pages_own_unknown(
+            self, cs, monkeypatch):
+        import core.autogen_config as ac
+
+        def _broken():
+            raise RuntimeError('config unreadable')
+        monkeypatch.setattr(ac, 'llm_stays_on_premises', _broken)
+        assert cs.canonical_served_by(None, 'flat') == 'cloud'
+
+    @pytest.mark.parametrize('tier', ['flat', 'regional', 'central'])
+    @pytest.mark.parametrize('endpoint', ['', 'https://openrouter.ai/api/v1',
+                                          'http://192.168.0.69:8080/v1'])
+    @pytest.mark.parametrize('provider, key', [('', ''), ('openrouter', 'k'),
+                                               ('openai', 'k'), ('anthropic', 'k'),
+                                               ('openrouter', '')])
+    def test_one_answer_to_local_or_api(self, monkeypatch, tier, endpoint,
+                                        provider, key):
+        """resolve_llm_backend's kind IS configured_api_endpoint's answer:
+        the badge cannot say local while the agents dial an API, or the
+        reverse."""
+        import core.autogen_config as ac
+        monkeypatch.setenv('HEVOLVE_NODE_TIER', tier)
+        for var, val in (('HEVOLVE_LLM_ENDPOINT_URL', endpoint),
+                         ('HEVOLVE_ACTIVE_CLOUD_PROVIDER', provider),
+                         ('HEVOLVE_LLM_API_KEY', key)):
+            if val:
+                monkeypatch.setenv(var, val)
+            else:
+                monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv('HEVOLVE_LLM_MODEL_NAME', 'm')
+        kind, entry = ac.resolve_llm_backend()
+        api = ac.configured_api_endpoint()
+        assert kind == ('api' if api else 'local'), (kind, api)
+        if kind == 'api':
+            assert (entry.get('base_url') or ac.OPENAI_SDK_DEFAULT_BASE) == api
 
     @pytest.mark.parametrize('junk', [123, ['hive'], {}, object(), 1.5, b'hive'])
     def test_a_value_that_is_not_a_string_never_raises(self, cs, junk):
@@ -271,6 +374,27 @@ class TestPublishAsyncStampsServedBy:
         assert data['node_tier'] == 'central'
         assert data['served_by'] == 'cloud'
 
+    def test_a_reply_from_a_node_on_a_public_api_is_cloud(
+            self, hie, monkeypatch, flat_node):
+        _on_api(monkeypatch, 'https://openrouter.ai/api/v1')
+        data, sse = self._publish(hie, monkeypatch, CHAT_TOPIC, {'text': ['hi']})
+        assert data['served_by'] == 'cloud'
+        assert sse[0][1]['served_by'] == 'cloud'
+
+    def test_a_failing_stamp_never_costs_the_delivery(
+            self, hie, monkeypatch, flat_node):
+        """Review: the stamp sat outside publish_async's try, so a raise there
+        delivered nothing.  The reply goes out; only the badge is missing."""
+        import core.constants as constants
+
+        def _broken(*a, **k):
+            raise RuntimeError('rule broke')
+        monkeypatch.setattr(constants, 'canonical_served_by', _broken)
+        data, sse = self._publish(hie, monkeypatch, CHAT_TOPIC, {'text': ['hi']})
+        assert data['text'] == ['hi']
+        assert 'served_by' not in data
+        assert sse and sse[0][1]['text'] == ['hi']
+
     def test_a_topic_that_is_not_chat_is_not_stamped(
             self, hie, monkeypatch, flat_node):
         bus = _Bus()
@@ -294,8 +418,8 @@ class TestChatReplyCarriesServedBy:
 
     @staticmethod
     def _reply(hie, tl, text='hello there', **payload):
-        """Run the REAL _chat_reply; the fake TTS records the origin the
-        reply's thread named AT THE MOMENT it was called."""
+        """Run the REAL _chat_reply; the fake TTS records whether it was
+        called (its payload carries no badge, so no origin travels to it)."""
         origins = []
         fake_tts = MagicMock(
             side_effect=lambda *a, **k: origins.append(tl.get_served_by()))
@@ -311,18 +435,16 @@ class TestChatReplyCarriesServedBy:
         body, origins = self._reply(hie, tl)
         assert body['served_by'] == 'local'
         assert body['response'] == 'hello there'
-        assert origins == ['local']
+        assert len(origins) == 1, "the reply was not spoken"
 
     def test_the_reply_is_cloud_on_central(self, hie, tl, central_node):
-        body, origins = self._reply(hie, tl)
+        body, _ = self._reply(hie, tl)
         assert body['served_by'] == 'cloud'
-        assert origins == ['cloud']
 
     def test_a_payload_tag_is_named_in_the_canonical_vocabulary(
             self, hie, tl, flat_node):
-        body, origins = self._reply(hie, tl, served_by='hive_langchain_bg')
+        body, _ = self._reply(hie, tl, served_by='hive_langchain_bg')
         assert body['served_by'] == 'hive'
-        assert origins == ['hive']
 
     def test_an_empty_reply_still_says_where_it_came_from(
             self, hie, tl, flat_node):
@@ -334,84 +456,6 @@ class TestChatReplyCarriesServedBy:
             self, hie, tl, flat_node):
         self._reply(hie, tl, served_by='hive')
         assert tl.get_served_by() is None
-
-
-# ─────────────────────────────────────────────────────────────────────
-# the spoken bubble (text + audio) is what the page renders for a reply
-# ─────────────────────────────────────────────────────────────────────
-
-class _InlineExecutor:
-    def submit(self, fn, *args, **kwargs):
-        fn(*args, **kwargs)
-
-
-class _ThreadExecutor:
-    """The real shape: the synthesis runs on another thread."""
-
-    def submit(self, fn, *args, **kwargs):
-        t = threading.Thread(target=fn, args=args, kwargs=kwargs)
-        t.start()
-        t.join(30)
-
-
-class TestSpokenBubbleCarriesServedBy:
-
-    @staticmethod
-    def _speak(hie, monkeypatch, tl, origin=None, executor=None):
-        wav = os.path.join(tempfile.mkdtemp(), 'reply.wav')
-        with open(wav, 'wb') as fh:
-            fh.write(b'RIFF')
-        engine = types.ModuleType('tts.tts_engine')
-        engine.get_tts_engine = lambda: types.SimpleNamespace(
-            backend_name='fake-engine')
-        engine.synthesize_text = lambda t, language='en', **k: wav
-        pkg = types.ModuleType('tts')
-        pkg.tts_engine = engine
-        sse, bus = [], []
-        monkeypatch.setenv('HEVOLVE_EXTERNAL_URL', 'http://node.test')
-        from integrations.channels.media import tts_text_normalizer as tn
-        with patch.dict(sys.modules, {'tts': pkg, 'tts.tts_engine': engine}), \
-                patch.object(hie, '_tts_executor', executor or _InlineExecutor()), \
-                patch.object(tn, '_llm_normalize', lambda *a, **k: None), \
-                patch.object(hie, 'publish_async',
-                             side_effect=lambda topic, msg, *a, **k: bus.append(
-                                 (topic, msg))), \
-                patch('core.platform.events.broadcast_sse_safe',
-                      side_effect=_sse_recorder(sse)):
-            with tl.reply_from(origin):
-                hie._tts_synthesize_and_publish(
-                    'a spoken answer', 'user-1', 'req-1', language='en')
-        assert sse, 'the audio bubble never reached SSE: nothing to assert'
-        assert bus, 'the audio bubble never reached the pupit topic'
-        return sse[0][1], json.loads(bus[0][1])
-
-    def test_the_bubble_defaults_to_local_on_a_flat_node(
-            self, hie, monkeypatch, tl, flat_node):
-        sse_payload, pupit_payload = self._speak(hie, monkeypatch, tl)
-        assert sse_payload['action'] == 'TTS'
-        assert sse_payload['served_by'] == 'local'
-        assert pupit_payload['served_by'] == 'local'
-
-    def test_the_bubble_carries_the_named_origin_on_both_transports(
-            self, hie, monkeypatch, tl, flat_node):
-        sse_payload, pupit_payload = self._speak(
-            hie, monkeypatch, tl, origin='hive_langchain_bg')
-        assert sse_payload['served_by'] == 'hive'
-        assert pupit_payload['served_by'] == 'hive'
-
-    def test_the_origin_survives_the_hand_off_to_the_tts_worker_thread(
-            self, hie, monkeypatch, tl, flat_node):
-        """The payload is built on the TTS executor's thread, where the
-        caller's context is empty: the origin must be read on entry."""
-        sse_payload, pupit_payload = self._speak(
-            hie, monkeypatch, tl, origin='hive', executor=_ThreadExecutor())
-        assert sse_payload['served_by'] == 'hive'
-        assert pupit_payload['served_by'] == 'hive'
-
-    def test_the_bubble_is_cloud_on_central(
-            self, hie, monkeypatch, tl, central_node):
-        sse_payload, _ = self._speak(hie, monkeypatch, tl)
-        assert sse_payload['served_by'] == 'cloud'
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -537,11 +581,17 @@ class TestExpertDeliveryNamesItsOrigin:
         pub.assert_called_once_with(chat_topic_for('u'), 'the answer')
 
 
-class TestExpertReplyReachesThePageWithItsOrigin:
+class TestExpertEnvelopeCarriesItsOrigin:
     """The real dispatcher -> the real publish_async, reached the way the
     dispatcher reaches it: through safe_hartos_attr, which on the desktop
     returns Nunba's wrapper.  A keyword-based design fails HERE: the wrapper
-    has three parameters, the publish raises, the reply is never sent."""
+    has three parameters, the publish raises, the reply is never sent.
+
+    What this proves is the ENVELOPE: the expert's chat.* envelope reaches
+    SSE carrying its origin.  It does not prove a badge: the expert's text
+    goes out as a bare string, i.e. {'raw': ...}, and the page renders
+    text[0] (Demopage.js handleDataReceived), so this envelope is not drawn
+    at all -- a rendering gap of its own, not closed here."""
 
     @staticmethod
     def _run(hie, monkeypatch, tl, registry, expert):
@@ -573,20 +623,20 @@ class TestExpertReplyReachesThePageWithItsOrigin:
                 'spec-1', 'p', 'r', expert, 'user-1', 'pid', None, 'general')
         return sse, spoken
 
-    def test_a_hive_expert_reply_reaches_the_page_badged_hive(
+    def test_a_hive_expert_envelope_names_hive(
             self, hie, monkeypatch, tl, flat_node, hive_registry):
         sse, spoken = self._run(hie, monkeypatch, tl, hive_registry,
                                 hive_registry.get_expert_model())
         assert [p['raw'] for _e, p, _u in sse] == ['an expert answer']
         assert sse[0][1]['served_by'] == 'hive'
-        assert spoken == [('an expert answer', 'hive_langchain_bg', {})]
+        assert [t for t, _o, _k in spoken] == ['an expert answer']
 
-    def test_a_local_expert_reply_reaches_the_page_badged_local(
+    def test_a_local_expert_envelope_names_local(
             self, hie, monkeypatch, tl, flat_node, local_registry):
         sse, spoken = self._run(hie, monkeypatch, tl, local_registry,
                                 local_registry.get_fast_model())
         assert sse[0][1]['served_by'] == 'local'
-        assert spoken == [('an expert answer', 'local_langchain_bg', {})]
+        assert [t for t, _o, _k in spoken] == ['an expert answer']
 
     def test_the_same_local_expert_is_cloud_on_central(
             self, hie, monkeypatch, tl, central_node, local_registry):
@@ -604,16 +654,24 @@ class TestExpertReplyReachesThePageWithItsOrigin:
 #: core.constants.canonical_served_by instead.
 _ALLOWED_WRITERS = {
     'core/constants.py': 'the rule itself',
-    'hart_intelligence_entry.py': 'publish_async, _chat_reply and the spoken '
-                                  'bubble stamp the canonical value',
+    'hart_intelligence_entry.py': 'publish_async and _chat_reply stamp the '
+                                  'canonical value',
     'integrations/agent_engine/speculative_dispatcher.py':
         'the dispatch site: its telemetry tag, normalized on delivery',
     'integrations/agent_engine/compute_mesh_service.py':
         'a DIFFERENT meaning: the id of the device that ran an offloaded '
         'compute job, never a chat tier',
 }
-_SKIP_DIRS = {'tests', 'build', 'venv', '.venv', 'node_modules', '.git',
-              '__pycache__', 'scripts'}
+#: Nunba writes one of its own: the /chat HTTP reply's hard-coded 'local'
+#: (routes/chatbot_routes.py), which should pass HARTOS's served_by through
+#: instead (Nunba follow-up #905).  Any OTHER Nunba writer fails this guard.
+_ALLOWED_NUNBA_WRITERS = {
+    'routes/chatbot_routes.py': "the /chat HTTP reply's hard-coded 'local'; "
+                                'follow-up #905 passes HARTOS\'s value through',
+}
+_SKIP_DIRS = {'tests', 'build', 'dist', 'node_modules', '.git', '__pycache__',
+              'scripts', 'runs', 'python-embed', 'landing-page', '_drops_ready',
+              '_buildsrc'}
 
 
 def _writes_served_by(tree):
@@ -634,27 +692,67 @@ def _writes_served_by(tree):
             for kw in node.keywords:
                 if kw.arg == 'served_by':
                     return True
+            # d.setdefault('served_by', ...) writes it too (review)
+            if (isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ('setdefault', '__setitem__')
+                    and node.args and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == 'served_by'):
+                return True
     return False
 
 
-def test_source_guard_one_rule_for_where_a_reply_came_from():
-    offenders = []
-    for root, dirs, files in os.walk(PROJECT_ROOT):
+def _writers_under(root):
+    """Every .py under ``root`` that writes a served_by key, as root-relative
+    paths.  Underscore modules and package __init__ files are scanned too:
+    skipping them hid 189 + 241 files from the first version of this guard."""
+    found = []
+    for here, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d not in _SKIP_DIRS
-                   and not d.startswith('_')]
+                   and not d.startswith('venv') and not d.startswith('.')]
         for name in files:
-            if not name.endswith('.py') or name.startswith('_'):
+            if not name.endswith('.py'):
                 continue
-            path = os.path.join(root, name)
-            rel = os.path.relpath(path, PROJECT_ROOT).replace('\\', '/')
+            path = os.path.join(here, name)
             try:
                 with open(path, encoding='utf-8') as fh:
                     tree = ast.parse(fh.read())
-            except (SyntaxError, UnicodeDecodeError, OSError):
+            except (SyntaxError, UnicodeDecodeError, OSError, ValueError):
                 continue
-            if _writes_served_by(tree) and rel not in _ALLOWED_WRITERS:
-                offenders.append(rel)
+            if _writes_served_by(tree):
+                found.append(os.path.relpath(path, root).replace('\\', '/'))
+    return found
+
+
+@pytest.mark.parametrize('src, writes', [
+    ("d['served_by'] = 'x'", True),
+    ("d.setdefault('served_by', 'x')", True),
+    ("d.update(served_by='x')", True),
+    ("d = {'served_by': 'x'}", True),
+    ("d.get('served_by')", False),
+    ("x = d['served_by']", False),
+])
+def test_the_guard_sees_every_way_to_write_it(src, writes):
+    assert _writes_served_by(ast.parse(src)) is writes
+
+
+def test_source_guard_one_rule_for_where_a_reply_came_from():
+    offenders = [rel for rel in _writers_under(PROJECT_ROOT)
+                 if rel not in _ALLOWED_WRITERS]
     assert not offenders, (
         'These files write a served_by of their own.  A reply\'s origin is '
         'named by core.constants.canonical_served_by (local | hive | cloud); '
         f'add the file to _ALLOWED_WRITERS only with a reason: {offenders}')
+
+
+def test_source_guard_the_sibling_repo_writes_no_second_rule():
+    """Review: the guard could not see Nunba, which writes the /chat HTTP
+    reply the page badges.  Its one known writer is listed with its
+    follow-up; any other fails here."""
+    nunba = os.path.join(os.path.dirname(PROJECT_ROOT), 'Nunba-HART-Companion')
+    if not os.path.isdir(os.path.join(nunba, 'routes')):
+        pytest.skip('the Nunba checkout is not beside this one')
+    offenders = [rel for rel in _writers_under(nunba)
+                 if rel not in _ALLOWED_NUNBA_WRITERS]
+    assert not offenders, (
+        f'Nunba writes served_by of its own in {offenders}: pass the value '
+        'HARTOS stamped through instead')
