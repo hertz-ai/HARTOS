@@ -175,6 +175,94 @@ class TestWhatIsNotTheAssistantsAnswerInARealLog(_Harness):
     def test_the_assistants_own_status_json_is_not_an_answer(self):
         self.assertIsNone(self._derived([('Assistant', _VERDICT)]))
 
+    def test_a_status_claim_in_any_dress_is_not_an_answer(self):
+        """The Assistant's own {"status": "completed"} report, fenced,
+        single-quoted, or after a line of prose.  REUSE refuses all three
+        (retrieve_json, then 'status' in the parsed dict); CREATE judged only
+        a message that STARTS with '{' and holds "status" in double quotes,
+        so the pipeline derived the claim as the receipt and completed a
+        prose action on text the model composed (reviewer finding B2 of
+        afd7c5a87, still at ab201d515; the #125 class)."""
+        claims = {
+            'fenced': '```json' + NL + _VERDICT + NL + '```',
+            'single-quoted': _VERDICT.replace('"', "'"),
+            'after prose': 'All done, here is my report: ' + _VERDICT,
+        }
+        cited = {'evidence': {'message_index': 1, 'kind': 'user_visible_result'}}
+        for dress, claim in claims.items():
+            with self.subTest(dress=dress):
+                self.assertIsNone(self._derived([('Assistant', claim)]))
+                self.assertFalse(lh._verifier_completion_has_conversation_evidence(
+                    self.UP, 1, cited))
+                self._state(S.IN_PROGRESS, S.STATUS_VERIFICATION_REQUESTED)
+                self.assertFalse(lh.commit_verified_action_completion(
+                    self.UP, 1, cited['evidence']))
+                self.assertNotEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)
+                lh.action_states.pop(self.UP, None)
+
+    def test_a_tool_call_in_the_models_own_syntax_is_not_an_answer(self):
+        """Markup, not a sentence: an unexecuted call (REUSE refuses it)."""
+        call = ('<tool_call>' + NL + '<function=execute_windows_or_android_command>'
+                + NL + '<parameter=instructions>' + NL + 'dir' + NL
+                + '</parameter>' + NL + '</function>' + NL + '</tool_call>')
+        self.assertIsNone(self._derived([('Assistant', call)]))
+
+    def test_a_note_to_the_loops_own_seats_is_routing_not_an_answer(self):
+        """@ChatInstructor and @UserProxy are seats the CREATE loop routes to
+        and REUSE's mention list does not name; 4b049241d's move onto that
+        list let a note to either complete a prose action again (reviewer
+        finding D1)."""
+        for note in ('@ChatInstructor Action 1 is done, please move on to the '
+                     'next action.',
+                     '@UserProxy please confirm the topic before I continue.'):
+            with self.subTest(note=note[:20]):
+                self.assertIsNone(self._derived([('Assistant', note)]))
+
+    def test_the_steers_unfilled_answer_template_is_not_an_answer(self):
+        """The synthesis steer's own template sent back as it stands (REUSE
+        has refused it since 09-09; reviewer finding C2 of 92e5a9560, still at
+        ab201d515: CREATE derived it and completed on it)."""
+        templates = {
+            'placeholder': '{"message2userfinal": "<your answer here>"}',
+            'to the person': '@user {"message2userfinal": "<your answer here>"}',
+            'empty': '{"message2userfinal": ""}',
+            'the other key': '{"message2": "<answer>"}',
+        }
+        cited = {'evidence': {'message_index': 1, 'kind': 'user_visible_result'}}
+        for shape, template in templates.items():
+            with self.subTest(shape=shape):
+                self.assertIsNone(self._derived([('Assistant', template)]))
+                self.assertFalse(lh._verifier_completion_has_conversation_evidence(
+                    self.UP, 1, cited))
+
+    def test_an_answer_key_holding_real_text_is_an_answer(self):
+        """The control: the envelope is how the Assistant may address the
+        person, so a filled one is the lesson."""
+        filled = ('{"message2userfinal": "' + _LESSON.replace(NL, ' ') + '"}')
+        self.assertEqual(self._derived([('Assistant', filled)]),
+                         {'message_index': 1, 'kind': 'user_visible_result'})
+
+    def test_a_text_the_parser_cannot_read_is_not_an_answer(self):
+        """Fails closed, as REUSE's filter does: a message this cannot judge is
+        not an answer, so a parser fault never completes an action."""
+        import hartos.helper as helper
+        message = {'role': 'user', 'name': 'Assistant', 'content': _LESSON}
+        self.assertTrue(lh.is_written_answer(message))
+
+        def unreadable(_text):
+            raise RuntimeError('parser down')
+        self.patch(helper, 'retrieve_json', unreadable)
+        self.assertFalse(lh.is_written_answer(message))
+
+    def test_prose_that_only_mentions_status_or_braces_is_still_an_answer(self):
+        """The control: no verdict object in it, so it is the lesson."""
+        for text in (_LESSON + NL + NL + 'The status of the cell is alive.',
+                     _LESSON + NL + NL + 'Think of a set {1, 2, 3} as a bag.'):
+            with self.subTest(text=text[-30:]):
+                self.assertEqual(self._derived([('Assistant', text)]),
+                                 {'message_index': 1,
+                                  'kind': 'user_visible_result'})
+
     def test_an_echo_of_the_dispatch_is_not_an_answer(self):
         """A seat name does not always survive a log: the dispatch comes back
         as the Assistant's, role user, and must not be its work."""
@@ -400,6 +488,21 @@ class TestTheMentionListIsOneList(unittest.TestCase):
                  and any(getattr(t, 'id', None) == '_AGENT_MENTIONS'
                          for t in node.targets)]
         self.assertEqual([tuple(v) for v in found], [AGENT_MENTIONS])
+
+
+class TestTheAnswerValueRuleIsOneRule(unittest.TestCase):
+    """reuse_recipe._reuse_is_written_answer has to stay literal (its
+    extract-and-exec tests build a namespace from that file's source), so the
+    CREATE side's copy is pinned to it by behaviour, over the values the live
+    steer produced and some it did not."""
+
+    def test_reuse_and_create_judge_every_value_the_same(self):
+        for value in (None, '', '   ', '<your answer here>', '<>', ' <x> ',
+                      'a lesson', '<b>bold</b> lesson', 'x <y>', 0, 12,
+                      ['a'], {}):
+            with self.subTest(value=value):
+                self.assertEqual(rr._reuse_is_written_answer(value),
+                                 lh._answer_value_is_text(value))
 
 
 if __name__ == '__main__':

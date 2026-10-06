@@ -1729,30 +1729,87 @@ def _verifier_completion_has_conversation_evidence(
 # lesson could never be one.  'tool' and 'function' are somebody's result.
 _ASSISTANT_WRITTEN_ROLES = ('assistant', 'user')
 
+# The tags that make a message routing.  The shared list (AGENT_MENTIONS: the
+# seats REUSE's loop routes by) plus the two seats the CREATE loop also routes
+# to, which that list does not name: 4b049241d moved this rule onto the shared
+# list and, with it, let "@ChatInstructor Action 1 is done, please move on"
+# complete a prose action again (reviewer finding D1).  They are not added to
+# the shared list because REUSE's loop and send_message_to_user read their own
+# copies of it for other decisions (task #166).
+_ROUTING_MENTIONS = AGENT_MENTIONS + ("@chatinstructor", "@userproxy")
+
+
+def _answer_value_is_text(value) -> bool:
+    """Whether the value of a ``message2userfinal`` / ``message2`` answer key
+    is text a person can read: not empty, and not an unfilled ``<...>``
+    placeholder (the synthesis steer's own template, ``<your answer here>``).
+    The rule of reuse_recipe._reuse_is_written_answer, which has to stay
+    literal in that module (its extract-and-exec tests); a test pins the two
+    equal."""
+    text = str(value or '').strip()
+    return bool(text) and not (text.startswith('<') and text.endswith('>'))
+
+
+def _is_control_message(text: str) -> bool:
+    """Whether ``text`` is the pipeline's control JSON rather than prose: a
+    status verdict object in any dress (bare, in a code fence, single-quoted,
+    after a line of prose), or an answer-key envelope whose value is empty or
+    an unfilled placeholder.  It is the parse REUSE's reply filter uses
+    (helper.retrieve_json), so the Assistant's own ``{"status": "completed"}``
+    report, or the steer's template sent back as it stands, is refused here
+    exactly where REUSE refuses it; an answer key holding real text is an
+    answer.  Fails closed: a text that cannot be read is control.  (A lesson
+    that quotes a ``{"status": 404}`` example is refused too, as in REUSE.)"""
+    try:
+        from hartos.helper import retrieve_json
+        parsed = retrieve_json(text)
+    except Exception:
+        return True
+    if not isinstance(parsed, dict):
+        return False
+    if 'status' in parsed:
+        return True
+    for key in ('message2userfinal', 'message2'):
+        if key in parsed:
+            return not _answer_value_is_text(parsed[key])
+    return False
+
 
 def is_written_answer(message) -> bool:
-    """An Assistant message that is written work.  The ONE judge of it: the
-    completion gate, the CREATE derivation below and REUSE's receipt finder
-    (reuse_recipe._reuse_completion_evidence) all ask this.
+    """An Assistant message that is written work, as the completion gate, the
+    CREATE derivation below and REUSE's receipt finder
+    (reuse_recipe._reuse_completion_evidence) judge it.
+
+    REUSE asks this AFTER its own reply filter (reuse_recipe.
+    _reuse_message_is_user_answer), which also refuses the pipeline's own text
+    (a steer, a dispatch echoed without its marker), the steering and verifier
+    seats and a placeholder answer key.  CREATE asks only this, so those
+    REUSE-only rules do not reach CREATE yet (task #171); what is here is the
+    part the two share.
 
     It is the Assistant's (the seat name, in either role a log holds it), not
     the dispatch echoed back (a seat name does not always survive a log, and a
     dispatch is the pipeline's text, never the work), not a control JSON (the
-    Assistant's own ``{"status": ...}`` report) and not routing: a message that
-    tags another agent (core.constants.AGENT_MENTIONS: ``@Helper``,
-    ``@StatusVerifier``...) is addressed to that agent whatever else it says,
-    the way REUSE reads it.  "Step 1 done. @StatusVerifier please verify." is
-    a note, and the pipeline appends its memory-skeleton line to exactly such
-    messages (create_recipe.state_transition).  A reply tagged to the person
-    (``@user {"message2user": ...}``) is an answer."""
+    Assistant's own ``{"status": ...}`` report, or the steer's unfilled answer
+    template, in any dress: _is_control_message),
+    not an unexecuted tool call in the model's own markup, and not routing: a
+    message that tags another agent (_ROUTING_MENTIONS: core.constants.
+    AGENT_MENTIONS, ``@Helper``, ``@StatusVerifier``..., plus the loop's own
+    ``@ChatInstructor`` and ``@UserProxy``) is addressed to that agent whatever
+    else it says, the way REUSE reads it.  "Step 1 done. @StatusVerifier
+    please verify." is a note, and the pipeline appends its memory-skeleton
+    line to exactly such messages (create_recipe.state_transition).  A reply
+    tagged to the person (``@user {"message2user": ...}``) is an answer."""
     if not (isinstance(message, dict) and message.get('name') == 'Assistant'
             and message.get('role') in _ASSISTANT_WRITTEN_ROLES):
         return False
     text = str(message.get('content') or '').strip()
+    low = text.lower()
     if (not text or text == 'TERMINATE' or _DISPATCH_MARKER.match(text)
-            or any(mention in text.lower() for mention in AGENT_MENTIONS)):
+            or any(mention in low for mention in _ROUTING_MENTIONS)
+            or '<tool_call>' in low or '<function=' in low):
         return False
-    return not (text.startswith('{') and '"status"' in text)
+    return not _is_control_message(text)
 
 
 def _derive_written_answer(user_prompt: str, action_id: int,
