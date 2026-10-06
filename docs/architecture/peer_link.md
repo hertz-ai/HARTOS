@@ -43,7 +43,7 @@
 ## The relay rung: reaching a node behind any NAT
 
 `core/peer_link/relay.py`. Both ends dial OUT to one WAMP router — central's by
-default (`core.wamp_url.DEFAULT_ROUTER_URL`; `HEVOLVE_PEER_LINK_RELAY_URL`
+default, its TLS endpoint first (`core.wamp_url.DEFAULT_SECURE_ROUTER_URL`, the one the phone joins) and its plaintext port after (`DEFAULT_ROUTER_URL`); `HEVOLVE_PEER_LINK_RELAY_URL`
 names another) — and an outbound connection crosses any NAT. Each endpoint
 subscribes to one inbox, `com.hertzai.hevolve.peerlink.relay.<endpoint id>`
 (a node's id is its `node_id`); a link is one conversation id inside it, and a

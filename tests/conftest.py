@@ -118,6 +118,14 @@ collect_ignore_glob = [
 # fixture-not-found errors to 48 passing).
 
 
+# The suite never joins the PeerLink relay (core.peer_link.relay): a test that
+# runs the real bootstrap would otherwise open a session to central's
+# production router (CI installs autobahn) and leave a process-wide hub behind
+# for every test after it.  Relay tests build their hubs on an in-memory
+# router.  An explicit value set before pytest starts is kept.
+os.environ.setdefault('HEVOLVE_PEER_LINK_RELAY', '0')
+
+
 def pytest_configure(config):
     """Register custom markers for optional dependencies."""
     config.addinivalue_line("markers", "requires_pyautogui: test needs pyautogui")

@@ -75,6 +75,22 @@ def _default_router_url() -> str:
 
 DEFAULT_ROUTER_URL = _default_router_url()
 
+#: Central's router behind TLS: the endpoint the phone app joins
+#: (Android AutobahnConnectionManager.url, wss://azurekong.hertzai.com:8445/wss).
+#: A public front of the SAME router as DEFAULT_ROUTER_URL (measured
+#: 2026-10-06: a publish on one reached a subscriber on the other), so a node
+#: that meets phones there is not sending its handshakes in the clear.
+_CENTRAL_TLS_ROUTER_PORT = 8445
+_TLS_ROUTER_PATH = '/wss'
+
+
+def _default_secure_router_url() -> str:
+    from core.constants import CENTRAL_HOST
+    return 'wss://%s:%d%s' % (CENTRAL_HOST, _CENTRAL_TLS_ROUTER_PORT, _TLS_ROUTER_PATH)
+
+
+DEFAULT_SECURE_ROUTER_URL = _default_secure_router_url()
+
 #: Legacy DNS alias for the SAME box (see core.constants.CENTRAL_HOST_LEGACY_ALIAS).
 #: Kept so a reader who greps the old literal lands on the explanation.
 LEGACY_ROUTER_ALIAS = 'ws://aws_rasa.hertzai.com:8088/ws'

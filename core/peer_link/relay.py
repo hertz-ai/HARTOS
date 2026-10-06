@@ -75,16 +75,22 @@ def relay_enabled() -> bool:
         '0', 'false', 'no', 'off')
 
 
-def relay_router_url() -> str:
-    """The router both ends meet on: central's, from the one place its URL is
-    composed (core.wamp_url), unless HEVOLVE_PEER_LINK_RELAY_URL names
-    another.  Not WAMP_URL/CBURL: a local-only node points those at its own
-    embedded router, which no phone off its Wi-Fi can reach."""
+def relay_router_urls() -> list:
+    """The router both ends meet on, in the order to try: central's TLS
+    endpoint first (the one the phone joins), its plaintext port after, both
+    composed in core.wamp_url.  HEVOLVE_PEER_LINK_RELAY_URL names the only
+    one to use instead.  Not WAMP_URL/CBURL: a local-only node points those at
+    its own embedded router, which no phone off its Wi-Fi can reach.
+
+    TLS first because the HELLO / HELLO_ACK pair travels before the session
+    key exists: over plaintext, anyone on the path between the router and
+    this node reads a phone's device-token claims and a SAME_USER proof.
+    Frames after the handshake are sealed either way."""
     explicit = os.environ.get('HEVOLVE_PEER_LINK_RELAY_URL', '').strip()
     if explicit:
-        return explicit
-    from core.wamp_url import DEFAULT_ROUTER_URL
-    return DEFAULT_ROUTER_URL
+        return [explicit]
+    from core.wamp_url import DEFAULT_ROUTER_URL, DEFAULT_SECURE_ROUTER_URL
+    return [DEFAULT_SECURE_ROUTER_URL, DEFAULT_ROUTER_URL]
 
 
 class RelaySocket:
@@ -161,8 +167,10 @@ class WampRelayTransport:
     to other inboxes, and rejoins with backoff when the router drops it (the
     same shape as core.platform.events.EventBus.connect_wamp)."""
 
-    def __init__(self, url: str, realm: str = 'realm1'):
-        self.url = url
+    def __init__(self, urls, realm: str = 'realm1'):
+        # Tried in order on each join (autobahn moves to the next transport
+        # when one cannot connect).
+        self.urls = [urls] if isinstance(urls, str) else list(urls)
         self.realm = realm
         self._session = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -183,8 +191,8 @@ class WampRelayTransport:
             import time as _time
             backoff = 1
             while not transport._stop:
-                component = Component(transports=[{'url': transport.url,
-                                                   'max_retries': 0}],
+                component = Component(transports=[{'url': url, 'max_retries': 0}
+                                                  for url in transport.urls],
                                       realm=transport.realm)
 
                 @component.on_join
@@ -197,13 +205,15 @@ class WampRelayTransport:
                     await session.subscribe(_handler, topic)
                     transport._session = session
                     transport.joined.set()
-                    logger.info("PeerLink relay joined %s as %s", transport.url, topic)
+                    logger.info("PeerLink relay joined %s as %s",
+                                getattr(getattr(details, 'transport', None), 'url', '')
+                                or transport.urls, topic)
 
                 @component.on_leave
                 async def _left(session, details):
                     transport._session = None
                     transport.joined.clear()
-                    logger.info("PeerLink relay left %s", transport.url)
+                    logger.info("PeerLink relay left the router")
 
                 loop = asyncio.new_event_loop()
                 transport._loop = loop
@@ -390,7 +400,7 @@ def start_relay_hub(endpoint_id: str = '', transport=None) -> Optional[RelayHub]
         if not endpoint_id:
             from security.node_integrity import get_node_identity
             endpoint_id = get_node_identity().get('node_id', '')
-        hub = RelayHub(endpoint_id, transport or WampRelayTransport(relay_router_url()))
+        hub = RelayHub(endpoint_id, transport or WampRelayTransport(relay_router_urls()))
 
         def _accept(sock: RelaySocket, hello: dict):
             peer_id = str(hello.get('node_id') or '')

@@ -335,3 +335,53 @@ def test_switched_off_the_node_stays_off_the_relay(monkeypatch):
     monkeypatch.setenv('HEVOLVE_PEER_LINK_RELAY', '0')
     assert relay_mod.start_relay_hub('node-x', transport=MemoryRouter().transport()) is None
     assert relay_mod.get_relay_hub() is None
+
+
+def test_unit_tests_never_join_the_production_router():
+    # tests/conftest.py keeps the suite off the relay: a test that runs the
+    # real bootstrap (test_desktop_socket_gate) must not open a session to
+    # central's router, nor leave a hub behind for the tests after it.
+    assert os.environ.get('HEVOLVE_PEER_LINK_RELAY') == '0'
+    assert relay_mod.start_relay_hub('node-x') is None
+    assert relay_mod.get_relay_hub() is None
+
+
+class _DroppedTransport:
+    """Joined, but the router session drops before the HELLO goes out."""
+
+    def __init__(self):
+        self.joined = threading.Event()
+
+    def start(self, topic, on_message):
+        self.joined.set()
+        return True
+
+    def publish(self, topic, envelope):
+        raise ConnectionError('router session dropped')
+
+    def stop(self):
+        pass
+
+
+def test_a_dial_that_fails_mid_handshake_gives_its_conversation_back():
+    # A failed dial must not keep a conversation open: past MAX_CONVERSATIONS
+    # the hub drops every inbound HELLO, so leaked dials would lock phones out.
+    hub = RelayHub('node-a', _DroppedTransport())
+    hub.start()
+    with patch.object(relay_mod, 'get_relay_hub', return_value=hub):
+        for _ in range(3):
+            link = PeerLink(peer_id='node-b', address='relay://node-b',
+                            trust=TrustLevel.PEER)
+            assert link.connect() is False
+    assert hub.conversation_count() == 0
+
+
+def test_the_router_is_met_over_tls_first():
+    urls = relay_mod.relay_router_urls()
+    assert urls[0].startswith('wss://')
+    assert all(u.startswith(('ws://', 'wss://')) for u in urls)
+
+
+def test_an_operator_router_is_the_only_one_tried(monkeypatch):
+    monkeypatch.setenv('HEVOLVE_PEER_LINK_RELAY_URL', 'wss://regional.example:9443/wss')
+    assert relay_mod.relay_router_urls() == ['wss://regional.example:9443/wss']

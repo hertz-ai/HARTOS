@@ -443,6 +443,14 @@ class PeerLink:
 
         except Exception as e:
             logger.debug(f"PeerLink connect failed to {self.peer_id[:8]}: {e}")
+            # Give the socket back: a relay conversation left open counts
+            # against the hub's cap, and past it every inbound HELLO is dropped.
+            ws, self._ws = self._ws, None
+            if ws is not None and hasattr(ws, 'close'):
+                try:
+                    ws.close()
+                except Exception as close_err:
+                    logger.debug(f"PeerLink socket close after a failed connect: {close_err}")
             self._state = LinkState.DISCONNECTED
             return False
 
