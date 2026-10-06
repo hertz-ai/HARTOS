@@ -1,8 +1,8 @@
 """A person's phone asks its desktop for a chat turn over the PeerLink device link.
 
-The phone already speaks this: PeerLinkConnectionBridge sends
-``{"type": "chat_request", ...}`` on the ``dispatch`` channel.  The desktop
-answers it as one more inbound channel -- the turn goes to the local /chat
+The phone's DesktopChat sends ``{"type": "chat_request", ...}`` on the
+``dispatch`` channel, as a request.  The desktop answers it as one more
+inbound channel -- the turn goes to the local /chat
 (the agentic CREATE/REUSE door every other channel uses, through
 FlaskChannelIntegration.run_turn) with the agent id the phone names, as the
 user the device token proved, never the user the body names -- and the /chat

@@ -343,10 +343,9 @@ class FlaskChannelIntegration:
         """A person's own phone asks for a chat turn over the PeerLink device
         link.
 
-        The frame is the one the phone's PeerLinkConnectionBridge sends on
-        ``dispatch``: ``{"type": "chat_request", "payload": {...}}``, as a
-        request (link.py lets a device send only that there, and only as a
-        request).  The phone names the agent (``prompt_id``: 54 for Teach
+        The frame is the one the phone's DesktopChat sends on ``dispatch``:
+        ``{"type": "chat_request", "payload": {...}}``, as a request (link.py
+        lets a device send only that there, and only as a request).  The phone names the agent (``prompt_id``: 54 for Teach
         Yourself, a custom bot's own id) and the turn runs through /chat like
         any channel's (run_turn), as the device's user.  The /chat body comes
         back as the request's reply: ``{"type": "chat_reply", "status",
