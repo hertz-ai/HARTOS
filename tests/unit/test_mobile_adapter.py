@@ -188,7 +188,7 @@ def test_a_row_whose_route_this_desktop_lacks_is_neither_claimed_nor_answered(
     monkeypatch.setattr(aliases, 'ALIASES', (ROW, absent, wrong_method, no_prefix, PREFIX))
     assert adapter.install(desktop_app)
     assert PeerLink._get_local_capabilities()['mobile_paths'] == [
-        f'POST {CLOUD} /db/getprompt_userid', 'GET mailer.hertzai.com /api/v1/books/']
+        f'POST {CLOUD} /db/getprompt_userid 15', 'GET mailer.hertzai.com /api/v1/books/ 15']
     link = _device_link(phone)
     assert _ask(link, _api(phone, f'https://{CLOUD}/chat/teachme2',
                            body={'user_id': PHONE_USER})) == [
@@ -218,7 +218,7 @@ def test_boot_claims_a_route_the_consumer_registered_during_boot(monkeypatch):
     with patch.dict(sys.modules, secrets), patch.multiple(hb, **stubs),             patch.object(hb, '_run_consumer_hook', side_effect=consumer_routes):
         hb._run_bootstrap(Flask('nunba'), {})
     caps = PeerLink._get_local_capabilities()
-    assert caps['mobile_paths'] == [f'POST {CLOUD} /chat/teachme2']
+    assert caps['mobile_paths'] == [f'POST {CLOUD} /chat/teachme2 15']
     assert 'api_request' in caps['device_requests']
 
 
@@ -232,11 +232,84 @@ def test_central_answers_no_phone_api_call(monkeypatch):
     assert 'api_request' not in caps.get('device_requests', [])
 
 
+def test_a_phones_call_is_a_foreground_turn_on_the_desktop(monkeypatch, phone):
+    """Background agents yield to a turn the desktop's foreground rule counts
+    (core.foreground.mark_view, the wrapper Nunba's teach / custom-bot routes
+    carry).  The rule asks dispatch.is_genuine_user_request about the
+    request's id; the stand-in check below reads the id the way
+    hart_intelligence_entry's registered check does (header, then body).  The
+    phone's teach body names no request_id, and its turn must still count."""
+    from core import foreground
+    from integrations.agent_engine.dispatch import is_genuine_user_request
+    monkeypatch.setenv('NUNBA_BUNDLED', '1')
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
+    for name in ('HEVOLVE_API_KEY', 'TRUSTED_PROXY', 'NUNBA_CI'):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(aliases, 'ALIASES', (
+        aliases.Alias('POST', CLOUD, '/chat/teachme2', '/chat/teachme2', aliases.CHAT_WAIT_S),))
+    app = Flask('nunba')
+    seen = []
+
+    def teach():
+        seen.append(foreground.foreground_active())
+        return jsonify({'text': 'ok'})
+    app.add_url_rule('/chat/teachme2', 'teachme2', foreground.mark_view(teach), methods=['POST'])
+    _apply_api_auth(app)
+
+    def genuine():
+        rid = (request.headers.get('X-HARTOS-Request-ID')
+               or (request.get_json(silent=True) or {}).get('request_id'))
+        return is_genuine_user_request(rid)
+    monkeypatch.setattr(foreground, '_genuine_check', genuine)
+    secrets = {'security.secrets_manager': types.SimpleNamespace(get_secret=lambda name: '')}
+    with patch.dict(sys.modules, secrets):
+        assert adapter.install(app)
+        link = _device_link(phone)
+        body = {'text': ['teach me fractions'], 'user_id': int(PHONE_USER), 'conversation_id': 'msg-1'}
+        reply = _ask(link, _api(phone, f'https://{CLOUD}/chat/teachme2', body=body))[0]
+    assert reply['status'] == 200
+    assert seen == [True]
+
+
 def test_the_handshake_names_what_this_desktop_answers(desktop_app):
     caps = PeerLink._get_local_capabilities()
     assert 'api_request' in caps['device_requests']
-    assert caps['mobile_paths'] == [f'POST {CLOUD} /db/getprompt_userid',
-                                    'GET mailer.hertzai.com /api/v1/books/']
+    assert caps['mobile_paths'] == [f'POST {CLOUD} /db/getprompt_userid 15',
+                                    'GET mailer.hertzai.com /api/v1/books/ 15']
+
+
+def test_a_phones_teach_and_custom_bot_turns_run_the_desktops_own_routes(monkeypatch, phone):
+    """The shipped rows: the phone's Teach Yourself and custom-bot calls run
+    this desktop's routes for central's contract, as the phone's user, the
+    body as sent; the handshake names them with a chat turn's wait."""
+    monkeypatch.setenv('NUNBA_BUNDLED', '1')
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
+    for name in ('HEVOLVE_API_KEY', 'TRUSTED_PROXY', 'NUNBA_CI'):
+        monkeypatch.delenv(name, raising=False)
+    app = Flask('nunba')
+    seen = []
+
+    def turn(kind):
+        def view():
+            seen.append((kind, request.get_json(), getattr(g, 'auth_source', None)))
+            return jsonify({'text': f'{kind} answer', 'request_id': 'r-1'})
+        return view
+    app.add_url_rule('/chat/teachme2', 'teachme2', turn('teach'), methods=['POST'])
+    app.add_url_rule('/chat/custom_gpt', 'custom_gpt', turn('custom'), methods=['POST'])
+    _apply_api_auth(app)
+    secrets = {'security.secrets_manager': types.SimpleNamespace(get_secret=lambda name: '')}
+    with patch.dict(sys.modules, secrets):
+        assert adapter.install(app)
+        assert PeerLink._get_local_capabilities()['mobile_paths'] == [
+            f'POST {CLOUD} /chat/teachme2 150', f'POST {CLOUD} /chat/custom_gpt 150']
+        link = _device_link(phone)
+        teach = {'text': ['teach me fractions'], 'user_id': int(PHONE_USER), 'teacher_avatar_id': 7}
+        reply = _ask(link, _api(phone, f'https://{CLOUD}/chat/teachme2', body=teach))[0]
+        assert reply['status'] == 200 and _body(reply) == {'text': 'teach answer', 'request_id': 'r-1'}
+        custom = {'text': 'hi', 'user_id': int(PHONE_USER), 'prompt_id': 60834540771}
+        reply = _ask(link, _api(phone, f'https://{CLOUD}/chat/custom_gpt', body=custom), rid='a-2')[0]
+        assert reply['status'] == 200 and _body(reply)['text'] == 'custom answer'
+    assert seen == [('teach', teach, 'device'), ('custom', custom, 'device')]
 
 
 def test_a_phone_past_its_request_slots_hears_busy_at_once(desktop_app, phone):

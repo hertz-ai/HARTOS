@@ -13,15 +13,37 @@ from typing import NamedTuple, Optional
 from urllib.parse import urlsplit
 
 
+#: How long a phone waits for this desktop's answer to a call before it sends
+#: the call to the cloud.  A short call is answered in well under this; a chat
+#: turn runs an agent on the desktop's model (a local 4B's first teaching turn
+#: measured ~45 s, a multi-step turn longer), and the phone's chat screens
+#: already waited 150 s for one.
+SHORT_WAIT_S = 15
+CHAT_WAIT_S = 150
+
+#: The cloud host the phone's own calls go to (Android BuildConfig base_url /
+#: chatbot_url, PeerLinkDiscovery.CLOUD_BACKEND_URL).
+CLOUD = 'azurekong.hertzai.com'
+
+
 class Alias(NamedTuple):
     method: str      # GET, POST, ...
     host: str        # the cloud host the phone calls, e.g. azurekong.hertzai.com
     path: str        # the cloud path; a prefix when it ends with '/'
     desktop: str     # the desktop route; for a prefix, the rest of the path follows it
+    wait_s: int = SHORT_WAIT_S   # how long the phone waits for this desktop
 
 
 #: The rows (plan #185 phase 6 adds them one call at a time).
-ALIASES: tuple = ()
+ALIASES: tuple = (
+    # The Teach Yourself and custom-bot turns (Android TeachYourselfChatApi
+    # and CustomChatBotAPI on the user Retrofit).  The desktop answers
+    # central's contract for both with the turn /chat runs (Nunba
+    # routes/chatbot_routes.py teachme2 / custom_gpt); a turn it does not
+    # serve (kids transport scopes: 501) goes to the cloud.
+    Alias('POST', CLOUD, '/chat/teachme2', '/chat/teachme2', CHAT_WAIT_S),
+    Alias('POST', CLOUD, '/chat/custom_gpt', '/chat/custom_gpt', CHAT_WAIT_S),
+)
 
 
 def _safe(path: str) -> bool:
@@ -75,5 +97,7 @@ def on_host(app, aliases: Optional[tuple] = None) -> tuple:
 
 def served(aliases: Optional[tuple] = None) -> list:
     """What the handshake tells a phone this desktop answers: one
-    "METHOD host path" per row (a path ending in '/' is a prefix)."""
-    return [f'{a.method} {a.host} {a.path}' for a in (ALIASES if aliases is None else aliases)]
+    "METHOD host path wait_s" per row (a path ending in '/' is a prefix;
+    wait_s is how long the phone waits for this desktop before the cloud)."""
+    return [f'{a.method} {a.host} {a.path} {a.wait_s}'
+            for a in (ALIASES if aliases is None else aliases)]

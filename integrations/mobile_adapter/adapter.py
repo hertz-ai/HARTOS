@@ -16,7 +16,9 @@ rules it applies to that phone over HTTP.
 """
 import base64
 import binascii
+import json
 import logging
+import uuid
 from typing import Any, Optional
 
 from . import aliases
@@ -67,6 +69,19 @@ def _token_user(token: str) -> str:
     return str(claims.get('user_id') or '')
 
 
+def _request_id(body: bytes) -> str:
+    """The id the call names in its JSON body, else a fresh one.  A request
+    with no id is background to this desktop (core.foreground.mark_view via
+    dispatch.is_genuine_user_request), and a phone's call is the person
+    acting now: the phone's teach and custom-bot bodies carry none (their
+    routes mint one inside the view, after the foreground rule ran)."""
+    try:
+        rid = json.loads(body).get('request_id') if body else None
+    except (ValueError, AttributeError, UnicodeDecodeError):
+        rid = None
+    return str(rid) if rid else f'device-{uuid.uuid4().hex[:12]}'
+
+
 def _reply(status: int, body: bytes, content_type: str = 'application/json') -> dict:
     return {'type': API_REPLY, 'status': status, 'content_type': content_type,
             'body_b64': base64.b64encode(body).decode('ascii')}
@@ -95,6 +110,7 @@ def answer(link, frame: dict) -> dict:
     headers = {h: str(sent[h]) for h in _CARRIED_HEADERS if h in sent}
     if token:
         headers['Authorization'] = f'Bearer {token}'
+    headers['X-HARTOS-Request-ID'] = _request_id(body)
     with _HOST_APP.test_client() as client:
         resp = client.open(route, method=method, data=body or None, headers=headers,
                            environ_base={'REMOTE_ADDR': REMOTE_ADDR})
