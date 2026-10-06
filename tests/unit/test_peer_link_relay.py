@@ -533,3 +533,107 @@ def test_the_relay_joins_one_router_at_a_time_and_says_which(caplog):
             transport._stop = True
     assert attempts == [['wss://down.example/wss'], ['ws://up.example/ws']]
     assert 'PeerLink relay joined ws://up.example/ws' in caplog.text
+
+
+def _fake_autobahn(attempts, join_on, transport, stop_after):
+    """autobahn modules whose Component records each URL tried; a URL in
+    join_on joins and then drops at once; the run stops after stop_after
+    attempts."""
+    class FakeSession:
+        async def subscribe(self, handler, topic):
+            pass
+
+        def leave(self):
+            pass
+
+    class FakeComponent:
+        def __init__(self, transports, realm):
+            self.urls = [t['url'] for t in transports]
+            attempts.append(self.urls)
+            self._join = None
+
+        def on_join(self, fn):
+            self._join = fn
+            return fn
+
+        def on_leave(self, fn):
+            return fn
+
+        async def start(self, loop=None):
+            if len(attempts) >= stop_after:
+                transport._stop = True
+            if self.urls[0] not in join_on:
+                raise ConnectionError('refused')
+            await self._join(FakeSession(), object())   # joined, then the session ends
+
+    autobahn = type(sys)('autobahn')
+    asyncio_pkg = type(sys)('autobahn.asyncio')
+    component_mod = type(sys)('autobahn.asyncio.component')
+    component_mod.Component = FakeComponent
+    return {'autobahn': autobahn, 'autobahn.asyncio': asyncio_pkg,
+            'autobahn.asyncio.component': component_mod}
+
+
+def test_a_router_that_took_us_and_dropped_us_is_retried_before_the_plaintext_one():
+    """The TLS router joined and then dropped the session: the next try is
+    that router again, after the backoff, not an immediate step down to the
+    plaintext URL.  Only a router that cannot be reached moves us on."""
+    attempts = []
+    transport = relay_mod.WampRelayTransport(['wss://tls.example/wss', 'ws://plain.example/ws'])
+    with patch.dict(sys.modules, _fake_autobahn(attempts, {'wss://tls.example/wss'}, transport, 3)),             patch('time.sleep'):
+        try:
+            assert transport.start('com.hertzai.hevolve.peerlink.relay.node-x', lambda e: None)
+            transport._thread.join(5)
+        finally:
+            transport._stop = True
+    assert attempts == [['wss://tls.example/wss']] * 3
+
+
+def test_a_peer_missed_on_the_relay_is_skipped_a_minute_then_longer_and_an_answer_clears_it(monkeypatch):
+    """One miss skips the peer's relay rung for 60 s, each further miss in a
+    row doubles that (to 600 s at most), and an answer forgets the misses: a
+    peer reachable only on the relay is not cut off for ten minutes by one
+    transient miss."""
+    from core.peer_link import link_manager as lm
+    manager = lm.PeerLinkManager()
+    clock = [1000.0]
+    monkeypatch.setattr(lm, '_now', lambda: clock[0])
+    relay_tries, answers = [], {'relay': False}
+
+    def upgrade_peer(peer_id, address, trust, x25519_public='', ed25519_public=''):
+        if address.startswith('relay://'):
+            relay_tries.append(clock[0])
+            return answers['relay']
+        return False
+
+    class Hub:
+        joined = True
+
+    peer = {'node_id': 'peer-nat', 'url': 'http://10.0.0.7:6777'}
+
+    class Gossip:
+        @staticmethod
+        def get_peer_list():
+            return [peer]
+
+    class Nat:
+        @staticmethod
+        def resolve_peer_address(info):
+            return None
+
+    def at(t, answer=False):
+        clock[0] = 1000.0 + t
+        answers['relay'] = answer
+        manager._try_auto_upgrade('peer-nat')
+
+    with patch.dict(sys.modules, {
+            'integrations.social.peer_discovery': type(sys)('pd')}),             patch.object(manager, 'upgrade_peer', side_effect=upgrade_peer),             patch.object(relay_mod, 'get_relay_hub', return_value=Hub()),             patch('core.peer_link.nat.get_nat_traversal', return_value=Nat()):
+        sys.modules['integrations.social.peer_discovery'].gossip = Gossip()
+        at(0)                       # miss 1: skipped for 60 s
+        at(30)
+        at(61)                      # miss 2: skipped for 120 s
+        at(150)
+        at(182, answer=True)        # answers: the misses are forgotten
+        at(200)                     # miss 1 again: 60 s, not 240 s
+        at(261)
+    assert [t - 1000.0 for t in relay_tries] == [0, 61, 182, 200, 261]

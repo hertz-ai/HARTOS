@@ -195,14 +195,16 @@ class WampRelayTransport:
 
         transport = self
 
-        def _session_on(url: str) -> bool:
-            """One session on one router URL, until it ends; True when it
-            lived a while (the next pass starts again from the first URL)."""
+        def _session_on(url: str) -> tuple:
+            """One session on one router URL, until it ends: (joined, lived),
+            lived when it lasted a while."""
             component = Component(transports=[{'url': url, 'max_retries': 0}],
                                   realm=transport.realm)
+            joined = []
 
             @component.on_join
             async def _joined(session, details):
+                joined.append(url)
                 def _handler(envelope=None, *args, **kwargs):
                     try:
                         on_message(envelope)
@@ -236,7 +238,7 @@ class WampRelayTransport:
                     loop.close()
                 except Exception:
                     pass
-            return _time.monotonic() - started > 60
+            return bool(joined), _time.monotonic() - started > 60
 
         def _run():
             import time as _time
@@ -246,8 +248,12 @@ class WampRelayTransport:
                 for url in transport.urls:
                     if transport._stop:
                         break
-                    if _session_on(url):
-                        lived = True
+                    joined, lived = _session_on(url)
+                    if joined:
+                        # A router that took us and then dropped us is retried
+                        # from the first URL after the backoff, never by
+                        # stepping down to the next (plaintext) one at once:
+                        # only a router that cannot be reached moves us on.
                         break
                 if transport._stop:
                     break
@@ -348,7 +354,9 @@ class RelayHub:
         if envelope.get('x'):
             # Unauthenticated: honoured only before the link is sealed (a
             # refused HELLO frees the dialer at once).  After that the link's
-            # sealed goodbye ends it, and a peer that vanished is idle-pruned.
+            # sealed goodbye ends it, and a peer that vanished is closed by
+            # link_manager._prune_idle_links (idle past _IDLE_TIMEOUT, 300 s),
+            # which closes this socket and frees its conversation.
             if sock is not None and not sock._sealed:
                 sock._remote_closed()
             return

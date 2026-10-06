@@ -433,3 +433,30 @@ def test_a_phone_asking_again_over_the_relay_spends_no_relay_budget(monkeypatch,
         scopes = {r.scope for r in db.query(UserConsent).filter_by(
             user_id=OWNER, consent_type='device_access')}
     assert scopes == {device_scope(phone.public_hex), device_scope(second.public_hex)}
+
+
+def test_a_phone_re_dialling_re_shows_its_card_at_most_every_30_seconds(monkeypatch, phone):
+    """A phone the owner has not answered re-dials on every backoff.  Its
+    repeats spend no shared budget (above), and they cannot flood the owner
+    either: the one card is re-shown at most every _REASK_EVERY_SECONDS."""
+    import hartos.hartos_bootstrap as hb
+    from integrations.social import consent_service, discovery
+    monkeypatch.setattr(discovery, '_ANNOUNCE_RATE', {})
+    monkeypatch.setattr(hb, '_reask_at', {})
+    clock = [500.0]
+    monkeypatch.setattr(hb, '_reask_clock', lambda: clock[0])
+    shown = []
+    real_emit = consent_service._emit
+
+    def emit(topic, data, *args, **kwargs):
+        if topic == 'consent.request':
+            shown.append(clock[0])
+        return real_emit(topic, data, *args, **kwargs)
+    monkeypatch.setattr(consent_service, '_emit', emit)
+    _install_real_verifier()
+    for n in range(5):                       # the first ask, then four re-dials in 4 s
+        clock[0] = 500.0 + n
+        assert _accept(_hello(phone, phone.token()), address=f'relay:conv-{n}') is None
+    clock[0] = 540.0                         # past the window: shown once more
+    assert _accept(_hello(phone, phone.token()), address='relay:conv-9') is None
+    assert shown == [500.0, 501.0, 540.0]

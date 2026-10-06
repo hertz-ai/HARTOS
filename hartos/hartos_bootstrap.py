@@ -56,6 +56,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 import types
 from typing import Any, Callable, Mapping, Optional
 
@@ -94,6 +95,30 @@ def _install_api_gate(app) -> None:
         logger.critical(f"HARTOS API gate not installed on the host app: {e}")
 
 
+#: A phone whose device ask is already on file re-shows its one card at most
+#: this often, however often it re-dials (each re-dial is a HELLO: a DB read
+#: and, past this, a consent event).  Its first ask spends the shared announce
+#: budget; repeats spend this per-key allowance instead (#187 R5).
+_REASK_EVERY_SECONDS = 30.0
+_reask_at: dict = {}            # device public key -> when its card was last re-shown
+_reask_lock = threading.Lock()
+_reask_clock = time.monotonic   # a seam for tests
+
+
+def _reask_due(public_key: str) -> bool:
+    """True (and noted) when this key's card may be re-shown now.  Entries
+    older than the window go on the way in, so the table holds only keys
+    seen in the last _REASK_EVERY_SECONDS."""
+    now = _reask_clock()
+    with _reask_lock:
+        for key in [k for k, at in _reask_at.items() if now - at >= _REASK_EVERY_SECONDS]:
+            del _reask_at[key]
+        if public_key in _reask_at:
+            return False
+        _reask_at[public_key] = now
+        return True
+
+
 def _install_device_verifier() -> None:
     """Step 1c: the verifier a phone's PeerLink HELLO is checked with (HARTOS
     #111): the same verify_device_jwt the API gate uses, against the same
@@ -118,13 +143,19 @@ def _install_device_verifier() -> None:
                     from integrations.social.discovery import _check_announce_rate
                     peer_host = peer_address.rsplit(':', 1)[0]
                     # A phone already asked about re-dials on every backoff;
-                    # its repeat re-shows the one card and costs no budget.
+                    # its repeat re-shows the one card (at most every
+                    # _REASK_EVERY_SECONDS) and costs no shared budget.
                     # That matters on the relay, where every phone's address
                     # is 'relay' and all share one budget (#187 R5).
                     asked = ConsentService.ask_on_file(
                         db, owner, 'device_access',
                         scope=device_scope(verdict['public_key']))
-                    if asked is not None or _check_announce_rate(peer_host):
+                    if asked is not None:
+                        if _reask_due(verdict['public_key']):
+                            file_device_access_ask(
+                                db, owner, verdict['public_key'],
+                                verdict.get('claims') or {})
+                    elif _check_announce_rate(peer_host):
                         file_device_access_ask(
                             db, owner, verdict['public_key'],
                             verdict.get('claims') or {})

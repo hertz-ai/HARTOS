@@ -48,10 +48,17 @@ _IDLE_TIMEOUT = 300  # 5 minutes
 _RECONNECT_MIN = 5
 _RECONNECT_MAX = 120
 
-#: A peer whose relay inbox did not answer is not dialled there again for this
-#: long: each relay dial to a peer off the relay waits out the handshake
-#: (link.py, 10 s) on the gossip thread that called _try_auto_upgrade.
+#: A peer whose relay inbox did not answer is not dialled there again for a
+#: while: each relay dial to a peer off the relay waits out the handshake
+#: (link.py, 10 s) on the gossip thread that called _try_auto_upgrade.  The
+#: first miss skips it for _RELAY_ABSENT_FIRST_SECONDS, each further miss in a
+#: row doubles that up to _RELAY_ABSENT_SECONDS, and an answer clears it, so a
+#: peer reachable only on the relay is not cut off long by one transient miss.
+_RELAY_ABSENT_FIRST_SECONDS = 60
 _RELAY_ABSENT_SECONDS = 600
+
+#: The clock the relay skip table reads (a seam for tests; time.monotonic).
+_now = time.monotonic
 
 
 class PeerLinkManager:
@@ -75,6 +82,8 @@ class PeerLinkManager:
         self._reconnect_backoff: Dict[str, float] = {}  # peer_id -> backoff duration (seconds)
         self._reconnect_last_attempt: Dict[str, float] = {}  # peer_id -> last attempt timestamp
         self._relay_absent_until: Dict[str, float] = {}  # peer_id -> monotonic deadline
+        self._relay_misses: Dict[str, int] = {}          # peer_id -> misses in a row
+        self._relay_absent_lock = threading.Lock()       # gossip threads share the table
 
         # Determine connection budget from tier
         try:
@@ -659,8 +668,7 @@ class PeerLinkManager:
             try:
                 from core.peer_link.relay import RELAY_ADDRESS_SCHEME, get_relay_hub
                 hub = get_relay_hub()
-                if (hub is not None and hub.joined
-                        and time.monotonic() >= self._relay_absent_until.get(peer_id, 0)):
+                if hub is not None and hub.joined and not self._relay_skipped(peer_id):
                     relay_address = RELAY_ADDRESS_SCHEME + peer_id
             except Exception as e:
                 logger.debug(f"PeerLink relay rung unavailable for {peer_id[:8]}: {e}")
@@ -743,21 +751,40 @@ class PeerLinkManager:
                         x25519_public=peer_info.get('x25519_public', ''),
                         ed25519_public=peer_info.get('public_key', ''),
                 ):
-                    self._relay_absent_until.pop(peer_id, None)
+                    self._clear_relay_absent(peer_id)
                     break
                 if candidate == relay_address:
                     self._note_relay_absent(peer_id)
         except Exception as e:
             logger.debug(f"Auto-upgrade failed for {peer_id[:8]}: {e}")
 
+    def _relay_skipped(self, peer_id: str) -> bool:
+        """True while the peer's relay rung is skipped after a miss."""
+        with self._relay_absent_lock:
+            return _now() < self._relay_absent_until.get(peer_id, 0)
+
     def _note_relay_absent(self, peer_id: str) -> None:
-        """The peer's relay inbox did not answer: skip that rung for it for
-        _RELAY_ABSENT_SECONDS.  Expired entries go on the way in, so the
-        table holds only peers missed in the last window."""
-        now = time.monotonic()
-        for pid in [p for p, until in self._relay_absent_until.items() if until <= now]:
-            del self._relay_absent_until[pid]
-        self._relay_absent_until[peer_id] = now + _RELAY_ABSENT_SECONDS
+        """The peer's relay inbox did not answer: skip that rung for it, 60 s
+        after one miss, doubling with each miss in a row up to
+        _RELAY_ABSENT_SECONDS.  Entries whose window ended long enough ago
+        to have reset go on the way in, so the table stays small."""
+        now = _now()
+        with self._relay_absent_lock:
+            for pid in [p for p, until in self._relay_absent_until.items()
+                        if until + _RELAY_ABSENT_SECONDS <= now]:
+                self._relay_absent_until.pop(pid, None)
+                self._relay_misses.pop(pid, None)
+            misses = self._relay_misses.get(peer_id, 0) + 1
+            self._relay_misses[peer_id] = misses
+            window = min(_RELAY_ABSENT_FIRST_SECONDS * 2 ** (misses - 1),
+                         _RELAY_ABSENT_SECONDS)
+            self._relay_absent_until[peer_id] = now + window
+
+    def _clear_relay_absent(self, peer_id: str) -> None:
+        """The peer answered (either rung): its relay misses are forgotten."""
+        with self._relay_absent_lock:
+            self._relay_absent_until.pop(peer_id, None)
+            self._relay_misses.pop(peer_id, None)
 
     @staticmethod
     def _http_fallback(peer_url: str, channel: str, data: dict,
