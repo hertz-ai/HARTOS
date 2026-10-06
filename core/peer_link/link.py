@@ -1397,7 +1397,7 @@ class PeerLink:
         except Exception:
             caps['tier'] = 'flat'
 
-        # The device requests this node answers (a phone's chat_request):
+        # The device requests this node answers (a phone's api_request):
         # a phone asks over the link only a node that names them, because
         # one that answers nothing sends no reply at all.  Additive, so an
         # older peer ignores it.

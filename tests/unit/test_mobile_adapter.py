@@ -28,18 +28,55 @@ from flask import Flask, g, jsonify, request  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
+from core.peer_link.channels import device_may_receive, device_may_send  # noqa: E402
 from core.peer_link.link import LinkState, PeerLink, TrustLevel  # noqa: E402
 from core.peer_link.link_manager import get_link_manager  # noqa: E402
 from integrations.mobile_adapter import adapter, aliases  # noqa: E402
 from security.middleware import _apply_api_auth  # noqa: E402
 from tests.unit.test_device_access_gate import Phone  # noqa: E402
 from tests.unit.test_desktop_socket_gate import _BOOT_STEPS  # noqa: E402
-from tests.unit.test_device_link_chat_turn import _serve  # noqa: E402
 from tests.unit.test_peer_link_device_links import (  # noqa: E402,F401
     _accept, _allow, _desktop, _hello, _install_real_verifier, phone,
 )
 
 PHONE_USER = '40021'
+
+
+class _Socket:
+    """Feeds frames to the real receive loop, then holds the socket open
+    until the link has answered (or a short wait passes), then drops."""
+
+    def __init__(self, frames, expect_reply=True):
+        self.frames = [json.dumps(f) for f in frames]
+        self.sent = []
+        self.replied = threading.Event()
+        self.expect_reply = expect_reply
+
+    def recv(self, timeout=None):
+        if self.frames:
+            return self.frames.pop(0)
+        self.replied.wait(5 if self.expect_reply else 0.3)
+        raise ConnectionResetError('done')
+
+    def send(self, data):
+        frame = json.loads(data.decode('utf-8') if isinstance(data, bytes) else data)
+        self.sent.append(frame)
+        if frame.get('re'):
+            self.replied.set()
+
+    def close(self):
+        pass
+
+
+def _serve(link, frames, expect_reply=True):
+    """Run the link's real receive loop over ``frames``; return the frames
+    the desktop sent back."""
+    sock = _Socket(frames, expect_reply)
+    link._ws = sock
+    link._state = LinkState.CONNECTED
+    link._receive_loop()
+    return sock.sent
+
 CLOUD = 'azurekong.hertzai.com'
 ROW = aliases.Alias('POST', CLOUD, '/db/getprompt_userid', '/prompts/mine')
 PREFIX = aliases.Alias('GET', 'mailer.hertzai.com', '/api/v1/books/', '/books/')
@@ -107,6 +144,31 @@ def _ask(link, d, rid='a-1', expect_reply=True):
 
 def _body(reply):
     return json.loads(base64.b64decode(reply['body_b64']))
+
+
+def test_a_phone_may_send_its_api_requests_on_dispatch_and_nothing_else_there():
+    """One door from a phone to its desktop: an api_request, as a request.
+    The chat_request door it replaced is shut, and device_control (embedded
+    nodes act on it on this channel) never opens to a phone."""
+    assert device_may_send('dispatch', {'type': 'api_request'})
+    assert not device_may_send('dispatch', {'type': 'chat_request'})
+    assert not device_may_send('dispatch', {'type': 'device_control'})
+    assert not device_may_send('dispatch', {'type': 'agent_task'})
+    assert not device_may_send('dispatch', {})
+    assert not device_may_send('dispatch', b'binary')
+    assert not device_may_send('dispatch')
+    assert not device_may_receive('dispatch')
+    assert device_may_send('control')
+    assert not device_may_send('compute', {'type': 'api_request'})
+
+
+def test_a_phones_chat_request_starts_nothing_and_gets_no_reply(desktop_app, phone):
+    link = _device_link(phone)
+    turns = []
+    get_link_manager().register_channel_handler('dispatch', lambda ch, d, p: turns.append(d) or {'x': 1})
+    frame = {'type': 'chat_request', 'payload': {'text': 'teach me fractions', 'prompt_id': 54}}
+    assert _ask(link, frame, expect_reply=False) == []
+    assert turns == []
 
 
 def test_a_phones_cloud_call_runs_the_desktops_own_route_as_the_phones_user(desktop_app, phone):

@@ -247,9 +247,7 @@ class FlaskChannelIntegration:
         """Run one agent turn through the local /chat and return
         ``(status, body)``.
 
-        The one /chat call of every inbound path that holds this
-        integration: a channel message (_handle_message) and a person's own
-        device on the PeerLink device link (handle_device_request).  /chat is
+        The one /chat call of a channel message (_handle_message).  /chat is
         the agentic door (CREATE/REUSE with the agent ``prompt_id`` names);
         this only carries the words to it.  ``fields`` are the request's other
         /chat keys (channel_context, conversation_id, device_id, ...) and win
@@ -330,91 +328,6 @@ class FlaskChannelIntegration:
             # cut at 500 characters so a whole HTML page never rides along.
             body = {'error': str(getattr(response, 'text', '') or '')[:500]}
         return response.status_code, body
-
-    #: What a person's device may set on its turn besides the words and the
-    #: agent: that conversation's own /chat keys.  Never the user -- the
-    #: turn is the user the device token proved (PeerLink.user_id).
-    _DEVICE_TURN_FIELDS = (
-        'conversation_id', 'request_id', 'teacher_avatar_id', 'create_agent',
-        'preferred_lang', 'language', 'media_mode', 'draft_first', 'device_id',
-    )
-
-    def handle_device_request(self, channel: str, data: Any, peer_id: str):
-        """A person's own phone asks for a chat turn over the PeerLink device
-        link.
-
-        The frame is the one the phone's DesktopChat sends on ``dispatch``:
-        ``{"type": "chat_request", "payload": {...}}``, as a request (link.py
-        lets a device send only that there, and only as a request).  The phone names the agent (``prompt_id``: 54 for Teach
-        Yourself, a custom bot's own id) and the turn runs through /chat like
-        any channel's (run_turn), as the device's user.  The /chat body comes
-        back as the request's reply: ``{"type": "chat_reply", "status",
-        "body"}``.
-
-        Anything else on ``dispatch`` -- another type, or a node's frame --
-        is not this handler's: it returns None and other handlers decide.
-        """
-        from core.peer_link.channels import CHAT_REQUEST
-        if not isinstance(data, dict) or data.get('type') != CHAT_REQUEST:
-            return None
-        try:
-            from core.peer_link.link_manager import get_link_manager
-            link = get_link_manager().get_link(peer_id)
-        except Exception as e:
-            logger.warning("Device chat request from %s unanswered: link "
-                           "lookup failed: %s", peer_id, e)
-            return None
-        if link is None or link.kind != 'device' or not link.user_id:
-            return None
-        payload = data.get('payload')
-        payload = payload if isinstance(payload, dict) else {}
-        text = payload.get('text')
-        if not isinstance(text, str) or not text.strip():
-            return {'type': 'chat_reply', 'status': 400,
-                    'body': {'error': 'Text is required'}}
-        fields = {k: payload[k] for k in self._DEVICE_TURN_FIELDS
-                  if k in payload}
-        # The reply to this request is the whole answer the phone gets, so
-        # the turn answers synchronously unless the phone says otherwise:
-        # with the draft first, a quick standby ("let me check...") would be
-        # the reply and the real answer would arrive nowhere it is awaited.
-        fields.setdefault('draft_first', False)
-        prompt_id = payload.get('prompt_id')
-        # Shape only, never the words.
-        logger.info("Device %s chat turn for user %s: prompt_id=%s text_len=%d",
-                    peer_id, link.user_id, prompt_id, len(text))
-        try:
-            status, body = self.run_turn(link.user_id, prompt_id, text,
-                                         **fields)
-        except requests.Timeout:
-            logger.warning("Device %s chat turn ran past the agent-turn "
-                           "budget; the phone is told 504", peer_id)
-            return {'type': 'chat_reply', 'status': 504,
-                    'body': {'error': 'The agent took too long to answer'}}
-        except Exception as e:
-            logger.warning("Device %s chat turn failed before /chat "
-                           "answered: %s", peer_id, e)
-            return {'type': 'chat_reply', 'status': 502,
-                    'body': {'error': 'The agent could not be reached'}}
-        return {'type': 'chat_reply', 'status': status, 'body': body}
-
-    def _bind_device_link(self) -> None:
-        """Answer a person's own devices' chat requests on the PeerLink
-        device link.  Binds the one module-level handler
-        (_answer_device_request), so binding from every start() of every
-        instance registers it once (PeerLinkManager.register_channel_handler
-        is a no-op for a handler already there)."""
-        try:
-            from core.peer_link.channels import CHAT_REQUEST
-            from core.peer_link.link_manager import get_link_manager
-            # answers: the handshake tells a phone this node answers its
-            # chat requests, so it asks over the link only here.
-            get_link_manager().register_channel_handler(
-                'dispatch', _answer_device_request, answers=(CHAT_REQUEST,))
-        except Exception as e:
-            logger.warning(
-                "PeerLink device chat NOT bound: a phone's turns over its "
-                "device link get no answer on this node: %s", e)
 
     def _resolve_user_id_for_sender(
         self, channel: str, sender_id: str, fallback,
@@ -1356,10 +1269,6 @@ class FlaskChannelIntegration:
         # therefore needs no extra lifecycle machinery.
         self.restore_persisted_channels()
 
-        # A person's own phone is one more inbound channel: its chat
-        # requests arrive on the PeerLink device link, not on an adapter.
-        self._bind_device_link()
-
         self._thread = threading.Thread(target=self._run_async_loop, daemon=True)
         self._thread.start()
         logger.info("Channel adapters started in background")
@@ -1384,22 +1293,6 @@ class FlaskChannelIntegration:
 
 # Global integration instance
 _integration: Optional[FlaskChannelIntegration] = None
-
-
-def _answer_device_request(channel: str, data: Any, peer_id: str):
-    """The PeerLink ``dispatch`` handler for a phone's chat requests, bound
-    once per process (FlaskChannelIntegration._bind_device_link).
-
-    It answers through the live integration, not the instance that bound it:
-    a process can start two -- an on-demand path (the WhatsApp QR poll's
-    get_channel_integration + ensure_running) may start one before
-    init_channels builds and starts its own -- and binding each instance's
-    method would run one phone request as two agent turns.
-    """
-    integration = _integration
-    if integration is None:
-        return None
-    return integration.handle_device_request(channel, data, peer_id)
 
 
 def get_channel_integration() -> FlaskChannelIntegration:

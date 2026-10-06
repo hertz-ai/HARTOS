@@ -33,7 +33,7 @@ class DataClass:
 #: messages, learning -- is closed to it unless a maintainer opens it here,
 #: so a new channel starts closed.  A channel opened 'in' may name the only
 #: frame types a device may send there (DEVICE_TYPES_KEY): 'dispatch' opens
-#: to a person's own phone for its chat requests and nothing else, because
+#: to a person's own phone for its API requests and nothing else, because
 #: embedded nodes act on 'device_control' frames on that same channel.  On a
 #: typed channel a device's frame must also be a request (link.py), so the
 #: work it starts has someone waiting for the answer.  link.py drops what a
@@ -41,14 +41,11 @@ class DataClass:
 #: elsewhere.
 DEVICE_POLICY_KEY = 'device'
 DEVICE_TYPES_KEY = 'device_types'
-#: A person's own phone asking its desktop for a chat turn: the one frame
-#: type a device may send on 'dispatch', and the request a desktop that
-#: answers it names in its handshake (link_manager.
-#: device_requests_answered).
-CHAT_REQUEST = 'chat_request'
 #: A person's own phone asking its desktop to answer one of its cloud API
-#: calls (integrations.mobile_adapter): the second frame type a device may
-#: send on 'dispatch', also only as a request.
+#: calls, its chat turns included (integrations.mobile_adapter): the one
+#: frame type a device may send on 'dispatch', only as a request, and the
+#: request a desktop that answers it names in its handshake (link_manager.
+#: device_requests_answered).
 API_REQUEST = 'api_request'
 
 CHANNEL_REGISTRY = {
@@ -69,12 +66,12 @@ CHANNEL_REGISTRY = {
     },
     'dispatch': {
         'id': 0x02,
-        # A person's own phone asks for a chat turn here, as a request
-        # (the phone's DesktopChat); the node answers it as an inbound
-        # channel (FlaskChannelIntegration.handle_device_request).  Typed:
+        # A person's own phone sends its cloud API calls here, as requests
+        # (the phone's DesktopRouteInterceptor); the node answers them with
+        # its own routes (integrations.mobile_adapter).  Typed:
         # device_control and every other dispatch frame stay node-only.
         DEVICE_POLICY_KEY: 'in',
-        DEVICE_TYPES_KEY: (CHAT_REQUEST, API_REQUEST),
+        DEVICE_TYPES_KEY: (API_REQUEST,),
         'data_class': DataClass.PRIVATE,  # Agent tasks are private
         'priority': 1,
         'reliable': True,
