@@ -1284,4 +1284,16 @@ class PeerLink:
             caps['tier'] = get_node_tier()
         except Exception:
             caps['tier'] = 'flat'
+
+        # The device requests this node answers (a phone's chat_request):
+        # a phone asks over the link only a node that names them, because
+        # one that answers nothing sends no reply at all.  Additive, so an
+        # older peer ignores it.
+        try:
+            from core.peer_link.link_manager import get_link_manager
+            answered = get_link_manager().device_requests_answered()
+            if answered:
+                caps['device_requests'] = answered
+        except Exception as e:
+            logger.debug("peer_link: device requests not advertised: %s", e)
         return caps

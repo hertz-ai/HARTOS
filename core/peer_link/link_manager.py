@@ -59,6 +59,10 @@ class PeerLinkManager:
         self._maintenance_thread: Optional[threading.Thread] = None
         self._http_exchange_counts: Dict[str, int] = {}  # peer_id -> successful exchanges
         self._channel_handlers: Dict[str, List[Callable]] = {}
+        # Device request types a bound handler answers, named in this
+        # node's handshake (link._get_local_capabilities) so a phone asks
+        # over the link only a node that answers.
+        self._device_requests: set = set()
         self._reconnect_backoff: Dict[str, float] = {}  # peer_id -> backoff duration (seconds)
         self._reconnect_last_attempt: Dict[str, float] = {}  # peer_id -> last attempt timestamp
 
@@ -415,13 +419,22 @@ class PeerLinkManager:
         if link:
             link.close()
 
-    def register_channel_handler(self, channel: str, handler: Callable):
+    def register_channel_handler(self, channel: str, handler: Callable,
+                                 answers: tuple = ()):
         """Register handler for incoming messages on a channel.
 
         Applied to all current and future links.  Registering the same
         handler again is a no-op, so a subsystem that binds on every
         start() is called once per frame, not once per start.
+
+        ``answers``: the device request types (a frame's ``type``) the
+        handler answers with a reply.  The handshake names them
+        (device_requests_answered): a node that answers nothing sends no
+        reply at all, and a phone that asked it would wait out its whole
+        budget.
         """
+        if answers:
+            self._device_requests.update(answers)
         if channel not in self._channel_handlers:
             self._channel_handlers[channel] = []
         if handler in self._channel_handlers[channel]:
@@ -432,6 +445,11 @@ class PeerLinkManager:
         with self._lock:
             for link in self._links.values():
                 link.on_message(channel, handler)
+
+    def device_requests_answered(self) -> List[str]:
+        """The device request types a bound handler answers, sorted
+        (register_channel_handler's ``answers``)."""
+        return sorted(self._device_requests)
 
     def record_http_exchange(self, peer_id: str):
         """Record a successful HTTP exchange with a peer.

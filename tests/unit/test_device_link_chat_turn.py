@@ -321,6 +321,30 @@ def test_a_phone_that_does_not_say_gets_one_synchronous_answer(fi, phone):
     assert calls[0]['json']['draft_first'] is False
 
 
+def _ack_of(link):
+    """The hello_ack the desktop sent the phone when it admitted this link."""
+    return json.loads(link._ws.sent[0])
+
+
+def test_a_desktop_that_answers_device_chat_says_so_in_its_hello_ack(fi, phone):
+    """A desktop on an older build has no chat_request handler and answers
+    nothing, so a phone that asked it anyway would wait out its whole turn
+    budget.  A desktop that answers names the device requests it answers in
+    the hello_ack; the phone asks over the link only when it sees them."""
+    fi._bind_device_link()
+    fi._bind_device_link()
+    link = _device_link(phone)
+    assert _ack_of(link)['capabilities']['device_requests'] == ['chat_request']
+    assert get_link_manager().device_requests_answered() == ['chat_request']
+
+
+def test_a_node_that_answers_no_device_request_advertises_none(phone):
+    link = _device_link(phone)
+    caps = _ack_of(link)['capabilities']
+    assert 'device_requests' not in caps
+    assert 'tier' in caps            # the rest of the handshake is unchanged
+
+
 def test_handle_message_runs_its_turn_through_run_turn():
     """One /chat call for every inbound path: _handle_message (Telegram,
     Discord, ...) and the device link both go through run_turn."""

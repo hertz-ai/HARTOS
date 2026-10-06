@@ -41,6 +41,11 @@ class DataClass:
 #: elsewhere.
 DEVICE_POLICY_KEY = 'device'
 DEVICE_TYPES_KEY = 'device_types'
+#: A person's own phone asking its desktop for a chat turn: the one frame
+#: type a device may send on 'dispatch', and the request a desktop that
+#: answers it names in its handshake (link_manager.
+#: device_requests_answered).
+CHAT_REQUEST = 'chat_request'
 
 CHANNEL_REGISTRY = {
     'control': {
@@ -60,13 +65,12 @@ CHANNEL_REGISTRY = {
     },
     'dispatch': {
         'id': 0x02,
-        # A person's own phone asks for a chat turn here, the frame its
-        # PeerLinkConnectionBridge already sends; the node answers it as
-        # an inbound channel (FlaskChannelIntegration.
-        # handle_device_request).  Typed: device_control and every other
-        # dispatch frame stay node-only.
+        # A person's own phone asks for a chat turn here, as a request
+        # (the phone's DesktopChat); the node answers it as an inbound
+        # channel (FlaskChannelIntegration.handle_device_request).  Typed:
+        # device_control and every other dispatch frame stay node-only.
         DEVICE_POLICY_KEY: 'in',
-        DEVICE_TYPES_KEY: ('chat_request',),
+        DEVICE_TYPES_KEY: (CHAT_REQUEST,),
         'data_class': DataClass.PRIVATE,  # Agent tasks are private
         'priority': 1,
         'reliable': True,

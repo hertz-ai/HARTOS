@@ -355,7 +355,8 @@ class FlaskChannelIntegration:
         Anything else on ``dispatch`` -- another type, or a node's frame --
         is not this handler's: it returns None and other handlers decide.
         """
-        if not isinstance(data, dict) or data.get('type') != 'chat_request':
+        from core.peer_link.channels import CHAT_REQUEST
+        if not isinstance(data, dict) or data.get('type') != CHAT_REQUEST:
             return None
         try:
             from core.peer_link.link_manager import get_link_manager
@@ -405,9 +406,12 @@ class FlaskChannelIntegration:
         instance registers it once (PeerLinkManager.register_channel_handler
         is a no-op for a handler already there)."""
         try:
+            from core.peer_link.channels import CHAT_REQUEST
             from core.peer_link.link_manager import get_link_manager
+            # answers: the handshake tells a phone this node answers its
+            # chat requests, so it asks over the link only here.
             get_link_manager().register_channel_handler(
-                'dispatch', _answer_device_request)
+                'dispatch', _answer_device_request, answers=(CHAT_REQUEST,))
         except Exception as e:
             logger.warning(
                 "PeerLink device chat NOT bound: a phone's turns over its "
