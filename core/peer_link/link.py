@@ -1236,6 +1236,17 @@ class PeerLink:
                                 logger.debug(f"PeerLink socket close after a goodbye: {close_err}")
                         break
 
+                    if (self.kind == 'device' and channel == 'control'
+                            and isinstance(data, dict)
+                            and data.get('type') == 'heartbeat'
+                            and not data.get('reply')):
+                        # Answered: on the relay the phone's socket is to
+                        # central, alive whether or not this desktop still is,
+                        # so this answer is how the phone knows it is.  Marked
+                        # a reply, and a reply is never answered, so a device
+                        # that echoes heartbeats cannot start a ping-pong.
+                        self.send('control', {'type': 'heartbeat', 'reply': True})
+
                     # Check if this is a response to a pending request
                     if msg.get('re'):
                         waiter = self._pending_responses.get(msg['re'])
@@ -1422,4 +1433,10 @@ class PeerLink:
                 caps['relay'] = hub.endpoint_id
         except Exception as e:
             logger.debug("peer_link: relay reachability not advertised: %s", e)
+        # A device's heartbeat is answered (_receive_loop), so a phone that
+        # hears nothing for a few of its heartbeats takes this node for gone
+        # (asleep, or off the relay without a goodbye) and sends its calls to
+        # the cloud at once.  Additive: a phone waits for an answer only from
+        # a node that names it.
+        caps['heartbeat_reply'] = True
         return caps

@@ -460,3 +460,50 @@ def test_a_phone_re_dialling_re_shows_its_card_at_most_every_30_seconds(monkeypa
     clock[0] = 540.0                         # past the window: shown once more
     assert _accept(_hello(phone, phone.token()), address='relay:conv-9') is None
     assert shown == [500.0, 501.0, 540.0]
+
+
+def _frames_out(link, frames_in):
+    """Run the link's real receive loop over ``frames_in``; the frames it
+    sent back, as JSON."""
+    frames = [json.dumps(f) for f in frames_in]
+    sent = []
+
+    class Ws:
+        def recv(self, timeout=None):
+            if frames:
+                return frames.pop(0)
+            raise ConnectionResetError('done')
+
+        def send(self, data):
+            sent.append(json.loads(data.decode('utf-8') if isinstance(data, bytes) else data))
+
+    link._ws = Ws()
+    link._receive_loop()
+    return sent
+
+
+def test_a_phones_heartbeat_is_answered_and_the_ack_says_so(phone):
+    """On the relay a phone's socket is to central, alive whether or not this
+    desktop still is: this desktop's answer to the phone's heartbeat is how
+    the phone knows it is there (PeerLinkClient ends a link that stays
+    silent).  The hello_ack names it, so a phone waits for an answer only
+    from a desktop that sends one."""
+    link = _device_link(phone)
+    out = _frames_out(link, [{'ch': 'control', 'id': 'hb-1', 'd': {'type': 'heartbeat'}}])
+    assert [f['d'] for f in out if f.get('ch') == 'control'] == [
+        {'type': 'heartbeat', 'reply': True}]
+    assert PeerLink._get_local_capabilities()['heartbeat_reply'] is True
+
+
+def test_a_heartbeat_reply_is_never_answered(phone):
+    """A device that echoes what it hears cannot start a ping-pong."""
+    link = _device_link(phone)
+    out = _frames_out(link, [{'ch': 'control', 'id': 'hb-2',
+                              'd': {'type': 'heartbeat', 'reply': True}}])
+    assert out == []
+
+
+def test_a_nodes_heartbeat_is_not_answered():
+    node = PeerLink('node-7', '10.0.0.7:6777', TrustLevel.PEER)
+    node._state = LinkState.CONNECTED
+    assert _frames_out(node, [{'ch': 'control', 'id': 'hb-1', 'd': {'type': 'heartbeat'}}]) == []
