@@ -418,10 +418,14 @@ class PeerLinkManager:
     def register_channel_handler(self, channel: str, handler: Callable):
         """Register handler for incoming messages on a channel.
 
-        Applied to all current and future links.
+        Applied to all current and future links.  Registering the same
+        handler again is a no-op, so a subsystem that binds on every
+        start() is called once per frame, not once per start.
         """
         if channel not in self._channel_handlers:
             self._channel_handlers[channel] = []
+        if handler in self._channel_handlers[channel]:
+            return
         self._channel_handlers[channel].append(handler)
 
         # Apply to existing links

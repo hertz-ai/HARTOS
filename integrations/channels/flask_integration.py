@@ -179,83 +179,23 @@ class FlaskChannelIntegration:
                     logger.debug(f"Ignoring group message without mention")
                     return None
 
-            # Prepare request to agent API
-            from .chat_contract import (
-                chat_request_fields, chat_reply, agent_turn_timeout)
-            payload = {
-                "user_id": user_id,
-                "prompt_id": prompt_id,
-                # Dual /chat contract (standalone HARTOS 'prompt' + bundled Nunba
-                # 'text') — single source in chat_contract, shared with
-                # SelfChatHandler so neither inbound path drifts.
-                **chat_request_fields(message.content),
-                "create_agent": self.create_mode,
-                "device_id": self._device_id,
-                "channel_context": {
-                    "channel": message.channel,
-                    "sender_id": message.sender_id,
-                    "sender_name": message.sender_name,
-                    "chat_id": message.chat_id,
-                    "is_group": message.is_group,
-                    "message_id": message.id,
-                }
+            from .chat_contract import chat_reply
+            channel_context = {
+                "channel": message.channel,
+                "sender_id": message.sender_id,
+                "sender_name": message.sender_name,
+                "chat_id": message.chat_id,
+                "is_group": message.is_group,
+                "message_id": message.id,
             }
 
             logger.info(f"Routing message from {message.channel}:{message.sender_id} to agent")
 
-            # Authenticate the internal hop to /chat.
-            #
-            # This call had no headers at all. On central/regional tiers
-            # security/middleware.py Gate 2 rejects an unauthenticated
-            # internal /chat POST with 401 "Authentication required (Bearer
-            # token)", so EVERY inbound channel message -- Telegram, Discord,
-            # WhatsApp, Slack -- got back "Sorry, I encountered an error
-            # processing your request." A connected channel looked wired up
-            # and answered every message with an apology.
-            #
-            # Reusing agent_engine.dispatch._internal_auth_headers rather than
-            # minting a header here: it already solves exactly this (its
-            # docstring records the same 401 silently breaking the outreach
-            # dispatch path from 2026-03-14). One implementation, so a future
-            # change to internal auth cannot fix one caller and miss the
-            # other -- which is precisely how this bug survived. Imported
-            # lazily to keep channels -> agent_engine out of module import
-            # order. Returns None on flat tier, where no header is needed.
-            # 2026-08-06 fix: pass the REAL resolved user_id here, not the
-            # function's 'system_daemon' default. /chat's JWT-vs-body
-            # check always trusts the JWT over the body (correct — stops
-            # body-spoofing), so leaving this at the default silently
-            # collapsed every channel user's identity into one shared
-            # 'system_daemon' agent session, corrupting concurrent turns
-            # across channels (empty/lost replies). See
-            # _internal_auth_headers' docstring for the full incident.
-            try:
-                from integrations.agent_engine.dispatch import (
-                    _internal_auth_headers)
-                _auth_headers = _internal_auth_headers(user_id=str(user_id),
-                                                       role='user')
-            except Exception as _auth_err:  # never block a message on this
-                logger.warning(
-                    "internal auth header unavailable, calling /chat "
-                    "unauthenticated (central/regional will answer 401): %s",
-                    _auth_err)
-                _auth_headers = None
+            status, result = self.run_turn(
+                user_id, prompt_id, message.content,
+                channel_context=channel_context)
 
-            # Call agent API
-            response = pooled_post(
-                self.agent_api_url,
-                json=payload,
-                headers=_auth_headers,
-                # 2 minute default for agent processing.  Overridable because
-                # a multi-agent turn against a LOCAL model makes several LLM
-                # calls (30-45s each on a 4B), blowing past 120s and replying
-                # "Sorry, the request timed out" even though the agent went on
-                # to produce a perfectly good answer.
-                timeout=agent_turn_timeout(),
-            )
-
-            if response.status_code == 200:
-                result = response.json()
+            if status == 200:
                 agent_reply = chat_reply(result)
                 if not agent_reply.strip():
                     # This used to become "I processed your request." -- a
@@ -286,14 +226,14 @@ class FlaskChannelIntegration:
                 self._response_router.route_response(
                     user_id=user_id,
                     response_text=agent_reply,
-                    channel_context=payload.get('channel_context'),
+                    channel_context=channel_context,
                     fan_out=True,
                     reply_to_origin=False,
                 )
 
                 return agent_reply
             else:
-                logger.error(f"Agent API error: {response.status_code} - {response.text}")
+                logger.error(f"Agent API error: {status} - {result}")
                 return "Sorry, I encountered an error processing your request."
 
         except requests.Timeout:
@@ -302,6 +242,171 @@ class FlaskChannelIntegration:
         except Exception as e:
             logger.error(f"Error handling message: {e}")
             return "Sorry, an unexpected error occurred."
+
+    def run_turn(self, user_id, prompt_id, content: str, **fields) -> tuple:
+        """Run one agent turn through the local /chat and return
+        ``(status, body)``.
+
+        The one /chat call of every inbound path that holds this
+        integration: a channel message (_handle_message) and a person's own
+        device on the PeerLink device link (handle_device_request).  /chat is
+        the agentic door (CREATE/REUSE with the agent ``prompt_id`` names);
+        this only carries the words to it.  ``fields`` are the request's other
+        /chat keys (channel_context, conversation_id, device_id, ...) and win
+        over the integration's own create_mode and device_id.
+
+        requests.Timeout and transport errors propagate: each caller tells
+        its own user in its own way.
+        """
+        from .chat_contract import agent_turn_timeout, chat_request_fields
+        payload = {
+            "user_id": user_id,
+            "prompt_id": prompt_id,
+            # Dual /chat contract (standalone HARTOS 'prompt' + bundled Nunba
+            # 'text') — single source in chat_contract, shared with
+            # SelfChatHandler so neither inbound path drifts.
+            **chat_request_fields(content),
+            "create_agent": self.create_mode,
+            "device_id": self._device_id,
+        }
+        payload.update(fields)
+
+        # Authenticate the internal hop to /chat.
+        #
+        # This call had no headers at all. On central/regional tiers
+        # security/middleware.py Gate 2 rejects an unauthenticated
+        # internal /chat POST with 401 "Authentication required (Bearer
+        # token)", so EVERY inbound channel message -- Telegram, Discord,
+        # WhatsApp, Slack -- got back "Sorry, I encountered an error
+        # processing your request." A connected channel looked wired up
+        # and answered every message with an apology.
+        #
+        # Reusing agent_engine.dispatch._internal_auth_headers rather than
+        # minting a header here: it already solves exactly this (its
+        # docstring records the same 401 silently breaking the outreach
+        # dispatch path from 2026-03-14). One implementation, so a future
+        # change to internal auth cannot fix one caller and miss the
+        # other -- which is precisely how this bug survived. Imported
+        # lazily to keep channels -> agent_engine out of module import
+        # order. Returns None on flat tier, where no header is needed.
+        # 2026-08-06 fix: pass the REAL resolved user_id here, not the
+        # function's 'system_daemon' default. /chat's JWT-vs-body
+        # check always trusts the JWT over the body (correct — stops
+        # body-spoofing), so leaving this at the default silently
+        # collapsed every channel user's identity into one shared
+        # 'system_daemon' agent session, corrupting concurrent turns
+        # across channels (empty/lost replies). See
+        # _internal_auth_headers' docstring for the full incident.
+        try:
+            from integrations.agent_engine.dispatch import (
+                _internal_auth_headers)
+            _auth_headers = _internal_auth_headers(user_id=str(user_id),
+                                                   role='user')
+        except Exception as _auth_err:  # never block a message on this
+            logger.warning(
+                "internal auth header unavailable, calling /chat "
+                "unauthenticated (central/regional will answer 401): %s",
+                _auth_err)
+            _auth_headers = None
+
+        response = pooled_post(
+            self.agent_api_url,
+            json=payload,
+            headers=_auth_headers,
+            # 2 minute default for agent processing.  Overridable because
+            # a multi-agent turn against a LOCAL model makes several LLM
+            # calls (30-45s each on a 4B), blowing past 120s and replying
+            # "Sorry, the request timed out" even though the agent went on
+            # to produce a perfectly good answer.
+            timeout=agent_turn_timeout(),
+        )
+        try:
+            body = response.json()
+        except Exception:
+            body = {}
+        return response.status_code, body if isinstance(body, dict) else {}
+
+    #: What a person's device may set on its turn besides the words and the
+    #: agent: that conversation's own /chat keys.  Never the user -- the
+    #: turn is the user the device token proved (PeerLink.user_id).
+    _DEVICE_TURN_FIELDS = (
+        'conversation_id', 'request_id', 'teacher_avatar_id', 'create_agent',
+        'preferred_lang', 'language', 'media_mode', 'draft_first', 'device_id',
+    )
+
+    def handle_device_request(self, channel: str, data: Any, peer_id: str):
+        """A person's own phone asks for a chat turn over the PeerLink device
+        link.
+
+        The frame is the one the phone's PeerLinkConnectionBridge sends on
+        ``dispatch``: ``{"type": "chat_request", "payload": {...}}``, as a
+        request (link.py lets a device send only that there, and only as a
+        request).  The phone names the agent (``prompt_id``: 54 for Teach
+        Yourself, a custom bot's own id) and the turn runs through /chat like
+        any channel's (run_turn), as the device's user.  The /chat body comes
+        back as the request's reply: ``{"type": "chat_reply", "status",
+        "body"}``.
+
+        Anything else on ``dispatch`` -- another type, or a node's frame --
+        is not this handler's: it returns None and other handlers decide.
+        """
+        if not isinstance(data, dict) or data.get('type') != 'chat_request':
+            return None
+        try:
+            from core.peer_link.link_manager import get_link_manager
+            link = get_link_manager().get_link(peer_id)
+        except Exception as e:
+            logger.warning("Device chat request from %s unanswered: link "
+                           "lookup failed: %s", peer_id, e)
+            return None
+        if link is None or link.kind != 'device' or not link.user_id:
+            return None
+        payload = data.get('payload')
+        payload = payload if isinstance(payload, dict) else {}
+        text = payload.get('text')
+        if not isinstance(text, str) or not text.strip():
+            return {'type': 'chat_reply', 'status': 400,
+                    'body': {'error': 'Text is required'}}
+        fields = {k: payload[k] for k in self._DEVICE_TURN_FIELDS
+                  if k in payload}
+        # The reply to this request is the whole answer the phone gets, so
+        # the turn answers synchronously unless the phone says otherwise:
+        # with the draft first, a quick standby ("let me check...") would be
+        # the reply and the real answer would arrive nowhere it is awaited.
+        fields.setdefault('draft_first', False)
+        prompt_id = payload.get('prompt_id')
+        # Shape only, never the words.
+        logger.info("Device %s chat turn for user %s: prompt_id=%s text_len=%d",
+                    peer_id, link.user_id, prompt_id, len(text))
+        try:
+            status, body = self.run_turn(link.user_id, prompt_id, text,
+                                         **fields)
+        except requests.Timeout:
+            logger.warning("Device %s chat turn ran past the agent-turn "
+                           "budget; the phone is told 504", peer_id)
+            return {'type': 'chat_reply', 'status': 504,
+                    'body': {'error': 'The agent took too long to answer'}}
+        except Exception as e:
+            logger.warning("Device %s chat turn failed before /chat "
+                           "answered: %s", peer_id, e)
+            return {'type': 'chat_reply', 'status': 502,
+                    'body': {'error': 'The agent could not be reached'}}
+        return {'type': 'chat_reply', 'status': status, 'body': body}
+
+    def _bind_device_link(self) -> None:
+        """Answer a person's own devices' chat requests on the PeerLink
+        device link.  Binds the one module-level handler
+        (_answer_device_request), so binding from every start() of every
+        instance registers it once (PeerLinkManager.register_channel_handler
+        is a no-op for a handler already there)."""
+        try:
+            from core.peer_link.link_manager import get_link_manager
+            get_link_manager().register_channel_handler(
+                'dispatch', _answer_device_request)
+        except Exception as e:
+            logger.warning(
+                "PeerLink device chat NOT bound: a phone's turns over its "
+                "device link get no answer on this node: %s", e)
 
     def _resolve_user_id_for_sender(
         self, channel: str, sender_id: str, fallback,
@@ -1243,6 +1348,10 @@ class FlaskChannelIntegration:
         # therefore needs no extra lifecycle machinery.
         self.restore_persisted_channels()
 
+        # A person's own phone is one more inbound channel: its chat
+        # requests arrive on the PeerLink device link, not on an adapter.
+        self._bind_device_link()
+
         self._thread = threading.Thread(target=self._run_async_loop, daemon=True)
         self._thread.start()
         logger.info("Channel adapters started in background")
@@ -1267,6 +1376,22 @@ class FlaskChannelIntegration:
 
 # Global integration instance
 _integration: Optional[FlaskChannelIntegration] = None
+
+
+def _answer_device_request(channel: str, data: Any, peer_id: str):
+    """The PeerLink ``dispatch`` handler for a phone's chat requests, bound
+    once per process (FlaskChannelIntegration._bind_device_link).
+
+    It answers through the live integration, not the instance that bound it:
+    a process can start two -- an on-demand path (the WhatsApp QR poll's
+    get_channel_integration + ensure_running) may start one before
+    init_channels builds and starts its own -- and binding each instance's
+    method would run one phone request as two agent turns.
+    """
+    integration = _integration
+    if integration is None:
+        return None
+    return integration.handle_device_request(channel, data, peer_id)
 
 
 def get_channel_integration() -> FlaskChannelIntegration:

@@ -29,11 +29,18 @@ class DataClass:
 #: device_access grant, HARTOS #111) may do on a channel: 'in' (the device
 #: may send on it), 'out' (the node may deliver on it), 'both', or absent
 #: (nothing).  A device is not a node: every channel that carries node
-#: authority -- compute, dispatch, gossip, federation, hivemind, ralt,
-#: sensor, messages, learning -- is closed to it unless a maintainer opens it
-#: here, so a new channel starts closed.  link.py drops what a device sends
-#: elsewhere; link_manager.broadcast/collect never deliver elsewhere.
+#: authority -- compute, gossip, federation, hivemind, ralt, sensor,
+#: messages, learning -- is closed to it unless a maintainer opens it here,
+#: so a new channel starts closed.  A channel opened 'in' may name the only
+#: frame types a device may send there (DEVICE_TYPES_KEY): 'dispatch' opens
+#: to a person's own phone for its chat requests and nothing else, because
+#: embedded nodes act on 'device_control' frames on that same channel.  On a
+#: typed channel a device's frame must also be a request (link.py), so the
+#: work it starts has someone waiting for the answer.  link.py drops what a
+#: device sends elsewhere; link_manager.broadcast/collect never deliver
+#: elsewhere.
 DEVICE_POLICY_KEY = 'device'
+DEVICE_TYPES_KEY = 'device_types'
 
 CHANNEL_REGISTRY = {
     'control': {
@@ -53,6 +60,13 @@ CHANNEL_REGISTRY = {
     },
     'dispatch': {
         'id': 0x02,
+        # A person's own phone asks for a chat turn here, the frame its
+        # PeerLinkConnectionBridge already sends; the node answers it as
+        # an inbound channel (FlaskChannelIntegration.
+        # handle_device_request).  Typed: device_control and every other
+        # dispatch frame stay node-only.
+        DEVICE_POLICY_KEY: 'in',
+        DEVICE_TYPES_KEY: ('chat_request',),
         'data_class': DataClass.PRIVATE,  # Agent tasks are private
         'priority': 1,
         'reliable': True,
@@ -138,9 +152,26 @@ def get_channel_config(channel: str) -> dict:
     return CHANNEL_REGISTRY.get(channel, {})
 
 
-def device_may_send(channel: str) -> bool:
-    """May a DEVICE link send on this channel (inbound to the node)?"""
-    return get_channel_config(channel).get(DEVICE_POLICY_KEY) in ('in', 'both')
+def device_send_types(channel: str) -> tuple:
+    """The only frame types a DEVICE link may send on this channel, or ()
+    when the channel does not narrow them."""
+    return tuple(get_channel_config(channel).get(DEVICE_TYPES_KEY) or ())
+
+
+def device_may_send(channel: str, frame: Any = None) -> bool:
+    """May a DEVICE link send this frame on this channel (inbound to the node)?
+
+    On a channel that names its device frame types (device_send_types)
+    the frame must be a dict whose 'type' is one of them; no frame (a
+    binary frame, or a caller asking about the channel alone) is refused
+    there.
+    """
+    if get_channel_config(channel).get(DEVICE_POLICY_KEY) not in ('in', 'both'):
+        return False
+    types = device_send_types(channel)
+    if not types:
+        return True
+    return isinstance(frame, dict) and frame.get('type') in types
 
 
 def device_may_receive(channel: str) -> bool:

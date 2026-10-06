@@ -149,7 +149,7 @@ class LinkState(Enum):
 # Channel IDs for binary frames — single source of truth is CHANNEL_REGISTRY
 # in core.peer_link.channels. Re-exported here for backwards compatibility.
 from core.peer_link.channels import (  # noqa: E402
-    CHANNEL_IDS, CHANNEL_NAMES, device_may_send)
+    CHANNEL_IDS, CHANNEL_NAMES, device_may_send, device_send_types)
 
 #: Verifies a phone's device_token from a HELLO (HARTOS #111): callable(token, peer_address)
 #: -> the verdict shape of integrations.social.auth.verify_device_jwt, plus
@@ -903,12 +903,21 @@ class PeerLink:
 
         return True
 
-    def _device_may_send(self, channel: str) -> bool:
+    def _device_may_send(self, channel: str, frame: Any = None,
+                         is_request: bool = False) -> bool:
         """Inbound frames from a device link reach a handler only on a
-        channel the registry opens to devices; the first refusal per channel
-        is logged, the rest are dropped quietly."""
-        if self.kind != 'device' or device_may_send(channel):
+        channel the registry opens to devices, and on a channel that names
+        its device frame types only as one of those types sent as a request
+        (a turn nobody waits for is never started).  The first refusal per
+        channel is logged, the rest are dropped quietly."""
+        if self.kind != 'device':
             return True
+        if device_may_send(channel, frame):
+            if is_request or not device_send_types(channel):
+                return True
+            logger.debug(f"Device {self.peer_id} sent a non-request frame on "
+                         f"'{channel}', where a device may only ask; dropped")
+            return False
         if channel not in self._device_channel_warned:
             self._device_channel_warned.add(channel)
             logger.warning(f"Device {self.peer_id} sent on '{channel}', "
@@ -1133,7 +1142,8 @@ class PeerLink:
                         continue
 
                     # Dispatch to handlers
-                    if not self._device_may_send(channel):
+                    if not self._device_may_send(
+                            channel, data, bool(msg.get('rq') and msg_id)):
                         continue
                     if msg.get('rq') and msg_id:
                         # The sender is waiting (send(wait_response=True) flags
