@@ -146,8 +146,8 @@ def get_local_fcm_token(user_id):
 # The central FCM registry is keyed by the central Hevolve account id (the
 # phone / account-number, e.g. 9003054371), but the local notification path
 # carries the local social ``User.id`` (a UUID).  When HARTOS knows the central
-# id for a user — it learns it at login with the central account, or central
-# pushes it down in the user-sync payload — we stash it on the canonical local
+# id for a user — from the person's own profile pull (core.profile_sync), never
+# from a sync batch (#188) — we stash it on the canonical local
 # record (``User.settings['central_user_id']``, a migration-free JSON field) so
 # the pull can query the registry by the id it is actually keyed with, instead
 # of the UUID that always missed (#90).  No mapping known → callers fall back to
@@ -183,8 +183,8 @@ def set_central_id(user_id, central_id):
     it knows both ids.  Idempotent, best-effort; returns True on a stored value.
 
     Note: writes through a fresh session, so the local User row must already be
-    committed.  Sync-time capture (a User created in the same transaction) sets
-    ``settings`` inline instead — see sync_engine._handle_sync_user."""
+    committed (core.profile_sync.sync_profile calls it after its user write
+    commits)."""
     if not user_id or not central_id:
         return False
     try:

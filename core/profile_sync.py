@@ -7,10 +7,12 @@ Background.  The sync fabric is up-only (a leaf POSTs queued items to its
 parent via ``SyncEngine.drain_queue``); central (Hevolve_Database, a FastAPI
 app) has no push fabric and a leaf is NAT'd, so central can't push to a node.
 The local social ``User`` receiver ``SyncEngine._handle_sync_user`` already
-exists and is idempotent (create-or-update by id + FCM-token cache +
-central-id map, all in one transaction) — but NOTHING ever fed it from
-central.  This module is the missing FETCH that produces the ``sync_user``
-payload and hands it straight to that EXISTING receiver — no parallel writer.
+exists and is idempotent (create-or-update by id) — but NOTHING ever fed it
+from central.  This module is the missing FETCH that produces the
+``sync_user`` payload and hands it straight to that EXISTING receiver — no
+parallel writer — and then maps the central id and caches the central FCM
+token, which the receiver never does (it also serves the unsigned-in-warn
+/api/social/hierarchy/sync ingress, #188).
 
 Mirrors ``core.fcm_sync`` exactly: the same PULL pattern (a node fetches its
 own data by central id), the same purity split (a pure payload builder + a
@@ -59,9 +61,9 @@ def build_user_sync_payload(local_user_id, central_user_id, central_resp):
 
     Keys the row on ``local_user_id`` — the LOCAL social UUID the push path
     looks up; the node knows its own id, central does not.  Carries the central
-    id through so the receiver populates ``User.settings['central_user_id']``
-    (#90 FCM resolution), the central FCMtoken so it lands already mapped to the
-    local UUID, plus the profile extras the receiver already tolerates.
+    id and the central FCMtoken, which ``sync_profile`` maps and caches under
+    the local UUID (#90 FCM resolution; the receiver ignores both), plus the
+    profile extras the receiver already tolerates.
 
     ``username`` is REQUIRED non-empty by the receiver (it early-returns
     otherwise) and central has no username column — so derive it
@@ -119,9 +121,11 @@ def fetch_central_profile(central_user_id, timeout=8):
 
 def sync_profile(local_user_id, central_user_id):
     """Pull ``central_user_id``'s profile DOWN and feed it to the EXISTING
-    local social receiver (``SyncEngine._handle_sync_user``) — create-or-update
-    the local ``User``, cache the central FCM token, and map the local UUID →
-    central id, all in the receiver's one idempotent transaction.
+    local social receiver (``SyncEngine._handle_sync_user``), which
+    creates-or-updates the local ``User``; then map the local UUID → central
+    id (``fcm_sync.set_central_id``) and cache the central FCM token under the
+    local UUID.  This pull is where both come from: a sync item never sets
+    them (#188).
 
     GATE: a SINGLE central id in → exactly that one user persisted.  No bulk,
     no fan-out — the receiver is handed one payload.
@@ -142,6 +146,17 @@ def sync_profile(local_user_id, central_user_id):
         from integrations.social.sync_engine import SyncEngine
         with db_session() as db:
             SyncEngine._handle_sync_user(db, payload)
+        # Where this person's pushes go, under the local UUID the push path
+        # reads: the central account id (#90) and central's token.  Set here,
+        # by the person's own pull, never by the receiver: it also serves
+        # /api/social/hierarchy/sync, which applies an unsigned batch outside
+        # hard enforcement (#188).  After the user write commits, so
+        # set_central_id finds the row.
+        from core.fcm_sync import set_central_id, store_local_fcm_token
+        set_central_id(local_user_id, payload['central_user_id'])
+        if payload.get('fcm_token'):
+            if store_local_fcm_token(local_user_id, payload['fcm_token']):
+                logger.info("profile_sync: cached the FCM token for %s", local_user_id)
         logger.info("profile_sync: synced central %s → local %s",
                     central_user_id, local_user_id)
         return True
