@@ -623,21 +623,29 @@ class PeerLinkManager:
                     # ws://host:8088/ws.  The strip above would mangle it into
                     # "host:8088/ws" and upgrade_peer would dial a WAMP router
                     # expecting the PeerLink protocol — a connect that can
-                    # never handshake.  PeerLink has no WAMP relay mode; the
-                    # canonical WAN relay is MessageBus's CROSSBAR leg
-                    # (core/peer_link/message_bus.py), so skip the upgrade
-                    # honestly instead of dialing garbage.
+                    # never handshake.  The relay rung is the peer's inbox on
+                    # that router instead (relay_address below).
                     logger.debug(
                         f"NAT resolved a relay URL for {peer_id[:8]} "
-                        f"({ws_url}); not dialable as PeerLink — leaving "
-                        f"transport to the MessageBus crossbar leg")
+                        f"({ws_url}); the relay rung dials its inbox")
             except Exception as e:
                 logger.debug(f"NAT traversal unavailable for {peer_id[:8]}: {e}")
 
             if not address:
                 address = (peer_info.get('url', '')
                            .replace('http://', '').replace('https://', '').rstrip('/'))
-            if not address:
+            # The relay rung (core.peer_link.relay): the peer's inbox on the
+            # router both ends dial out to, which answers from behind any NAT.
+            # Tried after the direct address, never instead of it.
+            relay_address = ''
+            try:
+                from core.peer_link.relay import RELAY_ADDRESS_SCHEME, get_relay_hub
+                hub = get_relay_hub()
+                if hub is not None and hub.joined:
+                    relay_address = RELAY_ADDRESS_SCHEME + peer_id
+            except Exception as e:
+                logger.debug(f"PeerLink relay rung unavailable for {peer_id[:8]}: {e}")
+            if not address and not relay_address:
                 # Was a bare `return`. Every exit from this function was silent,
                 # so a hive that never formed looked identical to one that was
                 # never asked to: three machines discovered each other on the
@@ -703,16 +711,20 @@ class PeerLinkManager:
             # The success path logs too. "Attempted and failed to connect" and
             # "never attempted" produced identical silence before this, which is
             # why connected_nodes=0 was unattributable.
-            logger.info(
-                "PeerLink upgrade for %s ATTEMPTING: address=%s trust=%s",
-                peer_id[:8], address, getattr(trust, 'name', trust))
-            self.upgrade_peer(
-                peer_id=peer_id,
-                address=address,
-                trust=trust,
-                x25519_public=peer_info.get('x25519_public', ''),
-                ed25519_public=peer_info.get('public_key', ''),
-            )
+            for candidate in (address, relay_address):
+                if not candidate:
+                    continue
+                logger.info(
+                    "PeerLink upgrade for %s ATTEMPTING: address=%s trust=%s",
+                    peer_id[:8], candidate, getattr(trust, 'name', trust))
+                if self.upgrade_peer(
+                        peer_id=peer_id,
+                        address=candidate,
+                        trust=trust,
+                        x25519_public=peer_info.get('x25519_public', ''),
+                        ed25519_public=peer_info.get('public_key', ''),
+                ):
+                    break
         except Exception as e:
             logger.debug(f"Auto-upgrade failed for {peer_id[:8]}: {e}")
 

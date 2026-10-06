@@ -173,6 +173,29 @@ def _install_peer_admission_ask() -> None:
         logger.critical(f"PeerLink admission ask not installed: {e}")
 
 
+def _install_peer_link_relay() -> None:
+    """Step 1e: put this node on the PeerLink relay (core.peer_link.relay),
+    after the verifier and the admission ask so the first relayed HELLO meets
+    the same gates as a websocket one.  The rung a phone or a peer reaches
+    from behind any NAT; every frame after the handshake is end-to-end
+    encrypted.  Central hosts the router and is not a relay endpoint.
+    Non-blocking: the session joins in the background and rejoins on loss."""
+    try:
+        from security.key_delegation import get_node_tier
+        if get_node_tier() == 'central':
+            return
+    except Exception as e:
+        # Tier unreadable: a node that is not central is the common case, and
+        # the relay only carries what the existing gates admit.
+        logger.debug(f"PeerLink relay: node tier unreadable ({e}); joining")
+    try:
+        from core.peer_link.relay import start_relay_hub
+        if start_relay_hub() is None:
+            logger.info("PeerLink relay not started (switched off or no WAMP client)")
+    except Exception as e:
+        logger.warning(f"PeerLink relay not started: {e}")
+
+
 def bootstrap(
     app,
     config: Optional[Mapping[str, Any]] = None,
@@ -293,6 +316,7 @@ def _run_bootstrap(app, cfg: dict) -> None:
             _install_api_gate(app)
             _install_device_verifier()
             _install_peer_admission_ask()
+            _install_peer_link_relay()
             _init_social_subsystem(app)
             _register_core_blueprints(app)
             _run_consumer_hook(app, cfg)

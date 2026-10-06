@@ -197,6 +197,22 @@ def set_peer_admission_ask(fn: Optional[Callable[[str, str], bool]]) -> None:
 # Key rotation interval (seconds)
 KEY_ROTATION_INTERVAL = 3600
 
+#: X.509 SubjectPublicKeyInfo of an X25519 key: this 12-byte prefix, then the
+#: 32-byte key.  An Android phone's JCA key encodes itself that way
+#: (PeerLinkCrypto.getX25519PublicHex sent `public.encoded`), while a node sends
+#: the raw 32 bytes -- the same split Ed25519 had (PeerLinkCrypto's
+#: ED25519_SPKI_PREFIX).
+_X25519_SPKI_PREFIX = bytes.fromhex('302a300506032b656e032100')
+
+
+def _x25519_raw(public_hex: str) -> bytes:
+    """A peer's X25519 public key as the 32 bytes X25519PublicKey reads,
+    whether it arrived raw or X.509-wrapped."""
+    key = bytes.fromhex(public_hex)
+    if len(key) == len(_X25519_SPKI_PREFIX) + 32 and key.startswith(_X25519_SPKI_PREFIX):
+        return key[len(_X25519_SPKI_PREFIX):]
+    return key
+
 
 def provable_user_id() -> str:
     """The user_id we can actually PROVE to a peer, or ''.
@@ -250,6 +266,10 @@ class PeerLink:
     # sees a node unless the handshake said otherwise.
     kind = 'node'
     user_id = ''
+    # True when the transport is shared with strangers (the relay,
+    # core.peer_link.relay): the link then carries the X25519/AES-GCM
+    # session whatever its trust, and refuses to run without one.
+    requires_e2e = False
 
     def __init__(self, peer_id: str, address: str, trust: TrustLevel,
                  x25519_public_hex: str = '', ed25519_public_hex: str = '',
@@ -266,6 +286,7 @@ class PeerLink:
         # budget and eviction.
         self.kind = 'node'
         self.user_id = ''
+        self.requires_e2e = False
         self._device_channel_warned: set = set()
 
         # G9: Trust ratchet — once trust is established at a level,
@@ -304,8 +325,16 @@ class PeerLink:
 
     @property
     def is_encrypted(self) -> bool:
-        """E2E encryption active (PEER/RELAY trust only)."""
+        """E2E encryption active (PEER/RELAY trust, or a relay transport)."""
         return self._session_key is not None
+
+    def _wants_session_key(self) -> bool:
+        """PEER/RELAY trust always; any trust on a shared transport."""
+        return self.trust in (TrustLevel.PEER, TrustLevel.RELAY) or self.requires_e2e
+
+    def _encrypting(self) -> bool:
+        """Frames after the handshake are sealed with the session key."""
+        return self._session_key is not None and self._wants_session_key()
 
     @property
     def min_trust_level(self) -> TrustLevel:
@@ -362,22 +391,36 @@ class PeerLink:
 
         self._state = LinkState.CONNECTING
         try:
-            ws_url = self._resolve_ws_url()
-
-            try:
-                import websockets.sync.client as ws_client
-                self._ws = ws_client.connect(ws_url, open_timeout=10,
-                                              close_timeout=5)
-            except ImportError:
-                # Fallback: use websocket-client library
-                try:
-                    import websocket
-                    self._ws = websocket.WebSocket()
-                    self._ws.connect(ws_url, timeout=10)
-                except ImportError:
-                    logger.warning("No WebSocket library available (need websockets or websocket-client)")
+            from core.peer_link.relay import RELAY_ADDRESS_SCHEME
+            if self.address.startswith(RELAY_ADDRESS_SCHEME):
+                # The peer's inbox on the relay (core.peer_link.relay): the
+                # rung that answers from behind any NAT.
+                from core.peer_link.relay import get_relay_hub
+                hub = get_relay_hub()
+                if hub is None or not hub.joined:
+                    logger.debug(f"PeerLink relay dial to {self.peer_id[:8]}: "
+                                 f"this node is not on the relay")
                     self._state = LinkState.DISCONNECTED
                     return False
+                self._ws = hub.dial(self.address[len(RELAY_ADDRESS_SCHEME):])
+                self.requires_e2e = True
+            else:
+                ws_url = self._resolve_ws_url()
+
+                try:
+                    import websockets.sync.client as ws_client
+                    self._ws = ws_client.connect(ws_url, open_timeout=10,
+                                                  close_timeout=5)
+                except ImportError:
+                    # Fallback: use websocket-client library
+                    try:
+                        import websocket
+                        self._ws = websocket.WebSocket()
+                        self._ws.connect(ws_url, timeout=10)
+                    except ImportError:
+                        logger.warning("No WebSocket library available (need websockets or websocket-client)")
+                        self._state = LinkState.DISCONNECTED
+                        return False
 
             self._state = LinkState.HANDSHAKING
             if not self._perform_handshake():
@@ -407,6 +450,8 @@ class PeerLink:
         """Accept incoming connection (called by link_manager's WS server)."""
         self._ws = ws
         self._state = LinkState.HANDSHAKING
+        # A socket on a shared transport (core.peer_link.relay) says so.
+        self.requires_e2e = bool(getattr(ws, 'requires_e2e', False))
 
         try:
             if not self._complete_handshake(handshake_data):
@@ -464,8 +509,8 @@ class PeerLink:
 
         frame_bytes = frame.encode('utf-8')
 
-        # Encrypt for PEER/RELAY trust
-        if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self._session_key:
+        # Encrypt for PEER/RELAY trust, and on a shared transport
+        if self._encrypting():
             frame_bytes = self._encrypt(frame_bytes)
 
         event = None
@@ -500,7 +545,7 @@ class PeerLink:
         msg_id_bytes = struct.pack('>I', hash(time.time()) & 0xFFFFFFFF)
         frame = bytes([ch_id]) + msg_id_bytes + data
 
-        if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self._session_key:
+        if self._encrypting():
             frame = self._encrypt(frame)
 
         try:
@@ -706,9 +751,13 @@ class PeerLink:
         self.peer_x25519_public = resp.get('x25519_public', '')
         self.capabilities = resp.get('capabilities', {})
 
-        # Derive session key for PEER/RELAY trust
-        if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self.peer_x25519_public:
+        # Derive session key for PEER/RELAY trust, and on a shared transport
+        if self._wants_session_key() and self.peer_x25519_public:
             self._derive_session_key()
+        if self.requires_e2e and self._session_key is None:
+            logger.warning(f"PeerLink relay link to {self.peer_id[:8]} refused: "
+                           f"no session key, and a relay link is never plaintext")
+            return False
 
         return True
 
@@ -756,6 +805,17 @@ class PeerLink:
         elif not self._decide_node_trust(hello_data, peer_ed25519):
             return False
 
+        # A shared transport carries nothing in the clear after this ack, so
+        # the session key must exist BEFORE the ack goes out: without one the
+        # HELLO is refused unanswered.
+        if self.requires_e2e:
+            if self.peer_x25519_public:
+                self._derive_session_key()
+            if self._session_key is None:
+                logger.warning("PeerLink relay HELLO refused: no session key, "
+                               "and a relay link is never plaintext")
+                return False
+
         # Send ack
         ack = {
             'type': 'hello_ack',
@@ -770,8 +830,9 @@ class PeerLink:
         ack_bytes = json.dumps(ack, separators=(',', ':')).encode('utf-8')
         self._ws_send(ack_bytes)
 
-        # Derive session key for PEER/RELAY trust
-        if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self.peer_x25519_public:
+        # Derive session key for PEER/RELAY trust (a relay link has one already)
+        if (self._session_key is None and self._wants_session_key()
+                and self.peer_x25519_public):
             self._derive_session_key()
 
         return True
@@ -934,7 +995,7 @@ class PeerLink:
 
             our_private, _ = get_x25519_keypair()
             peer_pub = X25519PublicKey.from_public_bytes(
-                bytes.fromhex(self.peer_x25519_public))
+                _x25519_raw(self.peer_x25519_public))
             shared_secret = our_private.exchange(peer_pub)
 
             self._session_key = HKDF(
@@ -1112,7 +1173,7 @@ class PeerLink:
                     raw = raw.encode('utf-8')
 
                 # Decrypt if needed
-                if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self._session_key:
+                if self._encrypting():
                     decrypted = self._decrypt(raw)
                     if decrypted is None:
                         continue
@@ -1296,4 +1357,14 @@ class PeerLink:
                 caps['device_requests'] = answered
         except Exception as e:
             logger.debug("peer_link: device requests not advertised: %s", e)
+        # Reachable on the relay (core.peer_link.relay): a phone that met
+        # this node on the LAN can reach it at relay://<node_id> from
+        # anywhere.  Additive, like device_requests.
+        try:
+            from core.peer_link.relay import get_relay_hub
+            hub = get_relay_hub()
+            if hub is not None and hub.joined:
+                caps['relay'] = True
+        except Exception as e:
+            logger.debug("peer_link: relay reachability not advertised: %s", e)
         return caps

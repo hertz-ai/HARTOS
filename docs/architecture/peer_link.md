@@ -5,7 +5,7 @@
 
 ## Design Principles
 
-1. **Same-user = simple, everywhere.** Your own devices talk via plain WebSocket — whether on the same LAN, across the internet, or on a regional node you logged into. Trust is based on **authenticated user identity** (matching user_id), not network proximity. No encryption overhead between your own machines.
+1. **Same-user = simple, everywhere.** Your own devices talk via plain WebSocket — whether on the same LAN, across the internet, or on a regional node you logged into. Trust is based on **authenticated user identity** (matching user_id), not network proximity. No encryption overhead between your own machines on a socket only they share; on the shared relay (below) the same link is sealed, because strangers share that router.
 
 2. **Cross-user = encrypted.** When data crosses to another user's device, E2E encryption is mandatory. No relay, regional node, or central server can read the payload.
 
@@ -39,6 +39,33 @@
 | `SAME_USER` | Your own devices (LAN, WAN, or regional) — same authenticated user_id | None (plain WebSocket) | Phone ↔ Laptop on home WiFi, Phone ↔ VPS you logged into, Laptop ↔ Regional GPU node where you're authenticated |
 | `PEER` | Different user's device | AES-256-GCM session key (X25519 ECDH) | Your node ↔ Contributor's GPU node |
 | `RELAY` | Traffic through intermediate | AES-256-GCM (relay sees only ciphertext) | NAT-challenged peer via seed relay |
+
+## The relay rung: reaching a node behind any NAT
+
+`core/peer_link/relay.py`. Both ends dial OUT to one WAMP router — central's by
+default (`core.wamp_url.DEFAULT_ROUTER_URL`; `HEVOLVE_PEER_LINK_RELAY_URL`
+names another) — and an outbound connection crosses any NAT. Each endpoint
+subscribes to one inbox, `com.hertzai.hevolve.peerlink.relay.<endpoint id>`
+(a node's id is its `node_id`); a link is one conversation id inside it, and a
+node dials another at the address `relay://<node_id>`.
+
+- **Same handshake, same gates.** The relay socket has the duck type of the
+  inbound websocket adapter, so an inbound relay HELLO goes through
+  `link_manager.accept_inbound` exactly like a websocket one: signatures,
+  device tokens, the owner's grants, the trust ratchet.
+- **Always sealed.** The router is shared with strangers, so a relay link
+  carries the X25519/AES-256-GCM session key whatever its trust — SAME_USER
+  included — and is refused without one. After HELLO / HELLO_ACK the router
+  sees only ciphertext (measured live 2026-10-06: an outside subscriber on both
+  inboxes read `hello`, `hello_ack`, then opaque frames only).
+- **A rung, not the destination.** `link_manager._try_auto_upgrade` tries the
+  direct address first and the relay after it. The relay is the rendezvous:
+  once a link is live, the ends move to a direct path when one forms.
+- **Who is on it.** Every owned node at boot (`hartos_bootstrap.
+  _install_peer_link_relay`), not central; `HEVOLVE_PEER_LINK_RELAY=0` keeps a
+  node off. A node on the relay says so in its handshake (`capabilities.relay`).
+- **Keys.** A phone sends X25519 keys X.509-wrapped (44 bytes); a node reads
+  raw or wrapped (`link._x25519_raw`).
 
 ## Data Classification
 
