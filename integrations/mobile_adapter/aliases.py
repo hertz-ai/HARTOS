@@ -10,7 +10,7 @@ is added only where the desktop has the canonical equivalent, with a test
 that pins the reply the phone already reads.
 """
 from typing import NamedTuple, Optional
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 
 #: How long a phone waits for this desktop's answer to a call before it sends
@@ -48,7 +48,9 @@ ALIASES: tuple = (
 
 def _safe(path: str) -> bool:
     """A path whose segments are plain: no '..' or empty segment to walk out
-    of the prefix it matched."""
+    of the prefix it matched.  Judged as the desktop routes it, decoded
+    ('%2e%2e' is '..' to the route), with a backslash read as a separator."""
+    path = unquote(path).replace('\\', '/')
     return all(seg not in ('..', '.') for seg in path.split('/')[1:]) and '//' not in path
 
 

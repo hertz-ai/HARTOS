@@ -394,3 +394,54 @@ def test_a_node_past_its_request_slots_still_hears_nothing(desktop_app):
     node._request_slots.acquire()
     node.on_message('dispatch', lambda ch, data, peer: {'ok': True})
     assert _ask(node, {'type': 'agent_task'}, expect_reply=False) == []
+
+
+def test_an_encoded_dot_dot_never_walks_out_of_a_prefix_row(desktop_app, phone, monkeypatch):
+    """The desktop decodes the path before it routes, so '%2e%2e' is '..' to
+    the route a prefix row reaches: an encoded walk out of the prefix is
+    not_here like a plain one, and the route never runs."""
+    files = aliases.Alias('GET', 'mailer.hertzai.com', '/api/v1/files/', '/files/')
+    got = []
+
+    @desktop_app.route('/files/<path:rest>')
+    def file_view(rest):
+        got.append(rest)
+        return jsonify({'rest': rest})
+    monkeypatch.setattr(aliases, 'ALIASES', (ROW, files))
+    assert adapter.install(desktop_app)
+    link = _device_link(phone)
+    for n, rest in enumerate(('a/%2e%2e/%2e%2e/admin', '%2E%2E/x', '..%2fadmin',
+                              'a/%2e/b', 'a%2f%2fb', '..%5cadmin')):
+        assert _ask(link, _api(phone, f'https://mailer.hertzai.com/api/v1/files/{rest}',
+                               method='GET'), rid=f'w-{n}') == [
+            {'type': 'api_reply', 'not_here': True}], rest
+    assert got == []
+    reply = _ask(link, _api(phone, 'https://mailer.hertzai.com/api/v1/files/a/b.txt',
+                            method='GET'), rid='ok')[0]
+    assert reply['status'] == 200 and _body(reply) == {'rest': 'a/b.txt'}
+
+
+def test_each_phone_has_its_own_rate_budget_on_the_desktop(desktop_app, phone, monkeypatch):
+    """A limiter keyed by the caller's address charges each phone its own
+    budget, as each phone's own address did over HTTP: one phone past its
+    limit leaves another of the same person's phones answered."""
+    from security import rate_limiter_redis
+    monkeypatch.setattr(rate_limiter_redis.RedisRateLimiter, '_init_redis', lambda self: None)
+    monkeypatch.setattr(rate_limiter_redis, '_limiter', rate_limiter_redis.RedisRateLimiter())
+    limit, _ = rate_limiter_redis.RedisRateLimiter.LIMITS['shell_power']
+
+    @desktop_app.route('/power', methods=['POST'])
+    @rate_limiter_redis.rate_limit('shell_power')
+    def power():
+        return jsonify({'ok': True})
+    monkeypatch.setattr(aliases, 'ALIASES', (ROW, aliases.Alias('POST', CLOUD, '/power', '/power')))
+    assert adapter.install(desktop_app)
+    tablet = Phone(user_id=PHONE_USER, username='Sathish')
+
+    def call(device, link, rid):
+        return _ask(link, _api(device, f'https://{CLOUD}/power',
+                               body={'user_id': PHONE_USER}), rid=rid)[0]['status']
+    first = _device_link(phone)
+    assert [call(phone, first, f'p-{n}') for n in range(limit + 1)] == [200] * limit + [429]
+    second = _device_link(tablet)
+    assert call(tablet, second, 't-0') == 200

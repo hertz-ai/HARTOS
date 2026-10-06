@@ -36,9 +36,12 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 #: The request headers carried into the desktop route, besides the bearer.
 _CARRIED_HEADERS = ('Content-Type', 'Accept', 'Accept-Language')
 
-#: The caller address the gate sees for an adapted call: not loopback, so the
-#: gate never takes a phone for this machine, and not an address a LAN host
-#: could also have.
+#: The caller address the gate sees for an adapted call, followed by the
+#: device's peer id: not loopback, so the gate never takes a phone for this
+#: machine; not an address a LAN host could also have; and one per device, so
+#: a limiter keyed by the caller's address (core.auth_local.client_key)
+#: charges each phone its own budget, as each phone's own address did over
+#: HTTP.
 REMOTE_ADDR = 'peerlink-device'
 
 _NOT_HERE = {'type': API_REPLY, 'not_here': True}
@@ -113,7 +116,7 @@ def answer(link, frame: dict) -> dict:
     headers['X-HARTOS-Request-ID'] = _request_id(body)
     with _HOST_APP.test_client() as client:
         resp = client.open(route, method=method, data=body or None, headers=headers,
-                           environ_base={'REMOTE_ADDR': REMOTE_ADDR})
+                           environ_base={'REMOTE_ADDR': f'{REMOTE_ADDR}/{link.peer_id}'})
     data = resp.get_data()
     if len(data) > MAX_BODY_BYTES:
         return _NOT_HERE
