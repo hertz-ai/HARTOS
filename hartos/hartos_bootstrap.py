@@ -104,7 +104,8 @@ def _install_device_verifier() -> None:
         from core.peer_link.link_manager import get_link_manager
         from integrations.social.auth import (
             file_device_access_ask, verify_device_jwt)
-        from integrations.social.consent_service import device_fingerprint
+        from integrations.social.consent_service import (
+            ConsentService, device_fingerprint, device_scope)
         from integrations.social.models import db_session
 
         def verify(token: str, peer_address: str) -> dict:
@@ -116,7 +117,14 @@ def _install_device_verifier() -> None:
                 if verdict.get('status') == 'pending':
                     from integrations.social.discovery import _check_announce_rate
                     peer_host = peer_address.rsplit(':', 1)[0]
-                    if _check_announce_rate(peer_host):
+                    # A phone already asked about re-dials on every backoff;
+                    # its repeat re-shows the one card and costs no budget.
+                    # That matters on the relay, where every phone's address
+                    # is 'relay' and all share one budget (#187 R5).
+                    asked = ConsentService.ask_on_file(
+                        db, owner, 'device_access',
+                        scope=device_scope(verdict['public_key']))
+                    if asked is not None or _check_announce_rate(peer_host):
                         file_device_access_ask(
                             db, owner, verdict['public_key'],
                             verdict.get('claims') or {})

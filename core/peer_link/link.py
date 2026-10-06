@@ -92,6 +92,12 @@ _MAX_CONCURRENT_REQUESTS = 8
 #: thread, outside the bound above, with nobody waiting for the result.
 _REQUEST_ONLY_CHANNELS = frozenset({'compute'})
 
+#: A peer leaving says so on 'control' before it closes: link.close() sends
+#: 'bye', a phone's PeerLinkClient.disconnect() sends 'disconnect'.  On a relay
+#: socket this frame, sealed, is the only close that ends a link (relay.py
+#: ignores a bare close once the link is sealed).
+_GOODBYE_TYPES = frozenset({'bye', 'disconnect'})
+
 
 def _is_recv_timeout(exc: BaseException) -> bool:
     """Is this exception "no message arrived in time", as opposed to a real fault?
@@ -448,6 +454,7 @@ class PeerLink:
             if not self._perform_handshake():
                 self.close()
                 return False
+            self._seal_transport()
 
             self._state = LinkState.CONNECTED
             self._connected_at = time.monotonic()
@@ -487,6 +494,7 @@ class PeerLink:
             if not self._complete_handshake(handshake_data):
                 self.close()
                 return False
+            self._seal_transport()
 
             self._state = LinkState.CONNECTED
             self._connected_at = time.monotonic()
@@ -504,6 +512,14 @@ class PeerLink:
             logger.debug(f"PeerLink accept failed: {e}")
             self._state = LinkState.DISCONNECTED
             return False
+
+    def _seal_transport(self) -> None:
+        """Tell a shared transport (core.peer_link.relay) that this link holds
+        its session key, so a bare close from the realm no longer ends it."""
+        if self.requires_e2e and self._session_key is not None:
+            seal = getattr(self._ws, 'seal', None)
+            if callable(seal):
+                seal()
 
     def send(self, channel: str, data: dict, wait_response: bool = False,
              timeout: float = 30.0, reply_to: str = '') -> Optional[dict]:
@@ -1207,6 +1223,18 @@ class PeerLink:
                     channel = msg.get('ch', 'control')
                     msg_id = msg.get('id', '')
                     data = msg.get('d', {})
+
+                    if (channel == 'control' and isinstance(data, dict)
+                            and data.get('type') in _GOODBYE_TYPES):
+                        logger.debug(f"PeerLink {self.peer_id[:8]} said goodbye")
+                        ws = self._ws
+                        self._handle_disconnect()
+                        if ws is not None and hasattr(ws, 'close'):
+                            try:
+                                ws.close()
+                            except Exception as close_err:
+                                logger.debug(f"PeerLink socket close after a goodbye: {close_err}")
+                        break
 
                     # Check if this is a response to a pending request
                     if msg.get('re'):

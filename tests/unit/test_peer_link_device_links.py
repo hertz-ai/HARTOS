@@ -414,3 +414,22 @@ def test_a_device_link_is_not_enrolled_in_hivemind(phone):
         node._state = LinkState.CONNECTED
         get_link_manager()._register_connected_link('node-3', node)
     assert enrolled == ['node-3']
+
+
+def test_a_phone_asking_again_over_the_relay_spends_no_relay_budget(monkeypatch, phone):
+    """#187 R5: relay HELLOs have no network address, so they share one ask
+    budget ('relay').  A phone already asked about re-dials on every backoff;
+    those repeats find the ask on file and must not use up the budget the
+    next phone's first ask needs."""
+    from integrations.social import discovery
+    monkeypatch.setattr(discovery, '_ANNOUNCE_RATE', {})
+    monkeypatch.setattr(discovery, '_RATE_LIMIT', 2)
+    _install_real_verifier()
+    for n in range(5):
+        assert _accept(_hello(phone, phone.token()), address=f'relay:conv-{n}') is None
+    second = Phone(user_id='40022', username='Second')
+    assert _accept(_hello(second, second.token()), address='relay:conv-9') is None
+    with db_session() as db:
+        scopes = {r.scope for r in db.query(UserConsent).filter_by(
+            user_id=OWNER, consent_type='device_access')}
+    assert scopes == {device_scope(phone.public_hex), device_scope(second.public_hex)}

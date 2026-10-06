@@ -385,3 +385,136 @@ def test_the_router_is_met_over_tls_first():
 def test_an_operator_router_is_the_only_one_tried(monkeypatch):
     monkeypatch.setenv('HEVOLVE_PEER_LINK_RELAY_URL', 'wss://regional.example:9443/wss')
     assert relay_mod.relay_router_urls() == ['wss://regional.example:9443/wss']
+
+
+# ── #187: what a stranger on the realm can and cannot do ───────────────────
+
+
+def test_a_forged_close_cannot_end_a_live_link(router, same_user):
+    # Anyone in the realm reads a conversation id off the inbox topic and can
+    # publish {'c': id, 'x': 1} to either end.  Once the session key exists
+    # the link ends only on the peer's sealed goodbye.
+    hub_b, accepted = _accepting_hub(
+        router, handlers={'dispatch': lambda ch, data, pid: {'ok': data.get('n')}})
+    hub_a, link, ok = _dial(router, hub_b, TrustLevel.SAME_USER)
+    try:
+        assert ok and _wait(lambda: accepted and accepted[0].is_connected)
+        conversation = link._ws.conversation
+        router.deliver(relay_topic('node-b'), {'c': conversation, 'r': relay_topic('node-a'), 'x': 1})
+        router.deliver(relay_topic('node-a'), {'c': conversation, 'r': relay_topic('node-b'), 'x': 1})
+        time.sleep(0.3)
+        assert accepted[0].is_connected and link.is_connected
+        assert link.send('dispatch', {'n': 6}, wait_response=True, timeout=5) == {'ok': 6}
+    finally:
+        link.close()
+
+
+def test_closing_a_relay_link_ends_its_far_side(router, same_user):
+    hub_b, accepted = _accepting_hub(router)
+    hub_a, link, ok = _dial(router, hub_b, TrustLevel.SAME_USER)
+    assert ok and _wait(lambda: accepted and accepted[0].is_connected)
+    link.close()
+    assert _wait(lambda: not accepted[0].is_connected)
+    assert _wait(lambda: hub_b.conversation_count() == 0)
+    assert hub_a.conversation_count() == 0
+
+
+def test_a_refused_hello_frees_the_dialer_at_once(router):
+    # Before any key exists the close is all a refused dialer gets: it must
+    # still end the dial now, not after the handshake's 10 s wait.
+    hub_b = RelayHub('node-b', router.transport())
+    hub_b.on_inbound(lambda sock, hello: None)
+    hub_b.start()
+    started = time.monotonic()
+    hub_a, link, ok = _dial(router, hub_b, TrustLevel.PEER)
+    assert ok is False
+    assert time.monotonic() - started < 3
+    assert hub_a.conversation_count() == 0
+
+
+def test_a_peer_not_on_the_relay_is_not_dialled_there_again_soon():
+    from core.peer_link.link_manager import PeerLinkManager
+    manager = PeerLinkManager()
+    tried = []
+
+    def upgrade_peer(peer_id, address, trust, x25519_public='', ed25519_public=''):
+        tried.append(address)
+        return False
+
+    class Hub:
+        joined = True
+
+    peer = {'node_id': 'peer-nat', 'url': 'http://10.0.0.7:6777'}
+
+    class Gossip:
+        @staticmethod
+        def get_peer_list():
+            return [peer]
+
+    class Nat:
+        @staticmethod
+        def resolve_peer_address(info):
+            return None
+
+    with patch.dict(sys.modules, {
+            'integrations.social.peer_discovery': type(sys)('pd')}), \
+            patch.object(manager, 'upgrade_peer', side_effect=upgrade_peer), \
+            patch.object(relay_mod, 'get_relay_hub', return_value=Hub()), \
+            patch('core.peer_link.nat.get_nat_traversal', return_value=Nat()):
+        sys.modules['integrations.social.peer_discovery'].gossip = Gossip()
+        manager._try_auto_upgrade('peer-nat')
+        manager._try_auto_upgrade('peer-nat')
+    # The relay rung answered nothing once: the next upgrade tries only the
+    # direct address, so a peer off the relay costs the gossip thread no
+    # handshake wait on every exchange.
+    assert tried == ['10.0.0.7:6777', 'relay://peer-nat', '10.0.0.7:6777']
+
+
+def test_the_relay_joins_one_router_at_a_time_and_says_which(caplog):
+    import logging
+    attempts = []
+    transport = relay_mod.WampRelayTransport(['wss://down.example/wss', 'ws://up.example/ws'])
+
+    class FakeSession:
+        async def subscribe(self, handler, topic):
+            pass
+
+        def publish(self, *args):
+            pass
+
+        def leave(self):
+            pass
+
+    class FakeComponent:
+        def __init__(self, transports, realm):
+            self.urls = [t['url'] for t in transports]
+            attempts.append(self.urls)
+            self._join = None
+
+        def on_join(self, fn):
+            self._join = fn
+            return fn
+
+        def on_leave(self, fn):
+            return fn
+
+        async def start(self, loop=None):
+            if self.urls[0].startswith('wss://down'):
+                raise ConnectionError('refused')
+            await self._join(FakeSession(), object())
+            transport._stop = True          # one join is the whole run
+
+    autobahn = type(sys)('autobahn')
+    asyncio_pkg = type(sys)('autobahn.asyncio')
+    component_mod = type(sys)('autobahn.asyncio.component')
+    component_mod.Component = FakeComponent
+    with patch.dict(sys.modules, {'autobahn': autobahn, 'autobahn.asyncio': asyncio_pkg,
+                                  'autobahn.asyncio.component': component_mod}), \
+            caplog.at_level(logging.INFO, logger='hevolve.peer_link'):
+        try:
+            assert transport.start('com.hertzai.hevolve.peerlink.relay.node-x', lambda e: None)
+            transport._thread.join(5)
+        finally:
+            transport._stop = True
+    assert attempts == [['wss://down.example/wss'], ['ws://up.example/ws']]
+    assert 'PeerLink relay joined ws://up.example/ws' in caplog.text

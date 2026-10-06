@@ -106,6 +106,14 @@ class RelaySocket:
         self.peer_topic = peer_topic
         self._inbox: 'queue.Queue' = queue.Queue(maxsize=_INBOX_FRAMES)
         self._closed = False
+        # Set by the link once its session key exists (link.py): from then on
+        # the conversation ends only on the peer's sealed goodbye, never on a
+        # bare close ('x') that anyone in the realm can publish.
+        self._sealed = False
+
+    def seal(self) -> None:
+        """The link on this socket holds its session key."""
+        self._sealed = True
 
     @property
     def address(self) -> str:
@@ -168,8 +176,8 @@ class WampRelayTransport:
     same shape as core.platform.events.EventBus.connect_wamp)."""
 
     def __init__(self, urls, realm: str = 'realm1'):
-        # Tried in order on each join (autobahn moves to the next transport
-        # when one cannot connect).
+        # Tried one at a time, in order, on each join: TLS first
+        # (relay_router_urls), so the log can say which one was joined.
         self.urls = [urls] if isinstance(urls, str) else list(urls)
         self.realm = realm
         self._session = None
@@ -187,55 +195,65 @@ class WampRelayTransport:
 
         transport = self
 
+        def _session_on(url: str) -> bool:
+            """One session on one router URL, until it ends; True when it
+            lived a while (the next pass starts again from the first URL)."""
+            component = Component(transports=[{'url': url, 'max_retries': 0}],
+                                  realm=transport.realm)
+
+            @component.on_join
+            async def _joined(session, details):
+                def _handler(envelope=None, *args, **kwargs):
+                    try:
+                        on_message(envelope)
+                    except Exception as e:
+                        logger.debug("relay frame not handled: %s", e)
+                await session.subscribe(_handler, topic)
+                transport._session = session
+                transport.joined.set()
+                logger.info("PeerLink relay joined %s as %s", url, topic)
+
+            @component.on_leave
+            async def _left(session, details):
+                transport._session = None
+                transport.joined.clear()
+                logger.info("PeerLink relay left %s", url)
+
+            import time as _time
+            loop = asyncio.new_event_loop()
+            transport._loop = loop
+            asyncio.set_event_loop(loop)
+            started = _time.monotonic()
+            try:
+                loop.run_until_complete(component.start(loop=loop))
+            except Exception as e:
+                logger.warning("PeerLink relay session on %s ended (%s)", url, e)
+            finally:
+                transport._session = None
+                transport.joined.clear()
+                transport._loop = None
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+            return _time.monotonic() - started > 60
+
         def _run():
             import time as _time
             backoff = 1
             while not transport._stop:
-                component = Component(transports=[{'url': url, 'max_retries': 0}
-                                                  for url in transport.urls],
-                                      realm=transport.realm)
-
-                @component.on_join
-                async def _joined(session, details):
-                    def _handler(envelope=None, *args, **kwargs):
-                        try:
-                            on_message(envelope)
-                        except Exception as e:
-                            logger.debug("relay frame not handled: %s", e)
-                    await session.subscribe(_handler, topic)
-                    transport._session = session
-                    transport.joined.set()
-                    logger.info("PeerLink relay joined %s as %s",
-                                getattr(getattr(details, 'transport', None), 'url', '')
-                                or transport.urls, topic)
-
-                @component.on_leave
-                async def _left(session, details):
-                    transport._session = None
-                    transport.joined.clear()
-                    logger.info("PeerLink relay left the router")
-
-                loop = asyncio.new_event_loop()
-                transport._loop = loop
-                asyncio.set_event_loop(loop)
-                started = _time.monotonic()
-                try:
-                    loop.run_until_complete(component.start(loop=loop))
-                except Exception as e:
-                    logger.warning("PeerLink relay session ended (%s); rejoining in %ds",
-                                   e, backoff)
-                finally:
-                    transport._session = None
-                    transport.joined.clear()
-                    transport._loop = None
-                    try:
-                        loop.close()
-                    except Exception:
-                        pass
+                lived = False
+                for url in transport.urls:
+                    if transport._stop:
+                        break
+                    if _session_on(url):
+                        lived = True
+                        break
                 if transport._stop:
                     break
                 # a session that lived a while resets the backoff
-                backoff = 1 if _time.monotonic() - started > 60 else min(backoff * 2, 60)
+                backoff = 1 if lived else min(backoff * 2, 60)
+                logger.info("PeerLink relay rejoining in %ds", backoff)
                 _time.sleep(backoff)
 
         self._thread = threading.Thread(target=_run, daemon=True, name='peerlink-relay')
@@ -328,7 +346,10 @@ class RelayHub:
         with self._lock:
             sock = self._sockets.get(conversation)
         if envelope.get('x'):
-            if sock is not None:
+            # Unauthenticated: honoured only before the link is sealed (a
+            # refused HELLO frees the dialer at once).  After that the link's
+            # sealed goodbye ends it, and a peer that vanished is idle-pruned.
+            if sock is not None and not sock._sealed:
                 sock._remote_closed()
             return
         payload = envelope.get('b')

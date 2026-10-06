@@ -524,12 +524,8 @@ class ConsentService:
         # Who is asking, by name: the card says "<name> asks to ...".
         _named(db, ask, agent_id)
 
-        existing = db.query(UserConsent).filter(
-            UserConsent.user_id == user_id,
-            UserConsent.consent_type == consent_type,
-            UserConsent.scope == scope,
-            UserConsent.agent_id == agent_id,
-        ).first()
+        existing = ConsentService.ask_on_file(db, user_id, consent_type,
+                                              scope=scope, agent_id=agent_id)
         if existing:
             # Idempotent RE-ASK: the old code returned silently here, so the
             # ask _emit fired exactly once at row creation -- if the UI wasn't
@@ -578,6 +574,21 @@ class ConsentService:
         # first ask and every re-ask above collapse to ONE card client-side.
         _emit('consent.request', ask, msg_id=f'consent.request:{consent.id}')
         return consent
+
+    @staticmethod
+    def ask_on_file(db, user_id: str, consent_type: str, scope: str = '*',
+                    agent_id=None):
+        """The row for exactly this combination, in any state, or None:
+        what request_consent returns instead of filing again.  A paced
+        caller (a phone's device ask) asks this first, so a repeat costs it
+        no budget."""
+        _validate_consent_type(consent_type)
+        return db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == consent_type,
+            UserConsent.scope == scope,
+            UserConsent.agent_id == agent_id,
+        ).first()
 
     @staticmethod
     def check_or_request(db, user_id: str, consent_type: str,

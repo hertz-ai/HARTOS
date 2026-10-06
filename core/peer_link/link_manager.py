@@ -48,6 +48,11 @@ _IDLE_TIMEOUT = 300  # 5 minutes
 _RECONNECT_MIN = 5
 _RECONNECT_MAX = 120
 
+#: A peer whose relay inbox did not answer is not dialled there again for this
+#: long: each relay dial to a peer off the relay waits out the handshake
+#: (link.py, 10 s) on the gossip thread that called _try_auto_upgrade.
+_RELAY_ABSENT_SECONDS = 600
+
 
 class PeerLinkManager:
     """Manages all peer connections. Singleton via get_link_manager()."""
@@ -65,6 +70,7 @@ class PeerLinkManager:
         self._device_requests: set = set()
         self._reconnect_backoff: Dict[str, float] = {}  # peer_id -> backoff duration (seconds)
         self._reconnect_last_attempt: Dict[str, float] = {}  # peer_id -> last attempt timestamp
+        self._relay_absent_until: Dict[str, float] = {}  # peer_id -> monotonic deadline
 
         # Determine connection budget from tier
         try:
@@ -641,7 +647,8 @@ class PeerLinkManager:
             try:
                 from core.peer_link.relay import RELAY_ADDRESS_SCHEME, get_relay_hub
                 hub = get_relay_hub()
-                if hub is not None and hub.joined:
+                if (hub is not None and hub.joined
+                        and time.monotonic() >= self._relay_absent_until.get(peer_id, 0)):
                     relay_address = RELAY_ADDRESS_SCHEME + peer_id
             except Exception as e:
                 logger.debug(f"PeerLink relay rung unavailable for {peer_id[:8]}: {e}")
@@ -724,9 +731,21 @@ class PeerLinkManager:
                         x25519_public=peer_info.get('x25519_public', ''),
                         ed25519_public=peer_info.get('public_key', ''),
                 ):
+                    self._relay_absent_until.pop(peer_id, None)
                     break
+                if candidate == relay_address:
+                    self._note_relay_absent(peer_id)
         except Exception as e:
             logger.debug(f"Auto-upgrade failed for {peer_id[:8]}: {e}")
+
+    def _note_relay_absent(self, peer_id: str) -> None:
+        """The peer's relay inbox did not answer: skip that rung for it for
+        _RELAY_ABSENT_SECONDS.  Expired entries go on the way in, so the
+        table holds only peers missed in the last window."""
+        now = time.monotonic()
+        for pid in [p for p, until in self._relay_absent_until.items() if until <= now]:
+            del self._relay_absent_until[pid]
+        self._relay_absent_until[peer_id] = now + _RELAY_ABSENT_SECONDS
 
     @staticmethod
     def _http_fallback(peer_url: str, channel: str, data: dict,
