@@ -214,6 +214,28 @@ def _x25519_raw(public_hex: str) -> bytes:
     return key
 
 
+def session_key_from(our_private, peer_public_hex: str) -> bytes:
+    """The AES-256-GCM session key between our X25519 private key and a
+    peer's public key (hex, raw or X.509-wrapped): X25519, then HKDF-SHA256.
+
+    A phone derives the same 32 bytes (PeerLinkCrypto.sessionKeyFrom); one
+    fixed-key vector pins both sides (tests/unit/test_peer_link_x25519_vector.py
+    here, PeerLinkCryptoX25519InteropTest in the phone repo).
+    """
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
+
+    shared_secret = our_private.exchange(
+        X25519PublicKey.from_public_bytes(_x25519_raw(peer_public_hex)))
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b'hart-peerlink-session-v1',
+        info=b'hart-peerlink-v1',
+    ).derive(shared_secret)
+
+
 def provable_user_id() -> str:
     """The user_id we can actually PROVE to a peer, or ''.
 
@@ -997,21 +1019,9 @@ class PeerLink:
         """Derive AES-256-GCM session key from X25519 ECDH."""
         try:
             from security.channel_encryption import get_x25519_keypair
-            from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
-            from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-            from cryptography.hazmat.primitives import hashes
 
             our_private, _ = get_x25519_keypair()
-            peer_pub = X25519PublicKey.from_public_bytes(
-                _x25519_raw(self.peer_x25519_public))
-            shared_secret = our_private.exchange(peer_pub)
-
-            self._session_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=b'hart-peerlink-session-v1',
-                info=b'hart-peerlink-v1',
-            ).derive(shared_secret)
+            self._session_key = session_key_from(our_private, self.peer_x25519_public)
 
             self._key_established_at = time.monotonic()
             self._session_nonce_counter = 0
