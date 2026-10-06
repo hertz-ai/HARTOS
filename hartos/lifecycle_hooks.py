@@ -1750,16 +1750,32 @@ def _answer_value_is_text(value) -> bool:
     return bool(text) and not (text.startswith('<') and text.endswith('>'))
 
 
+# What CREATE's own prompts show as the example of a message to the person
+# (create_recipe.py: "Your message here", "message here", "Your clear and
+# useful message here"); a model that sends the example back has sent nothing.
+_PROMPT_EXAMPLE_MESSAGES = ('your message here', 'message here',
+                            'your clear and useful message here')
+
+
 def _is_control_message(text: str) -> bool:
     """Whether ``text`` is the pipeline's control JSON rather than prose: a
     status verdict object in any dress (bare, in a code fence, single-quoted,
-    after a line of prose), or an answer-key envelope whose value is empty or
-    an unfilled placeholder.  It is the parse REUSE's reply filter uses
-    (helper.retrieve_json), so the Assistant's own ``{"status": "completed"}``
-    report, or the steer's template sent back as it stands, is refused here
-    exactly where REUSE refuses it; an answer key holding real text is an
-    answer.  Fails closed: a text that cannot be read is control.  (A lesson
-    that quotes a ``{"status": 404}`` example is refused too, as in REUSE.)"""
+    after a line of prose), or an answer-key envelope whose value is empty, an
+    unfilled placeholder or one of CREATE's own prompt examples.  It is the
+    parse REUSE's reply filter uses (helper.retrieve_json), in REUSE's order:
+    the answer key first, so a status object that carries a real
+    ``message2userfinal`` is the answer, as it is there; then status.  The
+    Assistant's own ``{"status": "completed"}`` report, or the steer's
+    template sent back as it stands, is refused here exactly where REUSE
+    refuses it.  Fails closed: a text that cannot be read is control.  (A
+    lesson that quotes a ``{"status": 404}`` example is refused too, as in
+    REUSE.)
+
+    A verdict or an answer key is an object, so text with no brace cannot be
+    control and is not handed to the parser, which logs two INFO lines per
+    call on prose."""
+    if '{' not in text:
+        return False
     try:
         from hartos.helper import retrieve_json
         parsed = retrieve_json(text)
@@ -1767,11 +1783,16 @@ def _is_control_message(text: str) -> bool:
         return True
     if not isinstance(parsed, dict):
         return False
-    if 'status' in parsed:
-        return True
     for key in ('message2userfinal', 'message2'):
         if key in parsed:
             return not _answer_value_is_text(parsed[key])
+    if 'status' in parsed:
+        return True
+    if 'message2user' in parsed:
+        value = parsed['message2user']
+        return (not _answer_value_is_text(value)
+                or str(value).strip().rstrip('.!').lower()
+                in _PROMPT_EXAMPLE_MESSAGES)
     return False
 
 

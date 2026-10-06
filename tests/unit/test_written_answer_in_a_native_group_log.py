@@ -242,11 +242,60 @@ class TestWhatIsNotTheAssistantsAnswerInARealLog(_Harness):
         self.assertEqual(self._derived([('Assistant', filled)]),
                          {'message_index': 1, 'kind': 'user_visible_result'})
 
+    def test_a_status_object_that_also_carries_the_answer_is_the_answer(self):
+        """REUSE's filter reads the answer key first, so a status object that
+        carries a real message2userfinal is the answer there.  The first cut
+        of _is_control_message read status first and, in REUSE, turned that
+        shape's receipt into GAVE_UP and the apology (reviewer of c3f7b0a7e,
+        confirmed by probe; not seen live)."""
+        body = ('{"status": "completed", "action_id": 1, "message2userfinal": "'
+                + _LESSON.replace(NL, ' ') + '"}')
+        for dress, text in {'plain': body,
+                            'fenced': '```json' + NL + body + NL + '```'}.items():
+            with self.subTest(dress=dress):
+                self.assertEqual(self._derived([('Assistant', text)]),
+                                 {'message_index': 1,
+                                  'kind': 'user_visible_result'})
+
+    def test_a_status_object_with_an_unfilled_answer_key_is_not_an_answer(self):
+        body = ('{"status": "completed", "action_id": 1, '
+                '"message2userfinal": "<your answer here>"}')
+        self.assertIsNone(self._derived([('Assistant', body)]))
+
+    def test_the_example_values_the_create_prompts_teach_are_not_an_answer(self):
+        """CREATE's own prompts show '@user {"message2user": "Your message
+        here"}' (create_recipe.py:3510/3536/3559, "message here" at 3274/3439,
+        "Your clear and useful message here" at 740); a model that sends the
+        example back has sent nothing."""
+        for value in ('Your message here', 'message here',
+                      'Your clear and useful message here',
+                      'Your message here.', '<your answer here>'):
+            with self.subTest(value=value):
+                text = '@user {"message2user": "' + value + '"}'
+                self.assertIsNone(self._derived([('Assistant', text)]))
+
+    def test_prose_without_a_brace_is_not_parsed_at_all(self):
+        """A verdict or an answer key is an object, so text with no brace
+        cannot be control: it is not handed to the parser, which logs two
+        INFO lines per call on prose (102 lines for one derivation over a
+        40-message log; reviewer of c3f7b0a7e)."""
+        import hartos.helper as helper
+        calls = []
+        self.patch(helper, 'retrieve_json',
+                   lambda text: calls.append(text) or None)
+        lesson = {'role': 'user', 'name': 'Assistant', 'content': _LESSON}
+        self.assertTrue(lh.is_written_answer(lesson))
+        self.assertEqual(calls, [])
+        with_brace = dict(lesson, content=_LESSON + ' {1, 2}')
+        lh.is_written_answer(with_brace)
+        self.assertEqual(len(calls), 1)
+
     def test_a_text_the_parser_cannot_read_is_not_an_answer(self):
         """Fails closed, as REUSE's filter does: a message this cannot judge is
         not an answer, so a parser fault never completes an action."""
         import hartos.helper as helper
-        message = {'role': 'user', 'name': 'Assistant', 'content': _LESSON}
+        message = {'role': 'user', 'name': 'Assistant',
+                   'content': _LESSON + ' {1, 2}'}
         self.assertTrue(lh.is_written_answer(message))
 
         def unreadable(_text):
@@ -360,6 +409,21 @@ class TestReuseFindsTheLessonInARealLog(_ReuseOnARealLog, _Harness):
         self._state(S.IN_PROGRESS, S.STATUS_VERIFICATION_REQUESTED)
         self.assertTrue(lh.commit_verified_action_completion(self.UP, 1, evidence))
         self.assertEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)
+
+    def test_a_status_object_that_carries_the_lesson_is_still_the_receipt(self):
+        """REUSE's reply filter reads the answer key first, so a status object
+        holding a real message2userfinal is the answer there; the shared check
+        had read status first and took that receipt away (reviewer of
+        c3f7b0a7e: GAVE_UP and the apology; not seen live)."""
+        body = ('{"status": "completed", "action_id": 1, "message2userfinal": "'
+                + _LESSON.replace(NL, ' ') + '"}')
+        for text in (body, '```json' + NL + body + NL + '```'):
+            with self.subTest(text=text[:12]):
+                self.gc = self._reuse_log(self.UP, [('Assistant', text),
+                                                    ('StatusVerifier', _VERDICT)])
+                self.assertEqual(
+                    rr._reuse_completion_evidence(self.UP, 1, self.gc),
+                    {'message_index': 1, 'kind': 'user_visible_result'})
 
     def test_no_lesson_is_no_receipt(self):
         self.gc = self._reuse_log(self.UP, [('StatusVerifier', _VERDICT)])
