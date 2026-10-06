@@ -177,12 +177,12 @@ def verify_hive_jwt(token: str, issuer_public_key_hex: str) -> dict:
     node's master trust anchor via the delegation chain), the way
     discovery._sender_signature_valid resolves it.
     Passing a caller-supplied key is self-certification: it always verifies and
-    proves nothing.  That was the /api/social/auth/sync-user admin-takeover
-    (a caller signed with its own key, sent that key as ``node_public_key``,
-    and created a role-'central' user); that route now uses
-    _sender_signature_valid and no longer calls this.  This function has NO
-    production caller (grep: only tests); a new route MUST NOT reuse the
-    key-as-parameter shape — resolve the key by identity first.
+    proves nothing.  That was the admin-takeover in the /api/social/auth/
+    sync-user route (#59: a caller signed with its own key, sent that key as
+    ``node_public_key``, and created a role-'central' user); the route was
+    deleted on 10-06, nothing ever called it.  This function has NO production
+    caller (grep: only tests); a new route MUST NOT reuse the key-as-parameter
+    shape — resolve the key by identity first.
     """
     mgr = _get_jwt_manager()
     if mgr:

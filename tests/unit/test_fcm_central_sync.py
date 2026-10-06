@@ -5,9 +5,11 @@ the token up by the notification user_id (a social UUID), but the central FCM
 registry keys by account-number/phone, so the lazy HARTOS->central pull-by-UUID
 always missed -> no token -> no push.
 
-The fix (central -> local, the documented design): when central syncs a user
-DOWN via /auth/sync-user -> SyncEngine._handle_sync_user, it may include the FCM
-token it owns; HARTOS caches it locally keyed by the SAME UUID. The token
+The fix (central -> local, the documented design): when a user-sync payload
+reaching SyncEngine._handle_sync_user carries the FCM token central owns, HARTOS
+caches it locally keyed by the SAME UUID.  (No sender includes the token today:
+the route central was meant to call, /auth/sync-user, never had a caller and
+was deleted on 10-06.) The token
 arrives already mapped to the local UUID, so send_fcm_push -> get_local_fcm_token
 (uuid) resolves it with no identity-mapping needed.
 
