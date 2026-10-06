@@ -68,6 +68,10 @@ class PeerLinkManager:
         # node's handshake (link._get_local_capabilities) so a phone asks
         # over the link only a node that answers.
         self._device_requests: set = set()
+        # Further facts the handshake names (link._get_local_capabilities),
+        # set by the subsystem that owns them: the mobile adapter's
+        # 'mobile_paths'.  core never imports the subsystem.
+        self._advertised: Dict[str, Any] = {}
         self._reconnect_backoff: Dict[str, float] = {}  # peer_id -> backoff duration (seconds)
         self._reconnect_last_attempt: Dict[str, float] = {}  # peer_id -> last attempt timestamp
         self._relay_absent_until: Dict[str, float] = {}  # peer_id -> monotonic deadline
@@ -456,6 +460,14 @@ class PeerLinkManager:
         """The device request types a bound handler answers, sorted
         (register_channel_handler's ``answers``)."""
         return sorted(self._device_requests)
+
+    def advertise(self, key: str, value: Any) -> None:
+        """Name ``value`` under ``key`` in this node's handshake (additive:
+        an older peer ignores a key it does not read)."""
+        self._advertised[key] = value
+
+    def advertised(self) -> Dict[str, Any]:
+        return dict(self._advertised)
 
     def record_http_exchange(self, peer_id: str):
         """Record a successful HTTP exchange with a peer.

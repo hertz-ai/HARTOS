@@ -204,6 +204,27 @@ def _install_peer_link_relay() -> None:
         logger.warning(f"PeerLink relay not started: {e}")
 
 
+def _install_mobile_adapter(app) -> None:
+    """Step 5c: a person's own phone's cloud API calls, answered by this
+    desktop over the device link (integrations.mobile_adapter), one alias
+    row per call, through the API gate _install_api_gate put on ``app``.
+    After the route steps, so the rows it claims are the routes ``app``
+    serves.  Central answers the cloud calls itself and is not a device's
+    desktop."""
+    try:
+        from security.key_delegation import get_node_tier
+        if get_node_tier() == 'central':
+            return
+    except Exception as e:
+        logger.debug(f"Mobile adapter: node tier unreadable ({e}); installing")
+    try:
+        from integrations.mobile_adapter.adapter import install
+        if not install(app):
+            logger.warning("Mobile adapter not installed: phones keep every call on the cloud")
+    except Exception as e:
+        logger.warning(f"Mobile adapter not installed: {e}")
+
+
 def bootstrap(
     app,
     config: Optional[Mapping[str, Any]] = None,
@@ -303,6 +324,9 @@ def _run_bootstrap(app, cfg: dict) -> None:
           the standalone hart_intelligence_entry path registered these,
           so bundled nodes served the SPA shell to every peer directory
           fetch (see _init_a2a_server)
+      5c. the mobile adapter (integrations.mobile_adapter) -- added
+          2026-10-06: a phone's cloud calls answered by the routes above,
+          over the device link
       6. init_db + run_migrations
       7. channel adapters (config + env-var + web)
       8. init_agent_engine
@@ -333,6 +357,7 @@ def _run_bootstrap(app, cfg: dict) -> None:
             # window with the other route steps.  See _init_a2a_server for
             # why the bundle needs this (peers got the SPA shell for /a2a/*).
             _init_a2a_server(app, cfg)
+            _install_mobile_adapter(app)
             _init_database(cfg)
             _init_channel_adapters(app, cfg)
             # IMPORTANT: spawn hevolveai BEFORE the agent-engine subsystem

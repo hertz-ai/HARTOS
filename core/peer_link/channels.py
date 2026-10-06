@@ -46,6 +46,10 @@ DEVICE_TYPES_KEY = 'device_types'
 #: answers it names in its handshake (link_manager.
 #: device_requests_answered).
 CHAT_REQUEST = 'chat_request'
+#: A person's own phone asking its desktop to answer one of its cloud API
+#: calls (integrations.mobile_adapter): the second frame type a device may
+#: send on 'dispatch', also only as a request.
+API_REQUEST = 'api_request'
 
 CHANNEL_REGISTRY = {
     'control': {
@@ -70,7 +74,7 @@ CHANNEL_REGISTRY = {
         # channel (FlaskChannelIntegration.handle_device_request).  Typed:
         # device_control and every other dispatch frame stay node-only.
         DEVICE_POLICY_KEY: 'in',
-        DEVICE_TYPES_KEY: (CHAT_REQUEST,),
+        DEVICE_TYPES_KEY: (CHAT_REQUEST, API_REQUEST),
         'data_class': DataClass.PRIVATE,  # Agent tasks are private
         'priority': 1,
         'reliable': True,

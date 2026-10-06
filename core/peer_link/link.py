@@ -1263,6 +1263,11 @@ class PeerLink:
                                 "PeerLink %s: %d requests in flight, dropping "
                                 "one on %s", self.peer_id[:8],
                                 _MAX_CONCURRENT_REQUESTS, channel)
+                            if self.kind == 'device':
+                                # A phone hears it at once and goes to the
+                                # cloud; a node keeps its own timeout and
+                                # fallback, which read any reply as an answer.
+                                self.send(channel, {'type': 'busy'}, reply_to=msg_id)
                             continue
                         try:
                             threading.Thread(
@@ -1398,19 +1403,23 @@ class PeerLink:
         # older peer ignores it.
         try:
             from core.peer_link.link_manager import get_link_manager
-            answered = get_link_manager().device_requests_answered()
+            manager = get_link_manager()
+            answered = manager.device_requests_answered()
             if answered:
                 caps['device_requests'] = answered
+            for key, value in manager.advertised().items():
+                caps.setdefault(key, value)
         except Exception as e:
             logger.debug("peer_link: device requests not advertised: %s", e)
-        # Reachable on the relay (core.peer_link.relay): a phone that met
-        # this node on the LAN can reach it at relay://<node_id> from
+        # Reachable on the relay (core.peer_link.relay): the inbox this node
+        # answers at, relay://<inbox>.  A phone that met this node on the LAN
+        # keeps it (with the node's key) and reaches the node there from
         # anywhere.  Additive, like device_requests.
         try:
             from core.peer_link.relay import get_relay_hub
             hub = get_relay_hub()
             if hub is not None and hub.joined:
-                caps['relay'] = True
+                caps['relay'] = hub.endpoint_id
         except Exception as e:
             logger.debug("peer_link: relay reachability not advertised: %s", e)
         return caps

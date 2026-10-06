@@ -331,6 +331,21 @@ def test_the_relay_rung_is_tried_after_the_direct_address():
     assert tried == ['10.0.0.7:6777', 'relay://peer-nat']
 
 
+def test_the_handshake_names_the_inbox_a_phone_reaches_this_node_at(router):
+    """A phone that met this node on the LAN keeps the inbox the hello_ack
+    names and dials relay://<inbox> from anywhere; off the relay the
+    handshake names none."""
+    hub = RelayHub('a1b2c3d4e5f60718', router.transport())
+    assert hub.start()
+    with patch.object(relay_mod, 'get_relay_hub', return_value=hub):
+        assert PeerLink._get_local_capabilities()['relay'] == 'a1b2c3d4e5f60718'
+    hub.stop()
+    with patch.object(relay_mod, 'get_relay_hub', return_value=hub):
+        assert 'relay' not in PeerLink._get_local_capabilities()
+    with patch.object(relay_mod, 'get_relay_hub', return_value=None):
+        assert 'relay' not in PeerLink._get_local_capabilities()
+
+
 def test_switched_off_the_node_stays_off_the_relay(monkeypatch):
     monkeypatch.setenv('HEVOLVE_PEER_LINK_RELAY', '0')
     assert relay_mod.start_relay_hub('node-x', transport=MemoryRouter().transport()) is None
