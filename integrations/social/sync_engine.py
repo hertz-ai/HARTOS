@@ -631,7 +631,9 @@ class SyncEngine:
                 id=user_id,
                 username=username,
                 display_name=payload.get('display_name', username),
-                handle=payload.get('handle', ''),
+                # NULL, not '': the handle is unique, and NULL is the "no
+                # handle" every other user creator leaves.
+                handle=payload.get('handle') or None,
                 role=SyncEngine._safe_synced_role(payload.get('role')) or 'flat',
                 user_type=payload.get('user_type', 'human'),
                 api_token=generate_api_token(),
