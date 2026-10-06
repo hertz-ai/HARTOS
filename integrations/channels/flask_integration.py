@@ -322,9 +322,14 @@ class FlaskChannelIntegration:
         )
         try:
             body = response.json()
-        except Exception:
-            body = {}
-        return response.status_code, body if isinstance(body, dict) else {}
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            # Not /chat's JSON object (a proxy's or server's error page): its
+            # words stay, for the caller's error log and the phone's reply,
+            # cut at 500 characters so a whole HTML page never rides along.
+            body = {'error': str(getattr(response, 'text', '') or '')[:500]}
+        return response.status_code, body
 
     #: What a person's device may set on its turn besides the words and the
     #: agent: that conversation's own /chat keys.  Never the user -- the

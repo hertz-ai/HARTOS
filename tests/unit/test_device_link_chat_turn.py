@@ -348,3 +348,38 @@ def test_handle_message_runs_its_turn_through_run_turn():
     args = run_turn.call_args
     assert args.args[1:4] == (7, 1, 'hello')
     assert args.kwargs['channel_context']['channel'] == 'telegram'
+
+
+def test_a_chat_error_that_is_not_json_keeps_its_words(caplog):
+    """A proxy's or server's error page is not /chat's JSON.  Its words stay
+    in the turn's body, so the channel's error log still says what went
+    wrong (the log line _handle_message wrote before run_turn existed) and
+    the phone's reply carries them too."""
+    fi = _integration()
+    fi.default_user_id = 7
+    fi.default_prompt_id = 1
+    fi.registry = Mock()
+    fi.registry.get.return_value = None
+    fi._session_manager = Mock()
+    fi._session_manager.get_session.return_value = Mock(user_id=None, prompt_id=None)
+    fi._self_chat = Mock()
+    fi._self_chat.is_self_message.return_value = False
+    fi._response_router = Mock()
+    fi._resolve_user_id_for_sender = Mock(return_value=7)
+    fi._get_channel_prompt_id = Mock(return_value=None)
+
+    def not_json():
+        raise ValueError('Expecting value: line 1 column 1 (char 0)')
+
+    page = Mock(status_code=502, json=not_json, text='<html>Bad gateway</html>')
+    with patch('integrations.channels.flask_integration.pooled_post',
+               return_value=page):
+        status, body = fi.run_turn(7, 1, 'hello')
+        from integrations.channels.base import Message
+        msg = Message(id='m1', channel='telegram', sender_id='s1',
+                      sender_name='S', chat_id='c1', text='hello')
+        with caplog.at_level('ERROR'):
+            reply = fi._handle_message(msg)
+    assert (status, body) == (502, {'error': '<html>Bad gateway</html>'})
+    assert reply == 'Sorry, I encountered an error processing your request.'
+    assert any('Bad gateway' in r.getMessage() for r in caplog.records)
