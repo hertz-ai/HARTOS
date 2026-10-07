@@ -68,6 +68,20 @@ from integrations.social import _livekit_room
 _HAS_LIVEKIT_RTC = _livekit_room.HAS_LIVEKIT_RTC
 
 
+def _hosts_rooms() -> bool:
+    """Does this deploy have LiveKit rooms at all (LiveKitService.hosts_rooms)?
+    Where it does not (central, LIVEKIT_DISABLE) a call is p2p mesh and an
+    agent has no room to speak into or hear from, so nothing about the
+    realtime SDK is the reason a reply goes unvoiced."""
+    try:
+        from integrations.social.livekit_service import LiveKitService
+    except Exception as e:  # pragma: no cover — import-only failure
+        logger.warning("AgentVoiceBridge: the LiveKit service did not import "
+                       "(%s); treating this deploy as having no rooms", e)
+        return False
+    return LiveKitService.hosts_rooms()
+
+
 # Active workers keyed by (call_id, agent_id).  Module-level dict +
 # lock — process-local, restart clears.  Workers are daemon threads
 # so process exit doesn't hang.
@@ -202,6 +216,9 @@ class AgentBridgeWorker:
         # first reply that needs voicing (so attach is cheap + no room is joined
         # for a silent agent).  None until then / when no LiveKit room exists.
         self._publisher: Any = None
+        # Why _ensure_publisher last found no room to publish into, for the
+        # reply's warning.
+        self._no_room: Optional[str] = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -467,13 +484,21 @@ class AgentBridgeWorker:
         the LiveKit room through this worker's ``LiveKitAudioPublisher`` (the
         agent's "mouth").
 
-        Degrades cleanly: when the realtime SDK cannot be used, a warning names
-        the reason (its import error) with the reply text; when the call has no
-        LiveKit room (p2p mesh / central), the reply is logged at INFO.  Either
-        way the call audit trail records the agent's contribution and no audio
-        is published.  Best-effort — never raises out of the tick loop.
+        Degrades cleanly.  On a deploy with no LiveKit rooms (p2p mesh /
+        central) the reply is logged at INFO: there is nothing to voice into.
+        Where there are rooms, a reply that cannot be voiced is a WARNING naming
+        why: the realtime SDK's import error, or no room token (its reason).
+        Either way the call audit trail records the agent's contribution and no
+        audio is published.  Best-effort — never raises out of the tick loop.
         """
         if not text:
+            return
+        if not _hosts_rooms():
+            logger.info(
+                "AgentBridgeWorker._publish_audio_for: no LiveKit room for "
+                "this call (p2p/central) — reply not voiced — "
+                "call=%s agent=%s text=%r",
+                self.call_id, self.agent_id, text[:120])
             return
         if not _HAS_LIVEKIT_RTC:
             logger.warning(
@@ -484,10 +509,10 @@ class AgentBridgeWorker:
             return
         pub = self._ensure_publisher()
         if pub is None:
-            logger.info(
-                "AgentBridgeWorker._publish_audio_for: no LiveKit room for "
-                "this call (p2p/central) — reply not voiced — "
-                "call=%s agent=%s text=%r",
+            logger.warning(
+                "AgentBridgeWorker._publish_audio_for: %s; reply not voiced "
+                "— call=%s agent=%s text=%r",
+                self._no_room or 'no room to publish into',
                 self.call_id, self.agent_id, text[:120])
             return
         pcm, rate, channels = self._synthesize_pcm(text)
@@ -503,20 +528,21 @@ class AgentBridgeWorker:
 
     def _ensure_publisher(self):
         """Return this worker's LiveKitAudioPublisher, creating + starting it on
-        first use.  Returns None when there is no LiveKit room to publish into
-        (issue_token returns a non-'livekit' mode) or the SDK/connect fails — the
-        caller then logs the reply text instead of voicing it."""
+        first use.  Returns None when there is no room to publish into (no room
+        token, the publisher would not start or stopped), keeping why in
+        ``self._no_room`` for the caller's warning."""
         if self._publisher is not None:
-            return self._publisher if self._publisher.is_alive() else None
+            if self._publisher.is_alive():
+                return self._publisher
+            self._no_room = 'the room publisher stopped'
+            return None
         try:
             from integrations.social.livekit_service import LiveKitService
             from integrations.social.livekit_audio_publisher import (
                 LiveKitAudioPublisher,
             )
         except Exception as e:  # pragma: no cover — import-only failure
-            logger.debug(
-                "AgentBridgeWorker._ensure_publisher: imports unavailable "
-                "(%s)", e)
+            self._no_room = f'the room publisher did not import ({e})'
             return None
         # Mint the agent's publisher token via the SAME issuer humans use; the
         # agent joins the room as identity=agent_id with publish rights.
@@ -528,15 +554,19 @@ class AgentBridgeWorker:
             logger.warning(
                 "AgentBridgeWorker._ensure_publisher: issue_token failed "
                 "(call=%s): %s", self.call_id, e)
+            self._no_room = f'no room token ({e})'
             return None
         if (tok.get('mode') != 'livekit' or not tok.get('token')
                 or not tok.get('url')):
-            # p2p mesh / livekit_pending / central — nothing to publish into.
+            # livekit_pending: issue_token logged the whole cause.
+            self._no_room = f"no room token ({tok.get('reason') or tok.get('mode')})"
             return None
         pub = LiveKitAudioPublisher(self.call_id, tok['url'], tok['token'])
         if not pub.start():
+            self._no_room = 'the room publisher did not start'
             return None
         self._publisher = pub
+        self._no_room = None
         return pub
 
     def _synthesize_pcm(self, text: str):
@@ -636,9 +666,13 @@ def _ensure_call_subscriber(call_id: str) -> None:
 
     Reuses the existing subscriber class + ``LiveKitService.issue_token`` and the
     same canonical per-call STT queue the worker drains — no parallel path.  No-op
-    when livekit-rtc cannot be used (warned, with its import error) or the call
-    has no LiveKit room (p2p/central): the worker then drains an empty queue
-    exactly as before.  Best-effort; never raises out to the caller."""
+    on a deploy with no LiveKit rooms (p2p/central: nothing to hear from), and
+    where there are rooms but the agent cannot join one -- livekit-rtc cannot be
+    used, or no room token -- a warning names why: the worker then drains an
+    empty queue exactly as before.  Best-effort; never raises out to the
+    caller."""
+    if not _hosts_rooms():
+        return
     if not _HAS_LIVEKIT_RTC:
         logger.warning("AgentVoiceBridge._ensure_call_subscriber: %s; the "
                        "agent cannot hear call=%s",
@@ -668,7 +702,10 @@ def _ensure_call_subscriber(call_id: str) -> None:
         return
     if (tok.get('mode') != 'livekit' or not tok.get('token')
             or not tok.get('url')):
-        return  # p2p mesh / central / pending — no room to subscribe to
+        logger.warning("AgentVoiceBridge._ensure_call_subscriber: no room token "
+                       "(%s); the agent cannot hear call=%s",
+                       tok.get('reason') or tok.get('mode'), call_id)
+        return
     sub = LiveKitTranscriptSubscriber(call_id, tok['url'], tok['token'])
     if not sub.start():
         return

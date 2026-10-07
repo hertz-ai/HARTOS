@@ -275,7 +275,7 @@ class TestWhatIsRefused:
         agent = _user(db, 'agent', owner_id=person)
         reply = _open(_phone(person), agent)
         assert reply['type'] == 'call_refused' and reply['reason'] == 'no_room'
-        assert 'timestamp_pb2' in reply['detail']
+        assert reply['detail'] == 'livekit-api did not import (ImportError)'
         from sqlalchemy import text
         from integrations.social.agent_voice_bridge import AgentVoiceBridge
         open_calls = db.execute(text(

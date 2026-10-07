@@ -61,11 +61,42 @@ except Exception as _e:
     _LIVEKIT_SDK_IMPORT_ERROR = f'{type(_e).__name__}: {_e}'
 
 
-def _sdk_unavailable_reason() -> str:
-    """Why tokens cannot be signed in this process: the import's own error."""
+def _sdk_unavailable_reason(detail: bool = True) -> str:
+    """Why tokens cannot be signed in this process.  ``detail`` (for this
+    node's log) gives the import's own error; without it (for a caller: a
+    token's reason reaches remote participants on a regional host) only its
+    kind, because the error names files on this machine."""
     if _LIVEKIT_SDK_IMPORT_ERROR:
-        return f'livekit-api did not import ({_LIVEKIT_SDK_IMPORT_ERROR})'
+        what = (_LIVEKIT_SDK_IMPORT_ERROR if detail
+                else _LIVEKIT_SDK_IMPORT_ERROR.split(':', 1)[0])
+        return f'livekit-api did not import ({what})'
     return 'livekit-api is not available'
+
+
+def _without_sdk(operation: str) -> Dict[str, Any]:
+    """{ok: False, reason} for an operation the SDK could not run: its
+    caller gets the failure's kind, this node's log the whole error."""
+    logger.warning("LiveKitService.%s: %s", operation, _sdk_unavailable_reason())
+    return {'ok': False, 'reason': _sdk_unavailable_reason(detail=False)}
+
+
+def _env_config():
+    """(url, api_key, api_secret) an operator set, or Nones."""
+    return (os.environ.get('LIVEKIT_URL'), os.environ.get('LIVEKIT_API_KEY'),
+            os.environ.get('LIVEKIT_API_SECRET'))
+
+
+def _hosts_rooms() -> bool:
+    """Does this deploy have LiveKit rooms at all: an operator's LiveKit, or
+    the SFU this node supervises?  Reads configuration only -- it makes no
+    dev keys (_resolved_config does, on the same two conditions)."""
+    if all(_env_config()):
+        return True
+    try:
+        from .livekit_supervisor import supervisor_should_run
+    except Exception:  # pragma: no cover — defensive
+        return False
+    return supervisor_should_run()
 
 
 def _resolved_config():
@@ -79,25 +110,14 @@ def _resolved_config():
     short-circuits supervisor_should_run() so no dev keys exist and
     we fall back to the {mode: 'p2p_mesh'} response.
     """
-    env_url = os.environ.get('LIVEKIT_URL')
-    env_key = os.environ.get('LIVEKIT_API_KEY')
-    env_secret = os.environ.get('LIVEKIT_API_SECRET')
+    env_url, env_key, env_secret = _env_config()
     if env_url and env_key and env_secret:
         return env_url, env_key, env_secret
+    if not _hosts_rooms():
+        return None, None, None
 
     # Lazy import to avoid a circular dep during module init.
-    try:
-        from .livekit_supervisor import (
-            ensure_dev_keys,
-            get_livekit_url,
-            supervisor_should_run,
-        )
-    except Exception:  # pragma: no cover — defensive
-        return None, None, None
-
-    if not supervisor_should_run():
-        return None, None, None
-
+    from .livekit_supervisor import ensure_dev_keys, get_livekit_url
     keys = ensure_dev_keys()
     url = env_url or get_livekit_url()
     return url, keys.get('api_key'), keys.get('api_secret')
@@ -113,6 +133,13 @@ def _has_livekit_config() -> bool:
 
 
 class LiveKitService:
+
+    @staticmethod
+    def hosts_rooms() -> bool:
+        """Does this deploy have LiveKit rooms at all?  False on central /
+        LIVEKIT_DISABLE / embedded: a call there is p2p mesh, and an agent in
+        it has no room to speak into or hear from, whatever is installed."""
+        return _hosts_rooms()
 
     @staticmethod
     def issue_token(call_id: str, user_id: str,
@@ -154,7 +181,6 @@ class LiveKitService:
         # available.  The SDK builds the JWT with the identity +
         # grants we want.  Falls back to a stub shape when the SDK
         # cannot be used so the REST contract stays testable.
-        reason = _sdk_unavailable_reason()
         if _HAS_LIVEKIT_SDK and livekit_api is not None:
             try:
                 grants = livekit_api.VideoGrants(
@@ -187,14 +213,20 @@ class LiveKitService:
                     'expires_at': int(time.time()) + ttl_seconds,
                 }
             except Exception as e:
-                reason = f'token signing failed ({type(e).__name__}: {e})'
+                logger.warning("LiveKitService.issue_token: no room token for "
+                               "call=%s: token signing failed (%s: %s)",
+                               call_id, type(e).__name__, e)
+                reason = f'token signing failed ({type(e).__name__})'
+        else:
+            logger.warning("LiveKitService.issue_token: no room token for "
+                           "call=%s: %s", call_id, _sdk_unavailable_reason())
+            reason = _sdk_unavailable_reason(detail=False)
 
         # SDK unusable OR signing failed — return the pending shape so the
-        # client knows infra is configured but not ready, and say why: no
-        # one can join this call's room until it is fixed.
+        # client knows infra is configured but not ready, and say why (its
+        # kind: the details are in this node's log): no one can join this
+        # call's room until it is fixed.
         # (Pass-4 P4-6: renamed from 'livekit_stub' for clarity.)
-        logger.warning("LiveKitService.issue_token: no room token for "
-                       "call=%s: %s", call_id, reason)
         return {
             'mode': 'livekit_pending',
             'url': url,
@@ -255,7 +287,7 @@ class LiveKitService:
             return {'ok': False, 'mode': 'p2p_mesh',
                     'reason': 'no LIVEKIT config; central/embedded deploy'}
         if not (_HAS_LIVEKIT_SDK and livekit_api is not None):
-            return {'ok': False, 'reason': _sdk_unavailable_reason()}
+            return _without_sdk('start_recording')
 
         if not output_path:
             output_path = f'{call_id}-{int(time.time())}.mp4'
@@ -299,7 +331,7 @@ class LiveKitService:
         if not (url and api_key and api_secret):
             return {'ok': False, 'reason': 'no LIVEKIT config'}
         if not (_HAS_LIVEKIT_SDK and livekit_api is not None):
-            return {'ok': False, 'reason': _sdk_unavailable_reason()}
+            return _without_sdk('stop_recording')
 
         async def _stop():
             lkapi = livekit_api.LiveKitAPI(
