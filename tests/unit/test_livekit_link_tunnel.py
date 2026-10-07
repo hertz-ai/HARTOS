@@ -487,6 +487,105 @@ def test_a_first_request_livekit_never_answers_ends_the_tunnel(monkeypatch, sign
     assert signal_port.ended.get(timeout=WAIT_S) is conn
 
 
+# ── the limits: each one ends the tunnel, and says why ────────────────────
+
+
+def _close_after(ws, *datas, tid='t1'):
+    for data in datas:
+        _send(ws, data, tid)
+    return ws.next_out('tunnel_close')['d']
+
+
+def test_a_chunk_over_max_chunk_ends_the_tunnel(signal_port):
+    from integrations.social import livekit_link
+    link, ws = _link()
+    _open(ws)
+    close = _close_after(ws, b'x' * (livekit_link.MAX_CHUNK + 1))
+    assert close == {'type': 'tunnel_close', 'id': 't1', 'reason': 'chunk too large'}
+
+
+def test_data_that_is_not_base64_ends_the_tunnel(signal_port):
+    link, ws = _link()
+    _open(ws)
+    # Strict base64 only: a lenient decoder would drop the '!' and read
+    # 'hello' -- bytes the phone never encoded.
+    ws.frame({'type': 'tunnel_data', 'id': 't1', 'b64': 'aGVsbG8=!!!!'})
+    close = ws.next_out('tunnel_close')['d']
+    assert close == {'type': 'tunnel_close', 'id': 't1', 'reason': 'bad data'}
+
+
+@pytest.mark.parametrize('tid', ['', 'x' * 65])
+def test_a_tunnel_id_outside_one_to_64_chars_is_refused(signal_port, tid):
+    link, ws = _link()
+    reply = _open(ws, tid)
+    assert reply['type'] == 'tunnel_refused' and reply['reason'] == 'bad_id'
+    assert signal_port.accepted.empty()
+
+
+def test_a_first_line_with_no_end_ends_the_tunnel(signal_port):
+    from integrations.social import livekit_link
+    link, ws = _link()
+    _open(ws)
+    close = _close_after(ws, b'GET /rtc' + b'x' * livekit_link._FIRST_LINE_MAX)
+    assert close['reason'] == 'not_signalling'
+    assert signal_port.request_lines() == []
+
+
+def test_a_first_request_whose_headers_never_end_ends_the_tunnel(signal_port):
+    from integrations.social import livekit_link
+    link, ws = _link()
+    _open(ws)
+    close = _close_after(ws, b'GET /rtc HTTP/1.1\r\n',
+                         b'X-Pad: ' + b'a' * livekit_link._HEAD_MAX + b'\r\n')
+    assert close['reason'] == 'not_signalling'
+    assert signal_port.request_lines() == []
+
+
+def test_bytes_held_past_max_chunk_before_the_answer_end_the_tunnel(signal_port):
+    """A phone sends far more before LiveKit has answered than a WebSocket
+    client ever would: the held bytes are capped."""
+    from integrations.social import livekit_link
+    link, ws = _link()
+    _open(ws)
+    signal_port.answering.clear()
+    try:
+        close = _close_after(ws, UPGRADE_REQUEST, b'h' * livekit_link.MAX_CHUNK, b'h')
+    finally:
+        signal_port.answering.set()
+    assert close['reason'] == 'overrun'
+
+
+def test_an_answer_whose_head_never_ends_ends_the_tunnel(signal_port):
+    from integrations.social import livekit_link
+    signal_port.upgrade_answer = (b'HTTP/1.1 101 Switching Protocols\r\nX-Pad: '
+                                  + b'a' * (livekit_link._HEAD_MAX + 1))
+    link, ws = _link()
+    _open(ws)
+    close = _close_after(ws, UPGRADE_REQUEST)
+    assert close['reason'] == 'not_upgraded'
+
+
+def test_a_write_queue_livekit_cannot_drain_ends_the_tunnel(monkeypatch, signal_port):
+    """LiveKit upgraded and stopped reading, and the phone keeps sending:
+    once the write queue is full the tunnel closes ('overrun') rather than
+    hold the link's receive loop."""
+    from integrations.social import livekit_link
+    monkeypatch.setattr(livekit_link, '_WRITE_QUEUE', 8)
+    monkeypatch.setattr(livekit_link, '_IO_TIMEOUT_S', 30)
+    link, ws = _link()
+    _open(ws)
+    _send(ws, UPGRADE_REQUEST)
+    assert _received(ws, len(UPGRADED)) == UPGRADED
+    signal_port.reading.clear()
+    try:
+        for _ in range(200):               # fills the sockets, then the queue
+            _send(ws, b'x' * livekit_link.MAX_CHUNK)
+        close = ws.next_out('tunnel_close')['d']
+    finally:
+        signal_port.reading.set()
+    assert close == {'type': 'tunnel_close', 'id': 't1', 'reason': 'overrun'}
+
+
 def test_the_handshake_names_tunnels_as_answered():
     """A phone opens a tunnel only to a desktop whose hello_ack says it
     answers one (link._get_local_capabilities device_requests)."""
