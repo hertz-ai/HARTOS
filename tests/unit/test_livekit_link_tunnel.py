@@ -167,8 +167,12 @@ def signal_port(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _manager():
+def _manager(monkeypatch):
     reset_link_manager()
+    # This node serves LiveKit on its loopback, as a flat desktop does.
+    monkeypatch.setenv('LIVEKIT_AUTOSTART', '1')
+    monkeypatch.delenv('LIVEKIT_URL', raising=False)
+    monkeypatch.delenv('LIVEKIT_PORT', raising=False)
     from integrations.social import livekit_link
     livekit_link.install()
     yield
@@ -342,6 +346,30 @@ def test_no_tunnel_when_livekit_is_not_served_on_this_desktop(monkeypatch, signa
     link, ws = _link()
     reply = _open(ws)
     assert reply['type'] == 'tunnel_refused' and reply['reason'] == 'unavailable'
+    assert signal_port.accepted.empty()
+
+
+@pytest.mark.parametrize('env', [{'LIVEKIT_URL': 'wss://sfu.example.org'},
+                                 {'LIVEKIT_PORT': 'abc'}])
+def test_no_tunnel_is_offered_where_livekit_is_not_on_this_loopback(monkeypatch, env):
+    """A node whose LiveKit is elsewhere (a managed SFU) or unreadable (a bad
+    LIVEKIT_PORT) names no tunnel_open in its handshake: a phone would only
+    have every open refused there."""
+    from integrations.social import livekit_link
+    reset_link_manager()
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert livekit_link.install() is False
+    assert 'tunnel_open' not in get_link_manager().device_requests_answered()
+
+
+def test_a_bad_livekit_port_is_answered_not_left_hanging(monkeypatch, signal_port):
+    """LIVEKIT_PORT unreadable after boot: the phone's open is refused with a
+    reason, not left waiting on a handler that raised."""
+    monkeypatch.setenv('LIVEKIT_PORT', 'abc')
+    link, ws = _link()
+    reply = _open(ws)
+    assert reply == {'type': 'tunnel_refused', 'id': 't1', 'reason': 'unavailable'}
     assert signal_port.accepted.empty()
 
 

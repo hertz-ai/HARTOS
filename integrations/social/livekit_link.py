@@ -99,11 +99,17 @@ def signal_address() -> Optional[Tuple[str, int]]:
     from .livekit_supervisor import get_livekit_url, supervisor_should_run
     if not supervisor_should_run():
         return None
-    parts = urlsplit(get_livekit_url())
+    url = get_livekit_url()
+    parts = urlsplit(url)
     host = parts.hostname or ''
     if host not in _LOOPBACK:
         return None
-    port = parts.port or (443 if parts.scheme in ('wss', 'https') else 80)
+    try:
+        port = parts.port or (443 if parts.scheme in ('wss', 'https') else 80)
+    except ValueError:
+        logger.warning("LiveKit URL %r names no usable port (LIVEKIT_PORT?); "
+                       "no tunnel to it", url)
+        return None
     return ('127.0.0.1' if host == 'localhost' else host, port)
 
 
@@ -407,8 +413,14 @@ def close_all() -> None:
 
 def install() -> bool:
     """Answer a person's own phones' tunnels on the 'tunnel' channel, named
-    in this node's handshake (device_requests).  False when PeerLink is not
-    available."""
+    in this node's handshake (device_requests).  False, offering nothing,
+    when LiveKit is not served on this node's loopback (signal_address: a
+    managed SFU elsewhere, an unreadable port) -- a phone would only have
+    every open refused -- or when PeerLink is not available."""
+    if signal_address() is None:
+        logger.info("LiveKit tunnel not offered: LiveKit is not served on this "
+                    "node's loopback")
+        return False
     try:
         from core.peer_link.link_manager import get_link_manager
     except Exception as e:
