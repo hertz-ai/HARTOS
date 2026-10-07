@@ -26,6 +26,7 @@ from core.peer_link.link import LinkState, PeerLink, TrustLevel  # noqa: E402
 from core.peer_link.relay import (  # noqa: E402
     RELAY_ADDRESS_SCHEME, RelayHub, relay_topic,
 )
+from tests.unit.module_swap import swap_modules  # noqa: E402
 
 
 class MemoryRouter:
@@ -321,7 +322,7 @@ def test_the_relay_rung_is_tried_after_the_direct_address():
         def resolve_peer_address(info):
             return None
 
-    with patch.dict(sys.modules, {
+    with swap_modules({
             'integrations.social.peer_discovery': type(sys)('pd')}), \
             patch.object(manager, 'upgrade_peer', side_effect=upgrade_peer), \
             patch.object(relay_mod, 'get_relay_hub', return_value=Hub()), \
@@ -471,7 +472,7 @@ def test_a_peer_not_on_the_relay_is_not_dialled_there_again_soon():
         def resolve_peer_address(info):
             return None
 
-    with patch.dict(sys.modules, {
+    with swap_modules({
             'integrations.social.peer_discovery': type(sys)('pd')}), \
             patch.object(manager, 'upgrade_peer', side_effect=upgrade_peer), \
             patch.object(relay_mod, 'get_relay_hub', return_value=Hub()), \
@@ -523,8 +524,8 @@ def test_the_relay_joins_one_router_at_a_time_and_says_which(caplog):
     asyncio_pkg = type(sys)('autobahn.asyncio')
     component_mod = type(sys)('autobahn.asyncio.component')
     component_mod.Component = FakeComponent
-    with patch.dict(sys.modules, {'autobahn': autobahn, 'autobahn.asyncio': asyncio_pkg,
-                                  'autobahn.asyncio.component': component_mod}), \
+    with swap_modules({'autobahn': autobahn, 'autobahn.asyncio': asyncio_pkg,
+                       'autobahn.asyncio.component': component_mod}), \
             caplog.at_level(logging.INFO, logger='hevolve.peer_link'):
         try:
             assert transport.start('com.hertzai.hevolve.peerlink.relay.node-x', lambda e: None)
@@ -580,7 +581,7 @@ def test_a_router_that_took_us_and_dropped_us_is_retried_before_the_plaintext_on
     plaintext URL.  Only a router that cannot be reached moves us on."""
     attempts = []
     transport = relay_mod.WampRelayTransport(['wss://tls.example/wss', 'ws://plain.example/ws'])
-    with patch.dict(sys.modules, _fake_autobahn(attempts, {'wss://tls.example/wss'}, transport, 3)),             patch('time.sleep'):
+    with swap_modules(_fake_autobahn(attempts, {'wss://tls.example/wss'}, transport, 3)),             patch('time.sleep'):
         try:
             assert transport.start('com.hertzai.hevolve.peerlink.relay.node-x', lambda e: None)
             transport._thread.join(5)
@@ -626,7 +627,7 @@ def test_a_peer_missed_on_the_relay_is_skipped_a_minute_then_longer_and_an_answe
         answers['relay'] = answer
         manager._try_auto_upgrade('peer-nat')
 
-    with patch.dict(sys.modules, {
+    with swap_modules({
             'integrations.social.peer_discovery': type(sys)('pd')}),             patch.object(manager, 'upgrade_peer', side_effect=upgrade_peer),             patch.object(relay_mod, 'get_relay_hub', return_value=Hub()),             patch('core.peer_link.nat.get_nat_traversal', return_value=Nat()):
         sys.modules['integrations.social.peer_discovery'].gossip = Gossip()
         at(0)                       # miss 1: skipped for 60 s

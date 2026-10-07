@@ -33,6 +33,7 @@ from core.peer_link.link import LinkState, PeerLink, TrustLevel  # noqa: E402
 from core.peer_link.link_manager import get_link_manager  # noqa: E402
 from integrations.mobile_adapter import adapter, aliases  # noqa: E402
 from security.middleware import _apply_api_auth  # noqa: E402
+from tests.unit.module_swap import swap_modules  # noqa: E402
 from tests.unit.test_device_access_gate import Phone  # noqa: E402
 from tests.unit.test_desktop_socket_gate import _BOOT_STEPS  # noqa: E402
 from tests.unit.test_peer_link_device_links import (  # noqa: E402,F401
@@ -117,7 +118,7 @@ def desktop_app(monkeypatch):
     monkeypatch.setattr(aliases, 'ALIASES', (ROW, PREFIX))
     app = _host_app()
     secrets = {'security.secrets_manager': types.SimpleNamespace(get_secret=lambda name: '')}
-    with patch.dict(sys.modules, secrets):
+    with swap_modules(secrets):
         assert adapter.install(app)
         yield app
     adapter.set_host_app(None)
@@ -277,7 +278,7 @@ def test_boot_claims_a_route_the_consumer_registered_during_boot(monkeypatch):
     stubs = {s: MagicMock() for s in _BOOT_STEPS
              if s not in ('_run_consumer_hook', '_install_mobile_adapter')}
     secrets = {'security.secrets_manager': types.SimpleNamespace(get_secret=lambda name: '')}
-    with patch.dict(sys.modules, secrets), patch.multiple(hb, **stubs),             patch.object(hb, '_run_consumer_hook', side_effect=consumer_routes):
+    with swap_modules(secrets), patch.multiple(hb, **stubs),             patch.object(hb, '_run_consumer_hook', side_effect=consumer_routes):
         hb._run_bootstrap(Flask('nunba'), {})
     caps = PeerLink._get_local_capabilities()
     assert caps['mobile_paths'] == [f'POST {CLOUD} /chat/teachme2 15']
@@ -324,7 +325,7 @@ def test_a_phones_call_is_a_foreground_turn_on_the_desktop(monkeypatch, phone):
         return is_genuine_user_request(rid)
     monkeypatch.setattr(foreground, '_genuine_check', genuine)
     secrets = {'security.secrets_manager': types.SimpleNamespace(get_secret=lambda name: '')}
-    with patch.dict(sys.modules, secrets):
+    with swap_modules(secrets):
         assert adapter.install(app)
         link = _device_link(phone)
         body = {'text': ['teach me fractions'], 'user_id': int(PHONE_USER), 'conversation_id': 'msg-1'}
@@ -360,7 +361,7 @@ def test_a_phones_teach_and_custom_bot_turns_run_the_desktops_own_routes(monkeyp
     app.add_url_rule('/chat/custom_gpt', 'custom_gpt', turn('custom'), methods=['POST'])
     _apply_api_auth(app)
     secrets = {'security.secrets_manager': types.SimpleNamespace(get_secret=lambda name: '')}
-    with patch.dict(sys.modules, secrets):
+    with swap_modules(secrets):
         assert adapter.install(app)
         assert PeerLink._get_local_capabilities()['mobile_paths'] == [
             f'POST {CLOUD} /chat/teachme2 150', f'POST {CLOUD} /chat/custom_gpt 150']
