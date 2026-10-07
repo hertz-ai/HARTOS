@@ -45,11 +45,13 @@ class SignalPort:
     Like LiveKit's, it answers each HTTP request on a connection in turn: an
     upgrade with 101, after which it echoes what it reads (the WebSocket),
     anything else with REFUSAL, keeping the connection for the next request.
-    It records every connection, every request line it was sent, and every
-    connection's end.  A refusal's head and body go out as two writes, as a
-    slow answer would arrive; clearing ``answering`` holds every answer until
-    it is set again, and clearing ``reading`` stops it reading an upgraded
-    connection (a LiveKit that stalled)."""
+    It records every connection, every byte it read before an upgrade, every
+    request line it was sent, and every connection's end.  A refusal's head
+    and body go out as two writes, as a slow answer would arrive, and an
+    upgrade answer in ``answer_piece``-byte writes when that is set; clearing
+    ``answering`` holds every answer until it is set again, and clearing
+    ``reading`` stops it reading an upgraded connection (a LiveKit that
+    stalled)."""
 
     def __init__(self):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -57,6 +59,7 @@ class SignalPort:
         self.server.listen(8)
         self.port = self.server.getsockname()[1]
         self.accepted = queue.Queue()
+        self.read = queue.Queue()
         self.requests = queue.Queue()
         self.ended = queue.Queue()
         self.answering = threading.Event()
@@ -64,6 +67,7 @@ class SignalPort:
         self.reading = threading.Event()
         self.reading.set()
         self.upgrade_answer = UPGRADED
+        self.answer_piece = 0
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self):
@@ -90,6 +94,7 @@ class SignalPort:
             if upgraded:
                 conn.sendall(data)
                 continue
+            self.read.put(data)
             buf += data
             while b'\r\n\r\n' in buf and not upgraded:
                 head, buf = buf.split(b'\r\n\r\n', 1)
@@ -97,7 +102,12 @@ class SignalPort:
                 upgraded = b'\r\nupgrade: websocket' in head.lower()
                 self.answering.wait(WAIT_S)
                 if upgraded:
-                    conn.sendall(self.upgrade_answer)
+                    answer = self.upgrade_answer
+                    step = self.answer_piece or len(answer)
+                    for at in range(0, len(answer), step):
+                        conn.sendall(answer[at:at + step])
+                        if step < len(answer):
+                            time.sleep(0.02)
                 else:
                     conn.sendall(REFUSAL_HEAD)
                     time.sleep(0.1)
@@ -111,6 +121,13 @@ class SignalPort:
         while not self.requests.empty():
             lines.append(self.requests.get())
         return lines
+
+    def bytes_read(self):
+        """Every byte read so far before an upgrade, on every connection."""
+        got = b''
+        while not self.read.empty():
+            got += self.read.get()
+        return got
 
     def close(self):
         self.server.close()
@@ -465,26 +482,35 @@ def test_one_phones_redial_leaves_another_phones_tunnels_open(signal_port):
     assert _received(b_ws, len(UPGRADED), 'b1') == UPGRADED
 
 
-def test_a_tunnel_whose_phone_never_sends_a_request_ends(monkeypatch, signal_port):
-    """Opened and then silent: the tunnel does not hold one of the phone's
-    two slots until its link goes; it ends 'no_request'."""
+def _deadlines(monkeypatch, request_s, answer_s=10):
     from integrations.social import livekit_link
-    monkeypatch.setattr(livekit_link, '_IO_TIMEOUT_S', 0.2, raising=False)
-    monkeypatch.setattr(livekit_link, '_REQUEST_TIMEOUT_S', 0.5, raising=False)
+    monkeypatch.setattr(livekit_link, '_IO_TIMEOUT_S', 0.2)
+    monkeypatch.setattr(livekit_link, '_REQUEST_TIMEOUT_S', request_s)
+    monkeypatch.setattr(livekit_link, '_ANSWER_TIMEOUT_S', answer_s)
+
+
+def test_tunnels_whose_phone_never_sends_a_request_end_and_free_its_slots(
+        monkeypatch, signal_port):
+    """Opened and then silent: the tunnels do not hold the phone's slots
+    until its link goes; they end 'no_request' and the phone opens again."""
+    from integrations.social import livekit_link
+    _deadlines(monkeypatch, request_s=0.5)
     link, ws = _link()
-    _open(ws)
-    conn = signal_port.accepted.get(timeout=WAIT_S)
-    close = ws.next_out('tunnel_close')['d']
-    assert close == {'type': 'tunnel_close', 'id': 't1', 'reason': 'no_request'}
-    assert signal_port.ended.get(timeout=WAIT_S) is conn
+    tids = [f't{n}' for n in range(livekit_link.MAX_TUNNELS_PER_LINK)]
+    for tid in tids:
+        assert _open(ws, tid) == {'type': 'tunnel_opened', 'id': tid}
+    conns = {signal_port.accepted.get(timeout=WAIT_S) for _ in tids}
+    closes = [ws.next_out('tunnel_close')['d'] for _ in tids]
+    assert sorted(closes, key=lambda c: c['id']) == [
+        {'type': 'tunnel_close', 'id': tid, 'reason': 'no_request'} for tid in tids]
+    assert {signal_port.ended.get(timeout=WAIT_S) for _ in tids} == conns
+    assert _open(ws, 'again') == {'type': 'tunnel_opened', 'id': 'again'}
 
 
 def test_a_phone_has_the_whole_request_deadline_to_send_its_request(monkeypatch, signal_port):
     """The deadline runs from the open: idle reads before it pass, and a
     request sent within it opens the WebSocket as usual."""
-    from integrations.social import livekit_link
-    monkeypatch.setattr(livekit_link, '_IO_TIMEOUT_S', 0.2, raising=False)
-    monkeypatch.setattr(livekit_link, '_REQUEST_TIMEOUT_S', 5, raising=False)
+    _deadlines(monkeypatch, request_s=5)
     link, ws = _link()
     _open(ws)
     signal_port.accepted.get(timeout=WAIT_S)
@@ -494,13 +520,66 @@ def test_a_phone_has_the_whole_request_deadline_to_send_its_request(monkeypatch,
     assert _received(ws, len(UPGRADED)) == UPGRADED
 
 
+def test_a_request_sent_a_byte_at_a_time_still_ends_at_the_deadline(monkeypatch, signal_port):
+    """The deadline runs from the open, not from the phone's last byte: a
+    phone that trickles a request it never finishes keeps no slot."""
+    _deadlines(monkeypatch, request_s=0.6)
+    link, ws = _link()
+    _open(ws)
+    conn = signal_port.accepted.get(timeout=WAIT_S)
+    _send(ws, b'GET /rtc')
+    ended_while_sending = False
+    for _ in range(12):                    # a byte every 0.25 s for 3 s
+        time.sleep(0.25)
+        if not ws.out.empty():
+            ended_while_sending = True
+            break
+        _send(ws, b'x')
+    assert ended_while_sending, 'a phone trickling bytes kept its slot past the deadline'
+    close = ws.next_out('tunnel_close')['d']
+    assert close == {'type': 'tunnel_close', 'id': 't1', 'reason': 'no_request'}
+    assert signal_port.ended.get(timeout=WAIT_S) is conn
+
+
+def test_a_whole_request_waits_out_livekits_answer_deadline_not_the_requests(
+        monkeypatch, signal_port):
+    """Once the request is whole, only LiveKit's answer deadline applies."""
+    _deadlines(monkeypatch, request_s=0.5, answer_s=5)
+    link, ws = _link()
+    _open(ws)
+    signal_port.accepted.get(timeout=WAIT_S)
+    signal_port.answering.clear()
+    try:
+        _send(ws, UPGRADE_REQUEST)
+        time.sleep(1.2)                    # past the request's deadline, inside the answer's
+        assert ws.out.empty(), 'the tunnel ended while LiveKit still had time to answer'
+    finally:
+        signal_port.answering.set()
+    assert _received(ws, len(UPGRADED)) == UPGRADED
+
+
+def test_a_call_outlives_the_request_deadline(monkeypatch, signal_port):
+    """The request deadline is the first request's, never the call's: an
+    upgraded tunnel idle past it stays open and carries the next frame."""
+    _deadlines(monkeypatch, request_s=0.5)
+    link, ws = _link()
+    _open(ws)
+    signal_port.accepted.get(timeout=WAIT_S)
+    _send(ws, UPGRADE_REQUEST)
+    assert _received(ws, len(UPGRADED)) == UPGRADED
+    time.sleep(1.2)                        # idle reads well past the request deadline
+    assert ws.out.empty(), 'a call was closed by the request deadline'
+    _send(ws, b'frame')
+    assert _received(ws, 5) == b'frame'
+
+
 def test_a_livekit_that_stops_reading_ends_the_tunnel(monkeypatch, signal_port):
     """LiveKit upgraded, then stopped reading: the tunnel's writer gives up
     after the I/O timeout instead of blocking for ever, the tunnel closes and
     the phone is told -- with the write queue far from full, so it is not
     the queue's overrun that ends it."""
     from integrations.social import livekit_link
-    monkeypatch.setattr(livekit_link, '_IO_TIMEOUT_S', 0.5, raising=False)
+    monkeypatch.setattr(livekit_link, '_IO_TIMEOUT_S', 0.5)
     link, ws = _link()
     _open(ws)
     conn = signal_port.accepted.get(timeout=WAIT_S)
@@ -520,8 +599,8 @@ def test_a_livekit_that_stops_reading_ends_the_tunnel(monkeypatch, signal_port):
 
 def test_a_first_request_livekit_never_answers_ends_the_tunnel(monkeypatch, signal_port):
     from integrations.social import livekit_link
-    monkeypatch.setattr(livekit_link, '_IO_TIMEOUT_S', 0.2, raising=False)
-    monkeypatch.setattr(livekit_link, '_ANSWER_TIMEOUT_S', 0.5, raising=False)
+    monkeypatch.setattr(livekit_link, '_IO_TIMEOUT_S', 0.2)
+    monkeypatch.setattr(livekit_link, '_ANSWER_TIMEOUT_S', 0.5)
     link, ws = _link()
     _open(ws)
     conn = signal_port.accepted.get(timeout=WAIT_S)
@@ -569,22 +648,31 @@ def test_a_tunnel_id_outside_one_to_64_chars_is_refused(signal_port, tid):
 
 
 def test_a_first_line_with_no_end_ends_the_tunnel(signal_port):
+    """Sent as a head that never ends arrives, in pieces each under the cap:
+    the cap is on what has built up, and none of it reaches LiveKit."""
     from integrations.social import livekit_link
     link, ws = _link()
     _open(ws)
-    close = _close_after(ws, b'GET /rtc' + b'x' * livekit_link._FIRST_LINE_MAX)
+    conn = signal_port.accepted.get(timeout=WAIT_S)
+    piece = b'x' * 1024
+    close = _close_after(ws, b'GET /rtc',
+                         *[piece] * (livekit_link._FIRST_LINE_MAX // len(piece)))
     assert close['reason'] == 'not_signalling'
-    assert signal_port.request_lines() == []
+    assert signal_port.ended.get(timeout=WAIT_S) is conn
+    assert signal_port.bytes_read() == b''
 
 
 def test_a_first_request_whose_headers_never_end_ends_the_tunnel(signal_port):
     from integrations.social import livekit_link
     link, ws = _link()
     _open(ws)
+    conn = signal_port.accepted.get(timeout=WAIT_S)
+    header = b'X-Pad: ' + b'a' * 1000 + b'\r\n'
     close = _close_after(ws, b'GET /rtc HTTP/1.1\r\n',
-                         b'X-Pad: ' + b'a' * livekit_link._HEAD_MAX + b'\r\n')
+                         *[header] * (livekit_link._HEAD_MAX // len(header) + 1))
     assert close['reason'] == 'not_signalling'
-    assert signal_port.request_lines() == []
+    assert signal_port.ended.get(timeout=WAIT_S) is conn
+    assert signal_port.bytes_read() == b''
 
 
 def test_bytes_held_past_max_chunk_before_the_answer_end_the_tunnel(signal_port):
@@ -602,21 +690,27 @@ def test_bytes_held_past_max_chunk_before_the_answer_end_the_tunnel(signal_port)
 
 
 def test_an_answer_whose_head_never_ends_ends_the_tunnel(signal_port):
+    """LiveKit's answer arrives in 4 KiB pieces, each under the cap."""
     from integrations.social import livekit_link
     signal_port.upgrade_answer = (b'HTTP/1.1 101 Switching Protocols\r\nX-Pad: '
                                   + b'a' * (livekit_link._HEAD_MAX + 1))
+    signal_port.answer_piece = 4096
     link, ws = _link()
     _open(ws)
     close = _close_after(ws, UPGRADE_REQUEST)
     assert close['reason'] == 'not_upgraded'
 
 
-def test_a_write_queue_livekit_cannot_drain_ends_the_tunnel(monkeypatch, signal_port):
-    """LiveKit upgraded and stopped reading, and the phone keeps sending:
-    once the write queue is full the tunnel closes ('overrun') rather than
-    hold the link's receive loop."""
+def test_a_full_write_queue_ends_the_tunnel(monkeypatch, signal_port):
+    """The phone sends faster than this desktop writes to LiveKit: once the
+    write queue is full the tunnel closes ('overrun') rather than hold the
+    link's receive loop.  A burst outruns the writer thread on its own (the
+    queue fills within its first chunks whether or not LiveKit reads);
+    LiveKit is stalled here as well, so nothing can drain it."""
     from integrations.social import livekit_link
     monkeypatch.setattr(livekit_link, '_WRITE_QUEUE', 8)
+    # Longer than the burst takes, so the stalled write cannot end the
+    # tunnel first ('livekit_stalled').
     monkeypatch.setattr(livekit_link, '_IO_TIMEOUT_S', 30)
     link, ws = _link()
     _open(ws)
@@ -624,7 +718,7 @@ def test_a_write_queue_livekit_cannot_drain_ends_the_tunnel(monkeypatch, signal_
     assert _received(ws, len(UPGRADED)) == UPGRADED
     signal_port.reading.clear()
     try:
-        for _ in range(200):               # fills the sockets, then the queue
+        for _ in range(200):
             _send(ws, b'x' * livekit_link.MAX_CHUNK)
         close = ws.next_out('tunnel_close')['d']
     finally:

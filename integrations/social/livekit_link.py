@@ -39,7 +39,9 @@ latest when the phone next opens one or within _WRITER_POLL_S; one whose
 LiveKit stops reading closes after _IO_TIMEOUT_S ('livekit_stalled'); one
 whose phone sends no whole first request within _REQUEST_TIMEOUT_S of the
 open closes ('no_request'), and one whose first request LiveKit leaves
-unanswered after _ANSWER_TIMEOUT_S ('no_answer').
+unanswered after _ANSWER_TIMEOUT_S ('no_answer').  Both deadlines are
+looked at when an idle read wakes, so each fires up to _IO_TIMEOUT_S after
+it has passed.
 
 Relay links are end-to-end encrypted (relay.py), so the relay reads none of
 it.  Media does not ride the tunnel: LiveKit's ICE candidates name this
@@ -80,7 +82,8 @@ _IO_TIMEOUT_S = 5
 #: How long LiveKit has to answer the tunnel's first request ('no_answer').
 _ANSWER_TIMEOUT_S = 10
 #: How long the phone has, from the open, to send that first request
-#: ('no_request'): a tunnel holds one of its phone's two slots.
+#: ('no_request'): a tunnel holds one of its phone's MAX_TUNNELS_PER_LINK
+#: slots.
 _REQUEST_TIMEOUT_S = 10
 #: How often the writer, idle, looks whether its link is still there.
 _WRITER_POLL_S = 1.0
