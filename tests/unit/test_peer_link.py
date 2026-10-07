@@ -569,6 +569,7 @@ class TestChannels(unittest.TestCase):
         expected = {
             'control', 'compute', 'dispatch', 'gossip', 'federation',
             'hivemind', 'events', 'ralt', 'sensor', 'messages', 'learning',
+            'tunnel',
         }
         self.assertEqual(set(CHANNEL_REGISTRY.keys()), expected)
 

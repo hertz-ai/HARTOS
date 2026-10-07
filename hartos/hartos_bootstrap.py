@@ -879,6 +879,19 @@ def _init_livekit_supervisor(cfg: dict) -> None:
                 info.get('reason') or info.get('mode'))
     except Exception as e:
         logger.warning(f"LiveKit supervisor init failed: {e}")
+        return
+    if not info.get('should_run'):
+        return
+    # A person's own phone reaches this SFU's signal port over its device
+    # link (integrations.social.livekit_link); only a node that hosts the SFU
+    # names tunnels in its handshake.
+    try:
+        from integrations.social.livekit_link import install as install_tunnel
+        if not install_tunnel():
+            logger.warning("LiveKit tunnel not installed: a phone cannot reach this "
+                           "SFU over its link")
+    except Exception as e:
+        logger.warning(f"LiveKit tunnel not installed: {e}")
 
 
 def _init_whatsapp_supervisor(cfg: dict) -> None:

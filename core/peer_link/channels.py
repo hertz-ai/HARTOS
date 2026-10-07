@@ -47,6 +47,15 @@ DEVICE_TYPES_KEY = 'device_types'
 #: request a desktop that answers it names in its handshake (link_manager.
 #: device_requests_answered).
 API_REQUEST = 'api_request'
+#: A channel's frame types a DEVICE link may send WITHOUT asking (no 'rq'):
+#: the bytes of a stream that flows both ways once it is open.  Every other
+#: type on a typed channel must still be a request (link.py).
+DEVICE_UNASKED_TYPES_KEY = 'device_unasked_types'
+#: A person's own phone's LiveKit signal tunnel (integrations.social.
+#: livekit_link): opened by a request, then bytes and a close either way.
+TUNNEL_OPEN = 'tunnel_open'
+TUNNEL_DATA = 'tunnel_data'
+TUNNEL_CLOSE = 'tunnel_close'
 
 CHANNEL_REGISTRY = {
     'control': {
@@ -141,6 +150,21 @@ CHANNEL_REGISTRY = {
         'description': 'Federation learning deltas — FedAvg metric sync '
                        '(peer transport for FederatedAggregator.receive_peer_delta)',
     },
+    'tunnel': {
+        'id': 0x0B,
+        # A person's own phone's LiveKit signalling (integrations.social.
+        # livekit_link): opened by a request, then bytes both ways for the
+        # life of a call; the handler joins them only to this node's own
+        # LiveKit signal port and answers nothing but a device.
+        DEVICE_POLICY_KEY: 'both',
+        DEVICE_TYPES_KEY: (TUNNEL_OPEN, TUNNEL_DATA, TUNNEL_CLOSE),
+        DEVICE_UNASKED_TYPES_KEY: (TUNNEL_DATA, TUNNEL_CLOSE),
+        'data_class': DataClass.PRIVATE,  # a person's call signalling
+        'priority': 1,      # interactive: a call's setup waits on it
+        'reliable': True,
+        'description': "A phone's LiveKit signal socket, tunnelled to this "
+                       "node's own LiveKit signal port",
+    },
 }
 
 # Reverse lookup: id -> name
@@ -161,6 +185,12 @@ def device_send_types(channel: str) -> tuple:
     """The only frame types a DEVICE link may send on this channel, or ()
     when the channel does not narrow them."""
     return tuple(get_channel_config(channel).get(DEVICE_TYPES_KEY) or ())
+
+
+def device_unasked_types(channel: str) -> tuple:
+    """The frame types a DEVICE link may send on this channel without
+    asking (DEVICE_UNASKED_TYPES_KEY), or ()."""
+    return tuple(get_channel_config(channel).get(DEVICE_UNASKED_TYPES_KEY) or ())
 
 
 def device_may_send(channel: str, frame: Any = None) -> bool:

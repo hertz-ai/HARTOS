@@ -250,6 +250,29 @@ def test_the_channel_policy_opens_only_control_and_events():
         assert not device_may_receive(closed), closed
 
 
+def test_a_phone_carries_only_its_tunnel_frames_on_tunnel(phone):
+    """'tunnel' (a phone's LiveKit signalling, integrations.social.
+    livekit_link): the phone opens a tunnel by asking, then streams its
+    bytes and its close unasked; any other frame type, or an open nobody
+    asked for, is dropped before a handler sees it."""
+    assert device_may_receive('tunnel')
+    link = _device_link(phone)
+    seen = []
+    link.on_message('tunnel', lambda channel, data, pid: seen.append(data.get('type')))
+    frames = [
+        {'ch': 'tunnel', 'id': 'f1', 'd': {'type': 'tunnel_data', 'id': 'a', 'b64': ''}},
+        {'ch': 'tunnel', 'id': 'f2', 'd': {'type': 'tunnel_close', 'id': 'a'}},
+        {'ch': 'tunnel', 'id': 'f3', 'd': {'type': 'tunnel_open', 'id': 'b'}},
+        {'ch': 'tunnel', 'id': 'f4', 'd': {'type': 'shell', 'id': 'c'}},
+        {'ch': 'tunnel', 'id': 'f5', 'rq': 1, 'd': {'type': 'tunnel_open', 'id': 'd'}},
+    ]
+    _frames_out(link, frames)
+    deadline = time.monotonic() + 5
+    while 'tunnel_open' not in seen and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert seen == ['tunnel_data', 'tunnel_close', 'tunnel_open']
+
+
 def test_a_device_sending_on_a_closed_channel_reaches_no_handler(phone, caplog):
     """(a) drive the real receive loop with frames on hivemind, learning and
     events: nothing dispatched, one warning per channel."""
