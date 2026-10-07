@@ -48,7 +48,8 @@ class SignalPort:
     It records every connection, every request line it was sent, and every
     connection's end.  A refusal's head and body go out as two writes, as a
     slow answer would arrive; clearing ``answering`` holds every answer until
-    it is set again."""
+    it is set again, and clearing ``reading`` stops it reading an upgraded
+    connection (a LiveKit that stalled)."""
 
     def __init__(self):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -60,6 +61,8 @@ class SignalPort:
         self.ended = queue.Queue()
         self.answering = threading.Event()
         self.answering.set()
+        self.reading = threading.Event()
+        self.reading.set()
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self):
@@ -74,6 +77,8 @@ class SignalPort:
     def _http(self, conn):
         buf, upgraded = b'', False
         while True:
+            if upgraded:
+                self.reading.wait(WAIT_S * 4)
             try:
                 data = conn.recv(65536)
             except OSError:
@@ -356,6 +361,70 @@ def test_a_phone_holds_at_most_two_tunnels(signal_port):
     assert _open(ws, 'b')['type'] == 'tunnel_opened'
     reply = _open(ws, 'c')
     assert reply['type'] == 'tunnel_refused' and reply['reason'] == 'busy'
+
+
+def _replace_link(old):
+    """The phone redials: a fresh link under the same peer id replaces the
+    old one in the manager, and the old one is closed (accept_inbound)."""
+    link, ws = _link()
+    old._state = LinkState.DISCONNECTED
+    return link, ws
+
+
+def test_a_phone_that_redials_opens_at_once_and_its_old_tunnels_end(signal_port):
+    """After a redial the old link's tunnels are not the phone's any more:
+    the new link's opens are not refused 'busy' behind them, a tunnel id is
+    reusable, and the old sockets on LiveKit close."""
+    old, old_ws = _link()
+    _open(old_ws, 'a')
+    _open(old_ws, 'b')
+    first = {signal_port.accepted.get(timeout=WAIT_S), signal_port.accepted.get(timeout=WAIT_S)}
+    link, ws = _replace_link(old)
+    started = time.monotonic()
+    assert _open(ws, 'a') == {'type': 'tunnel_opened', 'id': 'a'}
+    assert _open(ws, 'c') == {'type': 'tunnel_opened', 'id': 'c'}
+    assert time.monotonic() - started < 0.9
+    ended = {signal_port.ended.get(timeout=WAIT_S), signal_port.ended.get(timeout=WAIT_S)}
+    assert ended == first
+
+
+def test_a_livekit_that_stops_reading_ends_the_tunnel(monkeypatch, signal_port):
+    """LiveKit upgraded, then stopped reading: the tunnel's writer gives up
+    after the I/O timeout instead of blocking for ever, the tunnel closes and
+    the phone is told -- with the write queue far from full, so it is not
+    the queue's overrun that ends it."""
+    from integrations.social import livekit_link
+    monkeypatch.setattr(livekit_link, '_IO_TIMEOUT_S', 0.5, raising=False)
+    link, ws = _link()
+    _open(ws)
+    conn = signal_port.accepted.get(timeout=WAIT_S)
+    _send(ws, UPGRADE_REQUEST)
+    assert _received(ws, len(UPGRADED)) == UPGRADED
+    signal_port.reading.clear()
+    chunk = b'x' * livekit_link.MAX_CHUNK
+    for _ in range(160):                   # 10 MiB, 160 of the queue's 256 chunks
+        _send(ws, chunk)
+    try:
+        close = ws.next_out('tunnel_close')['d']
+    finally:
+        signal_port.reading.set()
+    assert close == {'type': 'tunnel_close', 'id': 't1', 'reason': 'livekit_stalled'}
+    assert signal_port.ended.get(timeout=WAIT_S) is conn
+
+
+def test_a_first_request_livekit_never_answers_ends_the_tunnel(monkeypatch, signal_port):
+    from integrations.social import livekit_link
+    monkeypatch.setattr(livekit_link, '_IO_TIMEOUT_S', 0.2, raising=False)
+    monkeypatch.setattr(livekit_link, '_ANSWER_TIMEOUT_S', 0.5, raising=False)
+    link, ws = _link()
+    _open(ws)
+    conn = signal_port.accepted.get(timeout=WAIT_S)
+    signal_port.answering.clear()
+    _send(ws, UPGRADE_REQUEST)
+    close = ws.next_out('tunnel_close')['d']
+    signal_port.answering.set()
+    assert close == {'type': 'tunnel_close', 'id': 't1', 'reason': 'no_answer'}
+    assert signal_port.ended.get(timeout=WAIT_S) is conn
 
 
 def test_the_handshake_names_tunnels_as_answered():

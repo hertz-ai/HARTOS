@@ -46,6 +46,7 @@ import queue
 import re
 import socket
 import threading
+import time
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -65,6 +66,14 @@ MAX_CHUNK = 64 * 1024
 #: Chunks waiting to be written to LiveKit before the tunnel is given up.
 _WRITE_QUEUE = 256
 _CONNECT_TIMEOUT_S = 5
+#: The longest one read or write on LiveKit's socket may block: a write
+#: that cannot finish in it means LiveKit stopped reading ('livekit_stalled'),
+#: and an idle read wakes this often to see whether the link is still there.
+_IO_TIMEOUT_S = 5
+#: How long LiveKit has to answer the tunnel's first request ('no_answer').
+_ANSWER_TIMEOUT_S = 10
+#: How often the writer, idle, looks whether its link is still there.
+_WRITER_POLL_S = 1.0
 _LOOPBACK = ('127.0.0.1', '::1', 'localhost')
 #: The first request on a tunnel: a GET of LiveKit's signal path.
 _SIGNAL_REQUEST = re.compile(rb'GET /rtc(?:[/?][^ ]*)? HTTP/1\.[01]\r?')
@@ -122,6 +131,9 @@ class _Tunnel:
         # judged), and a refusal's body still to reach the phone.
         self._answer: Optional[bytes] = b''
         self._body_left = 0
+        # When the first request went to LiveKit (monotonic), for its answer's
+        # deadline; 0 until it has.
+        self._asked_at = 0.0
 
     def start(self) -> None:
         threading.Thread(target=self._read, daemon=True,
@@ -147,6 +159,7 @@ class _Tunnel:
                     if end is not None:
                         data, self._held = self._head[:end.end()], self._head[end.end():]
                         self._head = None
+                        self._asked_at = time.monotonic()
                     elif len(self._head) > _HEAD_MAX:
                         fault = 'not_signalling'
             elif self._held is not None:
@@ -205,11 +218,26 @@ class _Tunnel:
                        "LiveKit signalling (%r)", self.tid[:8], self.link.peer_id[:12], line)
         self.close('not_signalling', tell_phone=True)
 
+    def _overdue(self) -> bool:
+        """LiveKit has not answered the first request in _ANSWER_TIMEOUT_S."""
+        with self._gate:
+            waiting = self._answer is not None and self._asked_at
+        return bool(waiting) and time.monotonic() - self._asked_at > _ANSWER_TIMEOUT_S
+
     def _read(self) -> None:
         reason = 'closed'
         while not self._closed.is_set():
             try:
                 data = self.sock.recv(MAX_CHUNK)
+            except TimeoutError:
+                # Idle (the socket's I/O timeout): still wanted?
+                if not self.link.is_connected:
+                    reason = 'link gone'
+                    break
+                if self._overdue():
+                    reason = 'no_answer'
+                    break
+                continue
             except OSError as e:
                 reason = f'error: {e}'
                 break
@@ -229,7 +257,7 @@ class _Tunnel:
     def _write(self) -> None:
         while not self._closed.is_set():
             try:
-                data = self._out.get(timeout=1.0)
+                data = self._out.get(timeout=_WRITER_POLL_S)
             except queue.Empty:
                 # The link this tunnel rode is gone: no one is there to read.
                 if not self.link.is_connected:
@@ -240,6 +268,12 @@ class _Tunnel:
                 break
             try:
                 self.sock.sendall(data)
+            except TimeoutError:
+                # LiveKit took nothing for the socket's whole I/O timeout.
+                logger.warning("LiveKit tunnel %s: LiveKit stopped reading; closing it",
+                               self.tid[:8])
+                self.close('livekit_stalled', tell_phone=True)
+                break
             except OSError as e:
                 self.close(f'error: {e}', tell_phone=True)
                 break
@@ -275,6 +309,15 @@ def _refused(tid, reason: str) -> dict:
 
 def _open(link, tid: str) -> dict:
     key = (link.peer_id, tid)
+    # A phone that redialled holds this peer id on a new link: the old link's
+    # tunnels are no one's now, so they end here rather than hold its slots
+    # (and its tunnel ids) until their own threads notice.
+    with _lock:
+        stale = [t for (pid, _), t in _tunnels.items()
+                 if pid == link.peer_id and t is not None
+                 and (t.link is not link or not t.link.is_connected)]
+    for t in stale:
+        t.close('link replaced', tell_phone=False)
     with _lock:
         # Opens arrive as requests, each on its own thread: the slot is
         # taken (None until the socket is up) before the connect.
@@ -290,7 +333,7 @@ def _open(link, tid: str) -> dict:
             return _refused(tid, 'unavailable')
         try:
             sock = socket.create_connection(address, timeout=_CONNECT_TIMEOUT_S)
-            sock.settimeout(None)
+            sock.settimeout(_IO_TIMEOUT_S)
         except OSError as e:
             logger.warning("LiveKit tunnel for %s: signal port %s:%d did not answer: %s",
                            link.peer_id[:12], address[0], address[1], e)
