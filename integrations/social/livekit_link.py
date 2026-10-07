@@ -23,6 +23,9 @@ phone (a device link):
   tunnel_close {id}       either way; the other end closes its side (from
                           here with a reason)
 
+The call those tunnels carry is started and ended on the same channel, by
+request (call_open / call_end, integrations.social.phone_call).
+
 The tunnel carries LiveKit signalling and nothing else: its first request
 must be a GET of LiveKit's signal path (/rtc -- the WebSocket, and the
 SDK's /rtc/validate), or the tunnel is closed ('not_signalling') before a
@@ -385,7 +388,9 @@ def _open(link, tid: str) -> dict:
     return {'type': TUNNEL_OPENED, 'id': tid}
 
 
-def _device_link(peer_id: str):
+def device_link(peer_id: str):
+    """The person's own phone's link behind ``peer_id``, or None (a node's
+    link, or none): only a phone's frames on 'tunnel' are answered."""
     try:
         from core.peer_link.link_manager import get_link_manager
         return get_link_manager().get_device_link(peer_id)
@@ -400,7 +405,7 @@ def handle_tunnel_frame(channel: str, data, peer_id: str) -> Optional[dict]:
     or with no usable id, is not answered."""
     if not isinstance(data, dict):
         return None
-    link = _device_link(peer_id)
+    link = device_link(peer_id)
     if link is None:
         return None
     tid = data.get('id')
@@ -438,9 +443,10 @@ def close_all() -> None:
 
 
 def install() -> bool:
-    """Answer a person's own phones' tunnels on the 'tunnel' channel, named
-    in this node's handshake (device_requests).  False, offering nothing,
-    when LiveKit is not served on this node's loopback (signal_address: a
+    """Answer a person's own phones' tunnels on the 'tunnel' channel, and
+    their requests to start and end a call there (phone_call), named in this
+    node's handshake (device_requests).  False, offering nothing, when
+    LiveKit is not served on this node's loopback (signal_address: a
     managed SFU elsewhere, an unreadable port) -- a phone would only have
     every open refused -- or when PeerLink is not available."""
     if signal_address() is None:
@@ -449,9 +455,12 @@ def install() -> bool:
         return False
     try:
         from core.peer_link.link_manager import get_link_manager
+        from .phone_call import ANSWERS, handle_call_frame
     except Exception as e:
         logger.warning("LiveKit tunnel not installed: %s", e)
         return False
-    get_link_manager().register_channel_handler(CHANNEL, handle_tunnel_frame,
-                                                answers=(TUNNEL_OPEN,))
+    manager = get_link_manager()
+    manager.register_channel_handler(CHANNEL, handle_tunnel_frame,
+                                     answers=(TUNNEL_OPEN,))
+    manager.register_channel_handler(CHANNEL, handle_call_frame, answers=ANSWERS)
     return True

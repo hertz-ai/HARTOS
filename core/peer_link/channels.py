@@ -58,6 +58,11 @@ DEVICE_UNASKED_TYPES_KEY = 'device_unasked_types'
 TUNNEL_OPEN = 'tunnel_open'
 TUNNEL_DATA = 'tunnel_data'
 TUNNEL_CLOSE = 'tunnel_close'
+#: A person's own phone starting and ending a voice call with their agent on
+#: this desktop (integrations.social.phone_call), beside the call's signal
+#: tunnel: requests, answered with the call and its room token.
+CALL_OPEN = 'call_open'
+CALL_END = 'call_end'
 
 CHANNEL_REGISTRY = {
     'control': {
@@ -157,9 +162,11 @@ CHANNEL_REGISTRY = {
         # A person's own phone's LiveKit signalling (integrations.social.
         # livekit_link): opened by a request, then bytes both ways for the
         # life of a call; the handler joins them only to this node's own
-        # LiveKit signal port and answers nothing but a device.
+        # LiveKit signal port and answers nothing but a device.  The call
+        # itself is started and ended here too, by request (phone_call).
         DEVICE_POLICY_KEY: 'both',
-        DEVICE_TYPES_KEY: (TUNNEL_OPEN, TUNNEL_DATA, TUNNEL_CLOSE),
+        DEVICE_TYPES_KEY: (TUNNEL_OPEN, TUNNEL_DATA, TUNNEL_CLOSE,
+                           CALL_OPEN, CALL_END),
         DEVICE_UNASKED_TYPES_KEY: (TUNNEL_DATA, TUNNEL_CLOSE),
         'data_class': DataClass.PRIVATE,  # a person's call signalling
         'priority': 1,      # interactive: a call's setup waits on it

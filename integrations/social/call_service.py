@@ -180,6 +180,7 @@ class CallService:
         """
         sess = CallService.get(db, call_id)
         if sess.get('ended_at'):
+            _stop_agents(call_id)
             return sess  # idempotent — already ended
         is_starter = sess['started_by'] == ended_by_id
         is_admin = _is_parent_admin(
@@ -196,6 +197,7 @@ class CallService:
                 "WHERE id = :id AND ended_at IS NULL"),
                 {'id': call_id})
         db.commit()
+        _stop_agents(call_id)
         return CallService.get(db, call_id)
 
     # ── Participant lifecycle ────────────────────────────────────────
@@ -509,6 +511,19 @@ def _is_parent_member(db, parent_kind: str, parent_id: str,
         ).fetchone()
         return row is not None
     return False
+
+
+def _stop_agents(call_id: str) -> None:
+    """Stop the agent bridges in an ended call.  attach_agent starts one per
+    agent; until it is detached its worker keeps ticking and its publisher
+    keeps a seat in the room, and nothing else detaches it."""
+    try:
+        from .agent_voice_bridge import AgentVoiceBridge
+        for worker in AgentVoiceBridge.list_active(call_id):
+            AgentVoiceBridge.detach_agent(call_id, worker['agent_id'])
+    except Exception as e:
+        logger.warning("CallService.end: the agents in call=%s were not "
+                       "stopped: %s", call_id, e)
 
 
 def _machine_owner() -> Optional[str]:
