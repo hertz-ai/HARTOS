@@ -275,6 +275,7 @@ def test_a_reply_the_room_does_not_take_is_said(monkeypatch, caplog):
             return False
 
     monkeypatch.setattr(avb, '_HAS_LIVEKIT_RTC', True)
+    monkeypatch.setattr(avb, '_hosts_rooms', lambda: True)
     worker = avb.AgentBridgeWorker('call-1', 'agent-1', 'owner-1', {})
     monkeypatch.setattr(worker, '_ensure_publisher', lambda: _Publisher())
     monkeypatch.setattr(worker, '_synthesize_pcm',

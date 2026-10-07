@@ -213,6 +213,26 @@ class TestTheRealtimeSdkCannotBeUsed:
         assert _warnings_naming(records, _ERR)
 
 
+class TestWhetherADeployHostsRooms:
+
+    def test_asking_makes_no_dev_keys(self, monkeypatch, tmp_path, hosts_rooms):
+        """A flat node hosts rooms -- and finding that out writes nothing;
+        only signing a token (_resolved_config) makes its dev keys."""
+        for name in ('LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET'):
+            monkeypatch.delenv(name, raising=False)
+        from integrations.social.livekit_service import LiveKitService
+        assert LiveKitService.hosts_rooms() is True
+        assert list(tmp_path.rglob('*')) == []
+
+    def test_part_of_an_operators_livekit_is_not_rooms(
+            self, monkeypatch, hosts_no_rooms):
+        """Central with only LIVEKIT_URL set: an operator's LiveKit needs the
+        url, the key and the secret, or no room token can be signed."""
+        monkeypatch.setenv('LIVEKIT_URL', 'wss://sfu.example')
+        from integrations.social.livekit_service import LiveKitService
+        assert LiveKitService.hosts_rooms() is False
+
+
 class TestADeployWithNoRooms:
     """Central / LIVEKIT_DISABLE: a call is p2p mesh, there is no room to
     voice into or hear from, so a missing rtc is not the cause of anything."""

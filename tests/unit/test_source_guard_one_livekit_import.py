@@ -19,7 +19,9 @@ THE RULE
     livekit_service.py, which keeps its error the same way.
 
 Checked by AST, so prose and docstrings that name the packages do not count.
-Tests are out of scope: they stand fakes in for livekit on purpose.
+Tests are out of scope: they stand fakes in for livekit on purpose.  It does
+not see a dynamic import (importlib.import_module('livekit.rtc'),
+__import__), and a file that does not parse is skipped.
 """
 import ast
 import os
