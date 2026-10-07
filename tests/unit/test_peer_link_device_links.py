@@ -120,11 +120,23 @@ def _install_real_verifier():
     _install_device_verifier()
 
 
-def _accept(hello, address='192.168.0.164:41234'):
+def _accept(hello, address='192.168.0.164:41234', ws=None):
     mgr = get_link_manager()
     with patch.object(PeerLink, 'accept', _accept_without_thread):
         return mgr.accept_inbound(str(hello.get('node_id', '')), address,
-                                  FakeWs(), hello)
+                                  ws if ws is not None else FakeWs(), hello)
+
+
+def _refusal(ws):
+    """The one frame a refused device HELLO is answered with, its signature
+    checked against the key it names (the phone checks it against the key it
+    remembers)."""
+    from security.node_integrity import verify_json_signature
+    assert len(ws.sent) == 1, ws.sent
+    frame = json.loads(ws.sent[0])
+    signature = frame.pop('signature')
+    assert verify_json_signature(frame['ed25519_public'], frame, signature)
+    return frame
 
 
 # ── the accept path ────────────────────────────────────────────────────────
@@ -168,8 +180,12 @@ def test_a_denied_phone_is_closed(phone):
 
 
 def test_no_verifier_installed_refuses_every_device_hello(phone):
+    """Refused, and told only that this desktop cannot admit devices now --
+    not which of its own parts failed."""
     _allow(phone)
-    assert _accept(_hello(phone, phone.token())) is None
+    ws = FakeWs()
+    assert _accept(_hello(phone, phone.token()), ws=ws) is None
+    assert _refusal(ws)['reason'] == 'unavailable'
 
 
 def test_a_token_for_another_key_than_the_sockets_is_closed(phone):
@@ -567,6 +583,52 @@ def test_a_sealed_token_that_does_not_open_here_is_refused(phone):
         assert _accept(_hello(phone, x25519_hex=pub, sealed=sealed)) is None
     assert asked_as_node == [], "a seal that does not open fell through to the node path"
     assert get_link_manager()._links == {}
+
+
+def test_a_seal_that_does_not_open_is_answered_with_this_desktops_key(phone):
+    """A phone that sealed to a key this desktop no longer holds (its key file
+    was replaced) is told so, under this desktop's signature, with the key to
+    seal to: it re-seals at once instead of re-dialling into silence."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives import serialization as ser
+    from security.channel_encryption import get_x25519_public_hex
+    from security.node_integrity import get_public_key_hex
+    _allow(phone)
+    _install_real_verifier()
+    stale = X25519PrivateKey.generate().public_key().public_bytes(
+        ser.Encoding.Raw, ser.PublicFormat.Raw).hex()
+    pub, sealed = _sealed_to(stale, phone.token())
+    hello = _hello(phone, x25519_hex=pub, sealed=sealed)
+    ws = FakeWs()
+    assert _accept(hello, ws=ws) is None
+    refusal = _refusal(ws)
+    assert refusal['type'] == 'hello_refused'
+    assert refusal['reason'] == 'seal_not_opened'
+    assert refusal['x25519_public'] == get_x25519_public_hex()
+    assert refusal['ed25519_public'] == get_public_key_hex()
+    # Bound to the HELLO it answers: one replayed into another dial is not
+    # that dial's answer, and the phone ignores it.
+    assert refusal['answers'] == hello['signature']
+
+
+def test_a_phone_the_owner_has_not_allowed_hears_why(phone):
+    """On the relay the phone has no HTTP call to the desktop to learn its
+    state from: the refused HELLO itself says it is waiting for the owner."""
+    _install_real_verifier()
+    ws = FakeWs()
+    assert _accept(_hello(phone, phone.token()), ws=ws) is None
+    assert _refusal(ws)['reason'] == 'pending'
+
+
+def test_a_refused_node_hello_is_not_answered(phone, monkeypatch):
+    """The refusal is a phone's: a node's HELLO refused under hard
+    enforcement closes as before, unanswered."""
+    monkeypatch.setattr(link_mod, '_enforcement_mode', lambda: 'hard')
+    hello = _hello(phone, trust='peer')
+    hello.pop('signature')
+    ws = FakeWs()
+    assert _accept(hello, ws=ws) is None
+    assert ws.sent == []
 
 
 def test_a_sealed_phone_is_bounded_by_its_owners_grant_not_the_node_budget(phone):

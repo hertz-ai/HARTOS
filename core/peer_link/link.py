@@ -251,6 +251,19 @@ def session_key_from(our_private, peer_public_hex: str) -> bytes:
 SEALED_DEVICE_TOKEN = 'device_token_sealed'
 
 
+#: What a refused device HELLO is answered with, before the socket closes
+#: (PeerLink._refuse_device): the reason and the refused HELLO's signature
+#: ('answers'), under this node's signature and with its keys, the shape of a
+#: hello_ack.  On the relay a phone has no HTTP call
+#: to the desktop to learn its state from, so without this every refusal was
+#: a 20-second wait for an ack that never came, and a phone whose seal no
+#: longer opened re-dialled into that silence forever.
+HELLO_REFUSED = 'hello_refused'
+#: The reason a seal does not open here: the frame names this node's X25519
+#: key, and a phone that pinned this node's Ed25519 key re-seals to it.
+SEAL_NOT_OPENED = 'seal_not_opened'
+
+
 def hello_names_device(hello: dict) -> bool:
     """Does this HELLO come from a phone: a device token, clear or sealed?"""
     return bool(hello.get('device_token') or hello.get(SEALED_DEVICE_TOKEN))
@@ -882,10 +895,11 @@ class PeerLink:
                 hello_data[SEALED_DEVICE_TOKEN], self.peer_x25519_public)
             if not device_token:
                 logger.warning("Device HELLO refused: its sealed token does not open here")
-                return False
+                return self._refuse_device(SEAL_NOT_OPENED, peer_sig)
         if device_token:
-            if not self._admit_device(peer_ed25519, peer_sig, str(device_token)):
-                return False
+            refusal = self._device_refusal(peer_ed25519, peer_sig, str(device_token))
+            if refusal:
+                return self._refuse_device(refusal, peer_sig)
         elif not self._decide_node_trust(hello_data, peer_ed25519):
             return False
 
@@ -928,7 +942,7 @@ class PeerLink:
         refuses THIS attempt -- which is the whole point, since nothing has
         been proved -- but by then the ask is filed and the card is in front
         of them, so an Allow admits the peer on its next try.  That is the
-        device path's behaviour (``_admit_device`` -> 'pending' -> ask ->
+        device path's behaviour (``_device_refusal`` -> 'pending' -> ask ->
         refuse -> granted -> admitted), and these two refusals sit in the
         same function; only one of them used to speak.
 
@@ -961,39 +975,68 @@ class PeerLink:
             f"enforcement); the owner has been asked and can admit it.")
         return False
 
-    def _admit_device(self, peer_ed25519: str, peer_sig: str, device_token: str) -> bool:
+    def _device_refusal(self, peer_ed25519: str, peer_sig: str, device_token: str) -> str:
         """The verifier's word on a device HELLO (HARTOS #111): 'ok' for the
         key that signed the HELLO opens a SAME_USER link of kind 'device' for
-        the token's user; anything else, or no verifier, refuses."""
+        the token's user and returns ''; anything else, or no verifier,
+        returns why it is refused (the verifier's own status where it gave
+        one: 'pending', 'denied', 'invalid'; 'unavailable' when this node
+        cannot verify a device now, whichever of its parts failed)."""
         if not (peer_ed25519 and peer_sig):
             logger.warning("Device HELLO without a signed key refused")
-            return False
+            return 'unsigned'
         if _DEVICE_VERIFIER is None:
             logger.warning("Device HELLO refused: no device verifier installed")
-            return False
+            return 'unavailable'
         try:
             verdict = _DEVICE_VERIFIER(device_token, self.address) or {}
         except Exception as e:
             logger.warning(f"Device verifier failed; refusing: {e}")
-            return False
+            return 'unavailable'
         if verdict.get('status') != 'ok':
-            logger.info(f"Device HELLO refused: {verdict.get('status', 'invalid')}")
-            return False
+            status = str(verdict.get('status') or 'invalid')
+            logger.info(f"Device HELLO refused: {status}")
+            return status
         if str(verdict.get('public_key', '')).lower() != str(peer_ed25519).lower():
             logger.warning("Device HELLO refused: token key is not the socket's key")
-            return False
+            return 'key_mismatch'
         user_id = str((verdict.get('payload') or {}).get('user_id') or '')
         if not user_id:
             logger.warning("Device HELLO refused: token names no user")
-            return False
+            return 'no_user'
         self.kind = 'device'
         self.user_id = user_id
         if verdict.get('peer_id'):
             self.peer_id = str(verdict['peer_id'])
         if not self.set_trust(TrustLevel.SAME_USER):
             logger.warning("Trust ratchet rejected SAME_USER for a device (should not happen)")
-            return False
-        return True
+            return 'trust'
+        return ''
+
+    def _refuse_device(self, reason: str, hello_signature: str) -> bool:
+        """Answer a refused device HELLO (HELLO_REFUSED) before the socket
+        closes, signed like a hello_ack and naming this node's keys, so the
+        phone hears why instead of waiting out its ack timeout.  'answers'
+        is the refused HELLO's own signature: on the relay anyone in the realm
+        can read a conversation, and a refusal replayed into another dial is
+        not that dial's answer (the phone checks).  Returns False, the
+        refusal, whether or not the answer could be sent."""
+        try:
+            from security.node_integrity import get_public_key_hex, sign_json_payload
+            from security.channel_encryption import get_x25519_public_hex
+            frame = {
+                'type': HELLO_REFUSED,
+                'reason': reason,
+                'answers': str(hello_signature or ''),
+                'ed25519_public': get_public_key_hex(),
+                'x25519_public': get_x25519_public_hex(),
+                'timestamp': time.time(),
+            }
+            frame['signature'] = sign_json_payload(frame)
+            self._ws_send(json.dumps(frame, separators=(',', ':')).encode('utf-8'))
+        except Exception as e:
+            logger.warning(f"Device HELLO refused ({reason}); the refusal was not sent: {e}")
+        return False
 
     def _decide_node_trust(self, hello_data: dict, peer_ed25519: str) -> bool:
         """A node's HELLO: trust decided locally, then its pre-trust contract."""
