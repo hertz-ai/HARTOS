@@ -36,7 +36,9 @@ class DataClass:
 #: to a person's own phone for its API requests and nothing else, because
 #: embedded nodes act on 'device_control' frames on that same channel.  On a
 #: typed channel a device's frame must also be a request (link.py), so the
-#: work it starts has someone waiting for the answer.  link.py drops what a
+#: work it starts has someone waiting for the answer -- except a type the
+#: channel names in DEVICE_UNASKED_TYPES_KEY (a stream's bytes and close once
+#: a request has opened it, 'tunnel').  link.py drops what a
 #: device sends elsewhere; link_manager.broadcast/collect never deliver
 #: elsewhere.
 DEVICE_POLICY_KEY = 'device'

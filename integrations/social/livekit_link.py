@@ -55,6 +55,7 @@ import time
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlsplit
 
+from core.auth_local import _is_loopback
 from core.peer_link.channels import TUNNEL_CLOSE, TUNNEL_DATA, TUNNEL_OPEN
 
 logger = logging.getLogger('hevolve_social')
@@ -79,7 +80,6 @@ _IO_TIMEOUT_S = 5
 _ANSWER_TIMEOUT_S = 10
 #: How often the writer, idle, looks whether its link is still there.
 _WRITER_POLL_S = 1.0
-_LOOPBACK = ('127.0.0.1', '::1', 'localhost')
 #: The first request on a tunnel: a GET of LiveKit's signal path.
 _SIGNAL_REQUEST = re.compile(rb'GET /rtc(?:[/?][^ ]*)? HTTP/1\.[01]\r?')
 #: How much of the first request line is read before it must have ended.
@@ -110,7 +110,7 @@ def signal_address() -> Optional[Tuple[str, int]]:
     url = get_livekit_url()
     parts = urlsplit(url)
     host = parts.hostname or ''
-    if host not in _LOOPBACK:
+    if not _is_loopback(host):
         return None
     try:
         port = parts.port or (443 if parts.scheme in ('wss', 'https') else 80)
@@ -368,14 +368,11 @@ def _open(link, tid: str) -> dict:
 def _device_link(peer_id: str):
     try:
         from core.peer_link.link_manager import get_link_manager
-        link = get_link_manager().get_link(peer_id)
+        return get_link_manager().get_device_link(peer_id)
     except Exception as e:
         logger.warning("LiveKit tunnel frame from %s unanswered: link lookup failed: %s",
                        peer_id, e)
         return None
-    if link is None or link.kind != 'device' or not link.user_id:
-        return None
-    return link
 
 
 def handle_tunnel_frame(channel: str, data, peer_id: str) -> Optional[dict]:

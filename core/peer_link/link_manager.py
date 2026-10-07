@@ -144,6 +144,15 @@ class PeerLinkManager:
                 return link
             return None
 
+    def get_device_link(self, peer_id: str) -> Optional[PeerLink]:
+        """The live link to a person's own phone (kind 'device', with the
+        token's user), or None: the one lookup every handler that answers
+        only a phone uses (the mobile adapter, the LiveKit tunnel)."""
+        link = self.get_link(peer_id)
+        if link is None or link.kind != 'device' or not link.user_id:
+            return None
+        return link
+
     def has_link(self, peer_id: str) -> bool:
         """Check if an active link exists to a peer."""
         return self.get_link(peer_id) is not None

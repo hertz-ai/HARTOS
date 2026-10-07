@@ -134,12 +134,12 @@ def handle_api_request(channel: str, data: Any, peer_id: str) -> Optional[dict]:
         return None
     try:
         from core.peer_link.link_manager import get_link_manager
-        link = get_link_manager().get_link(peer_id)
+        link = get_link_manager().get_device_link(peer_id)
     except Exception as e:
         logger.warning("Device API call from %s unanswered: link lookup failed: %s",
                        peer_id, e)
         return None
-    if link is None or link.kind != 'device' or not link.user_id:
+    if link is None:
         return None
     try:
         return answer(link, data)

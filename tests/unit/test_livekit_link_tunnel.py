@@ -380,6 +380,21 @@ def test_no_tunnel_is_offered_where_livekit_is_not_on_this_loopback(monkeypatch,
     assert 'tunnel_open' not in get_link_manager().device_requests_answered()
 
 
+@pytest.mark.parametrize('url,address', [
+    ('ws://localhost:7880', ('127.0.0.1', 7880)),
+    ('ws://127.0.0.1:7881', ('127.0.0.1', 7881)),
+    ('ws://[::1]:7882', ('::1', 7882)),
+    ('ws://192.168.0.5:7880', None),
+    ('wss://sfu.example.org', None),
+])
+def test_the_signal_address_is_this_desktops_loopback_only(monkeypatch, url, address):
+    """Loopback is judged by core.auth_local's one test, so IPv6 loopback
+    counts and any LAN or remote host does not."""
+    from integrations.social import livekit_link
+    monkeypatch.setenv('LIVEKIT_URL', url)
+    assert livekit_link.signal_address() == address
+
+
 def test_a_bad_livekit_port_is_answered_not_left_hanging(monkeypatch, signal_port):
     """LIVEKIT_PORT unreadable after boot: the phone's open is refused with a
     reason, not left waiting on a handler that raised."""

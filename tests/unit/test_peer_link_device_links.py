@@ -241,6 +241,26 @@ def _device_link(phone):
     return _accept(_hello(phone, phone.token()))
 
 
+def test_get_device_link_names_only_a_live_device_link_with_a_user(phone):
+    """The one lookup the handlers that answer only a phone share (the mobile
+    adapter, the LiveKit tunnel): a live device link of a user -- never a
+    node, a device link with no user, or one that dropped."""
+    mgr = get_link_manager()
+    node = PeerLink('node-7', '10.0.0.7:6777', TrustLevel.PEER)
+    node._state = LinkState.CONNECTED
+    node.user_id = OWNER        # a node is never a phone, whatever it carries
+    mgr._links['node-7'] = node
+    device = _device_link(phone)
+    assert mgr.get_device_link(device.peer_id) is device
+    assert mgr.get_device_link('node-7') is None
+    assert mgr.get_device_link('nobody') is None
+    device.user_id = ''
+    assert mgr.get_device_link(device.peer_id) is None
+    device.user_id = '40021'
+    device._state = LinkState.DISCONNECTED
+    assert mgr.get_device_link(device.peer_id) is None
+
+
 def test_the_channel_policy_opens_only_control_and_events():
     assert device_may_send('control') and device_may_receive('control')
     assert device_may_receive('events') and not device_may_send('events')
