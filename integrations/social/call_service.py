@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -323,16 +324,22 @@ class CallService:
             raise CallError("only the agent's owner can grant join")
 
         # Existing active grant? Update it in place.  It is then the
-        # granter's: the machine owner changing a grant its author made makes
-        # it theirs, and attach_agent runs the call as the grant's owner.
+        # updater's (attach_agent runs the call as the grant's owner), so the
+        # machine owner changing a grant its author made makes it theirs --
+        # and on their machine nobody else changes one they made.  (The first
+        # granter of a grant someone else has updated can no longer revoke it.)
         existing = db.execute(text(
-            "SELECT id FROM agent_join_grants "
+            "SELECT id, owner_id FROM agent_join_grants "
             "WHERE agent_id = :aid AND parent_kind = :pk "
             "AND parent_id = :pid AND revoked_at IS NULL"),
             {'aid': agent_id, 'pk': parent_kind, 'pid': parent_id}
         ).fetchone()
         scope_json = json.dumps(scope or {})
         if existing is not None:
+            if (machine_owner and str(existing[1]) == machine_owner
+                    and str(owner_id) != machine_owner):
+                raise CallError(
+                    "this machine's owner set this grant; only they change it")
             db.execute(text(
                 "UPDATE agent_join_grants SET scope = :s, owner_id = :oid "
                 "WHERE id = :id"),
@@ -507,11 +514,19 @@ def _is_parent_member(db, parent_kind: str, parent_id: str,
 def _machine_owner() -> Optional[str]:
     """Who owns the machine this node runs on, where one person does: on a
     flat node, HEVOLVE_OWNER_USER_ID as every owner gate reads it
-    (capability_setup.setup_owner).  None on a regional or central node,
-    which serves many people -- Nunba exports the variable on every tier,
-    so its presence says nothing about whose machine it is."""
+    (capability_setup.setup_owner).  None on a node that serves many people
+    -- Nunba exports the variable on every tier, so its presence says
+    nothing about whose machine it is.
+
+    Flat means flat both as claimed and as proven.  The claim
+    (HEVOLVE_NODE_TIER) withholds the right: the product's own promotions
+    set 'regional' with no certificate and leave an upgraded central with
+    no key, and get_node_tier, which asks what a node has PROVEN, answers
+    'flat' for both.  The proof catches the converse, a node promoted to
+    central by its key with no claim set."""
     from security.key_delegation import get_node_tier
-    if get_node_tier() != 'flat':
+    claimed = (os.environ.get('HEVOLVE_NODE_TIER') or 'flat').strip().lower()
+    if claimed != 'flat' or get_node_tier() != 'flat':
         return None
     from integrations.agent_engine.capability_setup import setup_owner
     return setup_owner()

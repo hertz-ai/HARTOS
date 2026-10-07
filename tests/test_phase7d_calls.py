@@ -333,6 +333,61 @@ def test_on_a_regional_node_the_machine_owner_variable_grants_nothing(
                                 scope={'can_voice': True})
 
 
+@pytest.mark.parametrize('claimed_tier', ['regional', 'central', 'local'])
+def test_a_node_that_claims_a_shared_tier_gives_the_machine_owner_nothing(
+        fresh_db, monkeypatch, claimed_tier):
+    """The tier a node claims is what withholds the right: Nunba's own
+    promotion sets HEVOLVE_NODE_TIER=regional with no certificate, and a
+    desktop upgraded to central keeps no key, and get_node_tier answers
+    'flat' for both.  'local' (a node under a regional host) keeps the old
+    rule too.  No key material is involved: the claim alone refuses."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', claimed_tier)
+    monkeypatch.delenv('HEVOLVE_REGIONAL_CERT', raising=False)
+    from integrations.social.call_service import CallService, CallError
+    with pytest.raises(CallError):
+        CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                scope={'can_voice': True})
+    grant = CallService.grant_agent(db, agent.id, author.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    with pytest.raises(CallError):
+        CallService.revoke_agent(db, grant['id'], me.id)
+
+
+def test_a_node_its_key_made_central_gives_the_machine_owner_nothing(
+        fresh_db, monkeypatch):
+    """Claiming nothing (flat) is not enough when the node has proven a
+    shared tier: get_node_tier promotes a key-holding node to central.
+    Stood in for here; no key material is involved."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from security import key_delegation
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
+    from integrations.social.call_service import CallService, CallError
+    with pytest.raises(CallError):
+        CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                scope={'can_voice': True})
+
+
+def test_the_author_cannot_take_back_a_grant_the_machine_owner_made(
+        fresh_db, monkeypatch):
+    """On the owner's machine the owner decides: once they set an agent's
+    grant, its author changing it would make the owner's calls run, and be
+    filed, as the author."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from integrations.social.call_service import CallService, CallError
+    mine = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                   scope={'can_voice': True})
+    with pytest.raises(CallError, match="machine's owner"):
+        CallService.grant_agent(db, agent.id, author.id, 'community', com.id,
+                                scope={'can_voice': True, 'can_screen': True})
+    kept = CallService.get_active_grant(db, agent.id, 'community', com.id)
+    assert kept['owner_id'] == me.id and kept['scope'] == {'can_voice': True}
+    assert kept['id'] == mine['id']
+
+
 def test_the_machine_owners_update_makes_the_grant_theirs(fresh_db, monkeypatch):
     """The author granted; the machine owner changes it: the grant is now
     the machine owner's, so the call it opens runs as them (the bridge is
