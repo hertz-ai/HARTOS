@@ -1566,6 +1566,10 @@ def test_a_call_turn_runs_the_agents_own_prompt_through_chat(
     assert body['media_mode'] == 'text'
     assert body['channel_context'] == {'source_kind': 'call',
                                        'source_id': 'call-7'}
+    # Someone speaking is a person's turn: it takes the model ahead of the
+    # daemons, and they yield to it (the one discriminator /chat applies).
+    from integrations.agent_engine.dispatch import is_genuine_user_request
+    assert is_genuine_user_request(body['request_id'])
     assert minted == [{'user_id': speaker.id, 'role': 'user'}]
     assert sent['headers'] == {'Authorization': 'Bearer t'}
     assert plain == [], 'the plain model never answered for the agent'

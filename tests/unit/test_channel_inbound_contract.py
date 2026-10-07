@@ -301,6 +301,7 @@ def test_run_turn_sends_the_whole_body_in_order_and_fields_win():
     with patch('integrations.channels.flask_integration.pooled_post', fake_post):
         fi.run_turn(7, 3, 'hello', channel_context={'channel': 'telegram'})
         fi.run_turn(7, 3, 'hello', create_agent=True, device_id='phone-2')
+    rids = [b.pop('request_id') for _, b in sent]
     assert [(u, list(b.items())) for u, b in sent] == [
         ('http://test-local/chat',
          [('user_id', 7), ('prompt_id', 3), ('prompt', 'hello'), ('text', 'hello'),
@@ -310,6 +311,21 @@ def test_run_turn_sends_the_whole_body_in_order_and_fields_win():
          [('user_id', 7), ('prompt_id', 3), ('prompt', 'hello'), ('text', 'hello'),
           ('create_agent', True), ('device_id', 'phone-2')]),
     ]
+    # A person on a channel is a person's turn, not background work: the
+    # one discriminator /chat applies reads the request id the turn carries.
+    from integrations.agent_engine.dispatch import is_genuine_user_request
+    assert all(is_genuine_user_request(rid) for rid in rids)
+
+
+def test_a_turn_that_names_its_own_request_id_keeps_it():
+    """core.chat_client passes an id another layer assigned through."""
+    fi = _bare_integration()
+    sent = []
+    with patch('integrations.channels.flask_integration.pooled_post',
+               lambda url, json=None, **k: sent.append(json) or Mock(
+                   status_code=200, json=lambda: {'response': 'ok'})):
+        fi.run_turn(7, 3, 'hello', request_id='tg-msg-42')
+    assert sent[0]['request_id'] == 'tg-msg-42'
 
 
 def test_a_chat_error_that_is_not_json_keeps_its_words(caplog):

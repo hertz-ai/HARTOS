@@ -52,8 +52,15 @@ def chat_turn_request(user_id, prompt_id, content: str,
 
     ``fields`` are the request's other /chat keys (create_agent,
     channel_context, media_mode, ...), added after the person, the agent
-    ``prompt_id`` and both request keys.  The headers carry the person's own
-    identity, minted with role 'user' by the one internal-auth helper
+    ``prompt_id`` and both request keys.  The body carries a request_id
+    (core.chat_client.normalize_chat_body: one a field names passes through,
+    else one is minted), so /chat takes it as a person's turn -- ahead of
+    the daemons, which yield to it -- and not as background work, which is
+    what a turn with no id is (dispatch.is_genuine_user_request; the steward
+    rule of 2026-08-09: a conversation-backed turn is priority).
+
+    The headers carry the person's own identity, minted with role 'user' by
+    the one internal-auth helper
     (agent_engine.dispatch._internal_auth_headers): /chat trusts the token
     over the body, so a default identity would put every person's turn in
     one shared agent session (its docstring has the 2026-08-06 incident), and
@@ -61,9 +68,11 @@ def chat_turn_request(user_id, prompt_id, content: str,
     no header is needed, or when minting fails (logged): central and regional
     then answer 401.
     """
+    from core.chat_client import normalize_chat_body
     payload = {"user_id": user_id, "prompt_id": prompt_id,
                **chat_request_fields(content)}
     payload.update(fields)
+    payload = normalize_chat_body(payload)
     try:
         from integrations.agent_engine.dispatch import _internal_auth_headers
         headers = _internal_auth_headers(user_id=str(user_id), role='user')
