@@ -1,9 +1,11 @@
 """whisper_tool.read_wav_f32 -- the one WAV reader -- reads what the engines
 write.  STT's own 16-bit PCM read as it always did; a TTS engine's float
-output (scipy.io.wavfile and soundfile write an IEEE-float WAV for a float
-array, plain or WAVE_FORMAT_EXTENSIBLE), which the stdlib ``wave`` module
-refuses with 'unknown format: 3', is read too: agent_voice_bridge speaks a
-call's reply from it (review of ca1de342a, finding 2)."""
+output, which the stdlib ``wave`` module refuses with 'unknown format: 3',
+is read too: agent_voice_bridge speaks a call's reply from it (review of
+ca1de342a, finding 2).  scipy.io.wavfile (pocket_tts_tool, gpu_worker's
+numpy_24k) and torchaudio.save (chatterbox_tool, cosyvoice_tool) write an
+IEEE-float WAV for a float array; soundfile does only when asked for
+subtype FLOAT (its WAV default is PCM_16), plain or WAVE_FORMAT_EXTENSIBLE."""
 import struct
 import wave
 
@@ -68,6 +70,36 @@ def test_a_float_wav_cut_off_mid_frame_reads_its_whole_frames(tmp_path):
     (tmp_path / 'b.wav').write_bytes(blob[:-2])  # half of the last sample
     _, data = whisper_tool.read_wav_f32(str(tmp_path / 'b.wav'))
     assert list(data) == SAMPLES[:-1]
+
+
+def _float_wav(chunks=b'', samples=SAMPLES):
+    """A 32-bit float WAV built by hand: fmt, then ``chunks``, then data."""
+    fmt = struct.pack('<HHIIHH', 3, 1, 24000, 96000, 4, 32)
+    data = np.array(samples, dtype='<f4').tobytes()
+    body = (b'WAVE' + b'fmt ' + struct.pack('<I', len(fmt)) + fmt + chunks
+            + b'data' + struct.pack('<I', len(data)) + data)
+    return b'RIFF' + struct.pack('<I', len(body)) + body
+
+
+def test_an_odd_sized_chunk_before_the_data_is_stepped_over(tmp_path):
+    """RIFF chunks are word-aligned: an odd-sized chunk (a LIST of three
+    bytes here) is followed by one pad byte before the next chunk."""
+    (tmp_path / 'a.wav').write_bytes(
+        _float_wav(chunks=b'LIST' + struct.pack('<I', 3) + b'abc' + b'\x00'))
+    _, data = whisper_tool.read_wav_f32(str(tmp_path / 'a.wav'))
+    assert list(data) == SAMPLES
+
+
+def test_a_float_tag_at_a_float_wavs_impossible_depth_is_refused(tmp_path):
+    """IEEE float is 32 or 64 bit; a header claiming 16 is not read as
+    either."""
+    fmt = struct.pack('<HHIIHH', 3, 1, 24000, 48000, 2, 16)
+    data = b'\x00\x01' * 4
+    body = (b'WAVE' + b'fmt ' + struct.pack('<I', len(fmt)) + fmt
+            + b'data' + struct.pack('<I', len(data)) + data)
+    (tmp_path / 'b.wav').write_bytes(b'RIFF' + struct.pack('<I', len(body)) + body)
+    with pytest.raises(ValueError, match='unsupported WAV format 3 at 16 bits'):
+        whisper_tool.read_wav_f32(str(tmp_path / 'b.wav'))
 
 
 def test_a_file_that_is_not_a_float_wav_says_what_it_is(tmp_path):

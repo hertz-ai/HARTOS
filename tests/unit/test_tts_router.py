@@ -286,7 +286,12 @@ class TestACallIsSpokenLive:
                         'sample_rate': 24000}
             return {'error': 'refused by the test'}
 
-        with patch.object(tts_router, '_get_gpu_info',
+        # The engines as shipped: the registry is a module global a catalogue
+        # populate rewrites in place, and a test that ran one first must not
+        # change which voice a call gets here.
+        with patch.dict(tts_router.ENGINE_REGISTRY, tts_router._SEED_SPECS,
+                        clear=True), \
+             patch.object(tts_router, '_get_gpu_info',
                           return_value={'cuda_available': False}), \
              patch.object(tts_router, '_get_compute_policy',
                           return_value={'compute_policy': policy}), \

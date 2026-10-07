@@ -498,7 +498,8 @@ class AgentBridgeWorker:
         if not pub.push_pcm(pcm, src_rate=rate, src_channels=channels):
             logger.warning(
                 "AgentBridgeWorker._publish_audio_for: the room did not take "
-                "the reply's audio (publisher stopped or not connected) — "
+                "the reply's audio (publisher stopped or not yet connected, or "
+                "the audio could not be converted to its format) — "
                 "call=%s agent=%s text=%r",
                 self.call_id, self.agent_id, text[:120])
 

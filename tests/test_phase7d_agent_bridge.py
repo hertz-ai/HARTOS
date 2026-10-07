@@ -227,6 +227,20 @@ def test_a_reply_an_engine_wrote_as_float_is_voiced(monkeypatch, tmp_path, dtype
         0, 8192, -16384, 32767, -32768, 32767]
 
 
+def test_a_float_sample_lands_on_the_nearest_16_bit_step(monkeypatch, tmp_path):
+    """1.7 and -1.7 sixteen-bit steps are 2 and -2, not cut toward zero."""
+    import numpy as np
+    import scipy.io.wavfile
+    from integrations.social.agent_voice_bridge import AgentBridgeWorker
+    step = 1.0 / 32768
+    scipy.io.wavfile.write(str(tmp_path / 'reply.wav'), 24000,
+                           np.array([1.7 * step, -1.7 * step], dtype='float32'))
+    _router_and_pocket(monkeypatch, _router_result(tmp_path / 'reply.wav'))
+    worker = AgentBridgeWorker('call-1', 'agent-1', 'owner-1', {})
+    pcm, _, _ = worker._synthesize_pcm('hi')
+    assert list(np.frombuffer(pcm, dtype='<i2')) == [2, -2]
+
+
 def test_a_pcm16_reply_reaches_the_room_sample_for_sample(monkeypatch, tmp_path):
     """Reading through floats must not move a 16-bit sample, full range."""
     import struct

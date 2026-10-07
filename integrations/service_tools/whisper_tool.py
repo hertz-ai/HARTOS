@@ -896,10 +896,12 @@ def read_wav_f32(audio_path: str):
     numpy — no libsndfile / ffmpeg native dependency — so it behaves
     identically in the frozen bundle on Windows, macOS and Linux.
 
-    Also the one reader for a TTS engine's output (agent_voice_bridge speaks
-    it into a call).  Engines that write a float tensor write an IEEE-float
-    WAV (scipy.io.wavfile in pocket_tts_tool, gpu_worker's numpy_24k), which
-    ``wave`` refuses with 'unknown format: 3'; _read_wav_float reads those.
+    Also the reader for a TTS engine's output (agent_voice_bridge speaks it
+    into a call).  Engines that write a float tensor write an IEEE-float WAV
+    (scipy.io.wavfile in pocket_tts_tool and gpu_worker's numpy_24k,
+    torchaudio.save in chatterbox_tool and cosyvoice_tool), which ``wave``
+    refuses with 'unknown format: 3'; _read_wav_float reads those.
+    (gpu_worker still keeps its own scipy fallback for a file's duration.)
     """
     import wave
     import numpy as np
