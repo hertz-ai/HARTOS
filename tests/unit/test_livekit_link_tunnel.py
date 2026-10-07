@@ -63,6 +63,7 @@ class SignalPort:
         self.answering.set()
         self.reading = threading.Event()
         self.reading.set()
+        self.upgrade_answer = UPGRADED
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self):
@@ -96,7 +97,7 @@ class SignalPort:
                 upgraded = b'\r\nupgrade: websocket' in head.lower()
                 self.answering.wait(WAIT_S)
                 if upgraded:
-                    conn.sendall(UPGRADED)
+                    conn.sendall(self.upgrade_answer)
                 else:
                     conn.sendall(REFUSAL_HEAD)
                     time.sleep(0.1)
@@ -246,6 +247,22 @@ def test_bytes_sent_behind_the_upgrade_request_reach_livekit_once_it_upgrades(si
     _send(ws, b'next')
     assert _received(ws, 4) == b'next'
     assert signal_port.request_lines() == [UPGRADE_REQUEST.split(b'\r\n', 1)[0]]
+
+
+def test_a_101_that_is_not_a_websocket_upgrade_releases_nothing(signal_port):
+    """Only a WebSocket upgrade opens the tunnel: a 101 to another protocol
+    (h2c) would let the held bytes through raw to the loopback port, so it
+    ends the tunnel like any other answer and they are never sent."""
+    h2c = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n'
+    signal_port.upgrade_answer = h2c
+    link, ws = _link()
+    _open(ws)
+    conn = signal_port.accepted.get(timeout=WAIT_S)
+    _send(ws, UPGRADE_REQUEST + b'held bytes')
+    got, close = _received_until_close(ws)
+    assert got == h2c
+    assert close == {'type': 'tunnel_close', 'id': 't1', 'reason': 'not_upgraded'}
+    assert signal_port.ended.get(timeout=WAIT_S) is conn
 
 
 def test_a_signal_request_livekit_refuses_ends_the_tunnel_before_another_request(signal_port):

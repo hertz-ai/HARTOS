@@ -27,13 +27,18 @@ The tunnel carries LiveKit signalling and nothing else: its first request
 must be a GET of LiveKit's signal path (/rtc -- the WebSocket, and the
 SDK's /rtc/validate), or the tunnel is closed ('not_signalling') before a
 byte reaches LiveKit -- so a phone cannot speak LiveKit's server API through
-it.  Only that first request is sent until LiveKit has answered it: an
-upgrade (101) opens the WebSocket and what the phone sent after the request
-follows; any other answer (no Upgrade header, a bad token -- LiveKit keeps
-such a connection open for another request) reaches the phone in full and
-the tunnel closes ('not_upgraded'), so no second request is ever sent.  A
-tunnel whose link is gone (dropped, pruned idle, replaced by the phone's
-redial) closes within a second.
+it.  Only that first request is sent until LiveKit has answered it: a
+WebSocket upgrade (101 with Upgrade: websocket) opens the WebSocket and what
+the phone sent after the request follows; any other answer (no Upgrade
+header, a bad token -- LiveKit keeps such a connection open for another
+request -- or a 101 to another protocol) reaches the phone, its body in full
+when it names a Content-Length (LiveKit's do), and the tunnel closes
+('not_upgraded'), so no second request is ever sent.  A tunnel whose link is
+gone (dropped, pruned idle, replaced by the phone's redial) closes, at the
+latest when the phone next opens one or within _WRITER_POLL_S; one whose
+LiveKit stops reading closes after _IO_TIMEOUT_S ('livekit_stalled'), and
+one whose first request LiveKit leaves unanswered after _ANSWER_TIMEOUT_S
+('no_answer').
 
 Relay links are end-to-end encrypted (relay.py), so the relay reads none of
 it.  Media does not ride the tunnel: LiveKit's ICE candidates name this
@@ -85,6 +90,9 @@ _HEAD_MAX = 16 * 1024
 #: Where an HTTP head ends.
 _HEAD_END = re.compile(rb'\r?\n\r?\n')
 _STATUS = re.compile(rb'HTTP/1\.[01] (\d{3})')
+#: The header that makes a 101 a WebSocket upgrade (and not h2c or another
+#: protocol, whose bytes would then pass raw to the loopback port).
+_WEBSOCKET_UPGRADE = re.compile(rb'(?im)^upgrade:[ \t]*websocket[ \t]*\r?$')
 _CONTENT_LENGTH = re.compile(rb'(?im)^content-length:[ \t]*(\d+)[ \t]*\r?$')
 
 #: (peer_id, tunnel id) -> its tunnel; None while its socket is connecting.
@@ -192,9 +200,10 @@ class _Tunnel:
 
     def _judge(self, data: bytes) -> Optional[str]:
         """LiveKit's bytes, as they reach the phone: why to close now, if so.
-        An upgrade (101) sends the phone's held bytes on and lets the rest
-        through; any other answer closes the tunnel once it reached the
-        phone in full."""
+        A WebSocket upgrade (101, Upgrade: websocket) sends the phone's held
+        bytes on and lets the rest through; any other answer closes the
+        tunnel once it reached the phone -- its body in full when it names a
+        Content-Length, else once its head has."""
         with self._gate:
             if self._answer is None:
                 if self._held is None:
@@ -208,7 +217,7 @@ class _Tunnel:
             head, rest = self._answer[:end.start()], self._answer[end.end():]
             self._answer = None
             status = _STATUS.match(head)
-            if status and status.group(1) == b'101':
+            if status and status.group(1) == b'101' and _WEBSOCKET_UPGRADE.search(head):
                 held, self._held = self._held, None
                 return self._send_to_livekit(held) if held else None
             length = _CONTENT_LENGTH.search(head)
