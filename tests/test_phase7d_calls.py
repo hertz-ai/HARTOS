@@ -666,6 +666,21 @@ def test_decide_media_mode_agent_always_livekit(monkeypatch):
     assert _decide_media_mode(sess, [], is_agent=True) == 'livekit'
 
 
+def test_decide_media_mode_a_person_calling_an_agent_gets_livekit(monkeypatch):
+    """A person's token for a call an agent is in: livekit.  The agent is
+    present through its AgentVoiceBridge, which has no media path but the
+    SFU room -- on a mesh it can neither hear the person nor speak."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    parts = [{'user_id': 'agent-7', 'left_at': None, 'agent_kind': 'agent',
+              'device_kind': 'agent_bridge'}]
+    assert _decide_media_mode({'kind': 'voice'}, parts, is_agent=False) == 'livekit'
+    # An agent that has left the call no longer holds it on the SFU.
+    gone = [dict(parts[0], left_at='2026-10-07 10:00:00')]
+    assert _decide_media_mode({'kind': 'voice'}, gone, is_agent=False) == 'p2p_mesh'
+
+
 def test_decide_media_mode_screen_share_always_livekit(monkeypatch):
     """screen_share / mixed kinds → livekit regardless of count."""
     monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)

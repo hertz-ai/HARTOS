@@ -137,13 +137,16 @@ def _decide_media_mode(sess, participants, *, is_agent: bool) -> str:
     response telling the client to do its own WebRTC handshake over
     the existing PeerLink DISPATCH channel.
     """
-    if is_agent:
+    # Count *active* participants — left_at IS NULL.
+    active = [p for p in (participants or []) if not p.get('left_at')]
+    # An agent in the call -- the caller, or an agent_bridge already in it --
+    # is there only through the SFU room (AgentVoiceBridge), so the call is
+    # LiveKit's: on a mesh the agent could neither hear nor speak.
+    if is_agent or any(p.get('device_kind') == 'agent_bridge' for p in active):
         return 'livekit'
     kind = (sess or {}).get('kind') or 'voice'
     if kind in ('screen_share', 'mixed'):
         return 'livekit'
-    # Count *active* participants — left_at IS NULL.
-    active = [p for p in (participants or []) if not p.get('left_at')]
     # +1 for the caller about to join, if not already in the list.
     caller_id = getattr(g.user, 'id', None)
     if caller_id and not any(p.get('user_id') == caller_id for p in active):
