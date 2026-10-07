@@ -446,6 +446,61 @@ def dispatch_via_chat(agent_id: str, rewritten_prompt: str,
     return reply.strip()
 
 
+def _call_turn_reply(agent_id: str, prompt: str, context: Dict) -> Optional[str]:
+    """What the agent answers to words spoken to it in a call, or None (with
+    a warning naming the agent) when it cannot be asked.
+
+    A call turn is a turn of the agent itself (owner rule: a turn from the
+    phone is agentic, CREATE/REUSE): this node's own /chat with the agent's
+    prompt_id, as the person who spoke, sent through the contract every turn
+    sent for a person uses (channels.chat_contract).  The agent is a trained
+    one: its User row keeps '{prompt_id}_{flow_id}' (agent_bridge).  /chat is
+    asked for text only (media_mode 'text'); the call's bridge speaks the
+    reply into the room, so /chat and Nunba's /chat must not voice it too.
+    create_agent is False: words in a call never build an agent.
+    """
+    from integrations.google_a2a.dynamic_agent_registry import prompt_id_of
+    try:
+        from integrations.social.models import User, db_session
+        with db_session() as db:
+            row = db.query(User.agent_id).filter(User.id == agent_id).first()
+        trained_id = row[0] if row else None
+    except Exception as e:
+        logger.warning("dispatch_to_agent: agent=%s call turn: its trained id "
+                       "could not be read (%s)", agent_id, e)
+        return None
+    prompt_id = prompt_id_of(trained_id)
+    if prompt_id is None:
+        logger.warning("dispatch_to_agent: agent=%s has no trained prompt "
+                       "(agent_id %r); its call turn is answered by the plain "
+                       "model", agent_id, trained_id)
+        return None
+    speaker = context.get('author_id') or context.get('owner_id')
+    from core.http_pool import pooled_post
+    from core.port_registry import get_local_backend_url
+    from integrations.channels.chat_contract import (
+        agent_turn_timeout, chat_reply, chat_turn_request, chat_turn_result)
+    payload, headers = chat_turn_request(
+        speaker, prompt_id, prompt, create_agent=False, media_mode='text',
+        channel_context={'source_kind': 'call',
+                         'source_id': context.get('source_id')})
+    try:
+        response = pooled_post(get_local_backend_url() + '/chat', json=payload,
+                               headers=headers, timeout=agent_turn_timeout())
+        status, body = chat_turn_result(response)
+    except Exception as e:
+        logger.warning("dispatch_to_agent: agent=%s call turn: /chat not "
+                       "reached (%s)", agent_id, e)
+        return None
+    reply = chat_reply(body).strip() if status == 200 else ''
+    if not reply:
+        logger.warning("dispatch_to_agent: agent=%s call turn: /chat answered "
+                       "%s with no reply (%s)", agent_id, status,
+                       str(body.get('error') or sorted(body))[:200])
+        return None
+    return reply
+
+
 def _dispatch_to_agent_worker(agent_id: str, prompt: str, context: Dict):
     """Worker body: guardrails → LLM → guardrails → post as Comment.
 
@@ -503,7 +558,12 @@ def _dispatch_to_agent_worker(agent_id: str, prompt: str, context: Dict):
         os.environ.get('HEVOLVE_FLAG_DISPATCH_VIA_CHAT', '').strip().lower()
         in ('1', 'true', 'yes', 'on')
     )
-    if use_chat:
+    if (context or {}).get('source_kind') == 'call':
+        # A call turn is always the agent's own: _call_turn_reply.  When it
+        # cannot be asked (it says why) the plain model below answers, so the
+        # person in the call is not met with silence.
+        reply_text = _call_turn_reply(agent_id, rewritten, context or {})
+    elif use_chat:
         reply_text = dispatch_via_chat(agent_id, rewritten, context)
         if reply_text is None:
             logger.info(

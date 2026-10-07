@@ -1423,6 +1423,147 @@ def test_router_source_kind_call_enqueues_tts(clean_bridge_outbox,
     assert tts_outbox_depth('call-X', 'agent-99') == 0
 
 
+# ── A call turn is a turn of the agent: its own prompt through /chat ──────
+
+
+def _call_turn_rig(db, monkeypatch, chat_status=200, chat_body=None,
+                   trained_id='54_0'):
+    """A trained agent (agent_bridge.sync_trained_agents names its row
+    'agent_{prompt_id}_{flow_id}' and keeps '{prompt_id}_{flow_id}' as its
+    agent_id), the local /chat it reaches, and the plain model it must not
+    need.  Returns (agent, speaker, posts, plain_model_calls, minted)."""
+    from integrations.social.models import User
+    speaker, = _seed_users(db, 1)
+    agent = User(id=str(uuid.uuid4()), username=f'agent_{uuid.uuid4().hex[:6]}',
+                 display_name='Tutor', email=f'a_{uuid.uuid4().hex[:6]}@x.test',
+                 password_hash='x:y', user_type='agent', agent_id=trained_id)
+    db.add(agent)
+    db.commit()
+    posts, plain, minted = [], [], []
+
+    def fake_post(url, json=None, headers=None, timeout=None, **kw):
+        posts.append({'url': url, 'json': json, 'headers': headers,
+                      'timeout': timeout})
+        from unittest.mock import Mock
+        return Mock(status_code=chat_status,
+                    json=lambda: (chat_body if chat_body is not None
+                                  else {'response': 'Halves are two equal parts.'}),
+                    text='')
+
+    class _PlainModel:
+        def invoke(self, prompt):
+            plain.append(prompt)
+            return type('R', (), {'content': 'a plain answer'})()
+
+    def fake_mint(user_id='system_daemon', username=None, role='admin'):
+        minted.append({'user_id': user_id, 'role': role})
+        return {'Authorization': 'Bearer t'}
+
+    import core.http_pool
+    import core.port_registry
+    import core.safe_hartos_attr
+    from integrations.agent_engine import dispatch
+    from integrations.social import chat_messages
+    # The reply's transcript row is written by chat_messages' own background
+    # thread; left running it writes into this test's database while the
+    # fixture disposes it (an access violation in sqlite).  Not this test's
+    # concern: recorded, not run.
+    monkeypatch.setattr(chat_messages, 'persist_external_room_event',
+                        lambda **kw: None)
+    monkeypatch.setattr(core.http_pool, 'pooled_post', fake_post)
+    monkeypatch.setattr(core.port_registry, 'get_local_backend_url',
+                        lambda: 'http://this-node')
+    monkeypatch.setattr(dispatch, '_internal_auth_headers', fake_mint)
+    monkeypatch.setattr(core.safe_hartos_attr, 'safe_hartos_attr',
+                        lambda name: (lambda **kw: _PlainModel())
+                        if name == 'get_llm' else None)
+    monkeypatch.delenv('HEVOLVE_FLAG_DISPATCH_VIA_CHAT', raising=False)
+    return agent, speaker, posts, plain, minted
+
+
+def _speak_in_call(agent, speaker, words='teach me fractions', call_id='call-7'):
+    from integrations import agentic_router
+    agentic_router.dispatch_to_agent(
+        agent_id=agent.id, prompt=words, synchronous=True,
+        context={'source_kind': 'call', 'source_id': call_id,
+                 'author_id': speaker.id, 'owner_id': 'whoever-granted-it',
+                 'platform': 'livekit'})
+
+
+def test_a_call_turn_runs_the_agents_own_prompt_through_chat(
+        fresh_db, clean_bridge_outbox, monkeypatch):
+    """Owner rule: a turn from the phone is agentic (CREATE/REUSE).  The
+    agent answers as itself -- /chat with its prompt_id, as the person who
+    spoke -- and its reply is what the call hears; the bridge speaks it, so
+    /chat is asked for text only (media_mode='text': no second voice)."""
+    db, _ = fresh_db
+    agent, speaker, posts, plain, minted = _call_turn_rig(db, monkeypatch)
+    _speak_in_call(agent, speaker)
+
+    assert len(posts) == 1, 'the call turn reached the local /chat once'
+    sent = posts[0]
+    assert sent['url'] == 'http://this-node/chat'
+    body = sent['json']
+    assert str(body['prompt_id']) == '54'
+    assert body['user_id'] == speaker.id
+    assert body['prompt'] == body['text'] == 'teach me fractions'
+    assert body['create_agent'] is False
+    assert body['media_mode'] == 'text'
+    assert body['channel_context'] == {'source_kind': 'call',
+                                       'source_id': 'call-7'}
+    assert minted == [{'user_id': speaker.id, 'role': 'user'}]
+    assert sent['headers'] == {'Authorization': 'Bearer t'}
+    assert plain == [], 'the plain model never answered for the agent'
+    from integrations.social.agent_voice_bridge import dequeue_tts_text
+    spoken = [r['text'] for r in dequeue_tts_text('call-7', agent.id)]
+    assert spoken == ['Halves are two equal parts.']
+
+
+def test_the_bundled_desktops_chat_answer_is_read_too(
+        fresh_db, clean_bridge_outbox, monkeypatch):
+    """On a bundled desktop Nunba's /chat answers, under 'text'."""
+    db, _ = fresh_db
+    agent, speaker, posts, plain, _ = _call_turn_rig(
+        db, monkeypatch, chat_body={'text': 'From the desktop.'})
+    _speak_in_call(agent, speaker)
+    from integrations.social.agent_voice_bridge import dequeue_tts_text
+    assert [r['text'] for r in dequeue_tts_text('call-7', agent.id)] == [
+        'From the desktop.']
+    assert plain == []
+
+
+@pytest.mark.parametrize('trained_id', [None, '', 'skills_agent', 'x_y', 'abc_0'])
+def test_an_agent_with_no_trained_prompt_is_answered_by_the_plain_model_and_says_so(
+        fresh_db, clean_bridge_outbox, monkeypatch, caplog, trained_id):
+    db, _ = fresh_db
+    agent, speaker, posts, plain, _ = _call_turn_rig(
+        db, monkeypatch, trained_id=trained_id)
+    with caplog.at_level('WARNING'):
+        _speak_in_call(agent, speaker)
+    assert posts == []
+    assert plain == ['teach me fractions']
+    assert any(agent.id in r.getMessage() and r.levelname == 'WARNING'
+               for r in caplog.records)
+
+
+@pytest.mark.parametrize('status,body', [
+    (503, {'error': 'busy'}),
+    # A refusal is not the agent's answer, whatever key carries its words.
+    (503, {'response': 'Your local AI is busy with another task right now.'}),
+    (200, {'response': '   '})])
+def test_a_call_turn_chat_cannot_answer_falls_to_the_plain_model_and_says_so(
+        fresh_db, clean_bridge_outbox, monkeypatch, caplog, status, body):
+    db, _ = fresh_db
+    agent, speaker, posts, plain, _ = _call_turn_rig(
+        db, monkeypatch, chat_status=status, chat_body=body)
+    with caplog.at_level('WARNING'):
+        _speak_in_call(agent, speaker)
+    assert len(posts) == 1
+    assert plain == ['teach me fractions']
+    assert any(agent.id in r.getMessage() and r.levelname == 'WARNING'
+               for r in caplog.records)
+
+
 def test_decide_media_mode_excludes_left_participants(monkeypatch):
     """Active count uses left_at IS NULL — left rows don't count."""
     monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)

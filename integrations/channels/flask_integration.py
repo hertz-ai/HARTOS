@@ -256,56 +256,19 @@ class FlaskChannelIntegration:
         requests.Timeout and transport errors propagate: each caller tells
         its own user in its own way.
         """
-        from .chat_contract import agent_turn_timeout, chat_request_fields
-        payload = {
-            "user_id": user_id,
-            "prompt_id": prompt_id,
-            # Dual /chat contract (standalone HARTOS 'prompt' + bundled Nunba
-            # 'text') — single source in chat_contract, shared with
-            # SelfChatHandler so neither inbound path drifts.
-            **chat_request_fields(content),
-            "create_agent": self.create_mode,
-            "device_id": self._device_id,
-        }
-        payload.update(fields)
-
-        # Authenticate the internal hop to /chat.
-        #
-        # This call had no headers at all. On central/regional tiers
-        # security/middleware.py Gate 2 rejects an unauthenticated
-        # internal /chat POST with 401 "Authentication required (Bearer
-        # token)", so EVERY inbound channel message -- Telegram, Discord,
-        # WhatsApp, Slack -- got back "Sorry, I encountered an error
-        # processing your request." A connected channel looked wired up
-        # and answered every message with an apology.
-        #
-        # Reusing agent_engine.dispatch._internal_auth_headers rather than
-        # minting a header here: it already solves exactly this (its
-        # docstring records the same 401 silently breaking the outreach
-        # dispatch path from 2026-03-14). One implementation, so a future
-        # change to internal auth cannot fix one caller and miss the
-        # other -- which is precisely how this bug survived. Imported
-        # lazily to keep channels -> agent_engine out of module import
-        # order. Returns None on flat tier, where no header is needed.
-        # 2026-08-06 fix: pass the REAL resolved user_id here, not the
-        # function's 'system_daemon' default. /chat's JWT-vs-body
-        # check always trusts the JWT over the body (correct — stops
-        # body-spoofing), so leaving this at the default silently
-        # collapsed every channel user's identity into one shared
-        # 'system_daemon' agent session, corrupting concurrent turns
-        # across channels (empty/lost replies). See
-        # _internal_auth_headers' docstring for the full incident.
-        try:
-            from integrations.agent_engine.dispatch import (
-                _internal_auth_headers)
-            _auth_headers = _internal_auth_headers(user_id=str(user_id),
-                                                   role='user')
-        except Exception as _auth_err:  # never block a message on this
-            logger.warning(
-                "internal auth header unavailable, calling /chat "
-                "unauthenticated (central/regional will answer 401): %s",
-                _auth_err)
-            _auth_headers = None
+        from .chat_contract import (
+            agent_turn_timeout, chat_turn_request, chat_turn_result)
+        # The body (both request keys, standalone HARTOS 'prompt' and bundled
+        # Nunba 'text') and the person's own credentials, from the one
+        # contract every turn sent for a person uses.  The headers matter:
+        # without them central/regional answer 401 and every channel message
+        # got "Sorry, I encountered an error processing your request."; with
+        # the default 'system_daemon' identity every channel user shared one
+        # agent session (2026-08-06; chat_turn_request says why).
+        payload, _auth_headers = chat_turn_request(
+            user_id, prompt_id, content,
+            **{"create_agent": self.create_mode, "device_id": self._device_id,
+               **fields})
 
         response = pooled_post(
             self.agent_api_url,
@@ -318,16 +281,9 @@ class FlaskChannelIntegration:
             # to produce a perfectly good answer.
             timeout=agent_turn_timeout(),
         )
-        try:
-            body = response.json()
-        except ValueError:
-            body = None
-        if not isinstance(body, dict):
-            # Not /chat's JSON object (a proxy's or server's error page): its
-            # words stay, for the caller's error log and the phone's reply,
-            # cut at 500 characters so a whole HTML page never rides along.
-            body = {'error': str(getattr(response, 'text', '') or '')[:500]}
-        return response.status_code, body
+        # A body that is not /chat's JSON keeps its words, for the caller's
+        # error log and the phone's reply.
+        return chat_turn_result(response)
 
     def _resolve_user_id_for_sender(
         self, channel: str, sender_id: str, fallback,

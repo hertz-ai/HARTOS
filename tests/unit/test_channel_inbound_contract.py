@@ -286,6 +286,32 @@ def test_handle_message_runs_its_turn_through_run_turn():
     assert args.kwargs['channel_context']['channel'] == 'telegram'
 
 
+def test_run_turn_sends_the_whole_body_in_order_and_fields_win():
+    """The channel turn's body, key for key and in order: the person, the
+    agent, both request keys, the integration's create_mode and device,
+    then the caller's own fields -- which win over the integration's.  The
+    same on the code before and after the body moved into chat_contract."""
+    fi = _bare_integration()
+    sent = []
+
+    def fake_post(url, json=None, timeout=None, headers=None, **kwargs):
+        sent.append((url, json))
+        return Mock(status_code=200, json=lambda: {'response': 'ok'})
+
+    with patch('integrations.channels.flask_integration.pooled_post', fake_post):
+        fi.run_turn(7, 3, 'hello', channel_context={'channel': 'telegram'})
+        fi.run_turn(7, 3, 'hello', create_agent=True, device_id='phone-2')
+    assert [(u, list(b.items())) for u, b in sent] == [
+        ('http://test-local/chat',
+         [('user_id', 7), ('prompt_id', 3), ('prompt', 'hello'), ('text', 'hello'),
+          ('create_agent', False), ('device_id', 'devtest'),
+          ('channel_context', {'channel': 'telegram'})]),
+        ('http://test-local/chat',
+         [('user_id', 7), ('prompt_id', 3), ('prompt', 'hello'), ('text', 'hello'),
+          ('create_agent', True), ('device_id', 'phone-2')]),
+    ]
+
+
 def test_a_chat_error_that_is_not_json_keeps_its_words(caplog):
     """A proxy's or server's error page is not /chat's JSON.  Its words stay
     in the turn's body, so the channel's error log still says what went

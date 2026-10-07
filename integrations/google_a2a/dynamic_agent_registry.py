@@ -79,6 +79,17 @@ class TrainedAgent:
         return action_is_autonomous(self.can_perform_without_user_input)
 
 
+def prompt_id_of(agent_id) -> Optional[str]:
+    """The prompt_id in a trained agent's id, '{prompt_id}_{flow_id}' as
+    _load_agent_from_recipe mints it from its recipe file name (and as
+    social.agent_bridge.sync_trained_agents keeps it on the agent's User
+    row), or None when ``agent_id`` is not one."""
+    prompt_id, sep, flow_id = str(agent_id or '').rpartition('_')
+    if not sep or not prompt_id.isdigit() or not flow_id.isdigit():
+        return None
+    return prompt_id
+
+
 class DynamicAgentDiscovery:
     """Discovers trained agents from prompts directory"""
 
