@@ -355,6 +355,35 @@ def test_a_node_that_claims_a_shared_tier_gives_the_machine_owner_nothing(
         CallService.revoke_agent(db, grant['id'], me.id)
 
 
+@pytest.mark.parametrize('claimed', [None, 'flat', ' Flat '])
+def test_a_desktop_that_claims_no_shared_tier_keeps_the_machine_owners_right(
+        fresh_db, monkeypatch, claimed):
+    """A Nunba desktop sets no tier at all: unset is flat, as a claim
+    written with spaces or capitals is."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    if claimed is None:
+        monkeypatch.delenv('HEVOLVE_NODE_TIER', raising=False)
+    else:
+        monkeypatch.setenv('HEVOLVE_NODE_TIER', claimed)
+    from integrations.social.call_service import CallService
+    grant = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    assert grant['owner_id'] == me.id
+
+
+def test_the_machine_owner_changes_their_own_grant(fresh_db, monkeypatch):
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from integrations.social.call_service import CallService
+    first = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    second = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                     scope={'can_voice': True, 'can_screen': True})
+    assert second['id'] == first['id'] and second['owner_id'] == me.id
+    assert second['scope'] == {'can_voice': True, 'can_screen': True}
+
+
 def test_a_node_its_key_made_central_gives_the_machine_owner_nothing(
         fresh_db, monkeypatch):
     """Claiming nothing (flat) is not enough when the node has proven a
