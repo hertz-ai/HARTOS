@@ -23,9 +23,22 @@ logger = logging.getLogger('hevolve_social')
 try:
     from livekit import rtc as livekit_rtc  # type: ignore
     HAS_LIVEKIT_RTC = True
-except Exception:
+    LIVEKIT_RTC_IMPORT_ERROR = None
+except Exception as _e:
     livekit_rtc = None  # type: ignore
     HAS_LIVEKIT_RTC = False
+    # Kept, not swallowed: an installed livekit can still fail to import.
+    # Inside Nunba.exe a shadowed, partial protobuf did (2026-10-08), and a
+    # log that said "not installed" pointed at the wrong fix.
+    LIVEKIT_RTC_IMPORT_ERROR = f'{type(_e).__name__}: {_e}'
+
+
+def rtc_unavailable_reason() -> str:
+    """Why the realtime SDK cannot be used in this process, for the log line
+    of a call that needed it: the import's own error, not a guess."""
+    if LIVEKIT_RTC_IMPORT_ERROR:
+        return f'livekit (rtc) did not import ({LIVEKIT_RTC_IMPORT_ERROR})'
+    return 'livekit (rtc) is not available'
 
 
 _SAMPLE_WIDTH = 2  # s16le
@@ -83,8 +96,9 @@ class _LiveKitRoomThread:
         """Spawn the daemon thread + asyncio loop.  No-op without the SDK (and
         no injected room_factory).  Returns True iff a thread was started."""
         if not HAS_LIVEKIT_RTC and self._room_factory is None:
-            logger.info('%s: livekit (rtc) not installed — start() no-op '
-                        '(call_id=%s)', self._THREAD_PREFIX, self.call_id)
+            logger.warning('%s: %s; not joining the room (call_id=%s)',
+                           self._THREAD_PREFIX, rtc_unavailable_reason(),
+                           self.call_id)
             return False
         if self._thread is not None and self._thread.is_alive():
             return True
@@ -184,5 +198,5 @@ class _LiveKitRoomThread:
         raise NotImplementedError
 
 
-__all__ = ['_LiveKitRoomThread', 'HAS_LIVEKIT_RTC', 'livekit_rtc',
-           'resample_pcm16']
+__all__ = ['_LiveKitRoomThread', 'HAS_LIVEKIT_RTC', 'LIVEKIT_RTC_IMPORT_ERROR',
+           'livekit_rtc', 'resample_pcm16', 'rtc_unavailable_reason']

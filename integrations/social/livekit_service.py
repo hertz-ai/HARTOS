@@ -51,9 +51,21 @@ logger = logging.getLogger('hevolve_social')
 try:
     from livekit import api as livekit_api  # type: ignore
     _HAS_LIVEKIT_SDK = True
-except Exception:
+    _LIVEKIT_SDK_IMPORT_ERROR = None
+except Exception as _e:
     livekit_api = None
     _HAS_LIVEKIT_SDK = False
+    # Kept, not swallowed: an installed livekit-api can still fail to import
+    # (inside Nunba.exe a shadowed, partial protobuf did, 2026-10-08), and
+    # "not installed; pip install" sends the reader to the wrong fix.
+    _LIVEKIT_SDK_IMPORT_ERROR = f'{type(_e).__name__}: {_e}'
+
+
+def _sdk_unavailable_reason() -> str:
+    """Why tokens cannot be signed in this process: the import's own error."""
+    if _LIVEKIT_SDK_IMPORT_ERROR:
+        return f'livekit-api did not import ({_LIVEKIT_SDK_IMPORT_ERROR})'
+    return 'livekit-api is not available'
 
 
 def _resolved_config():
@@ -141,7 +153,8 @@ class LiveKitService:
         # Phase 7d.B — sign a real LiveKit JWT when the SDK is
         # available.  The SDK builds the JWT with the identity +
         # grants we want.  Falls back to a stub shape when the SDK
-        # isn't installed so the REST contract stays testable.
+        # cannot be used so the REST contract stays testable.
+        reason = _sdk_unavailable_reason()
         if _HAS_LIVEKIT_SDK and livekit_api is not None:
             try:
                 grants = livekit_api.VideoGrants(
@@ -174,21 +187,21 @@ class LiveKitService:
                     'expires_at': int(time.time()) + ttl_seconds,
                 }
             except Exception as e:
-                logger.warning(
-                    "LiveKitService.issue_token: SDK failed (%s); "
-                    "falling back to livekit_pending shape", e)
+                reason = f'token signing failed ({type(e).__name__}: {e})'
 
-        # SDK absent OR signing failed — return the pending shape
-        # so the client knows infra is configured but not ready.
+        # SDK unusable OR signing failed — return the pending shape so the
+        # client knows infra is configured but not ready, and say why: no
+        # one can join this call's room until it is fixed.
         # (Pass-4 P4-6: renamed from 'livekit_stub' for clarity.)
+        logger.warning("LiveKitService.issue_token: no room token for "
+                       "call=%s: %s", call_id, reason)
         return {
             'mode': 'livekit_pending',
             'url': url,
             'token': '',
             'metadata': metadata,
             'expires_at': int(time.time()) + ttl_seconds,
-            'reason': ('livekit-api SDK not installed; pip install '
-                       'livekit-api to enable real token signing'),
+            'reason': reason,
         }
 
     @staticmethod
@@ -242,8 +255,7 @@ class LiveKitService:
             return {'ok': False, 'mode': 'p2p_mesh',
                     'reason': 'no LIVEKIT config; central/embedded deploy'}
         if not (_HAS_LIVEKIT_SDK and livekit_api is not None):
-            return {'ok': False,
-                    'reason': 'livekit-api SDK not installed; pip install livekit-api'}
+            return {'ok': False, 'reason': _sdk_unavailable_reason()}
 
         if not output_path:
             output_path = f'{call_id}-{int(time.time())}.mp4'
@@ -287,7 +299,7 @@ class LiveKitService:
         if not (url and api_key and api_secret):
             return {'ok': False, 'reason': 'no LIVEKIT config'}
         if not (_HAS_LIVEKIT_SDK and livekit_api is not None):
-            return {'ok': False, 'reason': 'livekit-api SDK not installed'}
+            return {'ok': False, 'reason': _sdk_unavailable_reason()}
 
         async def _stop():
             lkapi = livekit_api.LiveKitAPI(

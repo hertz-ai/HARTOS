@@ -59,15 +59,13 @@ from typing import Any, Deque, Dict, List, Optional
 logger = logging.getLogger('hevolve_social')
 
 
-# Best-effort imports — all of these may be absent on flat /
-# Nunba bundled deploys.  The bridge degrades to a no-op stub
-# in that case so importing this module is always safe.
-try:
-    from livekit import rtc as livekit_rtc  # type: ignore
-    _HAS_LIVEKIT_RTC = True
-except Exception:
-    livekit_rtc = None
-    _HAS_LIVEKIT_RTC = False
+# The realtime SDK may be absent (or fail to import) on flat / Nunba bundled
+# deploys; the bridge then degrades to a logged no-op, so importing this
+# module is always safe.  _livekit_room makes the one import and keeps its
+# error, which the warnings below name.
+from integrations.social import _livekit_room
+
+_HAS_LIVEKIT_RTC = _livekit_room.HAS_LIVEKIT_RTC
 
 
 # Active workers keyed by (call_id, agent_id).  Module-level dict +
@@ -469,19 +467,19 @@ class AgentBridgeWorker:
         the LiveKit room through this worker's ``LiveKitAudioPublisher`` (the
         agent's "mouth").
 
-        Degrades cleanly: when the realtime SDK is absent (flat / Nunba bundled)
-        OR the call has no LiveKit room (p2p mesh / central), we log the reply at
-        INFO so the call audit trail still records the agent's spoken
-        contribution; no audio is published.  Best-effort — never raises out of
-        the tick loop.
+        Degrades cleanly: when the realtime SDK cannot be used, a warning names
+        the reason (its import error) with the reply text; when the call has no
+        LiveKit room (p2p mesh / central), the reply is logged at INFO.  Either
+        way the call audit trail records the agent's contribution and no audio
+        is published.  Best-effort — never raises out of the tick loop.
         """
         if not text:
             return
         if not _HAS_LIVEKIT_RTC:
-            logger.info(
-                "AgentBridgeWorker._publish_audio_for: livekit (rtc) "
-                "absent; reply queued but not voiced — "
-                "call=%s agent=%s text=%r",
+            logger.warning(
+                "AgentBridgeWorker._publish_audio_for: %s; reply not voiced "
+                "— call=%s agent=%s text=%r",
+                _livekit_room.rtc_unavailable_reason(),
                 self.call_id, self.agent_id, text[:120])
             return
         pub = self._ensure_publisher()
@@ -638,10 +636,13 @@ def _ensure_call_subscriber(call_id: str) -> None:
 
     Reuses the existing subscriber class + ``LiveKitService.issue_token`` and the
     same canonical per-call STT queue the worker drains — no parallel path.  No-op
-    when livekit-rtc is absent or the call has no LiveKit room (p2p/central): the
-    worker then drains an empty queue exactly as before.  Best-effort; never
-    raises out to the caller."""
+    when livekit-rtc cannot be used (warned, with its import error) or the call
+    has no LiveKit room (p2p/central): the worker then drains an empty queue
+    exactly as before.  Best-effort; never raises out to the caller."""
     if not _HAS_LIVEKIT_RTC:
+        logger.warning("AgentVoiceBridge._ensure_call_subscriber: %s; the "
+                       "agent cannot hear call=%s",
+                       _livekit_room.rtc_unavailable_reason(), call_id)
         return
     with _WORKERS_LOCK:
         sub = _ACTIVE_SUBSCRIBERS.get(call_id)
