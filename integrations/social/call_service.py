@@ -105,15 +105,9 @@ class CallService:
         # partial index isn't in the migration today (deferred to
         # Phase 7d.B alongside the MySQL workaround for #2), but the
         # try/except on insert + recheck closes the window in code.
-        existing = db.execute(text(
-            "SELECT id FROM call_sessions "
-            "WHERE parent_kind = :pk AND parent_id = :pid "
-            "AND ended_at IS NULL "
-            "ORDER BY started_at DESC LIMIT 1"),
-            {'pk': parent_kind, 'pid': parent_id}
-        ).fetchone()
+        existing = CallService.active_call(db, parent_kind, parent_id)
         if existing is not None:
-            return CallService.get(db, existing[0])
+            return existing
 
         call_id = str(uuid.uuid4())
         try:
@@ -135,15 +129,9 @@ class CallService:
                 "CallService.create concurrent INSERT collision "
                 "for parent=%s/%s: %s; re-reading", parent_kind,
                 parent_id, e)
-            existing = db.execute(text(
-                "SELECT id FROM call_sessions "
-                "WHERE parent_kind = :pk AND parent_id = :pid "
-                "AND ended_at IS NULL "
-                "ORDER BY started_at DESC LIMIT 1"),
-                {'pk': parent_kind, 'pid': parent_id}
-            ).fetchone()
+            existing = CallService.active_call(db, parent_kind, parent_id)
             if existing is not None:
-                return CallService.get(db, existing[0])
+                return existing
             raise CallError(f"could not create call: {e}")
         db.commit()
 
@@ -152,6 +140,20 @@ class CallService:
         CallService.join(db, call_id, started_by,
                          device_kind='mobile', tenant_id=tenant_id)
         return CallService.get(db, call_id)
+
+    @staticmethod
+    def active_call(db, parent_kind: str,
+                    parent_id: str) -> Optional[Dict[str, Any]]:
+        """The parent's call in progress (the newest, the one create returns
+        instead of starting another), or None."""
+        row = db.execute(text(
+            "SELECT id FROM call_sessions "
+            "WHERE parent_kind = :pk AND parent_id = :pid "
+            "AND ended_at IS NULL "
+            "ORDER BY started_at DESC LIMIT 1"),
+            {'pk': parent_kind, 'pid': parent_id}
+        ).fetchone()
+        return CallService.get(db, row[0]) if row is not None else None
 
     @staticmethod
     def get(db, call_id: str) -> Dict[str, Any]:

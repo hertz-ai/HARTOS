@@ -12,26 +12,33 @@ those routes would:
   call_open {id, agent_id}  answered call_opened {id, call_id, url, token}
   call_end  {id, call_id}   answered call_ended {id, call_id}
 
-or call_refused {id, reason[, detail]}: 'bad_request', 'calls_off'
-(calls_v1 is off here), 'no_agent' (no such agent), 'not_allowed' (the call
-or grant rules said no; detail says which), 'not_found', 'no_room' (no room
-token could be made; detail says why), or 'error'.  A frame from anything
-but a person's own phone (livekit_link.device_link: a device link that
-names its person) is not answered.
+or call_refused {id, reason[, detail]}: 'bad_request', 'calls_off' (detail:
+the flag that is off -- calls_v1, or conversations, which the call's DM
+needs), 'no_user' (no account here for the link's person), 'no_agent' (no
+such agent), 'not_allowed' (banned, or the call or grant rules said no;
+detail says which), 'not_found', 'no_room' (no room token; detail says why),
+or 'error' (detail: the failure's kind -- the whole error is in this node's
+log).  A frame from anything but a person's own phone
+(livekit_link.device_link: a device link that names its person) is not
+answered.  One person's requests run one at a time, so a reconnect or a
+double tap joins the call the first one opened.
 
 call_open, in order: the person's DM with the agent (ConversationService.
 create returns the one that exists); the agent's leave to speak in it
 (CallService.grant_agent, whose rules decide: this machine's owner, or the
-agent's owner -- a grant that already has can_voice is left as it is); the
-DM's voice call (CallService.create returns the active one) with the person
-in it; the agent in it (CallService.attach_agent); and the person's room
-token (LiveKitService.issue_token -- with an agent in the call the room is
+agent's owner -- a grant that already has can_voice is used as it is); the
+DM's voice call (the one in progress, or a new one) with the person in it;
+the agent in it (CallService.attach_agent); and the person's room token
+(LiveKitService.issue_token -- with an agent in the call the room is
 LiveKit's, as api_calls decides).  The token's url names this desktop's
-loopback; the phone reaches it through its tunnel.  A refused grant leaves
-the DM, as starting one from the conversations API would.
+loopback; the phone reaches it through its tunnel.  When a step after the
+call fails, a call this request opened is ended (its agent leaves with it);
+a call already in progress is left as it was.  A refused grant leaves the
+DM, as starting one from the conversations API would.
 """
 import logging
-from typing import Optional
+import threading
+from typing import Dict, Optional
 
 from core.peer_link.channels import CALL_END, CALL_OPEN
 
@@ -45,6 +52,18 @@ CALL_REFUSED = 'call_refused'
 #: The device requests this module answers (the node's handshake names them).
 ANSWERS = (CALL_OPEN, CALL_END)
 
+#: One lock per person: their requests arrive on their own threads (the
+#: link answers each request on one), and two call_opens at once would each
+#: make a DM, a grant, a call and an agent.  A desktop serves a handful of
+#: people, so the map stays small.
+_person_locks: Dict[str, threading.Lock] = {}
+_person_locks_guard = threading.Lock()
+
+
+def _person_lock(person: str) -> threading.Lock:
+    with _person_locks_guard:
+        return _person_locks.setdefault(person, threading.Lock())
+
 
 def _refused(rid: str, reason: str, detail: Optional[str] = None) -> dict:
     reply = {'type': CALL_REFUSED, 'id': rid, 'reason': reason}
@@ -53,10 +72,27 @@ def _refused(rid: str, reason: str, detail: Optional[str] = None) -> dict:
     return reply
 
 
-def _calls_on(db) -> bool:
-    """calls_v1, from the source the call routes read (auth.require_auth)."""
-    from .feature_flags import get_flags_for_tenant
-    return bool(get_flags_for_tenant(db, None).get('calls_v1'))
+def _flag_off(db, names) -> Optional[str]:
+    """The first of ``names`` that is off here, from the flag source the
+    routes read (auth.require_auth: tenant None on this node), or None."""
+    from .feature_flags import get_flag
+    for name in names:
+        if not get_flag(name, db=db, tenant_id=None):
+            return name
+    return None
+
+
+def _person_refusal(db, rid: str, person: str) -> Optional[dict]:
+    """What require_auth would refuse: a person this node has no account
+    for, or a banned one."""
+    from sqlalchemy import text
+    row = db.execute(text("SELECT is_banned FROM users WHERE id = :id"),
+                     {'id': person}).fetchone()
+    if row is None:
+        return _refused(rid, 'no_user')
+    if row[0]:
+        return _refused(rid, 'not_allowed', 'banned')
+    return None
 
 
 def _is_agent(db, agent_id: str) -> bool:
@@ -64,6 +100,18 @@ def _is_agent(db, agent_id: str) -> bool:
     row = db.execute(text("SELECT user_type FROM users WHERE id = :id"),
                      {'id': agent_id}).fetchone()
     return row is not None and row[0] == 'agent'
+
+
+def _end_opened(db, call_id: str, person: str) -> None:
+    """End a call this request opened and could not finish setting up: the
+    phone never got its id, so nothing else would end it, and its agent
+    would hold a seat in the room for nothing."""
+    from .call_service import CallService
+    try:
+        CallService.end(db, call_id, person)
+    except Exception as e:
+        logger.warning("Phone call %s could not be ended after its setup "
+                       "failed: %s", call_id, e)
 
 
 def _open(db, rid: str, person: str, agent_id) -> dict:
@@ -85,19 +133,31 @@ def _open(db, rid: str, person: str, agent_id) -> dict:
             scope['can_voice'] = True
             CallService.grant_agent(db, agent_id, person, 'conversation',
                                     conv['id'], scope)
-        call = CallService.create(db, 'conversation', conv['id'], person,
-                                  kind='voice')
-        CallService.join(db, call['id'], person)
-        CallService.attach_agent(db, call['id'], agent_id)
+        call = CallService.active_call(db, 'conversation', conv['id'])
+        opened = call is None
+        if opened:
+            call = CallService.create(db, 'conversation', conv['id'], person,
+                                      kind='voice')
     except CallError as e:
         return _refused(rid, 'not_allowed', str(e))
-    token = LiveKitService.issue_token(call['id'], person, can_publish=True)
+    try:
+        CallService.join(db, call['id'], person)
+        CallService.attach_agent(db, call['id'], agent_id)
+        token = LiveKitService.issue_token(call['id'], person, can_publish=True)
+    except CallError as e:
+        if opened:
+            _end_opened(db, call['id'], person)
+        return _refused(rid, 'not_allowed', str(e))
+    except Exception:
+        if opened:
+            _end_opened(db, call['id'], person)
+        raise
     if token.get('mode') != 'livekit' or not token.get('token'):
-        # No one can join this room; the call holds the agent for nothing.
-        CallService.end(db, call['id'], person)
+        if opened:
+            _end_opened(db, call['id'], person)
         return _refused(rid, 'no_room', token.get('reason') or token.get('mode'))
-    logger.info("Phone call %s opened for %s with agent %s", call['id'],
-                person, agent_id)
+    logger.info("Phone call %s %s for %s with agent %s", call['id'],
+                'opened' if opened else 'joined', person, agent_id)
     return {'type': CALL_OPENED, 'id': rid, 'call_id': call['id'],
             'url': token['url'], 'token': token['token']}
 
@@ -115,6 +175,19 @@ def _end(db, rid: str, person: str, call_id) -> dict:
     return {'type': CALL_ENDED, 'id': rid, 'call_id': call_id}
 
 
+def _answer(db, kind: str, rid: str, person: str, data: dict) -> dict:
+    off = _flag_off(db, ('calls_v1', 'conversations') if kind == CALL_OPEN
+                    else ('calls_v1',))
+    if off:
+        return _refused(rid, 'calls_off', off)
+    refusal = _person_refusal(db, rid, person)
+    if refusal:
+        return refusal
+    if kind == CALL_OPEN:
+        return _open(db, rid, person, data.get('agent_id'))
+    return _end(db, rid, person, data.get('call_id'))
+
+
 def handle_call_frame(channel: str, data, peer_id: str) -> Optional[dict]:
     """The 'tunnel' handler for call_open / call_end.  Every other frame, and
     any frame from anything but a person's own phone, is not answered."""
@@ -126,21 +199,17 @@ def handle_call_frame(channel: str, data, peer_id: str) -> Optional[dict]:
     rid = data.get('id')
     if not isinstance(rid, str) or not 0 < len(rid) <= 64:
         return _refused('', 'bad_request')
-    person = link.user_id     # get_device_link answers only a link with one
+    person = link.user_id     # device_link answers only a link with one
+    kind = data['type']
     from .models import db_session
     try:
-        with db_session() as db:
-            if not _calls_on(db):
-                reply = _refused(rid, 'calls_off')
-            elif data['type'] == CALL_OPEN:
-                reply = _open(db, rid, person, data.get('agent_id'))
-            else:
-                reply = _end(db, rid, person, data.get('call_id'))
+        with _person_lock(person), db_session() as db:
+            reply = _answer(db, kind, rid, person, data)
     except Exception as e:
-        logger.warning("Phone call request %s from %s failed: %s", data['type'],
+        logger.warning("Phone call request %s from %s failed: %s", kind,
                        peer_id[:12], e, exc_info=True)
-        return _refused(rid, 'error', str(e))
+        return _refused(rid, 'error', type(e).__name__)
     if reply['type'] == CALL_REFUSED:
-        logger.info("Phone call request %s from %s refused: %s %s", data['type'],
+        logger.info("Phone call request %s from %s refused: %s %s", kind,
                     peer_id[:12], reply['reason'], reply.get('detail', ''))
     return reply

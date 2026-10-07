@@ -81,6 +81,7 @@ def db(monkeypatch):
 def desktop(monkeypatch, db):
     """A flat desktop that serves LiveKit on its loopback, with calls on."""
     monkeypatch.setenv('HEVOLVE_FLAG_CALLS_V1', 'true')
+    monkeypatch.setenv('HEVOLVE_FLAG_CONVERSATIONS', 'true')
     monkeypatch.setenv('LIVEKIT_AUTOSTART', '1')
     monkeypatch.setenv('LIVEKIT_URL', 'ws://127.0.0.1:7880')
     monkeypatch.setenv('LIVEKIT_API_KEY', 'test-key')
@@ -144,6 +145,82 @@ def _no_answer(ws, frame, wait_s=1.5):
     ws.frame(frame, rq=True, msg_id=f'rq-{uuid.uuid4().hex[:6]}')
     time.sleep(wait_s)
     return ws.out.empty()
+
+
+def _open_calls(db, person):
+    from sqlalchemy import text
+    db.expire_all()
+    return [r[0] for r in db.execute(text(
+        "SELECT id FROM call_sessions WHERE started_by = :p AND ended_at IS NULL"),
+        {'p': person}).fetchall()]
+
+
+class TestOnlyThePersonsOwnPhone:
+
+    def test_the_call_is_the_links_person_whatever_the_frame_names(self, db):
+        """The person is the one the device link was admitted for, never a
+        name the frame carries."""
+        person, other = _user(db), _user(db)
+        agent = _user(db, 'agent', owner_id=other)
+        _user(db, 'agent', owner_id=person)
+        reply = _ask(_phone(person), {'type': 'call_open', 'id': 'c1',
+                                      'agent_id': agent, 'user_id': other,
+                                      'person': other})
+        assert reply['type'] == 'call_refused' and reply['reason'] == 'not_allowed'
+        assert _open_calls(db, other) == [] and _open_calls(db, person) == []
+
+    def test_the_handshake_names_both_requests(self):
+        """A phone asks only a desktop whose handshake names the request
+        (link_manager.device_requests_answered); an unnamed one it never
+        sends, and its call button stays off."""
+        answered = set(get_link_manager().device_requests_answered())
+        assert {'call_open', 'call_end'} <= answered
+
+
+class TestOneAtATime:
+
+    def test_two_requests_at_once_make_one_call(self, db):
+        """The SDK reconnects and a person double-taps: requests run on their
+        own threads, and each must not make its own DM, grant, call and
+        agent."""
+        person = _user(db)
+        agent = _user(db, 'agent', owner_id=person)
+        ws = _phone(person)
+        for rid in ('c1', 'c2', 'c3'):
+            ws.frame({'type': 'call_open', 'id': rid, 'agent_id': agent},
+                     rq=True, msg_id=f'rq-{rid}')
+        replies = [ws.next_out()['d'] for _ in range(3)]
+        assert {r['type'] for r in replies} == {'call_opened'}
+        assert len({r['call_id'] for r in replies}) == 1
+        from sqlalchemy import text
+        from integrations.social.agent_voice_bridge import AgentVoiceBridge
+        assert len(_open_calls(db, person)) == 1
+        assert db.execute(text("SELECT COUNT(*) FROM conversations "
+                               "WHERE created_by = :p"), {'p': person}).scalar() == 1
+        assert db.execute(text("SELECT COUNT(*) FROM agent_join_grants "
+                               "WHERE agent_id = :a AND revoked_at IS NULL"),
+                          {'a': agent}).scalar() == 1
+        assert len(AgentVoiceBridge.list_active()) == 1
+
+
+class TestAGrantTheMachineOwnerMade:
+
+    def test_is_used_as_it_is(self, db, monkeypatch):
+        """A can_voice grant this machine's owner set is the one the call
+        runs under -- re-granting it as the agent's author would be refused
+        (grant_agent), and would take it over if it were not."""
+        owner, person = _user(db), _user(db)
+        agent = _user(db, 'agent', owner_id=person)
+        monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', owner)
+        from integrations.social.call_service import CallService
+        from integrations.social.conversation_service import ConversationService
+        conv = ConversationService.create(db, 'dm', [agent], person)
+        CallService.grant_agent(db, agent, owner, 'conversation', conv['id'],
+                                {'can_voice': True})
+        reply = _open(_phone(person), agent)
+        assert reply['type'] == 'call_opened'
+        grant = CallService.get_active_grant(db, agent, 'conversation', conv['id'])
+        assert grant['owner_id'] == owner
 
 
 class TestAPhoneStartsACallWithItsAgent:
@@ -237,7 +314,48 @@ class TestWhatIsRefused:
         person = _user(db)
         agent = _user(db, 'agent', owner_id=person)
         reply = _open(_phone(person), agent)
-        assert reply == {'type': 'call_refused', 'id': 'c1', 'reason': 'calls_off'}
+        assert reply == {'type': 'call_refused', 'id': 'c1', 'reason': 'calls_off',
+                         'detail': 'calls_v1'}
+
+    def test_conversations_switched_off_on_this_desktop(self, db, monkeypatch):
+        """The call lives in the person's DM with the agent, which the
+        conversations routes would refuse to create (503) with it off."""
+        monkeypatch.setenv('HEVOLVE_FLAG_CONVERSATIONS', 'false')
+        person = _user(db)
+        agent = _user(db, 'agent', owner_id=person)
+        reply = _open(_phone(person), agent)
+        assert reply == {'type': 'call_refused', 'id': 'c1', 'reason': 'calls_off',
+                         'detail': 'conversations'}
+        from sqlalchemy import text
+        assert db.execute(text("SELECT COUNT(*) FROM conversations "
+                               "WHERE created_by = :p"), {'p': person}).scalar() == 0
+
+    def test_a_person_with_no_account_here(self, db):
+        """require_auth refuses a token whose user this node does not know;
+        so does the phone's request."""
+        agent = _user(db, 'agent', owner_id=_user(db))
+        reply = _open(_phone('no-such-person'), agent)
+        assert reply == {'type': 'call_refused', 'id': 'c1', 'reason': 'no_user'}
+
+    def test_a_banned_person(self, db):
+        person = _user(db)
+        agent = _user(db, 'agent', owner_id=person)
+        from sqlalchemy import text
+        db.execute(text("UPDATE users SET is_banned = 1 WHERE id = :p"), {'p': person})
+        db.commit()
+        reply = _open(_phone(person), agent)
+        assert reply == {'type': 'call_refused', 'id': 'c1', 'reason': 'not_allowed',
+                         'detail': 'banned'}
+
+    def test_hanging_up_when_calls_are_switched_off(self, db, monkeypatch):
+        person = _user(db)
+        agent = _user(db, 'agent', owner_id=person)
+        ws = _phone(person)
+        call_id = _open(ws, agent)['call_id']
+        monkeypatch.setenv('HEVOLVE_FLAG_CALLS_V1', 'false')
+        reply = _ask(ws, {'type': 'call_end', 'id': 'e1', 'call_id': call_id})
+        assert reply == {'type': 'call_refused', 'id': 'e1', 'reason': 'calls_off',
+                         'detail': 'calls_v1'}
 
     def test_a_device_link_that_names_no_person_is_not_answered(self, db):
         agent = _user(db, 'agent', owner_id=_user(db))
@@ -264,7 +382,58 @@ class TestWhatIsRefused:
         agent = _user(db, 'agent', owner_id=person)
         reply = _open(_phone(person), agent)
         assert reply == {'type': 'call_refused', 'id': 'c1', 'reason': 'error',
-                         'detail': 'database is locked'}
+                         'detail': 'RuntimeError'}
+        assert _open_calls(db, person) == []
+
+    def test_a_step_refused_after_the_call_opened_ends_it(self, db, monkeypatch):
+        """The call rules refuse a step after the call was opened (the grant
+        changed under it): the phone is refused, and the call it would have
+        joined is not left open with no one able to end it."""
+        from integrations.social.call_service import CallError, CallService
+
+        def _refuses(*a, **k):
+            raise CallError('grant does not include can_voice')
+
+        monkeypatch.setattr(CallService, 'attach_agent', staticmethod(_refuses))
+        person = _user(db)
+        agent = _user(db, 'agent', owner_id=person)
+        reply = _open(_phone(person), agent)
+        assert reply == {'type': 'call_refused', 'id': 'c1', 'reason': 'not_allowed',
+                         'detail': 'grant does not include can_voice'}
+        assert _open_calls(db, person) == []
+
+    def test_a_token_step_that_raises_ends_the_call_and_its_agent(
+            self, db, monkeypatch):
+        """The phone never got a call_id to end it with: a call left open
+        here would hold the agent for nothing."""
+        from integrations.social.agent_voice_bridge import AgentVoiceBridge
+        from integrations.social.livekit_service import LiveKitService
+
+        def _fails(*a, **k):
+            raise RuntimeError('signer crashed')
+
+        monkeypatch.setattr(LiveKitService, 'issue_token', staticmethod(_fails))
+        person = _user(db)
+        agent = _user(db, 'agent', owner_id=person)
+        reply = _open(_phone(person), agent)
+        assert reply == {'type': 'call_refused', 'id': 'c1', 'reason': 'error',
+                         'detail': 'RuntimeError'}
+        assert _open_calls(db, person) == []
+        assert AgentVoiceBridge.list_active() == []
+
+    def test_no_room_token_leaves_a_call_already_in_progress(
+            self, db, monkeypatch):
+        """The call this request did not open -- the person's call on another
+        device -- is not ended because this request could get no token."""
+        person = _user(db)
+        agent = _user(db, 'agent', owner_id=person)
+        ws = _phone(person)
+        call_id = _open(ws, agent, 'c1')['call_id']
+        from integrations.social import livekit_service
+        monkeypatch.setattr(livekit_service, '_HAS_LIVEKIT_SDK', False)
+        reply = _open(ws, agent, 'c2')
+        assert reply['type'] == 'call_refused' and reply['reason'] == 'no_room'
+        assert _open_calls(db, person) == [call_id]
 
     def test_no_room_token_ends_the_call_it_opened(self, db, monkeypatch):
         from integrations.social import livekit_service
@@ -325,6 +494,28 @@ def test_ending_a_call_stops_its_agents(db):
                             {'can_voice': True})
     call = CallService.create(db, 'conversation', conv['id'], person)
     CallService.attach_agent(db, call['id'], agent)
+    assert len(AgentVoiceBridge.list_active(call['id'])) == 1
+    CallService.end(db, call['id'], person)
+    assert AgentVoiceBridge.list_active(call['id']) == []
+
+
+def test_ending_an_already_ended_call_stops_its_agents(db):
+    """A call marked ended elsewhere (another process, an older build) with
+    its agent still running here: ending it again stops the agent."""
+    from sqlalchemy import text
+    from integrations.social.agent_voice_bridge import AgentVoiceBridge
+    from integrations.social.call_service import CallService
+    from integrations.social.conversation_service import ConversationService
+    person = _user(db)
+    agent = _user(db, 'agent', owner_id=person)
+    conv = ConversationService.create(db, 'dm', [agent], person)
+    CallService.grant_agent(db, agent, person, 'conversation', conv['id'],
+                            {'can_voice': True})
+    call = CallService.create(db, 'conversation', conv['id'], person)
+    CallService.attach_agent(db, call['id'], agent)
+    db.execute(text("UPDATE call_sessions SET ended_at = CURRENT_TIMESTAMP "
+                    "WHERE id = :id"), {'id': call['id']})
+    db.commit()
     assert len(AgentVoiceBridge.list_active(call['id'])) == 1
     CallService.end(db, call['id'], person)
     assert AgentVoiceBridge.list_active(call['id']) == []

@@ -395,8 +395,8 @@ def device_link(peer_id: str):
         from core.peer_link.link_manager import get_link_manager
         return get_link_manager().get_device_link(peer_id)
     except Exception as e:
-        logger.warning("LiveKit tunnel frame from %s unanswered: link lookup failed: %s",
-                       peer_id, e)
+        logger.warning("A 'tunnel' frame from %s is unanswered: link lookup "
+                       "failed: %s", peer_id, e)
         return None
 
 
