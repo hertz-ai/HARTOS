@@ -27,8 +27,13 @@ The tunnel carries LiveKit signalling and nothing else: its first request
 must be a GET of LiveKit's signal path (/rtc -- the WebSocket, and the
 SDK's /rtc/validate), or the tunnel is closed ('not_signalling') before a
 byte reaches LiveKit -- so a phone cannot speak LiveKit's server API through
-it.  A tunnel whose link is gone (dropped, pruned idle, replaced by the
-phone's redial) closes within a second.
+it.  Only that first request is sent until LiveKit has answered it: an
+upgrade (101) opens the WebSocket and what the phone sent after the request
+follows; any other answer (no Upgrade header, a bad token -- LiveKit keeps
+such a connection open for another request) reaches the phone in full and
+the tunnel closes ('not_upgraded'), so no second request is ever sent.  A
+tunnel whose link is gone (dropped, pruned idle, replaced by the phone's
+redial) closes within a second.
 
 Relay links are end-to-end encrypted (relay.py), so the relay reads none of
 it.  Media does not ride the tunnel: LiveKit's ICE candidates name this
@@ -65,6 +70,13 @@ _LOOPBACK = ('127.0.0.1', '::1', 'localhost')
 _SIGNAL_REQUEST = re.compile(rb'GET /rtc(?:[/?][^ ]*)? HTTP/1\.[01]\r?')
 #: How much of the first request line is read before it must have ended.
 _FIRST_LINE_MAX = 8 * 1024
+#: How much of the first request, and of LiveKit's answer to it, is read
+#: before its headers must have ended.
+_HEAD_MAX = 16 * 1024
+#: Where an HTTP head ends.
+_HEAD_END = re.compile(rb'\r?\n\r?\n')
+_STATUS = re.compile(rb'HTTP/1\.[01] (\d{3})')
+_CONTENT_LENGTH = re.compile(rb'(?im)^content-length:[ \t]*(\d+)[ \t]*\r?$')
 
 #: (peer_id, tunnel id) -> its tunnel; None while its socket is connecting.
 _tunnels: Dict[Tuple[str, str], Optional['_Tunnel']] = {}
@@ -97,9 +109,19 @@ class _Tunnel:
         self.sock = sock
         self._out: 'queue.Queue' = queue.Queue(maxsize=_WRITE_QUEUE)
         self._closed = threading.Event()
-        # The phone's bytes until its first request line is whole and seen to
-        # be LiveKit signalling (None once it was).
+        # The phone's bytes and LiveKit's answer meet here (the link's thread
+        # pushes, the reader judges), so what is sent stays in order.
+        self._gate = threading.Lock()
+        # The phone's bytes until its first request's head is whole and that
+        # request is LiveKit signalling (None once it was sent).
         self._head: Optional[bytes] = b''
+        # The phone's bytes after that request, held until LiveKit upgrades
+        # (None once it has: they were sent, and the rest passes through).
+        self._held: Optional[bytes] = b''
+        # LiveKit's bytes until the head of its answer is whole (None once
+        # judged), and a refusal's body still to reach the phone.
+        self._answer: Optional[bytes] = b''
+        self._body_left = 0
 
     def start(self) -> None:
         threading.Thread(target=self._read, daemon=True,
@@ -108,22 +130,74 @@ class _Tunnel:
                          name=f'livekit-tunnel-w-{self.tid[:8]}').start()
 
     def push(self, data: bytes) -> None:
-        if self._head is not None:
-            self._head += data
-            if b'\n' not in self._head:
-                if len(self._head) > _FIRST_LINE_MAX:
-                    self._not_signalling()
-                return
-            if not _SIGNAL_REQUEST.fullmatch(self._head.split(b'\n', 1)[0]):
-                self._not_signalling()
-                return
-            data, self._head = self._head, None
+        """The phone's bytes: its first request once its head is whole and it
+        is LiveKit signalling, then nothing more until LiveKit upgrades."""
+        fault = None
+        with self._gate:
+            if self._head is not None:
+                self._head += data
+                data = b''
+                if b'\n' not in self._head:
+                    if len(self._head) > _FIRST_LINE_MAX:
+                        fault = 'not_signalling'
+                elif not _SIGNAL_REQUEST.fullmatch(self._head.split(b'\n', 1)[0]):
+                    fault = 'not_signalling'
+                else:
+                    end = _HEAD_END.search(self._head)
+                    if end is not None:
+                        data, self._held = self._head[:end.end()], self._head[end.end():]
+                        self._head = None
+                    elif len(self._head) > _HEAD_MAX:
+                        fault = 'not_signalling'
+            elif self._held is not None:
+                self._held += data
+                data = b''
+                if len(self._held) > MAX_CHUNK:
+                    fault = 'overrun'
+            if data:
+                fault = self._send_to_livekit(data)
+        if fault == 'not_signalling':
+            self._not_signalling()
+        elif fault:
+            self.close(fault, tell_phone=True)
+
+    def _send_to_livekit(self, data: bytes) -> Optional[str]:
+        """Queue bytes for the writer; 'overrun' when it is too far behind."""
         try:
             self._out.put_nowait(data)
         except queue.Full:
             logger.warning("LiveKit tunnel %s: %d chunks unwritten; closing it",
                            self.tid[:8], _WRITE_QUEUE)
-            self.close('overrun', tell_phone=True)
+            return 'overrun'
+        return None
+
+    def _judge(self, data: bytes) -> Optional[str]:
+        """LiveKit's bytes, as they reach the phone: why to close now, if so.
+        An upgrade (101) sends the phone's held bytes on and lets the rest
+        through; any other answer closes the tunnel once it reached the
+        phone in full."""
+        with self._gate:
+            if self._answer is None:
+                if self._held is None:
+                    return None               # upgraded: the WebSocket
+                self._body_left -= len(data)
+                return 'not_upgraded' if self._body_left <= 0 else None
+            self._answer += data
+            end = _HEAD_END.search(self._answer)
+            if end is None:
+                return 'not_upgraded' if len(self._answer) > _HEAD_MAX else None
+            head, rest = self._answer[:end.start()], self._answer[end.end():]
+            self._answer = None
+            status = _STATUS.match(head)
+            if status and status.group(1) == b'101':
+                held, self._held = self._held, None
+                return self._send_to_livekit(held) if held else None
+            length = _CONTENT_LENGTH.search(head)
+            self._body_left = (int(length.group(1)) if length else 0) - len(rest)
+            logger.info("LiveKit answered tunnel %s's first request %s, not an "
+                        "upgrade; closing it once the phone has the answer",
+                        self.tid[:8], status.group(1).decode() if status else 'unreadably')
+            return 'not_upgraded' if self._body_left <= 0 else None
 
     def _not_signalling(self) -> None:
         line = (self._head or b'').split(b'\n', 1)[0][:80]
@@ -146,6 +220,10 @@ class _Tunnel:
                 break
             self.link.send(CHANNEL, {'type': TUNNEL_DATA, 'id': self.tid,
                                      'b64': base64.b64encode(data).decode('ascii')})
+            judged = self._judge(data)
+            if judged:
+                reason = judged
+                break
         self.close(reason, tell_phone=True)
 
     def _write(self) -> None:

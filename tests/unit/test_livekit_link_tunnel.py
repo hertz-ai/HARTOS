@@ -30,9 +30,25 @@ from core.peer_link.link_manager import get_link_manager, reset_link_manager  # 
 WAIT_S = 5
 
 
+#: What the signal port answers a request that is not a WebSocket upgrade (a
+#: GET /rtc with no Upgrade header, a bad token): an HTTP error with a body,
+#: the connection kept alive for the next request, as Go's HTTP server does.
+REFUSAL_HEAD = b'HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\n\r\n'
+REFUSAL = REFUSAL_HEAD + b'unauthorized'
+UPGRADED = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n'
+UPGRADE_REQUEST = (b'GET /rtc?access_token=t HTTP/1.1\r\nHost: localhost\r\n'
+                   b'Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
+
+
 class SignalPort:
-    """A TCP server on loopback standing in for livekit-server's signal port:
-    it echoes what it reads, and records every connection and its end."""
+    """A TCP server on loopback standing in for livekit-server's signal port.
+    Like LiveKit's, it answers each HTTP request on a connection in turn: an
+    upgrade with 101, after which it echoes what it reads (the WebSocket),
+    anything else with REFUSAL, keeping the connection for the next request.
+    It records every connection, every request line it was sent, and every
+    connection's end.  A refusal's head and body go out as two writes, as a
+    slow answer would arrive; clearing ``answering`` holds every answer until
+    it is set again."""
 
     def __init__(self):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -40,7 +56,10 @@ class SignalPort:
         self.server.listen(8)
         self.port = self.server.getsockname()[1]
         self.accepted = queue.Queue()
+        self.requests = queue.Queue()
         self.ended = queue.Queue()
+        self.answering = threading.Event()
+        self.answering.set()
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self):
@@ -50,9 +69,10 @@ class SignalPort:
             except OSError:
                 return
             self.accepted.put(conn)
-            threading.Thread(target=self._echo, args=(conn,), daemon=True).start()
+            threading.Thread(target=self._http, args=(conn,), daemon=True).start()
 
-    def _echo(self, conn):
+    def _http(self, conn):
+        buf, upgraded = b'', False
         while True:
             try:
                 data = conn.recv(65536)
@@ -61,7 +81,30 @@ class SignalPort:
             if not data:
                 self.ended.put(conn)
                 return
-            conn.sendall(data)
+            if upgraded:
+                conn.sendall(data)
+                continue
+            buf += data
+            while b'\r\n\r\n' in buf and not upgraded:
+                head, buf = buf.split(b'\r\n\r\n', 1)
+                self.requests.put(head.split(b'\r\n', 1)[0])
+                upgraded = b'\r\nupgrade: websocket' in head.lower()
+                self.answering.wait(WAIT_S)
+                if upgraded:
+                    conn.sendall(UPGRADED)
+                else:
+                    conn.sendall(REFUSAL_HEAD)
+                    time.sleep(0.1)
+                    conn.sendall(REFUSAL[len(REFUSAL_HEAD):])
+            if upgraded and buf:
+                conn.sendall(buf)
+                buf = b''
+
+    def request_lines(self):
+        lines = []
+        while not self.requests.empty():
+            lines.append(self.requests.get())
+        return lines
 
     def close(self):
         self.server.close()
@@ -148,15 +191,101 @@ def _open(ws, tid='t1'):
     return ws.next_out()['d']
 
 
+def _send(ws, data, tid='t1'):
+    ws.frame({'type': 'tunnel_data', 'id': tid, 'b64': base64.b64encode(data).decode()})
+
+
+def _received_until_close(ws, tid='t1'):
+    """The bytes the desktop sent the phone on ``tid``, and its close."""
+    got = b''
+    while True:
+        d = ws.next_out()['d']
+        if d.get('id') != tid:
+            continue
+        if d['type'] == 'tunnel_close':
+            return got, d
+        got += base64.b64decode(d['b64'])
+
+
+def _received(ws, n, tid='t1'):
+    got = b''
+    while len(got) < n:
+        d = ws.next_out('tunnel_data')['d']
+        if d['id'] == tid:
+            got += base64.b64decode(d['b64'])
+    return got
+
+
 def test_a_phones_bytes_reach_this_desktops_signal_port_and_back(signal_port):
     link, ws = _link()
     assert _open(ws) == {'type': 'tunnel_opened', 'id': 't1'}
     signal_port.accepted.get(timeout=WAIT_S)
-    ws.frame({'type': 'tunnel_data', 'id': 't1',
-              'b64': base64.b64encode(b'GET /rtc HTTP/1.1\r\n\r\n').decode()})
-    back = ws.next_out('tunnel_data')['d']
-    assert back['id'] == 't1'
-    assert base64.b64decode(back['b64']) == b'GET /rtc HTTP/1.1\r\n\r\n'
+    _send(ws, UPGRADE_REQUEST)
+    assert _received(ws, len(UPGRADED)) == UPGRADED
+    _send(ws, b'websocket frame')
+    assert _received(ws, len(b'websocket frame')) == b'websocket frame'
+
+
+def test_bytes_sent_behind_the_upgrade_request_reach_livekit_once_it_upgrades(signal_port):
+    """A phone's bytes that follow its upgrade request in the same chunk are
+    held until LiveKit has answered 101, then sent, in order."""
+    link, ws = _link()
+    _open(ws)
+    signal_port.accepted.get(timeout=WAIT_S)
+    _send(ws, UPGRADE_REQUEST + b'first frame')
+    assert _received(ws, len(UPGRADED) + len(b'first frame')) == UPGRADED + b'first frame'
+    _send(ws, b'next')
+    assert _received(ws, 4) == b'next'
+    assert signal_port.request_lines() == [UPGRADE_REQUEST.split(b'\r\n', 1)[0]]
+
+
+def test_a_signal_request_livekit_refuses_ends_the_tunnel_before_another_request(signal_port):
+    """LiveKit keeps an HTTP connection open after an answer that is not an
+    upgrade (no Upgrade header, a bad token).  The phone gets that answer in
+    full and the tunnel closes: a second request on it -- LiveKit's server
+    API -- never reaches LiveKit."""
+    link, ws = _link()
+    _open(ws)
+    conn = signal_port.accepted.get(timeout=WAIT_S)
+    _send(ws, b'GET /rtc HTTP/1.1\r\nHost: localhost\r\n\r\n')
+    got, close = _received_until_close(ws)
+    assert got == REFUSAL
+    assert close == {'type': 'tunnel_close', 'id': 't1', 'reason': 'not_upgraded'}
+    _send(ws, b'POST /twirp/livekit.RoomService/ListRooms HTTP/1.1\r\n\r\n')
+    assert signal_port.ended.get(timeout=WAIT_S) is conn
+    assert signal_port.request_lines() == [b'GET /rtc HTTP/1.1']
+
+
+def test_a_request_sent_before_livekit_answers_waits_for_the_answer(signal_port):
+    """A phone's second request, sent on its own before LiveKit has answered
+    the first, is held; LiveKit refusing the first, it is never sent."""
+    link, ws = _link()
+    _open(ws)
+    conn = signal_port.accepted.get(timeout=WAIT_S)
+    signal_port.answering.clear()
+    _send(ws, b'GET /rtc HTTP/1.1\r\nHost: localhost\r\n\r\n')
+    assert signal_port.requests.get(timeout=WAIT_S) == b'GET /rtc HTTP/1.1'
+    _send(ws, b'POST /twirp/livekit.RoomService/ListRooms HTTP/1.1\r\n\r\n')
+    time.sleep(0.3)
+    signal_port.answering.set()
+    got, close = _received_until_close(ws)
+    assert got == REFUSAL and close['reason'] == 'not_upgraded'
+    assert signal_port.ended.get(timeout=WAIT_S) is conn
+    assert signal_port.request_lines() == []
+
+
+def test_a_request_pipelined_behind_the_signal_request_never_reaches_livekit(signal_port):
+    """A second request sent in the same chunk as the first waits for
+    LiveKit's answer to the first; refused, it is never sent."""
+    link, ws = _link()
+    _open(ws)
+    conn = signal_port.accepted.get(timeout=WAIT_S)
+    _send(ws, b'GET /rtc/validate HTTP/1.1\r\nHost: localhost\r\n\r\n'
+              b'POST /twirp/livekit.RoomService/DeleteRoom HTTP/1.1\r\n\r\n')
+    got, close = _received_until_close(ws)
+    assert got == REFUSAL and close['reason'] == 'not_upgraded'
+    assert signal_port.ended.get(timeout=WAIT_S) is conn
+    assert signal_port.request_lines() == [b'GET /rtc/validate HTTP/1.1']
 
 
 def test_a_tunnel_that_is_not_livekit_signalling_is_closed_unsent(signal_port):
