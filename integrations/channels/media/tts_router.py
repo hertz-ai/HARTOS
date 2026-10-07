@@ -5,7 +5,8 @@ Decision factors (in priority order):
 2. Availability — is the engine installed locally?
 3. Hardware — GPU present? Enough VRAM? CPU-only fallback?
 4. Compute policy — local_only | local_preferred | any (hive offload)
-5. Latency — instant (espeak/browser) vs quality (neural)
+5. Latency — instant (espeak/browser) vs quality (neural); live (a call:
+   this node's best voice, no LLM text rewrite)
 6. Voice cloning — only clone-capable engines if voice requested
 7. Hive peers — offload to GPU peer when local can't serve
 """
@@ -35,8 +36,20 @@ SOURCE_URGENCY: Dict[str, str] = {
     'channel': 'normal',             # Discord/Telegram response
     'cli': 'quality',                # hart voice "text"
     'agent_tool': 'normal',          # Agent using TTS tool
-    'call': 'instant',               # Agent speaking in a live call
+    'call': 'live',                  # Agent speaking in a live call
 }
+
+
+def llm_rewrite_allowed(urgency: str) -> bool:
+    """Whether text spoken at ``urgency`` may take normalize_for_tts's LLM
+    rewrite (numbers, units and the like the fast rule pass cannot say).
+
+    Not for 'instant', where the fastest engine is the point, nor for 'live',
+    where a person is waiting on the line and the rewrite would be another
+    round trip on the model that has just answered them.  The one rule:
+    TTSRouter.synthesize and the chat reply's own normalisation
+    (hart_intelligence_entry._tts_synthesize_and_publish) both ask it."""
+    return urgency not in ('instant', 'live')
 
 # ═══════════════════════════════════════════════════════════════
 # Engine Registry — static capabilities of every TTS engine
@@ -1249,7 +1262,9 @@ class TTSRouter:
             text: Text to synthesize
             language: ISO 639-1 code (auto-detected if None)
             voice: Voice reference (triggers clone-capable filter)
-            urgency: 'instant' (fastest), 'normal', 'quality' (best quality)
+            urgency: 'instant' (fastest), 'normal', 'quality' (best quality),
+                'live' (best quality among engines on this node, a hive
+                peer only when none here can speak)
             require_clone: Only return engines with voice cloning
 
         Returns:
@@ -1399,6 +1414,15 @@ class TTSRouter:
         elif urgency == 'quality':
             # Maximize quality — don't care about latency
             candidates.sort(key=lambda c: (-c.quality_score, c.estimated_latency_ms))
+        elif urgency == 'live':
+            # A person on the line hears this node's best voice.  Ranked by
+            # latency, espeak (quality 0.4, 10 ms) spoke every call where it
+            # is installed; here it is the last engine this node has.  The
+            # words stay on this node unless nothing here can speak them: a
+            # hive peer, ranked by quality, would win over every CPU engine.
+            candidates.sort(key=lambda c: (c.location != TTSLocation.LOCAL,
+                                           -c.quality_score,
+                                           c.estimated_latency_ms))
         else:
             # Balance: quality * 0.6 + inverse_latency * 0.4
             max_latency = max(c.estimated_latency_ms for c in candidates) or 1
@@ -1430,7 +1454,8 @@ class TTSRouter:
             output_path: Where to write WAV (auto-generated if None)
             source: Context hint (e.g. 'chat_response', 'greeting') —
                     auto-maps to urgency via SOURCE_URGENCY
-            urgency: 'instant' | 'normal' | 'quality' (used if source not set)
+            urgency: 'instant' | 'normal' | 'quality' | 'live' (used if
+                     source not set)
             engine_override: Force a specific engine (bypasses selection)
 
         Returns:
@@ -1450,14 +1475,14 @@ class TTSRouter:
 
         # Normalize numbers, currency, URLs, units to spoken form BEFORE
         # engine selection — every TTS engine benefits (single converging
-        # path).  Latency-sensitive ('instant' urgency) skips the LLM
-        # fallback but keeps the fast rule pass.
+        # path).  Latency-sensitive urgencies skip the LLM fallback but keep
+        # the fast rule pass (llm_rewrite_allowed).
         try:
             from integrations.channels.media.tts_text_normalizer import (
                 normalize_for_tts,
             )
             text = normalize_for_tts(
-                text, lang, use_llm=(urgency != 'instant'),
+                text, lang, use_llm=llm_rewrite_allowed(urgency),
             )
         except Exception as _e:  # never let normalization block synthesis
             logger.debug(f'tts normalization skipped: {_e}')

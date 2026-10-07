@@ -262,6 +262,95 @@ class TestUrgency:
             assert candidates[0].quality_score >= candidates[1].quality_score
 
 
+class TestACallIsSpokenLive:
+    """An agent speaking in a call (source 'call') is heard in this node's
+    best voice, its words stay on this node while anything here can speak
+    them, and it waits on no LLM rewrite of the text.  Ranked by latency
+    (urgency 'instant', ca1de342a), espeak -- quality 0.4 -- spoke every
+    call wherever it is installed (review of ca1de342a, finding 1)."""
+
+    _PEER = {'peer_id': 'node-p', 'address': '10.0.0.2', 'latency_ms': 100,
+             'gpu': 'RTX'}
+
+    def _order(self, installed, policy='local_preferred', peer=None,
+               succeed=False):
+        """The engines source='call' tries, in order, and the result."""
+        from integrations.channels.media import tts_router
+        router = tts_router.TTSRouter()
+        tried = []
+
+        def _execute(candidate, *a, **k):
+            tried.append((candidate.engine.engine_id, candidate.location.value))
+            if succeed:
+                return {'path': '/tmp/r.wav', 'duration': 1.0,
+                        'sample_rate': 24000}
+            return {'error': 'refused by the test'}
+
+        with patch.object(tts_router, '_get_gpu_info',
+                          return_value={'cuda_available': False}), \
+             patch.object(tts_router, '_get_compute_policy',
+                          return_value={'compute_policy': policy}), \
+             patch.object(tts_router, '_find_hive_peer_for_tts',
+                          return_value=peer), \
+             patch.object(tts_router, '_is_engine_installed',
+                          side_effect=lambda eid: eid in installed), \
+             patch.object(router, '_execute', side_effect=_execute):
+            result = router.synthesize("Halves are two equal parts.",
+                                       language='en', source='call')
+        return tried, result
+
+    def test_a_call_is_spoken_in_the_best_voice_here_and_espeak_last(self):
+        tried, _ = self._order({'espeak', 'pocket_tts', 'kokoro'})
+        assert [e for e, _ in tried] == ['pocket_tts', 'kokoro', 'espeak']
+
+    def test_a_calls_words_stay_here_while_an_engine_here_can_speak(self):
+        """A peer's GPU voice outranks every CPU engine on quality alone;
+        the call still tries everything on this node first."""
+        tried, _ = self._order({'pocket_tts', 'kokoro'}, policy='any',
+                               peer=self._PEER)
+        assert tried[:2] == [('pocket_tts', 'local'), ('kokoro', 'local')]
+        assert tried[2:] and all(loc == 'hive_peer' for _, loc in tried[2:])
+        assert tried[2][0] == 'chatterbox_turbo'
+
+    def test_a_call_nothing_here_can_speak_is_spoken_by_a_peer(self):
+        tried, result = self._order(set(), policy='any', peer=self._PEER,
+                                    succeed=True)
+        assert tried == [('chatterbox_turbo', 'hive_peer')]
+        assert (result.engine_id, result.location) == (
+            'chatterbox_turbo', 'hive_peer')
+
+    def test_a_call_never_leaves_a_local_only_node(self):
+        tried, result = self._order(set(), policy='local_only',
+                                    peer=self._PEER)
+        assert tried == []
+        assert result.error == 'No TTS engine is installed for this language'
+
+    @pytest.mark.parametrize('source, llm', [('call', False),
+                                             ('chat_response', True)])
+    def test_a_call_waits_on_no_llm_rewrite_of_its_text(self, source, llm):
+        from integrations.channels.media import tts_router
+        from integrations.channels.media import tts_text_normalizer
+        seen = []
+
+        def _normalize(text, lang, use_llm=True):
+            seen.append(use_llm)
+            return text
+
+        router = tts_router.TTSRouter()
+        with patch.object(tts_text_normalizer, 'normalize_for_tts',
+                          side_effect=_normalize), \
+             patch.object(router, 'select_engines', return_value=[]):
+            router.synthesize("It costs 5 dollars.", language='en',
+                              source=source)
+        assert seen == [llm]
+
+    def test_the_one_rule_for_the_llm_rewrite(self):
+        from integrations.channels.media.tts_router import llm_rewrite_allowed
+        assert [llm_rewrite_allowed(u) for u in
+                ('instant', 'live', 'normal', 'quality')] == [
+                    False, False, True, True]
+
+
 # ═══════════════════════════════════════════════════════════════
 # Voice Clone Filter
 # ═══════════════════════════════════════════════════════════════

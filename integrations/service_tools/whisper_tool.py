@@ -887,33 +887,85 @@ def _get_sherpa_recognizer(model_name: str = "whisper-tiny"):
     return _sherpa_recognizer
 
 
-def _read_wav_f32(audio_path: str):
-    """Read a PCM WAV into ``(sample_rate, float32 mono samples in [-1, 1])``.
+def read_wav_f32(audio_path: str):
+    """Read a WAV into ``(sample_rate, float32 mono samples in [-1, 1])``.
 
     sherpa-onnx's ``OfflineStream.accept_waveform`` wants normalized float32
     samples + the source sample rate.  The realtime STT pipeline writes 16-bit
     PCM WAV (see the streaming writer ~L1229).  Uses ONLY stdlib ``wave`` +
     numpy — no libsndfile / ffmpeg native dependency — so it behaves
     identically in the frozen bundle on Windows, macOS and Linux.
+
+    Also the one reader for a TTS engine's output (agent_voice_bridge speaks
+    it into a call).  Engines that write a float tensor write an IEEE-float
+    WAV (scipy.io.wavfile in pocket_tts_tool, gpu_worker's numpy_24k), which
+    ``wave`` refuses with 'unknown format: 3'; _read_wav_float reads those.
     """
     import wave
     import numpy as np
-    with wave.open(audio_path, 'rb') as wf:
-        sample_rate = wf.getframerate()
-        n_channels = wf.getnchannels()
-        sampwidth = wf.getsampwidth()
-        raw = wf.readframes(wf.getnframes())
-    if sampwidth == 2:
-        data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    elif sampwidth == 4:
-        data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
-    elif sampwidth == 1:  # 8-bit PCM is unsigned, centred at 128
-        data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    try:
+        with wave.open(audio_path, 'rb') as wf:
+            sample_rate = wf.getframerate()
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            raw = wf.readframes(wf.getnframes())
+    except wave.Error:
+        sample_rate, n_channels, data = _read_wav_float(audio_path)
     else:
-        raise ValueError(f"unsupported WAV sample width: {sampwidth} bytes")
+        if sampwidth == 2:
+            data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sampwidth == 4:
+            data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        elif sampwidth == 1:  # 8-bit PCM is unsigned, centred at 128
+            data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+        else:
+            raise ValueError(f"unsupported WAV sample width: {sampwidth} bytes")
     if n_channels > 1:  # down-mix to mono
         data = data.reshape(-1, n_channels).mean(axis=1)
     return sample_rate, data
+
+
+#: WAV format tags (the fmt chunk's first field).  WAVE_FORMAT_EXTENSIBLE
+#: names its real format in the first two bytes of its sub-format GUID.
+_WAVE_FORMAT_IEEE_FLOAT = 3
+_WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+
+
+def _read_wav_float(audio_path: str):
+    """``(sample_rate, channels, float32 interleaved samples)`` of an
+    IEEE-float WAV, 32 or 64 bit, plain or WAVE_FORMAT_EXTENSIBLE.  Anything
+    else raises ValueError naming what the file holds."""
+    import struct
+    import numpy as np
+    with open(audio_path, 'rb') as f:
+        blob = f.read()
+    if blob[:4] != b'RIFF' or blob[8:12] != b'WAVE':
+        raise ValueError(f"not a WAV file: {audio_path}")
+    fmt = samples = None
+    pos = 12
+    while pos + 8 <= len(blob):
+        chunk_id = blob[pos:pos + 4]
+        size = struct.unpack('<I', blob[pos + 4:pos + 8])[0]
+        body = blob[pos + 8:pos + 8 + size]
+        if chunk_id == b'fmt ':
+            fmt = body
+        elif chunk_id == b'data':
+            samples = body
+        pos += 8 + size + (size & 1)  # chunks are word-aligned
+    if fmt is None or len(fmt) < 16 or samples is None:
+        raise ValueError(f"WAV has no fmt or data chunk: {audio_path}")
+    tag, n_channels, sample_rate = struct.unpack('<HHI', fmt[:8])
+    bits = struct.unpack('<H', fmt[14:16])[0]
+    if tag == _WAVE_FORMAT_EXTENSIBLE and len(fmt) >= 26:
+        tag = struct.unpack('<H', fmt[24:26])[0]
+    if tag != _WAVE_FORMAT_IEEE_FLOAT or bits not in (32, 64):
+        raise ValueError(
+            f"unsupported WAV format {tag} at {bits} bits: {audio_path}")
+    dtype = '<f4' if bits == 32 else '<f8'
+    frame = (bits // 8) * max(n_channels, 1)
+    usable = len(samples) - len(samples) % frame  # a cut-off last frame
+    data = np.frombuffer(samples[:usable], dtype=dtype).astype(np.float32)
+    return sample_rate, max(n_channels, 1), data
 
 
 def _sherpa_transcribe(audio_path: str, model_name: str) -> Optional[str]:
@@ -926,7 +978,7 @@ def _sherpa_transcribe(audio_path: str, model_name: str) -> Optional[str]:
         # The old call raised AttributeError on every utterance, so STT
         # returned empty text — mic captured, nothing transcribed/sent/shown
         # (incident 2026-06-17).
-        sample_rate, samples = _read_wav_f32(audio_path)
+        sample_rate, samples = read_wav_f32(audio_path)
         stream = recognizer.create_stream()
         stream.accept_waveform(sample_rate, samples)
         recognizer.decode_stream(stream)

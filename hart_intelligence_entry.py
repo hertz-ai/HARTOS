@@ -9320,7 +9320,8 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
             # timed with the canonical latency_ms= key.
             #
             # use_llm is True here for chat_response (SOURCE_URGENCY says
-            # 'normal', and use_llm = urgency != 'instant'), so this stage can
+            # 'normal', and tts_router.llm_rewrite_allowed allows the rewrite
+            # for it), so this stage can
             # make an LLM round-trip on the SAME contended server that just
             # served the reply.  budget: the docstring's "never let
             # normalization block speech" promise is about crashes; the
@@ -9329,12 +9330,14 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
             if not audio_path:
                 try:
                     from core.tool_logging import timed_stage
-                    from integrations.channels.media.tts_router import SOURCE_URGENCY
+                    from integrations.channels.media.tts_router import (
+                        SOURCE_URGENCY, llm_rewrite_allowed,
+                    )
                     from integrations.channels.media.tts_text_normalizer import (
                         normalize_for_tts,
                     )
                     _urgency = SOURCE_URGENCY.get('chat_response', 'normal')
-                    _use_llm = (_urgency != 'instant')
+                    _use_llm = llm_rewrite_allowed(_urgency)
                     with timed_stage('tts.normalize', logger=app.logger,
                                      warn_over_ms=1500, use_llm=_use_llm,
                                      chars=len(_clean), lang=language):

@@ -495,7 +495,12 @@ class AgentBridgeWorker:
         pcm, rate, channels = self._synthesize_pcm(text)
         if not pcm:
             return
-        pub.push_pcm(pcm, src_rate=rate, src_channels=channels)
+        if not pub.push_pcm(pcm, src_rate=rate, src_channels=channels):
+            logger.warning(
+                "AgentBridgeWorker._publish_audio_for: the room did not take "
+                "the reply's audio (publisher stopped or not connected) — "
+                "call=%s agent=%s text=%r",
+                self.call_id, self.agent_id, text[:120])
 
     def _ensure_publisher(self):
         """Return this worker's LiveKitAudioPublisher, creating + starting it on
@@ -539,16 +544,19 @@ class AgentBridgeWorker:
         """``text`` → (pcm_bytes, sample_rate, channels) through the one TTS
         router (TTSRouter.synthesize: its engine ladder, text normalisation and
         fallbacks, the canonical synth entry), as source 'call' -- urgency
-        'instant', since a live call cannot wait on an LLM rewrite of the text.
+        'live': this node's best voice, and no LLM rewrite of the text, which
+        a person waiting on the line cannot wait for.
 
-        The engine writes a .wav; we read it back as PCM16 with the stdlib
-        ``wave`` module.  The publisher resamples to the LiveKit publish format,
-        so we pass the wav's native rate/channels straight through.  Returns
+        The engine writes a .wav, in whatever sample format it uses (a float
+        tensor becomes an IEEE-float WAV); whisper_tool.read_wav_f32, the one
+        WAV reader, reads either, and it becomes mono PCM16 here.  The
+        publisher resamples to the LiveKit publish format.  Returns
         ``(b'', 0, 1)`` on any failure (no engine, missing file, unreadable
         wav), logged with the router's reason — never raises."""
         try:
-            import wave
+            import numpy as np
             from integrations.channels.media.tts_router import get_tts_router
+            from integrations.service_tools.whisper_tool import read_wav_f32
             res = get_tts_router().synthesize(text, source='call')
             path = res.path
             if res.error or not path:
@@ -556,11 +564,12 @@ class AgentBridgeWorker:
                     "AgentBridgeWorker._synthesize_pcm: TTS produced no audio "
                     "(call=%s): %s", self.call_id, res.error or 'no file')
                 return b'', 0, 1
-            with wave.open(path, 'rb') as wf:
-                channels = wf.getnchannels()
-                rate = wf.getframerate()
-                pcm = wf.readframes(wf.getnframes())
-            return pcm, rate, channels
+            rate, samples = read_wav_f32(path)
+            # x32768 is exact for a PCM16 file (read as int16 / 32768); a float
+            # at full scale clips to the int16 range.
+            pcm = np.clip(np.round(samples * 32768.0), -32768, 32767
+                          ).astype('<i2').tobytes()
+            return pcm, rate, 1
         except Exception as e:
             logger.warning(
                 "AgentBridgeWorker._synthesize_pcm failed (call=%s): %s",
