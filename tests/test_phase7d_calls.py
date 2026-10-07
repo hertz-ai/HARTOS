@@ -301,6 +301,67 @@ def test_grant_agent_only_owner_can_grant(fresh_db):
             scope={'can_voice': True})
 
 
+def _machine_owner_and_stranger_agent(db, monkeypatch):
+    """This machine's owner (HEVOLVE_OWNER_USER_ID, set by Nunba at boot)
+    and an agent someone else wrote, in a community the owner is in."""
+    me, author = _seed_users(db, 2)
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', me.id)
+    agent = _seed_agent(db, owner_id=author.id)
+    com = _seed_community(db, owner_id=me.id)
+    return me, author, agent, com
+
+
+def test_this_machines_owner_grants_any_agent_on_it(fresh_db, monkeypatch):
+    """Owner ruling 2026-10-08: an agent is shared as a recipe; whoever runs
+    it on their own machine trusts it with their data, so that machine's
+    owner decides whether it joins their calls, not its author."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from integrations.social.call_service import CallService
+    grant = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    assert grant['owner_id'] == me.id and grant['scope'] == {'can_voice': True}
+
+
+def test_this_machines_owner_grants_a_system_agent_on_it(fresh_db, monkeypatch):
+    db, _ = fresh_db
+    me, _author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from integrations.social.models import User
+    agent_row = db.query(User).filter(User.id == agent.id).first()
+    agent_row.owner_id = None              # ownerless: made by an agent
+    db.commit()
+    from integrations.social.call_service import CallService
+    grant = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    assert grant['agent_id'] == agent.id
+
+
+def test_someone_else_on_the_machine_still_cannot_grant(fresh_db, monkeypatch):
+    """Only the machine's owner gains the right: another person signed in on
+    it is not the agent's owner and not the machine's."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    guest, = _seed_users(db, 1)
+    from integrations.social.call_service import CallService, CallError
+    with pytest.raises(CallError):
+        CallService.grant_agent(db, agent.id, guest.id, 'community', com.id,
+                                scope={'can_voice': True})
+
+
+def test_no_machine_owner_grants_nobody_the_machine_owners_right(fresh_db, monkeypatch):
+    """Central and regional nodes set no HEVOLVE_OWNER_USER_ID: the unset
+    owner matches no caller, not even one with no id."""
+    db, _ = fresh_db
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
+    a, = _seed_users(db, 1)
+    agent = _seed_agent(db, owner_id=None)
+    com = _seed_community(db, owner_id=a.id)
+    from integrations.social.call_service import CallService, CallError
+    with pytest.raises(CallError):
+        CallService.grant_agent(db, agent.id, '', 'community', com.id,
+                                scope={'can_voice': True})
+
+
 def test_grant_system_agent_refused_for_non_admin(fresh_db):
     """Pass-4 P4-3 fix: ownerless (system) agents must NOT be
     grantable by arbitrary authenticated users.  Previously the

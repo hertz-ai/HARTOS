@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -272,7 +273,9 @@ class CallService:
                     scope: Dict[str, Any],
                     source: str = 'user_explicit',
                     tenant_id: Optional[str] = None) -> Dict[str, Any]:
-        """Owner grants an agent permission to join a parent.
+        """The agent's owner grants it permission to join a parent -- or,
+        on a machine a person owns, that machine's owner does, for any
+        agent on it (HEVOLVE_OWNER_USER_ID; see below).
 
         Idempotent on (agent_id, parent_kind, parent_id) — a re-grant
         with the same triple updates the scope rather than inserting
@@ -295,7 +298,16 @@ class CallService:
         if agent_row[0] != 'agent':
             raise CallError("user is not an agent")
         agent_owner = agent_row[1]
-        if agent_owner is None:
+        # This machine's owner decides which agents join calls on it, whoever
+        # wrote them: an agent is shared as a recipe, and whoever runs it on
+        # their own compute trusts it with their data, not its author (owner
+        # ruling 2026-10-08).  HEVOLVE_OWNER_USER_ID names that owner where a
+        # person owns the machine (Nunba sets it at boot); central and
+        # regional nodes leave it unset and keep the rule below.
+        machine_owner = os.environ.get('HEVOLVE_OWNER_USER_ID') or ''
+        if machine_owner and str(owner_id) == machine_owner:
+            pass
+        elif agent_owner is None:
             # Pass-4 P4-3 fix: system / ownerless agents must NOT be
             # granted by an arbitrary user.  Previously the
             # `agent_row[1] is not None` short-circuit allowed any
