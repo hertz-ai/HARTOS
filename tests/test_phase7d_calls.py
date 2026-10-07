@@ -681,6 +681,18 @@ def test_decide_media_mode_a_person_calling_an_agent_gets_livekit(monkeypatch):
     assert _decide_media_mode({'kind': 'voice'}, gone, is_agent=False) == 'p2p_mesh'
 
 
+def test_decide_media_mode_a_person_naming_their_device_agent_bridge_stays_on_the_mesh(monkeypatch):
+    """device_kind is whatever a joining client says (join_call); only
+    attach_agent writes agent_kind 'agent'.  A person who joins with
+    device_kind 'agent_bridge' is not an agent and moves no one to LiveKit."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    parts = [{'user_id': 'person-9', 'left_at': None, 'agent_kind': 'human',
+              'device_kind': 'agent_bridge'}]
+    assert _decide_media_mode({'kind': 'voice'}, parts, is_agent=False) == 'p2p_mesh'
+
+
 def test_decide_media_mode_screen_share_always_livekit(monkeypatch):
     """screen_share / mixed kinds → livekit regardless of count."""
     monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)

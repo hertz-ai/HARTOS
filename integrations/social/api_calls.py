@@ -141,8 +141,12 @@ def _decide_media_mode(sess, participants, *, is_agent: bool) -> str:
     active = [p for p in (participants or []) if not p.get('left_at')]
     # An agent in the call -- the caller, or an agent_bridge already in it --
     # is there only through the SFU room (AgentVoiceBridge), so the call is
-    # LiveKit's: on a mesh the agent could neither hear nor speak.
-    if is_agent or any(p.get('device_kind') == 'agent_bridge' for p in active):
+    # LiveKit's: on a mesh the agent could neither hear nor speak.  An
+    # agent_bridge is the row attach_agent writes (agent_kind 'agent'): a
+    # joining client names its own device_kind (join_call), so device_kind
+    # alone proves nothing.
+    if is_agent or any(p.get('device_kind') == 'agent_bridge'
+                       and p.get('agent_kind') == 'agent' for p in active):
         return 'livekit'
     kind = (sess or {}).get('kind') or 'voice'
     if kind in ('screen_share', 'mixed'):
