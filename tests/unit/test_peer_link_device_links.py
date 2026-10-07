@@ -56,20 +56,22 @@ class FakeWs:
         self.closed = True
 
 
-def _hello(phone, token=None, node_id=None, trust='same_user'):
+def _hello(phone, token=None, node_id=None, trust='same_user', x25519_hex=None, sealed=None):
     """The HELLO the phone sends (PeerLinkHandshake.buildHelloMessage): every
     value a string or an integer, signed over canonical_payload."""
     hello = {
         'type': 'hello',
         'node_id': node_id or phone.public_hex[:16],
         'ed25519_public': phone.public_hex,
-        'x25519_public': 'cd' * 32,
+        'x25519_public': x25519_hex or 'cd' * 32,
         'trust_requested': trust,
         'protocol_version': 1,
         'timestamp': int(time.time()),
     }
     if token:
         hello['device_token'] = token
+    if sealed:
+        hello['device_token_sealed'] = sealed
     hello['signature'] = phone.key.sign(
         canonical_payload(hello, exclude=('signature',))).hex()
     return hello
@@ -507,3 +509,73 @@ def test_a_nodes_heartbeat_is_not_answered():
     node = PeerLink('node-7', '10.0.0.7:6777', TrustLevel.PEER)
     node._state = LinkState.CONNECTED
     assert _frames_out(node, [{'ch': 'control', 'id': 'hb-1', 'd': {'type': 'heartbeat'}}]) == []
+
+
+def _sealed_to(desktop_x25519_hex, token):
+    """A phone's device token sealed the way PeerLinkHandshake seals it: the
+    phone's X25519 key against the desktop's, the session key both ends
+    derive (link.session_key_from), AES-256-GCM, nonce first, base64.
+    Returns (the phone's X25519 public hex, the sealed token)."""
+    import base64
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives import serialization as ser
+    from core.peer_link.link import session_key_from
+    ours = X25519PrivateKey.generate()
+    key = session_key_from(ours, desktop_x25519_hex)
+    nonce = os.urandom(12)
+    sealed = base64.b64encode(nonce + AESGCM(key).encrypt(nonce, token.encode(), None)).decode()
+    pub = ours.public_key().public_bytes(ser.Encoding.Raw, ser.PublicFormat.Raw).hex()
+    return pub, sealed
+
+
+def test_a_phone_whose_token_is_sealed_to_this_desktop_opens_its_device_link(phone):
+    """On the relay the HELLO can cross a plaintext leg (the desktop's router
+    session falls back to ws:// when the TLS one is unreachable): a phone
+    that met this desktop on its LAN seals its token to the desktop's key,
+    and the desktop opens it -- the same device link as a token in clear."""
+    from security.channel_encryption import get_x25519_public_hex
+    _allow(phone)
+    _install_real_verifier()
+    pub, sealed = _sealed_to(get_x25519_public_hex(), phone.token())
+    link = _accept(_hello(phone, x25519_hex=pub, sealed=sealed))
+    assert link is not None and link.is_connected
+    assert link.kind == 'device'
+    assert link.user_id == '40021'
+    assert link.trust == TrustLevel.SAME_USER
+    assert link.peer_id == device_fingerprint(phone.public_hex)
+    assert get_link_manager().get_link(link.peer_id) is link
+    assert PeerLink._get_local_capabilities()['sealed_hello'] is True
+
+
+def test_a_sealed_token_that_does_not_open_here_is_refused(phone):
+    """Sealed to another desktop's key: no device link, and no node link
+    either -- it is not taken for a node's HELLO."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives import serialization as ser
+    _allow(phone)
+    _install_real_verifier()
+    elsewhere = X25519PrivateKey.generate().public_key().public_bytes(
+        ser.Encoding.Raw, ser.PublicFormat.Raw).hex()
+    pub, sealed = _sealed_to(elsewhere, phone.token())
+    asked_as_node = []
+
+    def node_would_admit(self, hello_data, peer_ed25519):
+        asked_as_node.append(peer_ed25519)
+        return True
+    with patch.object(PeerLink, '_decide_node_trust', node_would_admit):
+        assert _accept(_hello(phone, x25519_hex=pub, sealed=sealed)) is None
+    assert asked_as_node == [], "a seal that does not open fell through to the node path"
+    assert get_link_manager()._links == {}
+
+
+def test_a_sealed_phone_is_bounded_by_its_owners_grant_not_the_node_budget(phone):
+    """A phone is a device whether its token is clear or sealed: the node
+    connection budget never turns it away."""
+    from security.channel_encryption import get_x25519_public_hex
+    _allow(phone)
+    _install_real_verifier()
+    get_link_manager()._max_links = 0
+    pub, sealed = _sealed_to(get_x25519_public_hex(), phone.token())
+    link = _accept(_hello(phone, x25519_hex=pub, sealed=sealed))
+    assert link is not None and link.kind == 'device'

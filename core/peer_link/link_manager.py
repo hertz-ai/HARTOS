@@ -26,8 +26,8 @@ from typing import Any, Callable, Dict, List, Optional
 from core.foreground import should_yield_to_user
 
 from .channels import device_may_receive
-from .link import (PeerLink, TrustLevel, LinkState, provable_user_id,
-                   set_device_verifier, set_peer_admission_ask)
+from .link import (PeerLink, TrustLevel, LinkState, hello_names_device,
+                   provable_user_id, set_device_verifier, set_peer_admission_ask)
 
 logger = logging.getLogger('hevolve.peer_link')
 
@@ -314,7 +314,7 @@ class PeerLinkManager:
         Returns the live PeerLink, or None when the handshake failed or the
         connection budget refused it.
         """
-        is_device = bool(hello.get('device_token'))
+        is_device = hello_names_device(hello)
         if is_device:
             # A phone (HARTOS #111): its identity is the key its token proves,
             # named by link.accept() from the verdict, never the node_id it

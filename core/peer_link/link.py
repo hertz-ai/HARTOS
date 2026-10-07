@@ -242,6 +242,38 @@ def session_key_from(our_private, peer_public_hex: str) -> bytes:
     ).derive(shared_secret)
 
 
+#: A phone's device token sealed to this node (PeerLinkHandshake): AES-256-GCM
+#: under the session key both ends derive from the phone's X25519 key in the
+#: HELLO and this node's (session_key_from), nonce first, base64.  The phone
+#: learned this node's key meeting it on its LAN (the hello_ack), so on the
+#: relay -- where the desktop's router leg can be plaintext ws:// (relay.py
+#: falls back when the TLS router is unreachable) -- the token crosses unread.
+SEALED_DEVICE_TOKEN = 'device_token_sealed'
+
+
+def hello_names_device(hello: dict) -> bool:
+    """Does this HELLO come from a phone: a device token, clear or sealed?"""
+    return bool(hello.get('device_token') or hello.get(SEALED_DEVICE_TOKEN))
+
+
+def open_sealed_device_token(sealed: str, peer_x25519_public: str) -> Optional[str]:
+    """The device token a phone sealed to this node, or None (logged) when it
+    does not open under this node's key."""
+    try:
+        import base64
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from security.channel_encryption import get_x25519_keypair
+        our_private, _ = get_x25519_keypair()
+        key = session_key_from(our_private, peer_x25519_public)
+        data = base64.b64decode(str(sealed), validate=True)
+        if len(data) < 13:  # 12 nonce + at least 1 byte
+            raise ValueError('too short to be a sealed token')
+        return AESGCM(key).decrypt(data[:12], data[12:], None).decode('utf-8')
+    except Exception as e:
+        logger.warning(f"A sealed device token did not open under this node's key: {e}")
+        return None
+
+
 def provable_user_id() -> str:
     """The user_id we can actually PROVE to a peer, or ''.
 
@@ -845,6 +877,12 @@ class PeerLink:
         # filed and paced.  Trust is SAME_USER -- the owner said this device
         # is theirs -- with kind 'device' bounding everything else.
         device_token = hello_data.get('device_token')
+        if not device_token and hello_data.get(SEALED_DEVICE_TOKEN):
+            device_token = open_sealed_device_token(
+                hello_data[SEALED_DEVICE_TOKEN], self.peer_x25519_public)
+            if not device_token:
+                logger.warning("Device HELLO refused: its sealed token does not open here")
+                return False
         if device_token:
             if not self._admit_device(peer_ed25519, peer_sig, str(device_token)):
                 return False
@@ -1439,4 +1477,8 @@ class PeerLink:
         # the cloud at once.  Additive: a phone waits for an answer only from
         # a node that names it.
         caps['heartbeat_reply'] = True
+        # A phone's device token sealed to this node's X25519 key opens here
+        # (open_sealed_device_token): a phone that met this node on its LAN
+        # seals the token on the relay.  Additive, like heartbeat_reply.
+        caps['sealed_hello'] = True
         return caps
