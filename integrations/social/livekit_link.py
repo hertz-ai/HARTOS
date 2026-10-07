@@ -36,9 +36,10 @@ when it names a Content-Length (LiveKit's do), and the tunnel closes
 ('not_upgraded'), so no second request is ever sent.  A tunnel whose link is
 gone (dropped, pruned idle, replaced by the phone's redial) closes, at the
 latest when the phone next opens one or within _WRITER_POLL_S; one whose
-LiveKit stops reading closes after _IO_TIMEOUT_S ('livekit_stalled'), and
-one whose first request LiveKit leaves unanswered after _ANSWER_TIMEOUT_S
-('no_answer').
+LiveKit stops reading closes after _IO_TIMEOUT_S ('livekit_stalled'); one
+whose phone sends no whole first request within _REQUEST_TIMEOUT_S of the
+open closes ('no_request'), and one whose first request LiveKit leaves
+unanswered after _ANSWER_TIMEOUT_S ('no_answer').
 
 Relay links are end-to-end encrypted (relay.py), so the relay reads none of
 it.  Media does not ride the tunnel: LiveKit's ICE candidates name this
@@ -78,6 +79,9 @@ _CONNECT_TIMEOUT_S = 5
 _IO_TIMEOUT_S = 5
 #: How long LiveKit has to answer the tunnel's first request ('no_answer').
 _ANSWER_TIMEOUT_S = 10
+#: How long the phone has, from the open, to send that first request
+#: ('no_request'): a tunnel holds one of its phone's two slots.
+_REQUEST_TIMEOUT_S = 10
 #: How often the writer, idle, looks whether its link is still there.
 _WRITER_POLL_S = 1.0
 #: The first request on a tunnel: a GET of LiveKit's signal path.
@@ -146,8 +150,10 @@ class _Tunnel:
         self._answer: Optional[bytes] = b''
         self._body_left = 0
         # When the first request went to LiveKit (monotonic), for its answer's
-        # deadline; 0 until it has.
+        # deadline; 0 until it has.  And when the tunnel opened, for the
+        # request's own deadline.
         self._asked_at = 0.0
+        self._opened_at = time.monotonic()
 
     def start(self) -> None:
         threading.Thread(target=self._read, daemon=True,
@@ -233,11 +239,19 @@ class _Tunnel:
                        "LiveKit signalling (%r)", self.tid[:8], self.link.peer_id[:12], line)
         self.close('not_signalling', tell_phone=True)
 
-    def _overdue(self) -> bool:
-        """LiveKit has not answered the first request in _ANSWER_TIMEOUT_S."""
+    def _overdue(self) -> Optional[str]:
+        """Why an idle tunnel ends now, if it does: the phone sent no whole
+        first request in _REQUEST_TIMEOUT_S of the open ('no_request'), or
+        LiveKit has not answered it in _ANSWER_TIMEOUT_S ('no_answer')."""
         with self._gate:
+            unasked = self._head is not None
             waiting = self._answer is not None and self._asked_at
-        return bool(waiting) and time.monotonic() - self._asked_at > _ANSWER_TIMEOUT_S
+        now = time.monotonic()
+        if unasked and now - self._opened_at > _REQUEST_TIMEOUT_S:
+            return 'no_request'
+        if waiting and now - self._asked_at > _ANSWER_TIMEOUT_S:
+            return 'no_answer'
+        return None
 
     def _read(self) -> None:
         reason = 'closed'
@@ -249,8 +263,9 @@ class _Tunnel:
                 if not self.link.is_connected:
                     reason = 'link gone'
                     break
-                if self._overdue():
-                    reason = 'no_answer'
+                late = self._overdue()
+                if late:
+                    reason = late
                     break
                 continue
             except OSError as e:

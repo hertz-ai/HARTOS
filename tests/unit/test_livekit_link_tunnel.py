@@ -181,9 +181,9 @@ def _manager(monkeypatch):
     reset_link_manager()
 
 
-def _link(kind='device'):
+def _link(kind='device', peer_id=None):
     """A live link of ``kind`` with its receive loop running over a LinkSocket."""
-    link = PeerLink(f'{kind}-1', 'relay:conv-1', TrustLevel.SAME_USER)
+    link = PeerLink(peer_id or f'{kind}-1', 'relay:conv-1', TrustLevel.SAME_USER)
     link.kind = kind
     link.user_id = '40021' if kind == 'device' else ''
     ws = LinkSocket()
@@ -426,7 +426,7 @@ def test_a_phone_holds_at_most_two_tunnels(signal_port):
 def _replace_link(old):
     """The phone redials: a fresh link under the same peer id replaces the
     old one in the manager, and the old one is closed (accept_inbound)."""
-    link, ws = _link()
+    link, ws = _link(peer_id=old.peer_id)
     old._state = LinkState.DISCONNECTED
     return link, ws
 
@@ -446,6 +446,52 @@ def test_a_phone_that_redials_opens_at_once_and_its_old_tunnels_end(signal_port)
     assert time.monotonic() - started < 0.9
     ended = {signal_port.ended.get(timeout=WAIT_S), signal_port.ended.get(timeout=WAIT_S)}
     assert ended == first
+
+
+def test_one_phones_redial_leaves_another_phones_tunnels_open(signal_port):
+    """The redial sweep is one phone's: a second phone's tunnel on its own
+    link still carries its bytes after the first phone redials."""
+    a, a_ws = _link(peer_id='device-a')
+    b, b_ws = _link(peer_id='device-b')
+    _open(b_ws, 'b1')
+    b_conn = signal_port.accepted.get(timeout=WAIT_S)
+    _open(a_ws, 'a1')
+    signal_port.accepted.get(timeout=WAIT_S)
+    a2, a2_ws = _replace_link(a)
+    assert a2.peer_id == 'device-a'
+    assert _open(a2_ws, 'a1') == {'type': 'tunnel_opened', 'id': 'a1'}
+    assert signal_port.ended.get(timeout=WAIT_S) is not b_conn
+    _send(b_ws, UPGRADE_REQUEST, 'b1')
+    assert _received(b_ws, len(UPGRADED), 'b1') == UPGRADED
+
+
+def test_a_tunnel_whose_phone_never_sends_a_request_ends(monkeypatch, signal_port):
+    """Opened and then silent: the tunnel does not hold one of the phone's
+    two slots until its link goes; it ends 'no_request'."""
+    from integrations.social import livekit_link
+    monkeypatch.setattr(livekit_link, '_IO_TIMEOUT_S', 0.2, raising=False)
+    monkeypatch.setattr(livekit_link, '_REQUEST_TIMEOUT_S', 0.5, raising=False)
+    link, ws = _link()
+    _open(ws)
+    conn = signal_port.accepted.get(timeout=WAIT_S)
+    close = ws.next_out('tunnel_close')['d']
+    assert close == {'type': 'tunnel_close', 'id': 't1', 'reason': 'no_request'}
+    assert signal_port.ended.get(timeout=WAIT_S) is conn
+
+
+def test_a_phone_has_the_whole_request_deadline_to_send_its_request(monkeypatch, signal_port):
+    """The deadline runs from the open: idle reads before it pass, and a
+    request sent within it opens the WebSocket as usual."""
+    from integrations.social import livekit_link
+    monkeypatch.setattr(livekit_link, '_IO_TIMEOUT_S', 0.2, raising=False)
+    monkeypatch.setattr(livekit_link, '_REQUEST_TIMEOUT_S', 5, raising=False)
+    link, ws = _link()
+    _open(ws)
+    signal_port.accepted.get(timeout=WAIT_S)
+    time.sleep(1.0)                        # five idle reads, well inside the deadline
+    assert ws.out.empty(), 'the tunnel closed before its request deadline'
+    _send(ws, UPGRADE_REQUEST)
+    assert _received(ws, len(UPGRADED)) == UPGRADED
 
 
 def test_a_livekit_that_stops_reading_ends_the_tunnel(monkeypatch, signal_port):
