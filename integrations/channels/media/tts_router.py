@@ -35,6 +35,7 @@ SOURCE_URGENCY: Dict[str, str] = {
     'channel': 'normal',             # Discord/Telegram response
     'cli': 'quality',                # hart voice "text"
     'agent_tool': 'normal',          # Agent using TTS tool
+    'call': 'instant',               # Agent speaking in a live call
 }
 
 # ═══════════════════════════════════════════════════════════════

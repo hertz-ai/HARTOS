@@ -16,12 +16,12 @@ WHY this exists:
       path used for post / comment / message mentions.  GuardrailEnforcer
       (before_dispatch + after_response) gates every agent action — the
       agent never has a privileged path.
-    - TTS-ifies the agent's reply via PocketTTS and publishes the audio
+    - TTS-ifies the agent's reply via the TTS router and publishes the audio
       frames into the LiveKit room.
 
 This module ships the SCAFFOLDING + the worker contract.  The actual
 audio frame plumbing depends on the LiveKit Python SDK
-(`livekit-api`, `livekit-rtc`) and the existing PocketTTS + Whisper
+(`livekit-api`, `livekit-rtc`) and the existing TTS router + Whisper
 modules.  Each integration point is marked with a comment + a stub
 return so the module is importable + testable without those packages
 installed.
@@ -90,8 +90,8 @@ _ACTIVE_SUBSCRIBERS: Dict[str, 'LiveKitTranscriptSubscriber'] = {}
 # queue.  agentic_router._post_agent_reply for source_kind='call'
 # enqueues the agent's reply text here; the audio publisher (the
 # bridge worker's TTS half OR an external adapter — LiveKit-rtc
-# producer / Discord voice client) drains it, synthesizes via
-# PocketTTS, and publishes audio frames into the room.
+# producer / Discord voice client) drains it, synthesizes through
+# the TTS router, and publishes audio frames into the room.
 #
 # Single canonical home for outbound agent-text-on-calls.  No parallel
 # queues elsewhere — every producer pushes here, every consumer reads
@@ -173,7 +173,7 @@ class AgentBridgeWorker:
     publisher token, runs the STT/dispatch/TTS loop until detach.
 
     Scaffolded — actual frame I/O is wired alongside livekit-rtc +
-    PocketTTS + whisper integrations.  The contract here lets the
+    TTS router + whisper integrations.  The contract here lets the
     rest of the system call attach_agent / detach_agent today."""
 
     def __init__(self, call_id: str, agent_id: str, owner_id: str,
@@ -282,7 +282,7 @@ class AgentBridgeWorker:
 
     def _tick(self) -> None:
         """One worker iteration — lazy-importing the integrations so
-        unit tests don't drag in livekit/whisper/PocketTTS modules
+        unit tests don't drag in livekit/whisper/TTS modules
         that may not be installed.
 
         Drains finalized STT segments from
@@ -465,7 +465,7 @@ class AgentBridgeWorker:
                     self.call_id, self.agent_id, e)
 
     def _publish_audio_for(self, text: str) -> None:
-        """Synthesize ``text`` via PocketTTS and publish the audio frames into
+        """Synthesize ``text`` (the TTS router) and publish the audio frames into
         the LiveKit room through this worker's ``LiveKitAudioPublisher`` (the
         agent's "mouth").
 
@@ -536,25 +536,25 @@ class AgentBridgeWorker:
         return pub
 
     def _synthesize_pcm(self, text: str):
-        """``text`` → (pcm_bytes, sample_rate, channels) via PocketTTS.
+        """``text`` → (pcm_bytes, sample_rate, channels) through the one TTS
+        router (TTSRouter.synthesize: its engine ladder, text normalisation and
+        fallbacks, the canonical synth entry), as source 'call' -- urgency
+        'instant', since a live call cannot wait on an LLM rewrite of the text.
 
-        PocketTTS writes a .wav (``pocket_tts_synthesize`` → JSON ``{path}``);
-        we read it back as PCM16 with the stdlib ``wave`` module.  The publisher
-        resamples to the LiveKit publish format, so we pass the wav's native
-        rate/channels straight through.  Returns ``(b'', 0, 1)`` on any failure
-        (TTS error, missing file, unreadable wav) — never raises."""
+        The engine writes a .wav; we read it back as PCM16 with the stdlib
+        ``wave`` module.  The publisher resamples to the LiveKit publish format,
+        so we pass the wav's native rate/channels straight through.  Returns
+        ``(b'', 0, 1)`` on any failure (no engine, missing file, unreadable
+        wav), logged with the router's reason — never raises."""
         try:
-            import json
             import wave
-            from integrations.service_tools.pocket_tts_tool import (
-                pocket_tts_synthesize,
-            )
-            res = json.loads(pocket_tts_synthesize(text))
-            path = res.get('path')
-            if not path:
+            from integrations.channels.media.tts_router import get_tts_router
+            res = get_tts_router().synthesize(text, source='call')
+            path = res.path
+            if res.error or not path:
                 logger.warning(
                     "AgentBridgeWorker._synthesize_pcm: TTS produced no audio "
-                    "(call=%s): %s", self.call_id, res.get('error', res))
+                    "(call=%s): %s", self.call_id, res.error or 'no file')
                 return b'', 0, 1
             with wave.open(path, 'rb') as wf:
                 channels = wf.getnchannels()

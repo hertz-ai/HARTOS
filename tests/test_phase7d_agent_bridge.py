@@ -152,3 +152,67 @@ def test_worker_survives_transient_tick_exception(monkeypatch):
     assert len(bridges) == 1
     assert bridges[0]['alive'] is True
     assert raised['count'] >= 1  # the crash actually fired
+
+
+# ── The agent's voice in a call: the one TTS router ─────────────────────────
+
+
+def _wav(path, frames=b'\x01\x00\x02\x00' * 80, rate=22050, channels=1):
+    import wave
+    with wave.open(str(path), 'wb') as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(frames)
+    return frames
+
+
+def _router_and_pocket(monkeypatch, result):
+    """The canonical TTS router (recording its calls, answering ``result``)
+    and the PocketTTS tool the bridge used to call directly (recording)."""
+    from integrations.channels.media import tts_router
+    from integrations.service_tools import pocket_tts_tool
+    calls, pocket = [], []
+
+    class _Router:
+        def synthesize(self, text, **kw):
+            calls.append((text, kw))
+            return result
+
+    monkeypatch.setattr(tts_router, 'get_tts_router', lambda: _Router())
+    monkeypatch.setattr(pocket_tts_tool, 'pocket_tts_synthesize',
+                        lambda *a, **k: pocket.append(a) or '{"error": "unused"}')
+    return calls, pocket
+
+
+def test_the_agents_call_reply_is_spoken_by_the_one_tts_router(monkeypatch, tmp_path):
+    """One TTS path: the call's voice comes from TTSRouter.synthesize -- the
+    canonical synth entry, with its engine ladder and text normalisation --
+    never from one engine called directly, and as a call ('instant': a live
+    call cannot wait on an LLM rewrite of the text)."""
+    from integrations.channels.media.tts_router import SOURCE_URGENCY, TTSResult
+    from integrations.social.agent_voice_bridge import AgentBridgeWorker
+    frames = _wav(tmp_path / 'reply.wav', rate=24000)
+    calls, pocket = _router_and_pocket(monkeypatch, TTSResult(
+        path=str(tmp_path / 'reply.wav'), duration=0.1, engine_id='piper',
+        device='cpu', location='local', latency_ms=5, sample_rate=24000,
+        voice='default', quality_score=0.7))
+    worker = AgentBridgeWorker('call-1', 'agent-1', 'owner-1', {})
+    assert worker._synthesize_pcm('Halves are two equal parts.') == (frames, 24000, 1)
+    assert calls == [('Halves are two equal parts.', {'source': 'call'})]
+    assert SOURCE_URGENCY['call'] == 'instant'
+    assert pocket == []
+
+
+def test_a_call_reply_the_router_cannot_speak_says_why(monkeypatch, caplog):
+    from integrations.channels.media.tts_router import TTSResult
+    from integrations.social.agent_voice_bridge import AgentBridgeWorker
+    _router_and_pocket(monkeypatch, TTSResult(
+        path='', duration=0, engine_id='none', device='none', location='none',
+        latency_ms=0, sample_rate=0, voice='', quality_score=0,
+        error='no engine installed'))
+    worker = AgentBridgeWorker('call-1', 'agent-1', 'owner-1', {})
+    with caplog.at_level('WARNING'):
+        assert worker._synthesize_pcm('hello') == (b'', 0, 1)
+    assert any('no engine installed' in r.getMessage() and 'call-1' in r.getMessage()
+               for r in caplog.records)
