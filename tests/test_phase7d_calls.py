@@ -302,13 +302,84 @@ def test_grant_agent_only_owner_can_grant(fresh_db):
 
 
 def _machine_owner_and_stranger_agent(db, monkeypatch):
-    """This machine's owner (HEVOLVE_OWNER_USER_ID, set by Nunba at boot)
-    and an agent someone else wrote, in a community the owner is in."""
+    """On a flat node -- a machine a person owns -- this machine's owner
+    (HEVOLVE_OWNER_USER_ID, set by Nunba at boot) and an agent someone else
+    wrote, in a community the owner is in."""
     me, author = _seed_users(db, 2)
+    # The tier is read by security.key_delegation.get_node_tier; with no
+    # master key in the environment it never reaches key material.
+    monkeypatch.delenv('HEVOLVE_MASTER_PRIVATE_KEY', raising=False)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
     monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', me.id)
     agent = _seed_agent(db, owner_id=author.id)
     com = _seed_community(db, owner_id=me.id)
     return me, author, agent, com
+
+
+def test_on_a_regional_node_the_machine_owner_variable_grants_nothing(
+        fresh_db, monkeypatch, tmp_path):
+    """A regional node serves many people: whoever runs it is not every
+    agent's owner there, even when HEVOLVE_OWNER_USER_ID names them (Nunba
+    exports it on every tier)."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    cert = tmp_path / 'regional.cert'
+    cert.write_text('cert')
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'regional')
+    monkeypatch.setenv('HEVOLVE_REGIONAL_CERT', str(cert))
+    from integrations.social.call_service import CallService, CallError
+    with pytest.raises(CallError):
+        CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                scope={'can_voice': True})
+
+
+def test_the_machine_owners_update_makes_the_grant_theirs(fresh_db, monkeypatch):
+    """The author granted; the machine owner changes it: the grant is now
+    the machine owner's, so the call it opens runs as them (the bridge is
+    handed the grant's owner)."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from integrations.social.call_service import CallService
+    first = CallService.grant_agent(db, agent.id, author.id, 'community', com.id,
+                                    scope={'can_voice': False})
+    assert first['owner_id'] == author.id
+    second = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                     scope={'can_voice': True})
+    assert second['id'] == first['id']
+    assert second['owner_id'] == me.id and second['scope'] == {'can_voice': True}
+
+
+def test_the_machine_owner_revokes_a_grant_someone_else_made(fresh_db, monkeypatch):
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    guest, = _seed_users(db, 1)
+    from integrations.social.call_service import CallService, CallError
+    grant = CallService.grant_agent(db, agent.id, author.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    with pytest.raises(CallError):
+        CallService.revoke_agent(db, grant['id'], guest.id)
+    assert CallService.revoke_agent(db, grant['id'], me.id) is True
+    assert CallService.get_active_grant(db, agent.id, 'community', com.id) is None
+
+
+def test_the_machine_owner_cannot_grant_a_person(fresh_db, monkeypatch):
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from integrations.social.call_service import CallService, CallError
+    with pytest.raises(CallError, match='not an agent'):
+        CallService.grant_agent(db, author.id, me.id, 'community', com.id,
+                                scope={'can_voice': True})
+
+
+def test_a_machine_owner_written_with_spaces_is_still_the_owner(fresh_db, monkeypatch):
+    """Read as every other owner gate reads it (capability_setup.setup_owner)."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', f' {me.id} ')
+    from integrations.social.call_service import CallService
+    grant = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    assert grant['owner_id'] == me.id
 
 
 def test_this_machines_owner_grants_any_agent_on_it(fresh_db, monkeypatch):

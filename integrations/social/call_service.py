@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -299,12 +298,11 @@ class CallService:
             raise CallError("user is not an agent")
         agent_owner = agent_row[1]
         # This machine's owner decides which agents join calls on it, whoever
-        # wrote them: an agent is shared as a recipe, and whoever runs it on
-        # their own compute trusts it with their data, not its author (owner
-        # ruling 2026-10-08).  HEVOLVE_OWNER_USER_ID names that owner where a
-        # person owns the machine (Nunba sets it at boot); central and
-        # regional nodes leave it unset and keep the rule below.
-        machine_owner = os.environ.get('HEVOLVE_OWNER_USER_ID') or ''
+        # wrote them (_machine_owner): an agent is shared as a recipe, and
+        # whoever runs it on their own compute trusts it with their data, not
+        # its author (owner ruling 2026-10-08).  Elsewhere, and for anyone
+        # else, the rule below.
+        machine_owner = _machine_owner()
         if machine_owner and str(owner_id) == machine_owner:
             pass
         elif agent_owner is None:
@@ -324,7 +322,9 @@ class CallService:
         elif agent_owner != owner_id:
             raise CallError("only the agent's owner can grant join")
 
-        # Existing active grant? Update scope in place.
+        # Existing active grant? Update it in place.  It is then the
+        # granter's: the machine owner changing a grant its author made makes
+        # it theirs, and attach_agent runs the call as the grant's owner.
         existing = db.execute(text(
             "SELECT id FROM agent_join_grants "
             "WHERE agent_id = :aid AND parent_kind = :pk "
@@ -334,8 +334,9 @@ class CallService:
         scope_json = json.dumps(scope or {})
         if existing is not None:
             db.execute(text(
-                "UPDATE agent_join_grants SET scope = :s WHERE id = :id"),
-                {'s': scope_json, 'id': existing[0]})
+                "UPDATE agent_join_grants SET scope = :s, owner_id = :oid "
+                "WHERE id = :id"),
+                {'s': scope_json, 'oid': owner_id, 'id': existing[0]})
             db.commit()
             return CallService._grant_dict(db, existing[0])
 
@@ -353,7 +354,8 @@ class CallService:
 
     @staticmethod
     def revoke_agent(db, grant_id: str, revoker_id: str) -> bool:
-        """Owner revokes an active grant. Idempotent."""
+        """The granter revokes an active grant -- or this machine's owner
+        does, for any grant on it (_machine_owner). Idempotent."""
         row = db.execute(text(
             "SELECT owner_id, revoked_at FROM agent_join_grants "
             "WHERE id = :id"),
@@ -361,7 +363,9 @@ class CallService:
         ).fetchone()
         if not row:
             raise CallError("grant not found")
-        if row[0] != revoker_id:
+        machine_owner = _machine_owner()
+        if row[0] != revoker_id and not (
+                machine_owner and str(revoker_id) == machine_owner):
             raise CallError("only the granter can revoke")
         if row[1] is not None:
             return False  # already revoked
@@ -498,6 +502,19 @@ def _is_parent_member(db, parent_kind: str, parent_id: str,
         ).fetchone()
         return row is not None
     return False
+
+
+def _machine_owner() -> Optional[str]:
+    """Who owns the machine this node runs on, where one person does: on a
+    flat node, HEVOLVE_OWNER_USER_ID as every owner gate reads it
+    (capability_setup.setup_owner).  None on a regional or central node,
+    which serves many people -- Nunba exports the variable on every tier,
+    so its presence says nothing about whose machine it is."""
+    from security.key_delegation import get_node_tier
+    if get_node_tier() != 'flat':
+        return None
+    from integrations.agent_engine.capability_setup import setup_owner
+    return setup_owner()
 
 
 def _is_parent_admin(db, parent_kind: str, parent_id: str,
