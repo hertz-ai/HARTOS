@@ -504,7 +504,8 @@ def test_tunnels_whose_phone_never_sends_a_request_end_and_free_its_slots(
     assert sorted(closes, key=lambda c: c['id']) == [
         {'type': 'tunnel_close', 'id': tid, 'reason': 'no_request'} for tid in tids]
     assert {signal_port.ended.get(timeout=WAIT_S) for _ in tids} == conns
-    assert _open(ws, 'again') == {'type': 'tunnel_opened', 'id': 'again'}
+    for n in range(livekit_link.MAX_TUNNELS_PER_LINK):   # every slot is free
+        assert _open(ws, f'again{n}') == {'type': 'tunnel_opened', 'id': f'again{n}'}
 
 
 def test_a_phone_has_the_whole_request_deadline_to_send_its_request(monkeypatch, signal_port):
@@ -647,16 +648,25 @@ def test_a_tunnel_id_outside_one_to_64_chars_is_refused(signal_port, tid):
     assert signal_port.accepted.empty()
 
 
+def _first_piece_then_the_rest(ws, first, rest):
+    """A phone's head in pieces, the first given time to reach LiveKit if
+    anything would send it there before the head is checked; then the tunnel's
+    close."""
+    _send(ws, first)
+    time.sleep(0.1)
+    return _close_after(ws, *rest)
+
+
 def test_a_first_line_with_no_end_ends_the_tunnel(signal_port):
-    """Sent as a head that never ends arrives, in pieces each under the cap:
-    the cap is on what has built up, and none of it reaches LiveKit."""
+    """A head that never ends arrives in pieces, each under the cap: the cap
+    is on what has built up, and none of it reaches LiveKit."""
     from integrations.social import livekit_link
     link, ws = _link()
     _open(ws)
     conn = signal_port.accepted.get(timeout=WAIT_S)
     piece = b'x' * 1024
-    close = _close_after(ws, b'GET /rtc',
-                         *[piece] * (livekit_link._FIRST_LINE_MAX // len(piece)))
+    close = _first_piece_then_the_rest(
+        ws, b'GET /rtc', [piece] * (livekit_link._FIRST_LINE_MAX // len(piece)))
     assert close['reason'] == 'not_signalling'
     assert signal_port.ended.get(timeout=WAIT_S) is conn
     assert signal_port.bytes_read() == b''
@@ -668,8 +678,9 @@ def test_a_first_request_whose_headers_never_end_ends_the_tunnel(signal_port):
     _open(ws)
     conn = signal_port.accepted.get(timeout=WAIT_S)
     header = b'X-Pad: ' + b'a' * 1000 + b'\r\n'
-    close = _close_after(ws, b'GET /rtc HTTP/1.1\r\n',
-                         *[header] * (livekit_link._HEAD_MAX // len(header) + 1))
+    close = _first_piece_then_the_rest(
+        ws, b'GET /rtc HTTP/1.1\r\n',
+        [header] * (livekit_link._HEAD_MAX // len(header) + 1))
     assert close['reason'] == 'not_signalling'
     assert signal_port.ended.get(timeout=WAIT_S) is conn
     assert signal_port.bytes_read() == b''

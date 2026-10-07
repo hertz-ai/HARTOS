@@ -40,8 +40,10 @@ LiveKit stops reading closes after _IO_TIMEOUT_S ('livekit_stalled'); one
 whose phone sends no whole first request within _REQUEST_TIMEOUT_S of the
 open closes ('no_request'), and one whose first request LiveKit leaves
 unanswered after _ANSWER_TIMEOUT_S ('no_answer').  Both deadlines are
-looked at when an idle read wakes, so each fires up to _IO_TIMEOUT_S after
-it has passed.
+looked at only when a read finds LiveKit quiet for _IO_TIMEOUT_S: each fires
+up to that long after it has passed, and a LiveKit that keeps sending part
+of an answer, or a refusal's body it never finishes, is not ended by them
+(LiveKit is this desktop's own loopback service).
 
 Relay links are end-to-end encrypted (relay.py), so the relay reads none of
 it.  Media does not ride the tunnel: LiveKit's ICE candidates name this
