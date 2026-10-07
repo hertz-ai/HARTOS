@@ -64,9 +64,9 @@ def chat_turn_request(user_id, prompt_id, content: str,
     (agent_engine.dispatch._internal_auth_headers): /chat trusts the token
     over the body, so a default identity would put every person's turn in
     one shared agent session (its docstring has the 2026-08-06 incident), and
-    a person sent for is never an administrator.  None on a flat node, where
-    no header is needed, or when minting fails (logged): central and regional
-    then answer 401.
+    a person sent for is never an administrator.  A token is minted on every
+    tier (or HEVOLVE_API_KEY sent); None only when minting fails (logged):
+    central and regional then answer 401.
     """
     from core.chat_client import normalize_chat_body
     payload = {"user_id": user_id, "prompt_id": prompt_id,
@@ -82,6 +82,31 @@ def chat_turn_request(user_id, prompt_id, content: str,
             "unauthenticated (central/regional will answer 401): %s", e)
         headers = None
     return payload, headers
+
+
+def chat_turn_answer(status: int, body: Any) -> Optional[str]:
+    """The reply in a /chat answer when the turn produced one, else None.
+
+    Not a reply, whatever its words: a non-200; an answer that says it
+    failed -- 'success' False or an 'error' (Nunba's busy, starting and
+    refusal notices are HTTP 200 with both), still loading ('loading', or
+    the adapter's source 'hartos_loading', the notice
+    dispatch.local_chat_dispatch also refuses to count), or a route speaking
+    for itself (source 'system': Nunba's model-setup card); and a failure
+    sentence dressed as a reply (core.agent_tools.is_user_facing_error,
+    HARTOS's own).  For callers that must not pass such words off as the
+    agent's -- a call speaks the reply in the agent's voice.
+    """
+    if status != 200 or not isinstance(body, dict):
+        return None
+    if (body.get('success') is False or body.get('error') or body.get('loading')
+            or body.get('source') in ('hartos_loading', 'system')):
+        return None
+    reply = chat_reply(body).strip()
+    if not reply:
+        return None
+    from core.agent_tools import is_user_facing_error
+    return None if is_user_facing_error(reply) else reply
 
 
 def chat_turn_result(response) -> Tuple[int, Dict[str, Any]]:

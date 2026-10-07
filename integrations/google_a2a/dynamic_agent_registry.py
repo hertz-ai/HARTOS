@@ -80,19 +80,43 @@ class TrainedAgent:
 
 
 def prompt_id_of(agent_id) -> Optional[str]:
-    """The prompt_id in a trained agent's id, '{prompt_id}_{flow_id}' as
-    _load_agent_from_recipe mints it from its recipe file name (and as
-    social.agent_bridge.sync_trained_agents keeps it on the agent's User
-    row), or None when ``agent_id`` is not one.
+    """The prompt_id in an agent's id on its User row, or None when
+    ``agent_id`` names none.  Two shapes carry one:
+      - '{prompt_id}_{flow_id}', as _load_agent_from_recipe mints it from a
+        recipe file name and social.agent_bridge.sync_trained_agents keeps it;
+      - the bare prompt_id, as hart_intelligence_entry.
+        _create_social_agent_from_prompt registers an agent a person built.
 
-    Numeric only, like its minter: _load_agent_from_recipe skips a recipe
+    Numeric only, like the minter: _load_agent_from_recipe skips a recipe
     whose prompt part is not an int (an autonomous agent's UUID), so no
     trained agent carries one; and Nunba's /chat, which answers on a bundled
     desktop, runs a non-numeric prompt_id as its default agent."""
-    prompt_id, sep, flow_id = str(agent_id or '').rpartition('_')
+    agent_id = str(agent_id or '')
+    if agent_id.isdigit():
+        return agent_id
+    prompt_id, sep, flow_id = agent_id.rpartition('_')
     if not sep or not prompt_id.isdigit() or not flow_id.isdigit():
         return None
     return prompt_id
+
+
+def is_complete_here(prompt_id) -> bool:
+    """True when every flow of agent ``prompt_id`` has its recipe on this node,
+    in the folder recipes are saved to and /chat reads
+    (core.platform_paths.get_recipe_prompts_dir): the condition under which
+    /chat REUSEs the agent instead of resuming its build, gathering a new one,
+    or (Nunba's /chat, with no prompt file here) forwarding the turn to the
+    cloud."""
+    from core.platform_paths import get_recipe_prompts_dir
+    folder = get_recipe_prompts_dir()
+    try:
+        with open(os.path.join(folder, f'{prompt_id}.json'), encoding='utf-8') as f:
+            flows = json.load(f).get('flows') or []
+    except (OSError, ValueError, AttributeError):
+        return False
+    return bool(flows) and all(
+        os.path.exists(os.path.join(folder, f'{prompt_id}_{n}_recipe.json'))
+        for n in range(len(flows)))
 
 
 class DynamicAgentDiscovery:

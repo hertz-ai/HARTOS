@@ -453,33 +453,50 @@ def _call_turn_reply(agent_id: str, prompt: str, context: Dict) -> Optional[str]
     A call turn is a turn of the agent itself (owner rule: a turn from the
     phone is agentic, CREATE/REUSE): this node's own /chat with the agent's
     prompt_id, as the person who spoke, sent through the contract every turn
-    sent for a person uses (channels.chat_contract).  The agent is a trained
-    one: its User row keeps '{prompt_id}_{flow_id}' (agent_bridge).  /chat is
-    asked for text only (media_mode 'text'); the call's bridge speaks the
-    reply into the room, so /chat and Nunba's /chat must not voice it too.
-    create_agent is False: words in a call never build an agent.
+    sent for a person uses (channels.chat_contract).  Only:
+      - an agent with a prompt here (its User row keeps '{prompt_id}_{flow_id}'
+        or, for one a person built, the bare prompt_id: prompt_id_of) whose
+        every flow has its recipe here (is_complete_here) -- /chat then
+        REUSEs it, so words in a call never build or resume building an
+        agent, and never leave the node (Nunba's /chat sends a turn whose
+        prompt is not here to the cloud);
+      - as a person here: the turn runs as whoever spoke, so an author who is
+        no person on this node (an unattributed speaker, a LiveKit session
+        id, an agent) is never minted a token.
+    /chat is asked for text only (media_mode 'text'); the call's bridge
+    speaks the reply into the room, so /chat and Nunba's /chat must not voice
+    it too.  An answer that is a failure notice (chat_turn_answer) is no
+    reply: it is never spoken as the agent's words.
     """
-    from integrations.google_a2a.dynamic_agent_registry import prompt_id_of
+    from integrations.google_a2a.dynamic_agent_registry import (
+        is_complete_here, prompt_id_of)
+    speaker = context.get('author_id')
     try:
         from integrations.social.models import User, db_session
         with db_session() as db:
             row = db.query(User.agent_id).filter(User.id == agent_id).first()
-        trained_id = row[0] if row else None
+            trained_id = row[0] if row else None
+            person = (db.query(User.user_type).filter(User.id == speaker).first()
+                      if speaker else None)
     except Exception as e:
-        logger.warning("dispatch_to_agent: agent=%s call turn: its trained id "
-                       "could not be read (%s)", agent_id, e)
+        logger.warning("dispatch_to_agent: agent=%s call turn: its rows could "
+                       "not be read (%s)", agent_id, e)
         return None
     prompt_id = prompt_id_of(trained_id)
-    if prompt_id is None:
-        logger.warning("dispatch_to_agent: agent=%s has no trained prompt "
-                       "(agent_id %r); its call turn is answered by the plain "
-                       "model", agent_id, trained_id)
+    if prompt_id is None or not is_complete_here(prompt_id):
+        logger.warning("dispatch_to_agent: agent=%s (agent_id %r) is not an "
+                       "agent complete on this node; its call turn is answered "
+                       "by the plain model", agent_id, trained_id)
         return None
-    speaker = context.get('author_id') or context.get('owner_id')
+    if person is None or person[0] == 'agent':
+        logger.warning("dispatch_to_agent: agent=%s call turn: the speaker %r is "
+                       "no person on this node; answered by the plain model",
+                       agent_id, speaker)
+        return None
     from core.http_pool import pooled_post
     from core.port_registry import get_local_backend_url
     from integrations.channels.chat_contract import (
-        agent_turn_timeout, chat_reply, chat_turn_request, chat_turn_result)
+        agent_turn_timeout, chat_turn_answer, chat_turn_request, chat_turn_result)
     payload, headers = chat_turn_request(
         speaker, prompt_id, prompt, create_agent=False, media_mode='text',
         channel_context={'source_kind': 'call',
@@ -492,11 +509,12 @@ def _call_turn_reply(agent_id: str, prompt: str, context: Dict) -> Optional[str]
         logger.warning("dispatch_to_agent: agent=%s call turn: /chat not "
                        "reached (%s)", agent_id, e)
         return None
-    reply = chat_reply(body).strip() if status == 200 else ''
-    if not reply:
+    reply = chat_turn_answer(status, body)
+    if reply is None:
         logger.warning("dispatch_to_agent: agent=%s call turn: /chat answered "
                        "%s with no reply (%s)", agent_id, status,
-                       str(body.get('error') or sorted(body))[:200])
+                       str(body.get('error') or body.get('text')
+                           or body.get('response') or sorted(body))[:200])
         return None
     return reply
 
@@ -529,7 +547,9 @@ def _dispatch_to_agent_worker(agent_id: str, prompt: str, context: Dict):
 
     # 2. Run prompt through the canonical agent runtime.
     #
-    # Two paths, gated by HEVOLVE_FLAG_DISPATCH_VIA_CHAT:
+    # A call turn (source_kind 'call') always goes through /chat:
+    # _call_turn_reply.  Every other source takes one of two paths, gated
+    # by HEVOLVE_FLAG_DISPATCH_VIA_CHAT:
     #
     #   ON (target state) — delegate to the canonical /chat HTTP
     #     endpoint flask_integration._handle_message has used for

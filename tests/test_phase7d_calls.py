@@ -1511,12 +1511,27 @@ def test_router_source_kind_call_enqueues_tts(clean_bridge_outbox,
 
 
 def _call_turn_rig(db, monkeypatch, chat_status=200, chat_body=None,
-                   trained_id='54_0'):
+                   trained_id='54_0', prompt_file=True, flows=2, flows_built=2,
+                   prompt_name='54'):
     """A trained agent (agent_bridge.sync_trained_agents names its row
     'agent_{prompt_id}_{flow_id}' and keeps '{prompt_id}_{flow_id}' as its
-    agent_id), the local /chat it reaches, and the plain model it must not
-    need.  Returns (agent, speaker, posts, plain_model_calls, minted)."""
+    agent_id; one a person built keeps the bare prompt_id), its prompt and
+    recipes on this node (prompt 54, ``flows`` flows of which the first
+    ``flows_built`` have a recipe), the local /chat it reaches, and the plain
+    model it must not need.  Returns (agent, speaker, posts,
+    plain_model_calls, minted)."""
+    import json as _json
+    import tempfile
     from integrations.social.models import User
+    prompts = tempfile.mkdtemp(prefix='call_prompts_')
+    if prompt_file:
+        with open(os.path.join(prompts, f'{prompt_name}.json'), 'w') as f:
+            _json.dump({'flows': [{'flow_name': f'f{n}'} for n in range(flows)]}, f)
+    for n in range(flows_built):
+        with open(os.path.join(prompts, f'{prompt_name}_{n}_recipe.json'), 'w') as f:
+            _json.dump({'recipe': []}, f)
+    import core.platform_paths
+    monkeypatch.setattr(core.platform_paths, 'get_recipe_prompts_dir', lambda: prompts)
     speaker, = _seed_users(db, 1)
     agent = User(id=str(uuid.uuid4()), username=f'agent_{uuid.uuid4().hex[:6]}',
                  display_name='Tutor', email=f'a_{uuid.uuid4().hex[:6]}@x.test',
@@ -1565,13 +1580,22 @@ def _call_turn_rig(db, monkeypatch, chat_status=200, chat_body=None,
     return agent, speaker, posts, plain, minted
 
 
-def _speak_in_call(agent, speaker, words='teach me fractions', call_id='call-7'):
+def _speak_in_call(agent, speaker, words='teach me fractions', call_id='call-7',
+                   author_id=None):
     from integrations import agentic_router
     agentic_router.dispatch_to_agent(
         agent_id=agent.id, prompt=words, synchronous=True,
         context={'source_kind': 'call', 'source_id': call_id,
-                 'author_id': speaker.id, 'owner_id': 'whoever-granted-it',
-                 'platform': 'livekit'})
+                 'author_id': author_id or speaker.id,
+                 'owner_id': 'whoever-granted-it', 'platform': 'livekit'})
+
+
+def _answered_by_the_plain_model_and_said_so(agent, posts_expected, posts, plain,
+                                             caplog):
+    assert len(posts) == posts_expected
+    assert plain == ['teach me fractions']
+    assert any(agent.id in r.getMessage() and r.levelname == 'WARNING'
+               for r in caplog.records)
 
 
 def test_a_call_turn_runs_the_agents_own_prompt_through_chat(
@@ -1620,6 +1644,17 @@ def test_the_bundled_desktops_chat_answer_is_read_too(
     assert plain == []
 
 
+def test_an_agent_a_person_built_keeps_its_bare_prompt_id_and_gets_its_turn(
+        fresh_db, clean_bridge_outbox, monkeypatch):
+    """hart_intelligence_entry._create_social_agent_from_prompt registers a
+    person's agent with agent_id=str(prompt_id): '54', not '54_0'."""
+    db, _ = fresh_db
+    agent, speaker, posts, plain, _ = _call_turn_rig(db, monkeypatch, trained_id='54')
+    _speak_in_call(agent, speaker)
+    assert len(posts) == 1 and str(posts[0]['json']['prompt_id']) == '54'
+    assert plain == []
+
+
 @pytest.mark.parametrize('trained_id', [None, '', 'skills_agent', 'x_y', 'abc_0'])
 def test_an_agent_with_no_trained_prompt_is_answered_by_the_plain_model_and_says_so(
         fresh_db, clean_bridge_outbox, monkeypatch, caplog, trained_id):
@@ -1628,28 +1663,99 @@ def test_an_agent_with_no_trained_prompt_is_answered_by_the_plain_model_and_says
         db, monkeypatch, trained_id=trained_id)
     with caplog.at_level('WARNING'):
         _speak_in_call(agent, speaker)
-    assert posts == []
-    assert plain == ['teach me fractions']
-    assert any(agent.id in r.getMessage() and r.levelname == 'WARNING'
-               for r in caplog.records)
+    _answered_by_the_plain_model_and_said_so(agent, 0, posts, plain, caplog)
+
+
+def test_an_agent_whose_prompt_id_is_not_a_number_gets_no_turn_through_chat(
+        fresh_db, clean_bridge_outbox, monkeypatch, caplog):
+    """Complete here, but its prompt_id is a UUID: Nunba's /chat (a bundled
+    desktop) would run it as its default agent, answering in its name."""
+    db, _ = fresh_db
+    uid = 'f3a9c2d1-0b7e-4c55-9a21-6d0f2e8b1c44'
+    agent, speaker, posts, plain, _ = _call_turn_rig(
+        db, monkeypatch, trained_id=f'{uid}_0', prompt_name=uid)
+    with caplog.at_level('WARNING'):
+        _speak_in_call(agent, speaker)
+    _answered_by_the_plain_model_and_said_so(agent, 0, posts, plain, caplog)
+
+
+@pytest.mark.parametrize('prompt_file,flows_built', [
+    # No prompt here: /chat would start gathering a new agent, and Nunba's
+    # /chat would send the words to the cloud.
+    (False, 0),
+    # A flow still unbuilt: /chat would resume building the agent.
+    (True, 1),
+])
+def test_an_agent_not_complete_on_this_node_gets_no_turn_through_chat(
+        fresh_db, clean_bridge_outbox, monkeypatch, caplog, prompt_file, flows_built):
+    """Words in a call never build an agent, and never leave the node: only
+    an agent whose every flow has its recipe here (/chat's REUSE condition)
+    is asked."""
+    db, _ = fresh_db
+    agent, speaker, posts, plain, _ = _call_turn_rig(
+        db, monkeypatch, prompt_file=prompt_file, flows_built=flows_built)
+    with caplog.at_level('WARNING'):
+        _speak_in_call(agent, speaker)
+    _answered_by_the_plain_model_and_said_so(agent, 0, posts, plain, caplog)
+
+
+@pytest.mark.parametrize('author', ['unknown', 'PA_xK2j9', 'agent'])
+def test_words_from_no_person_here_run_as_nobody(
+        fresh_db, clean_bridge_outbox, monkeypatch, caplog, author):
+    """A turn runs as the person who spoke.  An author who is no person here
+    -- an unattributed speaker, a LiveKit session id, another agent -- is
+    never minted a token: every such speaker would share one agent session."""
+    db, _ = fresh_db
+    agent, speaker, posts, plain, minted = _call_turn_rig(db, monkeypatch)
+    with caplog.at_level('WARNING'):
+        _speak_in_call(agent, speaker,
+                       author_id=agent.id if author == 'agent' else author)
+    _answered_by_the_plain_model_and_said_so(agent, 0, posts, plain, caplog)
+    assert minted == []
+
+
+def _hartos_generic_error():
+    from core.constants import LLM_GENERIC_ERROR_REPLY
+    return {'response': LLM_GENERIC_ERROR_REPLY}
 
 
 @pytest.mark.parametrize('status,body', [
     (503, {'error': 'busy'}),
     # A refusal is not the agent's answer, whatever key carries its words.
     (503, {'response': 'Your local AI is busy with another task right now.'}),
-    (200, {'response': '   '})])
+    (200, {'response': '   '}),
+    # What /chat really answers with when it did not run the agent, as
+    # HTTP 200: Nunba's busy and starting notices, its refusal, the adapter's
+    # still-loading notice, and HARTOS's own failure sentence.
+    (200, {'text': 'Your local AI is busy with another task right now. '
+                   'Send your message again in a moment.',
+           'error': 'local_llm_starting', 'llm_starting': True, 'success': False}),
+    (200, {'text': 'Starting the local AI engine for you now.',
+           'error': 'local_llm_starting', 'success': False}),
+    (200, {'text': 'Request could not be processed: blocked',
+           'error': 'blocked', 'success': False}),
+    (200, {'text': 'Still waking up.', 'loading': True, 'source': 'hartos_loading'}),
+    (200, 'hartos-generic-error'),
+    # Nunba answering for itself while no model is loaded: its setup card.
+    (200, {'text': 'Setting up Qwen3.5-4B... Click below to start.',
+           'agent_type': 'local', 'source': 'system', 'success': True,
+           'llm_setup_card': {'model_type': 'llm'}}),
+    # Any answer that says it failed, with or without an error code.
+    (200, {'text': 'That did not work.', 'success': False}),
+])
 def test_a_call_turn_chat_cannot_answer_falls_to_the_plain_model_and_says_so(
         fresh_db, clean_bridge_outbox, monkeypatch, caplog, status, body):
     db, _ = fresh_db
+    if body == 'hartos-generic-error':
+        body = _hartos_generic_error()
     agent, speaker, posts, plain, _ = _call_turn_rig(
         db, monkeypatch, chat_status=status, chat_body=body)
     with caplog.at_level('WARNING'):
         _speak_in_call(agent, speaker)
-    assert len(posts) == 1
-    assert plain == ['teach me fractions']
-    assert any(agent.id in r.getMessage() and r.levelname == 'WARNING'
-               for r in caplog.records)
+    _answered_by_the_plain_model_and_said_so(agent, 1, posts, plain, caplog)
+    from integrations.social.agent_voice_bridge import dequeue_tts_text
+    assert [r['text'] for r in dequeue_tts_text('call-7', agent.id)] == [
+        'a plain answer']
 
 
 def test_decide_media_mode_excludes_left_participants(monkeypatch):
