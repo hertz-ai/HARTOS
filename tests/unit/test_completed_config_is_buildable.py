@@ -85,7 +85,7 @@ def test_an_entry_that_is_not_an_action_is_not_buildable():
         'sub_goal object in its place')
 
 
-def test_every_action_shape_a_saved_config_carries_is_buildable():
+def test_text_and_action_dict_steps_are_buildable():
     """Plain text, and the {'action': ...} dict saved configs also hold."""
     for actions in (['read the file'],
                     [{'action': 'read the file', 'action_id': 1}],
@@ -99,6 +99,23 @@ def test_an_action_with_no_text_is_not_buildable():
                     ['read the file', 7], 'read the file', 'summarise'):
         cfg = {'flows': [{'flow_name': 'main', 'actions': actions}]}
         assert hie._config_is_buildable(cfg) is False, actions
+
+
+def test_one_good_flow_does_not_carry_a_broken_one():
+    """Every flow that lists actions must be buildable, not just one of them."""
+    cfg = {'flows': [{'flow_name': 'main', 'actions': ['read the file']},
+                     {'flow_name': 'review', 'actions': [{'sub_goal': 'check it'}]}]}
+    assert hie._config_is_buildable(cfg) is False
+
+
+def test_a_tool_shaped_action_is_not_a_step():
+    """{tool, description} / {tool, command} entries carry no action text.
+    One desktop config of that shape (88659566083) did build, and its recipe
+    recorded those steps with empty text as no-op completions."""
+    for entry in ({'tool': 'shell', 'description': 'list the files'},
+                  {'tool': 'shell', 'command': 'dir'}):
+        cfg = {'flows': [{'flow_name': 'main', 'actions': ['read the file', entry]}]}
+        assert hie._config_is_buildable(cfg) is False, entry
 
 
 def test_malformed_input_does_not_raise():

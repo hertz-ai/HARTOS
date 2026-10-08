@@ -10701,11 +10701,13 @@ def chat():
                     # Completed (or forced completion after max turns)
                     if turn_num < MAX_GATHER_TURNS and not _config_is_buildable(new_res):
                         app.logger.warning(
-                            "[EMPTY-BUILD] status='completed' with no actions for %s "
-                            "- asking for the steps instead of saving a config that "
-                            "can never build (#718)", prompt_id)
+                            "[EMPTY-BUILD] status='completed' but not every action "
+                            "is a step for %s (flows: %.300s) - asking for the steps "
+                            "instead of saving a config that cannot build (#718)",
+                            prompt_id, new_res.get('flows'))
                         _record_lifecycle('Creation Mode', user_id, prompt_id,
-                                          'Completed with no actions - re-asking')
+                                          'Completed without a step for every '
+                                          'action - re-asking')
                         return _chat_reply(
                             user_id, request_id, _EMPTY_BUILD_REPLY,
                             intent=['FINAL_ANSWER'],
