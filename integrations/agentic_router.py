@@ -452,8 +452,9 @@ def _call_turn_reply(agent_id: str, prompt: str, context: Dict) -> Optional[str]
 
     A call turn is a turn of the agent itself (owner rule: a turn from the
     phone is agentic, CREATE/REUSE): this node's own /chat with the agent's
-    prompt_id, as the person who spoke, sent through the contract every turn
-    sent for a person uses (channels.chat_contract).  Only:
+    prompt_id, as the person who spoke, built by the contract every turn
+    sent for a person uses (channels.chat_contract) and sent by the one /chat
+    client (core.chat_client.post_chat).  Only:
       - an agent with a prompt here (its User row keeps '{prompt_id}_{flow_id}'
         or, for one a person built, the bare prompt_id: prompt_id_of) whose
         every flow has its recipe here (is_complete_here) -- /chat then
@@ -493,7 +494,7 @@ def _call_turn_reply(agent_id: str, prompt: str, context: Dict) -> Optional[str]
                        "no person on this node; answered by the plain model",
                        agent_id, speaker)
         return None
-    from core.http_pool import pooled_post
+    from core.chat_client import post_chat
     from core.port_registry import get_local_backend_url
     from integrations.channels.chat_contract import (
         agent_turn_timeout, chat_turn_answer, chat_turn_request, chat_turn_result)
@@ -502,8 +503,8 @@ def _call_turn_reply(agent_id: str, prompt: str, context: Dict) -> Optional[str]
         channel_context={'source_kind': 'call',
                          'source_id': context.get('source_id')})
     try:
-        response = pooled_post(get_local_backend_url() + '/chat', json=payload,
-                               headers=headers, timeout=agent_turn_timeout())
+        response = post_chat(get_local_backend_url() + '/chat', payload,
+                             headers=headers, timeout=agent_turn_timeout())
         status, body = chat_turn_result(response)
     except Exception as e:
         logger.warning("dispatch_to_agent: agent=%s call turn: /chat not "

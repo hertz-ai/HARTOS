@@ -1631,6 +1631,26 @@ def test_a_call_turn_runs_the_agents_own_prompt_through_chat(
     assert spoken == ['Halves are two equal parts.']
 
 
+def test_a_call_turn_is_sent_by_the_one_chat_client(
+        fresh_db, clean_bridge_outbox, monkeypatch):
+    """core.chat_client.post_chat is the one way anything inside HARTOS
+    calls /chat.  The call turn's body already carries its request_id
+    (chat_turn_request), so it reaches the transport unchanged."""
+    db, _ = fresh_db
+    agent, speaker, posts, plain, _ = _call_turn_rig(db, monkeypatch)
+    import core.chat_client
+    real, through_the_client = core.chat_client.post_chat, []
+
+    def _spy(url, body=None, **kw):
+        through_the_client.append((url, dict(body or {})))
+        return real(url, body, **kw)
+
+    monkeypatch.setattr(core.chat_client, 'post_chat', _spy)
+    _speak_in_call(agent, speaker)
+    assert [url for url, _ in through_the_client] == ['http://this-node/chat']
+    assert len(posts) == 1 and posts[0]['json'] == through_the_client[0][1]
+
+
 def test_the_bundled_desktops_chat_answer_is_read_too(
         fresh_db, clean_bridge_outbox, monkeypatch):
     """On a bundled desktop Nunba's /chat answers, under 'text'."""
