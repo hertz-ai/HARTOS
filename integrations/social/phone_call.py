@@ -12,10 +12,10 @@ those routes would:
   call_open {id, agent_id}  answered call_opened {id, call_id, url, token}
   call_end  {id, call_id}   answered call_ended {id, call_id}
 
-or call_refused {id, reason[, detail]}: 'bad_request', 'calls_off' (detail:
-the flag that is off -- calls_v1, or conversations, which the call's DM
-needs), 'no_user' (no account here for the link's person), 'no_agent' (no
-such agent), 'not_allowed' (banned, or the call or grant rules said no;
+or call_refused {id, reason[, detail]}: 'bad_request', 'calls_off' (calls_v1
+is off here), 'conversations_off' (call_open only: the call's DM needs it),
+'no_user' (no account here for the link's person), 'no_agent' (no such
+agent), 'not_allowed' (banned, or the call or grant rules said no;
 detail says which), 'not_found', 'no_room' (no room token; detail says why),
 or 'error' (detail: the failure's kind -- the whole error is in this node's
 log).  A frame from anything but a person's own phone
@@ -27,7 +27,8 @@ call_open, in order: the person's DM with the agent (ConversationService.
 create returns the one that exists); the agent's leave to speak in it
 (CallService.grant_agent, whose rules decide: this machine's owner, or the
 agent's owner -- a grant that already has can_voice is used as it is); the
-DM's voice call (the one in progress, or a new one) with the person in it;
+DM's voice call (CallService.start: the one in progress, or a new one,
+and which) with the person in it;
 the agent in it (CallService.attach_agent); and the person's room token
 (LiveKitService.issue_token -- with an agent in the call the room is
 LiveKit's, as api_calls decides).  The token's url names this desktop's
@@ -54,8 +55,9 @@ ANSWERS = (CALL_OPEN, CALL_END)
 
 #: One lock per person: their requests arrive on their own threads (the
 #: link answers each request on one), and two call_opens at once would each
-#: make a DM, a grant, a call and an agent.  A desktop serves a handful of
-#: people, so the map stays small.
+#: make a DM, a grant, a call and an agent.  One entry per person id a phone
+#: has named, unknown ones too -- only device links this desktop's owner
+#: admitted can name one.
 _person_locks: Dict[str, threading.Lock] = {}
 _person_locks_guard = threading.Lock()
 
@@ -70,6 +72,10 @@ def _refused(rid: str, reason: str, detail: Optional[str] = None) -> dict:
     if detail:
         reply['detail'] = detail
     return reply
+
+
+#: The refusal for each flag a request needs, when it is off.
+_OFF = {'calls_v1': 'calls_off', 'conversations': 'conversations_off'}
 
 
 def _flag_off(db, names) -> Optional[str]:
@@ -108,6 +114,7 @@ def _end_opened(db, call_id: str, person: str) -> None:
     would hold a seat in the room for nothing."""
     from .call_service import CallService
     try:
+        db.rollback()   # a failed statement can leave the transaction aborted
         CallService.end(db, call_id, person)
     except Exception as e:
         logger.warning("Phone call %s could not be ended after its setup "
@@ -133,11 +140,8 @@ def _open(db, rid: str, person: str, agent_id) -> dict:
             scope['can_voice'] = True
             CallService.grant_agent(db, agent_id, person, 'conversation',
                                     conv['id'], scope)
-        call = CallService.active_call(db, 'conversation', conv['id'])
-        opened = call is None
-        if opened:
-            call = CallService.create(db, 'conversation', conv['id'], person,
-                                      kind='voice')
+        call, opened = CallService.start(db, 'conversation', conv['id'],
+                                         person, kind='voice')
     except CallError as e:
         return _refused(rid, 'not_allowed', str(e))
     try:
@@ -179,7 +183,7 @@ def _answer(db, kind: str, rid: str, person: str, data: dict) -> dict:
     off = _flag_off(db, ('calls_v1', 'conversations') if kind == CALL_OPEN
                     else ('calls_v1',))
     if off:
-        return _refused(rid, 'calls_off', off)
+        return _refused(rid, _OFF[off])
     refusal = _person_refusal(db, rid, person)
     if refusal:
         return refusal

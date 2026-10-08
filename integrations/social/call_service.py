@@ -76,7 +76,22 @@ class CallService:
                max_participants: int = DEFAULT_MAX_PARTICIPANTS,
                settings: Optional[Dict[str, Any]] = None,
                tenant_id: Optional[str] = None) -> Dict[str, Any]:
-        """Create a CallSession row.
+        """The parent's call: the one in progress, or a new one (start)."""
+        return CallService.start(
+            db, parent_kind, parent_id, started_by, kind=kind, title=title,
+            max_participants=max_participants, settings=settings,
+            tenant_id=tenant_id)[0]
+
+    @staticmethod
+    def start(db, parent_kind: str, parent_id: str, started_by: str,
+              kind: str = 'voice', title: Optional[str] = None,
+              max_participants: int = DEFAULT_MAX_PARTICIPANTS,
+              settings: Optional[Dict[str, Any]] = None,
+              tenant_id: Optional[str] = None) -> Tuple[Dict[str, Any], bool]:
+        """Create a CallSession row, or return the parent's call in progress;
+        with it, whether this start opened it.  Only start can say: a caller
+        that looked first and then created would take a call someone else
+        opened in between for its own.
 
         The starter must be a member of the parent (community or
         conversation) — gated by Membership lookup.  Non-members
@@ -107,7 +122,7 @@ class CallService:
         # try/except on insert + recheck closes the window in code.
         existing = CallService.active_call(db, parent_kind, parent_id)
         if existing is not None:
-            return existing
+            return existing, False
 
         call_id = str(uuid.uuid4())
         try:
@@ -131,7 +146,7 @@ class CallService:
                 parent_id, e)
             existing = CallService.active_call(db, parent_kind, parent_id)
             if existing is not None:
-                return existing
+                return existing, False
             raise CallError(f"could not create call: {e}")
         db.commit()
 
@@ -139,7 +154,7 @@ class CallService:
         # query reflects them immediately.
         CallService.join(db, call_id, started_by,
                          device_kind='mobile', tenant_id=tenant_id)
-        return CallService.get(db, call_id)
+        return CallService.get(db, call_id), True
 
     @staticmethod
     def active_call(db, parent_kind: str,
