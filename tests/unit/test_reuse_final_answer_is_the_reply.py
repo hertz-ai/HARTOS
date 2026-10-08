@@ -83,9 +83,11 @@ def _chat_texts(pub):
 
 
 def _drive_turn(rr, monkeypatch, answer_key='message2userfinal',
-                mid_turn_question=False):
+                mid_turn_question=False, tail=None, then=None):
     """Run the real get_agent_response for one REUSE turn whose group ends
-    on the Assistant's answer.  Returns (reply, pooled_post mock)."""
+    on the Assistant's answer.  ``then``, when given, is one more message
+    posted after the answer in the first round only (the verifier's verdict
+    that ends it).  Returns (reply, pooled_post mock)."""
     from flask import Flask
 
     user_prompt = f'{_USER}_{_PROMPT}'
@@ -99,6 +101,7 @@ def _drive_turn(rr, monkeypatch, answer_key='message2userfinal',
 
     group_chat = SimpleNamespace(messages=[], agents=[])
     manager = SimpleNamespace(_oai_messages={})
+    rounds = []
 
     def initiate_chat(recipient, message=None, **_kw):
         group_chat.messages.append(
@@ -109,7 +112,10 @@ def _drive_turn(rr, monkeypatch, answer_key='message2userfinal',
             rr.send_message_to_user1(_USER, _QUESTION, '', _PROMPT)
         group_chat.messages.append(
             {'role': 'assistant', 'name': 'Assistant',
-             'content': json.dumps({answer_key: _ANSWER})})
+             'content': tail or json.dumps({answer_key: _ANSWER})})
+        if then is not None and not rounds:
+            group_chat.messages.append(then)
+        rounds.append(message)
 
     user_proxy = SimpleNamespace(initiate_chat=initiate_chat)
     chat_instructor = SimpleNamespace(initiate_chat=initiate_chat)
@@ -138,6 +144,50 @@ def test_desktop_delivers_the_finished_answer_only_as_the_reply(
     post.assert_not_called()
 
 
+@pytest.mark.parametrize('tail', [
+    json.dumps({'message2user': _ANSWER}),
+    '@user ' + json.dumps({'message2user': _ANSWER}),
+    json.dumps({'status': 'in progress', 'action_id': 1,
+                'message2user': _ANSWER}),
+], ids=['bare', 'to the person', 'beside a status'])
+def test_a_message2user_answer_reaches_the_learner_as_its_text(
+        rr, bundled, publisher, monkeypatch, tail):
+    """message2user is the key CREATE's prompts teach for a message to the
+    person, and REUSE's reply filter and receipt finder read it as the answer
+    (lifecycle_hooks.ANSWER_KEYS).  The extractor unwrapped only
+    message2userfinal and message2, so the learner was handed the JSON
+    envelope itself (peer hartos-77, review of 11ffd699f)."""
+    reply, _post = _drive_turn(rr, monkeypatch, tail=tail)
+    assert reply == _ANSWER
+
+
+def test_a_message2user_answer_after_the_verdict_reaches_the_learner(
+        rr, bundled, publisher, monkeypatch):
+    """The round ends on the verifier's verdict, so the turn is finalised by
+    the post-loop extractor, which walks back to the Assistant's answer.  It
+    unwrapped only message2, so the learner got the message2user envelope."""
+    verdict = {'role': 'assistant', 'name': 'StatusVerifier',
+               'content': json.dumps({'status': 'completed', 'action_id': 1})}
+    reply, _post = _drive_turn(
+        rr, monkeypatch, tail=json.dumps({'message2user': _ANSWER}),
+        then=verdict)
+    assert reply == _ANSWER
+
+
+def test_an_unreadable_message2user_envelope_still_gives_its_text(
+        rr, bundled, publisher, monkeypatch):
+    """When retrieve_json cannot read the tail, the post-loop extractor falls
+    back to a pattern match on @user {"message2...": "..."}.  It matched only
+    message2, so the learner was handed the envelope with the @user stripped."""
+    def _unreadable(_text):
+        raise ValueError('unreadable JSON')
+
+    monkeypatch.setattr(rr, 'retrieve_json', _unreadable)
+    reply, _post = _drive_turn(
+        rr, monkeypatch, tail='@user ' + json.dumps({'message2user': _ANSWER}))
+    assert reply == _ANSWER
+
+
 def test_a_mid_turn_question_still_reaches_the_desktop(
         rr, bundled, publisher, monkeypatch):
     """What 57516f078 correctly fixed must survive: a question the agent
@@ -160,3 +210,16 @@ def test_central_keeps_its_chatbot_pipeline_leg(
     body = json.loads(post.call_args.kwargs['data'])
     assert body['message'] == _ANSWER
     assert _chat_texts(publisher) == []
+
+
+def test_central_sends_a_message2user_answer_on_its_chatbot_leg(
+        rr, central, publisher, monkeypatch):
+    """A message2user answer ends the turn where it is written, as the
+    other answer keys do, and so takes central's off-box leg with it.  Left
+    to the post-loop extractor the learner still got the text, but nothing
+    went out on that leg."""
+    reply, post = _drive_turn(
+        rr, monkeypatch, tail=json.dumps({'message2user': _ANSWER}))
+    assert reply == _ANSWER
+    assert post.call_count == 1
+    assert json.loads(post.call_args.kwargs['data'])['message'] == _ANSWER

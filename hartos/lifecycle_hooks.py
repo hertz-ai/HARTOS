@@ -1759,16 +1759,22 @@ _PROMPT_EXAMPLE_MESSAGES = ('your message here', 'message here',
 
 # The keys a message to the person travels under: REUSE's two answer keys,
 # and message2user, the one CREATE's prompts teach (@user {"message2user":
-# ...}), which REUSE's reply filter also reads as the answer.
-_ANSWER_KEYS = ('message2userfinal', 'message2', 'message2user')
+# ...}), which REUSE's reply filter also reads as the answer.  REUSE's answer
+# extractors (reuse_recipe.get_agent_response) unwrap the same keys.
+ANSWER_KEYS = ('message2userfinal', 'message2', 'message2user')
+
+
+#: What may wrap a prompt example and still leave it the example: spaces,
+#: quotes, and closing or trailing marks (an ellipsis too).
+_EXAMPLE_TRIM = ' .!?,;:"\'…'
 
 
 def _is_answer_text(value) -> bool:
     """Whether an answer key's value is a message: readable text
     (_answer_value_is_text) that is not one of the prompts' own examples,
-    whatever mark closes it."""
+    however it is spaced, quoted or punctuated at its ends."""
     return (_answer_value_is_text(value)
-            and str(value).strip().rstrip('.!?').lower()
+            and ' '.join(str(value).split()).strip(_EXAMPLE_TRIM).lower()
             not in _PROMPT_EXAMPLE_MESSAGES)
 
 
@@ -1778,7 +1784,7 @@ def _is_control_message(text: str) -> bool:
     after a line of prose), or an answer-key envelope whose value is empty, an
     unfilled placeholder or one of the prompts' own examples.  It is the
     parse REUSE's reply filter uses (helper.retrieve_json), in REUSE's order:
-    an answer key first (_ANSWER_KEYS), so a status object that carries a real
+    an answer key first (ANSWER_KEYS), so a status object that carries a real
     message to the person is the answer, as it is there; then status.  The
     Assistant's own ``{"status": "completed"}`` report, or the steer's
     template sent back as it stands, is refused here exactly where REUSE
@@ -1798,7 +1804,7 @@ def _is_control_message(text: str) -> bool:
         return True
     if not isinstance(parsed, dict):
         return False
-    for key in _ANSWER_KEYS:
+    for key in ANSWER_KEYS:
         if key in parsed:
             return not _is_answer_text(parsed[key])
     return 'status' in parsed

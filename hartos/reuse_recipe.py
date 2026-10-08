@@ -380,7 +380,7 @@ from hartos.lifecycle_hooks import (
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
     clear_action_states, settled_action_id, commit_verified_action_completion,
     dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
-    action_is_autonomous, action_named_tools, is_written_answer,
+    action_is_autonomous, action_named_tools, is_written_answer, ANSWER_KEYS,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -6366,11 +6366,14 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # Extract and process message
                 try:
                     json_obj = retrieve_json(last_message['content'])
-                    if json_obj and 'message2' in json_obj:
-                        # Same as the message2userfinal branch above.
-                        _reuse_answer_off_box(
-                            user_id, json_obj['message2'], prompt_id)
-                        return json_obj['message2']
+                    _key = next((k for k in ANSWER_KEYS if isinstance(json_obj, dict)
+                                 and k in json_obj), None)
+                    if _key:
+                        # Same as the message2userfinal branch above, for every
+                        # key the pipeline reads as the answer (ANSWER_KEYS):
+                        # message2user was handed over as its JSON envelope.
+                        _reuse_answer_off_box(user_id, json_obj[_key], prompt_id)
+                        return json_obj[_key]
                 except Exception as e:
                     current_app.logger.error(f"Error extracting JSON: {e}")
             elif f'@user'.lower() not in content_lower:
@@ -6509,14 +6512,17 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         elif f'message2'.lower() in content_lower:
             try:
                 json_obj = retrieve_json(last_message['content'])
-                if json_obj and 'message2' in json_obj:
-                    last_message['content'] = json_obj['message2']
+                _key = next((k for k in ANSWER_KEYS if isinstance(json_obj, dict)
+                             and k in json_obj), None)
+                if _key:
+                    # Every answer key (ANSWER_KEYS), as in the loop above.
+                    last_message['content'] = json_obj[_key]
                     return last_message['content']
 
             except Exception as e:
                 current_app.logger.error(f"Error extracting JSON: {e}")
                 # Fallback to a basic pattern match if retrieve_json fails
-                pattern = r'@user\s*{[\'"]message2[\'"]\s*:\s*[\'"](.+?)[\'"]}'
+                pattern = r'@user\s*{[\'"]message2(?:user)?[\'"]\s*:\s*[\'"](.+?)[\'"]}'
                 match = re.search(pattern, last_message['content'], re.DOTALL)
                 if match:
                     last_message['content'] = match.group(1)

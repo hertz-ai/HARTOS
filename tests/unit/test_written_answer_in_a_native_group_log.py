@@ -276,9 +276,10 @@ class TestWhatIsNotTheAssistantsAnswerInARealLog(_Harness):
 
     def test_a_status_object_that_carries_a_message_to_the_person_is_the_answer(self):
         """message2user is the key CREATE's prompts teach for a message to the
-        person.  A status object carrying a real one was the answer at
-        ab201d515 and is the answer in REUSE's reply filter; reading status
-        before it made it control (task #174)."""
+        person.  A status object carrying a real one is the answer in REUSE's
+        reply filter.  At ab201d515 the @user and fenced dresses were answers
+        and the plain one was not (it opened with '{' and held "status");
+        11ffd699f^ read status first and made all three control (#174)."""
         body = ('{"status": "in progress", "action_id": 1, "message2user": "'
                 + _LESSON.replace(NL, ' ') + '"}')
         for dress, text in {'plain': body, 'to the person': '@user ' + body,
@@ -292,14 +293,25 @@ class TestWhatIsNotTheAssistantsAnswerInARealLog(_Harness):
         """The example values are refused whichever key carries them (CREATE's
         prompts show them under message2user and REUSE's under
         message2userfinal), with or without a status beside them, and
-        whatever the closing mark."""
+        however it is spaced, quoted or punctuated at its ends."""
         for key in ('message2userfinal', 'message2', 'message2user'):
             for value in ('Your clear and useful message here', 'Your message here',
-                          'Your message here?', 'message here!'):
+                          'Your message here?', 'message here!',
+                          'Your message here .', 'Your  message   here',
+                          'Your message here,', 'Your message here…',
+                          "'Your message here'"):
                 for status in ('', '"status": "completed", '):
                     with self.subTest(key=key, value=value, status=bool(status)):
                         text = '{' + status + '"' + key + '": "' + value + '"}'
                         self.assertIsNone(self._derived([('Assistant', text)]))
+
+    def test_the_answer_keys_are_read_in_reuses_order(self):
+        """message2userfinal is read before message2user, as REUSE's reply
+        filter reads it: an unfilled message2userfinal beside a real
+        message2user is the steer's template sent back, not an answer."""
+        text = ('{"message2userfinal": "<your answer here>", "message2user": "'
+                + _LESSON.replace(NL, ' ') + '"}')
+        self.assertIsNone(self._derived([('Assistant', text)]))
 
     def test_prose_without_a_brace_is_not_parsed_at_all(self):
         """A verdict or an answer key is an object, so text with no brace
@@ -453,9 +465,10 @@ class TestReuseFindsTheLessonInARealLog(_ReuseOnARealLog, _Harness):
                     {'message_index': 1, 'kind': 'user_visible_result'})
 
     def test_a_status_object_with_a_message2user_lesson_is_still_the_receipt(self):
-        """Task #174: the receipt REUSE had at ab201d515 for this shape.  Its
-        reply filter calls it an answer; without the receipt the action is
-        recorded GAVE_UP and the learner gets the apology."""
+        """Task #174: REUSE's reply filter calls this shape an answer, so the
+        receipt must find it too; without the receipt the action is recorded
+        GAVE_UP and the learner gets the apology.  (Not a receipt at
+        ab201d515 either: its plain dress opened with '{' and held "status".)"""
         body = ('{"status": "in progress", "action_id": 1, "message2user": "'
                 + _LESSON.replace(NL, ' ') + '"}')
         self.gc = self._reuse_log(self.UP, [('Assistant', body),
