@@ -46,27 +46,50 @@ sys.path.insert(0, os.path.abspath(
     os.path.join(os.path.dirname(__file__), '..', '..')))
 
 
-def test_call_service_create_returns_uuid_call_id():
-    """``CallService.create`` mints a uuid-shaped call_id and that
-    same value is the primary key returned by ``get``.  Sanity-check
-    that the source-of-truth call_id is what every other consumer
-    references."""
+@pytest.fixture
+def social_db(monkeypatch):
+    """The real social database (migrations), in memory."""
+    monkeypatch.setenv('HEVOLVE_DB_PATH', ':memory:')
+    from integrations.social import migrations
+    from integrations.social import models as models_mod
+    models_mod._engine = None
+    models_mod._SessionLocal = None
+    migrations.run_migrations()
+    session = models_mod.get_db()
+    yield session
+    session.close()
+    try:
+        models_mod.get_engine().dispose()
+    finally:
+        models_mod._engine = None
+        models_mod._SessionLocal = None
+
+
+def _person(db):
+    from integrations.social.models import User
+    u = User(id=str(uuid.uuid4()), username=f'p_{uuid.uuid4().hex[:8]}',
+             display_name='Person', email=f'{uuid.uuid4().hex[:8]}@x.test',
+             password_hash='x:y', user_type='human')
+    db.add(u)
+    db.commit()
+    return u.id
+
+
+def test_call_service_create_returns_uuid_call_id(social_db):
+    """``CallService.create`` mints a uuid call_id, and that same value is
+    the row's primary key: ``get`` returns it, and the starter's
+    participant row is keyed on it.  Changing the id source would
+    desynchronise every downstream consumer (AgentVoiceBridge, livekit
+    subscriber, whisper bridge)."""
     from integrations.social.call_service import CallService
-    # source-grep: assert the create method assigns call_id from uuid4
-    # and persists it as the row's id.  AST-equivalent: read create's
-    # body, confirm the variable name + uuid4 call.
-    import inspect
-    src = inspect.getsource(CallService.create)
-    assert 'uuid.uuid4' in src or 'uuid4()' in src, (
-        'CallService.create must mint call_id via uuid.uuid4() — '
-        'changing the id source silently desynchronises every '
-        'downstream consumer (AgentVoiceBridge, livekit subscriber, '
-        'whisper bridge).'
-    )
-    assert 'call_id' in src, (
-        'CallService.create must use the variable name `call_id` so '
-        'downstream tests + greps can trace the value flow.'
-    )
+    from integrations.social.conversation_service import ConversationService
+    person, other = _person(social_db), _person(social_db)
+    conv = ConversationService.create(social_db, 'dm', [other], person)
+    call = CallService.create(social_db, 'conversation', conv['id'], person)
+    assert str(uuid.UUID(call['id'])) == call['id']
+    assert CallService.get(social_db, call['id'])['id'] == call['id']
+    assert [p['user_id'] for p in
+            CallService.list_participants(social_db, call['id'])] == [person]
 
 
 def test_agent_voice_bridge_keys_on_call_id_not_separate_session_id():

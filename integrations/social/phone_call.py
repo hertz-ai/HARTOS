@@ -28,14 +28,15 @@ create returns the one that exists); the agent's leave to speak in it
 (CallService.grant_agent, whose rules decide: this machine's owner, or the
 agent's owner -- a grant that already has can_voice is used as it is); the
 DM's voice call (CallService.start: the one in progress, or a new one,
-and which) with the person in it;
-the agent in it (CallService.attach_agent); and the person's room token
-(LiveKitService.issue_token -- with an agent in the call the room is
-LiveKit's, as api_calls decides).  The token's url names this desktop's
+and which); the person's room token (LiveKitService.issue_token -- a call
+with an agent in it is LiveKit's, as api_calls decides, and this one will
+have one), asked for before anyone is added, so a phone with no room adds
+nothing to a call; then the person in the call, and the agent
+(CallService.attach_agent).  The token's url names this desktop's
 loopback; the phone reaches it through its tunnel.  When a step after the
 call fails, a call this request opened is ended (its agent leaves with it);
-a call already in progress is left as it was.  A refused grant leaves the
-DM, as starting one from the conversations API would.
+a call already in progress goes on.  A refused grant leaves the DM, as
+starting one from the conversations API would.
 """
 import logging
 import threading
@@ -74,17 +75,22 @@ def _refused(rid: str, reason: str, detail: Optional[str] = None) -> dict:
     return reply
 
 
-#: The refusal for each flag a request needs, when it is off.
-_OFF = {'calls_v1': 'calls_off', 'conversations': 'conversations_off'}
+#: The switches each request needs, each with its refusal when it is off:
+#: a call_open makes the person's DM with the agent, a call_end makes nothing.
+_NEEDS = {
+    CALL_OPEN: (('calls_v1', 'calls_off'), ('conversations', 'conversations_off')),
+    CALL_END: (('calls_v1', 'calls_off'),),
+}
 
 
-def _flag_off(db, names) -> Optional[str]:
-    """The first of ``names`` that is off here, from the flag source the
-    routes read (auth.require_auth: tenant None on this node), or None."""
+def _switched_off(db, kind: str) -> Optional[str]:
+    """The refusal for the first switch ``kind`` needs that is off here,
+    from the flag source the routes read (auth.require_auth: tenant None on
+    this node), or None."""
     from .feature_flags import get_flag
-    for name in names:
+    for name, refusal in _NEEDS[kind]:
         if not get_flag(name, db=db, tenant_id=None):
-            return name
+            return refusal
     return None
 
 
@@ -145,9 +151,14 @@ def _open(db, rid: str, person: str, agent_id) -> dict:
     except CallError as e:
         return _refused(rid, 'not_allowed', str(e))
     try:
+        token = LiveKitService.issue_token(call['id'], person, can_publish=True)
+        if token.get('mode') != 'livekit' or not token.get('token'):
+            if opened:
+                _end_opened(db, call['id'], person)
+            return _refused(rid, 'no_room',
+                            token.get('reason') or token.get('mode'))
         CallService.join(db, call['id'], person)
         CallService.attach_agent(db, call['id'], agent_id)
-        token = LiveKitService.issue_token(call['id'], person, can_publish=True)
     except CallError as e:
         if opened:
             _end_opened(db, call['id'], person)
@@ -156,10 +167,6 @@ def _open(db, rid: str, person: str, agent_id) -> dict:
         if opened:
             _end_opened(db, call['id'], person)
         raise
-    if token.get('mode') != 'livekit' or not token.get('token'):
-        if opened:
-            _end_opened(db, call['id'], person)
-        return _refused(rid, 'no_room', token.get('reason') or token.get('mode'))
     logger.info("Phone call %s %s for %s with agent %s", call['id'],
                 'opened' if opened else 'joined', person, agent_id)
     return {'type': CALL_OPENED, 'id': rid, 'call_id': call['id'],
@@ -180,10 +187,9 @@ def _end(db, rid: str, person: str, call_id) -> dict:
 
 
 def _answer(db, kind: str, rid: str, person: str, data: dict) -> dict:
-    off = _flag_off(db, ('calls_v1', 'conversations') if kind == CALL_OPEN
-                    else ('calls_v1',))
+    off = _switched_off(db, kind)
     if off:
-        return _refused(rid, _OFF[off])
+        return _refused(rid, off)
     refusal = _person_refusal(db, rid, person)
     if refusal:
         return refusal

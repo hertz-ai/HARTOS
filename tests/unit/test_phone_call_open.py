@@ -202,7 +202,6 @@ class TestOneAtATime:
                           {'a': agent}).scalar() == 1
         assert len(AgentVoiceBridge.list_active()) == 1
 
-
     def test_another_persons_requests_do_not_wait(self, db):
         """One person's requests wait for each other; someone else's do not."""
         first, second = _user(db), _user(db)
@@ -240,6 +239,35 @@ class TestStartingACall:
         assert opened is True and opened_again is False
         assert again['id'] == call['id']
         assert CallService.create(db, 'conversation', conv['id'], person)['id'] == call['id']
+
+    def test_a_start_the_database_refuses_did_not_open_the_call(
+            self, db, monkeypatch):
+        """Where the database refuses a second open call on one parent (a
+        unique index the migrations do not have yet), start re-reads: the
+        call in progress, not one it opened."""
+        from sqlalchemy import text
+        from integrations.social.call_service import CallService
+        from integrations.social.conversation_service import ConversationService
+        db.execute(text("CREATE UNIQUE INDEX test_one_open_call ON "
+                        "call_sessions (parent_kind, parent_id) "
+                        "WHERE ended_at IS NULL"))
+        db.commit()
+        person = _user(db)
+        agent = _user(db, 'agent', owner_id=person)
+        conv = ConversationService.create(db, 'dm', [agent], person)
+        first, _ = CallService.start(db, 'conversation', conv['id'], person)
+        real, lookups = CallService.active_call, []
+
+        def _misses_once(db_, parent_kind, parent_id):
+            lookups.append(parent_id)
+            if len(lookups) == 1:
+                return None
+            return real(db_, parent_kind, parent_id)
+
+        monkeypatch.setattr(CallService, 'active_call', staticmethod(_misses_once))
+        call, opened = CallService.start(db, 'conversation', conv['id'], person)
+        assert opened is False and call['id'] == first['id']
+        assert len(lookups) == 2
 
 
 class TestAGrantTheMachineOwnerMade:
@@ -507,7 +535,8 @@ class TestWhatIsRefused:
                          'detail': 'RuntimeError'}
         assert _open_calls(db, person) == [call_id]
 
-    def test_a_cleanup_that_fails_is_still_answered(self, db, monkeypatch):
+    def test_a_cleanup_that_fails_is_still_answered(self, db, monkeypatch,
+                                                    caplog):
         """Ending the call it opened can fail too (the database is locked):
         the phone still hears why it got no call, and the end's failure is
         logged."""
@@ -521,8 +550,63 @@ class TestWhatIsRefused:
         monkeypatch.setattr(CallService, 'end', staticmethod(_end_fails))
         person = _user(db)
         agent = _user(db, 'agent', owner_id=person)
+        import logging
+        with caplog.at_level(logging.WARNING, logger='hevolve_social'):
+            reply = _open(_phone(person), agent)
+        assert reply['type'] == 'call_refused' and reply['reason'] == 'no_room'
+        assert [r for r in caplog.records if r.levelno == logging.WARNING
+                and 'database is locked' in r.getMessage()]
+
+    def test_no_room_adds_no_agent_to_a_call_in_progress(self, db,
+                                                          monkeypatch):
+        """The person's call on the desktop, without the agent: a phone that
+        gets no room adds nothing to it.  Otherwise the agent would sit in
+        the desktop's call, listening and speaking, for a request that
+        failed."""
+        from integrations.social import livekit_service
+        from integrations.social.agent_voice_bridge import AgentVoiceBridge
+        from integrations.social.call_service import CallService
+        from integrations.social.conversation_service import ConversationService
+        person = _user(db)
+        agent = _user(db, 'agent', owner_id=person)
+        conv = ConversationService.create(db, 'dm', [agent], person)
+        on_desktop = CallService.create(db, 'conversation', conv['id'], person)
+        monkeypatch.setattr(livekit_service, '_HAS_LIVEKIT_SDK', False)
         reply = _open(_phone(person), agent)
         assert reply['type'] == 'call_refused' and reply['reason'] == 'no_room'
+        db.expire_all()
+        assert [p['user_id'] for p in
+                CallService.list_participants(db, on_desktop['id'])] == [person]
+        assert AgentVoiceBridge.list_active(on_desktop['id']) == []
+        assert _open_calls(db, person) == [on_desktop['id']]
+
+    def test_a_call_started_on_the_desktop_meanwhile_is_not_the_phones(
+            self, db, monkeypatch):
+        """The person starts the call on the desktop just after the phone's
+        request found none: the phone's failure ends only a call it opened,
+        never the desktop's.  (Looking first and then creating would take
+        the desktop's call for the phone's own.)"""
+        from integrations.social import livekit_service
+        from integrations.social.call_service import CallService
+        person = _user(db)
+        agent = _user(db, 'agent', owner_id=person)
+        real = CallService.active_call
+        on_desktop = {}
+
+        def _desktop_starts_after_the_lookup(db_, parent_kind, parent_id):
+            found = real(db_, parent_kind, parent_id)
+            if found is None and not on_desktop:
+                on_desktop['call'] = None     # the desktop's own lookup: real
+                on_desktop['call'] = CallService.create(
+                    db_, parent_kind, parent_id, person)
+            return found
+
+        monkeypatch.setattr(CallService, 'active_call',
+                            staticmethod(_desktop_starts_after_the_lookup))
+        monkeypatch.setattr(livekit_service, '_HAS_LIVEKIT_SDK', False)
+        reply = _open(_phone(person), agent)
+        assert reply['type'] == 'call_refused' and reply['reason'] == 'no_room'
+        assert _open_calls(db, person) == [on_desktop['call']['id']]
 
     def test_no_room_token_ends_the_call_it_opened(self, db, monkeypatch):
         from integrations.social import livekit_service

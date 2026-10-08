@@ -8,7 +8,8 @@ for create / join / leave / end / invite, plus the AgentJoinGrant
 gate for agents joining as participants.
 
 What lives here:
-  - CallService.create / get / end — CallSession bookkeeping.
+  - CallService.create / start / active_call / get / end — CallSession
+    bookkeeping (start also says whether it opened the call).
   - CallService.join / leave — CallParticipant lifecycle, with
     UNIQUE-WHERE-left_at-IS-NULL invariant ensuring exactly one
     active participant row per (call, user).
@@ -97,10 +98,10 @@ class CallService:
         conversation) — gated by Membership lookup.  Non-members
         raise CallError so we don't leak the existence of the parent.
 
-        Idempotency: a parent already has-an-active-call short-circuits
-        and returns the existing row instead of creating a duplicate.
-        Two clients racing on the Start Call button get the same call,
-        which is what users expect.
+        Idempotency: a parent's call in progress is returned instead of a
+        duplicate.  Not a guarantee: nothing in the schema stops two open
+        calls on one parent, so two starts that both pass the lookup before
+        either INSERTs each open one (P4-1 below).
         """
         if kind not in ALLOWED_CALL_KINDS:
             raise CallError(f"unsupported call kind: {kind!r}")
@@ -141,7 +142,7 @@ class CallService:
             # Concurrent starter beat us to the INSERT — re-SELECT
             # the now-active call and return it.  Reviewer P4-1.
             logger.info(
-                "CallService.create concurrent INSERT collision "
+                "CallService.start concurrent INSERT collision "
                 "for parent=%s/%s: %s; re-reading", parent_kind,
                 parent_id, e)
             existing = CallService.active_call(db, parent_kind, parent_id)
