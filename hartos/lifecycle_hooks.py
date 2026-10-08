@@ -1750,21 +1750,36 @@ def _answer_value_is_text(value) -> bool:
     return bool(text) and not (text.startswith('<') and text.endswith('>'))
 
 
-# What CREATE's own prompts show as the example of a message to the person
-# (create_recipe.py: "Your message here", "message here", "Your clear and
-# useful message here"); a model that sends the example back has sent nothing.
+# What the pipeline's own prompts show as the example of a message to the
+# person (create_recipe.py: "Your message here", "message here", "Your clear
+# and useful message here"; reuse_recipe.py shows the last two under
+# message2userfinal); a model that sends the example back has sent nothing.
 _PROMPT_EXAMPLE_MESSAGES = ('your message here', 'message here',
                             'your clear and useful message here')
+
+# The keys a message to the person travels under: REUSE's two answer keys,
+# and message2user, the one CREATE's prompts teach (@user {"message2user":
+# ...}), which REUSE's reply filter also reads as the answer.
+_ANSWER_KEYS = ('message2userfinal', 'message2', 'message2user')
+
+
+def _is_answer_text(value) -> bool:
+    """Whether an answer key's value is a message: readable text
+    (_answer_value_is_text) that is not one of the prompts' own examples,
+    whatever mark closes it."""
+    return (_answer_value_is_text(value)
+            and str(value).strip().rstrip('.!?').lower()
+            not in _PROMPT_EXAMPLE_MESSAGES)
 
 
 def _is_control_message(text: str) -> bool:
     """Whether ``text`` is the pipeline's control JSON rather than prose: a
     status verdict object in any dress (bare, in a code fence, single-quoted,
     after a line of prose), or an answer-key envelope whose value is empty, an
-    unfilled placeholder or one of CREATE's own prompt examples.  It is the
+    unfilled placeholder or one of the prompts' own examples.  It is the
     parse REUSE's reply filter uses (helper.retrieve_json), in REUSE's order:
-    the answer key first, so a status object that carries a real
-    ``message2userfinal`` is the answer, as it is there; then status.  The
+    an answer key first (_ANSWER_KEYS), so a status object that carries a real
+    message to the person is the answer, as it is there; then status.  The
     Assistant's own ``{"status": "completed"}`` report, or the steer's
     template sent back as it stands, is refused here exactly where REUSE
     refuses it.  Fails closed: a text that cannot be read is control.  (A
@@ -1783,17 +1798,10 @@ def _is_control_message(text: str) -> bool:
         return True
     if not isinstance(parsed, dict):
         return False
-    for key in ('message2userfinal', 'message2'):
+    for key in _ANSWER_KEYS:
         if key in parsed:
-            return not _answer_value_is_text(parsed[key])
-    if 'status' in parsed:
-        return True
-    if 'message2user' in parsed:
-        value = parsed['message2user']
-        return (not _answer_value_is_text(value)
-                or str(value).strip().rstrip('.!').lower()
-                in _PROMPT_EXAMPLE_MESSAGES)
-    return False
+            return not _is_answer_text(parsed[key])
+    return 'status' in parsed
 
 
 def is_written_answer(message) -> bool:
