@@ -56,22 +56,29 @@ USER_ID = 'livetest_gather_requirements_unit'
 PROMPT_ID = '7700000091'
 
 
-def _lift(names):
-    """Source of the named top-level defs / assignments, in file order."""
+def _lift(names, optional=()):
+    """Source of the named top-level defs / assignments, in file order.
+
+    ``optional`` names are lifted when the file has them: helpers chat()
+    calls only in later revisions, so the same test runs on an older copy
+    (HARTOS_ENTRY_SOURCE) and fails there on behaviour, not on a name."""
     src = open(_SRC, encoding='utf-8').read()
     tree = ast.parse(src)
-    out = []
+    wanted = set(names) | set(optional)
+    out, found = [], set()
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name in names:
+        if isinstance(node, ast.FunctionDef) and node.name in wanted:
             out.append(ast.get_source_segment(src, node))
+            found.add(node.name)
         elif (isinstance(node, ast.Assign) and len(node.targets) == 1
               and isinstance(node.targets[0], ast.Name)
-              and node.targets[0].id in names):
+              and node.targets[0].id in wanted):
             out.append(ast.get_source_segment(src, node))
-    found = len(out)
-    assert found == len(names), (
-        f'lifted {found} of {sorted(names)} from {_SRC} -- re-point this '
-        f'test rather than deleting it')
+            found.add(node.targets[0].id)
+    missing = set(names) - found
+    assert not missing, (
+        f'{sorted(missing)} not found in {_SRC} -- re-point this test '
+        f'rather than deleting it')
     return '\n\n'.join(out)
 
 
@@ -143,7 +150,9 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
     }
     ns.update(extra_ns or {})
     exec(compile(_lift({'chat', '_chat_reply', '_config_is_buildable',
-                        '_EMPTY_BUILD_REPLY'}), _SRC, 'exec'), ns)
+                        '_EMPTY_BUILD_REPLY'},
+                       optional={'_decode_config_lists',
+                                 '_CONFIG_LIST_FIELDS'}), _SRC, 'exec'), ns)
 
     social = MagicMock(chat_messages=chat_messages)
     stubs = {
@@ -206,6 +215,14 @@ _EXITS = [
                  0, 'Review Mode',
                  'Got Agent details successfully lets move on to review them '
                  'one at a time', id='completed'),
+    pytest.param(json.dumps({'status': 'completed', 'name': 'News',
+                             'personas': json.dumps([{'name': 'Reader'}]),
+                             'flows': json.dumps([{'flow_name': 'main',
+                                                   'persona': 'Reader',
+                                                   'actions': ['fetch news']}])}),
+                 0, 'Review Mode',
+                 'Got Agent details successfully lets move on to review them '
+                 'one at a time', id='completed_lists_as_json_text'),
     pytest.param('Context size has been exceeded', 0, 'Review Mode',
                  'Agent created with available details. Moving to review.',
                  id='salvage'),
@@ -230,6 +247,39 @@ def test_gather_exit_writes_both_sides(tmp_path, gather_reply, turn_before,
     assert ('assistant', payload['response']) in rows, rows
     memory.save_context.assert_called_once()
     assert memory.save_context.call_args.args[0] == {'input': USER_TEXT}
+
+
+# LIVE 2026-10-08 20:39:45 (agent 54, user 10202, request a54-8d833da2489c),
+# shortened: the gather model wrote every list field of the confirmed config
+# as JSON text.  The content was right (one flow, three plain-text actions);
+# only the encoding was off, and the config was refused as unbuildable.
+LIVE_LISTS_AS_JSON_TEXT = {
+    'status': 'completed', 'name': 'Personalised Learning Tutor',
+    'agent_name': 'teach.local.radha', 'broadcast_agent': False,
+    'personas': '[ { "name": "Tutor", "description": "A patient teacher." } ]',
+    'tools': '[ "get_user_id", "get_data_by_key", "save_data_in_memory" ]',
+    'flows': ('[ { "flow_name": "teach", "persona": "Tutor", "actions": '
+              '["1. Call get_user_id, then get_data_by_key.", '
+              '"2. Write the reply to the learner yourself.", '
+              '"3. Call save_data_in_memory."], '
+              '"sub_goal": "every learner gets the next step" } ]'),
+    'goal': 'teach each learner from their own books',
+}
+
+
+def test_a_config_whose_lists_came_as_json_text_is_saved_with_lists(tmp_path):
+    """The saved config carries the lists the model meant, so the build and
+    every reader of personas/flows get lists, not text."""
+    payload, _, _, _ = _drive(tmp_path, json.dumps(LIVE_LISTS_AS_JSON_TEXT))
+    assert payload['Agent_status'] == 'Review Mode', payload
+    saved = json.loads((tmp_path / f'{PROMPT_ID}.json').read_text())
+    assert saved['personas'] == [{'name': 'Tutor',
+                                  'description': 'A patient teacher.'}]
+    assert saved['tools'] == ['get_user_id', 'get_data_by_key',
+                              'save_data_in_memory']
+    assert [f['flow_name'] for f in saved['flows']] == ['teach']
+    assert len(saved['flows'][0]['actions']) == 3
+    assert saved['flows'][0]['sub_goal'] == 'every learner gets the next step'
 
 
 def test_first_turn_records_the_users_words_not_the_augmented_prompt(tmp_path):

@@ -9586,6 +9586,41 @@ def _config_is_buildable(cfg) -> bool:
         return False
 
 
+#: The list fields of an agent config.  gather_info's own completed template
+#: shows personas and tools as strings, and the model sometimes writes them,
+#: and flows, as JSON text of the list it means.
+_CONFIG_LIST_FIELDS = ('personas', 'tools', 'flows')
+
+
+def _decode_config_lists(cfg):
+    """The config with each list field the model wrote as JSON text decoded,
+    and the names of the fields decoded.
+
+    LIVE 2026-10-08 20:39:45 (prompt_id 54): the confirmed config came back
+    with personas, tools and flows each as the JSON text of the right list
+    (one flow, three plain-text actions, the sub_goal in place).  Left as
+    text, flows holds no flow and the config is refused as unbuildable, and a
+    personas string breaks every reader that indexes it.  Only text that
+    parses as a JSON list is decoded: anything else stays as it came, for
+    _config_is_buildable to judge.  The input is not changed.
+    """
+    if not isinstance(cfg, dict):
+        return cfg, ()
+    out, decoded = dict(cfg), []
+    for key in _CONFIG_LIST_FIELDS:
+        value = out.get(key)
+        if not (isinstance(value, str) and value.strip().startswith('[')):
+            continue
+        try:
+            items = json.loads(value)
+        except ValueError:
+            continue
+        if isinstance(items, list):
+            out[key] = items
+            decoded.append(key)
+    return out, tuple(decoded)
+
+
 @app.route('/chat', methods=['POST'])
 @_mark_foreground
 def chat():
@@ -10685,6 +10720,12 @@ def chat():
 
                 if new_res is None:
                     raise ValueError('new_res is None after parsing')
+
+                new_res, _decoded = _decode_config_lists(new_res)
+                if _decoded:
+                    app.logger.info(
+                        "[GATHER] %s came as JSON text for %s - decoded",
+                        ', '.join(_decoded), prompt_id)
 
                 if new_res.get('status') == 'pending' and turn_num < MAX_GATHER_TURNS:
                     app.logger.info('PENDING STATUS')

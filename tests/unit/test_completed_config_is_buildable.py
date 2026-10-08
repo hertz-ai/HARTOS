@@ -118,11 +118,51 @@ def test_a_tool_shaped_action_is_not_a_step():
         assert hie._config_is_buildable(cfg) is False, entry
 
 
+def test_list_fields_written_as_json_text_are_decoded():
+    """The gather template shows personas and tools as strings, and the
+    model sometimes writes flows the same way (LIVE 2026-10-08 20:39, agent
+    54).  Text that is a JSON list is decoded; the keys are named."""
+    cfg = {'status': 'completed', 'name': 'Tutor agent',
+           'personas': '[{"name": "Tutor"}]',
+           'tools': '[ "get_user_id" ]',
+           'flows': ' [{"flow_name": "teach", "actions": ["read", "reply"]}] '}
+    decoded, keys = hie._decode_config_lists(cfg)
+    assert keys == ('personas', 'tools', 'flows')
+    assert decoded['personas'] == [{'name': 'Tutor'}]
+    assert decoded['tools'] == ['get_user_id']
+    assert decoded['flows'] == [{'flow_name': 'teach', 'actions': ['read', 'reply']}]
+    assert decoded['name'] == 'Tutor agent'
+    assert hie._config_is_buildable(decoded) is True
+    assert cfg['flows'].strip().startswith('['), 'the input is not changed'
+
+
+def test_text_that_is_not_a_json_list_is_left_for_the_check():
+    """Only a JSON list is decoded: an unclosed list, an object, a plain
+    name or an empty string stays as it came, and the check refuses it."""
+    for flows in ('[{"flow_name": "teach", "actions": ["read"]',
+                  '{"flow_name": "teach", "actions": ["read"]}',
+                  'teach', '', '[1, 2'):
+        cfg = {'flows': flows, 'personas': ''}
+        decoded, keys = hie._decode_config_lists(cfg)
+        assert keys == (), flows
+        assert decoded['flows'] == flows
+        assert hie._config_is_buildable(decoded) is False, flows
+
+
+def test_real_lists_are_left_as_they_are():
+    cfg = {'personas': [{'name': 'Tutor'}], 'tools': [],
+           'flows': [{'flow_name': 'teach', 'actions': ['read']}]}
+    decoded, keys = hie._decode_config_lists(cfg)
+    assert keys == ()
+    assert decoded == cfg
+
+
 def test_malformed_input_does_not_raise():
     """A gate must not become a new crash site on the main creation path."""
     for bad in (None, {}, {'flows': None}, {'flows': 'nope'},
                 {'flows': [None]}, {'flows': [[]]}, 'not-a-dict'):
         assert hie._config_is_buildable(bad) is False, repr(bad)
+        assert hie._decode_config_lists(bad) == (bad, ()), repr(bad)
 
 
 def test_reply_exists_and_asks_for_steps():
