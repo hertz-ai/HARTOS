@@ -117,7 +117,7 @@ extras_require = {
     "remote-desktop": [
         "mss>=9.0.0",
         "websockets>=12.0",
-        "av>=12.0.0",
+        "av>=12.0.0,<19",
         "pynput>=1.7.0",
     ],
     "dev": [
