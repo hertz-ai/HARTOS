@@ -9542,8 +9542,9 @@ def _optional_capability_missing(exc):
 
 
 _EMPTY_BUILD_REPLY = (
-    "I have the name and goal, but not the steps yet. Tell me the actions "
-    "this agent should take, in order, and I will build it from those."
+    "I have the name and goal, but not every step came through as a step I "
+    "can build. Tell me the actions this agent should take, in order, and I "
+    "will build it from those."
 )
 
 
@@ -9561,11 +9562,26 @@ def _config_is_buildable(cfg) -> bool:
     "completed" meant buildable.  It was saved with is_active=true and can
     never produce a flow recipe, because there are no actions to execute.
     That shape is 485 of the 624-config corpus (#718).
+
+    Every action must be readable as one, too: text, or the {'action': text}
+    dict saved configs also carry.  LIVE 2026-10-08 18:47 (prompt_id 54): the
+    person confirmed a review of three actions and the model's final JSON held
+    two of them and the flow's sub_goal as an object in their place; saved as
+    is, the confirmed third step was gone and the flow carried an entry no
+    step can be built from.
     """
+    def _is_action(action):
+        if isinstance(action, dict):
+            action = action.get('action')
+        return isinstance(action, str) and bool(action.strip())
+
     try:
-        flows = (cfg or {}).get('flows') or []
-        return any((f or {}).get('actions') for f in flows
-                   if isinstance(f, dict))
+        flows = [f for f in ((cfg or {}).get('flows') or [])
+                 if isinstance(f, dict)]
+        listed = [f.get('actions') for f in flows if f.get('actions')]
+        return bool(listed) and all(
+            isinstance(actions, list) and all(_is_action(a) for a in actions)
+            for actions in listed)
     except (AttributeError, TypeError):
         return False
 

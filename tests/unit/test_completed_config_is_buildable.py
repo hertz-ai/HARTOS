@@ -61,6 +61,46 @@ def test_actions_in_a_later_flow_still_count():
     assert hie._config_is_buildable(cfg) is True
 
 
+# LIVE 2026-10-08 18:47 (prompt_id 54, user 10202, request a54-8bfa532bd98d):
+# the person confirmed a review listing three actions; the model's final JSON
+# kept the first two, dropped the third and put the flow's sub_goal inside
+# "actions" as an object.  It was saved as is: a flow missing the step the
+# person confirmed, with an entry no step can be built from.
+LIVE_ACTION_REPLACED_BY_SUB_GOAL = {
+    'status': 'completed', 'name': 'Personalised Learning Agent',
+    'agent_name': 'teach.local.radha',
+    'flows': [{'flow_name': 'teach', 'persona': 'Tutor', 'actions': [
+        'Call get_user_id, then get_data_by_key with the key teach.<that user '
+        "id> to read this learner's saved progress.",
+        "Write this turn's reply to the learner yourself, as your own chat "
+        'message to them, following the Teach Yourself rules.',
+        {'sub_goal': 'Every message from a learner gets the right next '
+                     "teaching step and that learner's progress is kept."}]}],
+}
+
+
+def test_an_entry_that_is_not_an_action_is_not_buildable():
+    assert hie._config_is_buildable(LIVE_ACTION_REPLACED_BY_SUB_GOAL) is False, (
+        'saved on 2026-10-08 with the confirmed third action missing and a '
+        'sub_goal object in its place')
+
+
+def test_every_action_shape_a_saved_config_carries_is_buildable():
+    """Plain text, and the {'action': ...} dict saved configs also hold."""
+    for actions in (['read the file'],
+                    [{'action': 'read the file', 'action_id': 1}],
+                    ['read the file', {'action': 'summarise it'}]):
+        cfg = {'flows': [{'flow_name': 'main', 'actions': actions}]}
+        assert hie._config_is_buildable(cfg) is True, actions
+
+
+def test_an_action_with_no_text_is_not_buildable():
+    for actions in ([''], ['   '], [None], [{'action': ''}], [{'action_id': 1}],
+                    ['read the file', 7], 'read the file', 'summarise'):
+        cfg = {'flows': [{'flow_name': 'main', 'actions': actions}]}
+        assert hie._config_is_buildable(cfg) is False, actions
+
+
 def test_malformed_input_does_not_raise():
     """A gate must not become a new crash site on the main creation path."""
     for bad in (None, {}, {'flows': None}, {'flows': 'nope'},
