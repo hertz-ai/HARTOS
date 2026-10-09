@@ -28,6 +28,7 @@ Multi-modal output:
   Haptic  -> Vibration patterns (phone, via Android bridge)
 """
 import copy
+import difflib
 import json
 import logging
 import os
@@ -104,15 +105,32 @@ _A2UI_XSS_RE = re.compile(
     re.I)
 
 
+def _a2ui_xss_path(value, path: str = '') -> Optional[str]:
+    """Path of the first nested string that carries an XSS vector, else None.
+
+    The path is what lets a refusal tell the composing model WHERE the markup
+    is (``items[1].text``) instead of only that some string somewhere is bad.
+    A top-level string answers with '' (falsy), so callers test ``is not None``.
+    """
+    if isinstance(value, str):
+        return path if _A2UI_XSS_RE.search(value) else None
+    if isinstance(value, dict):
+        for k, v in value.items():
+            hit = _a2ui_xss_path(v, f'{path}.{k}' if path else str(k))
+            if hit is not None:
+                return hit
+        return None
+    if isinstance(value, list):
+        for i, v in enumerate(value):
+            hit = _a2ui_xss_path(v, f'{path}[{i}]')
+            if hit is not None:
+                return hit
+    return None
+
+
 def _a2ui_has_xss(value) -> bool:
     """True if any nested string in the component carries an XSS vector."""
-    if isinstance(value, str):
-        return bool(_A2UI_XSS_RE.search(value))
-    if isinstance(value, dict):
-        return any(_a2ui_has_xss(v) for v in value.values())
-    if isinstance(value, list):
-        return any(_a2ui_has_xss(v) for v in value)
-    return False
+    return _a2ui_xss_path(value) is not None
 
 
 # ── GPU render verdict (#137 — reduced effects on software render) ───────────
@@ -910,17 +928,105 @@ _connectivity_cache = _ConnectivityCache()
 # UI Component Schema (A2UI protocol)
 # ═══════════════════════════════════════════════════════════════
 
+#
+# AI-native contract (2026-10-10).  ``props`` is the LEGACY declared name list and
+# stays exactly as shipped (tests and the shell read it).  An entry that also
+# carries ``attributes`` has a TYPED contract: a name -> type map in the grammar
+# the enriched ``metric`` spec already used (str | number | bool | list | dict |
+# any | a|b|c for one-of), plus ``required``, a one-line ``doc`` and an
+# ``example`` that must validate against its own schema (a test enforces it).
+# An attribute is the union of what is declared, what the real emit sites send
+# and what Nunba's AgentOverlay reads; ``aliases`` maps a name a producer was
+# MEASURED to send onto the prop the renderer reads.  validate_component() and
+# agent_ui_compose() are the readers; the model is handed component_prompt() /
+# component_json_schema() generated from these entries, never a hand-written copy.
 COMPONENT_TYPES = {
-    'card': {'props': ['title', 'content', 'icon', 'actions']},
-    'list': {'props': ['items', 'ordered', 'interactive']},
-    'form': {'props': ['fields', 'submit_label', 'action']},
-    'chart': {'props': ['type', 'data', 'labels', 'title']},
-    'progress': {'props': ['value', 'max', 'label', 'color']},
-    'notification': {'props': ['title', 'message', 'severity', 'actions']},
-    'approval': {'props': ['agent_id', 'action', 'description', 'options']},
-    'code': {'props': ['language', 'content', 'filename']},
-    'markdown': {'props': ['content']},
-    'media': {'props': ['type', 'src', 'alt', 'controls']},
+    'card': {
+        'props': ['title', 'content', 'icon', 'actions'],
+        'attributes': {'title': 'str', 'content': 'str', 'message': 'str',
+                       'icon': 'str', 'actions': 'list', 'intent': 'str'},
+        'doc': 'Titled text card; the body is `content` (or `message`).',
+        'example': {'title': 'Q3 numbers', 'content': 'Ready to review.'},
+    },
+    'list': {
+        'props': ['items', 'ordered', 'interactive'],
+        'attributes': {'items': 'list', 'ordered': 'bool',
+                       'interactive': 'bool', 'title': 'str'},
+        'required': ['items'],
+        'doc': 'Bulleted or numbered list; each item is a string or {text|label}.',
+        'example': {'items': ['Milk', 'Tea'], 'ordered': False},
+    },
+    'form': {
+        'props': ['fields', 'submit_label', 'action'],
+        'attributes': {'title': 'str', 'fields': 'list', 'submit_label': 'str',
+                       'action': 'str', 'submit_action': 'str',
+                       'channel': 'str', 'external_url': 'str'},
+        'required': ['fields'],
+        'doc': ('Input form. Each field is {name, label, type, required, secret, '
+                'placeholder, help, value, default, readonly}. `action` is the '
+                'endpoint the values are POSTed to.'),
+        'example': {'title': 'Your name',
+                    'fields': [{'name': 'name', 'label': 'Name', 'type': 'text'}],
+                    'submit_label': 'Save', 'action': '/api/example/save'},
+    },
+    'chart': {
+        'props': ['type', 'data', 'labels', 'title'],
+        'attributes': {'title': 'str', 'data': 'list', 'items': 'list',
+                       'labels': 'list'},
+        'doc': 'Bar chart; each data item is {label, value}.',
+        'example': {'title': 'Sales', 'data': [{'label': 'Mon', 'value': 3}]},
+    },
+    'progress': {
+        'props': ['value', 'max', 'label', 'color'],
+        'attributes': {'value': 'number', 'max': 'number', 'percent': 'number',
+                       'label': 'str', 'title': 'str', 'color': 'str'},
+        'doc': 'Progress bar; `value` (or `percent`) is 0-100.',
+        'example': {'label': 'Download', 'value': 40},
+    },
+    'notification': {
+        'props': ['title', 'message', 'severity', 'actions'],
+        'attributes': {'title': 'str', 'message': 'str', 'content': 'str',
+                       'severity': 'info|success|warning|error',
+                       'actions': 'list'},
+        'doc': ('Notice card. Each action is {label, kind: navigate|external, '
+                'target}.'),
+        'example': {'title': 'Backup done', 'message': 'All files saved.',
+                    'severity': 'success'},
+    },
+    'approval': {
+        'props': ['agent_id', 'action', 'description', 'options'],
+        'attributes': {'agent_id': 'str', 'action': 'str', 'description': 'str',
+                       'title': 'str', 'options': 'list', 'user_id': 'str'},
+        'required': ['action'],
+        'doc': ('Approve / deny / later card. `options` relabels the three '
+                'buttons in that order. The answer is recorded against `action`.'),
+        'example': {'agent_id': 'agent_1', 'action': 'delete_old_logs',
+                    'description': 'Delete logs older than 30 days?'},
+    },
+    'code': {
+        'props': ['language', 'content', 'filename'],
+        'attributes': {'language': 'str', 'content': 'str', 'code': 'str',
+                       'filename': 'str'},
+        'doc': 'Code block; the text is `content` (or `code`).',
+        'example': {'language': 'python', 'content': 'print(1)',
+                    'filename': 'a.py'},
+    },
+    'markdown': {
+        'props': ['content'],
+        'attributes': {'content': 'str', 'text': 'str'},
+        'doc': 'Short markdown: bold, italic, links and bullets.',
+        'example': {'content': '**Done**: 3 files.'},
+    },
+    'media': {
+        'props': ['type', 'src', 'alt', 'controls'],
+        'attributes': {'media_type': 'image|video|audio', 'src': 'str',
+                       'url': 'str', 'alt': 'str', 'title': 'str',
+                       'controls': 'bool'},
+        'doc': ("Image, video or audio. Nunba's AgentOverlay plays `url`; `src` "
+                'is the declared prop and AgentOverlay does not read it.'),
+        'example': {'media_type': 'audio', 'url': 'https://example.com/a.mp3',
+                    'alt': 'Sample', 'controls': True},
+    },
     # ``metric`` is the worked example of the ENRICHED interface shape (§6b): the
     # flat ``props`` stays (the attribute schema every consumer already reads), and
     # the entry additionally DECLARES the events it emits, its behaviours, and an
@@ -942,45 +1048,167 @@ COMPONENT_TYPES = {
             'compose': 'agent_ui_update(agent_id, {"type": "metric", ...attrs})',
         },
     },
-    'layout': {'props': ['type', 'children', 'gap']},
+    'layout': {
+        'props': ['type', 'children', 'gap'],
+        'attributes': {'children': 'list', 'gap': 'number',
+                       'direction': 'row|column'},
+        'required': ['children'],
+        'doc': 'Stack of other components; each child is a full component dict.',
+        'example': {'direction': 'row',
+                    'children': [{'type': 'metric', 'label': 'CPU',
+                                  'value': 12}]},
+    },
     # ── Ecommerce / Agent Action Live Fragments ──
-    'product_card': {'props': ['name', 'price', 'image', 'rating', 'description',
-                               'buy_action', 'compare_action']},
-    'cart': {'props': ['items', 'total', 'currency', 'checkout_action']},
-    'checkout': {'props': ['items', 'total', 'payment_methods', 'shipping_options',
-                           'confirm_action']},
-    'payment_status': {'props': ['status', 'amount', 'method', 'transaction_id']},
-    'order_tracking': {'props': ['order_id', 'status', 'steps', 'current_step',
-                                 'eta']},
-    'comparison': {'props': ['apps', 'features', 'winner']},
-    'agent_action': {'props': ['agent_id', 'action_type', 'description',
-                               'status', 'result', 'timestamp']},
-    'navigate': {'props': ['target', 'params', 'transition']},
+    'product_card': {
+        'props': ['name', 'price', 'image', 'rating', 'description',
+                  'buy_action', 'compare_action'],
+        'attributes': {'name': 'str', 'price': 'any', 'currency': 'str',
+                       'image': 'str', 'image_url': 'str', 'rating': 'number',
+                       'description': 'str', 'buy_action': 'str',
+                       'compare_action': 'str', 'sku': 'str',
+                       'product_id': 'str', 'category_id': 'str'},
+        'required': ['name'],
+        'doc': ('Product with an add-to-cart button. `price` is a number or a '
+                'preformatted string; `currency` is an ISO code such as INR.'),
+        'example': {'name': 'Masala tea', 'price': 120, 'currency': 'INR',
+                    'buy_action': 'cart.add'},
+    },
+    'cart': {
+        'props': ['items', 'total', 'currency', 'checkout_action'],
+        'attributes': {'items': 'list', 'total': 'any', 'currency': 'str',
+                       'checkout_action': 'str', 'superseded': 'bool',
+                       'ordered': 'bool'},
+        'required': ['items'],
+        'doc': 'Cart lines {name, qty, price} with a total and a checkout button.',
+        'example': {'items': [{'name': 'Tea', 'qty': 2, 'price': 40}],
+                    'total': 80, 'currency': 'INR'},
+    },
+    'checkout': {
+        'props': ['items', 'total', 'payment_methods', 'shipping_options',
+                  'confirm_action'],
+        'attributes': {'items': 'list', 'items_count': 'number', 'total': 'any',
+                       'amount': 'any', 'currency': 'str',
+                       'payment_methods': 'list', 'shipping_options': 'list',
+                       'confirm_action': 'str', 'approval_action': 'str',
+                       'paid': 'bool', 'cancelled': 'bool', 'order_id': 'str'},
+        'doc': 'Order summary with payment methods and a confirm button.',
+        'example': {'items_count': 2, 'total': 80, 'currency': 'INR',
+                    'payment_methods': ['UPI', 'Card']},
+    },
+    'payment_status': {
+        'props': ['status', 'amount', 'method', 'transaction_id'],
+        'attributes': {'status': 'success|pending|error', 'amount': 'any',
+                       'method': 'str', 'transaction_id': 'str'},
+        'required': ['status'],
+        'doc': ('Payment result. Use the CLIENT words success|pending|error; the '
+                'commerce words completed/failed are mapped by push_agent_ui.'),
+        'example': {'status': 'success', 'amount': 'INR 80', 'method': 'UPI'},
+    },
+    'order_tracking': {
+        'props': ['order_id', 'status', 'steps', 'current_step', 'eta'],
+        'attributes': {'order_id': 'str', 'status': 'str', 'steps': 'list',
+                       'current_step': 'number', 'eta': 'str'},
+        'required': ['order_id'],
+        'doc': 'Order progress; each step is {label, completed, current}.',
+        'example': {'order_id': 'A100', 'status': 'Packed',
+                    'steps': [{'label': 'Placed', 'completed': True}]},
+    },
+    'comparison': {
+        'props': ['apps', 'features', 'winner'],
+        'attributes': {'apps': 'list', 'features': 'list', 'winner': 'str'},
+        'required': ['apps'],
+        'doc': 'Side-by-side options; each app is {name, rating}.',
+        'example': {'apps': [{'name': 'A', 'rating': 4.5},
+                             {'name': 'B', 'rating': 3.5}], 'winner': 'A'},
+    },
+    'agent_action': {
+        'props': ['agent_id', 'action_type', 'description',
+                  'status', 'result', 'timestamp'],
+        'attributes': {'agent_id': 'str', 'action_type': 'str', 'action': 'str',
+                       'description': 'str', 'status': 'running|completed|error',
+                       'result': 'str', 'title': 'str', 'timestamp': 'any'},
+        'doc': 'What an agent is doing right now, and its result when done.',
+        'example': {'action': 'Searching', 'description': 'Looking up prices',
+                    'status': 'running'},
+    },
+    'navigate': {
+        'props': ['target', 'params', 'transition'],
+        'attributes': {'target': 'str', 'params': 'dict', 'transition': 'str',
+                       'title': 'str'},
+        'required': ['target'],
+        'doc': 'Open an in-app page; renders nothing itself.',
+        'example': {'target': '/social/settings/privacy'},
+    },
     # ── External-room copilot (UNIF-G5) ──
     # Live transcript + decisions + action items for an external Discord
     # audio room / Teams meet / WhatsApp group voice / Reddit voice room
     # joined via UNIF-G2 Join_External_Room.  Idempotent overwrite — backend
     # emits the FULL state on every transcript chunk; frontend replaces.
-    'meet_copilot': {'props': ['call_id', 'platform', 'room_id', 'state',
-                               'transcript_lines', 'decisions',
-                               'action_items', 'participants',
-                               'agent_role']},
+    'meet_copilot': {
+        'props': ['call_id', 'platform', 'room_id', 'state',
+                  'transcript_lines', 'decisions',
+                  'action_items', 'participants',
+                  'agent_role'],
+        'attributes': {'call_id': 'str', 'platform': 'str', 'room_id': 'str',
+                       'state': 'str', 'transcript_lines': 'list',
+                       'decisions': 'list', 'action_items': 'list',
+                       'participants': 'list', 'agent_role': 'str'},
+        'required': ['call_id'],
+        'doc': ('Live meeting copilot. Send the FULL state every time; the card '
+                'replaces itself.'),
+        'example': {'call_id': 'c1', 'platform': 'livekit', 'state': 'live',
+                    'transcript_lines': [], 'decisions': []},
+    },
     # ── Device pairing QR (used by hart_intelligence_entry) ──
     # WAS missing from allowlist while the emit site + web QRPairOverlay
     # renderer both existed — emits were silently rejected here.  Added
     # 2026-05-14 after probe_liquid_ui_audit found the gap.
-    'qr_pair': {'props': ['url', 'caption', 'expires_in_seconds',
-                          'session_id']},
+    'qr_pair': {
+        'props': ['url', 'caption', 'expires_in_seconds',
+                  'session_id'],
+        'attributes': {'qr': 'str', 'channel': 'str', 'title': 'str',
+                       'help': 'str', 'pair_code_action': 'str', 'url': 'str',
+                       'caption': 'str', 'expires_in_seconds': 'number',
+                       'session_id': 'str'},
+        'required': ['qr'],
+        'doc': ("QR to scan. Nunba's AgentOverlay draws `qr`; `url` and "
+                '`caption` are declared but it does not read them.'),
+        'example': {'qr': '2@abc123', 'channel': 'whatsapp',
+                    'title': 'Scan to connect WhatsApp'},
+    },
     # ── OAuth deep-link prompt ──
     # hart_intelligence_entry emits when a tool needs an OAuth handshake
     # (e.g. Reddit/Discord/Google sign-in).  Frontend renders as a
     # notification with a single navigate-to-external-URL action.
-    'oauth_link': {'props': ['title', 'provider', 'authorize_url',
-                             'description', 'scopes']},
+    'oauth_link': {
+        'props': ['title', 'provider', 'authorize_url',
+                  'description', 'scopes'],
+        'attributes': {'title': 'str', 'provider': 'str', 'authorize_url': 'str',
+                       'description': 'str', 'scopes': 'list', 'channel': 'str',
+                       'channel_type': 'str', 'display_name': 'str',
+                       'color': 'str', 'icon': 'str', 'url': 'str',
+                       'external_url': 'str', 'cta_label': 'str',
+                       'severity': 'str'},
+        'required': ['authorize_url'],
+        'doc': ("Sign-in prompt with one button that opens `authorize_url`. "
+                "The web renderer ignores `url`."),
+        'example': {'provider': 'Google', 'title': 'Sign in to Google',
+                    'authorize_url': 'https://example.com/auth'},
+    },
     # ── Transient toast (channels/agent_tools success/error feedback) ──
     # Lightweight notification with short auto-dismiss; web maps to the
     # same NotificationCard renderer with `severity` driving the colour.
-    'toast': {'props': ['title', 'message', 'severity']},
+    'toast': {
+        'props': ['title', 'message', 'severity'],
+        'attributes': {'title': 'str', 'message': 'str',
+                       'severity': 'info|success|warning|error',
+                       'channel': 'str', 'channel_type': 'str'},
+        'required': ['message'],
+        'aliases': {'text': 'message'},
+        'doc': ('Short notice. The body is `message`; AgentOverlay does not read '
+                '`text`, which two channel emitters send.'),
+        'example': {'message': 'Discord disconnected.', 'severity': 'info'},
+    },
     # ── Channel pair-code consent card (gateway_qr auth_method) ──
     # Emitted by hart_intelligence_entry._start_gateway_qr_pair_push
     # while a user is conversationally connecting WhatsApp / Telegram /
@@ -989,15 +1217,35 @@ COMPONENT_TYPES = {
     # the LiquidUI validator stops silently dropping the card on the
     # desktop shell.  Added 2026-05-26 after the consent-fanout audit
     # (memory/consent_fanout_p0_p3_plan.md, P0-A).
-    'pair_code': {'props': ['channel', 'channel_type', 'display_name',
-                            'color', 'icon', 'code', 'expires_in',
-                            'clipboard_payload', 'deeplink',
-                            'instructions']},
+    'pair_code': {
+        'props': ['channel', 'channel_type', 'display_name',
+                  'color', 'icon', 'code', 'expires_in',
+                  'clipboard_payload', 'deeplink',
+                  'instructions'],
+        'attributes': {'channel': 'str', 'channel_type': 'str',
+                       'display_name': 'str', 'color': 'str', 'icon': 'str',
+                       'code': 'str', 'expires_in': 'number',
+                       'clipboard_payload': 'str', 'deeplink': 'str',
+                       'instructions': 'str', 'notification_id': 'any'},
+        'required': ['code'],
+        'doc': 'One-time code to type on the phone; counts down `expires_in` seconds.',
+        'example': {'channel': 'whatsapp', 'display_name': 'WhatsApp',
+                    'code': 'ABCD1234', 'expires_in': 60},
+    },
     # ── Channel connected success card ──
     # Sibling of pair_code; rendered as a brief success toast once the
     # gateway confirms authentication.  Self-dismisses after 6s on web.
-    'channel_connected': {'props': ['channel', 'display_name', 'color',
-                                    'message']},
+    'channel_connected': {
+        'props': ['channel', 'display_name', 'color',
+                  'message'],
+        'attributes': {'channel': 'str', 'channel_type': 'str',
+                       'display_name': 'str', 'color': 'str', 'icon': 'str',
+                       'message': 'str'},
+        'required': ['channel'],
+        'doc': 'Brief success card once a channel is linked; it dismisses itself.',
+        'example': {'channel': 'discord', 'display_name': 'Discord',
+                    'message': 'Discord connected.'},
+    },
     # ── App installed → desktop icon (NixOS-style: install an app, its icon
     # appears) ── Emitted by app_installer._auto_register_app on a successful
     # install.  The desktop (hartDesktop.js) merges {id,title,icon,exec} into
@@ -1038,15 +1286,178 @@ def _component_spec_for(name: str, entry: dict) -> dict:
     if isinstance(entry.get('spec'), dict):
         return entry['spec']
     props = entry.get('props') or []
-    return {
+    typed = entry.get('attributes') if isinstance(
+        entry.get('attributes'), dict) and entry.get('attributes') else None
+    spec = {
         'name': name,
-        'attributes': {p: 'any' for p in props},
+        'attributes': dict(typed) if typed else {p: 'any' for p in props},
         'emits': list(entry.get('events') or []),
         'behaviors': list(entry.get('behaviors') or []),
         'mount': 'a2ui',
         'compose': ('agent_ui_update(agent_id, {"type": "%s", ...attributes})'
                     % name),
     }
+    if typed:
+        # The AI-native contract rides the same spec an agent already reads.
+        for key in ('required', 'doc', 'example', 'aliases'):
+            if entry.get(key):
+                spec[key] = copy.deepcopy(entry[key])
+    return spec
+
+
+# ── Typed attribute grammar + validation (AI-native registry, 2026-10-10) ────
+# One grammar for every reader (the validator, the prompt, the JSON schema, the
+# runtime registrar): str | number | bool | list | dict | any | a|b|c (one of).
+_ATTR_PY_TYPES = {
+    'str': (str,), 'list': (list, tuple), 'dict': (dict,), 'bool': (bool,),
+}
+_ATTR_SCALARS = frozenset({'str', 'number', 'bool', 'list', 'dict', 'any'})
+_ATTR_ENUM_VALUE_RE = re.compile(r'^[A-Za-z0-9_.:-]+$')
+_ATTR_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,39}$')
+
+# Keys that belong to the push envelope or to the transport, not to a
+# component's own contract.  ``_``-prefixed keys (``_ts``, ``_spec`` ...) are
+# the service's own stamps and are skipped by rule.
+_ENVELOPE_KEYS = frozenset({
+    'type', 'component_type', 'agent_id', 'agent_name', 'msg_id', 'user_id',
+    'timestamp',
+})
+
+
+def _attr_grammar_ok(spec) -> bool:
+    """True if ``spec`` is a type this grammar defines."""
+    if not isinstance(spec, str):
+        return False
+    if spec in _ATTR_SCALARS:
+        return True
+    parts = spec.split('|')
+    return len(parts) > 1 and all(
+        p and _ATTR_ENUM_VALUE_RE.match(p) for p in parts)
+
+
+def _attr_value_ok(spec: str, value) -> bool:
+    """Does ``value`` satisfy the already-valid grammar ``spec``?"""
+    if spec == 'any':
+        return True
+    if spec == 'number':
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if spec in _ATTR_PY_TYPES:
+        return isinstance(value, _ATTR_PY_TYPES[spec])
+    return isinstance(value, str) and value in spec.split('|')
+
+
+def _attributes_for(entry: dict) -> Optional[dict]:
+    """The name -> type map of a registry entry, or None if it declares none.
+
+    An entry-level ``attributes`` wins; the enriched ``metric`` keeps its map
+    under ``spec`` (the shape this grammar came from), and a runtime-registered
+    type keeps whatever ``register_component_type`` stored there.
+    """
+    attrs = entry.get('attributes')
+    if isinstance(attrs, dict) and attrs:
+        return attrs
+    spec = entry.get('spec')
+    if isinstance(spec, dict) and isinstance(spec.get('attributes'), dict):
+        return spec['attributes'] or None
+    return None
+
+
+def _short(value) -> str:
+    """A bounded repr, so one huge field cannot bloat a verdict."""
+    text = repr(value)
+    return text if len(text) <= 80 else text[:77] + '...'
+
+
+def validate_component(comp_type: str, component: dict, entry: dict) -> List[dict]:
+    """Check a component against its registry entry.  Pure and total: a
+    malformed entry or component yields fewer checks, never an exception.
+
+    Returns issues the composing model can act on, each
+    ``{path, code, level, expected, got, hint}``:
+
+    * ``required``     (error)   a required attribute is absent or None
+    * ``type``         (error)   the value is not the declared type
+    * ``enum``         (error)   the value is not one of the declared choices
+    * ``unknown_prop`` (warning) a key the type does not declare
+
+    Errors mean "the renderer will not show what you meant"; a warning means
+    "this key is ignored".  Legacy callers are never blocked by either (see
+    ``agent_ui_compose``); only a strict, AI-composed push is.
+    """
+    issues: List[dict] = []
+    attrs = _attributes_for(entry) or {
+        p: 'any' for p in (entry.get('props') or []) if p != 'type'}
+    if not attrs:
+        return issues
+    # A custom-types file is hand-editable, so every shape is checked, not trusted.
+    aliases = entry.get('aliases') if isinstance(entry.get('aliases'), dict) else {}
+    required = entry.get('required') if isinstance(entry.get('required'), list) else []
+    for name in required:
+        if component.get(name) is None:
+            issues.append({
+                'path': name, 'code': 'required', 'level': 'error',
+                'expected': attrs.get(name, 'any'), 'got': None,
+                'hint': f"{comp_type} needs '{name}'"})
+    for key, value in component.items():
+        if not isinstance(key, str) or key.startswith('_'):
+            continue
+        if key in _ENVELOPE_KEYS and key not in attrs:
+            continue
+        spec = attrs.get(key)
+        if spec is None:
+            if key in aliases:
+                hint = f"use '{aliases[key]}' instead of '{key}'"
+            else:
+                near = difflib.get_close_matches(key, list(attrs), n=1, cutoff=0.6)
+                hint = (f"did you mean '{near[0]}'?" if near else
+                        f"{comp_type} declares: " + ', '.join(sorted(attrs)[:12]))
+            issues.append({
+                'path': key, 'code': 'unknown_prop', 'level': 'warning',
+                'expected': None, 'got': _short(value), 'hint': hint})
+            continue
+        if (value is None or not isinstance(spec, str)
+                or _attr_value_ok(spec, value)):
+            continue
+        code = 'enum' if '|' in spec else 'type'
+        issues.append({
+            'path': key, 'code': code, 'level': 'error', 'expected': spec,
+            'got': _short(value),
+            'hint': (f"'{key}' must be one of {spec.replace('|', ', ')}"
+                     if code == 'enum' else f"'{key}' must be {spec}")})
+    return issues
+
+
+def _prompt_line(name: str, entry: dict) -> str:
+    """One catalogue line: ``name(req!: type, opt: type) - doc``."""
+    attrs = _attributes_for(entry) or {
+        p: 'any' for p in (entry.get('props') or []) if p != 'type'}
+    required = set(entry.get('required') or [])
+    ordered = sorted(attrs.items(), key=lambda kv: kv[0] not in required)
+    args = ', '.join(
+        f"{k}{'!' if k in required else ''}: {v}" for k, v in ordered)
+    doc = entry.get('doc') or (
+        entry.get('spec', {}).get('doc') if isinstance(entry.get('spec'), dict)
+        else None)
+    return f"- {name}({args})" + (f" - {doc}" if doc else '')
+
+
+def _json_schema_for(name: str, entry: dict) -> dict:
+    """A JSON Schema for one component, generated from its registry entry."""
+    attrs = _attributes_for(entry) or {
+        p: 'any' for p in (entry.get('props') or []) if p != 'type'}
+    scalar = {'str': {'type': 'string'}, 'number': {'type': 'number'},
+              'bool': {'type': 'boolean'}, 'list': {'type': 'array'},
+              'dict': {'type': 'object'}, 'any': {}}
+    props = {'type': {'const': name}}
+    for key, spec in attrs.items():
+        props[key] = (scalar[spec] if spec in scalar
+                      else {'type': 'string', 'enum': spec.split('|')})
+    schema = {'type': 'object', 'properties': props,
+              'required': ['type'] + list(entry.get('required') or []),
+              'additionalProperties': True}
+    if entry.get('doc'):
+        schema['description'] = entry['doc']
+    return schema
 
 # ── Agentic HOME composition — the producer's schema allow-sets ──────────────
 # compose_home pushes a {hero, rows} payload; hartHome.js (compose -> render) is
@@ -1713,7 +2124,37 @@ class LiquidUIService:
 
     def agent_ui_update(self, agent_id: str, component: dict,
                         user_id: Optional[str] = None) -> bool:
+        """Push a UI component; True if it was accepted.
+
+        The bool contract the production emitters rely on (17 call sites).  A
+        model that composes UI should call ``agent_ui_compose`` instead: the
+        same gates, but it says WHY a push was refused and what is wrong with
+        it.  This is that call with lenient schema checking, so nothing that was
+        accepted before is refused now.
+        """
+        return bool(self.agent_ui_compose(agent_id, component, user_id)['ok'])
+
+    def agent_ui_compose(self, agent_id: str, component: dict,
+                         user_id: Optional[str] = None,
+                         strict: bool = False) -> dict:
         """Push a UI component from an agent to all connected frontends.
+
+        Returns a VERDICT the composing model can read and act on, instead of a
+        bare bool plus a log line it never sees::
+
+            {'ok': bool,          # was it accepted and stored
+             'valid': bool|None,  # no schema errors (None: refused before checking)
+             'type': str,
+             'refused': None | 'not_an_object' | 'disabled' | 'unknown_type' |
+                        'hive_halted' | 'rate_capped' | 'guardrail' |
+                        'unsafe_content' | 'invalid',
+             'issues': [{path, code, level, expected, got, hint}],
+             'hint': str|None}    # what to change
+
+        ``strict=False`` (the legacy ``agent_ui_update``) delivers a component
+        whose schema has errors and reports them; ``strict=True`` (an AI-composed
+        push) refuses it with ``refused='invalid'`` and stores nothing.  Warnings
+        (an unknown prop) never block.
 
         Delivery paths (best-effort once accepted):
           1. In-memory store → the :6800 shell's /api/notifications/stream
@@ -1732,18 +2173,35 @@ class LiquidUIService:
         Constitutional controls (an agent painting the screen is governed
         like an agent dispatch): the push is REFUSED while the human has
         halted the HiveCircuitBreaker, and every accepted push is recorded
-        in the immutable audit log.  Returns False if disabled, the type is
-        unknown, or the hive is halted.
+        in the immutable audit log.  Refused (``ok`` False) if disabled, the type
+        is unknown, or the hive is halted.
         """
+        comp_type = component.get('type', '') if isinstance(component, dict) else ''
+
+        def verdict(ok, refused=None, hint=None, issues=None):
+            return {
+                'ok': ok,
+                'valid': (None if issues is None else
+                          not any(i['level'] == 'error' for i in issues)),
+                'type': comp_type, 'refused': refused,
+                'issues': list(issues or []), 'hint': hint}
+
+        if not isinstance(component, dict):
+            return verdict(False, 'not_an_object',
+                           'a component is a dict with a "type" key')
         if not self.a2ui_enabled:
-            return False
-        comp_type = component.get('type', '')
+            return verdict(False, 'disabled', 'A2UI is switched off on this node')
         # The ONE allowlist gate, now runtime-extensible (§6b): a builtin type OR a
         # component a HART agent registered at runtime.  No second gate, no fork.
         if (comp_type not in COMPONENT_TYPES
                 and comp_type not in self._custom_component_types):
             logger.warning("Invalid A2UI component type: %s", comp_type)
-            return False
+            known = sorted(set(COMPONENT_TYPES) | set(self._custom_component_types))
+            near = difflib.get_close_matches(str(comp_type), known, n=3, cutoff=0.6)
+            return verdict(False, 'unknown_type', (
+                f"unknown component type {comp_type!r}; did you mean: "
+                f"{', '.join(near)}?" if near else
+                f"unknown component type {comp_type!r}; see component_prompt()"))
 
         # Kill-switch: when the human halts the hive, agent UI pushes stop
         # too — the constitution governs an agent painting the screen exactly
@@ -1756,7 +2214,8 @@ class LiquidUIService:
                 logger.warning(
                     "A2UI push refused (hive halted): %s from %s",
                     comp_type, agent_id)
-                return False
+                return verdict(False, 'hive_halted',
+                               'the human halted the hive; do not retry')
         except Exception:
             logger.exception("agent_ui_update: swallowed Exception")
 
@@ -1765,19 +2224,38 @@ class LiquidUIService:
         if not self._a2ui_rate_ok(agent_id):
             logger.warning("A2UI push rate-capped: %s from %s",
                            comp_type, agent_id)
-            return False
+            return verdict(False, 'rate_capped',
+                           'at most 20 pushes in a burst, then 2 per second per agent')
 
         # Destructive verbs (window.close / fullscreen takeover, Phase 6) pass
         # the FULL fail-CLOSED guardrail; benign display cards do not.
         if (comp_type in DESTRUCTIVE_COMPONENT_TYPES
                 and not self._a2ui_guardrail_ok(component)):
-            return False
+            return verdict(False, 'guardrail',
+                           'blocked by the destructive-verb guardrail')
 
         # Server-side defense-in-depth: reject obvious XSS vectors.
-        if _a2ui_has_xss(component):
+        bad_path = _a2ui_xss_path(component)
+        if bad_path is not None:
             logger.warning("A2UI push rejected (unsafe content): %s from %s",
                            comp_type, agent_id)
-            return False
+            return verdict(False, 'unsafe_content', (
+                f"{bad_path or 'the component'} contains markup that is not "
+                "allowed (script/iframe/on*= handlers/javascript: URIs)"))
+
+        # The typed contract.  Lenient (legacy) pushes report these and go on;
+        # a strict (AI-composed) push stops here so nothing half-right is shown.
+        issues = validate_component(
+            comp_type, component,
+            COMPONENT_TYPES.get(comp_type)
+            or self._custom_component_types.get(comp_type) or {})
+        if issues:
+            logger.debug("A2UI %s from %s: %d schema issue(s): %s", comp_type,
+                         agent_id, len(issues),
+                         [(i['code'], i['path']) for i in issues])
+        if strict and any(i['level'] == 'error' for i in issues):
+            return verdict(False, 'invalid',
+                           'fix the listed issues and push again', issues)
 
         import time as _time
         component['_ts'] = _time.time()
@@ -1870,7 +2348,7 @@ class LiquidUIService:
             logger.exception("agent_ui_update: swallowed Exception")  # EventBus emission is best-effort
 
         logger.info("A2UI: agent %s pushed %s component", agent_id, comp_type)
-        return True
+        return verdict(True, issues=issues)
 
     def _a2ui_rate_ok(self, agent_id: str) -> bool:
         """Per-agent token bucket (20 burst, +2/s) — a runaway agent cannot
@@ -1958,6 +2436,30 @@ class LiquidUIService:
                                        self._custom_component_types[type_name])
         return None
 
+    def _all_component_entries(self) -> Dict[str, dict]:
+        """Builtin + runtime-registered entries; a builtin is never shadowed."""
+        return {**self._custom_component_types, **COMPONENT_TYPES}
+
+    def component_prompt(self, types: Optional[List[str]] = None) -> str:
+        """The catalogue a model is handed, GENERATED from the registry.
+
+        One line per component, ``name(required!: type, optional: type) - doc``.
+        It is derived from the same entries the validator reads, so the text the
+        model is shown and the check its push meets cannot drift apart.
+        """
+        entries = self._all_component_entries()
+        names = [n for n in entries if types is None or n in types]
+        head = ('Liquid UI components. Push one with '
+                'agent_ui_compose(agent_id, {"type": <name>, ...props}). '
+                '`!` marks a required prop. Types: str, number, bool, list, '
+                'dict, any, or a|b|c (one of).')
+        return '\n'.join([head] + [_prompt_line(n, entries[n]) for n in names])
+
+    def component_json_schema(self, type_name: str) -> Optional[dict]:
+        """JSON Schema for one component (for a function-calling tool), or None."""
+        entry = self._all_component_entries().get(type_name)
+        return None if entry is None else _json_schema_for(type_name, entry)
+
     def register_component_type(self, agent_id: str, type_name: str,
                                 spec: dict) -> dict:
         """A HART agent registers a NEW self-sufficient, interface-declared,
@@ -2013,6 +2515,42 @@ class LiquidUIService:
         }
         if isinstance(spec.get('template'), str):
             entry['template'] = spec['template']
+        # The typed contract (optional): an agent that declares attribute TYPES
+        # gets its pushes validated and its component listed in the catalogue.
+        # A malformed declaration is refused with the reason, not stored.
+        attrs = spec.get('attributes')
+        if isinstance(attrs, dict) and attrs:
+            typed = {}
+            for key, kind in list(attrs.items())[:40]:
+                if not _ATTR_NAME_RE.match(str(key)):
+                    return {'error': f'attribute name {str(key)[:40]!r} must be '
+                                     'an identifier of at most 40 characters'}
+                if not _attr_grammar_ok(kind):
+                    return {'error': (
+                        f'attribute "{key}" has type {str(kind)[:40]!r}; use '
+                        'str, number, bool, list, dict, any or a|b|c')}
+                typed[str(key)] = kind
+            entry['attributes'] = typed
+            entry['props'] = list(typed)
+            required = spec.get('required') or []
+            if (not isinstance(required, list)
+                    or any(r not in typed for r in required)):
+                return {'error': '"required" must list declared attributes'}
+            if required:
+                entry['required'] = [str(r) for r in required]
+            if isinstance(spec.get('doc'), str):
+                entry['doc'] = spec['doc'][:200]
+            example = spec.get('example')
+            if example is not None:
+                bad = ([] if not isinstance(example, dict) else [
+                    i for i in validate_component(
+                        name, {'type': name, **example}, entry)
+                    if i['level'] == 'error'])
+                if not isinstance(example, dict) or bad:
+                    return {'error': 'the example contradicts the declared '
+                                     'attributes: ' + (bad[0]['hint'] if bad
+                                                       else 'it must be an object')}
+                entry['example'] = example
         entry['spec'] = _component_spec_for(name, {**entry,
                                                    'spec': spec.get('spec')})
         with self._lock:
