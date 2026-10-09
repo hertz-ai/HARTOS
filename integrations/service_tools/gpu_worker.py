@@ -217,6 +217,15 @@ class GPUWorker:
     # 0.0 and the parent ignores the reading.
     VRAM_MARKER_PREFIX = '__WORKER_VRAM_GB__'
 
+    # A worker still loading when startup_timeout passes is NOT killed: the
+    # caller gets WorkerTimeout, and the next start() keeps waiting on the
+    # same process.  Killing it and spawning again restarted the cold import
+    # from zero every time, so on a busy CPU it never got there (Nunba,
+    # 2026-10-01: whisper respawned every 60s for minutes while llama-server
+    # held the CPU, and the mic returned empty text).  Only a worker that is
+    # still not ready after this many startup_timeouts is treated as hung.
+    STARTUP_GIVE_UP_FACTOR = 5
+
     def __init__(
         self,
         name: str,
@@ -250,6 +259,7 @@ class GPUWorker:
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._ready = False
+        self._starting_since: Optional[float] = None
         self._stderr_thread: Optional[threading.Thread] = None
         self._stdout_thread: Optional[threading.Thread] = None
         self._stdout_queue: queue.Queue = queue.Queue()
@@ -259,11 +269,23 @@ class GPUWorker:
     def start(self) -> None:
         """Spawn the subprocess and wait for READY handshake."""
         with self._lock:
-            if self._proc and self._proc.poll() is None and self._ready:
-                return  # already running
-
-            self._spawn()
+            if self._proc and self._proc.poll() is None:
+                if self._ready:
+                    return  # already running
+                # A previous start() timed out while this process was still
+                # loading: keep waiting on it rather than spawning again.
+            else:
+                self._spawn()
+                self._starting_since = time.monotonic()
             self._wait_ready()
+
+    def is_starting(self) -> bool:
+        """True if the subprocess is alive but has not reported READY yet."""
+        return (
+            self._proc is not None
+            and self._proc.poll() is None
+            and not self._ready
+        )
 
     def is_alive(self) -> bool:
         """True if subprocess is running and READY."""
@@ -295,6 +317,7 @@ class GPUWorker:
                         logger.warning("stop: swallowed subprocess.TimeoutExpired", exc_info=True)
             self._proc = None
             self._ready = False
+            self._starting_since = None
 
     # ── Request/response ───────────────────────────────────────────
 
@@ -826,6 +849,7 @@ class GPUWorker:
             stripped = line.strip()
             if stripped == self.READY_MARKER:
                 self._ready = True
+                self._starting_since = None
                 logger.info(f"{self.name}: worker ready")
                 return
             # VRAM-measurement marker — emitted by workers BEFORE READY.
@@ -836,7 +860,14 @@ class GPUWorker:
             # Ignore any other startup chatter
             logger.debug(f"[{self.name}] startup: {stripped}")
 
-        # Timeout
+        # Timeout.  Still loading and within the give-up budget: fail this
+        # caller but leave the process running for the next start().
+        started = self._starting_since or 0.0
+        give_up = self.startup_timeout * self.STARTUP_GIVE_UP_FACTOR
+        if (self._proc is not None and self._proc.poll() is None
+                and time.monotonic() - started < give_up):
+            raise WorkerTimeout(
+                f"{self.name}: startup timeout ({self.startup_timeout}s), still starting")
         self._reap(force=True)
         raise WorkerTimeout(f"{self.name}: startup timeout ({self.startup_timeout}s)")
 
@@ -900,6 +931,7 @@ class GPUWorker:
                 self._proc.kill()
         self._proc = None
         self._ready = False
+        self._starting_since = None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1471,7 +1503,12 @@ class ToolWorker:
         """
         spawned = False
         with self._lock:
-            if self._worker is None or not self._worker.is_alive():
+            if self._worker is not None and self._worker.is_starting():
+                # The last call timed out on a cold start that is still
+                # loading.  Wait on it -- a second GPUWorker would orphan
+                # this process and start a new import from zero.
+                self._worker.start()
+            elif self._worker is None or not self._worker.is_alive():
                 # Allocate VRAM INSIDE the lock so concurrent call()
                 # invocations don't double-count. T138 fix (c).
                 # If allocate() returns False (GPU full), try evicting
