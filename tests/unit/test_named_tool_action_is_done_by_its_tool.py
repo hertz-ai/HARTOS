@@ -113,6 +113,53 @@ class TestTheCompletionGate(_Harness):
                   _result('orphan', _CODING_RESULT))
         self.assertTrue(self._commit(2))
 
+    def test_a_word_that_spells_a_tool_does_not_make_prose_a_tool_step(self):
+        """LIVE 2026-10-10 15:35-15:42 IST, agent 54 CREATE (a54-addc628e387c):
+        step 2 is the tutor's written reply, and its rule (i) reads "remember
+        the interrupted one".  The memory tool `remember` is registered on the
+        same agents, so the step read as naming it: every completed verdict was
+        refused ("no tool result of this action's work") and the step GAVE_UP
+        on a correct reply.  A plain word is not a tool's name."""
+        self.gc.agents = [_agent(*_SERVED, 'remember', 'recall_memory')]
+        self.ledger = _Ledger(_TUTOR_STEP)
+        self._log({'role': 'assistant', 'name': 'Assistant',
+                   'content': 'I am confirming this. The Water Cycle chapter '
+                              'is pages 1 to 2. Shall we start?'})
+        self.assertTrue(self._commit(1, kind='user_visible_result'))
+        self.assertEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)
+
+
+# The live step, shortened: agent 54's step 2 as the 10-10 interview saved it.
+_TUTOR_STEP = ("Write this turn's reply to the learner yourself, as your own chat "
+               "message to them. (i) a new topic in the middle of a lesson: "
+               "remember the interrupted one, then start the new one.")
+
+
+@pytest.mark.parametrize('text,named', [
+    # The live shape, and two more measured in the desktop's 1,087 configs:
+    # the only three of 1,653 (action, tool) matches the narrower rule drops.
+    (_TUTOR_STEP, []),
+    ("send_message_to_user with content='I will remember your preferences'",
+     ['send_message_to_user']),
+    ('Remember: real wellness beats screen time.', []),
+    # A one-word name written as a call still names the tool.
+    ('Call remember with the learner\'s progress.', ['remember']),
+    ('use remember to store it', ['remember']),
+    ('remember(text=progress)', ['remember']),
+    ('The `remember` tool stores it.', ['remember']),
+    ('Store it in "remember".', ['remember']),
+    # ... and only as a whole word: another word that starts with it is not.
+    ('use remembered notes', []),
+    # A name shaped like an identifier names the tool wherever it stands, as
+    # before: unchanged for every other match on the desktop.
+    ('call_save_data_in_memory with the progress', ['save_data_in_memory']),
+    ('Call save_data_in_memory, then stop.', ['save_data_in_memory']),
+])
+def test_what_an_action_names(text, named):
+    agents = [_agent('remember', 'recall_memory', 'save_data_in_memory',
+                     'send_message_to_user')]
+    assert sorted(lh.action_named_tools(agents, text)[1]) == named, text
+
 
 class TestTheTraceBanker:
     @pytest.fixture(autouse=True)

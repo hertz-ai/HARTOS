@@ -1587,6 +1587,10 @@ def action_named_tools(agents, action_text):
     the REUSE gate blind (live 2026-09-10, agent 88719487304 action 4: an
     action naming execute_coding_task read like a prose action and
     advanced having run nothing).
+
+    "Names" is _text_names_tool's reading, not a bare substring: a tool whose
+    name is a plain English word (remember) is named only where the text
+    writes it as a call.
     """
     names = set()
     for ag in (agents or []):
@@ -1624,8 +1628,45 @@ def action_named_tools(agents, action_text):
             if _cn:
                 names.add(_cn)
     text = str(action_text or '').lower()
-    referenced = [n for n in names if n and len(n) > 3 and n.lower() in text]
+    referenced = [n for n in names if _text_names_tool(text, n)]
     return names, referenced
+
+
+#: What writes a one-word tool name as a call: "call remember", "use
+#: remember", "with remember", ...
+_TOOL_CALL_CUE = re.compile(
+    r'(?:\bcall|\buse|\busing|\brun|\binvoke|\bvia|\bwith|\btool)\s*[`"\']?\s*$')
+
+
+def _text_names_tool(text: str, name: str) -> bool:
+    """Whether the (lowercased) action ``text`` names the tool ``name``.
+
+    A name shaped like an identifier (an underscore, a digit, or a capital
+    inside it: save_data_in_memory, crawl4ai, Generate_video) is not a word of
+    prose, so it names the tool wherever it stands, as it always has.  A name
+    that is one plain word is an English word too: live 2026-10-10, agent
+    54's written reply step said "remember the interrupted one" and read as
+    naming the memory tool `remember`, so the completion gate wanted that
+    tool's result and the step GAVE_UP on a correct reply.  Such a name counts
+    only where the text writes it as a call: followed by "(", after call / use
+    / using / run / invoke / via / with / tool, or in quotes or backticks.
+    Measured on the desktop's 1,087 configs (5,889 actions): of 1,653 (action,
+    tool) matches, the three it drops are all the English "remember"."""
+    n = str(name or '').lower()
+    if len(n) <= 3 or n not in text:
+        return False
+    if '_' in name or any(c.isdigit() for c in name) or any(
+            c.isupper() for c in name[1:]):
+        return True
+    for m in re.finditer(r'(?<![a-z0-9_])' + re.escape(n) + r'(?![a-z0-9_])',
+                         text):
+        after = text[m.end():m.end() + 1]
+        if after == '(' or _TOOL_CALL_CUE.search(text[max(0, m.start() - 14):
+                                                      m.start()]):
+            return True
+        if m.start() and text[m.start() - 1] in '`"\'' and after in '`"\'':
+            return True
+    return False
 
 
 def _tools_this_action_names(user_prompt: str, action_id: int):
