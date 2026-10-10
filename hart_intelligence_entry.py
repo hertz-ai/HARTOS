@@ -969,6 +969,10 @@ app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_h
 # otherwise transport-rejects bodies Flask's own cap here would accept).
 from core.constants import MAX_PAYLOAD_BYTES, SHELL_COMMAND_TIMEOUT_S
 app.config['MAX_CONTENT_LENGTH'] = MAX_PAYLOAD_BYTES  # 2MB default, HEVOLVE_MAX_PAYLOAD_BYTES to override
+# ...for a remote caller.  A local caller's body has no cap (owner
+# 2026-10-10); the per-request rule is core.serve.max_body_size.
+from core.serve import caller_capped_request
+app.request_class = caller_capped_request(app.request_class)
 
 # ── LLM outbound logger ───────────────────────────────────────────────
 # Monkey-patches httpx.Client.send (+ AsyncClient) to (a) inject the

@@ -41,6 +41,7 @@ Imports are lazy on purpose: a caller that reaches these functions inside its
 own `try` must still see ImportError when hypercorn is absent, so its existing
 waitress fallback fires unchanged.
 """
+import sys
 from typing import Any, List, Optional, Sequence
 
 # Every entry point set these to the same values before this module existed.
@@ -136,6 +137,66 @@ def make_hypercorn_config(bind: Sequence[str],
     return config
 
 
+#: A local caller's request body has no size cap.  Owner, 2026-10-10: "local
+#: need not have a cap".  Measured live that day on the desktop: every body
+#: over 2 MB was refused before Nunba ran (2.1 MB: an empty 400; 3 MB: the
+#: connection dropped), so a book PDF uploaded from the browser, an avatar
+#: photo or a voice recording over 2 MB could never arrive.
+LOCAL_MAX_BODY_SIZE = sys.maxsize
+
+
+def max_body_size(is_local: bool) -> int:
+    """The request-body cap: none for a local caller, MAX_PAYLOAD_BYTES
+    (HEVOLVE_MAX_PAYLOAD_BYTES, 2 MB by default) for every other.
+
+    The ONE rule for both layers that cap a body: the transport
+    (build_asgi_app) and Flask (caller_capped_request).  "Local" is
+    core.auth_local's rule, read through is_local_environ: the socket peer is
+    loopback and, when that peer is a proxy on this machine, so is the client
+    it names.  A central node is reached through Docker's proxy, never from
+    loopback, so its callers keep the cap.
+
+    No cap means the body is held in memory as it arrives (the WSGI
+    middleware buffers it before the app runs), so a local upload is bounded
+    by this machine's memory instead.
+    """
+    from core.constants import MAX_PAYLOAD_BYTES
+    return LOCAL_MAX_BODY_SIZE if is_local else MAX_PAYLOAD_BYTES
+
+
+def _asgi_scope_is_local(scope: Any) -> bool:
+    """core.auth_local's locality rule over an ASGI scope: the WSGI environ
+    values Hypercorn would build from it (REMOTE_ADDR, and every
+    X-Forwarded-For header joined by commas)."""
+    from core.auth_local import is_local_environ
+
+    client = scope.get('client') or ('', 0)
+    forwarded = ','.join(
+        value.decode('latin-1') for name, value in scope.get('headers') or []
+        if name.lower() == b'x-forwarded-for')
+    return is_local_environ({'REMOTE_ADDR': client[0] or '',
+                             'HTTP_X_FORWARDED_FOR': forwarded})
+
+
+def caller_capped_request(base: Any) -> Any:
+    """A Flask request class whose body cap is max_body_size for its caller.
+
+    Flask's MAX_CONTENT_LENGTH is one number for every request; this reads
+    the cap per request instead.  A property, not Flask 3.1's per-request
+    setter, because requirements.txt pins Flask 2.3, which has no setter:
+    Werkzeug reads `max_content_length` when it opens the body stream and
+    when it parses a form, on both versions.
+    """
+    from core.auth_local import is_local_environ
+
+    class CallerCappedRequest(base):
+        @property
+        def max_content_length(self):
+            return max_body_size(is_local_environ(self.environ))
+
+    return CallerCappedRequest
+
+
 def build_asgi_app(wsgi_app: Any) -> Any:
     """Wrap a WSGI app so `/peer_link` websockets are served and HTTP is not.
 
@@ -150,7 +211,6 @@ def build_asgi_app(wsgi_app: Any) -> Any:
     """
     from hypercorn.middleware import AsyncioWSGIMiddleware
 
-    from core.constants import MAX_PAYLOAD_BYTES
     from core.peer_link.server import peer_link_asgi
 
     # Without an explicit max_body_size the middleware's library default of
@@ -160,9 +220,18 @@ def build_asgi_app(wsgi_app: Any) -> Any:
     # were transport-dead while Flask's MAX_CONTENT_LENGTH said 2 MB was
     # fine.  The +1 headroom lets a body at exactly the app cap through the
     # transport so Flask's own 413 (with a JSON body) owns the boundary
-    # error instead of the middleware's bare 400.
-    return peer_link_asgi(
-        AsyncioWSGIMiddleware(wsgi_app, max_body_size=MAX_PAYLOAD_BYTES + 1))
+    # error instead of the middleware's bare 400.  The middleware takes one
+    # size, so a local caller (max_body_size) is served by a second one.
+    capped = AsyncioWSGIMiddleware(
+        wsgi_app, max_body_size=max_body_size(False) + 1)
+    uncapped = AsyncioWSGIMiddleware(
+        wsgi_app, max_body_size=max_body_size(True))
+
+    async def by_caller(scope, receive, send):
+        app = uncapped if _asgi_scope_is_local(scope) else capped
+        await app(scope, receive, send)
+
+    return peer_link_asgi(by_caller)
 
 
 def shared_config_values() -> dict:
@@ -182,6 +251,9 @@ __all__: List[str] = [
     'ERROR_LOG',
     'UNIX_SOCKET_SERVER_NAME',
     'LOOPBACK_HOST_NAMES',
+    'LOCAL_MAX_BODY_SIZE',
+    'max_body_size',
+    'caller_capped_request',
     'local_server_names',
     'make_hypercorn_config',
     'build_asgi_app',

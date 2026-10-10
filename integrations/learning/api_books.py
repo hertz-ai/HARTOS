@@ -15,11 +15,12 @@ from anywhere else every route, the page images included, needs a user token
 
 Thin routes over integrations.learning.book_pipeline, the one implementation.
 
-Size: a multipart upload is bounded by the node's request-size limit
-(HEVOLVE_MAX_PAYLOAD_BYTES, 2 MB by default: hart_intelligence_entry sets
-Flask's MAX_CONTENT_LENGTH from it and core.serve the transport's), not by
-MAX_PDF_BYTES. A desktop takes larger books through /upload/native, which
-sends a path, and any node through a PDF link the agent reads (fetch_pdf).
+Size: a local caller's upload has no cap (owner 2026-10-10: "local need not
+have a cap"; core.serve.max_body_size lifts the request-size limit for it).
+Any other caller's multipart upload is bounded by the node's request-size
+limit (HEVOLVE_MAX_PAYLOAD_BYTES, 2 MB by default) and by MAX_PDF_BYTES.  A
+remote node reads larger books through a PDF link the agent fetches
+(fetch_pdf, MAX_PDF_BYTES).
 
 Auth: require_local_or_auth. The desktop's SPA calls these from 127.0.0.1 with
 no session, as it always has; any other caller must present a user token and
@@ -34,6 +35,7 @@ import logging
 
 from flask import Blueprint, g, jsonify, request, send_file
 
+from core.auth_local import is_local_environ
 from integrations.social.auth import require_local_or_auth
 from security.rate_limiter_redis import rate_limit
 
@@ -68,9 +70,13 @@ def parse_pdf():
             return jsonify({'error': 'Only PDF files accepted'}), 400
         user_id = _caller_user_id(request.form.get('user_id', '0'))
         request_id = request.form.get('request_id', '')
+        # A local caller's book has no size cap (owner 2026-10-10); any
+        # other caller's is bounded by MAX_PDF_BYTES.
+        limit = None if is_local_environ(request.environ) else bp.MAX_PDF_BYTES
         try:
-            path = bp.save_pdf(file_obj.stream.read(bp.MAX_PDF_BYTES + 1),
-                               file_obj.filename)
+            data = (file_obj.stream.read() if limit is None
+                    else file_obj.stream.read(limit + 1))
+            path = bp.save_pdf(data, file_obj.filename, max_bytes=limit)
         except bp.BookParseError as e:
             return jsonify({'error': str(e)}), 400
         except OSError as e:

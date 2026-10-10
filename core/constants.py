@@ -1143,8 +1143,10 @@ MACHINE_GOAL_AUTHORS = frozenset({
 
 
 # ── HTTP payload policy (ONE source, two consumers) ──────────────────────
-# hart_intelligence_entry sets Flask's MAX_CONTENT_LENGTH from this, and
-# core.serve passes it to Hypercorn's AsyncioWSGIMiddleware as max_body_size.
+# The cap for a REMOTE caller's request body; a local caller has none (owner
+# 2026-10-10).  core.serve.max_body_size owns that rule; through it,
+# hart_intelligence_entry's request class answers Flask's cap per request and
+# core.serve gives Hypercorn's AsyncioWSGIMiddleware its max_body_size.
 # Before 2026-08-21 the transport side was never set, so the middleware's
 # library default of 2**16 (64 KB) silently rejected every POST body larger
 # than that with an empty 400 — measured live: a 50 KB multipart reached the
