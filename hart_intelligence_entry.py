@@ -8351,6 +8351,12 @@ _state_lock = threading.Lock()  # Protects review_agents, conversation_agent, fi
 # After MAX_GATHER_TURNS without completion, force-complete with available data
 MAX_GATHER_TURNS = 12
 _gather_turn_counts = {}  # f'{user_id}_{prompt_id}' -> int
+# The gather sessions a review of the agent has been shown to, and what it
+# showed: the steps of the config shown (_config_steps of what
+# _config_review_text rendered), or None for the model's own review_details,
+# which is text.  A completed config is saved only for these, and only with
+# the steps that were shown (#205).  Same keys and lifetime as the turn counts.
+_gather_reviews_shown = {}
 
 # --- TTL-based cleanup for review_agents / conversation_agent (M2 fix) ---
 _AGENT_TTL = 3600  # 1 hour
@@ -8379,6 +8385,9 @@ def _cleanup_stale_agents():
     for tk in list(_gather_turn_counts.keys()):
         if tk not in _agent_timestamps:
             _gather_turn_counts.pop(tk, None)
+    for tk in list(_gather_reviews_shown):
+        if tk not in _agent_timestamps:
+            _gather_reviews_shown.pop(tk, None)
 
 # Per-user locks to prevent race conditions when concurrent requests
 # for the same user modify review_agents / conversation_agent dicts.
@@ -9621,6 +9630,121 @@ def _decode_config_lists(cfg):
     return out, tuple(decoded)
 
 
+#: What the gather model is told, in the same turn, when its completed config
+#: cannot be built (#205).  The steps are the ones the person confirmed, so the
+#: model is asked to write them again before the person is asked to.
+_BUILDABLE_REASK = (
+    'That configuration cannot be built: in "flows", every item of "actions" '
+    'must be one step written as plain text. Send the same configuration '
+    'again as one JSON object with "status": "completed" and the steps the '
+    'person confirmed, each step as its own string in "actions".')
+
+
+def _read_gather_config(response, prompt_id):
+    """The agent config in a gather_info reply, with its list fields decoded
+    (_decode_config_lists).  Raises ValueError when the reply holds none.
+
+    Moved out of chat() unchanged, so the model's second answer (#205) is read
+    the same way as its first."""
+    # Detect context-exceeded errors before parsing
+    if 'Context size has been exceeded' in response:
+        raise ValueError('LLM context size exceeded — cannot parse gather_info response')
+
+    new_response = response.replace('true','True').replace("false", "False")
+    try:
+        new_res = retrieve_json(new_response)
+        app.logger.info(f"new_res: {new_res}")
+    except Exception as e:
+        app.logger.error(f'Got some error while will try with re match error:{e}')
+        json_match = re.search(r'{[\s\S]*}', response)
+        if json_match:
+            new_res = json.loads(json_match.group(0))
+        else:
+            raise ValueError('No JSON in response')
+
+    # retrieve_json can return None without raising — catch it early
+    if new_res is None:
+        json_match = re.search(r'{[\s\S]*}', response)
+        if json_match:
+            new_res = json.loads(json_match.group(0))
+        else:
+            raise ValueError('retrieve_json returned None and no JSON found in response')
+
+    # LLM sometimes returns a list of conversation turns instead of a single dict
+    if isinstance(new_res, list):
+        app.logger.info(f'new_res is a list (len={len(new_res)}), extracting last dict with status')
+        for item in reversed(new_res):
+            if isinstance(item, dict) and 'status' in item:
+                new_res = item
+                break
+        else:
+            for item in reversed(new_res):
+                if isinstance(item, dict):
+                    new_res = item
+                    break
+            else:
+                raise ValueError(f'List response has no usable dict: {new_res}')
+        app.logger.info(f'Extracted dict: status={new_res.get("status")}')
+
+    if new_res is None:
+        raise ValueError('new_res is None after parsing')
+
+    new_res, _decoded = _decode_config_lists(new_res)
+    if _decoded:
+        app.logger.info(
+            "[GATHER] %s came as JSON text for %s - decoded",
+            ', '.join(_decoded), prompt_id)
+    return new_res
+
+
+#: A step's own number, as the model sometimes writes it ("1. Call ...").
+#: The space after it is required, so a step that begins with a decimal
+#: ("1.5 litres of water ...") keeps its number.
+_STEP_NUMBER = re.compile(r'^\s*\d+\s*[.)](?:\s+|$)')
+
+
+def _step_text(action):
+    """One action as the person reads it: its text (an action is text or
+    {'action': text}), spaces collapsed, without a number of its own, which
+    the review adds."""
+    text = action.get('action') if isinstance(action, dict) else action
+    return _STEP_NUMBER.sub('', ' '.join(str(text or '').split()))
+
+
+def _config_steps(cfg):
+    """Every flow's steps, in order, as _step_text reads them: what a review
+    of the config shows, and what a completed config is compared by before
+    it is built (#205).  Only the steps, on purpose: they are what gets
+    built and what the person checks.  A name, goal, flow name or persona
+    the model rewrites after the review does not show the config again."""
+    return tuple(tuple(_step_text(a) for a in (flow.get('actions') or []))
+                 for flow in (cfg.get('flows') or [])
+                 if isinstance(flow, dict))
+
+
+def _config_review_text(cfg):
+    """The config as the person reads it before it is built: its name, goal
+    and every flow's steps, numbered, and how to answer.  Shown when the model
+    finished without showing a review, or with steps other than the ones
+    shown (#205), so what the person confirms is the config that is built.
+    Only called on a buildable config."""
+    lines = ['Before I build it, here is the agent as I have it:', '']
+    if cfg.get('name'):
+        lines.append(f"Name: {cfg['name']}")
+    if cfg.get('goal'):
+        lines.append(f"Goal: {cfg['goal']}")
+    for flow in cfg.get('flows') or []:
+        if not isinstance(flow, dict):
+            continue
+        title = flow.get('flow_name') or 'Steps'
+        lines += ['', f"{title} ({flow['persona']}):" if flow.get('persona')
+                  else f"{title}:"]
+        for number, action in enumerate(flow.get('actions') or [], 1):
+            lines.append(f"{number}. {_step_text(action)}")
+    lines += ['', 'Reply yes to build it, or tell me what to change.']
+    return '\n'.join(lines)
+
+
 @app.route('/chat', methods=['POST'])
 @_mark_foreground
 def chat():
@@ -10640,7 +10764,6 @@ def chat():
                           'Return the full JSON immediately.')
 
             response = gather_info(user_id, prompt, prompt_id)
-            new_response = response.replace('true','True').replace("false", "False")
             app.logger.info('AFTER GATHER INFO')
 
             # --- Helper: save completed agent config and transition to Review ---
@@ -10673,62 +10796,39 @@ def chat():
                     review_agents[_ak] = True
                     _touch_agent_timestamp(_ak)
                 _gather_turn_counts.pop(turn_key, None)  # Reset turn counter
+                _gather_reviews_shown.pop(turn_key, None)
                 _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
 
             try:
                 # Parse gather_info response
-                new_res = None
+                new_res = _read_gather_config(response, prompt_id)
 
-                # Detect context-exceeded errors before parsing
-                if 'Context size has been exceeded' in response:
-                    raise ValueError('LLM context size exceeded — cannot parse gather_info response')
-
-                try:
-                    new_res = retrieve_json(new_response)
-                    app.logger.info(f"new_res: {new_res}")
-                except Exception as e:
-                    app.logger.error(f'Got some error while will try with re match error:{e}')
-                    json_match = re.search(r'{[\s\S]*}', response)
-                    if json_match:
-                        new_res = json.loads(json_match.group(0))
-                    else:
-                        raise ValueError('No JSON in response')
-
-                # retrieve_json can return None without raising — catch it early
-                if new_res is None:
-                    json_match = re.search(r'{[\s\S]*}', response)
-                    if json_match:
-                        new_res = json.loads(json_match.group(0))
-                    else:
-                        raise ValueError('retrieve_json returned None and no JSON found in response')
-
-                # LLM sometimes returns a list of conversation turns instead of a single dict
-                if isinstance(new_res, list):
-                    app.logger.info(f'new_res is a list (len={len(new_res)}), extracting last dict with status')
-                    for item in reversed(new_res):
-                        if isinstance(item, dict) and 'status' in item:
-                            new_res = item
-                            break
-                    else:
-                        for item in reversed(new_res):
-                            if isinstance(item, dict):
-                                new_res = item
-                                break
-                        else:
-                            raise ValueError(f'List response has no usable dict: {new_res}')
-                    app.logger.info(f'Extracted dict: status={new_res.get("status")}')
-
-                if new_res is None:
-                    raise ValueError('new_res is None after parsing')
-
-                new_res, _decoded = _decode_config_lists(new_res)
-                if _decoded:
-                    app.logger.info(
-                        "[GATHER] %s came as JSON text for %s - decoded",
-                        ', '.join(_decoded), prompt_id)
+                if (new_res.get('status') != 'pending'
+                        and turn_num < MAX_GATHER_TURNS
+                        and not _config_is_buildable(new_res)):
+                    # The steps are the ones the person confirmed; the MODEL
+                    # wrote them in a shape that cannot be built.  Ask the
+                    # model again, once, in this turn, before the person is
+                    # asked to type them again (#205).  Its answer goes through
+                    # the same exits as the first one.
+                    app.logger.warning(
+                        "[EMPTY-BUILD] status='completed' but not every action "
+                        "is a step for %s (flows: %.300s) - asking the model "
+                        "again (#205)", prompt_id, new_res.get('flows'))
+                    try:
+                        new_res = _read_gather_config(
+                            gather_info(user_id, _BUILDABLE_REASK, prompt_id),
+                            prompt_id)
+                    except Exception as _reask_err:
+                        app.logger.warning(
+                            "[EMPTY-BUILD] the model's second answer for %s "
+                            "could not be read (%s) - asking the person",
+                            prompt_id, _reask_err)
 
                 if new_res.get('status') == 'pending' and turn_num < MAX_GATHER_TURNS:
                     app.logger.info('PENDING STATUS')
+                    if new_res.get('review_details'):
+                        _gather_reviews_shown[turn_key] = None  # text, no steps
                     ans = new_res.get('question') or new_res.get('review_details', response)
                     _record_lifecycle('Creation Mode', user_id, prompt_id, f'Agent creation turn {turn_num}')
                     return _chat_reply(
@@ -10751,6 +10851,32 @@ def chat():
                                           'action - re-asking')
                         return _chat_reply(
                             user_id, request_id, _EMPTY_BUILD_REPLY,
+                            intent=['FINAL_ANSWER'],
+                            req_token_count=0, res_token_count=0, history_request_id=[],
+                            Agent_status='Creation Mode', prompt_id=prompt_id,
+                            user_prompt=_user_turn_text,
+                        )
+                    _steps = _config_steps(new_res)
+                    _shown = _gather_reviews_shown.get(turn_key, _steps)
+                    if (turn_num < MAX_GATHER_TURNS
+                            and (turn_key not in _gather_reviews_shown
+                                 or _shown not in (None, _steps))):
+                        # The person confirms what is built (#205).  The model
+                        # finished without showing a review, or with steps
+                        # other than the ones shown, so this config is shown,
+                        # and nothing is saved until the person answers it.
+                        _gather_reviews_shown[turn_key] = _steps
+                        app.logger.warning(
+                            "[GATHER] completed %s for %s - showing the config "
+                            "to the person (#205)",
+                            'before any review was shown'
+                            if _shown is _steps else
+                            'with steps other than the ones shown', prompt_id)
+                        _record_lifecycle('Creation Mode', user_id, prompt_id,
+                                          'Completed before a review was '
+                                          'shown - showing the config')
+                        return _chat_reply(
+                            user_id, request_id, _config_review_text(new_res),
                             intent=['FINAL_ANSWER'],
                             req_token_count=0, res_token_count=0, history_request_id=[],
                             Agent_status='Creation Mode', prompt_id=prompt_id,
