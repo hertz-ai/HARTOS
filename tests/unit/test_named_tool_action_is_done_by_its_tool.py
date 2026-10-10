@@ -150,13 +150,34 @@ _TUTOR_STEP = ("Write this turn's reply to the learner yourself, as your own cha
     ('Store it in "remember".', ['remember']),
     # ... and only as a whole word: another word that starts with it is not.
     ('use remembered notes', []),
+    # The way a person writes the call (review of d5c8c49bf, hartos-87): an
+    # article between the verb and the name, "tool" / "function" after it,
+    # and more verb forms.
+    ("Call the remember tool to store the learner's progress.", ['remember']),
+    ('invoke the remember function', ['remember']),
+    ('calling remember now', ['remember']),
+    ('it uses remember for that', ['remember']),
+    ('execute remember', ['remember']),
+    # Each of those signals alone: the noun after, the article, a long verb.
+    ('the remember tool stores the progress', ['remember']),
+    ('Call the remember action with the progress', ['remember']),
+    ('executing your remember action now', ['remember']),
+    # Prose that puts "with" (or a stray "tool") before the word is not a call.
+    ('start with remember the names of the learners', []),
+    ('be careful with remember and recall of facts', []),
+    ('I will tool remember', []),
+    # recall is the other one-word servable name (the MCP bridge).
+    ('recall the last lesson, then continue', []),
+    ('use recall to find the last lesson', ['recall']),
+    # An unbalanced quote at the very end of the text is not a quoted name.
+    ('save it as "remember', []),
     # A name shaped like an identifier names the tool wherever it stands, as
     # before: unchanged for every other match on the desktop.
     ('call_save_data_in_memory with the progress', ['save_data_in_memory']),
     ('Call save_data_in_memory, then stop.', ['save_data_in_memory']),
 ])
 def test_what_an_action_names(text, named):
-    agents = [_agent('remember', 'recall_memory', 'save_data_in_memory',
+    agents = [_agent('remember', 'recall', 'recall_memory', 'save_data_in_memory',
                      'send_message_to_user')]
     assert sorted(lh.action_named_tools(agents, text)[1]) == named, text
 

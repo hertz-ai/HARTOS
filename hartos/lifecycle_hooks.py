@@ -1632,10 +1632,15 @@ def action_named_tools(agents, action_text):
     return names, referenced
 
 
-#: What writes a one-word tool name as a call: "call remember", "use
-#: remember", "with remember", ...
+#: A verb that calls a one-word tool name, with an optional article between:
+#: "call remember", "use the remember", "calling remember", "via remember".
+#: Not "with": "start with remember the names" is prose.
 _TOOL_CALL_CUE = re.compile(
-    r'(?:\bcall|\buse|\busing|\brun|\binvoke|\bvia|\bwith|\btool)\s*[`"\']?\s*$')
+    r'\b(?:call|calls|calling|use|uses|using|run|runs|running|invoke|invokes|'
+    r'invoking|execute|executes|executing|via)\s+(?:(?:the|this|your|a|an)\s+)?'
+    r'[`"\']?$')
+#: ... or the noun after it: "the remember tool", "remember function".
+_TOOL_NOUN_AFTER = re.compile(r'[`"\']?\s+(?:tool|function)\b')
 
 
 def _text_names_tool(text: str, name: str) -> bool:
@@ -1648,10 +1653,11 @@ def _text_names_tool(text: str, name: str) -> bool:
     54's written reply step said "remember the interrupted one" and read as
     naming the memory tool `remember`, so the completion gate wanted that
     tool's result and the step GAVE_UP on a correct reply.  Such a name counts
-    only where the text writes it as a call: followed by "(", after call / use
-    / using / run / invoke / via / with / tool, or in quotes or backticks.
-    Measured on the desktop's 1,087 configs (5,889 actions): of 1,653 (action,
-    tool) matches, the three it drops are all the English "remember"."""
+    only where the text writes it as a call: followed by "(", after a calling
+    verb (_TOOL_CALL_CUE), before "tool" / "function", or in quotes or
+    backticks.  Measured on the desktop's 1,087 configs (5,889 actions): of
+    1,653 (action, tool) matches, the three it drops are all the English
+    "remember"."""
     n = str(name or '').lower()
     if len(n) <= 3 or n not in text:
         return False
@@ -1661,10 +1667,12 @@ def _text_names_tool(text: str, name: str) -> bool:
     for m in re.finditer(r'(?<![a-z0-9_])' + re.escape(n) + r'(?![a-z0-9_])',
                          text):
         after = text[m.end():m.end() + 1]
-        if after == '(' or _TOOL_CALL_CUE.search(text[max(0, m.start() - 14):
-                                                      m.start()]):
+        if after == '(' or _TOOL_NOUN_AFTER.match(text, m.end()):
             return True
-        if m.start() and text[m.start() - 1] in '`"\'' and after in '`"\'':
+        if _TOOL_CALL_CUE.search(text[max(0, m.start() - 24):m.start()]):
+            return True
+        if (m.start() and text[m.start() - 1] in '`"\''
+                and after and after in '`"\''):
             return True
     return False
 
