@@ -1,16 +1,18 @@
 """CREATE hands the action's own tool result to the StatusVerifier.
 
-MEASURED live 2026-10-10 16:36:56 -> 17:28:11 on the installed desktop (4B),
-agent 54 action 3, "Call save_data_in_memory with the key teach.<that same
-user id> to save this learner's updated progress ...", request
-a54-3c1e0febe271: the save succeeded ("Saved at teach.10202: {...}") and the
-model went on calling tools -- read_book_page, send_message_to_user, more
-saves under other keys -- for 51 minutes.  Every tool result went back to the
-Assistant (create_recipe.state_transition: "Message role is tool returning
+MEASURED live 2026-10-10 on the installed desktop (4B), agent 54 action 3,
+"Call save_data_in_memory with the key teach.<that same user id> to save this
+learner's updated progress ...", request a54-3c1e0febe271 (gui_app.log.1 and
+gui_app.log): dispatched at 16:36:56, 16:38:23 and 16:39:54, given up at
+16:41:12.  The save succeeded ("Saved at teach.10202: {...}") and the model
+went on calling tools -- 45 calls in those 4 minutes 16 seconds: get_data_by_key
+22, save_data_in_memory 7 (other keys too), get_user_id 5, read_book_page 4,
+send_message_to_user 3.  All 42 tool results went back to the Assistant
+(create_recipe.state_transition: "Message role is tool returning
 assistant"), so the StatusVerifier, which speaks only after an Assistant turn
-with no tool call, never spoke once.  Three attempts hit max_round=30 each
-and the build ended on "[NEEDS-INPUT] action 3 not completing after 3
-attempts", the generic builder question, on a step whose work was done.
+with no tool call, never spoke in any of the three attempts, and the build
+ended on "[NEEDS-INPUT] action 3 not completing after 3 attempts", the
+generic builder question, on a step whose work was done.
 
 REUSE's selector already hands a tool result the Assistant ran to the
 verifier (reuse_recipe.state_transition: ``return verify if last_speaker is

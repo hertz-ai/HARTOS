@@ -1806,9 +1806,9 @@ def tool_result_is_action_work(user_prompt: str, action_id: int,
     window (_work_results, the gate's per-result rule).  CREATE's speaker
     selector hands such a result to the StatusVerifier, as REUSE's selector
     hands it every result the Assistant ran: live 2026-10-10, agent 54 action
-    3, the save had succeeded and every later tool result went back to the
-    Assistant, so the verifier never spoke in three attempts of max_round
-    rounds each.
+    3, the save had succeeded and all 42 later tool results went back to the
+    Assistant, so the verifier never spoke in any of its three attempts
+    (16:36:56-16:41:12).
 
     Every named tool, not the first: agent 54's action 1 names get_user_id
     and then get_data_by_key, and the user id alone is not the progress the

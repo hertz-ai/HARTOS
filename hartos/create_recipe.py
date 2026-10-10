@@ -2552,16 +2552,17 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
         # current_app.logger.info(messages[-1])
         if messages[-1]['role'] == 'tool':
-            # The action's own named tool returned its work: the StatusVerifier
-            # judges it now, as REUSE's selector hands it a result the
-            # Assistant ran.  Back to the Assistant, the verifier never spoke
-            # while the model kept calling tools (live 2026-10-10, agent 54
-            # action 3: 51 minutes, three max_round attempts, [NEEDS-INPUT]).
+            # Every tool the action names has returned its work: the
+            # StatusVerifier judges it now, as REUSE's selector hands it a
+            # result the Assistant ran.  Back to the Assistant, the verifier
+            # never spoke while the model kept calling tools (live 2026-10-10,
+            # agent 54 action 3: three attempts in 4 min 16 s, 42 tool
+            # results, no verdict, [NEEDS-INPUT]).
             if tool_result_is_action_work(user_prompt, current_action_id,
                                           len(messages) - 1):
                 current_app.logger.info(
-                    f'[OWN-WORK] action {current_action_id}: its named tool '
-                    f'returned its work -> StatusVerifier')
+                    f'[OWN-WORK] action {current_action_id}: every tool it '
+                    f'names has returned its work -> StatusVerifier')
                 return verify
             current_app.logger.info('Message role is tool returning assistant')
             return assistant
