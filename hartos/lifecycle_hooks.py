@@ -1786,6 +1786,35 @@ def _verifier_completion_has_conversation_evidence(
     return agent is None and is_written_answer(message)
 
 
+def tool_result_is_action_work(user_prompt: str, action_id: int,
+                               index: int) -> bool:
+    """Whether the group log's message ``index`` is this action's own work:
+    a result of a tool the action names that the completion gate accepts as
+    its receipt (_verifier_completion_has_conversation_evidence: in the
+    action's dispatch window, not failed, not the placeholder, from a named
+    tool).  CREATE's speaker selector hands such a result to the
+    StatusVerifier, as REUSE's selector hands it every result the Assistant
+    ran: live 2026-10-10, agent 54 action 3, the save had succeeded and every
+    later tool result went back to the Assistant, so the verifier never
+    spoke in three attempts of max_round rounds each.
+
+    False for an action that names no tool: it is done by its written
+    answer, and a tool reply in its window is not its receipt
+    (derive_completion_evidence splits the same way).  Never raises: it sits
+    on the speaker-selection path."""
+    try:
+        if not _tools_this_action_names(user_prompt, action_id)[1]:
+            return False
+        return _verifier_completion_has_conversation_evidence(
+            user_prompt, action_id,
+            {'evidence': {'message_index': index, 'kind': 'tool_receipt'}})
+    except Exception:
+        logger.warning(
+            "tool_result_is_action_work: action %s in %s: the receipt check "
+            "failed", action_id, user_prompt, exc_info=True)
+        return False
+
+
 # The roles the Assistant's own message carries in a group log.  A plain reply
 # is 'user' there -- autogen's manager stores what it RECEIVED from a speaker
 # as 'user' -- and a message that carries tool_calls is 'assistant'; a log

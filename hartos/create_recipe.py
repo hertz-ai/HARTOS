@@ -263,6 +263,7 @@ from hartos.lifecycle_hooks import (
     cycle_guard_step,             # No-NET-progress tracker: cycling action (#485)
     recipe_correction_directive,  # Escalating "emit ONLY JSON" recipe fix (#89)
     is_recipe_creation_request,   # Deterministic recipe-prompt detector (speaker routing)
+    tool_result_is_action_work,   # The action's own tool result -> StatusVerifier (#220)
     RECIPE_CREATE_PROMPT_PREFIX,  # canonical recipe-prompt prefix (single source)
 )
 
@@ -2551,6 +2552,17 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
         # current_app.logger.info(messages[-1])
         if messages[-1]['role'] == 'tool':
+            # The action's own named tool returned its work: the StatusVerifier
+            # judges it now, as REUSE's selector hands it a result the
+            # Assistant ran.  Back to the Assistant, the verifier never spoke
+            # while the model kept calling tools (live 2026-10-10, agent 54
+            # action 3: 51 minutes, three max_round attempts, [NEEDS-INPUT]).
+            if tool_result_is_action_work(user_prompt, current_action_id,
+                                          len(messages) - 1):
+                current_app.logger.info(
+                    f'[OWN-WORK] action {current_action_id}: its named tool '
+                    f'returned its work -> StatusVerifier')
+                return verify
             current_app.logger.info('Message role is tool returning assistant')
             return assistant
 
