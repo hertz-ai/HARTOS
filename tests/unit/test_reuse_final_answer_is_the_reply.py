@@ -83,16 +83,20 @@ def _chat_texts(pub):
 
 
 def _drive_turn(rr, monkeypatch, answer_key='message2userfinal',
-                mid_turn_question=False, tail=None, then=None):
+                mid_turn_question=False, tail=None, then=None, tails=(),
+                autonomous=False):
     """Run the real get_agent_response for one REUSE turn whose group ends
     on the Assistant's answer.  ``then``, when given, is one more message
     posted after the answer in the first round only (the verifier's verdict
-    that ends it).  Returns (reply, pooled_post mock)."""
+    that ends it).  ``tails`` are the Assistant's messages in the first
+    rounds, one per round; later rounds give the answer.  Returns (reply,
+    pooled_post mock)."""
     from flask import Flask
 
     user_prompt = f'{_USER}_{_PROMPT}'
     action = {'action_id': 1, 'action': 'Report the overdue invoices',
-              'can_perform_without_user_input': 'no', 'recipe': []}
+              'can_perform_without_user_input': 'yes' if autonomous else 'no',
+              'recipe': []}
     monkeypatch.setattr(rr, 'recipes', {user_prompt: {'actions': [action]}})
     monkeypatch.setattr(rr, 'user_tasks', {user_prompt: rr.Action([action])})
     monkeypatch.setattr(rr, 'user_ledgers', {})
@@ -112,7 +116,8 @@ def _drive_turn(rr, monkeypatch, answer_key='message2userfinal',
             rr.send_message_to_user1(_USER, _QUESTION, '', _PROMPT)
         group_chat.messages.append(
             {'role': 'assistant', 'name': 'Assistant',
-             'content': tail or json.dumps({answer_key: _ANSWER})})
+             'content': (tails[len(rounds)] if len(rounds) < len(tails)
+                         else tail or json.dumps({answer_key: _ANSWER}))})
         if then is not None and not rounds:
             group_chat.messages.append(then)
         rounds.append(message)
@@ -186,6 +191,37 @@ def test_an_unreadable_message2user_envelope_still_gives_its_text(
     reply, _post = _drive_turn(
         rr, monkeypatch, tail='@user ' + json.dumps({'message2user': _ANSWER}))
     assert reply == _ANSWER
+
+
+@pytest.mark.parametrize('value', ['', '<your answer here>', None],
+                         ids=['empty', 'placeholder', 'null'])
+@pytest.mark.parametrize('autonomous', [False, True],
+                         ids=['waits for the person', 'autonomous'])
+def test_an_unwritten_message2user_is_not_the_reply(
+        rr, bundled, publisher, monkeypatch, value, autonomous):
+    """A message2user with nothing in it is not an answer, so the turn goes on
+    to the answer, as it does for the other answer keys.  REUSE's reply filter
+    judged only the message2userfinal and message2 values, so after b9c755da6
+    the loop handed the learner '' (or the placeholder, or None) where it
+    used to go on (review of b9c755da6).  An autonomous action's turn is
+    first read after its nudge round, so its first two rounds are unwritten."""
+    unwritten = json.dumps({'message2user': value})
+    reply, _post = _drive_turn(
+        rr, monkeypatch, tails=[unwritten] * (2 if autonomous else 1),
+        autonomous=autonomous)
+    assert reply == _ANSWER
+
+
+def test_central_sends_no_unwritten_message2user_on_its_chatbot_leg(
+        rr, central, publisher, monkeypatch):
+    """Central's off-box leg never carries the empty message2user the loop
+    used to stop on."""
+    reply, post = _drive_turn(
+        rr, monkeypatch, tails=[json.dumps({'message2user': ''})])
+    assert reply == _ANSWER
+    sent = [json.loads(c.kwargs['data']).get('message')
+            for c in post.call_args_list]
+    assert '' not in sent, sent
 
 
 def test_a_mid_turn_question_still_reaches_the_desktop(

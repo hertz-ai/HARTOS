@@ -26,6 +26,7 @@ the tests ever used -- which is how the gate passed them and failed the agent.
 Everything below runs on a REAL autogen group chat (scripted seats, no model),
 so the shape under test is autogen's, not this file's guess about it.
 """
+import json
 import os
 import sys
 import unittest
@@ -619,6 +620,42 @@ class TestTheAnswerValueRuleIsOneRule(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(rr._reuse_is_written_answer(value),
                                  lh._answer_value_is_text(value))
+
+
+class TestTheReplyFilterReadsTheAnswerKeys(unittest.TestCase):
+    """REUSE's reply filter (_reuse_message_is_user_answer) writes its answer
+    keys out, because it is exec'd from source too, so it is pinned to
+    lifecycle_hooks.ANSWER_KEYS here by behaviour: the value under every key
+    is judged, and the key judged is the first one present in ANSWER_KEYS
+    order, which is the key get_agent_response's extractors return.
+    message2user was missing, so a message2user tail passed whatever it held
+    and the loop handed the learner '' (review of b9c755da6)."""
+
+    LESSON = _LESSON.replace(NL, ' ')
+
+    @staticmethod
+    def _tail(obj):
+        return {'role': 'user', 'name': 'Assistant', 'content': json.dumps(obj)}
+
+    def test_the_value_under_every_answer_key_is_judged(self):
+        for key in lh.ANSWER_KEYS:
+            for value in ('', '   ', '<your answer here>', None):
+                with self.subTest(key=key, value=value):
+                    self.assertFalse(rr._reuse_message_is_user_answer(
+                        self._tail({key: value})))
+            with self.subTest(key=key, value='the lesson'):
+                self.assertTrue(rr._reuse_message_is_user_answer(
+                    self._tail({key: self.LESSON})))
+
+    def test_the_first_answer_key_present_is_the_one_judged(self):
+        keys = lh.ANSWER_KEYS
+        for i, first in enumerate(keys):
+            for later in keys[i + 1:]:
+                with self.subTest(first=first, later=later):
+                    self.assertFalse(rr._reuse_message_is_user_answer(
+                        self._tail({first: '', later: self.LESSON})))
+                    self.assertTrue(rr._reuse_message_is_user_answer(
+                        self._tail({first: self.LESSON, later: ''})))
 
 
 if __name__ == '__main__':

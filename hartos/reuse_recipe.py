@@ -4502,7 +4502,14 @@ def _reuse_message_is_user_answer(message):
             # synthesis.
             _ans = retrieve_json(content)
             if isinstance(_ans, dict):
-                for _ak in ('message2userfinal', 'message2'):
+                # lifecycle_hooks.ANSWER_KEYS, in its order: the key judged
+                # here is the key get_agent_response's extractors return.
+                # Written out because the tests exec this function from the
+                # source; a test pins it to ANSWER_KEYS.  message2user was
+                # missing, so any message2user tail passed as an answer and
+                # the loop handed over '' or a placeholder (review of
+                # b9c755da6).
+                for _ak in ('message2userfinal', 'message2', 'message2user'):
                     if _ak in _ans:
                         return _reuse_is_written_answer(_ans[_ak])
             return True                      # the answer is already there
