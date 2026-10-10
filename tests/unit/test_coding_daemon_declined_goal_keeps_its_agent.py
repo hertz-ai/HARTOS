@@ -48,6 +48,9 @@ class _Goal:
         self.priority = 0
         self.last_dispatched_at = None
         self.config_json = dict(config)
+        # Every AgentGoal row has it; the completion gate a dispatched coding
+        # goal now passes through reads it.
+        self.spark_spent = 0
 
     def to_dict(self):
         d = {'id': self.id, 'goal_type': self.goal_type, 'title': self.title,

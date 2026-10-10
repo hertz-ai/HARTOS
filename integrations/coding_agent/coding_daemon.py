@@ -48,8 +48,24 @@ class CodingAgentDaemon:
         with self._lock:
             if self._running:
                 return
-            self._running = True
             self._stop_event.clear()
+            # Never spawn beside a worker that is still alive (the guard
+            # AgentDaemon.start has had since 2026-08-17).  stop() gives the
+            # worker ten seconds to leave, and one inside a dispatch_to_chat
+            # turn takes far longer; the watchdog's restart then called
+            # start(), which spawned a second worker, and the first, seeing
+            # _running True again, kept going.  Measured on the owner's
+            # desktop 2026-10-10: two live threads named coding_daemon (py-spy),
+            # and "dispatched 2 goal(s)" 341 times in 107 minutes, every ~19 s
+            # against a 30 s tick.  Re-arm the live worker instead.
+            if self._thread is not None and self._thread.is_alive():
+                self._running = True
+                logger.warning(
+                    "coding daemon start(): worker %s still alive with "
+                    "_running=False -- re-arming it instead of spawning a "
+                    "second", self._thread.name)
+                return
+            self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name='coding_daemon')
         self._thread.start()
@@ -249,6 +265,11 @@ class CodingAgentDaemon:
                 used_agents.add(agent['user_id'])
 
                 goal.last_dispatched_at = now
+                # The spark snapshot the completion gate reads, staged the way
+                # the agent daemon stages it.
+                cfg = dict(goal.config_json or {})
+                cfg['spark_at_dispatch'] = goal.spark_spent or 0
+                goal.config_json = cfg
                 result = dispatch_to_chat(prompt, str(agent['user_id']), goal.id,
                                           goal_type=goal.goal_type or 'coding')
 
@@ -272,7 +293,22 @@ class CodingAgentDaemon:
                         goal.config_json = cfg
                         logger.warning(f"Coding goal {goal.id} AUTO-PAUSED after {fails} failures")
                 else:
-                    # Success — clear failure count
+                    # The ONE completion gate (agent_daemon's docstring: "every
+                    # dispatched goal must pass through").  This daemon never
+                    # called it, so a coding goal could neither complete nor
+                    # stop: the two self-heal goals on the owner's desktop were
+                    # dispatched every 30 s from 09-15 to 10-10, into a hive
+                    # task set long finished, and nothing ever settled them.
+                    from integrations.agent_engine.agent_daemon import (
+                        _settle_dispatched_goal)
+                    from integrations.agent_engine.dispatch import (
+                        handed_to_hive)
+                    _settle_dispatched_goal(
+                        db, goal, str(goal.id),
+                        handed_to_hive=handed_to_hive(goal.id))
+                    # Success — clear failure count.  After the gate: it
+                    # reloads the committed config, which would bring back a
+                    # count popped before it.
                     cfg = goal.config_json or {}
                     cfg.pop('_dispatch_failures', None)
                     goal.config_json = cfg
