@@ -1655,9 +1655,13 @@ def _text_names_tool(text: str, name: str) -> bool:
     tool's result and the step GAVE_UP on a correct reply.  Such a name counts
     only where the text writes it as a call: followed by "(", after a calling
     verb (_TOOL_CALL_CUE), before "tool" / "function", or in quotes or
-    backticks.  Measured on the desktop's 1,087 configs (5,889 actions): of
-    1,653 (action, tool) matches, the three it drops are all the English
-    "remember"."""
+    backticks.  That is "written as a call", not "is a call": prose shaped
+    like one still names the tool ("students use remember and recall as
+    study skills", "do not call remember here").  Measured on the desktop's
+    1,087 configs (5,889 actions, remember and recall among the names): of
+    1,664 (action, tool) matches, 13 change and none has that shape -- 3
+    English "remember", 3 English "recall", and 7 "recall" read inside
+    "recall_memory", which those actions still name."""
     n = str(name or '').lower()
     if len(n) <= 3 or n not in text:
         return False
