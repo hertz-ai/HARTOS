@@ -214,15 +214,19 @@ def commerce_find_stores(
                        'delivery': bool(s.get('deliveryAvailable'))})
     stores.sort(key=lambda s: (s['distance_km'] is None, s['distance_km'] or 0))
     stores = stores[:10]
-    push_fragment(user_id, {
-        'type': 'list', 'title': 'Stores near you',
-        'items': [{'title': s['name'],
-                   'subtitle': ' · '.join(x for x in (
-                       s['address'],
-                       f"{s['distance_km']} km" if s['distance_km'] is not None else '',
-                       'Delivers' if s['delivery'] else 'Pickup only') if x),
-                   'id': s['store_id']} for s in stores],
-    })
+    items = []
+    for s in stores:
+        subtitle = ' · '.join(x for x in (
+            s['address'],
+            f"{s['distance_km']} km" if s['distance_km'] is not None else '',
+            'Delivers' if s['delivery'] else 'Pickup only') if x)
+        # `text` is what the list renderers draw (COMPONENT_TYPES['list']:
+        # a string or {text|label}); title/subtitle/id stay for hosts keying on them.
+        items.append({'text': ' — '.join(x for x in (s['name'], subtitle) if x),
+                      'title': s['name'], 'subtitle': subtitle,
+                      'id': s['store_id']})
+    push_fragment(user_id, {'type': 'list', 'title': 'Stores near you',
+                            'items': items})
     return _out({'success': True, 'stores': stores})
 
 

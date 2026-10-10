@@ -172,6 +172,18 @@ class TestShopping:
         assert lst['items'][0]['title'] == 'Near'
         assert 'Delivers' in lst['items'][0]['subtitle']
 
+    def test_find_stores_rows_carry_the_text_the_list_renderers_read(self, env):
+        # COMPONENT_TYPES['list']: each item is a string or {text|label}.  The
+        # Nunba overlay draws item.text || item.label, so a row that had only
+        # title/subtitle came out as an empty bullet.
+        env['fake'].on('GET', '/zipcodesearch/stores/600078', body={
+            '300.0': {'id': 1, 'name': 'Near', 'address1': 'B', 'city': 'Chennai',
+                      'deliveryAvailable': True}})
+        json.loads(ct.commerce_find_stores(UID, zipcode='600078'))
+        row = pushed(env, 'list')[0]['items'][0]
+        shown = row.get('text') or row.get('label')
+        assert shown and 'Near' in shown and '0.3 km' in shown
+
     def test_find_stores_validates_pincode(self, env):
         assert json.loads(ct.commerce_find_stores(UID, zipcode='12'))['success'] is False
         assert json.loads(ct.commerce_find_stores(UID))['success'] is False
