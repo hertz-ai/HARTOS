@@ -938,8 +938,12 @@ _connectivity_cache = _ConnectivityCache()
 # An attribute is the union of what is declared, what the real emit sites send
 # and what Nunba's AgentOverlay reads; ``aliases`` maps a name a producer was
 # MEASURED to send onto the prop the renderer reads.  validate_component() and
-# agent_ui_compose() are the readers; the model is handed component_prompt() /
-# component_json_schema() generated from these entries, never a hand-written copy.
+# agent_ui_compose() are the readers.  component_prompt() / component_json_schema()
+# generate, from these entries, the catalogue a model should be handed; NO in-tree
+# model reads them yet (_build_ui_prompt still hand-writes its type list), so that
+# wiring is the next step, not a given.  ``props`` stays only while tests read it
+# (test_consent_fanout_p0, test_home_compose_feed, test_liquid_ui_meet_copilot):
+# once they assert on ``attributes`` it is deleted and ``attributes`` is the one list.
 COMPONENT_TYPES = {
     'card': {
         'props': ['title', 'content', 'icon', 'actions'],
@@ -1362,6 +1366,28 @@ def _attributes_for(entry: dict) -> Optional[dict]:
     return None
 
 
+def _contract_of(entry: dict):
+    """``(attributes, required)`` of a registry entry, normalised.  Total.
+
+    The ONE reader of an entry's shape: the validator, the catalogue line and the
+    JSON schema all go through it, so none of them can be the one that still
+    trusts a hand-editable custom-types file.  A type this grammar does not define
+    is read as 'any' (guessing would refuse every value), non-string names are
+    dropped, and ``required`` keeps only names that are declared.
+    """
+    raw = _attributes_for(entry)
+    if raw is None:
+        props = entry.get('props')
+        raw = ({p: 'any' for p in props if isinstance(p, str)}
+               if isinstance(props, list) else {})
+    attrs = {k: (v if _attr_grammar_ok(v) else 'any')
+             for k, v in raw.items() if isinstance(k, str) and k != 'type'}
+    req = entry.get('required')
+    required = ([r for r in req if isinstance(r, str) and r in attrs]
+                if isinstance(req, list) else [])
+    return attrs, required
+
+
 def _short(value) -> str:
     """A bounded repr, so one huge field cannot bloat a verdict."""
     text = repr(value)
@@ -1385,13 +1411,10 @@ def validate_component(comp_type: str, component: dict, entry: dict) -> List[dic
     ``agent_ui_compose``); only a strict, AI-composed push is.
     """
     issues: List[dict] = []
-    attrs = _attributes_for(entry) or {
-        p: 'any' for p in (entry.get('props') or []) if p != 'type'}
+    attrs, required = _contract_of(entry)
     if not attrs:
         return issues
-    # A custom-types file is hand-editable, so every shape is checked, not trusted.
     aliases = entry.get('aliases') if isinstance(entry.get('aliases'), dict) else {}
-    required = entry.get('required') if isinstance(entry.get('required'), list) else []
     for name in required:
         if component.get(name) is None:
             issues.append({
@@ -1429,22 +1452,26 @@ def validate_component(comp_type: str, component: dict, entry: dict) -> List[dic
 
 def _prompt_line(name: str, entry: dict) -> str:
     """One catalogue line: ``name(req!: type, opt: type) - doc``."""
-    attrs = _attributes_for(entry) or {
-        p: 'any' for p in (entry.get('props') or []) if p != 'type'}
-    required = set(entry.get('required') or [])
+    attrs, required = _contract_of(entry)
     ordered = sorted(attrs.items(), key=lambda kv: kv[0] not in required)
     args = ', '.join(
         f"{k}{'!' if k in required else ''}: {v}" for k, v in ordered)
-    doc = entry.get('doc') or (
-        entry.get('spec', {}).get('doc') if isinstance(entry.get('spec'), dict)
-        else None)
+    doc = _doc_of(entry)
     return f"- {name}({args})" + (f" - {doc}" if doc else '')
+
+
+def _doc_of(entry: dict) -> Optional[str]:
+    """The one-line doc of an entry (entry-level, else its ``spec``), or None."""
+    doc = entry.get('doc')
+    if not isinstance(doc, str):
+        spec = entry.get('spec')
+        doc = spec.get('doc') if isinstance(spec, dict) else None
+    return doc if isinstance(doc, str) and doc else None
 
 
 def _json_schema_for(name: str, entry: dict) -> dict:
     """A JSON Schema for one component, generated from its registry entry."""
-    attrs = _attributes_for(entry) or {
-        p: 'any' for p in (entry.get('props') or []) if p != 'type'}
+    attrs, required = _contract_of(entry)
     scalar = {'str': {'type': 'string'}, 'number': {'type': 'number'},
               'bool': {'type': 'boolean'}, 'list': {'type': 'array'},
               'dict': {'type': 'object'}, 'any': {}}
@@ -1453,10 +1480,11 @@ def _json_schema_for(name: str, entry: dict) -> dict:
         props[key] = (scalar[spec] if spec in scalar
                       else {'type': 'string', 'enum': spec.split('|')})
     schema = {'type': 'object', 'properties': props,
-              'required': ['type'] + list(entry.get('required') or []),
+              'required': ['type'] + required,
               'additionalProperties': True}
-    if entry.get('doc'):
-        schema['description'] = entry['doc']
+    doc = _doc_of(entry)
+    if doc:
+        schema['description'] = doc
     return schema
 
 # ── Agentic HOME composition — the producer's schema allow-sets ──────────────

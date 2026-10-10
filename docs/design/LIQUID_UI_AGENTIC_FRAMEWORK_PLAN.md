@@ -273,12 +273,32 @@ Slice 1 (all in `liquid_ui_service.py`, one registry, no second path):
 
 Contract mismatches the typed schema surfaced (NOT fixed here; each is a renderer or
 emitter change with its own evidence):
-- `toast`: `integrations/channels/agent_tools.py` sends `text` in two places; Nunba's
+- `toast`: `integrations/channels/agent_tools.py` sends `text` in two places. Nunba's
   AgentOverlay `NotificationCard` reads `message`/`content`, so the reason is blank there.
-  Whether the shell JS reads `text` is not measured.
-- `media`: `core/agent_tools.py` (game sound) sends `src`, the declared prop; AgentOverlay's
-  `MediaOverlay` plays `url`.
+  The HART OS shell (`renderAgentOverlay` in this file) has no `toast` branch: it falls to
+  the generic fallback `ev.content||ev.message||JSON.stringify(ev)`, so `text` is not read
+  there either and the card shows a JSON dump.
+- `media`: `core/agent_tools.py` (game sound) sends `src`, the declared prop. The shell
+  reads `ev.src||ev.url`, so it plays; Nunba's AgentOverlay `MediaOverlay` plays `url`
+  only, so the mismatch is on the Nunba side.
 - `qr_pair`: declared `url`/`caption`; the emitter sends and the renderer reads `qr`.
+
+Catalogue readers: `component_prompt()` / `component_json_schema()` have NO in-tree
+caller yet. `_build_ui_prompt` (the `/api/ui` generator) still hand-writes "Valid types:
+card, metric, notification, list, progress, markdown" and `_generate_ai_ui` returns the
+model's JSON unvalidated. The first reader should be that pair: build the prompt from
+`component_prompt()` and drop components whose `validate_component` has an error-level
+issue. Not done; it changes what `/api/ui` serves, so it waits for the owner.
+
+`props` and `attributes` are two lists for one fact while `props` stays. It is deleted
+when `test_consent_fanout_p0`, `test_home_compose_feed` and `test_liquid_ui_meet_copilot`
+assert on `attributes`; the date is the owner's to name.
+
+Hand-edited custom-types file: every catalogue reader (`validate_component`,
+`component_prompt`, `component_json_schema`) goes through `_contract_of`, which reads a
+non-string or invalid-grammar spec as `'any'` and keeps only string names. A peer review
+reproduced `component_json_schema` raising on an int or list spec; that is pinned by
+`test_every_catalogue_reader_survives_a_hand_edited_custom_entry`.
 
 Next slices, in order: component `id` + `patch`/`append` with a `streaming|final`
 lifecycle (AgentOverlay already replaces `qr_pair` in place by channel); one `ui.event`

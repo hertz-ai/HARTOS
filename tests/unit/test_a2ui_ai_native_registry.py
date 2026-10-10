@@ -146,6 +146,36 @@ def test_a_malformed_entry_or_component_degrades_instead_of_raising():
          'hint': 't declares: a, b'}]
 
 
+# A custom-types file is hand-editable.  Every reader of an entry goes through
+# ONE normaliser, so none of them can be the one that still trusts the file.
+HAND_EDITED = [
+    {'props': ['r'], 'attributes': {'r': 7}},                       # int type
+    {'props': ['r'], 'attributes': {'r': ['a']}},                   # list type
+    {'props': ['r'], 'attributes': {'r': 'integer'}},               # not in grammar
+    {'props': ['r'], 'attributes': {'r': 'str'}, 'required': 'r'},  # not a list
+    {'props': ['r'], 'attributes': {'r': 'str'}, 'required': [['r']]},
+    {'props': ['r'], 'attributes': {'r': 'str'}, 'doc': 5, 'aliases': 3},
+    {'props': 'abc'},                                               # not a list
+    {'props': [['r']]},                                             # unhashable
+]
+
+
+@pytest.mark.parametrize('entry', HAND_EDITED)
+def test_every_catalogue_reader_survives_a_hand_edited_custom_entry(svc, entry):
+    svc._custom_component_types = {'ringb': entry}
+    assert 'ringb' in svc.component_prompt(['ringb'])
+    json.dumps(svc.component_json_schema('ringb'))
+    verdict = svc.agent_ui_compose('a', {'type': 'ringb', 'r': 1}, strict=True)
+    assert verdict['type'] == 'ringb'
+
+
+def test_a_type_the_grammar_does_not_define_is_not_checked():
+    # 'integer' is not a type this grammar knows; guessing would refuse every
+    # value, so it is read as 'any'.
+    entry = {'props': ['r'], 'attributes': {'r': 'integer'}}
+    assert m.validate_component('t', {'type': 't', 'r': 'anything'}, entry) == []
+
+
 def test_an_untyped_custom_type_only_gets_unknown_prop_warnings():
     entry = {'props': ['radius'], 'spec': {'attributes': {'radius': 'any'}}}
     issues = m.validate_component('ring', {'type': 'ring', 'radius': 'huge',
