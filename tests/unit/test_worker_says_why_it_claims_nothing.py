@@ -117,6 +117,33 @@ def test_each_change_of_reason_is_said_and_a_claim_ends_it(world, caplog):
     assert len(said) == 3, said
 
 
+def test_a_reason_the_worker_keeps_coming_back_to_is_said_once(world, caplog):
+    """The first version of this said every change, and during a daemon's
+    turn the gate opens and closes with each model call: measured on the
+    owner's desktop 2026-10-10 11:04-11:09 IST, eight lines in five minutes
+    alternating "local LLM busy" and the queue's own reason.  A reason said
+    in the last ten minutes is not said again; after that it is."""
+    import time as _time
+    led, co, loop = world
+    clock = [1000.0]
+    with caplog.at_level(logging.INFO, logger='hevolve_social'), \
+            patch.object(_time, 'monotonic', lambda: clock[0]):
+        for _ in range(4):                  # busy, free, busy, free ...
+            _tick(loop, co, yield_=True)
+            clock[0] += 15
+            _tick(loop, co)
+            clock[0] += 15
+        assert len(_said(caplog)) == 2, _said(caplog)
+        clock[0] += loop._IDLE_RESAY_S      # ten minutes on, still flapping
+        _tick(loop, co, yield_=True)
+        _tick(loop, co)
+    said = _said(caplog)
+    assert len(said) == 4, said
+    assert said[0] == said[2] == ('Distributed worker claiming nothing: '
+                                  'waiting (user_present)'), said
+    assert said[1] == said[3], said
+
+
 def test_a_failing_tick_is_said_too(world, caplog):
     """A tick that raises was a DEBUG line; it is now said, once."""
     led, co, loop = world

@@ -99,6 +99,9 @@ class DistributedWorkerLoop:
     # Jitter factor so N workers don't all reconnect in the same second
     # when Redis comes back.  ±25% of the current backoff window.
     _BACKOFF_JITTER: float = 0.25
+    # A reason for claiming nothing that was said this recently is not said
+    # again when the worker comes back to it (_note_idle).
+    _IDLE_RESAY_S: float = 600.0
 
     def __init__(self):
         self._interval = int(os.environ.get('HEVOLVE_WORKER_POLL_INTERVAL', '15'))
@@ -109,9 +112,10 @@ class DistributedWorkerLoop:
         self._capabilities = self._detect_capabilities()
         # Current Redis backoff state — reset to 0 when a tick succeeds.
         self._redis_backoff: float = 0.0
-        # Why the last tick claimed nothing, or None after a claim.  Logged at
-        # INFO only when it changes (_note_idle).
+        # Why the last tick claimed nothing, or None after a claim, and when
+        # each reason was last said (_note_idle).
         self._idle_reason = None
+        self._idle_said_at = {}
 
     def _detect_capabilities(self):
         """Detect this node's capabilities from system_requirements."""
@@ -259,17 +263,30 @@ class DistributedWorkerLoop:
         tick.  Measured that day, it was the queue: 46 PENDING tasks, each
         demanding its own goal type as a capability this worker does not
         advertise, all of goals already completed or paused.  ``None`` means
-        the worker claimed again.  Same once-per-change rule as the yield
-        gate's own line (dispatch._note_yield_reason), so a steady state
-        costs one line, not one per 15 s tick.
+        the worker claimed again.  Said when the reason changes, so a steady
+        state costs one line, not one per 15 s tick, and a reason said in the
+        last _IDLE_RESAY_S is not said again: during a daemon's turn the local
+        LLM is busy for each model call and free between them, so the reason
+        swapped between "local LLM busy" and the queue's own reason every
+        tick or two (measured on the owner's desktop 2026-10-10 11:04-11:09
+        IST, eight lines in five minutes, after the first version of this).
         """
         if reason == self._idle_reason:
             return
         was, self._idle_reason = self._idle_reason, reason
         if reason is None:
             logger.info("Distributed worker claiming again (was: %s)", was)
-        else:
-            logger.info("Distributed worker claiming nothing: %s", reason)
+            return
+        now = time.monotonic()
+        said = self._idle_said_at.get(reason)
+        if said is not None and now - said < self._IDLE_RESAY_S:
+            return
+        # Only reasons said within the window are kept; a tick error's reason
+        # carries its message, so the set would otherwise grow without bound.
+        self._idle_said_at = {r: t for r, t in self._idle_said_at.items()
+                              if now - t < self._IDLE_RESAY_S}
+        self._idle_said_at[reason] = now
+        logger.info("Distributed worker claiming nothing: %s", reason)
 
     def _bump_redis_backoff(self) -> None:
         """Double the backoff window, clamped to [MIN, MAX]."""
