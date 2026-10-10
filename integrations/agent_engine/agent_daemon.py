@@ -478,11 +478,12 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
     # A turn handed to the expert settles that action first (#106d).
     if served_escalation and _settle_expert_turn(db, goal, served_escalation):
         return
-    # COPY, never mutate-in-place.  config_json is a plain JSON column, not a
-    # MutableDict: mutating the dict the attribute already holds and assigning
-    # that same object back compares equal at flush time, so the column is
-    # never written.  Every marker this gate records -- completion_grounding,
-    # noop_dispatch_count, awaiting_verification -- was lost that way.
+    # COPY, never mutate-in-place.  The model's column is
+    # MutableDict.as_mutable(JSON) (_models_local.py), which tracks in-place
+    # changes, but this gate is also handed goals whose config_json is a plain
+    # dict (tests, other callers' stand-ins), where mutating the dict the
+    # attribute already holds and assigning that same object back is no
+    # change at all.  A new dict is written under every column type.
     cfg = dict(goal.config_json or {})
     is_continuous = cfg.get('continuous', False)
     spark_spent = goal.spark_spent or 0
@@ -547,9 +548,13 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
         if waited is not None and waited > timeout_s:
             goal.status = 'paused'
             cfg['pause_reason'] = (
-                f'Auto-paused: work was handed off, but the ledger never '
-                f'reported every task done after {int(waited)}s.  Check '
-                f'the distributed worker on this node before resuming.')
+                f'Auto-paused: '
+                + ('work was handed to the hive'
+                   if handed_to_hive else
+                   'work was dispatched and spark was spent')
+                + f', but the ledger never reported every task done after '
+                f'{int(waited)}s.  Check the distributed worker on this '
+                f'node before resuming.')
             cfg['paused_at'] = datetime.utcnow().isoformat()
             # The wait ends with the pause.  Left in place, the mark made
             # a resumed goal's first settle read the old wait as expired
@@ -1924,9 +1929,8 @@ class AgentDaemon:
                 # subsequent tick without doing any new work.  Written to
                 # config_json (no schema change) and consumed by
                 # _settle_dispatched_goal below.
-                # dict(...) copies: config_json is a plain JSON column, so
-                # mutating the dict it already holds and assigning the SAME
-                # object back compares equal at flush time and never writes.
+                # dict(...) copies: a new dict is written whatever the
+                # column type (see the note in _settle_dispatched_goal).
                 _cfg_pre = dict(goal.config_json or {})
                 _cfg_pre['spark_at_dispatch'] = goal.spark_spent or 0
                 goal.config_json = _cfg_pre

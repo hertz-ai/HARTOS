@@ -336,6 +336,29 @@ def test_a_wait_that_runs_out_pauses_and_a_resume_starts_a_fresh_wait():
     assert 'awaiting_verification_since' in goal.config_json
 
 
+def test_the_timeout_pause_names_the_route_the_work_took():
+    """A hive handoff that never finished says it was handed to the hive; a
+    local dispatch that spent spark with tasks outstanding says so, as it did
+    before the hive route existed (review of 3d11fac5a, hartos-77, 3.i)."""
+    from datetime import datetime, timedelta
+    stale = (datetime.utcnow() - timedelta(seconds=3600)).isoformat()
+    outstanding = _Progress({'total_tasks': 1, 'completed': 0})
+    reasons = {}
+    for to_hive in (True, False):
+        goal = Goal(cfg={'spark_at_dispatch': 0,
+                         'awaiting_verification_since': stale},
+                    spark=4)
+        with patch.object(dispatch, '_get_distributed_coordinator',
+                          return_value=outstanding):
+            agent_daemon._settle_dispatched_goal(_Db(), goal, GOAL,
+                                                 handed_to_hive=to_hive)
+        assert goal.status == 'paused'
+        reasons[to_hive] = goal.config_json['pause_reason']
+    assert reasons[True].startswith('Auto-paused: work was handed to the hive')
+    assert reasons[False].startswith(
+        'Auto-paused: work was dispatched and spark was spent')
+
+
 # ── the local route is unchanged ─────────────────────────────────────────
 
 def test_with_no_other_node_the_turn_runs_here_and_its_spark_completes(coord):
