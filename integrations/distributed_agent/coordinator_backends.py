@@ -333,6 +333,7 @@ def create_coordinator(agent_id: str = None):
 
 def _try_redis_backend(agent_id: str):
     """Try to create coordinator with Redis backend."""
+    answered = False
     try:
         # Quick connectivity check — fail fast, no retries.  Via
         # core.redis_client: this site's retry_on_timeout=False was ignored by
@@ -342,12 +343,18 @@ def _try_redis_backend(agent_id: str):
         if r is None:
             raise ImportError("redis package unavailable")
         r.ping()
+        answered = True
 
         from agent_ledger import SmartLedger, RedisBackend
         from agent_ledger.distributed import DistributedTaskLock
         from agent_ledger.verification import TaskVerification, TaskBaseline
 
-        backend = RedisBackend(host=host, port=port)
+        # RedisBackend dials its own connection: give it the endpoint the probe
+        # just reached.  core.redis_client owns the REDIS_HOST/REDIS_PORT
+        # defaults, and 87b482e60 moved the probe there without leaving this
+        # call a host or port (NameError, swallowed below, so Redis never built).
+        endpoint = r.get_connection_kwargs()
+        backend = RedisBackend(host=endpoint['host'], port=endpoint['port'])
         shared_redis = backend.redis_client
 
         ledger = SmartLedger(
@@ -368,14 +375,22 @@ def _try_redis_backend(agent_id: str):
         return coordinator
 
     except Exception as e:
-        logger.debug(f"Redis backend unavailable: {e}")
+        if answered:
+            # A Redis that is not there is normal; one that answered and still
+            # did not build is a defect.  This was DEBUG, which hid a NameError
+            # here for seven weeks (central logs WARNING and above).
+            logger.warning("Redis answered but the coordinator did not build "
+                           "(%s: %s); using the JSON ledger",
+                           type(e).__name__, e)
+        else:
+            logger.debug(f"Redis backend unavailable: {e}")
         return None
 
 
 def coordinator_storage_dir() -> str:
     """Where the coordinator's JSON ledger lives.  THE one answer: the ledger
-    here and the requester tables (requesters.py) beside it, so those are
-    shared exactly when the coordinator's store is.
+    here and the requester tables (requesters.py) beside it.  The tables are
+    node-local files whichever backend holds the ledger.
 
     Absolute and writable -- never a relative path, which resolves to the
     read-only install dir in bundled mode: beside HEVOLVE_DB_PATH when that

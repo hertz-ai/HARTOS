@@ -212,19 +212,27 @@ transports.
   `/api/peer-link/message` route exists anywhere, so the encrypted-link layer
   never connects (budgets 10/50/200 are therefore moot).
 - Cross-node WAMP: the router lives in Nunba (`nunba.enable=false` shipped).
-- Cross-node goal execution: real ONLY with a shared `REDIS_HOST`
-  (`integrations/distributed_agent/coordinator_backends.py` Redis backend +
-  `integrations/distributed_agent/worker_loop.py` claim/execute).
-  Default backend is process-local -> 20 isolated dispatchers, the same seed
-  goals CREATEd 20x under 20 different md5-local prompt_ids.
+- Cross-node goal execution: NOT safe with a shared `REDIS_HOST` either.
+  `coordinator_backends._try_redis_backend` could not build at all from
+  87b482e60 (2026-08-17) until it was fixed (undefined `host`/`port`), so
+  every node ran the process-local JSON ledger.  It builds now, but every node
+  keys the same ledger blob (`HEVOLVE_AGENT_ID` defaults to `local`), loads it
+  once at start and rewrites all of it on each save, so one node's writes
+  replace another's and a finished task can run twice (found in review with a
+  fake Redis; not run against a real multi-node deploy).  The requester tables
+  also stay node-local.  Default backend is process-local -> 20 isolated
+  dispatchers, the same seed goals CREATEd 20x under 20 different md5-local
+  prompt_ids.  Gossip has no pull path either: nothing calls
+  `GossipTaskBridge.pull_tasks_from_peers` or the remote claim/submit routes.
 - Pooled inference: the mesh transport exists (`:6796`, WireGuard,
   `/mesh/infer`) but the flywheel's LLM path is hardwired to the local
   llama-server; only VIDEO_GEN offloads today.
 
 **The conversion hooks (canonical rails only — gossip HTTP on :6777, mesh
 :6796, ChannelDispatcher; each turns fleet size into learning speed):**
-1. Config-only, works today: point all nodes at one shared `REDIS_HOST` ->
-   fleet-wide claim/execute of dispatched goals.
+1. NOT config-only: pointing all nodes at one shared `REDIS_HOST` is unsafe
+   today (see "Does NOT work today"); it needs a per-node ledger key and a
+   ledger that re-reads Redis before it claims, or a pull-and-claim client.
 2. Key `prompt_id` by `bootstrap_slug` (not md5 of the node-local goal id) in
    `dispatch.py` — dedups CREATE fleet-wide AND repairs the recipe-sync key.
 3. SHIPPED (2026-07-17): pull recipes in the daemon BEFORE its

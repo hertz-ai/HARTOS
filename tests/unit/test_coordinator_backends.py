@@ -299,6 +299,93 @@ class TestCreateCoordinator:
         assert task2 is None  # Already claimed by worker_A
 
 
+class TestRedisBackendBuilds:
+    """_try_redis_backend against a Redis that answers.
+
+    TestCreateCoordinator patches _try_redis_backend itself, so nothing ran its
+    body after 87b482e60 (2026-08-17) dropped the lines that defined ``host``
+    and ``port``: with a reachable Redis it raised NameError, the blanket
+    except logged that at DEBUG and returned None, and every node fell back to
+    the JSON ledger whether or not Redis was there.
+
+    Only the network is faked: ``Redis.ping`` (the probe) and the agent_ledger
+    backend that would dial the server.  The probe, the endpoint settings and
+    the function under test all run for real.
+    """
+
+    ENDPOINT = {'host': 'redis.example.test', 'port': 6390}
+
+    @pytest.fixture
+    def redis_answers(self, monkeypatch, tmp_path):
+        """A Redis at ENDPOINT that answers every ping; yields the endpoints
+        the ledger's Redis backend was asked to dial."""
+        redis = pytest.importorskip('redis')
+        from agent_ledger.backends import InMemoryBackend
+
+        dialled = []
+
+        class _DialRecorder(InMemoryBackend):
+            def __init__(self, **kwargs):
+                super().__init__()
+                dialled.append(kwargs)
+                self.redis_client = MagicMock()
+
+        monkeypatch.chdir(tmp_path)          # SmartLedger makes ./agent_data
+        monkeypatch.delenv('NUNBA_BUNDLED', raising=False)
+        monkeypatch.setenv('REDIS_HOST', self.ENDPOINT['host'])
+        monkeypatch.setenv('REDIS_PORT', str(self.ENDPOINT['port']))
+        monkeypatch.setenv('HEVOLVE_DB_PATH', str(tmp_path / 'test.db'))
+        with patch.object(redis.Redis, 'ping', return_value=True), \
+                patch('agent_ledger.RedisBackend', _DialRecorder):
+            yield dialled
+
+    def test_builds_a_redis_coordinator_when_redis_answers(self, redis_answers):
+        from integrations.distributed_agent.coordinator_backends import _try_redis_backend
+
+        coordinator = _try_redis_backend('probe')
+
+        assert coordinator is not None
+        assert type(coordinator._lock).__name__ == 'DistributedTaskLock'
+        # the ledger's backend dials the server that answered the probe
+        assert redis_answers == [self.ENDPOINT]
+
+    def test_create_coordinator_reports_redis_when_it_answers(self, redis_answers):
+        from integrations.distributed_agent.coordinator_backends import create_coordinator
+
+        coordinator, backend_type = create_coordinator(agent_id='probe')
+
+        assert coordinator is not None
+        assert backend_type == 'redis'
+
+    def test_an_unreachable_redis_still_falls_back_to_the_json_ledger(self, redis_answers):
+        import redis
+        from integrations.distributed_agent import coordinator_backends as cb
+
+        with patch.object(redis.Redis, 'ping',
+                          side_effect=redis.exceptions.ConnectionError('refused')), \
+                patch.object(cb, 'logger') as log:
+            assert cb._try_redis_backend('probe') is None
+            coordinator, backend_type = cb.create_coordinator(agent_id='probe')
+
+        assert coordinator is not None
+        assert backend_type == 'inmemory'
+        assert redis_answers == []           # never dialled a Redis that did not answer
+        log.warning.assert_not_called()      # no Redis is normal, not a warning
+
+    def test_a_redis_that_answered_but_did_not_build_is_a_warning(self, redis_answers):
+        """The NameError sat at DEBUG for seven weeks, invisible on a node that
+        logs WARNING and above.  Redis answering and the coordinator still not
+        building is a defect, whatever raised."""
+        from integrations.distributed_agent import coordinator_backends as cb
+
+        with patch('agent_ledger.RedisBackend', side_effect=KeyError('port')), \
+                patch.object(cb, 'logger') as log:
+            assert cb._try_redis_backend('probe') is None
+
+        log.warning.assert_called_once()
+        assert 'KeyError' in str(log.warning.call_args)
+
+
 class TestApiCoordinatorSingleton:
     """Test that api._get_coordinator() uses the new backend factory."""
 
