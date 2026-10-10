@@ -183,6 +183,9 @@ class TestShopping:
         row = pushed(env, 'list')[0]['items'][0]
         shown = row.get('text') or row.get('label')
         assert shown and 'Near' in shown and '0.3 km' in shown
+        # Product text carries no em dash (the steward's rule); the first
+        # version of this row joined with one.
+        assert '—' not in shown
 
     def test_find_stores_validates_pincode(self, env):
         assert json.loads(ct.commerce_find_stores(UID, zipcode='12'))['success'] is False
