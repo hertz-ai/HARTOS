@@ -4,10 +4,13 @@ MEASURED live 2026-10-10 on the installed desktop (4B), agent 54 action 3,
 "Call save_data_in_memory with the key teach.<that same user id> to save this
 learner's updated progress ...", request a54-3c1e0febe271 (gui_app.log.1 and
 gui_app.log): dispatched at 16:36:56, 16:38:23 and 16:39:54, given up at
-16:41:12.  The save succeeded ("Saved at teach.10202: {...}") and the model
-went on calling tools -- 45 calls in those 4 minutes 16 seconds: get_data_by_key
-22, save_data_in_memory 7 (other keys too), get_user_id 5, read_book_page 4,
-send_message_to_user 3.  All 42 tool results went back to the Assistant
+16:41:12.  In those 4 minutes 16 seconds the model made 45 tool calls
+(get_data_by_key 22, save_data_in_memory 7, get_user_id 5, read_book_page 4,
+send_message_to_user 3, get_saved_metadata 3, list_books 1), answered in 42
+tool messages.  Attempt 1 saved under keys it made up
+(teach.user_11941619_11, teach.1234567890); the save the step asks for,
+"Saved at teach.10202: {...}", came at 16:38:36 in attempt 2, and 28 tool
+results followed it.  All 42 went back to the Assistant
 (create_recipe.state_transition: "Message role is tool returning
 assistant"), so the StatusVerifier, which speaks only after an Assistant turn
 with no tool call, never spoke in any of the three attempts, and the build
@@ -144,11 +147,12 @@ class TestTheActionsOwnWorkGoesToTheVerifier:
             _result('c1', SAVED)])
         assert s.select() is s.verify, (
             "the action's own save returned its work and went back to the "
-            "Assistant, so the verifier never judged it: live 2026-10-10, 51 "
-            "minutes of further tool calls and [NEEDS-INPUT] after 3 attempts")
+            "Assistant, so the verifier never judged it: live 2026-10-10, 28 "
+            "further tool results and [NEEDS-INPUT] after 3 attempts")
 
     def test_one_own_result_in_an_aggregate_is_enough(self, build):
-        """Live result 13 of that run: a send and the save in one envelope."""
+        """Live 16:37:39 in that run (attempt 1): a send and a save answered
+        in one tool message."""
         s = build(SAVE_ACTION, [
             _dispatch(1, SAVE_ACTION),
             {'role': 'assistant', 'name': 'Assistant', 'content': None,
