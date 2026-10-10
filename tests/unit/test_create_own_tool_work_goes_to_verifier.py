@@ -162,6 +162,44 @@ class TestTheActionsOwnWorkGoesToTheVerifier:
         assert s.select() is s.verify
 
 
+READ_ACTION = ("Call get_user_id, then get_data_by_key with the key teach.<that "
+               "user id> to read this learner's saved progress.")
+
+
+class TestAnActionNamingTwoToolsWaitsForBoth:
+    """Agent 54's action 1, verbatim in shape: the user id alone is not the
+    progress the action reads."""
+
+    def test_the_first_tools_result_goes_back_to_the_assistant(self, build):
+        s = build(READ_ACTION, [
+            _dispatch(1, READ_ACTION),
+            _call('u1', 'get_user_id', {}),
+            _result('u1', '10202')])
+        assert s.select() is s.assistant, (
+            'get_user_id alone handed the turn to the verifier; a "completed" '
+            'there skips reading the saved progress')
+
+    def test_the_second_tools_result_is_judged(self, build):
+        s = build(READ_ACTION, [
+            _dispatch(1, READ_ACTION),
+            _call('u1', 'get_user_id', {}),
+            _result('u1', '10202'),
+            _call('k1', 'get_data_by_key', {'key': 'teach.10202'}),
+            _result('k1', '[KV] teach.10202 = {"book": "The Water Cycle"}')])
+        assert s.select() is s.verify
+
+    def test_a_failed_second_call_does_not_count(self, build):
+        s = build(READ_ACTION, [
+            _dispatch(1, READ_ACTION),
+            _call('u1', 'get_user_id', {}),
+            _result('u1', '10202'),
+            _call('k1', 'get_data_by_key', {'key': 'teach.10202'}),
+            _result('k1', 'Error: the memory store is not readable'),
+            _call('u2', 'get_user_id', {}),
+            _result('u2', '10202')])
+        assert s.select() is s.assistant
+
+
 class TestEverythingElseStillGoesBackToTheAssistant:
 
     def test_another_tools_result(self, build):

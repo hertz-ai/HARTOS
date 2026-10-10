@@ -1725,8 +1725,19 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
     that tool's work either, the way the REUSE fabrication gate counts only a
     result it can resolve to a tool the action names.
     """
-    names = tool_call_names([messages])
     action_text, named = _tools_this_action_names(user_prompt, action_id)
+    return any(True for _ in _work_results(
+        message, tool_call_names([messages]), action_text, named))
+
+
+def _work_results(message: dict, names: Dict[str, str], action_text: str,
+                  named):
+    """The tool name of each result in a role='tool' ``message`` that is the
+    action's work, by _receipt_is_real_work's rule (its docstring gives the
+    four exclusions); None for a result whose function cannot be resolved,
+    which only an action naming no tool accepts.  ``names`` is
+    tool_call_names of the message's list; ``action_text`` and ``named`` are
+    _tools_this_action_names of the action."""
     responses = message.get('tool_responses')
     results = responses if isinstance(responses, list) and responses else [message]
     for result in results:
@@ -1743,8 +1754,7 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
             continue
         if named and name not in named:
             continue
-        return True
-    return False
+        yield name
 
 
 def _verifier_completion_has_conversation_evidence(
@@ -1788,26 +1798,44 @@ def _verifier_completion_has_conversation_evidence(
 
 def tool_result_is_action_work(user_prompt: str, action_id: int,
                                index: int) -> bool:
-    """Whether the group log's message ``index`` is this action's own work:
-    a result of a tool the action names that the completion gate accepts as
-    its receipt (_verifier_completion_has_conversation_evidence: in the
-    action's dispatch window, not failed, not the placeholder, from a named
-    tool).  CREATE's speaker selector hands such a result to the
-    StatusVerifier, as REUSE's selector hands it every result the Assistant
-    ran: live 2026-10-10, agent 54 action 3, the save had succeeded and every
-    later tool result went back to the Assistant, so the verifier never
-    spoke in three attempts of max_round rounds each.
+    """Whether the group log's message ``index`` finishes this action's own
+    work: a result the completion gate accepts as its receipt
+    (_verifier_completion_has_conversation_evidence: in the action's dispatch
+    window, not failed, not the placeholder, from a tool the action names),
+    after which every tool the action names has returned its work in that
+    window (_work_results, the gate's per-result rule).  CREATE's speaker
+    selector hands such a result to the StatusVerifier, as REUSE's selector
+    hands it every result the Assistant ran: live 2026-10-10, agent 54 action
+    3, the save had succeeded and every later tool result went back to the
+    Assistant, so the verifier never spoke in three attempts of max_round
+    rounds each.
+
+    Every named tool, not the first: agent 54's action 1 names get_user_id
+    and then get_data_by_key, and the user id alone is not the progress the
+    action reads.  An action that names alternatives ("google_search or
+    crawl4ai") therefore never qualifies and keeps going back to the
+    Assistant, as every action did before.
 
     False for an action that names no tool: it is done by its written
     answer, and a tool reply in its window is not its receipt
     (derive_completion_evidence splits the same way).  Never raises: it sits
     on the speaker-selection path."""
     try:
-        if not _tools_this_action_names(user_prompt, action_id)[1]:
+        action_text, named = _tools_this_action_names(user_prompt, action_id)
+        if not named:
             return False
-        return _verifier_completion_has_conversation_evidence(
-            user_prompt, action_id,
-            {'evidence': {'message_index': index, 'kind': 'tool_receipt'}})
+        if not _verifier_completion_has_conversation_evidence(
+                user_prompt, action_id,
+                {'evidence': {'message_index': index, 'kind': 'tool_receipt'}}):
+            return False
+        messages = getattr(get_registered_groupchat(user_prompt), 'messages', None)
+        names = tool_call_names([messages])
+        done = set()
+        for i, msg in enumerate(messages[:index + 1]):
+            if (isinstance(msg, dict) and msg.get('role') == 'tool'
+                    and latest_dispatch_before(messages, i + 1) == action_id):
+                done.update(_work_results(msg, names, action_text, named))
+        return set(named) <= done
     except Exception:
         logger.warning(
             "tool_result_is_action_work: action %s in %s: the receipt check "
