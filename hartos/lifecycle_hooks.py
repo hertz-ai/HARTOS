@@ -507,6 +507,21 @@ def resume_blocked_action(user_prompt: str, action_id: int,
     return True
 
 
+def ledger_holds_no_block(user_prompt: str, action_id: int) -> bool:
+    """Whether the registered ledger holds this action's task and it is NOT
+    BLOCKED: a user-input block on it never landed (block_for_user_input
+    refuses a task that is not in progress) or is already gone, so there is
+    nothing durable to resume.
+
+    False when there is no ledger or no such task (nothing is known, so a gate
+    stays as it is) and when the task IS blocked (a resume that failed to save
+    must be retried, not dropped)."""
+    ledger = _ledger_registry.get(user_prompt)
+    task = ledger.tasks.get(f"action_{action_id}") if ledger else None
+    return (task is not None
+            and task.status != _get_ledger_task_status().BLOCKED)
+
+
 def resume_from_user_input(user_prompt: str, action_id: int,
                            reason: str = "User responded",
                            answer: Optional[str] = None) -> bool:

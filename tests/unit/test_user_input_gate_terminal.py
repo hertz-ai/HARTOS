@@ -229,5 +229,72 @@ class UserInputGateTerminal(unittest.TestCase):
         self.assertEqual(task._needs_help_reason, 'need choice')
 
 
+class AGateTheLedgerNeverHeld(unittest.TestCase):
+    """LIVE 2026-10-10 14:48-14:53 IST, agent 54, user 10202.  CREATE resumed a
+    session another build had left (its action_2 FAILED).  The verifier said
+    action 2 waits for the person; block_for_user_input refused the block (the
+    task was not in progress) and the gate flag was set anyway.  The person's
+    "yes" then read:
+
+        [USER-INPUT-GATE] Keeping action 2 blocked: durable resume from a
+        genuine user reply failed
+
+    and got the same question back, every turn: nothing could resume a block
+    the ledger never held.  A genuine reply releases a gate whose block is not
+    in the ledger; a block the ledger DOES hold is still kept when its resume
+    fails, so the same answer can be retried."""
+
+    def setUp(self):
+        import tempfile
+        from agent_ledger.core import SmartLedger, Task, TaskType
+        from hartos import lifecycle_hooks as L
+        self.L = L
+        clear_action_states(_UP)
+        self.ledger = SmartLedger(agent_id='54', session_id=f'{_UP}_1',
+                                  ledger_dir=tempfile.mkdtemp())
+        self.ledger.add_task(Task(task_id='action_2', description='reply',
+                                  task_type=TaskType.PRE_ASSIGNED))
+        L.register_ledger_for_session(_UP, self.ledger)
+        self.task = SimpleNamespace(
+            _needs_user_input_action_id=2, _needs_help_reason='confirm topic',
+            _needs_user_input_kind='human_required')
+        create_recipe.user_tasks[_UP] = self.task
+        create_recipe.request_id_list[_UP] = 'user-request-3'
+
+    def tearDown(self):
+        clear_action_states(_UP)
+        with self.L._state_lock:
+            self.L._ledger_registry.pop(_UP, None)
+
+    def test_a_block_the_ledger_never_held_is_released_by_the_reply(self):
+        """THE LIVE SHAPE: the task the ledger holds is FAILED, not BLOCKED."""
+        from agent_ledger.core import TaskStatus
+        self.ledger.tasks['action_2'].status = TaskStatus.FAILED
+        self.assertTrue(_resume_prior_user_input_block(_UP, 'yes'),
+                        'the answer could never release this gate')
+        self.assertIsNone(self.task._needs_user_input_action_id)
+        self.assertIsNone(self.task._needs_user_input_kind)
+        self.assertIsNone(self.task._needs_help_reason)
+
+    def test_a_block_the_ledger_holds_is_kept_when_its_resume_fails(self):
+        """The storage-failure case the sticky gate exists for: the task IS
+        blocked, its resume could not be saved, the same answer can retry."""
+        from agent_ledger.core import TaskStatus
+        self.ledger.tasks['action_2'].status = TaskStatus.BLOCKED
+        with patch('hartos.create_recipe.resume_from_user_input',
+                   return_value=False):
+            self.assertFalse(_resume_prior_user_input_block(_UP, 'yes'))
+        self.assertEqual(self.task._needs_user_input_action_id, 2)
+
+    def test_a_daemon_turn_still_cannot_release_it(self):
+        """Releasing a block the ledger never held is the PERSON's to do; a
+        background retry is still not their answer."""
+        from agent_ledger.core import TaskStatus
+        self.ledger.tasks['action_2'].status = TaskStatus.FAILED
+        create_recipe.request_id_list[_UP] = 'daemon_goal-123'
+        self.assertFalse(_resume_prior_user_input_block(_UP, 'retry'))
+        self.assertEqual(self.task._needs_user_input_action_id, 2)
+
+
 if __name__ == '__main__':
     unittest.main()

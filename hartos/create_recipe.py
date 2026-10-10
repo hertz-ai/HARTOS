@@ -256,6 +256,7 @@ from hartos.lifecycle_hooks import (
     lifecycle_hook_track_recipe_completion,
     lifecycle_hook_check_all_actions_terminated, StateTransitionError, lifecycle_hook_validate_final_agent_creation,
     mark_action_waiting_for_user, resume_blocked_action, resume_from_user_input,
+    ledger_holds_no_block,
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
@@ -2644,9 +2645,18 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                     f"[USER-INPUT-GATE] flag set failed (non-blocking): {_gate_err}"
                                 )
                             if _needs_user_input:
-                                mark_action_waiting_for_user(
-                                    user_prompt, current_action_id,
-                                    json_obj.get('message') or 'Waiting for user input')
+                                if not mark_action_waiting_for_user(
+                                        user_prompt, current_action_id,
+                                        json_obj.get('message') or 'Waiting for user input'):
+                                    # Not silent: the person is still asked,
+                                    # and _resume_prior_user_input_block lets
+                                    # their answer release a block the ledger
+                                    # never held (live 2026-10-10, agent 54).
+                                    current_app.logger.warning(
+                                        f"[USER-INPUT-GATE] Action "
+                                        f"{current_action_id} waits for the "
+                                        f"person, but the ledger refused the "
+                                        f"block (its task is not in progress)")
                                 # END the chat round here, the way the loop-break
                                 # (#485) and the TERMINATE guard do: autogen's
                                 # run_chat breaks on a None speaker, and the OUTER
@@ -4464,6 +4474,17 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
     # Clear the CREATE-loop gate only after the canonical ledger accepted the
     # resume.  If storage is unavailable the same attributed answer can be
     # retried; clearing the marker here would strand the still-BLOCKED task.
+    # A block the ledger never held is the other case: block_for_user_input
+    # refuses a task that is not in progress, and the gate was flagged anyway
+    # (live 2026-10-10, agent 54: a resumed session's FAILED action_2), so no
+    # resume can ever succeed and every answer got the same question back.
+    # Nothing durable is waiting there; this attributed answer releases it.
+    if not resumed and ledger_holds_no_block(user_prompt, action_id):
+        logging.getLogger(__name__).warning(
+            '[USER-INPUT-GATE] Releasing action %s: the ledger never held its '
+            'block, so %s answers it', action_id,
+            'a genuine user reply' if is_user else 'its assigned expert turn')
+        resumed = True
     if not resumed:
         logging.getLogger(__name__).warning(
             '[USER-INPUT-GATE] Keeping action %s blocked: durable resume from '
