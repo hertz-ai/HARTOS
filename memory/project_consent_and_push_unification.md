@@ -826,9 +826,10 @@ fold that "looks trivial" in the plan text is exactly the one to check first.
   PRIVACY REGRESSION; do not execute that part without the owner.**
 
   Names, for accuracy: the canonical sender is `send_fcm_push(user_id, ...)`
-  (`core/fcm_sync.py:325`), not `send_push`. The audit also saw a node-keyed
-  sibling (a node id in place of a user id, `:346`); it had no production caller
-  and was deleted under F8 on 2026-10-10. The two were different TARGETS (a user
+  (`core/fcm_sync.py`), not `send_push`. The audit also saw a node-keyed
+  sibling (a node id in place of a user id); it had no production caller and
+  was deleted on 2026-10-10 (HARTOS 946a0d21d; this document's F8 is a
+  different item). The two were different TARGETS (a user
   vs a node), so per F12's lesson check they are genuinely duplicated before
   collapsing them: two callers needing two addressing modes is not the same as
   two rival implementations.
