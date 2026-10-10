@@ -4058,12 +4058,57 @@ _TERMINAL_TASK_STATUSES = frozenset({
     "rolled_back",
 })
 
+#: The task id of a build's own step (add_actions_to_ledger).  Tasks a run
+#: adds -- dynamic_<n>, action_<n>_seq_<i>, ... -- are not steps of the build.
+_BUILD_STEP_ID = re.compile(r'^action_\d+$')
+
+
+def _as_action(action: Any) -> Dict[str, Any]:
+    """An action as the ledger reads it: a bare string is its own text."""
+    if isinstance(action, str):
+        return {"description": action, "action": action}
+    return action
+
+
+def _action_task_id(position: int, action: Dict[str, Any]) -> str:
+    """``action_<action_id>``, or ``action_<position>`` (1-based) for an
+    action without one."""
+    return f"action_{action.get('action_id', position)}"
+
+
+def _action_description(action: Dict[str, Any]) -> str:
+    """The text a task stores for this action."""
+    return action.get('description', action.get('action', ''))
+
+
+def _build_steps(actions: Optional[List[Any]]) -> Dict[str, str]:
+    """The build ``actions`` describe: each step's task id -> its text."""
+    steps = {}
+    for position, action in enumerate(actions or [], 1):
+        action = _as_action(action)
+        steps[_action_task_id(position, action)] = _action_description(action)
+    return steps
+
+
+def _is_same_build(flow_tasks: List[Tuple[int, Dict[str, Any]]],
+                   steps: Dict[str, str]) -> bool:
+    """Whether a session's tasks are ``steps``: the same action_<n> ids with
+    the same texts, no more and no fewer.  Tasks the run added are not
+    compared."""
+    held = {}
+    for _action_id, task_dict in flow_tasks:
+        task_id = str(task_dict.get("task_id") or "")
+        if _BUILD_STEP_ID.match(task_id):
+            held[task_id] = task_dict.get("description") or ""
+    return held == steps
+
 
 def _find_resumable_session(
     agent_id: str,
     user_id: Optional[int],
     ledger_dir: str = "agent_data",
     flow_id: Optional[int] = None,
+    actions: Optional[List[Any]] = None,
 ) -> Optional[str]:
     """Return session_id of an in-flight ledger for this (agent_id, user_id),
     or ``None`` if every prior session is fully terminal / no priors exist.
@@ -4098,6 +4143,16 @@ def _find_resumable_session(
     meaning (any flow).  Tasks without ``recipe_flow_id`` count as flow 0,
     the fallback ``list_grouped_by_recipe_hierarchy`` applies.
 
+    ``actions`` scopes it to one build.  A build is its list of actions, and a
+    session left unfinished by another list of the same prompt is that
+    build's: live 2026-10-10, agent 54 rebuilt with 3 actions resumed the
+    20-action session an earlier build had left, its action_2 FAILED, and the
+    new action_2 inherited that status (the user-input block refuses a task
+    that is not in progress, so the action could never be answered).  A
+    session resumes only when its action_<n> steps are these actions' ids
+    and texts (``_is_same_build``).  ``None`` or an empty list compares
+    nothing and keeps the unscoped meaning.
+
     Returns:
         session_id string of the resumable session, or None.
     """
@@ -4112,6 +4167,7 @@ def _find_resumable_session(
         return None
 
     user_prefix = f"{user_id}_" if user_id is not None else None
+    steps = _build_steps(actions) if actions else None
 
     for session_id in sorted(prompt_sessions.keys(), reverse=True):
         if user_prefix is not None and not session_id.startswith(user_prefix):
@@ -4119,6 +4175,13 @@ def _find_resumable_session(
         flows = prompt_sessions[session_id]
         if flow_id is not None:
             flows = {flow_id: flows.get(flow_id, [])}
+        if steps is not None and not all(
+                _is_same_build(flow_tasks, steps)
+                for flow_tasks in flows.values()):
+            logger.info(
+                f"_find_resumable_session: not resuming {session_id} for "
+                f"prompt={agent_id}: its steps are another build's")
+            continue
         # Walk the flows' actions; any non-terminal task → resumable.
         for flow_tasks in flows.values():
             for _action_id, task_dict in flow_tasks:
@@ -4190,7 +4253,8 @@ def create_ledger_from_actions(
         if session_id is None:
             if resume_if_unfinished:
                 _resumable = _find_resumable_session(agent_id, user_id,
-                                                     flow_id=flow_id)
+                                                     flow_id=flow_id,
+                                                     actions=actions)
                 if _resumable is not None:
                     session_id = _resumable
                     logger.info(
@@ -4251,10 +4315,9 @@ def add_actions_to_ledger(
                       else str(ledger.agent_id))
     added = 0
     for position, action in enumerate(actions or [], 1):
-        if isinstance(action, str):
-            action = {"description": action, "action": action}
+        action = _as_action(action)
 
-        task_id = f"action_{action.get('action_id', position)}"
+        task_id = _action_task_id(position, action)
         if task_id in ledger.tasks:
             continue
 
@@ -4263,7 +4326,7 @@ def add_actions_to_ledger(
 
         task = Task(
             task_id=task_id,
-            description=action.get('description', action.get('action', '')),
+            description=_action_description(action),
             task_type=TaskType.PRE_ASSIGNED,
             execution_mode=execution_mode,
             status=TaskStatus.PENDING,

@@ -590,9 +590,11 @@ class TestRecipeHierarchyStamping:
         import json
         # Pre-write an unfinished ledger for prompt=42, user=10202.
         # Task status PENDING is non-terminal → session must be resumed.
+        # Its step is the action below ("x"): a session resumes only for the
+        # build that left it (test_resume_is_build_scoped.py).
         unfinished_tasks = {
             "action_1": {
-                "task_id": "action_1", "description": "in-flight",
+                "task_id": "action_1", "description": "x",
                 "execution_mode": "parallel", "task_type": "pre_assigned",
                 "status": "pending", "priority": 50,
             },
@@ -633,7 +635,7 @@ class TestRecipeHierarchyStamping:
         import json
         terminal_tasks = {
             "action_1": {
-                "task_id": "action_1", "description": "done",
+                "task_id": "action_1", "description": "x",
                 "execution_mode": "parallel", "task_type": "pre_assigned",
                 "status": "completed", "priority": 50,
             },
@@ -694,7 +696,7 @@ class TestRecipeHierarchyStamping:
         import json
         unfinished_tasks = {
             "action_1": {
-                "task_id": "action_1", "description": "in-flight",
+                "task_id": "action_1", "description": "x",
                 "execution_mode": "parallel", "task_type": "pre_assigned",
                 "status": "pending", "priority": 50,
             },
@@ -734,7 +736,7 @@ class TestRecipeHierarchyStamping:
         import json
         unfinished_tasks = {
             "action_1": {
-                "task_id": "action_1", "description": "legacy in-flight",
+                "task_id": "action_1", "description": "x",
                 "execution_mode": "parallel", "task_type": "pre_assigned",
                 "status": "in_progress", "priority": 50,
             },
