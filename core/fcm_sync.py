@@ -62,33 +62,6 @@ def fetch_central_fcm_token(user_id, timeout=8):
         return None
 
 
-def fetch_central_fcm_token_by_node(node_id, timeout=8):
-    """GET the FCM token registered for a peer_link ``node_id`` from the central
-    registry (``GET {registry}/get_node_token/{node_id}``, written by the
-    pre-login ``POST /register_node_token``).
-
-    Sibling of ``fetch_central_fcm_token``, keyed by the node's ed25519 device
-    identity rather than a user account — the reach for a device that has NOT yet
-    logged in (the desktop already auto-discovers the same node_id on the LAN).
-    Returns the token, or None when unregistered / unreachable.  Robust to both
-    the bare-string body ``get_node_token`` returns and a ``{"token": ...}`` wrap.
-    Timeout-bounded + exception-handled (never raises)."""
-    if not node_id:
-        return None
-    try:
-        import requests
-        resp = requests.get(f"{_FCM_REGISTRY}/get_node_token/{node_id}", timeout=timeout)
-        if resp.status_code != 200:
-            return None
-        body = resp.json()
-        if isinstance(body, str):
-            return body.strip() or None
-        return parse_fcm_token_response(body)
-    except Exception as e:
-        logger.debug("fetch_central_fcm_token_by_node(%s) failed: %s", node_id, e)
-        return None
-
-
 _CREATE_TABLE = (
     "CREATE TABLE IF NOT EXISTS fcm_tokens ("
     "user_id TEXT PRIMARY KEY, token TEXT NOT NULL, synced_at TEXT)"
@@ -291,7 +264,7 @@ def _fcm_credential():
     trigger a blocking token fetch just to discover it cannot send. Before this
     ordering, send_fcm_push fired an up-to-8s blocking GET per expired message in
     DeliveryTracker's cleanup loop, then no-op'd (2026-06-05 sweep, same family
-    as the governor hang). Shared by the user-keyed and node-keyed send paths."""
+    as the governor hang)."""
     access = _fcm_access_token()
     project = os.environ.get('HART_FCM_PROJECT', '')
     if not access or not project:
@@ -301,9 +274,8 @@ def _fcm_credential():
 
 def _post_fcm_message(access, project, token, title, body, data, timeout):
     """POST one built message to FCM v1.  Returns True on a 200, else False.
-    Never raises.  The SINGLE FCM-send implementation shared by both push paths
-    (send_fcm_push by user_id, send_fcm_push_to_node by node_id) — no parallel
-    send."""
+    Never raises.  The single FCM-send implementation (send_fcm_push's direct
+    leg)."""
     try:
         import requests
         resp = requests.post(
@@ -451,28 +423,6 @@ def send_fcm_push(user_id, title, body, data=None, timeout=8, relay=True):
     if not relay:
         return False
     return _relay_push(user_id, title, body, data)
-
-
-def send_fcm_push_to_node(node_id, title, body, data=None, timeout=8):
-    """Push an FCM notification to a device by its peer_link ``node_id`` — the
-    PRE-LOGIN reach.  The token was registered centrally against the node's
-    ed25519 identity (POST /register_node_token); the desktop, having
-    auto-discovered that node_id on the LAN, wakes the phone off-LAN through it.
-
-    Same credential gate + FCM send as send_fcm_push (the shared _fcm_credential
-    / _post_fcm_message helpers) — ONLY the token resolution differs, by node
-    rather than user.  Best-effort, never raises; returns True on a 200, else
-    False (no token, no credential/project, network/HTTP error)."""
-    if not node_id:
-        return False
-    access, project = _fcm_credential()
-    if not access:
-        logger.debug("send_fcm_push_to_node(%s): no FCM credential/project — push disabled", node_id)
-        return False
-    token = fetch_central_fcm_token_by_node(node_id)
-    if not token:
-        return False
-    return _post_fcm_message(access, project, token, title, body, data, timeout)
 
 
 # Read from the environment as this node's own configuration or key

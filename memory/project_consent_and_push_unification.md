@@ -825,11 +825,13 @@ fold that "looks trivial" in the plan text is exactly the one to check first.
 - **F13** FCM paths → one — **AUDITED 2026-09-22. One instruction in it would be a
   PRIVACY REGRESSION; do not execute that part without the owner.**
 
-  Names, for accuracy: the canonical pair is `send_fcm_push(user_id, ...)`
-  (`core/fcm_sync.py:325`) and `send_fcm_push_to_node(node_id, ...)` (`:346`), not
-  `send_push`. Those two are different TARGETS (a user vs a node), so per F12's
-  lesson check they are genuinely duplicated before collapsing them — two callers
-  needing two addressing modes is not the same as two rival implementations.
+  Names, for accuracy: the canonical sender is `send_fcm_push(user_id, ...)`
+  (`core/fcm_sync.py:325`), not `send_push`. The audit also saw a node-keyed
+  sibling (a node id in place of a user id, `:346`); it had no production caller
+  and was deleted under F8 on 2026-10-10. The two were different TARGETS (a user
+  vs a node), so per F12's lesson check they are genuinely duplicated before
+  collapsing them: two callers needing two addressing modes is not the same as
+  two rival implementations.
 
   **The "self-contradiction to resolve" is already resolved, knowingly.**
   `local_subscribers.py:165-173` says in so many words: "this is the FCM send the
