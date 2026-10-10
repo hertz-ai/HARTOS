@@ -857,6 +857,65 @@ def dispatch_failure_reason(goal_id) -> Optional[str]:
         return _turn_failures.pop(_failure_key(goal_id), None)
 
 
+# Where the latest dispatch_goal for a goal went: 'hive' (handed to the
+# coordinator; whichever worker claims the task runs it later) or 'local'
+# (the turn ran here before dispatch_goal returned).  The daemons' completion
+# gate needs it: a hive handoff returns before any work exists, so "this
+# dispatch spent no spark" is not a noop for it
+# (agent_daemon._settle_dispatched_goal).  Keyed like _turn_failures, by goal
+# AND thread, and cleared at the start of every dispatch_goal call.
+_dispatch_routes: Dict[tuple, str] = {}
+# The last route logged per goal, so a goal that moves between the hive and
+# this node says so once, not every tick.  Measured 2026-10-09/10 on the
+# owner's desktop: goals resumed 22-36 minutes late, and no line said which
+# way their dispatches went (R1, fix-all-log-observed-issues).
+_routes_logged: Dict[str, str] = {}
+
+
+def _record_route(goal_id, route, why='') -> None:
+    with _turn_failures_lock:
+        _dispatch_routes[_failure_key(goal_id)] = route
+        while len(_dispatch_routes) > _TURN_FAILURES_MAX:
+            _dispatch_routes.pop(next(iter(_dispatch_routes)))
+        was = _routes_logged.get(str(goal_id))
+        _routes_logged[str(goal_id)] = route
+        while len(_routes_logged) > _TURN_FAILURES_MAX:
+            _routes_logged.pop(next(iter(_routes_logged)))
+    if was != route:
+        logger.info(f"Goal {goal_id}: dispatched "
+                    f"{'to the hive' if route == 'hive' else 'here'}"
+                    f"{f' ({why})' if why else ''}; was "
+                    f"{was or 'not dispatched yet'}")
+
+
+def handed_to_hive(goal_id) -> bool:
+    """True when the latest dispatch_goal for ``goal_id``, from this thread,
+    handed the goal to the hive rather than running its turn here."""
+    with _turn_failures_lock:
+        return _dispatch_routes.get(_failure_key(goal_id)) == 'hive'
+
+
+def _hive_run_open(coordinator, goal_id) -> Optional[bool]:
+    """Does the goal's task set in the coordinator still hold work: a task
+    that is not in a terminal state (TaskStatus.is_terminal_state, the
+    ledger's own rule)?  None when the coordinator cannot say."""
+    try:
+        from agent_ledger.core import TaskStatus
+        progress = coordinator.get_goal_progress(str(goal_id))
+        if not isinstance(progress, dict) or progress.get('error'):
+            return None
+        tasks = progress.get('tasks') or []
+        if not tasks:
+            return None
+        return any(not TaskStatus.is_terminal_state(TaskStatus(t.get('status')))
+                   for t in tasks)
+    except Exception:
+        logger.warning('Could not read the hive task set of goal %s; '
+                       'treating the submit as a handoff', goal_id,
+                       exc_info=True)
+        return None
+
+
 def _dispatch_provider_host(model_config) -> str:
     """Host of the LLM endpoint this dispatch will use, for the provider
     breaker (#106b b): the expert override's base_url when one is given, else
@@ -1222,12 +1281,17 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
     # checks.  A failed lookup means "not continuous": a missed re-arm, never
     # a wrong one.
     continuous = False
+    # A hive run of this goal handed off earlier and not yet settled: the
+    # daemon's completion gate marks it (spark_at_handoff) and clears the mark
+    # when it settles the run.
+    run_awaiting = False
     try:
         from integrations.social.models import db_session, AgentGoal
         with db_session(commit=False) as _cdb:
             _crow = _cdb.query(AgentGoal).filter_by(id=goal_id).first()
-            continuous = bool(_crow is not None
-                              and (_crow.config_json or {}).get('continuous'))
+            _ccfg = (_crow.config_json or {}) if _crow is not None else {}
+            continuous = bool(_ccfg.get('continuous'))
+            run_awaiting = _ccfg.get('spark_at_handoff') is not None
     except Exception as _cerr:
         logger.debug(f"continuous lookup failed for goal {goal_id}: {_cerr}")
 
@@ -1259,6 +1323,21 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
             context=context,
             goal_id=str(goal_id),  # STABLE id → re-dispatch dedups, no ledger flood
         )
+        # submit_goal dedups a goal it has seen onto the task set it already
+        # holds, and re-opens that set only for a continuous goal.  For any
+        # other goal whose set is finished the submit did nothing, yet its id
+        # came back as if work had been handed off: measured on the owner's
+        # desktop 2026-10-10, two self-heal goals were "submitted" every 30 s
+        # into a set completed on 09-15, and the worker had nothing to claim.
+        # A finished set is a handoff only while the daemon still has to
+        # settle the run that finished it; otherwise nothing went to the hive
+        # and the goal runs here, through the same fallback as a failed submit.
+        if (not run_awaiting
+                and _hive_run_open(coordinator, distributed_goal_id) is False):
+            logger.info(f"Goal {goal_id}: its hive task set is finished and "
+                        f"no run of it is waiting to be settled, so nothing "
+                        f"was handed to the hive")
+            return None
         logger.info(f"Distributed dispatch: goal {goal_id} submitted as "
                     f"{distributed_goal_id} with {len(tasks)} tasks")
         return distributed_goal_id
@@ -1355,9 +1434,11 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     Returns:
         Response text or None on failure
     """
-    # A failure reason describes this call only (dispatch_failure_reason).
+    # A failure reason and a route describe this call only
+    # (dispatch_failure_reason, handed_to_hive).
     with _turn_failures_lock:
         _turn_failures.pop(_failure_key(goal_id), None)
+        _dispatch_routes.pop(_failure_key(goal_id), None)
 
     # BUDGET GATE: check goal budget + platform affordability before dispatch
     try:
@@ -1445,13 +1526,16 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
 
     # ROBOT: capability-matched dispatch — prefer distributed for hardware mismatches
     _tried_distributed = False
+    _why_here = '' if _can_distribute else 'a turn on a named model runs here'
     if _can_distribute and not _check_robot_capability_match(goal_type, goal_id):
         coordinator = _get_distributed_coordinator()
         if coordinator and _has_hive_peers():
             _tried_distributed = True
             result = dispatch_goal_distributed(prompt, user_id, goal_id, goal_type)
             if result is not None:
+                _record_route(goal_id, 'hive')
                 return result
+            _why_here = 'the hive took nothing'
         # Fall through to local if no capable peer found
 
     # DISTRIBUTED: auto-distribute when coordinator is reachable and hive has peers
@@ -1461,9 +1545,14 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
         if coordinator and _has_hive_peers():
             result = dispatch_goal_distributed(prompt, user_id, goal_id, goal_type)
             if result is not None:
+                _record_route(goal_id, 'hive')
                 return result
             # Fall through to local dispatch if distributed fails
             logger.info(f"Distributed fallback -> local dispatch for {goal_type} goal {goal_id}")
+            _why_here = 'the hive took nothing'
+        else:
+            _why_here = ('no coordinator' if not coordinator
+                         else 'no other active node')
 
     # NUMERIC prompt_id (same format as hart_intelligence_entry._next_prompt_id)
     # so it passes the isdigit() check in the adapter and /chat handler.
@@ -1529,6 +1618,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     # local_chat_dispatch now, so the instruction queue and the distributed
     # worker reach /chat exactly the way this goal path does instead of
     # hand-rolling a raw POST that lands on Nunba's route.
+    _record_route(goal_id, 'local', _why_here)
     _status, response = local_chat_dispatch(
         prompt, user_id, prompt_id, daemon_id=goal_id, model_config=model_config)
     if _status == 'deferred':

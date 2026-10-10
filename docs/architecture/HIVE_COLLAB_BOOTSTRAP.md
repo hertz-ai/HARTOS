@@ -131,6 +131,14 @@ banked, user idle, many-core box. Other pacing knobs:
    — purely-local completed work auto-pauses after 5 noops. If your work runs
    local-only, verify completion by ledger/recipe artifacts, not by the
    daemon's completed flag.
+   A goal handed to the hive (dispatch.handed_to_hive) is judged by its hive
+   run instead: no noop strike while its task is queued or running, and it
+   completes on the spark its flow charged since the handoff
+   (`spark_at_handoff`). A goal whose hive task set is already finished, with
+   no run waiting to be settled, is not handed off at all: it runs here. The
+   coding daemon's goals pass through the same gate. Today the hive queue is
+   this node's own (no peer pulls from it), so a handoff runs only when this
+   node's distributed worker claims it.
 2. **Completion is FSM-gated:** COMPLETED only via
    STATUS_VERIFICATION_REQUESTED -> StatusVerifier verdict
    (`lifecycle_hooks.py`). Do not force states around it.

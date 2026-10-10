@@ -381,7 +381,8 @@ def _settle_expert_turn(db, goal, served) -> bool:
     return True
 
 
-def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None):
+def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
+                            handed_to_hive=False):
     """The ONE completion gate every dispatched goal must pass through.
 
     Dispatch-style-independent by construction: it re-reads the goal from
@@ -411,6 +412,19 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None):
                               strike, bounded by HEVOLVE_GOAL_VERIFY_TIMEOUT_S
       noop                  — no new spark at all; unchanged 5-strike pause
     Continuous goals still never auto-complete.
+
+    ``handed_to_hive`` (dispatch.handed_to_hive): the dispatch gave the goal
+    to the coordinator, so it returned before any work existed and "this
+    dispatch spent no spark" says nothing.  Judged by the hive run instead:
+    while the run holds work the goal is awaiting_verification (no noop
+    strike, the same timeout bound); once every task is done it completes on
+    the spark charged since the handoff, which charge_goal_work_completed
+    adds when the worker's flow completes, i.e. between two ticks and after
+    the tick's own spark_at_dispatch snapshot.  spark_at_handoff keeps the
+    figure from the handoff and marks the run as waiting to be settled.
+    Measured on the owner's desktop 2026-10-10: 21 seed goals were paused
+    with "5 dispatches produced 0 spark" because every handoff, returned
+    instantly, was judged as a turn that had done nothing.
     """
     # MERGE, never blind-write, the config this tick staged before the
     # dispatch.  The tick copied config_json and added spark_at_dispatch
@@ -490,58 +504,83 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None):
     if is_continuous:
         # Continuous goals never auto-complete; cooldown gate
         # higher up already prevents re-dispatch storms.
-        pass
+        return
+    # goal_key IS str(goal.id) at every call site, and it is the same string
+    # dispatch_goal_distributed submits as the coordinator goal id.  Using it
+    # keeps this gate judging its own arguments rather than reaching into the
+    # ORM object.
+    if handed_to_hive:
+        grounded = _goal_ledger_grounding(goal_key)
+        base = cfg.get('spark_at_handoff')
+        if base is None:
+            base = spark_spent if spark_at_dispatch is None else spark_at_dispatch
+        earned = spark_spent - int(base or 0)
+        if grounded is False:
+            cfg['spark_at_handoff'] = int(base or 0)
+            outcome = 'awaiting'
+        elif grounded and earned > 0:
+            outcome = 'completed'
+        else:
+            # Finished with nothing charged, or no task set at all: this run
+            # did no work.  Its marks go, so the next dispatch starts afresh.
+            cfg.pop('spark_at_handoff', None)
+            cfg.pop('awaiting_verification_since', None)
+            outcome = 'noop'
     elif spark_this_dispatch > 0:
         # Work cost something this time round. Now: did it LAND?
-        # goal_key IS str(goal.id) at the only call site, and it is the
-        # same string dispatch_goal_distributed submits as the coordinator
-        # goal id.  Using it keeps this gate judging its own arguments
-        # rather than reaching into the ORM object.
         grounded = _goal_ledger_grounding(goal_key)
-        if grounded is False:
-            # In flight. Not a noop — do not touch the noop counter, and do
-            # not re-spin the goal — but do not sit here silently forever
-            # either: the pause below is the bound.
-            since = cfg.get('awaiting_verification_since')
-            if not since:
-                since = datetime.utcnow().isoformat()
-                cfg['awaiting_verification_since'] = since
-            cfg['last_verification_check'] = datetime.utcnow().isoformat()
-            waited = _seconds_since_iso(since)
-            timeout_s = int(os.environ.get(
-                'HEVOLVE_GOAL_VERIFY_TIMEOUT_S', '1800'))
-            if waited is not None and waited > timeout_s:
-                goal.status = 'paused'
-                cfg['pause_reason'] = (
-                    f'Auto-paused: work was dispatched and spark was spent, '
-                    f'but the ledger never reported every task done after '
-                    f'{int(waited)}s.  Check the distributed worker on this '
-                    f'node before resuming.')
-                cfg['paused_at'] = datetime.utcnow().isoformat()
-                logger.warning(
-                    f"Goal {goal_key} AUTO-PAUSED after {int(waited)}s "
-                    f"awaiting ledger grounding")
-            else:
-                logger.info(
-                    f"Goal {goal_key} awaiting verification "
-                    f"(spark_this_dispatch={spark_this_dispatch}, "
-                    f"ledger tasks outstanding)")
-            goal.config_json = cfg
-        else:
-            # grounded is True (every ledger task done) or None (no ledger
-            # entry for this goal — a purely local dispatch, where spend on
-            # this dispatch is the only evidence that exists).
-            goal.status = 'completed'
-            cfg['completed_at'] = datetime.utcnow().isoformat()
-            cfg['completion_grounding'] = (
-                'ledger_tasks_complete' if grounded else 'local_dispatch_spend')
-            cfg.pop('noop_dispatch_count', None)
+        outcome = 'awaiting' if grounded is False else 'completed'
+    else:
+        outcome = 'noop'
+    if outcome == 'awaiting':
+        # In flight. Not a noop — do not touch the noop counter, and do
+        # not re-spin the goal — but do not sit here silently forever
+        # either: the pause below is the bound.
+        since = cfg.get('awaiting_verification_since')
+        if not since:
+            since = datetime.utcnow().isoformat()
+            cfg['awaiting_verification_since'] = since
+        cfg['last_verification_check'] = datetime.utcnow().isoformat()
+        waited = _seconds_since_iso(since)
+        timeout_s = int(os.environ.get(
+            'HEVOLVE_GOAL_VERIFY_TIMEOUT_S', '1800'))
+        if waited is not None and waited > timeout_s:
+            goal.status = 'paused'
+            cfg['pause_reason'] = (
+                f'Auto-paused: work was handed off, but the ledger never '
+                f'reported every task done after {int(waited)}s.  Check '
+                f'the distributed worker on this node before resuming.')
+            cfg['paused_at'] = datetime.utcnow().isoformat()
+            # The wait ends with the pause.  Left in place, the mark made
+            # a resumed goal's first settle read the old wait as expired
+            # and pause it again on the spot.
             cfg.pop('awaiting_verification_since', None)
-            goal.config_json = cfg
+            cfg.pop('spark_at_handoff', None)
+            logger.warning(
+                f"Goal {goal_key} AUTO-PAUSED after {int(waited)}s "
+                f"awaiting ledger grounding")
+        else:
             logger.info(
-                f"Goal {goal_key} COMPLETED "
+                f"Goal {goal_key} awaiting verification "
                 f"(spark_this_dispatch={spark_this_dispatch}, "
-                f"grounding={cfg['completion_grounding']})")
+                f"ledger tasks outstanding)")
+        goal.config_json = cfg
+    elif outcome == 'completed':
+        # grounded is True (every ledger task done) or None (no ledger
+        # entry for this goal — a purely local dispatch, where spend on
+        # this dispatch is the only evidence that exists).
+        goal.status = 'completed'
+        cfg['completed_at'] = datetime.utcnow().isoformat()
+        cfg['completion_grounding'] = (
+            'ledger_tasks_complete' if grounded else 'local_dispatch_spend')
+        cfg.pop('noop_dispatch_count', None)
+        cfg.pop('awaiting_verification_since', None)
+        cfg.pop('spark_at_handoff', None)
+        goal.config_json = cfg
+        logger.info(
+            f"Goal {goal_key} COMPLETED "
+            f"(spark_this_dispatch={spark_this_dispatch}, "
+            f"grounding={cfg['completion_grounding']})")
     else:
         # Dispatched but zero real work — track and back off.
         noop_count = int(cfg.get('noop_dispatch_count', 0)) + 1
@@ -560,8 +599,9 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None):
                 f"{noop_count} noop dispatches")
         else:
             logger.info(
-                f"Goal {goal_key} dispatched but this dispatch spent no "
-                f"spark (lifetime={spark_spent}, noop #{noop_count})")
+                f"Goal {goal_key} dispatched but "
+                f"{'its hive run finished with no spark charged' if handed_to_hive else 'this dispatch spent no spark'}"
+                f" (lifetime={spark_spent}, noop #{noop_count})")
         goal.config_json = cfg
 
 def _reply_failure(result):
@@ -1474,8 +1514,8 @@ class AgentDaemon:
         from integrations.social.models import get_db, AgentGoal, Product
         from integrations.coding_agent.idle_detection import IdleDetectionService
         from .goal_manager import GoalManager, CODING_GOAL_TYPES
-        from .dispatch import (dispatch_goal, should_yield_to_user,
-                               max_autonomous_concurrency)
+        from .dispatch import (dispatch_goal, handed_to_hive,
+                               should_yield_to_user, max_autonomous_concurrency)
 
         # Single canonical yield gate — user activity + system pressure.
         # See dispatch.should_yield_to_user() docstring for the contract.
@@ -1957,10 +1997,12 @@ class AgentDaemon:
                     except ImportError:
                         pass
 
+                _to_hive = False
                 if not handed_off:
                     result = dispatch_goal(
                         prompt, str(agent['user_id']), goal.id, goal.goal_type,
                         **({'model_config': _expert_cfg} if _expert_cfg else {}))
+                    _to_hive = handed_to_hive(goal.id)
                     dispatched += 1
                     self._wd_heartbeat()
 
@@ -2050,7 +2092,8 @@ class AgentDaemon:
                     # skip it again (defect (b) was a `continue` doing exactly
                     # that).
                     _settle_dispatched_goal(db, goal, goal_key,
-                                            served_escalation=_served_escalation)
+                                            served_escalation=_served_escalation,
+                                            handed_to_hive=_to_hive)
             # ── HITL: notify owners of APPROVAL_REQUIRED tasks ──
             try:
                 for goal in goals:
