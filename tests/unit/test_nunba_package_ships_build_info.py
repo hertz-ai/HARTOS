@@ -37,3 +37,17 @@ def test_the_package_accepts_hart_rev_and_the_module_passes_it():
         'hart-nunba.nix must declare hartRev in its module args (flake.nix passes it as a specialArg)')
     assert 'callPackage ../packages/nunba.nix { inherit hartSrc hartRev; }' in mod, (
         'hart-nunba.nix must hand hartRev to the package')
+
+
+def test_the_floor_and_the_daemon_build_the_same_nunba_derivation():
+    """hart-liquid-ui.nix's NUNBA_STATIC_DIR floor and hart-nunba.nix's daemon must
+    call packages/nunba.nix with the SAME arguments, or the store holds two 155M
+    Nunba trees (measured on generation 14, 2026-10-11: one HARTOS_SHA=unknown,
+    one real, on a disk with 237M free)."""
+    ui = _read(os.path.join(ROOT, 'nixos', 'modules', 'hart-liquid-ui.nix'))
+    mod = _read(MOD)
+    assert 'callPackage ../packages/nunba.nix { inherit hartSrc hartRev; }' in ui, (
+        'hart-liquid-ui.nix must pass hartSrc AND hartRev, exactly as hart-nunba.nix does')
+    assert 'callPackage ../packages/nunba.nix { inherit hartSrc hartRev; }' in mod
+    assert re.search(r'^\{[^}]*hartRev \? "unknown"[^}]*\.\.\. \}:', ui, re.M), (
+        'hart-liquid-ui.nix must declare hartRev in its module args')
