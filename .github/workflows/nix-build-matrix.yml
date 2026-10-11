@@ -11,6 +11,18 @@ on:
         description: 'Comma-separated build targets (or "all")'
         default: 'iso-server,iso-desktop,iso-edge'
         required: false
+      skip_eval_gate:
+        description: >-
+          Build without the Flake Evaluation Gate. The gate evaluates EVERY
+          output (`nix flake check --no-build`); the build evaluates only the
+          targets it builds. Use when the gate itself is the blocker: measured
+          2026-10-11 (run 38107123650) the gate was cancelled at 45 min after 77
+          of ~126 outputs, with single checks taking 45-421 s to evaluate that
+          took 0-2 s on 2026-09-30 (run 36731188647), while nothing under nixos/
+          changed but packages/nunba.nix and modules/hart-nunba.nix. Dispatch
+          only; push runs always gate.
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -44,6 +56,9 @@ jobs:
   # ─── Fast Gate: evaluate first ─────────────────────────────
   evaluate:
     name: Flake Evaluation Gate
+    # A dispatch may skip the gate (see the skip_eval_gate input); the build
+    # job below accepts a skipped gate only for that case.
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_eval_gate) }}
     runs-on: ubuntu-latest
     # 25 (was 10): the eval outgrew the old budget on 2026-07-29 — attempt 3 of
     # run 30435280105 ran a MEASURED 15 minutes before enforcement cancelled it,
@@ -196,6 +211,12 @@ jobs:
     # `targets` as well as `evaluate`: the matrix is now computed, so the build
     # cannot start before the list exists.
     needs: [evaluate, targets]
+    # always(): a skipped gate (skip_eval_gate dispatch) must not skip the build
+    # transitively. A FAILED or CANCELLED gate still blocks it, as before.
+    if: >-
+      always() && needs.targets.result == 'success' &&
+      (needs.evaluate.result == 'success' ||
+       (needs.evaluate.result == 'skipped' && github.event_name == 'workflow_dispatch' && inputs.skip_eval_gate))
     runs-on: ubuntu-latest
     # Bumped 90 -> 150: with the throttling magic-nix-cache removed (see the Install
     # Nix step), HART's own derivations build from source each run instead of being
