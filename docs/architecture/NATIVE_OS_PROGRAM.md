@@ -240,7 +240,12 @@ Add, in order:
 3. Latency: every chat surface meets 3.4's budgets (press p50 < 25 ms, hover p50 < 16 ms) with the daemons running; Nunba's panels are measured by the same instrument, per component, on the box.
 4. App lifecycle validated end to end: install, launch, uninstall of a native app AND of a Nunba-hosted app, driven through the shell as `hart`, with the registry, the menu and the desktop updated, timed, and the same flow on Windows and macOS Nunba. Gate: a nixosTest and a Windows smoke run both green on the same commit.
 5. Parity: the Windows and macOS installs and the OS carry the same Nunba build (BUILD_SHA equal across BUILD_INFO files), the same onboarding, the same settings; a diff of the three BUILD_INFO files is part of the release summary.
-6. Prebundled, not downloaded: nothing Nunba needs on first run is fetched at first run (models, STT, TTS, fonts); the closure carries it or the OS declares it absent before the user asks.
+6. Prebundled, not downloaded: nothing Nunba needs on first run is fetched at first run (models, STT, TTS, fonts); the closure carries it or the OS declares it absent before the user asks.
+
+Implementation map for gate 1 (measured on the node and in the tree, 2026-10-11):
+- The shell's intent bar (liquid_ui_service.py inline JS, the `acSubmit` default path) POSTs `/api/agent/ask` on LiquidUI; `agent_ask()` forwards to the backend's `/chat` as `user_id='hart_desktop_user'`, `prompt_id='desktop_agent'`, so shell chat has no owner identity and no Nunba history.
+- LiquidUI already reverse-proxies EVERY non-shell path to the Nunba daemon over `unix:/run/hart/nunba.sock` (catch-all `nunba_proxy`, Host set to `core.serve.UNIX_SOCKET_SERVER_NAME`); Nunba's `/health` answers 200 there and reports `llama_port` 808; its API routes answer 401 "Authentication required (Bearer token)" from `security/middleware.py` (JWT via integrations.social.auth, or X-API-Key when HEVOLVE_API_KEY is set). Nunba derives a hardware-stable desktop guest identity (`desktop/guest_identity.py`) and maps the signed-in owner over it.
+- So gate 1 is: `agent_ask()` posts to Nunba's chat route over the socket with a JWT minted for the desktop owner (the same `_internal_auth_headers`/`decode_jwt` pair the tree already uses for internal `/chat` dispatch), falling back to the backend only when the socket is down; the shell's bubble renders Nunba's reply; the LiquidUI chat markup retires once the Nunba surface paints in its place. One history, one user, one agent engine.
 
 ## 4. Streams and ownership (parallel agents, one clone)
 
