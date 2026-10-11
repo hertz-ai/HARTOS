@@ -2641,11 +2641,15 @@ class LiquidUIService:
         same HEVOLVE_DB_PATH, so integrations.social.auth signs and
         security/middleware.py decodes with the one .social_secret_key in the
         data dir. Same mint internal /chat dispatch uses (dispatch.py)."""
-        from integrations.social.auth import generate_jwt
-        token = generate_jwt(user_id=user_id, username=user_id, role='flat')
-        return {'Authorization': f'Bearer {token}',
-                'Host': getattr(self, '_nunba_server_name', 'Nunba'),
-                'Content-Type': 'application/json'}
+        # dispatch._internal_auth_headers is the ONE internal-caller credential
+        # builder (HEVOLVE_API_KEY as X-API-Key, else a minted JWT); the shell
+        # adds only the Host the unix-socket proxy uses.
+        from integrations.agent_engine.dispatch import _internal_auth_headers
+        headers = dict(_internal_auth_headers(user_id=user_id, username=user_id,
+                                             role='flat') or {})
+        headers['Host'] = getattr(self, '_nunba_server_name', 'Nunba')
+        headers['Content-Type'] = 'application/json'
+        return headers
 
     def _shell_chat_via_nunba(self, text: str):
         """POST the shell's turn to the Nunba daemon's /chat over its unix
@@ -2658,16 +2662,18 @@ class LiquidUIService:
         user_id = self._desktop_owner_id()
         if not user_id:
             return None
-        import uuid as _uuid
-        body = {
+        # core.chat_client.normalize_chat_body is the ONE request_id mint: a
+        # user id (not daemon_-prefixed), so every hop downstream classifies
+        # the turn as a genuine user request (dispatch.is_genuine_user_request).
+        from core.chat_client import normalize_chat_body
+        body = normalize_chat_body({
             'text': text,
             'user_id': user_id,
             'agent_id': 'local_assistant',
             'agent_type': 'local',
             'media_mode': 'text',
-            'request_id': f'shell-{_uuid.uuid4().hex[:12]}',
             'source': 'hart_shell',
-        }
+        })
         try:
             client = get_client()
             resp = client.post('http://nunba/chat', json=body,

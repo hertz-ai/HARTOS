@@ -82,6 +82,18 @@ in
   options.hart.nunba = {
     enable = lib.mkEnableOption "Nunba full daemon (Python + React) as a native HART OS unix-socket service";
 
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = nunbaPkg;
+      defaultText = lib.literalExpression "pkgs.callPackage ../packages/nunba.nix { inherit hartSrc hartRev; }";
+      description = ''
+        THE Nunba package every consumer uses: this daemon's ExecStart and the
+        LiquidUI static floor (hart-liquid-ui.nix NUNBA_STATIC_DIR). One call
+        site, so the store holds one Nunba tree; a second callPackage with
+        different arguments produced a second 155M tree on generation 14.
+      '';
+    };
+
     socket = lib.mkOption {
       type = lib.types.str;
       default = "/run/hart/nunba.sock";

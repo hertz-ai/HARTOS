@@ -11,6 +11,17 @@ import logging
 from integrations.agent_engine import agent_daemon as ad
 
 
+def test_the_daemon_and_the_entry_share_one_rule():
+    import inspect
+    import core.log_handlers as lh
+    src = inspect.getsource(ad._give_the_journal_a_root_handler)
+    assert 'install_console_handler_if_bare' in src, 'the daemon must call the shared rule, not carry its own copy'
+    assert ad._HARTOS_HANDLER_TAG == lh.HARTOS_HANDLER_TAG
+    import hart_intelligence_entry as hie
+    assert hie._HARTOS_HANDLER_TAG == lh.HARTOS_HANDLER_TAG
+    assert 'install_console_handler_if_bare' in inspect.getsource(hie._install_root_handlers)
+
+
 def test_a_bare_root_gets_one_tagged_stdout_handler_at_info():
     root = logging.Logger('daemon-root-under-test')
     h = ad._give_the_journal_a_root_handler(root)

@@ -46,8 +46,12 @@ def test_the_floor_and_the_daemon_build_the_same_nunba_derivation():
     one real, on a disk with 237M free)."""
     ui = _read(os.path.join(ROOT, 'nixos', 'modules', 'hart-liquid-ui.nix'))
     mod = _read(MOD)
-    assert 'callPackage ../packages/nunba.nix { inherit hartSrc hartRev; }' in ui, (
-        'hart-liquid-ui.nix must pass hartSrc AND hartRev, exactly as hart-nunba.nix does')
-    assert 'callPackage ../packages/nunba.nix { inherit hartSrc hartRev; }' in mod
-    assert re.search(r'^\{[^}]*hartRev \? "unknown"[^}]*\.\.\. \}:', ui, re.M), (
-        'hart-liquid-ui.nix must declare hartRev in its module args')
+    assert 'callPackage ../packages/nunba.nix' not in ui, (
+        'hart-liquid-ui.nix must not call packages/nunba.nix itself: the ONE package is hart.nunba.package')
+    assert '${config.hart.nunba.package}/lib/nunba/static' in ui
+    assert ui.count('callPackage ../packages/nunba.nix') == 0
+    real_calls = [l for l in mod.splitlines()
+                  if 'callPackage ../packages/nunba.nix' in l and 'literalExpression' not in l]
+    assert len(real_calls) == 1, ('exactly one call site, in hart-nunba.nix (the option defaultText is documentation, not a call)', real_calls)
+    assert re.search(r'package = lib\.mkOption \{\s*\n\s*type = lib\.types\.package;\s*\n\s*default = nunbaPkg;', mod), (
+        'hart-nunba.nix must expose the package as hart.nunba.package with nunbaPkg as its default')

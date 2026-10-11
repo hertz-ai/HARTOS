@@ -18,7 +18,7 @@ from datetime import datetime
 logger = logging.getLogger('hevolve_social')
 
 
-_HARTOS_HANDLER_TAG = '_hartos_root_handler'  # same tag hart_intelligence_entry uses
+from core.log_handlers import HARTOS_HANDLER_TAG as _HARTOS_HANDLER_TAG  # one tag, one rule
 
 
 def _give_the_journal_a_root_handler(root=None):
@@ -35,18 +35,11 @@ def _give_the_journal_a_root_handler(root=None):
     that already configured root (Nunba, pytest) is left exactly as found.
     Returns the handler it attached, or None.
     """
-    root = root if root is not None else logging.getLogger()
-    if root.handlers:
-        return None
-    import sys as _sys
-    h = logging.StreamHandler(_sys.stdout)
-    h.setFormatter(logging.Formatter(
-        '%(asctime)s - %(name)s - [%(threadName)s] - %(levelname)s - %(message)s'))
-    setattr(h, _HARTOS_HANDLER_TAG, True)
-    root.addHandler(h)
-    if root.level == logging.NOTSET or root.level > logging.INFO:
-        root.setLevel(logging.INFO)
-    return h
+    # The rule itself lives in core.log_handlers, shared with
+    # hart_intelligence_entry; this is the daemon's call site, kept so
+    # run_forever reads as it did and the measurement above stays with it.
+    from core.log_handlers import install_console_handler_if_bare
+    return install_console_handler_if_bare(root)
 
 # Lock protecting module-level mutable state accessed from daemon thread + API threads
 _module_lock = threading.Lock()

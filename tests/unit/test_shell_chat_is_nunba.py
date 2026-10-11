@@ -55,6 +55,7 @@ def _not_halted():
 @pytest.fixture
 def svc(monkeypatch, tmp_path):
     monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.delenv('HEVOLVE_API_KEY', raising=False)
     monkeypatch.setenv('USERPROFILE', str(tmp_path))
     monkeypatch.setattr('integrations.social.auth.generate_jwt', lambda user_id, username, role='flat', tenant_id=None: 'tok-' + user_id)
     s = LiquidUIService(a2ui_enabled=False)
@@ -87,7 +88,8 @@ def test_the_turn_goes_to_nunba_as_the_owner_with_a_bearer_and_the_proxy_host(sv
     assert payload['user_id'] == 'owner-42'
     assert payload['text'] == 'hi'
     assert payload['agent_type'] == 'local' and payload['agent_id'] == 'local_assistant'
-    assert payload['request_id'].startswith('shell-')
+    from core.chat_client import is_user_turn
+    assert is_user_turn(payload), 'the id is minted by normalize_chat_body as a USER turn, never daemon_-prefixed'
     assert not [c for c in fake.calls if c[0] == 'GET'], 'with an owner file there is no guest-id lookup'
 
 

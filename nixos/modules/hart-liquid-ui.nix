@@ -835,12 +835,11 @@ in
           HART_THEME_DIR = "/run/current-system/sw/share/hart/conky-themes";
           HART_LIQUID_UI_PORT = toString ui.port;
           NUNBA_STATIC_DIR = lib.mkIf ui.embedNunba
-            # The SAME call hart-nunba.nix makes (hartSrc + hartRev), so this is the same
-            # derivation: one Nunba tree in the store, not two. Measured on the Samsung node
-            # at generation 14 (2026-10-11): the floor call without hartRev produced a
-            # second 155M nunba-1.0.0 (HARTOS_SHA=unknown) beside the daemon's, on a disk
-            # that had 237M free after the apply.
-            "${pkgs.callPackage ../packages/nunba.nix { inherit hartSrc hartRev; }}/lib/nunba/static";
+            # THE Nunba package, from hart-nunba.nix's option: one call site, one store
+            # tree. A second callPackage here (even with the same arguments, which it
+            # did not have on generation 14: a 155M HARTOS_SHA=unknown twin) is a
+            # parallel path.
+            "${config.hart.nunba.package}/lib/nunba/static";
           # When the native Nunba daemon runs (hart.nunba.enable), LiquidUI reverse-
           # proxies the FULL Nunba (Python + React) over its unix socket instead of
           # only serving the static React dist — same origin, no host port. The

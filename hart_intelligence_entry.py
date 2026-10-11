@@ -954,9 +954,13 @@ def _install_root_handlers(root, bundled, file_handler, console_handler):
         setattr(console_handler, _HARTOS_HANDLER_TAG, True)
         root.addHandler(file_handler)
         root.addHandler(console_handler)
-    elif not root.handlers:
-        setattr(console_handler, _HARTOS_HANDLER_TAG, True)
-        root.addHandler(console_handler)
+    else:
+        # The bare-root case is ONE rule shared with the agent daemon's
+        # entrypoint (core.log_handlers); it attaches `console_handler`
+        # only when root has no handler at all, tagged with the same tag.
+        from core.log_handlers import install_console_handler_if_bare
+        install_console_handler_if_bare(root, handler=console_handler,
+                                        tag=_HARTOS_HANDLER_TAG)
 
 
 _root = logging.getLogger()
