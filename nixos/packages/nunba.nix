@@ -228,6 +228,14 @@ pkgs.stdenv.mkDerivation {
     ln -sfn ${nunbaStatic} $out/lib/nunba/landing-page/build
     ln -sfn ${nunbaStatic} $out/lib/nunba/static
 
+    # routes/chatbot_routes.py loads APP_DIR/config.json at import and logs
+    # "Failed to load config.json: No such file" when it is absent (gen 14
+    # journal, Nunba main 4dbde904); the repo ships config.example.json only.
+    # The Windows installer lays the example down as the default; do the same.
+    if [ ! -e $out/lib/nunba/config.json ] && [ -e $out/lib/nunba/config.example.json ]; then
+      cp $out/lib/nunba/config.example.json $out/lib/nunba/config.json
+    fi
+
     # BUILD_INFO.txt: the SAME keys the Windows nightly ships beside Nunba.exe
     # (since Nunba 99af812), so a node can say which Nunba it runs and which
     # HARTOS it was shipped inside, and two installs can be diffed by one file.
