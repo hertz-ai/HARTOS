@@ -4235,6 +4235,14 @@ class TestSilentlyOptionalDepsAreMirroredIntoTheImage:
         # hart-liquid-ui.service into a restart loop and left the desktop with
         # no shell server at all. Now guarded AND mirrored; this pins the mirror.
         'httpx': 'httpx',
+        # PyJWT: security/jwt_manager.py wraps `import jwt` in try/except and
+        # falls back to an HMAC hex digest no verifier accepts. The OS image
+        # shipped without it through generation 16 (2026-10-11): every token
+        # dispatch._internal_auth_headers minted in hart-liquid-ui was opaque,
+        # so the shell's turn to the Nunba daemon (whose env has pyjwt) got
+        # 401 and silently took the backend fallback path. Pinned in
+        # requirements.txt as PyJWT; the nixpkgs attribute is pyjwt.
+        'pyjwt': 'pyjwt',
     }
 
     def _read(self, rel):
