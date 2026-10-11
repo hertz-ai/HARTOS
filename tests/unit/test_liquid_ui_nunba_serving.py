@@ -266,3 +266,65 @@ def test_missing_httpx_degrades_to_static_instead_of_killing_the_shell(
     r = client.get('/some/history/route')
     assert r.status_code == 200, r.get_data(as_text=True)
     assert b'<!doctype html>' in r.data.lower() or b'<html' in r.data.lower()
+
+
+# ─── The proxy names the browser to the daemon ──────────────────────────────
+
+def test_the_proxy_tells_the_daemon_which_browser_it_serves(nunba_dist, monkeypatch):
+    """Nunba's gate (security/middleware.py, bundled mode) admits this
+    machine's callers by their socket peer; a unix-socket peer has no
+    address, so core.auth_local reports it as the loopback forwarder and
+    reads the client from the LAST X-Forwarded-For hop. This proxy is that
+    forwarder: it sends the peer it saw, never a header the browser wrote.
+    Measured on the Samsung node, generation 17 (2026-10-11): without the
+    header every Nunba page through the shell answered 401."""
+    import httpx
+    seen = {}
+
+    class _Headers:
+        @staticmethod
+        def multi_items():
+            return [('Content-Type', 'text/html')]
+
+    class _Resp:
+        status_code = 200
+        headers = _Headers()
+
+        @staticmethod
+        def iter_raw():
+            yield b'<html>nunba</html>'
+
+        @staticmethod
+        def close():
+            pass
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def build_request(self, method, url, headers=None, content=None):
+            seen['headers'] = dict(headers or {})
+            seen['url'] = url
+            return object()
+
+        def send(self, req, stream=False):
+            return _Resp()
+
+    monkeypatch.setenv('NUNBA_STATIC_DIR', str(nunba_dist))
+    monkeypatch.setenv('HART_NUNBA_SOCKET', '/run/hart/nunba-test.sock')
+    monkeypatch.setattr(httpx, 'Client', _FakeClient)
+    svc = LiquidUIService()
+    app = svc._create_flask_app()
+    app.testing = True
+    c = app.test_client()
+
+    # The desktop's own browser, which also tried to write a hop of its own.
+    r = c.get('/local', headers={'X-Forwarded-For': '203.0.113.9'},
+              environ_base={'REMOTE_ADDR': '127.0.0.1'})
+    assert r.status_code == 200 and seen['url'] == 'http://nunba/local'
+    assert seen['headers']['Host'] == 'Nunba'
+    assert seen['headers']['X-Forwarded-For'] == '127.0.0.1', seen['headers']
+
+    # A browser on the LAN (the shell binds 0.0.0.0): named as what it is.
+    c.get('/static/js/main.js', environ_base={'REMOTE_ADDR': '192.168.0.9'})
+    assert seen['headers']['X-Forwarded-For'] == '192.168.0.9'

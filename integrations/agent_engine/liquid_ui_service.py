@@ -9059,6 +9059,19 @@ function renderAgentOverlay(ev) {{
                 # SPA redirect). _HOP already strips the inbound Host; this
                 # sets the one the daemon's allowlist accepts.
                 fwd['Host'] = UNIX_SOCKET_SERVER_NAME
+                # The daemon's gate (security/middleware.py, bundled mode)
+                # admits this machine's callers by their socket peer, and a
+                # unix-socket peer has no address: core.auth_local._peer
+                # reports it as the loopback forwarder and reads the client
+                # from the LAST X-Forwarded-For hop. This proxy IS that
+                # forwarder: it names the browser it serves, the peer it saw
+                # and nothing the browser wrote, so the desktop's own browser
+                # is local and a LAN browser (this shell binds 0.0.0.0:6800)
+                # stays remote. Measured on generation 17 (2026-10-11):
+                # without it /local, /static/js/main.js, every Nunba page
+                # answered 401 to the shell, and no panel could show Nunba.
+                from core.auth_local import peer_address
+                fwd['X-Forwarded-For'] = peer_address()
                 try:
                     client = _nunba_client()
                     upstream = client.build_request(
