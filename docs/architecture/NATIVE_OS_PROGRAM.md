@@ -225,12 +225,14 @@ regression gate that must stay green; the new gate the work must add; the milest
 
 The owner's words, recorded as the acceptance bar for this section and for N7 below: "all the design and latency requirements; Nunba as a prebundled app instead of the chat UI I see in the HART OS shell; the Windows and macOS app installations at full parity with Windows 11-class desktops; all app installation and uninstallation validated; all apps running fast without latencies; Nunba's agentic functionalities and LiquidUI kick in."
 
-What is TRUE on the node today (generation 14, 3b10ec03, measured over ssh 2026-10-11):
+What is TRUE on the node today (generations 14 to 16, 3b10ec03 to 11bfb9a3, measured over ssh 2026-10-11):
 - Nunba IS preinstalled as a native daemon: `hart-nunba.service` runs Nunba main 4dbde904 (2026-10-04) on `unix:/run/hart/nunba.sock`, `nunba` is on PATH, `lib/nunba/BUILD_INFO.txt` names BUILD_SHA and HARTOS_SHA (parity with the Windows nightly's file).
 - LiquidUI serves the shell in 10 ms (HTTP 200, 342 KB) and reverse-proxies `/nunba/` over that socket (401 without the session, by design).
 - Nunba's own LLM config inside the daemon pointed at a llama it cannot start (:8080, first_run=true); whisper_tool could not bind the OS STT port 801 as `hart`; `config.json` was absent. All three fixed in the generation after 14 (hart-nunba.nix seeds the OS endpoint, grants CAP_NET_BIND_SERVICE, nunba.nix ships config.json).
 - No STT engine is packaged in any Nix package (faster-whisper / sherpa-onnx absent), so voice input on the OS is not installed at all; S9's first deliverable.
 - The shell's chat panel is still LiquidUI's own chat UI, not Nunba's; app install and uninstall are proven only through the nix platform as the session user (VERIFICATION rows 18 and 21), not through the shell as `hart`.
+- Gate 1 traced on generation 16 (11bfb9a3): LiquidUI's hop to the Nunba daemon (11bfb9a3) authenticated with an OPAQUE token, because security/jwt_manager.py guards `import jwt` and the hart-app python env never shipped PyJWT; Nunba (whose env has it) answered 401 and the turn fell back to the backend as `hart_desktop_user` (a 2136-token gather_info prompt, 2 min 31 s). With PyJWT on the path the same mint is a JWT: `/api/guest-id` 200 in 10 ms and "[CHAT] turn received: user_id=g_... agent_id=local_assistant" in hart-nunba's journal. e9b740f7 ships pyjwt (generation 17).
+- Gate 2 measured on the same turn: Nunba's own reply to "hi" is a 2169-token prompt on the single CPU llama slot (~16 prompt tokens/s, 3.5 min), handed back after 150 s as `local_llm_starting` ("Your local AI is busy"), then re-sent once. A greeting costs two 2000-token prompts and answers with a placeholder; the prompt size is the nunba lane's, the prompt-eval speed the inference lane's.
 
 Keep green: hart-nunba active after every OTA; the socket answers; BUILD_INFO on the node matches the pinned nunbaRev; hart-liquid-ui and hart-nunba build ONE Nunba derivation (test_nunba_package_ships_build_info.py).
 
