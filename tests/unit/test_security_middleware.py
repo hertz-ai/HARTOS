@@ -104,9 +104,13 @@ class TestSecurityHeaders:
     """Test that security headers are applied to all responses."""
 
     def test_x_frame_options(self, make_app):
+        """SAMEORIGIN: the page's own origin may frame it, nobody else.
+        Under HART OS the shell frames every Nunba route panel through its
+        same-origin proxy; DENY left every panel blank (generation 18,
+        2026-10-11). Other sites are refused exactly as before."""
         client, _ = make_app()
         resp = client.get('/status')
-        assert resp.headers.get('X-Frame-Options') == 'DENY'
+        assert resp.headers.get('X-Frame-Options') == 'SAMEORIGIN'
 
     def test_x_content_type_options(self, make_app):
         client, _ = make_app()
@@ -149,7 +153,11 @@ class TestSecurityHeaders:
         csp = resp.headers.get('Content-Security-Policy', '')
         assert "default-src 'self'" in csp
         assert "script-src 'self'" in csp
-        assert "frame-ancestors 'none'" in csp
+        # 'self', not 'none': the OS shell frames Nunba same-origin (see
+        # test_x_frame_options); frame-ancestors wins over X-Frame-Options
+        # when both are present, so the two must agree.
+        assert "frame-ancestors 'self'" in csp
+        assert "frame-ancestors 'none'" not in csp
 
     def test_no_csp_in_development(self, make_app):
         client, _ = make_app({'HEVOLVE_ENV': 'development'})
@@ -505,7 +513,7 @@ class TestFullMiddlewareStack:
         client, _ = make_app({'HEVOLVE_ENV': 'production'})
         resp = client.get('/status')
         assert resp.status_code == 200
-        assert resp.headers.get('X-Frame-Options') == 'DENY'
+        assert resp.headers.get('X-Frame-Options') == 'SAMEORIGIN'
         assert resp.headers.get('X-Content-Type-Options') == 'nosniff'
         assert 'Content-Security-Policy' in resp.headers
         assert 'Strict-Transport-Security' in resp.headers
@@ -517,7 +525,7 @@ class TestFullMiddlewareStack:
         })
         resp = client.get('/status', headers={'Origin': 'https://hart.ai'})
         assert resp.headers.get('Access-Control-Allow-Origin') == 'https://hart.ai'
-        assert resp.headers.get('X-Frame-Options') == 'DENY'
+        assert resp.headers.get('X-Frame-Options') == 'SAMEORIGIN'
 
 
 # ── Admin Gate ───────────────────────────────────────────────────
