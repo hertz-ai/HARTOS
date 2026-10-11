@@ -221,6 +221,27 @@ regression gate that must stay green; the new gate the work must add; the milest
 | Add | a VM proof that `full_boot_verification` gates hart-comp on its own signature. |
 | Milestone | N3 alongside screencopy. |
 
+### 3.11 Nunba as THE app: the shell's chat, prebundled, at parity with the desktop installs (owner's bar, 2026-10-11)
+
+The owner's words, recorded as the acceptance bar for this section and for N7 below: "all the design and latency requirements; Nunba as a prebundled app instead of the chat UI I see in the HART OS shell; the Windows and macOS app installations at full parity with Windows 11-class desktops; all app installation and uninstallation validated; all apps running fast without latencies; Nunba's agentic functionalities and LiquidUI kick in."
+
+What is TRUE on the node today (generation 14, 3b10ec03, measured over ssh 2026-10-11):
+- Nunba IS preinstalled as a native daemon: `hart-nunba.service` runs Nunba main 4dbde904 (2026-10-04) on `unix:/run/hart/nunba.sock`, `nunba` is on PATH, `lib/nunba/BUILD_INFO.txt` names BUILD_SHA and HARTOS_SHA (parity with the Windows nightly's file).
+- LiquidUI serves the shell in 10 ms (HTTP 200, 342 KB) and reverse-proxies `/nunba/` over that socket (401 without the session, by design).
+- Nunba's own LLM config inside the daemon pointed at a llama it cannot start (:8080, first_run=true); whisper_tool could not bind the OS STT port 801 as `hart`; `config.json` was absent. All three fixed in the generation after 14 (hart-nunba.nix seeds the OS endpoint, grants CAP_NET_BIND_SERVICE, nunba.nix ships config.json).
+- No STT engine is packaged in any Nix package (faster-whisper / sherpa-onnx absent), so voice input on the OS is not installed at all; S9's first deliverable.
+- The shell's chat panel is still LiquidUI's own chat UI, not Nunba's; app install and uninstall are proven only through the nix platform as the session user (VERIFICATION rows 18 and 21), not through the shell as `hart`.
+
+Keep green: hart-nunba active after every OTA; the socket answers; BUILD_INFO on the node matches the pinned nunbaRev; hart-liquid-ui and hart-nunba build ONE Nunba derivation (test_nunba_package_ships_build_info.py).
+
+Add, in order:
+1. Nunba IS the chat. The shell's chat surface opens Nunba's chat (the daemon over the socket) and the LiquidUI chat UI retires; one chat, one history, one agent engine (the three agent daemons measured 2026-09-24 collapse to the one the OS runs). Gate: a message typed in the shell lands in `hart-nunba`'s journal and in the same DB row the Nunba window would write.
+2. Agentic Nunba from the shell: goals, recipes, copilot and computer-use reachable from the shell surface, with the consent gates of 3.10; the "hi -> 17-minute planner" routing (2026-10-05, prompt_id 54 with no local recipe) is a defect to fix, not a behaviour to keep: a greeting answers in one turn.
+3. Latency: every chat surface meets 3.4's budgets (press p50 < 25 ms, hover p50 < 16 ms) with the daemons running; Nunba's panels are measured by the same instrument, per component, on the box.
+4. App lifecycle validated end to end: install, launch, uninstall of a native app AND of a Nunba-hosted app, driven through the shell as `hart`, with the registry, the menu and the desktop updated, timed, and the same flow on Windows and macOS Nunba. Gate: a nixosTest and a Windows smoke run both green on the same commit.
+5. Parity: the Windows and macOS installs and the OS carry the same Nunba build (BUILD_SHA equal across BUILD_INFO files), the same onboarding, the same settings; a diff of the three BUILD_INFO files is part of the release summary.
+6. Prebundled, not downloaded: nothing Nunba needs on first run is fetched at first run (models, STT, TTS, fonts); the closure carries it or the OS declares it absent before the user asks.
+
 ## 4. Streams and ownership (parallel agents, one clone)
 
 Each stream is one agent at a time. Shared files carry region owners. Rust streams verify
@@ -257,6 +278,7 @@ A milestone closes only with a journal line from the box and a row in
 | N4 M6 flip | the WebView stands down for `home` and the bars; native scene default ON | the same five-point sweep, same boot, native alone: every component p99 within budget; VERIFICATION rows 19 and 24 verified; a week on the box with zero failed units |
 | N5 Windows, glass, voice | S5 native glass and panel chrome, S9 voice via PipeWire | glass pixel proof over a bright backdrop on HART OS; drag and resize of a panel one frame; mic to TTS with no WebKit capture |
 | N6 Onboarding and lock native | S10 | onboarding and lock rendered by the compositor, budgets measured, canonical source retired |
+| N7 Nunba is the app | 3.11: shell chat = Nunba over the socket, agentic surface, app lifecycle validated as `hart`, parity with Windows and macOS installs, prebundled | a message typed in the shell lands in hart-nunba's journal and the shared DB; a greeting answers in one turn; install, launch and uninstall of one native and one Nunba app pass a nixosTest and a Windows smoke run on the same commit; BUILD_SHA equal across the three BUILD_INFO files; press p50 < 25 ms on the Nunba chat surface with the daemons running |
 
 ## 6. Decisions only the steward can make (recorded, not re-decided here)
 
