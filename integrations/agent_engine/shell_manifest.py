@@ -236,9 +236,15 @@ PANEL_MANIFEST = {
     },
 
     # ─── Assistant (floating chat bubble) ───
+    # The route is Nunba's chat page. It was '/social/assistant', which
+    # Nunba's router does not have (landing-page/src/MainRoute.js: the chat
+    # is '/local', the guest/offline Agent page; '/' redirects to hevolve.ai
+    # when online, so the iframe must name '/local' itself). Found while
+    # tracing N7 gate 1 on generation 17 (2026-10-11): the pinned bubble
+    # opened an iframe on a page the SPA renders as NotFound.
     'assistant': {
         'title': 'Assistant', 'icon': 'chat_bubble',
-        'route': '/social/assistant', 'group': 'Discover',
+        'route': '/local', 'group': 'Discover',
         'default_size': [400, 600],
         'floating': True,
     },
