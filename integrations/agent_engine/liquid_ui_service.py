@@ -2599,6 +2599,102 @@ class LiquidUIService:
                     agent_id, name)
         return {'status': 'registered', 'type': name}
 
+    # The file Nunba's own desktop/guest_identity.get_user_data_file_path()
+    # reads for the signed-in owner, relative to the service user's HOME; both
+    # daemons run as `hart` on HART OS so the path is the same one Nunba writes.
+    _NUNBA_OWNER_FILE_PARTS = ("Documents", "HevolveAi Agent Companion", "storage", "user_data.json")
+
+    def _desktop_owner_id(self):
+        """Who the shell speaks as: the signed-in owner Nunba knows, else
+        Nunba's hardware-stable guest id, else None (the fallback path then
+        carries its old fixed identity). Mirrors Nunba's
+        get_desktop_owner_id(): the file is read on every turn so a sign-in
+        after boot is seen by the next one."""
+        try:
+            path = os.path.join(os.path.expanduser('~'), *self._NUNBA_OWNER_FILE_PARTS)
+            with open(path, encoding='utf-8') as fh:
+                uid = (json.load(fh) or {}).get('user_id')
+            if uid:
+                return str(uid)
+        except Exception:
+            pass
+        cached = getattr(self, '_nunba_guest_id', None)
+        if cached:
+            return cached
+        try:
+            client = self._nunba_chat_client()
+            resp = client.get('http://nunba/api/guest-id',
+                              headers=self._nunba_auth_headers('hart_shell'),
+                              timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json() or {}
+                gid = data.get('guest_id') or data.get('id')
+                if gid:
+                    self._nunba_guest_id = str(gid)
+                    return self._nunba_guest_id
+        except Exception as e:
+            logger.debug("shell chat: Nunba guest id unavailable: %s", e)
+        return None
+
+    def _nunba_auth_headers(self, user_id: str) -> dict:
+        """A JWT the Nunba daemon verifies: both units run as `hart` with the
+        same HEVOLVE_DB_PATH, so integrations.social.auth signs and
+        security/middleware.py decodes with the one .social_secret_key in the
+        data dir. Same mint internal /chat dispatch uses (dispatch.py)."""
+        from integrations.social.auth import generate_jwt
+        token = generate_jwt(user_id=user_id, username=user_id, role='flat')
+        return {'Authorization': f'Bearer {token}',
+                'Host': getattr(self, '_nunba_server_name', 'Nunba'),
+                'Content-Type': 'application/json'}
+
+    def _shell_chat_via_nunba(self, text: str):
+        """POST the shell's turn to the Nunba daemon's /chat over its unix
+        socket as the desktop owner. Returns Nunba's payload with a 'response'
+        key the bubble and the composer read, or None when the daemon cannot
+        be reached (caller falls back to the backend)."""
+        get_client = getattr(self, '_nunba_chat_client', None)
+        if get_client is None:
+            return None
+        user_id = self._desktop_owner_id()
+        if not user_id:
+            return None
+        import uuid as _uuid
+        body = {
+            'text': text,
+            'user_id': user_id,
+            'agent_id': 'local_assistant',
+            'agent_type': 'local',
+            'media_mode': 'text',
+            'request_id': f'shell-{_uuid.uuid4().hex[:12]}',
+            'source': 'hart_shell',
+        }
+        try:
+            client = get_client()
+            resp = client.post('http://nunba/chat', json=body,
+                               headers=self._nunba_auth_headers(user_id),
+                               timeout=300.0)
+        except Exception as e:
+            logger.warning("shell chat: Nunba daemon unreachable, falling back to the backend: %s", e)
+            return None
+        if resp.status_code != 200:
+            logger.warning("shell chat: Nunba /chat answered HTTP %s, falling back to the backend", resp.status_code)
+            return None
+        try:
+            payload = resp.json() or {}
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if 'response' not in payload:
+            for k in ('text', 'reply', 'message'):
+                if isinstance(payload.get(k), str):
+                    payload['response'] = payload[k]
+                    break
+        payload.setdefault('source', 'nunba')
+        logger.info("shell chat -> Nunba over the socket as %s (request %s)",
+                    user_id, body['request_id'])
+        return payload
+
     def _compose_intent_result(self, intent_text: str, chat_result: dict) -> bool:
         """M1 — turn a brain /chat decomposition into COMPOSED desktop UI.
 
@@ -8925,6 +9021,11 @@ function renderAgentOverlay(ev) {{
                                                write=30.0, pool=5.0))
                 return _nunba_proxy['client']
 
+            # The shell's own chat turn (agent_ask below) rides THIS client to
+            # THIS socket: one Nunba, one transport, no second HTTP path.
+            self._nunba_chat_client = _nunba_client
+            self._nunba_server_name = UNIX_SOCKET_SERVER_NAME
+
             # Hop-by-hop headers must not be forwarded (RFC 7230 §6.1).
             _HOP = {'host', 'connection', 'keep-alive', 'proxy-authenticate',
                     'proxy-authorization', 'te', 'trailer',
@@ -9177,18 +9278,30 @@ function renderAgentOverlay(ev) {{
             # flywheel load, so the old timeout was shorter than the p50 and this
             # loop could only ever time out.  post_chat's default is generous
             # because a CPU-floor decomposition legitimately takes minutes.
-            from core.chat_client import post_chat
-            try:
-                resp = post_chat(
-                    f'http://localhost:{self.backend_port}/chat',
-                    {
-                        'user_id': 'hart_desktop_user',
-                        'prompt_id': 'desktop_agent',
-                        'prompt': text,
-                    })
-                payload = resp.json()
-            except Exception as e:
-                return jsonify({'error': str(e)})
+            # N7 gate 1 (NATIVE_OS_PROGRAM.md 3.11): the shell's chat IS Nunba.
+            # Until 2026-10-11 this posted straight to the backend's /chat as a
+            # fixed 'hart_desktop_user' with prompt_id 'desktop_agent', so a turn
+            # typed in the shell had no owner identity and no Nunba history,
+            # while the preinstalled Nunba daemon ran the same backend behind its
+            # own /chat (agent resolution, the tier ladder, server TTS, the
+            # owner's conversation) one socket away. The turn now goes to that
+            # daemon as the desktop owner; the direct backend call is the
+            # fallback for a daemon that is down or absent (no socket configured,
+            # no httpx), never a parallel path when it is up.
+            payload = self._shell_chat_via_nunba(text)
+            if payload is None:
+                from core.chat_client import post_chat
+                try:
+                    resp = post_chat(
+                        f'http://localhost:{self.backend_port}/chat',
+                        {
+                            'user_id': 'hart_desktop_user',
+                            'prompt_id': 'desktop_agent',
+                            'prompt': text,
+                        })
+                    payload = resp.json()
+                except Exception as e:
+                    return jsonify({'error': str(e)})
             payload['composed'] = self._compose_intent_result(text, payload)
             return jsonify(payload)
 
