@@ -10562,6 +10562,17 @@ function renderAgentOverlay(ev) {{
 
     def serve_forever(self):
         """Start the glass desktop shell service."""
+        # hart-liquid-ui.nix starts this process as `python -c "...
+        # LiquidUIService(...).serve_forever()"`: nobody configures logging, so
+        # every INFO line went to Python's lastResort handler and was dropped.
+        # Measured on the Samsung node, generations 16 and 17 (2026-10-11):
+        # `journalctl -u hart-liquid-ui -b` held 24 lines, all WARNING, through
+        # a shell turn that DID reach the Nunba daemon; the "shell chat ->
+        # Nunba over the socket as <id>" line this file logs at INFO never
+        # appeared, and the hop had to be proven from Nunba's journal instead.
+        # The one rule the backend entry and the agent daemon already apply.
+        from core.log_handlers import install_console_handler_if_bare
+        install_console_handler_if_bare()
         self._running = True
 
         # Ensure platform substrate is ready (EventBus, AppRegistry, Extensions)
