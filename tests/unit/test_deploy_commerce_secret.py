@@ -88,12 +88,23 @@ def _script_prefix():
 
 # The commands a real deploy runs on the box, which a developer machine must
 # never run from a unit test. Each is shadowed by an executable of the same name
-# on a PATH entry placed first, which only records that it was called: a PATH
-# lookup also catches `command git`, `env git`, `xargs git` and `sh -c 'git'`,
-# which a shell function of the same name would not (review of bb1893b99, F3).
-# The prefix needs none of them today; a later edit that moves one above the
-# cut fails _assert_ran instead of touching docker or git on the dev host.
+# in the run dir's bin/, which only records that it was called: a PATH lookup
+# also catches `command git`, `env git`, `xargs git` and `sh -c 'git'`, which a
+# shell function of the same name would not (review of bb1893b99, F3).
+#
+# The PATH entry is set by the FIRST LINE of the script run (_PATH_FIRST), not
+# only in the environment handed to bash: Git for Windows' bin\bash.exe, which
+# _find_bash picks from a PowerShell or IDE shell, puts /mingw64/bin ahead of
+# whatever PATH it was given, so the real git and curl won there (review of
+# ce31f5925, F1, measured). Exported PATH set inside the script reaches every
+# child the prefix starts.
+#
+# Not caught, by construction: an absolute path (/usr/bin/git), git.exe, or a
+# PATH reset inside the script. The prefix needs none of these commands today; a
+# later edit that moves one above the cut fails _assert_ran instead of touching
+# docker or git on the dev host.
 _BOX_COMMANDS = ('git', 'docker', 'sudo', 'curl')
+_PATH_FIRST = 'PATH="$PWD/bin:$PATH"\n'
 
 
 def _keys(env_text):
@@ -148,7 +159,7 @@ class ScriptEnsuresTheKey(unittest.TestCase):
         # backslashes in the script's sed expression.
         with open(os.path.join(self.dir, 'prefix.sh'), 'w', encoding='utf-8',
                   newline='\n') as fh:
-            fh.write(_script_prefix())
+            fh.write(_PATH_FIRST + _script_prefix())
         self.bin = os.path.join(self.dir, 'bin')
         os.mkdir(self.bin)
         for name in _BOX_COMMANDS:
@@ -179,7 +190,6 @@ class ScriptEnsuresTheKey(unittest.TestCase):
         forwarded = set(_forwarded_names())
         env = {k: v for k, v in os.environ.items() if k not in forwarded}
         env.update(values)
-        env['PATH'] = self.bin + os.pathsep + env.get('PATH', '')
         env['DEPLOY_TEST_CALLS'] = self.calls
         proc = subprocess.run([_BASH, 'prefix.sh'], cwd=self.dir, env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -310,12 +320,30 @@ class ScriptEnsuresTheKey(unittest.TestCase):
 
     def test_an_absent_secret_with_the_key_in_env_says_it_is_kept(self):
         """The .env still holds the key, so the container still has it: the
-        log must not claim the route is unconfigured (review of bb1893b99, F1)."""
-        self._write_env('A=1\n%s=keep\n' % _NAME)
+        log must not claim the route is unconfigured (review of bb1893b99, F1).
+        No repo secret means nothing for GitHub to mask in this log, so the
+        kept value must not appear in it either (review of ce31f5925, F2)."""
+        self._write_env('A=1\n%s=Kept-Value-91\n' % _NAME)
         code, out, text = self._deploy(**{_NAME: ''})
         self._assert_ran(code, out)
         self.assertIn('.env keeps its existing value', out)
         self.assertNotIn('not in .env', out)
+        self.assertNotIn('Kept-Value-91', out)
+        self.assertEqual(_values(text, _NAME), ['Kept-Value-91'])
+
+    def test_only_a_real_key_with_a_value_counts_as_kept(self):
+        """A commented example, a prefix-sharing key and an empty value are
+        not the secret (get_secret treats '' as unset): the note must say
+        "not in .env", never "kept" (review of ce31f5925, F3 and F4)."""
+        for before in ('# %s=example\nA=1\n' % _NAME,
+                       '%s_OLD=x\n' % _NAME,
+                       '%s=\n' % _NAME):
+            with self.subTest(before=before):
+                self._write_env(before)
+                code, out, text = self._deploy(**{_NAME: ''})
+                self._assert_ran(code, out)
+                self.assertIn('%s secret absent and not in .env' % _NAME, out)
+                self.assertNotIn('keeps its existing value', out)
 
     def test_a_set_secret_prints_no_absent_note(self):
         self._write_env('A=1\n')

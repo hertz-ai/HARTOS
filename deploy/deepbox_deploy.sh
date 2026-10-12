@@ -221,7 +221,9 @@ if [ -n "${COMMERCE_SESSION_SECRET}" ] && [ -f .env ]; then
   _set_env_key COMMERCE_SESSION_SECRET "$COMMERCE_SESSION_SECRET"
   echo "  COMMERCE_SESSION_SECRET set from the secret (value not shown)"
 elif [ -z "${COMMERCE_SESSION_SECRET}" ]; then
-  if [ -f .env ] && grep -q '^COMMERCE_SESSION_SECRET=' .env; then
+  # `=.`: an empty value is no secret (config_cache.get_secret treats '' as
+  # unset), so it is reported as absent, not kept.
+  if [ -f .env ] && grep -q '^COMMERCE_SESSION_SECRET=.' .env; then
     echo "  COMMERCE_SESSION_SECRET secret absent — .env keeps its existing value (not shown)"
   else
     echo "  note: COMMERCE_SESSION_SECRET secret absent and not in .env — /api/commerce/session answers 503 unless config.json carries it"
