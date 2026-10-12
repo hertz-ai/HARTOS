@@ -24,9 +24,10 @@ echo "=== Ensure .env exists ==="
 # Create ONLY when absent. An existing .env is the node's live
 # configuration and may carry values this workflow does not know,
 # so it is never rewritten -- the reset above leaves it alone
-# because .env is untracked. The two exceptions are the keys the
+# because .env is untracked. The three exceptions are the keys the
 # workflow itself owns, ensured further down on every deploy: the
-# OTA host and the configured LLM trio. On a rebuilt or fresh box there was
+# OTA host, the configured LLM trio and the McGroce session secret.
+# On a rebuilt or fresh box there was
 # previously nothing to recreate it from, which meant the LLM
 # routing existed solely on one machine and would have been lost.
 #
@@ -162,6 +163,20 @@ if [ -n "$_OTA_HOST" ] && [ -f .env ]; then
   fi
 fi
 
+# ── _set_env_key: how a deploy sets ONE key in a live .env ──
+# Defined unconditionally, before every block that calls it: the LLM
+# trio and the McGroce secret below are independent, so neither may
+# depend on the other's secrets being present to have the helper.
+_set_env_key() {   # $1 key, $2 value: replace the line or append it
+  if grep -q "^$1=" .env; then
+    # a key may carry sed's replacement metacharacters; neutralise them
+    _v="$(printf '%s' "$2" | sed -e 's/[\\&|]/\\&/g')"
+    sed -i "s|^$1=.*|$1=$_v|" .env
+  else
+    echo "$1=$2" >> .env
+  fi
+}
+
 # ── The configured LLM, guaranteed on EVERY deploy ──
 # Same lesson as the OTA host above: the create-block is skipped on
 # every box that already has a .env, so central kept the model name
@@ -172,15 +187,6 @@ fi
 # operator configures this node, so when it carries the trio the
 # .env follows it, key by key, idempotently. Without the secrets the
 # file is left exactly as it is (the additive contract above).
-_set_env_key() {   # $1 key, $2 value: replace the line or append it
-  if grep -q "^$1=" .env; then
-    # a key may carry sed's replacement metacharacters; neutralise them
-    _v="$(printf '%s' "$2" | sed -e 's/[\\&|]/\\&/g')"
-    sed -i "s|^$1=.*|$1=$_v|" .env
-  else
-    echo "$1=$2" >> .env
-  fi
-}
 if [ -n "$_LLM_MODEL" ] && [ -f .env ]; then
   _set_env_key HEVOLVE_LLM_ENDPOINT_URL "$_LLM_ENDPOINT"
   _set_env_key HEVOLVE_LLM_MODEL_NAME "$_LLM_MODEL"
