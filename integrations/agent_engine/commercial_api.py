@@ -67,7 +67,8 @@ def _mock_payments_allowed(user) -> bool:
     may settle through the mock.
     """
     from integrations.social.auth import holds_central_role
-    return holds_central_role(user) or os.environ.get('HEVOLVE_DEV_MODE', '').lower() == 'true'
+    from security.master_key import is_dev_mode     # the ONE dev-mode switch
+    return holds_central_role(user) or is_dev_mode()
 
 COST_PER_1K_TOKENS = {
     'free': 0.0,
@@ -926,7 +927,7 @@ def upgrade_key(key_id):
         if not payment_method:
             return jsonify({
                 'success': False,
-                'error': 'payment_method required (card token, AP2 method id, or mock id)',
+                'error': 'payment_method required (card token or AP2 method id)',
             }), 400
 
         # Look up the API key being upgraded — must belong to this user.
@@ -939,9 +940,9 @@ def upgrade_key(key_id):
         target_cfg = TIER_CONFIG[target_tier]
         amount_usd = float(target_cfg['monthly_price_usd'])
 
-        # Route through AP2's PaymentLedger.  Falls back to MockPaymentGateway
-        # by default (registered in PaymentLedger.__init__); real connectors
-        # can be added via payment_ledger.add_gateway() at app start.
+        # Route through AP2's PaymentLedger, which registers Stripe and
+        # PhonePe at boot from their env keys; the gateway for this call is
+        # chosen below, and the mock settles nothing for a customer.
         try:
             from decimal import Decimal as _Decimal
             from integrations.ap2 import payment_ledger, PaymentMethod, PaymentStatus

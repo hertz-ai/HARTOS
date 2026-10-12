@@ -687,8 +687,14 @@ class PaymentLedger:
             import os as _os
             if _os.environ.get('STRIPE_API_KEY'):
                 _stripe_gateway = StripePaymentGateway()
-                # Only register if connect succeeded (sdk available + key valid).
-                if _stripe_gateway.connected:
+                # Register only when connect() succeeds (SDK present, key set).
+                # connect() is what sets ``connected``; reading the flag before
+                # calling it meant NO node ever registered Stripe, so every
+                # paid tier settled through the mock, or, since b6502ac00,
+                # was refused with "set STRIPE_API_KEY" while it was set
+                # (review of b6502ac00, measured).  add_gateway connects once
+                # more; both connectors' connect() is idempotent.
+                if _stripe_gateway.connect():
                     self.add_gateway(_stripe_gateway)
                     logger.info(
                         "PaymentLedger: Stripe gateway auto-registered "
@@ -708,7 +714,7 @@ class PaymentLedger:
             import os as _os
             if _os.environ.get('PHONEPE_MERCHANT_ID') and _os.environ.get('PHONEPE_SALT_KEY'):
                 _phonepe_gateway = PhonePePaymentGateway()
-                if _phonepe_gateway.connected:
+                if _phonepe_gateway.connect():     # same rule as Stripe above
                     self.add_gateway(_phonepe_gateway)
                     logger.info(
                         "PaymentLedger: PhonePe gateway auto-registered "

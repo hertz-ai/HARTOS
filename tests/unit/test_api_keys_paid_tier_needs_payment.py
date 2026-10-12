@@ -187,6 +187,58 @@ def test_a_person_naming_the_mock_still_pays_through_stripe(client, tmp_path, mo
     assert payment.gateway == PaymentGateway.STRIPE   # the card was asked, and declined
 
 
+class _AuthorizingStripe(PaymentGatewayConnector):
+    """A registered Stripe connector whose card is charged and captured."""
+
+    def __init__(self):
+        super().__init__(PaymentGateway.STRIPE)
+
+    def connect(self):
+        self.connected = True
+        return True
+
+    def create_payment(self, payment_request):
+        return {'success': True, 'transaction_id': 'ch_test_1', 'status': 'authorized'}
+
+    def capture_payment(self, payment_id, gateway_transaction_id):
+        return {'success': True, 'transaction_id': gateway_transaction_id, 'status': 'captured'}
+
+
+def test_a_person_who_pays_through_stripe_gets_the_tier(client, tmp_path, monkeypatch):
+    """Review of b6502ac00, mutant M13: nothing pinned the honest path.  A
+    refusal after a successful charge would take the money and keep the
+    tier."""
+    ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
+    ledger.add_gateway(_AuthorizingStripe())
+    monkeypatch.delenv('HEVOLVE_DEV_MODE', raising=False)
+    user = types.SimpleNamespace(id='u-10', is_admin=False)
+    api_key = types.SimpleNamespace(id='k1', tier='free', rate_limit_per_day=100, monthly_quota=3000)
+    db = MagicMock()
+    db.query.return_value.filter_by.return_value.first.return_value = api_key
+    with patch('integrations.social.auth._get_user_from_token', return_value=(user, db)), \
+            patch('integrations.ap2.payment_ledger', ledger):
+        r = client.post('/api/v1/intelligence/keys/k1/upgrade',
+                        json={'target_tier': 'pro', 'payment_method': 'pm_card_visa'},
+                        headers={'Authorization': 'Bearer tok'})
+    assert r.status_code == 200, r.get_json()
+    body = r.get_json()
+    assert api_key.tier == 'pro' and body['api_key']['tier'] == 'pro'
+    assert body['payment']['status'] == 'completed' and 'revenue_split' in body
+    db.commit.assert_called_once()
+    (payment,) = ledger.payments.values()
+    assert payment.gateway == PaymentGateway.STRIPE
+
+
+def test_the_mock_gate_reads_the_one_dev_mode_switch(client, tmp_path, monkeypatch):
+    """security.master_key.is_dev_mode is the switch the security layer reads;
+    the money gate must read the same one, not its own copy of the env rule."""
+    from security import master_key
+    monkeypatch.delenv('HEVOLVE_DEV_MODE', raising=False)
+    monkeypatch.setattr(master_key, 'is_dev_mode', lambda: True)
+    r, api_key, db, ledger = _upgrade(client, tmp_path, monkeypatch)
+    assert r.status_code == 200 and api_key.tier == 'enterprise'
+
+
 def test_an_operator_may_settle_through_the_mock(client, tmp_path, monkeypatch):
     r, api_key, db, ledger = _upgrade(client, tmp_path, monkeypatch, is_admin=True)
     assert r.status_code == 200, r.get_json()
