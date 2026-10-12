@@ -10,18 +10,18 @@
                    # "called with unexpected argument 'hartSrc'". The Nunba daemon
                    # is HARTOS-EXCLUDED — it fetches ONLY the Nunba repo, never the
                    # HART tree — so hartSrc is intentionally unused here.
-, nunbaRev ? "53bd28e9eb97a01452dff47bf91715e46539ac08"  # Nunba main 53bd28e9 (2026-10-12): the shell bridge
-                   # (landing-page/src/utils/shellBridge.js: nunba:ready /
-                   # nunba:compose / nunba:turn / nunba:onboarding) that lets the
-                   # HART OS shell compose into Nunba's panel and host Nunba's
-                   # first-run ceremony (HARTOS 2f423200), plus the clock-driven
-                   # letter-by-letter text (TypedText.js, TypeWriterSubtitle.js).
-                   # Carries de8a6d92's frame policy (SAMEORIGIN + 'self').
+, nunbaRev ? "c620a840dc79160f7607b09f91de1f73edf7f766"  # Nunba main c620a840 (2026-10-12): the orb's frame
+                   # budget (VoiceVisualizer.jsx nextFramePolicy: the resting orb
+                   # breathes at 12 fps, sleeps hidden/off-screen, holds still under
+                   # reduced motion; measured 96% of a core at rest in the assistant
+                   # panel on generation 22). Carries 53bd28e9 (the shell bridge:
+                   # nunba:ready / compose / turn / onboarding, the clock-driven
+                   # letter-by-letter text) and de8a6d92's frame policy.
                    # nunbaHash + npmDepsHash are pinned for THIS rev; if the rev
                    # is bumped, re-pin all three in ONE commit (npm ci fails the
                    # lock-vs-deps integrity check if the rev and the lock drift).
-, nunbaHash ? "sha256-KPbDSHtQ5eJMjY0PKU9XYAuc9TdkWevkjwSYylcC8Ak="  # pinned 2026-10-12 for nunbaRev 53bd28e9 (nunba-hash-pin dry run 38249876677, build verified GREEN)
-, npmDepsHash ? "sha256-mSce+t2+m46xpuz59Ng63U4vkbANa1oCbonPpo2E70M="  # pinned 2026-10-12 for nunbaRev 53bd28e9 (nunba-hash-pin dry run 38249876677; the lock did not move since de8a6d92); prefetch-npm-deps landing-page/package-lock.json
+, nunbaHash ? "sha256-f9LkpN3AHKKKOBK9nBI9EziGFFFh1vX7L6u1+QVJzBU="  # pinned 2026-10-12 for nunbaRev c620a840 (nunba-hash-pin dry run 38286721117, build verified GREEN)
+, npmDepsHash ? "sha256-mSce+t2+m46xpuz59Ng63U4vkbANa1oCbonPpo2E70M="  # pinned 2026-10-12 for nunbaRev c620a840 (nunba-hash-pin dry run 38286721117; the lock did not move since de8a6d92); prefetch-npm-deps landing-page/package-lock.json
 # The API base baked into the React bundle. It MUST be the origin the shell
 # page is loaded from (hart-liquid-ui.nix loads http://localhost:<port>), not
 # the HART backend: the bundle runs INSIDE the shell's WebKit, and a browser
