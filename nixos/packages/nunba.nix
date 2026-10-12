@@ -10,14 +10,15 @@
                    # "called with unexpected argument 'hartSrc'". The Nunba daemon
                    # is HARTOS-EXCLUDED — it fetches ONLY the Nunba repo, never the
                    # HART tree — so hartSrc is intentionally unused here.
-, nunbaRev ? "4dbde90480859332f276117f440f3fb55f29f0c1"  # Nunba HEAD carrying the
-                   # HART_NUNBA_SOCKET bind (main.py, commit cb849ba9). nunbaHash +
-                   # npmDepsHash are now BOTH pinned for THIS rev (CI hash-pin R3,
-                   # 2026-07-12); if the rev is bumped, re-pin all three in ONE commit
-                   # (npm ci fails the lock-vs-deps integrity check if the rev and the
-                   # lock drift apart).
-, nunbaHash ? "sha256-A8x57XEtXqnpywZDVxu0jo+q4kwo9mazEtTQ2X2AElY="  # pinned 2026-10-05 for nunbaRev 4dbde904 (nunba-hash-pin dry run 37230598688, build verified GREEN)
-, npmDepsHash ? "sha256-mSce+t2+m46xpuz59Ng63U4vkbANa1oCbonPpo2E70M="  # pinned 2026-10-05 for nunbaRev 4dbde904 (nunba-hash-pin dry run 37230598688 round B); prefetch-npm-deps landing-page/package-lock.json
+, nunbaRev ? "de8a6d92c8500605d271743790acedeed8cd8037"  # Nunba main de8a6d92 (2026-10-12): frame policy
+                   # SAMEORIGIN + frame-ancestors 'self', so the HART OS shell's
+                   # panels paint Nunba (generation 18 measured every one of them
+                   # blank under DENY / 'none'). nunbaHash + npmDepsHash are pinned
+                   # for THIS rev; if the rev is bumped, re-pin all three in ONE
+                   # commit (npm ci fails the lock-vs-deps integrity check if the
+                   # rev and the lock drift apart).
+, nunbaHash ? "sha256-4zlksnDvI1XatvNbYuDZDCKIWcB0xbYjbjOI3ips/xE="  # pinned 2026-10-12 for nunbaRev de8a6d92 (nunba-hash-pin dry run 38206318706, build verified GREEN)
+, npmDepsHash ? "sha256-mSce+t2+m46xpuz59Ng63U4vkbANa1oCbonPpo2E70M="  # pinned 2026-10-12 for nunbaRev de8a6d92 (nunba-hash-pin dry run 38206318706); prefetch-npm-deps landing-page/package-lock.json
 , backendUrl ? "http://127.0.0.1:6777"
 }:
 
