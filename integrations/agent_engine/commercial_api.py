@@ -11,6 +11,7 @@ Blueprint Pattern: Blueprint('commercial_api', __name__).
 import hashlib
 import hmac
 import logging
+import os
 import secrets
 import time
 from datetime import datetime, timedelta
@@ -46,7 +47,27 @@ TIER_CONFIG = {
 # the lanes (owner policy 2026-10-12) a paid-tier key runs on the revenue lane
 # where the Claude expert serves.  Operators (holds_central_role) may still
 # issue a paid key by hand.
-SELF_ISSUABLE_TIERS = frozenset({'free'})
+SELF_ISSUABLE_TIERS = frozenset(t for t, c in TIER_CONFIG.items() if not c['monthly_price_usd'])
+
+
+def _invalid_tier_error(tier) -> str:
+    """The ONE wording for a tier that is not in the table (service and route)."""
+    return f'Invalid tier: {tier}. Valid: {list(TIER_CONFIG.keys())}'
+
+
+def _mock_payments_allowed(user) -> bool:
+    """May this caller's tier upgrade be settled by the MockPaymentGateway?
+
+    The mock authorizes any payment_method string, so for a paying customer
+    it is a free tier (review of 0cf610371: a plain user named
+    ``gateway: mock``, or hit a node without Stripe, and got enterprise for
+    nothing, with the $499 recorded in the ledger as paid).  Only an operator
+    (integrations.social.auth.holds_central_role) or a node in the existing
+    dev mode (HEVOLVE_DEV_MODE=true, which central forces to false at boot)
+    may settle through the mock.
+    """
+    from integrations.social.auth import holds_central_role
+    return holds_central_role(user) or os.environ.get('HEVOLVE_DEV_MODE', '').lower() == 'true'
 
 COST_PER_1K_TOKENS = {
     'free': 0.0,
@@ -91,7 +112,7 @@ class CommercialAPIService:
         from integrations.social.models import CommercialAPIKey
 
         if tier not in TIER_CONFIG:
-            return {'error': f'Invalid tier: {tier}. Valid: {list(TIER_CONFIG.keys())}'}
+            return {'error': _invalid_tier_error(tier)}
 
         raw_key = secrets.token_urlsafe(48)
         key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
@@ -716,7 +737,14 @@ def create_key():
 
     try:
         data = request.get_json() or {}
-        tier = (data.get('tier') or 'free').strip().lower()
+        raw_tier = data.get('tier')
+        if raw_tier in (None, ''):
+            raw_tier = 'free'
+        if not isinstance(raw_tier, str):
+            return jsonify({'success': False, 'error': _invalid_tier_error(raw_tier)}), 400
+        tier = raw_tier.strip().lower()
+        if tier not in TIER_CONFIG:
+            return jsonify({'success': False, 'error': _invalid_tier_error(tier)}), 400
         if tier not in SELF_ISSUABLE_TIERS:
             from integrations.social.auth import holds_central_role
             if not holds_central_role(user):
@@ -923,12 +951,14 @@ def upgrade_key(key_id):
                 'error': f'AP2 payment surface unavailable: {_imp_err}',
             }), 503
 
-        # Pick the live gateway for the SYNCHRONOUS upgrade flow.
-        # Preference order:
-        #   1. Caller-requested gateway via `data['gateway']` (when registered
-        #      AND known to be synchronous — currently Stripe and Mock).
-        #   2. Stripe (USD/international cards, synchronous capture).
-        #   3. MockPaymentGateway (dev/test fallback).
+        # The gateway for the SYNCHRONOUS upgrade flow is the ledger's own
+        # choice for USD (PaymentLedger.select_gateway: Stripe when it is
+        # registered, else Mock).  The caller never picks it: a caller-named
+        # ``gateway: mock`` let a plain user settle a $499 tier through the
+        # MockPaymentGateway, which authorizes any payment_method string
+        # (review of 0cf610371, measured on the real route).  A Mock result
+        # is a paid tier for nothing, so it is refused unless the caller is an
+        # operator or the node is in dev mode (_mock_payments_allowed).
         #
         # PhonePe is intentionally NOT selected here even when registered —
         # it is a redirect-then-webhook flow.  Selecting it synchronously
@@ -938,35 +968,28 @@ def upgrade_key(key_id):
         # — to be added when the webhook handler is wired — can use it
         # without further code changes.  Until then, requests for
         # `gateway: 'phonepe'` are rejected with 501.
+        requested = str(data.get('gateway') or '').strip().lower()
+        if requested == 'phonepe':
+            return jsonify({
+                'success': False,
+                'error': 'PhonePe upgrades require the async redirect '
+                         'flow — not yet exposed on /upgrade.  Use '
+                         'Stripe (set STRIPE_API_KEY).',
+            }), 501
         try:
             from integrations.ap2 import PaymentGateway as _PG
-            requested = (data.get('gateway') or '').strip().lower()
-
-            _SYNC_OK = {_PG.STRIPE, _PG.MOCK}
-
-            if requested == 'phonepe':
-                return jsonify({
-                    'success': False,
-                    'error': 'PhonePe upgrades require the async redirect '
-                             'flow — not yet exposed on /upgrade.  Use '
-                             'Stripe (set STRIPE_API_KEY) or the dev mock.',
-                }), 501
-
-            _gateway_choice = None
-            if requested:
-                try:
-                    pg = _PG(requested)
-                    if pg in payment_ledger.gateways and pg in _SYNC_OK:
-                        _gateway_choice = pg
-                except ValueError:
-                    pass
-            if _gateway_choice is None:
-                _gateway_choice = (
-                    _PG.STRIPE if _PG.STRIPE in payment_ledger.gateways
-                    else _PG.MOCK
-                )
-        except Exception:
-            _gateway_choice = None  # PaymentLedger will pick a default
+            _gateway_choice = payment_ledger.select_gateway('USD')
+        except Exception as _sel_err:
+            return jsonify({
+                'success': False,
+                'error': f'No payment gateway could be selected: {_sel_err}',
+            }), 503
+        if _gateway_choice == _PG.MOCK and not _mock_payments_allowed(user):
+            return jsonify({
+                'success': False,
+                'error': 'No live payment gateway is configured on this node '
+                         '(set STRIPE_API_KEY); the dev mock settles nothing.',
+            }), 503
 
         # Three-step AP2 flow.  We do all synchronously here for the simple
         # upgrade case; long-lived subscriptions would split across webhooks.
@@ -984,8 +1007,7 @@ def upgrade_key(key_id):
                     'payment_method_token': payment_method,
                 },
             )
-            if _gateway_choice is not None:
-                _create_kwargs['gateway'] = _gateway_choice
+            _create_kwargs['gateway'] = _gateway_choice
             payment_req = payment_ledger.create_payment_request(**_create_kwargs)
             authorized = payment_ledger.authorize_payment(
                 payment_req.payment_id, approver_id=f'user:{user.id}')

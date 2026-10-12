@@ -34,7 +34,10 @@ def test_agent_still_cannot_authorize_itself(tmp_path, agent_id):
 def test_tier_upgrade_route_authorizes_through_the_real_guard(tmp_path):
     from integrations.agent_engine.commercial_api import commercial_api_bp
     ledger = _ledger(tmp_path)
-    user = MagicMock(id=7)
+    # An operator: since 0cf610371's rework only an operator (or a node in
+    # dev mode) may settle a tier through the MockPaymentGateway; a plain
+    # user is refused with 503 (tests/unit/test_api_keys_paid_tier_needs_payment.py).
+    user = MagicMock(id=7, is_admin=True)
     db = MagicMock()
     api_key = MagicMock(tier='free')
     db.query.return_value.filter_by.return_value.first.return_value = api_key
