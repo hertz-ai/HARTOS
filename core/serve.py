@@ -209,9 +209,68 @@ def build_asgi_app(wsgi_app: Any) -> Any:
     Callers must not reintroduce a bare AsyncioWSGIMiddleware assignment;
     Nunba's tests/test_peer_link_mounted.py fails the build if they do.
     """
+    from hypercorn.app_wrappers import WSGIWrapper
     from hypercorn.middleware import AsyncioWSGIMiddleware
 
     from core.peer_link.server import peer_link_asgi
+
+    class _StartsEmptyResponses(WSGIWrapper):
+        """An empty WSGI body still gets its http.response.start.
+
+        hypercorn 0.17.3's run_app sends the start from inside the body loop
+        only, so a response with no body chunks (304 Not Modified, HEAD, 204)
+        never starts; handle_http then sends its unconditional end-of-body
+        and HTTPStream.app_send raises "'HTTPStream' object has no attribute
+        'response'", which hypercorn logs and answers as 500. Measured on the
+        HART OS node 2026-10-12 (generation 21): through the shell's proxy a
+        conditional GET on any Nunba asset answered 500 and a HEAD answered
+        500 while the plain GET answered 200; on an assistant-panel reopen 18
+        of 33 asset requests were revalidations, so Nunba's page could not
+        boot in the panel. The node's Nunba environment ships hypercorn 0.16.0
+        from nixpkgs (requirements.txt names 0.17.3; a newer wrapper starts
+        before the loop and has no such bug), so this is the WSGIWrapper the
+        middleware delegates to (both versions keep it at .wsgi_app), with
+        hypercorn's own loop plus the start after an empty iteration.
+        tests/unit/test_serve_empty_body_responses.py drives 304, HEAD and 204
+        through the real middleware; on the node it is red on the shipped
+        wrapper and green on this one.
+        """
+
+        def run_app(self, environ: dict, send: Any) -> None:
+            headers: List[tuple] = []
+            headers_sent = False
+            response_started = False
+            status_code: Optional[int] = None
+
+            def start_response(status, response_headers, exc_info=None):
+                nonlocal headers, response_started, status_code
+                raw, _ = status.split(" ", 1)
+                status_code = int(raw)
+                headers = [
+                    (name.lower().encode("ascii"), value.encode("ascii"))
+                    for name, value in response_headers
+                ]
+                response_started = True
+
+            response_body = self.app(environ, start_response)
+
+            if not response_started:
+                raise RuntimeError("WSGI app did not call start_response")
+
+            start = {"type": "http.response.start", "status": status_code,
+                     "headers": headers}
+            try:
+                for output in response_body:
+                    if not headers_sent:
+                        send(start)
+                        headers_sent = True
+                    send({"type": "http.response.body", "body": output,
+                          "more_body": True})
+                if not headers_sent:
+                    send(start)
+            finally:
+                if hasattr(response_body, "close"):
+                    response_body.close()
 
     # Without an explicit max_body_size the middleware's library default of
     # 2**16 (64 KB) rejects every larger POST body with an empty 400 before
@@ -226,6 +285,9 @@ def build_asgi_app(wsgi_app: Any) -> Any:
         wsgi_app, max_body_size=max_body_size(False) + 1)
     uncapped = AsyncioWSGIMiddleware(
         wsgi_app, max_body_size=max_body_size(True))
+    for middleware in (capped, uncapped):
+        middleware.wsgi_app = _StartsEmptyResponses(
+            wsgi_app, middleware.max_body_size)
 
     async def by_caller(scope, receive, send):
         app = uncapped if _asgi_scope_is_local(scope) else capped
