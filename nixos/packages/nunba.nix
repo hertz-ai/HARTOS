@@ -10,15 +10,18 @@
                    # "called with unexpected argument 'hartSrc'". The Nunba daemon
                    # is HARTOS-EXCLUDED — it fetches ONLY the Nunba repo, never the
                    # HART tree — so hartSrc is intentionally unused here.
-, nunbaRev ? "de8a6d92c8500605d271743790acedeed8cd8037"  # Nunba main de8a6d92 (2026-10-12): frame policy
-                   # SAMEORIGIN + frame-ancestors 'self', so the HART OS shell's
-                   # panels paint Nunba (generation 18 measured every one of them
-                   # blank under DENY / 'none'). nunbaHash + npmDepsHash are pinned
-                   # for THIS rev; if the rev is bumped, re-pin all three in ONE
-                   # commit (npm ci fails the lock-vs-deps integrity check if the
-                   # rev and the lock drift apart).
-, nunbaHash ? "sha256-4zlksnDvI1XatvNbYuDZDCKIWcB0xbYjbjOI3ips/xE="  # pinned 2026-10-12 for nunbaRev de8a6d92 (nunba-hash-pin dry run 38206318706, build verified GREEN)
-, npmDepsHash ? "sha256-mSce+t2+m46xpuz59Ng63U4vkbANa1oCbonPpo2E70M="  # pinned 2026-10-12 for nunbaRev de8a6d92 (nunba-hash-pin dry run 38206318706); prefetch-npm-deps landing-page/package-lock.json
+, nunbaRev ? "53bd28e9eb97a01452dff47bf91715e46539ac08"  # Nunba main 53bd28e9 (2026-10-12): the shell bridge
+                   # (landing-page/src/utils/shellBridge.js: nunba:ready /
+                   # nunba:compose / nunba:turn / nunba:onboarding) that lets the
+                   # HART OS shell compose into Nunba's panel and host Nunba's
+                   # first-run ceremony (HARTOS 2f423200), plus the clock-driven
+                   # letter-by-letter text (TypedText.js, TypeWriterSubtitle.js).
+                   # Carries de8a6d92's frame policy (SAMEORIGIN + 'self').
+                   # nunbaHash + npmDepsHash are pinned for THIS rev; if the rev
+                   # is bumped, re-pin all three in ONE commit (npm ci fails the
+                   # lock-vs-deps integrity check if the rev and the lock drift).
+, nunbaHash ? "sha256-KPbDSHtQ5eJMjY0PKU9XYAuc9TdkWevkjwSYylcC8Ak="  # pinned 2026-10-12 for nunbaRev 53bd28e9 (nunba-hash-pin dry run 38249876677, build verified GREEN)
+, npmDepsHash ? "sha256-mSce+t2+m46xpuz59Ng63U4vkbANa1oCbonPpo2E70M="  # pinned 2026-10-12 for nunbaRev 53bd28e9 (nunba-hash-pin dry run 38249876677; the lock did not move since de8a6d92); prefetch-npm-deps landing-page/package-lock.json
 , backendUrl ? "http://127.0.0.1:6777"
 }:
 
