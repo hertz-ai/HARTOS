@@ -190,18 +190,16 @@ _request_lanes = {}  # type: dict
 _request_lanes_lock = threading.Lock()
 
 
-def register_request_lane(request_id, lane, keep_existing: bool = False) -> None:
-    """Record which lane the turn ``request_id`` runs on.  Unknown lanes and
-    empty ids are ignored: a lane is one of LANES or it is nothing.
-    ``keep_existing`` leaves a lane already registered for the id alone: the
-    daemon registers a revenue goal's turn before its self-POST reaches /chat,
-    and /chat, which cannot see the goal, must not demote it to 'user'."""
+def register_request_lane(request_id, lane) -> None:
+    """Record which lane the turn ``request_id`` runs on, replacing any earlier
+    answer for that id.  Unknown lanes and empty ids are ignored: a lane is
+    one of LANES or it is nothing.  Who may register what is decided by the
+    callers (core.request_lane.register_chat_lane for /chat, dispatch_goal for
+    a goal that earns), not here."""
     rid = str(request_id or '')
     if not rid or lane not in LANES:
         return
     with _request_lanes_lock:
-        if keep_existing and rid in _request_lanes:
-            return
         _request_lanes.pop(rid, None)
         _request_lanes[rid] = lane
         while len(_request_lanes) > _REQUEST_LANE_CAP:
@@ -391,16 +389,12 @@ def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
             # The user the elided-text store scopes a pointer to (see
             # _elision_scope): the same contextvar hop as the request id.
             _uid_token = _user_id_var.set(uid) if uid else None
-            # The lane /chat registered for this turn crosses the worker-thread
-            # boundary the same way the id does: looked up by the id, bound here.
-            _lane = lane_for_request(rid) if rid else ''
-            _lane_token = _lane_var.set(_lane) if _lane else None
+            # The lane needs no hop of its own: current_lane() reads the
+            # registry by the request id this context binds.
             try:
                 with source_context(source_name), request_id_context(rid):
                     return fn(*args, **kwargs)
             finally:
-                if _lane_token is not None:
-                    _lane_var.reset(_lane_token)
                 if _uid_token is not None:
                     _user_id_var.reset(_uid_token)
         return _wrapper
@@ -614,13 +608,35 @@ def _meter_response(body, response, status) -> None:
         logger.debug("[outbound] metering skipped: %s", e)
 
 
+def _hosted_body(request):
+    """The JSON body of a hosted chat/completions request, read without
+    mutation, or None.  Only for header stamping and metering: the hosted
+    path never trims (the n_ctx trim is the local llama-server's)."""
+    try:
+        raw = bytes(request.content or b'')
+        body = json.loads(raw.decode('utf-8')) if raw else None
+        return body if isinstance(body, dict) else None
+    except Exception:
+        return None
+
+
 def _send_and_feed(orig_send, client, request, kwargs):
-    """Run a HOSTED (non-target) chat/completions send unchanged and feed the
-    provider breaker with its real status.  Byte-transparent: the response
+    """Run a HOSTED (non-target) chat/completions send and feed the provider
+    breaker with its real status.  Body bytes are never touched; the response
     object is returned as-is and an exception is re-raised bare (exceptions do
-    not feed the breaker)."""
+    not feed the breaker).
+
+    The lane and model headers are stamped and the completed call is metered
+    here too (review of 065cef8bb, C1): the configured endpoint on central is
+    Kong at /llm/v1/..., whose path is not the local target's, so every Claude
+    call took this branch unlabelled and unmetered, the day cap never saw a
+    dollar and Kong routed the calls to its default lane."""
+    body = _hosted_body(request)
+    _annotate_request(request, body)
     response = orig_send(client, request, **kwargs)
-    _feed_provider_breaker(request.url, getattr(response, 'status_code', None))
+    _status = getattr(response, 'status_code', None)
+    _feed_provider_breaker(request.url, _status)
+    _meter_response(body, response, _status)
     return response
 
 
@@ -2160,6 +2176,11 @@ def _annotate_request(request, body):
         model = body.get('model') if isinstance(body, dict) else None
         if model:
             request.headers['X-HARTOS-Model'] = str(model)
+            # The family ('claude' or 'other') by the ONE rule the dollar
+            # meter prices with, so Kong's Claude fuse matches a header value
+            # instead of keeping its own list of model names.
+            from core.autogen_config import model_family
+            request.headers['X-HARTOS-Model-Family'] = model_family(model)
     except Exception as e:
         logger.debug("[outbound] header-stamp failed: %s", e)
 
@@ -2315,10 +2336,15 @@ def _install_async_patch(httpx_module) -> None:
 
     async def _patched(self, request, **kwargs):
         if not _is_target_request(request.url, request.method):
-            # Hosted chat/completions still feeds the provider breaker (#106b b).
+            # Hosted chat/completions: lane and model headers, the provider
+            # breaker (#106b b) and the dollar meter, as in _send_and_feed.
             if _is_chat_completions_post(request):
+                _hbody = _hosted_body(request)
+                _annotate_request(request, _hbody)
                 _resp = await _orig(self, request, **kwargs)
-                _feed_provider_breaker(request.url, getattr(_resp, 'status_code', None))
+                _hstatus = getattr(_resp, 'status_code', None)
+                _feed_provider_breaker(request.url, _hstatus)
+                _meter_response(_hbody, _resp, _hstatus)
                 return _resp
             return await _orig(self, request, **kwargs)
         try:

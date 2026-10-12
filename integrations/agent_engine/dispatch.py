@@ -24,6 +24,7 @@ from typing import Dict, List, Optional
 
 from core.http_pool import pooled_post
 from core.chat_client import daemon_request_id, normalize_chat_body
+from core.constants import SYSTEM_DAEMON_IDENTITY
 from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
@@ -81,7 +82,7 @@ def _local_dispatch_base_url() -> str:
     return get_local_backend_url()
 
 
-def _internal_auth_headers(user_id: str = 'system_daemon',
+def _internal_auth_headers(user_id: str = SYSTEM_DAEMON_IDENTITY,
                             username: str = None,
                             role: str = 'admin') -> Optional[Dict[str, str]]:
     """Build auth headers for internal /chat dispatch.

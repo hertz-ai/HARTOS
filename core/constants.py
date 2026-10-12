@@ -1131,6 +1131,13 @@ DEFAULT_SINGLE_ROLE = 'assistant'
 #: tests/unit/test_goal_owner_machine_authors.py AST-scans the tree and
 #: fails if a new bare-label `created_by=` literal appears unregistered,
 #: so this set cannot silently fall behind the producers.
+#: The identity the node mints its OWN JWT for when it calls itself with no
+#: person behind the call (dispatch._internal_auth_headers).  A request whose
+#: JWT names it is the node talking to itself: /chat trusts its body's lane
+#: claim on that basis (core.request_lane.is_internal_caller).
+SYSTEM_DAEMON_IDENTITY = 'system_daemon'
+SYSTEM_IDENTITIES = frozenset({SYSTEM_DAEMON_IDENTITY})
+
 MACHINE_GOAL_AUTHORS = frozenset({
     'error_advice',
     'system_bootstrap',
@@ -1138,7 +1145,7 @@ MACHINE_GOAL_AUTHORS = frozenset({
     'intelligence_milestone',
     'self_healing_dispatcher',
     'revenue_aggregator',
-    'system_daemon',
+    SYSTEM_DAEMON_IDENTITY,
 })
 
 

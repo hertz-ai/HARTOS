@@ -746,6 +746,7 @@ def test_user_turn_stamps_user_lane_and_the_model(tmp_path, monkeypatch):
     fake_httpx.Client.send(_FakeClient(), request)
     assert request.headers.get('X-HARTOS-Lane') == 'user'
     assert request.headers.get('X-HARTOS-Model') == 'qwen3-27b'
+    assert request.headers.get('X-HARTOS-Model-Family') == 'other'
     assert mod.current_lane() == 'user'
 
 
@@ -800,18 +801,18 @@ def test_lane_registry_is_bounded_and_ignores_unknown_lanes(tmp_path, monkeypatc
     assert mod.lane_for_request('') == ''
 
 
-def test_chat_keeps_the_lane_the_daemon_registered(tmp_path, monkeypatch):
-    """dispatch_goal registers a revenue goal's turn before its self-POST
-    reaches /chat; /chat re-registers what it can see (a user), with
-    keep_existing, so the goal's lane survives."""
+def test_registering_again_replaces_the_lane(tmp_path, monkeypatch):
+    """The registry always takes the latest answer; WHO may register what is
+    the callers' decision (core.request_lane.register_chat_lane leaves the
+    node's own daemon turn alone).  The keep_existing flag that let /chat keep
+    a goal's revenue lane also let a stranger naming that goal's request id
+    inherit it (review of 7086adff8, finding 3), so it is gone."""
+    import inspect
     mod, _ = _install_with_rid(monkeypatch, tmp_path, '')
     mod.register_request_lane('daemon_goal_rev', 'revenue')
-    mod.register_request_lane('daemon_goal_rev', 'user', keep_existing=True)
-    assert mod.lane_for_request('daemon_goal_rev') == 'revenue'
     mod.register_request_lane('daemon_goal_rev', 'user')
     assert mod.lane_for_request('daemon_goal_rev') == 'user'
-    mod.register_request_lane('fresh', 'user', keep_existing=True)
-    assert mod.lane_for_request('fresh') == 'user'
+    assert 'keep_existing' not in inspect.signature(mod.register_request_lane).parameters
 
 
 # ─── Dollar meter from the response's usage block (any node; pricing decides) ─
@@ -850,6 +851,38 @@ def test_a_completed_call_is_metered_from_its_usage_block_on_any_tier(tmp_path, 
     fake_httpx.Client.send(_FakeClient(), request)
     assert seen == [{'model': 'claude-sonnet-4-5', 'tokens_in': 120, 'tokens_out': 30,
                      'task_source': 'own'}]
+
+
+def test_the_hosted_path_stamps_lane_and_model_and_meters_too(tmp_path, monkeypatch):
+    """Review of 065cef8bb, C1: on central the configured endpoint is Kong at
+    /llm/v1/..., which is NOT the local target (port or path), so every Claude
+    call took the hosted branch: no lane header for Kong's routes and no
+    metered row for the day cap.  The hosted branch now stamps and meters;
+    it still never trims and never rewrites the body."""
+    mod, fake_httpx, seen = _install_with_usage(monkeypatch, tmp_path, 'central')
+    body = json.dumps({'model': 'claude-sonnet-4-5', 'messages': [{'role': 'user', 'content': 'x'}],
+                       'tools': [{'type': 'function', 'function': {'name': 't'}}]}).encode()
+    for url in (_FakeURL(host='172.17.0.1', port=8100, path='/llm/v1/chat/completions'),
+                _FakeURL(host='api.anthropic.com', port=443, path='/v1/chat/completions')):
+        request = _FakeRequest(body=body, url=url)
+        fake_httpx.Client.send(_FakeClient(), request)
+        assert request.headers.get('X-HARTOS-Lane') == 'user'
+        assert request.headers.get('X-HARTOS-Model') == 'claude-sonnet-4-5'
+        assert request.headers.get('X-HARTOS-Request-ID') == 'req-m'
+        # The family header is what Kong's Claude fuse matches, by the ONE
+        # rule the dollar meter prices with: no list of model names in Kong.
+        from integrations.gateway import kong_onboard as ko
+        from integrations.agent_engine import budget_gate as bg
+        assert request.headers.get(ko.LLM_MODEL_FAMILY_HEADER) == ko.CAPPED_MODEL_FAMILY
+        assert ko.CAPPED_MODEL_FAMILY == bg.CAPPED_FAMILY == 'claude'
+        assert fake_httpx._captured['send_calls'][-1]['content'] == body   # untouched
+    assert seen == [{'model': 'claude-sonnet-4-5', 'tokens_in': 120, 'tokens_out': 30,
+                     'task_source': 'own'}] * 2
+    # A hosted request that is not chat/completions is left alone entirely.
+    other = _FakeRequest(body=b'{"input": "x"}',
+                         url=_FakeURL(host='api.anthropic.com', port=443, path='/v1/embeddings'))
+    fake_httpx.Client.send(_FakeClient(), other)
+    assert 'X-HARTOS-Lane' not in other.headers and len(seen) == 2
 
 
 def test_a_failed_call_or_a_body_without_usage_is_not_metered(tmp_path, monkeypatch):

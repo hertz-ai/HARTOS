@@ -303,6 +303,25 @@ EXPERT_MODEL_VAR = 'HEVOLVE_EXPERT_LLM_MODEL_NAME'
 EXPERT_API_KEY_VAR = 'HEVOLVE_EXPERT_LLM_API_KEY'
 EXPERT_LANES_VAR = 'HEVOLVE_EXPERT_LANES'
 DEFAULT_EXPERT_LANES = 'revenue'
+# Dollars per 1k tokens (input, output) by model family, list prices.  The
+# ONE price table: the expert entry's autogen ``price`` below and the
+# budget gate's dollar meter (integrations.agent_engine.budget_gate) both
+# read it, so the ledger and the registry never disagree on what Claude costs.
+EXPERT_USD_PER_1K = {
+    'claude': (0.003, 0.015),     # Sonnet-class
+}
+OTHER_MODEL_FAMILY = 'other'
+
+
+def model_family(model_name) -> str:
+    """The priced family a model name belongs to ('claude'), else 'other'.
+    Substring match, the ONE rule the dollar meter, the day cap and the wire
+    header X-HARTOS-Model-Family share."""
+    lower = str(model_name or '').lower()
+    for family in EXPERT_USD_PER_1K:
+        if family in lower:
+            return family
+    return OTHER_MODEL_FAMILY
 
 
 def resolve_expert_backend():
@@ -325,11 +344,13 @@ def resolve_expert_backend():
                      "tier; one alone configures nothing"
                      % (EXPERT_ENDPOINT_VAR, EXPERT_MODEL_VAR))
         return None
+    price = next((p for fam, p in EXPERT_USD_PER_1K.items() if fam in model.lower()),
+                 (0.0025, 0.01))
     return {
         "model": model,
         "api_key": os.environ.get(EXPERT_API_KEY_VAR, '') or 'dummy',
         "base_url": endpoint,
-        "price": [0.003, 0.015],
+        "price": list(price),
     }
 
 

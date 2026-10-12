@@ -415,7 +415,10 @@ class TestClaudeDayCap:
         monkeypatch.setenv('HEVOLVE_CLAUDE_BUDGET_USD_DAY', '5')
         assert bg.expert_budget_allows('claude-sonnet-4-5')[0] is False
 
-    def test_an_unreadable_ledger_fails_open(self, monkeypatch):
+    def test_an_unreadable_ledger_fails_closed_and_withholds_the_expert(self, monkeypatch):
+        """Withholding the expert is not blocking (the turn runs on the node's
+        own model), so an unread ledger must not let the cap be overrun
+        (review of 065cef8bb, M1)."""
         from integrations.agent_engine import budget_gate as bg
         import integrations.social.models as models
 
@@ -423,8 +426,23 @@ class TestClaudeDayCap:
             raise RuntimeError('db down')
         monkeypatch.setattr(models, 'db_session', boom)
         from datetime import datetime
-        assert bg.usd_spent_since(datetime(2026, 10, 12), 'claude') == 0.0
-        assert bg.expert_budget_allows('claude-sonnet-4-5')[0] is True
+        assert bg.usd_spent_since(datetime(2026, 10, 12), 'claude') is None
+        allowed, why = bg.expert_budget_allows('claude-sonnet-4-5')
+        assert allowed is False and 'unreadable' in why
+        assert bg.expert_budget_allows('gpt-4o')[0] is True       # uncapped families unaffected
+
+    def test_one_price_table_shared_with_the_expert_entry(self):
+        from integrations.agent_engine import budget_gate as bg
+        from core import autogen_config as ac
+        assert bg.USD_PER_1K_BY_FAMILY is ac.EXPERT_USD_PER_1K
+        for k in ('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', 'HEVOLVE_EXPERT_LLM_MODEL_NAME'):
+            os.environ[k] = {'HEVOLVE_EXPERT_LLM_ENDPOINT_URL': 'http://gw/llm/v1',
+                             'HEVOLVE_EXPERT_LLM_MODEL_NAME': 'claude-sonnet-4-5'}[k]
+        try:
+            assert ac.resolve_expert_backend()['price'] == list(ac.EXPERT_USD_PER_1K['claude'])
+        finally:
+            for k in ('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', 'HEVOLVE_EXPERT_LLM_MODEL_NAME'):
+                os.environ.pop(k, None)
 
     def test_usd_spent_since_reads_this_nodes_own_rows_for_the_family(self, monkeypatch):
         from integrations.agent_engine import budget_gate as bg
@@ -440,6 +458,13 @@ class TestClaudeDayCap:
         monkeypatch.setattr(models, 'db_session', fake_session)
         from datetime import datetime
         assert bg.usd_spent_since(datetime(2026, 10, 12), 'claude') == 4.25
-        rendered = ' '.join(str(f) for f in db.query.return_value.filter.call_args[0])
+        filters = db.query.return_value.filter.call_args[0]
+        rendered = ' '.join(str(f) for f in filters)
         for col in ('node_id', 'task_source', 'model_id', 'created_at'):
             assert col in rendered, col
+        # The family is matched by substring, the same rule pricing uses, so a
+        # row named 'anthropic/claude-sonnet-4-5' counts (review M3).
+        like_params = [f.right.value for f in filters if hasattr(f, 'right')
+                       and getattr(getattr(f, 'right', None), 'value', None) is not None
+                       and 'claude' in str(f.right.value)]
+        assert like_params == ['%claude%']

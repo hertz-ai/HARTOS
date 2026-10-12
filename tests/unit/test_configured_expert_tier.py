@@ -146,9 +146,14 @@ def test_reconfiguring_the_trio_replaces_the_entry(registry, monkeypatch):
 def lanes(registry, monkeypatch):
     for k, v in EXPERT_ENV.items():
         monkeypatch.setenv(k, v)
-    registry.register(_backend('configured-api', mr.ModelTier.FAST,
-                               'http://172.17.0.1:8100/llm/v1', 'qwen3-27b', 0.85))
+    own = _backend('configured-api', mr.ModelTier.FAST,
+                   'http://172.17.0.1:8100/llm/v1', 'qwen3-27b', 0.85)
+    own.is_local = True                      # as _register_defaults registers it
+    registry.register(own)
     mr.ensure_configured_expert_registered()
+    # The lane gate is under test here, not the ledger: an empty day.
+    from integrations.agent_engine import budget_gate as bg
+    monkeypatch.setattr(bg, 'claude_usd_spent_today', lambda: 0.0)
     from core import llm_outbound_logger as lol
     return registry, lol
 
@@ -218,6 +223,64 @@ def test_lane_for_goal_type_is_the_daemon_twin_of_the_chat_rule():
     assert lane_for_goal_type('p2p_rideshare') == 'revenue'
     assert lane_for_goal_type('robot') == 'daemon'
     assert lane_for_goal_type(None) == 'daemon'
+
+
+# ─── only the expert selectors may pick it (review of 065cef8bb, C2) ─────────
+
+@pytest.mark.parametrize('lane', ['revenue', 'user', 'daemon'])
+def test_fast_local_and_policy_selectors_never_pick_the_configured_expert(lanes, lane):
+    registry, lol = lanes
+    # The own model slower than the expert and less accurate: the two
+    # conditions that let the expert win the fast and local paths before.
+    registry.get_model('configured-api').avg_latency_ms = 9000.0
+    with lol.lane_context(lane):
+        assert registry.get_fast_model().model_id == 'configured-api'
+        assert registry.get_fast_model(min_accuracy=0.9) is None
+        assert registry.get_local_model().model_id == 'configured-api'
+        for policy in ('local_only', 'local_preferred', 'any'):
+            assert registry.get_model_by_policy(policy).model_id == 'configured-api'
+        if lane == 'revenue':
+            fast, expert = registry.speculation_pair()
+            assert (fast.model_id, expert.model_id) == ('configured-api', 'configured-expert')
+
+
+def test_an_unreadable_lane_withholds_the_expert_instead_of_raising(lanes, monkeypatch):
+    registry, lol = lanes
+    import core.llm_outbound_logger as lol_mod
+
+    def boom():
+        raise RuntimeError('no lane')
+    monkeypatch.setattr(lol_mod, 'current_lane', boom)
+    assert registry.get_escalation_expert() is None
+    assert registry.get_expert_model().model_id == 'configured-api'
+
+
+def test_the_budget_is_read_outside_the_registry_lock(lanes, monkeypatch):
+    """The gate reads the spend ledger; holding the registry lock through it
+    would stall every other model lookup on a slow DB (review of 065cef8bb,
+    M4).  A gate that itself asks the registry proves the lock is free."""
+    import threading
+    registry, lol = lanes
+    from integrations.agent_engine import budget_gate as bg
+    seen = {}
+
+    def asks_the_registry(model):
+        seen['own'] = registry.get_model('configured-api') is not None   # deadlocks if locked
+        return True, 'ok'
+    monkeypatch.setattr(bg, 'expert_budget_allows', asks_the_registry)
+    result = {}
+
+    def run():
+        with lol.lane_context('revenue'):
+            result['expert'] = registry.get_escalation_expert()
+            result['best'] = registry.get_expert_model()
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(10)
+    assert not t.is_alive(), 'selector hung: the ledger read ran under the registry lock'
+    assert seen == {'own': True}
+    assert result['expert'].model_id == 'configured-expert'
+    assert result['best'].model_id == 'configured-expert'
 
 
 # ─── the day cap: not offered past it, never an error ─────────────────────

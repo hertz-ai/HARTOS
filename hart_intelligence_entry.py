@@ -9768,9 +9768,15 @@ def chat():
         # API key is configured — validate it first (Layer 0)
         # Accept either API key directly or a valid JWT
         import hmac as _hmac_mod
+        # The key arrives as the Bearer token or as X-API-Key, the header
+        # security/middleware.py's gate accepts and dispatch
+        # ._internal_auth_headers sends.  Before this, every metered
+        # self-POST on a keyed node (the PAID calls) was admitted by the
+        # middleware and then 401'd here (review of 7086adff8, finding 2).
+        _x_api_key = request.headers.get('X-API-Key', '')
         _api_key_match = (
-            _bearer_token and
-            _hmac_mod.compare_digest(_bearer_token, _api_key)
+            (_bearer_token and _hmac_mod.compare_digest(_bearer_token, _api_key)) or
+            (_x_api_key and _hmac_mod.compare_digest(_x_api_key, _api_key))
         )
         if _api_key_match:
             g.auth_source = 'api_key'
@@ -10182,17 +10188,23 @@ def chat():
     # prefix), decided here where the request's auth is in hand and
     # registered by request id so the autogen worker thread and the wire
     # header read the same answer (core.request_lane, owner policy 2026-10-12).
+    # The node's own daemon turn is left to the id's prefix rule and to the
+    # lane dispatch_goal registered for a goal that earns; every other caller
+    # is registered by what its request proves, replacing whatever the id
+    # held, so nobody inherits a goal's lane by naming its request id.
     try:
-        from core.request_lane import lane_for_chat
-        from core.llm_outbound_logger import register_request_lane
-        from integrations.social.auth import decode_jwt as _lane_decode_jwt
+        from core.constants import SYSTEM_IDENTITIES as _SYSTEM_IDENTITIES
+        from core.request_lane import register_chat_lane
+        from integrations.agent_engine.dispatch import (
+            is_genuine_user_request as _lane_is_genuine)
         from integrations.commerce.bindings import TENANT as _COMMERCE_TENANT
-        register_request_lane(request_id, lane_for_chat(
-            _bearer_token, data, getattr(g, 'auth_source', None),
-            decode_jwt=_lane_decode_jwt, tenant=_COMMERCE_TENANT),
-            keep_existing=True)   # a revenue goal's daemon turn stays revenue
+        from integrations.social.auth import decode_jwt as _lane_decode_jwt
+        register_chat_lane(request_id, _bearer_token, data, getattr(g, 'auth_source', None),
+                           decode_jwt=_lane_decode_jwt, tenant=_COMMERCE_TENANT,
+                           system_identities=_SYSTEM_IDENTITIES, is_genuine=_lane_is_genuine)
     except Exception as _lane_err:
-        app.logger.debug('lane not registered for %s: %s', request_id, _lane_err)
+        app.logger.warning('lane not registered for %s (the id rule decides it): %s',
+                           request_id, _lane_err)
 
     # Speculative dispatch: fast response + background expert
     if speculative and prompt and user_id and prompt_id:

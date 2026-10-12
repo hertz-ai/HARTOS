@@ -2,11 +2,15 @@
 .onboard_llm_gateway): what it asks Kong 2.8.5 to create, asserted on the
 admin-API calls, no network.
 
-Owner policy 2026-10-12: a revenue conversation is never throttled; Claude
-is capped per day on central; a person's turn and the daemon's turn have
-their own request caps; a caller that stamps no lane is treated as a user.
-Kong 2.8.5 community has no AI plugins (measured), so caps are requests per
-window matched on the X-HARTOS-Lane and X-HARTOS-Model headers HARTOS stamps.
+Owner policy 2026-10-12: a revenue conversation is never throttled; a
+person's turn and the daemon's turn have their own request caps; a caller
+that stamps no lane is treated as a user.  Kong 2.8.5 community has no AI
+plugins (measured), so caps are requests per window matched on the
+X-HARTOS-Lane and X-HARTOS-Model-Family headers HARTOS stamps; the family
+comes from the ONE rule the dollar meter prices with, so Kong keeps no list
+of Claude model names.  Revenue-lane Claude has no Kong fuse: its cap is the
+HARTOS day budget (budget_gate); the Claude route here fuses only the user
+and daemon Claude calls policy forbids anyway.
 """
 import json
 from unittest.mock import MagicMock
@@ -51,7 +55,7 @@ def _posts(session):
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for v in ("LLM_CLAUDE_MODELS", "LLM_CLAUDE_REQUESTS_PER_DAY", "LLM_CLAUDE_REQUESTS_PER_HOUR",
+    for v in ("LLM_CLAUDE_REQUESTS_PER_DAY", "LLM_CLAUDE_REQUESTS_PER_HOUR",
               "LLM_USER_PER_DAY", "LLM_DAEMON_PER_DAY", "LLM_USER_PER_MINUTE",
               "LLM_DAEMON_PER_MINUTE", "LLM_USER_PER_HOUR", "LLM_DAEMON_PER_HOUR"):
         monkeypatch.delenv(v, raising=False)
@@ -92,7 +96,12 @@ def test_five_lane_routes_strip_the_prefix_and_match_the_headers():
     # A revenue call to Claude does not match this route (its lane is not
     # listed), so only user and daemon Claude calls are capped.
     assert claude["X-HARTOS-Lane"] == ["user", "daemon"]
-    assert claude["X-HARTOS-Model"] == ["claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-1"]
+    # Matched on the family HARTOS stamps, never on a list of model names: a
+    # model the list would have missed (claude-sonnet-4-6 is already in the
+    # repo, deploy/bootstrap_hive_economy.py) still trips the fuse.
+    from core.autogen_config import model_family
+    assert claude["X-HARTOS-Model-Family"] == [model_family("anthropic/claude-sonnet-4-6")] == ["claude"]
+    assert "X-HARTOS-Model" not in claude
 
 
 def test_revenue_route_has_no_rate_limit_and_the_others_do():
@@ -114,18 +123,50 @@ def test_revenue_route_has_no_rate_limit_and_the_others_do():
     assert posts["/routes/llm-default/plugins"][0]["config"]["day"] == user["day"]
 
 
-def test_caps_and_claude_models_follow_the_environment(monkeypatch):
+def test_caps_follow_the_environment(monkeypatch):
     monkeypatch.setenv("LLM_CLAUDE_REQUESTS_PER_DAY", "25")
-    monkeypatch.setenv("LLM_CLAUDE_MODELS", "claude-sonnet-4-5, claude-opus-4-1")
     monkeypatch.setenv("LLM_DAEMON_PER_DAY", "100")
     s = _session()
     ko.onboard_llm_gateway(s, KONG)
     posts = _posts(s)
     assert posts["/routes/llm-claude/plugins"][0]["config"]["day"] == 25
     assert posts["/routes/llm-daemon/plugins"][0]["config"]["day"] == 100
-    routes = _puts(s)
-    assert routes["/services/llm-gateway/routes/llm-claude"]["headers"]["X-HARTOS-Model"] == [
-        "claude-sonnet-4-5", "claude-opus-4-1"]
+
+
+def test_a_cap_that_could_not_be_looked_up_or_updated_is_not_reported_applied():
+    """A failed lookup used to fall through to a POST that 409'd as "already
+    exists (no change)" while the cap on the box stayed the OLD one (review
+    of 00d29f073).  The fall-through stays (a first-time create survives an
+    admin-API hiccup, TestEnablePluginResilience), but a 409 after a failed
+    lookup is reported NOT applied and the gateway is not called ready."""
+    s = _session()
+
+    def get(url):
+        if url.endswith("/routes/llm-claude/plugins"):
+            return _resp(500)
+        return _resp(200, {"data": []})
+
+    def post(url, json=None):
+        if url.endswith("/routes/llm-claude/plugins"):
+            return _resp(409, {"message": "unique constraint violation"})
+        return _resp(201, {"id": "pl"})
+    s.get.side_effect = get
+    s.post.side_effect = post
+    assert ko.onboard_llm_gateway(s, KONG) is False
+    assert "/routes/llm-user/plugins" in _posts(s)          # the others were applied
+
+
+def test_an_update_kong_refuses_falls_through_and_is_applied_only_if_created():
+    existing = {"data": [{"id": "rl-1", "name": "rate-limiting"}]}
+    s = _session()
+    s.get.return_value = _resp(200, existing)
+    s.patch.return_value = _resp(400, {"message": "schema violation"})
+    s.post.return_value = _resp(409, {"message": "unique constraint violation"})
+    assert ko.onboard_llm_gateway(s, KONG) is False          # exists, not updated
+    s2 = _session()
+    s2.get.return_value = _resp(200, existing)
+    s2.patch.return_value = _resp(400, {"message": "schema violation"})
+    assert ko.onboard_llm_gateway(s2, KONG) is True          # the create (201) applied it
 
 
 def test_existing_plugin_is_patched_not_duplicated():
@@ -140,7 +181,6 @@ def test_existing_plugin_is_patched_not_duplicated():
 
 def test_returns_false_when_the_service_does_not_read_back():
     s = _session()
-    s.get.side_effect = [_resp(200, {"data": []})] * 20 + [_resp(404)]
 
     def get(url):
         if url.endswith("/services/llm-gateway"):

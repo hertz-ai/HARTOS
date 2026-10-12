@@ -474,7 +474,9 @@ def _metered_backend_chat(prompt: str, prompt_id: str):
     work, so inheriting that gate would trade this bug for a worse one.  What
     is shared with the other callers is the credential helper itself.
     """
+    import uuid as _uuid
     from core.http_pool import pooled_post
+    from core.llm_outbound_logger import LANE_REVENUE, LANE_USER
     from integrations.agent_engine.dispatch import _internal_auth_headers
 
     try:
@@ -485,13 +487,19 @@ def _metered_backend_chat(prompt: str, prompt_id: str):
                 'prompt_id': prompt_id,
                 'prompt': prompt,
                 'create_agent': False,
+                # A paying customer's call is a genuine turn, never background:
+                # a request id of its own (unique per call, so two calls in the
+                # same second cannot share a lane entry) makes /chat and the
+                # wire treat it so (core.chat_client: a missing id reads as
+                # background), and keys the lane below.
+                'request_id': 'api_%d_%s' % (int(time.time()), _uuid.uuid4().hex[:8]),
                 # Owner policy 2026-10-12: a paying tier's turn is revenue-
                 # bearing (may use the expert model, never throttled); the
                 # free tier runs on the free model like any person's turn.
-                # /chat believes this field only on a request that carries the
-                # node's own key, which is what _internal_auth_headers sends
-                # (core.request_lane).
-                'lane': 'revenue' if (g.api_key.get('tier') or 'free') != 'free' else 'user',
+                # /chat believes this field only from the node itself: the
+                # key or the system JWT _internal_auth_headers sends
+                # (core.request_lane.is_internal_caller).
+                'lane': LANE_REVENUE if (g.api_key.get('tier') or 'free') != 'free' else LANE_USER,
             },
             headers=_internal_auth_headers(),
             timeout=120)

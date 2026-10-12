@@ -47,14 +47,14 @@ agnostic. Both hold because nothing in the code reads the node tier for it:
 
 | Piece | Place | State |
 |---|---|---|
-| Lane decided for a /chat turn | `core/request_lane.py` (pure rule), called from `/chat` beside `set_request_id` | landed |
+| Lane decided for a /chat turn | `core/request_lane.py` (pure rule; `register_chat_lane` is /chat's one registration decision: the node's own daemon turn is left to the id's prefix rule and to `dispatch_goal`'s registration, everyone else is registered by what the request proves, replacing what the id held) | landed |
 | Lane decided for a daemon goal | `dispatch.is_revenue_goal_type`, registered in `dispatch_goal` | landed |
-| Lane crosses the worker thread, reaches the wire | `core.llm_outbound_logger` (`register_request_lane`, `current_lane`, `X-HARTOS-Lane`, `X-HARTOS-Model`) | landed |
-| Paid tier marks its turn | `commercial_api._metered_backend_chat` body `lane` (trusted only with the node's own key) | landed |
-| Kong fuse per lane and per Claude model | `integrations/gateway/kong_onboard.py --llm` (Kong 2.8.5 community: request caps only) | landed, apply on deepbox |
+| Lane crosses the worker thread, reaches the wire | `core.llm_outbound_logger` (`register_request_lane`, `current_lane`, `X-HARTOS-Lane`, `X-HARTOS-Model`, `X-HARTOS-Model-Family`), stamped on the local target AND on every hosted chat/completions call (Kong's `/llm/v1` path is a hosted call) | landed |
+| Paid tier marks its turn | `commercial_api._metered_backend_chat` body `lane` + a `request_id` of its own; trusted only from the node itself (its key, or the JWT it mints for its system identity when no key is set); /chat accepts the `X-API-Key` header the middleware accepts | landed |
+| Kong fuse per lane; a fuse on user/daemon Claude calls | `integrations/gateway/kong_onboard.py --llm` (Kong 2.8.5 community: request caps only; the Claude route matches `X-HARTOS-Model-Family: claude`, one rule with the meter). Revenue-lane Claude has NO Kong fuse by design: its cap is the HARTOS day budget below | landed, apply on deepbox |
 | Provider fan-out, verbatim relay, real statuses | gpt3 `llm_gateway.py` (hertz-ai/GPT3 main 36ebae1) | landed, redeploy with start.sh |
-| Claude as the expert tier, offered to the revenue lane only | `model_registry` from `HEVOLVE_EXPERT_LLM_*` | next |
-| Dollar meter: usage from every response, $6 Claude day cap before dispatch | `budget_gate` + metered-usage ledger | next |
+| Claude as the expert tier, offered to the revenue lane only, selectable only by the expert selectors | `model_registry` from `HEVOLVE_EXPERT_LLM_*` | landed |
+| Dollar meter: usage from every completed call on any host, $6 Claude day cap read before the expert is offered; an unreadable ledger withholds the expert (fail closed) | `budget_gate` + metered-usage ledger, `core.llm_outbound_logger` | landed |
 
 ## Product journeys and where the money enters
 
@@ -75,10 +75,15 @@ or a mix with merchant and driver subscriptions.
 
 1. OK the push of local main (the deploy-secret chain and the lane commits).
    A push to main deploys central.
-2. Set on central's `.env`: the McGroce trio, `HEVOLVE_API_KEY` (the paid
-   tier's lane is trusted only through it), `HEVOLVE_AUTONOMOUS_MARKETING=1`,
+2. Set on central's `.env`: the McGroce trio, `HEVOLVE_AUTONOMOUS_MARKETING=1`,
    the expert trio for Claude, and point the configured LLM at Kong
    (`http://172.17.0.1:8100/llm/v1`) in all three keys the deploy check names.
+   `HEVOLVE_API_KEY` is optional for the lanes: without it the node's
+   self-POSTs carry its system JWT and are trusted the same way.  Setting it
+   is safe only on a build that carries the /chat `X-API-Key` fix (this
+   commit); before it, a keyed central answered every paid metered call
+   with 401 inside /chat and the customer saw 503 (measured by the review of
+   7086adff8).
 3. Redeploy gpt3 (`bash start.sh` with `/opt/hzai-GPT3/gpt3.env` holding the
    provider keys) and apply the Kong routes
    (`python -m integrations.gateway.kong_onboard --llm --kong-url http://127.0.0.1:8101`).

@@ -196,30 +196,44 @@ def _upsert_plugin(
     }
     url = f"{kong_url}{scope_path}"
 
-    # Try to find existing plugin first for idempotent update
+    # Find the existing plugin first (idempotent update).  A lookup or update
+    # that fails still falls through to the create, so a first-time create
+    # survives an admin-API hiccup (TestEnablePluginResilience pins this),
+    # but it is remembered: see the 409 branch below.
+    unreached = False
     try:
         existing = session.get(url)
         if existing.status_code == 200:
-            data = existing.json().get("data", [])
-            for p in data:
+            for p in existing.json().get("data", []):
                 if p.get("name") == plugin_name:
-                    # Update existing plugin
-                    plugin_id = p["id"]
-                    resp = session.patch(
-                        f"{kong_url}/plugins/{plugin_id}",
-                        json=payload,
-                    )
+                    resp = session.patch(f"{kong_url}/plugins/{p['id']}", json=payload)
                     if resp.status_code in (200, 201):
                         _log(f"  plugin '{plugin_name}': updated")
                         return resp.json()
-    except Exception:
-        pass
+                    _log(f"  plugin '{plugin_name}': update HTTP {resp.status_code}; "
+                         "trying create")
+                    unreached = True
+                    break
+        else:
+            _log(f"  plugin '{plugin_name}': lookup HTTP {existing.status_code}; trying create")
+            unreached = True
+    except Exception as e:
+        _log(f"  plugin '{plugin_name}': lookup failed ({e}); trying create")
+        unreached = True
 
     # Create new
     resp = session.post(url, json=payload)
     if resp.status_code == 409:
+        if unreached:
+            # It exists, and neither the lookup nor the update reached it: the
+            # config on the box is whatever it was.  Reported, and falsy, so
+            # the caller does not call the gateway ready (review of 00d29f073:
+            # this used to read "already exists (no change)" while a changed
+            # cap was silently not applied).
+            _log(f"  plugin '{plugin_name}': exists but could NOT be updated; NOT applied")
+            return {}
         _log(f"  plugin '{plugin_name}': already exists (no change)")
-        return resp.json() if resp.text else {}
+        return resp.json() if resp.text else {"name": plugin_name}
     resp.raise_for_status()
     _log(f"  plugin '{plugin_name}': created")
     return resp.json()
@@ -468,9 +482,10 @@ def onboard(
 #
 #   llm-revenue  Lane=revenue                         no rate-limiting at all:
 #                a paying conversation is never throttled (owner).
-#   llm-claude   Lane in {user, daemon} + Model in    the Claude cap: $6/day
-#                the Claude list                      expressed as requests/day
-#                                                     (LLM_CLAUDE_REQUESTS_PER_DAY)
+#   llm-claude   Lane in {user, daemon} + Model-Family  a fuse on Claude calls
+#                = claude                               that policy already
+#                                                       forbids (requests/day,
+#                                                       LLM_CLAUDE_REQUESTS_PER_DAY)
 #   llm-user     Lane=user                            ordinary person caps
 #   llm-daemon   Lane=daemon                          background caps, tightest
 #   llm-default  no header required                   a caller that stamps no
@@ -478,20 +493,32 @@ def onboard(
 #
 # Two headers on llm-claude make it the most specific match for a user's or
 # the daemon's Claude call; a revenue call to Claude matches only llm-revenue
-# (its lane is not in the claude route's list), so it is never capped.
+# (its lane is not in the claude route's list), so Kong never throttles it.
+# SAID PLAINLY: revenue-lane Claude spend has NO Kong fuse.  Its cap is the
+# HARTOS day budget (budget_gate.expert_budget_allows), which withholds the
+# expert past $6 and when the ledger cannot be read; this route only fuses the
+# Claude calls policy forbids anyway (user and daemon lanes).
+# The family comes from HARTOS's X-HARTOS-Model-Family header (one rule,
+# core.autogen_config.model_family, the same the dollar meter prices by), so
+# there is no second list of Claude model names here.
 # Counters key on client ip per route (``limit_by: ip``): every HARTOS call on
 # the box arrives from the container's address, so one counter == one lane.
 # No key-auth: the service accepts only loopback and the docker bridge
-# (ip-restriction), which is where HARTOS runs; nothing off the box reaches it.
+# (ip-restriction), which is where HARTOS runs.  Any client the allowlist admits
+# picks its own cap with a header, so before applying this on a box whose Kong
+# proxy port is reachable from outside (deepbox's 8100 is NATed per
+# docs/internal/FLYWHEEL_RECOVERY_BRIEF.md) check Kong's trusted_ips / real_ip
+# settings, or narrow LLM_GATEWAY_ALLOWED_CLIENTS to the one container.
 LLM_SERVICE_NAME = "llm-gateway"
 LLM_ROUTE_PATH = "/llm"                 # stripped: /llm/v1/x -> gpt3 /v1/x
 DEFAULT_LLM_UPSTREAM_URL = _os.environ.get("LLM_GATEWAY_UPSTREAM", "http://172.17.0.1:5459")
 LLM_LANE_HEADER = "X-HARTOS-Lane"
-LLM_MODEL_HEADER = "X-HARTOS-Model"
+LLM_MODEL_FAMILY_HEADER = "X-HARTOS-Model-Family"
 LLM_READ_TIMEOUT_MS = 180000            # a 27B VL page read or a long Claude turn
 LLM_BODY_LIMIT_MB = 20                  # base64 pages and screenshots
-LLM_ALLOWED_CLIENTS = ["127.0.0.1", "172.17.0.0/16"]
-DEFAULT_CLAUDE_MODELS = ["claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-1"]
+LLM_ALLOWED_CLIENTS = [p.strip() for p in _os.environ.get(
+    "LLM_GATEWAY_ALLOWED_CLIENTS", "127.0.0.1,172.17.0.0/16").split(",") if p.strip()]
+CAPPED_MODEL_FAMILY = "claude"
 LLM_ROUTE_REVENUE = "llm-revenue"
 LLM_ROUTE_CLAUDE = "llm-claude"
 LLM_ROUTE_USER = "llm-user"
@@ -504,11 +531,6 @@ def _env_int(name: str, default: int) -> int:
         return max(1, int(_os.environ.get(name, "") or default))
     except ValueError:
         return default
-
-
-def claude_models() -> list:
-    raw = _os.environ.get("LLM_CLAUDE_MODELS", "")
-    return [m.strip() for m in raw.split(",") if m.strip()] or list(DEFAULT_CLAUDE_MODELS)
 
 
 def llm_lane_routes() -> list:
@@ -528,7 +550,8 @@ def llm_lane_routes() -> list:
     return [
         {"name": LLM_ROUTE_REVENUE, "headers": {LLM_LANE_HEADER: ["revenue"]}, "limits": None},
         {"name": LLM_ROUTE_CLAUDE,
-         "headers": {LLM_LANE_HEADER: ["user", "daemon"], LLM_MODEL_HEADER: claude_models()},
+         "headers": {LLM_LANE_HEADER: ["user", "daemon"],
+                     LLM_MODEL_FAMILY_HEADER: [CAPPED_MODEL_FAMILY]},
          "limits": claude},
         {"name": LLM_ROUTE_USER, "headers": {LLM_LANE_HEADER: ["user"]}, "limits": user},
         {"name": LLM_ROUTE_DAEMON, "headers": {LLM_LANE_HEADER: ["daemon"]}, "limits": daemon},
@@ -549,8 +572,12 @@ def onboard_llm_gateway(
     upstream_url: str = None,
 ) -> bool:
     """Create or update the LLM gateway service, its five lane routes and
-    their plugins.  Idempotent; returns True when the service reads back."""
+    their plugins.  Idempotent; returns True only when the service reads back
+    AND every plugin (body limit, allowlist, each lane's cap) was applied: a
+    cap that could not be set must not be reported as a gateway that is
+    ready."""
     upstream_url = upstream_url or DEFAULT_LLM_UPSTREAM_URL
+    applied = []
     _log("")
     _log("=== LLM gateway (HARTOS -> Kong -> gpt3) ===")
     _log("Step 1/3 — Service")
@@ -563,12 +590,12 @@ def onboard_llm_gateway(
         "read_timeout": LLM_READ_TIMEOUT_MS,
     }, f"service '{LLM_SERVICE_NAME}'")
     svc_plugins = f"/services/{LLM_SERVICE_NAME}/plugins"
-    _upsert_plugin(session, kong_url, svc_plugins, {
+    applied.append(bool(_upsert_plugin(session, kong_url, svc_plugins, {
         "name": "request-size-limiting",
-        "config": {"allowed_payload_size": LLM_BODY_LIMIT_MB}})
-    _upsert_plugin(session, kong_url, svc_plugins, {
+        "config": {"allowed_payload_size": LLM_BODY_LIMIT_MB}})))
+    applied.append(bool(_upsert_plugin(session, kong_url, svc_plugins, {
         "name": "ip-restriction",
-        "config": {"allow": list(LLM_ALLOWED_CLIENTS), "deny": []}})
+        "config": {"allow": list(LLM_ALLOWED_CLIENTS), "deny": []}})))
 
     _log("Step 2/3 — Lane routes")
     for route in llm_lane_routes():
@@ -585,16 +612,20 @@ def onboard_llm_gateway(
                      f"{kong_url}/services/{LLM_SERVICE_NAME}/routes/{route['name']}",
                      payload, f"route '{route['name']}'")
         if route["limits"]:
-            _upsert_plugin(session, kong_url, f"/routes/{route['name']}/plugins",
-                           _rate_limit_plugin(route["limits"]))
+            applied.append(bool(_upsert_plugin(
+                session, kong_url, f"/routes/{route['name']}/plugins",
+                _rate_limit_plugin(route["limits"]))))
 
     _log("Step 3/3 — Verify")
     try:
         resp = session.get(f"{kong_url}/services/{LLM_SERVICE_NAME}")
-        ok = resp.status_code == 200
+        readable = resp.status_code == 200
     except requests.ConnectionError:
-        ok = False
-    _log("  LLM gateway " + ("ready" if ok else "NOT readable back"))
+        readable = False
+    ok = readable and all(applied)
+    _log("  LLM gateway " + ("ready" if ok else
+                             "NOT readable back" if not readable else
+                             f"NOT ready: {applied.count(False)} plugin(s) not applied"))
     return ok
 
 

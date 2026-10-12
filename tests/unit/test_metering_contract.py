@@ -22,6 +22,7 @@ from integrations.agent_engine import budget_gate  # noqa: E402
 
 
 PRODUCTION_FILES = [
+    'core/llm_outbound_logger.py',      # the ONE wire meter (every completed call)
     'integrations/coding_agent/aider_core/hart_model_adapter.py',
     'hart_intelligence_entry.py',
     'integrations/agent_engine/budget_gate.py',

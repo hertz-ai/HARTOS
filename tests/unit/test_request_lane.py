@@ -8,12 +8,15 @@ are things /chat can verify itself:
   * the caller's JWT carries the commerce tenant claim (a McGroce shopper or
     store owner, minted by POST /api/commerce/session);
   * the metered API endpoints' own self-POST says so for a paying tier, and
-    the request authenticated with the node's own key (auth_source
-    'api_key'), which no outside client holds.
+    the request is the node itself: its own key (auth_source 'api_key') or
+    the JWT it mints for its system identity, neither of which an outside
+    client holds.
 
 Anything else, including a body that merely claims 'lane': 'revenue' over a
-JWT or body auth, is a user turn.  The daemon lane is not decided here: the
-request id's 'daemon_' prefix decides that on the wire (is_genuine_user_request).
+stranger's JWT or body auth, is a user turn.  The daemon lane is not decided
+here: the request id's 'daemon_' prefix decides that on the wire
+(is_genuine_user_request), and register_chat_lane leaves the node's own
+daemon turn to it.
 """
 import pytest
 
@@ -98,3 +101,99 @@ def test_owner_can_replace_the_earning_set(monkeypatch):
     monkeypatch.setenv('HEVOLVE_REVENUE_GOAL_TYPES', 'tutor, trading')
     assert is_revenue_goal_type('tutor') and is_revenue_goal_type('TRADING')
     assert not is_revenue_goal_type('marketing')
+
+
+# ─── the node talking to itself (is_internal_caller) ─────────────────────────
+# _internal_auth_headers sends the node's key when HEVOLVE_API_KEY is set and
+# otherwise a JWT for the node's own system identity (review of 7086adff8,
+# finding 2: the keyless case computed 'user' for every paying call).
+
+SYSTEM = ('system_daemon',)
+
+
+def test_internal_caller_is_the_nodes_key_or_its_system_jwt():
+    from core.request_lane import is_internal_caller
+    assert is_internal_caller('api_key', {}, ())
+    assert is_internal_caller('jwt', {'user_id': 'system_daemon'}, SYSTEM)
+    assert not is_internal_caller('jwt', {'user_id': 'u1'}, SYSTEM)
+    assert not is_internal_caller('jwt', {}, SYSTEM)
+    assert not is_internal_caller('body', None, SYSTEM)
+    assert not is_internal_caller(None, {'user_id': 'system_daemon'}, ())   # no identity named
+
+
+def test_paid_tier_claim_is_trusted_from_the_system_jwt_too():
+    body = {'prompt': 'x', 'lane': 'revenue'}
+    assert lane_for_chat('tok', body, 'jwt', decode_jwt=_decoder({'user_id': 'system_daemon'}),
+                         tenant=TENANT, system_identities=SYSTEM) == 'revenue'
+    assert lane_for_chat('tok', body, 'jwt', decode_jwt=_decoder({'user_id': 'u1'}),
+                         tenant=TENANT, system_identities=SYSTEM) == 'user'
+
+
+# ─── /chat's one registration decision (register_chat_lane) ──────────────────
+
+@pytest.fixture
+def lanes():
+    from core import llm_outbound_logger as lol
+    with lol._request_lanes_lock:
+        lol._request_lanes.clear()
+    yield lol
+    with lol._request_lanes_lock:
+        lol._request_lanes.clear()
+
+
+def _genuine(rid):
+    from integrations.agent_engine.dispatch import is_genuine_user_request
+    return is_genuine_user_request(rid)
+
+
+def test_the_nodes_own_daemon_turn_is_left_to_the_prefix_rule(lanes):
+    """dispatch_goal registered revenue for a goal that earns; its self-POST
+    reaches /chat as the node itself with a daemon_ id and must not be
+    demoted (review finding 1: it was registered 'user')."""
+    from core.request_lane import register_chat_lane
+    lanes.register_request_lane('daemon_goal-rev-1', 'revenue')
+    assert register_chat_lane('daemon_goal-rev-1', 'tok', {'prompt': 'x'}, 'jwt',
+                              decode_jwt=_decoder({'user_id': 'system_daemon'}), tenant=TENANT,
+                              system_identities=SYSTEM, is_genuine=_genuine) is None
+    assert lanes.lane_for_request('daemon_goal-rev-1') == 'revenue'
+    # A plain goal's turn: nothing registered, the prefix rule says daemon.
+    assert register_chat_lane('daemon_goal-plain-1', '', {'prompt': 'x'}, 'api_key',
+                              tenant=TENANT, is_genuine=_genuine) is None
+    assert lanes.lane_for_request('daemon_goal-plain-1') == ''
+
+
+def test_a_stranger_naming_a_goals_request_id_does_not_inherit_its_lane(lanes):
+    """Review finding 3 (security): with keep_existing a stranger's JWT turn
+    that named a revenue goal's id got the revenue lane."""
+    from core.request_lane import register_chat_lane
+    lanes.register_request_lane('daemon_goal-rev-1', 'revenue')
+    lane = register_chat_lane('daemon_goal-rev-1', 'tok', {'prompt': 'x', 'lane': 'revenue'}, 'jwt',
+                              decode_jwt=_decoder({'user_id': 'stranger'}), tenant=TENANT,
+                              system_identities=SYSTEM, is_genuine=_genuine)
+    assert lane == 'user'
+    assert lanes.lane_for_request('daemon_goal-rev-1') == 'user'
+
+
+def test_the_metered_self_post_is_registered_by_its_body_from_either_credential(lanes):
+    from core.request_lane import register_chat_lane
+    for auth, tok, dec in (('api_key', '', None),
+                           ('jwt', 'tok', _decoder({'user_id': 'system_daemon'}))):
+        rid = 'api_1760300000_' + auth
+        assert register_chat_lane(rid, tok, {'lane': 'revenue'}, auth, decode_jwt=dec,
+                                  tenant=TENANT, system_identities=SYSTEM,
+                                  is_genuine=_genuine) == 'revenue'
+        assert lanes.lane_for_request(rid) == 'revenue'
+    assert register_chat_lane('api_1760300000_free', '', {'lane': 'user'}, 'api_key',
+                              tenant=TENANT, is_genuine=_genuine) == 'user'
+
+
+def test_a_shopper_is_registered_revenue_and_a_person_user(lanes):
+    from core.request_lane import register_chat_lane
+    assert register_chat_lane('msg_1', 'tok', {}, 'jwt',
+                              decode_jwt=_decoder({'user_id': 'c1', 'tid': TENANT}),
+                              tenant=TENANT, is_genuine=_genuine) == 'revenue'
+    assert register_chat_lane('msg_2', 'tok', {'lane': 'revenue'}, 'jwt',
+                              decode_jwt=_decoder({'user_id': 'c2'}),
+                              tenant=TENANT, is_genuine=_genuine) == 'user'
+    assert lanes.lane_for_request('msg_1') == 'revenue'
+    assert lanes.lane_for_request('msg_2') == 'user'

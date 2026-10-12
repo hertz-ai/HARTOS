@@ -242,6 +242,11 @@ class ModelRegistry:
                 if m.accuracy_score >= min_accuracy
                 and m.tier != ModelTier.DRAFT
                 and m.is_dispatchable()
+                # The configured expert is an EXPERT: only the expert
+                # selectors may pick it (review of 065cef8bb, C2: with a high
+                # accuracy and a slow own model it won the fast path for a
+                # user's turn, around the lane gate).
+                and m.model_id != CONFIGURED_EXPERT_ID
             ]
         if not candidates:
             return None
@@ -268,13 +273,16 @@ class ModelRegistry:
                 return False
             # The day cap (owner: $6/day on Claude, never a blocker): past it
             # the expert is simply not offered and the turn runs on the node's
-            # own model.  Fails open inside budget_gate.
+            # own model.  An unreadable ledger withholds it too (fail closed).
+            # Called OUTSIDE the registry lock: this reads the ledger.
             from integrations.agent_engine.budget_gate import expert_budget_allows
             allowed, why = expert_budget_allows(m.config_list_entry.get('model'))
             if not allowed:
-                logger.info("configured expert not offered: %s", why)
+                logger.warning("configured expert not offered: %s", why)
             return allowed
-        except Exception:
+        except Exception as exc:
+            logger.warning("configured expert withheld: lane or budget unreadable (%s)",
+                           type(exc).__name__)
             return False
 
     def get_expert_model(self, max_cost: float = float('inf'),
@@ -288,8 +296,10 @@ class ModelRegistry:
                 if m.cost_per_1k_tokens <= max_cost
                 and m.tier != ModelTier.DRAFT
                 and m.is_dispatchable()
-                and self._offered(m, lane)
             ]
+        # The lane and budget gate reads the spend ledger: outside the lock,
+        # so a slow DB never stalls model selection for every other caller.
+        candidates = [m for m in candidates if self._offered(m, lane)]
         if not candidates:
             return None
         return max(candidates, key=lambda m: m.accuracy_score)
@@ -310,8 +320,8 @@ class ModelRegistry:
                 if m.tier == ModelTier.EXPERT
                 and m.is_dispatchable()
                 and _llm_target(m.config_list_entry) != own
-                and self._offered(m, lane)
             ]
+        candidates = [m for m in candidates if self._offered(m, lane)]   # outside the lock
         if not candidates:
             return None
         return max(candidates, key=lambda m: m.accuracy_score)
@@ -329,7 +339,11 @@ class ModelRegistry:
                           # is_local=True with high accuracy scores, so
                           # 'local_only' and 'local_preferred' policies resolved
                           # to a speech engine instead of the local Qwen.
-                          and m.is_dispatchable()]
+                          and m.is_dispatchable()
+                          # A hosted expert is not this node's compute, whatever
+                          # its is_local flag says to the dispatcher; the
+                          # 'local' policies must never resolve to it.
+                          and m.model_id != CONFIGURED_EXPERT_ID]
         if not candidates:
             return None
         return max(candidates, key=lambda m: m.accuracy_score)
@@ -457,7 +471,9 @@ def ensure_configured_expert_registered() -> bool:
     get_expert_model's cost cap see one number.  is_local=True for the same
     reason as 'configured-api': a dispatch to it runs this node's full /chat
     pipeline with a model_config override, not the hive-peer POST.  Called at
-    boot from _register_defaults; a trio removed later unregisters it."""
+    boot from _register_defaults; calling it again after the trio changed or
+    went re-registers or unregisters accordingly (a running node re-reads its
+    configuration only when something calls this)."""
     try:
         from core.autogen_config import resolve_expert_backend
         entry = resolve_expert_backend()

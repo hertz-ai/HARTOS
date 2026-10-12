@@ -182,3 +182,27 @@ def test_metered_self_post_names_the_lane_by_tier(app_client, tier, lane):
     assert r.status_code == 200
     assert captured['json']['lane'] == lane
     assert captured['json']['user_id'] == 'cust-42'
+    # A paying customer's call is a genuine turn: it carries a request id of
+    # its own (a missing id reads as background on the wire, core.chat_client).
+    rid = captured['json']['request_id']
+    assert rid.startswith('api_') and not rid.startswith('daemon_')
+
+
+def test_each_metered_call_mints_its_own_request_id(app_client):
+    """Two calls in the same second must not share a lane entry or a
+    correlation key (review of 7086adff8: per-second ids collide)."""
+    seen = []
+
+    def fake_post(url, **kwargs):
+        seen.append(kwargs['json']['request_id'])
+        return _resp(200, {'response': 'ok'})
+
+    patches = _tier_auth('pro')
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+            patch('core.http_pool.pooled_post', side_effect=fake_post), \
+            patch('integrations.agent_engine.dispatch._internal_auth_headers',
+                  return_value=MINTED):
+        for _ in range(3):
+            app_client.post('/api/v1/intelligence/chat', json={'prompt': 'hello'},
+                            headers={'X-API-Key': 'k'})
+    assert len(seen) == 3 and len(set(seen)) == 3

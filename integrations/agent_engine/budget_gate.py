@@ -631,9 +631,9 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
 # fuse on the Claude route is the hard backstop, and an error here must never
 # stop revenue work.  Prices are list prices per 1k tokens; the owner can pin
 # them.
-USD_PER_1K_BY_FAMILY = {
-    'claude': (0.003, 0.015),     # input, output: Sonnet-class list price
-}
+# ONE price table, owned by core.autogen_config beside the expert entry whose
+# autogen ``price`` it also fills; imported here, never a second copy.
+from core.autogen_config import EXPERT_USD_PER_1K as USD_PER_1K_BY_FAMILY  # noqa: E402
 CLAUDE_USD_PER_1K_IN_VAR = 'HEVOLVE_CLAUDE_USD_PER_1K_IN'
 CLAUDE_USD_PER_1K_OUT_VAR = 'HEVOLVE_CLAUDE_USD_PER_1K_OUT'
 CLAUDE_BUDGET_USD_DAY_VAR = 'HEVOLVE_CLAUDE_BUDGET_USD_DAY'
@@ -675,10 +675,14 @@ def blended_usd_per_1k(model_name, tokens_in, tokens_out) -> Optional[float]:
     return (tin * price[0] + tout * price[1]) / total
 
 
-def usd_spent_since(since, model_prefix: str) -> float:
-    """Dollars this node's own calls spent on models named ``model_prefix*``
-    since ``since`` (UTC), from the metered-usage ledger.  0.0 when the
-    ledger cannot be read: the meter fails open by design."""
+def usd_spent_since(since, family: str) -> Optional[float]:
+    """Dollars this node's own calls spent on models of ``family`` (matched
+    by substring, the same rule usd_price_per_1k prices by, so a row named
+    'anthropic/claude-sonnet-4-5' counts) since ``since`` (UTC), from the
+    metered-usage ledger.  None when the ledger cannot be read: the caller
+    fails CLOSED on None (the expert is withheld, the turn runs on the
+    node's own model), because withholding is not blocking and an unread
+    ledger must not let the cap be overrun."""
     try:
         from sqlalchemy import func as sa_func
         from integrations.social.models import db_session, MeteredAPIUsage
@@ -689,20 +693,20 @@ def usd_spent_since(since, model_prefix: str) -> float:
             ).filter(
                 MeteredAPIUsage.node_id == node_id,
                 MeteredAPIUsage.task_source == 'own',
-                sa_func.lower(MeteredAPIUsage.model_id).like(model_prefix.lower() + '%'),
+                sa_func.lower(MeteredAPIUsage.model_id).like('%' + family.lower() + '%'),
                 MeteredAPIUsage.created_at >= since,
             ).scalar()
             return float(total or 0.0)
     except Exception as e:
-        logger.debug(f"usd_spent_since unavailable (fails open): {e}")
-        return 0.0
+        logger.warning(f"usd_spent_since: ledger unreadable, the expert is withheld: {e}")
+        return None
 
 
 def claude_budget_usd_day() -> float:
     return max(0.0, _env_float(CLAUDE_BUDGET_USD_DAY_VAR, DEFAULT_CLAUDE_BUDGET_USD_DAY))
 
 
-def claude_usd_spent_today() -> float:
+def claude_usd_spent_today() -> Optional[float]:
     from datetime import datetime
     day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     return usd_spent_since(day_start, CAPPED_FAMILY)
@@ -711,15 +715,17 @@ def claude_usd_spent_today() -> float:
 def expert_budget_allows(model_name) -> Tuple[bool, str]:
     """May the expert model ``model_name`` be offered right now?
 
-    Only the capped family is ever refused, and only once today's metered
-    dollars reach the day budget.  A refusal is not an error anywhere: the
-    selector simply does not offer the expert and the turn runs on the
-    node's own model.
+    Only the capped family is ever refused: once today's metered dollars
+    reach the day budget, or while the ledger cannot be read.  A refusal is
+    not an error anywhere: the selector simply does not offer the expert and
+    the turn runs on the node's own model.
     """
     if CAPPED_FAMILY not in (model_name or '').lower():
         return True, 'not a capped family'
     cap = claude_budget_usd_day()
     spent = claude_usd_spent_today()
+    if spent is None:
+        return False, f'{CAPPED_FAMILY} ledger unreadable: expert withheld'
     if spent >= cap:
         return False, f'{CAPPED_FAMILY} day budget spent: ${spent:.2f} of ${cap:.2f}'
     return True, f'{CAPPED_FAMILY} day budget: ${spent:.2f} of ${cap:.2f}'
