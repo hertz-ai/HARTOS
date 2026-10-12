@@ -39,6 +39,15 @@ TIER_CONFIG = {
                    'monthly_price_usd': 499.0,    'description': 'For scale. Dedicated hive lane + SLA.'},
 }
 
+# The tiers a person may issue to themselves.  Every other tier is BOUGHT
+# through the upgrade routes (AP2 ledger, Stripe, PhonePe), never self-issued:
+# before this, POST /keys passed the body's tier straight through, so any
+# signed-in person could mint a pro key with pro quotas for nothing, and with
+# the lanes (owner policy 2026-10-12) a paid-tier key runs on the revenue lane
+# where the Claude expert serves.  Operators (holds_central_role) may still
+# issue a paid key by hand.
+SELF_ISSUABLE_TIERS = frozenset({'free'})
+
 COST_PER_1K_TOKENS = {
     'free': 0.0,
     'starter': 0.5,
@@ -707,10 +716,19 @@ def create_key():
 
     try:
         data = request.get_json() or {}
+        tier = (data.get('tier') or 'free').strip().lower()
+        if tier not in SELF_ISSUABLE_TIERS:
+            from integrations.social.auth import holds_central_role
+            if not holds_central_role(user):
+                return jsonify({
+                    'success': False,
+                    'error': (f"Tier '{tier}' is bought, not issued: create a free key, then "
+                              f"POST /api/v1/intelligence/keys/<key_id>/upgrade"),
+                }), 400
         result = CommercialAPIService.create_api_key(
             db, str(user.id),
             name=data.get('name', ''),
-            tier=data.get('tier', 'free'),
+            tier=tier,
         )
         if 'error' in result:
             return jsonify({'success': False, 'error': result['error']}), 400
