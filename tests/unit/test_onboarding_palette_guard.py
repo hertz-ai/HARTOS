@@ -7,11 +7,11 @@ the old indigo.
 WHY a source guard (test_source_guard_*): a CSS *color* has no runtime behaviour
 to assert - the only regression to catch is "the indigo literal came back into the
 onboarding surfaces". Per CLAUDE.md Gate 5 this is an ACCEPTABLE source-shape guard
-because it enforces an appearance invariant across two files (the JS companion bar
-and the CSS-in-Python .hob-* rules) that a behavioural test cannot cover for the
-static CSS half. The JS half additionally has a BEHAVIOURAL companion-gradient
-assertion in tests/unit/test_onboarding_companion.mjs, so this is never the ONLY
-guard for the JS change.
+because it enforces an appearance invariant across two files (the JS driver and
+the CSS-in-Python .hob-* rules) that a behavioural test cannot cover for the
+static CSS half. Since 2026-10-12 the driver hosts Nunba's own ceremony in a
+frame and paints no colour itself; the .hob-* rules style the backdrop and the
+Skip control, and that is where the brand check lives.
 
 The onboarding surfaces this covers:
   * integrations/agent_engine/static/hartOnboarding.js       (whole file - onboarding)
@@ -61,8 +61,8 @@ class OnboardingPaletteGuard(unittest.TestCase):
         # Sanity: the block must exist (guards against the selectors being renamed
         # away silently, which would make this test vacuously pass).
         self.assertTrue(
-            any(".hob-orb" in ln for ln in hob_lines),
-            ".hob-orb rule not found - the onboarding CSS block moved/renamed; "
+            any(".hob-frame" in ln for ln in hob_lines),
+            ".hob-frame rule not found - the onboarding CSS block moved/renamed; "
             "update this guard so it keeps covering the onboarding surface")
         blob = "\n".join(hob_lines).lower()
         for tok in BANNED:
@@ -73,10 +73,9 @@ class OnboardingPaletteGuard(unittest.TestCase):
 
     def test_source_guard_onboarding_carries_the_brand_teal(self):
         """Positive check: the rebrand actually landed the brand teal (not merely
-        stripped the indigo to nothing)."""
-        js = _read(ONBOARDING_JS).lower()
+        stripped the indigo to nothing). The JS paints no colour of its own since
+        Nunba's page fills the overlay, so the check is on the .hob-* rules."""
         hob = "\n".join(ln for ln in _read(SHELL_PY).splitlines() if "hob-" in ln).lower()
-        self.assertIn("#00e6c3", js, "onboarding JS companion gradient must lead with brand teal")
         self.assertIn("rgba(0,230,195", hob, ".hob-* rules must use the brand teal (rgb 0,230,195)")
 
 

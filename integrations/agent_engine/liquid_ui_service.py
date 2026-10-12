@@ -3431,41 +3431,18 @@ class LiquidUIService:
         if 'orb' in native_chrome:
             native_orb_css = (
                 '.hart-hero-orbwrap>canvas,#hart-voice-orb,'
-                # ── `.hart-onboarding .hob-orb` IS DELIBERATELY NOT IN THIS LIST ──
-                #
-                # It was added 2026-09-10 and REMOVED 2026-09-11 after the owner
-                # reported the orb simply gone from onboarding. It was: standing
-                # it down leaves the ceremony with NO orb at all, because the
-                # compositor cannot draw one there.
-                #
-                # Every other selector here is safe because the bloom claim makes
-                # the WALLPAPER transparent, so the compositor's layers show
-                # through underneath. `.hart-onboarding` paints its OWN backdrop:
-                #     position:fixed; inset:0; z-index:12000;
-                #     background:radial-gradient(circle at 50% 38%,#16142e,#07060f 72%)
-                # Both stops are fully opaque and it covers the viewport, so the
-                # wallpaper being transparent buys nothing. The native orb is
-                # drawn BELOW the shell surface, and orb.rs says exactly what that
-                # means: "when the shell paints its own opaque background this is
-                # OCCLUDED, exactly as the bloom is."
-                #
-                # The positions do not match either. The native orb sits at
-                # 0.72w/0.46h, the slot the HOME layout gives it. The onboarding's
-                # is centred in a flex column above the name reveal. It is the
-                # ceremony's composition, not a second copy of the desktop's.
-                #
-                # And the report that prompted the original change said the screen
-                # was ALTERNATING between two scenes. That is the DrmCompositor
-                # damage race, where a dropped frame on the shell surface lets the
-                # native bloom+orb flash through. Hiding the onboarding's orb never
-                # addressed the alternation; it removed one of the two things that
-                # alternate, so onboarding then flickered between having no orb and
-                # showing the desktop's.
-                #
-                # The animation-only gate on the software floor
-                # (`body.webkit-flat .hart-onboarding .hob-orb{animation:none}`) is
-                # a different rule and stays: it drops the breathing on a box that
-                # paints in software while KEEPING the orb visible.
+                # ── The first-run overlay (`.hart-onboarding`) has no orb of its
+                # own to stand down. Until 2026-10-12 it carried `.hob-orb`, and
+                # listing that here (2026-09-10) left the ceremony with NO orb at
+                # all (reverted 2026-09-11): `.hart-onboarding` paints its OWN
+                # opaque backdrop (position:fixed; inset:0; z-index:12000; two
+                # fully opaque radial stops), so a transparent wallpaper buys it
+                # nothing and the compositor's orb, drawn BELOW the shell surface,
+                # is OCCLUDED there (orb.rs says so by name). Today the overlay
+                # hosts Nunba's own ceremony (static/hartOnboarding.js mounts its
+                # /local page in `.hob-frame`), which draws its particles and name
+                # reveal inside the frame. The backdrop argument is unchanged:
+                # nothing behind it can show.
                 '.hart-orb-orbit,.hart-orb-orbit2{visibility:hidden;animation:none}'
             )
         # The HOME SURFACE half. The compositor claims this only for a frame that
@@ -3681,7 +3658,7 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
    draw no ring), matching Win11/macOS. The shell chrome controls had NO focus
    style at all, so keyboard users couldn't see where they were. */
 :focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
-.start-btn:focus-visible,.tray-btn:focus-visible,.start-item:focus-visible,.power-btn:focus-visible,.taskbar-chip:focus-visible,.agent-pill:focus-visible,.ctx-menu-item:focus-visible{outline:2px solid var(--hart-accent);outline-offset:-2px}
+.start-btn:focus-visible,.tray-btn:focus-visible,.start-item:focus-visible,.power-btn:focus-visible,.taskbar-chip:focus-visible,.ctx-menu-item:focus-visible{outline:2px solid var(--hart-accent);outline-offset:-2px}
 /* Skip link (a11y): jump straight to content; off-screen until keyboard-focused. */
 .skip-link{position:fixed;top:-200px;left:8px;z-index:100000;padding:8px 16px;background:var(--hart-accent);color:var(--hart-on-accent);border-radius:8px;font-weight:600;text-decoration:none;transition:top 0.2s}
 .skip-link:focus{top:8px}
@@ -4270,31 +4247,23 @@ html.a11y-rmotion .panel{animation:none}
 /* Orb closes its eyes when the human cuts the AI's senses */
 .hart-hero.ai-blind #hart-voice-orb{opacity:.12;filter:grayscale(1) brightness(.4);transition:opacity .5s,filter .5s}
 .hart-hero.ai-blind .hart-hero-orbwrap{cursor:default;box-shadow:none}
-/* ── First-run "Light Your HART" ceremony overlay ── */
+/* ── First-run "Light Your HART": Nunba's ceremony, hosted full-screen ── */
 .hart-onboarding{position:fixed;inset:0;z-index:12000;display:none;flex-direction:column;align-items:center;justify-content:center;
   gap:26px;text-align:center;padding:48px;background:radial-gradient(circle at 50% 38%,#16142e,#07060f 72%)}
 .hart-onboarding.open{display:flex}
-/* Brand duotone (b1.2 / GF3): the orb reads TEAL core with a teal-inner +
-   VIOLET-outer layered halo (the mockup look), NOT the deprecated indigo
-   #6C63FF. Teal LEADS the functional surfaces (orb core, name reveal, option
-   chips); violet ACCENTS (the outer halo + the option hover glow). */
-.hart-onboarding .hob-orb{width:150px;height:150px;border-radius:50%;flex-shrink:0;
-  background:radial-gradient(circle at 50% 40%,rgba(0,230,195,.95),rgba(0,230,195,.34) 45%,transparent 70%);
-  box-shadow:0 0 70px rgba(0,230,195,.5),0 0 150px rgba(155,92,255,.24);animation:hob-breathe 3.2s ease-in-out infinite}
-@keyframes hob-breathe{0%,100%{transform:scale(1);opacity:.85}50%{transform:scale(1.08);opacity:1}}
-.hart-onboarding .hob-name{font-size:34px;font-weight:600;letter-spacing:1px;color:#fff;min-height:0;opacity:0;
-  transform:translateY(8px);transition:opacity .6s,transform .6s}
-.hart-onboarding .hob-name.show{opacity:1;transform:none;text-shadow:0 0 30px rgba(0,230,195,.55)}
-.hart-onboarding .hob-narr{max-width:640px;min-height:84px;display:flex;flex-direction:column;gap:10px}
-.hart-onboarding .hob-line{font-size:20px;line-height:1.5;color:#e9f7f3;font-family:var(--ds-font-body);
-  opacity:0;transform:translateY(6px);transition:opacity .6s,transform .6s}
-.hart-onboarding .hob-line.in{opacity:1;transform:none}
-.hart-onboarding .hob-opts{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;max-width:700px}
+/* Nunba's /local page (hartOnboarding.js mounts it while hart_sealed is unset)
+   paints the whole ceremony itself, so the overlay draws only this backdrop,
+   the frame and the always-present Skip control. Brand duotone (b1.2 / GF3):
+   the Skip control reads teal; violet accents its hover, as the option chips
+   of the retired OS ceremony did. */
+.hart-onboarding .hob-frame{position:absolute;inset:0;width:100%;height:100%;border:0;background:transparent}
 .hart-onboarding .hob-opt{padding:12px 22px;border-radius:999px;border:1px solid rgba(0,230,195,.4);
   background:rgba(0,230,195,.12);color:#fff;font-size:15px;font-family:var(--ds-font-body);cursor:pointer;
   transition:background .18s,transform .18s cubic-bezier(.175,.885,.32,1.275),box-shadow .18s}
 .hart-onboarding .hob-opt:hover{background:rgba(0,230,195,.22);transform:translateY(-2px);box-shadow:0 8px 24px rgba(155,92,255,.35)}
-.hart-onboarding .hob-skip{position:fixed;bottom:20px;font-size:12px;color:rgba(255,255,255,.4)}
+.hart-onboarding .hob-skip-wrap{position:fixed;left:0;right:0;bottom:18px;z-index:1;display:flex;flex-direction:column;align-items:center;gap:6px}
+.hart-onboarding .hob-skip-btn{padding:8px 20px;font-size:13px}
+.hart-onboarding .hob-skip-hint{font-size:12px;color:rgba(255,255,255,.45)}
 '''
 
         # ═══ "Living Glass" unified design system (overhaul) ═══
@@ -4630,17 +4599,13 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
                 'body.webkit-flat .hart-hero-hevolve .dot,'
                 'body.webkit-flat .top-bar-orb,'
                 'body.webkit-flat .hart-hero-go,'
-                # The ONBOARDING orb, added 2026-09-10 after finding it on the
-                # live node. `.hob-orb` is 150px carrying `0 0 70px` AND
-                # `0 0 150px` box-shadows and scaling to 1.08 forever -- the
-                # exact shape this rule was written for, and it is strictly
-                # worse than `.hart-hero-orb` because it is the FIRST screen a
-                # new user sees and it stays up for the whole of onboarding.
-                # On the Samsung, sitting on "Light Your HART" with no
-                # onboarding state written, WebKit's main thread measured 487
-                # of 500 jiffies (97.4% of a core) continuously from boot while
-                # hart-comp idled at 2.2%: the cost was re-rasterising two large
-                # blurs per frame in software, not compositing them.
+                # The ONBOARDING orb (`.hob-orb`) was listed here 2026-09-10 after
+                # the live node measured 97.4% of a core on "Light Your HART":
+                # 150px, two large box-shadows, scaling to 1.08 forever, on the
+                # first screen a new user sees. Since 2026-10-12 the overlay
+                # hosts Nunba's own ceremony in a frame and paints no orb, so
+                # there is no selector to gate; test_liquid_ui_idle_motion_gate
+                # pins that it stays gone (or comes back gated).
                 # The SENSES eye, added 2026-09-10 after reading how it is lit.
                 # I had kept this out of the gate on the grounds that it is
                 # "state-driven -- runs only while a sense is active". That
@@ -4663,7 +4628,6 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
                 # can hear. What goes is the 2.4s pulse re-rasterising it
                 # forever on a box that paints in software.
                 'body.webkit-flat .hart-senses-btn.is-sensing .mi,'
-                'body.webkit-flat .hart-onboarding .hob-orb,'
                 'body.webkit-flat .ds-skeleton{animation:none!important}'
             )
 
@@ -4806,67 +4770,6 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   border-radius:8px;cursor:pointer;font-size:12px;transition:background var(--hart-anim-speed)}}
 .start-footer .power-btn:hover{{background:var(--hart-surface-hover,rgba(255,255,255,0.08))}}
 .start-footer .power-btn .mi{{font-size:16px}}
-
-/* ── Agent Pill (collapsed floating bubble) ── */
-.agent-pill{{position:fixed;bottom:56px;right:16px;z-index:1500;display:flex;
-  align-items:center;gap:8px;padding:8px 14px;cursor:pointer;
-  transition:all var(--hart-anim-speed);max-width:360px}}
-.agent-pill:hover{{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,0.3)}}
-.agent-pill.expanded{{max-width:400px;padding:12px}}
-.agent-pill.hidden{{display:none}}
-.agent-pill .mi{{font-size:20px;color:var(--hart-accent);flex-shrink:0}}
-.agent-pill input{{flex:1;background:transparent;border:none;color:var(--hart-text);
-  font-family:var(--ds-font-body);font-size:13px;outline:none;min-width:0}}
-.agent-pill input::placeholder{{color:var(--hart-muted)}}
-.agent-response{{font-size:12px;color:var(--hart-muted);padding-top:6px;
-  border-top:1px solid var(--hart-glass-border);display:none;width:100%}}
-.agent-response.visible{{display:block}}
-
-/* ── Floating Assistant Chat Panel ── */
-.assistant-chat{{position:fixed;bottom:56px;right:16px;z-index:1600;
-  width:380px;height:520px;display:none;flex-direction:column;
-  border-radius:var(--hart-radius);overflow:hidden;
-  resize:both;min-width:320px;min-height:400px;max-width:600px;max-height:80vh}}
-.assistant-chat.open{{display:flex}}
-.assistant-chat .ac-header{{display:flex;align-items:center;gap:8px;
-  padding:10px 14px;cursor:grab;user-select:none;
-  border-bottom:1px solid var(--hart-glass-border);flex-shrink:0}}
-.assistant-chat .ac-header:active{{cursor:grabbing}}
-.assistant-chat .ac-title{{flex:1;font-size:13px;font-weight:500}}
-.assistant-chat .ac-btn{{background:none;border:none;color:var(--hart-muted);
-  cursor:pointer;padding:2px;font-size:18px}}
-.assistant-chat .ac-btn:hover{{color:var(--hart-text)}}
-.assistant-chat .ac-caps{{display:flex;gap:6px;padding:8px 14px;overflow-x:auto;
-  flex-shrink:0;border-bottom:1px solid var(--hart-glass-border)}}
-.assistant-chat .ac-cap{{display:flex;align-items:center;gap:4px;
-  padding:4px 10px;border-radius:12px;font-size:11px;white-space:nowrap;
-  background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
-  cursor:pointer;transition:background 120ms}}
-.assistant-chat .ac-cap:hover{{background:var(--hart-surface-hover,rgba(255,255,255,0.1))}}
-.assistant-chat .ac-cap.active{{background:var(--hart-accent);color:#fff;border-color:var(--hart-accent)}}
-.assistant-chat .ac-cap .mi{{font-size:14px}}
-.assistant-chat .ac-messages{{flex:1;overflow-y:auto;padding:12px 14px;
-  display:flex;flex-direction:column;gap:8px}}
-.assistant-chat .ac-msg{{max-width:85%;padding:8px 12px;border-radius:12px;
-  font-size:13px;line-height:1.4;word-break:break-word}}
-.assistant-chat .ac-msg.user{{align-self:flex-end;
-  background:var(--hart-accent);color:#fff;border-bottom-right-radius:4px}}
-.assistant-chat .ac-msg.assistant{{align-self:flex-start;
-  background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
-  border-bottom-left-radius:4px}}
-.assistant-chat .ac-msg.typing{{opacity:0.6;font-style:italic}}
-.assistant-chat .ac-input-row{{display:flex;align-items:center;gap:6px;
-  padding:8px 10px;border-top:1px solid var(--hart-glass-border);flex-shrink:0}}
-.assistant-chat .ac-input{{flex:1;background:transparent;border:1px solid var(--hart-glass-border);
-  border-radius:20px;padding:8px 14px;color:var(--hart-text);
-  font-family:var(--ds-font-body);font-size:13px;outline:none;resize:none}}
-.assistant-chat .ac-input:focus{{border-color:var(--hart-accent)}}
-.assistant-chat .ac-input::placeholder{{color:var(--hart-muted)}}
-.assistant-chat .ac-send{{background:var(--hart-accent);border:none;
-  width:32px;height:32px;border-radius:50%;display:flex;align-items:center;
-  justify-content:center;cursor:pointer;flex-shrink:0;transition:opacity 120ms}}
-.assistant-chat .ac-send:hover{{opacity:0.85}}
-.assistant-chat .ac-send .mi{{font-size:16px;color:#fff}}
 
 /* ── Context Menu ── */
 .ctx-menu{{position:fixed;z-index:3000;min-width:180px;padding:4px;
@@ -5043,7 +4946,6 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <!-- Panel Container -->
 <div class="panel-container" id="panels" role="main" aria-label="Open windows"></div>
 
-<!-- Agent Pill (click to expand floating chat) -->
 <!-- Voice orb visualiser + hero orchestrator. The orb canvas now lives inside
      #hart-hero (centerpiece); initHartOrb still finds #hart-voice-orb and drives
      it. hartHero.js fuses the orb with the command bar, reusing toggleVoice /
@@ -5156,32 +5058,6 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      create more install sticks. Exposes window.loadFlashWizard. -->
 <script defer src="/shell/static/hartFlash.js"></script>
 
-<!-- Agent Pill (click to expand floating chat) -->
-<div class="agent-pill glass hidden" id="agent-pill" onclick="toggleAssistantChat()">
-  <span class="mi material-icons-round" style="color:var(--hart-accent)">chat_bubble</span>
-  <input id="agent-input" placeholder="Ask HART..." onclick="event.stopPropagation();toggleAssistantChat()" onkeydown="if(event.key==='Enter'){{event.stopPropagation();toggleAssistantChat();setTimeout(function(){{var i=document.getElementById('ac-input');if(i){{i.value=document.getElementById('agent-input').value;document.getElementById('agent-input').value=''}}}},100)}}">
-  <div class="agent-response" id="agent-resp"></div>
-</div>
-
-<!-- Floating Assistant Chat Panel -->
-<div class="assistant-chat glass" id="assistant-chat" role="dialog" aria-label="HART Assistant" aria-modal="false">
-  <div class="ac-header" id="ac-drag-handle">
-    <span class="mi material-icons-round" style="font-size:20px;color:var(--hart-accent)">chat_bubble</span>
-    <span class="ac-title">HART Assistant</span>
-    <button class="ac-btn mi material-icons-round" onclick="minimizeAssistant()" title="Minimize">remove</button>
-    <button class="ac-btn mi material-icons-round" onclick="toggleAssistantChat()" title="Close">close</button>
-  </div>
-  <div class="ac-caps" id="ac-caps"></div>
-  <div class="ac-messages" id="ac-messages" role="log" aria-live="polite">
-    <div class="ac-msg assistant">Hi! I can help with anything - chat, code, agents, vision, voice, remote desktop, and 3,200+ OpenClaw skills. What would you like to do?</div>
-  </div>
-  <div class="ac-input-row">
-    <span class="mi material-icons-round ac-btn" onclick="acVoiceInput()" title="Voice input" style="font-size:20px">mic</span>
-    <input class="ac-input" id="ac-input" placeholder="Ask anything..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();acSend()}}">
-    <button class="ac-send" onclick="acSend()"><span class="mi material-icons-round">send</span></button>
-  </div>
-</div>
-
 <!-- Start Menu -->
 <div class="start-menu glass" id="start-menu">
   <input class="start-search" id="start-search" placeholder="Search..." oninput="filterStart(this.value)" onkeydown="if(event.key==='Enter'){{event.preventDefault();startSearchEnter()}}">
@@ -5233,14 +5109,8 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   </div>
 </div>
 
-<!-- First-run "Light Your HART" ceremony (web, in-shell; auto-runs after OS install when not onboarded) -->
-<div class="hart-onboarding" id="hart-onboarding" role="dialog" aria-modal="true" aria-label="Light Your HART">
-  <div class="hob-orb" aria-hidden="true"></div>
-  <div class="hob-name" id="hart-onboarding-name"></div>
-  <div class="hob-narr" id="hart-onboarding-narr" role="status" aria-live="polite"></div>
-  <div class="hob-opts" id="hart-onboarding-opts"></div>
-  <div class="hob-skip">Press Esc to skip</div>
-</div>
+<!-- First-run "Light Your HART": Nunba's own ceremony, hosted full-screen by hartOnboarding.js while hart_sealed is unset -->
+<div class="hart-onboarding" id="hart-onboarding" role="dialog" aria-modal="true" aria-label="Light Your HART"></div>
 
 <!-- Toast Notifications -->
 <div class="toast-container" id="toast-container" role="status" aria-live="polite"></div>
@@ -6576,7 +6446,8 @@ function loadHartIdentityPanel(el, apis) {{
         '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-3" style="padding:40px 0">'+
         '<span class="mi material-icons-round ds-text-muted" style="font-size:48px">person_outline</span>'+
         '<div class="ds-body-md ds-text-muted">You haven&#39;t lit your HART yet.</div>'+
-        dsBtn('Light Your HART',{{variant:'primary', onclick:"fetch(SHELL+'/api/onboarding/start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{user_id:'1'}})}}).then(()=>showToast('Onboarding','Opening onboarding...','info')).catch(()=>{{}})"}})+'</div></div>';
+        // Nunba runs the ceremony (its /local page, unsealed): the assistant panel is the wizard.
+        dsBtn('Light Your HART',{{variant:'primary', onclick:"openPanel('assistant')"}})+'</div></div>';
       return;
     }}
     fetch(SHELL+profileUrl,{{signal:_sig(3000)}}).then(r=>r.json()).then(p=>{{
@@ -7789,146 +7660,119 @@ function loadRemoteDesktopPanel(el, apis) {{
     }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px">error_outline</span>Remote desktop unavailable</div>'; }});
 }}
 
-// ═══ Agent Pill ═══
-// focusAgent() (Super+A) focuses the pill input; the pill's onkeydown opens the
-// assistant chat and copies the text into #ac-input, where acSend() is the SOLE
-// intent dispatcher (theme/open fast-paths + the default /api/agent/ask compose).
-// The old askAgent() was a DEAD parallel copy of that same M1 block - no handler
-// invoked it - so it was removed (acSend is the one live path).
-function focusAgent() {{
-  document.getElementById('agent-input').focus();
-  document.getElementById('agent-pill').classList.add('expanded');
-}}
-
-// ═══ Floating Assistant Chat ═══
-const AC_CAPS = [
-  {{id:'chat',name:'Chat',icon:'chat'}},
-  {{id:'recipe',name:'Recipes',icon:'receipt_long'}},
-  {{id:'agents',name:'Agents',icon:'smart_toy'}},
-  {{id:'vision',name:'Vision',icon:'visibility'}},
-  {{id:'voice',name:'Voice',icon:'record_voice_over'}},
-  {{id:'expert',name:'Experts',icon:'psychology'}},
-  {{id:'openclaw',name:'OpenClaw',icon:'extension'}},
-  {{id:'code',name:'Code',icon:'code'}},
-  {{id:'remote',name:'Remote',icon:'desktop_windows'}},
-  {{id:'channels',name:'Channels',icon:'forum'}},
-];
-let acMessages = [];
-let acActiveCap = 'chat';
-let acDragging = false;
-let acInit = false;
-let acDragOfs = {{x:0,y:0}};
-
-function initAssistantChat() {{
-  // Render capability pills
-  const capsEl = document.getElementById('ac-caps');
-  if(!capsEl) return;
-  capsEl.innerHTML = AC_CAPS.map(c=>
-    '<div class="ac-cap'+(c.id===acActiveCap?' active':'')+'" data-cap-id="'+c.id+'" onclick="acSelectCap(this.dataset.capId)" title="'+c.name+'">'+
-    '<span class="mi material-icons-round">'+c.icon+'</span>'+c.name+'</div>'
-  ).join('');
-
-  // Drag support — bind the global mousemove/mouseup listeners ONCE. This fn runs
-  // on EVERY chat open, so without this guard each open added another live
-  // document listener (a growing perf leak on the low-end target).
-  if(acInit) return;
-  const handle = document.getElementById('ac-drag-handle');
-  const chat = document.getElementById('assistant-chat');
-  if(!handle||!chat) return;
-  acInit = true;
-  handle.addEventListener('mousedown', function(e) {{
-    if(e.target.closest('.ac-btn')) return;
-    acDragging = true;
-    const rect = chat.getBoundingClientRect();
-    acDragOfs = {{x: e.clientX - rect.left, y: e.clientY - rect.top}};
-    e.preventDefault();
-  }});
-  document.addEventListener('mousemove', function(e) {{
-    if(!acDragging) return;
-    const chat = document.getElementById('assistant-chat');
-    let nx = e.clientX - acDragOfs.x, ny = e.clientY - acDragOfs.y;
-    nx = Math.min(Math.max(nx, 8), window.innerWidth - 80);
-    ny = Math.min(Math.max(ny, 40), window.innerHeight - 80);
-    chat.style.left = nx + 'px';
-    chat.style.top = ny + 'px';
-    chat.style.right = 'auto';
-    chat.style.bottom = 'auto';
-  }});
-  document.addEventListener('mouseup', function() {{ acDragging = false; }});
-}}
-
-function toggleAssistantChat() {{
-  const chat = document.getElementById('assistant-chat');
-  const pill = document.getElementById('agent-pill');
-  if(!chat) return;
-  const isOpen = chat.classList.contains('open');
-  if(isOpen) {{
-    chat.classList.remove('open');
-    pill.classList.remove('hidden');
-  }} else {{
-    chat.classList.add('open');
-    pill.classList.add('hidden');
-    initAssistantChat();
-    const input = document.getElementById('ac-input');
-    if(input) setTimeout(function(){{input.focus()}},100);
+// ═══ Nunba is the chat ═══
+// The shell's own chat bubble (the #agent-pill, #assistant-chat, its capability
+// chips and transcript) retired 2026-10-12. Nunba, preinstalled as
+// hart-nunba.service and framed same-origin in the pinned 'assistant' panel,
+// is the ONE chat surface: its transcript, LiquidUI cards and voice paint
+// there. Everything that used to fill #ac-input goes through HartNunba.compose,
+// which carries the text into Nunba's composer over postMessage (Nunba's half:
+// landing-page/src/utils/shellBridge.js: nunba:ready / nunba:compose /
+// nunba:turn). acSend stays the ONE intent dispatcher: the deterministic
+// fast-paths (theme words, a named app) still resolve locally; free-form
+// intent is a conversation and lands in Nunba.
+window.HartNunba = (function() {{
+  const PANEL = 'assistant', READY_WAIT_MS = 15000;
+  let ready = false, knownFrame = null, queue = [], readyTimer = null;
+  function frame() {{
+    const body = document.getElementById('panel-body-'+PANEL);
+    const f = body ? body.querySelector('.route-frame') : null;
+    if(f !== knownFrame) {{ knownFrame = f; ready = false; }}   // a new frame announces itself again
+    return f;
   }}
-}}
-
-function minimizeAssistant() {{
-  const chat = document.getElementById('assistant-chat');
-  const pill = document.getElementById('agent-pill');
-  if(chat) chat.classList.remove('open');
-  if(pill) pill.classList.remove('hidden');
-}}
-
-function acSelectCap(id) {{
-  acActiveCap = id;
-  document.querySelectorAll('.ac-cap').forEach(function(el) {{
-    el.classList.toggle('active', el.dataset.capId === id);
+  function open() {{
+    // openPanel reuses + fronts an open instance, and bringToFront restores a
+    // minimised one (reloading a potato-destroyed frame). Potato's tap-to-load
+    // placeholder is loaded here: a composed line must reach a live page.
+    openPanel(PANEL);
+    const body = document.getElementById('panel-body-'+PANEL);
+    if(body && body.dataset.loaded === '0' && body.dataset.route) loadIframe(PANEL, body.dataset.route);
+  }}
+  function flush() {{
+    const f = frame();
+    if(!f || !f.contentWindow) return;
+    while(queue.length) {{
+      const m = queue.shift();
+      try {{ f.contentWindow.postMessage(m, location.origin); }}
+      catch(e) {{ console.debug('HartNunba: post failed', e); }}
+    }}
+  }}
+  function compose(text, send) {{
+    text = (text || '').trim();
+    open();
+    if(!text) return;
+    queue.push({{type:'nunba:compose', text:text, send:!!send}});
+    if(ready) {{ flush(); return; }}
+    // Nunba's page announces itself with nunba:ready; until then the text
+    // waits. A page without the bridge never announces: say so, do not hang.
+    if(!readyTimer) readyTimer = setTimeout(function() {{
+      readyTimer = null;
+      if(!ready && queue.length) {{
+        queue = [];
+        window._hartThinking = false;
+        showToast('Assistant', 'Nunba is still loading. Try again in a moment.', 'warning');
+      }}
+    }}, READY_WAIT_MS);
+  }}
+  window.addEventListener('message', function(e) {{
+    if(e.origin !== location.origin) return;
+    const d = e.data;
+    if(!d || typeof d !== 'object' || typeof d.type !== 'string' || d.type.indexOf('nunba:') !== 0) return;
+    const f = frame();
+    // Only the assistant panel's page; the first-run overlay has its own listener.
+    if(!f || e.source !== f.contentWindow) return;
+    if(d.type === 'nunba:ready') {{
+      ready = true;
+      if(readyTimer) {{ clearTimeout(readyTimer); readyTimer = null; }}
+      flush();
+    }} else if(d.type === 'nunba:turn') {{
+      // The orb lamp mirrors Nunba's turn: lit from send to reply, never a guess.
+      window._hartThinking = (d.state === 'start');
+    }}
   }});
+  // The panel closing mid-turn must not leave the orb thinking forever.
+  const pc = document.getElementById('panels');
+  if(pc && typeof MutationObserver === 'function') {{
+    new MutationObserver(function() {{
+      if(!document.getElementById('panel-'+PANEL)) {{
+        ready = false; knownFrame = null; queue = []; window._hartThinking = false;
+      }}
+    }}).observe(pc, {{childList:true}});
+  }}
+  return {{ open: open, compose: compose, isOpen: function() {{ return !!panels[PANEL]; }} }};
+}})();
+
+// Super+A and the hero's "surface the conversation": the Nunba panel, fronted.
+function focusAgent() {{ HartNunba.open(); }}
+// Open/close under its historical name for the modules that call it
+// (hartHero.js, hartAskMenu.js, hartHome.js, hartMarketplace.js).
+function toggleAssistantChat() {{
+  if(HartNunba.isOpen()) {{ closePanel('assistant'); return; }}
+  HartNunba.open();
 }}
 
-function acAddMsg(role, text) {{
-  const msgsEl = document.getElementById('ac-messages');
-  if(!msgsEl) return;
-  const div = document.createElement('div');
-  div.className = 'ac-msg ' + role;
-  div.textContent = text;
-  msgsEl.appendChild(div);
-  msgsEl.scrollTop = msgsEl.scrollHeight;
-  return div;
-}}
-
-function acSend() {{
-  const input = document.getElementById('ac-input');
-  if(!input) return;
-  const text = input.value.trim();
+function acSend(text) {{
+  text = (typeof text === 'string' ? text : '').trim();
   if(!text) return;
-  input.value = '';
-
-  acAddMsg('user', text);
-
-  // Show typing indicator
-  const typing = acAddMsg('assistant', 'Thinking...');
-  typing.classList.add('typing');
+  // A fast-path's outcome ('Opened Files', 'Applied aura') reports through the
+  // shell's own toast, the surface every other local action uses.
+  const resp = {{ set textContent(v) {{ if(v) showToast('Assistant', v, 'info'); }} }};
   // Drive the voice orb's energetic animation for the whole PROCESSING window
   // (not just TTS/mic) so it never looks frozen while the brain is thinking.
-  // Cleared on EVERY terminal path below (theme/open fast-paths, success, error)
-  // so it can't get stuck true. The orb poll ORs this flag in.
+  // Cleared on EVERY terminal path: the fast-paths here, and Nunba's own
+  // nunba:turn 'done' (HartNunba) for a conversation. The orb poll ORs this in.
   window._hartThinking = true;
 
   // M1 — INTENT IS THE DEFAULT OPERATING SURFACE.
   // The orb/command bar composes the desktop from what the human wants: the
-  // DEFAULT path sends free-form intent to /api/agent/ask, which routes it
-  // through the brain's EXISTING decompose (/chat → CREATE/REUSE) and PUSHES
-  // the result as a composed A2UI card via agent_ui_update (the SSE stream
-  // paints it through renderAgentOverlay).  'open <named app>' and theme words
-  // are demoted to explicit FALLBACK fast-paths, not the spine.
+  // DEFAULT path hands free-form intent to Nunba, the one chat, whose /chat
+  // runs the brain's EXISTING decompose and whose LiquidUI paints the result.
+  // 'open <named app>' and theme words are explicit FALLBACK fast-paths, not
+  // the spine.
   const lower = text.toLowerCase();
   if(lower.includes('theme')||lower.includes('font')||lower.includes('bigger')||
      lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
-    const fakeResp = {{set textContent(v){{typing.textContent=v;typing.classList.remove('typing')}}}};
-    handleThemeCommand(lower, fakeResp);
+    handleThemeCommand(lower, resp);
     window._hartThinking = false;  // terminal: handled locally, no brain wait
     return;
   }}
@@ -7963,40 +7807,19 @@ function acSend() {{
             title(v).includes(target) || k.toLowerCase().includes(target)) : null);
     if(match) {{
       openPanel(match[0]);
-      typing.textContent = 'Opened ' + match[1].title;
-      typing.classList.remove('typing');
+      resp.textContent = 'Opened ' + match[1].title;
       window._hartThinking = false;  // terminal: launched locally, no brain wait
       return;
     }}
   }}
 
-  // Default: route the intent through the brain and COMPOSE the desktop.
-  // Bound the client wait (server /chat caps at 30s): without a signal a wedged
-  // brain or a saturated shell pool left this fetch — and the 'Thinking...'
-  // bubble — hung forever. _sig aborts at 32s into the friendly catch below.
-  fetch(SHELL+'/api/agent/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{text:text,capability:acActiveCap}}),signal:_sig(32000)}})
-    .then(function(r){{return r.json()}}).then(function(data){{
-      const reply = data.response || data.error || 'No response';
-      // The composed card is painted on the desktop by the SSE overlay stream;
-      // the bubble is the spoken acknowledgement (casual chat still replies).
-      typing.textContent = data.composed ? ('✦ ' + reply) : reply;
-      typing.classList.remove('typing');
-      window._hartThinking = false;  // terminal: response arrived
-      speakText(reply, 'chat_response');
-    }}).catch(function(){{
-      typing.textContent = 'Assistant unavailable. It may still be starting - try again in a moment.';
-      typing.classList.remove('typing');
-      window._hartThinking = false;  // terminal: request failed
-    }});
+  // Default: a conversation. Nunba owns it: the text lands in its composer and
+  // is sent; its reply, LiquidUI cards and voice paint inside the assistant
+  // panel, and its nunba:turn clears the orb lamp. The brain hop stays
+  // reachable for API callers at /api/agent/ask (the same Nunba /chat over the
+  // socket); the shell no longer renders a second transcript of it.
+  HartNunba.compose(text, true);
 }}
-
-function acVoiceInput() {{
-  toggleVoice();
-}}
-
-// Init on load
-setTimeout(initAssistantChat, 500);
 
 function handleThemeCommand(text, resp) {{
   let customization = {{}};
@@ -8223,20 +8046,19 @@ async function startRecording() {{
       const blob = new Blob(audioChunks, {{type: mediaRecorder.mimeType || 'audio/webm'}});
       const formData = new FormData();
       formData.append('audio', blob, 'voice.webm');
-      const resp = document.getElementById('agent-resp');
-      resp.textContent = 'Transcribing...';
-      resp.classList.add('visible');
+      // The transcript shows on the hero bar (HartHeroShowTranscript, the one
+      // transcript surface) and is dispatched like typed text: acSend lands a
+      // conversation in Nunba. Errors report through the shell's toast.
       try {{
         const r = await fetch(SHELL+'/api/voice', {{method:'POST', body:formData}});
         const data = await r.json();
         if(data.text) {{
           if(window.HartHeroShowTranscript) window.HartHeroShowTranscript(data.text);
-          const aci = document.getElementById('ac-input');
-          if(aci) {{ aci.value = data.text; acSend(); }}
+          acSend(data.text);
         }} else if(data.error) {{
-          resp.textContent = data.error;
+          showToast('Voice', data.error, 'warning');
         }}
-      }} catch(err) {{ resp.textContent = 'Voice processing failed'; }}
+      }} catch(err) {{ showToast('Voice', 'Voice processing failed', 'error'); }}
     }};
     acStopSpeaking();  // barge-in: stop any in-progress TTS the instant the user starts speaking
     mediaRecorder.start();
@@ -10507,7 +10329,10 @@ function renderAgentOverlay(ev) {{
         try:
             from integrations.agent_engine.onboarding_routes import (
                 register_onboarding_routes)
-            register_onboarding_routes(app)
+            # No user_id on the request: the owner the shell chat speaks as
+            # (Nunba's owner file, else its guest id; None while Nunba is down,
+            # which /status reports as companion_ready=false).
+            register_onboarding_routes(app, resolve_user=self._desktop_owner_id)
         except Exception as e:
             logger.warning("Onboarding APIs registration: %s", e)
 

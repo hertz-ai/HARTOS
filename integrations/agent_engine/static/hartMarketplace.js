@@ -288,10 +288,8 @@
 
   // AI-native: route a natural-language need to the agent for a recommendation.
   function askAgent(q) {
-    if (window.toggleAssistantChat && !document.getElementById('assistant-chat').classList.contains('open'))
-      window.toggleAssistantChat();
-    var aci = document.getElementById('ac-input');
-    if (aci && window.acSend) { aci.value = 'Recommend a free, open-source app for: ' + q; window.acSend(); }
+    // acSend opens Nunba (the one chat) and lands the line there.
+    if (window.acSend) window.acSend('Recommend a free, open-source app for: ' + q);
   }
 
   window.hartRenderMarketplace = function (el) {
