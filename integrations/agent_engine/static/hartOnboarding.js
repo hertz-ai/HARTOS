@@ -56,7 +56,7 @@
     wrap.className = 'hob-skip-wrap';
     var b = document.createElement('button');
     b.type = 'button';
-    b.className = 'hob-opt hob-skip-btn';
+    b.className = 'hob-skip-btn';
     b.textContent = 'Skip setup';
     if (typeof b.setAttribute === 'function') b.setAttribute('aria-label', 'Skip setup (or press Esc)');
     b.addEventListener('click', function () { finish(); });

@@ -511,8 +511,9 @@ def test_onboarding_backdrop_is_opaque_so_nothing_native_can_show_behind_it():
     overlay. Every other selector in native_orb_css is safe because the bloom
     claim makes the WALLPAPER transparent, so the compositor's layers show
     through underneath. `.hart-onboarding` paints its own backdrop at
-    `inset:0; z-index:12000` out of two fully opaque stops, so the transparent
-    wallpaper buys it nothing and the native orb, drawn BELOW the shell surface,
+    `inset:0; z-index:12000` in opaque black (Nunba's own ceremony root is
+    black too), so the transparent wallpaper buys it nothing and the native orb,
+    drawn BELOW the shell surface,
     is OCCLUDED there (orb.rs calls that out by name).
 
     History: on 2026-09-10 the overlay's own orb (`.hob-orb`) was listed in the
@@ -537,7 +538,7 @@ def test_onboarding_backdrop_is_opaque_so_nothing_native_can_show_behind_it():
     # The backdrop is still the opaque thing this argument rests on, and the
     # ceremony inside it is Nunba's page.
     onb = _block(src, ".hart-onboarding{", "}")
-    assert 'z-index:12000' in onb and 'background:radial-gradient' in onb, (
+    assert 'z-index:12000' in onb and 'background:#000' in onb, (
         "the onboarding backdrop changed shape; re-check whether the native orb can "
         "now be seen behind it before trusting this test's reasoning")
     assert '.hart-onboarding .hob-frame{' in src, (

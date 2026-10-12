@@ -4248,22 +4248,28 @@ html.a11y-rmotion .panel{animation:none}
 .hart-hero.ai-blind #hart-voice-orb{opacity:.12;filter:grayscale(1) brightness(.4);transition:opacity .5s,filter .5s}
 .hart-hero.ai-blind .hart-hero-orbwrap{cursor:default;box-shadow:none}
 /* ── First-run "Light Your HART": Nunba's ceremony, hosted full-screen ── */
-.hart-onboarding{position:fixed;inset:0;z-index:12000;display:none;flex-direction:column;align-items:center;justify-content:center;
-  gap:26px;text-align:center;padding:48px;background:radial-gradient(circle at 50% 38%,#16142e,#07060f 72%)}
-.hart-onboarding.open{display:flex}
-/* Nunba's /local page (hartOnboarding.js mounts it while hart_sealed is unset)
-   paints the whole ceremony itself, so the overlay draws only this backdrop,
-   the frame and the always-present Skip control. Brand duotone (b1.2 / GF3):
-   the Skip control reads teal; violet accents its hover, as the option chips
-   of the retired OS ceremony did. */
-.hart-onboarding .hob-frame{position:absolute;inset:0;width:100%;height:100%;border:0;background:transparent}
-.hart-onboarding .hob-opt{padding:12px 22px;border-radius:999px;border:1px solid rgba(0,230,195,.4);
-  background:rgba(0,230,195,.12);color:#fff;font-size:15px;font-family:var(--ds-font-body);cursor:pointer;
-  transition:background .18s,transform .18s cubic-bezier(.175,.885,.32,1.275),box-shadow .18s}
-.hart-onboarding .hob-opt:hover{background:rgba(0,230,195,.22);transform:translateY(-2px);box-shadow:0 8px 24px rgba(155,92,255,.35)}
-.hart-onboarding .hob-skip-wrap{position:fixed;left:0;right:0;bottom:18px;z-index:1;display:flex;flex-direction:column;align-items:center;gap:6px}
-.hart-onboarding .hob-skip-btn{padding:8px 20px;font-size:13px}
-.hart-onboarding .hob-skip-hint{font-size:12px;color:rgba(255,255,255,.45)}
+/* The overlay is a host, nothing more: no padding, no flex centering (the
+   retired OS ceremony needed those; a 48px padding here left a 96px band of
+   backdrop under Nunba's page on generation 21, because the frame's percentage
+   height resolved against the content box). Black, like Nunba's own ceremony
+   root, so the backdrop is invisible before and behind the page. Opaque on
+   purpose: the native orb cannot show through it (see native_orb_css). */
+.hart-onboarding{position:fixed;inset:0;z-index:12000;display:none;margin:0;padding:0;background:#000}
+.hart-onboarding.open{display:block}
+.hart-onboarding .hob-frame{position:absolute;inset:0;border:0;background:transparent}
+/* The one control the shell draws over Nunba's page, in Nunba's chip language
+   (its LightYourHART optionChip: a thin white hairline pill, muted text, Inter,
+   no fill) so it reads as part of the ceremony. Brand teal (b1.2) only on the
+   keyboard focus ring, where Nunba has no colour of its own. */
+.hart-onboarding .hob-skip-wrap{position:fixed;left:0;right:0;bottom:22px;z-index:1;display:flex;flex-direction:column;align-items:center;gap:8px}
+.hart-onboarding .hob-skip-btn{appearance:none;-webkit-appearance:none;margin:0;padding:9px 24px;border-radius:24px;
+  border:1px solid rgba(255,255,255,.15);background:transparent;color:rgba(255,255,255,.7);
+  font-size:14px;font-weight:400;letter-spacing:.01em;font-family:"Inter","SF Pro Text",-apple-system,var(--ds-font-body),sans-serif;
+  cursor:pointer;transition:border-color .4s ease,color .4s ease,background .4s ease}
+.hart-onboarding .hob-skip-btn:hover{border-color:rgba(255,255,255,.35);color:rgba(255,255,255,.9);background:rgba(255,255,255,.04)}
+.hart-onboarding .hob-skip-btn:focus-visible{outline:1px solid rgba(0,230,195,.6);outline-offset:3px}
+.hart-onboarding .hob-skip-hint{font-size:12px;letter-spacing:.02em;color:rgba(255,255,255,.35);
+  font-family:"Inter","SF Pro Text",-apple-system,var(--ds-font-body),sans-serif}
 '''
 
         # ═══ "Living Glass" unified design system (overhaul) ═══
