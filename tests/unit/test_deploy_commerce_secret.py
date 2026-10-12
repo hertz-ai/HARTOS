@@ -36,6 +36,14 @@ _SCRIPT = os.path.join(_ROOT, 'deploy', 'deepbox_deploy.sh')
 _WORKFLOW = os.path.join(_ROOT, '.github', 'workflows', 'deploy-hartos-deepbox.yml')
 _NAME = 'COMMERCE_SESSION_SECRET'
 
+# The owner-set keys the deploy writes into central's live .env when their
+# repo secret is set (the expert tier, its Claude day budget, the autonomous
+# marketing switch, the node's own API key). Same contract as _NAME, minus the
+# absent-secret note.
+_OWNER_KEYS = ('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', 'HEVOLVE_EXPERT_LLM_MODEL_NAME',
+               'HEVOLVE_EXPERT_LLM_API_KEY', 'HEVOLVE_CLAUDE_BUDGET_USD_DAY',
+               'HEVOLVE_AUTONOMOUS_MARKETING', 'HEVOLVE_API_KEY')
+
 
 def _find_bash():
     """bash on PATH, else the one Git for Windows installs beside git.exe.
@@ -136,6 +144,13 @@ class WorkflowForwardsTheSecret(unittest.TestCase):
         set_here = set(_ssh_step().get('env') or {})
         self.assertEqual(sorted(forwarded - set_here), [], 'forwarded but never set')
         self.assertEqual(sorted(set_here - forwarded), [], 'set but never forwarded')
+
+    def test_every_owner_set_key_is_forwarded_and_set_from_its_secret(self):
+        step_env = _ssh_step().get('env') or {}
+        for key in _OWNER_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, _forwarded_names())
+                self.assertEqual(step_env.get(key), '${{ secrets.%s }}' % key)
 
 
 @unittest.skipUnless(_BASH, 'no bash on PATH and none beside git.exe, so the '
@@ -357,6 +372,43 @@ class ScriptEnsuresTheKey(unittest.TestCase):
         self._assert_ran(code, out)
         self.assertEqual(_values(text, _NAME), ['S3cr3t-value-77'])
         self.assertNotIn('S3cr3t-value-77', out)
+
+    # ── The owner-set keys ──
+
+    def test_every_owner_set_key_is_written_once_and_never_logged(self):
+        """All six set: each lands exactly once with its own value, a key
+        already in .env is replaced (not duplicated), and no value is
+        printed (the repo secret is masked by GitHub, a log copy of it in a
+        file or a rerun is not)."""
+        self._write_env('ALLOWED_HOSTS=*\nA=1\nHEVOLVE_API_KEY=old-key\n')
+        values = {k: 'Own-%d-zq' % i for i, k in enumerate(_OWNER_KEYS)}
+        code, out, text = self._deploy(**values)
+        self._assert_ran(code, out)
+        self.assertEqual(_values(text, 'A'), ['1'])
+        for key, value in values.items():
+            with self.subTest(key=key):
+                self.assertEqual(_values(text, key), [value])
+                self.assertNotIn(value, out)
+                self.assertIn('%s set from the secret (value not shown)' % key, out)
+
+    def test_one_owner_set_key_writes_only_itself(self):
+        """Setting the budget alone must not write the other five (an empty
+        expert key or an empty API key in .env would read as configured)."""
+        self._write_env('ALLOWED_HOSTS=*\nA=1\n')
+        code, out, text = self._deploy(HEVOLVE_CLAUDE_BUDGET_USD_DAY='3.30')
+        self._assert_ran(code, out)
+        self.assertEqual(text, 'ALLOWED_HOSTS=*\nA=1\nHEVOLVE_CLAUDE_BUDGET_USD_DAY=3.30\n')
+
+    def test_absent_owner_set_secrets_leave_env_exactly_as_it_is(self):
+        """No secret, no write: turning a key off is an edit on the box, so an
+        unset secret must not blank a value the owner put there by hand."""
+        before = 'ALLOWED_HOSTS=*\nA=1\nHEVOLVE_AUTONOMOUS_MARKETING=0\n'
+        self._write_env(before)
+        code, out, text = self._deploy(**{_NAME: 'c9'})
+        self._assert_ran(code, out)
+        self.assertEqual(text, before + '%s=c9\n' % _NAME)
+        for key in _OWNER_KEYS:
+            self.assertNotIn('%s set from the secret' % key, out)
 
 
 if __name__ == '__main__':

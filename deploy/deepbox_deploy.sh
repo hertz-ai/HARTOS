@@ -11,6 +11,9 @@
 #   GROQ_API_KEY LANGCHAIN_API_KEY ALLOWED_HOSTS CORS_ORIGINS HART_OTA_HOST
 #   HEVOLVE_ENFORCEMENT_MODE HEVOLVE_NODE_TIER LANGCHAIN_PROJECT
 #   COMMERCE_SESSION_SECRET
+#   HEVOLVE_EXPERT_LLM_ENDPOINT_URL HEVOLVE_EXPERT_LLM_MODEL_NAME
+#   HEVOLVE_EXPERT_LLM_API_KEY HEVOLVE_CLAUDE_BUDGET_USD_DAY
+#   HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY
 #
 # Why this file exists: any `with:` value carrying a ${{ }} expression
 # compiles to ONE GitHub expression, hard-capped at 21,000 chars of the
@@ -24,9 +27,10 @@ echo "=== Ensure .env exists ==="
 # Create ONLY when absent. An existing .env is the node's live
 # configuration and may carry values this workflow does not know,
 # so it is never rewritten -- the reset above leaves it alone
-# because .env is untracked. The three exceptions are the keys the
-# workflow itself owns, ensured further down on every deploy: the
-# OTA host, the configured LLM trio and the McGroce session secret.
+# because .env is untracked. The exceptions are the keys the workflow
+# itself owns, ensured further down on every deploy: the OTA host, the
+# configured LLM trio, the McGroce session secret and the owner-set keys
+# (expert tier, Claude budget, autonomous marketing, the node's API key).
 # On a rebuilt or fresh box there was previously nothing to recreate
 # it from, which meant the LLM routing existed solely on one machine
 # and would have been lost.
@@ -229,6 +233,24 @@ elif [ -z "${COMMERCE_SESSION_SECRET}" ]; then
     echo "  note: COMMERCE_SESSION_SECRET secret absent and not in .env — /api/commerce/session answers 503 unless config.json carries it"
   fi
 fi
+
+# ── Owner-set keys, each guaranteed on EVERY deploy its secret is set ──
+# The configured expert tier (core.autogen_config: endpoint, model, key), its
+# day budget (budget_gate), the autonomous-marketing switch (goal_seeding: it
+# grants the public_exposure consent at boot, i.e. lets the marketing agent
+# post publicly under the operator's identity), and the node's own API key
+# (the paid tier's lane is trusted only on a request carrying it). Same rule
+# as the McGroce secret: written key by key only when its secret is non-empty,
+# the value never logged, and an absent secret leaves .env as it is. Turning
+# one OFF is therefore a .env edit on the box, not an unset secret.
+for _k in HEVOLVE_EXPERT_LLM_ENDPOINT_URL HEVOLVE_EXPERT_LLM_MODEL_NAME \
+          HEVOLVE_EXPERT_LLM_API_KEY HEVOLVE_CLAUDE_BUDGET_USD_DAY \
+          HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY; do
+  if [ -n "${!_k}" ] && [ -f .env ]; then
+    _set_env_key "$_k" "${!_k}"
+    echo "  $_k set from the secret (value not shown)"
+  fi
+done
 
 DEPLOY_COMMIT="$(git rev-parse HEAD)"
 DEPLOY_COMMIT_SHORT="$(git rev-parse --short HEAD)"
