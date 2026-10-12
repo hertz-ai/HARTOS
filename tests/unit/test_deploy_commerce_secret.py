@@ -1,9 +1,11 @@
-"""COMMERCE_SESSION_SECRET reaches central's container through the deploy.
+"""COMMERCE_SESSION_SECRET and the owner-set keys reach central's container
+through the deploy.
 
 POST /api/commerce/session answers 503 until the container has the secret, and
 a repo secret alone changes nothing: the ssh step forwards only the names in
 its `envs:` list, and deploy/deepbox_deploy.sh never rewrites a live .env
-except for the keys it ensures one by one (the OTA host, the LLM trio, this).
+except for the keys it ensures one by one (the OTA host, the LLM trio, this,
+and the owner-set keys in _OWNER_KEYS).
 
 Both halves are tested on the REAL artefacts:
   * the workflow is parsed as YAML and the ssh step's `with.envs` and `env`
@@ -400,15 +402,28 @@ class ScriptEnsuresTheKey(unittest.TestCase):
         self.assertEqual(text, 'ALLOWED_HOSTS=*\nA=1\nHEVOLVE_CLAUDE_BUDGET_USD_DAY=3.30\n')
 
     def test_absent_owner_set_secrets_leave_env_exactly_as_it_is(self):
-        """No secret, no write: turning a key off is an edit on the box, so an
-        unset secret must not blank a value the owner put there by hand."""
-        before = 'ALLOWED_HOSTS=*\nA=1\nHEVOLVE_AUTONOMOUS_MARKETING=0\n'
+        """No secret, no write: an unset repo secret must not blank a value
+        the owner put in central's .env by hand. The workflow sends an absent
+        secret as an EMPTY string, not as an unset name, so that is what is
+        passed here (a `[ -v ]` guard would write six empty keys)."""
+        before = 'ALLOWED_HOSTS=*\nA=1\nHEVOLVE_API_KEY=by-hand\n'
         self._write_env(before)
-        code, out, text = self._deploy(**{_NAME: 'c9'})
+        code, out, text = self._deploy(**dict({k: '' for k in _OWNER_KEYS}, **{_NAME: 'c9'}))
         self._assert_ran(code, out)
         self.assertEqual(text, before + '%s=c9\n' % _NAME)
         for key in _OWNER_KEYS:
             self.assertNotIn('%s set from the secret' % key, out)
+
+    def test_a_fresh_box_gets_every_owner_set_key_once(self):
+        """No .env: the create-block writes one, and every owner-set key must
+        land in it (a loop above the create-block finds no .env and skips)."""
+        values = {k: 'Fresh-%d-q' % i for i, k in enumerate(_OWNER_KEYS)}
+        code, out, text = self._deploy(**dict(self._FRESH_BOX, **values))
+        self._assert_ran(code, out)
+        self.assertIsNotNone(text, 'the deploy prefix wrote no .env:\n' + out)
+        for key, value in values.items():
+            with self.subTest(key=key):
+                self.assertEqual(_values(text, key), [value])
 
 
 if __name__ == '__main__':

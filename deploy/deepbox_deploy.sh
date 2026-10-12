@@ -239,10 +239,14 @@ fi
 # day budget (budget_gate), the autonomous-marketing switch (goal_seeding: it
 # grants the public_exposure consent at boot, i.e. lets the marketing agent
 # post publicly under the operator's identity), and the node's own API key
-# (the paid tier's lane is trusted only on a request carrying it). Same rule
-# as the McGroce secret: written key by key only when its secret is non-empty,
-# the value never logged, and an absent secret leaves .env as it is. Turning
-# one OFF is therefore a .env edit on the box, not an unset secret.
+# (a full credential: security/middleware.py accepts it as X-API-Key on the
+# admin paths and on every network-protected path, and internal calls to
+# /chat carry it). Same rule as the McGroce secret: written key by key only
+# when its secret is non-empty, the value never logged, and an absent secret
+# leaves .env as it is. So unsetting a repo secret changes nothing on the box;
+# a key is removed by editing central's .env. The marketing switch is the
+# exception even then: the consent it granted is a database row that outlives
+# the flag, and only POST /api/social/consent/revoke stops the posting.
 for _k in HEVOLVE_EXPERT_LLM_ENDPOINT_URL HEVOLVE_EXPERT_LLM_MODEL_NAME \
           HEVOLVE_EXPERT_LLM_API_KEY HEVOLVE_CLAUDE_BUDGET_USD_DAY \
           HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY; do
