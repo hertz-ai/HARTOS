@@ -13,7 +13,7 @@
 #   COMMERCE_SESSION_SECRET
 #   HEVOLVE_EXPERT_LLM_ENDPOINT_URL HEVOLVE_EXPERT_LLM_MODEL_NAME
 #   HEVOLVE_EXPERT_LLM_API_KEY HEVOLVE_CLAUDE_BUDGET_USD_DAY
-#   HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY
+#   HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY STRIPE_API_KEY
 #
 # Why this file exists: any `with:` value carrying a ${{ }} expression
 # compiles to ONE GitHub expression, hard-capped at 21,000 chars of the
@@ -30,7 +30,8 @@ echo "=== Ensure .env exists ==="
 # because .env is untracked. The exceptions are the keys the workflow
 # itself owns, ensured further down on every deploy: the OTA host, the
 # configured LLM trio, the McGroce session secret and the owner-set keys
-# (expert tier, Claude budget, autonomous marketing, the node's API key).
+# (expert tier, Claude budget, autonomous marketing, the node's API key,
+# the Stripe key).
 # On a rebuilt or fresh box there was previously nothing to recreate
 # it from, which meant the LLM routing existed solely on one machine
 # and would have been lost.
@@ -241,7 +242,9 @@ fi
 # post publicly under the operator's identity), and the node's own API key
 # (a full credential: security/middleware.py accepts it as X-API-Key on the
 # admin paths and on every network-protected path, and internal calls to
-# /chat carry it). Same rule as the McGroce secret: written key by key only
+# /chat carry it), and the Stripe key (integrations/ap2/ap2_protocol.py
+# registers the Stripe gateway at boot only when it is set; without it the
+# paid-tier checkout answers 503 and no payment can be taken). Same rule as the McGroce secret: written key by key only
 # when its secret is non-empty, the value never logged, and an absent secret
 # leaves .env as it is. So unsetting a repo secret changes nothing on the box;
 # a key is removed by editing central's .env. The marketing switch is the
@@ -249,7 +252,7 @@ fi
 # the flag, and only POST /api/social/consent/revoke stops the posting.
 for _k in HEVOLVE_EXPERT_LLM_ENDPOINT_URL HEVOLVE_EXPERT_LLM_MODEL_NAME \
           HEVOLVE_EXPERT_LLM_API_KEY HEVOLVE_CLAUDE_BUDGET_USD_DAY \
-          HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY; do
+          HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY STRIPE_API_KEY; do
   if [ -n "${!_k}" ] && [ -f .env ]; then
     _set_env_key "$_k" "${!_k}"
     echo "  $_k set from the secret (value not shown)"

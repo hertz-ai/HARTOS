@@ -108,25 +108,25 @@ CI's docker-deploy will rebuild and the SDK will persist.
 
 ## Step 4 — Set `STRIPE_API_KEY` on the central container
 
+Set it as a GitHub repo secret; the deepbox deploy does the rest. The
+workflow (`.github/workflows/deploy-hartos-deepbox.yml`) forwards it and
+`deploy/deepbox_deploy.sh` writes it into central's `.env` on every
+deploy while the secret is non-empty (value never logged); the container
+runs with `--env-file .env`. Do not hand-edit `.env` for it.
+
 ```bash
-ssh -p 422 sathish@etime.hertzai.com
-cd /opt/hzai-LLM-Langchain-Chatbot-Agent/repo/LLM-langchain_Chatbot-Agent
+# Paste the key at the prompt (it is not echoed, not kept in shell history):
+gh secret set STRIPE_API_KEY --repo hertz-ai/HARTOS
 
-# Append to the host-side .env (which is mounted into the container
-# via --env-file .env):
-echo 'STRIPE_API_KEY=sk_live_REPLACE_WITH_REAL_KEY' >> .env
-
-# Verify it's readable:
-grep STRIPE_API_KEY .env
-
-# Restart so the container re-reads .env:
-sudo docker restart langchain
-
-# Wait ~30s for boot, then verify the gateway registered:
-sleep 30
+# The next deploy writes it; a push to main deploys. Then, on the box:
 sudo docker logs langchain 2>&1 | grep -i "stripe gateway"
-# Expected: "PaymentLedger: Stripe gateway auto-registered (real charges enabled)"
+# Expected: "PaymentLedger: Stripe gateway auto-registered (real charges enabled via STRIPE_API_KEY)"
+# The deploy log shows "STRIPE_API_KEY set from the secret (value not shown)".
 ```
+
+Unsetting the repo secret does NOT remove the key from central: an absent
+secret leaves `.env` as it is. To stop live charges, remove the line from
+central's `.env` and redeploy.
 
 If you see "STRIPE_API_KEY present but connect failed" instead, the
 key is bad or the SDK install didn't stick.  Re-run Step 3.
