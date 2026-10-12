@@ -650,6 +650,30 @@ class TestDnsModule:
         assert block is not None
         assert bool_assignment(block, "default") == "true"
 
+    def test_ships_both_root_trust_anchors(self):
+        """DNSSEC on needs a trust anchor the root is actually signed with.
+        systemd 256's built-in anchor is the 2017 root KSK (key tag 20326)
+        alone, resolved implements no RFC 5011 key rollover, and ICANN's root
+        has been signed by the 2024 KSK (key tag 38696) since 2026-10-11. On
+        the Samsung node, generation 18, EVERY lookup failed "DNSSEC
+        validation failed: missing-key" from 23:16 UTC that day (194,529
+        refusals in 2 h 50 min, the previous boot had none) and nixos-rebuild
+        could not resolve api.github.com. The module ships a positive anchor
+        file carrying both keys, so the old key keeps validating until ICANN
+        revokes it. Values from https://data.iana.org/root-anchors/root-anchors.xml."""
+        block = find_block(
+            self.raw, r'environment\.etc\."dnssec-trust-anchors\.d/root\.positive"')
+        assert block is not None, "hart-dns.nix ships no /etc/dnssec-trust-anchors.d/root.positive"
+        ds = r"^\s*\.\s+IN\s+DS\s+{tag}\s+8\s+2\s+{digest}\s*$"
+        assert re.search(ds.format(
+            tag=20326,
+            digest="E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"),
+            block, re.M), "2017 root KSK (20326) missing from the anchor file"
+        assert re.search(ds.format(
+            tag=38696,
+            digest="683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16"),
+            block, re.M), "2024 root KSK (38696) missing from the anchor file"
+
 
 # ═══════════════════════════════════════════════════════════════
 # Section 5: Email module owns the mailto handler (collision-avoidance)
