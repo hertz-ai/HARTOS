@@ -22,7 +22,18 @@
                    # lock-vs-deps integrity check if the rev and the lock drift).
 , nunbaHash ? "sha256-KPbDSHtQ5eJMjY0PKU9XYAuc9TdkWevkjwSYylcC8Ak="  # pinned 2026-10-12 for nunbaRev 53bd28e9 (nunba-hash-pin dry run 38249876677, build verified GREEN)
 , npmDepsHash ? "sha256-mSce+t2+m46xpuz59Ng63U4vkbANa1oCbonPpo2E70M="  # pinned 2026-10-12 for nunbaRev 53bd28e9 (nunba-hash-pin dry run 38249876677; the lock did not move since de8a6d92); prefetch-npm-deps landing-page/package-lock.json
-, backendUrl ? "http://127.0.0.1:6777"
+# The API base baked into the React bundle. It MUST be the origin the shell
+# page is loaded from (hart-liquid-ui.nix loads http://localhost:<port>), not
+# the HART backend: the bundle runs INSIDE the shell's WebKit, and a browser
+# sends a cross-origin XHR only after a CORS preflight the backend does not
+# answer (measured on generation 22, 2026-10-12: OPTIONS /prompts answered
+# 200 with no Access-Control headers, so Nunba's page in the assistant panel
+# could not load its agents or send a turn, showed "Network glitch", and the
+# ceremony's seal never left the browser). On its own origin every call lands
+# on the shell's catch-all proxy, which carries it over the unix socket to the
+# Nunba daemon: the SPA, its daemon and the ONE HART backend behind it, one
+# path, no CORS. hart-nunba.nix passes the configured shell port.
+, apiBaseUrl ? "http://localhost:6800"
 }:
 
 # ═══════════════════════════════════════════════════════════════
@@ -138,7 +149,7 @@ let
 
     PUBLIC_URL = "/";                     # root-absolute assets (/static/...) — the
                                           # no-basename <BrowserRouter> contract.
-    REACT_APP_API_BASE_URL = backendUrl;  # bake the API base onto the HART backend.
+    REACT_APP_API_BASE_URL = apiBaseUrl;  # the shell's own origin (see the arg above).
     DISABLE_ESLINT_PLUGIN = "true";
     ESLINT_NO_DEV_ERRORS = "true";
     CI = "false";                         # CRA: CI=true makes warnings fatal.

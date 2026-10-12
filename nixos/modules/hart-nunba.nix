@@ -29,7 +29,13 @@ let
   # ONE package expression (the same file hart-liquid-ui.nix callPackages for the
   # NUNBA_STATIC_DIR floor) → the daemon and the floor share the SAME store path.
   # hartRev rides along so the package's BUILD_INFO.txt names the HARTOS it ships in.
-  nunbaPkg = pkgs.callPackage ../packages/nunba.nix { inherit hartSrc hartRev; };
+  # apiBaseUrl: the origin the shell page is loaded from (hart-liquid-ui.nix's
+  # http://localhost:<port>), so the bundle's calls stay same-origin and ride
+  # the shell's proxy to this daemon (nunba.nix explains the measured CORS wall).
+  nunbaPkg = pkgs.callPackage ../packages/nunba.nix {
+    inherit hartSrc hartRev;
+    apiBaseUrl = "http://localhost:${toString config.hart.liquidUI.port}";
+  };
   # The NATIVE HARTOS tree (the SAME derivation the backend runs). Nunba's own code
   # imports HARTOS packages directly — models/catalog.py does an unguarded
   # `import integrations.service_tools.model_catalog` (→ integrations/__init__ →

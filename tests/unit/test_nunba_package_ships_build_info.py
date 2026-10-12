@@ -35,8 +35,31 @@ def test_the_package_accepts_hart_rev_and_the_module_passes_it():
     mod = _read(MOD)
     assert re.search(r'^\{ config, lib, pkgs, hartSrc \? /etc/hart, hartRev \? "unknown", \.\.\. \}:', mod, re.M), (
         'hart-nunba.nix must declare hartRev in its module args (flake.nix passes it as a specialArg)')
-    assert 'callPackage ../packages/nunba.nix { inherit hartSrc hartRev; }' in mod, (
+    assert re.search(r'callPackage \.\./packages/nunba\.nix \{\s*inherit hartSrc hartRev;', mod), (
         'hart-nunba.nix must hand hartRev to the package')
+
+
+def test_the_bundle_calls_the_shell_origin_not_the_backend():
+    """The React bundle runs INSIDE the shell's WebKit at http://localhost:<port>.
+    Baked onto the HART backend (http://127.0.0.1:6777) every XHR was
+    cross-origin, the backend answers no CORS preflight (measured on generation
+    22, 2026-10-12: OPTIONS /prompts 200 with no Access-Control headers), so
+    Nunba's page in the assistant panel could not load its agents or send a
+    turn and its ceremony's seal never left the browser. On its own origin the
+    calls ride the shell's catch-all proxy to the Nunba daemon: one path."""
+    src = _read(PKG)
+    assert re.search(r'^, apiBaseUrl \? "http://localhost:6800"', src, re.M), (
+        'nunba.nix must take apiBaseUrl defaulting to the shell origin')
+    assert 'REACT_APP_API_BASE_URL = apiBaseUrl;' in src
+    assert '127.0.0.1:6777' not in src, 'the bundle must not be baked onto the backend'
+    mod = _read(MOD)
+    assert 'apiBaseUrl = "http://localhost:${toString config.hart.liquidUI.port}";' in mod, (
+        'hart-nunba.nix must pass the configured shell port as the bundle origin')
+    # The host form must match what the shell page is loaded from, byte for byte:
+    # a browser origin check is a string compare (localhost is not 127.0.0.1).
+    ui = _read(os.path.join(ROOT, 'nixos', 'modules', 'hart-liquid-ui.nix'))
+    assert "'http://localhost:${toString ui.port}'" in ui or '"http://localhost:${toString ui.port}"' in ui, (
+        'hart-liquid-ui.nix loads the shell as http://localhost:<port>; the bundle origin must match')
 
 
 def test_the_floor_and_the_daemon_build_the_same_nunba_derivation():
