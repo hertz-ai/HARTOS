@@ -27,9 +27,9 @@ echo "=== Ensure .env exists ==="
 # because .env is untracked. The three exceptions are the keys the
 # workflow itself owns, ensured further down on every deploy: the
 # OTA host, the configured LLM trio and the McGroce session secret.
-# On a rebuilt or fresh box there was
-# previously nothing to recreate it from, which meant the LLM
-# routing existed solely on one machine and would have been lost.
+# On a rebuilt or fresh box there was previously nothing to recreate
+# it from, which meant the LLM routing existed solely on one machine
+# and would have been lost.
 #
 # Everything written here is either non-secret or a placeholder.
 # HARTOS holds no provider credential in this arrangement: it
@@ -144,10 +144,21 @@ fi
 # .env: it appends ONE host to ONE key, only when missing, which is
 # the same additive contract the create-block comment describes.
 # Re-running is a no-op, and an operator's '*' is left alone.
+#
+# _env_append is the ONE way a line is added to a live .env. A file
+# whose last line has no newline would otherwise get the new line glued
+# onto it: `LAST=xNEW=y` sets neither key and puts NEW's value inside
+# LAST's (measured on this helper's old body, review of 5100ca104).
+_env_append() {   # $1 the whole KEY=value line
+  if [ -s .env ] && [ -n "$(tail -c 1 .env)" ]; then
+    echo >> .env
+  fi
+  echo "$1" >> .env
+}
 _OTA_HOST="${HART_OTA_HOST:-etime.hertzai.com}"
 if [ -n "$_OTA_HOST" ] && [ -f .env ]; then
   if ! grep -q '^ALLOWED_HOSTS=' .env; then
-    echo "ALLOWED_HOSTS=$_OTA_HOST" >> .env
+    _env_append "ALLOWED_HOSTS=$_OTA_HOST"
     echo "  ALLOWED_HOSTS absent — created it with $_OTA_HOST"
   else
     _CUR="$(grep -E '^ALLOWED_HOSTS=' .env | head -1 | cut -d= -f2-)"
@@ -173,7 +184,7 @@ _set_env_key() {   # $1 key, $2 value: replace the line or append it
     _v="$(printf '%s' "$2" | sed -e 's/[\\&|]/\\&/g')"
     sed -i "s|^$1=.*|$1=$_v|" .env
   else
-    echo "$1=$2" >> .env
+    _env_append "$1=$2"
   fi
 }
 
@@ -206,6 +217,8 @@ fi
 if [ -n "${COMMERCE_SESSION_SECRET}" ] && [ -f .env ]; then
   _set_env_key COMMERCE_SESSION_SECRET "$COMMERCE_SESSION_SECRET"
   echo "  COMMERCE_SESSION_SECRET set from the secret (value not shown)"
+elif [ -z "${COMMERCE_SESSION_SECRET}" ]; then
+  echo "  note: COMMERCE_SESSION_SECRET secret absent — /api/commerce/session answers 503"
 fi
 
 DEPLOY_COMMIT="$(git rev-parse HEAD)"

@@ -73,12 +73,25 @@ def _ssh_step():
     return steps[0]
 
 
+def _forwarded_names():
+    """Every name the ssh step forwards to the box, read from the workflow."""
+    return _ssh_step()['with']['envs'].split(',')
+
+
 def _script_prefix():
     """deepbox_deploy.sh from line 1 up to the first line that needs git."""
     lines = _read(_SCRIPT).split('\n')
     cut = [i for i, line in enumerate(lines) if line.startswith('DEPLOY_COMMIT=')]
     assert cut, 'deepbox_deploy.sh has no DEPLOY_COMMIT= line to stop before'
     return '\n'.join(lines[:cut[0]]) + '\n'
+
+
+# Prepended to the prefix: the commands a real deploy runs on the box (and a
+# developer machine must never run from a unit test) only record that they were
+# called. The prefix needs none of them today; a later edit that moves one above
+# the cut fails _assert_ran instead of touching docker or git on the dev host.
+_TRAP = ''.join('%s() { echo "%s $*" >> "$PWD/.calls"; }\n' % (c, c)
+                for c in ('git', 'docker', 'sudo', 'curl'))
 
 
 def _keys(env_text):
@@ -114,20 +127,11 @@ class WorkflowForwardsTheSecret(unittest.TestCase):
         self.assertEqual(sorted(set_here - forwarded), [], 'set but never forwarded')
 
 
-@unittest.skipUnless(_BASH, 'bash is not on PATH, so the deploy script prefix '
-                            'cannot run: none of these deploy-script tests ran')
+@unittest.skipUnless(_BASH, 'no bash on PATH and none beside git.exe, so the '
+                            'deploy script prefix cannot run: none of these '
+                            'deploy-script tests ran')
 class ScriptEnsuresTheKey(unittest.TestCase):
     """The real script prefix, run the way a deploy runs it."""
-
-    # Every name the workflow forwards is removed from the inherited
-    # environment, so this machine's own settings cannot leak into the run.
-    _FORWARDED = ('DEPLOY_LOGS_PATH DEPLOY_IMAGES_PATH DEPLOY_MASTER_KEY_PATH '
-                  'DEPLOY_ADVERTISE_URL DEPLOY_AGENT_DATA_PATH LLM_GATEWAY_URL '
-                  'HEVOLVE_LLM_ENDPOINT_URL HEVOLVE_LLM_MODEL_NAME '
-                  'HEVOLVE_LLM_API_KEY GROQ_API_KEY LANGCHAIN_API_KEY '
-                  'ALLOWED_HOSTS CORS_ORIGINS HART_OTA_HOST '
-                  'HEVOLVE_ENFORCEMENT_MODE HEVOLVE_NODE_TIER LANGCHAIN_PROJECT '
-                  + _NAME).split()
 
     # What a fresh box needs or the create-block exits 1 before the commerce
     # block is reached. Placeholders only.
@@ -143,7 +147,7 @@ class ScriptEnsuresTheKey(unittest.TestCase):
         # backslashes in the script's sed expression.
         with open(os.path.join(self.dir, 'prefix.sh'), 'w', encoding='utf-8',
                   newline='\n') as fh:
-            fh.write(_script_prefix())
+            fh.write(_TRAP + _script_prefix())
 
     def _remove(self):
         # File by file, not shutil.rmtree: the prefix writes only flat files
@@ -158,8 +162,12 @@ class ScriptEnsuresTheKey(unittest.TestCase):
             fh.write(text)
 
     def _deploy(self, **values):
-        """Run the prefix; (exit status, combined output, .env text or None)."""
-        env = {k: v for k, v in os.environ.items() if k not in self._FORWARDED}
+        """Run the prefix; (exit status, combined output, .env text or None).
+
+        Every name the workflow forwards is removed from the inherited
+        environment first, so this machine's own settings cannot leak in."""
+        forwarded = set(_forwarded_names())
+        env = {k: v for k, v in os.environ.items() if k not in forwarded}
         env.update(values)
         proc = subprocess.run([_BASH, 'prefix.sh'], cwd=self.dir, env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -170,6 +178,10 @@ class ScriptEnsuresTheKey(unittest.TestCase):
 
     def _assert_ran(self, code, out):
         self.assertEqual(code, 0, 'the deploy prefix exited %d:\n%s' % (code, out))
+        calls = os.path.join(self.dir, '.calls')
+        self.assertFalse(os.path.exists(calls),
+                         'the prefix ran box commands: %s'
+                         % (_read(calls) if os.path.exists(calls) else ''))
 
     def test_a_live_env_without_the_llm_trio_gets_the_key(self):
         """No HEVOLVE_LLM_MODEL_NAME: the trio block is skipped, and the
@@ -221,6 +233,51 @@ class ScriptEnsuresTheKey(unittest.TestCase):
         self._assert_ran(code, out)
         self.assertEqual(second, first)
         self.assertEqual(_values(second, _NAME), ['same1'])
+
+    def test_a_last_line_without_a_newline_keeps_its_value(self):
+        """The append must not glue the key onto an unterminated last line:
+        `B=2COMMERCE_SESSION_SECRET=x` sets neither. ALLOWED_HOSTS=* keeps the
+        OTA block from appending first, so this is the commerce append alone
+        (review of 5100ca104: measured on the helper, `A=1` + append gave
+        `A=1COMMERCE_SESSION_SECRET=new`)."""
+        self._write_env('ALLOWED_HOSTS=*\nB=2')
+        code, out, text = self._deploy(**{_NAME: 'tail1'})
+        self._assert_ran(code, out)
+        self.assertEqual(_values(text, 'B'), ['2'])
+        self.assertEqual(_values(text, _NAME), ['tail1'])
+
+    def test_the_ota_append_keeps_an_unterminated_last_line_too(self):
+        """Same file, no ALLOWED_HOSTS: the OTA block appends first."""
+        self._write_env('A=1')
+        code, out, text = self._deploy(**{_NAME: 'tail2'})
+        self._assert_ran(code, out)
+        self.assertEqual(_values(text, 'A'), ['1'])
+        self.assertEqual(_values(text, 'ALLOWED_HOSTS'), ['etime.hertzai.com'])
+        self.assertEqual(_values(text, _NAME), ['tail2'])
+
+    def test_the_exact_key_is_replaced_beside_a_prefix_sharing_key(self):
+        """The replace path must match `KEY=`, not every line starting KEY."""
+        self._write_env('%s=old\n%s_OLD=x\n' % (_NAME, _NAME))
+        code, out, text = self._deploy(**{_NAME: 'new2'})
+        self._assert_ran(code, out)
+        self.assertEqual(_values(text, _NAME), ['new2'])
+        self.assertEqual(_values(text, _NAME + '_OLD'), ['x'])
+
+    def test_a_commented_example_does_not_block_the_write(self):
+        """Only a line that STARTS with KEY= counts as the key being set."""
+        self._write_env('# %s=example\nA=1\n' % _NAME)
+        code, out, text = self._deploy(**{_NAME: 'c1'})
+        self._assert_ran(code, out)
+        self.assertEqual(_values(text, _NAME), ['c1'])
+        self.assertIn('# %s=example' % _NAME, text)
+
+    def test_an_absent_secret_is_named_in_the_log(self):
+        """An unset secret leaves the route answering 503; the deploy log says
+        so, the way the create-block names a missing LangChain or Groq key."""
+        self._write_env('A=1\n')
+        code, out, text = self._deploy(**{_NAME: ''})
+        self._assert_ran(code, out)
+        self.assertIn('%s secret absent' % _NAME, out)
 
     def test_the_value_never_reaches_the_log(self):
         self._write_env('A=1\n')
