@@ -10,6 +10,7 @@
 #   HEVOLVE_LLM_ENDPOINT_URL HEVOLVE_LLM_MODEL_NAME HEVOLVE_LLM_API_KEY
 #   GROQ_API_KEY LANGCHAIN_API_KEY ALLOWED_HOSTS CORS_ORIGINS HART_OTA_HOST
 #   HEVOLVE_ENFORCEMENT_MODE HEVOLVE_NODE_TIER LANGCHAIN_PROJECT
+#   COMMERCE_SESSION_SECRET
 #
 # Why this file exists: any `with:` value carrying a ${{ }} expression
 # compiles to ONE GitHub expression, hard-capped at 21,000 chars of the
@@ -171,16 +172,16 @@ fi
 # operator configures this node, so when it carries the trio the
 # .env follows it, key by key, idempotently. Without the secrets the
 # file is left exactly as it is (the additive contract above).
+_set_env_key() {   # $1 key, $2 value: replace the line or append it
+  if grep -q "^$1=" .env; then
+    # a key may carry sed's replacement metacharacters; neutralise them
+    _v="$(printf '%s' "$2" | sed -e 's/[\\&|]/\\&/g')"
+    sed -i "s|^$1=.*|$1=$_v|" .env
+  else
+    echo "$1=$2" >> .env
+  fi
+}
 if [ -n "$_LLM_MODEL" ] && [ -f .env ]; then
-  _set_env_key() {   # $1 key, $2 value: replace the line or append it
-    if grep -q "^$1=" .env; then
-      # a key may carry sed's replacement metacharacters; neutralise them
-      _v="$(printf '%s' "$2" | sed -e 's/[\\&|]/\\&/g')"
-      sed -i "s|^$1=.*|$1=$_v|" .env
-    else
-      echo "$1=$2" >> .env
-    fi
-  }
   _set_env_key HEVOLVE_LLM_ENDPOINT_URL "$_LLM_ENDPOINT"
   _set_env_key HEVOLVE_LLM_MODEL_NAME "$_LLM_MODEL"
   _set_env_key OPENAI_MODEL "$_LLM_MODEL"
@@ -188,6 +189,17 @@ if [ -n "$_LLM_MODEL" ] && [ -f .env ]; then
     _set_env_key HEVOLVE_LLM_API_KEY "$_LLM_KEY"
   fi
   echo "  configured LLM: $_LLM_MODEL at $_LLM_ENDPOINT (key $([ -n "$_LLM_KEY" ] && echo from secret || echo unchanged))"
+fi
+
+# ── The McGroce session secret, guaranteed on EVERY deploy ──
+# Same reason as the blocks above: the create-block never runs on a box that
+# already has a .env, so a secret added to the repo later would reach this
+# script and stop. McGroce's Tomcat presents the same value as
+# X-Commerce-Secret (integrations/commerce/commerce_api.py); while it is unset
+# POST /api/commerce/session answers 503. An absent secret leaves .env alone.
+if [ -n "${COMMERCE_SESSION_SECRET}" ] && [ -f .env ]; then
+  _set_env_key COMMERCE_SESSION_SECRET "$COMMERCE_SESSION_SECRET"
+  echo "  COMMERCE_SESSION_SECRET set from the secret (value not shown)"
 fi
 
 DEPLOY_COMMIT="$(git rev-parse HEAD)"
