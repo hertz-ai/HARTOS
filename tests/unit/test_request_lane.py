@@ -146,20 +146,61 @@ def _genuine(rid):
     return is_genuine_user_request(rid)
 
 
-def test_the_nodes_own_daemon_turn_is_left_to_the_prefix_rule(lanes):
-    """dispatch_goal registered revenue for a goal that earns; its self-POST
-    reaches /chat as the node itself with a daemon_ id and must not be
-    demoted (review finding 1: it was registered 'user')."""
+@pytest.mark.parametrize('auth, tok, dec', [
+    ('jwt', 'tok', _decoder({'user_id': 'system_daemon'})),   # keyless node: system JWT
+    ('api_key', '', None),                                      # keyed node
+    ('body', '', None),                                         # bundled desktop / flat: no credential
+    ('none', '', None),
+    (None, '', None),
+])
+def test_the_nodes_own_daemon_turn_is_left_to_the_prefix_rule(lanes, auth, tok, dec):
+    """dispatch_goal registered revenue for a goal that earns; its turn reaches
+    /chat as the node itself with a daemon_ id and must not be demoted
+    (review of 7086adff8 finding 1: it was registered 'user'; review of
+    8947e2753 M2: the bundled desktop's in-process adapter sends no
+    credential at all and was demoted too)."""
     from core.request_lane import register_chat_lane
     lanes.register_request_lane('daemon_goal-rev-1', 'revenue')
-    assert register_chat_lane('daemon_goal-rev-1', 'tok', {'prompt': 'x'}, 'jwt',
-                              decode_jwt=_decoder({'user_id': 'system_daemon'}), tenant=TENANT,
+    assert register_chat_lane('daemon_goal-rev-1', tok, {'prompt': 'x'}, auth,
+                              decode_jwt=dec, tenant=TENANT,
                               system_identities=SYSTEM, is_genuine=_genuine) is None
     assert lanes.lane_for_request('daemon_goal-rev-1') == 'revenue'
     # A plain goal's turn: nothing registered, the prefix rule says daemon.
-    assert register_chat_lane('daemon_goal-plain-1', '', {'prompt': 'x'}, 'api_key',
-                              tenant=TENANT, is_genuine=_genuine) is None
+    assert register_chat_lane('daemon_goal-plain-1', tok, {'prompt': 'x'}, auth,
+                              decode_jwt=dec, tenant=TENANT,
+                              system_identities=SYSTEM, is_genuine=_genuine) is None
     assert lanes.lane_for_request('daemon_goal-plain-1') == ''
+
+
+@pytest.mark.parametrize('auth, tok, dec', [
+    ('jwt', 'tok', _decoder({'user_id': 'system_daemon'})),
+    ('api_key', '', None),
+])
+def test_the_nodes_own_inner_call_without_a_claim_keeps_the_turns_lane(lanes, auth, tok, dec):
+    """Review of 8947e2753, C1: when a revenue turn uses the expert, the
+    speculative dispatcher calls /chat again from inside the node with the
+    person's request id, the node's credential and NO lane field; that call
+    re-registered the shopper's turn as 'user' and the Claude call went out
+    capped.  An internal caller that makes no claim confirms the lane that
+    is there and registers nothing."""
+    from core.request_lane import register_chat_lane
+    lanes.register_request_lane('msg_shopper_1', 'revenue')            # the outer, shopper call
+    inner = {'user_id': 'c1', 'prompt': 'add milk', 'model_config': [{'model': 'claude-sonnet-4-5'}],
+             'speculative': False, 'request_id': 'msg_shopper_1'}
+    assert register_chat_lane('msg_shopper_1', tok, inner, auth, decode_jwt=dec, tenant=TENANT,
+                              system_identities=SYSTEM, is_genuine=_genuine) == 'revenue'
+    assert lanes.lane_for_request('msg_shopper_1') == 'revenue'
+    # A person's turn stays a user turn through the same inner call.
+    lanes.register_request_lane('msg_person_1', 'user')
+    assert register_chat_lane('msg_person_1', tok, dict(inner, request_id='msg_person_1'), auth,
+                              decode_jwt=dec, tenant=TENANT, system_identities=SYSTEM,
+                              is_genuine=_genuine) == 'user'
+    # No earlier registration and no claim: nothing is registered, the id
+    # rule decides on the wire.
+    assert register_chat_lane('msg_nobody', tok, dict(inner, request_id='msg_nobody'), auth,
+                              decode_jwt=dec, tenant=TENANT, system_identities=SYSTEM,
+                              is_genuine=_genuine) is None
+    assert lanes.lane_for_request('msg_nobody') == ''
 
 
 def test_a_stranger_naming_a_goals_request_id_does_not_inherit_its_lane(lanes):

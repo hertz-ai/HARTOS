@@ -324,6 +324,27 @@ def model_family(model_name) -> str:
     return OTHER_MODEL_FAMILY
 
 
+def family_usd_per_1k(family):
+    """(input, output) dollars per 1k tokens for a priced family, with the
+    owner's pin HEVOLVE_<FAMILY>_USD_PER_1K_IN / _OUT applied; None for an
+    unpriced one.  The ONE place a family's price is read: the expert entry's
+    autogen ``price`` below and the budget gate's meter both come here, so an
+    owner's pin reaches the ledger and the registry alike (review of
+    8947e2753: a pin used to move one and not the other)."""
+    base = EXPERT_USD_PER_1K.get(family)
+    if base is None:
+        return None
+
+    def _pinned(name, default):
+        try:
+            return float(os.environ.get(name, '') or default)
+        except (TypeError, ValueError):
+            return default
+    upper = str(family).upper()
+    return (_pinned('HEVOLVE_%s_USD_PER_1K_IN' % upper, base[0]),
+            _pinned('HEVOLVE_%s_USD_PER_1K_OUT' % upper, base[1]))
+
+
 def resolve_expert_backend():
     """A fresh autogen entry for the configured expert, or None when the owner
     configured none.  Endpoint AND model are required; a half-set pair is
@@ -344,14 +365,17 @@ def resolve_expert_backend():
                      "tier; one alone configures nothing"
                      % (EXPERT_ENDPOINT_VAR, EXPERT_MODEL_VAR))
         return None
-    price = next((p for fam, p in EXPERT_USD_PER_1K.items() if fam in model.lower()),
-                 (0.0025, 0.01))
-    return {
+    entry = {
         "model": model,
         "api_key": os.environ.get(EXPERT_API_KEY_VAR, '') or 'dummy',
         "base_url": endpoint,
-        "price": list(price),
     }
+    # autogen's ``price`` is optional: a priced family gets the table's (pinned)
+    # price, an unpriced one gets no invented number.
+    price = family_usd_per_1k(model_family(model))
+    if price:
+        entry["price"] = list(price)
+    return entry
 
 
 def expert_lanes() -> frozenset:

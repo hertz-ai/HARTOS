@@ -627,14 +627,18 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
 # Topology agnostic: no node-tier branch.  The cap only has anything to cap
 # where an expert trio is configured (core.autogen_config), which is central
 # by configuration; a node whose LLM is local meters at zero and writes no
-# row.  The meter fails OPEN (an unreadable ledger allows): the Kong request
-# fuse on the Claude route is the hard backstop, and an error here must never
-# stop revenue work.  Prices are list prices per 1k tokens; the owner can pin
-# them.
-# ONE price table, owned by core.autogen_config beside the expert entry whose
-# autogen ``price`` it also fills; imported here, never a second copy.
-from core.autogen_config import EXPERT_USD_PER_1K as USD_PER_1K_BY_FAMILY  # noqa: E402
-CLAUDE_USD_PER_1K_IN_VAR = 'HEVOLVE_CLAUDE_USD_PER_1K_IN'
+# row.  The gate fails CLOSED: an unreadable ledger withholds the expert, and
+# withholding is never blocking (the turn runs on the node's own model).
+# Kong has no fuse on revenue-lane Claude by design; this day budget is its
+# only cap.  Prices are list prices per 1k tokens; the owner can pin them.
+# ONE price table and ONE pin reader, owned by core.autogen_config beside the
+# expert entry whose autogen ``price`` they also fill; imported here, never a
+# second copy.
+from core.autogen_config import (  # noqa: E402
+    EXPERT_USD_PER_1K as USD_PER_1K_BY_FAMILY, OTHER_MODEL_FAMILY, family_usd_per_1k,
+    model_family,
+)
+CLAUDE_USD_PER_1K_IN_VAR = 'HEVOLVE_CLAUDE_USD_PER_1K_IN'      # read by family_usd_per_1k
 CLAUDE_USD_PER_1K_OUT_VAR = 'HEVOLVE_CLAUDE_USD_PER_1K_OUT'
 CLAUDE_BUDGET_USD_DAY_VAR = 'HEVOLVE_CLAUDE_BUDGET_USD_DAY'
 DEFAULT_CLAUDE_BUDGET_USD_DAY = 6.0
@@ -650,15 +654,12 @@ def _env_float(name: str, default: float) -> float:
 
 def usd_price_per_1k(model_name) -> Optional[Tuple[float, float]]:
     """(input, output) dollars per 1k tokens for a model with a real price
-    table row, else None (the Spark-derived rate applies)."""
-    lower = (model_name or '').lower()
-    for family, (pin, pout) in USD_PER_1K_BY_FAMILY.items():
-        if family in lower:
-            if family == CAPPED_FAMILY:
-                pin = _env_float(CLAUDE_USD_PER_1K_IN_VAR, pin)
-                pout = _env_float(CLAUDE_USD_PER_1K_OUT_VAR, pout)
-            return pin, pout
-    return None
+    table row, else None (the Spark-derived rate applies).  The family and
+    its (pinned) price come from the one rule in core.autogen_config."""
+    family = model_family(model_name)
+    if family == OTHER_MODEL_FAMILY:
+        return None
+    return family_usd_per_1k(family)
 
 
 def blended_usd_per_1k(model_name, tokens_in, tokens_out) -> Optional[float]:
@@ -720,7 +721,7 @@ def expert_budget_allows(model_name) -> Tuple[bool, str]:
     not an error anywhere: the selector simply does not offer the expert and
     the turn runs on the node's own model.
     """
-    if CAPPED_FAMILY not in (model_name or '').lower():
+    if model_family(model_name) != CAPPED_FAMILY:
         return True, 'not a capped family'
     cap = claude_budget_usd_day()
     spent = claude_usd_spent_today()

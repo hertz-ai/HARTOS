@@ -127,22 +127,71 @@ def test_a_paid_call_on_a_keyless_node_runs_revenue_through_the_system_jwt(
     assert r.status_code == 200
 
 
+def _node_credential(hie, monkeypatch, mode):
+    """The credential the node's own calls carry: the key on a keyed node, the
+    system JWT on a keyless one (dispatch._internal_auth_headers decides), or
+    nothing on a bundled desktop, where Nunba's in-process adapter posts
+    /chat bare and the gate trusts the machine's own callers."""
+    from integrations.agent_engine.dispatch import _internal_auth_headers
+    monkeypatch.delenv('NUNBA_BUNDLED', raising=False)
+    if mode == 'keyed':
+        monkeypatch.setenv('HEVOLVE_API_KEY', KEY)
+        monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+        return _internal_auth_headers()
+    if mode == 'keyless':
+        monkeypatch.delenv('HEVOLVE_API_KEY', raising=False)
+        monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+        return _internal_auth_headers()
+    monkeypatch.delenv('HEVOLVE_API_KEY', raising=False)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
+    monkeypatch.setenv('NUNBA_BUNDLED', '1')
+    return {}
+
+
+@pytest.mark.parametrize('mode', ['keyed', 'keyless', 'bundled'])
 def test_the_nodes_own_daemon_turn_keeps_the_lane_dispatch_goal_gave_it(
-        hie, lanes, monkeypatch):
-    monkeypatch.setenv('HEVOLVE_API_KEY', KEY)
-    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+        hie, lanes, monkeypatch, mode):
+    headers = _node_credential(hie, monkeypatch, mode)
     lanes.register_request_lane('daemon_goal-rev-1', 'revenue')     # a goal that earns
     body = {'user_id': 'system_daemon', 'prompt': 'market the thing',
             'request_id': 'daemon_goal-rev-1'}
-    assert _chat(hie, monkeypatch, body, {'X-API-Key': KEY}) == 'registered'
+    assert _chat(hie, monkeypatch, body, headers) == 'registered'
     assert lanes.lane_for_request('daemon_goal-rev-1') == 'revenue'
     # A plain goal's turn: nothing registered; the id's prefix rule says
     # daemon, which is what the wire stamps right after this turn.
     body['request_id'] = 'daemon_goal-plain-1'
-    assert _chat(hie, monkeypatch, body, {'X-API-Key': KEY}) == 'registered'
+    assert _chat(hie, monkeypatch, body, headers) == 'registered'
     assert lanes.lane_for_request('daemon_goal-plain-1') == ''
     assert hie.thread_local_data.get_request_id() == 'daemon_goal-plain-1'
     assert lanes.current_lane() == 'daemon'
+
+
+@pytest.mark.parametrize('mode', ['keyed', 'keyless'])
+def test_the_experts_inner_chat_call_keeps_the_revenue_turns_lane(hie, lanes, monkeypatch, mode):
+    """Review of 8947e2753, C1: when a revenue turn uses the expert, the
+    speculative dispatcher POSTs /chat again from inside the node with the
+    person's request id, the node's credential, model_config and no lane
+    field (speculative_dispatcher._build_dispatch_payload).  That inner call
+    re-registered the turn as 'user', so the Claude request went out on the
+    user lane into Kong's Claude cap.  Measured here through the real /chat:
+    the shopper's outer call, then the inner call it triggers."""
+    headers = _node_credential(hie, monkeypatch, mode)
+    from integrations.commerce.bindings import TENANT
+    from integrations.social.auth import generate_jwt
+    shopper = generate_jwt('c1', 'Shopper', tenant_id=TENANT)
+    outer = {'user_id': 'c1', 'prompt': 'add milk', 'request_id': 'msg_c1_expert'}
+    assert _chat(hie, monkeypatch, outer, {'Authorization': 'Bearer ' + shopper}) == 'registered'
+    assert lanes.lane_for_request('msg_c1_expert') == 'revenue'
+    inner = {'user_id': 'c1', 'prompt': 'add milk', 'create_agent': False, 'autonomous': False,
+             'casual_conv': False, 'draft_first': False, 'prompt_id': '7',
+             'model_config': [{'model': 'claude-sonnet-4-5', 'api_key': 'k',
+                               'base_url': 'http://172.17.0.1:8100/llm/v1'}],
+             'request_id': 'msg_c1_expert'}
+    assert _chat(hie, monkeypatch, inner, headers) == 'registered'
+    assert lanes.lane_for_request('msg_c1_expert') == 'revenue'
+    # What the wire would stamp on the Claude call right after this turn.
+    assert hie.thread_local_data.get_request_id() == 'msg_c1_expert'
+    assert lanes.current_lane() == 'revenue'
 
 
 def test_a_stranger_naming_a_goals_request_id_does_not_inherit_its_lane(

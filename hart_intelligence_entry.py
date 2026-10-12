@@ -9768,11 +9768,13 @@ def chat():
         # API key is configured — validate it first (Layer 0)
         # Accept either API key directly or a valid JWT
         import hmac as _hmac_mod
-        # The key arrives as the Bearer token or as X-API-Key, the header
-        # security/middleware.py's gate accepts and dispatch
-        # ._internal_auth_headers sends.  Before this, every metered
-        # self-POST on a keyed node (the PAID calls) was admitted by the
-        # middleware and then 401'd here (review of 7086adff8, finding 2).
+        # The key arrives as X-API-Key, the header security/middleware.py's
+        # gate accepts and dispatch._internal_auth_headers sends; before this,
+        # every metered self-POST on a keyed node (the PAID calls) was
+        # admitted by the middleware and then 401'd here (review of
+        # 7086adff8, finding 2).  The Bearer form of the key only reaches
+        # here from a caller the middleware does not gate (a bundled
+        # desktop's own local caller): the gate decodes a Bearer as a JWT.
         _x_api_key = request.headers.get('X-API-Key', '')
         _api_key_match = (
             (_bearer_token and _hmac_mod.compare_digest(_bearer_token, _api_key)) or

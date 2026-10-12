@@ -96,6 +96,14 @@ def test_a_completion_survives_metering(monkeypatch):
     monkeypatch.setattr(budget_gate, '_is_local_model', lambda: True)
     # the real meter_llm_call and record_metered_usage: the old keywords raised
     assert hma.send_completion([{'role': 'user', 'content': 'x'}]) == 'EDIT BLOCK'
+    # One meter per call: the wire hook (core.llm_outbound_logger) meters the
+    # httpx request this client makes; the adapter must not add a second row.
+    # The fake client here makes no httpx call, so a direct call from the
+    # adapter is the only way the meter could run.
+    calls = []
+    monkeypatch.setattr(budget_gate, 'meter_llm_call', lambda **kw: calls.append(kw))
+    assert hma.send_completion([{'role': 'user', 'content': 'x'}]) == 'EDIT BLOCK'
+    assert calls == []
     # and a metering layer that raises still does not cost the completion
     monkeypatch.setattr(budget_gate, 'meter_llm_call',
                         lambda **kw: (_ for _ in ()).throw(RuntimeError('down')))

@@ -170,10 +170,10 @@ _user_id_var: 'contextvars.ContextVar[str]' = contextvars.ContextVar(
 # /chat decides revenue-or-user where the request's auth is in hand
 # (core.request_lane) and REGISTERS it by request id here, because the
 # autogen entry points run on worker threads that neither the Flask ``g``
-# nor a thread-local reaches.  ``with_llm_context`` looks the lane up by the
-# request id it already binds and puts it in a contextvar, the same hop the
-# source label and request id take; ``current_lane`` is the one reader the
-# wire header, the budget gate and the expert selector all consult.
+# nor a thread-local reaches.  The lane needs no hop of its own across that
+# boundary: ``with_llm_context`` binds the request id, and ``current_lane``
+# reads the registry by it; ``current_lane`` is the one reader the wire
+# header, the budget gate and the expert selector all consult.
 LANE_REVENUE = 'revenue'
 LANE_USER = 'user'
 LANE_DAEMON = 'daemon'
@@ -228,8 +228,9 @@ def lane_context(lane: str):
 def current_lane() -> str:
     """The lane of the LLM call being made right now.
 
-    The bound contextvar first (set by with_llm_context from the registry),
-    then the registry by the current request id, then the request-id rule
+    An explicitly bound lane first (``lane_context``, a test and tooling
+    seam), then the registry by the current request id (the one
+    with_llm_context binds for the worker thread), then the request-id rule
     every other caller already uses: a ``daemon_`` or absent id is background,
     anything else is a person.
     """
@@ -620,23 +621,102 @@ def _hosted_body(request):
         return None
 
 
+_CONFIGURED_ENDPOINTS_TTL = 30.0
+_configured_endpoints_cache = (0.0, frozenset())
+
+
+def _host_port(url_text):
+    """(host, port) of a URL string, the port defaulted by scheme; None when
+    there is no host."""
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(str(url_text or ''))
+        host = (parts.hostname or '').lower()
+        if not host:
+            return None
+        port = parts.port
+        if port is None:
+            port = 443 if parts.scheme == 'https' else 80 if parts.scheme == 'http' else None
+        return (host, port)
+    except Exception:
+        return None
+
+
+def _configured_endpoints() -> frozenset:
+    """(host, port) of every LLM endpoint this node is CONFIGURED to call:
+    the main backend (core.autogen_config.resolve_llm_backend), the expert
+    trio (resolve_expert_backend) and OPENAI_BASE_URL (the langchain path's
+    base).  Re-read every _CONFIGURED_ENDPOINTS_TTL seconds."""
+    global _configured_endpoints_cache
+    now = time.time()
+    if now - _configured_endpoints_cache[0] < _CONFIGURED_ENDPOINTS_TTL:
+        return _configured_endpoints_cache[1]
+    found = set()
+    try:
+        from core.autogen_config import resolve_expert_backend, resolve_llm_backend
+        for resolver in (lambda: (resolve_llm_backend() or (None, None))[1],
+                         resolve_expert_backend):
+            try:
+                entry = resolver()
+                hp = _host_port((entry or {}).get('base_url')) if isinstance(entry, dict) else None
+                if hp:
+                    found.add(hp)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # The three keys the deploy check names (HEVOLVE_LLM_ENDPOINT_URL,
+    # OPENAI_BASE_URL, HEVOLVE_LOCAL_LLM_URL) are read directly too: a node
+    # that names an endpoint has configured it, whatever its tier resolves to.
+    for var in ('HEVOLVE_LLM_ENDPOINT_URL', 'OPENAI_BASE_URL', 'HEVOLVE_LOCAL_LLM_URL'):
+        hp = _host_port(os.environ.get(var, ''))
+        if hp:
+            found.add(hp)
+    _configured_endpoints_cache = (now, frozenset(found))
+    return _configured_endpoints_cache[1]
+
+
+def _is_configured_endpoint(url) -> bool:
+    """Is this hosted URL one of the node's configured LLM endpoints (the
+    gateway, or a provider the owner pointed a trio at)?  Only those calls
+    carry HARTOS's lane and model headers and feed the dollar meter; a call
+    to any other host (a person's own cloud key through some other path) is
+    left byte-for-byte and header-for-header as it was (owner rule
+    2026-10-06: the cloud request stays unchanged where the routing does not
+    apply; review of 8947e2753, M3)."""
+    try:
+        host = str(getattr(url, 'host', '') or '').lower()
+        port = getattr(url, 'port', None)
+        if port is None:
+            scheme = str(getattr(url, 'scheme', '') or '')
+            port = 443 if scheme == 'https' else 80 if scheme == 'http' else None
+        return bool(host) and (host, port) in _configured_endpoints()
+    except Exception:
+        return False
+
+
 def _send_and_feed(orig_send, client, request, kwargs):
     """Run a HOSTED (non-target) chat/completions send and feed the provider
     breaker with its real status.  Body bytes are never touched; the response
     object is returned as-is and an exception is re-raised bare (exceptions do
     not feed the breaker).
 
-    The lane and model headers are stamped and the completed call is metered
-    here too (review of 065cef8bb, C1): the configured endpoint on central is
-    Kong at /llm/v1/..., whose path is not the local target's, so every Claude
-    call took this branch unlabelled and unmetered, the day cap never saw a
-    dollar and Kong routed the calls to its default lane."""
-    body = _hosted_body(request)
-    _annotate_request(request, body)
+    When the host is one of the node's CONFIGURED endpoints, the lane and
+    model headers are stamped and the completed call is metered here too
+    (review of 065cef8bb, C1): the configured endpoint on central is Kong at
+    /llm/v1/..., whose path is not the local target's, so every Claude call
+    took this branch unlabelled and unmetered, the day cap never saw a dollar
+    and Kong routed the calls to its default lane.  Any other host is left
+    exactly as it was (_is_configured_endpoint)."""
+    gateway = _is_configured_endpoint(request.url)
+    body = _hosted_body(request) if gateway else None
+    if gateway:
+        _annotate_request(request, body)
     response = orig_send(client, request, **kwargs)
     _status = getattr(response, 'status_code', None)
     _feed_provider_breaker(request.url, _status)
-    _meter_response(body, response, _status)
+    if gateway:
+        _meter_response(body, response, _status)
     return response
 
 
@@ -2339,12 +2419,15 @@ def _install_async_patch(httpx_module) -> None:
             # Hosted chat/completions: lane and model headers, the provider
             # breaker (#106b b) and the dollar meter, as in _send_and_feed.
             if _is_chat_completions_post(request):
-                _hbody = _hosted_body(request)
-                _annotate_request(request, _hbody)
+                _gateway = _is_configured_endpoint(request.url)
+                _hbody = _hosted_body(request) if _gateway else None
+                if _gateway:
+                    _annotate_request(request, _hbody)
                 _resp = await _orig(self, request, **kwargs)
                 _hstatus = getattr(_resp, 'status_code', None)
                 _feed_provider_breaker(request.url, _hstatus)
-                _meter_response(_hbody, _resp, _hstatus)
+                if _gateway:
+                    _meter_response(_hbody, _resp, _hstatus)
                 return _resp
             return await _orig(self, request, **kwargs)
         try:

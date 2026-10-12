@@ -472,8 +472,9 @@ def onboard(
 # HARTOS calls ONE endpoint for every LLM turn (core.autogen_config).  With
 # Kong in front, that endpoint is this service: Kong forwards /llm/v1/... to
 # gpt3's /v1/... (the provider fan-out) and applies request caps by the two
-# headers HARTOS stamps on every call (core.llm_outbound_logger._annotate_
-# request): ``X-HARTOS-Lane`` (revenue | user | daemon) and ``X-HARTOS-Model``.
+# headers HARTOS stamps on every call to a configured endpoint
+# (core.llm_outbound_logger._annotate_request): ``X-HARTOS-Lane``
+# (revenue | user | daemon) and ``X-HARTOS-Model-Family`` (claude | other).
 #
 # This Kong is 2.8.5 community (measured 2026-10-12): no AI plugins, no token
 # or dollar awareness.  So Kong is the fuse and HARTOS's budget gate is the

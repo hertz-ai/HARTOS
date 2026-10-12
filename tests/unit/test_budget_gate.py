@@ -431,18 +431,27 @@ class TestClaudeDayCap:
         assert allowed is False and 'unreadable' in why
         assert bg.expert_budget_allows('gpt-4o')[0] is True       # uncapped families unaffected
 
-    def test_one_price_table_shared_with_the_expert_entry(self):
+    def test_one_price_table_and_one_pin_shared_with_the_expert_entry(self, monkeypatch):
+        """The meter's price and the expert entry's autogen price are the same
+        number, pinned or not (review of 8947e2753: an owner's pin moved the
+        meter and left the registry at the list price)."""
         from integrations.agent_engine import budget_gate as bg
         from core import autogen_config as ac
         assert bg.USD_PER_1K_BY_FAMILY is ac.EXPERT_USD_PER_1K
-        for k in ('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', 'HEVOLVE_EXPERT_LLM_MODEL_NAME'):
-            os.environ[k] = {'HEVOLVE_EXPERT_LLM_ENDPOINT_URL': 'http://gw/llm/v1',
-                             'HEVOLVE_EXPERT_LLM_MODEL_NAME': 'claude-sonnet-4-5'}[k]
-        try:
-            assert ac.resolve_expert_backend()['price'] == list(ac.EXPERT_USD_PER_1K['claude'])
-        finally:
-            for k in ('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', 'HEVOLVE_EXPERT_LLM_MODEL_NAME'):
-                os.environ.pop(k, None)
+        monkeypatch.setenv('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', 'http://gw/llm/v1')
+        monkeypatch.setenv('HEVOLVE_EXPERT_LLM_MODEL_NAME', 'anthropic/claude-sonnet-4-6')
+        monkeypatch.delenv('HEVOLVE_CLAUDE_USD_PER_1K_IN', raising=False)
+        monkeypatch.delenv('HEVOLVE_CLAUDE_USD_PER_1K_OUT', raising=False)
+        assert ac.resolve_expert_backend()['price'] == [0.003, 0.015]
+        assert bg.usd_price_per_1k('anthropic/claude-sonnet-4-6') == (0.003, 0.015)
+        monkeypatch.setenv('HEVOLVE_CLAUDE_USD_PER_1K_IN', '0.001')
+        monkeypatch.setenv('HEVOLVE_CLAUDE_USD_PER_1K_OUT', '0.005')
+        assert ac.resolve_expert_backend()['price'] == [0.001, 0.005]
+        assert bg.usd_price_per_1k('anthropic/claude-sonnet-4-6') == (0.001, 0.005)
+        # An unpriced family gets no invented price, in the entry or the meter.
+        monkeypatch.setenv('HEVOLVE_EXPERT_LLM_MODEL_NAME', 'gpt-4o')
+        assert 'price' not in ac.resolve_expert_backend()
+        assert bg.usd_price_per_1k('gpt-4o') is None
 
     def test_usd_spent_since_reads_this_nodes_own_rows_for_the_family(self, monkeypatch):
         from integrations.agent_engine import budget_gate as bg

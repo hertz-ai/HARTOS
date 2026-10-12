@@ -1477,7 +1477,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     # earns is revenue work and may use the expert model; registered by the
     # daemon request id BOTH dispatch paths carry (local_chat_dispatch and the
     # HTTP self-POST both name the turn daemon_request_id(goal_id)), before the
-    # budget gate so the gate can read it.  /chat keeps a registered lane.
+    # budget gate so the gate can read it.  /chat leaves the node's own daemon
+    # turn alone (core.request_lane.register_chat_lane), so this stands.
     try:
         from core.llm_outbound_logger import register_request_lane, LANE_REVENUE
         if is_revenue_goal_type(goal_type):

@@ -853,36 +853,112 @@ def test_a_completed_call_is_metered_from_its_usage_block_on_any_tier(tmp_path, 
                      'task_source': 'own'}]
 
 
-def test_the_hosted_path_stamps_lane_and_model_and_meters_too(tmp_path, monkeypatch):
+_HARTOS_HEADERS = ('X-HARTOS-Lane', 'X-HARTOS-Model', 'X-HARTOS-Model-Family',
+                   'X-HARTOS-Request-ID')
+_KONG = 'http://172.17.0.1:8100/llm/v1'
+
+
+def _claude_body():
+    return json.dumps({'model': 'claude-sonnet-4-5',
+                       'messages': [{'role': 'user', 'content': 'x'}],
+                       'tools': [{'type': 'function', 'function': {'name': 't'}}]}).encode()
+
+
+def test_the_hosted_path_stamps_and_meters_only_the_configured_endpoint(tmp_path, monkeypatch):
     """Review of 065cef8bb, C1: on central the configured endpoint is Kong at
     /llm/v1/..., which is NOT the local target (port or path), so every Claude
     call took the hosted branch: no lane header for Kong's routes and no
-    metered row for the day cap.  The hosted branch now stamps and meters;
-    it still never trims and never rewrites the body."""
+    metered row for the day cap.  The hosted branch now stamps and meters a
+    call to a CONFIGURED endpoint; it still never trims and never rewrites
+    the body.  Review of 8947e2753, M3: a call to any other host (a person's
+    own cloud key through some other path) stays header-for-header as it was
+    (owner rule 2026-10-06, the cloud request is unchanged)."""
+    monkeypatch.setenv('OPENAI_BASE_URL', _KONG)          # one of the three configured keys
+    monkeypatch.delenv('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', raising=False)
     mod, fake_httpx, seen = _install_with_usage(monkeypatch, tmp_path, 'central')
-    body = json.dumps({'model': 'claude-sonnet-4-5', 'messages': [{'role': 'user', 'content': 'x'}],
-                       'tools': [{'type': 'function', 'function': {'name': 't'}}]}).encode()
-    for url in (_FakeURL(host='172.17.0.1', port=8100, path='/llm/v1/chat/completions'),
-                _FakeURL(host='api.anthropic.com', port=443, path='/v1/chat/completions')):
-        request = _FakeRequest(body=body, url=url)
-        fake_httpx.Client.send(_FakeClient(), request)
-        assert request.headers.get('X-HARTOS-Lane') == 'user'
-        assert request.headers.get('X-HARTOS-Model') == 'claude-sonnet-4-5'
-        assert request.headers.get('X-HARTOS-Request-ID') == 'req-m'
-        # The family header is what Kong's Claude fuse matches, by the ONE
-        # rule the dollar meter prices with: no list of model names in Kong.
-        from integrations.gateway import kong_onboard as ko
-        from integrations.agent_engine import budget_gate as bg
-        assert request.headers.get(ko.LLM_MODEL_FAMILY_HEADER) == ko.CAPPED_MODEL_FAMILY
-        assert ko.CAPPED_MODEL_FAMILY == bg.CAPPED_FAMILY == 'claude'
-        assert fake_httpx._captured['send_calls'][-1]['content'] == body   # untouched
+    from integrations.gateway import kong_onboard as ko
+    from integrations.agent_engine import budget_gate as bg
+    body = _claude_body()
+
+    kong = _FakeRequest(body=body, url=_FakeURL(host='172.17.0.1', port=8100,
+                                                path='/llm/v1/chat/completions'))
+    fake_httpx.Client.send(_FakeClient(), kong)
+    assert kong.headers.get('X-HARTOS-Lane') == 'user'
+    assert kong.headers.get('X-HARTOS-Model') == 'claude-sonnet-4-5'
+    assert kong.headers.get('X-HARTOS-Request-ID') == 'req-m'
+    # The family header is what Kong's Claude fuse matches, by the ONE rule
+    # the dollar meter prices with: no list of model names in Kong.
+    assert kong.headers.get(ko.LLM_MODEL_FAMILY_HEADER) == ko.CAPPED_MODEL_FAMILY
+    assert ko.CAPPED_MODEL_FAMILY == bg.CAPPED_FAMILY == 'claude'
+    assert fake_httpx._captured['send_calls'][-1]['content'] == body   # untouched
     assert seen == [{'model': 'claude-sonnet-4-5', 'tokens_in': 120, 'tokens_out': 30,
-                     'task_source': 'own'}] * 2
+                     'task_source': 'own'}]
+
+    # An unconfigured third-party host: no HARTOS header, no metered row.
+    direct = _FakeRequest(body=body, url=_FakeURL(host='api.anthropic.com', port=443,
+                                                  path='/v1/chat/completions'))
+    fake_httpx.Client.send(_FakeClient(), direct)
+    assert not any(h in direct.headers for h in _HARTOS_HEADERS), dict(direct.headers)
+    assert fake_httpx._captured['send_calls'][-1]['content'] == body
+    assert len(seen) == 1
+
+    # The same host becomes a configured endpoint when the owner points the
+    # expert trio at it: then it is stamped and metered like the gateway.
+    monkeypatch.setenv('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', 'https://api.anthropic.com/v1')
+    monkeypatch.setenv('HEVOLVE_EXPERT_LLM_MODEL_NAME', 'claude-sonnet-4-5')
+    mod._configured_endpoints_cache = (0.0, frozenset())
+    configured = _FakeRequest(body=body, url=_FakeURL(host='api.anthropic.com', port=443,
+                                                      path='/v1/chat/completions'))
+    fake_httpx.Client.send(_FakeClient(), configured)
+    assert configured.headers.get('X-HARTOS-Lane') == 'user'
+    assert configured.headers.get(ko.LLM_MODEL_FAMILY_HEADER) == 'claude'
+    assert len(seen) == 2
+
     # A hosted request that is not chat/completions is left alone entirely.
     other = _FakeRequest(body=b'{"input": "x"}',
-                         url=_FakeURL(host='api.anthropic.com', port=443, path='/v1/embeddings'))
+                         url=_FakeURL(host='172.17.0.1', port=8100, path='/llm/v1/embeddings'))
     fake_httpx.Client.send(_FakeClient(), other)
-    assert 'X-HARTOS-Lane' not in other.headers and len(seen) == 2
+    assert not any(h in other.headers for h in _HARTOS_HEADERS) and len(seen) == 2
+
+
+def test_the_async_hosted_path_stamps_and_meters_the_configured_endpoint_too(
+        tmp_path, monkeypatch):
+    """The AsyncClient twin of the test above (review of 8947e2753: both
+    'async path does not meter' and 'does not stamp' mutants survived)."""
+    import asyncio
+    monkeypatch.setenv('OPENAI_BASE_URL', _KONG)
+    _reset_module(monkeypatch, tmp_path)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    fake_httpx = _build_fake_httpx_module(response_factory=_usage_response)
+
+    async def _async_send(self, request, **kwargs):          # answers with a usage block
+        fake_httpx._captured['send_calls'].append({'content': bytes(request._content or b''),
+                                                   'url': str(request.url)})
+        return _usage_response()
+    fake_httpx.AsyncClient.send = _async_send
+    monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
+    fake_tl = types.ModuleType('threadlocal')
+    fake_tl.thread_local_data = types.SimpleNamespace(get_request_id=lambda: 'req-m')
+    monkeypatch.setitem(sys.modules, 'hartos.threadlocal', fake_tl)
+    import core.llm_outbound_logger as mod
+    mod.install()
+    import integrations.agent_engine.budget_gate as bg
+    seen = []
+    monkeypatch.setattr(bg, 'meter_llm_call', lambda **kw: seen.append(kw))
+
+    body = _claude_body()
+    kong = _FakeRequest(body=body, url=_FakeURL(host='172.17.0.1', port=8100,
+                                                path='/llm/v1/chat/completions'))
+    asyncio.run(fake_httpx.AsyncClient().send(kong))
+    assert kong.headers.get('X-HARTOS-Lane') == 'user'
+    assert kong.headers.get('X-HARTOS-Model-Family') == 'claude'
+    assert fake_httpx._captured['send_calls'][-1]['content'] == body
+    assert seen == [{'model': 'claude-sonnet-4-5', 'tokens_in': 120, 'tokens_out': 30,
+                     'task_source': 'own'}]
+    direct = _FakeRequest(body=body, url=_FakeURL(host='api.anthropic.com', port=443,
+                                                  path='/v1/chat/completions'))
+    asyncio.run(fake_httpx.AsyncClient().send(direct))
+    assert not any(h in direct.headers for h in _HARTOS_HEADERS) and len(seen) == 1
 
 
 def test_a_failed_call_or_a_body_without_usage_is_not_metered(tmp_path, monkeypatch):

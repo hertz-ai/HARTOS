@@ -78,12 +78,26 @@ or a mix with merchant and driver subscriptions.
 2. Set on central's `.env`: the McGroce trio, `HEVOLVE_AUTONOMOUS_MARKETING=1`,
    the expert trio for Claude, and point the configured LLM at Kong
    (`http://172.17.0.1:8100/llm/v1`) in all three keys the deploy check names.
-   `HEVOLVE_API_KEY` is optional for the lanes: without it the node's
-   self-POSTs carry its system JWT and are trusted the same way.  Setting it
-   is safe only on a build that carries the /chat `X-API-Key` fix (this
-   commit); before it, a keyed central answered every paid metered call
-   with 401 inside /chat and the customer saw 503 (measured by the review of
-   7086adff8).
+   Then set `HEVOLVE_API_KEY`, AFTER the build carrying the /chat
+   `X-API-Key` fix is deployed (before it, a keyed central answered every
+   paid metered call with 401 inside /chat and the customer saw 503,
+   measured by the review of 7086adff8).  The key is not optional in
+   practice: without it the metered self-POST carries the node's system
+   JWT, /chat trusts the JWT over the body (correctly), and every paying
+   API customer's turn runs as `system_daemon`, one shared identity, session
+   and ledger (measured 2026-10-12; the same collapse the channel relays had
+   on 2026-08-06).  With the key, the body's customer id is kept and the lane
+   claim is trusted.
+
+   Deferred, recorded here so they are not lost: (a) request ids minted per
+   second collide (`core.chat_client.mint_request_id`); the metered endpoint
+   mints a unique `api_<ts>_<hex>` id of its own for now, and the shared
+   minter should become unique in a change that keeps Nunba's id shape in
+   step; (b) a stranger with a JWT who names a goal's `daemon_` request id
+   demotes that goal's in-flight lane to `user` (accepted: the alternative,
+   keeping the registration, let the stranger inherit revenue); (c) a paid
+   API call now counts as user activity, so background daemons yield to it
+   for the usual window (intended: a paying customer's turn is a real turn).
 3. Redeploy gpt3 (`bash start.sh` with `/opt/hzai-GPT3/gpt3.env` holding the
    provider keys) and apply the Kong routes
    (`python -m integrations.gateway.kong_onboard --llm --kong-url http://127.0.0.1:8101`).
