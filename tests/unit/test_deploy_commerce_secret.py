@@ -86,12 +86,14 @@ def _script_prefix():
     return '\n'.join(lines[:cut[0]]) + '\n'
 
 
-# Prepended to the prefix: the commands a real deploy runs on the box (and a
-# developer machine must never run from a unit test) only record that they were
-# called. The prefix needs none of them today; a later edit that moves one above
-# the cut fails _assert_ran instead of touching docker or git on the dev host.
-_TRAP = ''.join('%s() { echo "%s $*" >> "$PWD/.calls"; }\n' % (c, c)
-                for c in ('git', 'docker', 'sudo', 'curl'))
+# The commands a real deploy runs on the box, which a developer machine must
+# never run from a unit test. Each is shadowed by an executable of the same name
+# on a PATH entry placed first, which only records that it was called: a PATH
+# lookup also catches `command git`, `env git`, `xargs git` and `sh -c 'git'`,
+# which a shell function of the same name would not (review of bb1893b99, F3).
+# The prefix needs none of them today; a later edit that moves one above the
+# cut fails _assert_ran instead of touching docker or git on the dev host.
+_BOX_COMMANDS = ('git', 'docker', 'sudo', 'curl')
 
 
 def _keys(env_text):
@@ -111,18 +113,16 @@ def _values(env_text, key):
 class WorkflowForwardsTheSecret(unittest.TestCase):
 
     def test_named_in_the_forwarded_envs_and_set_in_the_step_env(self):
-        step = _ssh_step()
-        self.assertIn(_NAME, step['with']['envs'].split(','))
-        self.assertEqual((step.get('env') or {}).get(_NAME),
+        self.assertIn(_NAME, _forwarded_names())
+        self.assertEqual((_ssh_step().get('env') or {}).get(_NAME),
                          '${{ secrets.%s }}' % _NAME)
 
     def test_every_forwarded_name_is_set_and_every_set_name_forwarded(self):
         """A name forwarded but never set reaches the box empty; a name set but
         not forwarded never leaves the runner. Either way the deploy is green
         and the value is missing."""
-        step = _ssh_step()
-        forwarded = set(step['with']['envs'].split(','))
-        set_here = set(step.get('env') or {})
+        forwarded = set(_forwarded_names())
+        set_here = set(_ssh_step().get('env') or {})
         self.assertEqual(sorted(forwarded - set_here), [], 'forwarded but never set')
         self.assertEqual(sorted(set_here - forwarded), [], 'set but never forwarded')
 
@@ -143,18 +143,28 @@ class ScriptEnsuresTheKey(unittest.TestCase):
         self.dir = tempfile.mkdtemp()
         self.addCleanup(self._remove)
         self.env_path = os.path.join(self.dir, '.env')
+        self.calls = os.path.join(self.dir, '.calls')
         # A file, not `bash -c <text>`: Windows argv quoting rewrites the
         # backslashes in the script's sed expression.
         with open(os.path.join(self.dir, 'prefix.sh'), 'w', encoding='utf-8',
                   newline='\n') as fh:
-            fh.write(_TRAP + _script_prefix())
+            fh.write(_script_prefix())
+        self.bin = os.path.join(self.dir, 'bin')
+        os.mkdir(self.bin)
+        for name in _BOX_COMMANDS:
+            with open(os.path.join(self.bin, name), 'w', encoding='utf-8',
+                      newline='\n') as fh:
+                fh.write('#!/bin/sh\necho "%s $*" >> "$DEPLOY_TEST_CALLS"\n' % name)
+            os.chmod(os.path.join(self.bin, name), 0o755)
 
     def _remove(self):
-        # File by file, not shutil.rmtree: the prefix writes only flat files
-        # here, and rmtree is broken in one of this repo's test venvs
-        # (os._walk_symlinks_as_files missing).
-        for name in os.listdir(self.dir):
-            os.remove(os.path.join(self.dir, name))
+        # Bottom-up by hand, not shutil.rmtree: rmtree is broken in one of
+        # this repo's test venvs (os._walk_symlinks_as_files missing).
+        for root, dirs, files in os.walk(self.dir, topdown=False):
+            for name in files:
+                os.remove(os.path.join(root, name))
+            for name in dirs:
+                os.rmdir(os.path.join(root, name))
         os.rmdir(self.dir)
 
     def _write_env(self, text):
@@ -169,6 +179,8 @@ class ScriptEnsuresTheKey(unittest.TestCase):
         forwarded = set(_forwarded_names())
         env = {k: v for k, v in os.environ.items() if k not in forwarded}
         env.update(values)
+        env['PATH'] = self.bin + os.pathsep + env.get('PATH', '')
+        env['DEPLOY_TEST_CALLS'] = self.calls
         proc = subprocess.run([_BASH, 'prefix.sh'], cwd=self.dir, env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               timeout=60)
@@ -178,10 +190,9 @@ class ScriptEnsuresTheKey(unittest.TestCase):
 
     def _assert_ran(self, code, out):
         self.assertEqual(code, 0, 'the deploy prefix exited %d:\n%s' % (code, out))
-        calls = os.path.join(self.dir, '.calls')
-        self.assertFalse(os.path.exists(calls),
+        self.assertFalse(os.path.exists(self.calls),
                          'the prefix ran box commands: %s'
-                         % (_read(calls) if os.path.exists(calls) else ''))
+                         % (_read(self.calls) if os.path.exists(self.calls) else ''))
 
     def test_a_live_env_without_the_llm_trio_gets_the_key(self):
         """No HEVOLVE_LLM_MODEL_NAME: the trio block is skipped, and the
@@ -243,17 +254,33 @@ class ScriptEnsuresTheKey(unittest.TestCase):
         self._write_env('ALLOWED_HOSTS=*\nB=2')
         code, out, text = self._deploy(**{_NAME: 'tail1'})
         self._assert_ran(code, out)
-        self.assertEqual(_values(text, 'B'), ['2'])
-        self.assertEqual(_values(text, _NAME), ['tail1'])
+        self.assertEqual(text, 'ALLOWED_HOSTS=*\nB=2\n%s=tail1\n' % _NAME)
 
     def test_the_ota_append_keeps_an_unterminated_last_line_too(self):
         """Same file, no ALLOWED_HOSTS: the OTA block appends first."""
         self._write_env('A=1')
         code, out, text = self._deploy(**{_NAME: 'tail2'})
         self._assert_ran(code, out)
-        self.assertEqual(_values(text, 'A'), ['1'])
-        self.assertEqual(_values(text, 'ALLOWED_HOSTS'), ['etime.hertzai.com'])
-        self.assertEqual(_values(text, _NAME), ['tail2'])
+        self.assertEqual(text, 'A=1\nALLOWED_HOSTS=etime.hertzai.com\n%s=tail2\n' % _NAME)
+
+    def test_a_terminated_file_gets_no_blank_line(self):
+        """Exact bytes, both appends: a file that ends in a newline already is
+        the usual live .env, and a blank line there would be the regression
+        (an always-write-the-newline helper passed the key-only checks)."""
+        cases = [('ALLOWED_HOSTS=*\nB=2\n', 'ALLOWED_HOSTS=*\nB=2\n%s=t3\n' % _NAME, 't3'),
+                 ('A=1\n', 'A=1\nALLOWED_HOSTS=etime.hertzai.com\n%s=t4\n' % _NAME, 't4')]
+        for before, after, secret in cases:
+            with self.subTest(before=before):
+                self._write_env(before)
+                code, out, text = self._deploy(**{_NAME: secret})
+                self._assert_ran(code, out)
+                self.assertEqual(text, after)
+
+    def test_an_empty_env_gets_no_leading_blank_line(self):
+        self._write_env('')
+        code, out, text = self._deploy(**{_NAME: 'e1'})
+        self._assert_ran(code, out)
+        self.assertEqual(text, 'ALLOWED_HOSTS=etime.hertzai.com\n%s=e1\n' % _NAME)
 
     def test_the_exact_key_is_replaced_beside_a_prefix_sharing_key(self):
         """The replace path must match `KEY=`, not every line starting KEY."""
@@ -271,13 +298,30 @@ class ScriptEnsuresTheKey(unittest.TestCase):
         self.assertEqual(_values(text, _NAME), ['c1'])
         self.assertIn('# %s=example' % _NAME, text)
 
-    def test_an_absent_secret_is_named_in_the_log(self):
-        """An unset secret leaves the route answering 503; the deploy log says
-        so, the way the create-block names a missing LangChain or Groq key."""
+    def test_an_absent_secret_and_no_key_is_named_in_the_log(self):
+        """No repo secret and no key in .env: the container has none from the
+        environment, and the deploy log says so, the way the create-block names
+        a missing LangChain or Groq key. (config.json could still carry it, so
+        the note says that rather than promising a 503.)"""
         self._write_env('A=1\n')
         code, out, text = self._deploy(**{_NAME: ''})
         self._assert_ran(code, out)
-        self.assertIn('%s secret absent' % _NAME, out)
+        self.assertIn('%s secret absent and not in .env' % _NAME, out)
+
+    def test_an_absent_secret_with_the_key_in_env_says_it_is_kept(self):
+        """The .env still holds the key, so the container still has it: the
+        log must not claim the route is unconfigured (review of bb1893b99, F1)."""
+        self._write_env('A=1\n%s=keep\n' % _NAME)
+        code, out, text = self._deploy(**{_NAME: ''})
+        self._assert_ran(code, out)
+        self.assertIn('.env keeps its existing value', out)
+        self.assertNotIn('not in .env', out)
+
+    def test_a_set_secret_prints_no_absent_note(self):
+        self._write_env('A=1\n')
+        code, out, text = self._deploy(**{_NAME: 'set1'})
+        self._assert_ran(code, out)
+        self.assertNotIn('secret absent', out)
 
     def test_the_value_never_reaches_the_log(self):
         self._write_env('A=1\n')

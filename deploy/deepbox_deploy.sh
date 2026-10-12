@@ -125,6 +125,18 @@ else
   fi
 fi
 
+# ── _env_append: the ONE way a line is added to a live .env ──
+# A file whose last line has no newline would otherwise get the new line
+# glued onto it: `LAST=xNEW=y` sets neither key and puts NEW's value inside
+# LAST's (measured on the old `echo >> .env` appends, review of 5100ca104).
+# A file that already ends in a newline gets no blank line.
+_env_append() {   # $1 the whole KEY=value line
+  if [ -s .env ] && [ -n "$(tail -c 1 .env)" ]; then
+    echo >> .env
+  fi
+  echo "$1" >> .env
+}
+
 # ── The OTA host, guaranteed on EVERY deploy (not just a fresh box) ──
 # The block above writes .env only when it is ABSENT, which is the
 # right rule (a live .env carries values this workflow does not
@@ -144,17 +156,6 @@ fi
 # .env: it appends ONE host to ONE key, only when missing, which is
 # the same additive contract the create-block comment describes.
 # Re-running is a no-op, and an operator's '*' is left alone.
-#
-# _env_append is the ONE way a line is added to a live .env. A file
-# whose last line has no newline would otherwise get the new line glued
-# onto it: `LAST=xNEW=y` sets neither key and puts NEW's value inside
-# LAST's (measured on this helper's old body, review of 5100ca104).
-_env_append() {   # $1 the whole KEY=value line
-  if [ -s .env ] && [ -n "$(tail -c 1 .env)" ]; then
-    echo >> .env
-  fi
-  echo "$1" >> .env
-}
 _OTA_HOST="${HART_OTA_HOST:-etime.hertzai.com}"
 if [ -n "$_OTA_HOST" ] && [ -f .env ]; then
   if ! grep -q '^ALLOWED_HOSTS=' .env; then
@@ -212,13 +213,19 @@ fi
 # Same reason as the blocks above: the create-block never runs on a box that
 # already has a .env, so a secret added to the repo later would reach this
 # script and stop. McGroce's Tomcat presents the same value as
-# X-Commerce-Secret (integrations/commerce/commerce_api.py); while it is unset
-# POST /api/commerce/session answers 503. An absent secret leaves .env alone.
+# X-Commerce-Secret (integrations/commerce/commerce_api.py); while the
+# container has none (environment first, then config.json: core/config_cache)
+# POST /api/commerce/session answers 503. An absent secret leaves .env alone,
+# and the log says which of the two states that leaves the box in.
 if [ -n "${COMMERCE_SESSION_SECRET}" ] && [ -f .env ]; then
   _set_env_key COMMERCE_SESSION_SECRET "$COMMERCE_SESSION_SECRET"
   echo "  COMMERCE_SESSION_SECRET set from the secret (value not shown)"
 elif [ -z "${COMMERCE_SESSION_SECRET}" ]; then
-  echo "  note: COMMERCE_SESSION_SECRET secret absent — /api/commerce/session answers 503"
+  if [ -f .env ] && grep -q '^COMMERCE_SESSION_SECRET=' .env; then
+    echo "  COMMERCE_SESSION_SECRET secret absent — .env keeps its existing value (not shown)"
+  else
+    echo "  note: COMMERCE_SESSION_SECRET secret absent and not in .env — /api/commerce/session answers 503 unless config.json carries it"
+  fi
 fi
 
 DEPLOY_COMMIT="$(git rev-parse HEAD)"
