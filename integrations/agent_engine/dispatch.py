@@ -541,6 +541,13 @@ def is_revenue_goal_type(goal_type) -> bool:
     return gt in REVENUE_GOAL_TYPES or gt.startswith(REVENUE_GOAL_TYPE_PREFIXES)
 
 
+def lane_for_goal_type(goal_type) -> str:
+    """The lane a goal's turns run on: 'revenue' for a goal that earns, else
+    'daemon'.  The daemon-side twin of core.request_lane.lane_for_chat."""
+    from core.llm_outbound_logger import LANE_REVENUE, LANE_DAEMON
+    return LANE_REVENUE if is_revenue_goal_type(goal_type) else LANE_DAEMON
+
+
 def is_genuine_user_request(request_id) -> bool:
     """True when a /chat request comes from a real user (so it should
     mark user activity + make daemons yield), False when it's the

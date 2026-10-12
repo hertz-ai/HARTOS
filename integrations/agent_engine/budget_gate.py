@@ -596,8 +596,16 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
         if _is_local_model():
             usd_per_1k = 0.0
         else:
-            spark_per_usd = float(os.environ.get('HEVOLVE_SPARK_PER_USD', '100') or 100)
-            usd_per_1k = spark_per_1k(_resolve_model_name(model)) / max(spark_per_usd, 1e-9)
+            # A family with a real dollar price (Claude) is metered at it,
+            # blended over this call's input and output tokens so the stored
+            # actual_usd_cost is exact; every other cloud family keeps the
+            # Spark-derived rate.
+            blended = blended_usd_per_1k(_resolve_model_name(model), tokens_in, tokens_out)
+            if blended is not None:
+                usd_per_1k = blended
+            else:
+                spark_per_usd = float(os.environ.get('HEVOLVE_SPARK_PER_USD', '100') or 100)
+                usd_per_1k = spark_per_1k(_resolve_model_name(model)) / max(spark_per_usd, 1e-9)
         return record_metered_usage(
             node_id=node_id or 'local', model_id=model or 'unknown',
             task_source=task_source, tokens_in=int(tokens_in or 0),
@@ -606,6 +614,115 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
     except Exception as e:
         logger.warning(f"LLM metering failed (the call itself is unaffected): {e}")
         return None
+
+
+# ─── Dollar meter and the Claude day cap (owner policy 2026-10-12) ─────────
+#
+# "No more than $6 a day on Claude in central", and "Claude can never become
+# its own blocker": the cap is enforced where the expert is OFFERED
+# (ModelRegistry._offered asks expert_budget_allows), so a turn past the cap
+# is served by the node's own model instead of failing.  The ledger it reads
+# is MeteredAPIUsage, fed by the wire hook from every response's usage block
+# (core.llm_outbound_logger._meter_response) at a real dollar price.
+# Topology agnostic: no node-tier branch.  The cap only has anything to cap
+# where an expert trio is configured (core.autogen_config), which is central
+# by configuration; a node whose LLM is local meters at zero and writes no
+# row.  The meter fails OPEN (an unreadable ledger allows): the Kong request
+# fuse on the Claude route is the hard backstop, and an error here must never
+# stop revenue work.  Prices are list prices per 1k tokens; the owner can pin
+# them.
+USD_PER_1K_BY_FAMILY = {
+    'claude': (0.003, 0.015),     # input, output: Sonnet-class list price
+}
+CLAUDE_USD_PER_1K_IN_VAR = 'HEVOLVE_CLAUDE_USD_PER_1K_IN'
+CLAUDE_USD_PER_1K_OUT_VAR = 'HEVOLVE_CLAUDE_USD_PER_1K_OUT'
+CLAUDE_BUDGET_USD_DAY_VAR = 'HEVOLVE_CLAUDE_BUDGET_USD_DAY'
+DEFAULT_CLAUDE_BUDGET_USD_DAY = 6.0
+CAPPED_FAMILY = 'claude'
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, '') or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def usd_price_per_1k(model_name) -> Optional[Tuple[float, float]]:
+    """(input, output) dollars per 1k tokens for a model with a real price
+    table row, else None (the Spark-derived rate applies)."""
+    lower = (model_name or '').lower()
+    for family, (pin, pout) in USD_PER_1K_BY_FAMILY.items():
+        if family in lower:
+            if family == CAPPED_FAMILY:
+                pin = _env_float(CLAUDE_USD_PER_1K_IN_VAR, pin)
+                pout = _env_float(CLAUDE_USD_PER_1K_OUT_VAR, pout)
+            return pin, pout
+    return None
+
+
+def blended_usd_per_1k(model_name, tokens_in, tokens_out) -> Optional[float]:
+    """One cost_per_1k that makes ``(tin+tout)/1000 * rate`` equal the exact
+    input-plus-output dollar cost of this call; None for an unpriced family."""
+    price = usd_price_per_1k(model_name)
+    if price is None:
+        return None
+    tin = max(0, int(tokens_in or 0))
+    tout = max(0, int(tokens_out or 0))
+    total = tin + tout
+    if total <= 0:
+        return price[0]
+    return (tin * price[0] + tout * price[1]) / total
+
+
+def usd_spent_since(since, model_prefix: str) -> float:
+    """Dollars this node's own calls spent on models named ``model_prefix*``
+    since ``since`` (UTC), from the metered-usage ledger.  0.0 when the
+    ledger cannot be read: the meter fails open by design."""
+    try:
+        from sqlalchemy import func as sa_func
+        from integrations.social.models import db_session, MeteredAPIUsage
+        node_id = _this_node_id() or 'local'
+        with db_session() as db:
+            total = db.query(
+                sa_func.coalesce(sa_func.sum(MeteredAPIUsage.actual_usd_cost), 0.0)
+            ).filter(
+                MeteredAPIUsage.node_id == node_id,
+                MeteredAPIUsage.task_source == 'own',
+                sa_func.lower(MeteredAPIUsage.model_id).like(model_prefix.lower() + '%'),
+                MeteredAPIUsage.created_at >= since,
+            ).scalar()
+            return float(total or 0.0)
+    except Exception as e:
+        logger.debug(f"usd_spent_since unavailable (fails open): {e}")
+        return 0.0
+
+
+def claude_budget_usd_day() -> float:
+    return max(0.0, _env_float(CLAUDE_BUDGET_USD_DAY_VAR, DEFAULT_CLAUDE_BUDGET_USD_DAY))
+
+
+def claude_usd_spent_today() -> float:
+    from datetime import datetime
+    day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    return usd_spent_since(day_start, CAPPED_FAMILY)
+
+
+def expert_budget_allows(model_name) -> Tuple[bool, str]:
+    """May the expert model ``model_name`` be offered right now?
+
+    Only the capped family is ever refused, and only once today's metered
+    dollars reach the day budget.  A refusal is not an error anywhere: the
+    selector simply does not offer the expert and the turn runs on the
+    node's own model.
+    """
+    if CAPPED_FAMILY not in (model_name or '').lower():
+        return True, 'not a capped family'
+    cap = claude_budget_usd_day()
+    spent = claude_usd_spent_today()
+    if spent >= cap:
+        return False, f'{CAPPED_FAMILY} day budget spent: ${spent:.2f} of ${cap:.2f}'
+    return True, f'{CAPPED_FAMILY} day budget: ${spent:.2f} of ${cap:.2f}'
 
 
 def _this_node_id() -> str:

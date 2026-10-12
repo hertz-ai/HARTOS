@@ -288,3 +288,52 @@ def get_autogen_config_list() -> list:
     except Exception:
         pass
     return cfgs
+
+
+# ─── The configured EXPERT (owner policy 2026-10-12) ──────────────────────
+# A second configured trio, for the one model the owner wants spent only where
+# it drives revenue (Claude on central).  It is NOT a vendor side door (#69):
+# nothing here reads ANTHROPIC_API_KEY or any vendor variable; the owner names
+# the endpoint and the model explicitly, and on central the endpoint is the
+# same gateway the node's own LLM uses (Kong -> gpt3), so one wire, one set of
+# fuses.  The registry offers it as the EXPERT tier to the lanes in
+# HEVOLVE_EXPERT_LANES only (default: revenue); every other lane never sees it.
+EXPERT_ENDPOINT_VAR = 'HEVOLVE_EXPERT_LLM_ENDPOINT_URL'
+EXPERT_MODEL_VAR = 'HEVOLVE_EXPERT_LLM_MODEL_NAME'
+EXPERT_API_KEY_VAR = 'HEVOLVE_EXPERT_LLM_API_KEY'
+EXPERT_LANES_VAR = 'HEVOLVE_EXPERT_LANES'
+DEFAULT_EXPERT_LANES = 'revenue'
+
+
+def resolve_expert_backend():
+    """A fresh autogen entry for the configured expert, or None when the owner
+    configured none.  Endpoint AND model are required; a half-set pair is
+    reported once and treated as none (nothing is guessed, as for the main
+    trio).  No thinking-off kwargs: this entry is for a hosted frontier model,
+    and an unknown request field is how a provider says 400."""
+    endpoint = os.environ.get(EXPERT_ENDPOINT_VAR, '').strip()
+    model = os.environ.get(EXPERT_MODEL_VAR, '').strip()
+    if not endpoint and not model:
+        return None
+    # Topology agnostic on purpose: no node-tier branch here or anywhere this
+    # tier is read.  The owner wants it on central only, and central is the
+    # only node whose configuration carries the trio; a desktop or regional
+    # node without it runs exactly as before.  Configuration, never a tier
+    # check, is what decides (owner ruling 2026-10-12).
+    if not endpoint or not model:
+        _report_once('expert', "%s and %s must both be set for the expert "
+                     "tier; one alone configures nothing"
+                     % (EXPERT_ENDPOINT_VAR, EXPERT_MODEL_VAR))
+        return None
+    return {
+        "model": model,
+        "api_key": os.environ.get(EXPERT_API_KEY_VAR, '') or 'dummy',
+        "base_url": endpoint,
+        "price": [0.003, 0.015],
+    }
+
+
+def expert_lanes() -> frozenset:
+    """The lanes the configured expert is offered to."""
+    raw = os.environ.get(EXPERT_LANES_VAR, '') or DEFAULT_EXPERT_LANES
+    return frozenset(p.strip() for p in raw.split(',') if p.strip())

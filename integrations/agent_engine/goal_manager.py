@@ -439,7 +439,8 @@ class GoalManager:
             if step not in tried:
                 tried.append(step)
         record['tried'] = tried
-        expert = None if 'expert' in tried else GoalManager._escalation_expert()
+        expert = None if 'expert' in tried else GoalManager._escalation_expert(
+            getattr(goal, 'goal_type', None))
         if expert is not None:
             record.update(next='expert', expert=expert.model_id)
             cfg['escalation'] = record
@@ -459,11 +460,16 @@ class GoalManager:
         return dict(result, stage='human') if result.get('success') else result
 
     @staticmethod
-    def _escalation_expert():
-        """This node's expert for a stuck action, or None (#106d)."""
+    def _escalation_expert(goal_type=None):
+        """This node's expert for a stuck action, or None (#106d).  Asked on
+        the goal's lane (owner policy 2026-10-12): a goal that earns may be
+        handed the configured expert, any other goal only an expert every
+        lane may use (Claude Code, a hive peer)."""
         try:
             from integrations.agent_engine.model_registry import model_registry
-            return model_registry.get_escalation_expert()
+            from integrations.agent_engine.dispatch import lane_for_goal_type
+            lane = lane_for_goal_type(goal_type) if goal_type is not None else None
+            return model_registry.get_escalation_expert(lane=lane)
         except Exception as e:
             logger.debug(f"No escalation expert: {e}")
             return None

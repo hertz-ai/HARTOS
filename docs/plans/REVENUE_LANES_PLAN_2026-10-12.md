@@ -28,6 +28,21 @@ by Qwen through the autogen fallback ladder that already exists
 (`core.autogen_config.with_local_fallback`), and payment steps (AP2 mandates,
 Stripe, PhonePe) never touch an LLM gate.
 
+## Topology: central only, by configuration, never by tier branch
+
+The owner wants this routing on central only, and HARTOS stays topology
+agnostic. Both hold because nothing in the code reads the node tier for it:
+
+- The expert tier exists only where the expert trio
+  (`HEVOLVE_EXPERT_LLM_ENDPOINT_URL / MODEL_NAME / API_KEY`) is configured.
+  Central's `.env` carries it; a desktop or regional node does not, and runs
+  exactly as before: its person's one configured LLM.
+- The day cap only has anything to cap where that expert exists.
+- The dollar meter prices through the one meter: a local or free-family model
+  costs zero and writes no row, so a desktop on its own llama-server meters
+  nothing and a node on a paid API meters what it spends.
+- Kong is operator configuration on the box, not HARTOS runtime code.
+
 ## Where each piece lives
 
 | Piece | Place | State |

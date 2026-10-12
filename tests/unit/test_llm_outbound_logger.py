@@ -812,3 +812,53 @@ def test_chat_keeps_the_lane_the_daemon_registered(tmp_path, monkeypatch):
     assert mod.lane_for_request('daemon_goal_rev') == 'user'
     mod.register_request_lane('fresh', 'user', keep_existing=True)
     assert mod.lane_for_request('fresh') == 'user'
+
+
+# ─── Dollar meter from the response's usage block (any node; pricing decides) ─
+
+def _usage_response():
+    return _FakeResponse({'id': 'c', 'model': 'claude-sonnet-4-5',
+                          'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}],
+                          'usage': {'prompt_tokens': 120, 'completion_tokens': 30,
+                                    'total_tokens': 150}})
+
+
+def _install_with_usage(monkeypatch, tmp_path, tier, factory=_usage_response):
+    _reset_module(monkeypatch, tmp_path)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', tier)
+    fake_httpx = _build_fake_httpx_module(response_factory=factory)
+    monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
+    fake_tl = types.ModuleType('threadlocal')
+    fake_tl.thread_local_data = types.SimpleNamespace(get_request_id=lambda: 'req-m')
+    monkeypatch.setitem(sys.modules, 'hartos.threadlocal', fake_tl)
+    import core.llm_outbound_logger as mod
+    mod.install()
+    import integrations.agent_engine.budget_gate as bg
+    seen = []
+    monkeypatch.setattr(bg, 'meter_llm_call', lambda **kw: seen.append(kw))
+    return mod, fake_httpx, seen
+
+
+@pytest.mark.parametrize('tier', ['flat', 'regional', 'central'])
+def test_a_completed_call_is_metered_from_its_usage_block_on_any_tier(tmp_path, monkeypatch, tier):
+    """Topology agnostic: the hook hands every completed call to the ONE meter
+    (budget_gate.meter_llm_call); whether it costs anything is the meter's
+    pricing decision (local and free families price at zero), never a tier
+    branch here."""
+    mod, fake_httpx, seen = _install_with_usage(monkeypatch, tmp_path, tier)
+    request = _FakeRequest(body=json.dumps({'model': 'claude-sonnet-4-5', 'messages': []}).encode())
+    fake_httpx.Client.send(_FakeClient(), request)
+    assert seen == [{'model': 'claude-sonnet-4-5', 'tokens_in': 120, 'tokens_out': 30,
+                     'task_source': 'own'}]
+
+
+def test_a_failed_call_or_a_body_without_usage_is_not_metered(tmp_path, monkeypatch):
+    mod, fake_httpx, seen = _install_with_usage(
+        monkeypatch, tmp_path, 'central',
+        factory=lambda: _FakeResponse({'error': {'message': 'nope'}}, status_code=429))
+    request = _FakeRequest(body=json.dumps({'model': 'claude-sonnet-4-5', 'messages': []}).encode())
+    fake_httpx.Client.send(_FakeClient(), request)
+    assert seen == []
+    assert mod._response_usage(_FakeResponse({'choices': []})) is None
+    assert mod._response_usage(_FakeResponse({'usage': {'prompt_tokens': 0,
+                                                        'completion_tokens': 0}})) is None

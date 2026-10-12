@@ -569,6 +569,51 @@ def _feed_provider_breaker(url, status) -> None:
         pass
 
 
+def _response_usage(response):
+    """``(prompt_tokens, completion_tokens)`` from an ALREADY-BUFFERED
+    chat/completions response, or None.  Same read discipline as
+    _response_tool_calls: only ``_content``, never ``.content`` (which would
+    consume a stream the real caller is waiting for)."""
+    try:
+        raw = getattr(response, '_content', None)
+        if not raw:
+            return None
+        data = json.loads(bytes(raw).decode('utf-8', 'replace'))
+        usage = data.get('usage') if isinstance(data, dict) else None
+        if not isinstance(usage, dict):
+            return None
+        tin = int(usage.get('prompt_tokens') or 0)
+        tout = int(usage.get('completion_tokens') or 0)
+        if tin <= 0 and tout <= 0:
+            return None
+        return tin, tout
+    except Exception:
+        return None
+
+
+def _meter_response(body, response, status) -> None:
+    """Meter this node's own completed LLM call in dollars from the provider's
+    usage block (owner policy 2026-10-12: the Claude day cap needs a ledger).
+
+    Topology agnostic: no tier branch.  Pricing and the row belong to
+    budget_gate.meter_llm_call (the ONE meter): a local or free-family model
+    prices at zero and writes no row, so a desktop on its own llama-server
+    meters nothing and a node on a paid API meters what it spends.  Only a
+    2xx with a usage block is a completed call.  Never raises and never
+    touches the response stream."""
+    try:
+        if not (isinstance(status, int) and 200 <= status < 300):
+            return
+        usage = _response_usage(response)
+        if usage is None:
+            return
+        from integrations.agent_engine.budget_gate import meter_llm_call
+        meter_llm_call(model=(body or {}).get('model') if isinstance(body, dict) else None,
+                       tokens_in=usage[0], tokens_out=usage[1], task_source='own')
+    except Exception as e:
+        logger.debug("[outbound] metering skipped: %s", e)
+
+
 def _send_and_feed(orig_send, client, request, kwargs):
     """Run a HOSTED (non-target) chat/completions send unchanged and feed the
     provider breaker with its real status.  Byte-transparent: the response
@@ -2243,6 +2288,7 @@ def _install_sync_patch(httpx_module) -> None:
             # breaker the real status (#106b b) before logging.
             _status = getattr(response, 'status_code', None)
             _feed_provider_breaker(request.url, _status)
+            _meter_response(body, response, _status)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
                          response_status=_status,
@@ -2289,6 +2335,7 @@ def _install_async_patch(httpx_module) -> None:
             response = await _orig(self, request, **kwargs)
             _status = getattr(response, 'status_code', None)
             _feed_provider_breaker(request.url, _status)
+            _meter_response(body, response, _status)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
                          response_status=_status,
