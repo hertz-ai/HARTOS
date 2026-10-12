@@ -41,6 +41,8 @@ _MODEL_COST_MAP = {
     'gpt-4o': 4,
     'gpt-4': 6,
     'gpt-3.5': 1,
+    'claude': 4,    # Anthropic, the expert tier on central (2026-10-12): the
+                    # gpt-4o class, not the unknown-model default of 2
     'groq': 0,      # Groq free tier — zero Spark
     'llama': 0,      # Local model — zero metered cost
     'mistral': 0,    # Local model

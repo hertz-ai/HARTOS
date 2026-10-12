@@ -718,3 +718,97 @@ def test_argument_string_is_capped_so_the_log_stays_bounded(
     import core.llm_outbound_logger as mod
     assert len(got) <= mod._RESP_ARG_CAP + 32
     assert got.startswith('{"content":"xxx')
+
+
+# ─── Lane + model headers (owner policy 2026-10-12) ───────────────────────
+# Every outbound LLM call names its lane (revenue / user / daemon) and the
+# model it asks for, so the gateway in front of the provider can cap requests
+# per lane and per model without parsing bodies, and so the budget gate and
+# the expert selector read the SAME lane the wire carries.
+
+
+def _install_with_rid(monkeypatch, tmp_path, rid):
+    _reset_module(monkeypatch, tmp_path)
+    fake_httpx = _build_fake_httpx_module()
+    monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
+    fake_tl = types.ModuleType('threadlocal')
+    fake_tl.thread_local_data = types.SimpleNamespace(get_request_id=lambda: rid)
+    monkeypatch.setitem(sys.modules, 'hartos.threadlocal', fake_tl)
+    import core.llm_outbound_logger as mod
+    mod.install()
+    return mod, fake_httpx
+
+
+def test_user_turn_stamps_user_lane_and_the_model(tmp_path, monkeypatch):
+    mod, fake_httpx = _install_with_rid(monkeypatch, tmp_path, 'msg_1760160492473_k3j9x1')
+    request = _FakeRequest(body=json.dumps(
+        {'model': 'qwen3-27b', 'messages': [{'role': 'user', 'content': 'hi'}]}).encode())
+    fake_httpx.Client.send(_FakeClient(), request)
+    assert request.headers.get('X-HARTOS-Lane') == 'user'
+    assert request.headers.get('X-HARTOS-Model') == 'qwen3-27b'
+    assert mod.current_lane() == 'user'
+
+
+def test_daemon_turn_stamps_daemon_lane(tmp_path, monkeypatch):
+    mod, fake_httpx = _install_with_rid(monkeypatch, tmp_path, 'daemon_goal_20261012_abc')
+    request = _FakeRequest(body=json.dumps({'model': 'qwen3-27b', 'messages': []}).encode())
+    fake_httpx.Client.send(_FakeClient(), request)
+    assert request.headers.get('X-HARTOS-Lane') == 'daemon'
+
+
+def test_registered_revenue_lane_reaches_the_wire_from_the_worker_thread(tmp_path, monkeypatch):
+    """/chat registers the lane by request id; the autogen entry point runs on
+    a worker thread and binds it through with_llm_context, so the header on
+    the wire says 'revenue' there and only there."""
+    import threading
+    mod, fake_httpx = _install_with_rid(monkeypatch, tmp_path, '')
+    mod.register_request_lane('req-rev-1', 'revenue')
+    seen = {}
+
+    @mod.with_llm_context('autogen.reuse')
+    def chat_agent(user_id, text, prompt_id, request_id):
+        request = _FakeRequest(body=json.dumps({'model': 'claude-sonnet-4-5', 'messages': []}).encode())
+        fake_httpx.Client.send(_FakeClient(), request)
+        seen['lane'] = request.headers.get('X-HARTOS-Lane')
+        seen['model'] = request.headers.get('X-HARTOS-Model')
+        seen['current'] = mod.current_lane()
+
+    t = threading.Thread(target=chat_agent, args=('u1', 'buy milk', '54', 'req-rev-1'))
+    t.start()
+    t.join(10)
+    assert seen == {'lane': 'revenue', 'model': 'claude-sonnet-4-5', 'current': 'revenue'}
+    # Outside the bound context the lane is not revenue.
+    assert mod.current_lane() != 'revenue'
+
+
+def test_a_turn_with_no_registered_lane_falls_back_to_the_request_id_rule(tmp_path, monkeypatch):
+    mod, _ = _install_with_rid(monkeypatch, tmp_path, 'req-plain')
+    assert mod.lane_for_request('req-plain') == ''
+    assert mod.current_lane() == 'user'
+
+
+def test_lane_registry_is_bounded_and_ignores_unknown_lanes(tmp_path, monkeypatch):
+    mod, _ = _install_with_rid(monkeypatch, tmp_path, '')
+    monkeypatch.setattr(mod, '_REQUEST_LANE_CAP', 3)
+    for i in range(5):
+        mod.register_request_lane('r%d' % i, 'revenue')
+    assert mod.lane_for_request('r0') == '' and mod.lane_for_request('r1') == ''
+    assert mod.lane_for_request('r4') == 'revenue'
+    mod.register_request_lane('r9', 'vip')
+    assert mod.lane_for_request('r9') == ''
+    mod.register_request_lane('', 'revenue')
+    assert mod.lane_for_request('') == ''
+
+
+def test_chat_keeps_the_lane_the_daemon_registered(tmp_path, monkeypatch):
+    """dispatch_goal registers a revenue goal's turn before its self-POST
+    reaches /chat; /chat re-registers what it can see (a user), with
+    keep_existing, so the goal's lane survives."""
+    mod, _ = _install_with_rid(monkeypatch, tmp_path, '')
+    mod.register_request_lane('daemon_goal_rev', 'revenue')
+    mod.register_request_lane('daemon_goal_rev', 'user', keep_existing=True)
+    assert mod.lane_for_request('daemon_goal_rev') == 'revenue'
+    mod.register_request_lane('daemon_goal_rev', 'user')
+    assert mod.lane_for_request('daemon_goal_rev') == 'user'
+    mod.register_request_lane('fresh', 'user', keep_existing=True)
+    assert mod.lane_for_request('fresh') == 'user'

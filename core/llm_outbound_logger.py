@@ -155,6 +155,100 @@ _user_id_var: 'contextvars.ContextVar[str]' = contextvars.ContextVar(
     'llm_outbound_user_id', default='')
 
 
+# ─── Lanes (owner policy 2026-10-12) ──────────────────────────────────────
+# Every LLM call runs on ONE of three lanes, and the lane travels on the wire
+# as ``X-HARTOS-Lane`` beside the request id and source:
+#
+#   revenue  a conversation that is paying for itself: a McGroce commerce
+#            session (JWT tenant claim) or a paying API tier.  May use the
+#            expert model; never throttled, never budget-blocked.
+#   user     a person's ordinary turn.  Runs on the free model.
+#   daemon   autonomous background work (request id ``daemon_*`` or absent,
+#            the rule is dispatch.is_genuine_user_request).  Free model,
+#            capped first when money is tight.
+#
+# /chat decides revenue-or-user where the request's auth is in hand
+# (core.request_lane) and REGISTERS it by request id here, because the
+# autogen entry points run on worker threads that neither the Flask ``g``
+# nor a thread-local reaches.  ``with_llm_context`` looks the lane up by the
+# request id it already binds and puts it in a contextvar, the same hop the
+# source label and request id take; ``current_lane`` is the one reader the
+# wire header, the budget gate and the expert selector all consult.
+LANE_REVENUE = 'revenue'
+LANE_USER = 'user'
+LANE_DAEMON = 'daemon'
+LANES = (LANE_REVENUE, LANE_USER, LANE_DAEMON)
+
+_lane_var: 'contextvars.ContextVar[str]' = contextvars.ContextVar(
+    'llm_outbound_lane', default='')
+
+# request_id -> lane, insertion-ordered, bounded.  A turn's lane is read a
+# handful of times within seconds of registration; the cap only stops a
+# long-lived process from growing without end.
+_REQUEST_LANE_CAP = 4096
+_request_lanes = {}  # type: dict
+_request_lanes_lock = threading.Lock()
+
+
+def register_request_lane(request_id, lane, keep_existing: bool = False) -> None:
+    """Record which lane the turn ``request_id`` runs on.  Unknown lanes and
+    empty ids are ignored: a lane is one of LANES or it is nothing.
+    ``keep_existing`` leaves a lane already registered for the id alone: the
+    daemon registers a revenue goal's turn before its self-POST reaches /chat,
+    and /chat, which cannot see the goal, must not demote it to 'user'."""
+    rid = str(request_id or '')
+    if not rid or lane not in LANES:
+        return
+    with _request_lanes_lock:
+        if keep_existing and rid in _request_lanes:
+            return
+        _request_lanes.pop(rid, None)
+        _request_lanes[rid] = lane
+        while len(_request_lanes) > _REQUEST_LANE_CAP:
+            _request_lanes.pop(next(iter(_request_lanes)))
+
+
+def lane_for_request(request_id) -> str:
+    """The registered lane of ``request_id``, or '' when none was registered."""
+    rid = str(request_id or '')
+    if not rid:
+        return ''
+    with _request_lanes_lock:
+        return _request_lanes.get(rid, '')
+
+
+@contextlib.contextmanager
+def lane_context(lane: str):
+    """Bind the lane for LLM calls issued from this context; restored on exit."""
+    token = _lane_var.set(lane if lane in LANES else '')
+    try:
+        yield
+    finally:
+        _lane_var.reset(token)
+
+
+def current_lane() -> str:
+    """The lane of the LLM call being made right now.
+
+    The bound contextvar first (set by with_llm_context from the registry),
+    then the registry by the current request id, then the request-id rule
+    every other caller already uses: a ``daemon_`` or absent id is background,
+    anything else is a person.
+    """
+    lane = _lane_var.get() or ''
+    if lane in LANES:
+        return lane
+    rid = _get_request_id()
+    lane = lane_for_request(rid)
+    if lane in LANES:
+        return lane
+    try:
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+        return LANE_USER if is_genuine_user_request(rid) else LANE_DAEMON
+    except Exception:
+        return LANE_DAEMON if (not rid or str(rid).startswith('daemon_')) else LANE_USER
+
+
 def set_source(name: str) -> 'contextvars.Token':
     """Set the origin label for LLM calls issued from this context.
     Returns a Token; pass to ``reset_source`` to restore the prior
@@ -297,10 +391,16 @@ def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
             # The user the elided-text store scopes a pointer to (see
             # _elision_scope): the same contextvar hop as the request id.
             _uid_token = _user_id_var.set(uid) if uid else None
+            # The lane /chat registered for this turn crosses the worker-thread
+            # boundary the same way the id does: looked up by the id, bound here.
+            _lane = lane_for_request(rid) if rid else ''
+            _lane_token = _lane_var.set(_lane) if _lane else None
             try:
                 with source_context(source_name), request_id_context(rid):
                     return fn(*args, **kwargs)
             finally:
+                if _lane_token is not None:
+                    _lane_var.reset(_lane_token)
                 if _uid_token is not None:
                     _user_id_var.reset(_uid_token)
         return _wrapper
@@ -2008,6 +2108,13 @@ def _annotate_request(request, body):
             request.headers['X-HARTOS-Request-ID'] = rid
         if src:
             request.headers['X-HARTOS-Source'] = src
+        # The lane and the model, so a gateway in front of the provider can
+        # cap requests per lane and per model without parsing bodies (owner
+        # policy 2026-10-12: revenue never throttled, Claude capped per day).
+        request.headers['X-HARTOS-Lane'] = current_lane()
+        model = body.get('model') if isinstance(body, dict) else None
+        if model:
+            request.headers['X-HARTOS-Model'] = str(model)
     except Exception as e:
         logger.debug("[outbound] header-stamp failed: %s", e)
 

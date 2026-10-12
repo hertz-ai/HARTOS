@@ -516,6 +516,31 @@ def _user_chat_marker_recent() -> bool:
         return False
 
 
+# Owner policy 2026-10-12: Claude is used only where it drives revenue, and it
+# can never block the org's own revenue-driving work.  An org goal that earns
+# (marketing, SEO, revenue monitoring, hive growth and economics, the McGroce
+# merchant and shopper agents, every P2P vertical) runs on the REVENUE lane:
+# it may use the expert model and falls back to the free model when the day
+# fuse trips, so it never stops.  Every other goal type is background work on
+# the free model.  HEVOLVE_REVENUE_GOAL_TYPES (comma list) replaces the set.
+REVENUE_GOAL_TYPES = frozenset({
+    'marketing', 'seo', 'revenue', 'hive_growth', 'hive_economics',
+    'mcgroce_merchant', 'mcgroce_shopper',
+})
+REVENUE_GOAL_TYPE_PREFIXES = ('p2p_',)
+
+
+def is_revenue_goal_type(goal_type) -> bool:
+    """Does a goal of this type earn, so its turns run on the revenue lane?"""
+    gt = str(goal_type or '').strip().lower()
+    if not gt:
+        return False
+    override = os.environ.get('HEVOLVE_REVENUE_GOAL_TYPES', '')
+    if override.strip():
+        return gt in {p.strip().lower() for p in override.split(',') if p.strip()}
+    return gt in REVENUE_GOAL_TYPES or gt.startswith(REVENUE_GOAL_TYPE_PREFIXES)
+
+
 def is_genuine_user_request(request_id) -> bool:
     """True when a /chat request comes from a real user (so it should
     mark user activity + make daemons yield), False when it's the
@@ -1439,6 +1464,18 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     with _turn_failures_lock:
         _turn_failures.pop(_failure_key(goal_id), None)
         _dispatch_routes.pop(_failure_key(goal_id), None)
+
+    # The lane this goal's turns run on (owner policy 2026-10-12): a goal that
+    # earns is revenue work and may use the expert model; registered by the
+    # daemon request id BOTH dispatch paths carry (local_chat_dispatch and the
+    # HTTP self-POST both name the turn daemon_request_id(goal_id)), before the
+    # budget gate so the gate can read it.  /chat keeps a registered lane.
+    try:
+        from core.llm_outbound_logger import register_request_lane, LANE_REVENUE
+        if is_revenue_goal_type(goal_type):
+            register_request_lane(daemon_request_id(goal_id), LANE_REVENUE)
+    except Exception as _lane_err:
+        logger.debug(f"lane not registered for goal {goal_id}: {_lane_err}")
 
     # BUDGET GATE: check goal budget + platform affordability before dispatch
     try:

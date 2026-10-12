@@ -10178,6 +10178,21 @@ def chat():
     # `_req_rid` is '' and the worker's re-bind at :1580 (`if request_id:`)
     # cannot fire.  Attributing that caller is the open work, not this line.
     thread_local_data.set_request_id(request_id=request_id)
+    # The lane this turn runs on (revenue or user; daemon is the id's own
+    # prefix), decided here where the request's auth is in hand and
+    # registered by request id so the autogen worker thread and the wire
+    # header read the same answer (core.request_lane, owner policy 2026-10-12).
+    try:
+        from core.request_lane import lane_for_chat
+        from core.llm_outbound_logger import register_request_lane
+        from integrations.social.auth import decode_jwt as _lane_decode_jwt
+        from integrations.commerce.bindings import TENANT as _COMMERCE_TENANT
+        register_request_lane(request_id, lane_for_chat(
+            _bearer_token, data, getattr(g, 'auth_source', None),
+            decode_jwt=_lane_decode_jwt, tenant=_COMMERCE_TENANT),
+            keep_existing=True)   # a revenue goal's daemon turn stays revenue
+    except Exception as _lane_err:
+        app.logger.debug('lane not registered for %s: %s', request_id, _lane_err)
 
     # Speculative dispatch: fast response + background expert
     if speculative and prompt and user_id and prompt_id:

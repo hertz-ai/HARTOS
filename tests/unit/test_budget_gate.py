@@ -349,3 +349,15 @@ class TestAffordabilityCache:
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+def test_claude_is_priced_with_the_gpt4o_class_not_as_unknown():
+    """Owner policy 2026-10-12: Claude is the expert tier on central.  Priced
+    by family like every other cloud model, so the Spark estimate and the
+    expert selector's cost gate see the same number.  Before this row the
+    name fell to the unknown-model default."""
+    from integrations.agent_engine.budget_gate import spark_per_1k
+    assert spark_per_1k('claude-sonnet-4-5') == spark_per_1k('gpt-4o') == 4
+    assert spark_per_1k('claude-haiku-4-5') == 4
+    assert spark_per_1k('some-unknown-model') == 2
+    assert spark_per_1k('qwen3-27b') == 0

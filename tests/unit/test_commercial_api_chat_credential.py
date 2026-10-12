@@ -142,3 +142,43 @@ def test_transport_exception_still_not_billed(app_client, passing_auth,
     billable = (kwargs.get('tokens_in', 0) or 0) + (kwargs.get('tokens_out', 0) or 0)
     assert billable == 0
     assert r.get_json().get('success') is not True
+
+
+# ─── Lane (owner policy 2026-10-12) ──────────────────────────────────────────
+# A paying tier's turn is revenue-bearing: it may use the expert model and is
+# never throttled.  The free tier runs on the free model like any user.  The
+# self-POST says which, and /chat believes it only because the request carries
+# the node's own key (core.request_lane).
+
+
+def _tier_auth(tier):
+    from integrations.agent_engine.commercial_api import CommercialAPIService
+    key_data = {'id': 'key-1', 'user_id': 'cust-42', 'tier': tier}
+    return (patch('integrations.social.models.get_db', return_value=MagicMock()),
+            patch.object(CommercialAPIService, 'validate_api_key', return_value=key_data),
+            patch.object(CommercialAPIService, 'check_rate_limit', return_value=True),
+            patch.object(CommercialAPIService, 'reserve_quota', return_value=True),
+            patch.object(CommercialAPIService, 'log_usage'))
+
+
+@pytest.mark.parametrize('tier,lane', [
+    ('pro', 'revenue'), ('starter', 'revenue'), ('enterprise', 'revenue'),
+    ('free', 'user'),
+])
+def test_metered_self_post_names_the_lane_by_tier(app_client, tier, lane):
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured['json'] = kwargs.get('json')
+        return _resp(200, {'response': 'ok'})
+
+    patches = _tier_auth(tier)
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+            patch('core.http_pool.pooled_post', side_effect=fake_post), \
+            patch('integrations.agent_engine.dispatch._internal_auth_headers',
+                  return_value=MINTED):
+        r = app_client.post('/api/v1/intelligence/chat', json={'prompt': 'hello'},
+                            headers={'X-API-Key': 'k'})
+    assert r.status_code == 200
+    assert captured['json']['lane'] == lane
+    assert captured['json']['user_id'] == 'cust-42'

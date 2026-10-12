@@ -485,6 +485,13 @@ def _metered_backend_chat(prompt: str, prompt_id: str):
                 'prompt_id': prompt_id,
                 'prompt': prompt,
                 'create_agent': False,
+                # Owner policy 2026-10-12: a paying tier's turn is revenue-
+                # bearing (may use the expert model, never throttled); the
+                # free tier runs on the free model like any person's turn.
+                # /chat believes this field only on a request that carries the
+                # node's own key, which is what _internal_auth_headers sends
+                # (core.request_lane).
+                'lane': 'revenue' if (g.api_key.get('tier') or 'free') != 'free' else 'user',
             },
             headers=_internal_auth_headers(),
             timeout=120)
