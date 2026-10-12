@@ -173,17 +173,28 @@ def enable_plugin(
     kong_url: str,
     plugin_cfg: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Enable (or update) a single plugin on the service.
+    """Enable (or update) a single plugin on the Mindstory service."""
+    return _upsert_plugin(session, kong_url,
+                          f"/services/{SERVICE_NAME}/plugins", plugin_cfg)
 
-    Uses PUT to ``/services/{name}/plugins/{plugin_name}`` for idempotency.
-    """
+
+def _upsert_plugin(
+    session: requests.Session,
+    kong_url: str,
+    scope_path: str,
+    plugin_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Enable (or update) one plugin under ``scope_path`` (a service's or a
+    route's ``/plugins`` collection): list, PATCH the one with this name if
+    it exists, else POST; a 409 is "already there".  The ONE upsert every
+    onboarding block here uses."""
     plugin_name = plugin_cfg["name"]
     payload = {
         "name": plugin_name,
         "config": plugin_cfg["config"],
         "enabled": True,
     }
-    url = f"{kong_url}/services/{SERVICE_NAME}/plugins"
+    url = f"{kong_url}{scope_path}"
 
     # Try to find existing plugin first for idempotent update
     try:
@@ -440,6 +451,153 @@ def onboard(
 # CLI
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# LLM gateway: HARTOS -> Kong -> gpt3 (owner policy 2026-10-12)
+# ---------------------------------------------------------------------------
+#
+# HARTOS calls ONE endpoint for every LLM turn (core.autogen_config).  With
+# Kong in front, that endpoint is this service: Kong forwards /llm/v1/... to
+# gpt3's /v1/... (the provider fan-out) and applies request caps by the two
+# headers HARTOS stamps on every call (core.llm_outbound_logger._annotate_
+# request): ``X-HARTOS-Lane`` (revenue | user | daemon) and ``X-HARTOS-Model``.
+#
+# This Kong is 2.8.5 community (measured 2026-10-12): no AI plugins, no token
+# or dollar awareness.  So Kong is the fuse and HARTOS's budget gate is the
+# meter.  Routes are matched on header VALUES (Kong routes match headers
+# exactly), one route per cap:
+#
+#   llm-revenue  Lane=revenue                         no rate-limiting at all:
+#                a paying conversation is never throttled (owner).
+#   llm-claude   Lane in {user, daemon} + Model in    the Claude cap: $6/day
+#                the Claude list                      expressed as requests/day
+#                                                     (LLM_CLAUDE_REQUESTS_PER_DAY)
+#   llm-user     Lane=user                            ordinary person caps
+#   llm-daemon   Lane=daemon                          background caps, tightest
+#   llm-default  no header required                   a caller that stamps no
+#                                                     lane is a user
+#
+# Two headers on llm-claude make it the most specific match for a user's or
+# the daemon's Claude call; a revenue call to Claude matches only llm-revenue
+# (its lane is not in the claude route's list), so it is never capped.
+# Counters key on client ip per route (``limit_by: ip``): every HARTOS call on
+# the box arrives from the container's address, so one counter == one lane.
+# No key-auth: the service accepts only loopback and the docker bridge
+# (ip-restriction), which is where HARTOS runs; nothing off the box reaches it.
+LLM_SERVICE_NAME = "llm-gateway"
+LLM_ROUTE_PATH = "/llm"                 # stripped: /llm/v1/x -> gpt3 /v1/x
+DEFAULT_LLM_UPSTREAM_URL = _os.environ.get("LLM_GATEWAY_UPSTREAM", "http://172.17.0.1:5459")
+LLM_LANE_HEADER = "X-HARTOS-Lane"
+LLM_MODEL_HEADER = "X-HARTOS-Model"
+LLM_READ_TIMEOUT_MS = 180000            # a 27B VL page read or a long Claude turn
+LLM_BODY_LIMIT_MB = 20                  # base64 pages and screenshots
+LLM_ALLOWED_CLIENTS = ["127.0.0.1", "172.17.0.0/16"]
+DEFAULT_CLAUDE_MODELS = ["claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-1"]
+LLM_ROUTE_REVENUE = "llm-revenue"
+LLM_ROUTE_CLAUDE = "llm-claude"
+LLM_ROUTE_USER = "llm-user"
+LLM_ROUTE_DAEMON = "llm-daemon"
+LLM_ROUTE_DEFAULT = "llm-default"
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(_os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+def claude_models() -> list:
+    raw = _os.environ.get("LLM_CLAUDE_MODELS", "")
+    return [m.strip() for m in raw.split(",") if m.strip()] or list(DEFAULT_CLAUDE_MODELS)
+
+
+def llm_lane_routes() -> list:
+    """The five routes, each ``{name, headers, limits}``; ``limits`` None means
+    no rate-limiting plugin.  Caps are env-tunable so the owner can move them
+    without a code change; the Claude day cap is the $6/day policy in requests
+    (60 at about ten cents a call, the owner's number to tune from measured
+    tokens per turn)."""
+    user = {"minute": _env_int("LLM_USER_PER_MINUTE", 60),
+            "hour": _env_int("LLM_USER_PER_HOUR", 600),
+            "day": _env_int("LLM_USER_PER_DAY", 5000)}
+    daemon = {"minute": _env_int("LLM_DAEMON_PER_MINUTE", 20),
+              "hour": _env_int("LLM_DAEMON_PER_HOUR", 200),
+              "day": _env_int("LLM_DAEMON_PER_DAY", 2000)}
+    claude = {"hour": _env_int("LLM_CLAUDE_REQUESTS_PER_HOUR", 20),
+              "day": _env_int("LLM_CLAUDE_REQUESTS_PER_DAY", 60)}
+    return [
+        {"name": LLM_ROUTE_REVENUE, "headers": {LLM_LANE_HEADER: ["revenue"]}, "limits": None},
+        {"name": LLM_ROUTE_CLAUDE,
+         "headers": {LLM_LANE_HEADER: ["user", "daemon"], LLM_MODEL_HEADER: claude_models()},
+         "limits": claude},
+        {"name": LLM_ROUTE_USER, "headers": {LLM_LANE_HEADER: ["user"]}, "limits": user},
+        {"name": LLM_ROUTE_DAEMON, "headers": {LLM_LANE_HEADER: ["daemon"]}, "limits": daemon},
+        {"name": LLM_ROUTE_DEFAULT, "headers": None, "limits": dict(user)},
+    ]
+
+
+def _rate_limit_plugin(limits: Dict[str, int]) -> Dict[str, Any]:
+    cfg = {"policy": "local", "limit_by": "ip", "fault_tolerant": True,
+           "hide_client_headers": False}
+    cfg.update(limits)
+    return {"name": "rate-limiting", "config": cfg}
+
+
+def onboard_llm_gateway(
+    session: requests.Session,
+    kong_url: str,
+    upstream_url: str = None,
+) -> bool:
+    """Create or update the LLM gateway service, its five lane routes and
+    their plugins.  Idempotent; returns True when the service reads back."""
+    upstream_url = upstream_url or DEFAULT_LLM_UPSTREAM_URL
+    _log("")
+    _log("=== LLM gateway (HARTOS -> Kong -> gpt3) ===")
+    _log("Step 1/3 — Service")
+    _put_or_post(session, f"{kong_url}/services/{LLM_SERVICE_NAME}", {
+        "name": LLM_SERVICE_NAME,
+        "url": upstream_url,
+        "retries": 0,                      # never replay an LLM call
+        "connect_timeout": 10000,
+        "write_timeout": LLM_READ_TIMEOUT_MS,
+        "read_timeout": LLM_READ_TIMEOUT_MS,
+    }, f"service '{LLM_SERVICE_NAME}'")
+    svc_plugins = f"/services/{LLM_SERVICE_NAME}/plugins"
+    _upsert_plugin(session, kong_url, svc_plugins, {
+        "name": "request-size-limiting",
+        "config": {"allowed_payload_size": LLM_BODY_LIMIT_MB}})
+    _upsert_plugin(session, kong_url, svc_plugins, {
+        "name": "ip-restriction",
+        "config": {"allow": list(LLM_ALLOWED_CLIENTS), "deny": []}})
+
+    _log("Step 2/3 — Lane routes")
+    for route in llm_lane_routes():
+        payload = {
+            "name": route["name"],
+            "paths": [LLM_ROUTE_PATH],
+            "methods": ["POST", "GET"],
+            "protocols": ["http", "https"],
+            "strip_path": True,
+        }
+        if route["headers"]:
+            payload["headers"] = route["headers"]
+        _put_or_post(session,
+                     f"{kong_url}/services/{LLM_SERVICE_NAME}/routes/{route['name']}",
+                     payload, f"route '{route['name']}'")
+        if route["limits"]:
+            _upsert_plugin(session, kong_url, f"/routes/{route['name']}/plugins",
+                           _rate_limit_plugin(route["limits"]))
+
+    _log("Step 3/3 — Verify")
+    try:
+        resp = session.get(f"{kong_url}/services/{LLM_SERVICE_NAME}")
+        ok = resp.status_code == 200
+    except requests.ConnectionError:
+        ok = False
+    _log("  LLM gateway " + ("ready" if ok else "NOT readable back"))
+    return ok
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Onboard the Mindstory SDK into Kong API Gateway",
@@ -454,12 +612,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_UPSTREAM_URL,
         help=f"HevolveAI upstream URL (default: {DEFAULT_UPSTREAM_URL})",
     )
+    parser.add_argument(
+        "--llm",
+        action="store_true",
+        help="onboard ONLY the LLM gateway (HARTOS -> Kong -> gpt3) with its lane routes",
+    )
+    parser.add_argument(
+        "--llm-upstream",
+        default=DEFAULT_LLM_UPSTREAM_URL,
+        help=f"gpt3 base URL the LLM gateway forwards to (default: {DEFAULT_LLM_UPSTREAM_URL})",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.llm:
+        try:
+            ok = onboard_llm_gateway(requests.Session(), args.kong_url, args.llm_upstream)
+        except requests.RequestException as exc:
+            _log(f"ERROR: Kong Admin API: {exc}")
+            ok = False
+        return 0 if ok else 1
     ok = onboard(kong_url=args.kong_url, upstream_url=args.upstream)
     return 0 if ok else 1
 
