@@ -61,8 +61,8 @@ To remove one: delete the repo secret FIRST, then the line from `.env`.
 The PhonePe keys below are not forwarded by the workflow, so they still
 go into the host-side `.env` by hand (the deploy never rewrites keys it
 does not own). Docker reads `--env-file .env` only when the container is
-created, so a `docker restart` changes nothing: the keys take effect on
-the next deploy (which recreates the container):
+created, so a `docker restart` changes nothing: the keys take effect when
+the container is next created (Step 4 below, or the next deploy):
 
 ```bash
 # India (UPI / cards / netbanking via PhonePe)

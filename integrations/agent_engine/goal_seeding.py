@@ -2255,7 +2255,7 @@ def enable_autonomous_marketing_consent(db) -> int:
     return granted
 
 
-def disable_autonomous_marketing_consent(db) -> int:
+def disable_autonomous_marketing_consent(db):
     """End the standing ``public_exposure`` grants that
     ``enable_autonomous_marketing_consent`` made, so the external-post gate
     blocks again. Only identities holding an active blanket grant are revoked:
@@ -2265,7 +2265,8 @@ def disable_autonomous_marketing_consent(db) -> int:
     Args:
         db: SQLAlchemy session (caller owns the transaction / commit).
     Returns:
-        Number of identities revoked this call.
+        (revoked, failed): the number of identities revoked this call and
+        the identities whose lookup or revoke raised (still able to post).
     """
     from integrations.social.consent_service import ConsentService
     revoked, failed = 0, []
@@ -2283,7 +2284,7 @@ def disable_autonomous_marketing_consent(db) -> int:
         # An off-switch that did not switch off must not read as done.
         logger.error("Autonomous marketing OFF requested but the revoke failed "
                      "for %s: external posting may continue as them", failed)
-    return revoked
+    return revoked, failed
 
 
 _AUTONOMOUS_MARKETING_FLAG = 'HEVOLVE_AUTONOMOUS_MARKETING'
@@ -2309,11 +2310,11 @@ def apply_autonomous_marketing_flag(db):
                         "for %d system identit(ies)", n)
         return 'granted', n
     if not env_flag(_AUTONOMOUS_MARKETING_FLAG, True):
-        n = disable_autonomous_marketing_consent(db)
+        n, failed = disable_autonomous_marketing_consent(db)
         if n:
             logger.info("Autonomous marketing disabled: revoked public_exposure "
                         "for %d system identit(ies)", n)
-        else:
+        elif not failed:
             logger.info("Autonomous marketing is OFF (%s): no standing grant",
                         _AUTONOMOUS_MARKETING_FLAG)
         return 'revoked', n

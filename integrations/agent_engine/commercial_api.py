@@ -1576,7 +1576,7 @@ def create_upgrade_checkout(key_id):
                 or stripe_gw._stripe is None:
             return jsonify({
                 'success': False,
-                'error': 'No live payment gateway is configured on this node '
+                'error': 'Card checkout (Stripe) is not configured on this node '
                          '(set STRIPE_API_KEY; on central it is a repo secret, '
                          'see deploy/go_live_stripe.md Step 4).',
             }), 503

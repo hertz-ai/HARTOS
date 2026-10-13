@@ -287,6 +287,35 @@ def test_flag_off_on_every_later_boot_changes_nothing(consent_db):
     assert set(_posting_allowed(consent_db).values()) == {False}
 
 
+def test_a_failed_off_switch_is_loud_and_never_reads_as_off(consent_db, caplog):
+    """A revoke that raises leaves that identity able to post: the boot must
+    say so at ERROR and must NOT also print the all-clear "is OFF" line.
+    A clean later off-boot (nothing left to revoke) does print it."""
+    import logging
+    from integrations.social.consent_service import ConsentService
+    caplog.set_level(logging.INFO, logger='hevolve_social')
+    _apply(consent_db, '1')
+    real = ConsentService.revoke_consent
+
+    def _revoke(db, uid, *a, **kw):
+        if uid == 'system':
+            raise RuntimeError('database is locked')
+        return real(db, uid, *a, **kw)
+
+    with patch.object(ConsentService, 'revoke_consent', side_effect=_revoke):
+        assert _apply(consent_db, '0') == ('revoked', 2)
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("'system'" in m and 'may continue' in m for m in errors), errors
+    assert not any('is OFF' in r.getMessage() for r in caplog.records)
+    assert _posting_allowed(consent_db)['system'] is True
+
+    caplog.clear()
+    assert _apply(consent_db, '0') == ('revoked', 1)   # the retry clears 'system'
+    assert _apply(consent_db, '0') == ('revoked', 0)
+    assert any('is OFF' in r.getMessage() for r in caplog.records)
+    assert set(_posting_allowed(consent_db).values()) == {False}
+
+
 def test_flag_off_with_nothing_granted_writes_no_row(consent_db):
     """revoke_consent on an empty combination marks its first row as a
     declined ask; with no row at all it must not invent one per boot."""
