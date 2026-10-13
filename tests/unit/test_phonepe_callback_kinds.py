@@ -112,6 +112,31 @@ def test_a_tier_upgrade_callback_bumps_the_key(ctx, key_db):
     assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
 
 
+def test_a_tier_bump_that_fails_is_retried_by_phonepe(ctx, key_db):
+    """Money confirmed and the tier write failed: the payment stays
+    PROCESSING and PhonePe is answered a 500, so its retry runs the status
+    check and the bump again and finishes it; the ERROR line names the
+    payment.  It used to answer 200 completed and mark the payment
+    COMPLETED, so the retry was told already_completed and no success page
+    ever re-applied the tier (the review of ec0dbe7be, finding 6)."""
+    import logging
+    p = _processing(ctx['ledger'], {'kind': 'tier_upgrade', 'api_key_id': 'k1',
+                                    'target_tier': 'starter'})
+    key_db.fail_next_commit()
+    log = logging.getLogger('hevolve_social')
+    with patch.object(log, 'error') as said:
+        r = _callback(ctx['client'])
+    assert r.status_code == 500, r.get_json()
+    assert r.get_json()['success'] is False
+    assert said.called and p.payment_id in said.call_args.args[0]
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.PROCESSING
+    assert key_db.key() == _tier('free')
+    r2 = _callback(ctx['client'])                  # PhonePe's retry
+    assert r2.status_code == 200 and r2.get_json()['status'] == 'completed'
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
+    assert key_db.key() == _tier('starter')
+
+
 def test_a_tier_upgrade_callback_never_lowers_the_key(ctx, key_db):
     """The PhonePe rail writes the tier through the same rule as the card
     rails: a confirmed payment for a cheaper tier completes (the money is
@@ -199,6 +224,28 @@ def test_the_right_amount_completes(ctx):
     _set_capture(ctx, lambda *a: {'success': True, 'status': 'captured',
                                   'gateway_response': {'data': {'amount': 24000}}})
     assert _callback(ctx['client']).get_json()['status'] == 'completed'
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
+
+
+def test_the_captured_amount_is_checked_against_what_was_sent(ctx):
+    """A USD payment minted at 84 INR/USD and confirmed after the operator
+    moved the rate to 90: PhonePe captured the 75600 paise it was asked
+    for, and the callback compares with that recorded amount, not with a
+    recomputation (81000) that marked the capture 'amount mismatch' and
+    FAILED after the money was taken (the review of f08ff3e4c)."""
+    gw = ctx['ledger'].gateways[PaymentGateway.PHONEPE]
+    gw.usd_inr_rate = 84.0
+    p = ctx['ledger'].create_payment_request(
+        amount=Decimal('9.00'), currency='USD', description='starter',
+        requester_agent_id='user:u', gateway=PaymentGateway.PHONEPE,
+        metadata={'phonepe_amount_paise': 75600})     # as create_payment records it
+    p.status = PaymentStatus.PROCESSING
+    p.gateway_transaction_id = 'hartos_txn_1'
+    gw.usd_inr_rate = 90.0
+    _set_capture(ctx, lambda *a: {'success': True, 'status': 'captured',
+                                  'gateway_response': {'data': {'amount': 75600}}})
+    r = _callback(ctx['client'])
+    assert r.get_json()['status'] == 'completed', r.get_json()
     assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
 
 

@@ -150,35 +150,26 @@ class TestPhonePeGateway(unittest.TestCase):
         )
         self.assertEqual(g._to_paise(req), 75000)
 
-    def test_to_paise_inr_override_in_metadata(self):
+    def test_to_paise_reads_no_price_from_metadata(self):
+        """The price is the payment's amount at the operator's rate and
+        nothing else: a metadata 'inr_amount' (the override a buyer once
+        reached through the upgrade route's body, the review of af987a962
+        bought the enterprise tier for one rupee; then an internal override
+        nothing set) is ignored whether it carries a number or None (None
+        used to raise on float(None) and answer 502, task #122)."""
         Gateway, _ = self._import()
         from integrations.ap2 import PaymentRequest, PaymentMethod
         g = Gateway(merchant_id='M', salt_key='S', salt_index='1', env='UAT')
         g.usd_inr_rate = 84.0
-        req = PaymentRequest(
-            amount=Decimal('9.00'), currency='USD',
-            description='Starter upgrade', requester_agent_id='u',
-            payment_method=PaymentMethod.INTERNAL_CREDITS,
-            metadata={'inr_amount': 1000.0},
-        )
-        # inr_amount=1000 INR → 100000 paise; USD ignored when override present.
-        self.assertEqual(g._to_paise(req), 100000)
-
-    def test_to_paise_treats_a_none_override_as_absent(self):
-        """The upgrade route stamps 'inr_amount': None when the caller gave
-        none; that is no override, and it used to raise on float(None), so
-        the route answered 502 after minting the checkout (task #122)."""
-        Gateway, _ = self._import()
-        from integrations.ap2 import PaymentRequest, PaymentMethod
-        g = Gateway(merchant_id='M', salt_key='S', salt_index='1', env='UAT')
-        g.usd_inr_rate = 84.0
-        req = PaymentRequest(
-            amount=Decimal('9.00'), currency='USD',
-            description='Starter upgrade', requester_agent_id='u',
-            payment_method=PaymentMethod.INTERNAL_CREDITS,
-            metadata={'inr_amount': None, 'mobile_number': None},
-        )
-        self.assertEqual(g._to_paise(req), 75600)
+        for stale in ({'inr_amount': 1000.0}, {'inr_amount': 1},
+                      {'inr_amount': None, 'mobile_number': None}):
+            req = PaymentRequest(
+                amount=Decimal('9.00'), currency='USD',
+                description='Starter upgrade', requester_agent_id='u',
+                payment_method=PaymentMethod.INTERNAL_CREDITS,
+                metadata=stale,
+            )
+            self.assertEqual(g._to_paise(req), 75600, stale)
 
     def test_create_payment_refuses_when_disconnected(self):
         Gateway, _ = self._import()

@@ -1339,7 +1339,10 @@ def initiate_phonepe_upgrade(key_id: str):
                 'payment_request_id': payment_req.payment_id,
                 'gateway_transaction_id': payment_req.gateway_transaction_id,
                 'amount_usd': amount_usd,
-                'inr_amount_estimated_paise': gateway._to_paise(payment_req),
+                # The paise PhonePe was asked for (recorded on the payment
+                # by create_payment; the callback checks the capture
+                # against the same number).
+                'inr_amount_estimated_paise': gateway.expected_paise(payment_req),
                 'message': 'Redirect the user to redirect_url to complete payment. '
                            'The tier will be bumped once PhonePe confirms payment '
                            'via the callback webhook.',
@@ -1422,9 +1425,9 @@ def phonepe_callback():
       4. Idempotency: if already COMPLETED, 200 immediately.
       5. Defense in depth: re-query PhonePe status API via
          gateway.capture_payment — never trust the webhook body alone.
-      6. On confirmed PAYMENT_SUCCESS, mark COMPLETED and bump the
-         API key's tier limits.  Returns 200 to PhonePe regardless of
-         tier-bump success so retries stop.
+      6. On confirmed PAYMENT_SUCCESS, bump the API key's tier through the
+         one writer and mark COMPLETED; a failed bump leaves the payment
+         PROCESSING and answers 500 so PhonePe's retry finishes it.
     """
     gateway, envelope, refusal = _verified_phonepe_envelope('callback')
     if refusal is not None:
@@ -1492,12 +1495,14 @@ def phonepe_callback():
         }), 200
 
     # Status check confirmed PAYMENT_SUCCESS.  The amount PhonePe took must be
-    # the amount this payment asked for (when the status API reports one).
+    # the amount this payment SENT (recorded when the request was minted;
+    # a recomputation at today's rate marked a correct capture a mismatch
+    # after the operator moved the rate), when the status API reports one.
     _gw_data = (status_result.get('gateway_response') or {}).get('data') or {}
     if _gw_data.get('amount') is not None:
         try:
             _paid = int(_gw_data['amount'])
-            _expected = gateway._to_paise(payment_req)
+            _expected = gateway.expected_paise(payment_req)
         except (TypeError, ValueError):
             _paid, _expected = None, None
         if _paid is None or _paid != _expected:
@@ -1578,7 +1583,14 @@ def phonepe_callback():
 
     # The bought tier, through the one writer (_apply_bought_tier: never a
     # downgrade, whatever order confirmations land in; this rail used to
-    # bump with no rule, the review of fd2b4773c).
+    # bump with no rule, the review of fd2b4773c).  Money confirmed and the
+    # write failed: the payment stays PROCESSING and PhonePe is answered a
+    # 500, so its retry runs the status check and the bump again, as
+    # Stripe's retry does for the Checkout finalizer; it used to answer 200
+    # completed and mark the payment COMPLETED, so the retry was told
+    # already_completed and nothing ever re-applied the tier (the review of
+    # ec0dbe7be).
+    failure = None
     try:
         from integrations.social.models import get_db, CommercialAPIKey
         db = get_db()
@@ -1595,18 +1607,15 @@ def phonepe_callback():
                     'payment_request_id': payment_req.payment_id,
                 }), 200
             _changed, failure = _apply_bought_tier(db, api_key, target_tier)
-            if failure is not None:
-                raise RuntimeError(failure)
         finally:
             db.close()
     except Exception as db_err:
-        logger.exception("PhonePe callback: tier bump failed")
-        # Don't fail the payment — money has changed hands.  Mark
-        # COMPLETED and emit a loud error so operator can manually
-        # reconcile.
-        logger.error(f"MANUAL RECONCILIATION NEEDED: payment "
-                     f"{payment_req.payment_id} succeeded but tier bump "
-                     f"failed for api_key {api_key_id}: {db_err}")
+        failure = f'{type(db_err).__name__}: {db_err}'
+    if failure is not None:
+        payload, status = _bump_failed(
+            f'PhonePe payment {payment_req.payment_id}', api_key_id, failure,
+            payment_request_id=payment_req.payment_id, status='bump_failed')
+        return jsonify(payload), status
 
     payment_req.update_status(PaymentStatus.COMPLETED,
                               'PhonePe payment captured via callback')

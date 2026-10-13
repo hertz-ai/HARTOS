@@ -120,6 +120,28 @@ class TestThePayRequestsUrls:
         assert out['success'] is False
         post.assert_not_called()
 
+    def test_the_amount_sent_is_recorded_on_the_payment(self, monkeypatch):
+        """What PhonePe was asked for is written on the payment when the
+        request is minted, so the callback compares the captured amount
+        with the amount SENT and not with a recomputation at today's rate:
+        a rate change between the checkout and the confirmation marked a
+        correct capture 'amount mismatch', FAILED, after the money was
+        taken (the review of f08ff3e4c, finding 11)."""
+        monkeypatch.setenv('HARTOS_PUBLIC_URL', BASE)
+        g = _gateway()
+        g.usd_inr_rate = 84.0
+        req = _request()
+        with patch('requests.post', return_value=_phonepe_says(_CHECKOUT_MINTED)) as post:
+            out = g.create_payment(req)
+        assert out['success'] is True
+        assert _sent(post)['amount'] == 75600
+        # The ledger's on-disk spelling, as 'stripe_session_id' is pinned.
+        assert req.metadata['phonepe_amount_paise'] == 75600
+        assert g.sent_paise(req) == 75600
+        g.usd_inr_rate = 90.0                      # the operator's rate moves
+        assert g.sent_paise(req) == 75600          # what was sent does not
+        assert g.sent_paise(_request()) is None    # nothing sent yet
+
     def test_a_trusted_public_request_host_is_a_callback_address(self, monkeypatch):
         monkeypatch.delenv('HARTOS_PUBLIC_URL', raising=False)
         monkeypatch.setenv('ALLOWED_HOSTS', 'shop.example.com')

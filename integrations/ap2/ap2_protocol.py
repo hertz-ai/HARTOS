@@ -439,6 +439,12 @@ class StripePaymentGateway(PaymentGatewayConnector):
             return {'success': False, 'error': f'Stripe refund failed: {e}'}
 
 
+#: The payment-metadata key under which PhonePePaymentGateway.create_payment
+#: records the paise it asked PhonePe for; the one spelling the callback's
+#: amount check (expected_paise) reads.
+PHONEPE_SENT_AMOUNT_KEY = 'phonepe_amount_paise'
+
+
 class PhonePePaymentGateway(PaymentGatewayConnector):
     """PhonePe Payment Gateway (Standard Checkout / Hermes API).
 
@@ -463,9 +469,14 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
     Currency note: PhonePe is INR-only.  When a payment_request has
     currency='USD' we convert via PHONEPE_USD_INR_RATE (default 84.0)
     so the integration works for USD-priced API tiers without forcing
-    a schema change to upgrade flows.  Override the rate via env var
-    on the operator side, or pass `inr_amount` in metadata to bypass
-    conversion entirely.
+    a schema change to upgrade flows.  The rate is the operator's (the
+    env var); nothing in a payment's metadata prices it (a metadata
+    inr_amount once did, and a buyer reached it through the upgrade
+    route's body: the review of af987a962 bought the enterprise tier for
+    one rupee).  The paise actually sent are recorded on the payment
+    (PHONEPE_SENT_AMOUNT_KEY) when the request is minted, and the callback
+    compares the captured amount with THAT, not with a recomputation at
+    today's rate (sent_paise / expected_paise).
     """
 
     PROD_BASE = "https://api.phonepe.com/apis/hermes"
@@ -504,28 +515,42 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
         return f"{digest}###{self.salt_index}"
 
     def _to_paise(self, payment_request: 'PaymentRequest') -> int:
-        """Convert payment amount to paise (INR's smallest unit).
-
-        Honors ``metadata.inr_amount``, an INTERNAL override: no route takes
-        it from a caller.  The upgrade route used to store the body's
-        inr_amount here, and the callback's amount check compared against
-        the same override, so a buyer could name their own price (the review
-        of af987a962 measured the enterprise tier for one rupee).  Otherwise
-        converts USD via usd_inr_rate; INR amounts pass through unchanged.
-        """
-        meta = payment_request.metadata or {}
-        # An override is a value, not a key: the upgrade route stamped
-        # 'inr_amount': None when the caller gave none, and `in` took that
-        # as an override and raised on float(None) here, inside
-        # create_payment's try, so every PhonePe upgrade without an
-        # inr_amount answered 502 before anything was posted to PhonePe
-        # (measured on the parent by the review of af987a962, task #122).
-        if meta.get('inr_amount') is not None:
-            return int(round(float(meta['inr_amount']) * 100))
+        """The payment's amount in paise (INR's smallest unit) at the
+        operator's rate: INR passes through, USD converts via usd_inr_rate.
+        Metadata prices nothing (a metadata inr_amount was the override a
+        buyer reached through the upgrade route's body, the review of
+        af987a962; then an internal override nothing set, whose None value
+        raised on float(None) and answered 502: a stale key is ignored)."""
         amt = float(payment_request.amount)
         if payment_request.currency.upper() == 'INR':
             return int(round(amt * 100))
         return int(round(amt * self.usd_inr_rate * 100))
+
+    def sent_paise(self, payment_request: 'PaymentRequest') -> Optional[int]:
+        """The paise this gateway asked PhonePe for when it minted the
+        request (recorded by create_payment), or None when no request has
+        been minted for the payment."""
+        value = (payment_request.metadata or {}).get(PHONEPE_SENT_AMOUNT_KEY)
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def expected_paise(self, payment_request: 'PaymentRequest') -> int:
+        """What PhonePe should have captured: the amount SENT when known.
+        A capture is checked against that, never against a recomputation,
+        because the operator's rate can move between the checkout and the
+        confirmation and a correct capture then read 'amount mismatch',
+        FAILED, after the money was taken (the review of f08ff3e4c).  A
+        payment minted before the amount was recorded falls back to today's
+        rate, said at WARNING."""
+        sent = self.sent_paise(payment_request)
+        if sent is not None:
+            return sent
+        logger.warning("ap2: PhonePe payment %s has no recorded sent amount; "
+                       "checking its capture against today's rate",
+                       payment_request.payment_id)
+        return self._to_paise(payment_request)
 
     def connect(self) -> bool:
         """Validate that credentials are present; PhonePe has no per-session handshake."""
@@ -553,7 +578,13 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
             import requests as _requests
 
             amount_paise = self._to_paise(payment_request)
-            meta = payment_request.metadata or {}
+            # Recorded before the wire: the callback checks the capture
+            # against what was sent (expected_paise), and a request that
+            # was posted but whose reply was lost still has its amount.
+            if payment_request.metadata is None:
+                payment_request.metadata = {}
+            payment_request.metadata[PHONEPE_SENT_AMOUNT_KEY] = amount_paise
+            meta = payment_request.metadata
             # Where the buyer returns and where the signed confirmation is
             # posted: what the payment's metadata names (a cart mandate
             # stamps this node's URLs at creation; the upgrade route may
@@ -1533,6 +1564,7 @@ __all__ = [
     'create_payment_request_function', 'create_payment_authorization_function',
     'create_payment_processing_function', 'get_ap2_tools_for_autogen',
     'own_gateway_urls', 'PHONEPE_CALLBACK_PATH', 'PHONEPE_REFUND_CALLBACK_PATH',
+    'PHONEPE_SENT_AMOUNT_KEY',
 ]
 
 
