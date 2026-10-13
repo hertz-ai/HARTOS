@@ -19,7 +19,7 @@ import os
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from core.http_pool import pooled_get, pooled_post
+from core.http_pool import LLM_COMPLETION_TIMEOUT, pooled_get, pooled_post
 
 logger = logging.getLogger('hevolve_vision')
 
@@ -59,6 +59,12 @@ class VisionBackend(AutoReportSubsystemFailures, ABC):
     # silent.  Adding new methods to a concrete backend (e.g. `embed`)
     # just needs the method name in this tuple — no per-backend
     # except-block edits.
+    #
+    # `rate_frame` is deliberately NOT here.  A frame the model cannot rate
+    # (server down, a prose answer, the caller's time budget spent) falls
+    # back to a deterministic score in the caller; that is the designed
+    # path, not a subsystem failure, and 25 of them per reel would only
+    # flood the self-heal pipeline.
     AUTO_REPORTED_METHODS = ('start', 'describe', 'read_document', 'stop')
 
     @property
@@ -115,6 +121,30 @@ class VisionBackend(AutoReportSubsystemFailures, ABC):
         """
         return None
 
+    def rate_frame(self, image_bytes: bytes, prompt: str, *, long_side: int = 768,
+                   max_tokens: int = 80, timeout_s: float = 20.0) -> Optional[str]:
+        """Judge one video frame against a rubric prompt.
+
+        Reel Studio rates up to 25 keyframes of a reel this way (which makeup
+        stage the frame shows, how appealing it is), asking for a short JSON
+        answer that the caller parses.  The frame goes with its aspect kept,
+        no longer than ``long_side`` on its long side, at temperature 0 with
+        thinking off, and ``max_tokens`` of answer.
+
+        Unlike describe() and read_document(), it never starts a model
+        server: a server that does not answer /health is a None, and the
+        caller falls back.  ``timeout_s`` bounds the request itself, so a
+        caller with a time budget passes what is left of it.  It never
+        raises, and it is not an auto-reported method (see
+        AUTO_REPORTED_METHODS).
+
+        Returns:
+            The model's answer ('' when it answered with nothing), or None
+            when this backend cannot rate a frame, its server is not up, or
+            the request failed.  The default is None.
+        """
+        return None
+
     def start(self) -> bool:
         """Initialize the backend model. Returns True if ready."""
         return True
@@ -135,13 +165,14 @@ PAGE_LONG_SIDE = 1280
 PAGE_MAX_TOKENS = 4096
 
 
-def _page_jpeg(image_bytes: bytes) -> bytes:
-    """The page as JPEG bytes, no longer than PAGE_LONG_SIDE on its long side."""
+def _fit_jpeg(image_bytes: bytes, long_side: int) -> bytes:
+    """The image as JPEG bytes (quality 85), its aspect kept, no longer than
+    ``long_side`` on its long side.  A smaller image is not enlarged."""
     import io
     from PIL import Image
     img = Image.open(io.BytesIO(image_bytes))
-    if max(img.size) > PAGE_LONG_SIDE:
-        scale = PAGE_LONG_SIDE / max(img.size)
+    if max(img.size) > long_side:
+        scale = long_side / max(img.size)
         img = img.resize((round(img.width * scale), round(img.height * scale)),
                          Image.LANCZOS)
     buf = io.BytesIO()
@@ -149,24 +180,33 @@ def _page_jpeg(image_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
-def _read_page_with(completions_url: str, image_bytes: bytes, prompt: str, *,
-                    model: str, headers: Optional[dict] = None) -> Optional[str]:
-    """The one page-reading request to an OpenAI-compatible vision server.
+def _vision_complete(completions_url: str, image_bytes: bytes, prompt: str, *,
+                     model: str, long_side: int, max_tokens: int, temperature: float,
+                     headers: Optional[dict] = None,
+                     timeout=LLM_COMPLETION_TIMEOUT) -> Optional[str]:
+    """The one image + prompt request to an OpenAI-compatible vision server.
+
+    Page reads (_read_page_with) and frame ratings (rate_frame) both go
+    through here; they differ only in the image size, the answer budget,
+    the temperature and the timeout they pass.  The image goes first, then
+    the prompt.
 
     Thinking is off (core.constants.LLM_THINKING_OFF_KWARGS): a hybrid
     reasoning model otherwise spends its budget in reasoning_content and
-    answers with nothing. pooled_post admits the call through the priority
-    scheduler, so a page read by a background parse waits behind the user's
-    own turn. Never raises: a page the model does not read, the caller reads
-    from somewhere else.
+    answers with nothing. pooled_post admits a main-model call through the
+    priority scheduler, so a background request waits behind the user's own
+    turn. Never raises.
+
+    Returns the stripped answer ('' when the model answered with nothing), or
+    None when the image could not be prepared, the server could not be
+    reached, or it answered with a non-200 or with no usable JSON.
     """
     import base64
     from core.constants import LLM_THINKING_OFF_KWARGS
-    from core.http_pool import LLM_COMPLETION_TIMEOUT
     try:
-        b64 = base64.b64encode(_page_jpeg(image_bytes)).decode('ascii')
+        b64 = base64.b64encode(_fit_jpeg(image_bytes, long_side)).decode('ascii')
     except Exception as e:
-        logger.warning(f"page image could not be prepared for the VLM: {e}")
+        logger.warning(f"image could not be prepared for the VLM: {e}")
         return None
     body = {
         'model': model,
@@ -175,35 +215,95 @@ def _read_page_with(completions_url: str, image_bytes: bytes, prompt: str, *,
             {'type': 'text', 'text': prompt},
         ]}],
         'chat_template_kwargs': dict(LLM_THINKING_OFF_KWARGS),
-        'max_tokens': PAGE_MAX_TOKENS,
-        'temperature': 0.3,
+        'max_tokens': max_tokens,
+        'temperature': temperature,
     }
     extra = {'headers': headers} if headers else {}
     try:
-        resp = pooled_post(completions_url, json=body,
-                           timeout=LLM_COMPLETION_TIMEOUT, **extra)
+        resp = pooled_post(completions_url, json=body, timeout=timeout, **extra)
     except Exception as e:
-        logger.warning(f"page read failed at {completions_url}: {e}")
+        logger.warning(f"VLM request failed at {completions_url}: {e}")
         return None
     if resp.status_code != 200:
-        logger.warning(f"page read at {completions_url} returned HTTP "
+        logger.warning(f"VLM request at {completions_url} returned HTTP "
                        f"{resp.status_code}: {resp.text[:200]}")
         return None
     try:
         choice = (resp.json().get('choices') or [{}])[0]
     except (ValueError, AttributeError) as e:
-        logger.warning(f"page read at {completions_url} answered with no usable JSON: {e}")
+        logger.warning(f"VLM at {completions_url} answered with no usable JSON: {e}")
         return None
     message = choice.get('message') or {}
     content = (message.get('content') or '').strip()
     if choice.get('finish_reason') == 'length':
-        logger.warning("page read stopped at its %d-token budget: the answer is cut off",
-                       PAGE_MAX_TOKENS)
+        logger.warning("VLM answer stopped at its %d-token budget: it is cut off",
+                       max_tokens)
     if not content:
-        logger.warning("page read produced EMPTY content (finish_reason=%s, "
+        logger.warning("VLM produced EMPTY content (finish_reason=%s, "
                        "reasoning_content=%d chars)", choice.get('finish_reason'),
                        len(message.get('reasoning_content') or ''))
     return content
+
+
+def _read_page_with(completions_url: str, image_bytes: bytes, prompt: str, *,
+                    model: str, headers: Optional[dict] = None) -> Optional[str]:
+    """The one page-reading request to an OpenAI-compatible vision server:
+    the page at PAGE_LONG_SIDE, PAGE_MAX_TOKENS of answer, temperature 0.3,
+    the LLM completion timeout.  Never raises: a page the model does not
+    read, the caller reads from somewhere else."""
+    return _vision_complete(completions_url, image_bytes, prompt, model=model,
+                            long_side=PAGE_LONG_SIDE, max_tokens=PAGE_MAX_TOKENS,
+                            temperature=0.3, headers=headers)
+
+
+#: A health probe of a local vision server: 1 s to connect, 2 s to answer.
+#: llama-server answers /health 200 when its model is loaded and 503 while
+#: it loads; anything else, or no answer in time, is "not serving".
+HEALTH_TIMEOUT = (1, 2)
+
+
+def _health_ok(server_root: str) -> bool:
+    """True only when the server at ``server_root`` answers GET /health 200."""
+    try:
+        resp = pooled_get(f'{server_root.rstrip("/")}/health', timeout=HEALTH_TIMEOUT)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _server_root(base_url: str) -> str:
+    """An OpenAI-compatible base URL without its trailing /v1:
+    'http://127.0.0.1:8080/v1/' -> 'http://127.0.0.1:8080'."""
+    root = base_url.rstrip('/')
+    return root[:-len('/v1')] if root.endswith('/v1') else root
+
+
+def _rate_frame_at(completions_url: str, serving, image_bytes: bytes, prompt: str, *,
+                   model: str, long_side: int, max_tokens: int, timeout_s,
+                   headers: Optional[dict] = None) -> Optional[str]:
+    """VisionBackend.rate_frame for a backend with an OpenAI-compatible server.
+
+    ``serving()`` is the backend's own health check, asked first; nothing is
+    started when it says no.  Then one _vision_complete at temperature 0
+    with ``timeout_s`` as the request timeout.  A timeout that is not a
+    positive number is no time at all: no probe and no request.  Never
+    raises.
+    """
+    import math
+    try:
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) \
+                or not math.isfinite(timeout_s) or timeout_s <= 0:
+            logger.warning(f"rate_frame: no time to rate a frame (timeout_s={timeout_s!r})")
+            return None
+        if not serving():
+            logger.info(f"rate_frame: no vision server answering at {completions_url}")
+            return None
+        return _vision_complete(completions_url, image_bytes, prompt, model=model,
+                                long_side=long_side, max_tokens=max_tokens,
+                                temperature=0.0, headers=headers, timeout=timeout_s)
+    except Exception as e:
+        logger.warning(f"rate_frame failed at {completions_url}: {e}")
+        return None
 
 
 class MiniCPMBackend(VisionBackend):
@@ -596,6 +696,23 @@ class Qwen3VLVisionBackend(VisionBackend):
         return _read_page_with(url, image_bytes, prompt, model=endpoint.model_name,
                                headers={'Authorization': f'Bearer {endpoint.api_key}'})
 
+    def rate_frame(self, image_bytes: bytes, prompt: str, *, long_side: int = 768,
+                   max_tokens: int = 80, timeout_s: float = 20.0) -> Optional[str]:
+        """A keyframe rating through the same endpoint, after its /health
+        answers (see VisionBackend.rate_frame).  This backend has no
+        launcher; it sends nothing when the endpoint is not serving."""
+        try:
+            endpoint = self._endpoint()
+            url = self.completions_url()
+            root = _server_root(endpoint.base_url)
+        except Exception as e:
+            logger.warning(f"Qwen3-VL unavailable to rate a frame: {e}")
+            return None
+        return _rate_frame_at(url, lambda: _health_ok(root), image_bytes, prompt,
+                              model=endpoint.model_name, long_side=long_side,
+                              max_tokens=max_tokens, timeout_s=timeout_s,
+                              headers={'Authorization': f'Bearer {endpoint.api_key}'})
+
 
 class Qwen08BBackend(VisionBackend):
     """Qwen3.5-0.8B — fast continuous captioning (1s/frame).
@@ -604,8 +721,9 @@ class Qwen08BBackend(VisionBackend):
     core.port_registry, 'vlm_caption'), separate from the 4B model used for
     computer use / action planning.
 
-    Purpose: always-on frame captioning → FrameStore activity table, and
-    reading document pages (read_document) for the book pipeline.
+    Purpose: always-on frame captioning → FrameStore activity table,
+    reading document pages (read_document) for the book pipeline, and
+    rating Reel Studio keyframes (rate_frame, only while it is serving).
     NOT for computer use (use 4B Qwen3VLVisionBackend for that).
 
     Model: Qwen3.5-0.8B-UD-Q4_K_XL.gguf (~558MB) + mmproj-F16.gguf (~195MB)
@@ -650,11 +768,11 @@ class Qwen08BBackend(VisionBackend):
 
     def _is_serving(self) -> bool:
         """True only when the caption server answers /health on its port."""
-        try:
-            resp = pooled_get(f'http://127.0.0.1:{self._port}/health', timeout=2)
-            return resp.status_code == 200
-        except Exception:
-            return False
+        return _health_ok(f'http://127.0.0.1:{self._port}')
+
+    def completions_url(self) -> str:
+        """The caption server's chat completions URL (this node, its port)."""
+        return f'http://127.0.0.1:{self._port}/v1/chat/completions'
 
     def start(self) -> bool:
         """Lazy: don't boot at VisionService.start(). describe() does the
@@ -888,7 +1006,7 @@ class Qwen08BBackend(VisionBackend):
             b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
 
             resp = pooled_post(
-                f'http://127.0.0.1:{self._port}/v1/chat/completions',
+                self.completions_url(),
                 json={
                     'model': 'local',
                     'max_tokens': 100,
@@ -919,9 +1037,21 @@ class Qwen08BBackend(VisionBackend):
         if not self._ensure_running():
             return None
         self._last_describe_time = time.time()
-        return _read_page_with(
-            f'http://127.0.0.1:{self._port}/v1/chat/completions', image_bytes, prompt,
-            model='local')
+        return _read_page_with(self.completions_url(), image_bytes, prompt, model='local')
+
+    def rate_frame(self, image_bytes: bytes, prompt: str, *, long_side: int = 768,
+                   max_tokens: int = 80, timeout_s: float = 20.0) -> Optional[str]:
+        """A keyframe rating on the caption server, ONLY if it is already
+        serving (see VisionBackend.rate_frame).
+
+        Never _ensure_running: that lazy start emits vlm_caption.requested
+        and, standalone, spawns a llama-server -- right for the live
+        captioner, wrong for a tool that rates 25 frames and has a
+        deterministic fallback.  Not serving is a None.
+        """
+        return _rate_frame_at(self.completions_url(), self._is_serving, image_bytes, prompt,
+                              model='local', long_side=long_side, max_tokens=max_tokens,
+                              timeout_s=timeout_s)
 
 
 class NoneBackend(VisionBackend):
