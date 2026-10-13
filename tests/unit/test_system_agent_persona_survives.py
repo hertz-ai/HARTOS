@@ -13,8 +13,9 @@ from no agent config ("You are Hevolve") and the persona reached the model
 only as context; the agent's own id goes back to the turn now.
 
 These drive the real /chat handler and the real get_ans.  Only the draft
-dispatcher (made silent), memory/tools/LLM construction and the identity
-builder (it records nothing and stops the turn) are stubbed.
+dispatcher (made silent), memory/tools/LLM construction, the identity
+builder (it records nothing and stops the turn) and the desktop bus are
+stubbed.
 
     python -m pytest tests/unit/test_system_agent_persona_survives.py -q
 """
@@ -101,6 +102,13 @@ def _drive(hie, monkeypatch, body, answer=None):
         patch.object(hie, 'publish_chat_stage', lambda *a, **k: None),
         patch.object(hie, '_persist_language', lambda *a, **k: None),
         patch.object(hie, 'get_ans', spy_get_ans),
+        # The turn's 'longrunning.log' publish, made before get_ans, reached
+        # the desktop bus for real: six publishes per run, in flight at
+        # session end (task #137, measured with a submit trace).  Both the
+        # name and the Crossbar HTTP leg, which the message bus's HTTP
+        # transport calls directly.
+        patch.object(hie, 'publish_async', lambda *a, **k: None),
+        patch.object(hie, '_http_crossbar_publish', lambda *a, **k: None),
     ]
     if answer is not None:
         patches.append(patch.object(hie, '_chat_reply', record_reply))

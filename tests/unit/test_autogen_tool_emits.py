@@ -39,6 +39,22 @@ import pytest
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 
+@pytest.fixture(autouse=True)
+def _no_chat_context_outlives_a_test():
+    """T3 and T4b set a user id and a request id on the request thread-local
+    and nothing cleared them, so T5's wrappers (async and sync) ran with
+    T4b's context and published 'tool_call' to the desktop bus for real,
+    twice per run, whenever the entry point's HTTP transport was loaded in
+    the process (task #137, measured with a submit trace).  Every test here
+    starts and ends with no chat context."""
+    from hartos.threadlocal import thread_local_data
+    thread_local_data.set_user_id(None)
+    thread_local_data.set_request_id(None)
+    yield
+    thread_local_data.set_user_id(None)
+    thread_local_data.set_request_id(None)
+
+
 # ─── T1: Factory enforces ui_label kwarg ────────────────────────────
 
 def test_missing_ui_label_raises_type_error():
