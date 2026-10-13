@@ -512,13 +512,14 @@ class TestQueryHivemind(unittest.TestCase):
         self.bridge._http_disabled = False
         self.bridge._api_url = 'http://localhost:9999'
         mock_resp = MagicMock(status_code=200)
-        mock_resp.json.return_value = {'thought': 'collective answer'}
+        mock_resp.json.return_value = {'answer': 'collective answer', 'confidence': 0.7}
         mock_post.return_value = mock_resp
 
         with patch.object(self.bridge, '_check_cct_access', return_value=True), \
              patch('core.peer_link.link_manager.get_link_manager', side_effect=ImportError):
             result = self.bridge.query_hivemind('test query')
-        self.assertIsNotNone(result)
+        self.assertEqual(result, {'thought': 'collective answer', 'source': 'http',
+                                  'peer_count': 0, 'confidence': 0.7})
         self.assertEqual(self.bridge._stats['total_hivemind_queries'], 1)
 
     def test_consent_gate_blocks_external_query(self):
@@ -1000,26 +1001,17 @@ class TestSubmitOutputFeedback(unittest.TestCase):
         mock_rec.assert_not_called()
 
     def test_the_hive_hint_is_the_words_of_the_hives_reply(self):
-        """The hint attached to the correction is what the hive SAID, read
-        with the bridge's own reader (hivemind_result_text): the HTTP core's
-        'answer' (this attached no hint from it), a PeerLink envelope's
-        peers' words one per line (this attached a repr of the peer dicts),
-        and nothing when no peer said anything (this attached the same repr
-        of the silent peers' dicts; the review of c10535351 measured it).
-        The review of fbeb16284 named this reader."""
-        core_body = {'status': 'ok', 'query': 'q', 'answer': 'Lower the batch size.',
-                     'reasoning_chain': [], 'contributing_agents': ['inst-1'],
-                     'confidence': 0.9}
-        envelope = {'thoughts': [{'type': 'reply', 'thought': '', 'peer_id': 'p1'},
-                                 {'type': 'reply', 'thought': 'Use fp16.', 'peer_id': 'p2'},
-                                 {'type': 'reply', 'thought': 'Free the VRAM first.',
-                                  'peer_id': 'p3'}],
-                    'source': 'peerlink', 'peer_count': 3}
-        silent = {'thoughts': [{'type': 'reply', 'thought': '', 'peer_id': 'p1'}],
-                  'source': 'peerlink', 'peer_count': 1}
+        """The hint attached to the correction is the reply's words
+        (query_hivemind's one shape, 'thought'); a reply with nothing to say
+        and no reply at all attach none."""
+        core = {'thought': 'Lower the batch size.', 'source': 'http',
+                'peer_count': 0, 'confidence': 0.9}
+        peers = {'thought': 'Use fp16.\nFree the VRAM first.', 'source': 'peerlink',
+                 'peer_count': 3, 'confidence': 0.0}
+        silent = {'thought': '', 'source': 'peerlink', 'peer_count': 1, 'confidence': 0.0}
         for hive_result, hint in (
-                (core_body, 'hive_hint: Lower the batch size.'),
-                (envelope, 'hive_hint: Use fp16.\nFree the VRAM first.'),
+                (core, 'hive_hint: Lower the batch size.'),
+                (peers, 'hive_hint: Use fp16.\nFree the VRAM first.'),
                 (silent, None),
                 (None, None)):
             bridge = _make_bridge()
@@ -1058,6 +1050,7 @@ class TestPeerLinkLearningBoundary(unittest.TestCase):
 
         self.assertEqual(result['source'], 'peerlink')
         self.assertEqual(result['peer_count'], 3)
+        self.assertEqual(result['thought'], 'candidate one\ncandidate two')
         manager.collect.assert_called_once_with(
             'hivemind', timeout_ms=1000,
             payload={
@@ -1069,23 +1062,16 @@ class TestPeerLinkLearningBoundary(unittest.TestCase):
         self.assertEqual(bridge._stats['peerlink_responses_observed'], 2)
         self.assertNotIn('peerlink_responses_trained', bridge._stats)
 
-    def test_the_peer_count_keeps_its_own_rule(self):
-        """The count is telemetry and keeps the rule it was written with
-        (truthiness of thought/response/text); the metered endpoint's billing
-        rule (hivemind_result_has_a_thought: a non-blank string, 'answer'
-        included) is a different one.  Both directions of the difference are
-        pinned here, so neither rule can be folded onto the other unnoticed
-        (the review of c8a9e0c28: nothing pinned the count)."""
+    def test_every_leg_answers_the_one_shape(self):
+        """query_hivemind returns one shape whichever leg answered, and a
+        peer "said something" by the same rule billing reads: non-blank
+        words.  A blank, a list, the handler's empty reply and a key no peer
+        writes ('answer' is the HTTP core's) are silence; the peer count is
+        the replies, the observed count the ones with words."""
         from core.peer_link.hivemind_handler import _EMPTY_REPLY
-        from integrations.agent_engine.world_model_bridge import (
-            hivemind_result_has_a_thought)
-        peers = [
-            {'thought': ' '},                       # counted, not billed
-            {'thought': ['a', 'list']},             # counted, not billed
-            {'answer': 'words under answer'},       # billed, not counted
-            dict(_EMPTY_REPLY),                     # neither
-            {'response': 'a real reply'},           # both
-        ]
+        peers = [{'thought': ' '}, {'thought': ['a', 'list']},
+                 {'answer': 'the core key, not a peer key'}, dict(_EMPTY_REPLY),
+                 {'response': 'a real reply'}]
         bridge = _make_bridge()
         manager = MagicMock()
         manager.collect.return_value = list(peers)
@@ -1093,10 +1079,26 @@ class TestPeerLinkLearningBoundary(unittest.TestCase):
                    return_value=manager), \
              patch.object(bridge, '_check_cct_access', return_value=True):
             result = bridge.query_hivemind('what is the hive?')
-        self.assertEqual(bridge._stats['peerlink_responses_observed'], 3)
-        self.assertEqual(result['peer_count'], 5)
-        billed = [hivemind_result_has_a_thought({'thoughts': [p]}) for p in peers]
-        self.assertEqual(billed, [False, False, True, False, True])
+        self.assertEqual(result, {'thought': 'a real reply', 'source': 'peerlink',
+                                  'peer_count': 5, 'confidence': 0.0})
+        self.assertEqual(bridge._stats['peerlink_responses_observed'], 1)
+        # The HTTP core: words under 'answer', None when it had none.
+        core = {'status': 'ok', 'answer': 'The hive is a network of agents.',
+                'reasoning_chain': [], 'contributing_agents': ['inst-1'],
+                'weights': {'inst-1': 1.0}, 'confidence': 0.9, 'topology': {}}
+        for body, thought in ((core, 'The hive is a network of agents.'),
+                              (dict(core, answer=None), '')):
+            bridge = _make_bridge()
+            bridge._http_disabled = False
+            bridge._api_url = 'http://localhost:9999'
+            with patch.object(bridge, '_check_cct_access', return_value=True), \
+                 patch('core.peer_link.link_manager.get_link_manager',
+                       side_effect=ImportError), \
+                 patch('integrations.agent_engine.world_model_bridge.pooled_post',
+                       return_value=MagicMock(status_code=200, json=lambda: dict(body))):
+                result = bridge.query_hivemind('what is the hive?')
+            self.assertEqual(result, {'thought': thought, 'source': 'http',
+                                      'peer_count': 0, 'confidence': 0.9}, body)
 
 
 class TestGetLearningFeedback(unittest.TestCase):

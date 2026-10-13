@@ -785,32 +785,21 @@ def intelligence_hivemind():
     result, has_thought = None, False
 
     try:
-        from integrations.agent_engine.world_model_bridge import (
-            get_world_model_bridge, hivemind_result_has_a_thought)
+        from integrations.agent_engine.world_model_bridge import get_world_model_bridge
         bridge = get_world_model_bridge()
         result = bridge.query_hivemind(query)
-        has_thought = hivemind_result_has_a_thought(result)
+        has_thought = bool(result and result.get('thought'))
     except Exception as e:
         logger.warning(f"HiveMind endpoint error: {e}")
         result, has_thought = None, False
 
     elapsed_ms = int((time.time() - t0) * 1000)
     if not has_thought:
-        # No thought: query_hivemind returns None when no hive core is
-        # installed, the node holds no CCT for the capability, the
-        # constitutional filter refused the prompt or every leg failed
-        # (measured on central 2026-10-13: {"result": null, "success": true},
-        # counted as a call, task #110); and a PeerLink envelope whose every
-        # peer answered hivemind_handler's empty reply (a connected peer with
-        # no core) is no thought either (the review of 2efb73519 measured
-        # that envelope billed).  Two rules live in the bridge: the peer
-        # count's (_peer_said_something: truthiness of thought/response/text,
-        # telemetry) and the billing rule read here
-        # (hivemind_result_has_a_thought: a non-blank string under thought/
-        # response/text/answer).  They differ on a whitespace-only or truthy
-        # non-string thought (counted, not billed) and on words under
-        # 'answer' (billed, not counted); an empty or None thought is
-        # neither; billing reads only the second.
+        # No thought: None (no hive core installed, no CCT for the
+        # capability, the filter refused, every leg failed) or a reply whose
+        # words are '' (every peer silent, the core's answer None).  Measured
+        # on central 2026-10-13: {"result": null, "success": true} was
+        # counted as a call (task #110).
         return _metered_backend_failure(
             '/v1/intelligence/hivemind', tokens_in, elapsed_ms, 502)
 

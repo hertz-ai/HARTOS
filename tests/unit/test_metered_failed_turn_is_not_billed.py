@@ -146,30 +146,21 @@ def _hivemind(app_client, bridge_result=None, raises=None):
                               headers={'X-API-Key': 'k'})
 
 
-def _empty_peer_reply():
-    """What a connected peer with no hive core answers (the real sentinel)."""
-    from core.peer_link.hivemind_handler import _EMPTY_REPLY
-    return dict(_EMPTY_REPLY)
-
-
 @pytest.mark.parametrize('nothing', [
     pytest.param(None, id='none: no core, no CCT, filter refused, every leg failed'),
     pytest.param({}, id='empty dict'),
-    pytest.param('peerlink-empty', id='two peers that answered the empty reply'),
-    pytest.param({'thought': ' '}, id='a blank thought'),
-    pytest.param({'thoughts': [{'thought': '  '}], 'source': 'peerlink', 'peer_count': 1},
-                 id='one peer that answered blank'),
+    pytest.param({'thought': '', 'source': 'peerlink', 'peer_count': 2, 'confidence': 0.0},
+                 id='two peers that answered the empty reply'),
+    pytest.param({'thought': '', 'source': 'http', 'peer_count': 0, 'confidence': 0.0},
+                 id='the core answered with no words'),
 ])
 def test_hivemind_with_nothing_to_say_is_not_billed(app_client, passing_auth, nothing):
     """query_hivemind returns None when the core is not installed, the node
     has no CCT, or the filter refused the prompt: measured on central as
-    {"result": null, "success": true}, counted as a call.  A PeerLink
-    envelope whose every peer sent hivemind_handler's empty reply (a peer
-    with no core) is a non-empty dict and was still billed (the review of
-    2efb73519 measured it); the ONE rule is a non-empty thought."""
-    if nothing == 'peerlink-empty':
-        nothing = {'thoughts': [_empty_peer_reply(), _empty_peer_reply()],
-                   'source': 'peerlink', 'peer_count': 2}
+    {"result": null, "success": true}, counted as a call.  Its one shape
+    carries '' when a leg answered with nothing to say (two silent peers
+    were billed before the shape existed; the review of 2efb73519 measured
+    it); the ONE rule is non-empty words."""
     r = _hivemind(app_client, bridge_result=nothing)
     _assert_not_billed(r, passing_auth)
 
@@ -180,12 +171,11 @@ def test_hivemind_whose_bridge_raised_is_not_billed(app_client, passing_auth):
 
 
 @pytest.mark.parametrize('thought', [
-    {'thought': 'The hive thinks Paris.'},
-    {'thoughts': [{'thought': 'Paris'}], 'source': 'peerlink', 'peer_count': 1},
-    # One silent peer and one that answered: a thought was had.
-    {'thoughts': [{'type': 'reply', 'thought': ''}, {'response': 'Paris'}],
-     'source': 'peerlink', 'peer_count': 2},
-    {'thought': 'cached answer', 'source': 'cached', 'cct_gated': True},
+    {'thought': 'The hive thinks Paris.', 'source': 'in_process', 'peer_count': 0,
+     'confidence': 0.0},
+    {'thought': 'Paris', 'source': 'peerlink', 'peer_count': 2, 'confidence': 0.0},
+    {'thought': 'cached answer', 'source': 'cached', 'peer_count': 0, 'confidence': 0.0,
+     'cct_gated': True},
 ])
 def test_hivemind_with_a_thought_is_a_call(app_client, passing_auth, thought):
     r = _hivemind(app_client, bridge_result=thought)
@@ -205,64 +195,6 @@ HTTP_CORE_BODY = {
     'weights': {'inst-1': 1.0}, 'confidence': 0.9, 'num_contributors': 1,
     'distributed': False, 'topology': {}, 'adapted_timeout_ms': 1000,
 }
-
-
-def test_the_hivemind_rule_is_the_bridges_own():
-    """The endpoint reads the bridge's own predicate, driven here on the
-    shapes query_hivemind returns.  The bridge's peer count keeps its own
-    rule (telemetry, _peer_said_something: truthiness of thought/response/
-    text, pinned in tests/unit/test_world_model_bridge.py); billing is a
-    DIFFERENT rule, not a stricter one: a non-blank string under a thought
-    key, and 'answer' is a thought key there."""
-    from integrations.agent_engine.world_model_bridge import (
-        hivemind_result_has_a_thought as has_thought)
-    assert not has_thought(None)
-    assert not has_thought({})
-    assert not has_thought({'thought': ''})
-    assert not has_thought({'thought': ' '})
-    assert not has_thought({'thought': 0})
-    assert not has_thought({'thought': ['x']})
-    assert has_thought({'thought': None, 'answer': 'x'})
-    assert not has_thought({'thoughts': [_empty_peer_reply()], 'source': 'peerlink',
-                            'peer_count': 1})
-    assert not has_thought({'thoughts': [], 'source': 'peerlink', 'peer_count': 0})
-    assert has_thought({'thought': 'x'})
-    assert has_thought({'thoughts': [_empty_peer_reply(), {'text': 'x'}],
-                        'source': 'peerlink', 'peer_count': 2})
-    assert has_thought({'response': 'a peer answered'})
-    # The HTTP core's own body: its words are under 'answer', None when it
-    # had none (HevolveAI api_server, hivemind_think_together).
-    assert has_thought(dict(HTTP_CORE_BODY))
-    assert not has_thought(dict(HTTP_CORE_BODY, answer=None))
-
-
-def test_the_words_of_a_result_are_one_reader_and_billing_is_its_truth():
-    """hivemind_result_text reads what a whole query_hivemind result SAID
-    (the words the output-error hive hint and the robotics API hand on), and
-    hivemind_result_has_a_thought is exactly its truth on every shape, so the
-    two cannot drift (the review of fbeb16284: two consumers read their own
-    keys while the bridge said "the ONE reader")."""
-    from integrations.agent_engine.world_model_bridge import (
-        hivemind_result_has_a_thought as has_thought,
-        hivemind_result_text as words)
-    shapes = {
-        'none': (None, ''),
-        'empty': ({}, ''),
-        'blank': ({'thought': ' '}, ''),
-        'non-string': ({'thought': ['x']}, ''),
-        'in-process': ({'thought': 'plain'}, 'plain'),
-        'core': (dict(HTTP_CORE_BODY), HTTP_CORE_BODY['answer']),
-        'core-no-answer': (dict(HTTP_CORE_BODY, answer=None), ''),
-        'silent-peers': ({'thoughts': [_empty_peer_reply(), _empty_peer_reply()],
-                          'source': 'peerlink', 'peer_count': 2}, ''),
-        'peers': ({'thoughts': [_empty_peer_reply(), {'text': 'use fp16'},
-                                {'response': 'free the VRAM first'}],
-                   'source': 'peerlink', 'peer_count': 3},
-                  'use fp16\nfree the VRAM first'),
-    }
-    for name, (result, said) in shapes.items():
-        assert words(result) == said, name
-        assert has_thought(result) is bool(said), name
 
 
 # --------------------------------------------------------------------------
@@ -300,7 +232,11 @@ def test_the_http_cores_answer_is_a_call(app_client, passing_auth):
     ca3e314de drove this leg on the parent and at HEAD)."""
     r, _ = _hivemind_through_the_http_core(app_client, HTTP_CORE_BODY)
     _assert_billed_as_a_call(r, passing_auth)
-    assert r.get_json()['result'] == HTTP_CORE_BODY
+    # The customer gets the words, the source and the confidence: not the
+    # core's contributing agents, weights, topology or timings (task #136).
+    assert r.get_json()['result'] == {
+        'thought': HTTP_CORE_BODY['answer'], 'source': 'http',
+        'peer_count': 0, 'confidence': HTTP_CORE_BODY['confidence']}
 
 
 def test_the_http_core_with_no_answer_is_not_billed(app_client, passing_auth):

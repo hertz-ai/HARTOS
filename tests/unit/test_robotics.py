@@ -783,23 +783,17 @@ class TestRobotIntelligenceAPI(unittest.TestCase):
         return api
 
     def test_the_hive_strategy_is_the_words_of_the_hives_reply(self):
-        """_invoke_hivemind hands the fusion what the hive SAID, read with
-        the bridge's own reader (hivemind_result_text): the HTTP core's
-        'answer' and a PeerLink envelope's peers reached the robot as ''
-        while this read 'thought' alone (the review of fbeb16284); the
-        in-process 'thought' as before; nothing stays 'unavailable'."""
+        """_invoke_hivemind hands the fusion the reply's words
+        (query_hivemind's one shape) and its source; nothing stays
+        'unavailable'."""
         api = self._make_api()
-        core_body = {'status': 'ok', 'query': 'q', 'answer': 'Approach from the left.',
-                     'reasoning_chain': [], 'contributing_agents': ['inst-1'],
-                     'confidence': 0.9}
-        envelope = {'thoughts': [{'type': 'reply', 'thought': '', 'peer_id': 'p1'},
-                                 {'type': 'reply', 'thought': 'Slow down near the table.',
-                                  'peer_id': 'p2'}],
-                    'source': 'peerlink', 'peer_count': 2}
         for hive_result, strategy, source in (
-                (core_body, 'Approach from the left.', 'hivemind'),
-                (envelope, 'Slow down near the table.', 'peerlink'),
-                ({'thought': 'plain'}, 'plain', 'hivemind'),
+                ({'thought': 'Approach from the left.', 'source': 'http',
+                  'peer_count': 0, 'confidence': 0.9}, 'Approach from the left.', 'http'),
+                ({'thought': 'Slow down near the table.', 'source': 'peerlink',
+                  'peer_count': 2, 'confidence': 0.0}, 'Slow down near the table.', 'peerlink'),
+                ({'thought': 'plain', 'source': 'in_process', 'peer_count': 0,
+                  'confidence': 0.0}, 'plain', 'in_process'),
                 (None, '', 'unavailable')):
             bridge = MagicMock()
             bridge.query_hivemind.return_value = hive_result

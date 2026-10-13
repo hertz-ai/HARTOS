@@ -48,7 +48,7 @@ def handle_hivemind_message(data: Any, sender_peer_id: str) -> Optional[dict]:
     Failure modes:
     - malformed payload (non-dict)            → log at debug, return None
     - unknown ``type``                         → log at debug, return None
-    - the bridge's names missing from this copy of the tree → say so at
+    - the bridge module missing from this copy of the tree → say so at
       WARNING once per process (debug after), return ``_EMPTY_REPLY`` so
       the requesting peer's ``collect()`` still sees a structured response
       rather than hanging on the timeout.
@@ -85,15 +85,12 @@ def _handle_query(data: dict, sender_peer_id: str) -> Optional[dict]:
         enforce it here because ChannelDispatcher dispatches synchronously)
     """
     try:
-        from integrations.agent_engine.world_model_bridge import (
-            get_world_model_bridge, hivemind_thought_text,
-        )
+        from integrations.agent_engine.world_model_bridge import get_world_model_bridge
     except ImportError as e:
         # The bridge module is HARTOS's own and imports without the hive
         # core (central, with no core installed, runs it), so this is a copy
-        # of the tree that lacks a name this handler needs
-        # (hivemind_thought_text arrived in fbeb16284; the bundle carries
-        # more than one copy of HARTOS).  Said at WARNING once per process,
+        # of the tree that lacks it (the bundle carries more than one copy
+        # of HARTOS).  Said at WARNING once per process,
         # debug after (a peer's robot loop can ask many times a second; the
         # review of c10535351): every peer's query is otherwise answered
         # with the empty reply and nothing logged (the review of fbeb16284).
@@ -129,16 +126,13 @@ def _handle_query(data: dict, sender_peer_id: str) -> Optional[dict]:
     if not result:
         return _EMPTY_REPLY
 
-    # The words of the local result, through the bridge's reader of one
-    # reply (hivemind_thought_text: 'thought', 'response', 'text' and the HTTP
-    # core's 'answer'), so a peer whose own core is reached over HTTP relays
-    # the core's answer instead of an empty thought (this read only 'thought'
-    # and 'response'; the review of c8a9e0c28 measured the empty reply).  A
-    # PeerLink envelope ({'thoughts': [...]}) has no words of its own and
-    # relays '' as before.
+    # This node's own words (query_hivemind's one shape).  What its peers
+    # told it (source 'peerlink') is not relayed a second hop: the asker
+    # fans out to those peers itself.
+    own = '' if result.get('source') == 'peerlink' else (result.get('thought') or '')
     return {
         'type': 'reply',
-        'thought': hivemind_thought_text(result),
+        'thought': own,
         'peer_id': sender_peer_id,
     }
 

@@ -1516,7 +1516,7 @@ class WorldModelBridge:
             logger.debug("HiveMind query: no CCT with hivemind_query capability")
             cached = self._federation_aggregated.get('last_thought')
             if cached:
-                return {'thought': cached, 'source': 'cached', 'cct_gated': True}
+                return _hive_reply(cached, 'cached', cct_gated=True)
             return None
 
         try:
@@ -1583,10 +1583,10 @@ class WorldModelBridge:
                 )
                 with self._lock:
                     self._stats['total_hivemind_queries'] += 1
-                return {
-                    'thought': result.text if hasattr(result, 'text')
-                    else str(result)
-                }
+                # The one shape (_hive_reply): the core's words, or '' when
+                # its CollectiveThought carries no text (its repr used to be
+                # returned and billed as a thought, task #135).
+                return _hive_reply(getattr(result, 'text', None), 'in_process')
             except Exception as e:
                 logger.debug(f"In-process hivemind failed: {e}")
 
@@ -1618,16 +1618,12 @@ class WorldModelBridge:
                 # raw thought here duplicated the query into chat history,
                 # ingested it as a user sensor once per peer, and (after the
                 # verification gate was added) still claimed it was trained.
-                observed = sum(1 for peer_resp in responses
-                               if _peer_said_something(peer_resp))
+                said = [w for w in (_peer_words(r) for r in responses) if w]
                 with self._lock:
                     self._stats.setdefault('peerlink_responses_observed', 0)
-                    self._stats['peerlink_responses_observed'] += observed
-                return {
-                    'thoughts': responses,
-                    'source': 'peerlink',
-                    'peer_count': len(responses),
-                }
+                    self._stats['peerlink_responses_observed'] += len(said)
+                return _hive_reply('\n'.join(said), 'peerlink',
+                                   peer_count=len(responses))
         except Exception:
             logger.debug("[WorldModelBridge] peerlink thought query failed; falling through", exc_info=True)
 
@@ -1652,7 +1648,13 @@ class WorldModelBridge:
             if resp.status_code == 200:
                 with self._lock:
                     self._stats['total_hivemind_queries'] += 1
-                return resp.json()
+                body = resp.json()
+                body = body if isinstance(body, dict) else {}
+                # HevolveAI's api_server keeps the words under 'answer' (text
+                # or None) beside its reasoning chain, agents, weights and
+                # timings; only the words and the confidence leave here.
+                return _hive_reply(body.get('answer'), 'http',
+                                   confidence=body.get('confidence'))
         except requests.RequestException as e:
             self._cb_record_failure()
             logger.debug(f"HiveMind query failed: {e}")
@@ -2610,17 +2612,9 @@ class WorldModelBridge:
                 hive_result = self.query_hivemind(
                     query_text, user_id=user_id, timeout_ms=200
                 )
-                # What the hive SAID, through the bridge's own reader
-                # (hivemind_result_text): the in-process 'thought', a
-                # PeerLink envelope's peers one per line, the HTTP core's
-                # 'answer'.  This read 'thought', then the envelope's whole
-                # 'thoughts' list, so a repr of the peer dicts went to the
-                # learner whether the peers said something or not, and never
-                # the core's 'answer' (the review of fbeb16284 named this
-                # reader; its last fallback, 'source', could not be reached:
-                # the envelope is built only from a non-empty reply list, and
-                # the core's body has no such key).
-                hive_hint = hivemind_result_text(hive_result)
+                # What the hive said: query_hivemind's one shape carries the
+                # words under 'thought' ('' when nothing was said).
+                hive_hint = (hive_result or {}).get('thought') or ''
                 if hive_hint:
                     with self._lock:
                         self._stats.setdefault(
@@ -2726,86 +2720,45 @@ class WorldModelBridge:
 
 
 # ─── Module-level singleton ───
-#: The keys query_hivemind's peer count has read since it was written:
-#: 'thought' (a peer's reply, the in-process and cached shapes), 'response'
-#: and 'text' (a peer's other spellings).  Telemetry; its rule is truthiness.
-_PEER_COUNT_KEYS = ('thought', 'response', 'text')
-
-#: Where a hivemind reply keeps its words: the peer count's keys plus
-#: 'answer', the HTTP core's (HevolveAI's api_server answers POST
-#: /v1/hivemind/think with {"status": "ok", "query": ..., "answer": <text or
-#: None>, "reasoning_chain": ..., "contributing_agents": ..., "confidence":
-#: ..., ...}; the review of ca3e314de measured that reply refused as "no
-#: thought" while the list lacked 'answer').  Read by hivemind_thought_text
-#: (one reply) and hivemind_result_text (a whole query_hivemind result), the
-#: two readers of a reply's words; the billing rule below, the peer reply
-#: handler (core.peer_link.hivemind_handler), the output-error hive hint
-#: (submit_output_feedback) and the robotics API
-#: (integrations.robotics.intelligence_api._invoke_hivemind) all go through
-#: them (the review of fbeb16284 measured the last two reading their own
-#: keys while this said "the ONE reader").
-_THOUGHT_KEYS = _PEER_COUNT_KEYS + ('answer',)
+#: A PeerLink peer's reply keeps its words under 'thought'
+#: (core.peer_link.hivemind_handler); 'response' and 'text' are older
+#: spellings still accepted.
+_PEER_WORD_KEYS = ('thought', 'response', 'text')
 
 
-def _peer_said_something(peer_resp) -> bool:
-    """True when one PeerLink hivemind reply carries a truthy value under one
-    of _PEER_COUNT_KEYS.  A connected peer with no hive core answers
-    core.peer_link.hivemind_handler._EMPTY_REPLY ({'thought': ''}), which
-    collect() keeps because it is a non-empty dict; this is the rule
-    query_hivemind's peer count (telemetry) applies, unchanged since it was
-    written.  Billing reads a DIFFERENT rule, hivemind_result_has_a_thought
-    below: only a non-blank string counts there, and 'answer' counts there
-    too; so a whitespace-only or truthy non-string thought is counted here
-    and not billed, a reply whose words are under 'answer' is billed and not
-    counted here, and an empty or None thought is neither."""
-    return bool(isinstance(peer_resp, dict) and any(
-        peer_resp.get(k) for k in _PEER_COUNT_KEYS))
-
-
-def hivemind_thought_text(result) -> str:
-    """The words of ONE hivemind reply: the first non-blank string under
-    _THOUGHT_KEYS, else ''.  A PeerLink envelope ({'thoughts': [...]}) has no
-    words of its own and answers ''."""
-    if not isinstance(result, dict):
+def _peer_words(peer_resp) -> str:
+    """One peer reply's words: the first non-blank string under
+    _PEER_WORD_KEYS, else '' (a connected peer with no core answers the
+    handler's empty reply, which collect() keeps as a non-empty dict)."""
+    if not isinstance(peer_resp, dict):
         return ''
-    for key in _THOUGHT_KEYS:
-        value = result.get(key)
+    for key in _PEER_WORD_KEYS:
+        value = peer_resp.get(key)
         if isinstance(value, str) and value.strip():
             return value
     return ''
 
 
-def hivemind_result_text(result) -> str:
-    """The words of a whole query_hivemind() result.  A PeerLink envelope
-    ({'thoughts': [one reply per peer], ...}): every peer's words
-    (hivemind_thought_text), one per line, the silent peers left out.  Any
-    other shape (None; the in-process and cached {'thought': ...}; the HTTP
-    core's body): hivemind_thought_text of it.  '' when nothing was said;
-    hivemind_result_has_a_thought is its truth."""
-    if isinstance(result, dict) and isinstance(result.get('thoughts'), list):
-        said = (hivemind_thought_text(peer) for peer in result['thoughts'])
-        return '\n'.join(words for words in said if words)
-    return hivemind_thought_text(result)
-
-
-def hivemind_result_has_a_thought(result) -> bool:
-    """True when a query_hivemind() result carries at least one thought.
-
-    The shapes query_hivemind returns: None (no hive core, no CCT for the
-    capability, the constitutional filter refused, every leg failed); the
-    in-process and cached shapes, ``{'thought': ...}``; the PeerLink
-    envelope, ``{'thoughts': [one reply per peer], 'source': 'peerlink',
-    ...}``; and the HTTP core's own JSON, whose words are under 'answer'
-    (_THOUGHT_KEYS).  The metered hivemind endpoint counts a call only when
-    this is True (task #110; the review of 2efb73519 measured the envelope
-    of two silent peers billed as a success, the review of ca3e314de the
-    HTTP core's real answer refused).  The HTTP leg is reached only when no
-    peer answered at all: query_hivemind returns the PeerLink envelope as
-    soon as any peer replies, so one connected core-less peer still leaves
-    this False (task #134).  The billing rule for one reply is "it has
-    words" (hivemind_thought_text); not the peer count's rule
-    (_peer_said_something)."""
-    return bool(hivemind_result_text(result))
+def _hive_reply(words, source, peer_count=0, confidence=None, **extra) -> dict:
+    """The ONE shape query_hivemind returns, whichever leg answered:
+    ``{'thought': <words or ''>, 'source': 'in_process' | 'peerlink' |
+    'http' | 'cached', 'peer_count': <peers that replied>, 'confidence':
+    <float, 0.0 when the leg reports none>}``.  Every reader asks
+    ``result['thought']``: '' is a leg that answered with nothing to say,
+    None (no result at all) a leg that did not answer.  Before this the three
+    legs returned three shapes (the core's whole body, a list of peer dicts,
+    the in-process text or its repr) and six reader functions grew around
+    them in task #110's rounds two to six; the metered endpoint also handed
+    a customer the core's whole body (task #136)."""
+    text = words if isinstance(words, str) and words.strip() else ''
+    try:
+        conf = float(confidence) if confidence is not None else 0.0
+    except (TypeError, ValueError):
+        conf = 0.0
+    reply = {'thought': text, 'source': source,
+             'peer_count': int(peer_count or 0), 'confidence': conf}
+    reply.update(extra)
+    return reply
 
 
 _bridge = None

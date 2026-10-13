@@ -45,22 +45,19 @@ class HiveMindHandlerTest(unittest.TestCase):
         self.assertIn('thought', result)
 
     def test_query_relays_the_words_of_the_local_result(self):
-        """The reply's thought is read with the bridge's own key list
-        (hivemind_thought_text): a peer whose core is reached over HTTP has
-        its words under 'answer', and used to relay '' (the review of
-        c8a9e0c28 measured it); a plain 'thought' relays as before; an
-        answer of None relays ''."""
+        """The reply's thought is this node's own words (query_hivemind's one
+        shape): the core's answer over HTTP, the in-process thought, '' when
+        the core had none; what this node's own peers told it (source
+        'peerlink') is not relayed a second hop."""
         from core.peer_link.hivemind_handler import handle_hivemind_message
-        core_body = {'status': 'ok', 'query': 'q',
-                     'answer': 'The hive is a network of agents.',
-                     'reasoning_chain': [], 'contributing_agents': ['inst-1'],
-                     'confidence': 0.9}
         for local_result, relayed in (
-                (core_body, 'The hive is a network of agents.'),
-                (dict(core_body, answer=None), ''),
-                ({'thought': 'plain'}, 'plain'),
-                ({'thoughts': [{'thought': 'a further peer'}],
-                  'source': 'peerlink', 'peer_count': 1}, '')):
+                ({'thought': 'The hive is a network of agents.', 'source': 'http',
+                  'peer_count': 0, 'confidence': 0.9}, 'The hive is a network of agents.'),
+                ({'thought': '', 'source': 'http', 'peer_count': 0, 'confidence': 0.0}, ''),
+                ({'thought': 'plain', 'source': 'in_process', 'peer_count': 0,
+                  'confidence': 0.0}, 'plain'),
+                ({'thought': 'a further peer', 'source': 'peerlink', 'peer_count': 1,
+                  'confidence': 0.0}, '')):
             bridge = MagicMock()
             bridge.query_hivemind.return_value = local_result
             with patch('integrations.agent_engine.world_model_bridge.'
@@ -70,8 +67,8 @@ class HiveMindHandlerTest(unittest.TestCase):
             self.assertEqual(reply.get('type'), 'reply', reply)
             self.assertEqual(reply.get('thought'), relayed, local_result)
 
-    def test_a_tree_missing_the_bridges_reader_is_said_out_loud(self):
-        """A copy of the tree whose bridge lacks hivemind_thought_text (the
+    def test_a_tree_missing_the_bridge_is_said_out_loud(self):
+        """A copy of the tree whose bridge module cannot be imported (the
         bundle carries more than one copy of HARTOS) used to answer every
         peer's query with the empty reply and log nothing.  It still answers
         the empty reply (the asking peer's collect() must not hang) and says
@@ -84,8 +81,8 @@ class HiveMindHandlerTest(unittest.TestCase):
         from core.peer_link.hivemind_handler import (
             handle_hivemind_message, _EMPTY_REPLY,
         )
-        real = wmb.hivemind_thought_text
-        del wmb.hivemind_thought_text
+        real = wmb.get_world_model_bridge
+        del wmb.get_world_model_bridge
         hivemind_handler._handle_query.__dict__.pop('import_failure_said', None)
         try:
             with self.assertLogs('hevolve.peer_link.hivemind', level='DEBUG') as logs:
@@ -94,10 +91,10 @@ class HiveMindHandlerTest(unittest.TestCase):
                 second = handle_hivemind_message(
                     {'type': 'query', 'query': 'q'}, 'peer_x')
         finally:
-            wmb.hivemind_thought_text = real
+            wmb.get_world_model_bridge = real
             hivemind_handler._handle_query.__dict__.pop('import_failure_said', None)
         self.assertEqual((first, second), (_EMPTY_REPLY, _EMPTY_REPLY))
-        said = [r for r in logs.records if 'hivemind_thought_text' in r.getMessage()]
+        said = [r for r in logs.records if 'get_world_model_bridge' in r.getMessage()]
         self.assertEqual([r.levelno for r in said], [logging.WARNING, logging.DEBUG],
                          logs.output)
 
