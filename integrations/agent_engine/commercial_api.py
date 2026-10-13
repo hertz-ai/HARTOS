@@ -488,12 +488,12 @@ def _metered_backend_chat(prompt: str, label: str):
     this function's log lines; it is NOT an agent.
 
     The customer's call is an agent-less conversation turn (``prompt_id``
-    None): the self-POST itself never asks for an agent to be created.  The
-    default tool set that turn runs still carries ``Create_Agent`` and
-    ``Agentic_Router``; if the model picks one of them the customer gets the
-    creation interview as the answer (the review of 7e7ce19bc drove it;
-    making the metered turn ignore those two tool flags is task #120).
-    Two flags are deliberate: ``draft_first``
+    None): the self-POST itself never asks for an agent to be created, and
+    ``agent_tools`` False keeps ``Create_Agent`` and ``Agentic_Router`` out
+    of the turn's tool set (task #120: with them offered, the model could
+    hand the customer the creation interview, a Review Mode agent under
+    their id, or a Plan Mode consent question as the billed answer; the
+    review of 7e7ce19bc drove it).  Two more flags are deliberate: ``draft_first``
     False, so the 0.8B draft and its classifier never answer a paid call
     (a confident ``is_create_agent`` verdict would mint an agent and hand the
     customer the creation text again; a confident ``delegate=none`` would ship
@@ -555,6 +555,11 @@ def _metered_backend_chat(prompt: str, label: str):
                 # Never the draft: see the docstring.  HEVOLVE_DRAFT_FIRST=1
                 # in the node's env still overrides this body flag.
                 'draft_first': False,
+                # Never agent work: /chat withholds Create_Agent and
+                # Agentic_Router from this turn (task #120), so the model
+                # cannot hand the customer an interview or a consent question
+                # as the billed answer.
+                'agent_tools': False,
                 # casual_conv is deliberately NOT sent (False): the casual
                 # tool set carries Shell_Command / Computer_Action.
                 # A paying customer's call is a genuine turn, never background:

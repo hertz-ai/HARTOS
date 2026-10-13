@@ -97,11 +97,13 @@ def _metered_call_through_real_chat(hie, monkeypatch, route, body):
     # counted 12 publishes and 12 llama-server requests from this file).
     monkeypatch.setattr(hie, 'publish_async', lambda *a, **k: None)
     monkeypatch.setattr(hie, '_tune_resonance_after_chat', lambda *a, **k: {})
-    seen = {'get_ans': 0, 'gather_info': 0, 'casual_conv': None, 'draft': 0}
+    seen = {'get_ans': 0, 'gather_info': 0, 'casual_conv': None, 'draft': 0,
+            'agent_tools': 'not passed'}
 
     def fake_get_ans(casual_conv, *a, **k):
         seen['get_ans'] += 1
         seen['casual_conv'] = casual_conv
+        seen['agent_tools'] = k.get('agent_tools', 'not passed')
         return ANSWER
 
     def fake_gather_info(*a, **k):
@@ -169,6 +171,20 @@ def test_a_paid_call_never_consults_the_draft(hie, monkeypatch, route, body, res
     assert sent['json'].get('draft_first') is False
     assert seen['draft'] == 0, 'the draft classifier was consulted for a paid call'
     assert sent['chat_status'] == 200, sent['chat_json']
+    assert r.get_json()[resp_key] == ANSWER
+
+
+@pytest.mark.parametrize('route,body,resp_key', ROUTES)
+def test_a_paid_call_is_offered_no_agent_work_tools(hie, monkeypatch, route, body, resp_key):
+    """Task #120: the default tool set carries Create_Agent and Agentic_Router,
+    and when the model picked one the customer got the creation interview, a
+    Review Mode agent under their id, or a Plan Mode consent question the API
+    cannot answer, as the billed reply (the review of 7e7ce19bc drove it).
+    The self-POST says agent_tools False and /chat hands that to get_ans, so
+    those two tools are never offered to a paid turn."""
+    r, sent, seen = _metered_call_through_real_chat(hie, monkeypatch, route, body)
+    assert sent['json'].get('agent_tools') is False, sent['json']
+    assert seen['agent_tools'] is False, seen
     assert r.get_json()[resp_key] == ANSWER
 
 

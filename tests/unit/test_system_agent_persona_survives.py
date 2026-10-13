@@ -76,13 +76,15 @@ def _drive(hie, monkeypatch, body, answer=None):
     draft.dispatch_draft_first.return_value = {'response': ''}  # draft did not answer
     real_get_ans = hie.get_ans
 
-    def spy_get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang):
+    def spy_get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang,
+                    **kw):
         seen['custom_prompt'] = custom_prompt
         seen['casual_conv'] = casual_conv
         if answer is not None:
             return answer()
         return real_get_ans(casual_conv, req_tool, user_id=user_id, query=query,
-                            custom_prompt=custom_prompt, preferred_lang=preferred_lang)
+                            custom_prompt=custom_prompt, preferred_lang=preferred_lang,
+                            **kw)
 
     def record_reply(*_a, **kw):
         seen['reply'] = kw

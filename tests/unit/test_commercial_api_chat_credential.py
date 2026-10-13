@@ -94,6 +94,9 @@ def test_metered_chat_self_post_carries_daemon_credential(
     # No agent: a made-up agent id sent every customer into CREATE mode
     # (tests/unit/test_metered_chat_is_a_conversation.py).
     assert 'prompt_id' in captured['json'] and captured['json']['prompt_id'] is None
+    # No agent work either: Create_Agent and Agentic_Router are kept out of
+    # a paid turn (task #120, tests/unit/test_metered_chat_is_a_conversation.py).
+    assert captured['json'].get('agent_tools') is False
     assert r.get_json()[resp_key] == 'the answer'
 
 

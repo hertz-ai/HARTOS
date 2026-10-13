@@ -3028,6 +3028,22 @@ _CREATE_AGENT_TOOL_DESCRIPTION = (
     "input so the downstream pipeline runs in autonomous mode."
 )
 
+#: The two tools that turn a conversation into agent WORK: Create_Agent (an
+#: interview, or an autonomous build saved under the caller's id) and
+#: Agentic_Router (a Plan Mode consent question).  Both get_tools branches
+#: offer them to a person; a metered Hive API call must not get them, since
+#: its caller is a program that can answer none of those and the tool's
+#: output would be the billed reply (task #120; the review of 7e7ce19bc
+#: drove it).  The self-POST sends ``agent_tools`` False and
+#: _without_agent_work_tools() is the ONE filter both branches apply.
+_AGENT_WORK_TOOL_NAMES = frozenset({'Create_Agent', 'Agentic_Router'})
+
+
+def _without_agent_work_tools(tools):
+    """``tools`` minus the agent-work pair (_AGENT_WORK_TOOL_NAMES); every
+    other tool keeps its place.  Objects without a ``name`` are kept."""
+    return [t for t in tools if getattr(t, 'name', None) not in _AGENT_WORK_TOOL_NAMES]
+
 
 def _handle_create_agent_tool(input_text):
     """Tool handler: LLM decided user wants to create an agent.
@@ -5363,7 +5379,10 @@ def _warmup_tool_registries_in_background():
             "tool-registry-warmup spawn skipped: %s", _w_err)
 
 
-def get_tools(req_tool, is_first: bool = False):
+def get_tools(req_tool, is_first: bool = False, agent_tools: bool = True):
+    """The tool set for a turn.  ``agent_tools`` False withholds the
+    agent-work pair (_AGENT_WORK_TOOL_NAMES) on either branch; the metered
+    Hive API asks for that (task #120).  Nothing is added by asking."""
 
     if is_first:
         # ── Timing instrumentation (#185) ─────────────────────────────
@@ -5387,7 +5406,9 @@ def get_tools(req_tool, is_first: bool = False):
         try:
             _uid = thread_local_data.get_user_id()
             _pid = thread_local_data.get_prompt_id()
-            _cache_key = f"{_uid}:{_pid}"
+            # The flag is part of the key: a set built without the agent-work
+            # pair must never be served to a turn that may use it, or back.
+            _cache_key = f"{_uid}:{_pid}:{'all' if agent_tools else 'no-agent-work'}"
         except Exception:
             _cache_key = None
         if _cache_key and _cache_key in _FIRST_TOOLS_CACHE:
@@ -5809,6 +5830,8 @@ def get_tools(req_tool, is_first: bool = False):
             pass  # Non-blocking — memory tools are optional
 
         tools += tool
+        if not agent_tools:
+            tools = _without_agent_work_tools(tools)
 
         # Provider gateway tools (Cloud_LLM, Generate_Image, etc.).
         # Moved into the heavy-tools group (loaded eagerly at boot, non-
@@ -6056,6 +6079,8 @@ def get_tools(req_tool, is_first: bool = False):
                 final_tool.append(new_tool)
 
         tools += final_tool
+        if not agent_tools:
+            tools = _without_agent_work_tools(tools)
 
         # Wrap all tool functions with logging
         for t in tools:
@@ -7955,7 +7980,8 @@ from core.llm_outbound_logger import with_source as _with_source
 
 # main function
 @_with_source('langchain.chat')
-def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang):
+def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang,
+            agent_tools=True):
     start_time = time.time()
     _stage_req_id = str(thread_local_data.get_request_id() or '')
     publish_chat_stage('loading_context', user_id=str(user_id), request_id=_stage_req_id)
@@ -8000,14 +8026,14 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     if casual_conv:
         # Minimal first-pass tools — enough for the LLM to help with common
         # tasks (calculator, history, image) without loading the full registry.
-        tools = get_tools(req_tool=req_tool, is_first=True)
+        tools = get_tools(req_tool=req_tool, is_first=True, agent_tools=agent_tools)
         app.logger.info("get_tools loaded (is_first=True, casual_conv=True) %s seconds",
                         time.time() - tools_start_time)
     else:
         # Exhaustive intent-based tool set — full registry scan based on
         # detected intent. This is the heavy path (~2.5s) but gives the LLM
         # access to every tool for complex/agentic requests.
-        tools = get_tools(req_tool=req_tool, is_first=False)
+        tools = get_tools(req_tool=req_tool, is_first=False, agent_tools=agent_tools)
         app.logger.info("get_tools loaded (is_first=False, casual_conv=False) %s seconds",
                         time.time() - tools_start_time)
 
@@ -9973,6 +9999,14 @@ def chat():
     # downstream foreground/yield + log correlation) is never silently empty.
     request_id = data.get('request_id') or request.values.get('request_id') or None
     req_tool = data.get('tools', None)
+    # agent_tools False withholds Create_Agent and Agentic_Router from this
+    # turn (get_tools, _AGENT_WORK_TOOL_NAMES).  The metered Hive API's
+    # self-POST sends it (task #120): its caller is a program that cannot
+    # answer an agent interview or a Plan Mode consent question, and the
+    # tool's output was the billed reply.  Anyone may ask for fewer tools and
+    # nobody gets more, so the field needs no credential; absent, every
+    # person's turn keeps both.
+    agent_tools = data.get('agent_tools', True) not in (False, 0, '0', 'false', 'False')
     file_id = data.get('file_id', None)
     prompt_id = data.get('prompt_id', None)
 
@@ -11248,7 +11282,8 @@ def chat():
         "the time taken before get ans in main api is %s seconds", time.time() - start_time)
     ans_start_time = time.time()
     ans = get_ans(casual_conv, req_tool, user_id=user_id,
-                  query=prompt, custom_prompt=custom_prompt, preferred_lang=preferred_lang)
+                  query=prompt, custom_prompt=custom_prompt, preferred_lang=preferred_lang,
+                  agent_tools=agent_tools)
     app.logger.info("the time taken by get ans in main api is %s seconds",
                     time.time() - ans_start_time)
 
