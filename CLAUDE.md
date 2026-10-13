@@ -542,25 +542,59 @@ passed while proving nothing about behaviour.
 
 ### Gate 6 — cx_Freeze Bundle Accounting (BLOCKING for new modules)
 
-If the change adds a new `.py` file under `core/`, `integrations/`,
-`security/` or `hartos/` (the HARTOS packages Nunba ships):
+Nunba's three freeze scripts (`Nunba-HART-Companion/scripts/
+setup_freeze_{nunba,linux,mac}.py`) copy `core/`, `integrations/`,
+`security/` and `hartos/` whole into the bundle root through
+`include_files` (`_hartos_packages`).  What a new `.py` file needs
+depends on which of the four it lands in:
 
-1. Do NOT add it to `packages[]` in any Nunba `setup_freeze_*.py`.
-   Each of those scripts copies the four packages whole via
-   `include_files` (`_hartos_packages`), and the pip install of HARTOS
-   into python-embed carries them too.  A HARTOS module in `packages[]`
-   makes cx_Freeze build a partial `lib/<pkg>/` that shadows the full
-   copy; Nunba's `tests/test_freeze_packages_complete.py` refuses one in
-   `setup_freeze_nunba.py` (`test_setup_freeze_does_not_pull_hartos_into_packages`).
-   `packages[]` is for Nunba's own modules and third-party packages
-   the tracer misses.
-2. Confirm `__init__.py` exists in every new package dir: `setup.py`
-   collects packages with `find_packages`, which skips a dir without
-   one, and implicit namespace packages break under cx_Freeze.  Non-`.py`
-   files reach the pip install only if they match `package_data`.
-3. Verify no name collision with HARTOS's own package tree — Nunba
-   must NOT have its own `core/`, `integrations/`, `security/`, or
-   `models/` directory with the same name.
+1. **`core/`, `integrations/`, `security/`: nothing in `packages[]`.**
+   The Windows script keeps them out of cx_Freeze's tracing
+   (`excludes[]`), so no partial `lib/<pkg>/` shadows the root copy.
+   Nunba's `tests/test_freeze_packages_complete.py`
+   (`test_setup_freeze_does_not_pull_hartos_into_packages`) fails if
+   `setup_freeze_nunba.py` `packages[]` names any of the three (it
+   also refuses `agent_ledger` and `hevolve_database`).  The Windows
+   build also pip-installs HARTOS into the bundled python-embed; the
+   Linux and macOS scripts do not.
+2. **`hartos/`: `includes[]` when the tracer cannot reach it.**
+   `hartos` is NOT in `excludes[]`, so cx_Freeze also builds a traced
+   `lib/hartos/` that sits ahead of the complete root copy on
+   `sys.path`.  A module the tracer never reaches (imported only from
+   untraced code, such as Nunba's `main.py`, which ships as source, or
+   via `importlib`) is missing from it and unreachable at runtime.  Add
+   it as `"hartos.<name>"` to `includes[]` in `setup_freeze_nunba.py`,
+   next to `hartos.hartos_bootstrap`.  That script's post-build gate
+   exits 1 on any root `hartos/*.py` absent from `lib/hartos/`
+   ("lib/hartos SHADOWS ..."), unless it is a dev-only module listed
+   in `_HARTOS_LIB_EXEMPT`.
+3. **`__init__.py` in every new package dir** (memory
+   `feedback_frozen_build_pitfalls.md` Rule 3).  Non-`.py` files reach
+   python-embed only if they match `package_data` in `setup.py` /
+   `pyproject.toml`; the root copy takes the whole directory.
+4. **No top-level name shared with Nunba.**  Nunba must NOT have its
+   own `core/`, `integrations/`, `security/` or `hartos/` (it has
+   none).  HARTOS must NOT add a top-level package named after one of
+   Nunba's, e.g. `desktop/` or `models/`: Nunba owns both, and HARTOS
+   has neither (its former `desktop/` shadowed Nunba's).
+
+Known gaps, not fixed yet:
+- `setup.py` and `pyproject.toml` include `"hartos"`, not
+  `"hartos.*"`, so a future `hartos/<sub>/` package is left out of the
+  pip install, and the post-build gate lists only top-level
+  `hartos/*.py`.
+- `package_data` (yaml, yml, json, txt, md, js, svg, css) misses
+  `MaterialSymbolsRounded.woff2` and `hevolve-logo.png` (served by
+  `liquid_ui_service`), the aider `.scm` queries (read by
+  `repomap.py`) and `aider_core/LICENSE`.
+- Linux: `excludes[]` leaves `core`, `integrations` and `security`
+  traceable (it names only six `integrations.agent_engine` modules),
+  no `hartos.*` in `includes[]`, no post-build gate.  macOS:
+  `_optional_packages` adds `core`, `security`, `integrations`, five
+  `integrations.*` and `agent_ledger` to `packages[]` whenever they
+  are importable, and there is no `includes[]` or gate.
+  Nunba's guard test reads only the literal `packages[]` list in
+  `setup_freeze_nunba.py`, so it sees none of this.
 
 Skipping Gate 6 = `ModuleNotFoundError` at the installed .exe's
 first boot.  Ask the user; don't assume the module will be picked up.

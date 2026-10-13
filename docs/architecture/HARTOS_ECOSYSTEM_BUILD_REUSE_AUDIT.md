@@ -28,7 +28,8 @@ FOD-hash failure, not a cycle.
    (hevolveai / Hevolve_Database / mobile) reached only over HTTP/WAMP — **never a nix
    buildInput** (would drag torch/transformers/CUDA into the OS closure).
 5. **Route, never reinvent + Gate-6.** Every new module registers INTO `liquid_ui_service`
-   (never inlined) AND into `setup_freeze_nunba.py packages[]` + the Flask static route, or
+   (never inlined) AND clears CLAUDE.md Gate 6 (a HARTOS module never goes in
+   `setup_freeze_nunba.py packages[]`) + the Flask static route, or
    it 404s / ModuleNotFoundErrors in the frozen Nunba `.exe` (invisible in dev). Inference,
    download, cache, IPC, art all have canonical homes — extend them. The concurrent session
    owns `core/shard_runtime`.

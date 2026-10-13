@@ -23,12 +23,11 @@ Delete an entry when the change that closes it lands.
 
 ### Needs another repository (cannot be done from HARTOS)
 
-1. **Nunba freeze list (CLAUDE.md Gate 6).**  Add the new modules to
-   `Nunba-HART-Companion/scripts/setup_freeze_nunba.py` `packages[]`:
-   `integrations.commerce` (`__init__`, `approvals`, `bindings`,
-   `commerce_api`, `commerce_tools`, `drafts`, `mcgroce_client`) and
-   `integrations.ap2.ap2_mandate`.  Without it the installed Nunba build hits
-   `ModuleNotFoundError` the first time a commerce or AP2-mandate import runs.
+1. **Nunba freeze list (CLAUDE.md Gate 6): closed, nothing to add.**
+   `integrations.commerce` and `integrations.ap2.ap2_mandate` ship with the
+   whole `integrations/` tree, and HARTOS modules never go in Nunba's
+   `packages[]` (see CLAUDE.md Gate 6).  Nunba's `setup_freeze_nunba.py`
+   records the same beside `packages[]`.
 2. **Possible duplicate card in bundled Nunba.**  `push_agent_ui` sends a
    card on the shell leg (`agent.ui.update`, which also reaches SSE) AND on
    the per-user leg (`chat.social`, SSE event `chat.social`).  Whether
