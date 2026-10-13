@@ -59,12 +59,20 @@ def lanes():
 
 def _chat(hie, monkeypatch, body, headers):
     """POST ``body`` to the real /chat.  Returns 'registered' when the turn
-    got past the lane registration, else the HTTP status it was refused with."""
+    got past the lane registration, else the HTTP status it was refused with.
+
+    Two stop points, both after the registration: an agent-bound turn asks
+    for the speculative dispatcher; an agent-less turn with the draft off
+    (the metered self-POST since the review of e0abe7c34 sends prompt_id
+    None and draft_first False) reaches get_ans instead.  Without the second
+    stop that turn ran to the end of /chat and published to the desktop's
+    bus from a unit test."""
     def stop(*_a, **_k):
         raise _Stop()
     monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
     monkeypatch.setattr(hie, '_persist_language', lambda *a, **k: None)
     monkeypatch.setattr(hie, '_cleanup_stale_agents', lambda: None)
+    monkeypatch.setattr(hie, 'get_ans', stop)
     body = dict(body, speculative=True)
     body.setdefault('prompt_id', '7')
     with patch('integrations.agent_engine.speculative_dispatcher.get_speculative_dispatcher',

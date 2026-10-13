@@ -487,8 +487,15 @@ def _metered_backend_chat(prompt: str, label: str):
     Returns ``(ok, text, status_code)``.  ``label`` names the endpoint in
     this function's log lines; it is NOT an agent.
 
-    The customer's call is a conversation with no agent (``prompt_id``
-    None, the casual companion session), never an agent creation.  It
+    The customer's call is an agent-less conversation turn (``prompt_id``
+    None), never an agent creation.  Two flags are deliberate: ``draft_first``
+    False, so the 0.8B draft and its classifier never answer a paid call
+    (a confident ``is_create_agent`` verdict would mint an agent and hand the
+    customer the creation text again; a confident ``delegate=none`` would ship
+    the draft as the paid answer), and ``casual_conv`` left False, so the
+    turn runs the default tool set, not the casual one that carries
+    ``Shell_Command`` and ``Computer_Action`` (a self-issued free key must
+    never reach a shell on the serving node).  It
     used to send ``prompt_id`` 'api_intelligence' / 'api_analyze': no
     such prompt file exists on any node, so /chat's ladder logged 'GATHER
     JSON doesnot EXISTS', set create_agent and ran gather_info turn 1/12;
@@ -535,11 +542,16 @@ def _metered_backend_chat(prompt: str, label: str):
             {
                 'user_id': g.api_key['user_id'],
                 # No agent: the key is present (the route 400s without it)
-                # and None is the casual companion session.  See the
+                # and None is an agent-less conversation turn.  See the
                 # docstring for what a made-up agent id did to customers.
                 'prompt_id': None,
                 'prompt': prompt,
                 'create_agent': False,
+                # Never the draft: see the docstring.  HEVOLVE_DRAFT_FIRST=1
+                # in the node's env still overrides this body flag.
+                'draft_first': False,
+                # casual_conv is deliberately NOT sent (False): the casual
+                # tool set carries Shell_Command / Computer_Action.
                 # A paying customer's call is a genuine turn, never background:
                 # a request id of its own (unique per call, so two calls in the
                 # same second cannot share a lane entry) makes /chat and the
