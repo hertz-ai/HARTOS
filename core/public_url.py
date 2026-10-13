@@ -66,14 +66,17 @@ def is_public_host(host) -> bool:
     """Can the internet reach ``host``?
 
     ``host`` may carry a port, IPv6 brackets or a trailing dot; they are
-    read off first.  False for a loopback, private, link-local, reserved or
-    unspecified literal (also in the shorthand spellings the socket layer
-    accepts, '127.1' and '0x7f.1'), for 'localhost', for a bare name without
-    a dot (a LAN machine's name) and for a name under
-    UNROUTABLE_NAME_SUFFIXES; True for a global address or any other dotted
-    name.  An explicit ALLOWED_HOSTS entry can still be private (central's
-    list carries its docker bridge address), so trust and reachability are
-    two questions.  No DNS is asked.
+    read off first, and malformed brackets are no host.  False for a
+    loopback, private, link-local, reserved, multicast or unspecified
+    literal (also in the shorthand spellings the socket layer accepts,
+    '127.1' and '0x7f.1'), for 'localhost', for a bare name without a dot
+    (a LAN machine's name), for a name whose last label is all digits (never
+    a public TLD, RFC 1123 2.1: '256.1', '1.2.3.4.5' and the overflow
+    spellings Windows' inet_addr rejects where glibc takes them) and for a
+    name under UNROUTABLE_NAME_SUFFIXES; True for a global unicast address
+    or any other dotted name.  An explicit ALLOWED_HOSTS entry can still be
+    private (central's list carries its docker bridge address), so trust
+    and reachability are two questions.  No DNS is asked.
     """
     raw = str(host or '').strip().lower()
     if not raw:
@@ -83,24 +86,36 @@ def is_public_host(host) -> bool:
         # '2606:4700:4700::1111' as host '2606' with a port.
         h = raw
     else:
-        h = (urlparse('//' + raw).hostname or '').rstrip('.')
+        try:
+            h = (urlparse('//' + raw).hostname or '').rstrip('.')
+        except ValueError:
+            # '[1.1.1.1]', '[]', '[::1' (the review of 9e154b956 measured
+            # the raise reaching a direct caller).
+            return False
     if not h or h in LOOPBACK_HOSTS:
         return False
+    ip = _ip_literal(h)
+    if ip is not None:
+        return ip.is_global and not ip.is_multicast
+    labels = h.split('.')
+    if len(labels) < 2 or labels[-1].isdigit():
+        return False
+    return not any('.'.join(labels[i:]) in UNROUTABLE_NAME_SUFFIXES
+                   for i in range(len(labels)))
+
+
+def _ip_literal(h: str):
+    """The address ``h`` names: by ipaddress, else by the socket layer,
+    which also accepts the shorthand and hex IPv4 spellings ('127.1',
+    '0x7f.1') ipaddress refuses; None when ``h`` names no address."""
     try:
-        return ipaddress.ip_address(h).is_global
+        return ipaddress.ip_address(h)
     except ValueError:
         pass
     try:
-        # inet_aton accepts the shorthand and hex IPv4 spellings
-        # ipaddress refuses; what they name decides.
-        return ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(h))).is_global
+        return ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(h)))
     except (OSError, ValueError):
-        pass
-    if '.' not in h:
-        return False
-    labels = h.split('.')
-    return not any('.'.join(labels[i:]) in UNROUTABLE_NAME_SUFFIXES
-                   for i in range(len(labels)))
+        return None
 
 
 def configured_public_url() -> str:
@@ -115,11 +130,19 @@ def trusted_request_base() -> str:
         from flask import has_request_context, request
         if not has_request_context():
             return ''
+        raw_host = request.host or ''
+        if '@' in raw_host:
+            # A Host header is never a URL with credentials.  urlparse
+            # reads the part after the '@' as the host, so the trusted
+            # name could be the tail of 'attacker.example@<ours>' and the
+            # request root carried the userinfo into a gateway URL (the
+            # review of 9e154b956 measured it under ALLOWED_HOSTS='*,<host>').
+            return ''
         # urlparse's hostname drops the port and the brackets of an IPv6
         # literal ('[::1]:6777' and '[::1]' both give '::1') and lower-cases
         # the name; an rsplit on ':' got '[:' for a bracketed IPv6 host
         # without a port.
-        host = (urlparse('//' + (request.host or '')).hostname or '').lower()
+        host = (urlparse('//' + raw_host).hostname or '').lower()
         root = request.url_root.rstrip('/')
     except Exception:
         return ''

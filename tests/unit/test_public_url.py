@@ -83,11 +83,34 @@ def test_allowed_hosts_is_the_operators_list_with_the_wildcard_kept(monkeypatch)
     ('host.docker.internal', False), ('nas.home.arpa', False),
     ('box.localdomain', False), ('shop.example', False), ('api.test', False),
     ('x.invalid', False), ('abc.onion', False),
+    # Malformed brackets are no host (urlparse raised ValueError to a direct
+    # caller); a label that is all digits is never a public TLD (RFC 1123
+    # 2.1), which also closes the spellings neither parser accepts on one
+    # platform ('255.16777215' is rejected by Windows' inet_addr and taken
+    # by glibc); multicast is not a host anyone posts to (the review of
+    # 9e154b956 measured each of these).
+    ('[10.0.0.5]:80', False), ('[1.1.1.1]', False), ('[]', False), ('[::1', False),
+    ('08.1', False), ('256.1', False), ('1.2.3.4.5', False), ('255.16777215', False),
+    ('224.0.0.1', False), ('ff02::1', False), ('[ff02::1]:6777', False),
     ('1.1.1.1', True), ('2606:4700:4700::1111', True), ('1.1.1.1:443', True),
+    ('[2606:4700:4700::1111]:443', True),
     ('shop.example.com', True), ('API.Example.Com', True), ('api.hevolve.ai.', True),
+    ('shop1.example.com', True), ('1shop.example.com', True),
 ])
 def test_is_public_host(host, public):
     assert is_public_host(host) is bool(public)
+
+
+def test_a_host_carrying_userinfo_is_not_trusted():
+    """'attacker.example@shop.example.com' names the trusted host after the
+    '@', so the match passed and the request root carried the userinfo
+    into a gateway URL (the review of 9e154b956 measured it under central's
+    ALLOWED_HOSTS shape).  A Host header is never a URL with credentials."""
+    assert _in_request('attacker.example@shop.example.com',
+                       {'ALLOWED_HOSTS': 'shop.example.com'}) == ''
+    assert _in_request('attacker.example@shop.example.com',
+                       {'ALLOWED_HOSTS': '*'}, internet_base_url) == ''
+    assert _in_request('shop.example.com', {'ALLOWED_HOSTS': 'shop.example.com'}) == 'http://shop.example.com'
 
 
 def test_internet_base_url_prefers_the_configured_url(monkeypatch):
