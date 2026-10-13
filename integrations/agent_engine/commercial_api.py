@@ -584,8 +584,9 @@ def _metered_backend_chat(prompt: str, label: str):
         return False, '', 502
 
     # A /chat answer is read the way the call path reads it
-    # (integrations.agentic_router.dispatch_to_agent, the one production
-    # caller of this pair): chat_turn_result parses the body, and a 200
+    # (integrations.agentic_router._call_turn_reply, reached through
+    # dispatch_to_agent; the one production caller of this pair):
+    # chat_turn_result parses the body, and a 200
     # whose body is not /chat's JSON object (a proxy's or server's error
     # page) becomes an 'error' body instead of raising out of this function;
     # chat_turn_answer is the reply when the turn produced one, else None.
@@ -597,9 +598,17 @@ def _metered_backend_chat(prompt: str, label: str):
     # (task #110).  The same reader also refuses an empty reply, 'success'
     # False, an 'error', a 'loading' notice and a route speaking for itself
     # (the review of 2efb73519: this used to be a narrower inline copy of
-    # that rule; the review of 10600d264 corrected whose rule it is).
+    # that rule; the review of ca3e314de corrected whose rule it is).
     from integrations.channels.chat_contract import chat_turn_answer, chat_turn_result
-    status, data = chat_turn_result(result)
+    try:
+        status, data = chat_turn_result(result)
+    except Exception as e:
+        # chat_turn_result catches ValueError only (the call path's choice);
+        # whatever else a response raises while its body is read is still
+        # "no answer" here, with its audit row, instead of a 500 and no row
+        # (the review of c8a9e0c28 measured that on a non-200).
+        logger.warning(f"Metered {label} /chat answer could not be read: {e}")
+        return False, '', 502
     if status != 200:
         # WARNING, not DEBUG: central emits nothing below WARNING after boot,
         # which is why this leg was dead silently.  Same reasoning as the
@@ -790,8 +799,13 @@ def intelligence_hivemind():
         # counted as a call, task #110); and a PeerLink envelope whose every
         # peer answered hivemind_handler's empty reply (a connected peer with
         # no core) is no thought either (the review of 2efb73519 measured
-        # that envelope billed).  hivemind_result_has_a_thought is the ONE
-        # rule, the same one the bridge's own peer count applies.
+        # that envelope billed).  Two rules live in the bridge: the peer
+        # count's (_peer_said_something: truthiness of thought/response/text,
+        # telemetry) and the billing rule read here
+        # (hivemind_result_has_a_thought: a non-blank string under thought/
+        # response/text/answer).  They differ on a blank or non-string
+        # thought (counted, not billed) and on words under 'answer' (billed,
+        # not counted); billing reads only the second.
         return _metered_backend_failure(
             '/v1/intelligence/hivemind', tokens_in, elapsed_ms, 502)
 

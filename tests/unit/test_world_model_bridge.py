@@ -1034,6 +1034,35 @@ class TestPeerLinkLearningBoundary(unittest.TestCase):
         self.assertEqual(bridge._stats['peerlink_responses_observed'], 2)
         self.assertNotIn('peerlink_responses_trained', bridge._stats)
 
+    def test_the_peer_count_keeps_its_own_rule(self):
+        """The count is telemetry and keeps the rule it was written with
+        (truthiness of thought/response/text); the metered endpoint's billing
+        rule (hivemind_result_has_a_thought: a non-blank string, 'answer'
+        included) is a different one.  Both directions of the difference are
+        pinned here, so neither rule can be folded onto the other unnoticed
+        (the review of c8a9e0c28: nothing pinned the count)."""
+        from core.peer_link.hivemind_handler import _EMPTY_REPLY
+        from integrations.agent_engine.world_model_bridge import (
+            hivemind_result_has_a_thought)
+        peers = [
+            {'thought': ' '},                       # counted, not billed
+            {'thought': ['a', 'list']},             # counted, not billed
+            {'answer': 'the http core, relayed'},   # billed, not counted
+            dict(_EMPTY_REPLY),                     # neither
+            {'response': 'a real reply'},           # both
+        ]
+        bridge = _make_bridge()
+        manager = MagicMock()
+        manager.collect.return_value = list(peers)
+        with patch('core.peer_link.link_manager.get_link_manager',
+                   return_value=manager), \
+             patch.object(bridge, '_check_cct_access', return_value=True):
+            result = bridge.query_hivemind('what is the hive?')
+        self.assertEqual(bridge._stats['peerlink_responses_observed'], 3)
+        self.assertEqual(result['peer_count'], 5)
+        billed = [hivemind_result_has_a_thought({'thoughts': [p]}) for p in peers]
+        self.assertEqual(billed, [False, False, True, False, True])
+
 
 class TestGetLearningFeedback(unittest.TestCase):
     """FT: get_learning_feedback in-process and HTTP paths."""

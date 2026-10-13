@@ -18,7 +18,7 @@ for the capability, the filter refused, every leg failed; the metered call
 names no user, so a person's hive opt-out never applies), and for generate the
 media agent says ``status: unavailable`` or ``status: error``: none of those is
 work either.  The HTTP core's own 200 keeps its words under ``answer`` (the
-review of 10600d264 measured it refused as no thought), so that leg is driven
+review of ca3e314de measured it refused as no thought), so that leg is driven
 through the real bridge below.
 
 Each test drives the real blueprint with only the key gate stubbed (the
@@ -209,15 +209,20 @@ HTTP_CORE_BODY = {
 
 def test_the_hivemind_rule_is_the_bridges_own():
     """The endpoint reads the bridge's own predicate, driven here on the
-    shapes query_hivemind returns.  The bridge's peer count keeps its older,
-    looser rule (telemetry, _peer_said_something); billing is the stricter
-    one: a non-blank string under a thought key."""
+    shapes query_hivemind returns.  The bridge's peer count keeps its own
+    rule (telemetry, _peer_said_something: truthiness of thought/response/
+    text, pinned in tests/unit/test_world_model_bridge.py); billing is a
+    DIFFERENT rule, not a stricter one: a non-blank string under a thought
+    key, and 'answer' is a thought key there."""
     from integrations.agent_engine.world_model_bridge import (
         hivemind_result_has_a_thought as has_thought)
     assert not has_thought(None)
     assert not has_thought({})
     assert not has_thought({'thought': ''})
     assert not has_thought({'thought': ' '})
+    assert not has_thought({'thought': 0})
+    assert not has_thought({'thought': ['x']})
+    assert has_thought({'thought': None, 'answer': 'x'})
     assert not has_thought({'thoughts': [_empty_peer_reply()], 'source': 'peerlink',
                             'peer_count': 1})
     assert not has_thought({'thoughts': [], 'source': 'peerlink', 'peer_count': 0})
@@ -260,9 +265,10 @@ def _hivemind_through_the_http_core(app_client, core_body):
 
 def test_the_http_cores_answer_is_a_call(app_client, passing_auth):
     """On a node whose core is reached over HTTP (central's topology once a
-    core is installed), the core's real 200 is the answer and is billed; the
-    second round answered it 503 and dropped it (the review of 10600d264
-    drove this leg on the parent and at HEAD)."""
+    core is installed) and no peer answered (task #134: one connected peer
+    pre-empts this leg), the core's real 200 is the answer and is billed;
+    the second round answered it 503 and dropped it (the review of
+    ca3e314de drove this leg on the parent and at HEAD)."""
     r, _ = _hivemind_through_the_http_core(app_client, HTTP_CORE_BODY)
     _assert_billed_as_a_call(r, passing_auth)
     assert r.get_json()['result'] == HTTP_CORE_BODY
@@ -313,6 +319,24 @@ def test_a_200_that_is_not_chats_json_is_not_billed(
         r = app_client.post(route, json=body, headers={'X-API-Key': 'k'})
     _assert_not_billed(r, passing_auth)
     assert r.get_json().get(resp_key) is None
+
+
+@pytest.mark.parametrize('route,body,resp_key', CHAT_ROUTES)
+def test_a_non_200_whose_body_cannot_be_read_is_still_a_logged_failure(
+        app_client, passing_auth, route, body, resp_key):
+    """chat_turn_result catches ValueError only; a response whose body read
+    raises anything else must still end as an unbilled failure WITH its
+    audit row, not a 500 and no row (the review of c8a9e0c28 measured the
+    500 on a non-200)."""
+    page = MagicMock()
+    page.status_code = 502
+    page.json.side_effect = TypeError('body is not readable')
+    page.text = 'Bad Gateway'
+    with patch('core.http_pool.pooled_post', side_effect=lambda url, **kw: page), \
+            patch('integrations.agent_engine.dispatch._internal_auth_headers',
+                  return_value=MINTED):
+        r = app_client.post(route, json=body, headers={'X-API-Key': 'k'})
+    _assert_not_billed(r, passing_auth)
 
 
 # --------------------------------------------------------------------------

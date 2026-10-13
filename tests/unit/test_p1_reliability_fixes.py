@@ -44,6 +44,32 @@ class HiveMindHandlerTest(unittest.TestCase):
         self.assertIsInstance(result, dict)
         self.assertIn('thought', result)
 
+    def test_query_relays_the_words_of_the_local_result(self):
+        """The reply's thought is read with the bridge's own key list
+        (hivemind_thought_text): a peer whose core is reached over HTTP has
+        its words under 'answer', and used to relay '' (the review of
+        c8a9e0c28 measured it); a plain 'thought' relays as before; an
+        answer of None relays ''."""
+        from core.peer_link.hivemind_handler import handle_hivemind_message
+        core_body = {'status': 'ok', 'query': 'q',
+                     'answer': 'The hive is a network of agents.',
+                     'reasoning_chain': [], 'contributing_agents': ['inst-1'],
+                     'confidence': 0.9}
+        for local_result, relayed in (
+                (core_body, 'The hive is a network of agents.'),
+                (dict(core_body, answer=None), ''),
+                ({'thought': 'plain'}, 'plain'),
+                ({'thoughts': [{'thought': 'a further peer'}],
+                  'source': 'peerlink', 'peer_count': 1}, '')):
+            bridge = MagicMock()
+            bridge.query_hivemind.return_value = local_result
+            with patch('integrations.agent_engine.world_model_bridge.'
+                       'get_world_model_bridge', return_value=bridge):
+                reply = handle_hivemind_message(
+                    {'type': 'query', 'query': 'q'}, 'peer_x')
+            self.assertEqual(reply.get('type'), 'reply', reply)
+            self.assertEqual(reply.get('thought'), relayed, local_result)
+
     def test_deliver_missing_target_returns_ack_invalid(self):
         from core.peer_link.hivemind_handler import handle_hivemind_message
         result = handle_hivemind_message(

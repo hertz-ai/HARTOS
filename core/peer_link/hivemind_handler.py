@@ -85,7 +85,7 @@ def _handle_query(data: dict, sender_peer_id: str) -> Optional[dict]:
     """
     try:
         from integrations.agent_engine.world_model_bridge import (
-            get_world_model_bridge,
+            get_world_model_bridge, hivemind_thought_text,
         )
     except ImportError:
         # HTTP-only central tier — hevolveai not loaded, nothing to think.
@@ -117,17 +117,16 @@ def _handle_query(data: dict, sender_peer_id: str) -> Optional[dict]:
     if not result:
         return _EMPTY_REPLY
 
-    # Shape matches what world_model_bridge.query_hivemind reads back
-    # (line 954–958 of world_model_bridge.py):
-    #   peer_resp.get('thought') or peer_resp.get('response')
-    thought = (
-        (result.get('thought') if isinstance(result, dict) else None)
-        or (result.get('response') if isinstance(result, dict) else None)
-        or ''
-    )
+    # The words of the local result, through the bridge's ONE reader
+    # (hivemind_thought_text: 'thought', 'response', 'text' and the HTTP
+    # core's 'answer'), so a peer whose own core is reached over HTTP relays
+    # the core's answer instead of an empty thought (this read only 'thought'
+    # and 'response'; the review of c8a9e0c28 measured the empty reply).  A
+    # PeerLink envelope ({'thoughts': [...]}) has no words of its own and
+    # relays '' as before.
     return {
         'type': 'reply',
-        'thought': thought,
+        'thought': hivemind_thought_text(result),
         'peer_id': sender_peer_id,
     }
 
