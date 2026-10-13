@@ -18,14 +18,15 @@ What is read (ffmpeg 7.1 wording; older wording where noted):
   SDR/HLG base layer, so the clip is refused (``dolby_vision_p5``); other
   profiles decode their base layer and keep its transfer;
 * whether any audio stream exists;
-* the container's ``creation_time`` (UTC), else Apple's
-  ``com.apple.quicktime.creationdate`` (local time with an offset), else the
-  video stream's ``creation_time``, as epoch seconds.  Plausibility is
-  judged later by contracts.resolve_capture_order (A1 capture-order
-  fallback), not here.
+* Apple's ``com.apple.quicktime.creationdate`` (local time with an offset;
+  the capture time, kept when an iPhone clip is trimmed or exported), else
+  the container's ``creation_time`` (UTC; on an edited clip that is the
+  export time), else the video stream's ``creation_time``, as epoch
+  seconds.  Plausibility is judged later by
+  contracts.resolve_capture_order (A1 capture-order fallback), not here.
 
 ``hfr`` is ``fps_avg >= contracts.HFR_MIN_FPS``.  There is no ``is_vfr``:
-the render always forces 30 fps CFR (plan finding 31).
+the render always forces 30 fps CFR.
 """
 from __future__ import annotations
 
@@ -204,7 +205,9 @@ def _duration_s(match) -> Optional[float]:
 
 
 def _creation_time(meta: Dict[str, str], video: _Stream) -> Optional[float]:
-    for value in (meta.get('creation_time'), meta.get('com.apple.quicktime.creationdate'),
+    # Apple's key first: an iPhone clip trimmed or exported later gets a new
+    # container creation_time (the export) but keeps creationdate (the capture).
+    for value in (meta.get('com.apple.quicktime.creationdate'), meta.get('creation_time'),
                   video.meta.get('creation_time')):
         if value:
             seconds = _epoch_seconds(value)

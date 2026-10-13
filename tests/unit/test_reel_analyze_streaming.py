@@ -177,6 +177,92 @@ def test_no_frames_at_all_is_unreadable():
     assert err.value.reason == 'unreadable'
 
 
+class ShotDetector:
+    """A FaceDetector stand-in whose face depends on the shot (the frame's hue)."""
+
+    def __init__(self, boxes_by_hue):
+        self.boxes_by_hue = boxes_by_hue
+        self.calls = []
+
+    def detect(self, bgr):
+        hue = float(np.median(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 0]))
+        self.calls.append(hue)
+        return self.boxes_by_hue[min(self.boxes_by_hue, key=lambda h: abs(h - hue))]
+
+
+def test_the_face_is_found_again_right_after_a_cut():
+    # Shot A for frames 0-5, a hard cut to shot B at frame 6 (not a multiple
+    # of DETECT_EVERY).  Carrying A's box over frames 6-9 would give B's
+    # candidates, their face term and segment_face the wrong face.
+    box_a, box_b = Box(0.1, 0.1, 0.3, 0.2), Box(0.5, 0.6, 0.2, 0.15)
+    hue_a, hue_b = 20, 110
+    frames = [(i / FPS, _shot_base(hue_a if i < 6 else hue_b)) for i in range(15)]
+    det = ShotDetector({hue_a: box_a, hue_b: box_b})
+    analysis = analyze_clip(_info(3.0), detector=det, frames=iter(frames))
+    assert len(analysis.segments) == 2
+    assert analysis.faces == [box_a] * 6 + [box_b] * 9
+    assert all(c.face == box_b for c in analysis.candidates if c.t_s >= 6 / FPS)
+    assert len(det.calls) == 4                       # frames 0, 5, 6 (the cut) and 10
+
+
+@pytest.mark.parametrize('duration_s, n_frames, end_s', [
+    (4.0, 10, 2.0),     # 2 s of video in a 4 s container (audio runs on): video's end
+    (2.1, 11, 2.1),     # the last frame (2.0 s) is on screen until the clip ends
+    (1.5, 10, 2.0),     # container shorter than the frames: one step past the last
+])
+def test_segments_end_where_the_video_ends(duration_s, n_frames, end_s):
+    frames = ((i / FPS, _shot_base(40)) for i in range(n_frames))
+    analysis = analyze_clip(_info(duration_s), detector=CountingDetector(None), frames=frames)
+    assert analysis.segments[-1].t1 == pytest.approx(end_s)
+    assert all(c.t_s < end_s for c in analysis.candidates)
+
+
+def test_the_frame_source_is_closed_when_the_pass_fails(monkeypatch):
+    # A decode generator left open keeps ffmpeg blocked on its stdout pipe
+    # until garbage collection or the watchdog; the pass must close it.
+    state = {'closed': False, 'served': 0}
+
+    def frames():
+        try:
+            for i in range(50):
+                state['served'] += 1
+                yield i / FPS, _shot_base(40)
+        finally:
+            state['closed'] = True
+
+    real = analyze_mod.quality_from_gray
+    calls = []
+
+    def failing_quality(gray, face):
+        calls.append(1)
+        if len(calls) == 3:
+            raise RuntimeError('analysis broke on frame 3')
+        return real(gray, face)
+
+    monkeypatch.setattr(analyze_mod, 'quality_from_gray', failing_quality)
+    source = frames()
+    with pytest.raises(RuntimeError) as err:
+        analyze_clip(_info(10.0), detector=CountingDetector(None), frames=source)
+    # The traceback (held by err) still references the pass's frame, so only
+    # an explicit close() can have run the generator's finally by now.
+    assert err.value.__traceback__ is not None
+    assert state == {'closed': True, 'served': 3}
+
+
+def test_a_still_camera_has_no_shift():
+    # cv2.phaseCorrelate multiplies its inputs by the window IN PLACE
+    # (OpenCV 4.9).  Reusing the previous frame's array after that compares
+    # a twice-windowed frame with a once-windowed one, and a still grid
+    # reads as a steady 2 px drift (false shake).
+    grid = np.full((434, 768, 3), 128, np.uint8)
+    grid[::55, :] = 255
+    grid[:, ::89] = 255
+    frames = ((i / FPS, grid.copy()) for i in range(10))
+    analysis = analyze_clip(_info(2.0, width=1919, height=1080, display_w=1919, display_h=1080),
+                            detector=CountingDetector(None), frames=frames)
+    assert np.abs(analysis.shifts).max() < 0.01, analysis.shifts.tolist()
+
+
 def test_a_failing_detector_does_not_fail_the_analysis():
     class Broken:
         def detect(self, bgr):

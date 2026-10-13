@@ -6,17 +6,30 @@ long side, upright, tone-mapped) and, frame by frame, keeps only:
 * hue x saturation histogram correlation with the previous frame, and
   between the frames either side of each frame (flash rejection), from a
   160 px copy, holding two histograms at a time;
-* the cv2.phaseCorrelate shift against the previous 160 px gray frame;
+* the cv2.phaseCorrelate shift against the previous 160 px gray frame
+  (on copies: OpenCV windows its inputs in place);
 * Laplacian sharpness inside the face box, luma and blown highlights
   (quality.quality_from_gray);
-* the face box: Haar on every DETECT_EVERY-th frame, carried in between;
+* the face box: Haar on every DETECT_EVERY-th frame and on the first frame
+  after every jump above shots.CUT_FLOOR (so a new shot never inherits the
+  last shot's face), carried in between;
 * a few JPEG candidates (q85, 768 px) per run of frames that no final
   boundary can split.
 
+Exposure is kept as the mean luma and the clipped (blown) fraction per
+frame, not luma percentiles as plan WS-1 first listed: the contract
+(ClipAnalysis) carries one ``luma`` array, and the only reader, QA's
+advisory ``shot_quality`` row, judges the mean (0.3-0.7) and the clipped
+fraction (< 2 %).
+
 So memory is about ten numbers per frame plus a bounded set of JPEGs, never
-the frames (plan finding 20); a ten-minute clip holds a few MB.  Keyframes
-for the VLM come from these candidates, already at 768 px, so nothing is
-decoded twice (finding 21).
+the frames; a ten-minute clip holds a few MB.  Keyframes for the VLM come
+from these candidates, already at 768 px, so nothing is decoded twice.
+
+The segments end where the PICTURE ends: one frame step after the last
+decoded frame, or the container duration when that comes first.  A clip
+whose audio runs on after its video (the container says 4 s, the picture
+stops at 2 s) offers no in/out points past the picture.
 
 HOW CANDIDATES STAY CORRECT WITHOUT KNOWING THE SHOTS YET.  The shot
 boundaries are only known at the end (the cut threshold needs the whole
@@ -132,6 +145,17 @@ def _jpeg(bgr: np.ndarray) -> bytes:
     return buf.tobytes()
 
 
+def _picture_end_s(last_t: float, duration_s: float, fps: float) -> float:
+    """Where the picture ends: one frame step after the last frame, or the
+    container duration when that comes first (but never before the last frame).
+
+    The container duration is the longest stream's, so on its own it can
+    run past the video (audio recorded on after the picture stopped).
+    """
+    step_end = last_t + 1.0 / fps
+    return duration_s if last_t < duration_s < step_end else step_end
+
+
 class _Detect:
     """Runs the face detector; a detector error costs that frame its face, never the pass."""
 
@@ -163,12 +187,13 @@ def analyze_clip(info: ClipInfo, *, clip_id: Optional[str] = None,
 
     Raises ClipUnsupported('unreadable') when no frame comes out, and
     whatever decode.iter_frames raises (media_bin.FFmpegFailed,
-    MediaToolMissing).
+    MediaToolMissing).  The frame iterator is closed when the pass ends,
+    also when it fails part way (closing the decode stops ffmpeg at once).
     """
     clip = clip_id or info.path
     detect = _Detect(detector if detector is not None else HaarFaceDetector())
-    source = frames if frames is not None else decode.iter_frames(info, fps=fps,
-                                                                   long_side=long_side)
+    source = iter(frames if frames is not None else decode.iter_frames(info, fps=fps,
+                                                                        long_side=long_side))
     times: List[float] = []
     corr: List[float] = []
     corr_skip: List[float] = []
@@ -183,48 +208,58 @@ def analyze_clip(info: ClipInfo, *, clip_id: Optional[str] = None,
     window: Optional[np.ndarray] = None
     box: Optional[Box] = None
 
-    for i, (t, bgr) in enumerate(source):
-        t = float(t)
-        bgr = _resized(bgr, int(long_side))
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        small = _resized(bgr, SMALL_SIDE)
+    try:
+        for i, (t, bgr) in enumerate(source):
+            t = float(t)
+            bgr = _resized(bgr, int(long_side))
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            small = _resized(bgr, SMALL_SIDE)
 
-        hist = hs_histogram(small)
-        c = hist_corr(hists[-1], hist) if hists else 1.0
-        if len(hists) == 2:
-            corr_skip[i - 1] = hist_corr(hists[0], hist)
-        hists = (hists + [hist])[-2:]
-        corr.append(c)
-        corr_skip.append(c)              # replaced when the next frame arrives
+            hist = hs_histogram(small)
+            c = hist_corr(hists[-1], hist) if hists else 1.0
+            if len(hists) == 2:
+                corr_skip[i - 1] = hist_corr(hists[0], hist)
+            hists = (hists + [hist])[-2:]
+            corr.append(c)
+            corr_skip.append(c)              # replaced when the next frame arrives
+            jump = 1.0 - c > CUT_FLOOR       # a possible cut: the shot may have changed
 
-        small_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        if prev_small is None or prev_small.shape != small_gray.shape:
-            window = cv2.createHanningWindow((small_gray.shape[1], small_gray.shape[0]),
-                                             cv2.CV_32F)
-            shifts.append((0.0, 0.0))
-        else:
-            (dx, dy), _response = cv2.phaseCorrelate(prev_small, small_gray, window)
-            shifts.append((float(dx), float(dy)))
-        prev_small = small_gray
+            small_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            if prev_small is None or prev_small.shape != small_gray.shape:
+                window = cv2.createHanningWindow((small_gray.shape[1], small_gray.shape[0]),
+                                                 cv2.CV_32F)
+                shifts.append((0.0, 0.0))
+            else:
+                # phaseCorrelate multiplies its inputs by the window IN PLACE
+                # (OpenCV 4.9), so it gets copies: prev_small must reach the
+                # next frame unwindowed, or a still camera reads as a drift.
+                (dx, dy), _response = cv2.phaseCorrelate(prev_small.copy(), small_gray.copy(),
+                                                         window)
+                shifts.append((float(dx), float(dy)))
+            prev_small = small_gray
 
-        if i % DETECT_EVERY == 0:
-            box = detect(bgr)
-        faces.append(box)
-        quality: Quality = quality_from_gray(gray, box)
-        sharp.append(quality.sharp)
-        luma.append(quality.luma)
-        clipped.append(quality.clipped)
+            if i % DETECT_EVERY == 0 or jump:
+                box = detect(bgr)
+            faces.append(box)
+            quality: Quality = quality_from_gray(gray, box)
+            sharp.append(quality.sharp)
+            luma.append(quality.luma)
+            clipped.append(quality.clipped)
 
-        if (i == 0 or 1.0 - c > CUT_FLOOR
-                or math.floor(t / SPLIT_EVERY_S) != math.floor(times[-1] / SPLIT_EVERY_S)):
-            pools.open()
-        times.append(t)
-        pools.offer((quality.score, -i),
-                    lambda: _Kept((quality.score, -i), t, _jpeg(bgr), quality, box))
+            if (i == 0 or jump
+                    or math.floor(t / SPLIT_EVERY_S) != math.floor(times[-1] / SPLIT_EVERY_S)):
+                pools.open()
+            times.append(t)
+            pools.offer((quality.score, -i),
+                        lambda: _Kept((quality.score, -i), t, _jpeg(bgr), quality, box))
+    finally:
+        close = getattr(source, 'close', None)
+        if close is not None:
+            close()
 
     if not times:
         raise ClipUnsupported(UNREADABLE, 'no frame could be decoded from %s' % (info.path,))
-    end_s = float(info.duration_s) if info.duration_s > times[-1] else times[-1] + 1.0 / fps
+    end_s = _picture_end_s(times[-1], float(info.duration_s), fps)
     shots = segment_from_corr(times, corr, corr_skip, min_len_s=MIN_SHOT_S, end_s=end_s)
     segments = split_segments(shots, SPLIT_EVERY_S, min_len_s=MIN_SHOT_S)
 

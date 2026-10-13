@@ -6,7 +6,7 @@ down):
 
 * sharpness: variance of the Laplacian INSIDE the face box when one is
   known, because portrait-mode phones blur the background on purpose; the
-  whole frame otherwise, or when the box is too small to measure;
+  whole frame otherwise, or when the box is under MIN_SHARP_BOX_PX;
 * exposure: mean luma (0..1) and the fraction of blown highlights (gray >=
   CLIP_LEVEL); crushed blacks are not counted, since black hair and dupattas
   are legitimately dark;
@@ -41,8 +41,10 @@ CLIP_LEVEL = 250
 CLIPPED_ZERO = 0.10
 #: Face area (fraction of the frame) that earns the full face term.
 FACE_AREA_FULL = 0.02
-#: A face box smaller than this (pixels, either side) is measured as the whole frame.
-MIN_FACE_PX = 24
+#: A face box narrower or shorter than this many pixels of the analysed
+#: frame is too small to measure sharpness in; the whole frame is measured.
+#: (Not face.MIN_FACE_PX, the smallest face the cascades look for.)
+MIN_SHARP_BOX_PX = 24
 #: Frames either side in the shake smoothing window (1 s at 5 fps).
 SHAKE_RADIUS = 2
 
@@ -62,7 +64,7 @@ def quality_from_gray(gray: np.ndarray, face: Optional[Box] = None) -> Quality:
         face_area = max(0.0, float(face.w) * float(face.h))
         x0, y0 = max(0, int(face.x * w)), max(0, int(face.y * h))
         x1, y1 = min(w, int((face.x + face.w) * w)), min(h, int((face.y + face.h) * h))
-        if x1 - x0 >= MIN_FACE_PX and y1 - y0 >= MIN_FACE_PX:
+        if x1 - x0 >= MIN_SHARP_BOX_PX and y1 - y0 >= MIN_SHARP_BOX_PX:
             region = gray[y0:y1, x0:x1]
     sharp = float(cv2.Laplacian(region, cv2.CV_64F).var())
     luma = float(gray.mean()) / 255.0
@@ -94,5 +96,5 @@ def shake_from_shifts(shifts) -> np.ndarray:
     return np.linalg.norm(path - smooth, axis=1)
 
 
-__all__ = ['SHARP_REF', 'CLIP_LEVEL', 'CLIPPED_ZERO', 'FACE_AREA_FULL', 'MIN_FACE_PX',
+__all__ = ['SHARP_REF', 'CLIP_LEVEL', 'CLIPPED_ZERO', 'FACE_AREA_FULL', 'MIN_SHARP_BOX_PX',
            'SHAKE_RADIUS', 'frame_quality', 'quality_from_gray', 'shake_from_shifts']

@@ -76,6 +76,25 @@ def test_keyframes_spread_over_the_whole_story():
     assert all(abs(k.t_s % 1.0 - 0.8) < 1e-6 for k in keys)
 
 
+def test_the_story_s_last_segment_always_reaches_the_vlm():
+    # A1: the reel ends on the reveal, at the END of the story.  Here the
+    # final look is one short, softer shot (99-100 s) at the end of a slice
+    # full of crisper process shots; the best-per-slice rule alone would send
+    # process frames and final_look_found would come back false.
+    a = _analysis('a', 100.0, 1.0, lambda c, t: 0.2 if t >= 99.0 else 0.9)
+    keys = pick_keyframes([a])
+    assert len(keys) == 25
+    assert (keys[-1].clip, keys[-1].segment) == ('a', 99)
+    assert pick_keyframes([a], k=1) == keys[-1:]
+    # Across clips the story's last segment is the LAST clip's last one.
+    a = _analysis('a', 60.0, 1.0, lambda c, t: 0.9)
+    b = _analysis('b', 40.0, 1.0, lambda c, t: 0.2 if t >= 39.0 else 0.9)
+    keys = pick_keyframes([a, b])
+    assert len(keys) == 25
+    assert (keys[-1].clip, keys[-1].segment) == ('b', 39)
+    assert len({(k.clip, k.segment) for k in keys}) == 25
+
+
 def test_story_order_and_one_per_segment_when_spreading():
     a = _analysis('a', 40.0, 1.0, lambda c, t: 0.5)
     b = _analysis('b', 40.0, 1.0, lambda c, t: 0.5)

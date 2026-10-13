@@ -10,6 +10,7 @@ through probe + analyze_clip.
 import numpy as np
 import pytest
 
+from core import media_bin
 from integrations.reel_studio.contracts import Segment
 from integrations.reel_studio.media.analyze import analyze_clip
 from integrations.reel_studio.media.probe import probe
@@ -145,6 +146,26 @@ def test_a_static_clip_is_one_shot(tmp_path):
     analysis = analyze_clip(probe(make_clip(tmp_path, 's.mp4', size=(320, 180), duration_s=2.0,
                                             source='color', color='teal')))
     assert len(analysis.segments) == 1
+
+
+@requires_ffmpeg
+def test_segments_stop_where_the_video_stops(tmp_path):
+    # 2 s of video muxed with 4 s of audio: the container says 4 s, but there
+    # is no picture after 2 s, so no segment may offer in/out points there.
+    path = str(tmp_path / 'short_video.mp4')
+    result = media_bin.run_ffmpeg(
+        ['-y', '-loglevel', 'error',
+         '-t', '2', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30',
+         '-t', '4', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+         '-map', '0:v', '-map', '1:a',
+         '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', path],
+        timeout_s=120)
+    assert result.returncode == 0, result.stderr[-500:]
+    info = probe(path)
+    assert info.duration_s == pytest.approx(4.0, abs=0.1)
+    analysis = analyze_clip(info)
+    assert analysis.times[-1] == pytest.approx(1.8)
+    assert analysis.segments[-1].t1 == pytest.approx(2.0, abs=1e-6)
 
 
 @requires_ffmpeg

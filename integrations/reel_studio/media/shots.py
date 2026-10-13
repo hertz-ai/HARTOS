@@ -31,14 +31,15 @@ from typing import List, Optional, Sequence
 import cv2
 import numpy as np
 
-from integrations.reel_studio.contracts import Segment
+from integrations.reel_studio.contracts import QUALITY_BAR, Segment
 
 #: 1 - corr must exceed this for a cut, however calm the clip is.
 CUT_FLOOR = 0.35
 #: Robust spread multiplier for the adaptive threshold.
 MAD_K = 6.0
-#: Shortest shot kept (QUALITY_BAR shot_rules.min_shot_s is the EDL's own rule).
-MIN_SHOT_S = 0.4
+#: Shortest shot kept: the EDL's own shortest-shot rule (QUALITY_BAR
+#: shot_rules.min_shot_s), so a found shot is never too short to place.
+MIN_SHOT_S = QUALITY_BAR['shot_rules']['min_shot_s']
 #: Long shots are cut on this absolute grid (seconds from the clip start).
 SPLIT_EVERY_S = 8.0
 #: Hue x saturation histogram bins (OpenCV hue runs 0..179).

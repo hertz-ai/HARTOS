@@ -3,11 +3,21 @@
 ``iter_frames`` decodes a clip once at 5 fps into 8-bit BGR at a 768 px long
 side, in display orientation, tone-mapping HDR after the downscale.  The
 real ffmpeg runs on lavfi clips made in tmp_path; the pure helpers
-(frame_size, tonemap_filter) are checked without it.
+(frame_size, tonemap_filter's refusals, the decode bound) are checked
+without it.
+
+Both frame dimensions are even: the tone-map chain runs zscale on the
+scaled 4:2:0 frame, and zscale refuses a size its chroma subsampling does
+not divide ("image dimensions must be divisible by subsampling factor"),
+which a free display aspect (2336x1080, a gallery crop) otherwise gives.
 """
+import random
+
 import numpy as np
 import pytest
 
+from core import media_bin
+from core.subprocess_safe import BoundedResult
 from integrations.reel_studio.contracts import ClipInfo
 from integrations.reel_studio.media import decode
 from integrations.reel_studio.media.decode import frame_size, iter_frames, tonemap_filter
@@ -30,21 +40,45 @@ def _info(dw, dh, **kw):
     (1080, 2400, (346, 768)),      # a 20:9 phone
     (320, 180, (768, 432)),        # small sources are brought to the same scale
     (2160, 3840, (432, 768)),
+    # Display shapes whose exact short side is odd or fractional: rounded to
+    # the nearest EVEN size, so 4:2:0 chroma (and zscale) can take the frame.
+    (160, 346, (356, 768)),        # exact 355.1
+    (346, 160, (768, 356)),
+    (2336, 1080, (768, 356)),      # exact 355.1
+    (2460, 1080, (768, 338)),      # exact 337.2
+    (1792, 828, (768, 354)),       # exact 354.9
+    (2532, 1170, (768, 354)),
+    (1170, 2532, (354, 768)),
 ])
 def test_frame_size_keeps_the_display_aspect_at_a_768_long_side(dw, dh, want):
     assert frame_size(_info(dw, dh)) == want
+
+
+def test_frame_size_is_always_even_and_within_a_pixel_of_the_aspect():
+    rng = random.Random(11)
+    for _ in range(500):
+        dw, dh = rng.randint(16, 4096), rng.randint(16, 4096)
+        w, h = frame_size(_info(dw, dh))
+        assert w % 2 == 0 and h % 2 == 0, (dw, dh, w, h)
+        assert max(w, h) == 768
+        scale = 768.0 / max(dw, dh)
+        assert abs(w - dw * scale) <= 1.0 + 1e-9 and abs(h - dh * scale) <= 1.0 + 1e-9
 
 
 def test_frame_size_honours_long_side():
     assert frame_size(_info(1080, 1920), long_side=160) == (90, 160)
 
 
+def test_frame_size_refuses_an_odd_long_side():
+    # An odd long side cannot be honoured with even dimensions.
+    with pytest.raises(ValueError):
+        frame_size(_info(1080, 1920), long_side=767)
+
+
 def test_tonemap_filter_per_transfer():
     assert tonemap_filter('sdr') == ''
-    hlg = tonemap_filter('hlg')
-    pq = tonemap_filter('pq')
-    assert 'tin=arib-std-b67' in hlg and 'tonemap=' in hlg
-    assert 'tin=smpte2084' in pq and 'tonemap=' in pq
+    assert tonemap_filter('hlg') and tonemap_filter('pq')
+    assert tonemap_filter('hlg') != tonemap_filter('pq')
     with pytest.raises(ValueError):
         tonemap_filter('hdr10plus')
 
@@ -54,6 +88,95 @@ def test_iter_frames_refuses_bad_arguments_before_running_ffmpeg():
         iter_frames(_info(1080, 1920), fps=0)
     with pytest.raises(ValueError):
         iter_frames(_info(1080, 1920), long_side=1)
+    with pytest.raises(ValueError):
+        iter_frames(_info(1080, 1920), long_side=767)
+
+
+@pytest.mark.parametrize('fps_avg, want_s', [
+    (30.0, 60.0 + 2.0 * 10),
+    (24.0, 60.0 + 2.0 * 10),        # never below the 30 fps allowance
+    (60.0, 60.0 + 2.0 * 10 * 2),
+    (240.0, 60.0 + 2.0 * 10 * 8),   # slow motion decodes 8x the frames of 30 fps
+])
+def test_the_decode_bound_scales_with_the_source_frame_rate(monkeypatch, fps_avg, want_s):
+    seen = {}
+
+    def fake_stream(args, *, frame_bytes, timeout_s):
+        seen['timeout_s'] = timeout_s
+        return iter(())
+
+    monkeypatch.setattr(media_bin, 'ffmpeg_stream', fake_stream)
+    iter_frames(_info(1920, 1080, duration_s=10.0, fps_avg=fps_avg))
+    assert seen['timeout_s'] == pytest.approx(want_s)
+    # An explicit bound is used as given.
+    iter_frames(_info(1920, 1080, duration_s=10.0, fps_avg=fps_avg), timeout_s=5.0)
+    assert seen['timeout_s'] == 5.0
+
+
+# ── the tone-map capability check ─────────────────────────────────────────
+
+_FILTERS_WITH_ZIMG = """Filters:
+  T.. = Timeline support
+  .S. = Slice threading
+  ..C = Command support
+  A = Audio input/output
+  V = Video input/output
+  | = Source or sink filter
+ TSC scale             V->V       Scale the input video size and/or convert the image format.
+ ..C tonemap           V->V       Conversion to/from different dynamic ranges.
+ .SC zscale            V->V       Apply resizing, colorspace and bit depth conversion.
+"""
+
+
+@pytest.fixture
+def fresh_filter_listing():
+    """decode lists ffmpeg's filters once per process; start and end each test clean."""
+    def clear():
+        cached = getattr(decode, '_ffmpeg_filters', None)
+        if cached is not None:
+            cached.cache_clear()
+    clear()
+    yield
+    clear()
+
+
+def test_the_tonemap_check_lists_filters_only(monkeypatch, fresh_filter_listing):
+    # ffmpeg_caps() also runs an h264_nvenc test encode on the GPU; checking
+    # for zscale/tonemap must not open an NVENC session as a side effect.
+    calls = []
+
+    def no_caps():
+        raise AssertionError('the tone-map check must not run ffmpeg_caps (NVENC probe)')
+
+    def fake_run(args, *, timeout_s):
+        calls.append(list(args))
+        return BoundedResult(0, _FILTERS_WITH_ZIMG, '')
+
+    monkeypatch.setattr(media_bin, 'ffmpeg_caps', no_caps)
+    monkeypatch.setattr(media_bin, 'run_ffmpeg', fake_run)
+    assert decode._has_tonemap_filters() is True
+    assert decode._has_tonemap_filters() is True
+    assert calls == [['-filters']]                   # listed once, then remembered
+
+
+def test_the_tonemap_check_without_zimg_or_after_a_failed_listing(monkeypatch,
+                                                                  fresh_filter_listing):
+    answers = [BoundedResult(1, '', 'boom'),
+               BoundedResult(0, _FILTERS_WITH_ZIMG.replace(' .SC zscale', ' .SC zzz'), '')]
+    calls = []
+
+    def fake_run(args, *, timeout_s):
+        calls.append(list(args))
+        return answers.pop(0)
+
+    def no_caps():
+        raise AssertionError('the tone-map check must not run ffmpeg_caps (NVENC probe)')
+
+    monkeypatch.setattr(media_bin, 'ffmpeg_caps', no_caps)
+    monkeypatch.setattr(media_bin, 'run_ffmpeg', fake_run)
+    assert decode._has_tonemap_filters() is False    # the listing failed: untoned
+    assert decode._has_tonemap_filters() is False    # listed again (a failure is not kept)
+    assert len(calls) == 2
 
 
 # ── the real binary ───────────────────────────────────────────────────────
@@ -110,14 +233,54 @@ def test_each_frame_is_the_one_on_screen_at_its_time(tmp_path):
 
 
 @requires_ffmpeg
-def test_hlg_10_bit_decodes_to_8_bit_bgr(tmp_path):
-    info = probe(make_clip(tmp_path, 'hlg.mp4', size=(320, 180), duration_s=1.0, hdr='hlg'))
+@pytest.mark.parametrize('size, shape', [
+    ((320, 180), (432, 768, 3)),          # 16:9
+    ((160, 346), (768, 356, 3)),          # a free portrait aspect: 355.1 px exact
+    ((346, 160), (356, 768, 3)),          # and its landscape twin
+])
+def test_hlg_10_bit_decodes_to_8_bit_bgr(tmp_path, size, shape):
+    info = probe(make_clip(tmp_path, 'hlg.mp4', size=size, duration_s=1.0, hdr='hlg'))
     assert info.transfer == 'hlg' and info.bit_depth == 10
     frames = list(iter_frames(info))
     assert len(frames) == 5
     for _, bgr in frames:
-        assert bgr.dtype == np.uint8 and bgr.shape == (432, 768, 3)
+        assert bgr.dtype == np.uint8 and bgr.shape == shape
         assert 40 < bgr.mean() < 215          # tone-mapped picture, not black or blown
+
+
+def _column_luma(path):
+    """Mean of each column of the first decoded frame."""
+    _, bgr = next(iter(iter_frames(probe(path))))
+    return bgr.shape, bgr.astype(np.float64).mean(axis=(0, 2))
+
+
+@requires_ffmpeg
+def test_each_hdr_transfer_is_tone_mapped_by_its_own_curve(tmp_path):
+    # One 10-bit HEVC ramp (black at the left, full code at the right),
+    # stored twice: tagged HLG, and the SAME bitstream re-tagged PQ (only the
+    # VUI transfer changes).  At a free aspect (160x346 -> 356x768).  Each
+    # transfer's chain must run, keep the ramp's order, and apply its own
+    # curve: PQ codes above ~100 nits compress into SDR white, while HLG's
+    # relative curve spreads over the range.
+    hlg = make_clip(tmp_path, 'ramp_hlg.mp4', size=(160, 346), duration_s=0.4,
+                    source='color', color='black', vf="format=gray,geq=lum='X*255/W'",
+                    hdr='hlg')
+    pq = str(tmp_path / 'ramp_pq.mp4')
+    result = media_bin.run_ffmpeg(['-y', '-loglevel', 'error', '-i', hlg, '-c', 'copy',
+                                   '-bsf:v', 'hevc_metadata=transfer_characteristics=16', pq],
+                                  timeout_s=120)
+    assert result.returncode == 0, result.stderr[-500:]
+    assert probe(pq).transfer == 'pq'
+
+    hlg_shape, hlg_cols = _column_luma(hlg)
+    pq_shape, pq_cols = _column_luma(pq)
+    assert hlg_shape == pq_shape == (768, 356, 3)
+    for cols in (hlg_cols, pq_cols):
+        assert np.all(np.diff(cols) >= -1.0)            # the ramp keeps its order
+        assert cols[:8].mean() < 12 and cols[-8:].mean() > 240
+    # Different curves on identical codes.
+    assert np.abs(hlg_cols - pq_cols).mean() > 10
+    assert np.mean(pq_cols >= 250) > np.mean(hlg_cols >= 250) + 0.1
 
 
 @requires_ffmpeg

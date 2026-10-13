@@ -193,6 +193,18 @@ def test_non_square_pixels_widen_the_display_frame():
     assert (info.display_w, info.display_h) == (1920, 1080)
 
 
+def test_apple_capture_date_wins_over_an_export_time():
+    # An iPhone clip trimmed or exported later gets a new container
+    # creation_time (the export) but keeps Apple's creationdate (the capture).
+    text = _text('dovi_p84').replace(
+        '    com.apple.quicktime.creationdate: 2026-10-12T11:01:22+0530',
+        '    creation_time   : 2026-10-14T09:00:00.000000Z\n'
+        '    com.apple.quicktime.creationdate: 2026-10-12T11:01:22+0530', 1)
+    assert 'creation_time   : 2026-10-14' in text
+    info = parse_ffmpeg_info(text)
+    assert info.creation_time == _epoch(2026, 10, 12, 5, 31, 22)
+
+
 def test_stream_creation_time_is_the_fallback():
     text = _text('60fps').replace(
         '    creation_time   : 2026-10-12T05:35:00.000000Z\n    encoder         : Lavf61.7.100',
