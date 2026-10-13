@@ -1,4 +1,4 @@
-# User journeys on central, driven live (2026-10-13, 03:20 to 05:40 UTC)
+# User journeys on central, driven live (2026-10-13, 03:20 to 06:05 UTC)
 
 Owner's ask: prove each user, seller, buyer, searcher, admin and driver
 journey across RideSnap, McGroce, HARTOS agents, the admin UI, the listings,
@@ -15,15 +15,19 @@ its task number, never as steps. The matching plan is
 ## Method
 
 Central = the HARTOS container on the deploy box, build 903cd58c (deployed
-04:17:49 UTC). The only turns in this record that the model answered are the
-three direct answers saved at 03:27 UTC (section 1), BEFORE that deploy, on
-the previous build e829b072f. The paid-API probes never got a model answer on
-either build: at 03:25 (e829b072f) two came back as agent-building text and
-one as the prompt echoed; at 04:20, 05:00 and 06:00 (903cd58c) eight came
-back as agent-building text and one as the "internal snag" sentence (the
-metered path is identical in both builds, read). By this record's own count
-(section 8: 0 x HTTP 200 from the model since the container started at 04:17)
-no turn after the deploy was answered by the model. Central was reached on the LAN node and,
+04:17:49 UTC). The only turns in this record whose model answer was kept are
+the three direct answers saved at 03:27 UTC (section 1), BEFORE that deploy,
+on the previous build e829b072f. Twelve paid-API probes were saved; the 11
+whose reply text was kept never got a model answer on either build: at 03:25
+(e829b072f) two came back as agent-building text and one as the prompt
+echoed; at 04:20, 05:00 and 06:00 (903cd58c) seven came back as
+agent-building text and one as the "internal snag" sentence (the metered
+path is identical in both builds, read). The 12th, at 03:20 on e829b072f in
+the validation run, answered 200 with a 3-word reply the probe did not keep
+(none of the canned texts is 3 words), so it is not checked and may have
+been a model answer. By this record's own count (section 8: 0 x HTTP 200 from
+the model since the container started at 04:17) no turn after the deploy was
+answered by the model. Central was reached on the LAN node and,
 where Kong routes it, on the public host `https://api.hevolve.ai`. Surfaces
 were driven with plain HTTP by throwaway accounts (register is limited to 3
 per hour per client key, which ended one run; what a client key is on central
@@ -56,7 +60,7 @@ verdict means it was measured on the LAN node only, not on the public host.
 | Who am I | `GET /api/social/auth/me` | 200, profile | measured | WORKS, LAN |
 | Read the feed | `GET /api/social/feed/all` on LAN and on `api.hevolve.ai` | 200 both | measured | WORKS, public too |
 | Post and read back | `POST /api/social/posts`, `GET /posts/<id>` | created, read back with the post (201 by reading) | measured, read | WORKS, LAN |
-| Chat with no agent | `POST /chat` prompt_id null, LAN | 3 turns at 03:27 UTC answered ("Paris is the capital of France." twice, a correct `def square` function), the texts kept by the probe; two more turns (03:20 and 05:02 UTC) whose reply text the probe scripts did not keep (the 05:02 body shows 0 response tokens and no intent) | measured (3), not checked (2) | WORKS 3 of 3 saved, LAN, all before the 04:17 deploy; see section 8 for the model after 04:20 |
+| Chat with no agent | `POST /chat` prompt_id null, LAN | 3 turns at 03:27 UTC answered ("Paris is the capital of France." twice, a correct `def square` function), the texts kept by the probe; one more at 05:00 UTC whose reply text the probe did not keep (its body shows 0 response tokens and no intent). A 03:20 turn in the validation run was sent with a made-up `prompt_id` and `casual_conv` true, so it was not an agent-less turn; its reply was not kept either | measured (3), not checked (2) | WORKS 3 of 3 saved, LAN, all before the 04:17 deploy; see section 8 for the model after 04:20 |
 | Chat on the public host | `POST https://api.hevolve.ai/chat` with the same JWT | 401 `invalid_token` from Kong's OAuth2 gate: an unrelated route on the same path wins over HARTOS's | measured | BROKEN, task #119 |
 | Create an agent | `POST /chat` create_agent true, 05:00 UTC, LAN | 200, `Agent_status: Creation Mode`, prompt_id 91867635923 minted; the reply text was NOT captured (the probe cut the body before the `response` field), and after 04:17 the model answered nothing (section 8), so whether the user got an interview question or a failure sentence is unknown | measured (status), not checked (the reply) | NOT CHECKED: a status field is not the outcome the user sees |
 
@@ -70,7 +74,7 @@ verdict means it was measured on the LAN node only, not on the public host.
 | Analyze a document | `POST /api/v1/intelligence/analyze`, LAN | same creation text | measured | BROKEN, same cause |
 | Hivemind | `GET /api/v1/intelligence/hivemind?query=`, LAN | 200 `{"result": null, "success": true, "usage": {"compute_ms": ...}}` | measured | BROKEN: nothing behind the bridge on central (hevolve core not installed, task #129), and the call is counted (task #110) |
 | Generate an image | `POST /api/v1/intelligence/generate`, LAN | 200 `status: unavailable, "image not available on this node"`, `success: true` | measured | honest text, but counted as a call (task #110) |
-| Usage | `GET /api/v1/intelligence/usage`, LAN | 200, 4 calls: chat, analyze, hivemind, generate, all counted | measured | WORKS, LAN, and bills the broken and empty answers (task #110) |
+| Usage | `GET /api/v1/intelligence/usage`, LAN | 200, 4 calls: chat, analyze, hivemind, generate, all counted (cost 0.0: a free key) | measured | WORKS, LAN, and counts the broken and empty answers as calls, which a paid key would be charged for (task #110) |
 | Buy Starter by card | `POST /keys/<id>/upgrade/checkout`, LAN | 503 "Card checkout (Stripe) is not configured on this node (set STRIPE_API_KEY...)" | measured | BLOCKED on the owner's Stripe key |
 | Buy Starter, sync route | `POST /keys/<id>/upgrade`, LAN | 503 "No live USD payment gateway (Stripe)..." | measured | BLOCKED, same |
 | Buy with PhonePe | `POST /keys/<id>/upgrade/phonepe`, LAN | 503 "PhonePe gateway is not registered (set PHONEPE_MERCHANT_ID + PHONEPE_SALT_KEY)" | measured | BLOCKED on the owner's PhonePe decision; the route exists |
@@ -170,9 +174,10 @@ agent (the status said Creation Mode; the reply was not captured). Not
 working or not reachable: every paid step (no public route, no Stripe, no
 webhook, broken answers until the fix chain deploys), the hivemind leg, every
 automated channel (news, research, marketing), the seller and McGroce legs
-(unconfigured), RideSnap (no HARTOS surface, backend unreachable), and, since
-04:20 UTC, every OpenRouter turn (the free daily quota; whether central has a
-second LLM endpoint was not checked, section 8). Gaps that are not journeys:
+(unconfigured), RideSnap (no HARTOS surface, backend unreachable), and every
+OpenRouter turn from 04:20 to 05:40 UTC (measured; the free daily quota, so
+the rest of the day is expected to fail too; whether central has a second LLM
+endpoint was not checked, section 8). Gaps that are not journeys:
 tasks #121 (fixed in this chain, not deployed), #127 (the goals listing),
 #123 and #125 (not measured). The admin UI and the marketplace UI exist in
 the deployed bundle and were not driven in a browser.
