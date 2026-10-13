@@ -287,6 +287,24 @@ def test_flag_off_on_every_later_boot_changes_nothing(consent_db):
     assert set(_posting_allowed(consent_db).values()) == {False}
 
 
+def test_an_off_switch_that_revoked_nothing_and_failed_never_reads_as_off(
+        consent_db, caplog):
+    """Every revoke raises (database locked): nothing was revoked, so the
+    `if n` branch cannot hide it. The boot must say ERROR and must NOT print
+    the all-clear "is OFF"; all three identities can still post."""
+    import logging
+    from integrations.social.consent_service import ConsentService
+    caplog.set_level(logging.INFO, logger='hevolve_social')
+    _apply(consent_db, '1')
+    with patch.object(ConsentService, 'revoke_consent',
+                      side_effect=RuntimeError('database is locked')):
+        assert _apply(consent_db, '0') == ('revoked', 0)
+    messages = [(r.levelno, r.getMessage()) for r in caplog.records]
+    assert any(lvl == logging.ERROR and 'may continue' in m for lvl, m in messages), messages
+    assert not any('is OFF' in m for _, m in messages), messages
+    assert set(_posting_allowed(consent_db).values()) == {True}
+
+
 def test_a_failed_off_switch_is_loud_and_never_reads_as_off(consent_db, caplog):
     """A revoke that raises leaves that identity able to post: the boot must
     say so at ERROR and must NOT also print the all-clear "is OFF" line.

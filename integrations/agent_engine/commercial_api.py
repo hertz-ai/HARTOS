@@ -988,8 +988,9 @@ def upgrade_key(key_id):
         if _gateway_choice == _PG.MOCK and not _mock_payments_allowed(user):
             return jsonify({
                 'success': False,
-                'error': 'No live payment gateway is configured on this node '
-                         '(set STRIPE_API_KEY); the dev mock settles nothing.',
+                'error': 'No live USD payment gateway (Stripe) is configured on '
+                         'this node (set STRIPE_API_KEY); the dev mock settles '
+                         'nothing.',
             }), 503
 
         # Three-step AP2 flow.  We do all synchronously here for the simple

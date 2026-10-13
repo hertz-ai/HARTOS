@@ -9,7 +9,7 @@ Follows the exact same idempotent seed pattern as:
   - AdService.seed_placements()
 """
 import logging
-from typing import Optional
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger('hevolve_social')
 
@@ -2255,7 +2255,7 @@ def enable_autonomous_marketing_consent(db) -> int:
     return granted
 
 
-def disable_autonomous_marketing_consent(db):
+def disable_autonomous_marketing_consent(db) -> Tuple[int, List[str]]:
     """End the standing ``public_exposure`` grants that
     ``enable_autonomous_marketing_consent`` made, so the external-post gate
     blocks again. Only identities holding an active blanket grant are revoked:
