@@ -194,3 +194,80 @@ def test_enable_autonomous_marketing_consent_is_idempotent_and_covers_identities
     assert {c[1] for c in granted_calls} == {'public_exposure'}
     uids = {c[0] for c in granted_calls}
     assert {'system', 'system_bootstrap'} <= uids
+
+
+# ── 4. The same switch turns it OFF ────────────────────────────────
+#
+# Review of e45d8f769 (hartos-87's reviewer, 2026-10-12): the deploy writes
+# HEVOLVE_AUTONOMOUS_MARKETING into central's .env on every deploy, and boot
+# only ever GRANTED.  Setting the flag to 0 left the standing grant in place,
+# and POST /api/social/consent/revoke answers 404 for the system identities
+# (it revokes the caller's own rows; nobody signs in as `system`).  So once
+# on, posting could not be stopped without code.  Real consent table here,
+# not a mocked ConsentService: the property is that check_consent goes False.
+
+@pytest.fixture
+def consent_db():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from integrations.social.models import UserConsent
+
+    engine = create_engine('sqlite://', poolclass=StaticPool,
+                           connect_args={'check_same_thread': False})
+    UserConsent.__table__.create(engine)
+    db = sessionmaker(bind=engine, expire_on_commit=False)()
+    yield db
+    db.close()
+    engine.dispose()
+
+
+def _posting_allowed(db):
+    from integrations.agent_engine import goal_seeding
+    from integrations.social.consent_service import ConsentService
+    return {uid: ConsentService.check_consent(db, uid, 'public_exposure', scope='*')
+            for uid in goal_seeding._AUTONOMOUS_MARKETING_IDENTITIES}
+
+
+def _apply(db, flag):
+    from integrations.agent_engine import goal_seeding
+    env = {k: v for k, v in os.environ.items() if k != 'HEVOLVE_AUTONOMOUS_MARKETING'}
+    if flag is not None:
+        env['HEVOLVE_AUTONOMOUS_MARKETING'] = flag
+    with patch.dict(os.environ, env, clear=True):
+        return goal_seeding.apply_autonomous_marketing_flag(db)
+
+
+def test_flag_on_grants_every_identity(consent_db):
+    assert _apply(consent_db, ' True ') == ('granted', 3)
+    assert set(_posting_allowed(consent_db).values()) == {True}
+
+
+@pytest.mark.parametrize('off', ['0', 'false', 'NO', ' off '])
+def test_flag_off_after_on_stops_posting(consent_db, off):
+    _apply(consent_db, '1')
+    assert _apply(consent_db, off) == ('revoked', 3)
+    assert set(_posting_allowed(consent_db).values()) == {False}
+
+
+def test_flag_back_on_after_off_grants_again(consent_db):
+    _apply(consent_db, '1')
+    _apply(consent_db, '0')
+    assert _apply(consent_db, 'yes') == ('granted', 3)
+    assert set(_posting_allowed(consent_db).values()) == {True}
+
+
+@pytest.mark.parametrize('flag', [None, '', 'maybe'])
+def test_unset_or_unrecognised_flag_changes_nothing(consent_db, flag):
+    """Unset is not OFF: a node that never chose leaves whatever is there."""
+    _apply(consent_db, '1')
+    assert _apply(consent_db, flag) == (None, 0)
+    assert set(_posting_allowed(consent_db).values()) == {True}
+
+
+def test_flag_off_with_nothing_granted_writes_no_row(consent_db):
+    """revoke_consent on an empty combination marks its first row as a
+    declined ask; with no row at all it must not invent one per boot."""
+    from integrations.social.models import UserConsent
+    assert _apply(consent_db, '0') == ('revoked', 0)
+    assert consent_db.query(UserConsent).count() == 0
