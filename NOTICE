@@ -33,3 +33,17 @@ IMPORTANT NOTICES:
 5. ATTRIBUTION
    We appreciate (but do not require beyond Apache 2.0 terms) attribution
    as "Built on HART OS by Hevolve.ai" in derivative works.
+
+THIRD-PARTY SOFTWARE
+
+The following third-party work is included under its own license, which
+is reproduced in full beside it.
+
+instagram-agent-skill
+   Location: integrations/reel_studio/igkit/ (hooks.py, caption.py,
+   humanize.py, swipe.py, resources/*.json and the SKILL.md files under
+   skills/) is derived from instagram-agent-skill,
+   https://github.com/Jakeschincariol/instagram-agent-skill, commit d03c56b.
+   Copyright (c) 2026 Jake Schincariol.
+   License: MIT. Full text: integrations/reel_studio/igkit/LICENSE.txt.
+   The changes made are listed in integrations/reel_studio/igkit/__init__.py.
