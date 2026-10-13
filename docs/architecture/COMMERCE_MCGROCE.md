@@ -17,7 +17,7 @@ Tests: `tests/unit/test_commerce_{client,tools,api,wiring}.py`,
 | `MCGROCE_ORIGINS` | McGroce storefront origins, joined to the one CORS allowlist (`security.middleware.cors_allowed_origins`) |
 | `AP2_ALLOW_LLM_AUTHORIZE` | Default off. On, `authorize_payment` authorizes directly (still never as `system` or the requesting agent) |
 
-Payments use `PaymentLedger.select_gateway(currency)`: INR goes to PhonePe if live, else Stripe, else Mock. A Mock choice settles nothing for a shopper: `commerce_prepare_checkout` refuses before any approval card is shown, and `settle_checkout` refuses and cancels the payment, unless the node is in dev mode (`ap2_protocol.mock_settlement_allowed`, the same rule as the paid-tier upgrade route). A node with no gateway keys therefore cannot place a McGroce order "paid" with no money taken.
+Payments use `PaymentLedger.select_gateway(currency)`: INR goes to PhonePe if live, else Stripe, else Mock. A Mock choice settles nothing for a shopper: `commerce_prepare_checkout` refuses before any approval card is shown, and `settle_checkout` refuses and cancels the payment, unless the node is in dev mode (`ap2_protocol.mock_settlement_allowed`, the same rule as the paid-tier upgrade route). A node with no gateway keys therefore cannot place a McGroce order "paid" with no money taken; `ap2_mandate.settle` applies the same rule to every other mandate kind (any agent's `request_payment`), and each refusal logs which setting is missing for the operator.
 
 ## Session contract (McGroce `SpaAgentTokenEndpoint` → HARTOS)
 

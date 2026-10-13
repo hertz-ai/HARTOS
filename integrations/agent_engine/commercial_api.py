@@ -1076,14 +1076,14 @@ def upgrade_key(key_id):
                          'Stripe (set STRIPE_API_KEY).',
             }), 501
         try:
-            from integrations.ap2 import PaymentGateway as _PG, mock_settlement_allowed
+            from integrations.ap2 import mock_would_settle
             _gateway_choice = payment_ledger.select_gateway('USD')
         except Exception as _sel_err:
             return jsonify({
                 'success': False,
                 'error': f'No payment gateway could be selected: {_sel_err}',
             }), 503
-        if _gateway_choice == _PG.MOCK and not mock_settlement_allowed(user):
+        if mock_would_settle(_gateway_choice, user):
             return jsonify({
                 'success': False,
                 'error': 'No live USD payment gateway (Stripe) is configured on '

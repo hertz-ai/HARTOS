@@ -3,9 +3,10 @@
 Real McGroceClient, bindings, PaymentLedger, MandateStore and DraftStore on
 tmp paths.  Mocked boundaries only: core.http_pool.pooled_request (McGroce)
 and the LiquidUIService from core.platform.registry (the UI push).  The
-ledger carries a live synchronous card rail (_CardRailDouble, Stripe's
-shape), so the checkout tests run as a node with gateway keys; the node
-WITHOUT one, where select_gateway answers MOCK, is TestNoLiveGateway.
+ledger carries a live synchronous card rail (tests/unit/ap2_doubles.py
+CardRailDouble, Stripe's shape), so the checkout tests run as a node with
+gateway keys; the node WITHOUT one, where select_gateway answers MOCK, is
+TestNoLiveGateway.
 """
 import inspect
 import json
@@ -16,6 +17,7 @@ import pytest
 
 from core.circuit_breaker import CircuitBreaker
 from integrations.ap2 import ap2_protocol
+from tests.unit.ap2_doubles import CardRailDouble
 from integrations.ap2.ap2_mandate import MandateStore
 from integrations.ap2.ap2_protocol import PaymentLedger, PaymentStatus
 from integrations.commerce import commerce_tools as ct
@@ -71,28 +73,6 @@ class FakeMcGroce:
         return [c for c in self.calls if c[0] == method and c[1] == path]
 
 
-class _CardRailDouble(ap2_protocol.PaymentGatewayConnector):
-    """A live synchronous card rail (Stripe's shape: create, then capture).
-    Registered by default so the checkout tests run as a node with gateway
-    keys; TestNoLiveGateway removes it."""
-
-    def __init__(self):
-        super().__init__(ap2_protocol.PaymentGateway.STRIPE)
-        self.captures = []
-
-    def connect(self):
-        self.connected = True
-        return True
-
-    def create_payment(self, payment_request):
-        return {'success': True,
-                'transaction_id': f'card_{payment_request.payment_id}'}
-
-    def capture_payment(self, payment_id, gateway_transaction_id):
-        self.captures.append((payment_id, gateway_transaction_id))
-        return {'success': True}
-
-
 @pytest.fixture
 def env(tmp_path):
     bindings = CommerceBindings(str(tmp_path / 'bindings.json'))
@@ -103,7 +83,7 @@ def env(tmp_path):
                            admin_key='k', bindings=bindings,
                            breaker=CircuitBreaker('t'))
     ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
-    card = _CardRailDouble()
+    card = CardRailDouble()
     ledger.add_gateway(card)
     mandates = MandateStore(str(tmp_path / 'mandates.json'), ledger=ledger,
                             key=b'k' * 32)

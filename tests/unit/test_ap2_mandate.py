@@ -1,7 +1,9 @@
 """Behavioural tests for integrations/ap2/ap2_mandate.py.
 
-A real PaymentLedger (isolated tmp path, Mock gateway) sits behind a real
-MandateStore; nothing is mocked except time where expiry is under test.
+A real PaymentLedger (isolated tmp path) with a live card-rail double
+(tests/unit/ap2_doubles.py) sits behind a real MandateStore; nothing is
+mocked except time where expiry is under test, and the UI push in
+TestDecidePayment.  The Mock gateway alone is the no-payment-keys case.
 """
 import json
 from unittest.mock import patch
@@ -11,7 +13,8 @@ import pytest
 from integrations.ap2.ap2_mandate import (
     MandateError, MandateStore, canonical_cart_hash,
 )
-from integrations.ap2.ap2_protocol import PaymentLedger, PaymentStatus
+from integrations.ap2.ap2_protocol import PaymentGateway, PaymentLedger, PaymentStatus
+from tests.unit.ap2_doubles import CardRailDouble
 
 CART = {
     'lines': [{'sku_id': 11, 'qty': 2, 'unit_price': 40},
@@ -23,7 +26,12 @@ CART = {
 
 @pytest.fixture
 def store(tmp_path):
+    # A keyed node: the card rail is registered, so a mandate settles for
+    # real money.  The node WITHOUT one (select_gateway answers MOCK, and a
+    # Mock payment settles nothing for a person since abb2dcfaf) is the
+    # TestDecidePayment mock-only tests, which pop it again.
     ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
+    ledger.add_gateway(CardRailDouble())
     return MandateStore(path=str(tmp_path / 'ap2_mandates.json'),
                         ledger=ledger, key=b'k' * 32)
 
@@ -241,6 +249,35 @@ class TestDecidePayment:
         assert store.get(m.mandate_id).status == 'consumed'
         assert self.push.call_args.args[1]['type'] == 'payment_status'
         assert self.push.call_args.kwargs['user_id'] == 'u1'
+
+    def test_a_node_with_no_payment_keys_refuses_and_cancels_a_generic_mandate(self, store):
+        # Any agent's request_payment creates such a mandate; with no gateway
+        # keys select_gateway answers MOCK, and before this the mock "paid" it
+        # (review of abb2dcfaf, measured): completed, consumed, card shown,
+        # nothing taken.  The generic settler now reads the one rule.
+        from integrations.ap2.ap2_mandate import decide_payment
+        store.ledger.gateways.pop(PaymentGateway.STRIPE)
+        m = store.create_cart_mandate('u1', 'shop', CART)
+        assert store.ledger.get_payment(m.payment_id).gateway == PaymentGateway.MOCK
+        payload, code = decide_payment(m.payment_id, 'u1', True, store=store)
+        assert code == 200 and payload['result']['success'] is False
+        assert 'no live payment gateway' in payload['result']['error']
+        assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.CANCELLED
+        assert store.get(m.mandate_id).status == 'rejected'
+        card = self.push.call_args.args[1]
+        assert card['type'] == 'notification' and card['title'] == 'Payment not available'
+        assert self.push.call_args.kwargs['user_id'] == 'u1'
+
+    def test_dev_mode_still_settles_a_generic_mandate_on_the_mock(self, store, monkeypatch):
+        from security import master_key
+        from integrations.ap2.ap2_mandate import decide_payment
+        store.ledger.gateways.pop(PaymentGateway.STRIPE)
+        monkeypatch.setattr(master_key, 'is_dev_mode', lambda: True)
+        m = store.create_cart_mandate('u1', 'shop', CART)
+        payload, code = decide_payment(m.payment_id, 'u1', True, store=store)
+        assert code == 200 and payload['result']['success'] is True
+        assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.COMPLETED
+        assert store.ledger.get_payment(m.payment_id).gateway == PaymentGateway.MOCK
 
     @pytest.mark.parametrize('who,code', [(None, 401), ('', 401), ('u2', 403)])
     def test_only_the_owner_may_answer(self, store, who, code):

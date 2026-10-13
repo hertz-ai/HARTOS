@@ -501,6 +501,17 @@ def push_card(user_id, component: Dict[str, Any]) -> bool:
         return False
 
 
+def no_live_gateway_card(message: Optional[str] = None) -> Dict[str, Any]:
+    """The card a person sees when a payment they approved cannot be taken
+    because this node has no live gateway (ap2_protocol.mock_would_settle).
+    One title for every settler; the body may say what else did not happen
+    (the cart settler adds "and no order was placed")."""
+    return {'type': 'notification', 'severity': 'warning',
+            'title': 'Payment not available',
+            'message': message or ('This node cannot take payments right now, '
+                                   'so nothing was charged.')}
+
+
 def approval_card(m: CartMandate, description: Optional[str] = None) -> Dict[str, Any]:
     return {'type': 'approval', 'agent_id': AP2_AGENT_ID,
             'action': approval_action(m.payment_id),
@@ -548,6 +559,23 @@ def settle(m: CartMandate, store: Optional[MandateStore] = None) -> Dict[str, An
     if fn is not None:
         return fn(m)
     store = store or get_mandate_store()
+    from integrations.ap2.ap2_protocol import (
+        LIVE_GATEWAY_SETTINGS, NO_LIVE_GATEWAY, mock_would_settle)
+    payment = store.ledger.get_payment(m.payment_id)
+    if payment is not None and mock_would_settle(payment.gateway):
+        # The same gate the cart settler has (commerce_tools.settle_checkout):
+        # the mock captures anything, so an approved "pay 10 USD for X" from
+        # any agent's request_payment was marked paid, consumed and shown as
+        # completed with nothing taken (review of abb2dcfaf, measured).
+        # Refused BEFORE process_payment so no PROCESSING reservation is
+        # left; the approval is void, so the payment is cancelled, not left
+        # AUTHORIZED for anything else to take.
+        store.withdraw(m.mandate_id, 'no live payment gateway')
+        logger.warning('ap2: payment %s for %s refused: %s (set %s)',
+                       m.payment_id, m.user_id, NO_LIVE_GATEWAY, LIVE_GATEWAY_SETTINGS)
+        push_card(m.user_id, no_live_gateway_card())
+        return {'success': False, 'payment_id': m.payment_id,
+                'error': f'payment refused: {NO_LIVE_GATEWAY}; nothing was charged'}
     result = store.ledger.process_payment(m.payment_id, settler=True)
     if result.get('success'):
         store.consume(m.mandate_id)
@@ -653,4 +681,5 @@ __all__ = [
     'canonical_cart_hash', 'get_mandate_store', 'DEFAULT_MANDATE_TTL_S',
     'NON_HUMAN_APPROVERS', 'PERSON_ID_PREFIX', 'approval_action', 'parse_approval_action',
     'request_human_approval', 'register_settler', 'settle', 'decide_payment',
+    'no_live_gateway_card',
 ]

@@ -133,6 +133,25 @@ def mock_settlement_allowed(user=None) -> bool:
     return holds_central_role(user)
 
 
+#: The refusal every settlement path answers with when the mock is the only
+#: gateway (the person hears that nothing was charged; the operator reads
+#: which setting is missing in the WARNING each refusal logs).
+NO_LIVE_GATEWAY = 'no live payment gateway is configured on this node'
+LIVE_GATEWAY_SETTINGS = ('STRIPE_API_KEY, or PHONEPE_MERCHANT_ID with '
+                         'PHONEPE_SALT_KEY for INR')
+
+
+def mock_would_settle(gateway, user=None) -> bool:
+    """Would a payment on ``gateway`` be "paid" with no money moving for this
+    caller?  True when it is the Mock and mock_settlement_allowed says no.
+    The ONE spelling of that question: the tier upgrade route
+    (commercial_api.upgrade_key), the McGroce cart settler
+    (commerce_tools.settle_checkout and its prepare step) and the generic
+    mandate settler (ap2_mandate.settle) all read it (review of abb2dcfaf:
+    two spellings, and the generic settler read neither)."""
+    return gateway == PaymentGateway.MOCK and not mock_settlement_allowed(user)
+
+
 #: Metadata keys that are credentials: kept in memory for the gateway call,
 #: never persisted or returned (PaymentRequest.to_dict).
 _SECRET_METADATA_KEYS = ('payment_method_token',)
@@ -1595,6 +1614,8 @@ __all__ = [
     'create_payment_processing_function', 'get_ap2_tools_for_autogen',
     'own_gateway_urls', 'PHONEPE_CALLBACK_PATH', 'PHONEPE_REFUND_CALLBACK_PATH',
     'PHONEPE_SENT_AMOUNT_KEY',
+    'mock_settlement_allowed', 'mock_would_settle', 'NO_LIVE_GATEWAY',
+    'LIVE_GATEWAY_SETTINGS',
 ]
 
 
