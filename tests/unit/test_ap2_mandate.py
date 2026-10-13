@@ -74,13 +74,17 @@ class TestCreate:
         meta = store.ledger.get_payment(m.payment_id).metadata
         assert meta['callback_url'] == (
             'https://node7.example/api/v1/intelligence/phonepe/callback')
+        assert meta['refund_callback_url'] == (
+            'https://node7.example/api/v1/intelligence/phonepe/refund-callback')
         assert meta['redirect_url'].startswith('https://node7.example')
 
-    def test_no_public_base_leaves_the_gateway_default(self, store, monkeypatch):
+    def test_no_public_base_stamps_no_urls(self, store, monkeypatch):
+        """Nothing guessed into the payment: the gateway resolves this node's
+        URLs again when it mints the checkout, and refuses without them."""
         monkeypatch.delenv('HARTOS_PUBLIC_URL', raising=False)
         m = store.create_cart_mandate('u1', 'mcgroce', CART)
         meta = store.ledger.get_payment(m.payment_id).metadata
-        assert 'callback_url' not in meta
+        assert 'callback_url' not in meta and 'redirect_url' not in meta
 
     def test_over_cap_is_refused(self, store):
         with pytest.raises(MandateError, match='over the cap'):

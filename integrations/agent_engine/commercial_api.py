@@ -1187,6 +1187,14 @@ def upgrade_key(key_id):
 def initiate_phonepe_upgrade(key_id: str):
     """Initiate a PhonePe-rail upgrade for a paid tier.
 
+    Body: ``target_tier``; optional ``redirect_url`` (the page the buyer
+    returns to after paying, this node's public URL when absent),
+    ``mobile_number``, ``inr_amount``.  A ``callback_url`` in the body is
+    ignored: the server callback is always this node's own
+    (integrations.ap2.ap2_protocol.own_gateway_urls), since a caller-named
+    one would send PhonePe's signed confirmation elsewhere and the tier
+    would never be bumped.
+
     Returns:
         202 Accepted with `{redirect_url, payment_request_id,
         gateway_transaction_id}` — the caller should redirect the user
@@ -1252,7 +1260,24 @@ def initiate_phonepe_upgrade(key_id: str):
 
         # Build the payment request.  Metadata carries the bookkeeping
         # the webhook needs to finalize the tier change without trusting
-        # any caller-supplied data.
+        # any caller-supplied data.  The buyer's return page may be the
+        # caller's own (the app that started the upgrade); the server
+        # callback is never the caller's, and neither is written here
+        # when absent: the gateway resolves this node's URLs when it
+        # mints the checkout and refuses without them.  Both used to
+        # default to the web app's host here, which answers these paths
+        # with the web app's 404 (task #122).
+        metadata = {
+            'api_key_id': str(key_id),
+            'current_tier': api_key.tier,
+            'target_tier': target_tier,
+            'kind': 'tier_upgrade',
+            'user_id': str(user.id),
+            'mobile_number': data.get('mobile_number'),
+            'inr_amount': data.get('inr_amount'),  # optional override
+        }
+        if data.get('redirect_url'):
+            metadata['redirect_url'] = str(data['redirect_url'])
         try:
             payment_req = payment_ledger.create_payment_request(
                 amount=_Decimal(str(amount_usd)),
@@ -1261,23 +1286,7 @@ def initiate_phonepe_upgrade(key_id: str):
                 requester_agent_id=f'user:{user.id}',
                 payment_method=PaymentMethod.INTERNAL_CREDITS,
                 gateway=PaymentGateway.PHONEPE,
-                metadata={
-                    'api_key_id': str(key_id),
-                    'current_tier': api_key.tier,
-                    'target_tier': target_tier,
-                    'kind': 'tier_upgrade',
-                    'user_id': str(user.id),
-                    'redirect_url': data.get(
-                        'redirect_url',
-                        'https://hevolve.ai/api/v1/intelligence/keys',
-                    ),
-                    'callback_url': data.get(
-                        'callback_url',
-                        'https://hevolve.ai/api/v1/intelligence/phonepe/callback',
-                    ),
-                    'mobile_number': data.get('mobile_number'),
-                    'inr_amount': data.get('inr_amount'),  # optional override
-                },
+                metadata=metadata,
             )
 
             authorized = payment_ledger.authorize_payment(
@@ -1335,6 +1344,56 @@ def initiate_phonepe_upgrade(key_id: str):
             pass
 
 
+def _verified_phonepe_envelope(what: str):
+    """The decoded envelope of a PhonePe server-to-server POST whose X-VERIFY
+    signature checks out against the registered gateway's salt, as
+    ``(gateway, envelope, None)``; else ``(None, None, (response, status))``
+    for the route to return.  Shared by the payment and the refund callback:
+    PhonePe signs both the same way (``sha256(base64 + salt_key) + "###" +
+    salt_index``), and the AP2 import, the gateway lookup, the missing-payload
+    400, the bad-signature 401 and the undecodable 400 are one rule."""
+    import base64 as _b64
+    import json as _json
+
+    try:
+        from integrations.ap2 import payment_ledger, PaymentGateway
+    except Exception as imp_err:
+        logger.error(f"PhonePe {what}: AP2 import failed: {imp_err}")
+        return None, None, (jsonify({'success': False, 'error': 'AP2 unavailable'}), 503)
+
+    gateway = payment_ledger.gateways.get(PaymentGateway.PHONEPE)
+    if gateway is None:
+        # If PhonePe isn't registered we shouldn't be receiving callbacks.
+        # Log loudly so the operator notices.
+        logger.error(f"PhonePe {what} received but gateway is not registered")
+        return None, None, (jsonify({'success': False,
+                                     'error': 'PhonePe gateway unavailable'}), 503)
+
+    x_verify = request.headers.get('X-VERIFY', '')
+    body = request.get_json(silent=True) or {}
+    b64_response = body.get('response', '')
+    if not b64_response or not x_verify:
+        logger.warning(f"PhonePe {what}: missing response body or X-VERIFY header")
+        return None, None, (jsonify({'success': False,
+                                     'error': 'Missing signature payload'}), 400)
+
+    # Reject any callback that fails signature verification.  Constant-time
+    # compare inside verify_callback prevents timing oracles.
+    if not gateway.verify_callback(b64_response, x_verify):
+        logger.warning(f"PhonePe {what}: X-VERIFY signature mismatch — rejecting")
+        return None, None, (jsonify({'success': False, 'error': 'Invalid signature'}), 401)
+
+    try:
+        envelope = _json.loads(_b64.b64decode(b64_response).decode('utf-8'))
+        if not isinstance(envelope, dict):
+            raise ValueError('envelope is not an object')
+    except Exception as e:
+        logger.warning(f"PhonePe {what}: failed to decode response payload: {e}")
+        return None, None, (jsonify({'success': False,
+                                     'error': 'Invalid payload encoding'}), 400)
+    return gateway, envelope, None
+
+
 @commercial_api_bp.route('/api/v1/intelligence/phonepe/callback',
                          methods=['POST'])
 def phonepe_callback():
@@ -1343,7 +1402,8 @@ def phonepe_callback():
     PhonePe POSTs `{"response": "<base64>"}` with header
     `X-VERIFY: sha256(base64 + salt_key) + "###" + salt_index`.
     We:
-      1. Verify the signature with the registered PhonePe gateway.
+      1. Verify the signature with the registered PhonePe gateway
+         (_verified_phonepe_envelope).
       2. Decode the payload, recover our merchantTransactionId.
       3. Look up the payment in the ledger.
       4. Idempotency: if already COMPLETED, 200 immediately.
@@ -1353,43 +1413,10 @@ def phonepe_callback():
          API key's tier limits.  Returns 200 to PhonePe regardless of
          tier-bump success so retries stop.
     """
-    import base64 as _b64
-    import json as _json
-
-    try:
-        from integrations.ap2 import payment_ledger, PaymentStatus, PaymentGateway
-    except Exception as imp_err:
-        logger.error(f"PhonePe callback: AP2 import failed: {imp_err}")
-        return jsonify({'success': False, 'error': 'AP2 unavailable'}), 503
-
-    if PaymentGateway.PHONEPE not in payment_ledger.gateways:
-        # If PhonePe isn't registered we shouldn't be receiving callbacks.
-        # Log loudly so the operator notices.
-        logger.error("PhonePe callback received but gateway is not registered")
-        return jsonify({'success': False, 'error': 'PhonePe gateway unavailable'}), 503
-
-    gateway = payment_ledger.gateways[PaymentGateway.PHONEPE]
-    x_verify = request.headers.get('X-VERIFY', '')
-    body = request.get_json(silent=True) or {}
-    b64_response = body.get('response', '')
-
-    if not b64_response or not x_verify:
-        logger.warning("PhonePe callback: missing response body or X-VERIFY header")
-        return jsonify({'success': False, 'error': 'Missing signature payload'}), 400
-
-    # Reject any callback that fails signature verification.  Constant-time
-    # compare inside verify_callback prevents timing oracles.
-    if not gateway.verify_callback(b64_response, x_verify):
-        logger.warning("PhonePe callback: X-VERIFY signature mismatch — rejecting")
-        return jsonify({'success': False, 'error': 'Invalid signature'}), 401
-
-    # Decode the verified payload.
-    try:
-        decoded = _b64.b64decode(b64_response).decode('utf-8')
-        envelope = _json.loads(decoded)
-    except Exception as e:
-        logger.warning(f"PhonePe callback: failed to decode response payload: {e}")
-        return jsonify({'success': False, 'error': 'Invalid payload encoding'}), 400
+    gateway, envelope, refusal = _verified_phonepe_envelope('callback')
+    if refusal is not None:
+        return refusal
+    from integrations.ap2 import payment_ledger, PaymentStatus
 
     code = envelope.get('code', '')
     callback_data = envelope.get('data') or {}
@@ -1581,6 +1608,37 @@ def phonepe_callback():
         'new_tier': target_tier,
         'revenue_split': _revenue_split_usd(amount_usd),
     }), 200
+
+
+@commercial_api_bp.route('/api/v1/intelligence/phonepe/refund-callback',
+                         methods=['POST'])
+def phonepe_refund_callback():
+    """PhonePe's server-to-server refund status: acknowledge it and name it
+    for a person.
+
+    The refund request (PhonePePaymentGateway.refund_payment) names this
+    route as its callback.  It used to name a route that existed nowhere,
+    on the web app's host.  The signature is checked like the payment
+    callback's; the refund's merchantTransactionId, the original
+    transaction, the code and the amount are logged at WARNING for the
+    operator to reconcile by hand.  No ledger state changes here: nothing
+    in the tree calls refund_payment today, so there is no refund record to
+    finish; what this route guarantees is that a refund's confirmation is
+    received, verified and acknowledged (200, so PhonePe stops retrying)
+    instead of lost to a 404.
+    """
+    _gateway, envelope, refusal = _verified_phonepe_envelope('refund callback')
+    if refusal is not None:
+        return refusal
+    data = envelope.get('data') or {}
+    code = envelope.get('code', '')
+    logger.warning("PhonePe refund %s for transaction %s: %s (amount %s paise); "
+                   "reconcile by hand, the ledger is not changed by this callback",
+                   data.get('merchantTransactionId'), data.get('transactionId'),
+                   code, data.get('amount'))
+    return jsonify({'success': True, 'status': 'acknowledged',
+                    'refund_id': data.get('merchantTransactionId'),
+                    'code': code}), 200
 
 
 # ═══════════════════════════════════════════════════════════════

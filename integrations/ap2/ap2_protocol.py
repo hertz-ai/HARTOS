@@ -25,7 +25,34 @@ from enum import Enum
 from decimal import Decimal
 import hashlib
 
+from core.public_url import PUBLIC_URL_VAR, public_base_url
+
 logger = logging.getLogger(__name__)
+
+# Where a redirect gateway's server-to-server confirmations land on this
+# node (integrations.agent_engine.commercial_api serves both paths).  The
+# gateway composes its callback URLs from these; a test pins the blueprint's
+# rules to them.
+PHONEPE_CALLBACK_PATH = '/api/v1/intelligence/phonepe/callback'
+PHONEPE_REFUND_CALLBACK_PATH = '/api/v1/intelligence/phonepe/refund-callback'
+
+
+def own_gateway_urls() -> Dict[str, str]:
+    """The URLs a redirect gateway (PhonePe) returns the buyer to and posts
+    its confirmations to, on this node's public base
+    (core.public_url.public_base_url: HARTOS_PUBLIC_URL, else the live
+    request's root when its Host is trusted).  {} when the base is unknown,
+    and a warning says so: a payment is then refused rather than sent with
+    a host that is not this node."""
+    base = public_base_url()
+    if not base:
+        logger.warning('ap2: this node has no trusted public base for the '
+                       'gateway urls (set %s); a PhonePe payment cannot be '
+                       'started until it has one', PUBLIC_URL_VAR)
+        return {}
+    return {'redirect_url': base + '/',
+            'callback_url': base + PHONEPE_CALLBACK_PATH,
+            'refund_callback_url': base + PHONEPE_REFUND_CALLBACK_PATH}
 
 
 class PaymentStatus(str, Enum):
@@ -454,7 +481,12 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
         usd_inr_rate; INR amounts pass through unchanged.
         """
         meta = payment_request.metadata or {}
-        if 'inr_amount' in meta:
+        # An override is a value, not a key: the upgrade route stamps
+        # 'inr_amount': None when the caller gave none, and `in` took that
+        # as an override and raised on float(None), so every PhonePe
+        # upgrade without an inr_amount answered 502 after the checkout
+        # had been minted (measured by the route's test, task #122).
+        if meta.get('inr_amount') is not None:
             return int(round(float(meta['inr_amount']) * 100))
         amt = float(payment_request.amount)
         if payment_request.currency.upper() == 'INR':
@@ -488,15 +520,34 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
 
             amount_paise = self._to_paise(payment_request)
             meta = payment_request.metadata or {}
+            # Where the buyer returns and where the signed confirmation is
+            # posted: what the payment's metadata names (a cart mandate
+            # stamps this node's URLs at creation; the upgrade route may
+            # name the buyer's return page), else this node's public URLs
+            # now.  Never a guessed host: these defaulted to the web app's
+            # host, which answers the API paths with the web app's 404, so
+            # the callback never arrived and the money was taken with no
+            # tier bumped and no order placed (task #122).
+            redirect_url = meta.get('redirect_url')
+            callback_url = meta.get('callback_url')
+            if not redirect_url or not callback_url:
+                own = own_gateway_urls()
+                redirect_url = redirect_url or own.get('redirect_url')
+                callback_url = callback_url or own.get('callback_url')
+            if not redirect_url or not callback_url:
+                return {'success': False,
+                        'error': "PhonePe needs this node's public URL for the "
+                                 "buyer's return and the payment callback; set "
+                                 + PUBLIC_URL_VAR}
             merchant_txn_id = f"hartos_{payment_request.payment_id.replace('-', '')[:24]}"
             payload = {
                 "merchantId": self.merchant_id,
                 "merchantTransactionId": merchant_txn_id,
                 "merchantUserId": str(meta.get('user_id', payment_request.requester_agent_id))[:36],
                 "amount": amount_paise,
-                "redirectUrl": meta.get('redirect_url', 'https://hevolve.ai/api/v1/intelligence/keys'),
+                "redirectUrl": redirect_url,
                 "redirectMode": "POST",
-                "callbackUrl": meta.get('callback_url', 'https://hevolve.ai/api/v1/intelligence/phonepe/callback'),
+                "callbackUrl": callback_url,
                 "paymentInstrument": {"type": "PAY_PAGE"},
             }
             mobile = meta.get('mobile_number')
@@ -607,8 +658,15 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
                 "merchantUserId": payment_id,
                 "originalTransactionId": gateway_transaction_id,
                 "merchantTransactionId": refund_txn_id,
-                "callbackUrl": "https://hevolve.ai/api/v1/intelligence/phonepe/refund-callback",
             }
+            # The refund's status lands on this node's acknowledger
+            # (commercial_api.phonepe_refund_callback) when the node knows
+            # its public URL; the key is left out otherwise, rather than
+            # naming a host that is not this node (it named the web app's
+            # host, and a route that existed nowhere).
+            refund_callback = own_gateway_urls().get('refund_callback_url')
+            if refund_callback:
+                payload["callbackUrl"] = refund_callback
             if amount_paise is not None:
                 payload["amount"] = amount_paise
 
@@ -1431,7 +1489,8 @@ __all__ = [
     'MockPaymentGateway', 'StripePaymentGateway', 'PhonePePaymentGateway',
     'payment_ledger', 'get_payment_ledger',
     'create_payment_request_function', 'create_payment_authorization_function',
-    'create_payment_processing_function', 'get_ap2_tools_for_autogen'
+    'create_payment_processing_function', 'get_ap2_tools_for_autogen',
+    'own_gateway_urls', 'PHONEPE_CALLBACK_PATH', 'PHONEPE_REFUND_CALLBACK_PATH',
 ]
 
 

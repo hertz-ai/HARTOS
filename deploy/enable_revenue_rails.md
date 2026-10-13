@@ -51,12 +51,21 @@ The new mount line to add to the `docker run` command:
 
 ## Step 3 — Add the payment-rail env vars
 
-`STRIPE_API_KEY` and `HEVOLVE_API_KEY` are owned by the deploy: set each
-as a GitHub repo secret (`gh secret set STRIPE_API_KEY --repo
-hertz-ai/HARTOS`) and the deepbox deploy writes it into central's `.env`
-on every deploy (`deploy/deepbox_deploy.sh`). Do not hand-edit those two;
-while the secret is set, the next deploy writes the secret's value back.
-To remove one: delete the repo secret FIRST, then the line from `.env`.
+`STRIPE_API_KEY`, `HEVOLVE_API_KEY` and `HARTOS_PUBLIC_URL` are owned by
+the deploy: set each as a GitHub repo secret (`gh secret set
+STRIPE_API_KEY --repo hertz-ai/HARTOS`) and the deepbox deploy writes it
+into central's `.env` on every deploy (`deploy/deepbox_deploy.sh`). Do not
+hand-edit those; while the secret is set, the next deploy writes the
+secret's value back. To remove one: delete the repo secret FIRST, then the
+line from `.env`.
+
+`HARTOS_PUBLIC_URL` is the public base of this node's API (the host Kong
+fronts it on). PhonePe is sent `HARTOS_PUBLIC_URL` +
+`/api/v1/intelligence/phonepe/callback` as its server-to-server callback
+and the same base as the buyer's return page, and refund requests name
+`/api/v1/intelligence/phonepe/refund-callback`; without it a PhonePe
+payment is refused with a message naming the setting, never sent with a
+guessed host (`core/public_url.py`).
 
 The PhonePe keys below are not forwarded by the workflow, so they still
 go into the host-side `.env` by hand (the deploy never rewrites keys it
@@ -104,14 +113,14 @@ curl -s http://localhost:6777/api/v1/intelligence/pricing | python3 -m json.tool
 ## Step 5 — Register PhonePe S2S callback on the merchant dashboard
 
 Log into the PhonePe merchant portal and set the **server-to-server
-callback URL** to:
+callback URL** to the one HARTOS sends with every pay request:
 
 ```
-https://etime.hertzai.com/api/v1/intelligence/phonepe/callback
+<HARTOS_PUBLIC_URL>/api/v1/intelligence/phonepe/callback
 ```
 
-(or whatever public URL fronts your central instance — Cloudflare
-Tunnel, ALB DNS, Kong upstream, etc.  The URL must reach the
+(`HARTOS_PUBLIC_URL` is whatever public URL fronts your central instance
+— Cloudflare Tunnel, ALB DNS, Kong upstream, etc.  The URL must reach the
 container's port 6777.)
 
 PhonePe rejects mixed-case URLs in some configs — keep it all

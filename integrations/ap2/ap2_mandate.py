@@ -73,48 +73,6 @@ _MANDATES_FILENAME = 'ap2_mandates.json'
 _MANDATE_KEY_FILENAME = '.ap2_mandate_key'
 
 
-def _trusted_request_base() -> str:
-    """The live request's root, but only when its Host is one this node was
-    told to answer for: an explicit ALLOWED_HOSTS entry (never the '*'
-    wildcard) or a loopback address.  '' otherwise, and outside a request.
-
-    The Host header is the caller's to write.  With ALLOWED_HOSTS=* (the
-    deploy default) a forged Host would otherwise become the URL PhonePe
-    returns the buyer to and posts the signed confirmation to.
-    """
-    try:
-        from flask import has_request_context, request
-        if not has_request_context():
-            return ''
-        host = (request.host or '').rsplit(':', 1)[0].strip('[]').lower()
-        root = request.url_root.rstrip('/')
-    except Exception:
-        return ''
-    if not host:
-        return ''
-    allowed = {h.strip().lower() for h in
-               os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
-               if h.strip() and h.strip() != '*'}
-    if host in allowed or host in ('localhost', '127.0.0.1', '::1'):
-        return root
-    return ''
-
-
-def _own_gateway_urls() -> Dict[str, str]:
-    """This node's redirect/callback URLs: HARTOS_PUBLIC_URL, else the live
-    request's root when its Host is trusted (_trusted_request_base).  Empty
-    when neither exists -- the gateway default then applies, and a warning
-    says so, because the order is then placed only if that default can reach
-    this node."""
-    base = (os.environ.get('HARTOS_PUBLIC_URL') or '').rstrip('/')         or _trusted_request_base()
-    if not base:
-        logger.warning('ap2: no trusted public base for gateway urls (set '
-                       'HARTOS_PUBLIC_URL); the gateway default applies')
-        return {}
-    return {'redirect_url': base + '/',
-            'callback_url': base + '/api/v1/intelligence/phonepe/callback'}
-
-
 class MandateError(ValueError):
     """A mandate could not be created (bad cart, over the cap)."""
 
@@ -338,9 +296,13 @@ class MandateStore:
                 'merchant': merchant, 'user_id': str(user_id),
                 'cart_hash': cart_hash}
         # A redirect gateway (PhonePe) returns the buyer and posts its
-        # confirmation to THIS node, which owns the checkout; without these
-        # the gateway defaults to hevolve.ai and the order is never placed.
-        meta.update(_own_gateway_urls())
+        # confirmation to THIS node, which owns the checkout: its URLs are
+        # stamped now, while the shopper's own request (a trusted Host) is in
+        # hand.  The gateway resolves them again when it mints the checkout
+        # and refuses without them (ap2_protocol.own_gateway_urls); nothing
+        # defaults to a host that is not this node.
+        from integrations.ap2.ap2_protocol import own_gateway_urls
+        meta.update(own_gateway_urls())
         payment = ledger.create_payment_request(
             amount=amount, currency=currency,
             description=description or f'{merchant} order',

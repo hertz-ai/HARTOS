@@ -66,12 +66,18 @@ def _public_base_url() -> str:
     """The externally-reachable URL the OAuth provider will redirect to.
 
     Order:
-      1. HARTOS_PUBLIC_URL env (operator-set, e.g. https://hartos.example.com)
+      1. HARTOS_PUBLIC_URL (operator-set, e.g. https://hartos.example.com),
+         read by core.public_url, the one reader of it.
       2. request.url_root (works for localhost / direct access; will fail
-         for cloud-hosted providers since they can't reach 127.0.0.1)
+         for cloud-hosted providers since they can't reach 127.0.0.1).
+         A redirect_uri must equal the one registered with the provider,
+         so a Host a caller forged only fails that caller's own flow; the
+         payment gateways' URLs, which a forged Host could misdirect, go
+         through core.public_url.public_base_url, which trusts a request's
+         Host only when ALLOWED_HOSTS names it.
     """
-    return (os.environ.get('HARTOS_PUBLIC_URL') or '').rstrip('/') \
-        or request.url_root.rstrip('/')
+    from core.public_url import configured_public_url
+    return configured_public_url() or request.url_root.rstrip('/')
 
 
 def _redirect_uri(channel_type: str) -> str:

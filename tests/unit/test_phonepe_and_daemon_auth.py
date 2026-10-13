@@ -164,6 +164,22 @@ class TestPhonePeGateway(unittest.TestCase):
         # inr_amount=1000 INR → 100000 paise; USD ignored when override present.
         self.assertEqual(g._to_paise(req), 100000)
 
+    def test_to_paise_treats_a_none_override_as_absent(self):
+        """The upgrade route stamps 'inr_amount': None when the caller gave
+        none; that is no override, and it used to raise on float(None), so
+        the route answered 502 after minting the checkout (task #122)."""
+        Gateway, _ = self._import()
+        from integrations.ap2 import PaymentRequest, PaymentMethod
+        g = Gateway(merchant_id='M', salt_key='S', salt_index='1', env='UAT')
+        g.usd_inr_rate = 84.0
+        req = PaymentRequest(
+            amount=Decimal('9.00'), currency='USD',
+            description='Starter upgrade', requester_agent_id='u',
+            payment_method=PaymentMethod.INTERNAL_CREDITS,
+            metadata={'inr_amount': None, 'mobile_number': None},
+        )
+        self.assertEqual(g._to_paise(req), 75600)
+
     def test_create_payment_refuses_when_disconnected(self):
         Gateway, _ = self._import()
         from integrations.ap2 import PaymentRequest, PaymentMethod
