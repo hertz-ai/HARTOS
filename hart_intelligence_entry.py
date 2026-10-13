@@ -971,7 +971,10 @@ app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_h
 # One payload policy for app AND transport: core.serve passes the same
 # constant to Hypercorn's WSGI middleware (whose 64 KB library default
 # otherwise transport-rejects bodies Flask's own cap here would accept).
-from core.constants import MAX_PAYLOAD_BYTES, SHELL_COMMAND_TIMEOUT_S
+from core.constants import (
+    AGENT_WORK_TOOL_NAMES, AGENTIC_ROUTER_TOOL_NAME, CREATE_AGENT_TOOL_NAME,
+    MAX_PAYLOAD_BYTES, SHELL_COMMAND_TIMEOUT_S,
+)
 app.config['MAX_CONTENT_LENGTH'] = MAX_PAYLOAD_BYTES  # 2MB default, HEVOLVE_MAX_PAYLOAD_BYTES to override
 # ...for a remote caller.  A local caller's body has no cap (owner
 # 2026-10-10); the per-request rule is core.serve.max_body_size.
@@ -1895,7 +1898,7 @@ RAG_API = config.get('RAG_API', '')
 from core.config_cache import (
     get_db_url, get_action_api, get_student_api,
     get_vision_api, is_bundled as _config_is_bundled,
-    get_central_db_url,
+    get_central_db_url, flag_value,
 )
 DB_URL = get_db_url()
 # Distinct from DB_URL: always points at the central cloud (kong-routed)
@@ -3028,21 +3031,16 @@ _CREATE_AGENT_TOOL_DESCRIPTION = (
     "input so the downstream pipeline runs in autonomous mode."
 )
 
-#: The two tools that turn a conversation into agent WORK: Create_Agent (an
-#: interview, or an autonomous build saved under the caller's id) and
-#: Agentic_Router (a Plan Mode consent question).  Both get_tools branches
-#: offer them to a person; a metered Hive API call must not get them, since
-#: its caller is a program that can answer none of those and the tool's
-#: output would be the billed reply (task #120; the review of 7e7ce19bc
-#: drove it).  The self-POST sends ``agent_tools`` False and
-#: _without_agent_work_tools() is the ONE filter both branches apply.
-_AGENT_WORK_TOOL_NAMES = frozenset({'Create_Agent', 'Agentic_Router'})
-
-
 def _without_agent_work_tools(tools):
-    """``tools`` minus the agent-work pair (_AGENT_WORK_TOOL_NAMES); every
-    other tool keeps its place.  Objects without a ``name`` are kept."""
-    return [t for t in tools if getattr(t, 'name', None) not in _AGENT_WORK_TOOL_NAMES]
+    """``tools`` minus the agent-work pair (core.constants.AGENT_WORK_TOOL_NAMES:
+    Create_Agent, an interview or an autonomous build saved under the
+    caller's id, and Agentic_Router, a Plan Mode consent question); every
+    other tool keeps its place.  Objects without a ``name`` are kept.  Both
+    get_tools branches offer the pair to a person; a metered Hive API call
+    must not get it, since its caller is a program that can answer none of
+    those and the tool's output would be the billed reply (task #120; the
+    review of 7e7ce19bc drove it).  The ONE filter both branches apply."""
+    return [t for t in tools if getattr(t, 'name', None) not in AGENT_WORK_TOOL_NAMES]
 
 
 def _handle_create_agent_tool(input_text):
@@ -5379,10 +5377,20 @@ def _warmup_tool_registries_in_background():
             "tool-registry-warmup spawn skipped: %s", _w_err)
 
 
-def get_tools(req_tool, is_first: bool = False, agent_tools: bool = True):
-    """The tool set for a turn.  ``agent_tools`` False withholds the
-    agent-work pair (_AGENT_WORK_TOOL_NAMES) on either branch; the metered
-    Hive API asks for that (task #120).  Nothing is added by asking."""
+def get_tools(req_tool, is_first: bool = False, agent_tools=None):
+    """The tool set for a turn.
+
+    ``agent_tools`` False withholds the agent-work pair
+    (core.constants.AGENT_WORK_TOOL_NAMES) on either branch; the metered Hive
+    API asks for that (task #120).  None, the default, reads the turn's own
+    answer from the request thread-local (thread_local_data.get_agent_tools,
+    set once by /chat from the body), so every caller of this turn agrees:
+    get_ans's two calls and CustomGPT._call's prompt rebuild on later steps,
+    which passes no flag and, while the flag travelled as a keyword,
+    re-listed both tools in the prompt after the first step (the review of
+    5a66a3308 measured it).  Nothing is added by asking."""
+    if agent_tools is None:
+        agent_tools = thread_local_data.get_agent_tools()
 
     if is_first:
         # ── Timing instrumentation (#185) ─────────────────────────────
@@ -5538,7 +5546,7 @@ def get_tools(req_tool, is_first: bool = False, agent_tools: bool = True):
                 ui_label='Setting up a visual watcher…',
             ),
             labeled_tool(
-                name="Create_Agent",
+                name=CREATE_AGENT_TOOL_NAME,
                 func=_handle_create_agent_tool,
                 description=_CREATE_AGENT_TOOL_DESCRIPTION,
                 ui_label='Starting agent creation…',
@@ -5592,7 +5600,7 @@ def get_tools(req_tool, is_first: bool = False, agent_tools: bool = True):
                 ui_label='Reflecting on past suggestions…',
             ),
             labeled_tool(
-                name="Agentic_Router",
+                name=AGENTIC_ROUTER_TOOL_NAME,
                 func=_handle_agentic_router_tool,
                 description=(
                     "Use when the user's request requires multi-step execution such as building "
@@ -6011,7 +6019,7 @@ def get_tools(req_tool, is_first: bool = False, agent_tools: bool = True):
                 description="This tool captures the user's visual context during a video call, providing real-time captions. Use it for visual question answering, scene understanding, recognizing objects, activities, & monitoring the user. Input will be the user's input/query. If the last 16 seconds of visual context are available and sufficient, it crafts a creative, cohesive response. If not, inform the user of the glitch accessing the current camera feed and guess using the Last_5_Minutes_Visual_Context. Ensure responses are natural, avoiding lists of captions, and format them as if you are seeing the user scene via video call. Analyze the current tool response and previous visual context captions to recognize user activities and infer actions from multiple frames. If the user requests continuous narration without active input, adapt the response to include past, present, and future tenses for dynamic and contextually aware commentary."
             ),
             Tool(
-                name="Create_Agent",
+                name=CREATE_AGENT_TOOL_NAME,
                 func=_handle_create_agent_tool,
                 description=_CREATE_AGENT_TOOL_DESCRIPTION,
             ),
@@ -6060,7 +6068,7 @@ def get_tools(req_tool, is_first: bool = False, agent_tools: bool = True):
                 ),
             ),
             Tool(
-                name="Agentic_Router",
+                name=AGENTIC_ROUTER_TOOL_NAME,
                 func=_handle_agentic_router_tool,
                 description=(
                     "Use when the user's request requires multi-step execution such as building "
@@ -7980,8 +7988,7 @@ from core.llm_outbound_logger import with_source as _with_source
 
 # main function
 @_with_source('langchain.chat')
-def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang,
-            agent_tools=True):
+def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang):
     start_time = time.time()
     _stage_req_id = str(thread_local_data.get_request_id() or '')
     publish_chat_stage('loading_context', user_id=str(user_id), request_id=_stage_req_id)
@@ -8026,14 +8033,14 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     if casual_conv:
         # Minimal first-pass tools — enough for the LLM to help with common
         # tasks (calculator, history, image) without loading the full registry.
-        tools = get_tools(req_tool=req_tool, is_first=True, agent_tools=agent_tools)
+        tools = get_tools(req_tool=req_tool, is_first=True)
         app.logger.info("get_tools loaded (is_first=True, casual_conv=True) %s seconds",
                         time.time() - tools_start_time)
     else:
         # Exhaustive intent-based tool set — full registry scan based on
         # detected intent. This is the heavy path (~2.5s) but gives the LLM
         # access to every tool for complex/agentic requests.
-        tools = get_tools(req_tool=req_tool, is_first=False, agent_tools=agent_tools)
+        tools = get_tools(req_tool=req_tool, is_first=False)
         app.logger.info("get_tools loaded (is_first=False, casual_conv=False) %s seconds",
                         time.time() - tools_start_time)
 
@@ -10000,13 +10007,15 @@ def chat():
     request_id = data.get('request_id') or request.values.get('request_id') or None
     req_tool = data.get('tools', None)
     # agent_tools False withholds Create_Agent and Agentic_Router from this
-    # turn (get_tools, _AGENT_WORK_TOOL_NAMES).  The metered Hive API's
-    # self-POST sends it (task #120): its caller is a program that cannot
-    # answer an agent interview or a Plan Mode consent question, and the
-    # tool's output was the billed reply.  Anyone may ask for fewer tools and
-    # nobody gets more, so the field needs no credential; absent, every
-    # person's turn keeps both.
-    agent_tools = data.get('agent_tools', True) not in (False, 0, '0', 'false', 'False')
+    # turn (get_tools, core.constants.AGENT_WORK_TOOL_NAMES).  The metered
+    # Hive API's self-POST sends it (task #120): its caller is a program that
+    # cannot answer an agent interview or a Plan Mode consent question, and
+    # the tool's output was the billed reply.  Anyone may ask for fewer tools
+    # and nobody gets more, so the field needs no credential; absent, every
+    # person's turn keeps both.  Read by the one boolean reader the env flags
+    # use (core.config_cache.flag_value), so 'FALSE', 'no' and 'off' decline
+    # too; junk keeps the default.
+    agent_tools = flag_value(data.get('agent_tools'), True)
     file_id = data.get('file_id', None)
     prompt_id = data.get('prompt_id', None)
 
@@ -10032,6 +10041,20 @@ def chat():
     # which pins both the ordering and the survival of the later stamp.
     thread_local_data.set_user_id(user_id=user_id)
     thread_local_data.set_prompt_id(prompt_id)
+    # The turn's own answer to "may the model be offered agent work?", read
+    # by get_tools wherever it runs for this turn (get_ans's two calls and
+    # CustomGPT._call's prompt rebuild on later steps), so no caller of the
+    # turn can disagree with another.
+    thread_local_data.set_agent_tools(agent_tools)
+    # A Create_Agent or Agentic_Router flag left by an EARLIER turn on this
+    # reused worker thread (its turn ended before the handlers below get_ans
+    # read and cleared it) would route THIS turn into Creation Mode or Plan
+    # Mode: the handlers read the flags, never who set them (the review of
+    # 5a66a3308 read it; not measured live).  Nothing sets either flag before
+    # get_ans within a turn (their only writers are the two tool handlers),
+    # so the turn starts clean.
+    thread_local_data.clear_creation_flags()
+    thread_local_data.clear_agentic_flags()
 
     create_agent = data.get('create_agent', None)
     casual_conv = data.get('casual_conv', False)
@@ -10522,7 +10545,13 @@ def chat():
                 # fix.  Untrusted intent is treated as absent, everywhere.
                 _create_intent_actionable = (
                     bool(result.get('is_create_agent'))
-                    and _draft_conf >= _DRAFT_INTENT_CONFIDENCE)
+                    and _draft_conf >= _DRAFT_INTENT_CONFIDENCE
+                    # A turn that declined agent work (the metered Hive
+                    # API's self-POST, task #120) is not routed into CREATE
+                    # by the draft either: HEVOLVE_DRAFT_FIRST=1 in the
+                    # node's env overrides the body's draft_first False and
+                    # could bring a paid call here (read, not measured).
+                    and agent_tools)
 
                 if _create_intent_actionable:
                     app.logger.info(
@@ -11282,8 +11311,7 @@ def chat():
         "the time taken before get ans in main api is %s seconds", time.time() - start_time)
     ans_start_time = time.time()
     ans = get_ans(casual_conv, req_tool, user_id=user_id,
-                  query=prompt, custom_prompt=custom_prompt, preferred_lang=preferred_lang,
-                  agent_tools=agent_tools)
+                  query=prompt, custom_prompt=custom_prompt, preferred_lang=preferred_lang)
     app.logger.info("the time taken by get ans in main api is %s seconds",
                     time.time() - ans_start_time)
 

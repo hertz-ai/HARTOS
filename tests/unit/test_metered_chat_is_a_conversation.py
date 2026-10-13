@@ -98,12 +98,14 @@ def _metered_call_through_real_chat(hie, monkeypatch, route, body):
     monkeypatch.setattr(hie, 'publish_async', lambda *a, **k: None)
     monkeypatch.setattr(hie, '_tune_resonance_after_chat', lambda *a, **k: {})
     seen = {'get_ans': 0, 'gather_info': 0, 'casual_conv': None, 'draft': 0,
-            'agent_tools': 'not passed'}
+            'agent_tools': 'get_ans not reached'}
 
     def fake_get_ans(casual_conv, *a, **k):
         seen['get_ans'] += 1
         seen['casual_conv'] = casual_conv
-        seen['agent_tools'] = k.get('agent_tools', 'not passed')
+        # What get_tools reads for this turn: the thread-local /chat set from
+        # the body (no keyword travels; task #120's second round).
+        seen['agent_tools'] = hie.thread_local_data.get_agent_tools()
         return ANSWER
 
     def fake_gather_info(*a, **k):
@@ -180,8 +182,9 @@ def test_a_paid_call_is_offered_no_agent_work_tools(hie, monkeypatch, route, bod
     and when the model picked one the customer got the creation interview, a
     Review Mode agent under their id, or a Plan Mode consent question the API
     cannot answer, as the billed reply (the review of 7e7ce19bc drove it).
-    The self-POST says agent_tools False and /chat hands that to get_ans, so
-    those two tools are never offered to a paid turn."""
+    The self-POST says agent_tools False and /chat records it on the turn's
+    thread-local, which get_tools reads on every call of the turn, so those
+    two tools are never offered to a paid turn."""
     r, sent, seen = _metered_call_through_real_chat(hie, monkeypatch, route, body)
     assert sent['json'].get('agent_tools') is False, sent['json']
     assert seen['agent_tools'] is False, seen

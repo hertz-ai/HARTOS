@@ -125,17 +125,33 @@ _TRUTHY = ('1', 'true', 'yes', 'on')
 _FALSY = ('0', 'false', 'no', 'off')
 
 
-def env_flag(name: str, default: bool) -> bool:
-    """Boolean env flag with ONE semantics for every flag:
-    explicit truthy -> True, explicit falsy -> False, unset or
-    unrecognized junk -> the declared default (junk never silently
-    flips a feature)."""
-    val = os.environ.get(name, '').strip().lower()
+def flag_value(value, default: bool) -> bool:
+    """ONE reading of a boolean that arrived as a bool, a number or a string:
+    an env value (env_flag), a request body's field (/chat's ``agent_tools``).
+    A bool is itself; a number is its truth; a string is read stripped and
+    case-folded against the one truthy/falsy table above; None, '' and
+    unrecognized junk are the declared default (junk never silently flips a
+    feature).  Before this, /chat read its field against a five-spelling
+    tuple of its own, so 'FALSE', 'no' and 'off' did not decline (the review
+    of 5a66a3308 read it)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    val = str(value if value is not None else '').strip().lower()
     if val in _TRUTHY:
         return True
     if val in _FALSY:
         return False
     return default
+
+
+def env_flag(name: str, default: bool) -> bool:
+    """Boolean env flag with ONE semantics for every flag:
+    explicit truthy -> True, explicit falsy -> False, unset or
+    unrecognized junk -> the declared default (junk never silently
+    flips a feature).  The reading itself is flag_value's."""
+    return flag_value(os.environ.get(name, ''), default)
 
 
 def env_int(name: str, default: int, minimum: int = None) -> int:
