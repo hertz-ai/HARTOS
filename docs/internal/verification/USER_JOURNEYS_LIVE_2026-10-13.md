@@ -15,14 +15,15 @@ its task number, never as steps. The matching plan is
 ## Method
 
 Central = the HARTOS container on the deploy box, build 903cd58c (deployed
-04:17:49 UTC). Every turn in this record that the model answered ran BEFORE
-that deploy, on the previous build e829b072f: the 03:25 paid-API probes (which
-came back as agent-building text; the metered path is identical in both
-builds, read) and the 03:27 direct answers in section 1. By this record's own
-count (section 8: 0 x HTTP 200 from the model since the container started at
-04:17) no turn after the deploy was answered by the model, and the 05:00 to
-05:02 probes show it: the agent-less turn returned the generic error reply and
-the metered one the agent-building text. Central was reached on the LAN node and,
+04:17:49 UTC). The only turns in this record that the model answered are the
+three direct answers saved at 03:27 UTC (section 1), BEFORE that deploy, on
+the previous build e829b072f. The paid-API probes never got a model answer on
+either build: at 03:25 (e829b072f) two came back as agent-building text and
+one as the prompt echoed; at 04:20, 05:00 and 06:00 (903cd58c) eight came
+back as agent-building text and one as the "internal snag" sentence (the
+metered path is identical in both builds, read). By this record's own count
+(section 8: 0 x HTTP 200 from the model since the container started at 04:17)
+no turn after the deploy was answered by the model. Central was reached on the LAN node and,
 where Kong routes it, on the public host `https://api.hevolve.ai`. Surfaces
 were driven with plain HTTP by throwaway accounts (register is limited to 3
 per hour per client key, which ended one run; what a client key is on central
@@ -55,9 +56,9 @@ verdict means it was measured on the LAN node only, not on the public host.
 | Who am I | `GET /api/social/auth/me` | 200, profile | measured | WORKS, LAN |
 | Read the feed | `GET /api/social/feed/all` on LAN and on `api.hevolve.ai` | 200 both | measured | WORKS, public too |
 | Post and read back | `POST /api/social/posts`, `GET /posts/<id>` | created, read back with the post (201 by reading) | measured, read | WORKS, LAN |
-| Chat with no agent | `POST /chat` prompt_id null, 03:27 to 05:02 UTC, LAN | 5 turns: 4 answers ("Paris is the capital of France.", a correct function, ...), 1 "I ran into a problem handling that." | measured | WORKS 4 of 5, LAN; see section 8 for the model after 04:20 |
+| Chat with no agent | `POST /chat` prompt_id null, LAN | 3 turns at 03:27 UTC answered ("Paris is the capital of France." twice, a correct `def square` function), the texts kept by the probe; two more turns (03:20 and 05:02 UTC) whose reply text the probe scripts did not keep (the 05:02 body shows 0 response tokens and no intent) | measured (3), not checked (2) | WORKS 3 of 3 saved, LAN, all before the 04:17 deploy; see section 8 for the model after 04:20 |
 | Chat on the public host | `POST https://api.hevolve.ai/chat` with the same JWT | 401 `invalid_token` from Kong's OAuth2 gate: an unrelated route on the same path wins over HARTOS's | measured | BROKEN, task #119 |
-| Create an agent | `POST /chat` create_agent true, LAN | 200, `Agent_status: Creation Mode`, prompt_id minted | measured | WORKS (interview turn 1), LAN |
+| Create an agent | `POST /chat` create_agent true, 05:00 UTC, LAN | 200, `Agent_status: Creation Mode`, prompt_id 91867635923 minted; the reply text was NOT captured (the probe cut the body before the `response` field), and after 04:17 the model answered nothing (section 8), so whether the user got an interview question or a failure sentence is unknown | measured (status), not checked (the reply) | NOT CHECKED: a status field is not the outcome the user sees |
 
 ## 2. Buyer (Hive API customer)
 
@@ -146,7 +147,7 @@ outside this repository).
 | Public listing on the API host | `GET https://api.hevolve.ai/prompts/public` | 404: the `/prompts` route is pinned to the web hosts | measured | the API host lacks it; hevolve.ai has it |
 | REUSE a listed agent | `POST /chat` prompt_id 66722327257 ("Hive Model Trainer Incremental Improvement" in the listing above) and 28366228009 ("Agent 28366228009"), twice each, 05:19 to 05:20 UTC, LAN (the persistent account) | 200, `Agent_status: Reuse Mode`, `served_by: cloud`, response "I couldn't finish that: Error code: 400 - {'error': {'message': 'Reasoning is mandatory for this endpoint and cannot be disabled.', ...}}" 4 of 4; all four after the quota ran out (next row), so quota and the reasoning-only pick are not separated here | measured | BROKEN on `openrouter/free` (task #115) |
 | The model behind all of the above | inside the container at 05:40 UTC: the OpenRouter key endpoint says free tier; one plain request answered 429 "free-models-per-day" with `X-RateLimit-Limit: 50`; the new container's log (it starts at the 04:17 deploy) held 22 x HTTP 400, 18 x HTTP 429 and 0 x HTTP 200 to OpenRouter in that window, the first 429 at 04:20:26 UTC | every OpenRouter turn on central failed from 04:20 to 05:40 UTC (measured); the cap is daily, so the rest of the UTC day is expected to fail too (not measured); whether central has a second LLM endpoint configured (the lanes plan allows `OPENAI_BASE_URL` / `HEVOLVE_LOCAL_LLM_URL` to name one) was not checked, so "every turn" is claimed only for OpenRouter | measured, with the expectation and the gap labelled | BLOCKED on the owner's money decision (task #115) |
-| Create an agent | see person | Creation Mode turn 1 | measured | WORKS, LAN |
+| Create an agent | see person (section 1) | Creation Mode status, reply text not captured | measured (status), not checked (the reply) | NOT CHECKED |
 | Run a listed agent through the Hive API | no `agent_id` field on the metered endpoint; the metered reply carries only `success`, `response`, `usage` | read | BLOCKED, plan W1-9 |
 
 ## 9. The public host
@@ -162,13 +163,16 @@ served on the web hosts, not the API host.
 Measured on the public host: the social feed read and the public agent
 listing on hevolve.ai work; chat is captured by the wrong route; the paid
 paths have no route. Measured on the LAN node only: sign up and log in, write
-to the feed, search, start creating an agent, get a Hive API key, see usage,
-and chat with no agent (4 of 5 before the quota ran out). Not working or not
-reachable: every paid step (no public route, no Stripe, no webhook, broken
-answers until the fix chain deploys), the hivemind leg, every
+to the feed, search, get a Hive API key, see usage, and chat with no agent
+(the three turns whose replies were kept, all at 03:27 UTC before the
+deploy). Not checked: what a person gets back when they start creating an
+agent (the status said Creation Mode; the reply was not captured). Not
+working or not reachable: every paid step (no public route, no Stripe, no
+webhook, broken answers until the fix chain deploys), the hivemind leg, every
 automated channel (news, research, marketing), the seller and McGroce legs
 (unconfigured), RideSnap (no HARTOS surface, backend unreachable), and, since
-04:20 UTC, every LLM turn at all (the free daily quota). Gaps that are not
-journeys: tasks #121 (fixed in this chain, not deployed), #123 and #125 (not
-measured). The admin UI and the marketplace UI exist in the deployed bundle
-and were not driven in a browser.
+04:20 UTC, every OpenRouter turn (the free daily quota; whether central has a
+second LLM endpoint was not checked, section 8). Gaps that are not journeys:
+tasks #121 (fixed in this chain, not deployed), #127 (the goals listing),
+#123 and #125 (not measured). The admin UI and the marketplace UI exist in
+the deployed bundle and were not driven in a browser.
