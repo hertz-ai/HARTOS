@@ -163,10 +163,11 @@ gh secret set STRIPE_WEBHOOK_SECRET --repo hertz-ai/HARTOS
 3. Deploy. Until the secret is on the box the webhook route answers 503
    (nothing unsigned is trusted); Stripe retries a non-2xx delivery for
    days, so an event sent before the secret landed is not lost.
-4. Verify with the dashboard's "Send test webhook": a signed
-   `checkout.session.completed` for an unpaid or unknown session answers
-   200 (`status: unpaid` or `status: not_finalized`); a delivery with a
-   wrong secret answers 400.
+4. Verify with the dashboard's test event: a signed
+   `checkout.session.completed` answers 200 with `status: unpaid`, or
+   `status: ignored` when the session is not one of this node's tier
+   upgrades (the test event is not); a delivery with a wrong secret
+   answers 400.
 
 Source: `integrations/agent_engine/commercial_api.py: stripe_webhook`,
 `integrations/ap2/ap2_protocol.py: StripePaymentGateway.verify_webhook`.

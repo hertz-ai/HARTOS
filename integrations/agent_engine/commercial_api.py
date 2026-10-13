@@ -1817,11 +1817,37 @@ def create_upgrade_checkout(key_id):
             pass
 
 
-def _recorded_checkout(session_id: str):
+def _session_metadata(session) -> dict:
+    """A Stripe Checkout Session's metadata as a plain dict.
+
+    From stripe 15.0.0 (2026-03) StripeObject no longer subclasses dict:
+    ``.get`` raises AttributeError, where 7.0.0 through 14.4.1 still answer
+    it.  The review of 3153761b3 measured a 500 on every paid event with
+    15.0.0 and 16.0.0, which is what central's next image installs
+    (requirements.txt pins stripe>=7.0.0).  ``to_dict`` exists on every
+    version; a plain dict (the retrieve() of the older SDKs, or a test's)
+    is copied; None or anything else is nothing."""
+    meta = getattr(session, 'metadata', None)
+    if meta is None:
+        return {}
+    if hasattr(meta, 'to_dict'):
+        try:
+            return dict(meta.to_dict() or {})
+        except Exception:
+            return {}
+    if isinstance(meta, dict):
+        return dict(meta)
+    return {}
+
+
+def _tier_rank(tier: str) -> float:
+    """What a tier costs a month: the order a bought tier is compared in."""
+    return float(TIER_CONFIG.get(tier, {}).get('monthly_price_usd', 0.0) or 0.0)
+
+
+def _recorded_checkout_unlocked(session_id: str):
     """The ledger payment that already finalized this Checkout Session, or
-    None.  Read without the ledger's lock as a fast path (the browser route
-    answers a replay without asking Stripe); the finalizer repeats the read
-    under the lock before it records anything."""
+    None.  The caller holds payment_ledger.lock (the dict is iterated)."""
     from integrations.ap2 import payment_ledger
     for existing in payment_ledger.payments.values():
         if (existing.metadata or {}).get('stripe_session_id') == session_id:
@@ -1829,13 +1855,81 @@ def _recorded_checkout(session_id: str):
     return None
 
 
-def _already_completed(existing) -> dict:
-    return {
+def _recorded_checkout(session_id: str):
+    """_recorded_checkout_unlocked under the ledger's lock: the browser
+    route's fast path, answering a replay without asking Stripe.  (An
+    unlocked iteration while another thread inserts can raise 'dictionary
+    changed size'; find_by_gateway_transaction locks for the same reason.)"""
+    from integrations.ap2 import payment_ledger
+    with payment_ledger.lock:
+        return _recorded_checkout_unlocked(session_id)
+
+
+def _checkout_payload(payment, api_key, already_completed: bool = False) -> dict:
+    """The one answer a finalized Checkout gets, whichever caller asks and
+    however many times: the tier and its limits, the amount, the split and
+    the receipt ids the landing page's success screen renders
+    (UpgradeSuccess.js reads api_key.tier, api_key.rate_limit_per_day,
+    api_key.monthly_quota, payment.amount_usd, payment.stripe_payment_intent,
+    revenue_split.* and payment_request_id).  A replay used to answer a bare
+    already_completed envelope, on which that page threw (the review of
+    3153761b3 ran it)."""
+    meta = payment.metadata or {}
+    amount_usd = float(payment.amount)
+    body = {
         'success': True,
-        'already_completed': True,
-        'payment_request_id': existing.payment_id,
-        'status': existing.status.value if hasattr(existing.status, 'value') else str(existing.status),
+        'payment_request_id': payment.payment_id,
+        'api_key': {
+            'id': str(api_key.id),
+            'tier': api_key.tier,
+            'rate_limit_per_day': api_key.rate_limit_per_day,
+            'monthly_quota': api_key.monthly_quota,
+        },
+        'payment': {
+            'amount_usd': amount_usd,
+            'stripe_session_id': meta.get('stripe_session_id'),
+            'stripe_payment_intent': meta.get('stripe_payment_intent'),
+            'status': payment.status.value if hasattr(payment.status, 'value') else str(payment.status),
+        },
+        'revenue_split': _revenue_split_usd(amount_usd),
     }
+    if already_completed:
+        body['already_completed'] = True
+    return body
+
+
+def _apply_bought_tier(db, api_key, target_tier: str):
+    """Put ``api_key`` on the tier it bought; ``(changed, error)``.
+
+    Nothing to do when the key is already there, and nothing when it sits
+    on a tier that costs more: Stripe does not order deliveries and events
+    queue while the webhook secret is missing, so a starter session can be
+    finalized after the pro one (the review of 3153761b3 measured the
+    downgrade).  On a failure the key's attributes are put back and the
+    session rolled back, so a later call (Stripe's retry after the 500)
+    sees the key still below the bought tier and finishes the bump."""
+    current = str(getattr(api_key, 'tier', '') or '')
+    if current == target_tier:
+        return False, None
+    if current in TIER_CONFIG and _tier_rank(current) > _tier_rank(target_tier):
+        logger.info("Checkout: api_key %s stays on %s; the %s it bought costs less",
+                    getattr(api_key, 'id', None), current, target_tier)
+        return False, None
+    before = (api_key.tier, api_key.rate_limit_per_day, api_key.monthly_quota)
+    cfg = TIER_CONFIG[target_tier]
+    try:
+        api_key.tier = target_tier
+        api_key.rate_limit_per_day = cfg['rate_limit_per_day']
+        api_key.monthly_quota = cfg['monthly_quota']
+        db.commit()
+        return True, None
+    except Exception as e:
+        api_key.tier, api_key.rate_limit_per_day, api_key.monthly_quota = before
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False, str(e)
 
 
 def _finalize_paid_checkout_session(session, db):
@@ -1847,9 +1941,14 @@ def _finalize_paid_checkout_session(session, db):
     until the webhook, the tier moved only if the success page POSTed the
     session id (task #122).  Both may finish the same session, so the
     ledger record is made under the ledger's lock: the first to insert it
-    bumps the tier, the other reads the record and answers
-    ``already_completed``.  ``session`` is Stripe's object (attribute
-    access, as the SDK returns it from retrieve() and in an event); its
+    records the payment, every caller then applies the bought tier
+    (_apply_bought_tier: a no-op once the key is there, so a replay after a
+    failed bump finishes it, and never a downgrade), and every caller
+    answers the same payload (_checkout_payload), with
+    ``already_completed`` when the record was there before it.  ``session``
+    is Stripe's object (attribute access, as the SDK returns it from
+    retrieve() and in an event; its metadata through _session_metadata,
+    since the SDK's metadata object is not a dict from 15.0.0 on); the
     metadata was written by create_upgrade_checkout and comes back signed
     by Stripe, so the user_id and api_key_id it carries are trusted here.
     The browser route checks the user_id against the JWT before calling.
@@ -1862,7 +1961,7 @@ def _finalize_paid_checkout_session(session, db):
     from integrations.social.models import CommercialAPIKey
 
     session_id = getattr(session, 'id', None) or ''
-    meta = getattr(session, 'metadata', None) or {}
+    meta = _session_metadata(session)
     if meta.get('kind') != 'tier_upgrade_checkout':
         return {'success': False, 'error': 'Session is not a tier upgrade.'}, 400
     api_key_id = meta.get('api_key_id', '')
@@ -1876,72 +1975,54 @@ def _finalize_paid_checkout_session(session, db):
     if not api_key:
         return {'success': False, 'error': 'API key not found'}, 404
 
-    target_cfg = TIER_CONFIG[target_tier]
     amount_usd = float(session.amount_total) / 100.0
 
     with payment_ledger.lock:
-        existing = _recorded_checkout(session_id)
-        if existing is not None:
-            return _already_completed(existing), 200
-        # Record the revenue: a COMPLETED PaymentRequest in the ledger so
-        # settle_metered_api_costs + get_api_revenue_stats see it.
-        payment = PaymentRequest(
-            amount=_Decimal(str(amount_usd)),
-            currency=(getattr(session, 'currency', None) or 'usd').upper(),
-            description=f'API tier upgrade via Checkout: {api_key.tier} → {target_tier}',
-            requester_agent_id=f'user:{user_id}',
-            payment_method=PaymentMethod.STRIPE,
-            metadata={
-                'kind': 'tier_upgrade',
-                'api_key_id': api_key_id,
-                'current_tier': api_key.tier,
-                'target_tier': target_tier,
-                'stripe_session_id': session_id,
-                'stripe_payment_intent': getattr(session, 'payment_intent', None),
-                'stripe_customer': getattr(session, 'customer', None),
-            },
-        )
-        payment.gateway = PaymentGateway.STRIPE
-        payment.update_status(PaymentStatus.AUTHORIZED, 'Stripe Checkout paid')
-        payment.gateway_transaction_id = getattr(session, 'payment_intent', None) or session_id
-        payment.update_status(PaymentStatus.COMPLETED, 'Stripe Checkout finalized')
-        payment_ledger.payments[payment.payment_id] = payment
-        payment_ledger.save_ledger()
+        payment = _recorded_checkout_unlocked(session_id)
+        already = payment is not None
+        if not already:
+            # Record the revenue: a COMPLETED PaymentRequest in the ledger
+            # so settle_metered_api_costs + get_api_revenue_stats see it.
+            payment = PaymentRequest(
+                amount=_Decimal(str(amount_usd)),
+                currency=(getattr(session, 'currency', None) or 'usd').upper(),
+                description=f'API tier upgrade via Checkout: {api_key.tier} → {target_tier}',
+                requester_agent_id=f'user:{user_id}',
+                payment_method=PaymentMethod.STRIPE,
+                metadata={
+                    'kind': 'tier_upgrade',
+                    'api_key_id': api_key_id,
+                    'current_tier': api_key.tier,
+                    'target_tier': target_tier,
+                    'stripe_session_id': session_id,
+                    'stripe_payment_intent': getattr(session, 'payment_intent', None),
+                    'stripe_customer': getattr(session, 'customer', None),
+                },
+            )
+            payment.gateway = PaymentGateway.STRIPE
+            payment.update_status(PaymentStatus.AUTHORIZED, 'Stripe Checkout paid')
+            payment.gateway_transaction_id = getattr(session, 'payment_intent', None) or session_id
+            payment.update_status(PaymentStatus.COMPLETED, 'Stripe Checkout finalized')
+            payment_ledger.payments[payment.payment_id] = payment
+            payment_ledger.save_ledger()
 
-    # Apply the tier bump.
-    try:
-        api_key.tier = target_tier
-        api_key.rate_limit_per_day = target_cfg['rate_limit_per_day']
-        api_key.monthly_quota = target_cfg['monthly_quota']
-        db.commit()
-    except Exception as e:
+    # The bought tier: applied on the first finalize, and again by a replay
+    # when a bump failed after the record was made (a 500 asks Stripe to
+    # retry; the retry used to be answered already_completed over a key
+    # still on the old tier, the review of 3153761b3).  Never a downgrade.
+    _changed, failure = _apply_bought_tier(db, api_key, target_tier)
+    if failure is not None:
         logger.error(f"MANUAL RECONCILIATION NEEDED: Stripe session "
                      f"{session_id} paid but tier bump failed for "
-                     f"api_key {api_key_id}: {e}")
+                     f"api_key {api_key_id}: {failure}")
         return {
             'success': False,
-            'error': f'Payment succeeded but tier bump failed: {e}',
+            'error': f'Payment succeeded but tier bump failed: {failure}',
             'payment_request_id': payment.payment_id,
             'session_id': session_id,
         }, 500
 
-    return {
-        'success': True,
-        'payment_request_id': payment.payment_id,
-        'api_key': {
-            'id': str(api_key.id),
-            'tier': api_key.tier,
-            'rate_limit_per_day': api_key.rate_limit_per_day,
-            'monthly_quota': api_key.monthly_quota,
-        },
-        'payment': {
-            'amount_usd': amount_usd,
-            'stripe_session_id': session_id,
-            'stripe_payment_intent': getattr(session, 'payment_intent', None),
-            'status': 'completed',
-        },
-        'revenue_split': _revenue_split_usd(amount_usd),
-    }, 200
+    return _checkout_payload(payment, api_key, already_completed=already), 200
 
 
 @commercial_api_bp.route('/api/v1/intelligence/upgrade/checkout/complete',
@@ -1985,11 +2066,20 @@ def complete_upgrade_checkout():
         if refusal is not None:
             return refusal
 
-        # A replay (or the webhook got there first): answer without
-        # asking Stripe.
+        # A replay (or the webhook got there first): answer the same page
+        # without asking Stripe, to the key's owner only.
         existing = _recorded_checkout(session_id)
         if existing is not None:
-            return jsonify(_already_completed(existing)), 200
+            from integrations.social.models import CommercialAPIKey
+            api_key = db.query(CommercialAPIKey).filter_by(
+                id=(existing.metadata or {}).get('api_key_id'),
+                user_id=str(user.id)).first()
+            if not api_key:
+                return jsonify({
+                    'success': False,
+                    'error': 'Session belongs to a different user.',
+                }), 403
+            return jsonify(_checkout_payload(existing, api_key, already_completed=True)), 200
 
         try:
             session = stripe_gw._stripe.checkout.Session.retrieve(session_id)
@@ -2006,7 +2096,14 @@ def complete_upgrade_checkout():
                 'session_id': session_id,
             }), 402
 
-        meta = session.metadata or {}
+        # The kind before the user, as before the finalizer was lifted out:
+        # a session that is no tier upgrade is a 400 whoever asks.
+        meta = _session_metadata(session)
+        if meta.get('kind') != 'tier_upgrade_checkout':
+            return jsonify({
+                'success': False,
+                'error': 'Session is not a tier upgrade.',
+            }), 400
         if meta.get('user_id') != str(user.id):
             return jsonify({
                 'success': False,
@@ -2036,10 +2133,13 @@ def stripe_webhook():
     ever trusted; Stripe retries non-2xx for days, so the operator can fix
     the configuration without losing the event), 400 when the signature or
     the payload is refused, 200 for an event of another type or an unpaid
-    session (acknowledged, nothing done), the finalizer's status otherwise:
-    a 500 (the tier bump failed) asks Stripe to retry; a 4xx from it (bad
-    metadata, no such key) is answered 200 with the error named and an
-    ERROR line for a person, since a retry cannot fix it.
+    session, and 200 ``ignored`` for a paid session that is not one of
+    this node's tier upgrades (another product on the same Stripe account,
+    the dashboard's test event); the finalizer's status otherwise: a 500
+    (the tier bump failed) asks Stripe to retry, and the retry finds the
+    record and finishes the bump; a 4xx from it (malformed tier, no such
+    key) is answered 200 with the error named and an ERROR line for a
+    person, since a retry cannot fix it.
     """
     stripe_gw, refusal = _stripe_gateway()
     if refusal is not None:
@@ -2063,6 +2163,13 @@ def stripe_webhook():
     session_id = getattr(session, 'id', None)
     if getattr(session, 'payment_status', None) != 'paid':
         return jsonify({'success': True, 'status': 'unpaid', 'session_id': session_id}), 200
+    if _session_metadata(session).get('kind') != 'tier_upgrade_checkout':
+        # Not one of this node's tier upgrades: another product's checkout
+        # on the same account, or the dashboard's test event.  Acknowledged
+        # and ignored; it is not a reconciliation case.
+        logger.info("Stripe webhook: paid session %s is not a tier upgrade; ignored",
+                    session_id)
+        return jsonify({'success': True, 'status': 'ignored', 'session_id': session_id}), 200
 
     from integrations.social.models import get_db
     db = get_db()
