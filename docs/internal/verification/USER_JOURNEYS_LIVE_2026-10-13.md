@@ -26,9 +26,10 @@ path is identical in both builds, read). The 12th, at 03:20 on e829b072f in
 the validation run, answered 200 with a 3-word reply the probe did not keep
 (none of the canned texts is 3 words), so it is not checked and may have
 been a model answer. By this record's own count (section 8: 0 x HTTP 200 from
-the model from the container start at 04:17 to the last count at 05:40) no
-turn between the deploy and 05:40 was answered by the model. Central was
-reached on the LAN node and,
+OpenRouter from the container start at 04:17 to the last count at 05:40) no
+turn between the deploy and 05:40 was answered through OpenRouter (whether a
+second endpoint answered any: not checked, section 8). Central was reached on
+the LAN node and,
 where Kong routes it, on the public host `https://api.hevolve.ai`. Surfaces
 were driven with plain HTTP by throwaway accounts (register is limited to 3
 per hour per client key, which ended one run; what a client key is on central
@@ -153,7 +154,7 @@ outside this repository).
 | REUSE a listed agent | `POST /chat` prompt_id 66722327257 ("Hive Model Trainer Incremental Improvement" in the listing above) and 28366228009 ("Agent 28366228009"), twice each, 05:19 to 05:20 UTC, LAN (the persistent account) | 200, `Agent_status: Reuse Mode`, `served_by: cloud`, response "I couldn't finish that: Error code: 400 - {'error': {'message': 'Reasoning is mandatory for this endpoint and cannot be disabled.', ...}}" 4 of 4; all four after the quota ran out (next row), so quota and the reasoning-only pick are not separated here | measured | BROKEN on `openrouter/free` (task #115) |
 | The model behind all of the above | inside the container at 05:40 UTC: the OpenRouter key endpoint says free tier; one plain request answered 429 "free-models-per-day" with `X-RateLimit-Limit: 50`; the new container's log (it starts at the 04:17 deploy) held 22 x HTTP 400, 18 x HTTP 429 and 0 x HTTP 200 to OpenRouter in that window, the first 429 at 04:20:26 UTC | every OpenRouter turn on central failed from 04:20 to 05:40 UTC (measured); the cap is daily, so the rest of the UTC day is expected to fail too (not measured); whether central has a second LLM endpoint configured (the lanes plan allows `OPENAI_BASE_URL` / `HEVOLVE_LOCAL_LLM_URL` to name one) was not checked, so "every turn" is claimed only for OpenRouter | measured, with the expectation and the gap labelled | BLOCKED on the owner's money decision (task #115) |
 | Create an agent | see person (section 1) | Creation Mode status, reply text not captured | measured (status), not checked (the reply) | NOT CHECKED |
-| Run a listed agent through the Hive API | no `agent_id` field on the metered endpoint; the metered reply carries only `success`, `response`, `usage` | read | BLOCKED, plan W1-9 |
+| Run a listed agent through the Hive API | the metered endpoint's request fields and reply shape | no `agent_id` field on the metered endpoint; the metered reply carries only `success`, `response`, `usage` | read | BLOCKED, plan W1-9 |
 
 ## 9. The public host
 
