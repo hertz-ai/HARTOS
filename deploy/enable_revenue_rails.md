@@ -51,27 +51,25 @@ The new mount line to add to the `docker run` command:
 
 ## Step 3 — Add the payment-rail env vars
 
-Append the following to the host-side `.env` file at
-`/opt/hzai-LLM-Langchain-Chatbot-Agent/repo/LLM-langchain_Chatbot-Agent/.env`
-(this file is mounted in via `--env-file .env`, so the container picks
-up changes on next start):
+`STRIPE_API_KEY` and `HEVOLVE_API_KEY` are owned by the deploy: set each
+as a GitHub repo secret (`gh secret set STRIPE_API_KEY --repo
+hertz-ai/HARTOS`) and the deepbox deploy writes it into central's `.env`
+on every deploy (`deploy/deepbox_deploy.sh`). Do not hand-edit those two;
+while the secret is set, the next deploy writes the secret's value back.
+To remove one: delete the repo secret FIRST, then the line from `.env`.
+
+The PhonePe keys below are not forwarded by the workflow, so they still
+go into the host-side `.env` by hand (the deploy never rewrites keys it
+does not own). The file is mounted in via `--env-file .env`, so the
+container picks them up on its next start:
 
 ```bash
-# International (USD / cards)
-STRIPE_API_KEY=sk_live_XXXXX   # use sk_test_XXXXX during dry-run
-
 # India (UPI / cards / netbanking via PhonePe)
 PHONEPE_MERCHANT_ID=YOUR_MERCHANT_ID
 PHONEPE_SALT_KEY=YOUR_SALT_KEY
 PHONEPE_SALT_INDEX=1
 PHONEPE_ENV=PROD   # or UAT for sandbox
 PHONEPE_USD_INR_RATE=84.0   # optional override; default is 84.0
-
-# Internal-trust auth between HARTOS daemons.  EITHER set this to
-# a long random string, OR leave unset (the daemon will mint a
-# system_daemon JWT instead).  HEVOLVE_API_KEY is simpler if you
-# want grep'able audit lines.
-HEVOLVE_API_KEY=
 ```
 
 ## Step 4 — Restart the container with the new mount

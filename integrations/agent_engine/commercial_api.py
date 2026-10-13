@@ -1577,7 +1577,7 @@ def create_upgrade_checkout(key_id):
             return jsonify({
                 'success': False,
                 'error': 'Stripe gateway not registered.  Set STRIPE_API_KEY '
-                         'on the central deploy and restart (see '
+                         'as a repo secret and redeploy (see '
                          'deploy/go_live_stripe.md Step 4).',
             }), 503
 

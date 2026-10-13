@@ -246,10 +246,12 @@ fi
 # registers the Stripe gateway at boot only when it is set; without it the
 # paid-tier checkout answers 503 and no payment can be taken). Same rule as the McGroce secret: written key by key only
 # when its secret is non-empty, the value never logged, and an absent secret
-# leaves .env as it is. So unsetting a repo secret changes nothing on the box;
-# a key is removed by editing central's .env. The marketing switch is the
-# exception even then: the consent it granted is a database row that outlives
-# the flag, and only POST /api/social/consent/revoke stops the posting.
+# leaves .env as it is. So deleting a repo secret changes nothing on the box,
+# and editing .env while the secret is still set is undone by the next
+# deploy: to remove a key, delete the secret FIRST, then the .env line. To
+# turn marketing OFF, set its secret to 0 and redeploy: boot revokes the
+# standing consent on 0/false/no/off (goal_seeding.
+# apply_autonomous_marketing_flag); removing the flag alone revokes nothing.
 for _k in HEVOLVE_EXPERT_LLM_ENDPOINT_URL HEVOLVE_EXPERT_LLM_MODEL_NAME \
           HEVOLVE_EXPERT_LLM_API_KEY HEVOLVE_CLAUDE_BUDGET_USD_DAY \
           HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY STRIPE_API_KEY; do

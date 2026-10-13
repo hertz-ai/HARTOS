@@ -124,12 +124,21 @@ sudo docker logs langchain 2>&1 | grep -i "stripe gateway"
 # The deploy log shows "STRIPE_API_KEY set from the secret (value not shown)".
 ```
 
-Unsetting the repo secret does NOT remove the key from central: an absent
-secret leaves `.env` as it is. To stop live charges, remove the line from
-central's `.env` and redeploy.
+To stop live charges: delete the repo secret FIRST (`gh secret delete
+STRIPE_API_KEY --repo hertz-ai/HARTOS`), then remove the line from
+central's `.env`, then redeploy. In the other order the next deploy writes
+the key straight back; and deleting the secret alone changes nothing on the
+box (an absent secret leaves `.env` as it is).
 
-If you see "STRIPE_API_KEY present but connect failed" instead, the
-key is bad or the SDK install didn't stick.  Re-run Step 3.
+"STRIPE_API_KEY present but connect failed" means the `stripe` SDK did not
+import (re-run Step 3). It does NOT mean a bad key: `connect()` never checks
+the key, so a wrong or revoked key registers fine and fails at the first
+charge (402 from the upgrade route; Stripe dashboard → Logs has the reason).
+
+Without a live gateway (no key, or the SDK missing) a paid-tier upgrade
+answers 503 naming STRIPE_API_KEY. The mock gateway settles a paid tier only
+for an operator (central role) or with HEVOLVE_DEV_MODE=true, which central
+forces off at boot; a plain user never gets a tier for free.
 
 ## Step 5 — Verify Stripe is the selected gateway
 

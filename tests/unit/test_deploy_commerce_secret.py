@@ -379,12 +379,12 @@ class ScriptEnsuresTheKey(unittest.TestCase):
     # ── The owner-set keys ──
 
     def test_every_owner_set_key_is_written_once_and_never_logged(self):
-        """All six set: each lands exactly once with its own value, a key
-        already in .env is replaced (not duplicated), and no value is
-        printed (the repo secret is masked by GitHub, a log copy of it in a
-        file or a rerun is not)."""
+        """All set: each lands exactly once with its own value, a key
+        already in .env is replaced (not duplicated), and no value, nor
+        its first four characters, is printed (the repo secret is masked
+        by GitHub, a log copy of it in a file or a rerun is not)."""
         self._write_env('ALLOWED_HOSTS=*\nA=1\nHEVOLVE_API_KEY=old-key\n')
-        values = {k: 'Own-%d-zq' % i for i, k in enumerate(_OWNER_KEYS)}
+        values = {k: 'vQ7x%d-own' % i for i, k in enumerate(_OWNER_KEYS)}
         code, out, text = self._deploy(**values)
         self._assert_ran(code, out)
         self.assertEqual(_values(text, 'A'), ['1'])
@@ -392,10 +392,11 @@ class ScriptEnsuresTheKey(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertEqual(_values(text, key), [value])
                 self.assertNotIn(value, out)
+                self.assertNotIn(value[:4], out)
                 self.assertIn('%s set from the secret (value not shown)' % key, out)
 
     def test_one_owner_set_key_writes_only_itself(self):
-        """Setting the budget alone must not write the other five (an empty
+        """Setting the budget alone must not write the others (an empty
         expert key or an empty API key in .env would read as configured)."""
         self._write_env('ALLOWED_HOSTS=*\nA=1\n')
         code, out, text = self._deploy(HEVOLVE_CLAUDE_BUDGET_USD_DAY='3.30')
@@ -406,7 +407,7 @@ class ScriptEnsuresTheKey(unittest.TestCase):
         """No secret, no write: an unset repo secret must not blank a value
         the owner put in central's .env by hand. The workflow sends an absent
         secret as an EMPTY string, not as an unset name, so that is what is
-        passed here (a `[ -v ]` guard would write six empty keys)."""
+        passed here (a `[ -v ]` guard would write every key empty)."""
         before = 'ALLOWED_HOSTS=*\nA=1\nHEVOLVE_API_KEY=by-hand\n'
         self._write_env(before)
         code, out, text = self._deploy(**dict({k: '' for k in _OWNER_KEYS}, **{_NAME: 'c9'}))
