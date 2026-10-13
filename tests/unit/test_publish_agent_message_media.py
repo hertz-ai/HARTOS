@@ -171,6 +171,30 @@ def test_the_real_publisher_without_the_flag_still_reaches_the_crossbar(real_pub
     assert real_publisher.http.submit.call_count == 1
 
 
+def test_behind_a_three_argument_wrapper_a_reel_push_fails_closed(real_publisher, hie,
+                                                                   monkeypatch):
+    """Nunba wraps publish_async as (topic, message, timeout).  Until that
+    wrapper forwards the flag, every other message still goes through it, and
+    a skip_crossbar push is reported undelivered -- never sent to the
+    crossbar without it."""
+    seen = []
+
+    def nunba_wrapper(topic, message, timeout=2.0):
+        hie.publish_async(topic, message, timeout)
+        seen.append(topic)
+
+    monkeypatch.setitem(sys.modules, 'hart_intelligence',
+                        SimpleNamespace(publish_async=nunba_wrapper))
+    assert publish_agent_message(text='hi', user_id='u7', request_id='r',
+                                 prompt_id='42') is True
+    assert seen == ['com.hertzai.hevolve.chat.u7']
+    real_publisher.http.submit.reset_mock()
+    assert publish_agent_message(text='Your reel is ready', user_id='u7',
+                                 request_id='rid-1', prompt_id='42', media=MEDIA,
+                                 skip_crossbar=True) is False
+    real_publisher.http.submit.assert_not_called()
+
+
 def test_media_entries_that_are_not_objects_are_dropped(publisher):
     publish_agent_message(text='hi', user_id='u7', request_id='r', prompt_id='42',
                           media=[MEDIA[0], 'junk', None])
