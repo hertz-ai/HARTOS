@@ -295,19 +295,22 @@ class MandateStore:
         meta = {'kind': kind, 'mandate_id': mandate_id,
                 'merchant': merchant, 'user_id': str(user_id),
                 'cart_hash': cart_hash}
+        gateway = ledger.select_gateway(currency)
         # A redirect gateway (PhonePe) returns the buyer and posts its
         # confirmation to THIS node, which owns the checkout: its URLs are
-        # stamped now, while the shopper's own request (a trusted Host) is in
-        # hand.  The gateway resolves them again when it mints the checkout
-        # and refuses without them (ap2_protocol.own_gateway_urls); nothing
-        # defaults to a host that is not this node.
-        from integrations.ap2.ap2_protocol import own_gateway_urls
-        meta.update(own_gateway_urls())
+        # stamped now, while the shopper's own request is in hand.  The
+        # gateway resolves them again when it mints the checkout and refuses
+        # without them (ap2_protocol.own_gateway_urls); nothing defaults to a
+        # host that is not this node.  A synchronous gateway (Stripe, the dev
+        # mock) needs none, so none is looked up and nothing is logged for it.
+        from integrations.ap2.ap2_protocol import REDIRECT_GATEWAYS, own_gateway_urls
+        if gateway in REDIRECT_GATEWAYS:
+            meta.update(own_gateway_urls())
         payment = ledger.create_payment_request(
             amount=amount, currency=currency,
             description=description or f'{merchant} order',
             requester_agent_id=requester_agent_id or f'ap2:{merchant}',
-            gateway=ledger.select_gateway(currency),
+            gateway=gateway,
             require_approval=True,
             metadata=meta,
         )

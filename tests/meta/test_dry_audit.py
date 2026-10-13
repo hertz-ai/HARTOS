@@ -215,6 +215,9 @@ CANONICAL_OWNERS = {
     'configured_public_url': 'core/public_url.py',
     'trusted_request_base': 'core/public_url.py',
     'public_base_url': 'core/public_url.py',
+    'internet_base_url': 'core/public_url.py',
+    'is_public_host': 'core/public_url.py',
+    'allowed_hosts': 'core/public_url.py',
     'own_gateway_urls': 'integrations/ap2/ap2_protocol.py',
 }
 

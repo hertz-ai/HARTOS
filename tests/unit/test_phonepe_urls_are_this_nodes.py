@@ -89,13 +89,45 @@ class TestThePayRequestsUrls:
         sent = _sent(post)
         assert (sent['redirectUrl'], sent['callbackUrl']) == (BASE + '/', BASE + CALLBACK)
 
-    def test_without_a_public_url_nothing_is_sent_and_the_setting_is_named(self, monkeypatch):
+    def test_without_a_public_url_nothing_is_sent_and_the_shopper_sees_no_setting(
+            self, monkeypatch, caplog):
+        """The refusal reaches the shopper through the agent (settle_checkout
+        repeats a gateway error), so it names no environment variable; the
+        operator's detail, with the setting's name, is the ERROR line."""
         monkeypatch.delenv('HARTOS_PUBLIC_URL', raising=False)
-        with patch('requests.post') as post:
+        with patch('requests.post') as post, \
+                caplog.at_level(logging.ERROR, logger='integrations.ap2.ap2_protocol'):
             out = _gateway().create_payment(_request())
         assert out['success'] is False
-        assert 'HARTOS_PUBLIC_URL' in out['error']
+        assert out['error'] == ('This node is not set up to take PhonePe payments yet '
+                                '(it has no public address for the payment callback)')
+        assert 'HARTOS_PUBLIC_URL' not in out['error']
         post.assert_not_called()
+        said = [r for r in caplog.records if r.levelno == logging.ERROR
+                and 'HARTOS_PUBLIC_URL' in r.getMessage()]
+        assert said, caplog.records
+
+    def test_a_trusted_loopback_request_is_not_a_callback_address(self, monkeypatch):
+        """A desktop approving a mandate from its own UI: the request's Host is
+        trusted (localhost), but PhonePe cannot post to it, so the payment is
+        refused instead of started with a confirmation nobody can deliver (the
+        review of af987a962 measured the loopback callbackUrl on the parent)."""
+        monkeypatch.delenv('HARTOS_PUBLIC_URL', raising=False)
+        monkeypatch.setenv('ALLOWED_HOSTS', '*')
+        with patch('requests.post') as post, \
+                Flask('t').test_request_context('/', headers={'Host': 'localhost:6777'}):
+            out = _gateway().create_payment(_request())
+        assert out['success'] is False
+        post.assert_not_called()
+
+    def test_a_trusted_public_request_host_is_a_callback_address(self, monkeypatch):
+        monkeypatch.delenv('HARTOS_PUBLIC_URL', raising=False)
+        monkeypatch.setenv('ALLOWED_HOSTS', 'shop.example')
+        with patch('requests.post', return_value=_phonepe_says(_CHECKOUT_MINTED)) as post, \
+                Flask('t').test_request_context('/', headers={'Host': 'shop.example'}):
+            out = _gateway().create_payment(_request())
+        assert out['success'] is True
+        assert _sent(post)['callbackUrl'] == 'http://shop.example' + CALLBACK
 
 
 class TestTheRefundRequestsCallback:
@@ -178,6 +210,47 @@ class TestTheUpgradeRouteNamesNoCallback:
         assert 'redirect_url' not in payment.metadata
         assert 'callback_url' not in payment.metadata
 
+    def test_a_buyer_cannot_name_the_price(self, ctx):
+        """A body inr_amount used to be stored as the gateway's override and
+        the callback's amount check compared against it: the review of
+        af987a962 bought the enterprise tier for one rupee.  The tier's price
+        at the operator's rate is what PhonePe is asked for."""
+        from integrations.agent_engine.commercial_api import TIER_CONFIG
+        r = _initiate(ctx, {'target_tier': 'enterprise', 'inr_amount': 1})
+        assert r.status_code == 202, r.get_json()
+        (payment,) = ctx['ledger'].payments.values()
+        assert 'inr_amount' not in payment.metadata
+        rate = ctx['ledger'].gateways[PaymentGateway.PHONEPE].usd_inr_rate
+        expected = int(round(float(TIER_CONFIG['enterprise']['monthly_price_usd']) * rate * 100))
+        assert r.get_json()['inr_amount_estimated_paise'] == expected
+        assert expected > 100000
+
+
+@pytest.fixture
+def ctx_real(tmp_path):
+    """The real gateway, connected with test credentials, and no public URL."""
+    ledger = PaymentLedger(ledger_path=str(tmp_path / 'l.json'))
+    ledger.gateways[PaymentGateway.PHONEPE] = _gateway()
+    from integrations.agent_engine.commercial_api import commercial_api_bp
+    app = Flask(__name__)
+    app.register_blueprint(commercial_api_bp)
+    with patch.object(ap2_pkg, 'payment_ledger', ledger):
+        yield {'client': app.test_client(), 'ledger': ledger}
+
+
+def test_the_upgrade_route_refuses_without_a_public_url_and_posts_nothing(ctx_real, monkeypatch):
+    """The route's own refusal path, through the real gateway: 502, the
+    payment FAILED, nothing sent to PhonePe (the review of af987a962: the
+    stubbed gateway in the tests above never exercised it)."""
+    monkeypatch.delenv('HARTOS_PUBLIC_URL', raising=False)
+    with patch('requests.post') as post:
+        r = _initiate(ctx_real, {'target_tier': 'starter'})
+    assert r.status_code == 502, r.get_json()
+    assert 'HARTOS_PUBLIC_URL' not in r.get_json()['error']
+    post.assert_not_called()
+    (payment,) = ctx_real['ledger'].payments.values()
+    assert payment.status == PaymentStatus.FAILED
+
 
 def _refund_callback(client, sig='good', envelope=None):
     envelope = envelope or {'code': 'PAYMENT_SUCCESS',
@@ -214,6 +287,16 @@ class TestTheRefundCallbackLandsSomewhere:
         r = ctx['client'].post(REFUND_CALLBACK, json={'response': 'not base64 json'},
                                headers={'X-VERIFY': 'good'})
         assert r.status_code == 400
+
+    def test_a_signed_envelope_that_is_not_an_object_is_refused_on_both_callbacks(self, ctx):
+        """A verified payload that decodes to a list or a string is a 400 on
+        the payment callback and the refund callback alike (the shared
+        helper; the parent answered the payment callback with a 500)."""
+        not_an_object = base64.b64encode(b'[1, 2]').decode()
+        for path in (CALLBACK, REFUND_CALLBACK):
+            r = ctx['client'].post(path, json={'response': not_an_object},
+                                   headers={'X-VERIFY': 'good'})
+            assert r.status_code == 400, path
 
     def test_no_gateway_registered_is_a_503(self, ctx):
         del ctx['ledger'].gateways[PaymentGateway.PHONEPE]

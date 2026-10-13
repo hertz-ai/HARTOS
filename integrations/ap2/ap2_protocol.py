@@ -25,7 +25,7 @@ from enum import Enum
 from decimal import Decimal
 import hashlib
 
-from core.public_url import PUBLIC_URL_VAR, public_base_url
+from core.public_url import PUBLIC_URL_VAR, internet_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -39,16 +39,20 @@ PHONEPE_REFUND_CALLBACK_PATH = '/api/v1/intelligence/phonepe/refund-callback'
 
 def own_gateway_urls() -> Dict[str, str]:
     """The URLs a redirect gateway (PhonePe) returns the buyer to and posts
-    its confirmations to, on this node's public base
-    (core.public_url.public_base_url: HARTOS_PUBLIC_URL, else the live
-    request's root when its Host is trusted).  {} when the base is unknown,
-    and a warning says so: a payment is then refused rather than sent with
-    a host that is not this node."""
-    base = public_base_url()
+    its confirmations to, on this node's internet-reachable base
+    (core.public_url.internet_base_url: HARTOS_PUBLIC_URL, else the live
+    request's root when its Host is trusted AND the internet can reach it;
+    a loopback or LAN root is this node, but no gateway can post to it).
+    {} when there is none, and a warning says so: the payment is then
+    refused rather than sent with a host that is not this node or that
+    nothing can reach.  Called only for a redirect gateway: a cart mandate
+    on Stripe or the dev mock needs no such URLs."""
+    base = internet_base_url()
     if not base:
-        logger.warning('ap2: this node has no trusted public base for the '
-                       'gateway urls (set %s); a PhonePe payment cannot be '
-                       'started until it has one', PUBLIC_URL_VAR)
+        logger.warning('ap2: this node has no public address for a redirect '
+                       'gateway\'s return and callback urls (set %s); a payment '
+                       'through one cannot be started until it has one',
+                       PUBLIC_URL_VAR)
         return {}
     return {'redirect_url': base + '/',
             'callback_url': base + PHONEPE_CALLBACK_PATH,
@@ -502,15 +506,20 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
     def _to_paise(self, payment_request: 'PaymentRequest') -> int:
         """Convert payment amount to paise (INR's smallest unit).
 
-        Honors `metadata.inr_amount` override.  Otherwise converts USD via
-        usd_inr_rate; INR amounts pass through unchanged.
+        Honors ``metadata.inr_amount``, an INTERNAL override: no route takes
+        it from a caller.  The upgrade route used to store the body's
+        inr_amount here, and the callback's amount check compared against
+        the same override, so a buyer could name their own price (the review
+        of af987a962 measured the enterprise tier for one rupee).  Otherwise
+        converts USD via usd_inr_rate; INR amounts pass through unchanged.
         """
         meta = payment_request.metadata or {}
-        # An override is a value, not a key: the upgrade route stamps
+        # An override is a value, not a key: the upgrade route stamped
         # 'inr_amount': None when the caller gave none, and `in` took that
-        # as an override and raised on float(None), so every PhonePe
-        # upgrade without an inr_amount answered 502 after the checkout
-        # had been minted (measured by the route's test, task #122).
+        # as an override and raised on float(None) here, inside
+        # create_payment's try, so every PhonePe upgrade without an
+        # inr_amount answered 502 before anything was posted to PhonePe
+        # (measured on the parent by the review of af987a962, task #122).
         if meta.get('inr_amount') is not None:
             return int(round(float(meta['inr_amount']) * 100))
         amt = float(payment_request.amount)
@@ -560,10 +569,18 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
                 redirect_url = redirect_url or own.get('redirect_url')
                 callback_url = callback_url or own.get('callback_url')
             if not redirect_url or not callback_url:
+                # The operator's detail goes to the log; the sentence below
+                # reaches the shopper through the agent (settle_checkout
+                # repeats a gateway error), and a tenant-facing message
+                # names no environment variable.
+                logger.error("ap2: PhonePe payment %s refused: this node has no "
+                             "public address for the buyer's return and the "
+                             "payment callback (set %s)",
+                             payment_request.payment_id, PUBLIC_URL_VAR)
                 return {'success': False,
-                        'error': "PhonePe needs this node's public URL for the "
-                                 "buyer's return and the payment callback; set "
-                                 + PUBLIC_URL_VAR}
+                        'error': 'This node is not set up to take PhonePe payments '
+                                 'yet (it has no public address for the payment '
+                                 'callback)'}
             merchant_txn_id = f"hartos_{payment_request.payment_id.replace('-', '')[:24]}"
             payload = {
                 "merchantId": self.merchant_id,

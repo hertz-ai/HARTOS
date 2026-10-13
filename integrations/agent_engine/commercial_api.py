@@ -1188,12 +1188,17 @@ def initiate_phonepe_upgrade(key_id: str):
     """Initiate a PhonePe-rail upgrade for a paid tier.
 
     Body: ``target_tier``; optional ``redirect_url`` (the page the buyer
-    returns to after paying, this node's public URL when absent),
-    ``mobile_number``, ``inr_amount``.  A ``callback_url`` in the body is
-    ignored: the server callback is always this node's own
+    returns to after paying, this node's public URL when absent) and
+    ``mobile_number``.  A ``callback_url`` in the body is ignored: the
+    server callback is always this node's own
     (integrations.ap2.ap2_protocol.own_gateway_urls), since a caller-named
     one would send PhonePe's signed confirmation elsewhere and the tier
-    would never be bumped.
+    would never be bumped.  The price is the tier's, converted to INR at
+    the operator's rate by the gateway; an ``inr_amount`` in the body is
+    ignored too (it used to be stored as the gateway's override, and the
+    callback's amount check compared against the same override, so a buyer
+    could name their own price: the review of af987a962 measured the
+    enterprise tier for one rupee).
 
     Returns:
         202 Accepted with `{redirect_url, payment_request_id,
@@ -1274,7 +1279,7 @@ def initiate_phonepe_upgrade(key_id: str):
             'kind': 'tier_upgrade',
             'user_id': str(user.id),
             'mobile_number': data.get('mobile_number'),
-            'inr_amount': data.get('inr_amount'),  # optional override
+            # No 'inr_amount': the gateway prices the tier itself.
         }
         if data.get('redirect_url'):
             metadata['redirect_url'] = str(data['redirect_url'])

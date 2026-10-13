@@ -62,11 +62,14 @@ Delete an entry when the change that closes it lands.
 8. **Merchant drafts are open to any signed-in user.**
    `commerce_onboard_merchant` has no merchant-role check (only the drafter
    can approve).  Decide: require a McGroce merchant binding, or rate-limit.
-9. **PhonePe return URLs for commerce.**  Commerce payments carry no
-   `redirect_url` / `callback_url` in metadata, so `PhonePePaymentGateway`
-   falls back to the hevolve.ai intelligence routes.  Add config pointing the
-   redirect back at the McGroce SPA.  The S2S callback already completes
-   commerce payments.
+9. **PhonePe return URLs for commerce.**  A commerce payment on PhonePe
+   carries this node's `redirect_url` / `callback_url` (stamped at mandate
+   creation from `HARTOS_PUBLIC_URL`, `ap2_protocol.own_gateway_urls`), and
+   the gateway refuses to start a payment when the node has no public
+   address, so nothing falls back to another host any more.  Still open: the
+   buyer's return page is the API root with `redirectMode: POST`, which
+   serves no POST `/` route; point the redirect at the McGroce SPA (task
+   #145).  The S2S callback already completes commerce payments.
 10. **Single-process state.**  Bindings, mandates and drafts are JSON files
     under `agent_data/` with an in-memory copy per process.  With more than
     one server worker the copies diverge.  Old records are never pruned.

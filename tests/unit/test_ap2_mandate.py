@@ -67,9 +67,18 @@ class TestCreate:
         raw = json.load(open(store.path))
         assert raw['mandates'][m.mandate_id]['cart_hash'] == m.cart_hash
 
+    def _with_phonepe(self, store):
+        """An INR mandate settles on PhonePe when the gateway is registered
+        (PaymentLedger.select_gateway); the redirect URLs are stamped for it."""
+        from integrations.ap2.ap2_protocol import PaymentGateway, PhonePePaymentGateway
+        gw = PhonePePaymentGateway(merchant_id='M', salt_key='S', salt_index='1', env='UAT')
+        gw.connect()
+        store.ledger.gateways[PaymentGateway.PHONEPE] = gw
+
     def test_payment_metadata_carries_this_nodes_gateway_urls(
             self, store, monkeypatch):
         monkeypatch.setenv('HARTOS_PUBLIC_URL', 'https://node7.example/')
+        self._with_phonepe(store)
         m = store.create_cart_mandate('u1', 'mcgroce', CART)
         meta = store.ledger.get_payment(m.payment_id).metadata
         assert meta['callback_url'] == (
@@ -82,9 +91,24 @@ class TestCreate:
         """Nothing guessed into the payment: the gateway resolves this node's
         URLs again when it mints the checkout, and refuses without them."""
         monkeypatch.delenv('HARTOS_PUBLIC_URL', raising=False)
+        self._with_phonepe(store)
         m = store.create_cart_mandate('u1', 'mcgroce', CART)
         meta = store.ledger.get_payment(m.payment_id).metadata
         assert 'callback_url' not in meta and 'redirect_url' not in meta
+
+    def test_a_synchronous_gateway_mandate_looks_up_no_urls_and_warns_nothing(
+            self, store, monkeypatch, caplog):
+        """Only a redirect gateway needs the return and callback URLs; a
+        mandate on the dev mock (or Stripe) stamps none and logs no
+        'no public address' warning (the review of af987a962: every mandate
+        and refund used to warn)."""
+        import logging
+        monkeypatch.delenv('HARTOS_PUBLIC_URL', raising=False)
+        with caplog.at_level(logging.WARNING, logger='integrations.ap2.ap2_protocol'):
+            m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        meta = store.ledger.get_payment(m.payment_id).metadata
+        assert 'callback_url' not in meta and 'redirect_url' not in meta
+        assert not [r for r in caplog.records if 'public address' in r.getMessage()], caplog.records
 
     def test_over_cap_is_refused(self, store):
         with pytest.raises(MandateError, match='over the cap'):
