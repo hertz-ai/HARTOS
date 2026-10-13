@@ -588,19 +588,40 @@ def _metered_backend_chat(prompt: str, label: str):
         return False, '', status
 
     data = result.json() if hasattr(result, 'json') else {}
-    return True, (data.get('response') or ''), 200
+    text = data.get('response') or ''
+    # A turn that fails does not raise: the pipeline answers HTTP 200 with a
+    # polite sentence (core.agent_tools.user_facing_error, the LLM_*_REPLY
+    # constants, BUILD_INCOMPLETE_REPLY), which is right for a person and
+    # wrong for a billed call.  Measured on central 2026-10-12 18:14Z: the
+    # "internal snag" sentence went to a paying customer as success:true and
+    # was billed (task #110).  core.agent_tools.is_user_facing_error is the
+    # ONE recogniser; dispatch, the hive worker and the channel contract read
+    # it the same way.  An empty 200 is no answer either.
+    from core.agent_tools import is_user_facing_error
+    if not text.strip() or is_user_facing_error(text):
+        logger.warning(
+            f"Metered {label} /chat answered 200 without an answer: {text[:120]!r}")
+        return False, '', 502
+    return True, text, 200
 
 
 def _metered_backend_failure(endpoint: str, tokens_in: int, elapsed_ms: int,
                              status: int):
-    """Record a metered call whose backend produced nothing, and tell the
+    """Record a metered call whose backend produced no answer, and tell the
     customer the truth.
 
-    Billing 0 tokens is not a new policy -- ``require_api_key`` already
-    states it for the 429 path: "No log_usage() is called ... the backend was
-    never invoked, so no inference tokens are recorded."  The row is still
-    written (audit that the call happened, and its real status) but
-    ``cost_credits`` computes to 0 because both token counts are 0.
+    "No answer" is any of: the self-POST to /chat could not be made or was
+    refused (``status`` is the transport's: 502, 401, ...), /chat answered
+    200 with a failed-turn sentence or nothing (502: the backend answered,
+    not with an answer), the hive bridge had no thought, or the media agent
+    generated nothing.  Billing 0 tokens is not a new policy --
+    ``require_api_key`` already states it for the 429 path: "No log_usage()
+    is called ... the backend was never invoked, so no inference tokens are
+    recorded."  The row is still written (audit that the call happened, and
+    its real status) but ``cost_credits`` computes to 0 because both token
+    counts are 0.  The row does count toward the key's daily rate limit
+    (``check_rate_limit`` counts rows, not successes); task #111 (degraded
+    mode) is where a dead backend stops consuming the customer's day.
 
     ``reserve_quota`` has already consumed one unit of monthly quota by this
     point; that is the documented pre-execution reservation and is
@@ -693,9 +714,10 @@ def intelligence_generate():
         return jsonify({'success': False, 'error': 'prompt required'}), 400
 
     t0 = time.time()
+    tokens_in = len(prompt_text.split())
 
     try:
-        from integrations.service_tools.media_agent import generate_media
+        from integrations.service_tools.media_agent import generate_media, generated_nothing
         result_json = generate_media(
             context=prompt_text,
             output_modality=modality,
@@ -703,15 +725,23 @@ def intelligence_generate():
         )
         import json
         result = json.loads(result_json) if isinstance(result_json, str) else result_json
+        nothing = generated_nothing(result)
     except Exception as e:
         logger.warning(f"Generate endpoint error: {e}")
-        result = {'error': 'Generation service temporarily unavailable'}
+        result, nothing = None, True
 
     elapsed_ms = int((time.time() - t0) * 1000)
-    tokens_in = len(prompt_text.split())
+    if nothing:
+        # status error / unavailable / warming_up, or the agent raised: no
+        # file and no task to poll.  Counted as a call and reported
+        # success:true until task #110; the media agent's own reader
+        # (classify_error) names the same statuses.
+        return _metered_backend_failure(
+            '/v1/intelligence/generate', tokens_in, elapsed_ms, 502)
+
     CommercialAPIService.log_usage(
         g.api_db, g.api_key['id'], '/v1/intelligence/generate',
-        tokens_in=tokens_in, compute_ms=elapsed_ms)
+        tokens_in=tokens_in, compute_ms=elapsed_ms, status_code=200)
 
     return jsonify({'success': True, 'result': result,
                     'usage': {'tokens_in': tokens_in, 'compute_ms': elapsed_ms}})
@@ -726,7 +756,8 @@ def intelligence_hivemind():
         return jsonify({'success': False, 'error': 'query parameter required'}), 400
 
     t0 = time.time()
-    result = {}
+    tokens_in = len(query.split())
+    result = None
 
     try:
         from integrations.agent_engine.world_model_bridge import get_world_model_bridge
@@ -734,12 +765,21 @@ def intelligence_hivemind():
         result = bridge.query_hivemind(query)
     except Exception as e:
         logger.warning(f"HiveMind endpoint error: {e}")
-        result = {'error': 'HiveMind service temporarily unavailable'}
+        result = None
 
     elapsed_ms = int((time.time() - t0) * 1000)
+    if not result:
+        # query_hivemind returns None when it has nothing: no hive core
+        # installed, no CCT for the capability, the user opted out, the
+        # constitutional filter refused the prompt, or every leg failed.
+        # Measured on central 2026-10-13: {"result": null, "success": true},
+        # counted as a call (task #110).
+        return _metered_backend_failure(
+            '/v1/intelligence/hivemind', tokens_in, elapsed_ms, 502)
+
     CommercialAPIService.log_usage(
         g.api_db, g.api_key['id'], '/v1/intelligence/hivemind',
-        tokens_in=len(query.split()), compute_ms=elapsed_ms)
+        tokens_in=tokens_in, compute_ms=elapsed_ms, status_code=200)
 
     return jsonify({'success': True, 'result': result,
                     'usage': {'compute_ms': elapsed_ms}})

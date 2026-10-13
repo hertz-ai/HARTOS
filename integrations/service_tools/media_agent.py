@@ -489,6 +489,26 @@ _UNREACHABLE_MARKERS = ('connection refused', 'connectionerror', 'timed out',
                         # installed, but its sidecar has no registered port
                         'is not running')
 
+#: The statuses generate_media returns when it produced nothing a caller can
+#: use or poll: no file, no task id.  'error' and 'unavailable' carry an
+#: 'error' text (classify_error reads it); 'warming_up' carries a message
+#: instead (the composer is still starting).  Kept HERE, next to the returns
+#: that produce them, for the same reason as the markers above: a reader in
+#: another file would drift the day a status was renamed.  Readers:
+#: classify_error below and the metered /v1/intelligence/generate endpoint,
+#: which must not bill a customer for one of these (task #110).
+NOTHING_GENERATED_STATUSES = ('error', 'unavailable', 'warming_up')
+
+
+def generated_nothing(result) -> bool:
+    """True when ``result`` (the dict generate_media returns) carries no
+    output and no task to poll: one of NOTHING_GENERATED_STATUSES, or not a
+    dict at all.  'pending' and 'partial' are not nothing: they name a task
+    the caller can check."""
+    if not isinstance(result, dict):
+        return True
+    return result.get('status') in NOTHING_GENERATED_STATUSES
+
 
 def classify_error(result) -> str:
     """Why a generate_media call failed, as one of the four constants above.
@@ -517,7 +537,9 @@ def classify_error(result) -> str:
     # a machine with no music engine.  Reading only status=='error' answered
     # UNKNOWN there, so the caller could not offer to install what is plainly
     # not installed.  (Found by rn-1 wiring the game-sound install offer.)
-    if result.get('status') not in ('error', 'unavailable'):
+    # The set lives in NOTHING_GENERATED_STATUSES; 'warming_up' is in it too
+    # and carries no 'error' text, so it answers UNKNOWN below as before.
+    if not generated_nothing(result):
         return UNKNOWN
 
     text = str(result.get('error', '')).lower()
