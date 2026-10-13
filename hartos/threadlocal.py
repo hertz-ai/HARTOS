@@ -340,8 +340,10 @@ class ThreadLocalData:
     # turn a conversation into agent work: an interview, a build saved under
     # the caller's id, a Plan Mode consent question.  /chat records the
     # body's answer here once per turn, and hart_intelligence_entry.get_tools
-    # reads it whenever a caller passes no explicit value, so get_ans's two
-    # calls and CustomGPT._call's prompt rebuild on later steps agree (the
+    # reads it on every call (an explicit False still withholds the pair; an
+    # explicit True cannot bring it back on a declined turn; no caller passes
+    # a value today), so get_ans's two calls and CustomGPT._call's prompt
+    # rebuild on later steps agree (the
     # review of 5a66a3308 measured the rebuild re-listing both tools after
     # the first step when the flag travelled as a keyword).  Default True:
     # a person's turn keeps both; the metered Hive API declines (task #120).

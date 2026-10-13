@@ -6,7 +6,8 @@ autonomous build saved under the caller's id, or a Plan Mode consent
 question.  A metered Hive API call is made by a program that can answer none
 of those, so its self-POST sends ``agent_tools`` False.  /chat records that
 on the request's thread-local (thread_local_data.set_agent_tools) and
-get_tools reads it whenever a caller passes no explicit value, so the three
+get_tools reads it on every call (an explicit True cannot bring the pair back
+on a declined turn; no caller passes a value today), so the three
 callers of a turn agree: get_ans's two calls, and the model wrapper's prompt
 rebuild on later steps (CustomGPT._call), which the review of 5a66a3308
 measured re-listing both tools in the prompt text when the flag travelled as
