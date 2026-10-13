@@ -4,11 +4,16 @@ WHERE THE GRID COMES FROM (plan U2, amendment A3)
   The posted reel is silent: she adds the song inside Instagram and starts
   it at the suggested time.  The cuts can follow the song's real beats only
   when she attaches the song's audio (B2).  ``reel_beat_grid`` is the one
-  place that rule lives:
+  place that rule lives, and its grid always spans the whole reel (the
+  contract checks every cut against it):
     * song audio attached and a clear beat found -> the song's own beats
-      (source 'local_audio');
+      (source 'local_audio').  Where the beats heard stop short of the reel
+      (a song file shorter than the reel, a quiet intro or outro) they are
+      continued at the song's own tempo, phase-locked, because she plays
+      the full song in Instagram;
     * no audio, audio with no clear beat (silence, speech, noise:
-      confidence < MIN_CONFIDENCE), or audio ffmpeg cannot read
+      confidence < MIN_CONFIDENCE), beats too few or too irregular to
+      continue over the reel, or audio ffmpeg cannot read
       -> an exact SYNTHETIC_BPM (120) grid, source 'synthetic', confidence 0.
   The grid's ``source`` rides into the EDL and the reply's
   ``media.song.beats``, so the reply can say which one the cuts follow.
@@ -34,24 +39,39 @@ HOW BEATS ARE FOUND (numpy only, no librosa)
      tracked again.
   5. Each beat moves to the sub-frame peak of its onset, plus a measured
      9 ms correction for the analysis window seeing an onset early.
-  Confidence is the envelope's normalised autocorrelation at the beat
-  period, or at twice it for an accent pattern: 0 for silence, near 0 for
-  noise, near 1 for a steady drum track.
+  The autocorrelation is read only up to half the excerpt: past that it
+  rests on too few products, and noise there looks periodic by chance.
+  Confidence is the envelope's autocorrelation at the beat period, or at
+  twice it for an accent pattern, less the level noise of the same length
+  reaches by chance (_NOISE_AC / sqrt(frames)), rescaled so a perfectly
+  repeating envelope still reads 1: 0 for silence, near 0 for noise at any
+  length, near 1 for a steady drum track.
 
 MEASURED, ON SYNTHETIC SIGNALS ONLY (numpy and ffmpeg aevalsrc click
 tracks, synthesised kick/snare/hi-hat loops; no real song yet)
-  * click tracks, 60-180 BPM at three phases each: tempo within 0.1 %,
-    every beat within 7 ms;
+  * click tracks, 60-180 BPM at four phases each: tempo within 0.1 %,
+    every beat within 7 ms; the same from mp3, m4a, ogg and opus files;
   * drum loops, 78-165 BPM: every beat within 20 ms of a drum hit (13 ms at
     worst in one kit) and the tempo within 0.1 %, except that a loop at or
     under 92 BPM with an even hi-hat can read at the eighth-note rate, a
     grid that still holds every beat;
-  * white and pink noise: confidence <= 0.09; a held chord with a melody
-    off the beat: 0.06; 16, 22.05, 44.1 and 48 kHz input behave the same.
-  KNOWN LIMIT: a 3-3-2 accent pattern (dappankuthu) above about 130 BPM can
+  * white noise, 200 excerpts at each of 2, 2.5, 3, 4, 6, 10 and 20 s:
+    confidence 0 in 80 % (20 s) to 100 % (2 s) of them, at most 0.13;
+    noise bursts at random syllable times (a crude stand-in for speech),
+    20 excerpts of 21 s: at most 0.14; click tracks and drum loops from
+    3 s: at least 0.55; 16, 22.05, 44.1 and 48 kHz input behave the same;
+  * clicks at 70-170 BPM continued over a reel (6-12 s of song for a
+    21-31 s reel, or an 8-10 s silent intro): every beat within 13 ms of
+    the click grid; at 120 BPM, 5 s of song for a 21 s reel, or 6 s for a
+    31 s reel, is not continued (synthetic grid).
+  KNOWN LIMITS: a 3-3-2 accent pattern (dappankuthu) above about 130 BPM can
   read as the dotted quarter (a 3:2 error); its beats still fall on
-  eighth-note hits.  MIN_CONFIDENCE and the octave rules still need checking
-  on her real songs (plan E2E-1).
+  eighth-note hits.  A bare kick/snare backbeat with nothing between the
+  beats reads at half tempo above about 155 BPM; every other beat is still
+  on a hit.  A raw ADTS .aac file has nowhere to record the encoder's
+  priming, so its beats read one AAC frame (21-23 ms) late, inside the
+  contract's 80 ms; mp4/m4a files trim it.  MIN_CONFIDENCE and the octave
+  rules still need checking on her real songs (plan E2E-1).
 """
 from __future__ import annotations
 
@@ -75,8 +95,9 @@ SAMPLE_RATE = 22050
 #: The grid a reel follows when there is no usable song audio (A3/U2).
 SYNTHETIC_BPM = 120.0
 #: A detected grid below this confidence is not trusted and the reel uses
-#: the synthetic grid.  Measured: noise <= 0.09, synthetic drum loops
-#: >= 0.76.  Not yet measured on real songs.
+#: the synthetic grid.  Measured (module docstring): white noise <= 0.13 at
+#: 2-20 s, synthetic click tracks and drum loops >= 0.55 from 3 s.  Not yet
+#: measured on real songs.
 MIN_CONFIDENCE = 0.25
 #: Tempo search range for detected beats, in BPM.
 BPM_RANGE = (60.0, 180.0)
@@ -112,6 +133,19 @@ _FASTER_AC_RATIO = 0.8            # half the period nearly as periodic -> faster
 _MIDPOINT_RATIO = 0.5             # onsets between beats this strong -> faster
 _TIGHTNESS = 100.0                # Ellis's penalty weight
 _LATENCY_S = 0.009                # clicks read 12 ms early, drum loops 6.5 ms
+# What noise's envelope autocorrelation reaches at the chosen lag, times
+# sqrt(frames): white noise, 2-10 s, has its 90th percentile at 2.7-4.0 and
+# its worst of 1,200 at 6.4.  Subtracting it leaves noise near 0.
+_NOISE_AC = 4.0
+# Continuing the beats heard over the rest of the reel: at least two bars
+# of them, and the farthest added beat known to within 40 ms (half the
+# contract's 80 ms) at two standard errors of the fitted beat line, whose
+# scatter is taken as at least 5 ms (synthetic clicks and drum loops
+# scatter 1.6-2.9 ms about it; a real song will scatter more).
+_MIN_CONTINUE_BEATS = 8
+_CONTINUE_TOL_S = 0.040
+_CONTINUE_SIGMAS = 2.0
+_BEAT_SCATTER_FLOOR_S = 0.005
 _STFT_BLOCK = 512                 # frames per FFT block (bounded memory)
 _CHUNK_SAMPLES = 1024             # decode chunk; a partial last chunk is dropped
 _TIME_DECIMALS = 6
@@ -226,16 +260,25 @@ def _smooth(values: np.ndarray, sigma: float) -> np.ndarray:
     return np.convolve(values, kernel / kernel.sum(), 'same')
 
 
-def _autocorrelation(values: np.ndarray) -> Optional[np.ndarray]:
-    """Unbiased autocorrelation of the mean-removed values, 1.0 at lag 0."""
+def _autocorrelation(values: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Autocorrelation of the mean-removed values at lags 0..n/2.
+
+    Returns (unbiased, biased), both 1.0 at lag 0, or None for a constant
+    input.  The unbiased one divides lag k by the n - k products it sums,
+    so a period scores the same however many times it fits; that division
+    also scales the noise, by up to 2 at n/2 (and up to n at lag n - 1),
+    which is why lags past n/2 are left out.  The biased one divides by n
+    throughout and is what the confidence reads.
+    """
     x = values - values.mean()
     n = len(x)
     size = 1 << (2 * n - 1).bit_length()
     spectrum = np.fft.rfft(x, size)
-    ac = np.fft.irfft(spectrum * np.conj(spectrum), size)[:n]
+    ac = np.fft.irfft(spectrum * np.conj(spectrum), size)[:n // 2 + 1]
     if not ac[0] > 0:
         return None
-    return ac / ac[0] * n / (n - np.arange(n))
+    biased = ac / ac[0]
+    return biased * n / (n - np.arange(len(biased))), biased
 
 
 def _peak_near(values: np.ndarray, centres, radius: int) -> np.ndarray:
@@ -263,9 +306,10 @@ def _lag_bounds(fps: float, n: int) -> Tuple[int, int]:
 
 def _tempo(env: np.ndarray, fps: float) -> Optional[Tuple[float, float]]:
     """(beat period in frames, confidence 0..1), or None when there is no pulse."""
-    ac = _autocorrelation(_smooth(env, _TEMPO_SMOOTH_FRAMES))
-    if ac is None:
+    found = _autocorrelation(_smooth(env, _TEMPO_SMOOTH_FRAMES))
+    if found is None:
         return None
+    ac, biased = found
     lo, hi = _lag_bounds(fps, len(ac))
     if hi <= lo:
         return None
@@ -280,7 +324,9 @@ def _tempo(env: np.ndarray, fps: float) -> Optional[Tuple[float, float]]:
         near = half - 1 + int(np.argmax(ac[half - 1:half + 2]))
         if near >= lo and ac[near] >= _FASTER_AC_RATIO * ac[lag]:
             lag = near
-    confidence = max(float(ac[lag]), float(_peak_near(ac, [2 * lag], 1)[0]))
+    repeat = max(float(biased[lag]), float(_peak_near(biased, [2 * lag], 1)[0]))
+    chance = _NOISE_AC / math.sqrt(len(env))
+    confidence = (repeat - chance) / max(1.0 - chance, 1e-9)
     return _parabolic(ac, lag), float(np.clip(confidence, 0.0, 1.0))
 
 
@@ -359,8 +405,11 @@ def beat_grid_from_pcm(pcm, sr: int, *, source: str = 'local_audio',
     pulse) -> bpm 0.0, no times, confidence 0.0.  That grid fails
     validate_edl's beats schema on purpose; reel_beat_grid falls back to
     the synthetic grid instead.  A grid with beats but a low confidence is
-    returned as found; reel_beat_grid decides whether to trust it.
-    Raises ValueError for a bad sample rate, source, song_key or pcm.
+    returned as found, and its beats are only where the beat was heard;
+    reel_beat_grid decides whether to trust it and continues it over the
+    reel.  Raises ValueError for a bad sample rate, source, song_key or pcm
+    (NaN or infinite samples included: reading a file, beat_grid_from_audio
+    clears those first).
     """
     sr = _sample_rate(sr)
     _check_detected(source, song_key)
@@ -390,6 +439,13 @@ def beat_grid_from_pcm(pcm, sr: int, *, source: str = 'local_audio',
 
 # ── beats found in a file ─────────────────────────────────────────────────
 
+def _check_window(start_s, dur_s) -> None:
+    if not (_is_real(start_s) and start_s >= 0):
+        raise ValueError('start_s must be a number of seconds >= 0, got %r' % (start_s,))
+    if not (_is_real(dur_s) and 0 < dur_s <= MAX_DUR_S):
+        raise ValueError('dur_s must be in (0, %g] s, got %r' % (MAX_DUR_S, dur_s))
+
+
 def beat_grid_from_audio(path, *, start_s: float = 0.0, dur_s: float = DEFAULT_DUR_S,
                          source: str = 'local_audio', song_key: Optional[str] = None,
                          timeout_s: float = DECODE_TIMEOUT_S) -> BeatGrid:
@@ -397,42 +453,101 @@ def beat_grid_from_audio(path, *, start_s: float = 0.0, dur_s: float = DEFAULT_D
 
     Grid time 0 is ``start_s`` in the song.  The audio is decoded once by
     core.media_bin.ffmpeg_stream, bounded by ``timeout_s``.  A window past
-    the end of the song decodes nothing and has no beats.  Raises
-    ValueError for a bad window (before ffmpeg runs), FFmpegFailed when
-    ffmpeg cannot read the file (missing, no audio stream, corrupt) or times
-    out, and MediaToolMissing when there is no ffmpeg.
+    the end of the song decodes nothing and has no beats; a song shorter
+    than the window has beats only where it plays.  The file is untrusted:
+    NaN or infinite samples (a float WAV can hold them) are read as
+    silence, with a log line.  Raises ValueError for a bad window, source
+    or song_key (before ffmpeg runs), FFmpegFailed when ffmpeg cannot read
+    the file (missing, no audio stream, corrupt) or times out, and
+    MediaToolMissing when there is no ffmpeg.
     """
-    if not (_is_real(start_s) and start_s >= 0):
-        raise ValueError('start_s must be a number of seconds >= 0, got %r' % (start_s,))
-    if not (_is_real(dur_s) and 0 < dur_s <= MAX_DUR_S):
-        raise ValueError('dur_s must be in (0, %g] s, got %r' % (MAX_DUR_S, dur_s))
+    _check_window(start_s, dur_s)
     _check_detected(source, song_key)
+    path = os.path.abspath(os.fspath(path))
     args = ['-loglevel', 'error', '-ss', '%.3f' % start_s, '-t', '%.3f' % dur_s,
-            '-i', os.path.abspath(os.fspath(path)),
-            '-vn', '-sn', '-dn', '-ac', '1', '-ar', str(SAMPLE_RATE),
+            '-i', path, '-vn', '-sn', '-dn', '-ac', '1', '-ar', str(SAMPLE_RATE),
             '-c:a', 'pcm_f32le', '-f', 'f32le', 'pipe:1']
     chunks = media_bin.ffmpeg_stream(args, frame_bytes=4 * _CHUNK_SAMPLES, timeout_s=timeout_s)
     pcm = np.frombuffer(b''.join(chunks), dtype='<f4')
+    broken = ~np.isfinite(pcm)
+    if broken.any():
+        logger.warning('the song audio %r has %d NaN or infinite samples; they are read as '
+                       'silence', os.path.basename(path), int(broken.sum()))
+        pcm = np.where(broken, np.float32(0.0), pcm)
     return beat_grid_from_pcm(pcm, SAMPLE_RATE, source=source, song_key=song_key)
+
+
+def _span_reel(grid: BeatGrid, dur_s: float) -> Optional[BeatGrid]:
+    """``grid`` spanning 0..dur_s, continued at its own tempo; None if it cannot be.
+
+    A grid with a beat within one period of each end is returned as it is.
+    Otherwise a line is fitted through the beats heard (beat number against
+    time, least squares) and beats are added along it before the first and
+    after the last, so they stay phase-locked to the song.  None when the
+    beats heard cannot pin that line: fewer than _MIN_CONTINUE_BEATS, or a
+    farthest added beat whose time is uncertain by more than
+    _CONTINUE_TOL_S at _CONTINUE_SIGMAS standard errors.
+    """
+    times = np.asarray(grid.times_s, dtype=np.float64)
+    period = 60.0 / grid.bpm
+    if times[0] <= period and times[-1] >= dur_s - period:
+        return grid
+    if len(times) < _MIN_CONTINUE_BEATS:
+        return None
+    # Beat numbers from the tracked period, so a skipped beat keeps its slot.
+    numbers = np.round((times - times[0]) / period)
+    mean_k, mean_t = float(numbers.mean()), float(times.mean())
+    spread = float(np.sum((numbers - mean_k) ** 2))
+    if not spread > 0:
+        return None
+    step = float(np.sum((numbers - mean_k) * (times - mean_t))) / spread
+    if not step > 0:
+        return None
+    first = mean_t - step * mean_k                         # the line at beat number 0
+    scatter = max(_BEAT_SCATTER_FLOOR_S,
+                  math.sqrt(float(np.sum((times - first - step * numbers) ** 2))
+                            / (len(times) - 2)))
+    before = np.arange(-int(math.floor(first / step + 1e-9)), 0) if first > 0 else np.arange(0)
+    after = np.arange(int(numbers[-1]) + 1, int(math.floor((dur_s - first) / step + 1e-9)) + 1)
+    added = np.concatenate([before, after])
+    if not len(added):
+        return grid
+    farthest = float(np.max(np.abs(added - mean_k)))
+    uncertainty = _CONTINUE_SIGMAS * scatter * math.sqrt(1.0 / len(times)
+                                                         + farthest ** 2 / spread)
+    if uncertainty > _CONTINUE_TOL_S:
+        return None
+    spanned = np.clip(np.concatenate([first + step * before, times, first + step * after]),
+                      0.0, dur_s)
+    if not np.all(np.diff(spanned) > 0):
+        return None
+    return BeatGrid(bpm=grid.bpm, times_s=tuple(round(float(t), _TIME_DECIMALS) for t in spanned),
+                    source=grid.source, confidence=grid.confidence, song_key=grid.song_key)
 
 
 def reel_beat_grid(audio_path, *, dur_s: float, start_s: float = 0.0,
                    song_key: Optional[str] = None,
                    timeout_s: float = DECODE_TIMEOUT_S) -> BeatGrid:
-    """The grid a reel's cuts follow (plan U2, amendment A3).
+    """The grid a reel's cuts follow (plan U2, amendment A3); the one home of that rule.
 
     ``audio_path`` is her attached song audio (store purpose 'song_audio')
     or None; ``start_s`` is where the song starts in the reel; ``dur_s`` is
     the longest reel the planner may cut, e.g. target_s plus
     QUALITY_BAR['duration']['tol_s'].
 
-    Returns the song's own beats (source 'local_audio') when ffmpeg reads
-    the file and the beat is clear (confidence >= MIN_CONFIDENCE);
-    otherwise synthetic_grid(SYNTHETIC_BPM, dur_s), with a log line saying
-    why.  If the song file is shorter than dur_s, its grid ends where the
-    song does.  MediaToolMissing (no ffmpeg: nothing can be rendered
-    either) and ValueError (a bad window) are raised, not hidden.
+    The grid always spans the reel: a beat within about one period of 0
+    and of ``dur_s``, none past it.  It is the song's own beats (source
+    'local_audio') when ffmpeg reads the file and the beat is clear
+    (confidence >= MIN_CONFIDENCE).  Where those beats stop short of the
+    reel (a song file shorter than the reel, a quiet intro or outro) they
+    are continued at the song's tempo, phase-locked, as long as the beats
+    heard pin it (see _span_reel).  Otherwise it is
+    synthetic_grid(SYNTHETIC_BPM, dur_s).  Every outcome is logged with its
+    reason.  ValueError (a bad window, with or without audio) and
+    MediaToolMissing (no ffmpeg: nothing can be rendered either) are
+    raised; nothing in the file's content raises.
     """
+    _check_window(start_s, dur_s)
     fallback = synthetic_grid(SYNTHETIC_BPM, dur_s)
     if audio_path is None:
         logger.info('no song audio attached; the reel follows a synthetic %g BPM grid',
@@ -440,17 +555,29 @@ def reel_beat_grid(audio_path, *, dur_s: float, start_s: float = 0.0,
         return fallback
     name = os.path.basename(os.fspath(audio_path))
     try:
-        grid = beat_grid_from_audio(audio_path, start_s=start_s, dur_s=dur_s,
-                                    song_key=song_key, timeout_s=timeout_s)
+        heard = beat_grid_from_audio(audio_path, start_s=start_s, dur_s=dur_s,
+                                     song_key=song_key, timeout_s=timeout_s)
     except media_bin.FFmpegFailed as e:
         logger.warning('ffmpeg could not read the song audio %r (%s); the reel follows a '
                        'synthetic %g BPM grid', name, str(e)[:300], SYNTHETIC_BPM)
         return fallback
-    if grid.confidence < MIN_CONFIDENCE:
+    if heard.confidence < MIN_CONFIDENCE:
         logger.info('no clear beat in the song audio %r (confidence %.3f < %.2f); the reel '
-                    'follows a synthetic %g BPM grid', name, grid.confidence, MIN_CONFIDENCE,
+                    'follows a synthetic %g BPM grid', name, heard.confidence, MIN_CONFIDENCE,
                     SYNTHETIC_BPM)
         return fallback
+    grid = _span_reel(heard, dur_s)
+    if grid is None:
+        logger.info('the song audio %r has %d beats from %.2f to %.2f s, too few or too '
+                    'irregular to continue over the %.1f s reel; the reel follows a synthetic '
+                    '%g BPM grid', name, len(heard.times_s), heard.times_s[0],
+                    heard.times_s[-1], dur_s, SYNTHETIC_BPM)
+        return fallback
+    added = len(grid.times_s) - len(heard.times_s)
+    if added:
+        logger.info('the song audio %r has beats from %.2f to %.2f s; they are continued at '
+                    'its tempo over the %.1f s reel (%d beats added)', name, heard.times_s[0],
+                    heard.times_s[-1], dur_s, added)
     logger.info('the reel follows the beat of %r: %.1f BPM, %d beats, confidence %.2f',
                 name, grid.bpm, len(grid.times_s), grid.confidence)
     return grid

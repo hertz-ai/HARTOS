@@ -10,6 +10,12 @@ network is sealed, and one test removes the ffmpeg binary.
 "On the beat" is measured both ways: every true beat inside the window has a
 detected beat within 20 ms, and every detected beat inside it is within 20 ms
 of a true beat (no off-beat or spurious beats).
+
+The reel's grid (reel_beat_grid) must cover the whole reel: the contract
+checks every cut against it, so a grid that stops early leaves the planner
+nowhere to cut.  It is her song's beats, continued at the song's own tempo
+past a quiet intro or a song file shorter than the reel, or else the
+synthetic 120 BPM grid.
 """
 import math
 import os
@@ -29,6 +35,10 @@ SR = 22050
 BEAT_TOL_S = 0.020
 #: How far the reported tempo may be from the true one (plan section 5).
 BPM_TOL = 0.02
+#: Clicks are sharper than the plan's 20 ms: measured within 7 ms (module
+#: docstring of beats.py), which needs the sub-frame refinement and the
+#: latency correction; without them clicks read about 12 ms early.
+CLICK_TOL_S = 0.010
 
 
 @pytest.fixture(autouse=True)
@@ -92,6 +102,22 @@ def _assert_on_the_beat(grid, truth, lo_s, hi_s, tol_s=BEAT_TOL_S):
 
 def _assert_tempo(grid, bpm):
     assert abs(grid.bpm - bpm) <= BPM_TOL * bpm, 'reported %.2f BPM for a %s BPM track' % (grid.bpm, bpm)
+
+
+def _assert_covers(grid, dur_s):
+    """The grid spans the reel: a beat within one period of 0 and of dur_s,
+    nothing past dur_s, strictly ascending."""
+    times = np.asarray(grid.times_s)
+    period = 60.0 / grid.bpm
+    assert len(times) >= 2, grid
+    assert np.all(np.diff(times) > 0), 'beats out of order or doubled'
+    assert 0.0 <= times[0] <= period + 1e-6, 'first beat at %.3f s, period %.3f s' % (times[0], period)
+    assert dur_s - period - 1e-6 <= times[-1] <= dur_s, \
+        'last beat at %.3f s for a %.1f s reel, period %.3f s' % (times[-1], dur_s, period)
+
+
+def _noise_pcm(dur_s, seed, amp=0.3):
+    return (amp * np.random.default_rng(seed).standard_normal(int(round(dur_s * SR)))).astype(np.float32)
 
 
 # ── the synthetic grid (no song audio: A3/U2) ─────────────────────────────
@@ -177,6 +203,45 @@ def test_noise_is_not_trusted_as_a_beat():
         assert grid.confidence < beats.MIN_CONFIDENCE
 
 
+@pytest.mark.parametrize('dur_s', [2.0, 2.2, 2.5, 3.0, 4.0, 6.0])
+def test_a_few_seconds_of_noise_are_not_trusted_as_a_beat(dur_s):
+    """With only a few seconds, the envelope's autocorrelation at long lags
+    rests on few samples and noise can look periodic by chance; the
+    confidence must allow for that at every length that is analysed."""
+    confidences = [beats.beat_grid_from_pcm(_noise_pcm(dur_s, 100 + seed), SR).confidence
+                   for seed in range(12)]
+    trusted = [round(c, 3) for c in confidences if c >= beats.MIN_CONFIDENCE]
+    assert not trusted, '%.1f s of noise trusted as a beat: confidences %s' % (dur_s, trusted)
+
+
+def test_a_few_seconds_of_clicks_are_still_trusted():
+    """The allowance for short audio must not throw away a clear beat."""
+    for bpm in (96, 120, 140):
+        grid = beats.beat_grid_from_pcm(_click_pcm(bpm, 3.0), SR)
+        assert grid.confidence >= beats.MIN_CONFIDENCE, (bpm, grid.confidence)
+        _assert_tempo(grid, bpm)
+
+
+@pytest.mark.parametrize('bpm', [70, 120, 170])
+@pytest.mark.parametrize('offset_s', [0.25, 0.377])
+def test_click_beats_land_within_10_ms(bpm, offset_s):
+    """Pins the sub-frame refinement and the latency correction."""
+    grid = beats.beat_grid_from_pcm(_click_pcm(bpm, 20.0, offset_s), SR)
+    _assert_on_the_beat(grid, _beat_times(bpm, 20.0, offset_s), 0.5, 19.5, tol_s=CLICK_TOL_S)
+
+
+@pytest.mark.parametrize('floor', [0.0, 3e-4])
+def test_no_beats_are_placed_in_the_quiet_before_or_after_the_music(floor):
+    """Clicks from 3 s to 15 s of a 20 s track, digital silence or a -70 dBFS
+    hiss around them: every detected beat is on a click, none in the quiet."""
+    pcm = _click_pcm(120, 20.0, offset_s=3.0)
+    pcm[int(15.1 * SR):] = 0.0
+    pcm = pcm + (floor * np.random.default_rng(5).standard_normal(len(pcm))).astype(np.float32)
+    grid = beats.beat_grid_from_pcm(pcm, SR)
+    truth = _beat_times(120, 15.1, offset_s=3.0)
+    _assert_on_the_beat(grid, truth, 0.0, 20.0)
+
+
 def test_audio_too_short_for_a_tempo_has_no_beats():
     grid = beats.beat_grid_from_pcm(_click_pcm(120, 1.5, 0.1), SR)
     assert grid.confidence == 0.0 and grid.times_s == ()
@@ -244,6 +309,27 @@ def _write_audio(out_dir, name, source):
     out = os.path.join(os.fspath(out_dir), name)
     result = media_bin.run_ffmpeg(['-y', '-loglevel', 'error', '-f', 'lavfi', '-i', source,
                                    '-ac', '1', out], timeout_s=120.0)
+    assert result.returncode == 0 and not result.timed_out, result.stderr
+    return out
+
+
+def _write_float_wav(out_dir, name, pcm, sr):
+    """``pcm`` written sample for sample as a 32-bit float WAV (NaN and inf kept)."""
+    raw = os.path.join(os.fspath(out_dir), name + '.f32')
+    np.asarray(pcm, dtype='<f4').tofile(raw)
+    out = os.path.join(os.fspath(out_dir), name)
+    result = media_bin.run_ffmpeg(['-y', '-loglevel', 'error', '-f', 'f32le', '-ar', str(sr),
+                                   '-ac', '1', '-i', raw, '-c:a', 'pcm_f32le', out], timeout_s=120.0)
+    assert result.returncode == 0 and not result.timed_out, result.stderr
+    return out
+
+
+def _encode(src, out, codec):
+    """``src`` re-encoded with ``codec``; skips when this ffmpeg build lacks it."""
+    result = media_bin.run_ffmpeg(['-y', '-loglevel', 'error', '-i', src, '-c:a', codec, out],
+                                  timeout_s=120.0)
+    if result.returncode != 0 and 'Unknown encoder' in result.stderr:
+        pytest.skip('this ffmpeg build has no %s encoder' % codec)
     assert result.returncode == 0 and not result.timed_out, result.stderr
     return out
 
@@ -317,6 +403,44 @@ def test_audio_ffmpeg_cannot_read_raises_ffmpeg_failed(tmp_path):
         beats.beat_grid_from_audio(os.path.join(os.fspath(tmp_path), 'missing.mp3'))
 
 
+@requires_ffmpeg
+@pytest.mark.parametrize('ext, codec, tol_s', [
+    ('m4a', 'aac', BEAT_TOL_S),             # audio/mp4: the container's edit list trims the priming
+    ('mp3', 'libmp3lame', BEAT_TOL_S),      # audio/mpeg
+    ('ogg', 'libvorbis', BEAT_TOL_S),       # audio/ogg
+    # audio/aac as raw ADTS has nowhere to record the encoder's priming, so
+    # its beats read one AAC frame (21-23 ms) late; still well inside the
+    # contract's 80 ms (a known limit, see beats.py).
+    ('aac', 'aac', 0.030),
+])
+def test_compressed_song_files_keep_their_beats(tmp_path, ext, codec, tol_s):
+    """The phone sends her song as mpeg, mp4, aac, ogg or wav."""
+    wav = make_click_track(tmp_path, 120, 12.0, offset_s=0.25, sample_rate=44100)
+    path = _encode(wav, os.path.join(os.fspath(tmp_path), 'song.' + ext), codec)
+    grid = beats.beat_grid_from_audio(path)
+    _assert_tempo(grid, 120)
+    _assert_on_the_beat(grid, _beat_times(120, 12.0), 1.0, 11.0, tol_s=tol_s)
+    assert grid.confidence >= beats.MIN_CONFIDENCE
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize('bad', [float('nan'), float('inf'), float('-inf')])
+@pytest.mark.parametrize('sr', [22050, 44100])
+def test_nan_or_inf_samples_in_her_song_are_read_as_silence(tmp_path, bad, sr):
+    """Her attached file is untrusted: one broken sample in a float WAV must
+    neither fail the reel nor cost her song's beats."""
+    pcm = _click_pcm(120, 22.0, sr=sr)
+    pcm[int(5.1 * sr)] = bad
+    path = _write_float_wav(tmp_path, 'song.wav', pcm, sr)
+    grid = beats.beat_grid_from_audio(path, dur_s=21.0)
+    assert grid.source == 'local_audio'
+    _assert_tempo(grid, 120)
+    _assert_on_the_beat(grid, _beat_times(120, 21.0), 1.0, 20.0)
+    reel = beats.reel_beat_grid(path, dur_s=21.0)
+    assert reel.source == 'local_audio'
+    _assert_tempo(reel, 120)
+
+
 @pytest.mark.parametrize('kwargs', [
     {'start_s': -1.0}, {'start_s': float('nan')}, {'dur_s': 0.0}, {'dur_s': -3.0},
     {'dur_s': float('inf')}, {'dur_s': beats.MAX_DUR_S + 1}, {'source': 'synthetic'},
@@ -338,12 +462,74 @@ def test_the_reel_follows_her_song_when_it_has_a_beat(tmp_path):
     grid = beats.reel_beat_grid(path, dur_s=21.0, song_key='cluster:7')
     assert grid.source == 'local_audio' and grid.song_key == 'cluster:7'
     _assert_tempo(grid, 96)
-    assert grid.times_s[-1] <= 21.0
+    _assert_covers(grid, 21.0)
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize('case', ['song_shorter_than_the_reel', 'quiet_intro'])
+def test_her_songs_beats_are_continued_to_cover_the_whole_reel(tmp_path, case, caplog):
+    """Every cut is checked against the grid, so it must span the reel.  She
+    plays the full song in Instagram, so the beats heard are continued at
+    the song's own tempo, phase-locked: an 8 s song file for a 21 s reel,
+    or a song that is silent for its first 8 s."""
+    if case == 'song_shorter_than_the_reel':
+        path = make_click_track(tmp_path, 120, 8.0, offset_s=0.25)     # beats 0.25 .. 7.75 s
+        truth = 0.25 + 0.5 * np.arange(42)                               # .. 20.75 s
+    else:
+        path = make_click_track(tmp_path, 120, 24.0, offset_s=8.2)     # quiet until 8.2 s
+        truth = 0.2 + 0.5 * np.arange(42)                                # 0.2 .. 20.7 s
+    with caplog.at_level('INFO', logger=beats.__name__):
+        grid = beats.reel_beat_grid(path, dur_s=21.0, song_key='cluster:5')
+    assert grid.source == 'local_audio' and grid.song_key == 'cluster:5'
+    _assert_tempo(grid, 120)
+    _assert_covers(grid, 21.0)
+    _assert_on_the_beat(grid, truth, 0.0, 21.0)
+    assert any('continued' in r.getMessage() for r in caplog.records), \
+        'the log must say the grid goes past the beats heard'
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize('song_s', [3.0, 4.5])
+def test_a_snippet_too_short_to_pin_the_tempo_gives_the_synthetic_grid(tmp_path, caplog, song_s):
+    """A few seconds of song cannot say where its beats fall 25 s later:
+    3 s has too few beats, and 4.5 s (nine beats) cannot pin the period
+    finely enough to place a beat about 50 beats on."""
+    path = make_click_track(tmp_path, 120, song_s, offset_s=0.25)
+    with caplog.at_level('INFO', logger=beats.__name__):
+        grid = beats.reel_beat_grid(path, dur_s=30.0)
+    assert grid == beats.synthetic_grid(beats.SYNTHETIC_BPM, 30.0)
+    assert any('synthetic' in r.getMessage() for r in caplog.records)
+
+
+@requires_ffmpeg
+def test_a_few_seconds_of_noise_left_in_the_window_give_the_synthetic_grid(tmp_path):
+    path = _write_audio(tmp_path, 'noise.wav', 'anoisesrc=r=22050:a=0.3:d=12:seed=11')
+    for start_s in (9.0, 9.25, 9.5, 9.75, 10.0):
+        grid = beats.reel_beat_grid(path, start_s=start_s, dur_s=21.0)
+        assert grid == beats.synthetic_grid(beats.SYNTHETIC_BPM, 21.0), (start_s, grid)
 
 
 def test_no_song_audio_gives_the_synthetic_120_bpm_grid():
     grid = beats.reel_beat_grid(None, dur_s=21.0)
     assert grid == beats.synthetic_grid(120, 21.0)
+    _assert_covers(grid, 21.0)
+
+
+@pytest.mark.parametrize('audio', [None, 'song.mp3'])
+@pytest.mark.parametrize('kwargs', [
+    {'dur_s': 0.0}, {'dur_s': -1.0}, {'dur_s': float('nan')}, {'dur_s': beats.MAX_DUR_S + 1},
+    {'dur_s': 21.0, 'start_s': -1.0},
+])
+def test_the_reel_grid_refuses_a_bad_window_with_or_without_audio(tmp_path, monkeypatch,
+                                                                  audio, kwargs):
+    """The same limits whether or not she attached her song."""
+    def never(*a, **kw):
+        raise AssertionError('ffmpeg must not run for a refused window')
+
+    monkeypatch.setattr(media_bin, 'ffmpeg_stream', never)
+    path = None if audio is None else os.path.join(os.fspath(tmp_path), audio)
+    with pytest.raises(ValueError):
+        beats.reel_beat_grid(path, **kwargs)
 
 
 @requires_ffmpeg
