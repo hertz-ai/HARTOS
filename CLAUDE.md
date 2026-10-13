@@ -543,13 +543,21 @@ passed while proving nothing about behaviour.
 ### Gate 6 — cx_Freeze Bundle Accounting (BLOCKING for new modules)
 
 If the change adds a new `.py` file under `core/`, `integrations/`,
-or any other HARTOS-Nunba-shared package:
+`security/` or `hartos/` (the HARTOS packages Nunba ships):
 
-1. Add it to `Nunba-HART-Companion/scripts/setup_freeze_nunba.py`
-   `packages[]` explicitly (cx_Freeze tracer misses runtime-dynamic
-   imports; see `feedback_frozen_build_pitfalls.md`).
-2. Confirm `__init__.py` exists in every package dir (implicit
-   namespace packages break under cx_Freeze).
+1. Do NOT add it to `packages[]` in any Nunba `setup_freeze_*.py`.
+   Each of those scripts copies the four packages whole via
+   `include_files` (`_hartos_packages`), and the pip install of HARTOS
+   into python-embed carries them too.  A HARTOS module in `packages[]`
+   makes cx_Freeze build a partial `lib/<pkg>/` that shadows the full
+   copy; Nunba's `tests/test_freeze_packages_complete.py` refuses one in
+   `setup_freeze_nunba.py` (`test_setup_freeze_does_not_pull_hartos_into_packages`).
+   `packages[]` is for Nunba's own modules and third-party packages
+   the tracer misses.
+2. Confirm `__init__.py` exists in every new package dir: `setup.py`
+   collects packages with `find_packages`, which skips a dir without
+   one, and implicit namespace packages break under cx_Freeze.  Non-`.py`
+   files reach the pip install only if they match `package_data`.
 3. Verify no name collision with HARTOS's own package tree — Nunba
    must NOT have its own `core/`, `integrations/`, `security/`, or
    `models/` directory with the same name.
