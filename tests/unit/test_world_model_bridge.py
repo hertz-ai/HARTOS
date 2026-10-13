@@ -1100,6 +1100,37 @@ class TestPeerLinkLearningBoundary(unittest.TestCase):
             self.assertEqual(result, {'thought': thought, 'source': 'http',
                                       'peer_count': 0, 'confidence': 0.9}, body)
 
+    def test_the_in_process_leg_answers_the_one_shape(self):
+        """The core's CollectiveThought: its text and its confidence, '' and
+        0.0 when it carries neither.  The repr used to be billed as a thought
+        (task #135) and the confidence used to be dropped on this leg alone
+        (the review of 474f77a72).  torch is stood in for: the leg imports it
+        to encode the query, and this venv has none."""
+        from types import SimpleNamespace
+        from tests.unit.module_swap import swap_modules
+        cases = [
+            (SimpleNamespace(text='Lower the batch size.', confidence=0.8),
+             {'thought': 'Lower the batch size.', 'source': 'in_process',
+              'peer_count': 0, 'confidence': 0.8}),
+            (SimpleNamespace(confidence=0.4),
+             {'thought': '', 'source': 'in_process', 'peer_count': 0, 'confidence': 0.4}),
+            (object(),
+             {'thought': '', 'source': 'in_process', 'peer_count': 0, 'confidence': 0.0}),
+        ]
+        for thought, expected in cases:
+            bridge = _make_bridge()
+            bridge._in_process = True
+            bridge._hive_mind = MagicMock()
+            bridge._hive_mind.think_together_distributed.return_value = thought
+            with swap_modules({'torch': MagicMock()}), \
+                 patch.object(bridge, '_check_cct_access', return_value=True):
+                result = bridge.query_hivemind('what is the hive?')
+            self.assertEqual(result, expected, thought)
+            self.assertEqual(bridge._stats['total_hivemind_queries'], 1)
+            kwargs = bridge._hive_mind.think_together_distributed.call_args.kwargs
+            self.assertEqual(kwargs['timeout_ms'], 1000)
+            self.assertNotIn('owner_id', kwargs)      # no user_id was given
+
 
 class TestGetLearningFeedback(unittest.TestCase):
     """FT: get_learning_feedback in-process and HTTP paths."""

@@ -85,7 +85,9 @@ def _handle_query(data: dict, sender_peer_id: str) -> Optional[dict]:
         enforce it here because ChannelDispatcher dispatches synchronously)
     """
     try:
-        from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+        from integrations.agent_engine.world_model_bridge import (
+            HIVE_SOURCE_PEERLINK, get_world_model_bridge,
+        )
     except ImportError as e:
         # The bridge module is HARTOS's own and imports without the hive
         # core (central, with no core installed, runs it), so this is a copy
@@ -127,9 +129,9 @@ def _handle_query(data: dict, sender_peer_id: str) -> Optional[dict]:
         return _EMPTY_REPLY
 
     # This node's own words (query_hivemind's one shape).  What its peers
-    # told it (source 'peerlink') is not relayed a second hop: the asker
-    # fans out to those peers itself.
-    own = '' if result.get('source') == 'peerlink' else (result.get('thought') or '')
+    # told it (source HIVE_SOURCE_PEERLINK) is not relayed a second hop: the
+    # asker fans out to those peers itself.
+    own = '' if result.get('source') == HIVE_SOURCE_PEERLINK else (result.get('thought') or '')
     return {
         'type': 'reply',
         'thought': own,

@@ -1491,14 +1491,21 @@ class WorldModelBridge:
         """Query HevolveAI's HiveMind for distributed collective thinking.
 
         In-process: calls hive_mind.think_together_distributed() directly.
+        PeerLink: collects the connected peers' replies.
         HTTP: POST /v1/hivemind/think.
+
+        Every leg answers the ONE shape, ``_hive_reply``: ``{'thought':
+        <words or ''>, 'source': 'in_process' | 'peerlink' | 'http' |
+        'cached', 'peer_count', 'confidence'}``; None when no leg answered.
+        The core's contributing agents, weights, topology and timings stay
+        in the core (task #136: a metered caller used to be handed them).
 
         HevolveAI:
         1. Encodes query via frozen Qwen alignment layer (2048-D)
         2. Publishes local thought to WAMP
         3. Waits for remote agent responses (timeout_ms)
         4. Fuses with attention-weighted method
-        5. Returns collective thought with contributing agents + weights
+        5. Returns the collective thought (its words and confidence here)
 
         Use this for real-time multi-modal reasoning (tensor-level fusion).
         For coarse-grained task delegation, use agent-level dispatch instead.
@@ -1585,8 +1592,11 @@ class WorldModelBridge:
                     self._stats['total_hivemind_queries'] += 1
                 # The one shape (_hive_reply): the core's words, or '' when
                 # its CollectiveThought carries no text (its repr used to be
-                # returned and billed as a thought, task #135).
-                return _hive_reply(getattr(result, 'text', None), 'in_process')
+                # returned and billed as a thought, task #135), and its
+                # confidence, 0.0 when it carries none (this leg alone used
+                # to drop it; the review of 474f77a72).
+                return _hive_reply(getattr(result, 'text', None), 'in_process',
+                                   confidence=getattr(result, 'confidence', None))
             except Exception as e:
                 logger.debug(f"In-process hivemind failed: {e}")
 
@@ -1622,7 +1632,7 @@ class WorldModelBridge:
                 with self._lock:
                     self._stats.setdefault('peerlink_responses_observed', 0)
                     self._stats['peerlink_responses_observed'] += len(said)
-                return _hive_reply('\n'.join(said), 'peerlink',
+                return _hive_reply('\n'.join(said), HIVE_SOURCE_PEERLINK,
                                    peer_count=len(responses))
         except Exception:
             logger.debug("[WorldModelBridge] peerlink thought query failed; falling through", exc_info=True)
@@ -2724,6 +2734,11 @@ class WorldModelBridge:
 #: (core.peer_link.hivemind_handler); 'response' and 'text' are older
 #: spellings still accepted.
 _PEER_WORD_KEYS = ('thought', 'response', 'text')
+
+#: The 'source' of a reply made of this node's peers' words.  The peer
+#: reply handler (core.peer_link.hivemind_handler) reads it to relay this
+#: node's own words only, never its peers' a second hop.
+HIVE_SOURCE_PEERLINK = 'peerlink'
 
 
 def _peer_words(peer_resp) -> str:
