@@ -8991,6 +8991,25 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     # isolated namespace by tests.
     from core.constants import canonical_served_by
     _served_by = canonical_served_by(payload.get('served_by'))
+    # A reel this turn made rides its reply as `media` (Reel Studio, plan
+    # 4.2(f)): taken once from the user file store's outbox, which marks it
+    # replied.  Local imports, like the rest of this function's, and never
+    # the reason a reply fails.
+    _media = payload.get('media')
+    if not _media:
+        try:
+            from flask import has_request_context as _media_hrc
+            from flask import request as _media_req
+            _media_pid = payload.get('prompt_id') or (
+                (_media_req.get_json(silent=True) or {}).get('prompt_id')
+                if _media_hrc() else None)
+            if _media_pid:
+                from core.chat_attachments import take_outbound
+                _media = take_outbound(user_id, _media_pid, request_id)
+        except Exception as _media_err:
+            app.logger.warning(f"_chat_reply: reply media skipped: {_media_err}")
+    if _media:
+        payload['media'] = _media
     if response_text:
         # media_mode honor: the Nunba adapter has forwarded the user's
         # chosen mode ('audio'|'video'|'text') in the /chat body all
@@ -9161,11 +9180,17 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                     lang=_lang_hint, attachments=_atts,
                     channel_type=_chan_type,
                 )
+            # The reply's media (a reel) in the mirror's documented
+            # attachments shape; none for any other reply, as before.
+            _reply_atts = None
+            if _media:
+                from core.chat_attachments import media_to_mirror
+                _reply_atts = media_to_mirror(_media) or None
             _cm.persist_and_publish_async(
                 str(user_id), 'assistant', response_text,
                 agent_id=_agent, prompt_id=_prompt_id,
                 request_id=_rid, device_id=_dev,
-                lang=_lang_hint, attachments=None,
+                lang=_lang_hint, attachments=_reply_atts,
                 channel_type=_chan_type,
             )
         except Exception as _chat_sync_err:
@@ -10164,6 +10189,34 @@ def chat():
         if not re.fullmatch(r'[a-zA-Z0-9_-]+', prompt_id):
             return jsonify({'error': 'Invalid prompt_id format', 'response': None}), 400
 
+    # Reel Studio (plan WS-8a): read here, where the turn's identity is known
+    # and before the REUSE ladder below replaces `data` with the agent's own
+    # record.  The creation hint is held until the gather save stamps it.
+    if prompt_id is not None:
+        from core.cache_loaders import load_agent_config as _load_agent_record
+        from integrations.agent_engine.marketing_tools import (
+            hold_goal_tag_hint, is_local_only)
+        _hint_tags = hold_goal_tag_hint(f'{user_id}_{prompt_id}', data.get('goal_tags'))
+        if is_local_only(_hint_tags) or is_local_only(
+                (_load_agent_record(prompt_id) or {}).get('goal_tags')):
+            # This agent's turns stay on this node (decision U4: her clients'
+            # faces), in memory only -- nothing is persisted.  An agent-bound
+            # turn reads intelligence_preference nowhere below (draft-first
+            # is skipped for it); what can take it off the node is the body's
+            # model_config (a hive/cloud tier for its autogen agents) and
+            # speculative (the background expert), so both are refused.
+            if model_config or speculative:
+                app.logger.info(f'chat: agent {prompt_id} keeps to this node; '
+                                f'ignoring the turn\'s model_config/speculative')
+            intelligence_preference = 'local_only'
+            model_config = None
+            speculative = False
+    # The turn's file references (plan 4.2(e)), bound to this user, agent and
+    # request before anything runs, so the agent's reel tool finds them.
+    if data.get('attachments'):
+        from core.chat_attachments import bind_inbound, parse_inbound
+        bind_inbound(user_id, prompt_id, request_id, parse_inbound(data['attachments']))
+
     # Per-request model config override (speculative execution).
     #
     # The dispatcher sends ONE entry — the tier it selected
@@ -10873,6 +10926,19 @@ def chat():
             def _save_and_enter_review(agent_config):
                 agent_config['prompt_id'] = prompt_id
                 agent_config['creator_user_id'] = user_id
+                # Reel Studio (plan WS-8a): the record carries the user-
+                # assignable goal tags of the held creation hint and of its
+                # own words, so CREATE and REUSE build her agent with its
+                # tools.  Any other record is written exactly as before.
+                from integrations.agent_engine.marketing_tools import (
+                    drop_goal_tag_hint, held_goal_tag_hint, is_local_only,
+                    stamp_goal_tags)
+                _stamped = stamp_goal_tags(held_goal_tag_hint(turn_key), agent_config)
+                if _stamped:
+                    _stored = agent_config.get('goal_tags')
+                    agent_config['goal_tags'] = sorted(set(_stamped) | {
+                        t for t in (_stored if isinstance(_stored, list) else [])
+                        if isinstance(t, str) and t})
                 with _user_lock:
                     conversation_agent[_ak] = False
                     _touch_agent_timestamp(_ak)
@@ -10880,26 +10946,32 @@ def chat():
                 with open(name, "w") as json_file:
                     json.dump(agent_config, json_file)
                 app.logger.info(f"Agent config saved to {name}")
-                # Sync to cloud DB (non-fatal)
-                try:
-                    pooled_post(
-                        f'{DB_URL}/createpromptlist',
-                        json={'listprompts': [{
-                            'prompt_id': prompt_id,
-                            'prompt': agent_config.get('goal', ''),
-                            'user_id': user_id,
-                            'name': agent_config.get('name', ''),
-                            'is_active': True,
-                            'image_url': agent_config.get('image_url', ''),
-                        }]},
-                        timeout=5)
-                except Exception:
-                    logging.getLogger(__name__).exception("_save_and_enter_review: swallowed Exception")
+                # Sync to cloud DB (non-fatal) -- except a local-only agent's
+                # goal, which stays on this node (decision U4(c)).
+                if is_local_only(agent_config.get('goal_tags')):
+                    app.logger.info(f'Agent {prompt_id} keeps to this node: '
+                                    f'not synced to the cloud prompt list')
+                else:
+                    try:
+                        pooled_post(
+                            f'{DB_URL}/createpromptlist',
+                            json={'listprompts': [{
+                                'prompt_id': prompt_id,
+                                'prompt': agent_config.get('goal', ''),
+                                'user_id': user_id,
+                                'name': agent_config.get('name', ''),
+                                'is_active': True,
+                                'image_url': agent_config.get('image_url', ''),
+                            }]},
+                            timeout=5)
+                    except Exception:
+                        logging.getLogger(__name__).exception("_save_and_enter_review: swallowed Exception")
                 with _user_lock:
                     review_agents[_ak] = True
                     _touch_agent_timestamp(_ak)
                 _gather_turn_counts.pop(turn_key, None)  # Reset turn counter
                 _gather_reviews_shown.pop(turn_key, None)
+                drop_goal_tag_hint(turn_key)
                 _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
 
             try:

@@ -1884,10 +1884,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # Ungated, 50 rendered defs cost 5,820 of the 6,144-token slot.
         from integrations.agent_engine.marketing_tools import resolve_goal_tags
         from core.agent_tools import filter_service_tools
-        # No stored record exists yet at creation — resolve_goal_tags(None, x)
-        # is exactly detect_goal_tags(x); the stored leg activates when the
-        # create flow starts stamping goal_tags on the agent record (Lever 2).
-        goal_tags = resolve_goal_tags(None, task)
+        # The record loaded above (`config`) carries the goal_tags the gather
+        # save stamps (hart_intelligence_entry._save_and_enter_review), and
+        # they are what decides here: `task` is the session's helper.Action,
+        # whose str() is a repr, so detection on it finds nothing (plan C7).
+        # The keyword leg is unchanged; a record without stored tags resolves
+        # exactly as before.
+        goal_tags = resolve_goal_tags(config.get('goal_tags') if config else None, task)
         _n_all_svc = len(svc_tools)
         svc_tools = filter_service_tools(goal_tags, svc_tools, svc_defs,
                                          service_tool_registry)

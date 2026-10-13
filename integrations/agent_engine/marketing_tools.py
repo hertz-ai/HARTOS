@@ -13,6 +13,8 @@ import logging
 import re
 from typing import Annotated, Optional
 
+from core.session_cache import TTLCache
+
 logger = logging.getLogger('hevolve_social')
 
 
@@ -512,6 +514,35 @@ def register_marketing_tools(helper, assistant, user_id: str):
         logger.debug(f"Marketing skill registration skipped: {e}")
 
 
+#: The goal tag of a Reel Studio agent: her own Instagram-reel editor
+#: (integrations/reel_studio).
+REEL_STUDIO_TAG = 'reel_studio'
+
+#: Goal tags a client may ASK for when it creates an agent (the /chat body's
+#: ``goal_tags``, held by hold_goal_tag_hint until the record is saved and
+#: stamped by stamp_goal_tags).  Every other tag is only ever detected from
+#: the goal text, never taken from a request.  Nunba's turn_goal_tags reads
+#: this set to bound what it forwards.
+USER_ASSIGNABLE_GOAL_TAGS = frozenset({REEL_STUDIO_TAG})
+
+#: Goal tags whose agents keep their work on this node (decision U4): their
+#: turns run local_only and their record is not synced to the cloud prompt
+#: list.  A reel agent handles her clients' faces.
+LOCAL_ONLY_GOAL_TAGS = frozenset({REEL_STUDIO_TAG})
+
+#: What a Reel Studio agent's own words trip by accident, and the phrases
+#: that mean she really asked for that family (plan C8 / WS-8a step 6).  Her
+#: goal names songs (media: music generation), her brand and engagement
+#: (marketing: campaigns, ads) and following up with brides (outreach: an
+#: email CRM); none of those families edits a reel, and each costs schema
+#: room the reel family needs.
+_REEL_STUDIO_KEEPS = {
+    'media': ('compose', 'melody', 'jingle', 'vocals', 'tts', 'voiceover',
+              'voice over'),
+    'marketing': ('campaign', 'advertis', 'lead gen', 'email marketing'),
+    'outreach': ('email sequence', 'cold email', 'crm'),
+}
+
 _WORD_START_CACHE = {}
 
 
@@ -723,6 +754,21 @@ def detect_goal_tags(prompt) -> list:
     if _mentions(lower, commerce_keywords):
         tags.append('commerce')
 
+    # Reel Studio: her own Instagram-reel editor (integrations/reel_studio).
+    # PRECISE phrases only -- the tag grants the reel tools, keeps the agent
+    # on this node (LOCAL_ONLY_GOAL_TAGS) and quiets look-alike families in
+    # resolve_goal_tags.  Measured against the in-repo corpus (every
+    # SEED_BOOTSTRAP_GOALS title + description and every registered goal
+    # type's built prompt): 0 hits (tests/unit/test_reel_studio_goal_tag.py).
+    # DELIBERATELY NOT bare 'reel' ("reeling", a film reel), 'makeup' or
+    # 'instagram' (an Instagram marketing goal is not a reel editor).
+    reel_studio_keywords = [
+        'instagram reel', 'reel editor', 'reel studio', 'makeup reel',
+        'bridal makeup', 'makeup artist', 'make a reel', 'edit my reel',
+    ]
+    if _mentions(lower, reel_studio_keywords):
+        tags.append(REEL_STUDIO_TAG)
+
     media_keywords = [
         'song', 'music', 'compose', 'melody', 'sing', 'vocals',
         'voice clone', 'clone my voice', 'text to speech', 'tts',
@@ -765,10 +811,101 @@ def resolve_goal_tags(stored_tags, text) -> list:
     without stored tags resolves to exactly ``detect_goal_tags(text)``
     — the pre-existing behavior — and a tagged record can only GAIN
     tags, never lose one.  Non-string entries in stored_tags are
-    dropped, not raised on (the record is user-writable JSON).
+    dropped, not raised on, and so is a stored value that is not a list
+    of tags at all (the record is user-writable JSON: a bare string
+    would otherwise unlock one tag per character).
+
+    The one exception to "only gain": a Reel Studio agent loses the
+    look-alike families its words trip by accident (_REEL_STUDIO_KEEPS),
+    stored or detected alike, unless ``text`` really asks for them.
     """
     detected = detect_goal_tags(text)
+    if not isinstance(stored_tags, (list, tuple, set, frozenset)):
+        stored_tags = None
     stored = {t for t in (stored_tags or []) if isinstance(t, str) and t}
-    if not stored:
-        return detected
-    return sorted(stored | set(detected))
+    tags = detected if not stored else sorted(stored | set(detected))
+    if REEL_STUDIO_TAG not in tags:
+        return tags
+    lower = str(text).lower()
+    return [t for t in tags
+            if t not in _REEL_STUDIO_KEEPS or _mentions(lower, _REEL_STUDIO_KEEPS[t])]
+
+
+def user_assignable_goal_tags(raw) -> list:
+    """The tags of a client's creation hint that a client may assign.
+
+    ``raw`` is the /chat body's ``goal_tags``: a list of names.  Returns the
+    ones in USER_ASSIGNABLE_GOAL_TAGS, sorted, each once; anything that is
+    not a list of names reads as no hint.
+    """
+    if not isinstance(raw, list):
+        return []
+    return sorted({t for t in raw if isinstance(t, str) and t in USER_ASSIGNABLE_GOAL_TAGS})
+
+
+def record_goal_text(record) -> str:
+    """The words an agent record says it is for: its goal, every flow's name,
+    sub-goal and actions (text or {'action': text}), and its
+    extra_information, one per line.  '' for anything but a record."""
+    if not isinstance(record, dict):
+        return ''
+    parts = [record.get('goal'), record.get('extra_information')]
+    for flow in record.get('flows') or []:
+        if not isinstance(flow, dict):
+            continue
+        parts += [flow.get('flow_name'), flow.get('sub_goal')]
+        for action in flow.get('actions') or []:
+            parts.append(action.get('action') if isinstance(action, dict) else action)
+    return '\n'.join(p for p in parts if isinstance(p, str) and p)
+
+
+def is_local_only(tags) -> bool:
+    """Do these goal tags keep the agent on this node (LOCAL_ONLY_GOAL_TAGS)?
+    False for anything that is not a collection of tags."""
+    return isinstance(tags, (list, tuple, set, frozenset)) and any(
+        isinstance(t, str) and t in LOCAL_ONLY_GOAL_TAGS for t in tags)
+
+
+# The creation hint a client sent (the /chat body's ``goal_tags``, as far as
+# USER_ASSIGNABLE_GOAL_TAGS allows), per agent being created --
+# '{user_id}_{prompt_id}', the key hart_intelligence_entry counts gather turns
+# by -- until the saved record is stamped (Reel Studio, plan WS-8a).  The
+# phone's Reel Studio entry sends it with its create turns, but the record is
+# written on the turn gathering ends, which need not carry it; held here, it
+# is not lost.  An abandoned creation's hint expires with the cache.
+_creation_hints = TTLCache(ttl_seconds=7200, max_size=500,
+                           name='goal_tag_creation_hints')
+
+
+def hold_goal_tag_hint(key, raw) -> list:
+    """Hold the user-assignable tags of this turn's hint ``raw`` for the
+    agent ``key``; returns every tag held for it so far (sorted)."""
+    held = set(_creation_hints.get(key) or ())
+    asked = set(user_assignable_goal_tags(raw))
+    if not asked <= held:
+        held |= asked
+        _creation_hints[key] = sorted(held)
+    return sorted(held)
+
+
+def held_goal_tag_hint(key) -> list:
+    """The tags held for the agent ``key`` ([] when none)."""
+    return list(_creation_hints.get(key) or ())
+
+
+def drop_goal_tag_hint(key) -> None:
+    """Forget the agent ``key``'s hint (its record has been saved)."""
+    _creation_hints.pop(key, None)
+
+
+def stamp_goal_tags(hint, record) -> list:
+    """The goal tags to stamp on an agent record when it is saved.
+
+    The user-assignable tags of the creation hint (user_assignable_goal_tags)
+    united with those the record's own words detect (record_goal_text), so a
+    record stamps the same whether or not the client sent a hint.  Sorted;
+    [] for any agent that is none of them, whose record then stays as it was.
+    """
+    detected = detect_goal_tags(record_goal_text(record))
+    return sorted(set(user_assignable_goal_tags(hint))
+                  | (set(detected) & USER_ASSIGNABLE_GOAL_TAGS))
