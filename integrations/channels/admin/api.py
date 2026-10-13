@@ -67,12 +67,14 @@ admin_bp = Blueprint("admin", __name__, url_prefix="/api/admin")
 
 #: Node tiers on which the channel configuration is the operator's, not every
 #: registered user's.  Central only: it serves strangers over the public API
-#: host.  Regional is NOT listed: a regional node's operator carries role
-#: 'regional' (is_moderator, not is_admin; UserService.set_user_role), which
-#: holds_central_role does not recognise, so listing regional here locked
-#: every regional operator out of their own channels (review of 91a211c9e);
-#: who operates a regional node is the owner's ruling, task #124.  The same
-#: env read the network gate uses (security/middleware.py, HEVOLVE_NODE_TIER).
+#: host.  Regional is NOT listed: a regional node's own operator holds
+#: neither role 'central' nor is_admin (no code path grants either locally;
+#: the most such an account can carry is role 'regional' with is_moderator,
+#: what UserService.set_user_role writes), so holds_central_role refuses them
+#: and listing regional here locked every regional operator out of their own
+#: channels (review of 91a211c9e); who operates a regional node is the
+#: owner's ruling, task #124.  The same env read the network gate uses
+#: (security/middleware.py, HEVOLVE_NODE_TIER).
 _OPERATOR_ONLY_TIERS = ('central',)
 
 
@@ -2655,9 +2657,12 @@ def reset_config():
 def _require_admin_user():
     """Raise PermissionError unless the authenticated caller is an admin.
 
-    The blueprint's ``before_request`` gate only verifies the bearer token is
-    valid; admin-level operations on every-user resources still need an
-    explicit is_admin check.  ``api_response`` maps PermissionError to 403.
+    The blueprint's ``before_request`` gate verifies the bearer token and, on
+    central only, that the caller ``holds_central_role``; on a flat or
+    regional node any registered user passes it, so admin-level operations on
+    every-user resources still need an explicit is_admin check here (one
+    definition of admin for both is task #124's follow-up).  ``api_response``
+    maps PermissionError to 403.
     """
     user = getattr(g, 'user', None)
     if user is None or not getattr(user, 'is_admin', False):

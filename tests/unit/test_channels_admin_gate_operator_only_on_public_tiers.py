@@ -11,11 +11,13 @@ and identity.  On central the gate now requires the operator
 (holds_central_role: role 'central', or the is_admin flag kept in step with
 it); a flat desktop keeps its single-user rule.
 
-Regional keeps the single-user rule too, on purpose: a regional node's
-operator carries role 'regional' with is_moderator (UserService.set_user_role),
-which holds_central_role does not recognise, and the first version of this
-gate locked every regional operator out (review of 91a211c9e).  Who operates
-a regional node is the owner's ruling, task #124.
+Regional keeps the single-user rule too, on purpose: a regional node's own
+operator holds neither role 'central' nor is_admin (no code path grants
+either locally; the most such an account carries is role 'regional' with
+is_moderator, what UserService.set_user_role writes), which holds_central_role
+does not recognise, and the first version of this gate locked every regional
+operator out (review of 91a211c9e).  Who operates a regional node is the
+owner's ruling, task #124.
 
 Drives the real blueprint and the real gate; only the token lookup is stubbed.
 """
