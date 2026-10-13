@@ -13,9 +13,13 @@ with HTTP 200, which is right for a person and wrong for a caller deciding
 whether work was done.  ``core.agent_tools.is_user_facing_error`` is the one
 recogniser of that sentence; dispatch, the hive worker and the channel
 contract already use it, and the metered endpoints were the missing caller.
-For hivemind the bridge returns ``None`` when it has nothing (no core, no CCT,
-opted out), and for generate the media agent says ``status: unavailable`` or
-``status: error``: none of those is work either.
+For hivemind the bridge returns ``None`` when it has nothing (no core, no CCT
+for the capability, the filter refused, every leg failed; the metered call
+names no user, so a person's hive opt-out never applies), and for generate the
+media agent says ``status: unavailable`` or ``status: error``: none of those is
+work either.  The HTTP core's own 200 keeps its words under ``answer`` (the
+review of 10600d264 measured it refused as no thought), so that leg is driven
+through the real bridge below.
 
 Each test drives the real blueprint with only the key gate stubbed (the
 fixtures of tests/unit/test_commercial_api_chat_credential.py) and reads what
@@ -31,6 +35,7 @@ import pytest
 
 from tests.unit.test_commercial_api_chat_credential import (  # noqa: F401
     MINTED, _resp, app_client, passing_auth)
+from tests.unit.test_world_model_bridge import _make_bridge
 
 
 # --------------------------------------------------------------------------
@@ -151,6 +156,9 @@ def _empty_peer_reply():
     pytest.param(None, id='none: no core, no CCT, filter refused, every leg failed'),
     pytest.param({}, id='empty dict'),
     pytest.param('peerlink-empty', id='two peers that answered the empty reply'),
+    pytest.param({'thought': ' '}, id='a blank thought'),
+    pytest.param({'thoughts': [{'thought': '  '}], 'source': 'peerlink', 'peer_count': 1},
+                 id='one peer that answered blank'),
 ])
 def test_hivemind_with_nothing_to_say_is_not_billed(app_client, passing_auth, nothing):
     """query_hivemind returns None when the core is not installed, the node
@@ -185,21 +193,84 @@ def test_hivemind_with_a_thought_is_a_call(app_client, passing_auth, thought):
     assert r.get_json()['result'] == thought
 
 
+#: The 200 body HevolveAI's api_server answers on POST /v1/hivemind/think
+#: (hevolveai/src/hevolveai/server/api_server.py, the dict built at the end
+#: of hivemind_think_together).  Values are placeholders; the KEYS are the
+#: server's.
+HTTP_CORE_BODY = {
+    'status': 'ok', 'query': 'what is the hive',
+    'answer': 'The hive is a network of agents thinking together.',
+    'reasoning_chain': [], 'mode': 'LOCAL_ONLY', 'latency_ms': 12.0,
+    'phase_times': {}, 'contributing_agents': ['inst-1'],
+    'weights': {'inst-1': 1.0}, 'confidence': 0.9, 'num_contributors': 1,
+    'distributed': False, 'topology': {}, 'adapted_timeout_ms': 1000,
+}
+
+
 def test_the_hivemind_rule_is_the_bridges_own():
-    """The endpoint and the bridge's peer count read one predicate, and it
-    is driven here on the shapes query_hivemind returns."""
+    """The endpoint reads the bridge's own predicate, driven here on the
+    shapes query_hivemind returns.  The bridge's peer count keeps its older,
+    looser rule (telemetry, _peer_said_something); billing is the stricter
+    one: a non-blank string under a thought key."""
     from integrations.agent_engine.world_model_bridge import (
         hivemind_result_has_a_thought as has_thought)
     assert not has_thought(None)
     assert not has_thought({})
     assert not has_thought({'thought': ''})
+    assert not has_thought({'thought': ' '})
     assert not has_thought({'thoughts': [_empty_peer_reply()], 'source': 'peerlink',
                             'peer_count': 1})
     assert not has_thought({'thoughts': [], 'source': 'peerlink', 'peer_count': 0})
     assert has_thought({'thought': 'x'})
     assert has_thought({'thoughts': [_empty_peer_reply(), {'text': 'x'}],
                         'source': 'peerlink', 'peer_count': 2})
-    assert has_thought({'response': 'the http core answered'})
+    assert has_thought({'response': 'a peer answered'})
+    # The HTTP core's own body: its words are under 'answer', None when it
+    # had none (HevolveAI api_server, hivemind_think_together).
+    assert has_thought(dict(HTTP_CORE_BODY))
+    assert not has_thought(dict(HTTP_CORE_BODY, answer=None))
+
+
+# --------------------------------------------------------------------------
+# hivemind: the HTTP core's real answer, through the real bridge
+# --------------------------------------------------------------------------
+
+def _hivemind_through_the_http_core(app_client, core_body):
+    """Drive the endpoint with a REAL bridge whose only leg is the HTTP core:
+    no in-process core, no connected peer (collect answers []), the CCT held,
+    and the core's POST /v1/hivemind/think answered 200 with ``core_body``.
+    Returns (endpoint response, the pooled_post mock)."""
+    bridge = _make_bridge()
+    bridge._http_disabled = False
+    bridge._api_url = 'http://localhost:8000'
+    mgr = MagicMock()
+    mgr.collect.return_value = []
+    post = MagicMock(return_value=_resp(200, core_body))
+    with patch('integrations.agent_engine.world_model_bridge.get_world_model_bridge',
+               return_value=bridge), \
+            patch('core.peer_link.link_manager.get_link_manager', return_value=mgr), \
+            patch.object(bridge, '_check_cct_access', return_value=True), \
+            patch('integrations.agent_engine.world_model_bridge.pooled_post', post):
+        r = app_client.get('/api/v1/intelligence/hivemind?query=what+is+the+hive',
+                           headers={'X-API-Key': 'k'})
+    assert post.called, 'the HTTP core was never asked'
+    assert post.call_args.args[0].endswith('/v1/hivemind/think')
+    return r, post
+
+
+def test_the_http_cores_answer_is_a_call(app_client, passing_auth):
+    """On a node whose core is reached over HTTP (central's topology once a
+    core is installed), the core's real 200 is the answer and is billed; the
+    second round answered it 503 and dropped it (the review of 10600d264
+    drove this leg on the parent and at HEAD)."""
+    r, _ = _hivemind_through_the_http_core(app_client, HTTP_CORE_BODY)
+    _assert_billed_as_a_call(r, passing_auth)
+    assert r.get_json()['result'] == HTTP_CORE_BODY
+
+
+def test_the_http_core_with_no_answer_is_not_billed(app_client, passing_auth):
+    r, _ = _hivemind_through_the_http_core(app_client, dict(HTTP_CORE_BODY, answer=None))
+    _assert_not_billed(r, passing_auth)
 
 
 # --------------------------------------------------------------------------
@@ -212,16 +283,36 @@ def test_the_hivemind_rule_is_the_bridges_own():
     pytest.param({'response': 'Starting up', 'loading': True}, id='loading'),
     pytest.param({'response': 'Pick a model first', 'source': 'system'}, id='source-system'),
 ])
-def test_a_200_the_channel_bridge_would_not_pass_off_is_not_billed(
+def test_a_200_the_call_path_would_not_pass_off_is_not_billed(
         app_client, passing_auth, route, body, resp_key, answer):
-    """chat_contract.chat_turn_answer is the one reader: what it refuses to
-    speak in the agent's voice, the paid API does not bill."""
+    """chat_contract.chat_turn_answer is the reader the call path uses
+    (integrations.agentic_router.dispatch_to_agent, paired with
+    chat_turn_result): what it refuses to speak in the agent's voice, the
+    paid API does not bill."""
     with patch('core.http_pool.pooled_post',
                side_effect=lambda url, **kw: _resp(200, answer)), \
             patch('integrations.agent_engine.dispatch._internal_auth_headers',
                   return_value=MINTED):
         r = app_client.post(route, json=body, headers={'X-API-Key': 'k'})
     _assert_not_billed(r, passing_auth)
+
+
+@pytest.mark.parametrize('route,body,resp_key', CHAT_ROUTES)
+def test_a_200_that_is_not_chats_json_is_not_billed(
+        app_client, passing_auth, route, body, resp_key):
+    """A 200 whose body is not /chat's JSON object (a proxy's or server's
+    error page): chat_turn_result keeps its words under 'error', so it is a
+    failed turn, not an exception out of the metered endpoint."""
+    page = MagicMock()
+    page.status_code = 200
+    page.json.side_effect = ValueError('not JSON')
+    page.text = '<html><body>Bad Gateway</body></html>'
+    with patch('core.http_pool.pooled_post', side_effect=lambda url, **kw: page), \
+            patch('integrations.agent_engine.dispatch._internal_auth_headers',
+                  return_value=MINTED):
+        r = app_client.post(route, json=body, headers={'X-API-Key': 'k'})
+    _assert_not_billed(r, passing_auth)
+    assert r.get_json().get(resp_key) is None
 
 
 # --------------------------------------------------------------------------

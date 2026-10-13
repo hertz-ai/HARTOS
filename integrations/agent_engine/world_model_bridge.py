@@ -2725,14 +2725,32 @@ class WorldModelBridge:
 
 # ─── Module-level singleton ───
 def _peer_said_something(peer_resp) -> bool:
-    """True when one PeerLink hivemind reply carries a thought: a non-empty
+    """True when one PeerLink hivemind reply carries a thought: a truthy
     'thought', 'response' or 'text'.  A connected peer with no hive core
     answers core.peer_link.hivemind_handler._EMPTY_REPLY ({'thought': ''}),
-    which collect() keeps because it is a non-empty dict; this is the ONE
-    rule that tells it apart, read by query_hivemind's peer count and by
-    hivemind_result_has_a_thought."""
+    which collect() keeps because it is a non-empty dict; this is the rule
+    query_hivemind's peer count (telemetry) applies, unchanged since it was
+    written.  Billing reads the stricter _said_something below."""
     return bool(isinstance(peer_resp, dict) and (
         peer_resp.get('thought') or peer_resp.get('response') or peer_resp.get('text')))
+
+
+#: Where a hivemind reply keeps its words: 'thought' (the in-process and
+#: cached shapes, and a PeerLink peer), 'response' and 'text' (a peer's other
+#: spellings), and 'answer' (the HTTP core: HevolveAI's api_server answers
+#: POST /v1/hivemind/think with {"status": "ok", "query": ..., "answer":
+#: <text or None>, "reasoning_chain": ..., "contributing_agents": ...,
+#: "confidence": ..., ...}; the review of 10600d264 measured that reply
+#: refused as "no thought" because this list lacked 'answer').
+_THOUGHT_KEYS = ('thought', 'response', 'text', 'answer')
+
+
+def _said_something(reply) -> bool:
+    """True when ``reply`` is a dict with a non-blank string under one of
+    _THOUGHT_KEYS.  Stricter than the peer count's rule: a blank or
+    whitespace-only thought is no answer to bill."""
+    return isinstance(reply, dict) and any(
+        isinstance(reply.get(k), str) and reply[k].strip() for k in _THOUGHT_KEYS)
 
 
 def hivemind_result_has_a_thought(result) -> bool:
@@ -2742,15 +2760,16 @@ def hivemind_result_has_a_thought(result) -> bool:
     capability, the constitutional filter refused, every leg failed); the
     in-process and cached shapes, ``{'thought': ...}``; the PeerLink
     envelope, ``{'thoughts': [one reply per peer], 'source': 'peerlink',
-    ...}``; and the HTTP core's JSON, read like a single reply.  The metered
-    hivemind endpoint counts a call only when this is True (task #110; the
-    review of 2efb73519 measured the envelope of two silent peers billed as
-    a success)."""
+    ...}``; and the HTTP core's own JSON, whose words are under 'answer'
+    (_THOUGHT_KEYS).  The metered hivemind endpoint counts a call only when
+    this is True (task #110; the review of 2efb73519 measured the envelope
+    of two silent peers billed as a success, the review of 10600d264 the
+    HTTP core's real answer refused)."""
     if not isinstance(result, dict) or not result:
         return False
     if isinstance(result.get('thoughts'), list):
-        return any(_peer_said_something(p) for p in result['thoughts'])
-    return _peer_said_something(result)
+        return any(_said_something(p) for p in result['thoughts'])
+    return _said_something(result)
 
 
 _bridge = None

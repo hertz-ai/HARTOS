@@ -583,7 +583,23 @@ def _metered_backend_chat(prompt: str, label: str):
         logger.warning(f"Metered {label} /chat transport error: {e}")
         return False, '', 502
 
-    status = getattr(result, 'status_code', 200)
+    # A /chat answer is read the way the call path reads it
+    # (integrations.agentic_router.dispatch_to_agent, the one production
+    # caller of this pair): chat_turn_result parses the body, and a 200
+    # whose body is not /chat's JSON object (a proxy's or server's error
+    # page) becomes an 'error' body instead of raising out of this function;
+    # chat_turn_answer is the reply when the turn produced one, else None.
+    # A turn that fails does not raise: the pipeline answers HTTP 200 with a
+    # polite sentence (core.agent_tools.user_facing_error, the LLM_*_REPLY
+    # constants, BUILD_INCOMPLETE_REPLY), right for a person and wrong for a
+    # billed call.  Measured on central 2026-10-12 18:14Z: the "internal
+    # snag" sentence went to a paying customer as success:true and was billed
+    # (task #110).  The same reader also refuses an empty reply, 'success'
+    # False, an 'error', a 'loading' notice and a route speaking for itself
+    # (the review of 2efb73519: this used to be a narrower inline copy of
+    # that rule; the review of 10600d264 corrected whose rule it is).
+    from integrations.channels.chat_contract import chat_turn_answer, chat_turn_result
+    status, data = chat_turn_result(result)
     if status != 200:
         # WARNING, not DEBUG: central emits nothing below WARNING after boot,
         # which is why this leg was dead silently.  Same reasoning as the
@@ -592,23 +608,9 @@ def _metered_backend_chat(prompt: str, label: str):
             f"Metered {label} /chat returned HTTP {status}")
         return False, '', status
 
-    data = result.json() if hasattr(result, 'json') else {}
-    # The ONE reader of a /chat answer, integrations.channels.chat_contract
-    # .chat_turn_answer: the reply when the turn produced one, else None.
-    # A turn that fails does not raise: the pipeline answers HTTP 200 with a
-    # polite sentence (core.agent_tools.user_facing_error, the LLM_*_REPLY
-    # constants, BUILD_INCOMPLETE_REPLY), right for a person and wrong for a
-    # billed call.  Measured on central 2026-10-12 18:14Z: the "internal
-    # snag" sentence went to a paying customer as success:true and was billed
-    # (task #110).  The same reader also refuses an empty reply, 'success'
-    # False, an 'error', a 'loading' notice and a route speaking for itself,
-    # so what the channel bridge will not pass off as the agent's words, the
-    # paid API does not bill (the review of 2efb73519: this used to be a
-    # narrower inline copy of that rule).
-    from integrations.channels.chat_contract import chat_turn_answer
     text = chat_turn_answer(status, data)
     if text is None:
-        shown = data.get('response') if isinstance(data, dict) else data
+        shown = data.get('response') or data.get('error')
         logger.warning(
             f"Metered {label} /chat answered 200 without an answer: {str(shown)[:120]!r}")
         return False, '', 502
