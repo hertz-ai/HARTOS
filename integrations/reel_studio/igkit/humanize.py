@@ -50,10 +50,13 @@ logger = logging.getLogger(__name__)
 #: '@'s (5.9 s on a 2,200-character caption of "a@a@...", 7 s on 40,000
 #: letters with no space).  This is one pass.
 URL_RE = re.compile(r'https?://\S+|www\.\S+|(?<![^\s@])[^\s@]+@[^\s@]+\.[^\s@]+')
-#: A run of ASCII whitespace holding a line break, or of two or more spaces
-#: and tabs.  Hard spaces are not in it: the invisible pass reports and
-#: normalises them, and the detector counts them.
-_SPACE_RUN = re.compile(r'[ \t\f\v]*(?:\r\n?|\n)[ \t\r\n\f\v]*|[ \t\f\v]{2,}')
+#: Line breaks as str.splitlines sees them: LF, CR, VT, FF, the file, group
+#: and record separators, NEL, and the line and paragraph separators.
+_BREAKS = '\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029'
+#: A whitespace run holding a line break, or of two or more other spaces
+#: (hard spaces and the ideographic space too).  One pass: each run is tried
+#: from its start only.
+_SPACE_RUN = re.compile(r'[^\S%s]*[%s]\s*|[^\S%s]{2,}' % ((_BREAKS,) * 3))
 #: The detector's five checks, in report order.
 DETECT_CHECKS = ('BURSTINESS', 'SPECIFICITY', 'SLOP DENSITY', 'FINGERPRINT', 'VOICE')
 
@@ -115,17 +118,18 @@ def _invisible(text: str, i: int) -> bool:
 # ── humanize ────────────────────────────────────────────────────────────────
 
 def _fold_space(text: str) -> str:
-    """Whitespace as a phone writes it, in one pass: "\\n" line breaks, at
-    most one blank line, no spaces or tabs beside a line break, and one
-    space for a run of spaces or tabs.
+    """Whitespace as a phone writes it, in one pass: "\\n" line breaks (for
+    any of _BREAKS), at most one blank line, no spaces beside a line break,
+    and one space for a run of spaces of any kind.
 
-    The lexical pass ends with the same folds; doing them first means no
+    The lexical pass ends with similar folds; doing them first means no
     later pattern meets a long whitespace run, where patterns such as
-    "\\s*X" restart at every character of it (6 s on 20,000 blank lines).
+    "\\s*X" restart at every character of it (6 s on 20,000 blank lines,
+    17 s on 40,000 hard spaces).
     """
     def fold(m: 're.Match') -> str:
         run = m.group(0)
-        breaks = run.count('\n') + run.count('\r') - run.count('\r\n')
+        breaks = sum(1 for c in run if c in _BREAKS) - run.count('\r\n')
         return '\n\n' if breaks > 1 else ('\n' if breaks else ' ')
 
     return _SPACE_RUN.sub(fold, text)
@@ -457,15 +461,17 @@ def _check_voice(text: str, ws: List[str], lex: Mapping[str, Any],
 
 def _detect(text: str, lex: Mapping[str, Any], keep_emoji: Iterable[str],
             keep_words: Iterable[str]) -> Tuple[Dict[str, Any], float]:
-    # The structure patterns would restart inside a long run of blank lines.
-    text = _fold_space(text)
-    ws = words(text)
+    # The structure patterns would restart inside a long whitespace run, so
+    # every check reads the text folded except FINGERPRINT, which counts the
+    # hard spaces the fold would turn into plain ones.
+    folded = _fold_space(text)
+    ws = words(folded)
     results = {
-        'BURSTINESS': _check_burstiness(text),
-        'SPECIFICITY': _check_specificity(text, ws),
-        'SLOP DENSITY': _check_slop(text, ws, lex, keep_words),
+        'BURSTINESS': _check_burstiness(folded),
+        'SPECIFICITY': _check_specificity(folded, ws),
+        'SLOP DENSITY': _check_slop(folded, ws, lex, keep_words),
         'FINGERPRINT': _check_fingerprint(text),
-        'VOICE': _check_voice(text, ws, lex, keep_emoji),
+        'VOICE': _check_voice(folded, ws, lex, keep_emoji),
     }
     scores = [results[c][0] for c in DETECT_CHECKS]
     # The weakest check drags the verdict: a detector only needs one signal.
@@ -493,7 +499,8 @@ def detect_machine_text(text: str, before: Optional[str] = None, *,
     Returns ``{'checks': {name: {'score', 'detail'}}, 'human_score',
     'verdict', 'weakest'}``.  These are local heuristics, not any public
     detector's verdict; never tell her a text is undetectable.  Runs of
-    blank lines and spaces are folded first, as humanize_text does.
+    blank lines and spaces are folded first, as humanize_text does, for
+    every check but FINGERPRINT.
     """
     lex = _default_lexicon()
     text = text if isinstance(text, str) else ''
