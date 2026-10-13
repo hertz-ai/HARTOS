@@ -221,8 +221,20 @@ def test_tool_exception_is_logged_and_returns_json_envelope(caplog):
         )
         wrapped = mocked.call_args[0][0]
 
-    with caplog.at_level(logging.ERROR, logger='agent_logger'):
-        result = wrapped()
+    # hartos.create_recipe configures 'agent_logger' when it is imported (a
+    # file handler, a console handler, propagate False "to prevent double
+    # logging"), so once the entry point or the recipe module is loaded in
+    # the process the record never reaches the root logger caplog listens
+    # on, and this test failed by import order alone (task #133, measured:
+    # propagate True before that import, False after).  Listen on the
+    # logger itself.
+    agent_logger = logging.getLogger('agent_logger')
+    agent_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.ERROR, logger='agent_logger'):
+            result = wrapped()
+    finally:
+        agent_logger.removeHandler(caplog.handler)
 
     assert isinstance(result, str)
     assert result.startswith('Tool execution failed: ')
