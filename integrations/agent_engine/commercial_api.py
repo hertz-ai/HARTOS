@@ -302,10 +302,15 @@ class CommercialAPIService:
         return [k.to_dict() for k in keys]
 
     @staticmethod
-    def revoke_api_key(db: Session, api_key_id: str) -> Optional[Dict]:
-        """Revoke (deactivate) an API key."""
+    def revoke_api_key(db: Session, api_key_id: str, user_id: str) -> Optional[Dict]:
+        """Revoke (deactivate) ``user_id``'s API key ``api_key_id``; None when
+        that person has no such key.  The owner is part of the lookup, as on
+        every other key route: by id alone, any signed-in person who knew
+        another's key id could switch it off (the review of fd2b4773c read
+        it; task #146)."""
         from integrations.social.models import CommercialAPIKey
-        key = db.query(CommercialAPIKey).filter_by(id=api_key_id).first()
+        key = db.query(CommercialAPIKey).filter_by(
+            id=api_key_id, user_id=str(user_id)).first()
         if not key:
             return None
         key.is_active = False
@@ -910,7 +915,7 @@ def revoke_key(key_id):
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
 
     try:
-        result = CommercialAPIService.revoke_api_key(db, key_id)
+        result = CommercialAPIService.revoke_api_key(db, key_id, str(user.id))
         if not result:
             return jsonify({'success': False, 'error': 'Key not found'}), 404
         db.commit()

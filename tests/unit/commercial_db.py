@@ -7,8 +7,11 @@ with the same object and every write with nothing, so the review of
 fd2b4773c dropped the user_id filter from the browser route and twenty
 tests still passed, and the tier race it measured could not be written as
 a test at all.  This is one SQLite file per test (threads open their own
-sessions on it), the social schema created on it, two people and one free
-key; the engine is the test's, never the node's.
+sessions on it) carrying the two tables the key routes read and write,
+users and api_keys, two people and one free key; the engine is the test's,
+never the node's.  The metered routes (require_api_key, check_rate_limit,
+log_usage) also write api_usage_log, which is NOT created here: a test of
+those through this fixture needs that table added (the review of d3ac22782).
 """
 import threading
 from unittest.mock import patch
@@ -90,6 +93,12 @@ class ApiKeyDb:
         with self.Session() as s:
             k = s.get(self._CommercialAPIKey, key_id)
             return None if k is None else (k.tier, k.rate_limit_per_day, k.monthly_quota)
+
+    def is_active(self, key_id=KEY):
+        """The key's is_active flag as the table holds it now; None when gone."""
+        with self.Session() as s:
+            k = s.get(self._CommercialAPIKey, key_id)
+            return None if k is None else bool(k.is_active)
 
     def put_key_on(self, tier, key_id=KEY):
         from integrations.agent_engine.commercial_api import TIER_CONFIG

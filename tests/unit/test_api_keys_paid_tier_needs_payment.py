@@ -128,7 +128,7 @@ from decimal import Decimal  # noqa: E402
 from integrations.ap2.ap2_protocol import (  # noqa: E402
     PaymentGateway, PaymentGatewayConnector, PaymentLedger,
 )
-from tests.unit.commercial_db import KEY, OWNER, key_db  # noqa: E402,F401  (a fixture)
+from tests.unit.commercial_db import KEY, OTHER, OWNER, key_db  # noqa: E402,F401  (a fixture)
 
 
 class _DecliningStripe(PaymentGatewayConnector):
@@ -257,3 +257,31 @@ def test_phonepe_is_still_refused_on_the_synchronous_route(client, key_db, tmp_p
     r, ledger = _upgrade(client, key_db, tmp_path, monkeypatch, gateway='phonepe')
     assert r.status_code == 501
     assert _tier_of(key_db) == 'free' and ledger.payments == {}
+
+
+# ── revoking is the owner's ─────────────────────────────────────────────
+
+def _revoke_as(client, key_db, user_id):
+    user = types.SimpleNamespace(id=user_id, is_admin=False)
+    with patch('integrations.social.auth._get_user_from_token',
+               side_effect=lambda tok: (user, key_db.session())):
+        return client.delete(f'/api/v1/intelligence/keys/{KEY}',
+                             headers={'Authorization': 'Bearer tok'})
+
+
+def test_another_person_cannot_revoke_a_key_they_do_not_own(client, key_db):
+    """DELETE /keys/<id> deactivated any key by id: every other key route
+    reads the key by id AND the JWT's user, this one did not, so a signed-in
+    person who knew another's key id could switch it off (the review of
+    fd2b4773c read it; task #146).  The other person gets the same 404 a
+    missing key gets, and the key stays active."""
+    r = _revoke_as(client, key_db, OTHER)
+    assert r.status_code == 404, r.get_json()
+    assert key_db.is_active() is True
+
+
+def test_the_owner_revokes_their_own_key(client, key_db):
+    r = _revoke_as(client, key_db, OWNER)
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()['key']['is_active'] is False
+    assert key_db.is_active() is False
