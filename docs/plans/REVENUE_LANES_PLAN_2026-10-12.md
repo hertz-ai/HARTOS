@@ -75,10 +75,13 @@ or a mix with merchant and driver subscriptions.
 
 1. OK the push of local main (the deploy-secret chain and the lane commits).
    A push to main deploys central.
-2. Set on central's `.env`: the McGroce trio, `HEVOLVE_AUTONOMOUS_MARKETING=1`,
-   the expert trio for Claude, and point the configured LLM at Kong
-   (`http://172.17.0.1:8100/llm/v1`) in all three keys the deploy check names.
-   Then set `HEVOLVE_API_KEY`, AFTER the build carrying the /chat
+2. Set as GitHub repo secrets (the deepbox deploy writes each into central's
+   `.env` on every deploy while it is set; a hand edit of one of these is
+   overwritten): `HEVOLVE_AUTONOMOUS_MARKETING=1`, the expert trio for
+   Claude and `HEVOLVE_CLAUDE_BUDGET_USD_DAY`, `COMMERCE_SESSION_SECRET`,
+   `STRIPE_API_KEY`, and the configured LLM trio (point it at Kong,
+   `http://172.17.0.1:8100/llm/v1`). The rest of the McGroce trio is set in
+   central's `.env` by hand. Then set `HEVOLVE_API_KEY` (also a repo secret), AFTER the build carrying the /chat
    `X-API-Key` fix is deployed (before it, a keyed central answered every
    paid metered call with 401 inside /chat and the customer saw 503,
    measured by the review of 7086adff8).  The key is not optional in
