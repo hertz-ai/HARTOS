@@ -1004,8 +1004,9 @@ class TestSubmitOutputFeedback(unittest.TestCase):
         with the bridge's own reader (hivemind_result_text): the HTTP core's
         'answer' (this attached no hint from it), a PeerLink envelope's
         peers' words one per line (this attached a repr of the peer dicts),
-        and nothing when no peer said anything (this attached the envelope's
-        'source', 'peerlink').  The review of fbeb16284 named this reader."""
+        and nothing when no peer said anything (this attached the same repr
+        of the silent peers' dicts; the review of c10535351 measured it).
+        The review of fbeb16284 named this reader."""
         core_body = {'status': 'ok', 'query': 'q', 'answer': 'Lower the batch size.',
                      'reasoning_chain': [], 'contributing_agents': ['inst-1'],
                      'confidence': 0.9}

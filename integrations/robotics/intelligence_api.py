@@ -718,8 +718,11 @@ class RobotIntelligenceAPI:
                     # (hivemind_result_text): the HTTP core's 'answer' and a
                     # PeerLink envelope's peers reached the robot as ''
                     # while this read 'thought' alone (the review of
-                    # fbeb16284).  'strategy' stays the fallback it was; no
-                    # shape query_hivemind returns carries it today.
+                    # fbeb16284).  'strategy' stays a fallback, read after the
+                    # words now where it was read after 'thought' alone; no
+                    # shape query_hivemind returns carries it, and the hive
+                    # core's reply body has no such key (the review of
+                    # c10535351 read it).
                     'best_strategy': (hivemind_result_text(result)
                                       or result.get('strategy', '')),
                     'confidence': result.get('confidence', 0.0),

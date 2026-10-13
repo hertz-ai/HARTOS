@@ -2614,10 +2614,12 @@ class WorldModelBridge:
                 # (hivemind_result_text): the in-process 'thought', a
                 # PeerLink envelope's peers one per line, the HTTP core's
                 # 'answer'.  This read 'thought', then the envelope's whole
-                # 'thoughts' list (a repr of the peer dicts went to the
-                # learner), then 'source' ('peerlink' as the hint when no
-                # peer said anything), and never the core's 'answer' (the
-                # review of fbeb16284 named this reader).
+                # 'thoughts' list, so a repr of the peer dicts went to the
+                # learner whether the peers said something or not, and never
+                # the core's 'answer' (the review of fbeb16284 named this
+                # reader; its last fallback, 'source', could not be reached:
+                # the envelope is built only from a non-empty reply list, and
+                # the core's body has no such key).
                 hive_hint = hivemind_result_text(hive_result)
                 if hive_hint:
                     with self._lock:

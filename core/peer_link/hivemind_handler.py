@@ -48,9 +48,10 @@ def handle_hivemind_message(data: Any, sender_peer_id: str) -> Optional[dict]:
     Failure modes:
     - malformed payload (non-dict)            → log at debug, return None
     - unknown ``type``                         → log at debug, return None
-    - HiveMind bridge missing (HTTP-only tier) → log at debug, return
-      ``_EMPTY_REPLY`` so the requesting peer's ``collect()`` still sees a
-      structured response rather than hanging on the timeout.
+    - the bridge's names missing from this copy of the tree → say so at
+      WARNING once per process (debug after), return ``_EMPTY_REPLY`` so
+      the requesting peer's ``collect()`` still sees a structured response
+      rather than hanging on the timeout.
     """
     if not isinstance(data, dict):
         logger.debug(
@@ -92,10 +93,14 @@ def _handle_query(data: dict, sender_peer_id: str) -> Optional[dict]:
         # core (central, with no core installed, runs it), so this is a copy
         # of the tree that lacks a name this handler needs
         # (hivemind_thought_text arrived in fbeb16284; the bundle carries
-        # more than one copy of HARTOS).  Said at WARNING: every peer's
-        # query is otherwise answered with the empty reply and nothing logged
-        # (the review of fbeb16284).
-        logger.warning(f"hivemind query: bridge import failed, answering empty: {e}")
+        # more than one copy of HARTOS).  Said at WARNING once per process,
+        # debug after (a peer's robot loop can ask many times a second; the
+        # review of c10535351): every peer's query is otherwise answered
+        # with the empty reply and nothing logged (the review of fbeb16284).
+        said = _handle_query.__dict__.setdefault('import_failure_said', False)
+        _handle_query.import_failure_said = True
+        logger.log(logging.DEBUG if said else logging.WARNING,
+                   f"hivemind query: bridge import failed, answering empty: {e}")
         return _EMPTY_REPLY
 
     try:

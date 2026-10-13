@@ -75,22 +75,31 @@ class HiveMindHandlerTest(unittest.TestCase):
         bundle carries more than one copy of HARTOS) used to answer every
         peer's query with the empty reply and log nothing.  It still answers
         the empty reply (the asking peer's collect() must not hang) and says
-        why at WARNING, naming the import (the review of fbeb16284)."""
+        why at WARNING, naming the import (the review of fbeb16284), once per
+        process: the next query logs it at DEBUG (a peer's robot loop can ask
+        many times a second; the review of c10535351)."""
+        import logging
         import integrations.agent_engine.world_model_bridge as wmb
+        from core.peer_link import hivemind_handler
         from core.peer_link.hivemind_handler import (
             handle_hivemind_message, _EMPTY_REPLY,
         )
         real = wmb.hivemind_thought_text
         del wmb.hivemind_thought_text
+        hivemind_handler._handle_query.__dict__.pop('import_failure_said', None)
         try:
-            with self.assertLogs('hevolve.peer_link.hivemind', level='WARNING') as logs:
-                reply = handle_hivemind_message(
+            with self.assertLogs('hevolve.peer_link.hivemind', level='DEBUG') as logs:
+                first = handle_hivemind_message(
+                    {'type': 'query', 'query': 'q'}, 'peer_x')
+                second = handle_hivemind_message(
                     {'type': 'query', 'query': 'q'}, 'peer_x')
         finally:
             wmb.hivemind_thought_text = real
-        self.assertEqual(reply, _EMPTY_REPLY)
-        self.assertTrue(any('hivemind_thought_text' in line for line in logs.output),
-                        logs.output)
+            hivemind_handler._handle_query.__dict__.pop('import_failure_said', None)
+        self.assertEqual((first, second), (_EMPTY_REPLY, _EMPTY_REPLY))
+        said = [r for r in logs.records if 'hivemind_thought_text' in r.getMessage()]
+        self.assertEqual([r.levelno for r in said], [logging.WARNING, logging.DEBUG],
+                         logs.output)
 
     def test_deliver_missing_target_returns_ack_invalid(self):
         from core.peer_link.hivemind_handler import handle_hivemind_message
