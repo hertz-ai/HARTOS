@@ -65,26 +65,32 @@ _SAVE_CONFIG_LOCK = threading.Lock()
 admin_bp = Blueprint("admin", __name__, url_prefix="/api/admin")
 
 
-#: Node tiers that serve many people over the network.  On these the channel
-#: configuration is the operator's, not every user's.  The same env read the
-#: network gate uses (security/middleware.py, HEVOLVE_NODE_TIER).
-_OPERATOR_ONLY_TIERS = ('central', 'regional')
+#: Node tiers on which the channel configuration is the operator's, not every
+#: registered user's.  Central only: it serves strangers over the public API
+#: host.  Regional is NOT listed: a regional node's operator carries role
+#: 'regional' (is_moderator, not is_admin; UserService.set_user_role), which
+#: holds_central_role does not recognise, so listing regional here locked
+#: every regional operator out of their own channels (review of 91a211c9e);
+#: who operates a regional node is the owner's ruling, task #124.  The same
+#: env read the network gate uses (security/middleware.py, HEVOLVE_NODE_TIER).
+_OPERATOR_ONLY_TIERS = ('central',)
 
 
 @admin_bp.before_request
 def _admin_auth_gate():
-    """Require an authenticated user; on a public tier, the operator.
+    """Require an authenticated user; on central, the operator.
 
     Channel config (settings, identity, channels, workflows) is node
     configuration.  On a flat desktop any registered user is the one person
-    using the device, so a valid token is enough.  On the central and
-    regional tiers the node serves strangers and Kong routes /api/admin on
-    the public API host, so the gate requires the operator
-    (``holds_central_role``, the ONE check ``require_central`` applies).
-    Measured 2026-10-13 on central: a self-registered user's JWT reached
-    /api/admin/channels (task #121).  Network-wide admin operations (user
-    management, moderation) stay behind @require_central on the social
-    admin blueprint.
+    using the device, so a valid token is enough; a regional node keeps that
+    rule until task #124 says who its operator is.  On central the node
+    serves strangers and Kong routes /api/admin on the public API host, so
+    the gate requires the operator: ``holds_central_role``, the check the
+    social layer's central-only decorator applies.  Measured 2026-10-13 on
+    central: a self-registered user's JWT reached /api/admin/channels (task
+    #121).  Network-wide admin operations (user management, moderation) stay
+    behind the social admin blueprint's own @require_admin and
+    @require_moderator decorators.
     """
     from integrations.social.auth import _get_user_from_token, holds_central_role
     from flask import g
