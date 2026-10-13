@@ -13,7 +13,8 @@ from integrations.reel_studio import igkit
 from integrations.reel_studio.igkit import hooks
 
 TAMIL_HOOK = 'இந்த ப்ரைடல் லுக் பாருங்க'  # "look at this bridal look"
-ZWJ = '‍'
+ZWJ = '\u200d'
+ZWNJ = '\u200c'
 
 
 class TestWords:
@@ -34,6 +35,17 @@ class TestWords:
 
     def test_a_joiner_stays_inside_an_indic_word(self):
         assert igkit.words('क्' + ZWJ + 'ष') == ['क्' + ZWJ + 'ष']
+        assert igkit.words('क्' + ZWNJ + 'ष') == ['क्' + ZWNJ + 'ष']
+
+    def test_the_joiners_are_zwnj_and_zwj(self):
+        # Written as escapes in the source: an editor that strips invisible
+        # characters would otherwise empty this set without a diff anyone sees.
+        assert igkit.JOINERS == frozenset({'\u200c', '\u200d'})
+
+    def test_a_decimal_point_does_not_end_a_sentence(self):
+        assert igkit.sentences('Bridal from ₹1.5 lakh. Book 2.5 hours early!') == [
+            'Bridal from ₹1.5 lakh.', 'Book 2.5 hours early!']
+        assert igkit.sentences('Done at 5. Then photos.') == ['Done at 5.', 'Then photos.']
 
     def test_money_is_one_word_and_lone_punctuation_is_none(self):
         assert igkit.words('₹1,50,000 - $18,000 —') == ['₹150000', '$18000']
@@ -122,6 +134,15 @@ class TestScoreHooks:
         out = hooks.score_hooks(self.WEAK + '\n' + self.GOOD)
         assert [h['hook'] for h in out['hooks']] == [self.WEAK, self.GOOD]
 
+    def test_none_is_no_hooks(self):
+        assert hooks.score_hooks(None) == {'note': hooks.HOOK_NOTE, 'hooks': []}
+
+    @pytest.mark.parametrize('bad', [42, 4.2, b'Bare face to bride', {'hook': 'Bare face'},
+                                     object()])
+    def test_anything_but_text_or_lines_is_refused_by_name(self, bad):
+        with pytest.raises(TypeError, match=type(bad).__name__):
+            hooks.score_hooks(bad)
+
     def test_card_fit_uses_the_on_screen_word_limit(self):
         out = hooks.score_hooks(['Bare face to bride in 20 minutes', 'Bare face to bride'])
         long, short = out['hooks']
@@ -143,6 +164,29 @@ class TestClassify:
     ])
     def test_formula(self, hook, name):
         assert hooks.classify_hook(hook)[1] == name
+
+    @pytest.mark.parametrize('hook,name', [
+        ('Bridal transformation in 20 seconds', 'Bare Face To Bride'),
+        ('Wait for the final look', 'Jewellery Or Drape Reveal'),
+        ('Gold nath and maang tikka, last shot', 'Jewellery Or Drape Reveal'),
+        ('Her reaction when she saw the mirror', 'Client Reaction'),
+        ('மணப்பெண்ணின் ரியாக்ஷன்', 'Client Reaction'),
+        ('दुल्हन का रिएक्शन देखिए', 'Client Reaction'),
+    ])
+    def test_makeup_formula(self, hook, name):
+        assert hooks.classify_hook(hook)[1] == name
+
+    @pytest.mark.parametrize('hook,not_id', [
+        # The makeup formulas are classified first, so a broad pattern in one
+        # of them relabels other niches' hooks in the research swipe makes.
+        ('The transformation of my business in 2 years', 27),
+        ('Wait for the end, you will laugh', 29),
+        ('Ranbir Nath on startup funding', 29),
+        ('My reaction to the new budget', 30),
+        ('बजट पर मेरा रिएक्शन', 30),
+    ])
+    def test_a_makeup_formula_does_not_take_other_niches_hooks(self, hook, not_id):
+        assert hooks.classify_hook(hook)[0] != not_id
 
     def test_unclassified(self):
         assert hooks.classify_hook('a quiet morning') == (None, 'unclassified')

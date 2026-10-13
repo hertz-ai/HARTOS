@@ -7,12 +7,27 @@ logo corner.  The fields, their types and limits come from
 igkit/resources/voice_template.json (derived from instagram-agent-skill's
 voice.md, MIT); anything else is refused.
 
-Storage: ``get_agent_data_dir()/reel_studio/<user_id>/voice.json``, one file
-per user, written only by this module.  The file is encrypted at rest
-through security.crypto.encrypt_json_file (Fernet with HEVOLVE_DATA_KEY;
-that helper writes plaintext JSON when no key is configured) and replaced
-atomically, so a crash never leaves half a profile.  Updates for one user
-are serialised by a per-user lock.
+Storage: ``get_agent_data_dir()/reel_studio/<sha256(user_id)[:16]>/voice.json``,
+one file per user, written only by this module.  User ids follow
+core.user_file_store's rule (any non-empty text or int; 10077 and '10077'
+are one user) and its directory naming, so every user the store takes has a
+profile and no id can steer the path.  The file records its user id; a file
+holding another id (a hash collision) raises PermissionError and is never
+shown or written over.
+
+The file goes through security.crypto.encrypt_json_file: Fernet-encrypted
+with HEVOLVE_DATA_KEY when that key is set, plaintext JSON when it is not (a
+stock desktop has no key).  A plaintext profile is read, and encrypted by the
+next write, once a key is set.  A write goes to a temp file that is flushed
+to disk and then replaces the profile, so a crash never leaves half a
+profile.  Updates for one user are serialised by a per-user lock.
+
+A profile that exists but cannot be read (HEVOLVE_DATA_KEY missing for a
+launch or rotated, or the file damaged) is never written over: load_voice,
+save_voice and update_field raise VoiceProfileUnreadable and leave the file
+as it is, so her whole profile is back when the key is
+(security/node_integrity.py treats its key file the same way).  voice_brief
+says the profile exists and could not be read.
 
 voice_brief() is what reel_skill puts in front of a skill text, so a local
 model reads her profile before the instructions; it is bounded at
@@ -20,6 +35,7 @@ MAX_BRIEF_CHARS.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -41,13 +57,35 @@ MAX_BRIEF_CHARS = 1200
 #: Longest single line of the brief, so one long field cannot crowd out the rest.
 _BRIEF_LINE_CHARS = 240
 _FILE_NAME = 'voice.json'
-_SAFE_USER_ID = re.compile(r'[A-Za-z0-9_-]{1,128}')
 _XID = re.compile(r'[0-9a-f]{64}')
 _TRUE = frozenset({'true', 'yes', 'y', '1', 'on'})
 _FALSE = frozenset({'false', 'no', 'n', '0', 'off'})
 _EMPTY_BRIEF = ('No voice profile saved yet. Before writing for her, ask for three of her own '
                 'past captions, learn her language, tone and hashtags from them, and save each '
                 'field with reel_voice after she confirms it.')
+_UNREADABLE_BRIEF = ('Her voice profile is saved on this desktop but could not be read '
+                     '(HEVOLVE_DATA_KEY is not set or has changed, or the file is damaged). Do '
+                     'not rebuild it and do not save fields with reel_voice: saving is refused '
+                     'until the key is restored, and then her whole profile is back. Write in a '
+                     'plain, warm voice for now and tell her the desktop cannot read her saved '
+                     'style.')
+
+
+class VoiceProfileUnreadable(RuntimeError):
+    """Her saved profile exists but could not be read: HEVOLVE_DATA_KEY is
+    missing or is not the key it was saved with, or the file is damaged.
+
+    Nothing was written; ``path`` is the file, left as it was.  Not a
+    ValueError: no value she gives can fix it, the key has to come back.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        super().__init__(
+            'her voice profile is saved on this desktop but could not be read: '
+            'HEVOLVE_DATA_KEY is not set or is not the key it was saved with, or the file '
+            'is damaged. It was left untouched and nothing was saved; restore that '
+            'HEVOLVE_DATA_KEY and try again.')
 
 
 def _field_specs() -> Mapping[str, Mapping[str, Any]]:
@@ -75,17 +113,22 @@ _user_locks: Dict[str, threading.Lock] = {}
 # ── paths and locks ─────────────────────────────────────────────────────────
 
 def _user_key(user_id) -> str:
+    """The user id as text, by core.user_file_store's rule: any non-empty
+    text or int (10077 and '10077' are one user)."""
     if isinstance(user_id, bool) or not isinstance(user_id, (str, int)):
-        raise ValueError('unsafe user id %r' % (user_id,))
+        raise ValueError('user_id must be text or an int, got %r' % (user_id,))
     key = str(user_id).strip()
-    if not _SAFE_USER_ID.fullmatch(key):
-        raise ValueError('unsafe user id %r: letters, digits, _ and - only' % (user_id,))
+    if not key:
+        raise ValueError('user_id is empty')
     return key
 
 
 def _profile_path(key: str) -> str:
+    """Her profile file.  The directory is named like core.user_file_store's
+    user directories, sha256(user id)[:16], so an id never becomes a path."""
     from core.platform_paths import get_agent_data_dir
-    return os.path.join(get_agent_data_dir(), 'reel_studio', key, _FILE_NAME)
+    name = hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]
+    return os.path.join(get_agent_data_dir(), 'reel_studio', name, _FILE_NAME)
 
 
 def _lock_for(key: str) -> threading.Lock:
@@ -264,15 +307,26 @@ def _clean(data: Mapping[str, Any]) -> Dict[str, Any]:
 # ── storage ─────────────────────────────────────────────────────────────────
 
 def _read(key: str) -> Dict[str, Any]:
+    """Her stored fields, {} when she has no profile file.
+
+    Raises VoiceProfileUnreadable for a file that exists but does not
+    decrypt or parse, and PermissionError for a file another user id wrote;
+    callers hold the user's lock and write nothing after either.
+    """
     path = _profile_path(key)
     if not os.path.exists(path):
         return {}
     from security.crypto import decrypt_json_file
     doc = decrypt_json_file(path)
     if not isinstance(doc, Mapping) or not isinstance(doc.get('fields'), Mapping):
-        logger.warning('voice profile for %s could not be read (wrong data key or damaged '
-                       'file); treating it as empty', key)
-        return {}
+        logger.error('voice profile %s exists but could not be read (HEVOLVE_DATA_KEY missing '
+                     'or not the key it was saved with, or the file is damaged); left untouched '
+                     'and nothing will be written over it', path)
+        raise VoiceProfileUnreadable(path)
+    owner = doc.get('user_id')
+    if owner is not None and owner != key:
+        # sha256(user id)[:16] collided: never show one user another's profile.
+        raise PermissionError('voice profile %s belongs to another user' % path)
     out = {}
     for field, value in doc['fields'].items():
         if field not in FIELD_SPECS:
@@ -295,9 +349,15 @@ def _write(key: str, fields: Mapping[str, Any]) -> None:
     folder = os.path.dirname(path)
     os.makedirs(folder, exist_ok=True)
     tmp = os.path.join(folder, '.%s.%s.tmp' % (_FILE_NAME, uuid.uuid4().hex))
-    doc = {'schema': VOICE_SCHEMA, 'updated_at': time.time(), 'fields': dict(fields)}
+    doc = {'schema': VOICE_SCHEMA, 'user_id': key, 'updated_at': time.time(),
+           'fields': dict(fields)}
     try:
         encrypt_json_file(tmp, doc)
+        # encrypt_json_file closes without an fsync: put the new profile on
+        # disk before it replaces the old one, as core.file_cache's
+        # atomic_json_write does for plain JSON.
+        with open(tmp, 'rb+') as f:
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -313,7 +373,9 @@ def load_voice(user_id) -> Dict[str, Any]:
     """Her saved profile as ``{field: value}`` ({} when she has none).
 
     Fields the template no longer has, and values it no longer accepts,
-    are dropped with a log line.  Raises ValueError for an unsafe user id.
+    are dropped with a log line.  Raises ValueError for a user id that is
+    not non-empty text or an int, VoiceProfileUnreadable when her profile
+    exists but cannot be read, and PermissionError for another user's file.
     """
     key = _user_key(user_id)
     with _lock_for(key):
@@ -325,18 +387,22 @@ def save_voice(user_id, data: Mapping[str, Any]) -> None:
 
     Every key must be a field of the template and every value valid for it
     (text forms are accepted, as in update_field); empty values are left
-    out.  Nothing is written if anything is refused (ValueError).
+    out.  Nothing is written if anything is refused (ValueError), or if her
+    saved profile exists but cannot be read (VoiceProfileUnreadable): a
+    profile the key would bring back is never replaced.
     """
     key = _user_key(user_id)
     fields = _clean(data)
     with _lock_for(key):
+        _read(key)
         _write(key, fields)
 
 
 def update_field(user_id, field: str, value: Any) -> Dict[str, Any]:
     """Set one field (None or an empty value clears it) and return her
     whole profile.  Raises ValueError for an unknown field or a value the
-    field refuses, and then changes nothing."""
+    field refuses, and VoiceProfileUnreadable when her saved profile exists
+    but cannot be read; either way nothing changes."""
     key = _user_key(user_id)
     clean = _coerce(field, value)
     with _lock_for(key):
@@ -362,8 +428,12 @@ def voice_brief(user_id) -> str:
     MAX_BRIEF_CHARS.  Fields follow the template order; a field marked
     ``brief: false`` (the logo id, sample captions) is left out, a long line
     is shortened, and fields that no longer fit are dropped.  With no
-    profile it says so and how to start one."""
-    fields = load_voice(user_id)
+    profile it says so and how to start one; with a profile that exists but
+    cannot be read it says that, and not to rebuild it."""
+    try:
+        fields = load_voice(user_id)
+    except VoiceProfileUnreadable:
+        return _UNREADABLE_BRIEF[:MAX_BRIEF_CHARS]
     if not fields:
         return _EMPTY_BRIEF[:MAX_BRIEF_CHARS]
     lines = ['Her voice profile (follow it; never contradict it):']

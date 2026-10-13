@@ -6,8 +6,9 @@ Copyright (c) 2026 Jake Schincariol, MIT License (see LICENSE.txt in this
 package).  Modified for HARTOS Reel Studio: a pure function, hashtags in any
 script counted against the one cap (contracts.HASHTAG_LIMIT), the shared
 definition of "concrete", Indian booking asks (DM for bookings, bookings
-open, a WhatsApp number), more generic tags named, and search terms matched
-case-insensitively in any script.
+open, a WhatsApp number), more generic tags named, search terms matched
+case-insensitively in any script, and an emoji counted once with its
+variation selector, skin tone and joined parts.
 
 Instagram shows about 125 characters of a caption in the feed and hides the
 rest behind a tap; the real cut moves with the device and font, so aim for a
@@ -27,7 +28,14 @@ TRUNCATE = 125           # Roughly where the feed cuts to "... more".
 MENTION_RE = re.compile(r'(?:^|\s)(@[A-Za-z0-9_.]+)')
 LINK_RE = re.compile(r'https?://\S+|\bwww\.\S+|\b[a-z0-9-]+\.(?:com|co|io|net|org|ai|app)/\S*',
                      re.IGNORECASE)
-EMOJI_RE = re.compile('[\U0001F300-\U0001FAFF☀-➿←-⇿️]')
+#: Emoji code points: pictographs, the miscellaneous-symbol and dingbat
+#: blocks, and arrows.
+_EMOJI_CHARS = '\U0001F300-\U0001FAFF☀-➿←-⇿'
+#: One emoji as she sees it: a code point with its variation selector or skin
+#: tone, and any more that a zero-width joiner adds (a bride, a family).
+#: Upstream counted the selector as an emoji of its own, so a red heart was 2.
+_ONE_EMOJI = '[{0}][\ufe0f\U0001F3FB-\U0001F3FF]?'.format(_EMOJI_CHARS)
+EMOJI_RE = re.compile(_ONE_EMOJI + '(?:\u200d' + _ONE_EMOJI + ')*')
 
 #: Calls to action, each with the name the result reports.  The last three
 #: are the asks Indian makeup artists use; a WhatsApp number is not

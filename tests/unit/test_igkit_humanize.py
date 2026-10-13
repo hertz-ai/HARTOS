@@ -14,8 +14,8 @@ import pytest
 from integrations.reel_studio.igkit import humanize
 
 FIXTURES = pathlib.Path(__file__).resolve().parents[1] / 'fixtures' / 'igkit'
-ZWJ = '‍'
-ZWNJ = '‌'
+ZWJ = '\u200d'
+ZWNJ = '\u200c'
 
 
 def _fixture(name):
@@ -28,7 +28,7 @@ def _ids(report):
 
 class TestHumanize:
     def test_joiners_in_emoji_and_indic_letters_are_kept(self):
-        text = ('Bride 👰' + ZWJ + '♀️ ready, family 👨' + ZWJ + '👩' + ZWJ + '👧, '
+        text = ('Bride 👰' + ZWJ + '♀\ufe0f ready, family 👨' + ZWJ + '👩' + ZWJ + '👧, '
                 'क्' + ZWJ + 'ष and ന്' + ZWJ + ' and क्' + ZWNJ + 'ष')
         out = humanize.humanize_text(text)
         assert out['text'].count(ZWJ) == 5
@@ -36,10 +36,30 @@ class TestHumanize:
         assert out['report']['invisible'] == []
 
     def test_a_joiner_between_latin_letters_is_a_watermark(self):
-        out = humanize.humanize_text('wa' + ZWJ + 'ter​proof base')
+        out = humanize.humanize_text('wa' + ZWJ + 'ter\u200bproof base')
         assert out['text'] == 'waterproof base'
         assert {h['count'] for h in out['report']['invisible']} == {1}
         assert len(out['report']['invisible']) == 2
+
+    @pytest.mark.parametrize('word', ['café', 'cafe\u0301', 'Zoë', 'стиль'])
+    def test_a_joiner_beside_an_accented_latin_or_cyrillic_letter_is_a_watermark(self, word):
+        # Only scripts that join (Indic, Arabic) and emoji keep a joiner; a
+        # non-ASCII letter of an alphabet that never joins does not.
+        out = humanize.humanize_text(word + ZWJ + 'look and ' + word + ZWNJ + 'base')
+        assert ZWJ not in out['text'] and ZWNJ not in out['text']
+        assert out['text'] == word + 'look and ' + word + 'base'
+
+    def test_hard_spaces_become_spaces_and_count_as_a_fingerprint(self):
+        text = 'Base\u00a0done\u202fin\u200940 minutes'
+        assert humanize.humanize_text(text)['text'] == 'Base done in 40 minutes'
+        detail = humanize.detect_machine_text(text)['checks']['FINGERPRINT']['detail']
+        assert '3 hard space' in detail
+
+    def test_her_emoji_is_kept_with_or_without_its_variation_selector(self):
+        text = '✔ Long wear base\n✔ Kryolan base\n✔ Ready by 5 am'
+        assert 'emoji-bullets' in _ids(humanize.humanize_text(text)['report'])
+        kept = humanize.humanize_text(text, keep_emoji=['✔\ufe0f'])
+        assert 'emoji-bullets' not in _ids(kept['report'])
 
     def test_em_dash_and_stock_words(self):
         out = humanize.humanize_text('This look is stunning — it will elevate your day.')
@@ -117,7 +137,7 @@ class TestDetect:
         assert r['before']['verdict'] in ('REVIEW', 'FLAGGED')
 
     def test_emoji_and_indic_joiners_are_not_a_fingerprint(self):
-        r = humanize.detect_machine_text('Bride 👰' + ZWJ + '♀️ ready, क्' + ZWJ + 'ष done')
+        r = humanize.detect_machine_text('Bride 👰' + ZWJ + '♀\ufe0f ready, क्' + ZWJ + 'ष done')
         assert r['checks']['FINGERPRINT']['score'] == 100.0
         r = humanize.detect_machine_text('ready' + ZWJ + 'now')
         assert r['checks']['FINGERPRINT']['score'] < 100.0

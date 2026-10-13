@@ -85,6 +85,24 @@ class TestRankReels:
         rows = [{'account': '@x', 'median': '11,000', 'views': '412,000', 'hook': 'x'}]
         assert swipe.rank_reels(rows)['reels'][0]['outlier'] == 37.45
 
+    @pytest.mark.parametrize('text,count', [
+        ('412,000', 412000), ('1,50,000', 150000), (' 7 ', 7), ('12.5', 12.5),
+        ('4.5k', 4500), ('412K', 412000), ('1.2M', 1200000), ('2B', 2000000000),
+        ('1.5 lakh', 150000), ('2 lakhs', 200000), ('1.2 crore', 12000000), ('3 cr', 30000000),
+    ])
+    def test_text_counts_keep_their_decimals_and_suffixes(self, text, count):
+        # Upstream deleted every non-digit: "1.2M" was read as 12 and "4.5k"
+        # as 45, with no error.
+        assert swipe.outlier(text, 1) == count
+
+    @pytest.mark.parametrize('text', ['1.2.3', 'about 400', '12 views', '1.2MM', 'k', '',
+                                      '-5', '1,2', '1e6', 'nan', '12,34,5'])
+    def test_text_that_is_not_a_count_is_none(self, text):
+        assert swipe.outlier(text, 1) is None
+
+    def test_a_baseline_from_text_counts(self):
+        assert swipe.account_median(['1.2M', '800K', '1M', '900k', '1.1M', '950K']) == 975000.0
+
     def test_the_callers_rows_are_not_changed(self):
         rows = copy.deepcopy(ROWS)
         swipe.rank_reels(rows)

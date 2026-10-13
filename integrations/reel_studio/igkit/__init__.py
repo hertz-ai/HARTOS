@@ -27,7 +27,7 @@ What was changed for HARTOS:
  2. Words in any script.  A word is a run of letters, combining marks,
     digits and joiners; upstream's ``[A-Za-z0-9]`` pattern counted a Tamil
     hook as 0 words.  Sentences also end at the danda (U+0964) and double
-    danda (U+0965).
+    danda (U+0965), and not at a decimal point ("₹1.5 lakh").
  3. One definition of "concrete" (``concrete_markers``) for the hook
     checker, the beat sheet, the caption linter and the detector, where
     upstream had four slightly different regexes.  It knows rupees, lakh and
@@ -36,8 +36,10 @@ What was changed for HARTOS:
     brands, because Indian scripts have no capital letters to find names by.
  4. Zero-width joiners are kept inside Indic words and emoji sequences
     (upstream deleted them, breaking the bride and family emoji, Malayalam
-    chillu letters and Hindi conjuncts); a joiner between Latin letters is
-    still a watermark and still goes.
+    chillu letters and Hindi conjuncts); a joiner beside a Latin, Greek or
+    Cyrillic letter, accented or not, is still a watermark and still goes.
+    Invisible characters are written as escapes in this package's source,
+    never as literals, so no editor can strip them unseen.
  5. Hook checks are shown as WEAK/OK plus the weakest check, never as a
     score: upstream measured AUC 0.56 at telling a creator's hits from her
     misses.  Two upstream bugs are fixed: "hi" no longer marks "highlighter"
@@ -55,7 +57,11 @@ What was changed for HARTOS:
     Punjabi.
 10. swipe takes rows as dicts, drops muted songs, and groups and scores
     songs (``top_songs``) for the central trends job, which uses this one
-    implementation of the outlier maths.
+    implementation of the outlier maths.  Counts written as text keep their
+    decimals and multipliers ("1.2M", "4.5k", "1.5 lakh"); upstream deleted
+    every non-digit and read "1.2M" as 12.
+11. caption counts an emoji once with its variation selector, skin tone and
+    joined parts; upstream counted the selector as an emoji of its own.
 
 This module imports only the standard library.
 """
@@ -70,7 +76,7 @@ UPSTREAM = 'instagram-agent-skill@d03c56b'
 
 #: Zero-width non-joiner and joiner: they belong inside Indic conjuncts and
 #: emoji sequences.
-JOINERS = frozenset('‌‍')
+JOINERS = frozenset('\u200c\u200d')
 
 #: Characters kept inside a word beside letters and digits: "$18,000",
 #: "₹15k", "12-hour", "don't".
@@ -79,7 +85,9 @@ _WORD_EXTRA = frozenset("$%'’-₹_")
 #: "$18,000" is one word when it is spoken, so it is one word here too.
 _DIGIT_COMMA = re.compile(r'(?<=\d),(?=\d)')
 
-_SENTENCE = re.compile(r'[^.!?।॥\n]+[.!?।॥]*')
+#: A sentence: up to . ! ? the danda, the double danda or a line break; a
+#: point between two digits ("₹1.5 lakh") is a decimal point, not an end.
+_SENTENCE = re.compile(r'(?:[^.!?।॥\n]|(?<=\d)\.(?=\d))+[.!?।॥]*')
 
 #: A figure: money ($, ₹, k, lakh, crore) or a number with an optional unit.
 FIGURE_RE = re.compile(
@@ -201,7 +209,7 @@ def sentences(text: str) -> List[str]:
     """Sentences and lines of ``text``, each with its closing mark.
 
     A sentence ends at . ! ? the danda or the double danda, or at a line
-    break.
+    break.  A point between two digits ("₹1.5 lakh") does not end one.
     """
     return [s.strip() for s in _SENTENCE.findall(text or '') if s.strip()]
 

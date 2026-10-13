@@ -48,8 +48,8 @@ DETECT_CHECKS = ('BURSTINESS', 'SPECIFICITY', 'SLOP DENSITY', 'FINGERPRINT', 'VO
 
 _CONTRACTIONS = re.compile(r"\b\w+'(?:s|t|re|ve|ll|d|m)\b", re.IGNORECASE)
 _PERSON_WORDS = YOU_WORDS | ME_WORDS
-_HARD_SPACES = '   '
-_VS16 = '️'
+_HARD_SPACES = '\u00a0\u202f\u2009'
+_VS16 = '\ufe0f'
 
 
 @functools.lru_cache(maxsize=1)
@@ -63,20 +63,33 @@ def _lexicon(lexicon: Optional[Mapping[str, Any]]) -> Mapping[str, Any]:
 
 # ── joiners ─────────────────────────────────────────────────────────────────
 
+#: Alphabets whose letters never join: a joiner beside one ("é", Greek,
+#: Cyrillic) is a watermark, just as between ASCII letters.
+_NON_JOINING_SCRIPTS = ('LATIN', 'GREEK', 'CYRILLIC')
+
+
 def _joinable(ch: str) -> bool:
-    """A neighbour a joiner may legitimately sit next to: a non-ASCII letter
-    or mark (Indic letters, viramas, the emoji variation selector) or a
-    symbol (emoji)."""
+    """A neighbour a joiner may legitimately sit next to: a letter of a
+    script that joins (Indic, Arabic and the rest; not Latin, Greek or
+    Cyrillic), a mark other than a combining accent (Indic viramas and vowel
+    signs, the emoji variation selector) or a symbol (emoji, skin tones)."""
     if not ch or ord(ch) < 0x80:
         return False
     cat = unicodedata.category(ch)
-    return cat[0] in 'LM' or cat in ('So', 'Sk')
+    if cat in ('So', 'Sk'):
+        return True
+    name = unicodedata.name(ch, '')
+    if cat[0] == 'L':
+        return not name.startswith(_NON_JOINING_SCRIPTS)
+    if cat[0] == 'M':
+        return not name.startswith('COMBINING')
+    return False
 
 
 def _joins(text: str, i: int) -> bool:
     """Whether the joiner at ``text[i]`` sits inside an Indic word or an
-    emoji sequence (kept), rather than between Latin letters or spaces (a
-    watermark)."""
+    emoji sequence (kept), rather than beside Latin, Greek or Cyrillic
+    letters, digits or spaces (a watermark)."""
     before = text[i - 1] if i > 0 else ''
     after = text[i + 1] if i + 1 < len(text) else ''
     return _joinable(before) or _joinable(after)

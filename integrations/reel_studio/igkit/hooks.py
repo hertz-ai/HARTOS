@@ -21,6 +21,7 @@ import functools
 import math
 import re
 import statistics
+from collections.abc import Iterable, Mapping
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from integrations.reel_studio.igkit import (CONCRETE_WORDS, FIGURE_RE, ME_WORDS, YOU_WORDS,
@@ -253,11 +254,13 @@ def classify_hook(text: str) -> Tuple[Optional[int], str]:
     return None, 'unclassified'
 
 
-def score_hooks(hooks: Union[str, Sequence[str]]) -> Dict[str, Any]:
+def score_hooks(hooks: Union[str, Sequence[str], None]) -> Dict[str, Any]:
     """Check hook lines and say which are weak, in the order given.
 
-    ``hooks`` is a list of lines, or one string with a line per hook; blank
-    lines are dropped and at most MAX_HOOKS are checked.  Each result is
+    ``hooks`` is one string with a line per hook, a list of lines, or None
+    (no hooks); anything else (a number, bytes, a mapping) raises TypeError
+    naming its type.  Blank lines and items that are not text are dropped,
+    and at most MAX_HOOKS are checked.  Each result is
     ``{'hook', 'verdict': 'WEAK'|'OK', 'weakest': {'check', 'detail'},
     'flags', 'formula_id', 'formula', 'card_ok', 'card_words'}``: no score
     and no ranking, because neither predicts how a reel does.  A hook with a
@@ -265,9 +268,14 @@ def score_hooks(hooks: Union[str, Sequence[str]]) -> Dict[str, Any]:
     ``card_ok`` says whether the line fits one on-screen card
     (CARD_MAX_WORDS words).
     """
-    if isinstance(hooks, str):
+    if hooks is None:
+        hooks = ()
+    elif isinstance(hooks, str):
         hooks = hooks.splitlines()
-    lines = [h.strip() for h in (hooks or ()) if isinstance(h, str) and h.strip()]
+    elif isinstance(hooks, (bytes, bytearray, Mapping)) or not isinstance(hooks, Iterable):
+        raise TypeError('hooks must be text with a line per hook or a list of lines, got %s'
+                        % type(hooks).__name__)
+    lines = [h.strip() for h in hooks if isinstance(h, str) and h.strip()]
     out = []
     for hook in lines[:MAX_HOOKS]:
         rated = rate_hook(hook)

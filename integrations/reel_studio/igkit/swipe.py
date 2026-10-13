@@ -35,10 +35,31 @@ from integrations.reel_studio.igkit.hooks import classify_hook, rate_hook
 MEDIAN_WINDOW = 12
 MEDIAN_MIN = 6
 
+#: A count written as text: digits with thousands separators in either
+#: grouping ("412,000", "1,50,000"), an optional decimal part, and an
+#: optional multiplier ("4.5k", "1.2M", "1.5 lakh", "2 crore").
+_COUNT_TEXT = re.compile(r'(\d{1,3}(?:,\d{2,3})+|\d+)(\.\d+)?\s*([a-z]+)?', re.IGNORECASE)
+_MULTIPLIERS = {'k': 10 ** 3, 'm': 10 ** 6, 'b': 10 ** 9, 'lakh': 10 ** 5, 'lakhs': 10 ** 5,
+                'lac': 10 ** 5, 'lacs': 10 ** 5, 'cr': 10 ** 7, 'crore': 10 ** 7,
+                'crores': 10 ** 7}
+
+
+def _count_text(text: str):
+    """The count ``text`` writes, or None when it is not one count."""
+    m = _COUNT_TEXT.fullmatch(text.strip())
+    if not m:
+        return None
+    whole, frac, unit = m.group(1).replace(',', ''), m.group(2), m.group(3)
+    if unit:
+        scale = _MULTIPLIERS.get(unit.lower())
+        return None if scale is None else int(round(float(whole + (frac or '')) * scale))
+    return float(whole + frac) if frac else int(whole)
+
 
 def _amount(value) -> Optional[float]:
-    """A count or size: a non-negative int or float, or digits in text
-    ("412,000"); None for anything else (bools, negatives, words)."""
+    """A count or size: a non-negative int or float, or one count written as
+    text ("412,000", "1,50,000", "12.5", "4.5k", "1.2M", "1.5 lakh"); None
+    for anything else (bools, negatives, words, "1.2.3", "12 views")."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -46,10 +67,7 @@ def _amount(value) -> Optional[float]:
     if isinstance(value, float):
         return value if math.isfinite(value) and value >= 0 else None
     if isinstance(value, str):
-        if value.strip().startswith('-'):
-            return None
-        digits = re.sub(r'[^\d]', '', value)
-        return int(digits) if digits else None
+        return _count_text(value)
     return None
 
 
@@ -145,8 +163,9 @@ def rank_reels(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
     ``followers``, ``median`` (the account's typical views, the better
     baseline; see account_median), ``hook``, ``song_id``, ``song_title``,
     ``artist``, ``lang``, ``should_mute``, ``highlight_start_ms`` (an int or a
-    list) and ``weight`` (default 1.0).  Counts may be ints or text such as
-    "412,000".  Rows whose song is muted, and rows with no views, are
+    list) and ``weight`` (default 1.0).  Counts may be ints, or text such
+    as "412,000" or "1.2M"; text that is not one count is no count.
+    Rows whose song is muted, and rows with no views, are
     dropped and counted.  The caller's rows are not changed.
 
     Returns ``{'baseline': 'account median'|'follower count', 'n',

@@ -105,3 +105,26 @@ def test_a_clean_caption_is_ready():
 def test_over_the_caption_limit_fails():
     r = caption.lint_caption('Look in 40 minutes. ' + 'a' * caption.LIMIT)
     assert _check(r, 'LENGTH')['status'] == 'FAIL'
+
+
+@pytest.mark.parametrize('emoji', [
+    '❤\ufe0f',                         # red heart with its selector
+    '\U0001F470\u200d♀\ufe0f',         # bride: woman, joined
+    '\U0001F44D\U0001F3FD',            # thumbs up with a skin tone
+    '✨',
+])
+def test_one_emoji_counts_once(emoji):
+    # Upstream counted the variation selector as an emoji of its own, so a
+    # red heart was 2 and the emoji-density warning fired early.
+    assert caption.lint_caption('Reception look for Priya ' + emoji)['emoji'] == 1
+
+
+def test_emoji_side_by_side_count_each():
+    assert caption.lint_caption('Reception look ✨✨ ❤\ufe0f❤\ufe0f')['emoji'] == 4
+
+
+def test_two_hearts_in_a_seventy_character_caption_are_not_decoration():
+    text = 'Reception look for Priya in Madurai, 40 minutes start to finish ❤\ufe0f❤\ufe0f'
+    r = caption.lint_caption(text)
+    assert (r['characters'], r['emoji']) == (68, 2)
+    assert _check(r, 'EMOJI')['status'] == 'PASS'
