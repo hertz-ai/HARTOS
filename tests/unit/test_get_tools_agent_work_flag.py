@@ -113,6 +113,17 @@ def test_a_caller_that_passes_no_flag_reads_the_turns_thread_local(hie, tools_bu
     assert AGENT_WORK <= _names(hie.get_tools(None, is_first=False))
 
 
+def test_an_explicit_true_cannot_bring_the_pair_back_on_a_declined_turn(hie, tools_buildable):
+    """Nothing is added by asking: the decline is the turn's, and a caller
+    passing agent_tools=True on that turn still gets the set without the
+    pair (the review of df2474851 measured the pair coming back)."""
+    hie.thread_local_data.set_agent_tools(False)
+    names = _names(hie.get_tools(None, is_first=False, agent_tools=True))
+    assert not (AGENT_WORK & names), names
+    hie.thread_local_data.set_agent_tools(True)
+    assert AGENT_WORK <= _names(hie.get_tools(None, is_first=False, agent_tools=True))
+
+
 def test_the_rebuilt_prompt_on_a_later_step_omits_the_pair(hie, tools_buildable, monkeypatch):
     """The second and later model calls rebuild the tool list into the prompt
     text between <TOOLS_START> and <TOOLS_END> when the intent moved, and log

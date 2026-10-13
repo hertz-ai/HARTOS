@@ -103,8 +103,12 @@ class FlagValueSemantics(unittest.TestCase):
             self.assertFalse(flag_value(v, False), repr(v))
 
     def test_env_flag_is_flag_value_on_the_env_string(self):
-        """Old-vs-new equivalence: env_flag read the env value itself before
-        it delegated; every spelling the table knows, and junk, agree."""
+        """env_flag delegates to flag_value: for every spelling the table
+        knows, and junk, both answer the same.  The table's own semantics
+        are pinned by EnvFlagSemantics above (the old env_flag body is gone,
+        so this compares the two readers that exist, not old against new;
+        the review of df2474851 measured the old env_flag against the new
+        over 66 cases and found 0 differences)."""
         for v in ('1', 'true', 'YES', 'On ', '0', 'false', 'No', ' off',
                   'nah', 'enable', '2', 'tru', ''):
             for default in (True, False):

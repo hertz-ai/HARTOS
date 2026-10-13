@@ -5388,9 +5388,12 @@ def get_tools(req_tool, is_first: bool = False, agent_tools=None):
     get_ans's two calls and CustomGPT._call's prompt rebuild on later steps,
     which passes no flag and, while the flag travelled as a keyword,
     re-listed both tools in the prompt after the first step (the review of
-    5a66a3308 measured it).  Nothing is added by asking."""
-    if agent_tools is None:
-        agent_tools = thread_local_data.get_agent_tools()
+    5a66a3308 measured it).  Nothing is added by asking: an explicit False
+    withholds the pair on any turn, and an explicit True cannot bring it
+    back on a turn that declined (the review of df2474851 measured that it
+    did; no caller passes a value today)."""
+    turn_allows = thread_local_data.get_agent_tools()
+    agent_tools = turn_allows if agent_tools is None else (bool(agent_tools) and turn_allows)
 
     if is_first:
         # ── Timing instrumentation (#185) ─────────────────────────────
