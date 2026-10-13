@@ -309,6 +309,31 @@ class StripePaymentGateway(PaymentGatewayConnector):
             **kwargs,
         )
         self._stripe = None  # lazy-imported in connect()
+        # The signing secret of the Checkout webhook (Stripe dashboard ->
+        # Developers -> Webhooks -> the endpoint's signing secret, whsec_...).
+        # Without it no webhook event is trusted (commercial_api.stripe_webhook
+        # answers 503), so a paid Checkout bumps its tier only through the
+        # buyer's success page.
+        self.webhook_secret = _os.environ.get('STRIPE_WEBHOOK_SECRET', '')
+
+    def verify_webhook(self, payload: bytes, sig_header: str):
+        """The event Stripe signed, or ValueError.
+
+        ``payload`` is the request body exactly as received (the signature
+        covers its bytes), ``sig_header`` the Stripe-Signature header.  The
+        SDK's Webhook.construct_event checks the HMAC against
+        STRIPE_WEBHOOK_SECRET and its timestamp tolerance; whatever it
+        raises, and a missing secret or connection, is one ValueError here,
+        so the route's only branches are "verified" and "refused".
+        """
+        if not self.connected or not self._stripe:
+            raise ValueError('Stripe gateway not connected')
+        if not self.webhook_secret:
+            raise ValueError('STRIPE_WEBHOOK_SECRET not set')
+        try:
+            return self._stripe.Webhook.construct_event(payload, sig_header, self.webhook_secret)
+        except Exception as e:
+            raise ValueError(f'Stripe webhook rejected: {e}') from e
 
     def connect(self) -> bool:
         """Lazy-import the stripe SDK and configure with the API key.
@@ -1501,4 +1526,5 @@ __all__ = [
 ENV_SECRETS = (
     'PHONEPE_SALT_KEY',
     'STRIPE_API_KEY',
+    'STRIPE_WEBHOOK_SECRET',
 )

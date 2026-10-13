@@ -14,7 +14,7 @@
 #   HEVOLVE_EXPERT_LLM_ENDPOINT_URL HEVOLVE_EXPERT_LLM_MODEL_NAME
 #   HEVOLVE_EXPERT_LLM_API_KEY HEVOLVE_CLAUDE_BUDGET_USD_DAY
 #   HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY STRIPE_API_KEY
-#   HARTOS_PUBLIC_URL
+#   HARTOS_PUBLIC_URL STRIPE_WEBHOOK_SECRET
 #
 # Why this file exists: any `with:` value carrying a ${{ }} expression
 # compiles to ONE GitHub expression, hard-capped at 21,000 chars of the
@@ -248,7 +248,10 @@ fi
 # paid-tier checkout answers 503 and no payment can be taken), and the node's
 # public URL (core/public_url.py: the base of the URLs PhonePe returns the
 # buyer to and posts its signed confirmation to; without it a PhonePe payment
-# is refused rather than sent with a guessed host). Same rule as the McGroce secret: written key by key only
+# is refused rather than sent with a guessed host), and the Stripe webhook's
+# signing secret (commercial_api.stripe_webhook trusts no event without it, so
+# a paid Checkout then bumps its tier only through the buyer's success
+# page). Same rule as the McGroce secret: written key by key only
 # when its secret is non-empty, the value never logged, and an absent secret
 # leaves .env as it is. So deleting a repo secret changes nothing on the box,
 # and editing .env while the secret is still set is undone by the next
@@ -259,7 +262,7 @@ fi
 for _k in HEVOLVE_EXPERT_LLM_ENDPOINT_URL HEVOLVE_EXPERT_LLM_MODEL_NAME \
           HEVOLVE_EXPERT_LLM_API_KEY HEVOLVE_CLAUDE_BUDGET_USD_DAY \
           HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY STRIPE_API_KEY \
-          HARTOS_PUBLIC_URL; do
+          HARTOS_PUBLIC_URL STRIPE_WEBHOOK_SECRET; do
   if [ -n "${!_k}" ] && [ -f .env ]; then
     _set_env_key "$_k" "${!_k}"
     echo "  $_k set from the secret (value not shown)"

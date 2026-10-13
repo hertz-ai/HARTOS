@@ -140,6 +140,37 @@ answers 503 naming STRIPE_API_KEY. The mock gateway settles a paid tier only
 for an operator (central role) or with HEVOLVE_DEV_MODE=true, which central
 forces off at boot; a plain user never gets a tier for free.
 
+## Step 4b — Register the Checkout webhook (the tier bump that needs no page)
+
+A paid Checkout is finalized by Stripe's own `checkout.session.completed`
+event, delivered to HARTOS and verified against the endpoint's signing
+secret. Without it the tier moves only when the buyer's browser reaches
+the success page and POSTs the session id, and the deployed landing page
+has no such page: the buyer is charged and never upgraded.
+
+1. Stripe dashboard → Developers → Webhooks → Add endpoint:
+   URL `<HARTOS_PUBLIC_URL>/api/v1/intelligence/stripe/webhook`
+   (`HARTOS_PUBLIC_URL` is the public base of this node's API, the
+   same repo secret the PhonePe callbacks use), event
+   `checkout.session.completed`.
+2. Copy the endpoint's signing secret (`whsec_...`) and set it as the
+   repo secret the deploy writes into central's `.env`:
+
+```bash
+gh secret set STRIPE_WEBHOOK_SECRET --repo hertz-ai/HARTOS
+```
+
+3. Deploy. Until the secret is on the box the webhook route answers 503
+   (nothing unsigned is trusted); Stripe retries a non-2xx delivery for
+   days, so an event sent before the secret landed is not lost.
+4. Verify with the dashboard's "Send test webhook": a signed
+   `checkout.session.completed` for an unpaid or unknown session answers
+   200 (`status: unpaid` or `status: not_finalized`); a delivery with a
+   wrong secret answers 400.
+
+Source: `integrations/agent_engine/commercial_api.py: stripe_webhook`,
+`integrations/ap2/ap2_protocol.py: StripePaymentGateway.verify_webhook`.
+
 ## Step 5 — Verify Stripe is the selected gateway
 
 ```bash
@@ -206,13 +237,17 @@ Buyer-side flow:
 3. Frontend POSTs to /upgrade/checkout, receives `checkout_url`.
 4. Frontend redirects browser to `checkout_url` (Stripe-hosted).
 5. User pays on Stripe's hosted page.
-6. Stripe redirects to `success_url` (defaults to
+6. Stripe POSTs `checkout.session.completed` to the webhook (Step 4b),
+   which verifies the signature, inserts a COMPLETED PaymentRequest into
+   the AP2 ledger (so `get_api_revenue_stats` ticks up by $9) and bumps
+   the API key's tier + limits. This is the step that upgrades the buyer;
+   it needs no page.
+7. Stripe redirects the browser to `success_url` (defaults to
    `https://hevolve.ai/upgrade-success?session_id={CHECKOUT_SESSION_ID}`).
-7. Success page POSTs `{session_id}` to /upgrade/checkout/complete.
-8. Backend retrieves the Stripe session, verifies `payment_status=paid`,
-   inserts a COMPLETED PaymentRequest into the AP2 ledger (so
-   `get_api_revenue_stats` ticks up by $9), and bumps the API key's
-   tier + limits.
+8. The success page, where one is deployed, POSTs `{session_id}` to
+   /upgrade/checkout/complete, which answers `already_completed` when
+   the webhook finalized the session first and finalizes it the same
+   way otherwise (one finalizer for both).
 
 You do NOT need to create Stripe Products + Prices in the dashboard
 ahead of time — the endpoint uses `price_data` with inline currency +

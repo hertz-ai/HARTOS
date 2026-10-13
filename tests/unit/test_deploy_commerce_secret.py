@@ -41,12 +41,12 @@ _NAME = 'COMMERCE_SESSION_SECRET'
 # The owner-set keys the deploy writes into central's live .env when their
 # repo secret is set (the expert tier, its Claude day budget, the autonomous
 # marketing switch, the node's own API key, the Stripe key, the node's public
-# URL for the payment gateways' return and callback URLs). Same contract as
-# _NAME, minus the absent-secret note.
+# URL for the payment gateways' return and callback URLs, the Stripe webhook's
+# signing secret). Same contract as _NAME, minus the absent-secret note.
 _OWNER_KEYS = ('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', 'HEVOLVE_EXPERT_LLM_MODEL_NAME',
                'HEVOLVE_EXPERT_LLM_API_KEY', 'HEVOLVE_CLAUDE_BUDGET_USD_DAY',
                'HEVOLVE_AUTONOMOUS_MARKETING', 'HEVOLVE_API_KEY',
-               'STRIPE_API_KEY', 'HARTOS_PUBLIC_URL')
+               'STRIPE_API_KEY', 'HARTOS_PUBLIC_URL', 'STRIPE_WEBHOOK_SECRET')
 
 
 def _find_bash():

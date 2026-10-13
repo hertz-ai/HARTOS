@@ -51,13 +51,14 @@ The new mount line to add to the `docker run` command:
 
 ## Step 3 — Add the payment-rail env vars
 
-`STRIPE_API_KEY`, `HEVOLVE_API_KEY` and `HARTOS_PUBLIC_URL` are owned by
-the deploy: set each as a GitHub repo secret (`gh secret set
-STRIPE_API_KEY --repo hertz-ai/HARTOS`) and the deepbox deploy writes it
-into central's `.env` on every deploy (`deploy/deepbox_deploy.sh`). Do not
-hand-edit those; while the secret is set, the next deploy writes the
-secret's value back. To remove one: delete the repo secret FIRST, then the
-line from `.env`.
+`STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET`, `HEVOLVE_API_KEY` and
+`HARTOS_PUBLIC_URL` are owned by the deploy: set each as a GitHub repo
+secret (`gh secret set STRIPE_API_KEY --repo hertz-ai/HARTOS`) and the
+deepbox deploy writes it into central's `.env` on every deploy
+(`deploy/deepbox_deploy.sh`). Do not hand-edit those; while the secret is
+set, the next deploy writes the secret's value back. To remove one: delete
+the repo secret FIRST, then the line from `.env`. The webhook secret and
+its Stripe-side registration are `deploy/go_live_stripe.md` Step 4b.
 
 `HARTOS_PUBLIC_URL` is the public base of this node's API (the host Kong
 fronts it on). PhonePe is sent `HARTOS_PUBLIC_URL` +
