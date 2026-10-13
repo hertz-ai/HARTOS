@@ -1871,6 +1871,14 @@ def _tier_rank(tier: str) -> float:
     return float(TIER_CONFIG.get(tier, {}).get('monthly_price_usd', 0.0) or 0.0)
 
 
+def _tiers_at_least(target_tier: str) -> list:
+    """The tiers a key may already hold that make ``target_tier`` no
+    upgrade: those costing the same or more.  The ONE expression of the
+    rule, read by _is_tier_upgrade (before a charge) and by the bought-tier
+    UPDATE's WHERE (at the write), so the two cannot drift."""
+    return [t for t in TIER_CONFIG if _tier_rank(t) >= _tier_rank(target_tier)]
+
+
 def _is_tier_upgrade(current_tier, target_tier) -> bool:
     """The ONE rule for selling a tier, on every rail (the card checkout,
     the synchronous card charge, the PhonePe redirect) and for every writer
@@ -1883,19 +1891,21 @@ def _is_tier_upgrade(current_tier, target_tier) -> bool:
     a legacy name) counts as free."""
     if target_tier not in TIER_CONFIG or target_tier == 'free':
         return False
-    return _tier_rank(target_tier) > _tier_rank(str(current_tier or ''))
+    return str(current_tier or '') not in _tiers_at_least(target_tier)
 
 
 def _not_an_upgrade(api_key, target_tier):
     """The 400 a rail answers before charging when ``target_tier`` is not an
-    upgrade for ``api_key`` (_is_tier_upgrade), else None."""
+    upgrade for ``api_key`` (_is_tier_upgrade), else None.  Nothing here is
+    a subscription (Checkout is a one-off payment and no tier expires), so
+    the sentence names no renewal."""
     current = str(getattr(api_key, 'tier', '') or 'free')
     if _is_tier_upgrade(current, target_tier):
         return None
     return jsonify({
         'success': False,
         'error': f'This key is on the {current} tier; {target_tier} is not an '
-                 f'upgrade from it (there is no downgrade; revoke the key to stop paying).',
+                 f'upgrade from it (a tier is never lowered).',
         'current_tier': current,
         'target_tier': target_tier,
     }), 400
@@ -1986,13 +1996,17 @@ def _apply_bought_tier(db, api_key, target_tier: str):
     row afterwards, so the caller's payload shows what the table holds."""
     from sqlalchemy import or_
     from integrations.social.models import CommercialAPIKey
+    if target_tier not in TIER_CONFIG:
+        # Only a hand-edited ledger record lacks its target_tier (every
+        # writer stamps it); it is a reconciliation case for the caller, not
+        # a KeyError outside this try (the review of ec0dbe7be).
+        return False, f'bought tier {target_tier!r} is not a tier'
     cfg = TIER_CONFIG[target_tier]
-    at_least = [t for t in TIER_CONFIG if _tier_rank(t) >= _tier_rank(target_tier)]
     try:
         rows = db.query(CommercialAPIKey).filter(
             CommercialAPIKey.id == api_key.id,
             or_(CommercialAPIKey.tier.is_(None),
-                CommercialAPIKey.tier.notin_(at_least)),
+                CommercialAPIKey.tier.notin_(_tiers_at_least(target_tier))),
         ).update({
             CommercialAPIKey.tier: target_tier,
             CommercialAPIKey.rate_limit_per_day: cfg['rate_limit_per_day'],
@@ -2006,10 +2020,16 @@ def _apply_bought_tier(db, api_key, target_tier: str):
         except Exception as rb:
             logger.debug("tier bump: rollback after %s also failed: %s", e, rb)
         return False, str(e)
-    if not rows:
-        logger.info("api_key %s stays on %s; the %s it bought costs no more",
-                    getattr(api_key, 'id', None), getattr(api_key, 'tier', None),
-                    target_tier)
+    current = getattr(api_key, 'tier', None)
+    if not rows and current != target_tier:
+        # Money was taken for a tier the key is already above: a refund
+        # case the operator must see.  A replay of an applied session (the
+        # key is already there) is routine and says nothing; one INFO line
+        # covered both, and central logs nothing below WARNING (the review
+        # of ec0dbe7be).
+        logger.warning("api_key %s stays on %s: it paid for %s, which costs less; "
+                       "the payment is recorded and may need a refund",
+                       getattr(api_key, 'id', None), current, target_tier)
     return bool(rows), None
 
 

@@ -99,13 +99,7 @@ def test_tier_upgrade_path_is_unchanged(ctx):
     assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.FAILED
 
 
-from tests.unit.commercial_db import key_db  # noqa: E402,F401  (a fixture)
-
-
-def _tier(name):
-    from integrations.agent_engine.commercial_api import TIER_CONFIG
-    cfg = TIER_CONFIG[name]
-    return (name, cfg['rate_limit_per_day'], cfg['monthly_quota'])
+from tests.unit.commercial_db import key_db, tier_tuple as _tier  # noqa: E402,F401  (key_db is a fixture)
 
 
 def test_a_tier_upgrade_callback_bumps_the_key(ctx, key_db):

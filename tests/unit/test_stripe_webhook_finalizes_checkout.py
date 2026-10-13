@@ -29,7 +29,9 @@ import integrations.ap2 as ap2_pkg
 from integrations.ap2.ap2_protocol import (
     PaymentGateway, PaymentLedger, PaymentStatus, StripePaymentGateway,
 )
-from tests.unit.commercial_db import KEY, OTHER, OWNER, key_db  # noqa: F401  (a fixture)
+from tests.unit.commercial_db import (  # noqa: F401  (key_db is a fixture)
+    KEY, OTHER, OWNER, key_db, tier_tuple,
+)
 
 WEBHOOK = '/api/v1/intelligence/stripe/webhook'
 COMPLETE = '/api/v1/intelligence/upgrade/checkout/complete'
@@ -42,13 +44,7 @@ RAW = b'{"id": "evt_1", "type": "checkout.session.completed"}'
 AUTH = {'Authorization': 'Bearer tok'}
 
 
-def _tier(name):
-    from integrations.agent_engine.commercial_api import TIER_CONFIG
-    cfg = TIER_CONFIG[name]
-    return (name, cfg['rate_limit_per_day'], cfg['monthly_quota'])
-
-
-FREE, STARTER, PRO = _tier('free'), _tier('starter'), _tier('pro')
+FREE, STARTER, PRO = tier_tuple('free'), tier_tuple('starter'), tier_tuple('pro')
 
 
 class _SdkObject:
@@ -180,14 +176,27 @@ class TestTheWebhookFinalizesAPaidSession:
         """Stripe does not order deliveries and events queue while the secret
         is missing: a starter session finalized after a pro one records its
         payment and leaves the key on pro (the review of 3153761b3 measured
-        the downgrade)."""
+        the downgrade).  That is money taken for a tier the key is already
+        above, a refund case, so the operator gets a WARNING naming the key
+        and both tiers; a plain redelivery of an applied session gets no
+        line at all (central logs nothing below WARNING, and the one INFO
+        line covered both cases: the review of ec0dbe7be)."""
+        log = logging.getLogger('hevolve_social')
         _deliver(ctx, _event(_session(id='cs_new_pro')))
         assert ctx['db'].key() == PRO
-        r = _deliver(ctx, _event(_starter_session('cs_old_starter')))
+        with patch.object(log, 'warning') as warned, patch.object(log, 'info') as told:
+            _deliver(ctx, _event(_session(id='cs_new_pro')))        # a redelivery
+        warned.assert_not_called()
+        told.assert_not_called()
+        with patch.object(log, 'warning') as warned:
+            r = _deliver(ctx, _event(_starter_session('cs_old_starter')))
         assert r.status_code == 200, r.get_json()
         assert ctx['db'].key() == PRO
         assert r.get_json()['api_key']['tier'] == 'pro'
         assert len(ctx['ledger'].payments) == 2
+        assert warned.call_count == 1
+        said = warned.call_args.args[0] % warned.call_args.args[1:]
+        assert KEY in said and 'pro' in said and 'starter' in said
 
     def test_two_deliveries_racing_never_lower_the_tier(self, ctx):
         """The pro and the starter session delivered at the same moment, each
@@ -380,6 +389,21 @@ class TestTheBrowserRouteSharesTheFinalizer:
         assert ctx['db'].key() == PRO
         assert len(ctx['ledger'].payments) == 1
         ctx['stripe'].checkout.Session.retrieve.assert_called_once()
+
+    def test_a_record_without_a_bought_tier_is_a_reconciliation_case(self, ctx):
+        """A ledger record missing target_tier (only a hand-edited ledger can
+        lack it: every writer stamps it) used to raise KeyError outside the
+        writer's try and answer Flask's HTML 500 with no reconciliation line
+        (the review of ec0dbe7be).  It is the same case as a failed bump."""
+        _deliver(ctx, _event(_session()))
+        (payment,) = ctx['ledger'].payments.values()
+        del payment.metadata['target_tier']
+        log = logging.getLogger('hevolve_social')
+        with patch.object(log, 'error') as said:
+            r = _complete(ctx)
+        assert r.status_code == 500 and r.get_json()['success'] is False
+        assert said.called and KEY in said.call_args.args[0]
+        assert ctx['db'].key() == PRO
 
     def test_a_session_without_metadata_is_not_a_tier_upgrade(self, ctx):
         """The kind is checked before the user, as before the finalizer was

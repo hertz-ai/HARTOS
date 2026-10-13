@@ -20,6 +20,14 @@ from sqlalchemy.orm import sessionmaker
 OWNER, OTHER, KEY = 'u-1', 'u-2', 'k1'
 
 
+def tier_tuple(name):
+    """``(tier, rate_limit_per_day, monthly_quota)`` as TIER_CONFIG prices
+    it: what ApiKeyDb.key() reads back for a key on that tier."""
+    from integrations.agent_engine.commercial_api import TIER_CONFIG
+    cfg = TIER_CONFIG[name]
+    return (name, cfg['rate_limit_per_day'], cfg['monthly_quota'])
+
+
 @pytest.fixture
 def key_db(tmp_path):
     """The table for one test, with get_db() handing out its sessions.
@@ -40,7 +48,14 @@ class ApiKeyDb:
         self.engine = create_engine(
             f"sqlite:///{tmp_path / 'commercial.db'}",
             connect_args={'check_same_thread': False, 'timeout': 30})
-        Base.metadata.create_all(self.engine)
+        # A test's file needs no durability: fsync-ed DDL for the whole
+        # social schema cost 3.5 s per test (the review of ec0dbe7be
+        # measured it); the two tables the key routes touch, unsynced,
+        # cost well under a second.
+        event.listen(self.engine, 'connect',
+                     lambda conn, rec: conn.execute('PRAGMA synchronous=OFF'))
+        Base.metadata.create_all(
+            self.engine, tables=[User.__table__, CommercialAPIKey.__table__])
         self.Session = sessionmaker(bind=self.engine)
         with self.Session() as s:
             s.add_all([
