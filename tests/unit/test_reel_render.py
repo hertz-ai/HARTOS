@@ -206,6 +206,28 @@ def test_escape_filter_path_round_trips_through_both_ffmpeg_levels(path):
     assert _ffmpeg_unescape(escaped) == path.replace('\\', '/')
 
 
+# ── text layout ───────────────────────────────────────────────────────────
+
+def test_long_hook_text_wraps_inside_the_safe_zone_width():
+    text = 'Bridal glow from bare skin to the final look in twenty seconds flat'
+    lines = R.wrap_text(text, 72, 806)
+    assert len(lines) > 1 and ' '.join(lines) == text
+    assert all(R.text_width(line, 72) <= 806 for line in lines)
+
+
+def test_tamil_text_is_estimated_wider_than_its_latin_letters_and_wraps():
+    tamil = 'மணமகள் அலங்காரம் இருபது வினாடிகளில் முழு மாற்றம்'
+    lines = R.wrap_text(tamil, 72, 806)
+    assert len(lines) > 1 and ' '.join(lines) == tamil
+    assert R.text_width('மண', 72) > R.text_width('ab', 72)
+
+
+def test_a_word_wider_than_the_line_stays_whole_and_lines_are_capped():
+    assert R.wrap_text('Supercalifragilistic', 72, 100) == ['Supercalifragilistic']
+    lines = R.wrap_text(' '.join(['word'] * 40), 72, 300)
+    assert len(lines) == R.TEXT_MAX_LINES and ' '.join(lines).split() == ['word'] * 40
+
+
 # ── fonts ─────────────────────────────────────────────────────────────────
 
 def test_latin_text_gets_an_existing_font_file():
@@ -215,7 +237,8 @@ def test_latin_text_gets_an_existing_font_file():
     assert os.path.isfile(path)
 
 
-@pytest.mark.skipif(sys.platform != 'win32', reason='Nirmala ships with Windows only (U12)')
+@pytest.mark.skipif(sys.platform != 'win32',
+                    reason='Nirmala ships with Windows only; no Indic font is bundled yet')
 @pytest.mark.parametrize('text', [TAMIL_HOOK, 'दुल्हन का मेकअप', 'ਦੁਲਹਨ ਮੇਕਅਪ', 'Bridal மணமகள்'])
 def test_indic_text_on_windows_uses_nirmala(text):
     path = fonts.resolve_font(text)
@@ -271,7 +294,7 @@ def test_three_clips_and_a_speed_ramp_pass_every_hard_qa_check(three_clips, tmp_
     monkeypatch.setattr(R.media_bin, 'run_ffmpeg', spy)
     work = tmp_path / 'work'
     out = str(tmp_path / 'reel.mp4')
-    result = R.render(edl, out, workdir=str(work), encoder='libx264', timeout_s=300)
+    result = R.render_reel(edl, out, workdir=str(work), encoder='libx264', timeout_s=300)
 
     pass1 = [a for a in _outputs(spy, work) if '-frames:v' in a]
     assert len(pass1) == len(edl['segments'])
@@ -323,7 +346,7 @@ def test_hook_text_is_drawn_from_a_textfile_in_an_awkward_work_dir(tmp_path):
     edl = _one_seg_edl(src, [_text(hook, 0.0, 2.0)])
     work = tmp_path / "it's [a], work; dir"
     out = str(tmp_path / 'text.mp4')
-    result = R.render(edl, out, workdir=str(work), encoder='libx264', canvas=SMALL)
+    result = R.render_reel(edl, out, workdir=str(work), encoder='libx264', canvas=SMALL)
     assert result.notes == ()
     frame = _frame_at(out, 0.5, SMALL['w'], SMALL['h'])
     band = frame[int(0.18 * 384) - 25:int(0.18 * 384) + 25]
@@ -336,7 +359,7 @@ def test_text_with_no_font_is_skipped_with_a_note(tmp_path, monkeypatch):
     monkeypatch.setattr(R.fonts, 'resolve_font', lambda text, **kw: None)
     edl = _one_seg_edl(src, [_text('Hook')])
     out = str(tmp_path / 'nofont.mp4')
-    result = R.render(edl, out, workdir=str(tmp_path / 'w'), encoder='libx264', canvas=SMALL)
+    result = R.render_reel(edl, out, workdir=str(tmp_path / 'w'), encoder='libx264', canvas=SMALL)
     assert R.NOTE_TEXT_NO_FONT in result.notes
     frame = _frame_at(out, 0.5, SMALL['w'], SMALL['h'])
     assert frame.max() < 40
@@ -351,7 +374,7 @@ def test_hlg_source_comes_out_bt709_with_exact_frames(tmp_path):
                 _seg(XL, 0.8, 2.0, 1.0, 2.2, stage='final_look', role='reveal')],
                target=5.0)
     out = str(tmp_path / 'hlg_out.mp4')
-    result = R.render(edl, out, workdir=str(tmp_path / 'w'), encoder='libx264', canvas=SMALL)
+    result = R.render_reel(edl, out, workdir=str(tmp_path / 'w'), encoder='libx264', canvas=SMALL)
     assert result.duration_s == pytest.approx(2.2)
     info = probe(out)
     assert info.transfer == 'sdr' and info.bit_depth == 8
@@ -369,7 +392,7 @@ def test_nvenc_failure_falls_back_to_libx264_with_a_note(tmp_path, monkeypatch):
     spy = _Spy(media_bin.run_ffmpeg, fail=lambda args: 'h264_nvenc' in args)
     monkeypatch.setattr(R.media_bin, 'run_ffmpeg', spy)
     out = str(tmp_path / 'fallback.mp4')
-    result = R.render(_one_seg_edl(src), out, workdir=str(tmp_path / 'w'),
+    result = R.render_reel(_one_seg_edl(src), out, workdir=str(tmp_path / 'w'),
                       encoder='h264_nvenc', canvas=SMALL)
     assert result.encoder == 'libx264' and R.NOTE_NVENC_FAILED in result.notes
     assert os.path.isfile(out)
@@ -383,7 +406,7 @@ def test_a_failed_render_leaves_no_output_and_no_intermediates(tmp_path, monkeyp
     out = str(tmp_path / 'broken.mp4')
     work = tmp_path / 'w'
     with pytest.raises(media_bin.FFmpegFailed):
-        R.render(_one_seg_edl(src), out, workdir=str(work), encoder='libx264', canvas=SMALL)
+        R.render_reel(_one_seg_edl(src), out, workdir=str(work), encoder='libx264', canvas=SMALL)
     assert not os.path.exists(out)
     assert [p for p in os.listdir(work) if p.startswith('reel_')] == []
 
@@ -392,12 +415,12 @@ def test_a_structurally_broken_edl_is_refused_before_ffmpeg_runs(tmp_path, monke
     spy = _Spy(lambda args, timeout_s: pytest.fail('ffmpeg must not run'))
     monkeypatch.setattr(R.media_bin, 'run_ffmpeg', spy)
     with pytest.raises(ValueError):
-        R.render({'schema': C.EDL_SCHEMA}, str(tmp_path / 'x.mp4'), workdir=str(tmp_path))
+        R.render_reel({'schema': C.EDL_SCHEMA}, str(tmp_path / 'x.mp4'), workdir=str(tmp_path))
     assert spy.calls == []
 
 
 def test_an_unknown_encoder_is_refused(tmp_path):
     with pytest.raises(ValueError):
-        R.render(_edl({XL: dict(_hlg_clip(), transfer='sdr')},
+        R.render_reel(_edl({XL: dict(_hlg_clip(), transfer='sdr')},
                       [_seg(XL, 0.0, 5.0, 0.0, 5.0, stage='final_look', role='reveal')]),
                  str(tmp_path / 'x.mp4'), workdir=str(tmp_path), encoder='h265_magic')

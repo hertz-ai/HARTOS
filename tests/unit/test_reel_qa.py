@@ -254,7 +254,8 @@ def test_a_reveal_that_shows_the_wrong_footage_is_flagged_but_advisory(kit):
     wrong = str(kit['dir'] / 'wrong_end.mp4')
     _ff(['-i', kit['src'], '-filter_complex',
          '[0:v]trim=0:2.5,setpts=PTS-STARTPTS[a];[0:v]trim=0:2.5,setpts=PTS-STARTPTS[b];'
-         '[a][b]concat=n=2:v=1:a=0,scale=1080:1920,setsar=1,' + _BT709 + ',format=yuv420p[v]',
+         '[a][b]concat=n=2:v=1:a=0,fps=30,scale=1080:1920,setsar=1,' + _BT709
+         + ',format=yuv420p[v]',
          '-map', '[v]', '-an', '-c:v', 'libx264', '-preset', 'superfast', '-crf', '23',
          '-movflags', '+faststart', wrong])
     report = Q.run_qa(wrong, _edl(kit))

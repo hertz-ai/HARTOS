@@ -323,21 +323,16 @@ def _shots(clips: Sequence[_Clip], items: Sequence[Mapping]) -> List[_Shot]:
             shots.append(_Shot(clip=c, seg=k, t0=float(seg.t0), t1=float(seg.t1), stage=stage,
                                appeal=min(10.0, max(0.0, appeal)), judged=m is not None,
                                moment_t=moment_t, anchor=float(anchor), framed=framed))
-    # An unjudged shot shows what the last judged shot before it showed.
-    previous = None
-    for shot in shots:
-        if shot.judged:
-            previous = shot.stage
-        elif previous is not None:
-            shot.stage = previous
-    following = 'other'
-    for shot in reversed(shots):
-        if shot.judged:
-            following = shot.stage
-        elif shot.stage is None:
-            shot.stage = following
+    # An unjudged shot shows what the last judged shot before it showed; one
+    # before any judged shot is 'other' (a later label, such as the final
+    # look, says nothing about footage filmed earlier).
+    previous = 'other'
     for i, shot in enumerate(shots):
         shot.index = i
+        if shot.judged:
+            previous = shot.stage
+        else:
+            shot.stage = previous
     return shots
 
 

@@ -115,7 +115,7 @@ def _plan(analyses, moments, **style):
     return E.plan_edit(moments, analyses, _grid(), _style(**style))
 
 
-# ── the story (A1) ────────────────────────────────────────────────────────
+# ── the story: filming order, ending on the reveal ────────────────────────
 
 def test_the_plan_is_a_valid_edl_in_capture_order_ending_on_the_reveal():
     analyses, moments = _story()
@@ -133,6 +133,15 @@ def test_the_plan_is_a_valid_edl_in_capture_order_ending_on_the_reveal():
     assert edl['final_look_found'] is True and edl['hook_first'] is False
     assert C.capture_note('phone') in edl['notes'] and edl['capture_src'] == 'phone'
     assert edl['audio'] is None
+
+
+def test_the_reveal_holds_near_its_ideal_length_when_there_is_footage_for_it():
+    # A 20 s reel aims its reveal at 0.15 x 20 = 3 s; the shots before it
+    # must not eat that time down to the 1.5 s minimum.
+    analyses, moments = _story()
+    last = _plan(analyses, moments)['segments'][-1]
+    assert 2.5 - 1e-9 <= _seg_len(last) <= 4.0 + 1e-9
+    assert last['speed'] == 1.0
 
 
 def test_the_reveal_is_the_best_final_look_and_nothing_filmed_after_it_plays():
@@ -263,6 +272,17 @@ def test_hook_first_without_a_final_look_skips_the_teaser_with_a_note():
     assert C.validate_edl(edl) == []
     assert edl['hook_first'] is False
     assert E.NOTE_TEASER_SKIPPED in edl['notes']
+
+
+def test_a_later_final_look_label_does_not_spread_back_to_earlier_footage():
+    a = _analysis(XA, [0, 3, 6, 9, 12], capture=_phone(XA, 0))
+    c = _analysis(XC, [0, 3, 6], capture=_phone(XC, 1))
+    moments = _moments([_moment(XC, 4.4, 'final_look', 9.0)])
+    edl = E.plan_edit(moments, [a, c], _grid(), _style(target_s=10))
+    assert C.validate_edl(edl) == []
+    assert [s['stage'] for s in edl['segments'] if s['clip'] == XA] != []
+    assert all(s['stage'] == 'other' for s in edl['segments'] if s['clip'] == XA)
+    assert edl['segments'][-1]['stage'] == C.FINAL_LOOK
 
 
 def test_no_moments_at_all_still_plans_a_reel():

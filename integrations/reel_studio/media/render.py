@@ -41,7 +41,8 @@ import math
 import os
 import re
 import time
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+import unicodedata
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from core import media_bin
 from integrations.reel_studio.contracts import (
@@ -74,8 +75,12 @@ TEXT_BOX_COLOR = '0x000000@0.45'
 TEXT_PAD = 0.3
 TEXT_LINE_SPACING = 0.2
 TEXT_MAX_LINES = 4
-#: Width per character when the font cannot be measured (fraction of size).
-TEXT_EM_GUESS = 0.6
+#: Estimated advance widths in ems (see text_width): a Latin letter or digit
+#: of a bold sans, an Indic letter, a spacing vowel sign, a space.
+TEXT_EM_LATIN = 0.62
+TEXT_EM_INDIC = 0.9
+TEXT_EM_MARK = 0.45
+TEXT_EM_SPACE = 0.3
 
 NOTE_TEXT_NO_FONT = 'text_skipped_no_font'
 NOTE_EMOJI_DROPPED = 'emoji_dropped'
@@ -235,28 +240,41 @@ def plan_final_args(edl: Mapping, concat_list: str, out_path: str, *, encoder: s
 
 # ── text layout ───────────────────────────────────────────────────────────
 
-def _measurer(fontfile: str, size_px: int) -> Callable[[str], float]:
-    try:
-        from PIL import ImageFont
-        font = ImageFont.truetype(fontfile, size_px)
-        return lambda s: float(font.getlength(s))
-    except (ImportError, OSError, ValueError) as e:
-        logger.info('cannot measure text with %s (%s); estimating widths', fontfile, e)
-        return lambda s: len(s) * TEXT_EM_GUESS * size_px
+def _em_width(ch: str) -> float:
+    """A generous advance width of ``ch`` in ems (bold sans; Indic letters wider)."""
+    category = unicodedata.category(ch)
+    if category == 'Mn' or ch in '‌‍':
+        return 0.0
+    if category == 'Mc':
+        return TEXT_EM_MARK
+    if ch.isspace():
+        return TEXT_EM_SPACE
+    if fonts.needs_indic_font(ch):
+        return TEXT_EM_INDIC
+    return TEXT_EM_LATIN
 
 
-def wrap_text(text: str, fontfile: str, size_px: int, max_width_px: float) -> List[str]:
-    """``text`` broken at spaces into lines no wider than ``max_width_px``.
+def text_width(text: str, size_px: float) -> float:
+    """Estimated width of one line of ``text`` at ``size_px`` (an over-estimate).
+
+    Widths are estimated, not measured: Pillow's FreeType text path (the
+    pinned 9.5.0) crashed the interpreter with a segmentation fault on
+    Nirmala.ttc under Python 3.12, so no font is opened in-process.
+    """
+    return size_px * sum(_em_width(ch) for ch in text)
+
+
+def wrap_text(text: str, size_px: int, max_width_px: float) -> List[str]:
+    """``text`` broken at spaces into lines no wider than ``max_width_px`` (estimated).
 
     A word wider than the line stays whole; past TEXT_MAX_LINES the rest
     runs on in the last line rather than being cut.
     """
-    measure = _measurer(fontfile, size_px)
     lines: List[str] = []
     current = ''
     for word in text.split():
         candidate = word if not current else current + ' ' + word
-        if current and measure(candidate) > max_width_px:
+        if current and text_width(candidate, size_px) > max_width_px:
             lines.append(current)
             current = word
         else:
@@ -288,7 +306,7 @@ def _write_texts(edl: Mapping, workdir: str, canvas: Mapping, notes: List[str],
             continue
         size = max(8, int(round(ov['size_px'] * f)))
         pad = max(1, int(round(TEXT_PAD * ov['size_px'] * f)))
-        lines = wrap_text(text, fontfile, size, zone['x_max'] - zone['x_min'] - 2 * pad)
+        lines = wrap_text(text, size, zone['x_max'] - zone['x_min'] - 2 * pad)
         path = os.path.join(workdir, 'reel_text_%d.txt' % i)
         made.append(path)
         with open(path, 'w', encoding='utf-8', newline='\n') as fh:
@@ -343,17 +361,17 @@ def _dedupe(items: Sequence[str]) -> Tuple[str, ...]:
 
 def _remove(paths: Sequence[str]) -> None:
     for path in paths:
+        if not os.path.exists(path):
+            continue
         try:
             os.remove(path)
-        except FileNotFoundError:
-            pass
         except OSError as e:
             logger.warning('could not remove render intermediate %s: %s', path, e)
 
 
-def render(edl: Mapping, out_path: str, *, workdir: str, encoder: str = 'auto',
-           timeout_s: float = RENDER_TIMEOUT_S,
-           canvas: Optional[Mapping] = None) -> RenderResult:
+def render_reel(edl: Mapping, out_path: str, *, workdir: str, encoder: str = 'auto',
+                timeout_s: float = RENDER_TIMEOUT_S,
+                canvas: Optional[Mapping] = None) -> RenderResult:
     """Render ``edl`` to ``out_path`` (see the module note).
 
     ``encoder`` is 'auto' (h264_nvenc when its test encode works, else
@@ -422,6 +440,7 @@ def render(edl: Mapping, out_path: str, *, workdir: str, encoder: str = 'auto',
 
 __all__ = ['FPS', 'ENCODERS', 'RENDER_TIMEOUT_S', 'SEGMENT_TIMEOUT_BASE_S',
            'SEGMENT_TIMEOUT_PER_S', 'PASS1_ENCODE', 'X264_FINAL', 'NVENC_FINAL', 'RATE_CAP',
-           'BT709', 'NOTE_TEXT_NO_FONT', 'NOTE_EMOJI_DROPPED', 'NOTE_NVENC_FAILED',
+           'BT709', 'TEXT_MAX_LINES', 'TEXT_EM_LATIN', 'TEXT_EM_INDIC', 'TEXT_EM_MARK',
+           'TEXT_EM_SPACE', 'NOTE_TEXT_NO_FONT', 'NOTE_EMOJI_DROPPED', 'NOTE_NVENC_FAILED',
            'NOTE_HDR_UNTONED', 'escape_filter_path', 'segment_frames', 'geometry_filter',
-           'plan_segment_args', 'plan_final_args', 'wrap_text', 'render']
+           'plan_segment_args', 'plan_final_args', 'text_width', 'wrap_text', 'render_reel']
