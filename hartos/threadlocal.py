@@ -343,10 +343,10 @@ class ThreadLocalData:
     # reads it on every call (an explicit False still withholds the pair; an
     # explicit True cannot bring it back on a declined turn; no caller passes
     # a value today), so get_ans's two calls and CustomGPT._call's prompt
-    # rebuild on later steps agree (the
-    # review of 5a66a3308 measured the rebuild re-listing both tools after
-    # the first step when the flag travelled as a keyword).  Default True:
-    # a person's turn keeps both; the metered Hive API declines (task #120).
+    # rebuild on later steps agree (the review of 5a66a3308 measured the
+    # rebuild re-listing both tools after the first step when the flag
+    # travelled as a keyword).  Default True: a person's turn keeps both;
+    # the metered Hive API declines (task #120).
 
     def set_agent_tools(self, allowed):
         self._local.agent_tools = bool(allowed)
