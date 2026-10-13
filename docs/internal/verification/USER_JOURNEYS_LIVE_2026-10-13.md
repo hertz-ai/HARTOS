@@ -17,7 +17,7 @@ its task number, never as steps. The matching plan is
 Central = the HARTOS container on the deploy box, build 903cd58c (deployed
 04:17:49 UTC). The only turns in this record whose model answer was kept are
 the three direct answers saved at 03:27 UTC (section 1), BEFORE that deploy,
-on the previous build e829b072f. Twelve paid-API probes were saved; the 11
+on the previous build e829b072f. Twelve chat/analyze probes were saved; the 11
 whose reply text was kept never got a model answer on either build: at 03:25
 (e829b072f) two came back as agent-building text and one as the prompt
 echoed; at 04:20, 05:00 and 06:00 (903cd58c) seven came back as
@@ -26,8 +26,9 @@ path is identical in both builds, read). The 12th, at 03:20 on e829b072f in
 the validation run, answered 200 with a 3-word reply the probe did not keep
 (none of the canned texts is 3 words), so it is not checked and may have
 been a model answer. By this record's own count (section 8: 0 x HTTP 200 from
-the model since the container started at 04:17) no turn after the deploy was
-answered by the model. Central was reached on the LAN node and,
+the model from the container start at 04:17 to the last count at 05:40) no
+turn between the deploy and 05:40 was answered by the model. Central was
+reached on the LAN node and,
 where Kong routes it, on the public host `https://api.hevolve.ai`. Surfaces
 were driven with plain HTTP by throwaway accounts (register is limited to 3
 per hour per client key, which ended one run; what a client key is on central
@@ -43,7 +44,7 @@ throwaway users `lanesval_20261013032019` (03:20), two `routerval_*` (03:25,
 persistent account the daily check uses (05:18, name kept out of this record
 because it holds a long-lived key); one free API key per account that created one
 (lanesval, both routerval, journeys, and that persistent account's single
-key, created at 06:00 after the window above); one public post titled
+key); one public post titled
 "journey probe" (top of the trending feed at 05:20 UTC); one half-created
 agent (`prompt_id` 91867635923, Creation Mode, no recipe).
 
