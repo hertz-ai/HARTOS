@@ -488,7 +488,12 @@ def _metered_backend_chat(prompt: str, label: str):
     this function's log lines; it is NOT an agent.
 
     The customer's call is an agent-less conversation turn (``prompt_id``
-    None), never an agent creation.  Two flags are deliberate: ``draft_first``
+    None): the self-POST itself never asks for an agent to be created.  The
+    default tool set that turn runs still carries ``Create_Agent`` and
+    ``Agentic_Router``; if the model picks one of them the customer gets the
+    creation interview as the answer (the review of 7e7ce19bc drove it;
+    making the metered turn ignore those two tool flags is task #120).
+    Two flags are deliberate: ``draft_first``
     False, so the 0.8B draft and its classifier never answer a paid call
     (a confident ``is_create_agent`` verdict would mint an agent and hand the
     customer the creation text again; a confident ``delegate=none`` would ship

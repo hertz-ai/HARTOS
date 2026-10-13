@@ -73,6 +73,9 @@ def _chat(hie, monkeypatch, body, headers):
     monkeypatch.setattr(hie, '_persist_language', lambda *a, **k: None)
     monkeypatch.setattr(hie, '_cleanup_stale_agents', lambda: None)
     monkeypatch.setattr(hie, 'get_ans', stop)
+    # The INITIALIZED publish sits just before get_ans; a unit test must not
+    # hand it to the desktop's bus (review of 7e7ce19bc: 2 publishes here).
+    monkeypatch.setattr(hie, 'publish_async', lambda *a, **k: None)
     body = dict(body, speculative=True)
     body.setdefault('prompt_id', '7')
     with patch('integrations.agent_engine.speculative_dispatcher.get_speculative_dispatcher',

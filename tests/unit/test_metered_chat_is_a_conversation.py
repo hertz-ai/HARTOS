@@ -91,6 +91,12 @@ def _metered_call_through_real_chat(hie, monkeypatch, route, body):
     monkeypatch.setattr(hie, '_cleanup_stale_agents', lambda: None)
     monkeypatch.setattr(hie, '_tts_synthesize_and_publish', lambda *a, **k: None)
     monkeypatch.setattr(_cm, 'persist_and_publish_async', lambda *a, **k: None)
+    # The turn's own side effects, none of which belong in a unit test: the
+    # longrunning.log publishes to the desktop's bus (Crossbar :8088) and
+    # the resonance tuner's call to the live model (the review of 7e7ce19bc
+    # counted 12 publishes and 12 llama-server requests from this file).
+    monkeypatch.setattr(hie, 'publish_async', lambda *a, **k: None)
+    monkeypatch.setattr(hie, '_tune_resonance_after_chat', lambda *a, **k: {})
     seen = {'get_ans': 0, 'gather_info': 0, 'casual_conv': None, 'draft': 0}
 
     def fake_get_ans(casual_conv, *a, **k):
@@ -169,7 +175,9 @@ def test_a_paid_call_never_consults_the_draft(hie, monkeypatch, route, body, res
 @pytest.mark.parametrize('route,body,resp_key', ROUTES)
 def test_a_paid_call_is_not_the_casual_tool_set(hie, monkeypatch, route, body, resp_key):
     """casual_conv stays False: the casual tool set carries Shell_Command and
-    Computer_Action, and the shell handler has only a denylist."""
+    Computer_Action.  The shell handler is a denylist plus the owner's
+    computer-control consent, and one grant covers every agent, so a free key
+    must not be able to select that set."""
     r, sent, seen = _metered_call_through_real_chat(hie, monkeypatch, route, body)
     assert not sent['json'].get('casual_conv')
     assert seen['casual_conv'] is False, seen
